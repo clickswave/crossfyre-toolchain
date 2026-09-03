@@ -190,7 +190,10 @@ class MainActivity : ComponentActivity() {
             } catch (e: Exception) {
                 creepJob?.cancel(); creepJob = null
                 patching = false
-                patchStatus = "Patch failed: ${e.message}"
+                // e.message is null for plenty of exceptions, and "Patch failed: null" tells
+                // nobody anything. Patcher passes the server's own sentence through here.
+                patchStatus = "Patch failed: " + (e.message?.takeIf { it.isNotBlank() }
+                    ?: "something went wrong on the way to the server.")
             }
         }
     }

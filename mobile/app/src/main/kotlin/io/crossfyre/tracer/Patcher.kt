@@ -99,8 +99,14 @@ object Patcher {
         progress(Step("Patching on server…", null)) // server-side; indeterminate
         val code = conn.responseCode
         if (code != 200) {
-            val err = runCatching { conn.errorStream?.bufferedReader()?.readText() }.getOrNull()
-            throw IllegalStateException("Patch failed (HTTP $code): ${err ?: ""}")
+            val err = runCatching { conn.errorStream?.bufferedReader()?.readText()?.trim() }.getOrNull()
+            // The server explains itself in the body, and the caller already labels this as a
+            // failure, so pass the sentence through rather than wrapping it. Prefixing here as
+            // well produced "Patch failed: Patch failed (HTTP 501): ...". The status code only
+            // appears when there is no message to show instead of it.
+            throw IllegalStateException(
+                if (err.isNullOrBlank()) "the server returned HTTP $code" else err
+            )
         }
         // Download with progress (0.55 .. 0.99). Content-Length is set by the proxy.
         val dlTotal = conn.contentLengthLong
