@@ -1857,7 +1857,45 @@ pub async fn run_daemon(force: bool, paths: &NodePaths) -> Result<(), Box<dyn st
     // node per api_key" - so if it returns valid=false we abort instead of
     // falling through to a cached config (which would let two daemons race
     // for the same NATS subjects).
-    if let Err(e) = refresh_node_state(&mut config, &config_path, &paths.network_dir, force).await {
+    // Retry a control plane that is not up YET, rather than treating it as fatal.
+    //
+    // WHY: on a reboot the node service and the control plane start together, and
+    // the node usually wins the race. It used to call exit(1) on the resulting
+    // connection error; the supervisor then parked it as dead and "held until its
+    // config changes", i.e. forever. systemd never intervened either, because
+    // Restart=on-failure watches the SUPERVISOR, which stayed perfectly healthy
+    // holding a corpse. Net effect: every reboot silently killed the fleet until a
+    // human ran `systemctl restart` by hand, and the dashboard just said 0 nodes
+    // online without saying why.
+    //
+    // Only genuinely transient failures are retried. A deleted node, a revoked key
+    // or another daemon holding the same api_key are permanent and still exit
+    // immediately: retrying those would spin forever hiding a real problem.
+    const AUTH_RETRY_WINDOW_SECS: u64 = 600;
+    let auth_started = std::time::Instant::now();
+    let mut backoff = std::time::Duration::from_secs(2);
+    let refresh_result = loop {
+        match refresh_node_state(&mut config, &config_path, &paths.network_dir, force).await {
+            Ok(()) => break Ok(()),
+            Err(e) => {
+                let transient = e
+                    .downcast_ref::<reqwest::Error>()
+                    .map(|re| re.is_connect() || re.is_timeout() || re.is_request())
+                    .unwrap_or(false);
+                if !transient || auth_started.elapsed().as_secs() >= AUTH_RETRY_WINDOW_SECS {
+                    break Err(e);
+                }
+                eprintln!(
+                    "  Control plane not reachable yet ({e}); retrying in {}s",
+                    backoff.as_secs()
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
+            }
+        }
+    };
+
+    if let Err(e) = refresh_result {
         if e.downcast_ref::<NodeDeleted>().is_some() {
             eprintln!(
                 "\n  Node {} not found on the server (deleted in the dashboard, or its key was revoked).",

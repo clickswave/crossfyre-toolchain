@@ -175,6 +175,15 @@ struct Ctx {
     /// Present only under `--seed-credentials`: the per-host auth material observed so far. When
     /// absent (the default) no secret value is ever read or retained.
     seed: Option<SeedStore>,
+    /// The session's capture settings, fetched once at start from the control plane
+    /// via the shared `cfx_capture::CaptureConfig`. When `full_capture` is on this
+    /// proxy attaches the real bytes to each event, which is what the Requests tab
+    /// and the Bench Repeater read.
+    ///
+    /// This used to be absent entirely: the desktop never asked for the config and
+    /// never attached the bytes, so PC captures produced a populated Assets tab and
+    /// a permanently empty Requests tab with no error anywhere.
+    capture: Arc<cfx_capture::CaptureConfig>,
 }
 
 // ---------------------------------------------------------------------------
@@ -386,6 +395,22 @@ async fn forward(req: Request<Incoming>, base: &str, ctx: &Ctx) -> Response<Body
     let body_params =
         crate::toolchain::trace::body_param_keys(content_type.as_deref(), &body_bytes);
 
+    // Kept for full capture, which needs the real request bytes and headers. Cloned
+    // before the body is moved into the upstream request. Skipped entirely when the
+    // session is in shape-only mode, so the default path allocates nothing extra.
+    let full_capture = ctx.capture.full_capture;
+    let cap_req_headers = if full_capture {
+        header_pairs(parts.headers.iter().map(|(n, v)| (n.as_str(), v)))
+    } else {
+        Vec::new()
+    };
+    let cap_req_body = if full_capture {
+        String::from_utf8_lossy(&body_bytes).to_string()
+    } else {
+        String::new()
+    };
+    let started = std::time::Instant::now();
+
     let mut rb = ctx.client.request(method.clone(), url.as_str());
     for (name, value) in parts.headers.iter() {
         if !is_hop_header(name.as_str()) {
@@ -403,8 +428,6 @@ async fn forward(req: Request<Incoming>, base: &str, ctx: &Ctx) -> Response<Body
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
 
-            // Emit the shape (scope-filtered). Response status + tech are known here, so unlike the
-            // packet path this is one correlated event per request.
             let raw = RawCapture {
                 method: Some(method.as_str().to_string()),
                 uri: Some(url.clone()),
@@ -414,9 +437,6 @@ async fn forward(req: Request<Incoming>, base: &str, ctx: &Ctx) -> Response<Body
                 content_type: content_type.clone(),
                 body_params: body_params.clone(),
             };
-            if let Some(ev) = shape(&raw, ctx.scope.as_deref()) {
-                let _ = ctx.tx.send(ev).await;
-            }
 
             let mut builder = Response::builder().status(status);
             for (name, value) in resp.headers().iter() {
@@ -424,7 +444,37 @@ async fn forward(req: Request<Incoming>, base: &str, ctx: &Ctx) -> Response<Body
                     builder = builder.header(name, value);
                 }
             }
+            let cap_resp_headers = if full_capture {
+                header_pairs(resp.headers().iter().map(|(n, v)| (n.as_str(), v)))
+            } else {
+                Vec::new()
+            };
+
+            // The response body has to be read before the event can carry it, so the
+            // event is emitted here rather than above. Ordering matters: the browser
+            // still gets the identical bytes, we just also keep a copy.
             let bytes = resp.bytes().await.unwrap_or_default();
+
+            // Emit the shape (scope-filtered). Response status + tech are known here, so unlike the
+            // packet path this is one correlated event per request.
+            if let Some(mut ev) = shape(&raw, ctx.scope.as_deref()) {
+                if full_capture {
+                    // One shared call rather than six hand-set fields. A half-filled
+                    // full-capture event is stored without complaint and surfaces as
+                    // an empty Requests tab rather than an error, which is exactly
+                    // how this went unnoticed on the desktop path.
+                    ev.attach_full(cfx_capture::FullExchange {
+                        url: url.clone(),
+                        req_headers: cap_req_headers,
+                        req_body: cap_req_body,
+                        resp_headers: cap_resp_headers,
+                        resp_body: String::from_utf8_lossy(&bytes).to_string(),
+                        duration_ms: Some(started.elapsed().as_millis() as u64),
+                    });
+                }
+                let _ = ctx.tx.send(ev).await;
+            }
+
             builder
                 .body(full(bytes))
                 .unwrap_or_else(|_| Response::new(empty()))
@@ -439,6 +489,60 @@ async fn forward(req: Request<Incoming>, base: &str, ctx: &Ctx) -> Response<Body
                 .unwrap()
         }
     }
+}
+
+/// Fetch this session's capture settings from the control plane.
+///
+/// Transport only: the endpoint, the request shape, the parsing and the fallback
+/// all live in `cfx_capture::CaptureConfig`, shared with the mobile client. That
+/// split is deliberate. When the two clients each owned their own copy of "what
+/// full capture means", one of them silently stopped implementing it.
+async fn fetch_capture_config(
+    client: &reqwest::Client,
+    api_url: &str,
+    workflow_id: &str,
+    token: &str,
+) -> cfx_capture::CaptureConfig {
+    let url = format!(
+        "{}{}",
+        api_url.trim_end_matches('/'),
+        cfx_capture::config::CONFIG_PATH
+    );
+    let body = cfx_capture::CaptureConfig::request_body(workflow_id, token);
+    match client.post(&url).json(&body).send().await {
+        Ok(r) => match r.json::<serde_json::Value>().await {
+            Ok(v) => cfx_capture::CaptureConfig::parse(&v),
+            Err(e) => {
+                eprintln!("[trace] capture config unreadable ({e}); using defaults");
+                cfx_capture::CaptureConfig::default()
+            }
+        },
+        Err(e) => {
+            eprintln!("[trace] capture config fetch failed ({e}); using defaults");
+            cfx_capture::CaptureConfig::default()
+        }
+    }
+}
+
+/// Flatten a header map into the ordered `[name, value]` pairs the captured-requests
+/// store expects. Generic over the iterator so the same helper serves hyper's request
+/// headers and reqwest's response headers; two near-identical copies is how the two
+/// sides drift apart.
+///
+/// Non-UTF-8 header values are lossily decoded rather than dropped: a header that
+/// exists is worth showing even if one byte is unprintable, and silently omitting it
+/// would misrepresent the request that was actually sent.
+fn header_pairs<'a, I>(iter: I) -> Vec<[String; 2]>
+where
+    I: Iterator<Item = (&'a str, &'a hyper::header::HeaderValue)>,
+{
+    iter.map(|(n, v)| {
+        [
+            n.to_string(),
+            String::from_utf8_lossy(v.as_bytes()).to_string(),
+        ]
+    })
+    .collect()
 }
 
 /// reqwest's `Display` collapses to "error sending request for url (...)" and hides WHY. Walk the
@@ -581,6 +685,24 @@ pub async fn run_proxy(cfg: TraceConfig) -> Result<(), BoxErr> {
         None
     };
 
+    // Ask the control plane what this session wants captured. The desktop never
+    // used to do this, which is the entire reason PC traces produced an empty
+    // Requests tab: the server was gating on `full_capture` while the client had
+    // no idea the setting existed and never sent the bytes it gates.
+    //
+    // A failed fetch falls back to CaptureConfig::default() (full capture ON), the
+    // same default the shared crate documents, so a control plane blip degrades to
+    // capturing more rather than to silently capturing nothing useful.
+    let capture = fetch_capture_config(&client, &cfg.api_url, &cfg.workflow_id, &cfg.token).await;
+    println!(
+        "  capture mode: {}",
+        if capture.full_capture {
+            "full (headers + bodies -> Requests tab)"
+        } else {
+            "shape only (Assets tab; Requests tab will stay empty)"
+        }
+    );
+
     let (tx, mut rx) = mpsc::channel::<TraceEvent>(1024);
     let ctx = Ctx {
         client,
@@ -589,6 +711,7 @@ pub async fn run_proxy(cfg: TraceConfig) -> Result<(), BoxErr> {
         scope: cfg.host_filter.clone(),
         ca_pem: Arc::new(ca.pem.clone()),
         seed: seed_store.clone(),
+        capture: Arc::new(capture),
     };
     tokio::spawn(serve(listener, ctx));
 

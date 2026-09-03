@@ -9,34 +9,49 @@ use std::time::Duration;
 use cfx_capture::{EditedRequest, InterceptDecision, InterceptGate};
 use serde_json::json;
 
-/// Ask the control plane whether full capture / manual interception is on for this session.
+/// Ask the control plane whether full capture / manual interception is on.
+///
+/// Transport only. The endpoint, request shape, parsing and fallback all live in
+/// `cfx_capture::CaptureConfig`, shared with the desktop proxy, so the two clients
+/// cannot disagree about what a setting means. They previously did: this function
+/// used to default `full_capture` to FALSE on a failed or partial response while
+/// the documented default was true, so a control-plane blip quietly downgraded a
+/// session to shape-only and the Requests tab just looked empty.
 pub async fn fetch_config(
     client: &reqwest::Client,
     api_url: &str,
     workflow_id: &str,
     token: &str,
 ) -> (bool, String) {
-    let url = format!("{}/api/v1/web-trace/config", api_url.trim_end_matches('/'));
-    let body = json!({ "workflow_id": workflow_id, "token": token });
+    let cfg = fetch_capture_config(client, api_url, workflow_id, token).await;
+    (cfg.full_capture, cfg.intercept_mode)
+}
+
+/// The shared-config fetch. Prefer this over [`fetch_config`], which exists only
+/// so the existing tuple call sites keep compiling.
+pub async fn fetch_capture_config(
+    client: &reqwest::Client,
+    api_url: &str,
+    workflow_id: &str,
+    token: &str,
+) -> cfx_capture::CaptureConfig {
+    let url = format!(
+        "{}{}",
+        api_url.trim_end_matches('/'),
+        cfx_capture::config::CONFIG_PATH
+    );
+    let body = cfx_capture::CaptureConfig::request_body(workflow_id, token);
     match client.post(&url).json(&body).send().await {
-        Ok(r) => {
-            let v: serde_json::Value = r.json().await.unwrap_or_default();
-            // The control plane wraps payloads as { status, data: {...} }.
-            let d = v.get("data").cloned().unwrap_or(v);
-            let full = d
-                .get("full_capture")
-                .and_then(|b| b.as_bool())
-                .unwrap_or(false);
-            let mode = d
-                .get("intercept_mode")
-                .and_then(|s| s.as_str())
-                .unwrap_or("auto")
-                .to_string();
-            (full, mode)
-        }
+        Ok(r) => match r.json::<serde_json::Value>().await {
+            Ok(v) => cfx_capture::CaptureConfig::parse(&v),
+            Err(e) => {
+                log::warn!("capture config unreadable: {e}");
+                cfx_capture::CaptureConfig::default()
+            }
+        },
         Err(e) => {
-            log::warn!("config fetch failed: {e}");
-            (false, "auto".into())
+            log::warn!("capture config fetch failed: {e}");
+            cfx_capture::CaptureConfig::default()
         }
     }
 }

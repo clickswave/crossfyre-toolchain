@@ -11,11 +11,13 @@
 //! CA machinery is identical either way, which is the point: install one CA, trust every capture
 //! surface, and never diverge the certificate behavior between desktop and mobile.
 
+pub mod config;
 pub mod flow;
 pub mod reduce;
 
+pub use config::CaptureConfig;
 pub use flow::serve_mitm_flow;
-pub use reduce::{TraceEvent, body_field_names, redact_url};
+pub use reduce::{FullExchange, TraceEvent, body_field_names, redact_url};
 
 use std::collections::HashMap;
 use std::error::Error;

@@ -50,6 +50,45 @@ pub struct TraceEvent {
     pub duration_ms: Option<u64>,
 }
 
+/// One captured exchange's real bytes, for full-capture mode.
+///
+/// Exists so "what a full-capture event must contain" is one type rather than
+/// six optional fields each client remembers to set independently. The desktop
+/// proxy forgot all six for the life of the feature, which is why the Requests
+/// tab was empty for every PC capture while Assets worked fine.
+#[derive(Debug, Clone, Default)]
+pub struct FullExchange {
+    /// Unredacted absolute URL, real query values included.
+    pub url: String,
+    pub req_headers: Vec<[String; 2]>,
+    pub req_body: String,
+    pub resp_headers: Vec<[String; 2]>,
+    pub resp_body: String,
+    pub duration_ms: Option<u64>,
+}
+
+impl TraceEvent {
+    /// Attach the real bytes to an already-shaped event.
+    ///
+    /// Call this and only this when the session has full capture on. Setting the
+    /// fields by hand is how they drift: the server stores whatever arrives and
+    /// reports nothing when half of it is missing, so a partial event fails
+    /// silently and looks like an empty tab rather than a bug.
+    pub fn attach_full(&mut self, ex: FullExchange) {
+        self.full_url = Some(ex.url);
+        self.req_headers = Some(ex.req_headers);
+        self.req_body = Some(ex.req_body);
+        self.resp_headers = Some(ex.resp_headers);
+        self.resp_body = Some(ex.resp_body);
+        self.duration_ms = ex.duration_ms;
+    }
+
+    /// Whether this event carries the real bytes.
+    pub fn has_full_capture(&self) -> bool {
+        self.full_url.is_some() && self.req_headers.is_some()
+    }
+}
+
 /// Redact a URL down to a safe shape: strip `user:pass@` userinfo, drop the `#fragment`, and keep
 /// query parameter KEYS while blanking their VALUES (`?a=secret&b=2` -> `?a=&b=`). Pure and robust to
 /// malformed input.
