@@ -1,6 +1,6 @@
 [package]
 name = "crossfyre"
-version = "0.1.27"
+version = "0.1.28"
 edition = "2024"
 homepage = "https://clickswave.org"
 repository = "https://github.com/clickswave/crossfyre_toolchain"
