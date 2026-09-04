@@ -166,17 +166,32 @@ class MainActivity : ComponentActivity() {
 
     /** The package currently being patched, so success can be attributed to it. */
     private var patchingPkg: String? = null
+    /** The running patch, so it can be cancelled from the progress dialog.
+     *
+     * Compose state, because the Cancel button's presence follows it: once the
+     * coroutine hands off to the system installer there is nothing left for us
+     * to cancel, and offering a button that cannot do anything is worse than
+     * offering none.
+     */
+    private var patchJob by mutableStateOf<kotlinx.coroutines.Job?>(null)
+
+    /** Stop a running patch. Teardown lives in the coroutine's cancellation
+     *  handler so it runs no matter who cancels or why. */
+    private fun cancelPatch() {
+        creepJob?.cancel(); creepJob = null
+        patchJob?.cancel()
+    }
 
     private fun patchApp(pkg: String) {
         patchingPkg = pkg
         val pair = Pairing.load(this)
         if (pair == null) { patchStatus = "Pair a workspace first."; return }
-        val ca = File(getExternalFilesDir(null), caFileName())
-        if (!ca.exists()) { patchStatus = "Generate + install the CA first."; return }
+        val ca = ensureCaFile()
+        if (ca == null) { patchStatus = "Could not create this device's certificate."; return }
         patching = true
         patchStatus = "Starting…"
         patchProgress = null
-        lifecycleScope.launch {
+        patchJob = lifecycleScope.launch {
             try {
                 val patched = Patcher.buildPatched(applicationContext, pkg, pair.apiUrl, pair.workflowId, pair.token, ca) { step ->
                     patchStatus = step.label
@@ -199,13 +214,31 @@ class MainActivity : ComponentActivity() {
                 patchStatus = "Uninstalling the old build (you'll re-login), then installing the patched one…"
                 patchProgress = 0.99f
                 requestUninstall(pkg)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // Cancelling is a normal outcome, not a failure, and must not
+                // read like one. Leave nothing half-set: no pending install, no
+                // package waiting to be attributed, no stale progress bar.
+                creepJob?.cancel(); creepJob = null
+                patching = false
+                patchProgress = null
+                pendingInstall = null
+                pendingPkg = null
+                patchingPkg = null
+                Patcher.discardWorkspace(applicationContext)
+                patchStatus = "Patch cancelled. Nothing was installed or changed."
+                throw e
             } catch (e: Exception) {
                 creepJob?.cancel(); creepJob = null
                 patching = false
+                patchProgress = null
+                patchingPkg = null
+                Patcher.discardWorkspace(applicationContext)
                 // e.message is null for plenty of exceptions, and "Patch failed: null" tells
                 // nobody anything. Patcher passes the server's own sentence through here.
                 patchStatus = "Patch failed: " + (e.message?.takeIf { it.isNotBlank() }
                     ?: "something went wrong on the way to the server.")
+            } finally {
+                patchJob = null
             }
         }
     }
@@ -255,6 +288,17 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         runCatching { Native.setStorageDir(filesDir.absolutePath) }
+        // A patch killed mid-flight (app swiped away, process reaped) leaves its
+        // staged APKs behind: tens to hundreds of megabytes of a phone's storage
+        // with nothing left that will ever read them. Nothing is patching at
+        // launch by definition, so anything still here is debris.
+        Patcher.discardWorkspace(this)
+        // Forget patch records for apps that are no longer installed, so the
+        // count of "patched apps" a certificate reset threatens stays honest.
+        PatchPrefs.all(this).keys.forEach { pkg ->
+            val gone = runCatching { packageManager.getApplicationInfo(pkg, 0) }.isFailure
+            if (gone) PatchPrefs.forget(this, pkg)
+        }
         paired = Pairing.load(this) != null
         allowFullCapture = FullCapturePrefs.allowed(this)
         // Restore persisted scope so the operator's choice survives closing the app.
@@ -413,6 +457,24 @@ class MainActivity : ComponentActivity() {
             val prepare = VpnService.prepare(this)
             if (prepare != null) vpnConsent.launch(prepare) else { launchService(); running = true }
         }
+    }
+
+    /** The CA as a file the patcher can upload, minting one if this device has
+     *  none yet. Returns null only if the certificate could not be created.
+     *
+     * Patching does not require the certificate to be installed into Android,
+     * so it must not require the button that installs it either. Requiring the
+     * exported file to already exist made "Generate + install CA" a prerequisite
+     * for patching, which is exactly the friction the patch path exists to
+     * avoid, and the error said "Generate + install the CA first" while the card
+     * beside it said installing was unnecessary.
+     */
+    private fun ensureCaFile(): java.io.File? {
+        val out = java.io.File(getExternalFilesDir(null), caFileName())
+        if (out.exists() && out.length() > 0) return out
+        val pem = runCatching { Native.generateCaPem() }.getOrNull() ?: return null
+        if (pem.startsWith("ERROR")) return null
+        return runCatching { out.writeText(pem); out }.getOrNull()
     }
 
     private fun installCa() {
@@ -595,9 +657,26 @@ class MainActivity : ComponentActivity() {
                         }
                         OutlinedAccentButton("Choose") { showPicker = true }
                     }
+                    if (scopeMode == TracerVpnService.MODE_ONLY && selectedApps.isNotEmpty()) {
+                        val current = caFingerprint()
+                        val ready = selectedApps.count { PatchPrefs.caFor(this@MainActivity, it) == current && current != null }
+                        val staleHere = selectedApps.count {
+                            val f = PatchPrefs.caFor(this@MainActivity, it); f != null && f != current
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            when {
+                                staleHere > 0 -> "$staleHere of ${selectedApps.size} need re-patching before they will decrypt."
+                                ready == selectedApps.size -> "All ${selectedApps.size} patched and ready."
+                                else -> "$ready of ${selectedApps.size} patched. Unpatched apps only decrypt if they trust user certificates."
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (staleHere > 0) Cfx.warningLight else Cfx.text3
+                        )
+                    }
                     Spacer(Modifier.height(8.dp))
                     Text(
-                        "Pinned apps (banking, dating, etc.) reject the CA and can't be captured, so they may fail to connect while captured. Put them in \"All except\" to keep them working.",
+                        "Pinned apps (banking, dating, etc.) reject the CA and can't be captured, so they may fail to connect while captured. Patch them here, or put them in \"All except\" to keep them working.",
                         style = MaterialTheme.typography.bodySmall, color = Cfx.text3
                     )
                 }
@@ -653,7 +732,16 @@ class MainActivity : ComponentActivity() {
         if (patching) {
             AlertDialog(
                 onDismissRequest = {},
-                confirmButton = {},
+                // Only offered while there is something to stop. After the handoff
+                // to the system installer this disappears, because cancelling here
+                // could not undo an install Android is already carrying out.
+                confirmButton = {
+                    if (patchJob != null) {
+                        TextButton(onClick = { cancelPatch() }) {
+                            Text("Cancel", color = Cfx.text3)
+                        }
+                    }
+                },
                 containerColor = Cfx.surfaceRaised,
                 title = { Text("Patching app", color = Cfx.text) },
                 text = {

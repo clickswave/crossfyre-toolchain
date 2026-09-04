@@ -11,7 +11,9 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
+import kotlin.coroutines.coroutineContext
 
 /**
  * Server-assisted pinning bypass. Rewriting an installed app reliably is not something a phone can do
@@ -30,6 +32,17 @@ object Patcher {
      * Collect [pkg]'s splits, upload them for patching, and return the patched split files (in cache).
      * Throws on any failure (unreadable APK, network, server error). Runs off the main thread.
      */
+    /** Delete the scratch directory a patch works in.
+     *
+     * Called when a patch is cancelled or fails. The APKs staged here are tens
+     * to hundreds of megabytes, and leaving them behind after an abandoned patch
+     * quietly eats a phone's storage. `buildPatched` also clears it on entry, so
+     * this is about not leaving the mess in the first place.
+     */
+    fun discardWorkspace(ctx: Context) {
+        runCatching { File(ctx.cacheDir, "patch").deleteRecursively() }
+    }
+
     suspend fun buildPatched(
         ctx: Context,
         pkg: String,
@@ -107,6 +120,8 @@ object Patcher {
                 var lastPct = -1
                 var n = ins.read(buf)
                 while (n >= 0) {
+                    // A 200MB upload must stop when asked, not at the end.
+                    coroutineContext.ensureActive()
                     os.write(buf, 0, n)
                     sent += n
                     val pct = (sent * 100 / uploadTotal).toInt()
@@ -138,7 +153,10 @@ object Patcher {
         var expectedSha = ""
         val deadline = System.currentTimeMillis() + PATCH_WAIT_MS
         while (System.currentTimeMillis() < deadline) {
-            Thread.sleep(POLL_INTERVAL_MS)
+            // delay(), not Thread.sleep(): the server phase is the longest part of
+            // a patch and the most likely place to be cancelled, and Thread.sleep
+            // ignores cancellation entirely.
+            kotlinx.coroutines.delay(POLL_INTERVAL_MS)
             val st = postJson(
                 "$base/api/v1/web-trace/patch-job/status",
                 JSONObject().put("workflow_id", workflowId).put("token", token).put("job_id", jobId)
@@ -172,6 +190,7 @@ object Patcher {
                 var lastPct = -1
                 var n = input.read(buf)
                 while (n >= 0) {
+                    coroutineContext.ensureActive()
                     os.write(buf, 0, n)
                     digest.update(buf, 0, n)
                     read += n
