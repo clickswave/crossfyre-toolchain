@@ -5,6 +5,8 @@ import android.content.pm.PackageManager
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.security.MessageDigest
+import org.json.JSONObject
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
@@ -62,21 +64,43 @@ object Patcher {
 
         val out = File(work, "out.zip")
         val uploadTotal = upload.length()
-        // Fixed content length lets us stream with a real upload progress %.
-        val conn = (URL("${apiUrl.trimEnd('/')}/api/v1/web-trace/patch").openConnection() as HttpURLConnection).apply {
-            requestMethod = "POST"
+        val base = apiUrl.trimEnd('/')
+
+        // 1. Ask for a job and somewhere to put the bytes.
+        //
+        // The app used to POST the bundle to the control plane and hold that one
+        // request open for the whole rebuild. Three things were wrong with it: an
+        // edge in front of the control plane rejects bodies over ~100MB, which is
+        // smaller than the apps worth patching; a rebuild takes minutes, so a
+        // phone that moved between cells lost the entire upload; and every byte
+        // crossed the control plane twice for no reason. Now the bytes go
+        // straight to storage and only small JSON comes through here.
+        progress(Step("Preparing…", 0.03f))
+        val create = postJson(
+            "$base/api/v1/web-trace/patch-job",
+            JSONObject()
+                .put("workflow_id", workflowId)
+                .put("token", token)
+                .put("package_name", pkg)
+                .put("app_label", installedLabel(ctx, pkg))
+        )
+        val job = create.optJSONObject("data") ?: JSONObject()
+        val jobId = job.optString("job_id", "")
+        val uploadUrl = job.optString("upload_url", "")
+        if (jobId.isEmpty() || uploadUrl.isEmpty()) {
+            throw IllegalStateException(create.optString("message", "the server would not start a patch"))
+        }
+
+        // 2. Straight to storage, not through the control plane.
+        val put = (URL(uploadUrl).openConnection() as HttpURLConnection).apply {
+            requestMethod = "PUT"
             doOutput = true
             connectTimeout = 30_000
-            readTimeout = 300_000 // patching a big app takes a while
+            readTimeout = 600_000
             setRequestProperty("Content-Type", "application/zip")
-            setRequestProperty("X-Cfx-Token", token)
-            // The session this token belongs to. The proxy needs both halves to
-            // verify it; it previously forwarded the token without checking it.
-            setRequestProperty("X-Cfx-Workflow", workflowId)
             setFixedLengthStreamingMode(uploadTotal)
         }
-        // Upload with progress (0.05 .. 0.45 of the whole flow).
-        conn.outputStream.use { os ->
+        put.outputStream.use { os ->
             upload.inputStream().use { ins ->
                 val buf = ByteArray(1 shl 16)
                 var sent = 0L
@@ -95,22 +119,53 @@ object Patcher {
                 os.flush()
             }
         }
-
-        progress(Step("Patching on server…", null)) // server-side; indeterminate
-        val code = conn.responseCode
-        if (code != 200) {
-            val err = runCatching { conn.errorStream?.bufferedReader()?.readText()?.trim() }.getOrNull()
-            // The server explains itself in the body, and the caller already labels this as a
-            // failure, so pass the sentence through rather than wrapping it. Prefixing here as
-            // well produced "Patch failed: Patch failed (HTTP 501): ...". The status code only
-            // appears when there is no message to show instead of it.
-            throw IllegalStateException(
-                if (err.isNullOrBlank()) "the server returned HTTP $code" else err
-            )
+        if (put.responseCode !in 200..299) {
+            throw IllegalStateException("the upload was rejected (HTTP ${put.responseCode})")
         }
-        // Download with progress (0.55 .. 0.99). Content-Length is set by the proxy.
-        val dlTotal = conn.contentLengthLong
-        conn.inputStream.use { input ->
+
+        // 3. Nothing else sees the bytes, so the job only becomes work once we
+        //    say they arrived.
+        postJson(
+            "$base/api/v1/web-trace/patch-job/uploaded",
+            JSONObject().put("workflow_id", workflowId).put("token", token)
+                .put("job_id", jobId).put("raw_size", uploadTotal)
+        )
+
+        // 4. Wait for the worker. Polling rather than a held connection is the
+        //    point: the phone can lose signal here and pick the answer back up.
+        progress(Step("Patching on server…", null))
+        var downloadUrl = ""
+        var expectedSha = ""
+        val deadline = System.currentTimeMillis() + PATCH_WAIT_MS
+        while (System.currentTimeMillis() < deadline) {
+            Thread.sleep(POLL_INTERVAL_MS)
+            val st = postJson(
+                "$base/api/v1/web-trace/patch-job/status",
+                JSONObject().put("workflow_id", workflowId).put("token", token).put("job_id", jobId)
+            ).optJSONObject("data") ?: JSONObject()
+            when (st.optString("status")) {
+                "done" -> {
+                    downloadUrl = st.optString("download_url", "")
+                    expectedSha = st.optString("sha256", "")
+                    break
+                }
+                // The server writes this for the person holding the phone.
+                "failed" -> throw IllegalStateException(
+                    st.optString("error", "").ifBlank { "the app could not be patched" }
+                )
+            }
+        }
+        if (downloadUrl.isEmpty()) throw IllegalStateException("the patch took too long")
+
+        // 5. Fetch from storage, hashing as it lands.
+        val get = (URL(downloadUrl).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 30_000
+            readTimeout = 600_000
+        }
+        val dlTotal = get.contentLengthLong
+        val digest = MessageDigest.getInstance("SHA-256")
+        get.inputStream.use { input ->
             out.outputStream().use { os ->
                 val buf = ByteArray(1 shl 16)
                 var read = 0L
@@ -118,6 +173,7 @@ object Patcher {
                 var n = input.read(buf)
                 while (n >= 0) {
                     os.write(buf, 0, n)
+                    digest.update(buf, 0, n)
                     read += n
                     if (dlTotal > 0) {
                         val pct = (read * 100 / dlTotal).toInt()
@@ -130,6 +186,15 @@ object Patcher {
                     }
                     n = input.read(buf)
                 }
+            }
+        }
+        // The bytes came from storage rather than from the service that made
+        // them, so check they are the ones it said it produced before unpacking
+        // anything. Skipped only when the server published no hash to check.
+        if (expectedSha.isNotBlank()) {
+            val got = digest.digest().joinToString("") { "%02x".format(it) }
+            if (!got.equals(expectedSha, ignoreCase = true)) {
+                throw IllegalStateException("the downloaded app did not match its checksum")
             }
         }
 
@@ -182,6 +247,35 @@ object Patcher {
             }
         }
         patched
+    }
+
+    /** How long to wait for a rebuild before giving up, and how often to ask. */
+    private const val PATCH_WAIT_MS = 20L * 60 * 1000
+    private const val POLL_INTERVAL_MS = 4000L
+
+    /** POST JSON, read JSON back. Small bodies only: the app itself never comes
+     *  through these, it goes to storage. An error body is still parsed, because
+     *  that is where the server puts the sentence worth showing. */
+    private fun postJson(url: String, body: JSONObject): JSONObject {
+        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            doOutput = true
+            connectTimeout = 30_000
+            readTimeout = 60_000
+            setRequestProperty("Content-Type", "application/json")
+        }
+        conn.outputStream.use { it.write(body.toString().toByteArray()) }
+        val text = runCatching {
+            (if (conn.responseCode in 200..299) conn.inputStream else conn.errorStream)
+                ?.bufferedReader()?.readText()
+        }.getOrNull().orEmpty()
+        val parsed = runCatching { JSONObject(text) }.getOrElse { JSONObject() }
+        if (conn.responseCode !in 200..299) {
+            throw IllegalStateException(
+                parsed.optString("message", "").ifBlank { "the server returned HTTP ${conn.responseCode}" }
+            )
+        }
+        return parsed
     }
 
     /** Caps on what a patch response may unpack to. */
