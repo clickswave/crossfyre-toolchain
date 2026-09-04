@@ -148,7 +148,14 @@ class MainActivity : ComponentActivity() {
                 if (status == PackageInstaller.STATUS_SUCCESS) {
                     patching = false
                     patchProgress = 1f
-                    patchStatus = "Patched + installed. Start capture, then use the app: it'll trust the CA."
+                    // Remember WHICH certificate this build trusts. Without it the
+                    // app cannot later tell a working patch from one invalidated by
+                    // a certificate reset, which is the difference between "ready"
+                    // and a TLS alert at capture time.
+                    patchingPkg?.let { pkg ->
+                        caFingerprint()?.let { PatchPrefs.record(this@MainActivity, pkg, it) }
+                    }
+                    patchStatus = "Patched + installed. Start capture, then use the app: it trusts this device's certificate directly, so there is nothing to install."
                 } else {
                     patching = false
                     patchStatus = "Install failed: ${msg ?: "unknown"}"
@@ -157,7 +164,11 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** The package currently being patched, so success can be attributed to it. */
+    private var patchingPkg: String? = null
+
     private fun patchApp(pkg: String) {
+        patchingPkg = pkg
         val pair = Pairing.load(this)
         if (pair == null) { patchStatus = "Pair a workspace first."; return }
         val ca = File(getExternalFilesDir(null), caFileName())
@@ -219,10 +230,15 @@ class MainActivity : ComponentActivity() {
     }
 
     private var caStatus by mutableStateOf("")
-    // Shown after unpair: the CA stays trusted until the user removes it by hand.
+    // Shown after a certificate RESET: Android still trusts the old one until
+    // the user removes it by hand, and the key it vouched for is now gone.
     private var showRemoveCaHint by mutableStateOf(false)
     // Device-side consent for full capture; see FullCapturePrefs.
     private var allowFullCapture by mutableStateOf(false)
+    /** Non-empty while a "this will not decrypt" warning is on screen. */
+    private var preflightWarnings by mutableStateOf<List<String>>(emptyList())
+    private var preflightAcknowledged = false
+    private var showResetCa by mutableStateOf(false)
     private var pendingCaPem: String? = null
     private val caSave =
         registerForActivityResult(ActivityResultContracts.CreateDocument("application/x-x509-ca-cert")) { uri ->
@@ -279,18 +295,52 @@ class MainActivity : ComponentActivity() {
         ScopePrefs.save(this, scopeMode, selectedApps.toSet())
     }
 
+    /** SHA-256 of the current CA, or null when there is no CA yet.
+     *
+     * Read straight off disk rather than through `generateCaPem()`, which MINTS
+     * a CA when none exists. Asking "which certificate am I on?" must never be
+     * the thing that creates one.
+     */
+    private fun caFingerprint(): String? = runCatching {
+        val pem = java.io.File(filesDir, "ca.pem").takeIf { it.exists() }?.readText() ?: return null
+        val der = java.util.Base64.getMimeDecoder().decode(
+            pem.substringAfter("-----BEGIN CERTIFICATE-----")
+                .substringBefore("-----END CERTIFICATE-----")
+        )
+        java.security.MessageDigest.getInstance("SHA-256").digest(der)
+            .joinToString("") { "%02x".format(it) }
+    }.getOrNull()
+
+    /** Packages patched with a CA that is not the current one. */
+    private fun stalePatches(): List<String> = PatchPrefs.stale(this, caFingerprint())
+
+    /** Unpair from the workspace. Deliberately does NOT touch the certificate.
+     *
+     * The CA is a device-local identity; the pairing is a workspace session.
+     * Coupling them meant unpairing silently invalidated every patched app,
+     * with no warning and no way back short of re-patching each one. Removing
+     * the certificate is its own explicit action now, which is also the only
+     * one that can state what it will break.
+     */
     private fun unpair() {
         if (running) toggleCapture()
         Pairing.clear(this)
-        // Delete the interception CA's key material too. Clearing only the
-        // pairing left `ca.key` on disk and, more importantly, left the
-        // certificate installed and trusted in the OS user store: a user who
-        // unpairs reasonably believes they are done, while their device goes on
-        // trusting a CA whose private key is still present.
+        paired = false
+    }
+
+    /** Destroy the CA and forget every patch made with it.
+     *
+     * The security reason the old unpair did this is real: a trusted CA whose
+     * private key is still on the device should not outlive the user's intent.
+     * It just belongs behind a deliberate action that says so, rather than
+     * riding along with unpair.
+     */
+    private fun resetCertificate() {
+        if (running) toggleCapture()
         runCatching { java.io.File(filesDir, "ca.pem").delete() }
         runCatching { java.io.File(filesDir, "ca.key").delete() }
         runCatching { java.io.File(getExternalFilesDir(null), caFileName()).delete() }
-        paired = false
+        PatchPrefs.clear(this)
         caStatus = ""
         showRemoveCaHint = true
     }
@@ -327,11 +377,39 @@ class MainActivity : ComponentActivity() {
         )
     }
 
+    /** Apps that are in scope but will not decrypt, with the reason.
+     *
+     * Only meaningful for `only` mode, where the operator has named exactly what
+     * they intend to capture, so silence about a broken one is a wrong answer.
+     */
+    private fun scopeWarnings(): List<String> {
+        if (scopeMode != TracerVpnService.MODE_ONLY) return emptyList()
+        val current = caFingerprint()
+        return selectedApps.mapNotNull { pkg ->
+            val patchedWith = PatchPrefs.caFor(this, pkg)
+            when {
+                patchedWith == null -> null // never patched: may still work if it trusts user CAs
+                current == null -> "$pkg was patched, but this device has no certificate now"
+                patchedWith != current -> "$pkg trusts an older certificate and needs re-patching"
+                else -> null
+            }
+        }
+    }
+
     private fun toggleCapture() {
         if (running) {
             startService(Intent(this, TracerVpnService::class.java).setAction(TracerVpnService.ACTION_STOP))
             running = false
         } else {
+            // Refuse to start quietly broken. A stale patch fails as
+            // `CertificateUnknown` deep in a log, which reads as "capture is
+            // broken" rather than "this app trusts the wrong certificate".
+            val warnings = scopeWarnings()
+            if (warnings.isNotEmpty() && !preflightAcknowledged) {
+                preflightWarnings = warnings
+                return
+            }
+            preflightAcknowledged = false
             val prepare = VpnService.prepare(this)
             if (prepare != null) vpnConsent.launch(prepare) else { launchService(); running = true }
         }
@@ -393,8 +471,8 @@ class MainActivity : ComponentActivity() {
                 title = { Text("Remove the Crossfyre certificate") },
                 text = {
                     Text(
-                        "Unpairing deleted this app's certificate files, but Android still " +
-                            "trusts the certificate you installed. Remove it under " +
+                        "This app's certificate has been reset, but if you ever installed " +
+                            "the old one into Android it is still trusted there. Remove it under " +
                             "Security > Encryption & credentials > User credentials."
                     )
                 },
@@ -464,12 +542,30 @@ class MainActivity : ComponentActivity() {
                 }
 
                 SectionCard("Certificate", step = "2") {
+                    // Installing this into Android is the most painful step in the
+                    // product (lock-screen PIN, five levels of Settings, a standing
+                    // "network may be monitored" warning) and patching an app does
+                    // NOT need it: the patch embeds this certificate directly. Say
+                    // so, rather than sending everyone through it by default.
                     Text(
-                        "Capture terminates TLS with an on-device CA. Install it, then trust it in the app you test.",
+                        "Capture terminates TLS with a certificate that stays on this device. Patching an app in Scope builds this certificate into it, so most testing needs nothing installed here.",
                         style = MaterialTheme.typography.bodySmall
                     )
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "Install it into Android only for apps you cannot patch, and only if they trust user certificates.",
+                        style = MaterialTheme.typography.bodySmall, color = Cfx.text3
+                    )
+                    val stale = stalePatches()
+                    if (stale.isNotEmpty()) {
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "${stale.size} patched ${if (stale.size == 1) "app trusts" else "apps trust"} an older certificate and will not decrypt until re-patched.",
+                            style = MaterialTheme.typography.bodySmall, color = Cfx.warningLight
+                        )
+                    }
                     Spacer(Modifier.height(10.dp))
-                    PrimaryButton("Generate + install CA", fill = false) { installCa() }
+                    PrimaryButton("Install into Android", fill = false) { installCa() }
                     if (caStatus.isNotEmpty()) {
                         Spacer(Modifier.height(8.dp))
                         Text(caStatus, style = MaterialTheme.typography.bodySmall, color = Cfx.text2)
@@ -479,6 +575,10 @@ class MainActivity : ComponentActivity() {
                         Text(if (showCaHelp) "Hide trust steps" else "Chrome won't work: how to trust it ›", color = Cfx.ember, fontSize = 13.sp)
                     }
                     if (showCaHelp) CaHelp()
+                    Spacer(Modifier.height(4.dp))
+                    TextButton(onClick = { showResetCa = true }, contentPadding = PaddingValues(0.dp)) {
+                        Text("Reset certificate", color = Cfx.text3, fontSize = 12.sp)
+                    }
                 }
 
                 SectionCard("Scope", step = "3") {
@@ -579,6 +679,74 @@ class MainActivity : ComponentActivity() {
                 confirmButton = { TextButton(onClick = { patchStatus = "" }) { Text("OK", color = Cfx.ember) } },
                 title = { Text("Patch", color = Cfx.text) },
                 text = { Text(patchStatus, color = Cfx.text2) }
+            )
+        }
+
+        // Named an app that cannot decrypt? Say so before capturing, not after.
+        if (preflightWarnings.isNotEmpty()) {
+            AlertDialog(
+                onDismissRequest = { preflightWarnings = emptyList() },
+                containerColor = Cfx.surfaceRaised,
+                title = { Text("These apps won't decrypt", color = Cfx.text) },
+                text = {
+                    Column {
+                        preflightWarnings.forEach {
+                            Text("- $it", color = Cfx.text2, fontSize = 13.sp)
+                            Spacer(Modifier.height(4.dp))
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            "Re-patch them from Scope, or start anyway and capture only what they send in the clear.",
+                            color = Cfx.text3, fontSize = 12.sp
+                        )
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        preflightWarnings = emptyList()
+                        preflightAcknowledged = true
+                        toggleCapture()
+                    }) { Text("Start anyway", color = Cfx.warningLight) }
+                },
+                dismissButton = {
+                    TextButton(onClick = { preflightWarnings = emptyList() }) {
+                        Text("Cancel", color = Cfx.text3)
+                    }
+                }
+            )
+        }
+
+        // Removing the certificate is destructive in a way that is invisible
+        // until you next capture, so it states its blast radius up front.
+        if (showResetCa) {
+            val patchedCount = PatchPrefs.all(this).size
+            AlertDialog(
+                onDismissRequest = { showResetCa = false },
+                containerColor = Cfx.surfaceRaised,
+                title = { Text("Reset certificate?", color = Cfx.text) },
+                text = {
+                    Text(
+                        buildString {
+                            append("A new certificate is created the next time you capture. ")
+                            if (patchedCount > 0) {
+                                append("The ")
+                                append(patchedCount)
+                                append(if (patchedCount == 1) " app you have patched" else " apps you have patched")
+                                append(" trust the current one, so they will stop decrypting until you re-patch them. ")
+                            }
+                            append("Do this if you think the private key may have been exposed.")
+                        },
+                        color = Cfx.text2
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = { showResetCa = false; resetCertificate() }) {
+                        Text("Reset", color = Cfx.dangerLight)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showResetCa = false }) { Text("Cancel", color = Cfx.text3) }
+                }
             )
         }
     }
@@ -800,13 +968,38 @@ class MainActivity : ComponentActivity() {
                                 },
                                 colors = CheckboxDefaults.colors(checkedColor = Cfx.ember, uncheckedColor = Cfx.text3, checkmarkColor = Color.Black)
                             )
+                            // An app's readiness is a fact about THIS device: was it
+                            // patched, and with the certificate that is current now.
+                            // Showing it here is the difference between finding out
+                            // now and finding out as a TLS alert mid-capture.
+                            val patchedWith = PatchPrefs.caFor(this@MainActivity, pkg)
+                            val current = caFingerprint()
+                            val isPatched = patchedWith != null
+                            val isStale = isPatched && current != null && patchedWith != current
+
                             Column(Modifier.weight(1f)) {
                                 Text(label, color = Cfx.text1, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                 Text(pkg, color = Cfx.text3, fontFamily = Cfx.mono, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                if (isStale) {
+                                    Text(
+                                        "Re-patch needed: trusts an old certificate",
+                                        color = Cfx.warningLight, fontSize = 10.sp, maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                } else if (isPatched) {
+                                    Text(
+                                        "Patched",
+                                        color = Cfx.successLight, fontSize = 10.sp, maxLines = 1
+                                    )
+                                }
                             }
                             // Patch a pinned app on the server so it trusts the CA (unroot bypass).
                             TextButton(onClick = { patchApp(pkg) }, enabled = !patching) {
-                                Text("Patch", color = Cfx.emberLight, fontSize = 12.sp)
+                                Text(
+                                    if (isPatched) "Re-patch" else "Patch",
+                                    color = if (isStale) Cfx.warningLight else Cfx.emberLight,
+                                    fontSize = 12.sp
+                                )
                             }
                         }
                     }

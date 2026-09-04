@@ -131,3 +131,52 @@ object ScopePrefs {
         return Pair(p.getString("mode", "all") ?: "all", p.getStringSet("apps", emptySet()) ?: emptySet())
     }
 }
+
+/**
+ * Which CA each app was patched with.
+ *
+ * Patching embeds the CA into the app (`apk-mitm --certificate ca.pem`), so a
+ * patched app trusts exactly one certificate forever. Rotate the CA and every
+ * previously patched app keeps trusting the old one and fails the handshake with
+ * `CertificateUnknown` the moment it is captured.
+ *
+ * Nothing used to record this, so nothing could tell you it had happened. The
+ * app looked patched, the switch looked on, and capture produced an empty tab
+ * and a TLS alert in a log nobody reads. Storing the fingerprint at patch time
+ * is what lets the scope list say "re-patch needed" instead of leaving you to
+ * work it out.
+ */
+object PatchPrefs {
+    private const val PREFS = "patches"
+
+    /** Record that [pkg] was patched with the CA identified by [caFingerprint]. */
+    fun record(ctx: Context, pkg: String, caFingerprint: String) {
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit().putString(pkg, caFingerprint).apply()
+    }
+
+    /** The CA fingerprint [pkg] was patched with, or null if we never patched it. */
+    fun caFor(ctx: Context, pkg: String): String? =
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(pkg, null)
+
+    fun forget(ctx: Context, pkg: String) {
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(pkg).apply()
+    }
+
+    /** Every package we have patched, whether or not it is still current. */
+    fun all(ctx: Context): Map<String, String> {
+        @Suppress("UNCHECKED_CAST")
+        return ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).all
+            .filterValues { it is String } as Map<String, String>
+    }
+
+    /** Packages patched with a CA that is no longer the current one. */
+    fun stale(ctx: Context, currentCa: String?): List<String> {
+        if (currentCa.isNullOrEmpty()) return emptyList()
+        return all(ctx).filterValues { it != currentCa }.keys.sorted()
+    }
+
+    fun clear(ctx: Context) {
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().clear().apply()
+    }
+}
