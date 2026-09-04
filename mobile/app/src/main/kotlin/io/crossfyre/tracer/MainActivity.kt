@@ -39,6 +39,7 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -419,6 +420,23 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        // Nothing works, and nothing should be offered, until this device belongs to
+        // a session.
+        //
+        // The whole app used to render unpaired: four numbered steps, the app
+        // picker, and a Patch button beside every installed app. Patching asks a
+        // server to rewrite one of your applications and hands it back to be
+        // installed, so offering it to someone who has not connected to anything
+        // is the wrong shape regardless of what the server does with the request.
+        // It also made the first screen a wall of controls that mostly did not
+        // work yet, when there is exactly one thing to do: scan the code.
+        if (!paired) {
+            Scaffold(containerColor = Cfx.bg) { pad ->
+                PairingGate(Modifier.padding(pad))
+            }
+            return
+        }
+
         Scaffold(containerColor = Cfx.bg) { pad ->
             Column(
                 Modifier
@@ -561,6 +579,69 @@ class MainActivity : ComponentActivity() {
                 confirmButton = { TextButton(onClick = { patchStatus = "" }) { Text("OK", color = Cfx.ember) } },
                 title = { Text("Patch", color = Cfx.text) },
                 text = { Text(patchStatus, color = Cfx.text2) }
+            )
+        }
+    }
+
+    /** The whole screen when this device is not connected to a session.
+     *
+     * Deliberately one thing: the code is the only way in, so the screen is the
+     * invitation to scan it and nothing else. No numbered steps to read past, no
+     * controls that cannot work yet.
+     */
+    @Composable
+    private fun PairingGate(modifier: Modifier = Modifier) {
+        Column(
+            modifier
+                .fillMaxSize()
+                .padding(horizontal = 32.dp),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Image(
+                painter = painterResource(R.drawable.cfx_wordmark),
+                contentDescription = "Crossfyre",
+                modifier = Modifier.height(30.dp)
+            )
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "Mobile Tracer",
+                fontFamily = Cfx.mono,
+                fontSize = 12.sp,
+                letterSpacing = 2.sp,
+                color = Cfx.text3
+            )
+
+            Spacer(Modifier.height(40.dp))
+
+            Text(
+                "Connect to a session",
+                style = MaterialTheme.typography.headlineSmall,
+                color = Cfx.text,
+                textAlign = TextAlign.Center
+            )
+            Spacer(Modifier.height(10.dp))
+            Text(
+                "Open a Web Tracer session in Crossfyre and scan the pairing code it shows you.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = Cfx.text2,
+                textAlign = TextAlign.Center
+            )
+
+            Spacer(Modifier.height(28.dp))
+
+            PrimaryButton("Scan pairing code", fill = true) {
+                scan.launch(Intent(this@MainActivity, ScannerActivity::class.java))
+            }
+
+            Spacer(Modifier.height(18.dp))
+            // Says what connecting actually means, on the screen where the choice
+            // is made rather than in a dialog after the fact.
+            Text(
+                "Captured traffic is sent to the workspace you pair with. You choose which apps, and you can unpair at any time.",
+                style = MaterialTheme.typography.bodySmall,
+                color = Cfx.text3,
+                textAlign = TextAlign.Center
             )
         }
     }
