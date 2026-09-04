@@ -601,7 +601,9 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 name = "cfx_capture"
 version = "0.0.1"
 dependencies = [
+ "brotli",
  "bytes",
+ "flate2",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -614,6 +616,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "webpki-roots 0.26.11",
+ "zstd",
 ]
 
 [[package]]

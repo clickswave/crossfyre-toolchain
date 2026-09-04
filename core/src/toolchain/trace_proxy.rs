@@ -404,10 +404,12 @@ async fn forward(req: Request<Incoming>, base: &str, ctx: &Ctx) -> Response<Body
     } else {
         Vec::new()
     };
-    let cap_req_body = if full_capture {
-        String::from_utf8_lossy(&body_bytes).to_string()
+    // Raw bytes, not a String: attach_full decodes by content-encoding, and the
+    // lossy conversion has to happen after that or a gzip body is destroyed.
+    let cap_req_body: Vec<u8> = if full_capture {
+        body_bytes.to_vec()
     } else {
-        String::new()
+        Vec::new()
     };
     let started = std::time::Instant::now();
 
@@ -468,7 +470,7 @@ async fn forward(req: Request<Incoming>, base: &str, ctx: &Ctx) -> Response<Body
                         req_headers: cap_req_headers,
                         req_body: cap_req_body,
                         resp_headers: cap_resp_headers,
-                        resp_body: String::from_utf8_lossy(&bytes).to_string(),
+                        resp_body: bytes.to_vec(),
                         duration_ms: Some(started.elapsed().as_millis() as u64),
                     });
                 }

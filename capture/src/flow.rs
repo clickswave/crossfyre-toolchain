@@ -301,12 +301,17 @@ async fn forward(
     if cfg.full {
         let req_hdr_arr: Vec<[String; 2]> =
             req_header_pairs.into_iter().map(|(k, v)| [k, v]).collect();
-        event.full_url = Some(full_url);
-        event.req_headers = Some(req_hdr_arr);
-        event.req_body = Some(String::from_utf8_lossy(&body_bytes).into_owned());
-        event.resp_headers = Some(resp_headers);
-        event.resp_body = Some(String::from_utf8_lossy(&resp_bytes).into_owned());
-        event.duration_ms = Some(duration_ms);
+        // Hand over the RAW bytes and let attach_full decode them. Doing the
+        // lossy conversion here is what turned every gzip response into
+        // mojibake, and it is unrecoverable once done.
+        event.attach_full(crate::FullExchange {
+            url: full_url,
+            req_headers: req_hdr_arr,
+            req_body: body_bytes.to_vec(),
+            resp_headers,
+            resp_body: resp_bytes.to_vec(),
+            duration_ms: Some(duration_ms),
+        });
         // Full capture is the mode where "nothing showed up" is indistinguishable from
         // "nothing was captured", so say what actually got attached per flow. Without
         // this the only observable is a Requests tab that stays empty.
@@ -454,6 +459,91 @@ mod tests {
     // the JSON, so a field that is populated but named differently (or skipped when empty)
     // produces exactly the failure we saw in the field, which is assets arriving normally and
     // the Requests tab staying empty with nothing logged anywhere.
+    // A gzip response through the real flow, asserted on the serialized event.
+    // This is the exact path mobile capture takes, and it is where the bodies
+    // were arriving as mojibake: the proxy sees the compressed bytes, and
+    // from_utf8_lossy on a deflate stream is not reversible, so the decode has
+    // to happen before the event is built.
+    #[tokio::test]
+    async fn a_gzip_response_is_captured_as_readable_text() {
+        use std::io::Write as _;
+        let payload = r#"{"name":"projects/aculogic-405f8/installations/abc"}"#;
+        let gz = {
+            let mut e =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(payload.as_bytes()).unwrap();
+            e.finish().unwrap()
+        };
+
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_port = origin.local_addr().unwrap().port();
+        let gz2 = gz.clone();
+        tokio::spawn(async move {
+            let (mut s, _) = origin.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = s.read(&mut buf).await.unwrap();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+                gz2.len()
+            );
+            let _ = s.write_all(head.as_bytes()).await;
+            let _ = s.write_all(&gz2).await;
+            let _ = s.flush().await;
+        });
+
+        let ca = Arc::new(crate::generate_ca().unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TraceEvent>();
+        let mitm = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mitm_port = mitm.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (client, _) = mitm.accept().await.unwrap();
+            let _ = serve_mitm_flow(
+                client,
+                "127.0.0.1".into(),
+                origin_port,
+                ca,
+                Egress::Direct,
+                tx,
+                crate::CaptureCfg { full: true, gate: None },
+            )
+            .await;
+        });
+
+        let tcp = TcpStream::connect(("127.0.0.1", mitm_port)).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/projects/aculogic-405f8/installations")
+            .header(HOST, "firebaseinstallations.googleapis.test")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        // The CLIENT still receives the original compressed bytes: capture
+        // observes, it does not rewrite the traffic it is proxying.
+        let got = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&got[..], &gz[..], "the proxied response must be untouched");
+
+        let ev = rx.recv().await.expect("a trace event");
+        let wire = serde_json::to_value(&ev).unwrap();
+        let body = wire.get("resp_body").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(body, payload, "captured body should be readable JSON");
+
+        // And the stored headers no longer claim an encoding the body has lost,
+        // which is what lets the Repeater replay the request as stored.
+        let hdrs = format!("{:?}", wire.get("resp_headers").unwrap()).to_lowercase();
+        assert!(
+            !hdrs.contains("content-encoding"),
+            "content-encoding should be dropped once decoded: {hdrs}"
+        );
+    }
+
     #[tokio::test]
     async fn full_capture_puts_headers_and_bodies_on_the_wire() {
         let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
