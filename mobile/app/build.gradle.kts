@@ -54,6 +54,39 @@ android {
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
     }
 
+    // One app per environment, installable side by side.
+    //
+    // Android keys an installation by applicationId, so without a suffix the dev
+    // build replaces the production one on the same phone: testing meant
+    // uninstalling the real app, which also destroys its data, which means its CA
+    // and its pairing. A suffix makes them three separate apps that happen to
+    // share a codebase.
+    //
+    // Each therefore keeps its OWN CA, in its own private storage, which is what
+    // you want: a dev CA has no business being trusted for production traffic.
+    // Within one flavour the CA is stable, because updates preserve app data as
+    // long as the signing key does not change, and all three are signed by the
+    // same release key.
+    flavorDimensions += "env"
+    productFlavors {
+        create("prod") {
+            dimension = "env"
+            // No suffix: the production app keeps the identity it already has on
+            // every phone that installed it. Changing it would orphan them.
+            resValue("string", "app_name", "Crossfyre Tracer")
+        }
+        create("staging") {
+            dimension = "env"
+            applicationIdSuffix = ".staging"
+            resValue("string", "app_name", "Crossfyre Tracer Staging")
+        }
+        create("dev") {
+            dimension = "env"
+            applicationIdSuffix = ".dev"
+            resValue("string", "app_name", "Crossfyre Tracer Dev")
+        }
+    }
+
     signingConfigs {
         if (canSignRelease) {
             create("release") {

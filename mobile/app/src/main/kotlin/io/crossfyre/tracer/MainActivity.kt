@@ -159,7 +159,7 @@ class MainActivity : ComponentActivity() {
     private fun patchApp(pkg: String) {
         val pair = Pairing.load(this)
         if (pair == null) { patchStatus = "Pair a workspace first."; return }
-        val ca = File(getExternalFilesDir(null), "crossfyre-ca.crt")
+        val ca = File(getExternalFilesDir(null), caFileName())
         if (!ca.exists()) { patchStatus = "Generate + install the CA first."; return }
         patching = true
         patchStatus = "Starting…"
@@ -288,10 +288,24 @@ class MainActivity : ComponentActivity() {
         // trusting a CA whose private key is still present.
         runCatching { java.io.File(filesDir, "ca.pem").delete() }
         runCatching { java.io.File(filesDir, "ca.key").delete() }
-        runCatching { java.io.File(getExternalFilesDir(null), "crossfyre-ca.crt").delete() }
+        runCatching { java.io.File(getExternalFilesDir(null), caFileName()).delete() }
         paired = false
         caStatus = ""
         showRemoveCaHint = true
+    }
+
+    /** Filename for the exported CA certificate.
+     *
+     * Suffixed per environment, because all three builds can be installed at once
+     * and they each have a DIFFERENT certificate. Three files called
+     * "crossfyre-ca.crt" in Downloads, and three indistinguishable entries in the
+     * OS trust store, is how you end up importing the dev CA and wondering why
+     * production traffic will not decrypt.
+     */
+    private fun caFileName(): String = when {
+        packageName.endsWith(".dev") -> "crossfyre-ca-dev.crt"
+        packageName.endsWith(".staging") -> "crossfyre-ca-staging.crt"
+        else -> "crossfyre-ca.crt"
     }
 
     /** Open the OS security settings so the user can remove the trusted CA. */
@@ -326,9 +340,9 @@ class MainActivity : ComponentActivity() {
         val pem = runCatching { Native.generateCaPem() }.getOrElse { caStatus = "ERROR: ${it.message}"; return }
         if (pem.startsWith("ERROR")) { caStatus = pem; return }
         pendingCaPem = pem
-        runCatching { java.io.File(getExternalFilesDir(null), "crossfyre-ca.crt").writeText(pem) }
+        runCatching { java.io.File(getExternalFilesDir(null), caFileName()).writeText(pem) }
         caStatus = "Choose where to save the CA (Downloads is fine)…"
-        caSave.launch("crossfyre-ca.crt")
+        caSave.launch(caFileName())
     }
 
     private fun userApps(): List<Pair<String, String>> =

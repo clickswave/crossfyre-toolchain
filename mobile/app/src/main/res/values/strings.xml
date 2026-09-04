@@ -1,3 +1,5 @@
 <resources>
-    <string name="app_name">Crossfyre Tracer</string>
+    <!-- app_name is NOT here: each product flavour defines it, so the three
+         environments are distinguishable on one phone. Declaring it here too is
+         a duplicate-resource build failure. -->
 </resources>

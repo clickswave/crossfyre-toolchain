@@ -87,14 +87,37 @@ pub extern "system" fn Java_io_crossfyre_tracer_Native_generateCaPem<'local>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jstring {
-    let pem = match cfx_capture::generate_ca() {
-        Ok(ca) => {
+    // Reuse the stored CA if there is one, and only mint when there is not.
+    //
+    // This used to generate unconditionally, so every tap of "Generate + install
+    // CA" produced a NEW certificate and overwrote the old one. Three things
+    // broke at once: the user had to re-import into the OS trust store every
+    // time, any app already patched to trust the previous CA silently stopped
+    // being decryptable, and the certificate they had just been told to trust was
+    // no longer the one capture would present.
+    //
+    // `startCapture` already preferred the persisted CA, so the two entry points
+    // disagreed about which certificate was current. They now agree.
+    //
+    // Unpair is the deliberate reset: it deletes ca.pem and ca.key, so the next
+    // call here mints a fresh one, which is what someone clearing their session
+    // is asking for.
+    let pem = match load_persisted_ca() {
+        Some(ca) => {
+            log::info!("generateCaPem: reusing persisted CA");
             let pem = ca.pem.clone();
-            persist_ca(&ca);
             *session_ca().lock().unwrap() = Some(Arc::new(ca));
             pem
         }
-        Err(e) => format!("ERROR: {e}"),
+        None => match cfx_capture::generate_ca() {
+            Ok(ca) => {
+                let pem = ca.pem.clone();
+                persist_ca(&ca);
+                *session_ca().lock().unwrap() = Some(Arc::new(ca));
+                pem
+            }
+            Err(e) => format!("ERROR: {e}"),
+        },
     };
     env.new_string(pem)
         .map(|s| s.into_raw())
