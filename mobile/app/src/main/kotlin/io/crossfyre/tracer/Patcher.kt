@@ -236,18 +236,52 @@ object Patcher {
         // got installed, and the arrival of its response is what triggered
         // uninstalling the legitimate app. At minimum the returned APKs must be
         // parseable and must be the package we asked to patch.
+        // A split install is a base plus its config splits, and only the base can be
+        // parsed on its own: `getPackageArchiveInfo` returns null for a config
+        // split, because Android cannot resolve one without the base it belongs to.
+        // Requiring every returned file to parse therefore rejected every app that
+        // ships splits, which is most of them: AfterShip came back as base +
+        // config.arm64_v8a + config.xxhdpi, all three genuinely correct, and the
+        // install was refused as "not an APK".
+        //
+        // So the identity check runs on the base, which is the file that carries
+        // it. Splits are checked for being real APKs, and PackageInstaller does
+        // the rest: it refuses a split whose package or signature disagrees with
+        // the base, which is exactly the substitution this guards against.
         val pm = ctx.packageManager
+        var baseSeen = false
         for (apk in patched) {
             val info = pm.getPackageArchiveInfo(apk.absolutePath, 0)
-                ?: throw IllegalStateException("Patch service returned a file that is not an APK")
-            if (info.packageName != pkg) {
-                throw IllegalStateException(
-                    "Patch service returned ${info.packageName}, expected $pkg"
-                )
+            if (info != null) {
+                if (info.packageName != pkg) {
+                    throw IllegalStateException(
+                        "Patch service returned ${info.packageName}, expected $pkg"
+                    )
+                }
+                baseSeen = true
+            } else if (!looksLikeApk(apk)) {
+                throw IllegalStateException("Patch service returned a file that is not an APK")
             }
+        }
+        if (!baseSeen) {
+            // Nothing identified itself as the package, so nothing here can be
+            // trusted to be it.
+            throw IllegalStateException("Patch service returned no installable build of $pkg")
         }
         patched
     }
+
+    /** Is this a real APK, as far as can be told without the base it belongs to?
+     *
+     * A config split cannot be parsed by PackageManager on its own, so this is the
+     * available check: a zip carrying an AndroidManifest. It is deliberately not
+     * the security boundary. PackageInstaller enforces that every split matches
+     * the base's package and signing certificate at install time, and that is what
+     * stops a substituted split.
+     */
+    private fun looksLikeApk(f: File): Boolean = runCatching {
+        java.util.zip.ZipFile(f).use { it.getEntry("AndroidManifest.xml") != null }
+    }.getOrDefault(false)
 
     /** How long to wait for a rebuild before giving up, and how often to ask. */
     private const val PATCH_WAIT_MS = 20L * 60 * 1000
