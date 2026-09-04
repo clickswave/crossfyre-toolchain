@@ -307,6 +307,18 @@ async fn forward(
         event.resp_headers = Some(resp_headers);
         event.resp_body = Some(String::from_utf8_lossy(&resp_bytes).into_owned());
         event.duration_ms = Some(duration_ms);
+        // Full capture is the mode where "nothing showed up" is indistinguishable from
+        // "nothing was captured", so say what actually got attached per flow. Without
+        // this the only observable is a Requests tab that stays empty.
+        log::info!(
+            "full capture: {} {} req_headers={} req_body={}B resp_headers={} resp_body={}B",
+            event.method,
+            event.url,
+            event.req_headers.as_ref().map_or(0, |h| h.len()),
+            event.req_body.as_ref().map_or(0, |b| b.len()),
+            event.resp_headers.as_ref().map_or(0, |h| h.len()),
+            event.resp_body.as_ref().map_or(0, |b| b.len()),
+        );
     }
     let _ = tx.send(event);
 
@@ -434,5 +446,102 @@ mod tests {
         // The secret VALUES never appear anywhere in the event.
         let blob = format!("{ev:?}");
         assert!(!blob.contains("secret") && !blob.contains("Bearer") && !blob.contains("a@b"));
+    }
+
+    // Same flow with `full` on, asserted against the SERIALIZED event rather than the struct.
+    // The wire is where this can go wrong silently: the ingest endpoint decides whether a batch
+    // is worth storing by looking for the keys `req_headers` / `resp_headers` / `resp_body` in
+    // the JSON, so a field that is populated but named differently (or skipped when empty)
+    // produces exactly the failure we saw in the field, which is assets arriving normally and
+    // the Requests tab staying empty with nothing logged anywhere.
+    #[tokio::test]
+    async fn full_capture_puts_headers_and_bodies_on_the_wire() {
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_port = origin.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = origin.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = s.read(&mut buf).await.unwrap();
+            let body = r#"{"ok":true}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nServer: test-origin\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = s.write_all(resp.as_bytes()).await;
+            let _ = s.flush().await;
+        });
+
+        let ca = Arc::new(crate::generate_ca().unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TraceEvent>();
+        let mitm = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mitm_port = mitm.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (client, _) = mitm.accept().await.unwrap();
+            let _ = serve_mitm_flow(
+                client,
+                "127.0.0.1".into(),
+                origin_port,
+                ca,
+                Egress::Direct,
+                tx,
+                crate::CaptureCfg {
+                    full: true,
+                    gate: None,
+                },
+            )
+            .await;
+        });
+
+        let tcp = TcpStream::connect(("127.0.0.1", mitm_port)).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/login?token=secret")
+            .header(HOST, "origin.test")
+            .header(CONTENT_TYPE, "application/json")
+            .header(AUTHORIZATION, "Bearer xyz")
+            .body(Full::new(Bytes::from_static(br#"{"email":"a@b"}"#)))
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let _ = resp.into_body().collect().await.unwrap();
+
+        let ev = rx.recv().await.expect("a trace event");
+        let wire = serde_json::to_value(&ev).unwrap();
+
+        // Exactly the three keys the ingest gate tests for, by their wire names.
+        assert!(
+            wire.get("req_headers").is_some(),
+            "req_headers missing from the wire event: {wire}"
+        );
+        assert!(
+            wire.get("resp_headers").is_some(),
+            "resp_headers missing from the wire event: {wire}"
+        );
+        assert!(
+            wire.get("resp_body").is_some(),
+            "resp_body missing from the wire event: {wire}"
+        );
+        // And a host to attribute the row to, without which the server skips it.
+        assert!(
+            wire.get("full_url").and_then(|v| v.as_str()).is_some(),
+            "full_url missing from the wire event: {wire}"
+        );
+
+        // Full capture means UNREDACTED: this is the whole point of the mode, and it is
+        // what separates a Requests row from the shape-only event beside it.
+        let body = wire.get("resp_body").and_then(|v| v.as_str()).unwrap();
+        assert!(body.contains("ok"), "response body not captured: {body:?}");
+        let req_hdrs = format!("{:?}", wire.get("req_headers").unwrap());
+        assert!(
+            req_hdrs.contains("authorization"),
+            "request headers did not survive: {req_hdrs}"
+        );
     }
 }
