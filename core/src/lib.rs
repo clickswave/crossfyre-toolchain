@@ -418,22 +418,76 @@ async fn run_operation(cmd: serde_json::Value, ctx: OpCtx) {
             .send()
             .await;
 
-        let claimed = match claim_res {
+        // Losing the race and failing to ask are NOT the same thing, and treating
+        // them the same is what made a broken claim invisible.
+        //
+        // Both used to collapse into `false`, and the op was then dropped without
+        // a word. Losing the race is normal: another node runs it. A 401, a 500 or
+        // a dead socket means NOBODY runs it, and because the message is acked
+        // once this function returns, the operation vanished: `claimed_by` stayed
+        // null, no result ever arrived, and the workflow sat at "running" forever
+        // with nothing anywhere saying why. Single-node ops are `pre_claimed` and
+        // never come through here, so the whole failure mode hid in the one path
+        // that only multi-node scans exercise.
+        enum ClaimOutcome {
+            Won,
+            Lost,
+            Failed(String),
+        }
+        let outcome = match claim_res {
             Ok(res) if res.status().is_success() => {
                 let body: serde_json::Value = res.json().await.unwrap_or_default();
-                body["data"]["claimed"].as_bool().unwrap_or(false)
+                if body["data"]["claimed"].as_bool().unwrap_or(false) {
+                    ClaimOutcome::Won
+                } else {
+                    ClaimOutcome::Lost
+                }
             }
-            _ => false,
+            Ok(res) => {
+                let code = res.status();
+                let body = res.text().await.unwrap_or_default();
+                ClaimOutcome::Failed(format!("HTTP {code}: {}", body.trim()))
+            }
+            Err(e) => ClaimOutcome::Failed(e.to_string()),
         };
 
         use std::sync::atomic::Ordering;
-        if !claimed {
-            // Counter still tracked for the periodic
-            // snapshot below; per-event log dropped.
-            CLAIM_MISS.fetch_add(1, Ordering::Relaxed);
-            return;
+        match outcome {
+            ClaimOutcome::Won => {
+                CLAIM_OK.fetch_add(1, Ordering::Relaxed);
+            }
+            ClaimOutcome::Lost => {
+                // Someone else is running it. Nothing to say and nothing to do.
+                CLAIM_MISS.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            ClaimOutcome::Failed(why) => {
+                CLAIM_MISS.fetch_add(1, Ordering::Relaxed);
+                let short = workflow_id.get(..8).unwrap_or(&workflow_id);
+                eprintln!(
+                    "[scan {short}] claim FAILED for op {op_id}: {why}. \
+                     This node cannot run it and no other node will be told to; \
+                     reporting it so the workflow does not wait forever."
+                );
+                // Tell the controller. Without this the op is simply gone: the
+                // message is acked on return, so nothing redelivers it and
+                // nothing times it out. Reporting a completion with no findings
+                // lets the workflow finish instead of hanging, and the log line
+                // above says why it found nothing.
+                let failed = serde_json::json!({
+                    "type": "operation_completed",
+                    "operation_id": op_id,
+                    "workflow_id": workflow_id,
+                    "found_count": 0,
+                    "node_id": node_id,
+                    "error": format!("claim failed: {why}"),
+                });
+                let _ = pub_clone
+                    .publish(status_subj.clone(), failed.to_string().into())
+                    .await;
+                return;
+            }
         }
-        CLAIM_OK.fetch_add(1, Ordering::Relaxed);
     } else if pre_claimed {
         use std::sync::atomic::Ordering;
         CLAIM_OK.fetch_add(1, Ordering::Relaxed);
