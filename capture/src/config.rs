@@ -42,6 +42,16 @@ pub struct CaptureConfig {
     pub full_capture: bool,
     /// `auto` (forward everything) or `manual` (hold each exchange for a decision).
     pub intercept_mode: String,
+    /// Hosts to relay WITHOUT interception (exact host, or a bare domain to
+    /// cover its subdomains).
+    ///
+    /// Some hosts cannot be intercepted: an app that pins its API refuses our
+    /// certificate and the request fails outright. Capturing such a host does
+    /// not merely lose the traffic, it breaks the feature being tested, and the
+    /// only workaround before this was to exclude the whole app from capture.
+    /// Naming the host instead keeps the rest of the app captured.
+    #[serde(default)]
+    pub bypass_hosts: Vec<String>,
 }
 
 impl Default for CaptureConfig {
@@ -60,6 +70,7 @@ impl Default for CaptureConfig {
         Self {
             full_capture: true,
             intercept_mode: "auto".to_string(),
+            bypass_hosts: Vec::new(),
         }
     }
 }
@@ -108,6 +119,17 @@ impl CaptureConfig {
                 .and_then(|s| s.as_str())
                 .unwrap_or(&def.intercept_mode)
                 .to_string(),
+            bypass_hosts: d
+                .get("bypass_hosts")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str())
+                        .map(|x| x.trim().to_ascii_lowercase())
+                        .filter(|x| !x.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 

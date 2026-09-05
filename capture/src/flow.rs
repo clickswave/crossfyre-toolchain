@@ -16,7 +16,7 @@ use hyper::header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, HOST, SERVER};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_rustls::TlsConnector;
 
@@ -53,6 +53,8 @@ static UPSTREAM_TLS: LazyLock<TlsConnector> = LazyLock::new(|| {
 pub struct FlowOutcome {
     pub tls: bool,
     pub requests: usize,
+    /// Carried through without interception, by operator choice.
+    pub bypassed: bool,
 }
 
 pub async fn serve_mitm_flow<C>(
@@ -76,16 +78,58 @@ where
         return Ok(FlowOutcome::default());
     }
     let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let stream = PrefixedIo::new(first[..n].to_vec(), client);
     if first[0] == 0x16 {
+        // Read the ClientHello before deciding. The server name is in it, in the
+        // clear, and it is the only thing that can distinguish two hosts sharing
+        // one CDN address. Whatever is read here is replayed verbatim, so the
+        // decision costs the connection nothing either way.
+        let mut head = first[..n].to_vec();
+        let mut probe = [0u8; 2048];
+        // One read is enough in practice (a ClientHello arrives in one segment)
+        // and a second could block a connection that has nothing more to send.
+        if let Ok(m) = client.read(&mut probe).await {
+            head.extend_from_slice(&probe[..m]);
+        }
+        let sni = crate::sni::server_name(&head);
+
+        // Name every TLS flow, decryptable or not. Until now a host we could not
+        // intercept appeared only as an IP in a error line, so "which host is
+        // refusing us?" had no answer at all: behind a CDN one address serves
+        // thousands of names. The ClientHello says it in the clear.
+        match sni.as_deref() {
+            Some(h) => log::info!("tls flow -> {h} ({target_host}:{target_port})"),
+            None => log::info!("tls flow -> {target_host}:{target_port} (no SNI)"),
+        }
+
+        if let Some(host) = sni.as_deref() {
+            if crate::sni::is_bypassed(host, &cfg.bypass_hosts) {
+                log::info!("bypass {host}: relaying untouched, not intercepting");
+                let mut upstream = egress.connect(target_host.as_str(), target_port).await?;
+                upstream.write_all(&head).await?;
+                let mut client = PrefixedIo::new(Vec::new(), client);
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                return Ok(FlowOutcome { tls: true, requests: 0, bypassed: true });
+            }
+        }
+
+        let stream = PrefixedIo::new(head, client);
         log::debug!("flow {target_host}:{target_port}: TLS detected, accepting (MITM handshake)");
         let tls = mitm_acceptor(ca).accept(stream).await?;
         log::debug!("flow {target_host}:{target_port}: TLS handshake done, serving HTTP");
         serve_http(tls, "https", target_host, target_port, egress, tx, cfg, served.clone()).await?;
-        Ok(FlowOutcome { tls: true, requests: served.load(std::sync::atomic::Ordering::Relaxed) })
+        Ok(FlowOutcome {
+            tls: true,
+            requests: served.load(std::sync::atomic::Ordering::Relaxed),
+            bypassed: false,
+        })
     } else {
+        let stream = PrefixedIo::new(first[..n].to_vec(), client);
         serve_http(stream, "http", target_host, target_port, egress, tx, cfg, served.clone()).await?;
-        Ok(FlowOutcome { tls: false, requests: served.load(std::sync::atomic::Ordering::Relaxed) })
+        Ok(FlowOutcome {
+            tls: false,
+            requests: served.load(std::sync::atomic::Ordering::Relaxed),
+            bypassed: false,
+        })
     }
 }
 
@@ -524,7 +568,7 @@ mod tests {
                 ca,
                 Egress::Direct,
                 tx,
-                crate::CaptureCfg { full: true, gate: None },
+                crate::CaptureCfg { full: true, gate: None, bypass_hosts: Vec::new() },
             )
             .await;
         });
@@ -597,6 +641,7 @@ mod tests {
                 crate::CaptureCfg {
                     full: true,
                     gate: None,
+                    bypass_hosts: Vec::new(),
                 },
             )
             .await;

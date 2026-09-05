@@ -205,9 +205,11 @@ pub extern "system" fn Java_io_crossfyre_tracer_Native_startCapture<'local>(
         // Ask the control plane whether this session wants full capture / manual interception, then
         // build the capture config (a gate is installed only in manual mode).
         let http = reqwest::Client::new();
-        let (server_full, mode) =
-            intercept::fetch_config(&http, &cfg_api, &cfg_wf, &cfg_token, device_allows_full)
-                .await;
+        let session_cfg = intercept::fetch_capture_config(
+            &http, &cfg_api, &cfg_wf, &cfg_token, device_allows_full,
+        )
+        .await;
+        let (server_full, mode) = (session_cfg.full_capture, session_cfg.intercept_mode.clone());
         // The server may REQUEST full capture; the device decides. Previously the
         // response alone flipped this on, so a control plane (including one
         // reached by scanning someone else's QR) could turn shape-only capture
@@ -228,7 +230,18 @@ pub extern "system" fn Java_io_crossfyre_tracer_Native_startCapture<'local>(
         } else {
             None
         };
-        let capture_cfg = cfx_capture::CaptureCfg { full, gate };
+        if !session_cfg.bypass_hosts.is_empty() {
+            log::info!(
+                "bypassing {} host(s) without interception: {}",
+                session_cfg.bypass_hosts.len(),
+                session_cfg.bypass_hosts.join(", ")
+            );
+        }
+        let capture_cfg = cfx_capture::CaptureCfg {
+            full,
+            gate,
+            bypass_hosts: session_cfg.bypass_hosts,
+        };
         if let Err(e) = netstack::run(tun_fd, ca, egress, tx, capture_cfg).await {
             log::error!("netstack ended: {e}");
         }
