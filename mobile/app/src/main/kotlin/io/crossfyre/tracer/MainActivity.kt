@@ -354,6 +354,30 @@ class MainActivity : ComponentActivity() {
         ScopePrefs.save(this, scopeMode, selectedApps.toSet())
     }
 
+    /** Whether an app ships a Flutter engine.
+     *
+     * This decides whether patching can help it at all. Flutter's Dart HTTP
+     * client speaks TLS through its OWN BoringSSL inside libflutter.so and never
+     * consults Android's trust store or the network security config, so the
+     * config rewrite that patching performs cannot reach it. The Java side of
+     * the same app (Firebase and friends) decrypts perfectly, which is what
+     * makes this so confusing from the outside: the capture looks half broken
+     * rather than "one of this app's two network stacks is out of reach".
+     *
+     * Reading the APK can fail on a locked-down device; unknown is reported as
+     * "not Flutter" so this never invents a warning it cannot support.
+     */
+    private fun isFlutterApp(pkg: String): Boolean = flutterCache.getOrPut(pkg) {
+        runCatching {
+            val src = packageManager.getApplicationInfo(pkg, 0).sourceDir
+            java.util.zip.ZipFile(src).use { zip ->
+                zip.entries().asSequence().any { it.name.endsWith("/libflutter.so") }
+            }
+        }.getOrDefault(false)
+    }
+
+    private val flutterCache = mutableMapOf<String, Boolean>()
+
     /** SHA-256 of the current CA, or null when there is no CA yet.
      *
      * Read straight off disk rather than through `generateCaPem()`, which MINTS
@@ -697,15 +721,17 @@ class MainActivity : ComponentActivity() {
                         val staleHere = selectedApps.count {
                             val f = PatchPrefs.caFor(this@MainActivity, it); f != null && f != current
                         }
+                        val flutterHere = selectedApps.count { isFlutterApp(it) }
                         Spacer(Modifier.height(8.dp))
                         Text(
                             when {
                                 staleHere > 0 -> "$staleHere of ${selectedApps.size} need re-patching before they will decrypt."
+                                flutterHere > 0 -> "$flutterHere built with Flutter: their own API traffic will not decrypt even when patched."
                                 ready == selectedApps.size -> "All ${selectedApps.size} patched and ready."
                                 else -> "$ready of ${selectedApps.size} patched. Unpatched apps only decrypt if they trust user certificates."
                             },
                             style = MaterialTheme.typography.bodySmall,
-                            color = if (staleHere > 0) Cfx.warningLight else Cfx.text3
+                            color = if (staleHere > 0 || flutterHere > 0) Cfx.warningLight else Cfx.text3
                         )
                     }
                     Spacer(Modifier.height(8.dp))
@@ -954,7 +980,8 @@ class MainActivity : ComponentActivity() {
         // MEANS, so the panel needs to know.
         val current = caFingerprint()
         val patchedInScope = selectedApps.any { PatchPrefs.caFor(this@MainActivity, it) == current && current != null }
-        val diag = diagnose(running, s, patchedInScope)
+        val flutterInScope = selectedApps.any { isFlutterApp(it) }
+        val diag = diagnose(running, s, patchedInScope, flutterInScope)
         Column(
             Modifier
                 .fillMaxWidth()
@@ -1114,7 +1141,15 @@ class MainActivity : ComponentActivity() {
                             Column(Modifier.weight(1f)) {
                                 Text(label, color = Cfx.text1, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                 Text(pkg, color = Cfx.text3, fontFamily = Cfx.mono, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                if (isStale) {
+                                if (isFlutterApp(pkg)) {
+                                    // Say it here, at the moment of choosing, rather than
+                                    // after a patch that was never going to help.
+                                    Text(
+                                        "Flutter: its API traffic won't decrypt",
+                                        color = Cfx.warningLight, fontSize = 10.sp, maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                } else if (isStale) {
                                     Text(
                                         "Re-patch needed: trusts an old certificate",
                                         color = Cfx.warningLight, fontSize = 10.sp, maxLines = 1,
@@ -1236,7 +1271,7 @@ private data class Stats(
 }
 
 /** Turn the raw counters into one actionable message: the whole point of the panel. */
-private fun diagnose(running: Boolean, s: Stats?, patchedInScope: Boolean = false): Diag? {
+private fun diagnose(running: Boolean, s: Stats?, patchedInScope: Boolean = false, flutterInScope: Boolean = false): Diag? {
     if (!running || s == null) return null
     if (s.events > 0 && s.ingestSent > 0)
         return Diag(Level.SUCCESS, "Capturing and shipping shapes.", "Open the workflow in the web app to see the asset graph fill in.")
@@ -1251,6 +1286,8 @@ private fun diagnose(running: Boolean, s: Stats?, patchedInScope: Boolean = fals
     // saying nothing: it sends them round a loop that cannot fix it. A patched
     // app that still refuses is pinning its API in code, which patching does not
     // touch, and that is the honest answer even though it is the unwelcome one.
+    if (s.caRejected > 0 && flutterInScope)
+        return Diag(Level.WARN, "Flutter app: its own API won't decrypt.", "Flutter speaks TLS through its own engine and ignores Android's trust store, so patching cannot reach it. The app's Java traffic (Firebase and similar) still captures normally. ${s.lastError}")
     if (s.caRejected > 0 && patchedInScope)
         return Diag(Level.WARN, "This app is patched and still refusing.", "It pins its own API in code, which patching does not remove, so those requests cannot be decrypted. Other hosts in the app will still capture normally. ${s.lastError}")
     if (s.caRejected > 0)
