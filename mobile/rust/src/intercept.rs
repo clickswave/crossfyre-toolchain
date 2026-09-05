@@ -11,26 +11,18 @@ use serde_json::json;
 
 /// Ask the control plane whether full capture / manual interception is on.
 ///
+/// The shared-config fetch.
+///
 /// Transport only. The endpoint, request shape, parsing and fallback all live in
 /// `cfx_capture::CaptureConfig`, shared with the desktop proxy, so the two clients
-/// cannot disagree about what a setting means. They previously did: this function
+/// cannot disagree about what a setting means. They previously did: the caller
 /// used to default `full_capture` to FALSE on a failed or partial response while
 /// the documented default was true, so a control-plane blip quietly downgraded a
 /// session to shape-only and the Requests tab just looked empty.
-pub async fn fetch_config(
-    client: &reqwest::Client,
-    api_url: &str,
-    workflow_id: &str,
-    token: &str,
-    device_full_capture: bool,
-) -> (bool, String) {
-    let cfg =
-        fetch_capture_config(client, api_url, workflow_id, token, device_full_capture).await;
-    (cfg.full_capture, cfg.intercept_mode)
-}
-
-/// The shared-config fetch. Prefer this over [`fetch_config`], which exists only
-/// so the existing tuple call sites keep compiling.
+///
+/// This returns the whole config rather than a tuple of the two fields anyone
+/// happened to need first: a session carries bypass hosts now, and a tuple is how
+/// the next setting gets silently dropped on one client.
 pub async fn fetch_capture_config(
     client: &reqwest::Client,
     api_url: &str,

@@ -61,7 +61,9 @@ pub fn server_name(buf: &[u8]) -> Option<String> {
             }
             let name_len = u16::from_be_bytes([e[3], e[4]]) as usize;
             let name = e.get(5..5 + name_len)?;
-            return std::str::from_utf8(name).ok().map(|s| s.to_ascii_lowercase());
+            return std::str::from_utf8(name)
+                .ok()
+                .map(|s| s.to_ascii_lowercase());
         }
         p += elen;
     }
@@ -88,7 +90,7 @@ mod tests {
     /// Build a minimal but structurally real ClientHello carrying `name`.
     fn hello(name: &str) -> Vec<u8> {
         let mut ext = vec![0x00, 0x00]; // server_name
-        let mut sni = vec![0x00];       // host_name type
+        let mut sni = vec![0x00]; // host_name type
         sni.extend_from_slice(&(name.len() as u16).to_be_bytes());
         sni.extend_from_slice(name.as_bytes());
         let mut list = (sni.len() as u16).to_be_bytes().to_vec();
@@ -98,9 +100,9 @@ mod tests {
 
         let mut body = vec![0x03, 0x03];
         body.extend_from_slice(&[0u8; 32]); // random
-        body.push(0);                       // session_id len
+        body.push(0); // session_id len
         body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]); // cipher suites
-        body.extend_from_slice(&[0x01, 0x00]);             // compression
+        body.extend_from_slice(&[0x01, 0x00]); // compression
         body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
         body.extend_from_slice(&ext);
 
@@ -116,7 +118,10 @@ mod tests {
 
     #[test]
     fn reads_the_name_out_of_a_client_hello() {
-        assert_eq!(server_name(&hello("api.example.com")).as_deref(), Some("api.example.com"));
+        assert_eq!(
+            server_name(&hello("api.example.com")).as_deref(),
+            Some("api.example.com")
+        );
     }
 
     #[test]
@@ -148,6 +153,9 @@ mod tests {
     #[test]
     fn an_empty_bypass_list_bypasses_nothing() {
         assert!(!is_bypassed("api.example.com", &[]));
-        assert!(!is_bypassed("api.example.com", &["".to_string(), "   ".to_string()]));
+        assert!(!is_bypassed(
+            "api.example.com",
+            &["".to_string(), "   ".to_string()]
+        ));
     }
 }

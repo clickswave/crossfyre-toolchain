@@ -206,7 +206,11 @@ pub extern "system" fn Java_io_crossfyre_tracer_Native_startCapture<'local>(
         // build the capture config (a gate is installed only in manual mode).
         let http = reqwest::Client::new();
         let session_cfg = intercept::fetch_capture_config(
-            &http, &cfg_api, &cfg_wf, &cfg_token, device_allows_full,
+            &http,
+            &cfg_api,
+            &cfg_wf,
+            &cfg_token,
+            device_allows_full,
         )
         .await;
         let (server_full, mode) = (session_cfg.full_capture, session_cfg.intercept_mode.clone());

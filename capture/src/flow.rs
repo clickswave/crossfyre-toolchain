@@ -108,7 +108,11 @@ where
                 upstream.write_all(&head).await?;
                 let mut client = PrefixedIo::new(Vec::new(), client);
                 let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
-                return Ok(FlowOutcome { tls: true, requests: 0, bypassed: true });
+                return Ok(FlowOutcome {
+                    tls: true,
+                    requests: 0,
+                    bypassed: true,
+                });
             }
         }
 
@@ -116,7 +120,13 @@ where
         log::debug!("flow {target_host}:{target_port}: TLS detected, accepting (MITM handshake)");
         let tls = mitm_acceptor(ca).accept(stream).await?;
         log::debug!("flow {target_host}:{target_port}: TLS handshake done, serving HTTP");
-        serve_http(tls, "https", target_host, target_port, egress, tx, cfg, served.clone()).await?;
+        let ctx = ServeCtx {
+            egress,
+            tx,
+            cfg,
+            served: served.clone(),
+        };
+        serve_http(tls, "https", target_host, target_port, ctx).await?;
         Ok(FlowOutcome {
             tls: true,
             requests: served.load(std::sync::atomic::Ordering::Relaxed),
@@ -124,7 +134,13 @@ where
         })
     } else {
         let stream = PrefixedIo::new(first[..n].to_vec(), client);
-        serve_http(stream, "http", target_host, target_port, egress, tx, cfg, served.clone()).await?;
+        let ctx = ServeCtx {
+            egress,
+            tx,
+            cfg,
+            served: served.clone(),
+        };
+        serve_http(stream, "http", target_host, target_port, ctx).await?;
         Ok(FlowOutcome {
             tls: false,
             requests: served.load(std::sync::atomic::Ordering::Relaxed),
@@ -133,21 +149,35 @@ where
     }
 }
 
+/// What every request on one connection needs, so the count stays a property of
+/// the connection rather than another positional argument.
+struct ServeCtx {
+    egress: Egress,
+    tx: UnboundedSender<TraceEvent>,
+    cfg: CaptureCfg,
+    /// Requests actually served. Zero on a TLS connection means the client
+    /// refused our certificate rather than that it had nothing to say.
+    served: Arc<std::sync::atomic::AtomicUsize>,
+}
+
 /// Serve HTTP/1 over an (already TLS-terminated or plaintext) client stream, forwarding each request.
 async fn serve_http<S>(
     io: S,
     scheme: &'static str,
     target_host: String,
     target_port: u16,
-    egress: Egress,
-    tx: UnboundedSender<TraceEvent>,
-    cfg: CaptureCfg,
-    served: Arc<std::sync::atomic::AtomicUsize>,
+    ctx: ServeCtx,
 ) -> Result<(), BoxErr>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let host = Arc::new(target_host);
+    let ServeCtx {
+        egress,
+        tx,
+        cfg,
+        served,
+    } = ctx;
     let svc = service_fn(move |req: Request<Incoming>| {
         let egress = egress.clone();
         let tx = tx.clone();
@@ -532,8 +562,7 @@ mod tests {
         use std::io::Write as _;
         let payload = r#"{"name":"projects/aculogic-405f8/installations/abc"}"#;
         let gz = {
-            let mut e =
-                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
             e.write_all(payload.as_bytes()).unwrap();
             e.finish().unwrap()
         };
@@ -568,7 +597,11 @@ mod tests {
                 ca,
                 Egress::Direct,
                 tx,
-                crate::CaptureCfg { full: true, gate: None, bypass_hosts: Vec::new() },
+                crate::CaptureCfg {
+                    full: true,
+                    gate: None,
+                    bypass_hosts: Vec::new(),
+                },
             )
             .await;
         });

@@ -216,7 +216,10 @@ mod tests {
     fn decoding_restates_the_headers_it_invalidated() {
         let mut h = hdrs("gzip");
         strip_encoding_headers(&mut h, 42);
-        assert!(!h.iter().any(|kv| kv[0].eq_ignore_ascii_case("content-encoding")));
+        assert!(
+            !h.iter()
+                .any(|kv| kv[0].eq_ignore_ascii_case("content-encoding"))
+        );
         assert_eq!(header(&h, "content-length"), Some("42"));
         assert_eq!(header(&h, "content-type"), Some("application/json"));
     }
