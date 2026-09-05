@@ -4,7 +4,9 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ExperimentalGetImage
@@ -16,7 +18,10 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
@@ -62,6 +67,14 @@ class ScannerActivity : ComponentActivity() {
             permission.launch(Manifest.permission.CAMERA)
             return
         }
+        // Draw behind the system bars and force LIGHT icons on both, so the
+        // navigation bar stops rendering as a white slab under a black app.
+        // Transparent + dark style also stops the platform painting its own
+        // contrast scrim over the bottom of the screen.
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+        )
         setContent { CrossfyreTheme { ScannerUi() } }
     }
 
@@ -122,7 +135,12 @@ class ScannerActivity : ComponentActivity() {
                 "Scan the workspace QR from the web app",
                 color = Color.White,
                 fontSize = 14.sp,
-                modifier = Modifier.align(Alignment.BottomCenter).padding(28.dp)
+                // Edge to edge means this sits over the navigation bar unless it
+                // is inset. The camera preview behind it SHOULD reach the edges.
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .windowInsetsPadding(WindowInsets.navigationBars)
+                    .padding(28.dp)
             )
         }
     }

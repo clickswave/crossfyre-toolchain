@@ -15,7 +15,9 @@ import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.launch
 import java.io.File
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -24,6 +26,11 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
+import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -321,6 +328,14 @@ class MainActivity : ComponentActivity() {
             IntentFilter(INSTALL_ACTION).apply { addAction(UNINSTALL_ACTION) },
             androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED
         )
+        // Draw behind the system bars and force LIGHT icons on both, so the
+        // navigation bar stops rendering as a white slab under a black app.
+        // Transparent + dark style also stops the platform painting its own
+        // contrast scrim over the bottom of the screen.
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+        )
         setContent { CrossfyreTheme { Screen() } }
     }
 
@@ -571,18 +586,27 @@ class MainActivity : ComponentActivity() {
         // It also made the first screen a wall of controls that mostly did not
         // work yet, when there is exactly one thing to do: scan the code.
         if (!paired) {
-            Scaffold(containerColor = Cfx.bg) { pad ->
-                PairingGate(Modifier.padding(pad))
+                Scaffold(containerColor = Cfx.bg, contentWindowInsets = WindowInsets(0, 0, 0, 0)) { _ ->
+                PairingGate(Modifier.windowInsetsPadding(WindowInsets.safeDrawing))
             }
             return
         }
 
-        Scaffold(containerColor = Cfx.bg) { pad ->
+        // contentWindowInsets = 0 so Scaffold does not inset the whole surface:
+        // the background should reach the screen edges. The insets are applied
+        // to the CONTENT instead, inside the scroll, so the first card clears
+        // the status bar and the last one clears the navigation bar while the
+        // list still scrolls under both.
+        //
+        // Applying them outside verticalScroll (as .padding(pad) did) shrinks
+        // the viewport rather than the content, which is what left the bottom of
+        // the page sitting under the navigation bar.
+        Scaffold(containerColor = Cfx.bg, contentWindowInsets = WindowInsets(0, 0, 0, 0)) { _ ->
             Column(
                 Modifier
-                    .padding(pad)
                     .fillMaxSize()
                     .verticalScroll(rememberScrollState())
+                    .padding(WindowInsets.safeDrawing.asPaddingValues())
                     .padding(horizontal = 16.dp)
                     .padding(bottom = 24.dp),
                 verticalArrangement = Arrangement.spacedBy(14.dp)
@@ -1008,7 +1032,15 @@ class MainActivity : ComponentActivity() {
             if (query.isBlank()) apps else apps.filter { it.second.contains(query, true) || it.first.contains(query, true) }
         }
         ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheet, containerColor = Cfx.surfaceRaised, dragHandle = { BottomSheetDefaults.DragHandle() }) {
-            Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(bottom = 8.dp)) {
+            // A bottom sheet ends exactly where the navigation bar is, so its last
+            // row and the Done button sit under the bar without this.
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .windowInsetsPadding(WindowInsets.navigationBars)
+                    .padding(horizontal = 16.dp)
+                    .padding(bottom = 8.dp)
+            ) {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                     Text("Scope apps", style = MaterialTheme.typography.titleMedium, color = Cfx.text)
                     TextButton(onClick = { scopeMode = TracerVpnService.MODE_ALL; selected.clear(); onDismiss() }) {

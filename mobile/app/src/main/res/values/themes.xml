@@ -1,3 +1,23 @@
 <resources>
-    <style name="Theme.CrossfyreTracer" parent="@android:style/Theme.Material.Light.NoActionBar" />
+    <!-- Dark, and edge to edge.
+
+         This was Theme.Material.Light.NoActionBar, which is why the navigation
+         bar rendered white with dark icons underneath a black app: the Compose
+         theme is dark but the WINDOW followed the platform theme, and the system
+         bars follow the window. Nothing in Compose could have fixed that.
+
+         The bars are transparent and contrast enforcement is off, so the app
+         paints behind them instead of the system laying a pale scrim over the
+         bottom of the screen. Contrast enforcement is API 29+ and the light-bar
+         flags are API 23/27+; older devices ignore what they do not know, and
+         enableEdgeToEdge() sets the same things at runtime anyway. -->
+    <style name="Theme.CrossfyreTracer" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:enforceStatusBarContrast">false</item>
+        <item name="android:enforceNavigationBarContrast">false</item>
+    </style>
 </resources>
