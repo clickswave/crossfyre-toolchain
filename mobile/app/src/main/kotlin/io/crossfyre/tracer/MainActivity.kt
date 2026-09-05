@@ -602,13 +602,23 @@ class MainActivity : ComponentActivity() {
         // the viewport rather than the content, which is what left the bottom of
         // the page sitting under the navigation bar.
         Scaffold(containerColor = Cfx.bg, contentWindowInsets = WindowInsets(0, 0, 0, 0)) { _ ->
+            // The two insets want opposite treatment, which is why one modifier for
+            // both was wrong.
+            //
+            // TOP goes OUTSIDE the scroll, so the viewport starts below the status
+            // bar and content never slides under the clock. BOTTOM goes INSIDE, so
+            // it is part of the content: the list scrolls all the way under the
+            // navigation bar and the last card still clears it. The Scaffold's
+            // background paints the full window either way, so the app still
+            // reaches both edges.
+            val bars = WindowInsets.safeDrawing.asPaddingValues()
             Column(
                 Modifier
                     .fillMaxSize()
+                    .padding(top = bars.calculateTopPadding())
                     .verticalScroll(rememberScrollState())
-                    .padding(WindowInsets.safeDrawing.asPaddingValues())
                     .padding(horizontal = 16.dp)
-                    .padding(bottom = 24.dp),
+                    .padding(bottom = bars.calculateBottomPadding() + 24.dp),
                 verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
                 Header()
