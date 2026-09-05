@@ -27,6 +27,7 @@ counters!(
     INGEST_SENT,     // events acknowledged by the server
     INGEST_REJECTED, // server returned a non-2xx (e.g. 401 bad token)
     INGEST_FAILED,   // ingest POST could not be delivered (network/TLS)
+    QUIC_DROPPED,    // HTTP/3 flows blackholed to force TCP fallback (invisible traffic)
 );
 
 fn last_event() -> &'static Mutex<String> {
@@ -78,7 +79,13 @@ pub fn record_flow_error(err: &str) {
         || (e.contains("alert") && e.contains("cert"))
         || e.contains("certificate required")
         || e.contains("handshakefailure")
-        || e.contains("handshake_failure");
+        || e.contains("handshake_failure")
+        // A client that opens TCP to :443 and dies mid-handshake has, in
+        // practice, refused us. Leaving this in the generic bucket is why an app
+        // pinning its API showed up as an unexplained "flow error" and the panel
+        // had nothing to say about it.
+        || e.contains("handshake eof")
+        || (e.contains("handshake") && e.contains("eof"));
     if ca_reject {
         inc(&CA_REJECTED);
     } else {
@@ -104,6 +111,7 @@ pub fn snapshot_json() -> String {
         "ingest_sent": g(&INGEST_SENT),
         "ingest_rejected": g(&INGEST_REJECTED),
         "ingest_failed": g(&INGEST_FAILED),
+        "quic_dropped": g(&QUIC_DROPPED),
         "last_event": le,
         "last_error": lerr,
     })

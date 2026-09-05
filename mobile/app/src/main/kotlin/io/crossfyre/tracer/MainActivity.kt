@@ -950,7 +950,11 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun StatusCard(running: Boolean, s: Stats?, hasCaHelp: () -> Unit) {
-        val diag = diagnose(running, s)
+        // Whether anything in scope is a patched build changes what a refusal
+        // MEANS, so the panel needs to know.
+        val current = caFingerprint()
+        val patchedInScope = selectedApps.any { PatchPrefs.caFor(this@MainActivity, it) == current && current != null }
+        val diag = diagnose(running, s, patchedInScope)
         Column(
             Modifier
                 .fillMaxWidth()
@@ -1215,6 +1219,7 @@ private data class Diag(val level: Level, val title: String, val body: String)
 private data class Stats(
     val flows: Long, val tlsFlows: Long, val caRejected: Long, val flowErrors: Long,
     val events: Long, val ingestSent: Long, val ingestRejected: Long, val ingestFailed: Long,
+    val quicDropped: Long,
     val lastEvent: String, val lastError: String
 ) {
     companion object {
@@ -1223,6 +1228,7 @@ private data class Stats(
             return Stats(
                 o.optLong("flows"), o.optLong("tls_flows"), o.optLong("ca_rejected"), o.optLong("flow_errors"),
                 o.optLong("events"), o.optLong("ingest_sent"), o.optLong("ingest_rejected"), o.optLong("ingest_failed"),
+                o.optLong("quic_dropped"),
                 o.optString("last_event"), o.optString("last_error")
             )
         }
@@ -1230,7 +1236,7 @@ private data class Stats(
 }
 
 /** Turn the raw counters into one actionable message: the whole point of the panel. */
-private fun diagnose(running: Boolean, s: Stats?): Diag? {
+private fun diagnose(running: Boolean, s: Stats?, patchedInScope: Boolean = false): Diag? {
     if (!running || s == null) return null
     if (s.events > 0 && s.ingestSent > 0)
         return Diag(Level.SUCCESS, "Capturing and shipping shapes.", "Open the workflow in the web app to see the asset graph fill in.")
@@ -1238,9 +1244,27 @@ private fun diagnose(running: Boolean, s: Stats?): Diag? {
         return Diag(Level.WARN, "Server rejected the shapes.", "Likely a stale token: re-pair the QR (regenerating it rotates the token).")
     if (s.events > 0 && s.ingestFailed > 0)
         return Diag(Level.WARN, "Captured shapes but can't reach the server.", "Check the Ingest URL (base only, no path) and that the tunnel is up.")
-    if (s.caRejected > 0 && s.events == 0L)
-        return Diag(Level.WARN, "Apps are refusing the certificate.", "They don't trust the user CA. Chrome ignores it. Use Firefox (see trust steps) or an app that trusts user certs.")
+    // Two different refusals, and they need different advice. If OTHER hosts are
+    // decrypting, the app already trusts this certificate, so a host that still
+    // refuses is pinning its own API in code, and patching again will not help.
+    // Telling someone to patch an app they have already patched is worse than
+    // saying nothing: it sends them round a loop that cannot fix it. A patched
+    // app that still refuses is pinning its API in code, which patching does not
+    // touch, and that is the honest answer even though it is the unwelcome one.
+    if (s.caRejected > 0 && patchedInScope)
+        return Diag(Level.WARN, "This app is patched and still refusing.", "It pins its own API in code, which patching does not remove, so those requests cannot be decrypted. Other hosts in the app will still capture normally. ${s.lastError}")
+    if (s.caRejected > 0)
+        return Diag(Level.WARN, "Apps are refusing the certificate.", "They don't trust this device's certificate. Patch the app in Scope, or use one that trusts user certificates. Chrome ignores them entirely.")
+    // HTTP/3 cannot be intercepted, so it is dropped to force a TCP fallback. An
+    // app whose API is behind a CDN speaking h3 can sit there retrying QUIC for
+    // up to a minute first, and while it does, the only thing captured is the
+    // analytics traffic from SDKs that never tried h3. That looks exactly like
+    // "capture is broken", so name it rather than leaving the operator guessing.
+    if (s.quicDropped > 0 && s.events == 0L)
+        return Diag(Level.WARN, "Blocking HTTP/3 so traffic falls back to TCP.", "${s.quicDropped} QUIC flow(s) dropped. Apps behind an HTTP/3 CDN can stall up to a minute before retrying over TCP. Give it a moment, then repeat the action.")
     if (s.flows > 0 && s.events == 0L)
         return Diag(Level.INFO, "Seeing traffic, no shapes yet.", "Browse an HTTPS site in an app that trusts the CA (Firefox), or wait for a request.")
+    if (s.quicDropped > 0)
+        return Diag(Level.INFO, "Capturing. Some HTTP/3 was dropped.", "${s.quicDropped} QUIC flow(s) were blocked so the app would retry over TCP, where they can be decrypted.")
     return Diag(Level.INFO, "No traffic captured yet.", "Make sure the app you're testing is in scope, then generate some requests.")
 }

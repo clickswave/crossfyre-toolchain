@@ -17,7 +17,7 @@ pub mod flow;
 pub mod reduce;
 
 pub use config::CaptureConfig;
-pub use flow::serve_mitm_flow;
+pub use flow::{FlowOutcome, serve_mitm_flow};
 pub use reduce::{FullExchange, TraceEvent, body_field_names, redact_url};
 
 use std::collections::HashMap;

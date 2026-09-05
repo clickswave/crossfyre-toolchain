@@ -156,7 +156,22 @@ pub async fn run(
                     )
                     .await
                     {
-                        Ok(()) => log::info!("flow -> {dst} closed cleanly"),
+                        // A TLS flow that completed the handshake and then carried
+                        // no request at all is the fingerprint of pinning done in
+                        // app code: the app trusts our CA (that is what patching
+                        // arranges, and why other hosts decrypt), then its own
+                        // pinner refuses this certificate and closes without
+                        // sending anything. Counting it as a refusal is the
+                        // difference between the panel saying "no traffic yet" and
+                        // saying which host would not accept us.
+                        Ok(outcome) if outcome.tls && outcome.requests == 0 => {
+                            crate::stats::inc(&crate::stats::CA_REJECTED);
+                            crate::stats::set_last_error(format!(
+                                "{dst} accepted the handshake then sent nothing (pinned?)"
+                            ));
+                            log::info!("flow -> {dst} refused our certificate after the handshake (likely pinned)");
+                        }
+                        Ok(_) => log::info!("flow -> {dst} closed cleanly"),
                         Err(e) => {
                             log::info!("flow -> {dst} error: {e}");
                             crate::stats::record_flow_error(&e.to_string());
@@ -167,11 +182,22 @@ pub async fn run(
             Ok(IpStackStream::Udp(udp)) => {
                 let dst = udp.peer_addr();
                 if dst.port() == 443 {
-                    // Drop QUIC (HTTP/3 over UDP :443). We can't MITM QUIC, so if we relayed it the
-                    // browser would use it and its HTTPS traffic would never be captured. Dropping it
-                    // makes the app fall back to TCP + TLS, which we DO MITM. Small first-connection
-                    // delay while QUIC times out; then everything flows over TCP.
-                    log::debug!("drop QUIC -> {dst} (forcing TCP+TLS fallback)");
+                    // Drop QUIC (HTTP/3 over UDP :443). We cannot MITM QUIC, so relaying it would
+                    // let the app use it and its HTTPS traffic would never be captured at all.
+                    // Dropping it is meant to make the app fall back to TCP + TLS, which we DO MITM.
+                    //
+                    // The fallback is NOT always quick. Blackholing gives the client no signal, so
+                    // it retries the handshake until its own timer expires: measured at ~60s against
+                    // an app whose API is fronted by a CDN speaking h3, during which its TCP
+                    // connection sits open without ever sending a ClientHello. The visible result is
+                    // a capture holding nothing but analytics, because the SDKs that do not try h3
+                    // are the only ones getting through.
+                    //
+                    // Count it and say so at INFO. This used to be a debug line, which is off in
+                    // release, so the traffic vanished and so did any hint that it had: the one
+                    // thing worse than dropping traffic is dropping it silently.
+                    crate::stats::inc(&crate::stats::QUIC_DROPPED);
+                    log::info!("dropped QUIC/h3 -> {dst} (forcing TCP+TLS fallback; app may stall briefly)");
                 } else {
                     // Relay other UDP (crucially DNS on :53) transparently, or the phone can't resolve
                     // anything and nothing browses. The app is excluded from the VPN, so this socket

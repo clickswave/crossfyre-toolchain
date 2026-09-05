@@ -41,6 +41,20 @@ static UPSTREAM_TLS: LazyLock<TlsConnector> = LazyLock::new(|| {
 /// netstack flow (mobile TUN) work. `target_host`/`target_port` is the flow's original destination and
 /// is used as the forwarding fallback when a request carries no Host header. Returns when the client
 /// closes the connection.
+/// What a finished flow turned out to be.
+///
+/// `tls` with zero `requests` is the signature of certificate pinning done in
+/// application code: the TLS handshake completes (the app trusts our CA at the
+/// platform level, which is what patching arranges), and then the pinner rejects
+/// the certificate and closes before sending a byte. Without this distinction
+/// that flow is indistinguishable from an idle connection, so a pinned API looks
+/// like "nothing happened" rather than "we were refused".
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FlowOutcome {
+    pub tls: bool,
+    pub requests: usize,
+}
+
 pub async fn serve_mitm_flow<C>(
     client: C,
     target_host: String,
@@ -49,7 +63,7 @@ pub async fn serve_mitm_flow<C>(
     egress: Egress,
     tx: UnboundedSender<TraceEvent>,
     cfg: CaptureCfg,
-) -> Result<(), BoxErr>
+) -> Result<FlowOutcome, BoxErr>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -59,16 +73,19 @@ where
     let mut first = [0u8; 1];
     let n = client.read(&mut first).await?;
     if n == 0 {
-        return Ok(());
+        return Ok(FlowOutcome::default());
     }
+    let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let stream = PrefixedIo::new(first[..n].to_vec(), client);
     if first[0] == 0x16 {
         log::debug!("flow {target_host}:{target_port}: TLS detected, accepting (MITM handshake)");
         let tls = mitm_acceptor(ca).accept(stream).await?;
         log::debug!("flow {target_host}:{target_port}: TLS handshake done, serving HTTP");
-        serve_http(tls, "https", target_host, target_port, egress, tx, cfg).await
+        serve_http(tls, "https", target_host, target_port, egress, tx, cfg, served.clone()).await?;
+        Ok(FlowOutcome { tls: true, requests: served.load(std::sync::atomic::Ordering::Relaxed) })
     } else {
-        serve_http(stream, "http", target_host, target_port, egress, tx, cfg).await
+        serve_http(stream, "http", target_host, target_port, egress, tx, cfg, served.clone()).await?;
+        Ok(FlowOutcome { tls: false, requests: served.load(std::sync::atomic::Ordering::Relaxed) })
     }
 }
 
@@ -81,6 +98,7 @@ async fn serve_http<S>(
     egress: Egress,
     tx: UnboundedSender<TraceEvent>,
     cfg: CaptureCfg,
+    served: Arc<std::sync::atomic::AtomicUsize>,
 ) -> Result<(), BoxErr>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -91,6 +109,7 @@ where
         let tx = tx.clone();
         let host = host.clone();
         let cfg = cfg.clone();
+        served.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         async move { handle_request(req, scheme, host, target_port, egress, tx, cfg).await }
     });
     hyper::server::conn::http1::Builder::new()

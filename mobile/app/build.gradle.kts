@@ -48,8 +48,8 @@ android {
         applicationId = "io.crossfyre.tracer"
         minSdk = 26
         targetSdk = 35
-        versionCode = 13
-        versionName = "0.1.12"
+        versionCode = 16
+        versionName = "0.1.15"
         // arm64 for real devices, x86_64 for the emulator.
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
     }
