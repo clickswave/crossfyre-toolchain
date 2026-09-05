@@ -155,6 +155,16 @@ object PatchPrefs {
             .edit().putString(pkg, caFingerprint).apply()
     }
 
+    /** Pack a CA fingerprint and the signer of the build we produced. */
+    fun join(caFingerprint: String, signer: String?): String =
+        if (signer.isNullOrEmpty()) caFingerprint else "$caFingerprint|$signer"
+
+    /** Split a stored record back into (caFingerprint, signer-or-null). */
+    fun split(record: String): Pair<String, String?> {
+        val i = record.indexOf('|')
+        return if (i < 0) record to null else record.substring(0, i) to record.substring(i + 1)
+    }
+
     /** The CA fingerprint [pkg] was patched with, or null if we never patched it. */
     fun caFor(ctx: Context, pkg: String): String? =
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(pkg, null)
@@ -173,7 +183,7 @@ object PatchPrefs {
     /** Packages patched with a CA that is no longer the current one. */
     fun stale(ctx: Context, currentCa: String?): List<String> {
         if (currentCa.isNullOrEmpty()) return emptyList()
-        return all(ctx).filterValues { it != currentCa }.keys.sorted()
+        return all(ctx).filterValues { split(it).first != currentCa }.keys.sorted()
     }
 
     fun clear(ctx: Context) {

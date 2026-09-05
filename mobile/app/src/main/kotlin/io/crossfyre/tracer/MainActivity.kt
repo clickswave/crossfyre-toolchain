@@ -160,7 +160,12 @@ class MainActivity : ComponentActivity() {
                     // a certificate reset, which is the difference between "ready"
                     // and a TLS alert at capture time.
                     patchingPkg?.let { pkg ->
-                        caFingerprint()?.let { PatchPrefs.record(this@MainActivity, pkg, it) }
+                        caFingerprint()?.let {
+                            PatchPrefs.record(
+                                this@MainActivity, pkg,
+                                PatchPrefs.join(it, signerOf(pkg)),
+                            )
+                        }
                     }
                     patchStatus = "Patched + installed. Start capture, then use the app: it trusts this device's certificate directly, so there is nothing to install."
                 } else {
@@ -356,13 +361,17 @@ class MainActivity : ComponentActivity() {
 
     /** Whether an app ships a Flutter engine.
      *
-     * This decides whether patching can help it at all. Flutter's Dart HTTP
-     * client speaks TLS through its OWN BoringSSL inside libflutter.so and never
-     * consults Android's trust store or the network security config, so the
-     * config rewrite that patching performs cannot reach it. The Java side of
-     * the same app (Firebase and friends) decrypts perfectly, which is what
-     * makes this so confusing from the outside: the capture looks half broken
-     * rather than "one of this app's two network stacks is out of reach".
+     * Flutter's Dart HTTP client speaks TLS through its OWN BoringSSL inside
+     * libflutter.so and never consults Android's trust store or the network
+     * security config. So an UNPATCHED Flutter app decrypts only its Java
+     * traffic (Firebase and friends) while its own API refuses the handshake,
+     * which reads as a half-broken capture rather than as two network stacks
+     * with different opinions.
+     *
+     * Patching now handles both: the server rewrites the security config for
+     * the Java stack AND neuters Flutter's own certificate check. Knowing an app
+     * is Flutter still matters, because it changes what an unpatched app can
+     * possibly show and what a refusal after patching means.
      *
      * Reading the APK can fail on a locked-down device; unknown is reported as
      * "not Flutter" so this never invents a warning it cannot support.
@@ -384,6 +393,37 @@ class MainActivity : ComponentActivity() {
      * a CA when none exists. Asking "which certificate am I on?" must never be
      * the thing that creates one.
      */
+    /** SHA-256 of the signing certificate of the INSTALLED build of [pkg].
+     *
+     * A patch is only real while the build that carries it is the one on the
+     * device. Recording the package and the CA was not enough: reinstalling the
+     * original app leaves both records intact, so Scope went on reporting
+     * "patched and ready" about a pristine build that decrypts nothing. Every
+     * patched build is re-signed by the patch service, so the signer identifies
+     * our build as surely as a version would, and unlike a version it cannot be
+     * reused by the vendor.
+     */
+    private fun signerOf(pkg: String): String? = runCatching {
+        val flags = android.content.pm.PackageManager.GET_SIGNING_CERTIFICATES
+        val info = packageManager.getPackageInfo(pkg, flags)
+        val sig = info.signingInfo?.apkContentsSigners?.firstOrNull() ?: return null
+        java.security.MessageDigest.getInstance("SHA-256").digest(sig.toByteArray())
+            .joinToString("") { "%02x".format(it) }
+    }.getOrNull()
+
+    /** True when [pkg] carries a patch made with the CURRENT certificate AND is
+     *  still the build we produced. */
+    private fun isPatchedAndCurrent(pkg: String): Boolean {
+        val rec = PatchPrefs.caFor(this, pkg) ?: return false
+        val (ca, signer) = PatchPrefs.split(rec)
+        if (ca != caFingerprint()) return false
+        // A record with no signer cannot be verified, so it does not count as
+        // ready. Being told to re-patch once is a small price; the alternative
+        // is what this replaced, where a pristine reinstall still reported
+        // "patched and ready" and quietly captured nothing.
+        return signer != null && signer == signerOf(pkg)
+    }
+
     private fun caFingerprint(): String? = runCatching {
         val pem = java.io.File(filesDir, "ca.pem").takeIf { it.exists() }?.readText() ?: return null
         val der = java.util.Base64.getMimeDecoder().decode(
@@ -469,12 +509,10 @@ class MainActivity : ComponentActivity() {
         if (scopeMode != TracerVpnService.MODE_ONLY) return emptyList()
         val current = caFingerprint()
         return selectedApps.mapNotNull { pkg ->
-            val patchedWith = PatchPrefs.caFor(this, pkg)
             when {
-                patchedWith == null -> null // never patched: may still work if it trusts user CAs
-                current == null -> "$pkg was patched, but this device has no certificate now"
-                patchedWith != current -> "$pkg trusts an older certificate and needs re-patching"
-                else -> null
+                PatchPrefs.caFor(this, pkg) == null -> null // never patched
+                isPatchedAndCurrent(pkg) -> null
+                else -> "$pkg is no longer running the build we patched, or trusts an older certificate"
             }
         }
     }
@@ -717,7 +755,7 @@ class MainActivity : ComponentActivity() {
                     }
                     if (scopeMode == TracerVpnService.MODE_ONLY && selectedApps.isNotEmpty()) {
                         val current = caFingerprint()
-                        val ready = selectedApps.count { PatchPrefs.caFor(this@MainActivity, it) == current && current != null }
+                        val ready = selectedApps.count { isPatchedAndCurrent(it) }
                         val staleHere = selectedApps.count {
                             val f = PatchPrefs.caFor(this@MainActivity, it); f != null && f != current
                         }
@@ -726,12 +764,12 @@ class MainActivity : ComponentActivity() {
                         Text(
                             when {
                                 staleHere > 0 -> "$staleHere of ${selectedApps.size} need re-patching before they will decrypt."
-                                flutterHere > 0 -> "$flutterHere built with Flutter: their own API traffic will not decrypt even when patched."
+                                flutterHere > 0 && ready < selectedApps.size -> "$flutterHere built with Flutter. Patch it: Flutter ships its own TLS stack, so an unpatched Flutter app decrypts nothing but its analytics."
                                 ready == selectedApps.size -> "All ${selectedApps.size} patched and ready."
                                 else -> "$ready of ${selectedApps.size} patched. Unpatched apps only decrypt if they trust user certificates."
                             },
                             style = MaterialTheme.typography.bodySmall,
-                            color = if (staleHere > 0 || flutterHere > 0) Cfx.warningLight else Cfx.text3
+                            color = if (staleHere > 0) Cfx.warningLight else Cfx.text3
                         )
                     }
                     Spacer(Modifier.height(8.dp))
@@ -979,7 +1017,7 @@ class MainActivity : ComponentActivity() {
         // Whether anything in scope is a patched build changes what a refusal
         // MEANS, so the panel needs to know.
         val current = caFingerprint()
-        val patchedInScope = selectedApps.any { PatchPrefs.caFor(this@MainActivity, it) == current && current != null }
+        val patchedInScope = selectedApps.any { isPatchedAndCurrent(it) }
         val flutterInScope = selectedApps.any { isFlutterApp(it) }
         val diag = diagnose(running, s, patchedInScope, flutterInScope)
         Column(
@@ -1134,9 +1172,10 @@ class MainActivity : ComponentActivity() {
                             // Showing it here is the difference between finding out
                             // now and finding out as a TLS alert mid-capture.
                             val patchedWith = PatchPrefs.caFor(this@MainActivity, pkg)
-                            val current = caFingerprint()
                             val isPatched = patchedWith != null
-                            val isStale = isPatched && current != null && patchedWith != current
+                            // Stale covers both a rotated certificate and a build
+                            // that is no longer the one we patched.
+                            val isStale = isPatched && !isPatchedAndCurrent(pkg)
 
                             Column(Modifier.weight(1f)) {
                                 Text(label, color = Cfx.text1, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -1145,8 +1184,8 @@ class MainActivity : ComponentActivity() {
                                     // Say it here, at the moment of choosing, rather than
                                     // after a patch that was never going to help.
                                     Text(
-                                        "Flutter: its API traffic won't decrypt",
-                                        color = Cfx.warningLight, fontSize = 10.sp, maxLines = 1,
+                                        "Flutter app: patch it to read its API",
+                                        color = Cfx.text3, fontSize = 10.sp, maxLines = 1,
                                         overflow = TextOverflow.Ellipsis
                                     )
                                 } else if (isStale) {
@@ -1287,7 +1326,7 @@ private fun diagnose(running: Boolean, s: Stats?, patchedInScope: Boolean = fals
     // app that still refuses is pinning its API in code, which patching does not
     // touch, and that is the honest answer even though it is the unwelcome one.
     if (s.caRejected > 0 && flutterInScope)
-        return Diag(Level.WARN, "Flutter app: its own API won't decrypt.", "Flutter speaks TLS through its own engine and ignores Android's trust store, so patching cannot reach it. The app's Java traffic (Firebase and similar) still captures normally. ${s.lastError}")
+        return Diag(Level.WARN, "A Flutter app is refusing the certificate.", "Flutter ships its own TLS stack, which only a patch can reach. Re-patch this app from Scope with the current build. ${s.lastError}")
     if (s.caRejected > 0 && patchedInScope)
         return Diag(Level.WARN, "This app is patched and still refusing.", "It pins its own API in code, which patching does not remove, so those requests cannot be decrypted. Other hosts in the app will still capture normally. ${s.lastError}")
     if (s.caRejected > 0)
