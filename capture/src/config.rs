@@ -70,6 +70,24 @@ impl CaptureConfig {
         serde_json::json!({ "workflow_id": workflow_id, "token": token })
     }
 
+    /// Same, plus what THIS client decided about full capture.
+    ///
+    /// Full capture takes two yeses: the session asks for it and the device
+    /// grants it. Only the client knows the second one, and until it said so the
+    /// control plane could not tell "nothing was captured" from "the device
+    /// declined", so an empty Requests tab had no explanation anywhere.
+    pub fn request_body_with_device(
+        workflow_id: &str,
+        token: &str,
+        device_full_capture: bool,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "workflow_id": workflow_id,
+            "token": token,
+            "device_full_capture": device_full_capture,
+        })
+    }
+
     /// Parse a control-plane response into settings.
     ///
     /// Tolerates the `{ status, data: {...} }` envelope the control plane wraps
@@ -139,5 +157,12 @@ mod tests {
         let b = CaptureConfig::request_body("wf-1", "tok");
         assert_eq!(b["workflow_id"], "wf-1");
         assert_eq!(b["token"], "tok");
+    }
+
+    #[test]
+    fn request_body_carries_the_device_answer() {
+        let b = CaptureConfig::request_body_with_device("wf-1", "tok", false);
+        assert_eq!(b["workflow_id"], "wf-1");
+        assert_eq!(b["device_full_capture"], false);
     }
 }

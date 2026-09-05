@@ -206,7 +206,8 @@ pub extern "system" fn Java_io_crossfyre_tracer_Native_startCapture<'local>(
         // build the capture config (a gate is installed only in manual mode).
         let http = reqwest::Client::new();
         let (server_full, mode) =
-            intercept::fetch_config(&http, &cfg_api, &cfg_wf, &cfg_token).await;
+            intercept::fetch_config(&http, &cfg_api, &cfg_wf, &cfg_token, device_allows_full)
+                .await;
         // The server may REQUEST full capture; the device decides. Previously the
         // response alone flipped this on, so a control plane (including one
         // reached by scanning someone else's QR) could turn shape-only capture

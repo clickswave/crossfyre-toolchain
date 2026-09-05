@@ -22,8 +22,10 @@ pub async fn fetch_config(
     api_url: &str,
     workflow_id: &str,
     token: &str,
+    device_full_capture: bool,
 ) -> (bool, String) {
-    let cfg = fetch_capture_config(client, api_url, workflow_id, token).await;
+    let cfg =
+        fetch_capture_config(client, api_url, workflow_id, token, device_full_capture).await;
     (cfg.full_capture, cfg.intercept_mode)
 }
 
@@ -34,13 +36,20 @@ pub async fn fetch_capture_config(
     api_url: &str,
     workflow_id: &str,
     token: &str,
+    device_full_capture: bool,
 ) -> cfx_capture::CaptureConfig {
     let url = format!(
         "{}{}",
         api_url.trim_end_matches('/'),
         cfx_capture::config::CONFIG_PATH
     );
-    let body = cfx_capture::CaptureConfig::request_body(workflow_id, token);
+    // Report our own answer while asking for theirs, so the control plane can
+    // explain an empty Requests tab instead of showing an unexplained blank.
+    let body = cfx_capture::CaptureConfig::request_body_with_device(
+        workflow_id,
+        token,
+        device_full_capture,
+    );
     match client.post(&url).json(&body).send().await {
         Ok(r) => match r.json::<serde_json::Value>().await {
             Ok(v) => cfx_capture::CaptureConfig::parse(&v),
