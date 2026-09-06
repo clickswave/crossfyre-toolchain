@@ -110,6 +110,9 @@ class MainActivity : ComponentActivity() {
     private var patchProgress by mutableStateOf<Float?>(0f) // 0..1 across the whole flow
     private var creepJob: kotlinx.coroutines.Job? = null
     private var pendingInstall: List<File>? = null
+    /** The last successfully patched APK(s), kept so they can be exported. */
+    private var exportable by mutableStateOf<List<File>?>(null)
+    private var exportPkg: String? = null
     private var pendingPkg: String? = null
     private val INSTALL_ACTION = "io.crossfyre.tracer.INSTALL_RESULT"
     private val UNINSTALL_ACTION = "io.crossfyre.tracer.UNINSTALL_RESULT"
@@ -159,6 +162,12 @@ class MainActivity : ComponentActivity() {
                     // app cannot later tell a working patch from one invalidated by
                     // a certificate reset, which is the difference between "ready"
                     // and a TLS alert at capture time.
+                    // Hold on to what we built. The patched APK is the artefact of
+                    // this whole operation, and until now it was written to cache,
+                    // installed, and then unreachable: no way to keep it, hand it
+                    // to a colleague, or attach it to a report.
+                    exportable = pendingInstall
+                    exportPkg = pendingPkg
                     patchingPkg?.let { pkg ->
                         caFingerprint()?.let {
                             PatchPrefs.record(
@@ -189,6 +198,17 @@ class MainActivity : ComponentActivity() {
 
     /** Stop a running patch. Teardown lives in the coroutine's cancellation
      *  handler so it runs no matter who cancels or why. */
+    /** Save the last patched APK somewhere the user picks. */
+    private fun exportPatchedApk() {
+        val files = exportable
+        if (files.isNullOrEmpty()) {
+            patchStatus = "Nothing to export yet: patch an app first."
+            return
+        }
+        val name = (exportPkg ?: "patched").substringAfterLast('.')
+        apkSave.launch("$name-patched.apk")
+    }
+
     private fun cancelPatch() {
         creepJob?.cancel(); creepJob = null
         patchJob?.cancel()
@@ -196,6 +216,11 @@ class MainActivity : ComponentActivity() {
 
     private fun patchApp(pkg: String) {
         patchingPkg = pkg
+        // buildPatched clears the scratch directory on entry, so anything left
+        // exportable from a previous patch is about to stop existing. Drop the
+        // offer now rather than letting it fail when taken up.
+        exportable = null
+        exportPkg = null
         val pair = Pairing.load(this)
         if (pair == null) { patchStatus = "Pair a workspace first."; return }
         val ca = ensureCaFile()
@@ -284,7 +309,37 @@ class MainActivity : ComponentActivity() {
     private var preflightWarnings by mutableStateOf<List<String>>(emptyList())
     private var preflightAcknowledged = false
     private var showResetCa by mutableStateOf(false)
+    /** Package whose details are on screen, if any. */
+    private var inspectPkg by mutableStateOf<String?>(null)
     private var pendingCaPem: String? = null
+    /** Write the patched APK wherever the user chooses.
+     *
+     * A patch takes minutes of server time and produces the one artefact worth
+     * keeping: an APK of the target app that a proxy can read. It used to be
+     * installed and then lost. Exporting it means it can be kept for a report,
+     * handed to a colleague, or reinstalled later without patching again.
+     *
+     * Split APKs cannot be represented as one file, so the base is exported and
+     * the caller is told the rest were left behind rather than being handed a
+     * file that will not install.
+     */
+    private val apkSave =
+        registerForActivityResult(ActivityResultContracts.CreateDocument("application/vnd.android.package-archive")) { uri ->
+            val files = exportable
+            patchStatus = if (uri != null && !files.isNullOrEmpty()) {
+                runCatching {
+                    val base = files.maxByOrNull { it.length() }!!
+                    contentResolver.openOutputStream(uri)?.use { out ->
+                        base.inputStream().use { it.copyTo(out) }
+                    }
+                    if (files.size > 1)
+                        "Exported the base APK. This app ships ${files.size} splits, so the export " +
+                            "alone will not install: use Patch to install it here."
+                    else "Exported the patched APK."
+                }.getOrElse { "Export failed: ${it.message}" }
+            } else "Export cancelled."
+        }
+
     private val caSave =
         registerForActivityResult(ActivityResultContracts.CreateDocument("application/x-x509-ca-cert")) { uri ->
             val pem = pendingCaPem
@@ -386,6 +441,38 @@ class MainActivity : ComponentActivity() {
     }
 
     private val flutterCache = mutableMapOf<String, Boolean>()
+
+    /** Per-app facts, filled off the main thread. Reading this during scroll is
+     *  a map lookup; computing it there was disk I/O per row per frame. */
+    private val insights = mutableStateMapOf<String, AppInsight>()
+
+    /** The current CA fingerprint, resolved once rather than per row. */
+    private var caFpCache by mutableStateOf<String?>(null)
+
+    /** Fill [insights] for [pkgs] in the background, nearest-first. */
+    private fun prefetchInsights(pkgs: List<Pair<String, String>>) {
+        lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            caFpCache = caFingerprint()
+            for ((pkg, label) in pkgs) {
+                if (insights.containsKey(pkg)) continue
+                val i = runCatching { AppInspector.inspect(this@MainActivity, pkg, label) }.getOrNull()
+                if (i != null) insights[pkg] = i
+            }
+        }
+    }
+
+    /** Patch state for a row, computed from cached values only. */
+    private fun rowPatchState(pkg: String): String {
+        val rec = PatchPrefs.caFor(this, pkg) ?: return "none"
+        val (ca, signer) = PatchPrefs.split(rec)
+        if (ca != caFpCache) return "stale"
+        if (signer == null) return "stale"
+        return if (signer == insightSigner(pkg)) "current" else "stale"
+    }
+
+    private val signerCache = mutableMapOf<String, String?>()
+    private fun insightSigner(pkg: String): String? =
+        signerCache.getOrPut(pkg) { AppInspector.signerOf(this, pkg) }
 
     /** SHA-256 of the current CA, or null when there is no CA yet.
      *
@@ -772,6 +859,12 @@ class MainActivity : ComponentActivity() {
                             color = if (staleHere > 0) Cfx.warningLight else Cfx.text3
                         )
                     }
+                    if (!exportable.isNullOrEmpty()) {
+                        Spacer(Modifier.height(8.dp))
+                        TextButton(onClick = { exportPatchedApk() }, contentPadding = PaddingValues(0.dp)) {
+                            Text("Export last patched APK", color = Cfx.ember, fontSize = 13.sp)
+                        }
+                    }
                     Spacer(Modifier.height(8.dp))
                     Text(
                         "Pinned apps (banking, dating, etc.) reject the CA and can't be captured, so they may fail to connect while captured. Patch them here, or put them in \"All except\" to keep them working.",
@@ -863,6 +956,15 @@ class MainActivity : ComponentActivity() {
                 onDismissRequest = { patchStatus = "" },
                 containerColor = Cfx.surfaceRaised,
                 confirmButton = { TextButton(onClick = { patchStatus = "" }) { Text("OK", color = Cfx.ember) } },
+                // Offered at the moment the artefact exists, which is when
+                // someone actually wants it.
+                dismissButton = {
+                    if (!exportable.isNullOrEmpty()) {
+                        TextButton(onClick = { patchStatus = ""; exportPatchedApk() }) {
+                            Text("Export APK", color = Cfx.text3)
+                        }
+                    }
+                },
                 title = { Text("Patch", color = Cfx.text) },
                 text = { Text(patchStatus, color = Cfx.text2) }
             )
@@ -898,6 +1000,64 @@ class MainActivity : ComponentActivity() {
                     TextButton(onClick = { preflightWarnings = emptyList() }) {
                         Text("Cancel", color = Cfx.text3)
                     }
+                }
+            )
+        }
+
+        // What we know about one app, and what to expect from patching it.
+        inspectPkg?.let { pkg ->
+            val i = insights[pkg]
+            val patched = rowPatchState(pkg) == "current"
+            AlertDialog(
+                onDismissRequest = { inspectPkg = null },
+                containerColor = Cfx.surfaceRaised,
+                title = { Text(i?.label ?: pkg, color = Cfx.text) },
+                text = {
+                    Column(Modifier.verticalScroll(rememberScrollState())) {
+                        if (i == null) {
+                            Text("Reading the app…", color = Cfx.text3, fontSize = 13.sp)
+                        } else {
+                            InsightRow("Package", i.pkg)
+                            InsightRow("Size", "${i.sizeMb} MB")
+                            InsightRow("Framework", i.framework)
+                            InsightRow("Network stacks", buildList {
+                                if (i.flutter) add("Flutter (own TLS)")
+                                if (i.cronet) add("Cronet")
+                                add("Java/OkHttp")
+                            }.joinToString(", "))
+                            InsightRow("Patched", if (patched) "yes, with this certificate" else "no")
+                            InsightRow(
+                                "Resources",
+                                if (i.packed) "packed (relocated, unpacked at runtime)" else "normal",
+                            )
+                            if (i.shieldLibs.isNotEmpty()) {
+                                InsightRow(
+                                    "Shield indicators",
+                                    "${i.shieldLibs.size} machine-named libraries",
+                                )
+                            }
+                            Spacer(Modifier.height(10.dp))
+                            Text(
+                                i.outlook(patched),
+                                color = if (i.shielded) Cfx.dangerLight else Cfx.text2,
+                                fontSize = 13.sp,
+                            )
+                            if (i.nativeLibs.isNotEmpty()) {
+                                Spacer(Modifier.height(10.dp))
+                                Text(
+                                    "Native libraries",
+                                    color = Cfx.text3, fontSize = 11.sp, fontFamily = Cfx.mono,
+                                )
+                                Text(
+                                    i.nativeLibs.joinToString(", "),
+                                    color = Cfx.text3, fontSize = 10.sp, fontFamily = Cfx.mono,
+                                )
+                            }
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = { inspectPkg = null }) { Text("Close", color = Cfx.ember) }
                 }
             )
         }
@@ -1102,10 +1262,23 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    @Composable
+    private fun InsightRow(label: String, value: String) {
+        Row(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
+            Text(label, color = Cfx.text3, fontSize = 12.sp, modifier = Modifier.width(120.dp))
+            Text(value, color = Cfx.text2, fontSize = 12.sp)
+        }
+    }
+
     @OptIn(ExperimentalMaterial3Api::class)
     @Composable
     private fun AppPickerSheet(apps: List<Pair<String, String>>, selected: MutableList<String>, onDismiss: () -> Unit) {
         val sheet = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+        // Read every app's APK once, in the background, so scrolling stays a
+        // map lookup. Selected apps first: those are the ones being judged.
+        LaunchedEffect(apps) {
+            prefetchInsights(apps.sortedByDescending { selected.contains(it.first) })
+        }
         var query by remember { mutableStateOf("") }
         val filtered = remember(query) {
             if (query.isBlank()) apps else apps.filter { it.second.contains(query, true) || it.first.contains(query, true) }
@@ -1167,24 +1340,29 @@ class MainActivity : ComponentActivity() {
                                 },
                                 colors = CheckboxDefaults.colors(checkedColor = Cfx.ember, uncheckedColor = Cfx.text3, checkmarkColor = Color.Black)
                             )
-                            // An app's readiness is a fact about THIS device: was it
-                            // patched, and with the certificate that is current now.
-                            // Showing it here is the difference between finding out
-                            // now and finding out as a TLS alert mid-capture.
-                            val patchedWith = PatchPrefs.caFor(this@MainActivity, pkg)
-                            val isPatched = patchedWith != null
-                            // Stale covers both a rotated certificate and a build
-                            // that is no longer the one we patched.
-                            val isStale = isPatched && !isPatchedAndCurrent(pkg)
+                            // Every value here is a cache read. This used to read a
+                            // certificate off disk, hash it, query PackageManager for a
+                            // signature and open the app's zip, per row per frame, which
+                            // is what made dragging the list feel like it ignored you.
+                            val state = rowPatchState(pkg)
+                            val insight = insights[pkg]
+                            val isPatched = state != "none"
+                            val isStale = state == "stale"
 
                             Column(Modifier.weight(1f)) {
                                 Text(label, color = Cfx.text1, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                 Text(pkg, color = Cfx.text3, fontFamily = Cfx.mono, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                if (isFlutterApp(pkg)) {
-                                    // Say it here, at the moment of choosing, rather than
-                                    // after a patch that was never going to help.
+                                if (insight != null && insight.shielded) {
+                                    // The most useful sentence we can offer, said before
+                                    // ten minutes are spent rather than after.
                                     Text(
-                                        "Flutter app: patch it to read its API",
+                                        "Shielded: may refuse to run once patched",
+                                        color = Cfx.dangerLight, fontSize = 10.sp, maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                } else if (insight != null && insight.flutter && !isPatched) {
+                                    Text(
+                                        "Flutter: patch it to read its API",
                                         color = Cfx.text3, fontSize = 10.sp, maxLines = 1,
                                         overflow = TextOverflow.Ellipsis
                                     )
@@ -1200,6 +1378,11 @@ class MainActivity : ComponentActivity() {
                                         color = Cfx.successLight, fontSize = 10.sp, maxLines = 1
                                     )
                                 }
+                            }
+                            // Look before you patch: a shielded or Cronet app is worth
+                            // knowing about before spending ten minutes on it.
+                            TextButton(onClick = { inspectPkg = pkg }, contentPadding = PaddingValues(horizontal = 6.dp)) {
+                                Text("Details", color = Cfx.text3, fontSize = 12.sp)
                             }
                             // Patch a pinned app on the server so it trusts the CA (unroot bypass).
                             TextButton(onClick = { patchApp(pkg) }, enabled = !patching) {
