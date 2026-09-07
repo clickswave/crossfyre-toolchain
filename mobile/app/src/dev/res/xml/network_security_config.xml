@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Dev only. A dev stack is a web_server on a LAN address over plain http
+  (http://192.168.x.x:12004), and Android blocks cleartext by default, so the
+  patch flow died at the first POST with "Cleartext HTTP traffic ... not
+  permitted" while pairing and capture kept working - those go through the Rust
+  capture crate over JNI, which the network security config does not govern.
+  Only Patcher.kt uses HttpURLConnection, so only patching broke.
+
+  Permitted for every host rather than a listed one: the dev box's LAN address
+  changes with the network it is on, and a domain-config takes hostnames, not
+  ranges. This is scoped by build flavour instead - it reaches only
+  io.crossfyre.tracer.dev, never the app that captures anyone's real traffic.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>
