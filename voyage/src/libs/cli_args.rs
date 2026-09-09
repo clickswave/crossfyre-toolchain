@@ -61,6 +61,24 @@ pub enum Commands {
     ScanExec(ScanExecArgs),
     /// Discover a target's real origin IP behind a CDN/WAF
     Origin(OriginArgs),
+    /// Try a DNS zone transfer (AXFR) and print every name the zone gives up
+    Axfr(AxfrArgs),
+}
+
+#[derive(ClapArgs, Clone, Debug)]
+pub struct AxfrArgs {
+    /// Zone to request (e.g. example.com)
+    #[arg(short, long)]
+    pub domain: String,
+
+    /// Nameserver to ask, as `ip` or `ip:port`. Omit to ask the zone's own
+    /// authoritative servers.
+    #[arg(long, default_value = "")]
+    pub dns_server: String,
+
+    /// Per-step timeout in ms
+    #[arg(long, default_value_t = 8000)]
+    pub timeout: u64,
 }
 
 #[derive(ClapArgs, Clone, Debug)]

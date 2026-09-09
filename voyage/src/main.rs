@@ -6,6 +6,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
+mod axfr;
 mod client_tui;
 mod daemon;
 mod libs;
@@ -88,12 +89,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return handle_origin(origin_args.clone()).await;
     }
 
+    if let Some(Commands::Axfr(args)) = &cli.command {
+        return handle_axfr(args.clone(), cli.port).await;
+    }
+
     // -----------------------------------------------------------------------
     // Scan subcommand - client that talks to the running daemon
     // -----------------------------------------------------------------------
     let mut enum_args = match cli.command {
         Some(Commands::Scan(args)) => args,
-        Some(Commands::ScanExec(_)) | Some(Commands::Db(_)) | Some(Commands::Origin(_)) | None => {
+        Some(Commands::ScanExec(_))
+        | Some(Commands::Db(_))
+        | Some(Commands::Origin(_))
+        | Some(Commands::Axfr(_))
+        | None => {
             eprintln!(
                 "No command given. Use `voyage scan`, `voyage scan-exec`, `voyage db`, or `voyage --daemon`. Try --help."
             );
@@ -295,5 +304,43 @@ async fn handle_enum_exec(args: ScanExecArgs, port: u16) -> Result<(), Box<dyn s
         println!("{line}");
     }
 
+    Ok(())
+}
+
+/// `voyage axfr`: ask the daemon for a zone transfer and print what comes back.
+async fn handle_axfr(
+    args: crate::libs::cli_args::AxfrArgs,
+    port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .map_err(|_| {
+            format!("Voyage daemon is not running on port {port}. Start it with: voyage --daemon")
+        })?;
+    let request = serde_json::json!({
+        "operation": "axfr",
+        "response": "stream",
+        "domain": args.domain,
+        "dns_server": args.dns_server,
+        "timeout_ms": args.timeout,
+    });
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut req_str = serde_json::to_string(&request)?;
+    req_str.push('\n');
+    writer.write_all(req_str.as_bytes()).await?;
+
+    let mut lines = BufReader::new(reader).lines();
+    while let Some(line) = lines.next_line().await? {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        match v["type"].as_str().unwrap_or("") {
+            "result" => println!("{}", v["subdomain"].as_str().unwrap_or("")),
+            "finding" => eprintln!("[!] {}", v["data"]["name"].as_str().unwrap_or("")),
+            "log" | "error" => eprintln!("[-] {}", v["message"].as_str().unwrap_or("")),
+            "done" => break,
+            _ => {}
+        }
+    }
     Ok(())
 }

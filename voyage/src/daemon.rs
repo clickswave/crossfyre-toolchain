@@ -242,6 +242,9 @@ async fn handle_connection(
         if req.response == "stream" {
             match req.operation.as_str() {
                 "takeover" => handle_stream_takeover(req, writer).await?,
+                // Zone transfer: when a nameserver answers it, the zone lists
+                // every name it holds and the brute-force phase is redundant.
+                "axfr" => handle_stream_axfr(req, writer).await?,
                 _ => handle_stream_enum(req, writer, Arc::clone(&db)).await?,
             }
             return Ok(());
@@ -761,6 +764,157 @@ fn default_takeover_timeout() -> u64 {
 /// than this buys nothing and hands a hostile target a cheap way to tie up the
 /// engine, which is the same reason the raw HTTP sender caps its reads.
 const MAX_BODY_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, serde::Deserialize)]
+struct AxfrParams {
+    /// The zone to ask for.
+    domain: String,
+    /// `ip` or `ip:port`. Empty asks the zone's own authoritative servers,
+    /// which is the usual case; naming one is how you reach an internal
+    /// resolver or a lab.
+    #[serde(default)]
+    dns_server: String,
+    #[serde(default = "default_axfr_timeout")]
+    timeout_ms: u64,
+}
+fn default_axfr_timeout() -> u64 {
+    8000
+}
+
+async fn handle_stream_axfr(
+    req: DaemonRequest,
+    mut writer: OwnedWriteHalf,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let operation_id = Uuid::new_v4().to_string();
+    let params: AxfrParams = match serde_json::from_value(req.params.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            write_json(
+                &mut writer,
+                &serde_json::json!({
+                    "type": "error",
+                    "operation_id": operation_id,
+                    "message": format!("Invalid axfr params: {}", e),
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let zone = params.domain.trim().trim_end_matches('.').to_string();
+    let timeout = std::time::Duration::from_millis(params.timeout_ms.clamp(500, 60_000));
+    // `map_err` to a String BEFORE any await: create_resolver's error is a bare
+    // `Box<dyn Error>`, which is not Send, and holding one across an await stops
+    // the whole connection future being spawnable.
+    let built = crate::libs::dns::create_resolver(if params.dns_server.trim().is_empty() {
+        None
+    } else {
+        Some(params.dns_server.as_str())
+    })
+    .map_err(|e| format!("DNS resolver error: {e}"));
+    let resolver = match built {
+        Ok(r) => r,
+        Err(msg) => {
+            write_json(
+                &mut writer,
+                &serde_json::json!({"type":"error","operation_id":operation_id,
+                                    "message": msg}),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    write_json(
+        &mut writer,
+        &serde_json::json!({"type":"ack","operation_id":operation_id,"domain":zone}),
+    )
+    .await?;
+
+    // An explicitly named server is asked directly; otherwise ask the zone's
+    // own authoritative servers, which is what a transfer is normally against.
+    let port = crate::libs::dns::server_addr(&params.dns_server)
+        .map(|a| a.port())
+        .unwrap_or(53);
+    let mut servers: Vec<(String, std::net::SocketAddr)> = Vec::new();
+    if let Some(explicit) = crate::libs::dns::server_addr(&params.dns_server) {
+        servers.push((params.dns_server.trim().to_string(), explicit));
+    }
+    for (host, addr) in crate::axfr::authoritative(&resolver, &zone, port).await {
+        if !servers.iter().any(|(_, a)| *a == addr) {
+            servers.push((host, addr));
+        }
+    }
+    if servers.is_empty() {
+        write_json(
+            &mut writer,
+            &serde_json::json!({"type":"error","operation_id":operation_id,
+                                "message": format!("no nameservers found for {zone}")}),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let mut total = 0usize;
+    for (label, addr) in servers {
+        let t = crate::axfr::transfer(&zone, addr, timeout).await;
+        if let Some(why) = &t.refused {
+            write_json(
+                &mut writer,
+                &serde_json::json!({"type":"log","operation_id":operation_id,
+                                    "message": format!("{label} ({addr}): {why}")}),
+            )
+            .await?;
+            continue;
+        }
+        total += t.names.len();
+        // The transfer itself is the finding: a zone anyone can copy.
+        write_json(
+            &mut writer,
+            &serde_json::json!({"type":"finding","data": {
+                "type": "vulnerability",
+                "vuln_class": "misconfig",
+                "name": "DNS zone transfer (AXFR) allowed",
+                "severity": "medium",
+                "confidence": "confirmed",
+                "source": "voyage-axfr",
+                "target": format!("{addr}"),
+                "url": format!("{addr}"),
+                "matched_at": format!("{addr}"),
+                "location": "service",
+                "description": format!(
+                    "The nameserver at {addr} transferred the whole `{zone}` zone to an \
+                     unauthenticated request: {} records, {} distinct names. That is the \
+                     complete internal inventory - hosts nobody links to, staging and admin \
+                     names, mail and VPN endpoints - handed over without a wordlist. Restrict \
+                     allow-transfer to the secondaries that need it.",
+                    t.names.len(), t.names.len()
+                ),
+            }}),
+        )
+        .await?;
+        for name in &t.names {
+            write_json(
+                &mut writer,
+                &serde_json::json!({"type":"result","operation_id":operation_id,
+                                    "subdomain": name, "source": "axfr",
+                                    "server": label}),
+            )
+            .await?;
+        }
+        // One successful transfer is the whole zone; asking the secondaries too
+        // would just repeat it.
+        break;
+    }
+
+    write_json(
+        &mut writer,
+        &serde_json::json!({"type":"done","operation_id":operation_id,"found":total}),
+    )
+    .await?;
+    Ok(())
+}
 
 async fn handle_stream_takeover(
     req: DaemonRequest,
