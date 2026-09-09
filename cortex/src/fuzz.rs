@@ -289,6 +289,7 @@ mod tests {
             method: "POST".into(),
             url: "https://api.x/pets".into(),
             params: vec![],
+            path_params: vec![],
             body: vec![
                 BodyField {
                     name: "name".into(),

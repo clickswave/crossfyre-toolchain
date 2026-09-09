@@ -83,6 +83,15 @@ pub struct InjEndpoint {
     /// "form" (x-www-form-urlencoded) or "json".
     #[serde(default = "d_form")]
     pub body_type: String,
+    /// Path segments that are parameters rather than fixed route text.
+    ///
+    /// This is the strongest signal available and it comes from a contract: an
+    /// OpenAPI `{id}`, or an operation in the asset graph whose request shape
+    /// records the segment as a variable. Accepts either a 0-based segment
+    /// index, or the segment's text (with or without `{}`), because callers
+    /// have one or the other depending on where the endpoint came from.
+    #[serde(default)]
+    pub path_params: Vec<Value>,
 }
 
 const SLEEP_SECS: u64 = 5;
@@ -243,6 +252,11 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
     // probed once per (method, version-family) and deduped across the endpoint list.
     let mut inv_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    // Positions the corpus proves variable, computed once over every endpoint
+    // we were given rather than per endpoint: the evidence for `/users/alice`
+    // lives in `/users/bob`, which is a different endpoint.
+    let varying = varying_path_indices(&params.endpoints);
+
     let mut rl_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut cors_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -265,7 +279,7 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
                 found += 1;
             }
         }
-        for site in sites_for(ep) {
+        for site in sites_for(ep, &varying) {
             let baseline = match send_site(&client, &site, &site.base_value).await {
                 Some(r) => r,
                 None => continue,
@@ -338,8 +352,9 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
     let _ = tx.send(json!({"type":"done","found":found}));
 }
 
-/// Expand an endpoint into its fuzzable sites (query params + body fields).
-fn sites_for(ep: &InjEndpoint) -> Vec<Site> {
+/// Expand an endpoint into its fuzzable sites (query params, path segments,
+/// body fields). `varying` carries the positions the corpus proved variable.
+fn sites_for(ep: &InjEndpoint, varying: &HashMap<String, Vec<usize>>) -> Vec<Site> {
     let method = ep.method.to_uppercase();
     let mut out = Vec::new();
     let qnames: Vec<String> = if ep.params.is_empty() {
@@ -359,13 +374,35 @@ fn sites_for(ep: &InjEndpoint) -> Vec<Site> {
             path_idx: 0,
         });
     }
-    // Id-like path segments (numeric / uuid / slug-with-digit) are fuzzed too:
-    // REST APIs put the object key in the path (e.g. /users/v1/{id}), and an
-    // OpenAPI `{param}` is filled with a numeric sample here, so this reaches
-    // path-parameter SQLi/traversal that query+body fuzzing misses.
+    // Path segments carrying a value rather than route text. REST APIs put the
+    // object key in the path (/users/{id}, /orgs/{slug}), so this reaches
+    // injection that query and body fuzzing structurally cannot.
+    //
+    // Three sources of truth, strongest first:
+    //   1. the endpoint declares them (OpenAPI `{id}`, or the asset graph's
+    //      recorded request shape)
+    //   2. the corpus shows the position varying between otherwise identical
+    //      paths, which catches `/users/alice` where no heuristic would
+    //   3. the segment merely looks like an identifier
+    //
+    // The third is a guess and is used only when the first two say nothing,
+    // because a guess that fires on every wordy segment costs requests and
+    // credibility on real targets.
     let path = path_only(&ep.url);
+    let declared = declared_path_indices(ep);
+    let observed = varying
+        .get(&format!("{}{}", host_of(&ep.url), path))
+        .cloned()
+        .unwrap_or_default();
+    let have_evidence = !declared.is_empty() || !observed.is_empty();
     for (i, seg) in path.split('/').enumerate() {
-        if looks_like_id_seg(seg) {
+        if seg.is_empty() {
+            continue;
+        }
+        let is_param = declared.contains(&i)
+            || observed.contains(&i)
+            || (!have_evidence && looks_like_id_seg(seg));
+        if is_param {
             out.push(Site {
                 method: method.clone(),
                 url: ep.url.clone(),
@@ -439,6 +476,95 @@ fn sites_for(ep: &InjEndpoint) -> Vec<Site> {
 
     out.truncate(MAX_SITES_PER_EP);
     out
+}
+
+/// Segment indices this endpoint declares as parameters.
+fn declared_path_indices(ep: &InjEndpoint) -> Vec<usize> {
+    if ep.path_params.is_empty() {
+        return Vec::new();
+    }
+    let path = path_only(&ep.url);
+    let segs: Vec<&str> = path.split('/').collect();
+    let mut out = Vec::new();
+    for spec in &ep.path_params {
+        match spec {
+            Value::Number(n) => {
+                if let Some(i) = n.as_u64() {
+                    if (i as usize) < segs.len() {
+                        out.push(i as usize);
+                    }
+                }
+            }
+            Value::String(sv) => {
+                let want = sv.trim_matches(|c| c == '{' || c == '}');
+                if let Some(i) = segs.iter().position(|s| {
+                    *s == sv.as_str()
+                        || *s == want
+                        || s.trim_matches(|c| c == '{' || c == '}') == want
+                }) {
+                    out.push(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Path positions that demonstrably vary across the endpoint corpus.
+///
+/// Two requests that agree on every segment except position `i` are proof that
+/// position `i` carries a value rather than route text: `/users/alice` beside
+/// `/users/bob` says segment 1 is a parameter, and says it about a segment no
+/// shape heuristic would ever accept, because "alice" looks exactly like a
+/// static route.
+///
+/// This is the difference between guessing what an identifier looks like and
+/// observing what actually moves. It only ever adds sites, and it says nothing
+/// about positions it has not seen vary, so a corpus of one endpoint falls
+/// through to the shape heuristic unchanged.
+fn varying_path_indices(endpoints: &[InjEndpoint]) -> HashMap<String, Vec<usize>> {
+    // key: host + segment count + the segments with position i blanked.
+    let mut buckets: HashMap<(String, usize, usize, String), HashSet<String>> = HashMap::new();
+    for ep in endpoints {
+        let host = host_of(&ep.url);
+        let path = path_only(&ep.url);
+        let segs: Vec<&str> = path.split('/').collect();
+        for i in 0..segs.len() {
+            if segs[i].is_empty() {
+                continue;
+            }
+            let mut masked = segs.clone();
+            masked[i] = "\u{0}";
+            let key = (host.clone(), segs.len(), i, masked.join("/"));
+            buckets.entry(key).or_default().insert(segs[i].to_string());
+        }
+    }
+    let mut varying: HashMap<String, Vec<usize>> = HashMap::new();
+    for ((host, _len, i, masked), values) in buckets {
+        if values.len() < 2 {
+            continue; // one observation is not evidence of anything
+        }
+        for v in &values {
+            let concrete = masked.replace('\u{0}', v);
+            varying
+                .entry(format!("{host}{concrete}"))
+                .or_default()
+                .push(i);
+        }
+    }
+    for v in varying.values_mut() {
+        v.sort_unstable();
+        v.dedup();
+    }
+    varying
+}
+
+fn host_of(url: &str) -> String {
+    let after = url.split("://").nth(1).unwrap_or(url);
+    after.split('/').next().unwrap_or("").to_string()
 }
 
 fn looks_like_id_seg(seg: &str) -> bool {
@@ -1535,6 +1661,7 @@ fn set_param(url: &str, param: &str, value: &str) -> String {
 
 use crate::probe::{is_passwd, is_sql_error};
 use regex::Regex;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 #[cfg(test)]
 mod tests {
