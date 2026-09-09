@@ -222,6 +222,56 @@ pub async fn build_context(
 /// Replay a form/JSON login and capture the session as a cookie and/or bearer
 /// token. Driven entirely by the credential's `config` (login_url, field names,
 /// success check, token extraction).
+
+/// Names commonly used for a per-session anti-CSRF form token.
+const CSRF_FIELD_NAMES: [&str; 8] = [
+    "csrf_token",
+    "authenticity_token",
+    "user_token",
+    "_token",
+    "__RequestVerificationToken",
+    "csrfmiddlewaretoken",
+    "_csrf",
+    "csrf",
+];
+
+/// Pull a hidden form field's value out of an HTML page.
+///
+/// Handles both quoting styles and either attribute order, because real login
+/// pages are written by hand and use all four combinations:
+///   <input type="hidden" name="user_token" value="abc">
+///   <input value='abc' name='user_token' />
+fn extract_form_field(html: &str, field: &str) -> Option<String> {
+    for quote in ['"', '\''] {
+        // name=... then value=...
+        let needle = format!("name={q}{field}{q}", q = quote, field = field);
+        if let Some(i) = html.find(&needle) {
+            let rest = &html[i + needle.len()..];
+            let stop = rest.find('>').unwrap_or(rest.len());
+            if let Some(v) = attr_after(&rest[..stop], "value", quote) {
+                return Some(v);
+            }
+        }
+        // value=... then name=...
+        let needle = format!("name={q}{field}{q}", q = quote, field = field);
+        if let Some(i) = html.find(&needle) {
+            let start = html[..i].rfind('<').unwrap_or(0);
+            if let Some(v) = attr_after(&html[start..i], "value", quote) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+fn attr_after(fragment: &str, attr: &str, quote: char) -> Option<String> {
+    let needle = format!("{attr}={quote}");
+    let i = fragment.find(&needle)? + needle.len();
+    let rest = &fragment[i..];
+    let end = rest.find(quote)?;
+    Some(rest[..end].to_string())
+}
+
 async fn login_flow(
     http: &reqwest::Client,
     cred: &ResolvedCredential,
@@ -240,6 +290,16 @@ async fn login_flow(
     let username = cred.secret["username"].as_str().unwrap_or("");
     let password = cred.secret["password"].as_str().unwrap_or("");
 
+    // A cookie store lets us capture Set-Cookie session cookies from the login,
+    // and lets an anti-CSRF prefetch share the session the token was minted for.
+    let jar = std::sync::Arc::new(reqwest::cookie::Jar::default());
+    let client = reqwest::Client::builder()
+        .cookie_provider(jar.clone())
+        .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .unwrap_or_else(|_| http.clone());
+
     // Assemble the credential body plus any extra static fields.
     let mut form = serde_json::Map::new();
     form.insert(user_field.to_string(), json!(username));
@@ -252,14 +312,46 @@ async fn login_flow(
         }
     }
 
-    // A cookie store lets us capture Set-Cookie session cookies from the login.
-    let jar = std::sync::Arc::new(reqwest::cookie::Jar::default());
-    let client = reqwest::Client::builder()
-        .cookie_provider(jar.clone())
-        .timeout(Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .build()
-        .unwrap_or_else(|_| http.clone());
+    // Anti-CSRF form token.
+    //
+    // Server-rendered login forms very commonly carry a hidden, per-session
+    // token, and reject any POST without it. Static extra_fields cannot express
+    // that: the token is minted for the session that fetched the page. So when
+    // `csrf` is configured we GET the form first, on this same cookie jar, lift
+    // the token out, and send it with the credentials.
+    //
+    // Config:
+    //   "csrf": true                          fetch login_url, auto-detect the field
+    //   "csrf": {"field": "user_token"}       name the field explicitly
+    //   "csrf": {"url": "...", "field": ...}  fetch a different page for it
+    //
+    // Nothing here is app-specific: it is the mechanism every CSRF-protected
+    // form login uses, and it fails closed by leaving the token out.
+    let csrf_cfg = cfg.get("csrf");
+    let csrf_enabled = matches!(csrf_cfg, Some(Value::Bool(true)))
+        || matches!(csrf_cfg, Some(Value::Object(_)));
+    if csrf_enabled {
+        let form_url = csrf_cfg
+            .and_then(|c| c.get("url"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(login_url);
+        let named = csrf_cfg
+            .and_then(|c| c.get("field"))
+            .and_then(|v| v.as_str());
+        if let Ok(r) = client.get(form_url).send().await {
+            let page = r.text().await.unwrap_or_default();
+            let candidates: Vec<&str> = match named {
+                Some(f) => vec![f],
+                None => CSRF_FIELD_NAMES.to_vec(),
+            };
+            for field in candidates {
+                if let Some(tok) = extract_form_field(&page, field) {
+                    form.insert(field.to_string(), json!(tok));
+                    break;
+                }
+            }
+        }
+    }
 
     let as_json = cfg["content_type"]
         .as_str()
