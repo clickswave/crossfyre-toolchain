@@ -14,7 +14,7 @@
 use regex::Regex;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::LazyLock;
 use tokio::sync::mpsc;
 use transport::Client;
@@ -166,6 +166,14 @@ impl CrawlEvent {
             ..Self::blank()
         }
     }
+    /// An operator-facing observation about the crawl itself (not a URL).
+    fn note(msg: String) -> Self {
+        Self {
+            kind: "log".into(),
+            message: Some(msg),
+            ..Self::blank()
+        }
+    }
     fn error(msg: String) -> Self {
         Self {
             kind: "error".into(),
@@ -314,6 +322,239 @@ struct Page {
     content_hash: String,
 }
 
+// ---------------------------------------------------------------------------
+// Routing parameters
+// ---------------------------------------------------------------------------
+//
+// Dropping query VALUES from the dedup key is right for a data parameter:
+// /item?id=1 and /item?id=2 are one endpoint rendered twice, and crawling ten
+// thousand of them buys nothing. It is wrong for a ROUTING parameter, where the
+// value selects which page is served. Mutillidae hangs ~120 pages off
+// index.php?page=, and a value-dropping crawler sees exactly one of them; so do
+// plenty of real CMSes, admin consoles and legacy dispatchers.
+//
+// Neither can be assumed, so the crawler decides from evidence. For a parameter
+// it has not judged yet it admits a small probe budget of distinct values,
+// fingerprints the STRUCTURE of each response, and then decides:
+//
+//   same structure every time  -> data. Collapse it, drop the held values.
+//   structure differs          -> routing. Release everything it held.
+//
+// The fingerprint is deliberately structural (status, the set of link paths,
+// the set of form actions and field names) and not content, because two product
+// pages differ in their text while being the same page, and two dispatcher
+// pages differ in their forms and navigation while sharing text.
+
+/// Distinct values admitted for a parameter while its role is unknown. This is
+/// the cost of the decision: at most this many extra fetches per parameter.
+const ROUTE_PROBE_VALUES: usize = 3;
+/// Ceiling on how many values of a confirmed routing parameter we will crawl.
+const MAX_ROUTE_VALUES: usize = 200;
+/// Values held per parameter while undecided. Bounded so a page linking
+/// thousands of variants cannot grow the queue without limit.
+const MAX_HELD_VALUES: usize = 400;
+
+/// A URL waiting in (or held back from) the frontier: where, how deep, and what
+/// linked to it.
+type Queued = (Url, u32, Option<String>);
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ParamRole {
+    Unknown,
+    Routing,
+    Data,
+}
+
+#[derive(Default)]
+struct RouteSense {
+    role: HashMap<String, ParamRole>,
+    /// key -> (value -> structural fingerprint of what that value served)
+    prints: HashMap<String, HashMap<String, u64>>,
+    /// key -> distinct values already admitted to the frontier
+    admitted: HashMap<String, HashSet<String>>,
+    /// key -> URLs held back until the role is decided
+    held: HashMap<String, Vec<Queued>>,
+}
+
+/// `scheme://host[:port]/path|param` - a parameter on one endpoint.
+fn param_key(url: &Url, param: &str) -> String {
+    let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+    format!(
+        "{}://{}{}{}|{}",
+        url.scheme(),
+        url.host_str().unwrap_or(""),
+        port,
+        url.path().trim_end_matches('/'),
+        param
+    )
+}
+
+impl RouteSense {
+    fn role(&self, key: &str) -> ParamRole {
+        *self.role.get(key).unwrap_or(&ParamRole::Unknown)
+    }
+
+    /// The dedup key. A data parameter contributes its name only (the historical
+    /// behaviour); anything else contributes name and value, so two routes are
+    /// two endpoints.
+    fn norm_key(&self, url: &Url) -> String {
+        let scheme = url.scheme();
+        let host = url.host_str().unwrap_or("");
+        let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+        let path = url.path().trim_end_matches('/');
+        let mut parts: Vec<String> = url
+            .query_pairs()
+            .map(|(k, v)| {
+                if self.role(&param_key(url, &k)) == ParamRole::Data {
+                    k.into_owned()
+                } else {
+                    format!("{k}={v}")
+                }
+            })
+            .collect();
+        parts.sort();
+        parts.dedup();
+        let q = if parts.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", parts.join("&"))
+        };
+        format!("{scheme}://{host}{port}{path}{q}")
+    }
+
+    /// Should this URL enter the frontier now, be held, or be dropped?
+    ///
+    /// Held rather than dropped, because a parameter that later proves to be
+    /// routing must not have lost the 117 pages that were discovered before the
+    /// third probe came back.
+    fn admit(&mut self, url: &Url, depth: u32, parent: &Option<String>) -> bool {
+        let pairs: Vec<(String, String)> = url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        for (k, v) in &pairs {
+            let key = param_key(url, k);
+            match self.role(&key) {
+                ParamRole::Data => continue,
+                ParamRole::Routing => {
+                    let seen = self.admitted.entry(key.clone()).or_default();
+                    if seen.contains(v) || seen.len() < MAX_ROUTE_VALUES {
+                        seen.insert(v.clone());
+                        continue;
+                    }
+                    return false; // past the ceiling: stop expanding this parameter
+                }
+                ParamRole::Unknown => {
+                    let seen = self.admitted.entry(key.clone()).or_default();
+                    if seen.contains(v) || seen.len() < ROUTE_PROBE_VALUES {
+                        seen.insert(v.clone());
+                        continue;
+                    }
+                    let held = self.held.entry(key).or_default();
+                    if held.len() < MAX_HELD_VALUES {
+                        held.push((url.clone(), depth, parent.clone()));
+                    }
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Record what a fetched page's parameter values served, and decide a role
+    /// once the probe budget is spent. Returns the URLs to release, and a note
+    /// worth telling the operator about.
+    fn observe(&mut self, url: &Url, structure: u64) -> (Vec<Queued>, Option<String>) {
+        let mut release: Vec<Queued> = Vec::new();
+        let mut note = None;
+        let pairs: Vec<(String, String)> = url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        for (k, v) in pairs {
+            let key = param_key(url, &k);
+            if self.role(&key) != ParamRole::Unknown {
+                continue;
+            }
+            self.prints
+                .entry(key.clone())
+                .or_default()
+                .insert(v, structure);
+            let prints = &self.prints[&key];
+            if prints.len() < ROUTE_PROBE_VALUES {
+                continue;
+            }
+            let distinct: HashSet<u64> = prints.values().copied().collect();
+            if distinct.len() > 1 {
+                self.role.insert(key.clone(), ParamRole::Routing);
+                if let Some(mut h) = self.held.remove(&key) {
+                    let seen = self.admitted.entry(key.clone()).or_default();
+                    h.retain(|(u, _, _)| {
+                        let val = u
+                            .query_pairs()
+                            .find(|(kk, _)| *kk == k)
+                            .map(|(_, vv)| vv.into_owned())
+                            .unwrap_or_default();
+                        seen.len() < MAX_ROUTE_VALUES && seen.insert(val)
+                    });
+                    note = Some(format!(
+                        "`{k}` on {} routes content: {} more value(s) queued",
+                        url.path(),
+                        h.len()
+                    ));
+                    release = h;
+                } else {
+                    note = Some(format!("`{k}` on {} routes content", url.path()));
+                }
+            } else {
+                self.role.insert(key.clone(), ParamRole::Data);
+                self.held.remove(&key);
+            }
+        }
+        (release, note)
+    }
+}
+
+/// A hash of what a page IS rather than what it says: status, the set of link
+/// paths, and the set of form actions and field names. Two renderings of one
+/// template hash the same however different their text; two different pages
+/// behind a dispatcher do not.
+fn structure_print(page: &Page) -> u64 {
+    use std::collections::BTreeSet;
+    let mut marks: BTreeSet<String> = BTreeSet::new();
+    for l in &page.links {
+        let raw = l.split('#').next().unwrap_or(l);
+        let path = raw.split('?').next().unwrap_or(raw);
+        // Keep the query KEYS: a dispatcher's pages differ by which parameters
+        // their own links carry, and that is signal.
+        let keys: Vec<&str> = raw
+            .split_once('?')
+            .map(|(_, q)| {
+                q.split('&')
+                    .filter_map(|kv| kv.split('=').next())
+                    .filter(|k| !k.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        marks.insert(format!("l:{path}?{}", keys.join(",")));
+    }
+    for (action, method, fields) in &page.forms {
+        let mut f = fields.clone();
+        f.sort();
+        marks.insert(format!("f:{method}:{action}:{}", f.join(",")));
+    }
+    let mut p = page.params.clone();
+    p.sort();
+    marks.insert(format!("p:{}", p.join(",")));
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    use std::hash::{Hash, Hasher};
+    page.status.hash(&mut h);
+    for m in marks {
+        m.hash(&mut h);
+    }
+    h.finish()
+}
+
 const MAX_VISITED: usize = 20_000;
 
 /// Run a crawl, streaming events into `tx`. Returns when the crawl finishes,
@@ -364,15 +605,18 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
     let _ = tx.send(CrawlEvent::ack(max_pages));
 
     let mut visited: HashSet<String> = HashSet::new();
-    let mut frontier: VecDeque<(Url, u32, Option<String>)> = VecDeque::new();
-    visited.insert(norm_key(&seed));
+    let mut frontier: VecDeque<Queued> = VecDeque::new();
+    // Which query parameters route content and which merely carry data; decided
+    // from the responses themselves as the crawl runs.
+    let mut routes = RouteSense::default();
+    visited.insert(routes.norm_key(&seed));
     frontier.push_back((seed.clone(), 0, None));
 
     let mut pages_crawled: u32 = 0;
 
     while !frontier.is_empty() && pages_crawled < max_pages {
         // Take a wave of up to `tasks` URLs without exceeding the page budget.
-        let mut wave: Vec<(Url, u32, Option<String>)> = Vec::new();
+        let mut wave: Vec<Queued> = Vec::new();
         while wave.len() < tasks && pages_crawled + (wave.len() as u32) < max_pages {
             match frontier.pop_front() {
                 Some(x) => wave.push(x),
@@ -404,6 +648,19 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
             pages_crawled += 1;
             let _ = tx.send(CrawlEvent::url_fetched(&page));
 
+            // What did this page's parameter values actually serve?
+            let (release, note) = routes.observe(&page.url, structure_print(&page));
+            if let Some(n) = note {
+                let _ = tx.send(CrawlEvent::note(n));
+            }
+            for (u, d, parent) in release {
+                // Already registered in `visited` when the link was first seen -
+                // holding it back was a queueing decision, not a dedup one - so
+                // push straight to the frontier. `RouteSense` has already
+                // dropped duplicate values.
+                frontier.push_back((u, d, parent));
+            }
+
             for raw in &page.links {
                 if visited.len() >= MAX_VISITED {
                     break;
@@ -412,7 +669,7 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
                     Some(c) => c,
                     None => continue,
                 };
-                let key = norm_key(&child);
+                let key = routes.norm_key(&child);
                 if !visited.insert(key) {
                     continue;
                 }
@@ -432,11 +689,16 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
                 }
                 let child_depth = page.depth + 1;
                 let parent = Some(page.url.to_string());
-                if child_depth <= max_depth {
+                if child_depth > max_depth {
+                    let _ = tx.send(CrawlEvent::url_candidate(&child, parent, child_depth));
+                    continue;
+                }
+                // A value of a parameter we have not judged yet is held rather
+                // than queued once the probe budget is spent, and released if
+                // the parameter turns out to route content.
+                if routes.admit(&child, child_depth, &parent) {
                     frontier.push_back((child, child_depth, parent));
                     // Emitted when fetched (or drained as a candidate below).
-                } else {
-                    let _ = tx.send(CrawlEvent::url_candidate(&child, parent, child_depth));
                 }
             }
 
@@ -481,6 +743,14 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
     // Budget exhausted: surface the remaining known-but-unfetched URLs as candidates.
     while let Some((u, d, parent)) = frontier.pop_front() {
         let _ = tx.send(CrawlEvent::url_candidate(&u, parent, d));
+    }
+    // Values still held when the crawl ended (their parameter never got its
+    // third probe) are reported as candidates rather than dropped: undecided is
+    // not the same as uninteresting.
+    for (_, held) in std::mem::take(&mut routes.held) {
+        for (u, d, parent) in held {
+            let _ = tx.send(CrawlEvent::url_candidate(&u, parent, d));
+        }
     }
 
     // Probe API-spec locations AFTER the link crawl so the burst of probe requests
@@ -793,24 +1063,6 @@ fn resolve_and_scope(raw: &str, base: &Url, params: &CrawlParams, seed_host: &st
     Some(url)
 }
 
-/// A canonical dedup key: scheme, host, path, and sorted query keys (values
-/// dropped so /x?id=1 and /x?id=2 collapse to the same endpoint).
-fn norm_key(url: &Url) -> String {
-    let scheme = url.scheme();
-    let host = url.host_str().unwrap_or("");
-    let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
-    let path = url.path().trim_end_matches('/');
-    let mut keys: Vec<String> = url.query_pairs().map(|(k, _)| k.into_owned()).collect();
-    keys.sort();
-    keys.dedup();
-    let q = if keys.is_empty() {
-        String::new()
-    } else {
-        format!("?{}", keys.join("&"))
-    };
-    format!("{scheme}://{host}{port}{path}{q}")
-}
-
 fn query_keys(url: &Url) -> Vec<String> {
     let mut v: Vec<String> = url.query_pairs().map(|(k, _)| k.into_owned()).collect();
     dedup(&mut v);
@@ -868,5 +1120,108 @@ mod normalize_seed_tests {
     fn empty_is_none() {
         assert!(normalize_seed("").is_none());
         assert!(normalize_seed("   ").is_none());
+    }
+}
+
+#[cfg(test)]
+mod route_sense_tests {
+    use super::*;
+
+    fn u(s: &str) -> Url {
+        Url::parse(s).unwrap()
+    }
+
+    fn page(url: &str, links: &[&str], status: u16) -> Page {
+        Page {
+            url: u(url),
+            depth: 0,
+            parent: None,
+            status,
+            content_type: "text/html".into(),
+            links: links.iter().map(|l| l.to_string()).collect(),
+            params: Vec::new(),
+            api_calls: Vec::new(),
+            forms: Vec::new(),
+            content_hash: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_parameter_serving_one_template_collapses() {
+        // /item?id=1..3 render the same page with different text: one endpoint.
+        let mut r = RouteSense::default();
+        for id in ["1", "2", "3"] {
+            let url = u(&format!("http://h/item?id={id}"));
+            assert!(
+                r.admit(&url, 1, &None),
+                "probe value {id} should be crawled"
+            );
+            let p = page(url.as_str(), &["/item?id=9", "/home"], 200);
+            r.observe(&url, structure_print(&p));
+        }
+        assert_eq!(
+            r.role(&param_key(&u("http://h/item?id=4"), "id")),
+            ParamRole::Data
+        );
+        // Now the value stops mattering, so a fourth id is the same endpoint.
+        assert_eq!(
+            r.norm_key(&u("http://h/item?id=4")),
+            r.norm_key(&u("http://h/item?id=5"))
+        );
+    }
+
+    #[test]
+    fn a_parameter_serving_different_pages_is_followed() {
+        let mut r = RouteSense::default();
+        let probes = [
+            ("home.php", vec!["/index.php?page=a", "/logout.php"]),
+            ("login.php", vec!["/index.php?page=b"]),
+            (
+                "lookup.php",
+                vec!["/index.php?page=c", "/help.php", "/x.php"],
+            ),
+        ];
+        // Everything discovered past the probe budget is held, not dropped.
+        for extra in 0..40 {
+            let url = u(&format!("http://h/index.php?page=extra{extra}.php"));
+            r.admit(&url, 1, &None);
+        }
+        let mut released = 0;
+        for (val, links) in probes {
+            let url = u(&format!("http://h/index.php?page={val}"));
+            let p = page(url.as_str(), &links, 200);
+            let (rel, _note) = r.observe(&url, structure_print(&p));
+            released += rel.len();
+        }
+        assert_eq!(
+            r.role(&param_key(&u("http://h/index.php?page=z"), "page")),
+            ParamRole::Routing
+        );
+        assert!(
+            released >= 37,
+            "held values must be released, got {released}"
+        );
+        assert_ne!(
+            r.norm_key(&u("http://h/index.php?page=a.php")),
+            r.norm_key(&u("http://h/index.php?page=b.php"))
+        );
+    }
+
+    #[test]
+    fn the_probe_budget_bounds_the_cost() {
+        let mut r = RouteSense::default();
+        let admitted = (0..50)
+            .filter(|i| r.admit(&u(&format!("http://h/x?q=v{i}")), 1, &None))
+            .count();
+        assert_eq!(admitted, ROUTE_PROBE_VALUES);
+    }
+
+    #[test]
+    fn structure_ignores_content_but_not_shape() {
+        let a = page("http://h/a", &["/one", "/two"], 200);
+        let b = page("http://h/b", &["/one", "/two"], 200);
+        let c = page("http://h/c", &["/one", "/two", "/three"], 200);
+        assert_eq!(structure_print(&a), structure_print(&b));
+        assert_ne!(structure_print(&a), structure_print(&c));
     }
 }
