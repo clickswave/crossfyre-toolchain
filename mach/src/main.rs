@@ -98,15 +98,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             posture: "balanced".to_string(),
         };
 
-        let mach_db = libs::mach_db::MachDb::init(
-            &toolchain_cfg.postgres.host,
-            toolchain_cfg.postgres.port,
-            &toolchain_cfg.postgres.user,
-            toolchain_cfg.postgres.password.as_deref(),
-            &dummy_config,
-        )
-        .await?;
-        mach_db.create_tables().await?;
+        // Postgres being briefly unreachable is not a reason to exit: systemd
+        // would restart us straight into the same failure, which is how one
+        // host logged 2,663 restarts and reported nothing but "down". Wait for
+        // it, saying so each time, and start as soon as it answers.
+        let mach_db =
+            dguard::wait_for("postgres", std::time::Duration::from_secs(3600), || async {
+                let db = libs::mach_db::MachDb::init(
+                    &toolchain_cfg.postgres.host,
+                    toolchain_cfg.postgres.port,
+                    &toolchain_cfg.postgres.user,
+                    toolchain_cfg.postgres.password.as_deref(),
+                    &dummy_config,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                db.create_tables().await.map_err(|e| e.to_string())?;
+                Ok::<_, String>(db)
+            })
+            .await?;
 
         return daemon::run(cli.port, mach_db).await;
     }

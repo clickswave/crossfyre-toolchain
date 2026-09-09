@@ -1274,6 +1274,7 @@ name = "dguard"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -5535,6 +5536,7 @@ dependencies = [
  "dguard",
  "dialoguer 0.11.0",
  "dirs 5.0.1",
+ "hickory-proto",
  "hickory-resolver",
  "ipnet",
  "rand 0.9.5",

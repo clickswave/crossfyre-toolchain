@@ -10,3 +10,7 @@ keywords = ["security"]
 
 [dependencies]
 serde_json = "1"
+tokio = { version = "1", features = ["time", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["time", "macros", "rt", "rt-multi-thread"] }
