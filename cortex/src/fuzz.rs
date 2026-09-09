@@ -8,9 +8,9 @@
 //! that have one (from a spec, capture, or discovery).
 
 use crate::engine::AuthSpec;
-use crate::finding::Finding;
 use crate::inject::InjEndpoint;
 use crate::probe::{self, is_server_error, json_typed, typed_default};
+use cfx_finding::Finding;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;

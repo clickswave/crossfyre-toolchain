@@ -7,8 +7,8 @@
 //! out-of-band callback, never a destructive payload.
 
 use crate::engine::{AuthSpec, OastSpec};
-use crate::finding::Finding;
 use crate::probe::{self, de_null_seq, is_sql_error};
+use cfx_finding::Finding;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::Duration;

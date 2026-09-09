@@ -14,10 +14,10 @@
 //! parsing / OpenAPI ingestion / JS analysis) and passed in per endpoint.
 
 use crate::engine::{AuthSpec, OastSpec};
-use crate::finding::Finding;
 use crate::probe::{
     self, Resp, is_server_error, json_typed, pct_decode, pct_encode, send, send_with, typed_default,
 };
+use cfx_finding::Finding;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::Duration;

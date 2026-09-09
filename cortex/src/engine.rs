@@ -7,8 +7,8 @@
 //! asset graph. OAST-backed blind detection, the full DSL, and the generative
 //! API mode are the documented next milestones (docs/tier1-engines-plan.md).
 
-use crate::finding::Finding;
 use crate::template;
+use cfx_finding::Finding;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::Duration;

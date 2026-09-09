@@ -31,7 +31,7 @@ pub struct Info {
     pub description: String,
     /// nuclei-style comma-separated tags (`vuln,ssti,injection`). Read as the
     /// template's own declaration of what class of bug it finds, so consumers
-    /// stop re-deriving that from the id: see `finding::class_from_tags`.
+    /// stop re-deriving that from the id: see `class_from_tags` below.
     #[serde(default)]
     pub tags: String,
     #[serde(default)]
@@ -208,11 +208,7 @@ pub async fn eval_template(
                 };
                 out.push(Match {
                     template_id: tmpl.id.clone(),
-                    class: crate::finding::class_from_tags(
-                        &tmpl.info.tags,
-                        &tmpl.id,
-                        &tmpl.info.metadata.category,
-                    ),
+                    class: class_from_tags(&tmpl.info.tags, &tmpl.id, &tmpl.info.metadata.category),
                     name: if tmpl.info.name.is_empty() {
                         tmpl.id.clone()
                     } else {
@@ -291,11 +287,7 @@ pub async fn eval_template(
                 }
                 out.push(Match {
                     template_id: tmpl.id.clone(),
-                    class: crate::finding::class_from_tags(
-                        &tmpl.info.tags,
-                        &tmpl.id,
-                        &tmpl.info.metadata.category,
-                    ),
+                    class: class_from_tags(&tmpl.info.tags, &tmpl.id, &tmpl.info.metadata.category),
                     name: if tmpl.info.name.is_empty() {
                         tmpl.id.clone()
                     } else {
@@ -1047,8 +1039,122 @@ fn load_dir_into(dir: &std::path::Path, out: &mut Vec<Template>) {
     }
 }
 
+/// The class a template finding belongs to, from its own metadata.
+///
+/// Template findings used to carry no class at all, so every consumer that
+/// wanted one (dedupe, grouping, the benchmark scorer) re-derived it from the
+/// template id with its own private lookup table, and each table was wrong in a
+/// different way. The template already declares what it is in `info.tags`, so
+/// read that instead of guessing from the id.
+///
+/// A known CVE stays classed `cve` rather than as its underlying bug type: the
+/// CVE id in `template` is the precise identity, and the rest of the system
+/// (answer keys, the dashboard) treats "a known, published vulnerability" as
+/// its own class.
+pub fn class_from_tags(tags: &str, template_id: &str, category: &str) -> String {
+    let tags: Vec<String> = tags
+        .split(',')
+        .map(|t| t.trim().to_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let has = |t: &str| tags.iter().any(|x| x == t);
+
+    if template_id.to_uppercase().starts_with("CVE-") || has("cve") {
+        return "cve".into();
+    }
+
+    // Specific bug classes before the generic ones: a template tagged
+    // `ssti,injection,rce` is an SSTI finding, not an unspecified RCE.
+    for (tag, class) in [
+        ("sqli", "sqli"),
+        ("sql-injection", "sqli"),
+        ("nosql", "nosqli"),
+        ("xss", "xss"),
+        ("ssti", "ssti"),
+        ("ssrf", "ssrf"),
+        ("xxe", "xxe"),
+        ("crlf", "crlf"),
+        ("lfi", "lfi"),
+        ("traversal", "traversal"),
+        ("cmdi", "cmdi"),
+        ("command-injection", "cmdi"),
+        ("deserialization", "deserialization"),
+        ("redirect", "open_redirect"),
+        ("cors", "cors"),
+        ("auth-bypass", "auth_bypass"),
+        ("access-control", "access_control"),
+        ("default-login", "default_login"),
+        ("rce", "rce"),
+    ] {
+        if has(tag) {
+            return class.into();
+        }
+    }
+
+    for (tag, class) in [
+        ("panel", "panel"),
+        ("exposure", "exposure"),
+        ("disclosure", "exposure"),
+        ("misconfig", "misconfig"),
+        ("waf", "waf"),
+        ("tech", "tech"),
+    ] {
+        if has(tag) {
+            return class.into();
+        }
+    }
+
+    // Fall back to the pack directory the template lives in, which is always set.
+    match category {
+        "cves" => "cve",
+        "exposures" => "exposure",
+        "panels" => "panel",
+        "technologies" => "tech",
+        "default-logins" => "default_login",
+        "misconfigurations" => "misconfig",
+        "vulnerabilities" => "vuln",
+        _ => "vuln",
+    }
+    .into()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn template_class_comes_from_tags() {
+        use super::class_from_tags;
+        assert_eq!(
+            class_from_tags("vuln,ssti,injection,rce", "ssti-x", "vulnerabilities"),
+            "ssti"
+        );
+        assert_eq!(
+            class_from_tags("cve,cve2021,rce", "CVE-2021-44228", "cves"),
+            "cve"
+        );
+        assert_eq!(
+            class_from_tags("exposure,git,source-code", "git-head", "exposures"),
+            "exposure"
+        );
+        assert_eq!(
+            class_from_tags("", "spring-actuator-env", "misconfigurations"),
+            "misconfig"
+        );
+        // `credentials` is a modifier on an exposure ("this file holds secrets"),
+        // not a default-login finding.
+        assert_eq!(
+            class_from_tags("exposure,npm,credentials", "npmrc", "exposures"),
+            "exposure"
+        );
+        assert_eq!(
+            class_from_tags(
+                "default-login,tomcat,credentials",
+                "tomcat-manager-default",
+                "default-logins"
+            ),
+            "default_login"
+        );
+    }
+
     #[test]
     fn all_builtins_parse() {
         // Every embedded template must parse against the supported subset;
@@ -1124,7 +1230,7 @@ mod tests {
         assert!(all.len() > 12, "the on-disk pack did not load");
         for (id, tags, category) in all {
             assert!(!tags.is_empty(), "template `{id}` carries no tags");
-            let class = crate::finding::class_from_tags(tags, id, category);
+            let class = super::class_from_tags(tags, id, category);
             assert_ne!(
                 class, "vuln",
                 "template `{id}` falls through to the generic class"

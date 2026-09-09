@@ -654,6 +654,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "cfx_finding"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "cfx_mobile"
 version = "0.0.1"
 dependencies = [
@@ -948,6 +955,7 @@ dependencies = [
  "aes-gcm",
  "base64 0.22.1",
  "boring2",
+ "cfx_finding",
  "cfx_tui",
  "clap",
  "dguard",
@@ -4136,6 +4144,7 @@ version = "0.0.6"
 dependencies = [
  "adaptive",
  "base64 0.22.1",
+ "cfx_finding",
  "cfx_tui",
  "clap",
  "dguard",

@@ -219,10 +219,6 @@ pub async fn build_context(
     }
 }
 
-/// Replay a form/JSON login and capture the session as a cookie and/or bearer
-/// token. Driven entirely by the credential's `config` (login_url, field names,
-/// success check, token extraction).
-
 /// Names commonly used for a per-session anti-CSRF form token.
 const CSRF_FIELD_NAMES: [&str; 8] = [
     "csrf_token",
@@ -243,8 +239,8 @@ const CSRF_FIELD_NAMES: [&str; 8] = [
 ///   <input value='abc' name='user_token' />
 fn extract_form_field(html: &str, field: &str) -> Option<String> {
     for quote in ['"', '\''] {
+        let needle = format!("name={quote}{field}{quote}");
         // name=... then value=...
-        let needle = format!("name={q}{field}{q}", q = quote, field = field);
         if let Some(i) = html.find(&needle) {
             let rest = &html[i + needle.len()..];
             let stop = rest.find('>').unwrap_or(rest.len());
@@ -252,8 +248,7 @@ fn extract_form_field(html: &str, field: &str) -> Option<String> {
                 return Some(v);
             }
         }
-        // value=... then name=...
-        let needle = format!("name={q}{field}{q}", q = quote, field = field);
+        // value=... then name=..., so look back to the start of the tag
         if let Some(i) = html.find(&needle) {
             let start = html[..i].rfind('<').unwrap_or(0);
             if let Some(v) = attr_after(&html[start..i], "value", quote) {
@@ -272,6 +267,9 @@ fn attr_after(fragment: &str, attr: &str, quote: char) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+/// Replay a form/JSON login and capture the session as a cookie and/or bearer
+/// token. Driven entirely by the credential's `config` (login_url, field names,
+/// success check, token extraction).
 async fn login_flow(
     http: &reqwest::Client,
     cred: &ResolvedCredential,
@@ -328,8 +326,8 @@ async fn login_flow(
     // Nothing here is app-specific: it is the mechanism every CSRF-protected
     // form login uses, and it fails closed by leaving the token out.
     let csrf_cfg = cfg.get("csrf");
-    let csrf_enabled = matches!(csrf_cfg, Some(Value::Bool(true)))
-        || matches!(csrf_cfg, Some(Value::Object(_)));
+    let csrf_enabled =
+        matches!(csrf_cfg, Some(Value::Bool(true))) || matches!(csrf_cfg, Some(Value::Object(_)));
     if csrf_enabled {
         let form_url = csrf_cfg
             .and_then(|c| c.get("url"))

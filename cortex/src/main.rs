@@ -9,7 +9,6 @@ mod daemon;
 mod discover;
 mod dsl;
 mod engine;
-mod finding;
 mod fuzz;
 mod graphql;
 mod inject;

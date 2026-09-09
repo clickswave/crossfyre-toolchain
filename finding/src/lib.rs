@@ -1,4 +1,4 @@
-//! One shape for every finding cortex emits, whatever produced it.
+//! One shape for every finding a crossfyre engine emits, whatever produced it.
 //!
 //! Each producer used to hand-roll its own `json!` object and they drifted. The
 //! template engine emitted `matched_at` and `template` but no `vuln_class`; the
@@ -167,85 +167,6 @@ impl Finding {
     }
 }
 
-/// The class a template finding belongs to, from its own metadata.
-///
-/// Template findings used to carry no class at all, so every consumer that
-/// wanted one (dedupe, grouping, the benchmark scorer) re-derived it from the
-/// template id with its own private lookup table, and each table was wrong in a
-/// different way. The template already declares what it is in `info.tags`, so
-/// read that instead of guessing from the id.
-///
-/// A known CVE stays classed `cve` rather than as its underlying bug type: the
-/// CVE id in `template` is the precise identity, and the rest of the system
-/// (answer keys, the dashboard) treats "a known, published vulnerability" as
-/// its own class.
-pub fn class_from_tags(tags: &str, template_id: &str, category: &str) -> String {
-    let tags: Vec<String> = tags
-        .split(',')
-        .map(|t| t.trim().to_lowercase())
-        .filter(|t| !t.is_empty())
-        .collect();
-    let has = |t: &str| tags.iter().any(|x| x == t);
-
-    if template_id.to_uppercase().starts_with("CVE-") || has("cve") {
-        return "cve".into();
-    }
-
-    // Specific bug classes before the generic ones: a template tagged
-    // `ssti,injection,rce` is an SSTI finding, not an unspecified RCE.
-    for (tag, class) in [
-        ("sqli", "sqli"),
-        ("sql-injection", "sqli"),
-        ("nosql", "nosqli"),
-        ("xss", "xss"),
-        ("ssti", "ssti"),
-        ("ssrf", "ssrf"),
-        ("xxe", "xxe"),
-        ("crlf", "crlf"),
-        ("lfi", "lfi"),
-        ("traversal", "traversal"),
-        ("cmdi", "cmdi"),
-        ("command-injection", "cmdi"),
-        ("deserialization", "deserialization"),
-        ("redirect", "open_redirect"),
-        ("cors", "cors"),
-        ("auth-bypass", "auth_bypass"),
-        ("access-control", "access_control"),
-        ("default-login", "default_login"),
-        ("rce", "rce"),
-    ] {
-        if has(tag) {
-            return class.into();
-        }
-    }
-
-    for (tag, class) in [
-        ("panel", "panel"),
-        ("exposure", "exposure"),
-        ("disclosure", "exposure"),
-        ("misconfig", "misconfig"),
-        ("waf", "waf"),
-        ("tech", "tech"),
-    ] {
-        if has(tag) {
-            return class.into();
-        }
-    }
-
-    // Fall back to the pack directory the template lives in, which is always set.
-    match category {
-        "cves" => "cve",
-        "exposures" => "exposure",
-        "panels" => "panel",
-        "technologies" => "tech",
-        "default-logins" => "default_login",
-        "misconfigurations" => "misconfig",
-        "vulnerabilities" => "vuln",
-        _ => "vuln",
-    }
-    .into()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,39 +206,5 @@ mod tests {
         assert_eq!(normalise_class("mass-assignment"), "mass_assignment");
         assert_eq!(normalise_class("Type-Confusion"), "type_confusion");
         assert_eq!(normalise_class("open_redirect"), "open_redirect");
-    }
-
-    #[test]
-    fn template_class_comes_from_tags() {
-        assert_eq!(
-            class_from_tags("vuln,ssti,injection,rce", "ssti-x", "vulnerabilities"),
-            "ssti"
-        );
-        assert_eq!(
-            class_from_tags("cve,cve2021,rce", "CVE-2021-44228", "cves"),
-            "cve"
-        );
-        assert_eq!(
-            class_from_tags("exposure,git,source-code", "git-head", "exposures"),
-            "exposure"
-        );
-        assert_eq!(
-            class_from_tags("", "spring-actuator-env", "misconfigurations"),
-            "misconfig"
-        );
-        // `credentials` is a modifier on an exposure ("this file holds secrets"),
-        // not a default-login finding.
-        assert_eq!(
-            class_from_tags("exposure,npm,credentials", "npmrc", "exposures"),
-            "exposure"
-        );
-        assert_eq!(
-            class_from_tags(
-                "default-login,tomcat,credentials",
-                "tomcat-manager-default",
-                "default-logins"
-            ),
-            "default_login"
-        );
     }
 }

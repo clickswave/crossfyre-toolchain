@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["capture", "core", "node", "crossfyre", "tui", "mach", "voyage", "pulse", "scout", "cortex", "oast", "transport", "dguard", "mobile/rust"]
+members = ["capture", "core", "node", "crossfyre", "tui", "mach", "voyage", "pulse", "scout", "cortex", "finding", "oast", "transport", "dguard", "mobile/rust"]
 # `adaptive` is a path dependency of the engines, not a workspace member: the
 # .cargo/config.toml `paths` override swaps it for the git-ignored tuned drop-in
 # `adaptive-private` in first-party builds, and Cargo cannot override a member.

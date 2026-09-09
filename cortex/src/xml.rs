@@ -23,8 +23,8 @@
 //! POSTing XML at every discovered endpoint would multiply request volume for
 //! nothing on the great majority of targets that speak JSON.
 
-use crate::finding::Finding;
 use crate::probe::{self, Resp, is_passwd};
+use cfx_finding::Finding;
 use serde_json::Value;
 use std::collections::HashSet;
 use transport::Client;
