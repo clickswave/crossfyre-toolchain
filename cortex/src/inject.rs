@@ -260,6 +260,8 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
 
     let mut rl_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut cors_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // XML/SOAP is a per-service property, not a per-parameter one.
+    let mut xml_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for ep in params.endpoints.iter().take(MAX_ENDPOINTS) {
         if want("inventory") {
@@ -280,70 +282,80 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
                 found += 1;
             }
         }
+        if want("xxe") {
+            for f in
+                crate::xml::probe(&client, &ep.method, &ep.url, oast.as_ref(), &mut xml_seen).await
+            {
+                let _ = tx.send(json!({"type":"finding","data":f}));
+                found += 1;
+            }
+        }
         for site in sites_for(ep, &varying) {
             let baseline = match send_site(&client, &site, &site.base_value).await {
                 Some(r) => r,
                 None => continue,
             };
-            if want("sqli") {
+            // One injection point can be more than one kind of sink: PHP's
+            // include() takes a local path AND a URL, so the same parameter is
+            // both LFI and SSRF, with different severities and different fixes.
+            // Stopping at the first confirmed class hid the others, so every
+            // class runs. The cap is only a guard against an endpoint that
+            // echoes or executes everything, where a fifth confirmation adds
+            // nothing but requests.
+            const MAX_CLASSES_PER_SITE: usize = 4;
+            let mut hits = 0usize;
+            let emit = |f: Value, hits: &mut usize| {
+                let _ = tx.send(json!({"type":"finding","data":f}));
+                *hits += 1;
+            };
+            if want("sqli") && hits < MAX_CLASSES_PER_SITE {
                 if let Some(f) = probe_sqli(&client, &site, &baseline).await {
-                    let _ = tx.send(json!({"type":"finding","data":f}));
-                    found += 1;
-                    continue;
+                    emit(f, &mut hits);
                 }
             }
-            if want("cmdi") {
+            if want("cmdi") && hits < MAX_CLASSES_PER_SITE {
                 if let Some(f) = probe_cmdi(&client, &site, oast.as_ref()).await {
-                    let _ = tx.send(json!({"type":"finding","data":f}));
-                    found += 1;
-                    continue;
+                    emit(f, &mut hits);
                 }
             }
-            if want("ssrf") {
+            if want("ssrf") && hits < MAX_CLASSES_PER_SITE {
                 if let Some(f) = probe_ssrf(&client, &site, oast.as_ref()).await {
-                    let _ = tx.send(json!({"type":"finding","data":f}));
-                    found += 1;
-                    continue;
+                    emit(f, &mut hits);
                 }
             }
-            if want("xss") {
+            if want("xss") && hits < MAX_CLASSES_PER_SITE {
                 if let Some(f) = probe_xss(&client, &site).await {
-                    let _ = tx.send(json!({"type":"finding","data":f}));
-                    found += 1;
+                    emit(f, &mut hits);
                 }
             }
-            if want("lfi") {
+            if want("lfi") && hits < MAX_CLASSES_PER_SITE {
                 if let Some(f) = probe_lfi(&client, &site, &baseline).await {
-                    let _ = tx.send(json!({"type":"finding","data":f}));
-                    found += 1;
+                    emit(f, &mut hits);
                 }
             }
-            if want("ssti") {
+            if want("ssti") && hits < MAX_CLASSES_PER_SITE {
                 if let Some(f) = probe_ssti(&client, &site).await {
-                    let _ = tx.send(json!({"type":"finding","data":f}));
-                    found += 1;
+                    emit(f, &mut hits);
                 }
             }
-            if want("crlf") {
+            if want("crlf") && hits < MAX_CLASSES_PER_SITE {
                 if let Some(f) = probe_crlf(&client, &site).await {
-                    let _ = tx.send(json!({"type":"finding","data":f}));
-                    found += 1;
+                    emit(f, &mut hits);
                 }
             }
-            if want("nosql") {
+            if want("nosql") && hits < MAX_CLASSES_PER_SITE {
                 if let Some(f) = probe_nosql(&client, &site, &baseline).await {
-                    let _ = tx.send(json!({"type":"finding","data":f}));
-                    found += 1;
+                    emit(f, &mut hits);
                 }
             }
-            if want("open_redirect") {
+            if want("open_redirect") && hits < MAX_CLASSES_PER_SITE {
                 if let Some(nr) = client_nr.as_ref() {
                     if let Some(f) = probe_open_redirect(nr, &site).await {
-                        let _ = tx.send(json!({"type":"finding","data":f}));
-                        found += 1;
+                        emit(f, &mut hits);
                     }
                 }
             }
+            found += hits as i64;
         }
         done += 1;
         if done % 3 == 0 || done == total {
