@@ -7,6 +7,7 @@
 //! out-of-band callback, never a destructive payload.
 
 use crate::engine::{AuthSpec, OastSpec};
+use crate::finding::Finding;
 use crate::probe::{self, de_null_seq, is_sql_error};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -118,13 +119,13 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
         .is_some();
 
     if has_schema && want("introspection") {
-        let _ = tx.send(json!({"type":"finding","data": finding(
+        let _ = tx.send(finding(
             "graphql_introspection",
             "GraphQL introspection enabled",
             "medium",
             &url, "POST",
             "The server answered a full `__schema` introspection query in production. This hands an attacker the complete API map -- every type, field, argument, and mutation -- turning targeted attacks (injection, BOLA, hidden admin mutations) into a lookup. Disable introspection outside development."
-        )}));
+        ).event());
         found += 1;
     }
 
@@ -134,13 +135,13 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
         if let Some(r) = post(&client, &url, q).await {
             let low = r.body.to_lowercase();
             if low.contains("did you mean") {
-                let _ = tx.send(json!({"type":"finding","data": finding(
+                let _ = tx.send(finding(
                     "graphql_suggestions",
                     "GraphQL field-suggestion leakage",
                     "low",
                     &url, "POST",
                     "An unknown field triggered a 'Did you mean ...' suggestion. When introspection is disabled this still lets an attacker recover the schema field by field. Turn off field suggestions in production."
-                )}));
+                ).event());
                 found += 1;
             }
         }
@@ -164,13 +165,13 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
             let q = json!({ "query": format!("{{ {aliases} }}") }).to_string();
             if let Some(r) = post(&client, &url, &q).await {
                 if r.status == 200 && r.body.matches("\"a99\"").count() >= 1 {
-                    let _ = tx.send(json!({"type":"finding","data": finding(
+                    let _ = tx.send(finding(
                         "graphql_dos",
                         "GraphQL query-cost / alias amplification",
                         "medium",
                         &url, "POST",
                         &format!("A single request aliasing `{}` 100 times was fully resolved. With no query-cost, depth, or alias limit, one small request multiplies into thousands of resolver calls, enabling denial of service (OWASP API4). Enforce query cost / depth limits.", f.name)
-                    )}));
+                    ).event());
                     found += 1;
                 }
             }
@@ -187,13 +188,13 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
             if r.status == 200 {
                 if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(&r.body) {
                     if arr.len() >= 2 {
-                        let _ = tx.send(json!({"type":"finding","data": finding(
+                        let _ = tx.send(finding(
                             "graphql_batching",
                             "GraphQL query batching enabled",
                             "medium",
                             &url, "POST",
                             "The endpoint executed a JSON array of 10 operations in a single request. Query batching lets an attacker run thousands of login / OTP / password-reset attempts per request, defeating per-request rate limits (OWASP API4). Disable batching or count each batched op against the limit."
-                        )}));
+                        ).event());
                         found += 1;
                     }
                 }
@@ -229,13 +230,13 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
                 hits.sort();
                 hits.dedup();
                 hits.truncate(20);
-                let _ = tx.send(json!({"type":"finding","data": finding(
+                let _ = tx.send(finding(
                     "graphql_sensitive_field",
                     "Sensitive fields exposed in GraphQL schema",
                     "medium",
                     &url, "POST",
                     &format!("The schema exposes credential/secret fields that clients can request: {}. Query-able password/token/secret fields are a data-exposure and account-takeover risk - remove them from the API type or gate them behind field-level authorization.", hits.join(", ")),
-                )}));
+                ).event());
                 found += 1;
             }
         }
@@ -258,13 +259,13 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
             let doc = build_doc(f, "", "1"); // benign args; we only care whether authz blocks it
             if let Some(r) = post(&client, &url, &doc).await {
                 if r.status == 200 && !denied(&r.body) && resolver_ran(&r.body, &f.name) {
-                    let _ = tx.send(json!({"type":"finding","data": finding(
+                    let _ = tx.send(finding(
                         "graphql_bfla",
                         "Privileged GraphQL operation reachable without authorization",
                         "high",
                         &url, "POST",
                         &format!("The privileged {} `{}` resolved for an unauthenticated/low-privilege caller with no authorization error. Function-level access control is missing on a sensitive operation (OWASP API5: BFLA) - an attacker can invoke admin/destructive functionality directly.", f.op, f.name),
-                    )}));
+                    ).param(&f.name).event());
                     found += 1;
                 }
             }
@@ -522,7 +523,11 @@ async fn probe_field_injection(
                         "An unbalanced quote in the `{arg}` argument of the `{}` {} produced a database error that a balanced quote did not: the argument reaches a SQL statement unparameterised.",
                         field.name, field.op
                     ),
-                ));
+                )
+                // The injected argument, so a consumer can reproduce it without
+                // parsing it back out of the prose.
+                .param(arg)
+                .build());
             }
         }
     }
@@ -558,7 +563,9 @@ async fn probe_field_injection(
                             "A shell metacharacter injected into the `{arg}` argument of `{}` produced an out-of-band callback: the value is passed to a shell.",
                             field.name
                         ),
-                    ));
+                    )
+                    .param(arg)
+                    .build());
                 }
             }
             oc.deregister(client, &reg).await;
@@ -567,6 +574,9 @@ async fn probe_field_injection(
     None
 }
 
+/// A GraphQL finding, pre-filled with what every one of them shares. Call sites
+/// add what only they know (`.param(arg)` for an injected argument) and finish
+/// with `.event()` or `.build()`.
 fn finding(
     class: &str,
     name: &str,
@@ -574,20 +584,11 @@ fn finding(
     url: &str,
     method: &str,
     detail: &str,
-) -> Value {
-    json!({
-        "type": "vulnerability",
-        "vuln_class": class,
-        "name": name,
-        "severity": severity,
-        "confidence": "confirmed",
-        "target": url,
-        "url": url,
-        "method": method,
-        "location": "graphql",
-        "description": detail,
-        "source": "cortex-graphql",
-    })
+) -> Finding {
+    Finding::new("cortex-graphql", class, name, severity, url)
+        .method(method)
+        .location("graphql")
+        .describe(detail)
 }
 
 #[cfg(test)]

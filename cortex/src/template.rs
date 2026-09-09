@@ -29,6 +29,21 @@ pub struct Info {
     pub severity: String,
     #[serde(default)]
     pub description: String,
+    /// nuclei-style comma-separated tags (`vuln,ssti,injection`). Read as the
+    /// template's own declaration of what class of bug it finds, so consumers
+    /// stop re-deriving that from the id: see `finding::class_from_tags`.
+    #[serde(default)]
+    pub tags: String,
+    #[serde(default)]
+    pub metadata: Meta,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct Meta {
+    /// The pack directory the template belongs to; the fallback class when a
+    /// template carries no tags.
+    #[serde(default)]
+    pub category: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,6 +128,8 @@ fn default_or() -> String {
 /// A confirmed template match.
 pub struct Match {
     pub template_id: String,
+    /// Canonical vulnerability class, from the template's own tags.
+    pub class: String,
     pub name: String,
     pub severity: String,
     pub description: String,
@@ -191,6 +208,11 @@ pub async fn eval_template(
                 };
                 out.push(Match {
                     template_id: tmpl.id.clone(),
+                    class: crate::finding::class_from_tags(
+                        &tmpl.info.tags,
+                        &tmpl.id,
+                        &tmpl.info.metadata.category,
+                    ),
                     name: if tmpl.info.name.is_empty() {
                         tmpl.id.clone()
                     } else {
@@ -269,6 +291,11 @@ pub async fn eval_template(
                 }
                 out.push(Match {
                     template_id: tmpl.id.clone(),
+                    class: crate::finding::class_from_tags(
+                        &tmpl.info.tags,
+                        &tmpl.id,
+                        &tmpl.info.metadata.category,
+                    ),
                     name: if tmpl.info.name.is_empty() {
                         tmpl.id.clone()
                     } else {
@@ -558,7 +585,11 @@ fn echoes_request_path(resp: &Resp) -> bool {
     }
     // Also catch the percent-decoded form, since a traversal payload is usually
     // encoded on the wire and printed decoded.
-    let decoded = needle.replace("%252e", ".").replace("%2e", ".").replace("%252f", "/").replace("%2f", "/");
+    let decoded = needle
+        .replace("%252e", ".")
+        .replace("%2e", ".")
+        .replace("%252f", "/")
+        .replace("%2f", "/");
     decoded != needle && body.contains(&decoded)
 }
 
@@ -678,6 +709,7 @@ info:
   name: Exposed .git/config
   severity: medium
   description: A publicly readable .git/config can leak source, credentials, and internal remotes.
+  tags: exposure,git,source-code
 http:
   - method: GET
     path:
@@ -700,6 +732,7 @@ info:
   name: Exposed .env file
   severity: high
   description: A publicly readable .env file commonly exposes application secrets and DB credentials.
+  tags: exposure,config,credentials
 http:
   - method: GET
     path:
@@ -720,6 +753,7 @@ info:
   name: Exposed phpinfo()
   severity: low
   description: A reachable phpinfo() page discloses environment, paths, and module configuration.
+  tags: exposure,php,disclosure
 http:
   - method: GET
     path:
@@ -751,6 +785,7 @@ info:
   name: Exposed Apache server-status
   severity: low
   description: mod_status exposes request and worker information to unauthenticated clients.
+  tags: exposure,apache,disclosure
 http:
   - method: GET
     path:
@@ -771,6 +806,7 @@ info:
   name: Directory listing enabled
   severity: info
   description: An auto-index directory listing can expose files not meant to be enumerable.
+  tags: misconfig,disclosure
 http:
   - method: GET
     path:
@@ -802,6 +838,7 @@ info:
   name: Exposed .env backup
   severity: high
   description: A backup copy of the environment file can leak the same secrets as the live file.
+  tags: exposure,config,backup
 http:
   - method: GET
     path:
@@ -823,6 +860,7 @@ info:
   name: Exposed SSH/TLS private key
   severity: critical
   description: A publicly readable private key allows full server impersonation and compromise.
+  tags: exposure,credentials,secrets
 http:
   - method: GET
     path:
@@ -850,6 +888,7 @@ info:
   name: Exposed AWS credentials
   severity: critical
   description: AWS secret keys exposed in a reachable file grant direct access to cloud infrastructure.
+  tags: exposure,credentials,aws,cloud
 http:
   - method: GET
     path:
@@ -871,6 +910,7 @@ info:
   name: Application debug stack trace disclosed
   severity: medium
   description: A debug or exception page discloses framework internals, file paths, and sometimes secrets. Demonstrates the dsl matcher.
+  tags: exposure,disclosure,debug
 http:
   - method: GET
     path:
@@ -886,6 +926,7 @@ info:
   name: Local file inclusion / path traversal
   severity: high
   description: A path that returns the contents of /etc/passwd indicates local file inclusion. Demonstrates payload fuzzing.
+  tags: vuln,lfi,traversal
 http:
   - method: GET
     unsafe: true
@@ -913,6 +954,7 @@ info:
   name: Blind server-side request forgery (out-of-band)
   severity: high
   description: A parameter that makes the server fetch an attacker-controlled URL indicates SSRF. Requires a configured OAST server; confirmed by an out-of-band callback.
+  tags: vuln,ssrf,oast
 http:
   - method: GET
     path:
@@ -929,6 +971,7 @@ info:
   name: Exposed database backup
   severity: critical
   description: A downloadable SQL dump exposes the full database, including password hashes and credentials.
+  tags: exposure,backup,database
 http:
   - method: GET
     path:
@@ -1021,6 +1064,72 @@ mod tests {
                 .iter()
                 .any(|t| t.id == "debug-stacktrace-disclosure")
         );
+    }
+
+    fn walk_yaml(dir: &std::path::Path) -> usize {
+        let mut n = 0;
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                n += walk_yaml(&p);
+            } else if p
+                .extension()
+                .and_then(|x| x.to_str())
+                .map(|x| x == "yaml" || x == "yml")
+                .unwrap_or(false)
+            {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn every_template_declares_its_class() {
+        // A template's tags are how a finding gets its `vuln_class`. A template
+        // with none would emit findings that fall through to the generic class,
+        // which is how consumers ended up re-deriving classes from template ids.
+        let mut all: Vec<(&str, &str, &str)> = super::BUILTIN
+            .iter()
+            .map(|t| {
+                (
+                    t.id.as_str(),
+                    t.info.tags.as_str(),
+                    t.info.metadata.category.as_str(),
+                )
+            })
+            .collect();
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/templates");
+        let pack = super::load_dir(dir);
+        // load_dir skips anything that fails to parse, which is how a broken
+        // CVE template sat in the pack unnoticed and never ran. Count the files
+        // so a skip is a test failure rather than a silently smaller pack.
+        let on_disk = walk_yaml(std::path::Path::new(dir));
+        assert_eq!(
+            pack.len(),
+            on_disk,
+            "{} template file(s) in the pack failed to parse and were skipped",
+            on_disk - pack.len()
+        );
+        all.extend(pack.iter().map(|t| {
+            (
+                t.id.as_str(),
+                t.info.tags.as_str(),
+                t.info.metadata.category.as_str(),
+            )
+        }));
+        assert!(all.len() > 12, "the on-disk pack did not load");
+        for (id, tags, category) in all {
+            assert!(!tags.is_empty(), "template `{id}` carries no tags");
+            let class = crate::finding::class_from_tags(tags, id, category);
+            assert_ne!(
+                class, "vuln",
+                "template `{id}` falls through to the generic class"
+            );
+        }
     }
 
     #[test]

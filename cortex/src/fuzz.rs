@@ -8,6 +8,7 @@
 //! that have one (from a spec, capture, or discovery).
 
 use crate::engine::AuthSpec;
+use crate::finding::Finding;
 use crate::inject::InjEndpoint;
 use crate::probe::{self, is_server_error, json_typed, typed_default};
 use serde::Deserialize;
@@ -163,23 +164,23 @@ async fn probe_typefuzz(client: &Client, ep: &InjEndpoint) -> Vec<Value> {
                     .map(|a| is_server_error(a.status, &a.body))
                     .unwrap_or(false)
                 {
-                    out.push(json!({
-                        "type": "vulnerability",
-                        "vuln_class": "type-confusion",
-                        "name": "Unhandled input type (type confusion)",
-                        "severity": "medium",
-                        "confidence": "confirmed",
-                        "target": ep.url,
-                        "url": ep.url,
-                        "method": method,
-                        "param": f.name,
-                        "location": "body",
-                        "description": format!(
+                    out.push(
+                        Finding::new(
+                            "cortex-fuzz",
+                            "type_confusion",
+                            "Unhandled input type (type confusion)",
+                            "medium",
+                            &ep.url,
+                        )
+                        .method(&method)
+                        .param(&f.name)
+                        .location("body")
+                        .describe(format!(
                             "Sending `{}` where body field `{}` expects a {} caused a server error (5xx / stack trace) that a well-typed request did not, and it reproduced - unvalidated input of the wrong type reaches the handler.",
                             w, f.name, ty
-                        ),
-                        "source": "cortex-fuzz",
-                    }));
+                        ))
+                        .build(),
+                    );
                     break;
                 }
             }
@@ -257,22 +258,22 @@ async fn probe_massassign(client: &Client, ep: &InjEndpoint) -> Vec<Value> {
     }
     for (name, s) in &sentinels {
         if r.body.contains(s) {
-            out.push(json!({
-                "type": "vulnerability",
-                "vuln_class": "mass-assignment",
-                "name": "Mass assignment (unexpected field bound)",
-                "severity": "high",
-                "confidence": "confirmed",
-                "target": ep.url,
-                "url": ep.url,
-                "method": method,
-                "param": name,
-                "location": "body",
-                "description": format!(
+            out.push(
+                Finding::new(
+                    "cortex-fuzz",
+                    "mass_assignment",
+                    "Mass assignment (unexpected field bound)",
+                    "high",
+                    &ep.url,
+                )
+                .method(&method)
+                .param(name.as_str())
+                .location("body")
+                .describe(format!(
                     "An unsolicited `{name}` field added to the request body was accepted and reflected in the response, while a control junk field was not - the endpoint binds client-supplied fields it should not expose, enabling privilege/field tampering (BOPLA)."
-                ),
-                "source": "cortex-fuzz",
-            }));
+                ))
+                .build(),
+            );
         }
     }
     out

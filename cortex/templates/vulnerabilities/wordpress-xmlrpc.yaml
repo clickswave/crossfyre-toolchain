@@ -3,7 +3,7 @@ info:
   name: WordPress XML-RPC enabled
   severity: low
   description: /xmlrpc.php is reachable and accepting requests. It enables credential brute-force amplification (system.multicall) and pingback-based SSRF/DDoS, and should be disabled if unused.
-  tags: vuln,wordpress,xmlrpc
+  tags: vuln,misconfig,wordpress,xmlrpc
   metadata:
     category: vulnerabilities
     vendor: wordpress

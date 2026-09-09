@@ -3,6 +3,9 @@ info:
   name: XML external entity (XXE) local file disclosure
   severity: critical
   description: The XML parser resolves external SYSTEM entities, so a crafted DOCTYPE reads a local file (/etc/passwd) and reflects its contents in the response.
+  tags: vuln,xxe,injection,lfi
+  metadata:
+    category: vulnerabilities
 http:
   - method: POST
     path:

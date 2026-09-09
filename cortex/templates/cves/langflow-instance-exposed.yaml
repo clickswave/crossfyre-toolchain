@@ -3,6 +3,9 @@ info:
   name: Langflow instance exposed (unauthenticated version disclosure)
   severity: medium
   description: A Langflow LLM-agent platform is reachable without authentication and discloses its version at /api/v1/version. Langflow has a history of critical unauthenticated RCE (CVE-2025-3248, plus exposed public build/playground endpoints that instantiate attacker-supplied component code). Uses a vhost Host header for name-based routing.
+  tags: cve,langflow,disclosure,unauth
+  metadata:
+    category: cves
 http:
   - method: GET
     path:

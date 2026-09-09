@@ -14,6 +14,7 @@
 //! parsing / OpenAPI ingestion / JS analysis) and passed in per endpoint.
 
 use crate::engine::{AuthSpec, OastSpec};
+use crate::finding::Finding;
 use crate::probe::{
     self, Resp, is_server_error, json_typed, pct_decode, pct_encode, send, send_with, typed_default,
 };
@@ -1071,21 +1072,21 @@ async fn probe_ratelimit(
     }
     // Only flag when the burst clearly went through unthrottled (avoid a target that was simply down).
     if throttled == 0 && ok >= (BURST as u32 * 3 / 4) {
-        return Some(json!({
-            "type": "vulnerability",
-            "vuln_class": "no_rate_limit",
-            "name": "Missing rate limiting on a sensitive endpoint",
-            "severity": "medium",
-            "confidence": "confirmed",
-            "target": ep.url,
-            "url": ep.url,
-            "method": method,
-            "location": "endpoint",
-            "description": format!(
+        return Some(
+            Finding::new(
+                "cortex-inject",
+                "no_rate_limit",
+                "Missing rate limiting on a sensitive endpoint",
+                "medium",
+                &ep.url,
+            )
+            .method(&method)
+            .location("endpoint")
+            .describe(format!(
                 "{BURST} requests were sent in quick succession to this authentication/account endpoint and none were throttled (no 429 / Retry-After). Without rate limiting it is open to credential stuffing, OTP/2FA brute-force, and password-reset or signup flooding (OWASP API4: Unrestricted Resource Consumption)."
-            ),
-            "source": "cortex-inject",
-        }));
+            ))
+            .build(),
+        );
     }
     None
 }
@@ -1136,22 +1137,22 @@ async fn probe_inventory(
         // 404 / 410 = the version genuinely does not exist. Anything else (200/2xx, 401/403 auth,
         // 405 method, 5xx app error) means the route is wired up -> a live sibling version.
         if resp.status != 404 && resp.status != 410 && resp.status != 0 {
-            out.push(json!({
-                "type": "vulnerability",
-                "vuln_class": "improper_inventory",
-                "name": "Undocumented / shadow API version",
-                "severity": "medium",
-                "confidence": "confirmed",
-                "target": sib_url,
-                "url": sib_url,
-                "method": method,
-                "location": "path",
-                "description": format!(
+            out.push(
+                Finding::new(
+                    "cortex-inject",
+                    "improper_inventory",
+                    "Undocumented / shadow API version",
+                    "medium",
+                    &sib_url,
+                )
+                .method(&method)
+                .location("path")
+                .describe(format!(
                     "The operation is versioned `v{cur}`, but sibling version `v{v}` at this path still answers (HTTP {}) instead of 404. Undocumented or un-retired versions frequently miss the auth, validation, or rate-limit fixes applied to the current version (OWASP API9: Improper Inventory Management).",
                     resp.status
-                ),
-                "source": "cortex-inject",
-            }));
+                ))
+                .build(),
+            );
         }
     }
     out
@@ -1374,14 +1375,19 @@ async fn probe_cors(
     let r2 = send_with(client, &method, &ep.url, None, &hdrs).await;
     // Require the reflection to reproduce before reporting (confirm-before-report).
     check(&r2)?;
-    Some(json!({
-        "type": "vulnerability", "vuln_class": "cors",
-        "name": "CORS misconfiguration (credentialed cross-origin read)",
-        "severity": "high", "confidence": "confirmed",
-        "target": ep.url, "url": ep.url, "method": method, "location": "header",
-        "description": format!("The endpoint reflects an arbitrary request `Origin` into `Access-Control-Allow-Origin` (`{acao}`) while allowing credentials - so any attacker-controlled site can read this endpoint's authenticated cross-origin responses (account takeover / data theft)."),
-        "source": "cortex-inject",
-    }))
+    Some(
+        Finding::new(
+            "cortex-inject",
+            "cors",
+            "CORS misconfiguration (credentialed cross-origin read)",
+            "high",
+            &ep.url,
+        )
+        .method(&method)
+        .location("header")
+        .describe(format!("The endpoint reflects an arbitrary request `Origin` into `Access-Control-Allow-Origin` (`{acao}`) while allowing credentials - so any attacker-controlled site can read this endpoint's authenticated cross-origin responses (account takeover / data theft)."))
+        .build(),
+    )
 }
 
 // ---------------------------------------------------------------- CRLF / header injection
@@ -1580,20 +1586,17 @@ fn boolean_differential(baseline: &Resp, t: &Resp, f: &Resp, min_diff: i64) -> b
 }
 
 fn finding(class: &str, name: &str, severity: &str, site: &Site, detail: String) -> Value {
-    json!({
-        "type": "vulnerability",
-        "vuln_class": class,
-        "name": name,
-        "severity": severity,
-        "confidence": "confirmed",
-        "target": site.url,
-        "url": site.url,
-        "method": site.method,
-        "param": site.param,
-        "location": match site.loc { Loc::Query => "query", Loc::Path => "path", Loc::Header => "header", _ => "body" },
-        "description": detail,
-        "source": "cortex-inject",
-    })
+    Finding::new("cortex-inject", class, name, severity, &site.url)
+        .method(&site.method)
+        .param(&site.param)
+        .location(match site.loc {
+            Loc::Query => "query",
+            Loc::Path => "path",
+            Loc::Header => "header",
+            _ => "body",
+        })
+        .describe(detail)
+        .build()
 }
 
 fn query_param_names(url: &str) -> Vec<String> {

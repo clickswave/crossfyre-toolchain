@@ -3,6 +3,9 @@ info:
   name: Mass assignment leads to privilege escalation
   severity: critical
   description: The account-update endpoint binds request fields directly to the model, so a normal user can set privileged fields (role, balance) on themselves. The response reflects the elevated role, confirming self-escalation to admin.
+  tags: vuln,mass-assignment,access-control
+  metadata:
+    category: vulnerabilities
 http:
   - method: PATCH
     path:

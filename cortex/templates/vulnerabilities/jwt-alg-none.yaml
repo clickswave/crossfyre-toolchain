@@ -3,6 +3,9 @@ info:
   name: JWT 'alg:none' accepted (signature verification bypass)
   severity: critical
   description: The API accepts a JWT with the "none" algorithm and an empty signature, so an attacker can forge a token for any user/role. This probe presents an unsigned admin (sub=1) token and receives the admin account.
+  tags: vuln,jwt,auth-bypass
+  metadata:
+    category: vulnerabilities
 http:
   - method: GET
     path:

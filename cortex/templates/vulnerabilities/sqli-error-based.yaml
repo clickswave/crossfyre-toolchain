@@ -3,6 +3,9 @@ info:
   name: SQL injection (error-based)
   severity: high
   description: Appending a single quote to the query provokes a database engine error, proving unsanitized input is concatenated into a SQL statement.
+  tags: vuln,sqli,injection
+  metadata:
+    category: vulnerabilities
 http:
   - method: GET
     path:

@@ -7,6 +7,7 @@
 //! asset graph. OAST-backed blind detection, the full DSL, and the generative
 //! API mode are the documented next milestones (docs/tier1-engines-plan.md).
 
+use crate::finding::Finding;
 use crate::template;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -351,20 +352,19 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
     // A persistent WAF challenge on the base is itself reportable and a reason to
     // skip the active phase.
     if blocked {
-        let _ = tx.send(json!({
-            "type":"finding",
-            "data":{
-                "target": base,
-                "type":"waf",
-                "source":"cortex",
-                "severity":"info",
-                "name": format!("Target behind WAF/anti-bot ({block_label})"),
-                "template":"cortex:waf-challenge",
-                "matched_at": base,
-                "description":"The base URL returned a WAF/anti-bot challenge that could not be cleared, so active vulnerability templates were skipped. Consider origin discovery, an attribution/allowlist header, or a challenge-solving session.",
-                "confidence":"confirmed",
-            }
-        }));
+        let _ = tx.send(
+            Finding::new(
+                "cortex",
+                "waf",
+                format!("Target behind WAF/anti-bot ({block_label})"),
+                "info",
+                &base,
+            )
+            .kind("waf")
+            .template("cortex:waf-challenge")
+            .describe("The base URL returned a WAF/anti-bot challenge that could not be cleared, so active vulnerability templates were skipped. Consider origin discovery, an attribution/allowlist header, or a challenge-solving session.")
+            .event(),
+        );
     }
 
     let sev_filter: Vec<String> = params.severity.iter().map(|s| s.to_lowercase()).collect();
@@ -389,20 +389,15 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
         for (name, template, severity, description) in header_checks(&resp) {
             if allow(severity) && allow_id(template) {
                 found += 1;
-                let _ = tx.send(json!({
-                    "type": "finding",
-                    "data": {
-                        "target": base,
-                        "type": "vulnerability",
-                        "source": "cortex",
-                        "severity": severity,
-                        "name": name,
-                        "template": template,
-                        "matched_at": base,
-                        "description": description,
-                        "confidence": "confirmed",
-                    }
-                }));
+                let _ = tx.send(
+                    Finding::new("cortex", "misconfig", name, severity, &base)
+                        .template(template)
+                        // These are read off the base response's headers, so the
+                        // location is not a guess.
+                        .location("header")
+                        .describe(description)
+                        .event(),
+                );
             }
         }
         true
@@ -455,20 +450,12 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
                         .await
                 {
                     found += 1;
-                    let _ = tx.send(json!({
-                        "type": "finding",
-                        "data": {
-                            "target": m.matched_at,
-                            "type": "vulnerability",
-                            "source": "cortex",
-                            "severity": m.severity,
-                            "name": m.name,
-                            "template": m.template_id,
-                            "matched_at": m.matched_at,
-                            "description": m.description,
-                            "confidence": "confirmed",
-                        }
-                    }));
+                    let _ = tx.send(
+                        Finding::new("cortex", &m.class, m.name, m.severity, m.matched_at)
+                            .template(m.template_id)
+                            .describe(m.description)
+                            .event(),
+                    );
                 }
             }
             done += 1;
