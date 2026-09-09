@@ -123,6 +123,9 @@ struct Resp {
     status: u16,
     headers: String,
     body: String,
+    /// The URL this response came from. Needed so a matcher can tell evidence
+    /// from an echo: see `matches_one`.
+    url: String,
 }
 
 const OOB_MARKERS: [&str; 2] = ["{{interactsh-url}}", "{{oast-url}}"];
@@ -425,6 +428,7 @@ async fn fetch_raw(method: &str, v: &ReqVariant) -> Option<Resp> {
         status: r.status,
         headers: r.headers,
         body: r.body,
+        url: v.url.clone(),
     })
 }
 
@@ -470,6 +474,7 @@ async fn fetch(client: &Client, method: &str, v: &ReqVariant) -> Option<Resp> {
                     status,
                     headers,
                     body,
+                    url: v.url.clone(),
                 });
             }
             Err(_) => {
@@ -519,6 +524,44 @@ fn matches_all(req: &HttpReq, resp: &Resp) -> bool {
     if cond_and { all } else { any }
 }
 
+/// Does this response simply echo the requested path back into its body?
+///
+/// Catch-all handlers, soft 404s and "page not found" templates routinely do
+/// this. When they do, any matcher word that also appears in the request URL is
+/// worthless as evidence: the scanner put it there. A WebLogic template probing
+/// `/console/css/..%2fconsole.portal` and matching the word "console.portal"
+/// will otherwise fire on every app in the world that prints the path it could
+/// not find, which is how a 200-line Python app got reported as a critical
+/// Oracle WebLogic auth bypass.
+///
+/// Deliberately narrow. Evidence is only discounted on responses that provably
+/// echo, so a real WebLogic console still matches on "WebLogic" and
+/// "Deployment", and templates whose words legitimately appear in the path keep
+/// working everywhere else.
+fn echoes_request_path(resp: &Resp) -> bool {
+    let path = match resp.url.split_once("://") {
+        Some((_, rest)) => match rest.find('/') {
+            Some(i) => &rest[i..],
+            None => return false,
+        },
+        None => return false,
+    };
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    let trimmed = path.trim_matches('/');
+    if trimmed.len() < 4 {
+        return false;
+    }
+    let body = resp.body.to_lowercase();
+    let needle = trimmed.to_lowercase();
+    if body.contains(&needle) {
+        return true;
+    }
+    // Also catch the percent-decoded form, since a traversal payload is usually
+    // encoded on the wire and printed decoded.
+    let decoded = needle.replace("%252e", ".").replace("%2e", ".").replace("%252f", "/").replace("%2f", "/");
+    decoded != needle && body.contains(&decoded)
+}
+
 fn matches_one(m: &Matcher, resp: &Resp) -> bool {
     let hay = part_text(&m.part, resp);
     match m.mtype.as_str() {
@@ -535,7 +578,15 @@ fn matches_one(m: &Matcher, resp: &Resp) -> bool {
             // case (e.g. "Server:", "X-Powered-By:"), which would otherwise miss.
             let header_part = matches!(m.part.as_str(), "header" | "all_headers");
             let hay_cmp = if header_part { hay.to_lowercase() } else { hay };
+            // On a response that echoes the request path, a word that is itself
+            // in the URL proves nothing. Only applied to body-ish parts, and
+            // only when the echo is demonstrated.
+            let discount_echo = !header_part && echoes_request_path(resp);
+            let url_lc = resp.url.to_lowercase();
             let contains = |w: &str| {
+                if discount_echo && url_lc.contains(&w.to_lowercase()) {
+                    return false;
+                }
                 if header_part {
                     hay_cmp.contains(&w.to_lowercase())
                 } else {
@@ -976,6 +1027,7 @@ mod tests {
     fn dsl_matcher_wired() {
         // The dsl matcher path is reachable and evaluates the response context.
         let resp = super::Resp {
+            url: String::new(),
             status: 200,
             headers: "Server: nginx\n".to_string(),
             body: "Werkzeug Debugger traceback".to_string(),
