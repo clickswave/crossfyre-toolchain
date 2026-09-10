@@ -942,15 +942,39 @@ async fn probe_sqli(client: &Client, site: &Site, baseline: &Resp) -> Option<Val
                 .as_ref()
                 .map(|x| is_server_error(x.status, &x.body))
                 .unwrap_or(false);
-            if clean(&r_double) && clean(&r_comment) && repro {
+            // The doubled delimiter is the mandatory recovery; the
+            // comment-out is corroboration when it agrees.
+            //
+            // Doubling the quote is the minimal repair that PRESERVES the
+            // query's meaning: it stays inside the string literal, so the same
+            // rows match and the app takes the same code path. Commenting the
+            // rest out CHANGES the meaning - it can turn a query that matched
+            // nothing into one that matches a row, after which the app acts on
+            // that row and may fail there for reasons that are not SQL at all.
+            // RailsGoat does exactly this: the commented form finds user 1 and
+            // then errors inside save!, while the doubled form matches no row
+            // and returns cleanly.
+            //
+            // Requiring both therefore loses real injections in any app that
+            // hides DB errors and does work after the query, which is most
+            // production software. Requiring the doubled form keeps the
+            // precision control that matters: a backend that merely errors on
+            // odd input would error on the doubled form too, since that also
+            // carries a delimiter.
+            if clean(&r_double) && repro {
                 return Some(finding(
                     "sqli",
                     "SQL injection (error-based, differential)",
                     "high",
                     site,
                     format!(
-                        "An unbalanced `{brk}` in the {} triggered a server error while a balanced form and a commented-out form both returned normally -- the value breaks and re-balances a SQL statement, so it is injected unparameterised (the DB error is masked behind a generic error page).",
-                        site.where_label()
+                        "An unbalanced `{brk}` in the {} triggered a server error while the balanced form returned normally{} -- the value breaks and re-balances a SQL statement, so it is injected unparameterised (the DB error is masked behind a generic error page).",
+                        site.where_label(),
+                        if clean(&r_comment) {
+                            ", as did the commented-out form"
+                        } else {
+                            " (the commented-out form did not, which is what happens when commenting the rest out makes the query match a row the app then acts on)"
+                        }
                     ),
                 ));
             }
