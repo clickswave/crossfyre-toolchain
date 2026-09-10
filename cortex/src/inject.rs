@@ -1962,10 +1962,28 @@ async fn probe_crlf(client: &Client, site: &Site) -> Option<Value> {
     // Raw CR/LF; set_param percent-encodes it (%0D%0A) on the wire, the app decodes it, and if it
     // writes the value into a header our injected `X-Cfx-Inj` header splits out. Try single and double
     // CRLF (the latter starts a new body, catching stricter parsers).
-    for pl in [
-        format!("{base}\r\nX-Cfx-Inj: {marker}"),
-        format!("{base}%0d%0aX-Cfx-Inj: {marker}"),
-    ] {
+    // A RAW CR/LF is only worth sending where the application decodes the value
+    // itself - a query or path parameter. In a request header it cannot work:
+    // the server's own parser splits the header before the application ever
+    // sees it, so the value the app copies into the response never contains the
+    // CR/LF. reqwest refuses to build such a request at all (correctly - it
+    // would be client-side smuggling), which produced 28 unsendable requests
+    // per pass, invisible until the engine was made to say why a request
+    // failed. Neither the raw sender nor any other client changes that: the
+    // payload is unreachable by construction, not by client policy.
+    //
+    // The encoded form is the one that matters on a header site, and it sends
+    // fine: the app decodes `%0d%0a` itself and writes the result into a
+    // response header.
+    let payloads: Vec<String> = if matches!(site.loc, Loc::Header) {
+        vec![format!("{base}%0d%0aX-Cfx-Inj: {marker}")]
+    } else {
+        vec![
+            format!("{base}\r\nX-Cfx-Inj: {marker}"),
+            format!("{base}%0d%0aX-Cfx-Inj: {marker}"),
+        ]
+    };
+    for pl in payloads {
         let hit = |r: &Option<Resp>| {
             r.as_ref()
                 .and_then(|x| x.header("x-cfx-inj"))
