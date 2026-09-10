@@ -271,6 +271,31 @@ impl Site {
         Some((Value::Object(obj).to_string(), "application/json"))
     }
 
+    /// The body with extra keys added at the TOP level, beside the real fields.
+    ///
+    /// Prototype pollution is not a per-parameter injection: `__proto__` has to
+    /// be a sibling of the application's own fields, not the value of one of
+    /// them. Rendering it through the per-parameter path produces
+    /// `{"name": {"__proto__": ...}}`, which is just a nested object and
+    /// pollutes nothing - a mistake that made the probe silently find nothing
+    /// against a fixture built to be vulnerable.
+    fn render_body_json_with(
+        &self,
+        extra: &serde_json::Map<String, Value>,
+    ) -> Option<(String, &'static str)> {
+        if self.loc != Loc::BodyJson {
+            return None;
+        }
+        let mut obj = serde_json::Map::new();
+        for (k, v, ty) in &self.body {
+            obj.insert(k.clone(), json_typed(v, ty.as_deref()));
+        }
+        for (k, v) in extra {
+            obj.insert(k.clone(), v.clone());
+        }
+        Some((Value::Object(obj).to_string(), "application/json"))
+    }
+
     /// Request headers this site overrides for its payload. Empty for URL/body sites; for a Header
     /// site it carries the payload in the named request header.
     fn header_override(&self, value: &str) -> Vec<(String, String)> {
@@ -805,6 +830,14 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
         }
         if want("crlf") {
             if let Some(f) = probe_crlf(&client, &site).await {
+                emit(f, &mut hits);
+            }
+        }
+        // Named explicitly only. `want` treats an empty class list as
+        // "everything", and this one must never be part of that: it changes the
+        // target's state and cannot be undone from outside.
+        if classes.iter().any(|c| c == "proto_pollution") {
+            if let Some(f) = probe_proto_pollution(&client, &site, &baseline).await {
                 emit(f, &mut hits);
             }
         }
@@ -1861,6 +1894,99 @@ async fn probe_ssti(client: &Client, site: &Site) -> Option<Value> {
 /// object and look for a result-set change (a match-everything `$gt:""` vs a match-nothing high
 /// sentinel). Confirmed by a reproducible boolean differential, so it does not fire on a field the
 /// server simply ignores. JSON bodies only (that is where operator objects are interpreted).
+/// Server-side prototype pollution.
+///
+/// A JSON body carrying `__proto__` can write onto `Object.prototype` in a Node
+/// application that merges request data into an object without guarding the
+/// key. Every object created afterwards inherits what was written, which is how
+/// it becomes privilege escalation, authentication bypass or remote code
+/// execution, depending on what the application reads next.
+///
+/// OPT-IN, and never part of the default sweep. Every other probe here is
+/// read-only: it sends a payload, reads the answer, and leaves the target as it
+/// found it. This one does not. Polluting `Object.prototype` changes the
+/// behaviour of the whole process for as long as it lives, and nothing outside
+/// the process can undo it. Doing that to someone's service without being asked
+/// would be indefensible, so it fires only when the caller names the class.
+///
+/// The oracle is a property that has no reason to exist. Write a random key
+/// onto the prototype, then make an ordinary request and look for that key in
+/// the answer. An application that hands back an object carrying a key we
+/// invented is an application whose prototype we just wrote to. There is no
+/// benign reading of that, which is what makes it confirmable without a
+/// destructive payload.
+async fn probe_proto_pollution(client: &Client, site: &Site, baseline: &Resp) -> Option<Value> {
+    if site.loc != Loc::BodyJson {
+        return None;
+    }
+    // A key no application has: if it comes back, we put it there.
+    let marker = format!(
+        "cfxpp{:x}{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0),
+        site.url.len()
+    );
+    if baseline.body.contains(&marker) {
+        return None;
+    }
+
+    // Both spellings. `__proto__` is the direct route; `constructor.prototype`
+    // reaches the same object by a path that key-name filters routinely miss.
+    for shape in [
+        json!({ "__proto__": { marker.clone(): marker.clone() } }),
+        json!({ "constructor": { "prototype": { marker.clone(): marker.clone() } } }),
+    ] {
+        // Top level, beside the real fields - not as the value of one of them.
+        let Some(extra) = shape.as_object() else {
+            continue;
+        };
+        let Some((body, ctype)) = site.render_body_json_with(extra) else {
+            continue;
+        };
+        let _ = send(
+            client,
+            &site.method,
+            &site.url,
+            Some((body.as_str(), ctype)),
+        )
+        .await;
+
+        // Now ask an ordinary question. If the answer carries our key, the
+        // prototype every object inherits from is carrying it too.
+        let after = send_site(client, site, &site.base_value).await;
+        if !after
+            .as_ref()
+            .map(|r| r.body.contains(&marker))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let again = send_site(client, site, &site.base_value).await;
+        if again.map(|r| r.body.contains(&marker)).unwrap_or(false) {
+            return Some(finding(
+                "proto_pollution",
+                "Server-side prototype pollution",
+                "high",
+                site,
+                format!(
+                    "A key invented for this test was written through the {} onto the object \
+                     prototype, and a later ordinary request came back carrying it. The \
+                     application merges request data into an object without rejecting \
+                     `__proto__` / `constructor.prototype`, so every object built afterwards \
+                     inherits whatever an attacker writes. Depending on what the application \
+                     reads next, that is authentication bypass, privilege escalation or remote \
+                     code execution. Note: this test leaves the property set, and the process \
+                     must be restarted to clear it.",
+                    site.where_label()
+                ),
+            ));
+        }
+    }
+    None
+}
+
 async fn probe_nosql(client: &Client, site: &Site, baseline: &Resp) -> Option<Value> {
     if site.loc != Loc::BodyJson {
         return None;
