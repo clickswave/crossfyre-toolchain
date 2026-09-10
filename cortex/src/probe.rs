@@ -108,6 +108,151 @@ pub fn build_client_no_redirect(
 }
 
 /// Send one request with an optional `(body, content-type)` and read the capped response.
+/// Per-host pacing, so the scanner does not knock over what it is measuring.
+///
+/// This exists because of a measured failure, not a theory. Batching the
+/// out-of-band callbacks removed the only thing that had been spacing our
+/// requests out: the blocking polls between injection points were accidental
+/// rate limiting. With them gone, an injection point fires ten payloads back to
+/// back, six points run at once, and a small PHP application ran out of worker
+/// processes. The pass that followed skipped almost every site with "the
+/// endpoint did not answer", and reported seven findings where it had reported
+/// fifteen. Nothing was wrong with the target: it answers in 8ms when asked
+/// alone.
+///
+/// Accidental throttling is not a design. This is the deliberate version:
+/// additive-increase on success, multiplicative-decrease on transport failure,
+/// per host, with a floor of one in-flight request and a delay that decays as
+/// the target recovers.
+mod pace {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+    use tokio::sync::Semaphore;
+
+    /// Ceiling on concurrent requests to one host. FIXED, deliberately.
+    ///
+    /// The first version of this adapted the ceiling by permanently forgetting
+    /// semaphore permits on failure. It stalled a scan dead: permits consumed,
+    /// growth gated behind successes that could no longer happen, and the
+    /// engine sat on idle connections issuing nothing at 0.2% CPU. Capacity
+    /// that can only shrink is a deadlock waiting for the right sequence of
+    /// failures.
+    ///
+    /// Rate is controlled by delay instead. Delay cannot strand anything: the
+    /// worst case is slow, and slow recovers on its own.
+    const MAX_INFLIGHT: usize = 8;
+    /// Consecutive transport failures before we brake.
+    const SHRINK_AFTER: u64 = 2;
+    /// Consecutive successes before we ease off.
+    const GROW_AFTER: u64 = 20;
+    const MAX_DELAY_MS: u64 = 1500;
+
+    /// Consecutive failures before we stop overlapping requests entirely.
+    const SERIALISE_AFTER: u64 = 4;
+    /// Successes before we allow overlap again.
+    const UNSERIALISE_AFTER: u64 = 40;
+
+    pub struct HostPace {
+        sem: Arc<Semaphore>,
+        /// Held for the whole request when the host is judged to be serialising
+        /// us anyway. Reversible, unlike consuming capacity.
+        gate: tokio::sync::Mutex<()>,
+        serial: std::sync::atomic::AtomicBool,
+        fails: AtomicU64,
+        oks: AtomicU64,
+        delay_ms: AtomicU64,
+    }
+
+    impl HostPace {
+        fn new() -> Self {
+            Self {
+                sem: Arc::new(Semaphore::new(MAX_INFLIGHT)),
+                gate: tokio::sync::Mutex::new(()),
+                serial: std::sync::atomic::AtomicBool::new(false),
+                fails: AtomicU64::new(0),
+                oks: AtomicU64::new(0),
+                delay_ms: AtomicU64::new(0),
+            }
+        }
+
+        pub fn delay(&self) -> u64 {
+            self.delay_ms.load(Ordering::Relaxed)
+        }
+
+        pub fn sem(&self) -> Arc<Semaphore> {
+            Arc::clone(&self.sem)
+        }
+
+        pub fn serialising(&self) -> bool {
+            self.serial.load(Ordering::Relaxed)
+        }
+
+        pub fn gate(&self) -> &tokio::sync::Mutex<()> {
+            &self.gate
+        }
+
+        /// A request came back. Ease off the brake, slowly.
+        pub fn ok(&self) {
+            self.fails.store(0, Ordering::Relaxed);
+            let n = self.oks.fetch_add(1, Ordering::Relaxed) + 1;
+            if n >= GROW_AFTER {
+                let d = self.delay_ms.load(Ordering::Relaxed);
+                self.delay_ms
+                    .store(d.saturating_sub(d / 4), Ordering::Relaxed);
+            }
+            if n >= UNSERIALISE_AFTER {
+                self.oks.store(0, Ordering::Relaxed);
+                self.serial.store(false, Ordering::Relaxed);
+            } else if n >= GROW_AFTER {
+                self.oks.store(0, Ordering::Relaxed);
+            }
+        }
+
+        /// A request did not come back at all. Brake, hard.
+        pub fn failed(&self) {
+            self.oks.store(0, Ordering::Relaxed);
+            let n = self.fails.fetch_add(1, Ordering::Relaxed) + 1;
+            if n >= SHRINK_AFTER {
+                let d = self.delay_ms.load(Ordering::Relaxed);
+                self.delay_ms
+                    .store(((d * 2) + 100).min(MAX_DELAY_MS), Ordering::Relaxed);
+            }
+            // Requests that never come back, repeatedly, mean overlapping is
+            // not working here. The usual cause is not the target being small:
+            // it is that WE hold a session the target locks per request, and a
+            // time-based payload parks that lock for five or ten seconds while
+            // everything else queues behind it and times out. Measured on
+            // Mutillidae: eight concurrent requests on one session serialise
+            // into a perfect staircase, while eight without a session run flat.
+            //
+            // So stop overlapping. The target was serialising us anyway; all
+            // the parallelism bought was timeouts, and a timeout is read as
+            // "the endpoint did not answer", which silently skips real work.
+            if n >= SERIALISE_AFTER {
+                self.fails.store(0, Ordering::Relaxed);
+                self.serial.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    static HOSTS: OnceLock<Mutex<HashMap<String, Arc<HostPace>>>> = OnceLock::new();
+
+    pub fn for_url(url: &str) -> Arc<HostPace> {
+        let host = url
+            .split("://")
+            .nth(1)
+            .unwrap_or(url)
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .to_string();
+        let map = HOSTS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut m = map.lock().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(m.entry(host).or_insert_with(|| Arc::new(HostPace::new())))
+    }
+}
+
 pub async fn send(
     client: &Client,
     method: &str,
@@ -126,22 +271,65 @@ pub async fn send_with(
     body: Option<(&str, &str)>,
     extra_headers: &[(String, String)],
 ) -> Option<Resp> {
-    let mut rb = match method {
-        "POST" => client.post(url),
-        "PUT" => client.put(url),
-        "DELETE" => client.delete(url),
-        "PATCH" => client.patch(url),
-        _ => client.get(url),
+    // Pace against this host: hold a permit for the request, and wait out any
+    // backoff the host has earned. See `pace`.
+    let pacer = pace::for_url(url);
+    let sem = pacer.sem();
+    let _permit = sem.acquire().await.ok()?;
+    // When the host has shown it cannot overlap, take the gate so this request
+    // has it to itself. Reversible: sustained success releases the mode.
+    let _gate = if pacer.serialising() {
+        Some(pacer.gate().lock().await)
+    } else {
+        None
     };
-    for (k, v) in extra_headers {
-        rb = rb.header(k.as_str(), v.as_str());
+    let d = pacer.delay();
+    if d > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(d)).await;
     }
-    if let Some((b, ctype)) = body {
-        rb = rb.header("content-type", ctype).body(b.to_string());
-    }
+
+    // A connection-level failure is not an answer about the endpoint, so it is
+    // retried once on a fresh connection before it counts as one.
+    //
+    // This is the keep-alive race, and it is not rare: Apache's default
+    // MaxKeepAliveRequests is 100, so a pooled connection is closed by the
+    // server exactly when a scanner is most likely to be reusing it. Measured
+    // against Mutillidae, it arrived in bursts - 59 failures inside one second
+    // - and every one of them was reported as "the endpoint did not answer a
+    // baseline request", which skipped the site and read as a detection
+    // failure. Hand-testing never reproduced it, because a hand test opens a
+    // fresh connection every time.
     let t0 = Instant::now();
-    match rb.send().await {
+    let mut attempt = 0;
+    let outcome = loop {
+        let mut rb = match method {
+            "POST" => client.post(url),
+            "PUT" => client.put(url),
+            "DELETE" => client.delete(url),
+            "PATCH" => client.patch(url),
+            _ => client.get(url),
+        };
+        for (k, v) in extra_headers {
+            rb = rb.header(k.as_str(), v.as_str());
+        }
+        if let Some((b, ctype)) = body {
+            rb = rb.header("content-type", ctype).body(b.to_string());
+        }
+        let r = rb.send().await;
+        let retryable = r
+            .as_ref()
+            .err()
+            .map(|e| e.is_connect() && !e.is_timeout())
+            .unwrap_or(false);
+        if retryable && attempt == 0 {
+            attempt += 1;
+            continue;
+        }
+        break r;
+    };
+    match outcome {
         Ok(r) => {
+            pacer.ok();
             let status = r.status().as_u16();
             let headers: Vec<(String, String)> = r
                 .headers()
@@ -165,7 +353,25 @@ pub async fn send_with(
                 headers,
             })
         }
-        Err(_) => None,
+        Err(e) => {
+            // Say WHY. "The endpoint did not answer" has been reported hundreds
+            // of times in a single pass while the same URL answered a hand
+            // request in 8ms, and without the reason there is nothing to act
+            // on: a connect refusal, a read timeout and a body error are three
+            // different problems wearing one message.
+            if std::env::var("CORTEX_TRACE_FAIL").is_ok() {
+                eprintln!(
+                    "cortex: request failed {} {} :: timeout={} connect={} request={} :: {e}",
+                    method,
+                    url,
+                    e.is_timeout(),
+                    e.is_connect(),
+                    e.is_request(),
+                );
+            }
+            pacer.failed();
+            None
+        }
     }
 }
 

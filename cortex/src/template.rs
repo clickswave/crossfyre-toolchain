@@ -163,6 +163,8 @@ pub async fn eval_template(
     base: &str,
     tmpl: &Template,
     oast: Option<&crate::oast::OastClient>,
+    oob_reg: Option<&crate::oast::OastReg>,
+    oob_queue: Option<&crate::inject::OobQueue>,
     evasive: bool,
 ) -> Vec<Match> {
     let mut out = Vec::new();
@@ -171,13 +173,14 @@ pub async fn eval_template(
 
         // Out-of-band request: only runnable when an OAST server is configured.
         if references_oob(req) {
-            let Some(oc) = oast else { continue };
-            // Register a fresh correlation (sealed to this scan's keypair) for this
-            // template, so callbacks are attributable and encrypted end to end.
-            let Some(reg) = oc.register(client).await else {
+            let (Some(oc), Some(reg), Some(q)) = (oast, oob_reg, oob_queue) else {
                 continue;
             };
-            let host = oc.host(&reg);
+            // One correlation for the whole scan, a marker for this template.
+            // Blocking six seconds here per out-of-band template was cheap next
+            // to what the injector was doing, but it is the same mistake and it
+            // is paid on every scan, so it goes the same way.
+            let (host, marker) = oc.host_marked(reg);
             let mut fired = false;
             for raw_path in &req.path {
                 for mut v in expand_request(req, raw_path, base, MAX_PAYLOAD_REQUESTS) {
@@ -187,43 +190,39 @@ pub async fn eval_template(
                 }
             }
             if !fired {
-                oc.deregister(client, &reg).await;
                 continue;
             }
-            // Poll for the callback: the target processes the payload asynchronously.
-            let mut hits = 0u64;
-            for _ in 0..4 {
-                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-                hits = oc.poll(client, &reg).await;
-                if hits > 0 {
-                    break;
-                }
-            }
-            oc.deregister(client, &reg).await;
-            if hits > 0 {
+            {
                 let base_desc = if tmpl.info.description.is_empty() {
                     tmpl.id.clone()
                 } else {
                     tmpl.info.description.clone()
                 };
-                out.push(Match {
-                    template_id: tmpl.id.clone(),
-                    class: class_from_tags(&tmpl.info.tags, &tmpl.id, &tmpl.info.metadata.category),
-                    name: if tmpl.info.name.is_empty() {
+                // Built now, released only if this template's marker calls back.
+                let finding = cfx_finding::Finding::new(
+                    "cortex",
+                    &class_from_tags(&tmpl.info.tags, &tmpl.id, &tmpl.info.metadata.category),
+                    if tmpl.info.name.is_empty() {
                         tmpl.id.clone()
                     } else {
                         tmpl.info.name.clone()
                     },
-                    severity: if tmpl.info.severity.is_empty() {
+                    if tmpl.info.severity.is_empty() {
                         "high".to_string()
                     } else {
                         tmpl.info.severity.clone()
                     },
-                    description: format!(
-                        "{base_desc} Confirmed out-of-band: {hits} callback(s) to {host}."
-                    ),
-                    matched_at: base.to_string(),
-                });
+                    base,
+                )
+                .template(tmpl.id.clone())
+                .describe(format!(
+                    "{base_desc} Confirmed out-of-band: the target called back to a host only this \
+                     scan knows, so the payload was processed."
+                ))
+                .build();
+                if let Ok(mut v) = q.lock() {
+                    v.push(crate::inject::PendingOob { marker, finding });
+                }
             }
             continue;
         }

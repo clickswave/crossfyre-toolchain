@@ -143,6 +143,24 @@ pub struct PendingOob {
 
 pub type OobQueue = std::sync::Mutex<Vec<PendingOob>>;
 
+/// What makes two findings the same bug: class, path, parameter, injection
+/// point. Not the URL - a routing parameter gives one sink many URLs.
+///
+/// Defined once because there are two emit paths. The per-site path reports as
+/// it goes; the out-of-band path reports at the end of the pass when the
+/// callbacks come back. Both have to answer "have we already said this?" the
+/// same way, and when only the first one did, two injection points on one path
+/// could each park a callback and both be reported.
+pub fn finding_identity(f: &Value) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        f["vuln_class"].as_str().unwrap_or(""),
+        path_only(f["url"].as_str().unwrap_or("")),
+        f["param"].as_str().unwrap_or(""),
+        f["location"].as_str().unwrap_or("")
+    )
+}
+
 pub type SeenSet = std::sync::Mutex<HashSet<String>>;
 
 /// True the first time this key is offered. The lock is taken and released
@@ -320,10 +338,31 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
     // waiting on it. Registering per injection point, then blocking on four
     // polls each, is what made a 45-endpoint scan take an hour while the target
     // sat idle at 0.09% CPU.
-    let oob_reg: Option<Arc<crate::oast::OastReg>> = match oast.as_ref() {
-        Some(oc) => oc.register(&client).await.map(Arc::new),
-        None => None,
-    };
+    // Registration is now a single point of failure for the whole pass, where
+    // before every probe registered its own and a transient failure cost only
+    // that probe. So retry it, and if it still fails, SAY SO. A scanner that
+    // quietly stops testing a whole class is the worst failure mode there is:
+    // the report looks the same as a clean one.
+    let mut oob_reg: Option<Arc<crate::oast::OastReg>> = None;
+    if let Some(oc) = oast.as_ref() {
+        for attempt in 0..3 {
+            if let Some(r) = oc.register(&client).await {
+                oob_reg = Some(Arc::new(r));
+                break;
+            }
+            if attempt < 2 {
+                tokio::time::sleep(Duration::from_millis(500 << attempt)).await;
+            }
+        }
+        if oob_reg.is_none() {
+            let _ = tx.send(json!({
+                "type": "log",
+                "message": "out-of-band callbacks are UNAVAILABLE (registration failed after 3 \
+                            attempts). Blind command injection, blind SSRF and blind XXE cannot be \
+                            confirmed in this run; their absence from the results is not evidence."
+            }));
+        }
+    }
     let oob_queue: Arc<OobQueue> = Arc::new(OobQueue::default());
     let xml_seen: Arc<SeenSet> = Arc::new(SeenSet::default());
     let classes = Arc::new(
@@ -448,7 +487,9 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
                 }
             }
             for p in pending {
-                if hosts.iter().any(|h| h.contains(&p.marker)) {
+                if hosts.iter().any(|h| h.contains(&p.marker))
+                    && seen_once(&found_seen, finding_identity(&p.finding))
+                {
                     let _ = tx.send(json!({"type":"finding","data": p.finding}));
                     found += 1;
                 }
@@ -562,7 +603,17 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
         }
     }
     if want("xxe") {
-        for f in crate::xml::probe(&client, &ep.method, &ep.url, oast, &xml_seen).await {
+        for f in crate::xml::probe(
+            &client,
+            &ep.method,
+            &ep.url,
+            oast,
+            oob_reg.as_deref(),
+            Some(&oob_queue),
+            &xml_seen,
+        )
+        .await
+        {
             let _ = tx.send(json!({"type":"finding","data":f}));
             found += 1;
         }
@@ -631,17 +682,7 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
         // time.
         let mut hits = 0usize;
         let emit = |f: Value, hits: &mut usize| {
-            // One bug per (class, path, parameter, location). The same sink
-            // reached through several values of a routing parameter is still
-            // one bug, and one fix.
-            let key = format!(
-                "{}|{}|{}|{}",
-                f["vuln_class"].as_str().unwrap_or(""),
-                path_only(f["url"].as_str().unwrap_or("")),
-                f["param"].as_str().unwrap_or(""),
-                f["location"].as_str().unwrap_or("")
-            );
-            if !seen_once(&found_seen, key) {
+            if !seen_once(&found_seen, finding_identity(&f)) {
                 return;
             }
             let _ = tx.send(json!({"type":"finding","data":f}));

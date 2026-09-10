@@ -105,6 +105,13 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
         }
         _ => crate::oast::OastClient::from_env(),
     };
+    // One correlation for the whole GraphQL pass, and one queue of findings
+    // waiting on it.
+    let oob_reg = match oast.as_ref() {
+        Some(oc) => oc.register(&client).await,
+        None => None,
+    };
+    let oob_queue: crate::inject::OobQueue = Default::default();
 
     let mut found = 0i64;
 
@@ -278,13 +285,49 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
     if want("injection") && !fields.is_empty() {
         for f in &fields {
             for arg in &f.string_args {
-                if let Some(fd) = probe_field_injection(&client, &url, f, arg, oast.as_ref()).await
+                if let Some(fd) = probe_field_injection(
+                    &client,
+                    &url,
+                    f,
+                    arg,
+                    oast.as_ref(),
+                    oob_reg.as_ref(),
+                    Some(&oob_queue),
+                )
+                .await
                 {
                     let _ = tx.send(json!({"type":"finding","data": fd}));
                     found += 1;
                 }
             }
         }
+    }
+
+    // Out-of-band callbacks, collected once for the whole pass.
+    if let (Some(oc), Some(reg)) = (oast.as_ref(), oob_reg.as_ref()) {
+        let pending: Vec<crate::inject::PendingOob> = oob_queue
+            .lock()
+            .map(|mut v| std::mem::take(&mut *v))
+            .unwrap_or_default();
+        if !pending.is_empty() {
+            let mut hosts: Vec<String> = Vec::new();
+            for wait in [0u64, 2000, 4000] {
+                if wait > 0 {
+                    tokio::time::sleep(Duration::from_millis(wait)).await;
+                }
+                hosts = oc.poll_hosts(&client, reg).await;
+                if !hosts.is_empty() {
+                    break;
+                }
+            }
+            for p in pending {
+                if hosts.iter().any(|h| h.contains(&p.marker)) {
+                    let _ = tx.send(json!({"type":"finding","data": p.finding}));
+                    found += 1;
+                }
+            }
+        }
+        oc.deregister(&client, reg).await;
     }
 
     let _ = tx.send(json!({"type":"done","found":found}));
@@ -495,6 +538,8 @@ async fn probe_field_injection(
     field: &Field,
     arg: &str,
     oast: Option<&crate::oast::OastClient>,
+    oob_reg: Option<&crate::oast::OastReg>,
+    oob_queue: Option<&crate::inject::OobQueue>,
 ) -> Option<Value> {
     // --- error-based SQLi: a single quote that a well-formed value does not trigger ---
     let baseline = post(client, url, &build_doc(field, arg, "1")).await;
@@ -533,42 +578,43 @@ async fn probe_field_injection(
     }
 
     // --- blind OS command injection, OAST-confirmed ---
-    if let Some(oc) = oast {
-        if let Some(reg) = oc.register(client).await {
-            let host = oc.host(&reg);
-            for sep in [";", "|", "&&", "$(", "`"] {
-                let close = if sep == "$(" {
-                    ")"
-                } else if sep == "`" {
-                    "`"
-                } else {
-                    ""
-                };
-                let pl = format!("1{sep}curl http://{host}/g{close}");
-                let _ = post(client, url, &build_doc(field, arg, &pl)).await;
-                let pl2 = format!("1{sep}nslookup {host}{close}");
-                let _ = post(client, url, &build_doc(field, arg, &pl2)).await;
-            }
-            for _ in 0..4 {
-                tokio::time::sleep(Duration::from_millis(700)).await;
-                if oc.poll(client, &reg).await > 0 {
-                    oc.deregister(client, &reg).await;
-                    return Some(finding(
-                        "cmdi",
-                        "OS command injection via GraphQL argument (blind, OAST-confirmed)",
-                        "critical",
-                        url,
-                        "POST",
-                        &format!(
-                            "A shell metacharacter injected into the `{arg}` argument of `{}` produced an out-of-band callback: the value is passed to a shell.",
-                            field.name
-                        ),
-                    )
-                    .param(arg)
-                    .build());
-                }
-            }
-            oc.deregister(client, &reg).await;
+    //
+    // Fire and park, for the reason inject.rs does: a schema of any size has
+    // many (field, argument) pairs, and blocking four polls on each one to
+    // learn that almost none of them reach a shell is the whole scan's time
+    // spent waiting on nothing.
+    if let (Some(oc), Some(reg), Some(q)) = (oast, oob_reg, oob_queue) {
+        let (host, marker) = oc.host_marked(reg);
+        for sep in [";", "|", "&&", "$(", "`"] {
+            let close = if sep == "$(" {
+                ")"
+            } else if sep == "`" {
+                "`"
+            } else {
+                ""
+            };
+            let pl = format!("1{sep}curl http://{host}/g{close}");
+            let _ = post(client, url, &build_doc(field, arg, &pl)).await;
+            let pl2 = format!("1{sep}nslookup {host}{close}");
+            let _ = post(client, url, &build_doc(field, arg, &pl2)).await;
+        }
+        if let Ok(mut v) = q.lock() {
+            v.push(crate::inject::PendingOob {
+                marker,
+                finding: finding(
+                    "cmdi",
+                    "OS command injection via GraphQL argument (blind, OAST-confirmed)",
+                    "critical",
+                    url,
+                    "POST",
+                    &format!(
+                        "A shell metacharacter injected into the `{arg}` argument of `{}` produced an out-of-band callback: the value is passed to a shell.",
+                        field.name
+                    ),
+                )
+                .param(arg)
+                .build(),
+            });
         }
     }
     None

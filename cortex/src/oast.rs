@@ -113,18 +113,6 @@ impl OastClient {
         }
     }
 
-    /// The callback host for a correlation: `<corr><rand>.<domain>`, with the domain
-    /// drawn at random from the pool.
-    pub fn host(&self, reg: &OastReg) -> String {
-        use rand::Rng;
-        let domain = if self.domains.len() == 1 {
-            &self.domains[0]
-        } else {
-            &self.domains[rand::thread_rng().gen_range(0..self.domains.len())]
-        };
-        format!("{}{}.{}", reg.corr_id, rand_alnum(13), domain)
-    }
-
     /// The callback host for a correlation, plus the marker that identifies THIS
     /// payload within it.
     ///
@@ -174,34 +162,6 @@ impl OastClient {
             }
         }
         out
-    }
-
-    /// Poll for interactions on a correlation, returning how many we could decrypt
-    /// (i.e. real callbacks sealed to our key).
-    pub async fn poll(&self, http: &Client, reg: &OastReg) -> u64 {
-        let url = format!(
-            "{}/poll?corr_id={}&secret={}",
-            self.api_base, reg.corr_id, reg.secret
-        );
-        let resp = match http.get(&url).timeout(Duration::from_secs(6)).send().await {
-            Ok(r) => r,
-            Err(_) => return 0,
-        };
-        let body: Value = match resp.json().await {
-            Ok(b) => b,
-            Err(_) => return 0,
-        };
-        let mut n = 0u64;
-        if let Some(items) = body["interactions"].as_array() {
-            for it in items {
-                if let Some(enc) = it["enc"].as_str()
-                    && self.decrypt(enc).is_some()
-                {
-                    n += 1;
-                }
-            }
-        }
-        n
     }
 
     /// Decrypt a sealed interaction blob {k,n,c} with our private key.

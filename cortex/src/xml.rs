@@ -74,6 +74,8 @@ pub async fn probe(
     method: &str,
     url: &str,
     oast: Option<&crate::oast::OastClient>,
+    oob_reg: Option<&crate::oast::OastReg>,
+    oob_queue: Option<&crate::inject::OobQueue>,
     seen: &crate::inject::SeenSet,
 ) -> Vec<Value> {
     let mut out = Vec::new();
@@ -200,9 +202,9 @@ pub async fn probe(
     // Blind XXE: the parser resolves the entity but never echoes it back, which
     // is the common case on a service that returns a fixed response shape. Only
     // an out-of-band callback can see it.
-    if let Some(oc) = oast {
-        if let Some(reg) = oc.register(client).await {
-            let host = oc.host(&reg);
+    if let (Some(oc), Some(reg), Some(q)) = (oast, oob_reg, oob_queue) {
+        {
+            let (host, marker) = oc.host_marked(reg);
             let doctypes = [
                 format!("<!DOCTYPE cfx [<!ENTITY cfxe SYSTEM \"http://{host}/x\">]>"),
                 // Parameter entity: reaches parsers that refuse a general entity
@@ -214,18 +216,12 @@ pub async fn probe(
                     let _ = probe::send(client, m, &base, Some((&body, ct))).await;
                 }
             }
-            let mut hits = 0;
-            for _ in 0..4 {
-                tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-                hits = oc.poll(client, &reg).await;
-                if hits > 0 {
-                    break;
-                }
-            }
-            oc.deregister(client, &reg).await;
-            if hits > 0 {
-                out.push(
-                    Finding::new(
+            // Parked, not waited on: one poll at the end of the pass decides.
+            if let Ok(mut v) = q.lock() {
+                v.push(crate::inject::PendingOob {
+                    marker,
+                    finding: (
+                        Finding::new(
                         "cortex-xml",
                         "xxe",
                         "XML external entity (XXE, blind - out-of-band confirmed)",
@@ -241,8 +237,9 @@ pub async fn probe(
                          and reaches internal services the application server can see. Disable \
                          external entities and DTD processing.",
                     )
-                    .build(),
-                );
+                    .build()
+                    ),
+                });
             }
         }
     }

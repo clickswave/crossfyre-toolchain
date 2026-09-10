@@ -431,6 +431,28 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
             .as_ref()
             .and_then(|s| crate::oast::OastClient::from_spec(s.domains.clone(), &s.api_url))
             .or_else(crate::oast::OastClient::from_env);
+        // One correlation for the scan's out-of-band templates, polled once at
+        // the end rather than six seconds per template.
+        let mut oob_reg = None;
+        if let Some(oc) = oast.as_ref() {
+            for attempt in 0..3 {
+                if let Some(r) = oc.register(&client).await {
+                    oob_reg = Some(r);
+                    break;
+                }
+                if attempt < 2 {
+                    tokio::time::sleep(Duration::from_millis(500 << attempt)).await;
+                }
+            }
+            if oob_reg.is_none() {
+                let _ = tx.send(json!({
+                    "type": "log",
+                    "message": "out-of-band callbacks are UNAVAILABLE (registration failed); \
+                                out-of-band templates cannot be confirmed in this run."
+                }));
+            }
+        }
+        let oob_queue: crate::inject::OobQueue = Default::default();
 
         for tmpl in template::BUILTIN.iter().chain(external.iter()) {
             // Skipped before the progress counter, because `total` above counts
@@ -445,9 +467,16 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
                 tmpl.info.severity.to_lowercase()
             };
             if allow(&sev) {
-                for m in
-                    template::eval_template(&client, &base, tmpl, oast.as_ref(), params.evasive)
-                        .await
+                for m in template::eval_template(
+                    &client,
+                    &base,
+                    tmpl,
+                    oast.as_ref(),
+                    oob_reg.as_ref(),
+                    Some(&oob_queue),
+                    params.evasive,
+                )
+                .await
                 {
                     found += 1;
                     let _ = tx.send(
@@ -460,6 +489,33 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
             }
             done += 1;
             let _ = tx.send(json!({"type":"progress","processed": done, "total": total}));
+        }
+
+        // Out-of-band template callbacks, collected once for the whole scan.
+        if let (Some(oc), Some(reg)) = (oast.as_ref(), oob_reg.as_ref()) {
+            let pending: Vec<crate::inject::PendingOob> = oob_queue
+                .lock()
+                .map(|mut v| std::mem::take(&mut *v))
+                .unwrap_or_default();
+            if !pending.is_empty() {
+                let mut hosts: Vec<String> = Vec::new();
+                for wait in [0u64, 2000, 4000] {
+                    if wait > 0 {
+                        tokio::time::sleep(Duration::from_millis(wait)).await;
+                    }
+                    hosts = oc.poll_hosts(&client, reg).await;
+                    if !hosts.is_empty() {
+                        break;
+                    }
+                }
+                for p in pending {
+                    if hosts.iter().any(|h| h.contains(&p.marker)) {
+                        found += 1;
+                        let _ = tx.send(json!({"type":"finding","data": p.finding}));
+                    }
+                }
+            }
+            oc.deregister(&client, reg).await;
         }
     }
 
