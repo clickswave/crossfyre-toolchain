@@ -175,6 +175,64 @@ fn neighbours(value: &str) -> Vec<String> {
     }
 }
 
+/// Field names whose values are identifiers a caller can put back in a path.
+const ID_FIELDS: &[&str] = &[
+    "id", "uuid", "guid", "slug", "username", "user", "name", "code", "key", "handle", "login",
+];
+
+/// Ask the collection endpoint which identifiers actually exist.
+///
+/// A path parameter declared by a spec arrives filled with a made-up sample:
+/// VAmPI's `/users/v1/{username}` reaches us as `/users/v1/1`, which is nobody,
+/// so the endpoint answers with no record and there is nothing to compare. That
+/// is not the endpoint being safe, it is us asking for a user that does not
+/// exist.
+///
+/// A human tests this by listing the collection first and then reading two of
+/// the records it names, so that is what this does: drop the identifier segment,
+/// GET the collection, and harvest the values of id-ish fields. A wrong guess
+/// costs one request and proves nothing, which is why the oracle downstream
+/// still requires two different people's data before it reports.
+async fn learn_identifiers(client: &Client, url: &str, idx: usize) -> Vec<String> {
+    let Some(head) = url.split_once("://") else {
+        return Vec::new();
+    };
+    let (scheme, rest) = head;
+    let path_and_q = rest;
+    let path = path_and_q.split('?').next().unwrap_or("");
+    let segs: Vec<&str> = path.split('/').collect();
+    if idx == 0 || idx >= segs.len() {
+        return Vec::new();
+    }
+    let collection = format!("{scheme}://{}", segs[..idx].join("/"));
+    let Some(resp) = crate::probe::send(client, "GET", &collection, None).await else {
+        return Vec::new();
+    };
+    if !(200..300).contains(&resp.status) {
+        return Vec::new();
+    }
+    let Some(doc) = parse(&resp.body) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    collect(&doc, ID_FIELDS, &mut found, 0);
+    let mut out: Vec<String> = Vec::new();
+    for (_k, v) in found {
+        // Only values that can sit in a path segment: no spaces, no slashes,
+        // nothing long enough to be prose rather than a key.
+        if v.is_empty() || v.len() > 64 || v.contains([' ', '/', '?', '#']) {
+            continue;
+        }
+        if !out.contains(&v) {
+            out.push(v);
+        }
+        if out.len() >= 4 {
+            break;
+        }
+    }
+    out
+}
+
 /// `alternatives` is (segment index, other values observed at that position).
 /// `declared` are positions the endpoint itself says are parameters, used when
 /// the corpus has only ever seen one value there.
@@ -189,10 +247,16 @@ pub async fn probe(
         return None; // reading somebody's record is a GET
     }
     let first = crate::probe::send(client, "GET", url, None).await?;
-    if !(200..300).contains(&first.status) {
-        return None;
-    }
-    let doc = parse(&first.body)?;
+    // A 404 here is not an answer about the endpoint, it is an answer about the
+    // identifier we were handed. A spec-declared path parameter arrives filled
+    // with a made-up sample, so the common case is that we asked for a record
+    // that does not exist. Fall through to the collection lookup rather than
+    // treating "no such user" as "no such problem".
+    let doc = if (200..300).contains(&first.status) {
+        parse(&first.body).unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
 
     // --- 1. credentials in a response served to nobody in particular --------
     let mut secrets = Vec::new();
@@ -227,7 +291,71 @@ pub async fn probe(
     // --- 2. two identifiers, two people -------------------------------------
     let mut personal = Vec::new();
     collect(&doc, PERSONAL, &mut personal, 0);
+
+    // Nothing personal came back. Before concluding the endpoint is safe, check
+    // whether we simply asked for a record that does not exist: a spec-declared
+    // path parameter arrives filled with a made-up sample. If the collection
+    // names real identifiers, read two of them and compare those instead.
     if personal.is_empty() {
+        let mut positions: Vec<usize> = declared.to_vec();
+        positions.extend(alternatives.iter().map(|(i, _)| *i));
+        positions.sort_unstable();
+        positions.dedup();
+        for idx in positions {
+            let ids = learn_identifiers(client, url, idx).await;
+            if ids.len() < 2 {
+                continue;
+            }
+            for pair in ids.windows(2) {
+                let (Some(ua), Some(ub)) = (
+                    with_segment(url, idx, &pair[0]),
+                    with_segment(url, idx, &pair[1]),
+                ) else {
+                    continue;
+                };
+                let (Some(ra), Some(rb)) = (
+                    crate::probe::send(client, "GET", &ua, None).await,
+                    crate::probe::send(client, "GET", &ub, None).await,
+                ) else {
+                    continue;
+                };
+                if !(200..300).contains(&ra.status) || !(200..300).contains(&rb.status) {
+                    continue;
+                }
+                let (Some(da), Some(db)) = (parse(&ra.body), parse(&rb.body)) else {
+                    continue;
+                };
+                let (mut pa, mut pb) = (Vec::new(), Vec::new());
+                collect(&da, PERSONAL, &mut pa, 0);
+                collect(&db, PERSONAL, &mut pb, 0);
+                let changed = differing(&pa, &pb);
+                if changed.is_empty() {
+                    continue;
+                }
+                let mut fields = changed;
+                fields.sort();
+                return Some(
+                    Finding::new(
+                        "cortex-exposure",
+                        "excessive_exposure",
+                        "Personal records readable without authentication, by identifier",
+                        "high",
+                        &ua,
+                    )
+                    .method("GET")
+                    .location("path")
+                    .describe(format!(
+                        "The collection at this path names its own members, and reading two of \
+                         them with no credentials returned two different people's records: {} \
+                         differ between `{ua}` and `{ub}`. One record could belong to the caller; \
+                         two cannot. Anyone who can list the collection can then read every \
+                         record in it (OWASP API3: Excessive Data Exposure).",
+                        fields.join(", ")
+                    ))
+                    .build(),
+                );
+            }
+        }
         return None;
     }
 
