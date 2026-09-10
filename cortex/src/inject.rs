@@ -627,6 +627,25 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
                     pace_ms / 1000
                 )
             }));
+            // And where it went. Engine-seconds, so the column sums past the
+            // pass duration - workers run concurrently - but the ranking is
+            // what decides which oracle is worth making cheaper.
+            let by_class = crate::probe::meter::by_class();
+            if !by_class.is_empty() {
+                let line = by_class
+                    .iter()
+                    .filter(|(_, ms, _)| *ms >= 1000)
+                    .take(8)
+                    .map(|(c, ms, n)| format!("{c} {}s/{n}", ms / 1000))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if !line.is_empty() {
+                    let _ = tx.send(json!({
+                        "type": "log",
+                        "message": format!("injection pass, engine-seconds by class: {line}")
+                    }));
+                }
+            }
         }
     }
 
@@ -728,19 +747,21 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
     let mut sites = 0usize;
     let mut starved = 0usize;
     if want("inventory") {
-        for f in probe_inventory(&client, &ep, &inv_seen).await {
+        for f in crate::probe::spent("inventory", probe_inventory(&client, &ep, &inv_seen)).await {
             let _ = tx.send(json!({"type":"finding","data":f}));
             found += 1;
         }
     }
     if want("ratelimit") {
-        if let Some(f) = probe_ratelimit(&client, &ep, &rl_seen).await {
+        if let Some(f) =
+            crate::probe::spent("ratelimit", probe_ratelimit(&client, &ep, &rl_seen)).await
+        {
             let _ = tx.send(json!({"type":"finding","data":f}));
             found += 1;
         }
     }
     if want("cors") {
-        if let Some(f) = probe_cors(&client, &ep, &cors_seen).await {
+        if let Some(f) = crate::probe::spent("cors", probe_cors(&client, &ep, &cors_seen)).await {
             let _ = tx.send(json!({"type":"finding","data":f}));
             found += 1;
         }
@@ -752,7 +773,7 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
     if classes.iter().any(|c| c == "smuggling")
         && crate::inject::seen_once(&xml_seen, format!("smuggle:{}", host_of(&ep.url)))
     {
-        if let Some(f) = crate::smuggle::probe(&ep.url).await {
+        if let Some(f) = crate::probe::spent("smuggling", crate::smuggle::probe(&ep.url)).await {
             let _ = tx.send(json!({"type":"finding","data":f}));
             found += 1;
         }
@@ -768,7 +789,7 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
             })
             .is_ok();
         if took {
-            let out = crate::race::probe(recipe, &ep).await;
+            let out = crate::probe::spent("race", crate::race::probe(recipe, &ep)).await;
             if let Some(msg) = out.note {
                 let _ = tx.send(json!({"type": "log", "message": format!("   inject: {msg}")}));
             }
@@ -779,14 +800,17 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
         }
     }
     if want("xxe") {
-        for f in crate::xml::probe(
-            &client,
-            &ep.method,
-            &ep.url,
-            oast,
-            oob_reg.as_deref(),
-            Some(&oob_queue),
-            &xml_seen,
+        for f in crate::probe::spent(
+            "xxe",
+            crate::xml::probe(
+                &client,
+                &ep.method,
+                &ep.url,
+                oast,
+                oob_reg.as_deref(),
+                Some(&oob_queue),
+                &xml_seen,
+            ),
         )
         .await
         {
@@ -803,8 +827,11 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
             .map(|m| m.iter().map(|(i, v)| (*i, v.clone())).collect())
             .unwrap_or_default();
         let declared = declared_path_indices(&ep);
-        if let Some(f) =
-            crate::exposure::probe(&client, &ep.method, &ep.url, &alts, &declared).await
+        if let Some(f) = crate::probe::spent(
+            "exposure",
+            crate::exposure::probe(&client, &ep.method, &ep.url, &alts, &declared),
+        )
+        .await
         {
             let _ = tx.send(json!({"type":"finding","data":f}));
             found += 1;
@@ -824,7 +851,9 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_millis(500 * attempt)).await;
             }
-            if let Some(r) = send_site(&client, &site, &site.base_value).await {
+            if let Some(r) =
+                crate::probe::spent("baseline", send_site(&client, &site, &site.base_value)).await
+            {
                 baseline = Some(r);
                 break;
             }
@@ -865,25 +894,33 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
             *hits += 1;
         };
         if want("sqli") {
-            if let Some(f) = probe_sqli(&client, &site, &baseline).await {
+            if let Some(f) =
+                crate::probe::spent("sqli", probe_sqli(&client, &site, &baseline)).await
+            {
                 emit(f, &mut hits);
             }
         }
         if want("cmdi") {
-            if let Some(f) =
-                probe_cmdi(&client, &site, oast, oob_reg.as_deref(), Some(&oob_queue)).await
+            if let Some(f) = crate::probe::spent(
+                "cmdi",
+                probe_cmdi(&client, &site, oast, oob_reg.as_deref(), Some(&oob_queue)),
+            )
+            .await
             {
                 emit(f, &mut hits);
             }
         }
         if want("ssrf") {
-            if let Some(f) = probe_ssrf(
-                &client,
-                client_nr.as_ref(),
-                &site,
-                oast,
-                oob_reg.as_deref(),
-                Some(&oob_queue),
+            if let Some(f) = crate::probe::spent(
+                "ssrf",
+                probe_ssrf(
+                    &client,
+                    client_nr.as_ref(),
+                    &site,
+                    oast,
+                    oob_reg.as_deref(),
+                    Some(&oob_queue),
+                ),
             )
             .await
             {
@@ -891,22 +928,23 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
             }
         }
         if want("xss") {
-            if let Some(f) = probe_xss(&client, &site).await {
+            if let Some(f) = crate::probe::spent("xss", probe_xss(&client, &site)).await {
                 emit(f, &mut hits);
             }
         }
         if want("lfi") {
-            if let Some(f) = probe_lfi(&client, &site, &baseline).await {
+            if let Some(f) = crate::probe::spent("lfi", probe_lfi(&client, &site, &baseline)).await
+            {
                 emit(f, &mut hits);
             }
         }
         if want("ssti") {
-            if let Some(f) = probe_ssti(&client, &site).await {
+            if let Some(f) = crate::probe::spent("ssti", probe_ssti(&client, &site)).await {
                 emit(f, &mut hits);
             }
         }
         if want("crlf") {
-            if let Some(f) = probe_crlf(&client, &site).await {
+            if let Some(f) = crate::probe::spent("crlf", probe_crlf(&client, &site)).await {
                 emit(f, &mut hits);
             }
         }
@@ -914,18 +952,27 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
         // "everything", and this one must never be part of that: it changes the
         // target's state and cannot be undone from outside.
         if classes.iter().any(|c| c == "proto_pollution") {
-            if let Some(f) = probe_proto_pollution(&client, &site, &baseline).await {
+            if let Some(f) = crate::probe::spent(
+                "proto_pollution",
+                probe_proto_pollution(&client, &site, &baseline),
+            )
+            .await
+            {
                 emit(f, &mut hits);
             }
         }
         if want("nosql") {
-            if let Some(f) = probe_nosql(&client, &site, &baseline).await {
+            if let Some(f) =
+                crate::probe::spent("nosql", probe_nosql(&client, &site, &baseline)).await
+            {
                 emit(f, &mut hits);
             }
         }
         if want("open_redirect") {
             if let Some(nr) = client_nr.as_ref() {
-                if let Some(f) = probe_open_redirect(nr, &site).await {
+                if let Some(f) =
+                    crate::probe::spent("open_redirect", probe_open_redirect(nr, &site)).await
+                {
                     emit(f, &mut hits);
                 }
             }

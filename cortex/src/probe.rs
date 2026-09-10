@@ -132,7 +132,9 @@ pub fn build_client_no_redirect(
 /// where a scan's time goes cost several hours today; this is the cheap way to
 /// stop guessing.
 pub mod meter {
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{LazyLock, Mutex};
 
     pub static REQUESTS: AtomicU64 = AtomicU64::new(0);
     pub static WAIT_MS: AtomicU64 = AtomicU64::new(0);
@@ -153,7 +155,48 @@ pub mod meter {
         WAIT_MS.store(0, Ordering::Relaxed);
         PACE_MS.store(0, Ordering::Relaxed);
         FAILURES.store(0, Ordering::Relaxed);
+        CLASSES.lock().unwrap().clear();
     }
+
+    /// Engine-time per detection class, and how many times each one ran.
+    ///
+    /// "The scan sent 41,000 requests" says the pass was expensive. It does not
+    /// say which check was expensive, and the difference decides whether the
+    /// answer is a faster oracle, a cheaper one, or not running it at all. The
+    /// first attempt at this problem was three hours of guessing.
+    ///
+    /// These are engine-seconds, not wall-clock: classes run concurrently
+    /// across workers, so the column sums to more than the pass took. The
+    /// ratios are the point.
+    static CLASSES: LazyLock<Mutex<BTreeMap<&'static str, (u64, u64)>>> =
+        LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+    pub fn charge(class: &'static str, d: std::time::Duration) {
+        let mut g = CLASSES.lock().unwrap();
+        let e = g.entry(class).or_insert((0, 0));
+        e.0 += d.as_millis() as u64;
+        e.1 += 1;
+    }
+
+    /// (class, milliseconds, calls), most expensive first.
+    pub fn by_class() -> Vec<(&'static str, u64, u64)> {
+        let mut v: Vec<_> = CLASSES
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, (ms, n))| (*k, *ms, *n))
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v
+    }
+}
+
+/// Run one class's probe and charge the meter for what it took.
+pub async fn spent<T>(class: &'static str, fut: impl std::future::Future<Output = T>) -> T {
+    let t0 = Instant::now();
+    let out = fut.await;
+    meter::charge(class, t0.elapsed());
+    out
 }
 
 mod pace {
