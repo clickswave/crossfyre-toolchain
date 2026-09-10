@@ -1,6 +1,6 @@
 [package]
 name = "mach"
-version = "0.0.13"
+version = "0.0.14"
 edition = "2024"
 homepage = "https://clickswave.org"
 repository = "https://github.com/clickswave/crossfyre_toolchain"

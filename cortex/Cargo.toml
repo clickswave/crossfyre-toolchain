@@ -1,6 +1,6 @@
 [package]
 name = "cortex"
-version = "0.0.20"
+version = "0.0.21"
 edition = "2024"
 homepage = "https://clickswave.org"
 repository = "https://github.com/clickswave/crossfyre_toolchain"

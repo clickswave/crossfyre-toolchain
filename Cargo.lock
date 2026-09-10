@@ -949,7 +949,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "cortex"
-version = "0.0.20"
+version = "0.0.21"
 dependencies = [
  "adaptive",
  "aes-gcm",
@@ -2665,7 +2665,7 @@ dependencies = [
 
 [[package]]
 name = "mach"
-version = "0.0.13"
+version = "0.0.14"
 dependencies = [
  "adaptive",
  "base64 0.22.1",
