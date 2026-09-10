@@ -1028,11 +1028,8 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
             }
         }
         if want("deserialization") {
-            if let Some(f) = crate::probe::spent(
-                "deserialization",
-                probe_deserialization(&client, &site, &baseline),
-            )
-            .await
+            if let Some(f) =
+                crate::probe::spent("deserialization", probe_deserialization(&client, &site)).await
             {
                 emit(f, &mut hits);
             }
@@ -2221,9 +2218,9 @@ async fn probe_ssti(client: &Client, site: &Site) -> Option<Value> {
 /// One request asks the question; a second one answers it. See `deserial` for
 /// why this is an error-differential check rather than a gadget chain, and why
 /// that is not a compromise.
-async fn probe_deserialization(client: &Client, site: &Site, baseline: &Resp) -> Option<Value> {
+async fn probe_deserialization(client: &Client, site: &Site) -> Option<Value> {
     let probe = send_site(client, site, crate::deserial::PROBE_VALUE).await?;
-    let format = crate::deserial::accused(&probe.body, &baseline.body)?;
+    let format = crate::deserial::accused(&probe.body)?;
 
     // The complaint alone would be a guess: some pages carry a parser's name in
     // a stack trace for reasons of their own, and only the baseline was checked

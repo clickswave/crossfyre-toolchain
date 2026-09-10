@@ -170,15 +170,24 @@ pub const FORMATS: &[Format] = &[
 
 /// Which deserializer, if any, complained in this response.
 ///
-/// `baseline` is the same page answered for the parameter's own value: a
-/// signature that was already there before we touched anything is a property of
-/// the page, not an answer to the probe.
-pub fn accused(body: &str, baseline: &str) -> Option<&'static Format> {
+/// Deliberately no baseline comparison. The obvious guard - "the signature must
+/// not already be there for the parameter's own value" - is wrong here, and a
+/// live PHP endpoint proved it: the baseline value is not a valid serialized
+/// object either, so `unserialize()` complains about that too, and the guard
+/// suppressed the finding on an application doing exactly the thing being looked
+/// for. It also made the RailsGoat detection an accident, since that one only
+/// survived because Ruby happens to word "too short" and "cannot be read"
+/// differently.
+///
+/// A page that carries a parser's name whatever it is sent is excluded by the
+/// step that follows instead: hand the deserializer something valid, and if the
+/// complaint does not stop, nothing was parsing our bytes. That is the stronger
+/// test, and it is the only one this needs.
+pub fn accused(body: &str) -> Option<&'static Format> {
     let b = body.to_lowercase();
-    let base = baseline.to_lowercase();
     FORMATS
         .iter()
-        .find(|f| f.errors.iter().any(|e| b.contains(e) && !base.contains(e)))
+        .find(|f| f.errors.iter().any(|e| b.contains(e)))
 }
 
 /// True when this response still carries the accused parser's complaint.
@@ -222,32 +231,29 @@ mod tests {
     }
 
     #[test]
-    fn a_signature_already_on_the_page_is_not_an_answer() {
-        let page = "Error: unserialize(): Error at offset 0 of 4 bytes";
-        // Present in the probe response AND in the baseline: the page always
-        // says it, so it says nothing about our input.
-        assert!(accused(page, page).is_none());
-        assert!(accused(page, "ok").is_some());
+    fn an_endpoint_that_errors_on_its_own_value_too_is_still_accused() {
+        // The baseline value is not a valid serialized object either, so a real
+        // deserializing endpoint complains about BOTH. Excluding that case
+        // suppressed the finding on a live PHP endpoint doing precisely what
+        // this looks for. What separates it from a page that always says this
+        // is the confirmation step, not a baseline comparison.
+        let page = "failed: unserialize(): Error at offset 0 of 24 bytes";
+        assert_eq!(accused(page).unwrap().name, "php_unserialize");
     }
 
     #[test]
     fn formats_are_told_apart() {
         assert_eq!(
-            accused("TypeError: marshal data too short", "")
-                .unwrap()
-                .name,
+            accused("TypeError: marshal data too short").unwrap().name,
             "ruby_marshal"
         );
         assert_eq!(
-            accused(
-                "java.io.StreamCorruptedException: invalid stream header",
-                ""
-            )
-            .unwrap()
-            .name,
+            accused("java.io.StreamCorruptedException: invalid stream header")
+                .unwrap()
+                .name,
             "java_serialization"
         );
-        assert!(accused("HTTP 500 Internal Server Error", "").is_none());
+        assert!(accused("HTTP 500 Internal Server Error").is_none());
     }
 
     /// Minimal base64 decoder, tests only: the point is to check the tables in
