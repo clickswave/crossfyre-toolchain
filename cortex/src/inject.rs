@@ -485,7 +485,7 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> i64 {
             }
         }
         if want("ssrf") && hits < MAX_CLASSES_PER_SITE {
-            if let Some(f) = probe_ssrf(&client, &site, oast).await {
+            if let Some(f) = probe_ssrf(&client, client_nr.as_ref(), &site, oast).await {
                 emit(f, &mut hits);
             }
         }
@@ -1161,6 +1161,7 @@ fn looks_like_url(v: &str) -> bool {
 /// managed/BYO OAST client the cmdi probe uses.
 async fn probe_ssrf(
     client: &Client,
+    client_nr: Option<&Client>,
     site: &Site,
     oast: Option<&crate::oast::OastClient>,
 ) -> Option<Value> {
@@ -1172,12 +1173,38 @@ async fn probe_ssrf(
     }
     let reg = oc.register(client).await?;
     let host = oc.host(&reg);
+    // Send the payloads with a client that does NOT follow redirects.
+    //
+    // An open redirect answers 302 to wherever you point it, and a
+    // redirect-following client then fetches our own listener - so the callback
+    // arrives, and "the server fetched it" is false: WE fetched it. That is not
+    // hypothetical; it reported SSRF on Crawlground's `/api/redirect`, which
+    // only ever sets a Location header. Refusing to follow makes the callback
+    // mean what the finding says it means.
+    let sender = client_nr.unwrap_or(client);
+    let mut redirected_to_listener = false;
     for payload in [
         format!("http://{host}/"),
         format!("https://{host}/"),
         format!("http://{host}/{}", site.param),
     ] {
-        let _ = send_site(client, site, &payload).await;
+        if let Some(r) = send_site(sender, site, &payload).await {
+            if (300..400).contains(&r.status)
+                && r.location
+                    .as_deref()
+                    .map(|l| l.contains(&host))
+                    .unwrap_or(false)
+            {
+                redirected_to_listener = true;
+            }
+        }
+    }
+    if redirected_to_listener {
+        // The endpoint pointed a browser at our listener rather than fetching
+        // it. That is an open redirect, which probe_open_redirect reports, and
+        // it is not SSRF.
+        oc.deregister(client, &reg).await;
+        return None;
     }
     for _ in 0..4 {
         tokio::time::sleep(Duration::from_millis(700)).await;
