@@ -249,7 +249,11 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
         params.auth.as_ref(),
         &params.target,
         params.timeout_ms,
-        SLEEP_SECS * 1000 + 3000,
+        // Room for the DOUBLED sleep the time-based oracle uses to prove the
+        // delay tracks the number we asked for. Sized for one sleep, the
+        // confirming request times out and every real time-based finding is
+        // lost with the false ones.
+        SLEEP_SECS * 2 * 1000 + 3000,
     ) {
         Some(c) => c,
         None => {
@@ -1185,21 +1189,51 @@ async fn probe_cmdi(
             let ctrl = send_site(client, site, &format!("{base}{sep}sleep 0{close}")).await;
             let again = send_site(client, site, &pl).await;
             let ctrl_fast = ctrl
+                .as_ref()
                 .map(|x| x.elapsed_ms < SLEEP_THRESHOLD_MS)
                 .unwrap_or(false);
             let repro = again
+                .as_ref()
                 .map(|x| x.elapsed_ms >= SLEEP_THRESHOLD_MS)
                 .unwrap_or(false);
-            if ctrl_fast && repro {
+
+            // The delay has to TRACK the number we asked for, not merely exist.
+            //
+            // A threshold plus a control is not enough on a target that is
+            // already slow: the payload request, the control and the retry are
+            // three different moments, and a target under load answers some
+            // quickly and some slowly whatever we send. Measured against
+            // Mutillidae during a concurrent pass, that produced eight
+            // command-injection findings on parameters with no shell behind
+            // them at all - `do=logout` among them, which answers in 8ms when
+            // asked on its own.
+            //
+            // Doubling the sleep is the discriminator. A real shell takes
+            // roughly twice as long; a slow application has no reason to.
+            let scales = if repro {
+                let long = format!("{base}{sep}sleep {}{close}", SLEEP_SECS * 2);
+                let base_ms = again.as_ref().map(|x| x.elapsed_ms).unwrap_or(0);
+                match send_site(client, site, &long).await {
+                    // Allow for jitter and for the app's own cost, which is
+                    // present in both measurements: require most of the extra
+                    // sleep to show up.
+                    Some(x) => x.elapsed_ms >= base_ms + (SLEEP_SECS as u128 * 1000 * 6 / 10),
+                    None => false,
+                }
+            } else {
+                false
+            };
+            if ctrl_fast && repro && scales {
                 return Some(finding(
                     "cmdi",
                     "OS command injection (time-based blind)",
                     "critical",
                     site,
                     format!(
-                        "A shell `sleep {SLEEP_SECS}` injected into the {} (separator `{sep}`) delayed the response past {}ms while `sleep 0` returned promptly and the delay reproduced.",
+                        "A shell `sleep {SLEEP_SECS}` injected into the {} (separator `{sep}`) delayed the response past {}ms while `sleep 0` returned promptly, the delay reproduced, and doubling the sleep to {}s roughly doubled the delay. The response time tracks the number we asked for, which a merely slow application does not do.",
                         site.where_label(),
-                        SLEEP_THRESHOLD_MS
+                        SLEEP_THRESHOLD_MS,
+                        SLEEP_SECS * 2
                     ),
                 ));
             }
