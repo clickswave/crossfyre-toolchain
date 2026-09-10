@@ -16,6 +16,7 @@ mod inject;
 mod libs;
 mod oast;
 mod probe;
+mod race;
 mod rawhttp;
 mod smuggle;
 mod solver;

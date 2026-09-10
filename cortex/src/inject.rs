@@ -21,6 +21,7 @@ use cfx_finding::Finding;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use transport::Client;
@@ -116,6 +117,9 @@ pub struct InjEndpoint {
     pub path_params: Vec<Value>,
 }
 
+/// How many endpoints get a race burst in one scan. Small on purpose: see
+/// `race`, where every probe is a state change that cannot be undone.
+const MAX_RACE_ENDPOINTS: usize = 3;
 const SLEEP_SECS: u64 = 5;
 const SLEEP_THRESHOLD_MS: u128 = 3800;
 // Two large coprime factors for the reflected-cmdi echo oracle. Their product is a distinctive
@@ -440,6 +444,33 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
             .collect::<Vec<String>>(),
     );
     let oast = oast.map(Arc::new);
+    // Race conditions run only when named. Building the recipe here rather than
+    // per endpoint keeps the identity fixed for the whole scan, which is what
+    // makes the burst a race between one user's requests instead of eight
+    // users' first requests.
+    let race = classes.iter().any(|c| c == "race").then(|| {
+        Arc::new(crate::race::Recipe {
+            evasive: params.evasive,
+            identify: params.identify.clone(),
+            auth: params.auth.clone(),
+            target: params.target.clone(),
+            timeout_ms: params.timeout_ms,
+        })
+    });
+    let race_budget = Arc::new(AtomicUsize::new(if race.is_some() {
+        MAX_RACE_ENDPOINTS
+    } else {
+        0
+    }));
+    if race.is_some() {
+        let _ = tx.send(json!({
+            "type": "log",
+            "message": format!(
+                "race-condition checks are ON for up to {MAX_RACE_ENDPOINTS} endpoints. Each one sends {} identical requests at once and then two more, and every one of them is a real state change on the target: this check cannot ask its question without doing so.",
+                crate::race::BURST
+            )
+        }));
+    }
     let mut tasks = params.tasks.clamp(1, 16);
 
     let mut found = 0i64;
@@ -498,6 +529,8 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
                 rl_seen: Arc::clone(&rl_seen),
                 cors_seen: Arc::clone(&cors_seen),
                 found_seen: Arc::clone(&found_seen),
+                race: race.clone(),
+                race_budget: Arc::clone(&race_budget),
                 xml_seen: Arc::clone(&xml_seen),
                 tx: tx.clone(),
             };
@@ -649,6 +682,15 @@ struct EndpointCtx {
     cors_seen: Arc<SeenSet>,
     found_seen: Arc<SeenSet>,
     xml_seen: Arc<SeenSet>,
+    /// Present only when the caller named the `race` class. Carries what the
+    /// race probe needs to build its own connections, because the shared client
+    /// is paced against the host and pacing is the opposite of what this check
+    /// requires.
+    race: Option<Arc<crate::race::Recipe>>,
+    /// How many endpoints are still allowed a race burst this scan. Shared, and
+    /// small: every burst is eight real state changes on somebody's
+    /// application.
+    race_budget: Arc<AtomicUsize>,
     tx: mpsc::UnboundedSender<Value>,
 }
 
@@ -676,6 +718,8 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
         cors_seen,
         found_seen,
         xml_seen,
+        race,
+        race_budget,
         tx,
     } = ctx;
     let want = |c: &str| classes.is_empty() || classes.iter().any(|x| x == c);
@@ -711,6 +755,27 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
         if let Some(f) = crate::smuggle::probe(&ep.url).await {
             let _ = tx.send(json!({"type":"finding","data":f}));
             found += 1;
+        }
+    }
+    // Race conditions, named explicitly only, and rationed. Same rule again:
+    // proving a single-use limit can be used twice means using it twice, so the
+    // budget is spent on the first few endpoints that could carry one rather
+    // than on all of them.
+    if let Some(recipe) = race.as_ref().filter(|_| crate::race::eligible(&ep)) {
+        let took = race_budget
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (n > 0).then(|| n - 1)
+            })
+            .is_ok();
+        if took {
+            let out = crate::race::probe(recipe, &ep).await;
+            if let Some(msg) = out.note {
+                let _ = tx.send(json!({"type": "log", "message": format!("   inject: {msg}")}));
+            }
+            if let Some(f) = out.finding {
+                let _ = tx.send(json!({"type":"finding","data":f}));
+                found += 1;
+            }
         }
     }
     if want("xxe") {
