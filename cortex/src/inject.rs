@@ -293,11 +293,16 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
             .collect::<Vec<String>>(),
     );
     let oast = oast.map(Arc::new);
-    let tasks = params.tasks.clamp(1, 16);
+    let mut tasks = params.tasks.clamp(1, 16);
 
     let mut found = 0i64;
     let mut done = 0i64;
-    let mut set: tokio::task::JoinSet<i64> = tokio::task::JoinSet::new();
+    let mut set: tokio::task::JoinSet<(InjEndpoint, EndpointOutcome)> = tokio::task::JoinSet::new();
+    // Endpoints the target stopped answering while the pass was at full width.
+    // Retried one at a time afterwards rather than written off: the failure is
+    // a statement about how hard we were pushing, not about the endpoint.
+    let mut starved: Vec<InjEndpoint> = Vec::new();
+    let mut retrying = false;
     let mut queue = params
         .endpoints
         .iter()
@@ -333,15 +338,39 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
                 xml_seen: Arc::clone(&xml_seen),
                 tx: tx.clone(),
             };
-            set.spawn(async move { run_endpoint(ep, ctx).await });
+            set.spawn(async move {
+                let ep2 = ep.clone();
+                (ep2, run_endpoint(ep, ctx).await)
+            });
         }
         match set.join_next().await {
-            Some(Ok(n)) => {
-                found += n;
+            Some(Ok((ep, outcome))) => {
+                found += outcome.found;
                 done += 1;
+                if outcome.starved && !retrying {
+                    starved.push(ep);
+                }
             }
             Some(Err(_)) => done += 1,
-            None => break,
+            None => {
+                if !starved.is_empty() && !retrying {
+                    // Second pass, single file, so a target that could not keep
+                    // up with eight workers gets a fair chance.
+                    retrying = true;
+                    tasks = 1;
+                    let _ = tx.send(json!({
+                        "type": "log",
+                        "message": format!(
+                            "{} endpoint(s) stopped answering under load; retrying them one at a \
+                             time",
+                            starved.len()
+                        )
+                    }));
+                    queue.extend(starved.drain(..));
+                    continue;
+                }
+                break;
+            }
         }
         if done % 3 == 0 || done == total {
             let _ = tx.send(json!({"type":"progress","processed":done,"total":total}));
@@ -398,8 +427,16 @@ struct EndpointCtx {
     tx: mpsc::UnboundedSender<Value>,
 }
 
-/// Probe one endpoint end to end. Returns how many findings it emitted.
-async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> i64 {
+/// What one endpoint's pass produced.
+struct EndpointOutcome {
+    found: i64,
+    /// Every site was skipped because the target stopped answering. That is a
+    /// statement about load, not about the endpoint, so the driver retries it.
+    starved: bool,
+}
+
+/// Probe one endpoint end to end.
+async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
     let EndpointCtx {
         client,
         client_nr,
@@ -416,6 +453,8 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> i64 {
     let want = |c: &str| classes.is_empty() || classes.iter().any(|x| x == c);
     let oast = oast.as_deref();
     let mut found = 0i64;
+    let mut sites = 0usize;
+    let mut starved = 0usize;
     if want("inventory") {
         for f in probe_inventory(&client, &ep, &inv_seen).await {
             let _ = tx.send(json!({"type":"finding","data":f}));
@@ -475,7 +514,9 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> i64 {
                 break;
             }
         }
+        sites += 1;
         let Some(baseline) = baseline else {
+            starved += 1;
             let _ = tx.send(json!({
                 "type": "log",
                 "message": format!(
@@ -554,7 +595,10 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> i64 {
         }
         found += hits as i64;
     }
-    found
+    EndpointOutcome {
+        found,
+        starved: sites > 0 && starved == sites,
+    }
 }
 
 /// Expand an endpoint into its fuzzable sites (query params, path segments,
