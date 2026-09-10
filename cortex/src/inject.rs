@@ -288,6 +288,11 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
     let inv_seen: Arc<SeenSet> = Arc::new(SeenSet::default());
     let rl_seen: Arc<SeenSet> = Arc::new(SeenSet::default());
     let cors_seen: Arc<SeenSet> = Arc::new(SeenSet::default());
+    // One bug, reported once. A routing parameter gives the same sink many
+    // URLs - Mutillidae's hints-page-wrapper.php answers on a dozen values of
+    // `level1HintIncludeFile`, all reaching one query - and reporting the same
+    // SQL injection once per value is noise that buries the rest.
+    let found_seen: Arc<SeenSet> = Arc::new(SeenSet::default());
     let xml_seen: Arc<SeenSet> = Arc::new(SeenSet::default());
     let classes = Arc::new(
         params
@@ -339,6 +344,7 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
                 inv_seen: Arc::clone(&inv_seen),
                 rl_seen: Arc::clone(&rl_seen),
                 cors_seen: Arc::clone(&cors_seen),
+                found_seen: Arc::clone(&found_seen),
                 xml_seen: Arc::clone(&xml_seen),
                 tx: tx.clone(),
             };
@@ -427,6 +433,7 @@ struct EndpointCtx {
     inv_seen: Arc<SeenSet>,
     rl_seen: Arc<SeenSet>,
     cors_seen: Arc<SeenSet>,
+    found_seen: Arc<SeenSet>,
     xml_seen: Arc<SeenSet>,
     tx: mpsc::UnboundedSender<Value>,
 }
@@ -451,6 +458,7 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
         inv_seen,
         rl_seen,
         cors_seen,
+        found_seen,
         xml_seen,
         tx,
     } = ctx;
@@ -547,6 +555,19 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
         // time.
         let mut hits = 0usize;
         let emit = |f: Value, hits: &mut usize| {
+            // One bug per (class, path, parameter, location). The same sink
+            // reached through several values of a routing parameter is still
+            // one bug, and one fix.
+            let key = format!(
+                "{}|{}|{}|{}",
+                f["vuln_class"].as_str().unwrap_or(""),
+                path_only(f["url"].as_str().unwrap_or("")),
+                f["param"].as_str().unwrap_or(""),
+                f["location"].as_str().unwrap_or("")
+            );
+            if !seen_once(&found_seen, key) {
+                return;
+            }
             let _ = tx.send(json!({"type":"finding","data":f}));
             *hits += 1;
         };
