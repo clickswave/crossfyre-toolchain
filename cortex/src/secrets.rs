@@ -20,6 +20,9 @@
 //! not a service to anyone. The evidence needed is that the file was readable
 //! and what class of secret it holds. That is what is kept.
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
 /// A configuration file worth one request, and how to know it when it arrives.
 pub struct SecretFile {
     pub label: &'static str,
@@ -83,6 +86,33 @@ pub const DEPTHS: usize = 3;
 
 /// At least this many of a file's key names must appear before it counts.
 pub const KEY_HITS: usize = 2;
+
+/// Escalation results already computed, keyed by host + parameter.
+///
+/// Mutillidae answers on a dozen values of one routing parameter, and every one
+/// of them confirms the same file read through the same `page` parameter. The
+/// finding is deduplicated on the way out, but the eighteen requests this
+/// escalation costs were being spent once per URL before anything could
+/// deduplicate them - so twelve identical answers cost two hundred requests to
+/// produce, and eleven of them were discarded.
+///
+/// Keyed by parameter rather than by host because two parameters can sit in
+/// scripts at different depths, and the recorded path should be the one that
+/// actually worked.
+static REACHED: OnceLock<Mutex<HashMap<String, Vec<serde_json::Value>>>> = OnceLock::new();
+
+/// The cached escalation for this (host, param), if one has been done.
+pub fn cached_reach(key: &str) -> Option<Vec<serde_json::Value>> {
+    let m = REACHED.get_or_init(|| Mutex::new(HashMap::new()));
+    let g = m.lock().unwrap_or_else(|e| e.into_inner());
+    g.get(key).cloned()
+}
+
+pub fn remember_reach(key: &str, out: &[serde_json::Value]) {
+    let m = REACHED.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+    g.insert(key.to_string(), out.to_vec());
+}
 
 /// Which of this file's key names are present in a response body.
 ///

@@ -2704,6 +2704,12 @@ async fn lfi_reach_secrets(
         // spelling, so there is nothing to reuse and nothing to guess.
         return Vec::new();
     };
+    // Once per (host, parameter). A routing parameter gives the same sink a
+    // dozen URLs, and this escalation costs eighteen requests each time.
+    let key = format!("{}|{}", host_of(&site.url), site.param);
+    if let Some(cached) = crate::secrets::cached_reach(&key) {
+        return cached;
+    }
     let mut out = Vec::new();
     for f in crate::secrets::SECRET_FILES {
         for depth in 0..crate::secrets::DEPTHS {
@@ -2722,6 +2728,7 @@ async fn lfi_reach_secrets(
             }
         }
     }
+    crate::secrets::remember_reach(&key, &out);
     out
 }
 
