@@ -701,6 +701,18 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
             found += 1;
         }
     }
+    // Request smuggling, named explicitly only. Confirming a desync leaves a
+    // partial request on a connection that may be shared, so it is never part
+    // of a default sweep - the same rule as prototype pollution, for the same
+    // reason: this one cannot leave the target as it found it.
+    if classes.iter().any(|c| c == "smuggling")
+        && crate::inject::seen_once(&xml_seen, format!("smuggle:{}", host_of(&ep.url)))
+    {
+        if let Some(f) = crate::smuggle::probe(&ep.url).await {
+            let _ = tx.send(json!({"type":"finding","data":f}));
+            found += 1;
+        }
+    }
     if want("xxe") {
         for f in crate::xml::probe(
             &client,

@@ -17,6 +17,7 @@ mod libs;
 mod oast;
 mod probe;
 mod rawhttp;
+mod smuggle;
 mod solver;
 mod template;
 mod xml;
