@@ -457,6 +457,7 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
             timeout_ms: params.timeout_ms,
         })
     });
+    let skips = Arc::new(AtomicUsize::new(0));
     let race_budget = Arc::new(AtomicUsize::new(if race.is_some() {
         MAX_RACE_ENDPOINTS
     } else {
@@ -531,6 +532,7 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
                 found_seen: Arc::clone(&found_seen),
                 race: race.clone(),
                 race_budget: Arc::clone(&race_budget),
+                skips: Arc::clone(&skips),
                 xml_seen: Arc::clone(&xml_seen),
                 tx: tx.clone(),
             };
@@ -616,6 +618,19 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
     // a capacity decision. Only one of those can be acted on, and until this
     // was reported the difference was a guess.
     {
+        let total_skips = skips.load(Ordering::Relaxed);
+        if total_skips > SKIPS_SPELLED_OUT {
+            let _ = tx.send(json!({
+                "type": "log",
+                "message": format!(
+                    "{total_skips} injection sites were skipped because the endpoint did not \
+                     answer a baseline request; the first {SKIPS_SPELLED_OUT} are named above. \
+                     Those sites were not tested, which is not the same as their coming back \
+                     clean. A count this high usually means the pass was pushing harder than the \
+                     target could answer rather than that the endpoints are broken."
+                )
+            }));
+        }
         let (reqs, wait_ms, pace_ms, fails) = crate::probe::meter::snapshot();
         if reqs > 0 {
             let _ = tx.send(json!({
@@ -710,8 +725,21 @@ struct EndpointCtx {
     /// small: every burst is eight real state changes on somebody's
     /// application.
     race_budget: Arc<AtomicUsize>,
+    /// How many sites have been skipped for a missing baseline, and how many of
+    /// those were spelled out.
+    ///
+    /// The last Mutillidae pass emitted 86 of these, one per site, and the node
+    /// keeps the newest fifty operator notes. So the messages that actually
+    /// change what a reader believes - "out-of-band callbacks are UNAVAILABLE",
+    /// "time-based oracles are OFF for this host" - were pushed out of the ring
+    /// by the same sentence repeated eighty-six times. Loud and repetitive is
+    /// its own kind of silent.
+    skips: Arc<AtomicUsize>,
     tx: mpsc::UnboundedSender<Value>,
 }
+
+/// How many skipped sites are named individually before they are counted.
+const SKIPS_SPELLED_OUT: usize = 5;
 
 /// What one endpoint's pass produced.
 struct EndpointOutcome {
@@ -739,6 +767,7 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
         xml_seen,
         race,
         race_budget,
+        skips,
         tx,
     } = ctx;
     let want = |c: &str| classes.is_empty() || classes.iter().any(|x| x == c);
@@ -864,14 +893,17 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
         sites += 1;
         let Some(baseline) = baseline else {
             starved += 1;
-            let _ = tx.send(json!({
-                "type": "log",
-                "message": format!(
-                    "skipped {} {} ({}): the endpoint did not answer a baseline request after 3 \
-                     attempts, so no oracle could run against it",
-                    site.method, site.url, site.where_label()
-                )
-            }));
+            let n = skips.fetch_add(1, Ordering::Relaxed);
+            if n < SKIPS_SPELLED_OUT {
+                let _ = tx.send(json!({
+                    "type": "log",
+                    "message": format!(
+                        "skipped {} {} ({}): the endpoint did not answer a baseline request after \
+                         3 attempts, so no oracle could run against it",
+                        site.method, site.url, site.where_label()
+                    )
+                }));
+            }
             continue;
         };
         // One injection point can be more than one kind of sink: PHP's
