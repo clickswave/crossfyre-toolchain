@@ -457,9 +457,34 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> i64 {
         }
     }
     for site in sites_for(&ep, &varying) {
-        let baseline = match send_site(&client, &site, &site.base_value).await {
-            Some(r) => r,
-            None => continue,
+        // Every oracle on this site compares against the baseline, so losing it
+        // loses the site - silently, which is the problem. One timed-out
+        // request was enough to drop a whole endpoint, and on a target being
+        // hit by time-based probes on other workers that happens: PHP's worker
+        // pool is finite and a few five-second sleeps exhaust it.
+        //
+        // Retry before giving up, and when it still fails, say which endpoint
+        // was skipped instead of leaving a hole that reads as "nothing here".
+        let mut baseline = None;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(500 * attempt)).await;
+            }
+            if let Some(r) = send_site(&client, &site, &site.base_value).await {
+                baseline = Some(r);
+                break;
+            }
+        }
+        let Some(baseline) = baseline else {
+            let _ = tx.send(json!({
+                "type": "log",
+                "message": format!(
+                    "skipped {} {} ({}): the endpoint did not answer a baseline request after 3 \
+                     attempts, so no oracle could run against it",
+                    site.method, site.url, site.where_label()
+                )
+            }));
+            continue;
         };
         // One injection point can be more than one kind of sink: PHP's
         // include() takes a local path AND a URL, so the same parameter is both
