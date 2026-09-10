@@ -1193,6 +1193,73 @@ mod tests {
         n
     }
 
+    /// A matcher word that the template itself put in the request can never be
+    /// evidence: the target only has to echo the request back to "prove" the
+    /// finding. That is how the Shellshock template reported critical RCE
+    /// against Mutillidae, which simply prints the User-Agent on its home page.
+    ///
+    /// The rule is mechanical, so it is enforced here rather than left to
+    /// review. A template that is genuinely about reflection (its whole point
+    /// being that the payload comes back) opts out with the `reflection` tag.
+    #[test]
+    fn no_template_matches_its_own_payload() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/templates");
+        let mut all: Vec<&super::Template> = super::BUILTIN.iter().collect();
+        let pack = super::load_dir(dir);
+        all.extend(pack.iter());
+        for t in all {
+            if t.info.tags.contains("reflection") {
+                continue;
+            }
+            for req in &t.http {
+                // What this request transmits OTHER than its path. A word the
+                // template puts in the path is already handled at runtime by
+                // the echo guard in `matches_one`, which discounts URL words on
+                // a response that echoes the path; nothing covers a header or
+                // body value that comes back in the page.
+                let mut sent = String::new();
+                for v in req.headers.values() {
+                    sent.push(' ');
+                    sent.push_str(v);
+                }
+                if let Some(b) = &req.body {
+                    sent.push(' ');
+                    sent.push_str(b);
+                }
+                for lists in req.payloads.values() {
+                    for v in lists {
+                        sent.push(' ');
+                        sent.push_str(v);
+                    }
+                }
+                let sent = sent.to_lowercase();
+                for m in &req.matchers {
+                    if m.mtype != "word" || m.negative {
+                        continue;
+                    }
+                    if matches!(m.part.as_str(), "header" | "all_headers") {
+                        continue;
+                    }
+                    for w in &m.words {
+                        let w_lc = w.to_lowercase();
+                        // Very short words are substrings of everything; the
+                        // rule is about distinctive markers.
+                        if w_lc.len() < 6 {
+                            continue;
+                        }
+                        assert!(
+                            !sent.contains(&w_lc),
+                            "template `{}` matches on `{w}`, which it sends itself - \
+                             an echo would satisfy it. Use a marker the target can only \
+                             produce by executing something, or tag the template `reflection`.",
+                            t.id
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn every_template_declares_its_class() {
         // A template's tags are how a finding gets its `vuln_class`. A template
