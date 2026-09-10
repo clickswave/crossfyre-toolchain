@@ -199,8 +199,9 @@ pub async fn spent<T>(class: &'static str, fut: impl std::future::Future<Output 
     out
 }
 
-mod pace {
+pub mod pace {
     use std::collections::HashMap;
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
     use tokio::sync::Semaphore;
@@ -228,6 +229,15 @@ mod pace {
     /// Successes before we allow overlap again.
     const UNSERIALISE_AFTER: u64 = 40;
 
+    /// How many recent unpayloaded responses the latency window keeps.
+    ///
+    /// Enough that one slow answer does not move the picture, few enough that
+    /// the picture is of NOW: a target that has been under a scan for twenty
+    /// minutes is not the target that was idle when the pass started, and the
+    /// number the time-based oracles need is what normal costs under the load
+    /// we are ourselves applying.
+    const LATENCY_WINDOW: usize = 64;
+
     pub struct HostPace {
         sem: Arc<Semaphore>,
         /// Held for the whole request when the host is judged to be serialising
@@ -237,6 +247,8 @@ mod pace {
         fails: AtomicU64,
         oks: AtomicU64,
         delay_ms: AtomicU64,
+        /// Round-trip times for requests that carried no payload, in ms.
+        latency: Mutex<VecDeque<u128>>,
     }
 
     impl HostPace {
@@ -248,7 +260,34 @@ mod pace {
                 fails: AtomicU64::new(0),
                 oks: AtomicU64::new(0),
                 delay_ms: AtomicU64::new(0),
+                latency: Mutex::new(VecDeque::new()),
             }
+        }
+
+        /// Record what an ordinary request to this host cost.
+        ///
+        /// Only baseline sends feed this. A payload request is the thing being
+        /// measured against the window, so letting it into the window would let
+        /// a real five-second sleep raise the bar it has to clear.
+        pub fn observe(&self, ms: u128) {
+            let mut w = self.latency.lock().unwrap_or_else(|e| e.into_inner());
+            if w.len() == LATENCY_WINDOW {
+                w.pop_front();
+            }
+            w.push_back(ms);
+        }
+
+        /// What a slow-but-ordinary response costs here: the 90th percentile of
+        /// the window, or `None` until there is enough of a window to mean
+        /// anything.
+        pub fn slow_normal_ms(&self) -> Option<u128> {
+            let w = self.latency.lock().unwrap_or_else(|e| e.into_inner());
+            if w.len() < 8 {
+                return None;
+            }
+            let mut v: Vec<u128> = w.iter().copied().collect();
+            v.sort_unstable();
+            Some(v[(v.len() * 9) / 10])
         }
 
         pub fn delay(&self) -> u64 {
@@ -326,6 +365,57 @@ mod pace {
         let mut m = map.lock().unwrap_or_else(|e| e.into_inner());
         Arc::clone(m.entry(host).or_insert_with(|| Arc::new(HostPace::new())))
     }
+}
+
+/// What a time-based oracle is allowed to treat as a delay on this host, and
+/// whether it can conclude anything here at all.
+pub enum Timing {
+    /// A response slower than this many milliseconds is a candidate. Everything
+    /// below is the application being itself.
+    Above(u128),
+    /// The target's own ordinary responses already run at or past the sleep we
+    /// would inject, so no delay measured here could distinguish a sleeping
+    /// database from a busy one. `slow_normal_ms` is what normal costs.
+    Hopeless { slow_normal_ms: u128 },
+}
+
+/// Decide the bar from what this host is actually doing right now.
+///
+/// A fixed threshold is what turned a 45-endpoint application into a 69-minute
+/// scan. It is correct in isolation - a five-second sleep does cross 3.8
+/// seconds - but it says nothing about whether crossing 3.8 seconds MEANS
+/// anything on a target whose own pages take four. Every response that drifted
+/// over the line entered the confirmation sequence: control, retry, and a
+/// doubled sleep, ten-odd seconds each, five separators deep, on parameters
+/// with no shell behind them.
+///
+/// The bar is now the host's own slow-normal plus half the sleep we injected,
+/// never below the fixed floor. A target answering in 8ms keeps the old
+/// behaviour exactly; a target answering in four seconds stops volunteering
+/// every page for a confirmation it was never going to pass.
+///
+/// This does NOT relax any confirmation. The control, the reproduction and the
+/// scaling check all still have to pass; the change is which responses are
+/// worth spending them on. Weakening the scaling check was the tempting fix and
+/// it is the wrong one: that check exists because the oracle was reading load
+/// the scanner itself created as proof of a shell.
+pub fn timing(url: &str, sleep_secs: u64, floor_ms: u128) -> Timing {
+    let sleep_ms = sleep_secs as u128 * 1000;
+    let Some(slow) = pace::for_url(url).slow_normal_ms() else {
+        // Nothing measured yet: the floor is the only honest answer.
+        return Timing::Above(floor_ms);
+    };
+    if slow >= sleep_ms {
+        return Timing::Hopeless {
+            slow_normal_ms: slow,
+        };
+    }
+    Timing::Above(floor_ms.max(slow + sleep_ms / 2))
+}
+
+/// Record what an ordinary, unpayloaded request to this URL's host cost.
+pub fn observe_latency(url: &str, ms: u128) {
+    pace::for_url(url).observe(ms);
 }
 
 pub async fn send(
@@ -580,5 +670,63 @@ mod tests {
         );
         assert_eq!(json_typed("42", Some("integer")), Value::from(42i64));
         assert_eq!(json_typed("true", Some("boolean")), Value::Bool(true));
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+
+    fn feed(url: &str, samples: &[u128]) {
+        for ms in samples {
+            observe_latency(url, *ms);
+        }
+    }
+
+    #[test]
+    fn a_fast_target_keeps_the_old_bar() {
+        let url = "http://timing-fast.test/x";
+        feed(url, &[6, 7, 8, 8, 9, 10, 11, 12, 9, 8]);
+        match timing(url, 5, 3800) {
+            Timing::Above(ms) => assert_eq!(ms, 3800),
+            Timing::Hopeless { .. } => panic!("a target answering in 8ms is not hopeless"),
+        }
+    }
+
+    #[test]
+    fn a_slow_target_raises_the_bar_instead_of_confirming_noise() {
+        // Pages that take about three seconds. A four-second answer used to be
+        // a command-injection candidate here, and cost ten seconds to disprove.
+        let url = "http://timing-slow.test/x";
+        feed(
+            url,
+            &[2900, 3000, 3100, 2800, 3200, 3050, 2950, 3300, 3000, 3100],
+        );
+        match timing(url, 5, 3800) {
+            // slow-normal (~3300) plus half the injected sleep.
+            Timing::Above(ms) => assert!(ms > 5000, "bar was {ms}, expected above 5000"),
+            Timing::Hopeless { .. } => panic!("three seconds is slow, not unmeasurable"),
+        }
+    }
+
+    #[test]
+    fn a_target_slower_than_the_sleep_cannot_be_measured_this_way() {
+        let url = "http://timing-hopeless.test/x";
+        feed(
+            url,
+            &[5200, 5400, 6000, 5100, 7000, 5500, 5300, 5900, 6100, 5800],
+        );
+        match timing(url, 5, 3800) {
+            Timing::Hopeless { slow_normal_ms } => assert!(slow_normal_ms >= 5000),
+            Timing::Above(ms) => panic!("bar {ms} pretends a 5s sleep is detectable here"),
+        }
+    }
+
+    #[test]
+    fn with_nothing_measured_the_floor_is_the_answer() {
+        match timing("http://timing-unknown.test/x", 5, 3800) {
+            Timing::Above(ms) => assert_eq!(ms, 3800),
+            Timing::Hopeless { .. } => panic!("no samples is not evidence of slowness"),
+        }
     }
 }

@@ -854,6 +854,9 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
             if let Some(r) =
                 crate::probe::spent("baseline", send_site(&client, &site, &site.base_value)).await
             {
+                // The site's own value, no payload: this is what "normal" costs
+                // here, and it is what the time-based oracles measure against.
+                crate::probe::observe_latency(&site.url, r.elapsed_ms);
                 baseline = Some(r);
                 break;
             }
@@ -885,6 +888,30 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
         // Cost is already bounded by the concurrency limit and by each probe's
         // own request budget. Hiding findings is not an acceptable way to buy
         // time.
+        // A target whose ordinary pages already take as long as the sleep we
+        // would inject cannot be measured this way, and the time-based oracles
+        // return nothing there. Nothing is not the same as "clean", so say it
+        // once per host - a scanner that quietly stops testing a class produces
+        // a report indistinguishable from one that tested it and found nothing.
+        if let crate::probe::Timing::Hopeless { slow_normal_ms } =
+            crate::probe::timing(&site.url, SLEEP_SECS, SLEEP_THRESHOLD_MS)
+        {
+            if seen_once(&xml_seen, format!("slowhost:{}", host_of(&site.url))) {
+                let _ = tx.send(json!({
+                    "type": "log",
+                    "message": format!(
+                        "time-based SQL and command-injection oracles are OFF for {}: its own \
+                         unpayloaded responses run to {}ms, at or past the {}s sleep they inject, \
+                         so a delay here could not be told from the application being busy. Their \
+                         absence from the results is not evidence. Reflected, error-based and \
+                         out-of-band detection for both classes is unaffected.",
+                        host_of(&site.url),
+                        slow_normal_ms,
+                        SLEEP_SECS
+                    )
+                }));
+            }
+        }
         let mut hits = 0usize;
         let emit = |f: Value, hits: &mut usize| {
             if !seen_once(&found_seen, finding_identity(&f)) {
@@ -1444,12 +1471,14 @@ async fn probe_sqli(client: &Client, site: &Site, baseline: &Resp) -> Option<Val
         // Oracle
         format!("' AND DBMS_LOCK.SLEEP({SLEEP_SECS})-- -"),
     ];
+    // As in `probe_cmdi`: the bar comes from this host's own responses.
+    let bar = match crate::probe::timing(&site.url, SLEEP_SECS, SLEEP_THRESHOLD_MS) {
+        crate::probe::Timing::Above(ms) => ms,
+        crate::probe::Timing::Hopeless { .. } => return None,
+    };
     for p in payloads {
         let r = send_site(client, site, &format!("{base}{p}")).await;
-        if r.as_ref()
-            .map(|x| x.elapsed_ms >= SLEEP_THRESHOLD_MS)
-            .unwrap_or(false)
-        {
+        if r.as_ref().map(|x| x.elapsed_ms >= bar).unwrap_or(false) {
             // Neutralise the delay for the control run: SLEEP(5)->SLEEP(0) (also covers
             // DBMS_LOCK.SLEEP), pg_sleep, PG_SLEEP, and WAITFOR's '0:0:5'->'0:0:0'.
             let zero = p
@@ -1459,12 +1488,8 @@ async fn probe_sqli(client: &Client, site: &Site, baseline: &Resp) -> Option<Val
                 .replace(&format!("0:0:{SLEEP_SECS}"), "0:0:0");
             let rc = send_site(client, site, &format!("{base}{zero}")).await;
             let again = send_site(client, site, &format!("{base}{p}")).await;
-            let ctrl_fast = rc
-                .map(|x| x.elapsed_ms < SLEEP_THRESHOLD_MS)
-                .unwrap_or(false);
-            let repro = again
-                .map(|x| x.elapsed_ms >= SLEEP_THRESHOLD_MS)
-                .unwrap_or(false);
+            let ctrl_fast = rc.map(|x| x.elapsed_ms < bar).unwrap_or(false);
+            let repro = again.map(|x| x.elapsed_ms >= bar).unwrap_or(false);
             if ctrl_fast && repro {
                 return Some(finding(
                     "sqli",
@@ -1472,9 +1497,9 @@ async fn probe_sqli(client: &Client, site: &Site, baseline: &Resp) -> Option<Val
                     "high",
                     site,
                     format!(
-                        "A `SLEEP({SLEEP_SECS})` injected into the {} delayed the response past {}ms while a `SLEEP(0)` control returned promptly and the delay reproduced.",
+                        "A `SLEEP({SLEEP_SECS})` injected into the {} delayed the response past {}ms - a bar set from this host's own slow-normal response time, not a constant - while a `SLEEP(0)` control returned promptly and the delay reproduced.",
                         site.where_label(),
-                        SLEEP_THRESHOLD_MS
+                        bar
                     ),
                 ));
             }
@@ -1561,6 +1586,12 @@ async fn probe_cmdi(
             });
         }
     }
+    // What counts as a delay HERE, decided from what this host is doing now
+    // rather than from a constant. See `probe::timing`.
+    let bar = match crate::probe::timing(&site.url, SLEEP_SECS, SLEEP_THRESHOLD_MS) {
+        crate::probe::Timing::Above(ms) => ms,
+        crate::probe::Timing::Hopeless { .. } => return None,
+    };
     for sep in [";", "|", "&&", "$(", "`"] {
         let close = if sep == "$(" {
             ")"
@@ -1571,20 +1602,11 @@ async fn probe_cmdi(
         };
         let pl = format!("{base}{sep}sleep {SLEEP_SECS}{close}");
         let r = send_site(client, site, &pl).await;
-        if r.as_ref()
-            .map(|x| x.elapsed_ms >= SLEEP_THRESHOLD_MS)
-            .unwrap_or(false)
-        {
+        if r.as_ref().map(|x| x.elapsed_ms >= bar).unwrap_or(false) {
             let ctrl = send_site(client, site, &format!("{base}{sep}sleep 0{close}")).await;
             let again = send_site(client, site, &pl).await;
-            let ctrl_fast = ctrl
-                .as_ref()
-                .map(|x| x.elapsed_ms < SLEEP_THRESHOLD_MS)
-                .unwrap_or(false);
-            let repro = again
-                .as_ref()
-                .map(|x| x.elapsed_ms >= SLEEP_THRESHOLD_MS)
-                .unwrap_or(false);
+            let ctrl_fast = ctrl.as_ref().map(|x| x.elapsed_ms < bar).unwrap_or(false);
+            let repro = again.as_ref().map(|x| x.elapsed_ms >= bar).unwrap_or(false);
 
             // The delay has to TRACK the number we asked for, not merely exist.
             //
@@ -1619,9 +1641,9 @@ async fn probe_cmdi(
                     "critical",
                     site,
                     format!(
-                        "A shell `sleep {SLEEP_SECS}` injected into the {} (separator `{sep}`) delayed the response past {}ms while `sleep 0` returned promptly, the delay reproduced, and doubling the sleep to {}s roughly doubled the delay. The response time tracks the number we asked for, which a merely slow application does not do.",
+                        "A shell `sleep {SLEEP_SECS}` injected into the {} (separator `{sep}`) delayed the response past {}ms - a bar set from this host's own slow-normal response time, not a constant - while `sleep 0` returned promptly, the delay reproduced, and doubling the sleep to {}s roughly doubled the delay. The response time tracks the number we asked for, which a merely slow application does not do.",
                         site.where_label(),
-                        SLEEP_THRESHOLD_MS,
+                        bar,
                         SLEEP_SECS * 2
                     ),
                 ));
