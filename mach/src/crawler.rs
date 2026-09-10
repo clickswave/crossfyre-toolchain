@@ -274,6 +274,13 @@ static RE_JS_CALL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)(?:fetch|axios(?:\.\w+)?|\.(?:get|post|put|delete|patch|ajax))\s*\(\s*["'`]([^"'`]+)["'`]"#).unwrap()
 });
 
+/// A backtick string that looks like a URL path, interpolations and all. Kept
+/// separate from `RE_JS_PATH` because that one deliberately excludes `$` and
+/// `{`, which is what made every interpolated URL invisible.
+static RE_JS_TEMPLATE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"`((?:\$\{[^`{}]{0,80}\})?/[A-Za-z0-9_./$\{\}\-]{1,200})`"#).unwrap()
+});
+
 /// Same call sites, but capturing the HTTP verb: `axios.post('/x')`, `http.put('/x')`, `.delete('/x')`.
 /// Group 1 or 2 is the verb; group 3 is the URL. `fetch(...)` has no verb here (stays GET).
 static RE_JS_CALL_METHOD: LazyLock<Regex> = LazyLock::new(|| {
@@ -1073,6 +1080,59 @@ fn extract_js(body: &str, out: &mut Vec<String>) {
             out.push(m.as_str().to_string());
         }
     }
+    extract_js_templates(body, out);
+}
+
+/// Template-literal URLs: `` fetch(`${API}/users/${id}/orders`) ``.
+///
+/// The other two patterns require a plain quoted string, so every URL a modern
+/// bundle builds by interpolation was invisible - and interpolation is how a
+/// bundle writes any URL with an id in it, which is most of the interesting
+/// ones. A crawl of an SPA saw the static asset paths and none of the API.
+///
+/// A leading `${...}` is a base-URL constant and is dropped; the rest has to
+/// start with `/` to be a path we can resolve. Interior interpolations become
+/// `1`, because a fetchable URL is what the frontier takes: `/users/{id}/orders`
+/// describes the endpoint better but nothing downstream of this event carries
+/// path-parameter metadata, and a URL nothing can request is worth less than one
+/// that answers.
+fn extract_js_templates(body: &str, out: &mut Vec<String>) {
+    for c in RE_JS_TEMPLATE.captures_iter(body) {
+        let Some(raw) = c.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+        if let Some(u) = template_to_path(raw) {
+            out.push(u);
+        }
+    }
+}
+
+/// `${API}/users/${id}/orders` -> `/users/1/orders`. `None` when the result is
+/// not a path we could ask for.
+fn template_to_path(raw: &str) -> Option<String> {
+    let mut s = raw.trim();
+    // A leading interpolation is a base-URL constant, not a segment.
+    if s.starts_with("${") {
+        let close = s.find('}')?;
+        s = &s[close + 1..];
+    }
+    if !s.starts_with('/') {
+        return None;
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(at) = rest.find("${") {
+        out.push_str(&rest[..at]);
+        let close = rest[at..].find('}')? + at;
+        out.push('1');
+        rest = &rest[close + 1..];
+    }
+    out.push_str(rest);
+    // Anything still carrying JS syntax was not a URL to begin with.
+    if out.contains(['$', '{', '}', ' ', '`']) || out.len() < 2 {
+        return None;
+    }
+    Some(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1383,5 +1443,56 @@ mod route_sense_tests {
         let c = page("http://h/c", &["/one", "/two", "/three"], 200);
         assert_eq!(structure_print(&a), structure_print(&b));
         assert_ne!(structure_print(&a), structure_print(&c));
+    }
+}
+
+#[cfg(test)]
+mod template_tests {
+    use super::*;
+
+    fn found(js: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        extract_js_templates(js, &mut out);
+        out
+    }
+
+    #[test]
+    fn an_interpolated_api_url_becomes_a_fetchable_path() {
+        let js = "fetch(`${API_BASE}/users/${userId}/orders`)";
+        assert_eq!(found(js), vec!["/users/1/orders".to_string()]);
+    }
+
+    #[test]
+    fn a_plain_template_path_survives_unchanged() {
+        assert_eq!(
+            found("axios.get(`/api/v2/profile`)"),
+            vec!["/api/v2/profile"]
+        );
+    }
+
+    #[test]
+    fn several_interpolations_all_become_values() {
+        let js = "`/orgs/${org}/repos/${repo}/issues`";
+        assert_eq!(found(js), vec!["/orgs/1/repos/1/issues".to_string()]);
+    }
+
+    #[test]
+    fn a_template_that_is_not_a_path_is_not_offered_as_one() {
+        // Prose, a CSS rule and a relative reference are all backtick strings
+        // and none of them is a URL we could request.
+        assert!(found("`hello ${name}, welcome`").is_empty());
+        assert!(found("`translate(${x}px)`").is_empty());
+        assert!(found("`users/${id}`").is_empty());
+    }
+
+    #[test]
+    fn the_old_patterns_still_do_their_job() {
+        let mut out = Vec::new();
+        extract_js(
+            r#"fetch("/api/plain"); const p = "/static/app.js";"#,
+            &mut out,
+        );
+        assert!(out.iter().any(|u| u == "/api/plain"));
+        assert!(out.iter().any(|u| u == "/static/app.js"));
     }
 }
