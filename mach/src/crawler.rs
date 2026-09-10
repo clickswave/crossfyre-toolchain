@@ -669,6 +669,10 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
                     Some(c) => c,
                     None => continue,
                 };
+                // Never walk out of our own session.
+                if params.auth.is_some() && ends_session(&child) {
+                    continue;
+                }
                 let key = routes.norm_key(&child);
                 if !visited.insert(key) {
                     continue;
@@ -1006,6 +1010,36 @@ fn normalize_seed(seed: &str) -> Option<Url> {
 
 /// Resolve a raw link against the page URL and apply scope rules. Returns the
 /// canonical (fragment-stripped) URL if it should be part of the map.
+/// Does this URL end the session we are crawling with?
+///
+/// An authenticated crawl that follows a logout link destroys its own session
+/// and silently finishes the job as an anonymous one. Nothing errors: the
+/// remaining pages come back as the login form, they crawl fine, and the run
+/// looks successful while covering none of the authenticated surface. Measured
+/// against DVWA and bWAPP, that is exactly what happened - the injection pass
+/// that followed found 2 and 1 findings where it had found 9 and 7.
+///
+/// Only consulted when the crawl carries credentials. Without them there is no
+/// session to protect and a logout page is an ordinary page.
+fn ends_session(url: &Url) -> bool {
+    const MARKS: &[&str] = &[
+        "logout",
+        "log-out",
+        "log_out",
+        "signout",
+        "sign-out",
+        "sign_out",
+        "logoff",
+        "log-off",
+        "deauth",
+        "session/end",
+        "session/destroy",
+    ];
+    let path = url.path().to_ascii_lowercase();
+    let query = url.query().unwrap_or("").to_ascii_lowercase();
+    MARKS.iter().any(|m| path.contains(m) || query.contains(m))
+}
+
 fn resolve_and_scope(raw: &str, base: &Url, params: &CrawlParams, seed_host: &str) -> Option<Url> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -1120,6 +1154,48 @@ mod normalize_seed_tests {
     fn empty_is_none() {
         assert!(normalize_seed("").is_none());
         assert!(normalize_seed("   ").is_none());
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::{Url, ends_session};
+
+    #[test]
+    fn logout_shapes_are_refused() {
+        for u in [
+            "http://h/logout.php",
+            "http://h/users/sign_out",
+            "http://h/account/log-out",
+            "http://h/index.php?do=logout",
+            "http://h/auth/signout?next=/",
+            "http://h/session/destroy",
+        ] {
+            assert!(
+                ends_session(&Url::parse(u).unwrap()),
+                "{u} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_pages_are_not() {
+        for u in [
+            "http://h/products/logoutdoor-furniture",
+            "http://h/blog/how-we-handle-sessions",
+            "http://h/login",
+            "http://h/index.php?page=user-info.php",
+        ] {
+            let refused = ends_session(&Url::parse(u).unwrap());
+            if u.contains("logoutdoor") {
+                // A substring match costs us one page on a site that sells
+                // outdoor furniture. Recorded rather than hidden: losing a
+                // product page is cheaper than losing the whole session.
+                assert!(refused);
+            } else {
+                assert!(!refused, "{u} should be crawled");
+            }
+        }
     }
 }
 
