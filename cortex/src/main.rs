@@ -19,6 +19,7 @@ mod oast;
 mod probe;
 mod race;
 mod rawhttp;
+mod secrets;
 mod smuggle;
 mod solver;
 mod ssrf;

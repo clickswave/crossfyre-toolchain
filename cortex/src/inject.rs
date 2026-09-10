@@ -2612,20 +2612,101 @@ async fn probe_lfi(client: &Client, site: &Site, baseline: &Resp) -> Option<Valu
                 continue;
             };
             if lfi_leak(p, &again.body, &baseline.body).is_some() {
-                return Some(finding(
+                // `/etc/passwd` proves the bug and is worth nothing to an
+                // attacker. What it is worth is the file next to it, so look -
+                // briefly, and only now. See `secrets`.
+                let reached = lfi_reach_secrets(client, site, p, baseline).await;
+                let severity = if reached.is_empty() {
+                    "high"
+                } else {
+                    "critical"
+                };
+                let mut f = Finding::new(
+                    "cortex-inject",
                     "lfi",
                     "Local file inclusion / path traversal",
-                    "high",
-                    site,
-                    format!(
-                        "A traversal/wrapper payload in the {} returned `{what}` -- the parameter is used to build a file path without containment.",
-                        site.where_label()
-                    ),
+                    severity,
+                    &site.url,
+                )
+                .method(&site.method)
+                .param(&site.param)
+                .location(&site.where_label())
+                .describe(format!(
+                    "A traversal/wrapper payload in the {} returned `{what}` -- the parameter \
+                     is used to build a file path without containment.{}",
+                    site.where_label(),
+                    secrets_sentence(&reached)
                 ));
+                if !reached.is_empty() {
+                    f = f
+                        .with("secrets_reachable", json!(reached))
+                        .with("chained", json!(true));
+                }
+                return Some(f.build());
             }
         }
     }
     None
+}
+
+/// Follow a confirmed file read to the application's own configuration.
+///
+/// Bounded: the files in `secrets::SECRET_FILES` at up to `secrets::DEPTHS`
+/// levels up, and it stops at the first depth that answers for a given file. On
+/// an endpoint with no traversal this costs nothing, because it is only reached
+/// after a leak has been confirmed twice.
+async fn lfi_reach_secrets(
+    client: &Client,
+    site: &Site,
+    worked: &str,
+    baseline: &Resp,
+) -> Vec<Value> {
+    let Some(style) = crate::secrets::traversal_style(worked) else {
+        // An absolute path proved the read without proving a traversal
+        // spelling, so there is nothing to reuse and nothing to guess.
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for f in crate::secrets::SECRET_FILES {
+        for depth in 0..crate::secrets::DEPTHS {
+            let payload = format!("{}{}", style.repeat(depth), f.path);
+            let Some(r) = send_site(client, site, &payload).await else {
+                continue;
+            };
+            if let Some(keys) = crate::secrets::is_the_file(f, &r.body, &baseline.body) {
+                out.push(json!({
+                    "file": f.label,
+                    "path": payload,
+                    // Names only. The values arrived; they are not written down.
+                    "keys": keys,
+                }));
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// The sentence a reachable config file adds to an LFI finding.
+fn secrets_sentence(reached: &[Value]) -> String {
+    if reached.is_empty() {
+        return " No application configuration file was reachable from this parameter at the \
+                depths tried, so the read is confined to what the traversal already showed."
+            .to_string();
+    }
+    let names: Vec<&str> = reached
+        .iter()
+        .filter_map(|v| v.get("file").and_then(|s| s.as_str()))
+        .collect();
+    format!(
+        " It also reads the application's own configuration ({}), which is the escalation: the \
+         credentials in those files are the database, the session signing key and whatever cloud \
+         account the deployment runs as, and none of them are rotated by fixing this parameter. \
+         Treat every secret in them as disclosed and rotate first. Only the key NAMES are recorded \
+         here - the values arrived in the response and are deliberately not written into this \
+         finding, an export or a report.",
+        names.join(", ")
+    )
 }
 
 // ---------------------------------------------------------------- helpers
