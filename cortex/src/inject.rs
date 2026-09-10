@@ -968,6 +968,16 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
                 emit(f, &mut hits);
             }
         }
+        if want("deserialization") {
+            if let Some(f) = crate::probe::spent(
+                "deserialization",
+                probe_deserialization(&client, &site, &baseline),
+            )
+            .await
+            {
+                emit(f, &mut hits);
+            }
+        }
         if want("open_redirect") {
             if let Some(nr) = client_nr.as_ref() {
                 if let Some(f) =
@@ -2018,6 +2028,69 @@ async fn probe_ssti(client: &Client, site: &Site) -> Option<Value> {
 /// object and look for a result-set change (a match-everything `$gt:""` vs a match-nothing high
 /// sentinel). Confirmed by a reproducible boolean differential, so it does not fire on a field the
 /// server simply ignores. JSON bodies only (that is where operator objects are interpreted).
+/// Unsafe deserialization of a request parameter.
+///
+/// One request asks the question; a second one answers it. See `deserial` for
+/// why this is an error-differential check rather than a gadget chain, and why
+/// that is not a compromise.
+async fn probe_deserialization(client: &Client, site: &Site, baseline: &Resp) -> Option<Value> {
+    let probe = send_site(client, site, crate::deserial::PROBE_VALUE).await?;
+    let format = crate::deserial::accused(&probe.body, &baseline.body)?;
+
+    // The complaint alone would be a guess: some pages carry a parser's name in
+    // a stack trace for reasons of their own, and only the baseline was checked
+    // so far. Hand the deserializer something it CAN read, and if it stops
+    // complaining then it really was reading our bytes.
+    let mut candidates: Vec<(&str, &str)> = vec![("base64-encoded", format.valid_b64)];
+    // The raw form only when the blob happens to be text. Java's and .NET's
+    // headers are not, and pushing them through a String would send a different
+    // sequence of bytes than the one the table describes - a probe that cannot
+    // say what it sent is not a probe.
+    if let Ok(raw) = std::str::from_utf8(format.valid_raw) {
+        candidates.push(("raw", raw));
+    }
+    let mut confirmed_as = None;
+    for (how, candidate) in candidates {
+        let Some(r) = send_site(client, site, candidate).await else {
+            continue;
+        };
+        if !crate::deserial::still_complaining(format, &r.body) {
+            confirmed_as = Some(how);
+            break;
+        }
+    }
+    let how = confirmed_as?;
+
+    Some(
+        Finding::new(
+            "cortex-deserial",
+            "deserialization",
+            format!("Unsafe deserialization ({})", format.label),
+            "critical",
+            &site.url,
+        )
+        .method(&site.method)
+        .param(&site.param)
+        .location(&site.where_label())
+        .describe(format!(
+            "`{}` is passed to {} without being checked first. A value that is not a serialized \
+             object made the deserializer itself complain in the response - text this scan never \
+             sent - and a minimal valid {how} object made the complaint stop, which is what shows \
+             the application is parsing these bytes rather than merely echoing a stack trace it \
+             always shows. From here an attacker supplies an object graph instead of a value, and \
+             the damage is decided by which classes the application's dependencies happen to \
+             provide: at worst, code execution before any of your own logic runs. No gadget chain \
+             was attempted and none is needed to fix it - deserializing untrusted input is the \
+             bug. Carry the value in a format that describes data rather than objects (JSON with a \
+             schema), or sign the blob and reject anything unsigned.",
+            site.param, format.label
+        ))
+        .with("format", json!(format.name))
+        .with("transport", json!(how))
+        .build(),
+    )
+}
+
 /// Server-side prototype pollution.
 ///
 /// A JSON body carrying `__proto__` can write onto `Object.prototype` in a Node

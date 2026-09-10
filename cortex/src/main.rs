@@ -6,6 +6,7 @@ use tokio::net::TcpStream;
 mod authz;
 mod client_tui;
 mod daemon;
+mod deserial;
 mod discover;
 mod dsl;
 mod engine;
