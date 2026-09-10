@@ -462,59 +462,65 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> i64 {
             None => continue,
         };
         // One injection point can be more than one kind of sink: PHP's
-        // include() takes a local path AND a URL, so the same parameter is
-        // both LFI and SSRF, with different severities and different fixes.
-        // Stopping at the first confirmed class hid the others, so every
-        // class runs. The cap is only a guard against an endpoint that
-        // echoes or executes everything, where a fifth confirmation adds
-        // nothing but requests.
-        const MAX_CLASSES_PER_SITE: usize = 4;
+        // include() takes a local path AND a URL, so the same parameter is both
+        // LFI and SSRF, with different severities and different fixes. Every
+        // class runs.
+        //
+        // A cap of four confirmed classes per point used to sit here, meant to
+        // stop an endpoint that executes everything from burning requests. It
+        // was a guess, and it reintroduced the exact bug it was written beside:
+        // Mutillidae's `?page=` confirms SQLi, XSS, command injection and SSRF
+        // before the LFI probe is reached, so the file read - the most severe of
+        // the five - was cut off by the cap and looked like a detection failure.
+        // Cost is already bounded by the concurrency limit and by each probe's
+        // own request budget. Hiding findings is not an acceptable way to buy
+        // time.
         let mut hits = 0usize;
         let emit = |f: Value, hits: &mut usize| {
             let _ = tx.send(json!({"type":"finding","data":f}));
             *hits += 1;
         };
-        if want("sqli") && hits < MAX_CLASSES_PER_SITE {
+        if want("sqli") {
             if let Some(f) = probe_sqli(&client, &site, &baseline).await {
                 emit(f, &mut hits);
             }
         }
-        if want("cmdi") && hits < MAX_CLASSES_PER_SITE {
+        if want("cmdi") {
             if let Some(f) = probe_cmdi(&client, &site, oast).await {
                 emit(f, &mut hits);
             }
         }
-        if want("ssrf") && hits < MAX_CLASSES_PER_SITE {
+        if want("ssrf") {
             if let Some(f) = probe_ssrf(&client, client_nr.as_ref(), &site, oast).await {
                 emit(f, &mut hits);
             }
         }
-        if want("xss") && hits < MAX_CLASSES_PER_SITE {
+        if want("xss") {
             if let Some(f) = probe_xss(&client, &site).await {
                 emit(f, &mut hits);
             }
         }
-        if want("lfi") && hits < MAX_CLASSES_PER_SITE {
+        if want("lfi") {
             if let Some(f) = probe_lfi(&client, &site, &baseline).await {
                 emit(f, &mut hits);
             }
         }
-        if want("ssti") && hits < MAX_CLASSES_PER_SITE {
+        if want("ssti") {
             if let Some(f) = probe_ssti(&client, &site).await {
                 emit(f, &mut hits);
             }
         }
-        if want("crlf") && hits < MAX_CLASSES_PER_SITE {
+        if want("crlf") {
             if let Some(f) = probe_crlf(&client, &site).await {
                 emit(f, &mut hits);
             }
         }
-        if want("nosql") && hits < MAX_CLASSES_PER_SITE {
+        if want("nosql") {
             if let Some(f) = probe_nosql(&client, &site, &baseline).await {
                 emit(f, &mut hits);
             }
         }
-        if want("open_redirect") && hits < MAX_CLASSES_PER_SITE {
+        if want("open_redirect") {
             if let Some(nr) = client_nr.as_ref() {
                 if let Some(f) = probe_open_redirect(nr, &site).await {
                     emit(f, &mut hits);
