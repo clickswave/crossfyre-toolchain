@@ -2222,6 +2222,16 @@ async fn probe_deserialization(client: &Client, site: &Site) -> Option<Value> {
     let probe = send_site(client, site, crate::deserial::PROBE_VALUE).await?;
     let format = crate::deserial::accused(&probe.body)?;
 
+    // A second invalid value, unlike the first. The parser has to complain
+    // about both before "it stopped complaining" means anything: an endpoint
+    // running a deserializer over something else entirely, which happened to
+    // fall quiet on the one valid blob we sent, would otherwise read as a
+    // finding.
+    let alt = send_site(client, site, crate::deserial::PROBE_VALUE_ALT).await?;
+    if !crate::deserial::still_complaining(format, &alt.body) {
+        return None;
+    }
+
     // The complaint alone would be a guess: some pages carry a parser's name in
     // a stack trace for reasons of their own, and only the baseline was checked
     // so far. Hand the deserializer something it CAN read, and if it stops
@@ -2260,9 +2270,10 @@ async fn probe_deserialization(client: &Client, site: &Site) -> Option<Value> {
         .describe(format!(
             "`{}` is passed to {} without being checked first. A value that is not a serialized \
              object made the deserializer itself complain in the response - text this scan never \
-             sent - and a minimal valid {how} object made the complaint stop, which is what shows \
-             the application is parsing these bytes rather than merely echoing a stack trace it \
-             always shows. From here an attacker supplies an object graph instead of a value, and \
+             sent - a second, differently shaped invalid value made it complain again, and a \
+             minimal valid {how} object made the complaint stop. That is what shows the \
+             application is parsing THESE bytes, rather than echoing a stack trace it always \
+             shows or running a deserializer over something else. From here an attacker supplies an object graph instead of a value, and \
              the damage is decided by which classes the application's dependencies happen to \
              provide: at worst, code execution before any of your own logic runs. No gadget chain \
              was attempted and none is needed to fix it - deserializing untrusted input is the \

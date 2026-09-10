@@ -51,6 +51,16 @@
 /// value goes, and an application that ignores it simply ignores it.
 pub const PROBE_VALUE: &str = "Y3Jvc3NmeXJlLWRlc2VyaWFsLWNoZWNr";
 
+/// A second value that is also valid in no format, and does not look like the
+/// first.
+///
+/// The complaint has to appear for BOTH invalid values and stop for the valid
+/// one. Without this, an endpoint that runs a deserializer over something else
+/// entirely - a cookie, a header - and happened to fall quiet on the one valid
+/// blob we sent would read as a finding. Different length, different alphabet,
+/// not valid base64, so nothing about its shape is shared with `PROBE_VALUE`.
+pub const PROBE_VALUE_ALT: &str = "zzq..not-a-serialized-object..qzz";
+
 /// One serialization format: how its parser complains, and the smallest valid
 /// object we can hand it to make the complaint stop.
 pub struct Format {
@@ -199,6 +209,17 @@ pub fn still_complaining(f: &Format, body: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_two_probe_values_share_no_shape() {
+        assert_ne!(PROBE_VALUE.len(), PROBE_VALUE_ALT.len());
+        // The alternate is not base64, so an endpoint that decodes first gets
+        // something different in kind, not just in content.
+        assert!(PROBE_VALUE_ALT.contains('.'));
+        for f in FORMATS {
+            assert!(!PROBE_VALUE_ALT.as_bytes().starts_with(f.valid_raw));
+        }
+    }
 
     #[test]
     fn the_probe_value_is_valid_in_no_format() {
