@@ -448,7 +448,10 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> i64 {
             .get(&format!("{}{}", host_of(&ep.url), path_only(&ep.url)))
             .map(|m| m.iter().map(|(i, v)| (*i, v.clone())).collect())
             .unwrap_or_default();
-        if let Some(f) = crate::exposure::probe(&client, &ep.method, &ep.url, &alts).await {
+        let declared = declared_path_indices(&ep);
+        if let Some(f) =
+            crate::exposure::probe(&client, &ep.method, &ep.url, &alts, &declared).await
+        {
             let _ = tx.send(json!({"type":"finding","data":f}));
             found += 1;
         }

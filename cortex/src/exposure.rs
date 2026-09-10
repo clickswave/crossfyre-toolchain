@@ -157,12 +157,33 @@ fn with_segment(url: &str, idx: usize, value: &str) -> Option<String> {
     Some(format!("{scheme_host}{}{query}", segs.join("/")))
 }
 
+/// A neighbouring identifier to compare against, when the corpus offered none.
+///
+/// A declared path parameter tells us the position varies without telling us a
+/// second value. For a numeric id the neighbour is obvious and is exactly how
+/// this bug gets exploited - iterate the id - so `7` gets `8` and `6` tried
+/// against it. For anything else we do not guess: inventing a username would
+/// only produce a 404, and a 404 is not evidence of anything.
+fn neighbours(value: &str) -> Vec<String> {
+    match value.parse::<i64>() {
+        Ok(n) => [n + 1, n - 1]
+            .iter()
+            .filter(|x| **x >= 0)
+            .map(|x| x.to_string())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// `alternatives` is (segment index, other values observed at that position).
+/// `declared` are positions the endpoint itself says are parameters, used when
+/// the corpus has only ever seen one value there.
 pub async fn probe(
     client: &Client,
     method: &str,
     url: &str,
     alternatives: &[(usize, Vec<String>)],
+    declared: &[usize],
 ) -> Option<Value> {
     if !method.eq_ignore_ascii_case("GET") {
         return None; // reading somebody's record is a GET
@@ -210,7 +231,33 @@ pub async fn probe(
         return None;
     }
 
-    for (idx, values) in alternatives {
+    // Observed values first; a declared position with no observed alternative
+    // falls back to numeric neighbours.
+    let mut candidates: Vec<(usize, Vec<String>)> = alternatives.to_vec();
+    let segs: Vec<&str> = url
+        .split_once("://")
+        .map(|(_, r)| r)
+        .unwrap_or(url)
+        .split('?')
+        .next()
+        .unwrap_or("")
+        .split('/')
+        .collect();
+    for d in declared {
+        if candidates.iter().any(|(i, _)| i == d) {
+            continue;
+        }
+        // `segs` here counts the host as element 0, which is how the path
+        // indices elsewhere are numbered.
+        if let Some(cur) = segs.get(*d) {
+            let n = neighbours(cur);
+            if !n.is_empty() {
+                candidates.push((*d, n));
+            }
+        }
+    }
+
+    for (idx, values) in &candidates {
         for alt in values {
             let Some(other) = with_segment(url, *idx, alt) else {
                 continue;
@@ -302,6 +349,13 @@ mod tests {
         assert!(differing(&a, &same).is_empty());
         let b = vec![("email".to_string(), "b@x.test".to_string())];
         assert_eq!(differing(&a, &b), vec!["email".to_string()]);
+    }
+
+    #[test]
+    fn a_numeric_id_has_neighbours_and_a_username_does_not() {
+        assert_eq!(neighbours("7"), vec!["8".to_string(), "6".to_string()]);
+        assert_eq!(neighbours("0"), vec!["1".to_string()]);
+        assert!(neighbours("alice").is_empty());
     }
 
     #[test]
