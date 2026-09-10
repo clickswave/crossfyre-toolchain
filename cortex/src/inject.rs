@@ -1793,8 +1793,14 @@ async fn probe_ssrf_reflected(client: &Client, site: &Site) -> Option<Value> {
     // A page of the target, fetched by us, so we know what it says before we
     // ask the server to say it.
     let root = origin_of(&site.url)?;
-    let canary = probe::send(client, "GET", &root, None).await?;
-    let candidates = crate::ssrf::canary_tokens(&canary.body);
+    // One fetch of the canary page per host, not one per candidate parameter.
+    let candidates = match crate::ssrf::cached_canary(&root) {
+        Some(c) => c,
+        None => {
+            let canary = probe::send(client, "GET", &root, None).await?;
+            crate::ssrf::canary_tokens_for(&root, &canary.body)
+        }
+    };
     if candidates.is_empty() {
         return None;
     }

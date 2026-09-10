@@ -40,6 +40,8 @@
 //! session keys in a findings database is a worse problem than the one it found.
 
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 /// Internal addresses worth one request each, once a fetch is confirmed.
 pub struct Internal {
@@ -191,6 +193,32 @@ fn visible_text(body: &str) -> String {
         }
     }
     out.trim().to_string()
+}
+
+/// Canary candidates for a host, computed once.
+///
+/// Every parameter named `url`, `uri`, `link` or `callback` on a target is a
+/// candidate site, and each one used to refetch the same page to draw the same
+/// token out of it. On an application with fifty such parameters that is fifty
+/// identical requests for one answer that does not change.
+static CANARIES: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
+
+/// Cached [`canary_tokens`] for `key`, computing them from `body` the first
+/// time. Returns a clone, since the caller holds it across an await.
+pub fn canary_tokens_for(key: &str, body: &str) -> Vec<String> {
+    let map = CANARIES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut m = map.lock().unwrap_or_else(|e| e.into_inner());
+    m.entry(key.to_string())
+        .or_insert_with(|| canary_tokens(body))
+        .clone()
+}
+
+/// Whether this host's canary has already been computed, so the caller can skip
+/// fetching the page again.
+pub fn cached_canary(key: &str) -> Option<Vec<String>> {
+    let map = CANARIES.get_or_init(|| Mutex::new(HashMap::new()));
+    let m = map.lock().unwrap_or_else(|e| e.into_inner());
+    m.get(key).cloned()
 }
 
 /// A confirmed reach into the target's own network, ready to attach to a
