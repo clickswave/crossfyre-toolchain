@@ -354,6 +354,75 @@ const MAX_ROUTE_VALUES: usize = 200;
 /// thousands of variants cannot grow the queue without limit.
 const MAX_HELD_VALUES: usize = 400;
 
+/// Ask for a path nothing could have registered, and see whether the error page
+/// is the application's own routing table.
+///
+/// Two outputs, and the second is not a bonus: an application serving a
+/// development error page has published its whole attack surface to anyone who
+/// mistypes a URL, and that is worth saying even when the routes turn out to be
+/// dull.
+#[allow(clippy::too_many_arguments)]
+async fn harvest_routes(
+    client: &transport::Client,
+    seed: &Url,
+    params: &CrawlParams,
+    seed_host: &str,
+    visited: &mut HashSet<String>,
+    frontier: &mut VecDeque<Queued>,
+    routes: &mut RouteSense,
+    tx: &mpsc::UnboundedSender<CrawlEvent>,
+) {
+    let Ok(probe) = seed.join(crate::routetable::PROBE_PATH) else {
+        return;
+    };
+    let Ok(resp) = client.get(probe.as_str()).send().await else {
+        return;
+    };
+    // A site that answers a made-up path with a 200 is answering everything
+    // that way, and nothing it says about routes means anything.
+    if resp.status().is_success() {
+        return;
+    }
+    let Ok(body) = resp.text().await else {
+        return;
+    };
+    let Some(h) = crate::routetable::parse(&body) else {
+        return;
+    };
+
+    let mut queued = 0usize;
+    let mut listed = 0usize;
+    for (method, path) in &h.routes {
+        let Ok(u) = seed.join(path) else { continue };
+        if resolve_and_scope(u.as_str(), seed, params, seed_host).is_none() {
+            continue;
+        }
+        listed += 1;
+        let mut ev = CrawlEvent::url_candidate(&u, Some("route table".into()), 0);
+        if !method.is_empty() {
+            ev.method = Some(method.clone());
+        }
+        let _ = tx.send(ev);
+        // Only fetchable routes join the frontier. A path with a `:id` segment
+        // is a real endpoint and is reported as one, but requesting it
+        // literally fetches nothing and costs a page from the budget.
+        let fetchable = !path.contains(':') && !path.contains('<');
+        let is_get = method.is_empty() || method == "GET";
+        if fetchable && is_get && visited.insert(routes.norm_key(&u)) {
+            frontier.push_back((u, 0, Some("route table".into())));
+            queued += 1;
+        }
+    }
+
+    let _ = tx.send(CrawlEvent::note(format!(
+        "{} published its routing table on an error page: {} in-scope route(s), {} queued to crawl. \
+         This is an exposure in its own right - a deployment answering an unknown path with a \
+         development error page has told every visitor its entire attack surface, including the \
+         endpoints nothing links to.",
+        h.framework, listed, queued
+    )));
+}
+
 /// A URL waiting in (or held back from) the frontier: where, how deep, and what
 /// linked to it.
 type Queued = (Url, u32, Option<String>);
@@ -613,6 +682,21 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
     frontier.push_back((seed.clone(), 0, None));
 
     let mut pages_crawled: u32 = 0;
+
+    // Before walking the links, ask whether the application will simply hand
+    // over its routing table. A crawl finds what is linked, and the routes worth
+    // attacking are often the ones nothing links to. See `routetable`.
+    harvest_routes(
+        &client,
+        &seed,
+        &params,
+        &seed_host,
+        &mut visited,
+        &mut frontier,
+        &mut routes,
+        &tx,
+    )
+    .await;
 
     while !frontier.is_empty() && pages_crawled < max_pages {
         // Take a wave of up to `tasks` URLs without exceeding the page budget.

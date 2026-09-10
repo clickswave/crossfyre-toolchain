@@ -12,6 +12,7 @@ mod daemon;
 mod exporter;
 mod libs;
 mod prober;
+mod routetable;
 mod scanner;
 mod tui;
 
