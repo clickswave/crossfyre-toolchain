@@ -125,6 +125,57 @@ impl OastClient {
         format!("{}{}.{}", reg.corr_id, rand_alnum(13), domain)
     }
 
+    /// The callback host for a correlation, plus the marker that identifies THIS
+    /// payload within it.
+    ///
+    /// One correlation can carry any number of payloads: the hostname already
+    /// ends in thirteen random characters, and the server seals the full
+    /// hostname it was asked for. That marker is what lets a single poll at the
+    /// end of a scan say WHICH injection point called back, instead of every
+    /// payload needing its own registration and its own blocking wait.
+    pub fn host_marked(&self, reg: &OastReg) -> (String, String) {
+        use rand::Rng;
+        let domain = if self.domains.len() == 1 {
+            &self.domains[0]
+        } else {
+            &self.domains[rand::thread_rng().gen_range(0..self.domains.len())]
+        };
+        let marker = rand_alnum(13);
+        (format!("{}{}.{}", reg.corr_id, marker, domain), marker)
+    }
+
+    /// Poll once and return the hostnames that were actually called back.
+    ///
+    /// The sealed plaintext carries `full_host`, so a batched scan can match a
+    /// callback to the payload that caused it. Only interactions we can decrypt
+    /// count, which is what makes a callback proof: nobody else can produce one
+    /// sealed to this scan's key.
+    pub async fn poll_hosts(&self, http: &Client, reg: &OastReg) -> Vec<String> {
+        let mut out = Vec::new();
+        let url = format!(
+            "{}/poll?corr_id={}&secret={}",
+            self.api_base, reg.corr_id, reg.secret
+        );
+        let Ok(resp) = http.get(&url).timeout(Duration::from_secs(10)).send().await else {
+            return out;
+        };
+        let Ok(body) = resp.json::<Value>().await else {
+            return out;
+        };
+        if let Some(items) = body["interactions"].as_array() {
+            for it in items {
+                if let Some(enc) = it["enc"].as_str()
+                    && let Some(plain) = self.decrypt(enc)
+                    && let Ok(v) = serde_json::from_slice::<Value>(&plain)
+                    && let Some(h) = v["full_host"].as_str()
+                {
+                    out.push(h.to_ascii_lowercase());
+                }
+            }
+        }
+        out
+    }
+
     /// Poll for interactions on a correlation, returning how many we could decrypt
     /// (i.e. real callbacks sealed to our key).
     pub async fn poll(&self, http: &Client, reg: &OastReg) -> u64 {

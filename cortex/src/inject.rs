@@ -120,6 +120,29 @@ const DEFAULT_TASKS: usize = 6;
 /// Dedupe keys shared across the concurrent endpoint workers, for the checks
 /// that are a property of a service or a path family rather than of one
 /// endpoint (shadow versions, rate limiting, CORS, XML).
+/// A finding that is built and waiting on an out-of-band callback.
+///
+/// Blind out-of-band detection used to block: every injection point registered
+/// its own correlation, fired its payloads, then slept and polled four times
+/// before giving up. Against a target with no shell - which is almost every
+/// injection point on almost every target - that is several seconds of waiting
+/// per point for a callback that will never come, and it dominated scan time.
+/// A 45-endpoint application spent an hour idle, talking to the callback
+/// service rather than to the target.
+///
+/// Nothing about out-of-band detection needs that wait. The callback only has
+/// to arrive before the scan reports. So the payloads go out carrying a marker
+/// that identifies the point that sent them, the finding is built and parked
+/// here, and one poll at the end of the pass decides which of them fired.
+pub struct PendingOob {
+    /// The per-payload label inside the callback hostname.
+    pub marker: String,
+    /// Emitted verbatim if that marker calls back.
+    pub finding: Value,
+}
+
+pub type OobQueue = std::sync::Mutex<Vec<PendingOob>>;
+
 pub type SeenSet = std::sync::Mutex<HashSet<String>>;
 
 /// True the first time this key is offered. The lock is taken and released
@@ -293,6 +316,15 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
     // `level1HintIncludeFile`, all reaching one query - and reporting the same
     // SQL injection once per value is noise that buries the rest.
     let found_seen: Arc<SeenSet> = Arc::new(SeenSet::default());
+    // ONE out-of-band correlation for the whole pass, and one queue of findings
+    // waiting on it. Registering per injection point, then blocking on four
+    // polls each, is what made a 45-endpoint scan take an hour while the target
+    // sat idle at 0.09% CPU.
+    let oob_reg: Option<Arc<crate::oast::OastReg>> = match oast.as_ref() {
+        Some(oc) => oc.register(&client).await.map(Arc::new),
+        None => None,
+    };
+    let oob_queue: Arc<OobQueue> = Arc::new(OobQueue::default());
     let xml_seen: Arc<SeenSet> = Arc::new(SeenSet::default());
     let classes = Arc::new(
         params
@@ -338,6 +370,8 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
                 client: client.clone(),
                 client_nr: client_nr.clone(),
                 oast: oast.clone(),
+                oob_reg: oob_reg.clone(),
+                oob_queue: Arc::clone(&oob_queue),
                 varying: Arc::clone(&varying),
                 classes: Arc::clone(&classes),
                 unauthenticated: params.auth.is_none(),
@@ -387,6 +421,42 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
         }
     }
 
+    // Out-of-band callbacks, collected once. Everything that was going to call
+    // back has had the whole pass to do it; this is the grace period for a
+    // target that queues its outbound requests, not a per-payload wait.
+    if let (Some(oc), Some(reg)) = (oast.as_ref(), oob_reg.as_ref()) {
+        let pending: Vec<PendingOob> = oob_queue
+            .lock()
+            .map(|mut v| std::mem::take(&mut *v))
+            .unwrap_or_default();
+        if !pending.is_empty() {
+            let _ = tx.send(json!({
+                "type": "log",
+                "message": format!(
+                    "{} out-of-band payload(s) sent; polling once for callbacks",
+                    pending.len()
+                )
+            }));
+            let mut hosts: Vec<String> = Vec::new();
+            for wait in [0u64, 2000, 4000] {
+                if wait > 0 {
+                    tokio::time::sleep(Duration::from_millis(wait)).await;
+                }
+                hosts = oc.poll_hosts(&client, reg).await;
+                if !hosts.is_empty() {
+                    break;
+                }
+            }
+            for p in pending {
+                if hosts.iter().any(|h| h.contains(&p.marker)) {
+                    let _ = tx.send(json!({"type":"finding","data": p.finding}));
+                    found += 1;
+                }
+            }
+        }
+        oc.deregister(&client, reg).await;
+    }
+
     let _ = tx.send(json!({"type":"done","found":found}));
 }
 
@@ -424,6 +494,10 @@ struct EndpointCtx {
     client: Client,
     client_nr: Option<Client>,
     oast: Option<Arc<crate::oast::OastClient>>,
+    /// One correlation for the whole pass. Every out-of-band payload rides it,
+    /// tagged with its own marker, and a single poll at the end sorts them out.
+    oob_reg: Option<Arc<crate::oast::OastReg>>,
+    oob_queue: Arc<OobQueue>,
     varying: Arc<VaryingPaths>,
     classes: Arc<Vec<String>>,
     /// Whether this scan is running without credentials. The public-exposure
@@ -452,6 +526,8 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
         client,
         client_nr,
         oast,
+        oob_reg,
+        oob_queue,
         varying,
         classes,
         unauthenticated,
@@ -577,12 +653,23 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
             }
         }
         if want("cmdi") {
-            if let Some(f) = probe_cmdi(&client, &site, oast).await {
+            if let Some(f) =
+                probe_cmdi(&client, &site, oast, oob_reg.as_deref(), Some(&oob_queue)).await
+            {
                 emit(f, &mut hits);
             }
         }
         if want("ssrf") {
-            if let Some(f) = probe_ssrf(&client, client_nr.as_ref(), &site, oast).await {
+            if let Some(f) = probe_ssrf(
+                &client,
+                client_nr.as_ref(),
+                &site,
+                oast,
+                oob_reg.as_deref(),
+                Some(&oob_queue),
+            )
+            .await
+            {
                 emit(f, &mut hits);
             }
         }
@@ -1119,6 +1206,8 @@ async fn probe_cmdi(
     client: &Client,
     site: &Site,
     oast: Option<&crate::oast::OastClient>,
+    oob_reg: Option<&crate::oast::OastReg>,
+    oob_queue: Option<&OobQueue>,
 ) -> Option<Value> {
     let base = &site.base_value;
 
@@ -1154,43 +1243,40 @@ async fn probe_cmdi(
         }
     }
 
-    if let Some(oc) = oast {
-        if let Some(reg) = oc.register(client).await {
-            let host = oc.host(&reg);
-            for sep in [";", "|", "&&", "$(", "`"] {
-                let close = if sep == "$(" {
-                    ")"
-                } else if sep == "`" {
-                    "`"
-                } else {
-                    ""
-                };
-                let _ = send_site(
-                    client,
+    // Blind, out-of-band. Fire and park: the callback is checked once at the end
+    // of the pass rather than waited on here. See `PendingOob`.
+    if let (Some(oc), Some(reg), Some(q)) = (oast, oob_reg, oob_queue) {
+        let (host, marker) = oc.host_marked(reg);
+        for sep in [";", "|", "&&", "$(", "`"] {
+            let close = if sep == "$(" {
+                ")"
+            } else if sep == "`" {
+                "`"
+            } else {
+                ""
+            };
+            let _ = send_site(
+                client,
+                site,
+                &format!("{base}{sep}curl http://{host}/c{close}"),
+            )
+            .await;
+            let _ = send_site(client, site, &format!("{base}{sep}nslookup {host}{close}")).await;
+        }
+        if let Ok(mut v) = q.lock() {
+            v.push(PendingOob {
+                marker,
+                finding: finding(
+                    "cmdi",
+                    "OS command injection (blind, OAST-confirmed)",
+                    "critical",
                     site,
-                    &format!("{base}{sep}curl http://{host}/c{close}"),
-                )
-                .await;
-                let _ =
-                    send_site(client, site, &format!("{base}{sep}nslookup {host}{close}")).await;
-            }
-            for _ in 0..4 {
-                tokio::time::sleep(Duration::from_millis(700)).await;
-                if oc.poll(client, &reg).await > 0 {
-                    oc.deregister(client, &reg).await;
-                    return Some(finding(
-                        "cmdi",
-                        "OS command injection (blind, OAST-confirmed)",
-                        "critical",
-                        site,
-                        format!(
-                            "A shell metacharacter + `curl`/`nslookup` injected into the {} produced an out-of-band callback -- the value is executed by a shell.",
-                            site.where_label()
-                        ),
-                    ));
-                }
-            }
-            oc.deregister(client, &reg).await;
+                    format!(
+                        "A shell metacharacter + `curl`/`nslookup` injected into the {} produced an out-of-band callback -- the value is executed by a shell.",
+                        site.where_label()
+                    ),
+                ),
+            });
         }
     }
     for sep in [";", "|", "&&", "$(", "`"] {
@@ -1318,6 +1404,8 @@ async fn probe_ssrf(
     client_nr: Option<&Client>,
     site: &Site,
     oast: Option<&crate::oast::OastClient>,
+    oob_reg: Option<&crate::oast::OastReg>,
+    oob_queue: Option<&OobQueue>,
 ) -> Option<Value> {
     let oc = oast?;
     let name = site.param.to_lowercase();
@@ -1325,8 +1413,9 @@ async fn probe_ssrf(
     if !hinted && !looks_like_url(&site.base_value) {
         return None;
     }
-    let reg = oc.register(client).await?;
-    let host = oc.host(&reg);
+    let reg = oob_reg?;
+    let q = oob_queue?;
+    let (host, marker) = oc.host_marked(reg);
     // Send the payloads with a client that does NOT follow redirects.
     //
     // An open redirect answers 302 to wherever you point it, and a
@@ -1356,15 +1445,16 @@ async fn probe_ssrf(
     if redirected_to_listener {
         // The endpoint pointed a browser at our listener rather than fetching
         // it. That is an open redirect, which probe_open_redirect reports, and
-        // it is not SSRF.
-        oc.deregister(client, &reg).await;
+        // it is not SSRF. Nothing is parked, so a callback arriving from a
+        // browser following that redirect cannot be read as a fetch.
         return None;
     }
-    for _ in 0..4 {
-        tokio::time::sleep(Duration::from_millis(700)).await;
-        if oc.poll(client, &reg).await > 0 {
-            oc.deregister(client, &reg).await;
-            return Some(finding(
+    // Park it. One poll at the end of the pass decides whether the server
+    // actually fetched our listener.
+    if let Ok(mut v) = q.lock() {
+        v.push(PendingOob {
+            marker,
+            finding: finding(
                 "ssrf",
                 "Server-side request forgery (blind, OAST-confirmed)",
                 "high",
@@ -1373,10 +1463,9 @@ async fn probe_ssrf(
                     "A URL pointing at our out-of-band listener, supplied in the {}, was fetched by the server: it makes outbound requests to attacker-controlled destinations (SSRF), which can reach internal-only services and cloud metadata endpoints.",
                     site.where_label()
                 ),
-            ));
-        }
+            ),
+        });
     }
-    oc.deregister(client, &reg).await;
     None
 }
 
