@@ -308,12 +308,25 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
     loop {
         while set.len() < tasks {
             let Some(ep) = queue.pop_front() else { break };
+            if !in_scope(&params.target, &ep.url) {
+                let _ = tx.send(json!({
+                    "type": "log",
+                    "message": format!(
+                        "skipping {} - not on the scan target's host ({}). Active payloads are \
+                         never sent off-scope.",
+                        ep.url, params.target
+                    )
+                }));
+                done += 1;
+                continue;
+            }
             let ctx = EndpointCtx {
                 client: client.clone(),
                 client_nr: client_nr.clone(),
                 oast: oast.clone(),
                 varying: Arc::clone(&varying),
                 classes: Arc::clone(&classes),
+                unauthenticated: params.auth.is_none(),
                 inv_seen: Arc::clone(&inv_seen),
                 rl_seen: Arc::clone(&rl_seen),
                 cors_seen: Arc::clone(&cors_seen),
@@ -338,6 +351,33 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
     let _ = tx.send(json!({"type":"done","found":found}));
 }
 
+/// Hosts an injection pass is allowed to touch.
+///
+/// A crawl of Mutillidae picked up a donate form whose action is
+/// `https://www.paypal.com/cgi-bin/webscr`, that endpoint reached this engine,
+/// and it sent SQL injection payloads to PayPal. Nothing downstream of the
+/// crawler was checking, so a single off-site form action was enough to point
+/// active probes at a third party's production service.
+///
+/// The scan target now defines the scope. An endpoint on another host is
+/// skipped and said out loud. When no target is given the caller is trusted,
+/// because that is an explicit endpoint list from an operator rather than
+/// something a crawl produced.
+fn in_scope(target: &str, url: &str) -> bool {
+    let scope = host_of(target);
+    if scope.is_empty() {
+        return true;
+    }
+    let host = host_of(url);
+    if host.is_empty() || host == scope {
+        return true;
+    }
+    // A port difference on the same name is the same service to an operator who
+    // named the host; a different name is not.
+    let bare = |h: &str| h.split(':').next().unwrap_or(h).to_string();
+    bare(&host) == bare(&scope)
+}
+
 /// Everything one endpoint worker needs. Cloned per endpoint; the clients are
 /// connection-pool handles and the sets are shared behind a mutex, so this is
 /// cheap.
@@ -345,8 +385,12 @@ struct EndpointCtx {
     client: Client,
     client_nr: Option<Client>,
     oast: Option<Arc<crate::oast::OastClient>>,
-    varying: Arc<HashMap<String, Vec<usize>>>,
+    varying: Arc<VaryingPaths>,
     classes: Arc<Vec<String>>,
+    /// Whether this scan is running without credentials. The public-exposure
+    /// oracle's whole claim is "an anonymous caller gets this", so it must not
+    /// run when the request carries a session.
+    unauthenticated: bool,
     inv_seen: Arc<SeenSet>,
     rl_seen: Arc<SeenSet>,
     cors_seen: Arc<SeenSet>,
@@ -362,6 +406,7 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> i64 {
         oast,
         varying,
         classes,
+        unauthenticated,
         inv_seen,
         rl_seen,
         cors_seen,
@@ -391,6 +436,19 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> i64 {
     }
     if want("xxe") {
         for f in crate::xml::probe(&client, &ep.method, &ep.url, oast, &xml_seen).await {
+            let _ = tx.send(json!({"type":"finding","data":f}));
+            found += 1;
+        }
+    }
+    // Personal data served to a caller who never authenticated. Only meaningful
+    // when the scan itself holds no credentials, which is what
+    // `unauthenticated` records.
+    if want("exposure") && unauthenticated {
+        let alts: Vec<(usize, Vec<String>)> = varying
+            .get(&format!("{}{}", host_of(&ep.url), path_only(&ep.url)))
+            .map(|m| m.iter().map(|(i, v)| (*i, v.clone())).collect())
+            .unwrap_or_default();
+        if let Some(f) = crate::exposure::probe(&client, &ep.method, &ep.url, &alts).await {
             let _ = tx.send(json!({"type":"finding","data":f}));
             found += 1;
         }
@@ -467,7 +525,7 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> i64 {
 
 /// Expand an endpoint into its fuzzable sites (query params, path segments,
 /// body fields). `varying` carries the positions the corpus proved variable.
-fn sites_for(ep: &InjEndpoint, varying: &HashMap<String, Vec<usize>>) -> Vec<Site> {
+fn sites_for(ep: &InjEndpoint, varying: &VaryingPaths) -> Vec<Site> {
     let method = ep.method.to_uppercase();
     let mut out = Vec::new();
     let qnames: Vec<String> = if ep.params.is_empty() {
@@ -503,9 +561,9 @@ fn sites_for(ep: &InjEndpoint, varying: &HashMap<String, Vec<usize>>) -> Vec<Sit
     // credibility on real targets.
     let path = path_only(&ep.url);
     let declared = declared_path_indices(ep);
-    let observed = varying
+    let observed: Vec<usize> = varying
         .get(&format!("{}{}", host_of(&ep.url), path))
-        .cloned()
+        .map(|m| m.keys().copied().collect())
         .unwrap_or_default();
     let have_evidence = !declared.is_empty() || !observed.is_empty();
     for (i, seg) in path.split('/').enumerate() {
@@ -638,7 +696,13 @@ fn declared_path_indices(ep: &InjEndpoint) -> Vec<usize> {
 /// observing what actually moves. It only ever adds sites, and it says nothing
 /// about positions it has not seen vary, so a corpus of one endpoint falls
 /// through to the shape heuristic unchanged.
-fn varying_path_indices(endpoints: &[InjEndpoint]) -> HashMap<String, Vec<usize>> {
+type VaryingPaths = HashMap<String, HashMap<usize, Vec<String>>>;
+
+/// Positions the corpus proves variable, and the values seen at each. The
+/// values matter as much as the positions: two different identifiers at the
+/// same position are two different objects, which is what the public-exposure
+/// oracle compares.
+fn varying_path_indices(endpoints: &[InjEndpoint]) -> VaryingPaths {
     // key: host + segment count + the segments with position i blanked.
     let mut buckets: HashMap<(String, usize, usize, String), HashSet<String>> = HashMap::new();
     for ep in endpoints {
@@ -655,22 +719,20 @@ fn varying_path_indices(endpoints: &[InjEndpoint]) -> HashMap<String, Vec<usize>
             buckets.entry(key).or_default().insert(segs[i].to_string());
         }
     }
-    let mut varying: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut varying: VaryingPaths = HashMap::new();
     for ((host, _len, i, masked), values) in buckets {
         if values.len() < 2 {
             continue; // one observation is not evidence of anything
         }
+        let mut all: Vec<String> = values.iter().cloned().collect();
+        all.sort();
         for v in &values {
             let concrete = masked.replace('\u{0}', v);
             varying
                 .entry(format!("{host}{concrete}"))
                 .or_default()
-                .push(i);
+                .insert(i, all.clone());
         }
-    }
-    for v in varying.values_mut() {
-        v.sort_unstable();
-        v.dedup();
     }
     varying
 }
@@ -1598,26 +1660,34 @@ async fn probe_xss(client: &Client, site: &Site) -> Option<Value> {
 /// What a response leaked for a given LFI payload, or None. Handles Unix/Windows file reads,
 /// `/proc/self/environ` disclosure, and PHP source via the `php://filter` wrapper (raw `<?php` or its
 /// base64 signature `PD9waHA`).
-fn lfi_leak(payload: &str, body: &str) -> Option<&'static str> {
-    if is_passwd(body) {
+/// What a response leaked, given what the endpoint says WITHOUT a payload.
+///
+/// Every branch requires the marker to be absent from the baseline, because a
+/// page that already contains it proves nothing. That is not hypothetical: the
+/// php:// branch reported seven file-read findings against a static
+/// `mutillidae-test-scripts.txt`, a documentation file full of `<?php`
+/// examples, which contains the marker no matter what we send.
+fn lfi_leak(payload: &str, body: &str, baseline: &str) -> Option<&'static str> {
+    let win = |b: &str| {
+        b.contains("[extensions]") || b.contains("[fonts]") || b.contains("for 16-bit app support")
+    };
+    let environ = |b: &str| {
+        b.contains("HTTP_HOST=")
+            || b.contains("HTTP_USER_AGENT=")
+            || (b.contains("PATH=") && b.contains("PWD="))
+    };
+    let php = |b: &str| b.contains("<?php") || b.contains("<?=") || b.contains("PD9waHA");
+
+    if is_passwd(body) && !is_passwd(baseline) {
         return Some("/etc/passwd");
     }
-    if body.contains("[extensions]")
-        || body.contains("[fonts]")
-        || body.contains("for 16-bit app support")
-    {
+    if win(body) && !win(baseline) {
         return Some("windows/win.ini");
     }
-    if payload.contains("self/environ")
-        && (body.contains("HTTP_HOST=")
-            || body.contains("HTTP_USER_AGENT=")
-            || (body.contains("PATH=") && body.contains("PWD=")))
-    {
+    if payload.contains("self/environ") && environ(body) && !environ(baseline) {
         return Some("/proc/self/environ");
     }
-    if payload.starts_with("php://")
-        && (body.contains("<?php") || body.contains("<?=") || body.contains("PD9waHA"))
-    {
+    if payload.starts_with("php://") && php(body) && !php(baseline) {
         return Some("PHP source via php:// wrapper");
     }
     None
@@ -1644,9 +1714,9 @@ async fn probe_lfi(client: &Client, site: &Site, baseline: &Resp) -> Option<Valu
     ];
     for p in payloads {
         let r = send_site(client, site, p).await?;
-        if let Some(what) = lfi_leak(p, &r.body) {
+        if let Some(what) = lfi_leak(p, &r.body, &baseline.body) {
             let again = send_site(client, site, p).await?;
-            if lfi_leak(p, &again.body).is_some() {
+            if lfi_leak(p, &again.body, &baseline.body).is_some() {
                 return Some(finding(
                     "lfi",
                     "Local file inclusion / path traversal",
@@ -1766,6 +1836,30 @@ use crate::probe::{is_passwd, is_sql_error};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
+#[cfg(test)]
+mod scope_tests {
+    use super::in_scope;
+
+    #[test]
+    fn an_off_site_form_action_is_refused() {
+        let target = "http://127.0.0.1:7012/";
+        assert!(in_scope(target, "http://127.0.0.1:7012/index.php?page=a"));
+        assert!(in_scope(target, "http://127.0.0.1:7012/x"));
+        assert!(!in_scope(target, "https://www.paypal.com/cgi-bin/webscr"));
+        assert!(!in_scope(target, "https://evil.example/collect"));
+    }
+
+    #[test]
+    fn a_port_difference_on_the_named_host_is_still_in_scope() {
+        assert!(in_scope("http://app.test/", "http://app.test:8443/api"));
+    }
+
+    #[test]
+    fn no_target_means_the_caller_is_trusted() {
+        assert!(in_scope("", "https://anything.example/"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
