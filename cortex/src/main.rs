@@ -21,6 +21,7 @@ mod race;
 mod rawhttp;
 mod smuggle;
 mod solver;
+mod ssrf;
 mod template;
 mod xml;
 

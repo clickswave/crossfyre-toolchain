@@ -1711,12 +1711,23 @@ async fn probe_ssrf(
     oob_reg: Option<&crate::oast::OastReg>,
     oob_queue: Option<&OobQueue>,
 ) -> Option<Value> {
-    let oc = oast?;
     let name = site.param.to_lowercase();
     let hinted = SSRF_HINT.iter().any(|h| name == *h || name.contains(h));
     if !hinted && !looks_like_url(&site.base_value) {
         return None;
     }
+    // The version that reads back comes FIRST, and needs no listener.
+    //
+    // It used to sit after the OAST gate, which made it unreachable in exactly
+    // the deployments it exists for: an engine with no out-of-band endpoint, or
+    // a target with no route to the internet. An SSRF confined to internal
+    // addresses produces no callback by definition, so gating the internal
+    // check on the external one meant the dangerous case could only be found
+    // when the harmless one already had been.
+    if let Some(f) = probe_ssrf_reflected(client_nr.unwrap_or(client), site).await {
+        return Some(f);
+    }
+    let oc = oast?;
     let reg = oob_reg?;
     let q = oob_queue?;
     let (host, marker) = oc.host_marked(reg);
@@ -1771,6 +1782,123 @@ async fn probe_ssrf(
         });
     }
     None
+}
+
+/// SSRF confirmed by reading the fetch back, then followed where it leads.
+///
+/// Costs nothing on a parameter that is not an SSRF: the canary fetch and one
+/// payload, and it stops there unless the target's own page comes back through
+/// the parameter.
+async fn probe_ssrf_reflected(client: &Client, site: &Site) -> Option<Value> {
+    // A page of the target, fetched by us, so we know what it says before we
+    // ask the server to say it.
+    let root = origin_of(&site.url)?;
+    let canary = probe::send(client, "GET", &root, None).await?;
+    let candidates = crate::ssrf::canary_tokens(&canary.body);
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // A candidate that already appears in the endpoint's ordinary answer proves
+    // nothing: site-wide chrome is on both pages whether or not anything was
+    // fetched. Take the first candidate that is not.
+    let base = send_site(client, site, &site.base_value).await?;
+    let token = candidates.into_iter().find(|t| !base.body.contains(t))?;
+
+    let hit = send_site(client, site, &root).await?;
+    if !hit.body.contains(&token) {
+        return None;
+    }
+
+    // Control: the same parameter pointed somewhere nothing can answer. An
+    // endpoint that echoes a whole response body whatever you give it would
+    // otherwise read as SSRF.
+    let ctrl = send_site(client, site, crate::ssrf::CLOSED_INTERNAL).await?;
+    if ctrl.body.contains(&token) {
+        return None;
+    }
+
+    // Confirmed. Now one request per internal address, and only now.
+    let mut reached = Vec::new();
+    let mut worst = "high";
+    for svc in crate::ssrf::INTERNAL {
+        let headers: Vec<(String, String)> = svc
+            .headers
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let (url, body) = site.render(svc.url);
+        let Some(r) = probe::send_with(
+            client,
+            &site.method,
+            &url,
+            body.as_ref().map(|(b, c)| (b.as_str(), *c)),
+            &headers,
+        )
+        .await
+        else {
+            continue;
+        };
+        if crate::ssrf::identify(&r.body).is_some() {
+            reached.push(crate::ssrf::reach_note(svc));
+            worst = "critical";
+        }
+    }
+
+    let where_to = if reached.is_empty() {
+        "No cloud metadata service answered, so this instance is either not in one or is running \
+         IMDSv2, which requires a token this probe deliberately does not try to obtain. The bug is \
+         the same; only the shortest path off it is missing."
+            .to_string()
+    } else {
+        format!(
+            "It reaches {}, which is the escalation: those services answer any request from inside \
+             the instance and hand out the role credentials the instance runs as. This probe asked \
+             each one for its INDEX and stopped there - it did not fetch a credential, and a \
+             scanner holding somebody's live cloud session keys would be a worse problem than the \
+             one it found.",
+            reached
+                .iter()
+                .filter_map(|v| v.get("service").and_then(|s| s.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+
+    let mut f = Finding::new(
+        "cortex-ssrf",
+        "ssrf",
+        "Server-side request forgery (response returned to the caller)",
+        worst,
+        &site.url,
+    )
+    .method(&site.method)
+    .param(&site.param)
+    .location(&site.where_label())
+    .describe(format!(
+        "A URL supplied in the {} was fetched by the server and its body returned in the \
+         response: text from a different page of this application came back through `{}`, while \
+         the same parameter pointed at a closed port did not. The server makes requests on demand \
+         and shows the answers, so every address reachable from it is reachable from outside - \
+         loopback services with no authentication because \"only the app can reach them\", \
+         internal admin panels, and the private ranges. Unlike the out-of-band case, this one \
+         needs no route to the internet, so a firewalled deployment does not mitigate it. {}",
+        site.where_label(),
+        site.param,
+        where_to
+    ))
+    .with("internal_reach", json!(reached));
+    if !reached.is_empty() {
+        f = f.with("chained", json!(true));
+    }
+    Some(f.build())
+}
+
+/// `http://host:port/` for a URL, which is the page the canary comes from.
+fn origin_of(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let host = rest.split('/').next()?;
+    (!host.is_empty()).then(|| format!("{scheme}://{host}/"))
 }
 
 // ---------------------------------------------------------------- resource consumption (API4)
