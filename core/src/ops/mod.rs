@@ -48,6 +48,33 @@ impl Relay<'_> {
         format!("{}-{}", self.workflow_id, self.op_id)
     }
 
+    /// An engine said something an operator needs to know about COVERAGE.
+    ///
+    /// Engines emit `type:"log"` for the things that change what a result
+    /// means: out-of-band callbacks unavailable, so blind classes could not be
+    /// confirmed; an endpoint skipped because it stopped answering; a target
+    /// refused because it is off-scope; a routing parameter found, so a
+    /// dispatcher's pages entered the crawl.
+    ///
+    /// Every one of those used to be discarded here by a catch-all match arm.
+    /// That is the expensive kind of silence: a scan that quietly stopped
+    /// testing a whole class produces a report indistinguishable from a clean
+    /// one, and the operator has no way to tell the difference. They are now
+    /// carried to the control plane and stored on the operation.
+    pub async fn publish_note(&self, message: &str) {
+        let msg = serde_json::json!({
+            "type": "operation_note",
+            "operation_id": self.op_id,
+            "workflow_id": self.workflow_id,
+            "node_id": self.node_id,
+            "message": message,
+        });
+        let _ = self
+            .pubc
+            .publish(self.status_subj.to_string(), msg.to_string().into())
+            .await;
+    }
+
     /// The engine daemon was unreachable: publish `completed{code:1}` on the
     /// result subject. The op logs its own engine-specific message and returns.
     pub async fn publish_failed(&self) {

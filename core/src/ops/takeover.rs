@@ -121,6 +121,12 @@ pub async fn handle(env: OpEnv) {
                     total = t;
                 }
             }
+            // Coverage notes: what the engine could not test, and why.
+            "log" => {
+                if let Some(m) = event["message"].as_str() {
+                    relay.publish_note(m).await;
+                }
+            }
             "done" => break,
             "error" => {
                 eprintln!(

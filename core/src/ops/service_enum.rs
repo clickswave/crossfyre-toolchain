@@ -226,6 +226,12 @@ async fn run_scout(
                             .publish(result_subj.to_string(), result_msg.to_string().into())
                             .await;
                     }
+                    // Coverage notes: what the engine could not test, and why.
+                    "log" => {
+                        if let Some(m) = event["message"].as_str() {
+                            relay.publish_note(m).await;
+                        }
+                    }
                     "done" => break,
                     "error" => {
                         eprintln!(
