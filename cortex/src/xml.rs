@@ -26,7 +26,6 @@
 use crate::probe::{self, Resp, is_passwd};
 use cfx_finding::Finding;
 use serde_json::Value;
-use std::collections::HashSet;
 use transport::Client;
 
 /// Does this response look like a WSDL / service contract?
@@ -75,11 +74,11 @@ pub async fn probe(
     method: &str,
     url: &str,
     oast: Option<&crate::oast::OastClient>,
-    seen: &mut HashSet<String>,
+    seen: &crate::inject::SeenSet,
 ) -> Vec<Value> {
     let mut out = Vec::new();
     let base = url.split('?').next().unwrap_or(url).to_string();
-    if !seen.insert(base.clone()) {
+    if !crate::inject::seen_once(seen, base.clone()) {
         return out;
     }
 

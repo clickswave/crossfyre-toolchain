@@ -20,6 +20,7 @@ use crate::probe::{
 use cfx_finding::Finding;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use transport::Client;
@@ -43,9 +44,16 @@ pub struct InjectParams {
     /// Which classes to run (sqli/xss/cmdi/lfi); empty/null = all.
     #[serde(default, deserialize_with = "crate::probe::de_null_seq")]
     pub classes: Vec<String>,
+    /// Endpoints probed concurrently. Same meaning as mach's and pulse's
+    /// `tasks`, and clamped, because the target is someone's service.
+    #[serde(default = "d_tasks")]
+    pub tasks: usize,
 }
 fn d_timeout() -> u64 {
     12_000
+}
+fn d_tasks() -> usize {
+    DEFAULT_TASKS
 }
 fn d_true() -> bool {
     true
@@ -103,6 +111,27 @@ const SLEEP_THRESHOLD_MS: u128 = 3800;
 const CMDI_ECHO_A: u64 = 199_933;
 const CMDI_ECHO_B: u64 = 314_573;
 const MAX_ENDPOINTS: usize = 300;
+/// Endpoints probed at once. Injection is request-bound, not CPU-bound, and one
+/// endpoint at a time meant a scan of a few dozen endpoints across every class
+/// took long enough that callers capped it and lost coverage instead. Kept low
+/// by default: a target being scanned is someone's production service.
+const DEFAULT_TASKS: usize = 6;
+
+/// Dedupe keys shared across the concurrent endpoint workers, for the checks
+/// that are a property of a service or a path family rather than of one
+/// endpoint (shadow versions, rate limiting, CORS, XML).
+pub type SeenSet = std::sync::Mutex<HashSet<String>>;
+
+/// True the first time this key is offered. The lock is taken and released
+/// around the insert alone, never held across a request.
+pub fn seen_once(seen: &SeenSet, key: String) -> bool {
+    match seen.lock() {
+        Ok(mut g) => g.insert(key),
+        // A poisoned lock means another worker panicked; carry on rather than
+        // taking the whole scan down with it.
+        Err(p) => p.into_inner().insert(key),
+    }
+}
 const MAX_SITES_PER_EP: usize = 16;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -213,8 +242,6 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
         let _ = tx.send(json!({"type":"done","found":0}));
         return;
     }
-    let want = |c: &str| params.classes.is_empty() || params.classes.iter().any(|x| x == c);
-
     // Injection probes send a benign SLEEP, so the timeout floor must clear it.
     let client = match probe::build_client(
         params.evasive,
@@ -246,123 +273,196 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
         _ => crate::oast::OastClient::from_env(),
     };
 
-    let mut found = 0i64;
-    let mut done = 0i64;
     let total = params.endpoints.len().min(MAX_ENDPOINTS) as i64;
-    // Improper inventory (API9) is a property of a versioned path family, not of one param, so it is
-    // probed once per (method, version-family) and deduped across the endpoint list.
-    let mut inv_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Positions the corpus proves variable, computed once over every endpoint
     // we were given rather than per endpoint: the evidence for `/users/alice`
     // lives in `/users/bob`, which is a different endpoint.
-    let varying = varying_path_indices(&params.endpoints);
+    let varying = Arc::new(varying_path_indices(&params.endpoints));
+    // Dedupe keys for the checks that belong to a service or a path family
+    // rather than to one endpoint.
+    let inv_seen: Arc<SeenSet> = Arc::new(SeenSet::default());
+    let rl_seen: Arc<SeenSet> = Arc::new(SeenSet::default());
+    let cors_seen: Arc<SeenSet> = Arc::new(SeenSet::default());
+    let xml_seen: Arc<SeenSet> = Arc::new(SeenSet::default());
+    let classes = Arc::new(
+        params
+            .classes
+            .iter()
+            .map(|c| c.to_lowercase())
+            .collect::<Vec<String>>(),
+    );
+    let oast = oast.map(Arc::new);
+    let tasks = params.tasks.clamp(1, 16);
 
-    let mut rl_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut cors_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // XML/SOAP is a per-service property, not a per-parameter one.
-    let mut xml_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut found = 0i64;
+    let mut done = 0i64;
+    let mut set: tokio::task::JoinSet<i64> = tokio::task::JoinSet::new();
+    let mut queue = params
+        .endpoints
+        .iter()
+        .take(MAX_ENDPOINTS)
+        .cloned()
+        .collect::<std::collections::VecDeque<_>>();
 
-    for ep in params.endpoints.iter().take(MAX_ENDPOINTS) {
-        if want("inventory") {
-            for f in probe_inventory(&client, ep, &mut inv_seen).await {
-                let _ = tx.send(json!({"type":"finding","data":f}));
-                found += 1;
-            }
-        }
-        if want("ratelimit") {
-            if let Some(f) = probe_ratelimit(&client, ep, &mut rl_seen).await {
-                let _ = tx.send(json!({"type":"finding","data":f}));
-                found += 1;
-            }
-        }
-        if want("cors") {
-            if let Some(f) = probe_cors(&client, ep, &mut cors_seen).await {
-                let _ = tx.send(json!({"type":"finding","data":f}));
-                found += 1;
-            }
-        }
-        if want("xxe") {
-            for f in
-                crate::xml::probe(&client, &ep.method, &ep.url, oast.as_ref(), &mut xml_seen).await
-            {
-                let _ = tx.send(json!({"type":"finding","data":f}));
-                found += 1;
-            }
-        }
-        for site in sites_for(ep, &varying) {
-            let baseline = match send_site(&client, &site, &site.base_value).await {
-                Some(r) => r,
-                None => continue,
+    loop {
+        while set.len() < tasks {
+            let Some(ep) = queue.pop_front() else { break };
+            let ctx = EndpointCtx {
+                client: client.clone(),
+                client_nr: client_nr.clone(),
+                oast: oast.clone(),
+                varying: Arc::clone(&varying),
+                classes: Arc::clone(&classes),
+                inv_seen: Arc::clone(&inv_seen),
+                rl_seen: Arc::clone(&rl_seen),
+                cors_seen: Arc::clone(&cors_seen),
+                xml_seen: Arc::clone(&xml_seen),
+                tx: tx.clone(),
             };
-            // One injection point can be more than one kind of sink: PHP's
-            // include() takes a local path AND a URL, so the same parameter is
-            // both LFI and SSRF, with different severities and different fixes.
-            // Stopping at the first confirmed class hid the others, so every
-            // class runs. The cap is only a guard against an endpoint that
-            // echoes or executes everything, where a fifth confirmation adds
-            // nothing but requests.
-            const MAX_CLASSES_PER_SITE: usize = 4;
-            let mut hits = 0usize;
-            let emit = |f: Value, hits: &mut usize| {
-                let _ = tx.send(json!({"type":"finding","data":f}));
-                *hits += 1;
-            };
-            if want("sqli") && hits < MAX_CLASSES_PER_SITE {
-                if let Some(f) = probe_sqli(&client, &site, &baseline).await {
-                    emit(f, &mut hits);
-                }
-            }
-            if want("cmdi") && hits < MAX_CLASSES_PER_SITE {
-                if let Some(f) = probe_cmdi(&client, &site, oast.as_ref()).await {
-                    emit(f, &mut hits);
-                }
-            }
-            if want("ssrf") && hits < MAX_CLASSES_PER_SITE {
-                if let Some(f) = probe_ssrf(&client, &site, oast.as_ref()).await {
-                    emit(f, &mut hits);
-                }
-            }
-            if want("xss") && hits < MAX_CLASSES_PER_SITE {
-                if let Some(f) = probe_xss(&client, &site).await {
-                    emit(f, &mut hits);
-                }
-            }
-            if want("lfi") && hits < MAX_CLASSES_PER_SITE {
-                if let Some(f) = probe_lfi(&client, &site, &baseline).await {
-                    emit(f, &mut hits);
-                }
-            }
-            if want("ssti") && hits < MAX_CLASSES_PER_SITE {
-                if let Some(f) = probe_ssti(&client, &site).await {
-                    emit(f, &mut hits);
-                }
-            }
-            if want("crlf") && hits < MAX_CLASSES_PER_SITE {
-                if let Some(f) = probe_crlf(&client, &site).await {
-                    emit(f, &mut hits);
-                }
-            }
-            if want("nosql") && hits < MAX_CLASSES_PER_SITE {
-                if let Some(f) = probe_nosql(&client, &site, &baseline).await {
-                    emit(f, &mut hits);
-                }
-            }
-            if want("open_redirect") && hits < MAX_CLASSES_PER_SITE {
-                if let Some(nr) = client_nr.as_ref() {
-                    if let Some(f) = probe_open_redirect(nr, &site).await {
-                        emit(f, &mut hits);
-                    }
-                }
-            }
-            found += hits as i64;
+            set.spawn(async move { run_endpoint(ep, ctx).await });
         }
-        done += 1;
+        match set.join_next().await {
+            Some(Ok(n)) => {
+                found += n;
+                done += 1;
+            }
+            Some(Err(_)) => done += 1,
+            None => break,
+        }
         if done % 3 == 0 || done == total {
             let _ = tx.send(json!({"type":"progress","processed":done,"total":total}));
         }
     }
+
     let _ = tx.send(json!({"type":"done","found":found}));
+}
+
+/// Everything one endpoint worker needs. Cloned per endpoint; the clients are
+/// connection-pool handles and the sets are shared behind a mutex, so this is
+/// cheap.
+struct EndpointCtx {
+    client: Client,
+    client_nr: Option<Client>,
+    oast: Option<Arc<crate::oast::OastClient>>,
+    varying: Arc<HashMap<String, Vec<usize>>>,
+    classes: Arc<Vec<String>>,
+    inv_seen: Arc<SeenSet>,
+    rl_seen: Arc<SeenSet>,
+    cors_seen: Arc<SeenSet>,
+    xml_seen: Arc<SeenSet>,
+    tx: mpsc::UnboundedSender<Value>,
+}
+
+/// Probe one endpoint end to end. Returns how many findings it emitted.
+async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> i64 {
+    let EndpointCtx {
+        client,
+        client_nr,
+        oast,
+        varying,
+        classes,
+        inv_seen,
+        rl_seen,
+        cors_seen,
+        xml_seen,
+        tx,
+    } = ctx;
+    let want = |c: &str| classes.is_empty() || classes.iter().any(|x| x == c);
+    let oast = oast.as_deref();
+    let mut found = 0i64;
+    if want("inventory") {
+        for f in probe_inventory(&client, &ep, &inv_seen).await {
+            let _ = tx.send(json!({"type":"finding","data":f}));
+            found += 1;
+        }
+    }
+    if want("ratelimit") {
+        if let Some(f) = probe_ratelimit(&client, &ep, &rl_seen).await {
+            let _ = tx.send(json!({"type":"finding","data":f}));
+            found += 1;
+        }
+    }
+    if want("cors") {
+        if let Some(f) = probe_cors(&client, &ep, &cors_seen).await {
+            let _ = tx.send(json!({"type":"finding","data":f}));
+            found += 1;
+        }
+    }
+    if want("xxe") {
+        for f in crate::xml::probe(&client, &ep.method, &ep.url, oast, &xml_seen).await {
+            let _ = tx.send(json!({"type":"finding","data":f}));
+            found += 1;
+        }
+    }
+    for site in sites_for(&ep, &varying) {
+        let baseline = match send_site(&client, &site, &site.base_value).await {
+            Some(r) => r,
+            None => continue,
+        };
+        // One injection point can be more than one kind of sink: PHP's
+        // include() takes a local path AND a URL, so the same parameter is
+        // both LFI and SSRF, with different severities and different fixes.
+        // Stopping at the first confirmed class hid the others, so every
+        // class runs. The cap is only a guard against an endpoint that
+        // echoes or executes everything, where a fifth confirmation adds
+        // nothing but requests.
+        const MAX_CLASSES_PER_SITE: usize = 4;
+        let mut hits = 0usize;
+        let emit = |f: Value, hits: &mut usize| {
+            let _ = tx.send(json!({"type":"finding","data":f}));
+            *hits += 1;
+        };
+        if want("sqli") && hits < MAX_CLASSES_PER_SITE {
+            if let Some(f) = probe_sqli(&client, &site, &baseline).await {
+                emit(f, &mut hits);
+            }
+        }
+        if want("cmdi") && hits < MAX_CLASSES_PER_SITE {
+            if let Some(f) = probe_cmdi(&client, &site, oast).await {
+                emit(f, &mut hits);
+            }
+        }
+        if want("ssrf") && hits < MAX_CLASSES_PER_SITE {
+            if let Some(f) = probe_ssrf(&client, &site, oast).await {
+                emit(f, &mut hits);
+            }
+        }
+        if want("xss") && hits < MAX_CLASSES_PER_SITE {
+            if let Some(f) = probe_xss(&client, &site).await {
+                emit(f, &mut hits);
+            }
+        }
+        if want("lfi") && hits < MAX_CLASSES_PER_SITE {
+            if let Some(f) = probe_lfi(&client, &site, &baseline).await {
+                emit(f, &mut hits);
+            }
+        }
+        if want("ssti") && hits < MAX_CLASSES_PER_SITE {
+            if let Some(f) = probe_ssti(&client, &site).await {
+                emit(f, &mut hits);
+            }
+        }
+        if want("crlf") && hits < MAX_CLASSES_PER_SITE {
+            if let Some(f) = probe_crlf(&client, &site).await {
+                emit(f, &mut hits);
+            }
+        }
+        if want("nosql") && hits < MAX_CLASSES_PER_SITE {
+            if let Some(f) = probe_nosql(&client, &site, &baseline).await {
+                emit(f, &mut hits);
+            }
+        }
+        if want("open_redirect") && hits < MAX_CLASSES_PER_SITE {
+            if let Some(nr) = client_nr.as_ref() {
+                if let Some(f) = probe_open_redirect(nr, &site).await {
+                    emit(f, &mut hits);
+                }
+            }
+        }
+        found += hits as i64;
+    }
+    found
 }
 
 /// Expand an endpoint into its fuzzable sites (query params, path segments,
@@ -1046,17 +1146,13 @@ static SENSITIVE_PATH: &[&str] = &[
 /// Missing rate limiting on a sensitive flow (OWASP API4). Fire a short burst of the baseline
 /// request; if none are throttled (429 / 503 / Retry-After) the endpoint accepts unlimited attempts.
 /// Deduped per (method, path) so a burst runs once, not per param.
-async fn probe_ratelimit(
-    client: &Client,
-    ep: &InjEndpoint,
-    seen: &mut std::collections::HashSet<String>,
-) -> Option<Value> {
+async fn probe_ratelimit(client: &Client, ep: &InjEndpoint, seen: &SeenSet) -> Option<Value> {
     let path_l = ep.url.to_lowercase();
     if !SENSITIVE_PATH.iter().any(|k| path_l.contains(k)) {
         return None;
     }
     let key = format!("{} {}", ep.method.to_uppercase(), ep.url);
-    if !seen.insert(key) {
+    if !seen_once(seen, key) {
         return None;
     }
     let method = ep.method.to_uppercase();
@@ -1111,11 +1207,7 @@ static VERSION_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)/v(\d+)(?
 /// the sibling versions (`v1`, `v3`, ...); any that still answer as a real route (not 404 / not a
 /// transport error) is an undocumented or un-retired version - a common source of "the old endpoint
 /// skipped the new auth check". Deduped per (method, version-family) so it fires once, not per param.
-async fn probe_inventory(
-    client: &Client,
-    ep: &InjEndpoint,
-    seen: &mut std::collections::HashSet<String>,
-) -> Vec<Value> {
+async fn probe_inventory(client: &Client, ep: &InjEndpoint, seen: &SeenSet) -> Vec<Value> {
     let mut out = Vec::new();
     let url = ep.url.clone();
     let Some(m) = VERSION_RE.captures(&url) else {
@@ -1129,7 +1221,7 @@ async fn probe_inventory(
         ep.method.to_uppercase(),
         url.replacen(&whole, "/v#/", 1)
     );
-    if !seen.insert(family) {
+    if !seen_once(seen, family) {
         return out;
     }
     let method = ep.method.to_uppercase();
@@ -1357,12 +1449,8 @@ async fn probe_nosql(client: &Client, site: &Site, baseline: &Resp) -> Option<Va
 /// A request carrying an attacker `Origin` that the server reflects into `Access-Control-Allow-Origin`
 /// while also allowing credentials means any site can read this endpoint's authenticated responses
 /// cross-origin. Confirmed by reproducing the reflection. Endpoint-level, deduped per URL.
-async fn probe_cors(
-    client: &Client,
-    ep: &InjEndpoint,
-    seen: &mut std::collections::HashSet<String>,
-) -> Option<Value> {
-    if !seen.insert(ep.url.clone()) {
+async fn probe_cors(client: &Client, ep: &InjEndpoint, seen: &SeenSet) -> Option<Value> {
+    if !seen_once(seen, ep.url.clone()) {
         return None;
     }
     let method = ep.method.to_uppercase();
