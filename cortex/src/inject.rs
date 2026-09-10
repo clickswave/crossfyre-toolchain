@@ -39,6 +39,19 @@ pub struct InjectParams {
     pub identify: Option<String>,
     #[serde(default)]
     pub auth: Option<AuthSpec>,
+    /// Independent sessions for the same identity, one per worker.
+    ///
+    /// A single session is a bottleneck on any target that locks it per
+    /// request - PHP does by default - because the target then serialises the
+    /// whole pass however many workers we run. Worse, a time-based payload
+    /// holds that lock for five or ten seconds while everything else queues
+    /// behind it and times out, and a timeout is reported as "the endpoint did
+    /// not answer", so the visible symptom is missing coverage.
+    ///
+    /// Empty (the default) means "use `auth` for everything", which is right
+    /// for a stateless credential: a bearer token has no lock to contend on.
+    #[serde(default)]
+    pub auth_pool: Vec<AuthSpec>,
     #[serde(default)]
     pub oast: Option<OastSpec>,
     /// Which classes to run (sqli/xss/cmdi/lfi); empty/null = all.
@@ -302,6 +315,34 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
             return;
         }
     };
+    // One client per session in the pool. Workers take one each, so two workers
+    // never contend on the same server-side session lock.
+    let session_clients: Vec<Client> = params
+        .auth_pool
+        .iter()
+        .skip(1)
+        .filter_map(|a| {
+            probe::build_client(
+                params.evasive,
+                params.identify.clone(),
+                Some(a),
+                &params.target,
+                params.timeout_ms,
+                SLEEP_SECS * 2 * 1000 + 3000,
+            )
+        })
+        .collect();
+    if !session_clients.is_empty() {
+        let _ = tx.send(json!({
+            "type": "log",
+            "message": format!(
+                "{} independent sessions in use, so workers do not queue behind one another on the \
+                 target's session lock",
+                session_clients.len() + 1
+            )
+        }));
+    }
+
     // A redirect-following client hides the 3xx + Location the open-redirect oracle needs, so build a
     // second client with redirects disabled just for that probe.
     let client_nr = probe::build_client_no_redirect(
@@ -364,6 +405,7 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
         }
     }
     let oob_queue: Arc<OobQueue> = Arc::new(OobQueue::default());
+    crate::probe::meter::reset();
     let xml_seen: Arc<SeenSet> = Arc::new(SeenSet::default());
     let classes = Arc::new(
         params
@@ -377,6 +419,7 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
 
     let mut found = 0i64;
     let mut done = 0i64;
+    let mut spawned: usize = 0;
     let mut set: tokio::task::JoinSet<(InjEndpoint, EndpointOutcome)> = tokio::task::JoinSet::new();
     // Endpoints the target stopped answering while the pass was at full width.
     // Retried one at a time afterwards rather than written off: the failure is
@@ -405,8 +448,20 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
                 done += 1;
                 continue;
             }
+            // Round-robin the sessions so consecutive workers land on
+            // different ones.
+            let worker_client = if session_clients.is_empty() {
+                client.clone()
+            } else {
+                let n = session_clients.len() + 1;
+                match spawned % n {
+                    0 => client.clone(),
+                    k => session_clients[k - 1].clone(),
+                }
+            };
+            spawned += 1;
             let ctx = EndpointCtx {
-                client: client.clone(),
+                client: worker_client,
                 client_nr: client_nr.clone(),
                 oast: oast.clone(),
                 oob_reg: oob_reg.clone(),
@@ -496,6 +551,25 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
             }
         }
         oc.deregister(&client, reg).await;
+    }
+
+    // What this pass cost, in the operator's terms. A scan that takes an hour
+    // is a defect; a scan that took an hour because it sent 41,000 requests is
+    // a capacity decision. Only one of those can be acted on, and until this
+    // was reported the difference was a guess.
+    {
+        let (reqs, wait_ms, pace_ms, fails) = crate::probe::meter::snapshot();
+        if reqs > 0 {
+            let _ = tx.send(json!({
+                "type": "log",
+                "message": format!(
+                    "injection pass: {reqs} requests, {}s waiting on the target, {}s pacing \
+                     back-off, {fails} that never answered",
+                    wait_ms / 1000,
+                    pace_ms / 1000
+                )
+            }));
+        }
     }
 
     let _ = tx.send(json!({"type":"done","found":found}));

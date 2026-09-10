@@ -578,6 +578,60 @@ pub async fn resolve_identities(
 
 /// Resolve + build + cache in one call. Returns the `auth` JSON object to inject
 /// into an engine request, or an error string (logged by the caller).
+/// Resolve a credential into SEVERAL independent sessions.
+///
+/// One session is a bottleneck, not a convenience. PHP locks the session file
+/// for the duration of each request, so every worker sharing one cookie is
+/// serialised by the target: measured on Mutillidae, eight concurrent requests
+/// on one session produce a perfect staircase while eight without a session run
+/// flat. Add a time-based payload, which parks that lock for five or ten
+/// seconds, and the rest of the pass queues behind it and times out. Those
+/// timeouts are then reported as "the endpoint did not answer", so the symptom
+/// is missing coverage rather than slowness.
+///
+/// Only a `login_flow` credential can be multiplied: logging in again is what
+/// produces a genuinely separate session. A bearer token, an API key or a
+/// browser-brokered SSO session is the same value however many times it is
+/// asked for, so those return a single entry and the caller shares it - which
+/// is correct, because a stateless credential has no lock to contend on.
+///
+/// Bounded deliberately. Every extra session is a real login against someone
+/// else's application: it shows up in their audit log, it counts against
+/// lockout thresholds, and on a target with per-account rate limiting it is
+/// hostile. Four is enough to keep the workers busy and small enough to explain.
+pub async fn resolve_auth_pool(
+    http: &reqwest::Client,
+    api_url: &str,
+    node_api_key: &str,
+    credential_id: &str,
+    host: &str,
+    want: usize,
+) -> Result<Vec<Value>, String> {
+    let first = resolve_auth(http, api_url, node_api_key, credential_id, host).await?;
+    let want = want.clamp(1, 4);
+    if want == 1 {
+        return Ok(vec![first]);
+    }
+    let cred = resolve(http, api_url, node_api_key, credential_id, host).await?;
+    // Anything that is not a form login hands back the same material each time.
+    if cred.auth_type != "login_flow" || cred.resolved_auth.is_some() {
+        return Ok(vec![first]);
+    }
+    let mut out = vec![first];
+    for _ in 1..want {
+        match build_context(http, &cred).await {
+            Ok(ctx) => out.push(ctx.to_json()),
+            // A login that fails the second time is not fatal: the pass runs on
+            // the sessions it has. Silence would be, so it is reported.
+            Err(e) => {
+                eprintln!("[creds] extra session for {credential_id} failed: {e}");
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub async fn resolve_auth(
     http: &reqwest::Client,
     api_url: &str,

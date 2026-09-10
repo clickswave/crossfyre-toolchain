@@ -124,6 +124,38 @@ pub fn build_client_no_redirect(
 /// additive-increase on success, multiplicative-decrease on transport failure,
 /// per host, with a floor of one in-flight request and a delay that decays as
 /// the target recovers.
+/// How many requests this process has sent, and how long it spent waiting on
+/// them. Reported at the end of a pass.
+///
+/// Added because "the scan took 69 minutes" is not actionable and "the scan
+/// sent 41,000 requests and spent 55 minutes in transport" is. Guessing at
+/// where a scan's time goes cost several hours today; this is the cheap way to
+/// stop guessing.
+pub mod meter {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub static REQUESTS: AtomicU64 = AtomicU64::new(0);
+    pub static WAIT_MS: AtomicU64 = AtomicU64::new(0);
+    pub static PACE_MS: AtomicU64 = AtomicU64::new(0);
+    pub static FAILURES: AtomicU64 = AtomicU64::new(0);
+
+    pub fn snapshot() -> (u64, u64, u64, u64) {
+        (
+            REQUESTS.load(Ordering::Relaxed),
+            WAIT_MS.load(Ordering::Relaxed),
+            PACE_MS.load(Ordering::Relaxed),
+            FAILURES.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn reset() {
+        REQUESTS.store(0, Ordering::Relaxed);
+        WAIT_MS.store(0, Ordering::Relaxed);
+        PACE_MS.store(0, Ordering::Relaxed);
+        FAILURES.store(0, Ordering::Relaxed);
+    }
+}
+
 mod pace {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -285,6 +317,7 @@ pub async fn send_with(
     };
     let d = pacer.delay();
     if d > 0 {
+        meter::PACE_MS.fetch_add(d, std::sync::atomic::Ordering::Relaxed);
         tokio::time::sleep(std::time::Duration::from_millis(d)).await;
     }
 
@@ -327,6 +360,11 @@ pub async fn send_with(
         }
         break r;
     };
+    meter::REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    meter::WAIT_MS.fetch_add(
+        t0.elapsed().as_millis() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     match outcome {
         Ok(r) => {
             pacer.ok();
@@ -369,6 +407,7 @@ pub async fn send_with(
                     e.is_request(),
                 );
             }
+            meter::FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             pacer.failed();
             None
         }

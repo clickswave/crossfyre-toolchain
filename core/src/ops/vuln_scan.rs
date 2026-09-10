@@ -125,12 +125,24 @@ pub async fn handle(env: OpEnv) {
     // resolves its own per-identity credentials, so it is skipped here.
     if mode != "authz" {
         if let Some(cid) = data["credential_id"].as_str().filter(|s| !s.is_empty()) {
-            match creds::resolve_auth(&http, &api_url, &api_key, cid, &host).await {
-                Ok(auth) => {
+            // Several independent sessions for the injection pass, one per
+            // worker. A single session is a bottleneck on any target that locks
+            // it per request, and the resulting timeouts are reported as
+            // "the endpoint did not answer" rather than as slowness.
+            //
+            // Only the injection mode benefits: template scanning is stateless
+            // per request, so it takes one session like before.
+            let want = if mode == "inject" { 4 } else { 1 };
+            match creds::resolve_auth_pool(&http, &api_url, &api_key, cid, &host, want).await {
+                Ok(pool) if !pool.is_empty() => {
                     if let Some(cr) = cortex_req.as_object_mut() {
-                        cr.insert("auth".into(), auth);
+                        cr.insert("auth".into(), pool[0].clone());
+                        if pool.len() > 1 {
+                            cr.insert("auth_pool".into(), serde_json::json!(pool));
+                        }
                     }
                 }
+                Ok(_) => {}
                 Err(e) => eprintln!("[op] vuln-scan credential resolve failed ({cid}): {e}"),
             }
         }
