@@ -1476,9 +1476,17 @@ async fn probe_ssti(client: &Client, site: &Site) -> Option<Value> {
         format!("{a}{{7*7}}{b}"),
     ];
     for p in &payloads {
-        let r = send_site(client, site, p).await?;
+        // A payload whose request failed is one payload lost, not the whole
+        // class. `?` here abandoned every remaining payload the moment one
+        // request timed out, which is common the instant anything else on the
+        // scan is issuing time-based probes.
+        let Some(r) = send_site(client, site, p).await else {
+            continue;
+        };
         if r.body.contains(&want) {
-            let again = send_site(client, site, p).await?;
+            let Some(again) = send_site(client, site, p).await else {
+                continue;
+            };
             if again.body.contains(&want) {
                 return Some(finding(
                     "ssti",
@@ -1749,9 +1757,17 @@ async fn probe_lfi(client: &Client, site: &Site, baseline: &Resp) -> Option<Valu
         "php://filter/resource=index.php",
     ];
     for p in payloads {
-        let r = send_site(client, site, p).await?;
+        // As in probe_ssti: a failed request costs that payload, not the rest.
+        // This is what actually hid Mutillidae's `?page=` file read - the probe
+        // aborted on a timeout while the same target was being hit by the
+        // time-based command-injection probe on another worker.
+        let Some(r) = send_site(client, site, p).await else {
+            continue;
+        };
         if let Some(what) = lfi_leak(p, &r.body, &baseline.body) {
-            let again = send_site(client, site, p).await?;
+            let Some(again) = send_site(client, site, p).await else {
+                continue;
+            };
             if lfi_leak(p, &again.body, &baseline.body).is_some() {
                 return Some(finding(
                     "lfi",
