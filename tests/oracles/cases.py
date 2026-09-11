@@ -133,6 +133,20 @@ CASES = {
         ),
         "must_not": [{"class": "proto_pollution"}],
     },
+    # -------------------------------------------- noticing a target that moved ---
+    "the-pass-says-when-it-moved-the-target": {
+        "what": "an endpoint that stops answering the way it did is reported, not ignored",
+        "fixtures": [{"name": "app", "script": "target_that_moves.py"}],
+        "request": lambda p: inject(
+            _u(p["app"], "/"), classes=["sqli"],
+            endpoints=[{"method": "GET", "url": _u(p["app"], "/page?q=1"), "params": ["q"]}],
+        ),
+        # Guards stop what can be recognised from a URL or a field name. Nothing
+        # could have predicted this one, so the pass re-requests its own baseline
+        # at the end and says the answer changed shape. It cannot say what
+        # changed; saying that something did is the part that was missing.
+        "must_say": ["does not answer the way it did before this pass"],
+    },
     # ------------------------------------- a login form is not a change form ---
     "login-is-tested-change-form-is-not": {
         "what": "a password field is testable; a password field with a confirmation is not",
@@ -184,6 +198,12 @@ CASES = {
         # DVWA, marked confirmed, because the application varied its own length
         # between the true and false requests and the pair had no control.
         "must_not": [{"class": "sqli"}],
+        # And it must not cry wolf either. This page differs from its own
+        # baseline about half the time, which is what an ad slot, a rotating
+        # banner or a counter does. The end-of-pass check samples twice and
+        # requires both to disagree with the baseline, so a page that oscillates
+        # is not reported as a target the scan broke.
+        "must_not_say": ["does not answer the way it did before this pass"],
     },
     # -------------------------------------------------------------- opt-in ---
     "intrusive-classes-are-opt-in": {

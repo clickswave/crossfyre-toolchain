@@ -126,6 +126,16 @@ MUTATIONS = [
         "probing an address nobody said we could touch",
     ),
     (
+        # Removing the end-of-pass re-check restores the silence that made every
+        # expensive failure of 2026-09-11 look like a clean result.
+        "inject-never-checks-whether-it-moved-the-target",
+        "cortex/src/inject.rs",
+        "        let persistent = moved(verdict(&after)) && moved(verdict(&after2));",
+        "        let persistent = false;",
+        ["the-pass-says-when-it-moved-the-target"],
+        "staying silent after breaking the thing it was measuring",
+    ),
+    (
         # Without this, the pass submits the change form. The fixture reflects
         # what it is given, so submitting it shows up as an XSS finding the case
         # forbids: the mutation is caught by what the scanner DID, not by what it
