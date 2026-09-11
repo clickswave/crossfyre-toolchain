@@ -333,6 +333,10 @@ struct Page {
     depth: u32,
     parent: Option<String>,
     status: u16,
+    /// Why the fetch produced no response, when it produced none. `status`
+    /// of 0 says a page came back empty; only this says whether that was
+    /// the server's answer or a connection that never delivered one.
+    error: Option<String>,
     content_type: String,
     links: Vec<String>,
     params: Vec<String>,
@@ -716,6 +720,14 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
     frontier.push_back((seed.clone(), 0, None));
 
     let mut pages_crawled: u32 = 0;
+    // Links that name an action: reported, never requested, and the verbs that
+    // gave them away, so the crawl can say what it declined to touch.
+    let mut state_skipped: u32 = 0;
+    let mut state_verbs: Vec<String> = Vec::new();
+    // Fetches that came back with no response at all, by reason. A transport
+    // error is not an empty page, and a crawl that cannot tell the two apart
+    // reports a clean, confident, wrong result.
+    let mut fetch_errors: HashMap<String, u32> = HashMap::new();
 
     // Before walking the links, ask whether the application will simply hand
     // over its routing table. A crawl finds what is linked, and the routes worth
@@ -764,6 +776,9 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
                 Err(_) => continue,
             };
             pages_crawled += 1;
+            if let Some(reason) = &page.error {
+                *fetch_errors.entry(reason.clone()).or_insert(0) += 1;
+            }
             let _ = tx.send(CrawlEvent::url_fetched(&page));
 
             // What did this page's parameter values actually serve?
@@ -793,6 +808,21 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
                 }
                 let key = routes.norm_key(&child);
                 if !visited.insert(key) {
+                    continue;
+                }
+                // A link naming an action is a button someone drew as a link.
+                // Report it, so the operator knows the endpoint is there, and do
+                // not press it.
+                if let Some(verb) = changes_state(&child) {
+                    state_skipped += 1;
+                    if !state_verbs.contains(&verb) {
+                        state_verbs.push(verb);
+                    }
+                    let _ = tx.send(CrawlEvent::url_candidate(
+                        &child,
+                        Some(page.url.to_string()),
+                        page.depth + 1,
+                    ));
                     continue;
                 }
                 if is_static_asset(&child) {
@@ -870,6 +900,36 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
 
             let _ = tx.send(CrawlEvent::progress(pages_crawled, max_pages));
         }
+    }
+
+    // What the crawl declined to touch, and what it could not reach. Both are
+    // said out loud: a crawl that quietly returns less than it should is worse
+    // than one that returns nothing, because the number it returns gets believed.
+    if state_skipped > 0 {
+        state_verbs.sort();
+        let _ = tx.send(CrawlEvent::note(format!(
+            "skipped {state_skipped} link(s) that name an action rather than a page ({}). \
+             They are reported as endpoints but never requested: following one changes the \
+             application, and an application that draws its settings as links will happily let \
+             a crawler switch them.",
+            state_verbs.join(", ")
+        )));
+    }
+    let failed: u32 = fetch_errors.values().sum();
+    if failed > 0 {
+        let mut by: Vec<(&String, &u32)> = fetch_errors.iter().collect();
+        by.sort_by(|a, b| b.1.cmp(a.1));
+        let detail = by
+            .iter()
+            .map(|(r, n)| format!("{n} {r}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let share = (failed as f64 / pages_crawled.max(1) as f64 * 100.0).round() as u32;
+        let _ = tx.send(CrawlEvent::note(format!(
+            "{failed} of {pages_crawled} fetch(es) returned no response at all ({share}%): {detail}. \
+             Those pages contributed no links, no forms and no parameters, so treat this crawl's \
+             coverage as that much short of what it looks like.",
+        )));
     }
 
     // Budget exhausted: surface the remaining known-but-unfetched URLs as candidates.
@@ -1021,6 +1081,7 @@ async fn fetch_page(
         depth,
         parent,
         status: 0,
+        error: None,
         content_type: String::new(),
         links: Vec::new(),
         api_calls: Vec::new(),
@@ -1029,7 +1090,18 @@ async fn fetch_page(
         client_routes: Vec::new(),
     };
 
-    match client.get(url.clone()).send().await {
+    // One retry, then the truth. A small application closing a pooled connection
+    // is ordinary and costs nothing to redo; a target that is genuinely gone says
+    // so twice. Either way the reason is kept, because a crawl that turns every
+    // transport failure into an empty page is the cheapest way to report that a
+    // site has nothing on it.
+    let mut attempt = client.get(url.clone()).send().await;
+    if attempt.is_err() {
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        attempt = client.get(url.clone()).send().await;
+    }
+
+    match attempt {
         Ok(resp) => {
             page.status = resp.status().as_u16();
             let ct = resp
@@ -1105,8 +1177,9 @@ async fn fetch_page(
                 }
             }
         }
-        Err(_) => {
+        Err(e) => {
             page.status = 0;
+            page.error = Some(fetch_reason(&e));
         }
     }
 
@@ -1343,6 +1416,125 @@ fn normalize_seed(seed: &str) -> Option<Url> {
 /// that followed found 2 and 1 findings where it had found 9 and 7.
 ///
 /// Only consulted when the crawl carries credentials. Without them there is no
+/// Reduce a transport failure to a short, countable reason.
+///
+/// The wording matters more than it looks. "141 fetches returned nothing" sends
+/// someone to read the crawler; "141 fetches failed to connect: TLS" sends them
+/// to the one link that switched the session to https on a plaintext port, which
+/// is where the fault actually was.
+fn fetch_reason(e: &reqwest::Error) -> String {
+    if e.is_timeout() {
+        return "timed out".into();
+    }
+    if e.is_redirect() {
+        return "too many redirects".into();
+    }
+    if e.is_connect() {
+        // A redirect onto https against a port that speaks plain HTTP fails here,
+        // and it is worth naming because a crawl can cause it to itself.
+        let s = e.to_string().to_ascii_lowercase();
+        if s.contains("tls") || s.contains("ssl") || s.contains("handshake") {
+            return "TLS handshake failed".into();
+        }
+        return "could not connect".into();
+    }
+    if e.is_body() || e.is_decode() {
+        return "response body unreadable".into();
+    }
+    "request failed".into()
+}
+
+/// Verbs that name an action rather than a destination. A link carrying one of
+/// these is a button someone drew as a link, and a crawler must not press it.
+const STATE_VERBS: &[&str] = &[
+    "toggle",
+    "enable",
+    "disable",
+    "activate",
+    "deactivate",
+    "delete",
+    "destroy",
+    "remove",
+    "reset",
+    "revoke",
+    "purge",
+    "truncate",
+    "wipe",
+    "shutdown",
+    "restart",
+    "reboot",
+    "install",
+    "uninstall",
+    "impersonate",
+    "approve",
+    "reject",
+    "publish",
+    "unpublish",
+    "ban",
+    "unban",
+    "lock",
+    "unlock",
+    "archive",
+    "logout",
+    "signout",
+    "logoff",
+    "deauth",
+    "drop",
+];
+
+/// Path segments that are an action on their own, whatever the query says. Kept
+/// deliberately short: `/password/reset` renders a form and is worth crawling,
+/// while `/logout` is not, and only the unambiguous ones belong here.
+const STATE_PATHS: &[&str] = &[
+    "logout", "signout", "log-out", "sign-out", "logoff", "deauth", "destroy", "truncate",
+    "shutdown",
+];
+
+/// Split on anything that is not a letter or digit, so `toggle-enforce-ssl`
+/// yields `toggle`, and `password_resets` yields `resets` rather than `reset`.
+fn verb_tokens(s: &str) -> impl Iterator<Item = &str> {
+    s.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+}
+
+/// Does following this link change the application rather than navigate it?
+/// Returns the word that gave it away, for the note the operator reads.
+///
+/// This exists because of a measured failure, not a theory. Mutillidae draws its
+/// settings as links: one GET to `index.php?do=toggle-enforce-ssl` puts the
+/// session into SSL-enforced mode, after which every page 302s to `https` on a
+/// port that speaks only HTTP, so every later fetch dies in the TLS handshake.
+/// A crawl of 223 pages came back with 141 of them empty, and the scan that
+/// followed never saw the two forms carrying the answer key. The neighbouring
+/// link, `do=toggle-security`, raises the security level: the crawler hardens
+/// the very target it is about to test.
+///
+/// The rule is narrow on purpose. A verb in the QUERY is the classic
+/// GET-as-a-button (`?action=delete`, `?do=reset`); a verb in the PATH is
+/// usually just a noun in a URL, so only whole segments that cannot be anything
+/// else count. The link is still reported as a discovered endpoint. Knowing a
+/// destructive endpoint exists is worth having. Requesting it is not ours to do.
+fn changes_state(url: &Url) -> Option<String> {
+    for (k, v) in url.query_pairs() {
+        for tok in verb_tokens(&k).chain(verb_tokens(&v)) {
+            let t = tok.to_ascii_lowercase();
+            if STATE_VERBS.contains(&t.as_str()) {
+                return Some(t);
+            }
+        }
+    }
+    for seg in url.path().split('/') {
+        let s = seg
+            .trim_end_matches(".php")
+            .trim_end_matches(".aspx")
+            .to_ascii_lowercase();
+        if STATE_PATHS.contains(&s.as_str()) {
+            return Some(s);
+        }
+    }
+    None
+}
+
 /// session to protect and a logout page is an ordinary page.
 fn ends_session(url: &Url) -> bool {
     const MARKS: &[&str] = &[
@@ -1536,6 +1728,7 @@ mod route_sense_tests {
             depth: 0,
             parent: None,
             status,
+            error: None,
             content_type: "text/html".into(),
             links: links.iter().map(|l| l.to_string()).collect(),
             params: Vec::new(),
@@ -1674,5 +1867,57 @@ mod template_tests {
         );
         assert!(out.iter().any(|u| u == "/api/plain"));
         assert!(out.iter().any(|u| u == "/static/app.js"));
+    }
+
+    #[test]
+    fn action_links_are_not_followed() {
+        // The link that started this: one GET and the whole crawl is talking to a
+        // port that does not speak TLS.
+        for u in [
+            "http://h/index.php?do=toggle-enforce-ssl&page=home.php",
+            "http://h/index.php?do=toggle-security&page=home.php",
+            "http://h/app?action=delete&id=7",
+            "http://h/admin?op=reset",
+            "http://h/x?logout=1",
+            "http://h/logout",
+            "http://h/account/signout",
+            "http://h/index.php?page=logout.php",
+        ] {
+            assert!(
+                changes_state(&Url::parse(u).unwrap()).is_some(),
+                "should not be followed: {u}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_pages_are_still_followed() {
+        // Every one of these has a verb somewhere in it and is a page, not a
+        // button. A guard that blocks these costs more coverage than it saves.
+        for u in [
+            "http://h/password/reset",             // renders a form
+            "http://h/password_resets",            // RailsGoat's answer key lives here
+            "http://h/posts/how-to-delete-a-user", // a verb inside a slug
+            "http://h/clearance/policy",           // "clear" is not a token here
+            "http://h/index.php?page=user-info.php",
+            "http://h/index.php?page=dns-lookup.php",
+            "http://h/products?sort=name&page=2",
+            "http://h/archives/2026", // plural noun, not the verb
+            "http://h/api/v1/locks",  // plural noun
+        ] {
+            assert_eq!(
+                changes_state(&Url::parse(u).unwrap()),
+                None,
+                "should still be crawled: {u}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_verb_is_named_so_the_note_can_say_why() {
+        assert_eq!(
+            changes_state(&Url::parse("http://h/i.php?do=toggle-security").unwrap()),
+            Some("toggle".to_string())
+        );
     }
 }
