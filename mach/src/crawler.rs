@@ -82,6 +82,19 @@ pub struct CrawlParams {
     /// node. Applied as default headers so every fetched page is authenticated.
     #[serde(default)]
     pub auth: Option<AuthSpec>,
+    /// Run the headless tier: drive a real browser and record what the running
+    /// application asks for. Off by default, because it needs a browser on the
+    /// node and most crawls do not need it. See `browser`.
+    #[serde(default)]
+    pub browser: bool,
+    /// How many pages the headless tier may visit. Each is a real browser
+    /// navigation, which costs seconds rather than milliseconds.
+    #[serde(default = "d_browser_pages")]
+    pub browser_pages: usize,
+}
+
+fn d_browser_pages() -> usize {
+    12
 }
 
 /// Request auth resolved from a credential. Shared across all engines via
@@ -334,6 +347,11 @@ struct Page {
     /// sha256 of the response body for non-HTML text/code (js/json/xml). Empty otherwise. Lets the
     /// asset graph change-monitor JS/config bundles across scans without storing the body.
     content_hash: String,
+    /// Client-side routes a router config declared. Kept apart from `links`
+    /// because these are the pages the headless tier should NAVIGATE to: a SPA
+    /// serves its shell for all of them, so fetching them statically says
+    /// nothing, while loading one in a browser makes it fetch its own data.
+    client_routes: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -692,6 +710,8 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
     // Which query parameters route content and which merely carry data; decided
     // from the responses themselves as the crawl runs.
     let mut routes = RouteSense::default();
+    // Client-side routes seen anywhere in the crawl, for the headless tier.
+    let mut client_routes: Vec<Url> = Vec::new();
     visited.insert(routes.norm_key(&seed));
     frontier.push_back((seed.clone(), 0, None));
 
@@ -804,6 +824,16 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
                 }
             }
 
+            // Client-side routes go to the headless tier rather than being fetched:
+            // a SPA answers all of them with the same shell.
+            for r in &page.client_routes {
+                if let Ok(u) = Url::parse(r)
+                    && !client_routes.contains(&u)
+                {
+                    client_routes.push(u);
+                }
+            }
+
             // Mined write-verb API calls (axios.post/.put/...): surface each with its real method so
             // the asset graph records a POST/PUT/... operation the shape-discovery and injection
             // engines can then exercise, instead of a param-less GET they skip.
@@ -864,7 +894,114 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
         probe_specs(&client, &seed, &seed_host, &params, &tx).await;
     }
 
+    // The headless tier last, on the routes everything above discovered.
+    if params.browser {
+        run_browser_tier(&seed, &seed_host, &params, &client_routes, &tx).await;
+    }
+
     let _ = tx.send(CrawlEvent::done(pages_crawled));
+}
+
+/// Drive a real browser over the seed and the client-side routes, and report
+/// what the running application asked for.
+///
+/// Runs last, and never blocks the crawl: a node without a browser gets a note
+/// saying the tier did not run, which is a different result from it running and
+/// finding nothing. A scan that confuses those two is lying about its coverage.
+async fn run_browser_tier(
+    seed: &Url,
+    seed_host: &str,
+    params: &CrawlParams,
+    client_routes: &[Url],
+    tx: &mpsc::UnboundedSender<CrawlEvent>,
+) {
+    let Some(exe) = crate::browser::find_browser() else {
+        let _ = tx.send(CrawlEvent::note(
+            "the headless tier was requested but no browser was found. Set MACH_BROWSER to a \
+             Chrome or Chromium binary. Endpoints that only exist once the application is running \
+             were NOT looked for in this crawl."
+                .to_string(),
+        ));
+        return;
+    };
+    let no_sandbox = std::env::var("MACH_BROWSER_NO_SANDBOX").is_ok();
+    let browser = match crate::browser::Browser::launch(&exe, no_sandbox).await {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = tx.send(CrawlEvent::note(format!(
+                "the headless tier could not start a browser ({e}). Endpoints that only exist \
+                 once the application is running were NOT looked for in this crawl."
+            )));
+            return;
+        }
+    };
+    let mut cdp = match crate::browser::Cdp::connect(&browser.ws_url).await {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.send(CrawlEvent::note(format!(
+                "the headless tier could not attach to the browser ({e}). Endpoints that only \
+                 exist once the application is running were NOT looked for in this crawl."
+            )));
+            browser.shutdown().await;
+            return;
+        }
+    };
+
+    // The seed first, then the routes the static tiers recovered. Those routes
+    // are the lazily-loaded sections - the admin area, the reports section - and
+    // loading one makes the application fetch its own data, which is the whole
+    // reason to run a browser at all.
+    let mut plan: Vec<Url> = vec![seed.clone()];
+    for r in client_routes {
+        if plan.len() >= params.browser_pages {
+            break;
+        }
+        if !plan.contains(r) {
+            plan.push(r.clone());
+        }
+    }
+
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut visited = 0usize;
+    for url in &plan {
+        let Ok(v) = crate::browser::visit(&mut cdp, url.as_str()).await else {
+            continue;
+        };
+        visited += 1;
+        for (method, raw) in v.requests {
+            let Some(child) = resolve_and_scope(&raw, url, params, seed_host) else {
+                continue;
+            };
+            if !seen.insert((method.clone(), child.to_string())) {
+                continue;
+            }
+            let mut ev = CrawlEvent::url_candidate(&child, Some(url.to_string()), 1);
+            ev.method = Some(method);
+            let _ = tx.send(ev);
+        }
+        // The DOM the application built, which is where a client-rendered
+        // page's links live. They are not in the HTML the server sent.
+        if !v.dom.is_empty() {
+            let mut links = Vec::new();
+            extract_html(&v.dom, &mut links);
+            for raw in links {
+                let Some(child) = resolve_and_scope(&raw, url, params, seed_host) else {
+                    continue;
+                };
+                if !seen.insert(("GET".to_string(), child.to_string())) {
+                    continue;
+                }
+                let _ = tx.send(CrawlEvent::url_candidate(&child, Some(url.to_string()), 1));
+            }
+        }
+    }
+    browser.shutdown().await;
+    let _ = tx.send(CrawlEvent::note(format!(
+        "headless tier: loaded {visited} page(s) in a real browser and recorded {} request(s) the \
+         running application made. It navigates and never clicks, because a crawler that presses \
+         whatever it finds eventually presses \"delete\" on somebody's live data.",
+        seen.len()
+    )));
 }
 
 // ---------------------------------------------------------------------------
@@ -889,6 +1026,7 @@ async fn fetch_page(
         api_calls: Vec::new(),
         forms: Vec::new(),
         content_hash: String::new(),
+        client_routes: Vec::new(),
     };
 
     match client.get(url.clone()).send().await {
@@ -945,6 +1083,7 @@ async fn fetch_page(
                         for r in crate::spa::route_paths(&body) {
                             if let Ok(u) = url.join(&r) {
                                 page.links.push(u.to_string());
+                                page.client_routes.push(u.to_string());
                             }
                         }
                     }
@@ -958,6 +1097,7 @@ async fn fetch_page(
                             for r in crate::spa::route_paths(&src) {
                                 if let Ok(u) = url.join(&r) {
                                     page.links.push(u.to_string());
+                                    page.client_routes.push(u.to_string());
                                 }
                             }
                         }
@@ -1402,6 +1542,7 @@ mod route_sense_tests {
             api_calls: Vec::new(),
             forms: Vec::new(),
             content_hash: String::new(),
+            client_routes: Vec::new(),
         }
     }
 

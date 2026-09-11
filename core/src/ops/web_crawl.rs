@@ -44,6 +44,12 @@ pub async fn handle(env: OpEnv) {
             "delay",
             "timeout_ms",
             "parse_js",
+            // The headless tier: drive a real browser and record what the
+            // running application asks for. Needs a browser on the node, so the
+            // engine says plainly when it could not run rather than scoring a
+            // silent pass.
+            "browser",
+            "browser_pages",
             "exclude",
             "posture",
         ] {
