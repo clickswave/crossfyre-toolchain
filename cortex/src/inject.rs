@@ -1338,39 +1338,6 @@ fn set_path_seg(url: &str, idx: usize, value: &str) -> String {
     format!("{scheme}{authority}{}{suffix}", segs.join("/"))
 }
 
-/// Ask a site several independent questions at once.
-///
-/// A class's payload list is a set of independent probes against one parameter,
-/// and they were being sent one round trip at a time. Measured on Mutillidae:
-/// the file-inclusion oracle alone accounted for 196 of a pass's 411
-/// engine-seconds, because that application takes about a second to reject each
-/// traversal it is handed and there are nine of them per site.
-///
-/// The per-host concurrency cap in `probe::pace` is untouched, so this does not
-/// hit the target any harder than before. It stops the cap from sitting idle
-/// between one worker's own sequential requests, which is a different thing
-/// entirely: the politeness limit is a ceiling, and the engine was nowhere near
-/// it while taking an hour.
-///
-/// Results come back in the order the payloads were given, so which payload
-/// fired stays deterministic and a reported finding names the one it means.
-async fn send_site_many(client: &Client, site: &Site, values: &[String]) -> Vec<Option<Resp>> {
-    let mut set = tokio::task::JoinSet::new();
-    for (i, v) in values.iter().enumerate() {
-        let client = client.clone();
-        let site = site.clone();
-        let v = v.clone();
-        set.spawn(async move { (i, send_site(&client, &site, &v).await) });
-    }
-    let mut out: Vec<Option<Resp>> = (0..values.len()).map(|_| None).collect();
-    while let Some(joined) = set.join_next().await {
-        if let Ok((i, r)) = joined {
-            out[i] = r;
-        }
-    }
-    out
-}
-
 async fn send_site(client: &Client, site: &Site, value: &str) -> Option<Resp> {
     let (url, body) = site.render(value);
     let headers = site.header_override(value);
@@ -1738,6 +1705,24 @@ async fn probe_cmdi(
 /// Param names that commonly carry a URL/host the server then fetches. SSRF is only meaningful on
 /// these (or on a value that already looks like a URL); firing on every string param would burn OAST
 /// registrations and add noise for no signal.
+/// Does this parameter name match one of a class's hint words?
+///
+/// Substring for a real word, exact for a short one. `REDIRECT_HINT` carries
+/// "u", "r" and "to", and matched by substring those make `username`,
+/// `password` and `author` redirect parameters - which is to say the gate was
+/// letting nearly every parameter on every target through, and the class was
+/// paying four requests a site for it. A one- or two-letter parameter really is
+/// sometimes a redirect target, so the words stay; only the matching narrows.
+fn hint_matches(name: &str, hints: &[&str]) -> bool {
+    hints.iter().any(|h| {
+        if h.len() <= 2 {
+            name == *h
+        } else {
+            name.contains(h)
+        }
+    })
+}
+
 static SSRF_HINT: &[&str] = &[
     "url",
     "uri",
@@ -1793,7 +1778,7 @@ async fn probe_ssrf(
     oob_queue: Option<&OobQueue>,
 ) -> Option<Value> {
     let name = site.param.to_lowercase();
-    let hinted = SSRF_HINT.iter().any(|h| name == *h || name.contains(h));
+    let hinted = hint_matches(&name, SSRF_HINT);
     if !hinted && !looks_like_url(&site.base_value) {
         return None;
     }
@@ -2161,8 +2146,7 @@ async fn probe_open_redirect(client_nr: &Client, site: &Site) -> Option<Value> {
         return None;
     }
     let name = site.param.to_lowercase();
-    let hinted = REDIRECT_HINT.iter().any(|h| name == *h || name.contains(h))
-        || looks_like_url(&site.base_value);
+    let hinted = hint_matches(&name, REDIRECT_HINT) || looks_like_url(&site.base_value);
     if !hinted {
         return None;
     }
@@ -2697,14 +2681,18 @@ async fn probe_lfi(client: &Client, site: &Site, baseline: &Resp) -> Option<Valu
         "php://filter/convert.base64-encode/resource=index.php",
         "php://filter/resource=index.php",
     ];
-    // All nine at once. They are nine independent questions about one
-    // parameter; asking them in series was half this engine's time. A failed
-    // request still costs that payload and not the rest, which is what hid
-    // Mutillidae's `?page=` file read when the probe aborted on a timeout.
-    let values: Vec<String> = payloads.iter().map(|p| p.to_string()).collect();
-    let answers = send_site_many(client, site, &values).await;
-    for (p, r) in payloads.iter().zip(answers.into_iter()) {
-        let Some(r) = r else {
+    // Sequential, and measured to be the right choice. Sending all nine at once
+    // looked obviously better - nine independent questions about one parameter -
+    // and made the pass 75% SLOWER: 123s to 215s over the same five endpoints,
+    // with the pacer's back-off tripling from 26s to 82s and SQL injection
+    // going from 64 engine-seconds to 337 as everything queued behind the
+    // burst. The per-host ceiling of eight was not sitting idle; the pacer was
+    // already braking against it, and adding demand only made it brake harder.
+    //
+    // A failed request still costs that payload and not the rest, which is what
+    // hid Mutillidae's `?page=` file read when the probe aborted on a timeout.
+    for p in payloads {
+        let Some(r) = send_site(client, site, p).await else {
             continue;
         };
         if let Some(what) = lfi_leak(p, &r.body, &baseline.body) {
@@ -2974,5 +2962,39 @@ mod tests {
         assert_eq!(v["ownerId"], Value::from(1i64));
         assert_eq!(v["enabled"], Value::Bool(true));
         assert_eq!(v["tags"], serde_json::json!([]));
+    }
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::*;
+
+    #[test]
+    fn a_one_letter_hint_does_not_match_every_word_containing_it() {
+        // REDIRECT_HINT carries "u", "r" and "to". Substring matching made
+        // these three redirect parameters, and the class paid four requests a
+        // site for each of them on every target.
+        for name in ["username", "password", "author", "quantity"] {
+            assert!(
+                !hint_matches(name, REDIRECT_HINT),
+                "{name} should not read as a redirect parameter"
+            );
+        }
+    }
+
+    #[test]
+    fn the_parameters_the_list_is_for_still_match() {
+        for name in ["url", "redirect_uri", "returnto", "next", "goto", "page"] {
+            assert!(hint_matches(name, REDIRECT_HINT), "{name} should match");
+        }
+        // And a genuinely short one, spelled exactly.
+        assert!(hint_matches("to", REDIRECT_HINT));
+        assert!(hint_matches("u", REDIRECT_HINT));
+    }
+
+    #[test]
+    fn ssrf_hints_are_words_and_behave_the_same() {
+        assert!(hint_matches("callback_url", SSRF_HINT));
+        assert!(!hint_matches("firstname", SSRF_HINT));
     }
 }
