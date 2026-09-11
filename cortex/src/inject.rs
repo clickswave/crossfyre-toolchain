@@ -325,6 +325,20 @@ impl Site {
             _ => Vec::new(),
         }
     }
+    /// The machine-readable half of `where_label`. Anything that groups, dedupes
+    /// or filters findings keys on this, so it has to be one of a closed set of
+    /// tokens. Six call sites were passing `where_label()` here instead, which
+    /// put "query parameter `page`" in a field whose other values are "query" and
+    /// "header": a finding that no dedup key could match and no filter could find.
+    fn where_token(&self) -> &'static str {
+        match self.loc {
+            Loc::Query => "query",
+            Loc::BodyForm | Loc::BodyJson => "body",
+            Loc::Path => "path",
+            Loc::Header => "header",
+        }
+    }
+
     fn where_label(&self) -> String {
         match self.loc {
             Loc::Query => format!("query parameter `{}`", self.param),
@@ -917,7 +931,7 @@ async fn escalate_learned(
         )
         .method(&site.method)
         .param(&site.param)
-        .location(&site.where_label())
+        .location(site.where_token())
         .describe(format!(
             "Two bugs on this target compose into one path, and both halves were demonstrated \
              rather than inferred. A file read on this application disclosed its own \
@@ -2413,7 +2427,7 @@ async fn probe_ssrf_reflected(
     )
     .method(&site.method)
     .param(&site.param)
-    .location(&site.where_label())
+    .location(site.where_token())
     .describe(format!(
         "A URL supplied in the {} was fetched by the server and its body returned in the \
          response: text from a different page of this application came back through `{}`, while \
@@ -2776,7 +2790,7 @@ async fn probe_tampering(client: &Client, site: &Site, baseline: &Resp) -> Optio
             )
             .method(&site.method)
             .param(&site.param)
-            .location(&site.where_label())
+            .location(site.where_token())
             .describe(format!(
                 "`{}` is used in an arithmetic whose result the application then returns. Sending \
                  {} instead of {} moved a value in the response from {} to {}, the original value \
@@ -2927,7 +2941,7 @@ async fn probe_deserialization(client: &Client, site: &Site) -> Option<Value> {
         )
         .method(&site.method)
         .param(&site.param)
-        .location(&site.where_label())
+        .location(site.where_token())
         .describe(format!(
             "`{}` is passed to {} without being checked first. A value that is not a serialized \
              object made the deserializer itself complain in the response - text this scan never \
@@ -3383,7 +3397,7 @@ async fn probe_lfi(
                 )
                 .method(&site.method)
                 .param(&site.param)
-                .location(&site.where_label())
+                .location(site.where_token())
                 .describe(format!(
                     "A traversal/wrapper payload in the {} returned `{what}` -- the parameter \
                      is used to build a file path without containment.{}",
@@ -3559,12 +3573,7 @@ fn finding(class: &str, name: &str, severity: &str, site: &Site, detail: String)
     Finding::new("cortex-inject", class, name, severity, &site.url)
         .method(&site.method)
         .param(&site.param)
-        .location(match site.loc {
-            Loc::Query => "query",
-            Loc::Path => "path",
-            Loc::Header => "header",
-            _ => "body",
-        })
+        .location(site.where_token())
         .describe(detail)
         .build()
 }
