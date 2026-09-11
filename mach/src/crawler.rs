@@ -252,6 +252,13 @@ impl CrawlEvent {
 // ---------------------------------------------------------------------------
 
 /// href/src/action attribute values. Skips pure-fragment and inline handlers.
+/// How many lazily-loaded chunks one bundle may contribute.
+///
+/// A chunk map can name hundreds of files, and each is a request against
+/// somebody's server. The aim is to reach the parts of the application a crawl
+/// cannot see, not to mirror the build output.
+const SPA_CHUNK_LIMIT: usize = 40;
+
 static RE_HTML_ATTR: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?i)(?:href|src|action)\s*=\s*["']([^"'][^"']*)["']"#).unwrap());
 /// `<input name="...">` for parameter collection.
@@ -922,6 +929,38 @@ async fn fetch_page(
                     if parse_js {
                         extract_js(&body, &mut page.links);
                         extract_js_calls(&body, &mut page.api_calls);
+                    }
+                    // A source map is the bundle's original source, which is
+                    // what the minifier folded the readable paths out of. It is
+                    // queued rather than fetched here so it goes through the
+                    // same scope, budget and dedup as anything else.
+                    if parse_js && is_js {
+                        let here = url.as_str();
+                        if let Some(m) = crate::spa::source_map_url(here, &body) {
+                            page.links.push(m);
+                        }
+                        for c in crate::spa::chunk_urls(here, &body, SPA_CHUNK_LIMIT) {
+                            page.links.push(c);
+                        }
+                        for r in crate::spa::route_paths(&body) {
+                            if let Ok(u) = url.join(&r) {
+                                page.links.push(u.to_string());
+                            }
+                        }
+                    }
+                    // A `.map` is JSON, so it never reaches the JS branch above.
+                    // Mining the sources it carries is the whole point of having
+                    // fetched it.
+                    if parse_js && path.ends_with(".map") {
+                        for src in crate::spa::sources_from_map(&body) {
+                            extract_js(&src, &mut page.links);
+                            extract_js_calls(&src, &mut page.api_calls);
+                            for r in crate::spa::route_paths(&src) {
+                                if let Ok(u) = url.join(&r) {
+                                    page.links.push(u.to_string());
+                                }
+                            }
+                        }
                     }
                 }
             }

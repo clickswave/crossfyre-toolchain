@@ -14,6 +14,7 @@ mod libs;
 mod prober;
 mod routetable;
 mod scanner;
+mod spa;
 mod tui;
 
 /// Mirrors the toolchain config at ~/.config/crossfyre/config.toml
