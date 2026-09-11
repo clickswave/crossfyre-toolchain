@@ -83,6 +83,8 @@ pub async fn handle(env: OpEnv) {
             "timeout_ms": data["timeout_ms"].as_i64().unwrap_or(15000),
             "name": data["flow_name"].clone(),
             "steps": data["steps"].clone(),
+            // The same flow as a second user, when one was marked.
+            "other_steps": data["other_steps"].clone(),
             "evasive": data["evasive"].clone(),
             "identify": data["identify"].clone(),
             "block_internal": data["block_internal"].as_bool().unwrap_or(false),
