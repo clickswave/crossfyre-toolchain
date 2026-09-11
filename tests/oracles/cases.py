@@ -66,12 +66,17 @@ CASES = {
         "must_find": [{"class": "tampering", "param": "quantity"}],
     },
     "tampering-negatives": {
-        "what": "rejecting, clamping, echoing, and a counter that moves on its own",
+        "what": "rejecting, clamping, echoing, a counter, and a total that drifts",
         "fixtures": [{"name": "app", "script": "tampering.py"}],
         "request": lambda p: inject(
             _u(p["app"], "/"), classes=["tampering"],
             endpoints=[{"method": "GET", "url": _u(p["app"], f"{path}?quantity=2")}
-                       for path in ("/order-safe", "/order-clamp", "/echo", "/noisy")],
+                       for path in ("/order-safe", "/order-clamp", "/echo", "/noisy",
+                                    # /drift establishes a perfect scaling
+                                    # relationship and then gives a different
+                                    # answer to the same question. Only the
+                                    # determinism re-check rejects it.
+                                    "/drift")],
         ),
         # Clamping is CORRECT behaviour and must stay silent; a hit counter moves
         # for reasons that have nothing to do with the input.
@@ -88,13 +93,19 @@ CASES = {
         "must_find": [{"class": "smuggling", "severity": "critical"}],
     },
     "smuggling-negatives": {
-        "what": "a front-end that rejects the ambiguous request, and a lone server",
+        "what": "a rejecting front-end, a lone server, and one that is merely slow",
         "fixtures": [{"name": "safe", "script": "smuggling.py", "args": ["safe"]},
-                     {"name": "lone", "script": "race.py"}],
+                     {"name": "lone", "script": "race.py"},
+                     {"name": "slow", "script": "slow_on_odd_body.py"}],
         "request": lambda p: inject(
             _u(p["safe"], "/"), classes=["smuggling"],
             endpoints=[{"method": "GET", "url": _u(p["safe"], "/")},
-                       {"method": "GET", "url": _u(p["lone"], "/")}],
+                       {"method": "GET", "url": _u(p["lone"], "/")},
+                       # One process, so it cannot desync with itself, but it is
+                       # slow about the probe body and fast about the control.
+                       # That is the signature of a desync, and only the
+                       # single-framing control says otherwise.
+                       {"method": "GET", "url": _u(p["slow"], "/")}],
         ),
         # The lone server is the case mirage caught: one process cannot desync
         # with itself, and an under-fed Content-Length probe made it look like it
@@ -203,6 +214,21 @@ CASES = {
         "must_not": [{"class": "chain"}],
         "must_say": ["not in the authorised scope"],
     },
+    "chain-black-holed-host": {
+        "what": "a host that swallows every port is not a reachable service",
+        "fixtures": [{"name": "internal", "script": "blackhole_host.py"},
+                     {"name": "app", "script": "ssrf_app.py", "args": ["{internal}"]}],
+        "request": lambda p: inject(
+            _u(p["app"], "/"), classes=["lfi", "ssrf"], scope=["127.0.0.1"],
+            endpoints=[{"method": "GET", "url": _u(p["app"], "/read?file=welcome.txt")},
+                       {"method": "GET", "url": _u(p["app"], "/fetch?url=" + quote("http://127.0.0.1:9/", safe=""))}],
+        ),
+        # The config names it and the fetch reaches it, but nothing answers on
+        # any port. A refusal and a silence are different answers, so without
+        # the same-host control this reports a service that is not there.
+        "must_not": [{"class": "chain"}],
+    },
+
     # ---------------------------------------------------------------- flow ---
     # Flow cases are driven by `flow_cases.py`, which records the flow against
     # the fixture first: a recording is the input, so it cannot be a literal.

@@ -19,6 +19,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 UNIT = 25.0
 HITS = {"n": 1000}
+# Per-quantity call counts for /drift, so the first answer for each value is
+# clean and later ones are not.
+DRIFT: dict = {}
 
 
 class H(BaseHTTPRequestHandler):
@@ -56,6 +59,23 @@ class H(BaseHTTPRequestHandler):
         if p == "/noisy":
             HITS["n"] += 1
             return self.reply(200, {"quantity": qty, "views": HITS["n"], "total": UNIT})
+        if p == "/drift":
+            # A total that LOOKS computed and is not stable.
+            #
+            # The FIRST time each quantity is asked about it answers exactly as a
+            # real computation would, so two in-domain samples establish a
+            # perfect scaling relationship and the link is found. Asking the same
+            # quantity again gives a different answer.
+            #
+            # The offset has to be large enough to exceed the comparison
+            # tolerance and the drift must not show up between the two samples
+            # that establish the link, or the link is simply never found and the
+            # determinism check is not what rejected it. Getting that wrong was
+            # the first version of this endpoint.
+            n = DRIFT.get(raw, 0)
+            DRIFT[raw] = n + 1
+            total = UNIT * qty + (0 if n == 0 else 20 * n)
+            return self.reply(200, {"quantity": qty, "total": round(total, 2)})
         return self.reply(404, {"error": "no such thing"})
 
     def log_message(self, *a):
