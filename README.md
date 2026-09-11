@@ -94,8 +94,8 @@ The platform is optional. The tools never require it, and nothing here reports b
 You need a recent stable [Rust toolchain](https://rustup.rs).
 
 ```sh
-git clone https://github.com/clickswave/crossfyre_toolchain.git
-cd crossfyre_toolchain
+git clone https://github.com/clickswave/crossfyre-toolchain.git
+cd crossfyre-toolchain
 cargo build --release
 # binaries land in ./target/release/{crossfyre,node,mach,voyage,pulse,scout,cortex}
 ```
@@ -103,7 +103,7 @@ cargo build --release
 Install a single engine straight from the repo:
 
 ```sh
-cargo install --git https://github.com/clickswave/crossfyre_toolchain.git mach
+cargo install --git https://github.com/clickswave/crossfyre-toolchain.git mach
 ```
 
 ## Responsible use

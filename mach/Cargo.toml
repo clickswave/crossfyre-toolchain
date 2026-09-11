@@ -3,7 +3,7 @@ name = "mach"
 version = "0.0.14"
 edition = "2024"
 homepage = "https://clickswave.org"
-repository = "https://github.com/clickswave/crossfyre_toolchain"
+repository = "https://github.com/clickswave/crossfyre-toolchain"
 keywords = ["asset-discovery", "security", "red-teaming", "stateful"]
 authors = ["Clickswave <team@clickswave.org>"]
 

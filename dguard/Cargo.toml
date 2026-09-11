@@ -5,7 +5,7 @@ edition = "2024"
 authors = ["Crossfyre"]
 description = "Inbound listener policy for the Crossfyre engine daemons"
 homepage = "https://crossfyre.io"
-repository = "https://github.com/clickswave/crossfyre_toolchain"
+repository = "https://github.com/clickswave/crossfyre-toolchain"
 keywords = ["security"]
 
 [dependencies]

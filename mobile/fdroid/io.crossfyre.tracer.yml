@@ -25,8 +25,8 @@ License: Apache-2.0
 AuthorName: Clickswave Labs Private Limited
 AuthorEmail: team@crossfyre.io
 WebSite: https://crossfyre.io
-SourceCode: https://github.com/clickswave/crossfyre_toolchain
-IssueTracker: https://github.com/clickswave/crossfyre_toolchain/issues
+SourceCode: https://github.com/clickswave/crossfyre-toolchain
+IssueTracker: https://github.com/clickswave/crossfyre-toolchain/issues
 
 AutoName: Crossfyre Tracer
 
@@ -64,7 +64,7 @@ Description: |-
     Intercept only traffic you are entitled to intercept.
 
 RepoType: git
-Repo: https://github.com/clickswave/crossfyre_toolchain.git
+Repo: https://github.com/clickswave/crossfyre-toolchain.git
 
 Builds:
   - versionName: 0.1.0

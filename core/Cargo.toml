@@ -3,7 +3,7 @@ name = "cfx_core"
 version = "0.1.0"
 edition = "2024"
 homepage = "https://clickswave.org"
-repository = "https://github.com/clickswave/crossfyre_toolchain"
+repository = "https://github.com/clickswave/crossfyre-toolchain"
 authors = ["Clickswave <team@clickswave.org>"]
 
 [lib]
