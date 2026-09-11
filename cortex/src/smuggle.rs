@@ -59,62 +59,90 @@ const CONTROL_CEILING: Duration = Duration::from_secs(3);
 /// Ceiling on how long to wait for a hop that is never going to answer.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(12);
 
-/// The two ways the disagreement runs, and how each is spelled on the wire.
+/// Only CL.TE is tested by timing, and TE.CL deliberately is not.
+///
+/// The first version of this file tested both, and mirage - a single-process
+/// Python server with no front-end at all, so a desync is impossible by
+/// construction - reported TE.CL as critical. The probe declared
+/// `Content-Length: 4096` and sent four bytes, so the server sat waiting for a
+/// body that was never coming. EVERY server honouring Content-Length does that.
+/// The delay was the scanner under-sending, not two hops disagreeing, and the
+/// oracle had no way to tell those apart.
+///
+/// TE.CL cannot be established by timing at all, for that reason: its signature
+/// delay is a Content-Length reader waiting for bytes, and a lone Content-Length
+/// reader waiting for bytes looks identical. Confirming it needs a
+/// differential-RESPONSE technique (poison the socket, then show the next
+/// request on it answered differently), which is a materially more invasive
+/// thing to do to somebody's server and is not something this probe should do
+/// uninvited. So it is not attempted, and that is better than reporting a class
+/// this method cannot distinguish.
 enum Variant {
     /// Front-end reads Content-Length, back-end reads Transfer-Encoding.
     ClTe,
-    /// Front-end reads Transfer-Encoding, back-end reads Content-Length.
-    TeCl,
 }
 
 impl Variant {
     fn label(&self) -> &'static str {
         match self {
             Variant::ClTe => "CL.TE",
-            Variant::TeCl => "TE.CL",
         }
     }
 
-    /// (terminating body, non-terminating body, content-length to declare).
+    /// (terminating body, hanging body, content-length to declare).
     ///
-    /// For CL.TE the Content-Length covers the whole body, so the front-end
-    /// forwards all of it and the back-end reads it as chunks.
+    /// The hanging body is the classic shape and the detail matters: a chunk of
+    /// one byte followed by a line that is NOT a valid chunk size.
     ///
-    /// For TE.CL the chunked framing is what the front-end honours, and the
-    /// declared Content-Length is what the back-end waits on: a length longer
-    /// than the bytes that arrive leaves it waiting.
+    ///   * A front-end reading Content-Length forwards exactly `cl` bytes, which
+    ///     is the chunk and nothing after it. The back-end reading chunked takes
+    ///     the one-byte chunk and then waits for the next chunk header that its
+    ///     front-end is never going to send. That wait is the signal.
+    ///   * A LONE server reading chunked gets the malformed size line `X` as a
+    ///     complete line and rejects it at once. The trailing CRLF is load
+    ///     bearing: without it that parser blocks waiting to finish reading a
+    ///     line, and a careless single server then looks exactly like a desync.
+    ///   * A LONE server reading Content-Length takes its `cl` bytes, finds them
+    ///     all present, and answers immediately. It is never left waiting, which
+    ///     is the mistake the first version of this file made.
     fn bodies(&self) -> (String, String, usize) {
-        match self {
-            Variant::ClTe => {
-                let ok = "0\r\n\r\n".to_string();
-                // A chunk header promising a byte, with no terminating chunk.
-                let hang = "1\r\nZ\r\n".to_string();
-                let cl = hang.len();
-                (ok, hang, cl)
-            }
-            Variant::TeCl => {
-                // A terminated chunked body whose declared length is honest.
-                let ok = "0\r\n\r\n".to_string();
-                // Same body, but the declared length asks for bytes that never
-                // arrive, so a Content-Length reader waits.
-                let hang = "0\r\n\r\n".to_string();
-                (ok, hang, 4096)
-            }
-        }
+        let ok = "0\r\n\r\n".to_string();
+        let hang = "1\r\nA\r\nX\r\n".to_string();
+        // Covers the chunk and nothing after it, so the two hops see different
+        // bytes. Every byte of it is sent, so nobody is left short.
+        let cl = "1\r\nA\r\n".len();
+        (ok, hang, cl)
     }
 }
 
-fn request(variant: &Variant, host_hdr: &str, target: &str, body: &str, cl: usize) -> Vec<u8> {
+/// How a probe is framed: both headers (the ambiguous request), or one of them.
+enum Framing {
+    /// Both, which is the request two hops can read differently.
+    Ambiguous(usize),
+    /// Content-Length only. Unambiguous, and the discriminating control: every
+    /// byte it declares is sent, so a server that still takes its time is one
+    /// that is slow about this request generally rather than one that is
+    /// confused about where the request ends.
+    ///
+    /// Chunked-only was tried here first and is wrong. On a genuine CL.TE pair
+    /// the front-end has no Content-Length to read, forwards no body at all, and
+    /// the back-end waits exactly as it does for the real probe - so the control
+    /// hangs on precisely the targets that are vulnerable, and suppressed every
+    /// true positive.
+    LengthOnly(usize),
+}
+
+fn request(host_hdr: &str, target: &str, body: &str, framing: Framing) -> Vec<u8> {
     // `Connection: close` on every probe: if this works, the socket carries a
     // fragment of a request that belongs to nobody, and it should not be reused.
-    let te_first = matches!(variant, Variant::TeCl);
-    let framing = if te_first {
-        format!("Transfer-Encoding: chunked\r\nContent-Length: {cl}\r\n")
-    } else {
-        format!("Content-Length: {cl}\r\nTransfer-Encoding: chunked\r\n")
+    let headers = match framing {
+        Framing::Ambiguous(cl) => {
+            format!("Content-Length: {cl}\r\nTransfer-Encoding: chunked\r\n")
+        }
+        Framing::LengthOnly(cl) => format!("Content-Length: {cl}\r\n"),
     };
     format!(
-        "POST {target} HTTP/1.1\r\nHost: {host_hdr}\r\n{framing}\
+        "POST {target} HTTP/1.1\r\nHost: {host_hdr}\r\n{headers}\
          Connection: close\r\nAccept: */*\r\n\r\n{body}"
     )
     .into_bytes()
@@ -129,33 +157,52 @@ pub async fn probe(url: &str) -> Option<Value> {
         format!("{host}:{port}")
     };
 
-    for variant in [Variant::ClTe, Variant::TeCl] {
+    let variant = Variant::ClTe;
+    {
         let (ok_body, hang_body, cl) = variant.bodies();
 
-        // Control first. A target that is slow to answer the unambiguous
-        // version cannot be measured this way, and saying so is better than
-        // reporting a delay that was never ours.
-        let control = request(&variant, &host_hdr, &target, &ok_body, ok_body.len());
+        // Control one: the same ambiguous request with a body that terminates.
+        // A target slow to answer this cannot be measured by timing at all, and
+        // saying so beats reporting a delay that was never ours.
+        let control = request(
+            &host_hdr,
+            &target,
+            &ok_body,
+            Framing::Ambiguous(ok_body.len()),
+        );
         let (_, control_time) =
             crate::rawhttp::send_exact(&host, port, https, &control, PROBE_TIMEOUT).await;
         if control_time >= CONTROL_CEILING {
-            continue;
+            return None;
         }
 
-        let hang = request(&variant, &host_hdr, &target, &hang_body, cl);
+        let hang = request(&host_hdr, &target, &hang_body, Framing::Ambiguous(cl));
         let (_, hang_time) =
             crate::rawhttp::send_exact(&host, port, https, &hang, PROBE_TIMEOUT).await;
         if hang_time < control_time + DESYNC_GAP {
-            continue;
+            return None;
+        }
+
+        // Control two, and this is the one mirage's false positive bought.
+        //
+        // The same body, framed unambiguously by Content-Length alone. Nothing
+        // to disagree about, and every declared byte is sent. If THIS is slow,
+        // the target is slow about this request for its own reasons and no
+        // disagreement has been demonstrated.
+        let unambiguous = request(&host_hdr, &target, &hang_body, Framing::LengthOnly(cl));
+        let (_, unambiguous_time) =
+            crate::rawhttp::send_exact(&host, port, https, &unambiguous, PROBE_TIMEOUT).await;
+        if unambiguous_time >= control_time + DESYNC_GAP {
+            return None;
         }
 
         // Reproduce before reporting, as every other oracle here does.
         let (_, again) = crate::rawhttp::send_exact(&host, port, https, &hang, PROBE_TIMEOUT).await;
         if again < control_time + DESYNC_GAP {
-            continue;
+            return None;
         }
 
-        return Some(
+        Some(
             Finding::new(
                 "cortex-smuggle",
                 "smuggling",
@@ -170,7 +217,11 @@ pub async fn probe(url: &str) -> Option<Value> {
                  differently by two hops in front of this endpoint ({}). A body that terminates \
                  for the chunked parser was answered in {:.1}s; the same request with a body that \
                  does not terminate took {:.1}s, twice, because one hop is still waiting for the \
-                 rest of a request the other has already finished. Whatever follows that boundary \
+                 rest of a request the other has already finished. The same body framed \
+                 unambiguously by Content-Length alone, where there is nothing to disagree \
+                 about, came back in {:.1}s, so the delay is the disagreement rather than this \
+                 endpoint being slow. \
+                 Whatever follows that boundary \
                  is prefixed onto the NEXT request on that connection - somebody else's - which \
                  is how this becomes session theft, cache poisoning, or bypass of every control \
                  the front-end enforces. Fix by making both hops agree: reject any request \
@@ -179,10 +230,10 @@ pub async fn probe(url: &str) -> Option<Value> {
                  disturb.",
                 variant.label(),
                 control_time.as_secs_f64(),
-                hang_time.as_secs_f64()
+                hang_time.as_secs_f64(),
+                unambiguous_time.as_secs_f64()
             ))
             .build(),
-        );
+        )
     }
-    None
 }
