@@ -1158,8 +1158,11 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
     let mut sites = 0usize;
     let mut starved = 0usize;
     // What this endpoint looked like before anything was sent at it, so the pass
-    // can tell afterwards whether it did something to the target.
-    let mut first_baseline: Option<(u16, usize)> = None;
+    // can tell afterwards whether it did something to the target. The SITE is
+    // carried with the shape, not just the numbers: the first site to answer is
+    // not always the first site tried, and comparing one site's "before" against
+    // another site's "after" would report a target that moved when nothing did.
+    let mut first_baseline: Option<(Site, u16, usize)> = None;
     if want("inventory") {
         for f in crate::probe::spent("inventory", probe_inventory(&client, &ep, &inv_seen)).await {
             let _ = tx.send(json!({"type":"finding","data":f}));
@@ -1313,7 +1316,7 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
         sites += 1;
         if first_baseline.is_none() {
             if let Some(b) = &baseline {
-                first_baseline = Some((b.status, b.body.len()));
+                first_baseline = Some((site.clone(), b.status, b.body.len()));
             }
         }
         let Some(baseline) = baseline else {
@@ -1497,9 +1500,7 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
     // One request, at the end, against the same site that produced the first
     // baseline. It cannot say what changed, only that something did, and that is
     // worth saying out loud rather than discovering three runs later.
-    if let (Some((was_status, was_len)), Some(site)) =
-        (first_baseline, sites_for(&ep, &varying).into_iter().next())
-    {
+    if let Some((site, was_status, was_len)) = first_baseline {
         // Twice, and both have to agree. A page that merely oscillates - a rotating
         // banner, an ad slot, a counter - differs from its own baseline about half
         // the time, and reporting that would put a warning on every scan of every
