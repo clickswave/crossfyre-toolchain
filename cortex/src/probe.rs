@@ -267,6 +267,11 @@ pub mod pace {
     /// we are ourselves applying.
     const LATENCY_WINDOW: usize = 64;
 
+    /// How long a host's pacing survives without a request before it is thrown
+    /// away. Pacing is a statement about conditions right now, and conditions go
+    /// stale: a target that was overloaded ten minutes ago is not overloaded.
+    const IDLE_RESET_MS: u64 = 60_000;
+
     pub struct HostPace {
         sem: Arc<Semaphore>,
         /// Held for the whole request when the host is judged to be serialising
@@ -278,6 +283,9 @@ pub mod pace {
         delay_ms: AtomicU64,
         /// Round-trip times for requests that carried no payload, in ms.
         latency: Mutex<VecDeque<u128>>,
+        /// Milliseconds since the epoch at the last request to this host, so an
+        /// idle gap can retire the brake instead of carrying it forever.
+        last_ms: AtomicU64,
     }
 
     impl HostPace {
@@ -290,6 +298,59 @@ pub mod pace {
                 oks: AtomicU64::new(0),
                 delay_ms: AtomicU64::new(0),
                 latency: Mutex::new(VecDeque::new()),
+                last_ms: AtomicU64::new(0),
+            }
+        }
+
+        /// Retire pacing that describes a moment that has passed.
+        ///
+        /// This state lives in the daemon, keyed by host, for the life of the
+        /// process. Without this, one pass that pushed a small target into
+        /// serialising left every later scan of that host crawling: measured on
+        /// Mutillidae, one class on one parameter took over 200 seconds on a
+        /// daemon that had run a long pass earlier, and 2.7 seconds on a freshly
+        /// started one. Same engine, same target, same request. The target
+        /// answers a hand request in 9ms throughout.
+        ///
+        /// Recovery through successes alone cannot do this. A serialising host
+        /// runs one request at a time, each waiting out the delay, so the forty
+        /// consecutive successes that would clear it are themselves the thing
+        /// the delay makes slow. Time is the honest signal: no requests for a
+        /// minute means whatever was true then is not evidence about now.
+        #[cfg(test)]
+        pub fn new_for_test() -> Self {
+            Self::new()
+        }
+
+        /// Put the pacer into the state a saturating pass leaves behind.
+        #[cfg(test)]
+        pub fn set_for_test(&self, delay: u64, serial: bool) {
+            self.delay_ms.store(delay, Ordering::Relaxed);
+            self.serial.store(serial, Ordering::Relaxed);
+            self.last_ms.store(now_ms(), Ordering::Relaxed);
+        }
+
+        /// Pretend the last request to this host was `ago_ms` ago, then do what
+        /// `for_url` does.
+        #[cfg(test)]
+        pub fn touch_for_test(&self, ago_ms: u64) {
+            self.last_ms
+                .store(now_ms().saturating_sub(ago_ms), Ordering::Relaxed);
+            self.expire_if_idle();
+        }
+
+        fn expire_if_idle(&self) {
+            let now = now_ms();
+            let prev = self.last_ms.swap(now, Ordering::Relaxed);
+            if prev != 0 && now.saturating_sub(prev) >= IDLE_RESET_MS {
+                self.delay_ms.store(0, Ordering::Relaxed);
+                self.serial.store(false, Ordering::Relaxed);
+                self.fails.store(0, Ordering::Relaxed);
+                self.oks.store(0, Ordering::Relaxed);
+                self.latency
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
             }
         }
 
@@ -381,6 +442,18 @@ pub mod pace {
 
     static HOSTS: OnceLock<Mutex<HashMap<String, Arc<HostPace>>>> = OnceLock::new();
 
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub fn idle_reset_ms_for_test() -> u64 {
+        IDLE_RESET_MS
+    }
+
     pub fn for_url(url: &str) -> Arc<HostPace> {
         let host = url
             .split("://")
@@ -392,7 +465,9 @@ pub mod pace {
             .to_string();
         let map = HOSTS.get_or_init(|| Mutex::new(HashMap::new()));
         let mut m = map.lock().unwrap_or_else(|e| e.into_inner());
-        Arc::clone(m.entry(host).or_insert_with(|| Arc::new(HostPace::new())))
+        let pace = Arc::clone(m.entry(host).or_insert_with(|| Arc::new(HostPace::new())));
+        pace.expire_if_idle();
+        pace
     }
 }
 
@@ -757,5 +832,22 @@ mod timing_tests {
             Timing::Above(ms) => assert_eq!(ms, 3800),
             Timing::Hopeless { .. } => panic!("no samples is not evidence of slowness"),
         }
+    }
+
+    #[test]
+    fn pacing_is_retired_when_a_host_goes_idle() {
+        let p = pace::HostPace::new_for_test();
+        // A pass that pushed this host into the brake.
+        p.set_for_test(1500, true);
+        assert_eq!(p.delay(), 1500);
+        assert!(p.serialising());
+        // Still inside the window: the brake stays on, because the host may
+        // still be under the load that earned it.
+        p.touch_for_test(pace::idle_reset_ms_for_test() - 1_000);
+        assert_eq!(p.delay(), 1500, "a recent pass is still evidence");
+        // Past the window: whatever was true then says nothing about now.
+        p.touch_for_test(pace::idle_reset_ms_for_test() + 1_000);
+        assert_eq!(p.delay(), 0, "an idle host should not inherit a brake");
+        assert!(!p.serialising());
     }
 }
