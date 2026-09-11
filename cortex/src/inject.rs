@@ -1932,7 +1932,10 @@ async fn probe_sqli(client: &Client, site: &Site, baseline: &Resp) -> Option<Val
                 let rt2 = send_site(client, site, &format!("{base}{t}")).await;
                 let rf2 = send_site(client, site, &format!("{base}{f}")).await;
                 if let (Some(a2), Some(b2)) = (rt2, rf2) {
-                    if boolean_differential(baseline, &a2, &b2, min_diff) {
+                    if boolean_differential(baseline, &a2, &b2, min_diff)
+                        && !inert_splits_the_same_way(client, site, base, t, f, baseline, min_diff)
+                            .await
+                    {
                         return Some(finding(
                             "sqli",
                             "SQL injection (boolean-based blind)",
@@ -3627,6 +3630,60 @@ fn secrets_sentence(reached: &[Value]) -> String {
 /// true (baseline-equivalent) branch is the larger one (row present vs absent), but some apps render
 /// more on the false branch, so we anchor on "one branch tracks the baseline, the other diverges past
 /// the split" rather than assuming true > false.
+/// The same shape and length as a payload, with nothing SQL can act on: every
+/// character that is not a letter becomes `q`, and the digits that carry the
+/// true/false meaning go with them. Length has to survive exactly, or the
+/// control measures the wrong thing.
+fn inert_like(payload: &str) -> String {
+    payload
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphabetic() && c != 'q' {
+                c
+            } else {
+                'q'
+            }
+        })
+        .collect()
+}
+
+/// Would two values that cannot possibly be SQL split the same way?
+///
+/// The true/false pair is the experiment; this is its control. Both payloads are
+/// already the same length, so reflection cannot produce the split, but anything
+/// the application itself varies can: a flash message, a rotating token, a
+/// counter. On DVWA the scanner was the cause. A concurrent worker kept
+/// submitting a password-change form, and the success banner it produced, about
+/// eighty bytes, surfaced on whichever page rendered next in that session. The
+/// oracle saw a consistent difference across two rounds and reported SQL
+/// injection in a request header on a page with no SQL on it, twice, marked
+/// confirmed.
+///
+/// So: send two inert values of exactly the payloads' lengths and ask whether
+/// they differ too. If they do, the endpoint is producing the difference, not the
+/// injection, and there is nothing here to report.
+async fn inert_splits_the_same_way(
+    client: &Client,
+    site: &Site,
+    base: &str,
+    t: &str,
+    f: &str,
+    baseline: &Resp,
+    min_diff: i64,
+) -> bool {
+    // Same shape, same length, no SQL meaning: letters only, so nothing quotes,
+    // comments or terminates a statement.
+    let (it, if_) = (inert_like(t), inert_like(f));
+    let (Some(a), Some(b)) = (
+        send_site(client, site, &format!("{base}{it}")).await,
+        send_site(client, site, &format!("{base}{if_}")).await,
+    ) else {
+        // No control means no claim. Refusing to report is the safe direction.
+        return true;
+    };
+    boolean_differential(baseline, &a, &b, min_diff)
+}
+
 fn boolean_differential(baseline: &Resp, t: &Resp, f: &Resp, min_diff: i64) -> bool {
     if !(200..500).contains(&t.status) || !(200..500).contains(&f.status) {
         return false;
@@ -3908,5 +3965,26 @@ mod hint_tests {
     fn an_endpoint_with_no_secret_is_never_skipped() {
         let names = vec!["id".to_string(), "Submit".to_string(), "page".to_string()];
         assert_eq!(changes_a_credential(&names), None);
+    }
+
+    #[test]
+    fn the_control_keeps_the_length_and_loses_the_sql() {
+        for p in [
+            " AND 1=1",
+            " AND 1=2",
+            "' AND '1'='1",
+            "/**/AND/**/1=1",
+            " OR 1=1-- -",
+        ] {
+            let c = inert_like(p);
+            assert_eq!(c.len(), p.len(), "length must survive: {p:?} -> {c:?}");
+            for bad in ['\'', '"', '=', '-', '/', '*', '1', '2', ';'] {
+                assert!(!c.contains(bad), "{c:?} still carries {bad:?} from {p:?}");
+            }
+        }
+        // A true/false pair collapses to the same control, which is the point:
+        // two identical requests are the cleanest possible measure of whether the
+        // endpoint varies on its own.
+        assert_eq!(inert_like(" AND 1=1"), inert_like(" AND 1=2"));
     }
 }
