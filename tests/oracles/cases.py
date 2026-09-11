@@ -133,6 +133,23 @@ CASES = {
         ),
         "must_not": [{"class": "proto_pollution"}],
     },
+    # ----------------------------------------------- not pressing the button ---
+    "crawl-does-not-press-the-settings": {
+        "what": "a settings link is reported, never followed, and the crawl survives",
+        "engine": "mach",
+        "fixtures": [{"name": "app", "script": "settings_as_links.py"}],
+        "request": lambda p: crawl(_u(p["app"], "/"), max_depth=5),
+        # /step4 is four links deep and only reachable if the crawl never
+        # requested a settings link: the fixture breaks itself when one is used,
+        # and every later fetch dies in a TLS handshake against a plaintext port.
+        # Reaching it is the whole assertion; no fixture state is inspected.
+        "must_find": [
+            {"url_contains": "/step4"},
+            # Still reported, because knowing a destructive endpoint exists is
+            # worth having. Only requesting it is not.
+            {"url_contains": "/settings?do=toggle-enforce-ssl"},
+        ],
+    },
     # ------------------------------------------------- self-inflicted drift ---
     "sqli-negative-drifting-page": {
         "what": "a page that changes length on its own is not a SQL oracle",

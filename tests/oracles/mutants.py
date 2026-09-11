@@ -126,6 +126,17 @@ MUTATIONS = [
         "probing an address nobody said we could touch",
     ),
     (
+        # The guard that stops a crawl from disabling itself. Removing it should
+        # cost the far side of the crawl, because the fixture breaks when the
+        # link is used.
+        "crawler-follows-action-links",
+        "mach/src/crawler.rs",
+        """                if let Some(verb) = changes_state(&child) {""",
+        "                if let Some(verb) = None::<String> {",
+        ["crawl-does-not-press-the-settings"],
+        "following a link that changes the application",
+    ),
+    (
         # The control that the DVWA false positives cost us. Without it the
         # oracle has only the true/false pair and the baseline, and an
         # application that varies its own length between two requests looks
