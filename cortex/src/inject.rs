@@ -1258,6 +1258,18 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
             ep.params.clone()
         };
         names.extend(ep.body.iter().map(|b| b.name.clone()));
+        if let Some(verb) = names_an_action(&ep.url) {
+            let _ = tx.send(json!({"type":"log","message": format!(
+                "skipped {} {} without testing it: `{}` in the query names an action, and requesting \
+                 it performs that action. The crawler reports these and does not follow them; neither \
+                 does this. A finding behind a button is not worth logging the scan out to reach.",
+                ep.method, ep.url, verb
+            )}));
+            return EndpointOutcome {
+                found,
+                starved: false,
+            };
+        }
         if let Some(which) = changes_a_credential(&names) {
             let _ = tx.send(json!({"type":"log","message": format!(
                 "skipped {} {} without testing it: `{}` alongside a confirmation field makes this a \
@@ -1473,6 +1485,71 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
 
 /// Expand an endpoint into its fuzzable sites (query params, path segments,
 /// body fields). `varying` carries the positions the corpus proved variable.
+/// Does requesting this URL perform an action rather than read a page?
+///
+/// The crawler reports these and refuses to follow them. The injection pass was
+/// then requesting them anyway, hundreds of times each, because an endpoint is an
+/// endpoint once it reaches the list. On Mutillidae that meant every pass
+/// re-enabled SSL enforcement on its own session, after which the target
+/// answered every request with a redirect to a port that speaks no TLS: 93
+/// requests that never answered and 23 sites skipped for "the endpoint did not
+/// answer", in a run whose target was healthy throughout.
+///
+/// Same rule as the crawler's, and same reasoning: a verb in the query is a
+/// button (`?do=toggle-security`, `?action=delete`), a verb in a path is usually
+/// a noun. Testing a button can find a real bug, and it can also log the scan
+/// out, harden the target, or delete a customer's data; the second outcome is
+/// not worth the first.
+fn names_an_action(url: &str) -> Option<String> {
+    const VERBS: &[&str] = &[
+        "toggle",
+        "enable",
+        "disable",
+        "activate",
+        "deactivate",
+        "delete",
+        "destroy",
+        "remove",
+        "reset",
+        "revoke",
+        "purge",
+        "truncate",
+        "wipe",
+        "shutdown",
+        "restart",
+        "reboot",
+        "install",
+        "uninstall",
+        "impersonate",
+        "approve",
+        "reject",
+        "publish",
+        "unpublish",
+        "ban",
+        "unban",
+        "lock",
+        "unlock",
+        "archive",
+        "logout",
+        "signout",
+        "logoff",
+        "deauth",
+        "drop",
+    ];
+    let q = url.split('?').nth(1)?;
+    for pair in q.split('&') {
+        for half in pair.splitn(2, '=') {
+            for tok in half.split(|c: char| !c.is_ascii_alphanumeric()) {
+                let t = tok.to_ascii_lowercase();
+                if VERBS.contains(&t.as_str()) {
+                    return Some(t);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Would submitting this endpoint change a credential rather than test one?
 ///
 /// DVWA's password-change exercise is a GET form:
@@ -3986,5 +4063,31 @@ mod hint_tests {
         // two identical requests are the cleanest possible measure of whether the
         // endpoint varies on its own.
         assert_eq!(inert_like(" AND 1=1"), inert_like(" AND 1=2"));
+    }
+
+    #[test]
+    fn an_action_endpoint_is_not_requested() {
+        for u in [
+            "http://h/index.php?do=toggle-enforce-ssl&page=home.php",
+            "http://h/index.php?do=toggle-security&page=home.php",
+            "http://h/admin?action=delete&id=3",
+            "http://h/x?logout=1",
+        ] {
+            assert!(names_an_action(u).is_some(), "{u}");
+        }
+    }
+
+    #[test]
+    fn an_ordinary_endpoint_is_still_tested() {
+        for u in [
+            "http://h/index.php?page=user-info.php",
+            "http://h/hints-page-wrapper.php?level1HintIncludeFile=1",
+            "http://h/search?q=archives",
+            "http://h/api/locks?id=2",
+            "http://h/password/reset?token=abc",
+            "http://h/vulnerabilities/sqli/?id=1&Submit=Submit",
+        ] {
+            assert_eq!(names_an_action(u), None, "{u}");
+        }
     }
 }
