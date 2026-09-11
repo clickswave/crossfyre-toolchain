@@ -62,6 +62,10 @@ pub struct InjectParams {
     /// `tasks`, and clamped, because the target is someone's service.
     #[serde(default = "d_tasks")]
     pub tasks: usize,
+    /// Destinations beyond the scan target that the OPERATOR has asserted they
+    /// may test. Empty is the historical behaviour exactly. See `scope`.
+    #[serde(default, deserialize_with = "crate::probe::de_null_seq")]
+    pub scope: Vec<String>,
     /// Refuse private and reserved destinations at connect time. Absent = false,
     /// which is what an authorised customer scan gets: reaching your own
     /// internal network from your own node is the product. The free public
@@ -470,6 +474,33 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
             block_internal: params.block_internal,
         })
     });
+    // The operator's authorisation list, parsed once. Anything unparseable is
+    // refused and named rather than dropped, because a scan running with two of
+    // five rules misunderstood produces results that mean something other than
+    // what the operator thinks.
+    let (authorised, refused) = crate::scope::parse(&params.scope);
+    if !refused.is_empty() {
+        let _ = tx.send(json!({
+            "type": "log",
+            "message": format!(
+                "{} scope entr{} refused and NOT authorised: {}. They are not treated as \
+                 wildcards; anything they were meant to cover is out of scope for this pass.",
+                refused.len(),
+                if refused.len() == 1 { "y was" } else { "ies were" },
+                refused.join(", ")
+            )
+        }));
+    }
+    if !authorised.is_empty() {
+        let _ = tx.send(json!({
+            "type": "log",
+            "message": format!(
+                "{} destination(s) beyond the scan target are authorised for this pass by the \
+                 workspace scope list.",
+                authorised.len()
+            )
+        }));
+    }
     let skips = Arc::new(AtomicUsize::new(0));
     let race_budget = Arc::new(AtomicUsize::new(if race.is_some() {
         MAX_RACE_ENDPOINTS
@@ -506,7 +537,7 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
     loop {
         while set.len() < tasks {
             let Some(ep) = queue.pop_front() else { break };
-            if !in_scope(&params.target, &ep.url) {
+            if !in_scope(&params.target, &ep.url, &authorised) {
                 let _ = tx.send(json!({
                     "type": "log",
                     "message": format!(
@@ -706,11 +737,15 @@ fn report_cost(tx: &mpsc::UnboundedSender<Value>, done: i64, total: i64) {
 /// crawler was checking, so a single off-site form action was enough to point
 /// active probes at a third party's production service.
 ///
-/// The scan target now defines the scope. An endpoint on another host is
-/// skipped and said out loud. When no target is given the caller is trusted,
-/// because that is an explicit endpoint list from an operator rather than
-/// something a crawl produced.
-fn in_scope(target: &str, url: &str) -> bool {
+/// The scan target defines the scope. An endpoint on another host is skipped and
+/// said out loud. When no target is given the caller is trusted, because that is
+/// an explicit endpoint list from an operator rather than something a crawl
+/// produced.
+///
+/// `extra` widens it, and only an operator can put anything in there. See
+/// `scope`: nothing a scan discovers is ever added, because "the scanner found
+/// this" and "you may attack this" are different sentences.
+fn in_scope(target: &str, url: &str, extra: &crate::scope::Scope) -> bool {
     let scope = host_of(target);
     if scope.is_empty() {
         return true;
@@ -722,7 +757,33 @@ fn in_scope(target: &str, url: &str) -> bool {
     // A port difference on the same name is the same service to an operator who
     // named the host; a different name is not.
     let bare = |h: &str| h.split(':').next().unwrap_or(h).to_string();
-    bare(&host) == bare(&scope)
+    if bare(&host) == bare(&scope) {
+        return true;
+    }
+    extra.admits(&bare(&host), port_of(url))
+}
+
+/// The URL's port: what it says, or what its scheme implies.
+///
+/// A rule written `redis.internal:6379` has to match a URL that says `:6379`,
+/// and a rule written `api.example.com:443` has to match `https://api.example.com/`
+/// which does not say a port at all.
+fn port_of(url: &str) -> Option<u16> {
+    let (scheme, rest) = url.split_once("://")?;
+    let host = rest.split('/').next().unwrap_or("");
+    let after = match host.rsplit_once(']') {
+        // [::1]:8080
+        Some((_, tail)) => tail.strip_prefix(':'),
+        None => host.rsplit_once(':').map(|(_, p)| p),
+    };
+    if let Some(p) = after.and_then(|p| p.parse::<u16>().ok()) {
+        return Some(p);
+    }
+    match scheme {
+        "https" => Some(443),
+        "http" => Some(80),
+        _ => None,
+    }
 }
 
 /// Everything one endpoint worker needs. Cloned per endpoint; the clients are
@@ -3116,25 +3177,79 @@ use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 #[cfg(test)]
 mod scope_tests {
-    use super::in_scope;
+    use super::{in_scope, port_of};
+
+    fn none() -> crate::scope::Scope {
+        crate::scope::Scope::default()
+    }
 
     #[test]
     fn an_off_site_form_action_is_refused() {
         let target = "http://127.0.0.1:7012/";
-        assert!(in_scope(target, "http://127.0.0.1:7012/index.php?page=a"));
-        assert!(in_scope(target, "http://127.0.0.1:7012/x"));
-        assert!(!in_scope(target, "https://www.paypal.com/cgi-bin/webscr"));
-        assert!(!in_scope(target, "https://evil.example/collect"));
+        assert!(in_scope(
+            target,
+            "http://127.0.0.1:7012/index.php?page=a",
+            &none()
+        ));
+        assert!(in_scope(target, "http://127.0.0.1:7012/x", &none()));
+        assert!(!in_scope(
+            target,
+            "https://www.paypal.com/cgi-bin/webscr",
+            &none()
+        ));
+        assert!(!in_scope(target, "https://evil.example/collect", &none()));
     }
 
     #[test]
     fn a_port_difference_on_the_named_host_is_still_in_scope() {
-        assert!(in_scope("http://app.test/", "http://app.test:8443/api"));
+        assert!(in_scope(
+            "http://app.test/",
+            "http://app.test:8443/api",
+            &none()
+        ));
+    }
+
+    #[test]
+    fn an_authorised_destination_is_admitted_and_only_that_one() {
+        let target = "http://app.test/";
+        let (s, _) = crate::scope::parse(&["10.0.0.0/8".to_string()]);
+        assert!(in_scope(target, "http://10.1.2.3:6379/", &s));
+        // Still refused: the list said one range, not "anything but the target".
+        assert!(!in_scope(target, "https://www.paypal.com/x", &s));
+        assert!(!in_scope(target, "http://172.16.0.1/", &s));
+    }
+
+    #[test]
+    fn the_paypal_case_stays_refused_under_a_realistic_list() {
+        let target = "http://app.test/";
+        let (s, _) = crate::scope::parse(&[
+            "*.app.test".to_string(),
+            "10.0.0.0/8".to_string(),
+            "redis.internal:6379".to_string(),
+        ]);
+        assert!(!in_scope(
+            target,
+            "https://www.paypal.com/cgi-bin/webscr",
+            &s
+        ));
+        assert!(in_scope(target, "http://api.app.test/v1", &s));
+        assert!(in_scope(target, "http://redis.internal:6379/", &s));
+        // Named with a port, so another port on the same name is not authorised.
+        assert!(!in_scope(target, "http://redis.internal:6380/", &s));
+    }
+
+    #[test]
+    fn a_ports_scheme_default_is_what_a_rule_compares_against() {
+        assert_eq!(port_of("https://api.example.com/x"), Some(443));
+        assert_eq!(port_of("http://api.example.com/x"), Some(80));
+        assert_eq!(port_of("http://api.example.com:8080/x"), Some(8080));
+        assert_eq!(port_of("http://[::1]:6379/"), Some(6379));
+        assert_eq!(port_of("http://[::1]/"), Some(80));
     }
 
     #[test]
     fn no_target_means_the_caller_is_trusted() {
-        assert!(in_scope("", "https://anything.example/"));
+        assert!(in_scope("", "https://anything.example/", &none()));
     }
 }
 

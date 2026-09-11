@@ -46,6 +46,9 @@ pub async fn handle(env: OpEnv) {
             // Refuse private / reserved destinations at the resolver. The scan
             // mode has always forwarded this; the others silently dropped it.
             "block_internal": data["block_internal"].as_bool().unwrap_or(false),
+            // Destinations beyond the target the OPERATOR authorised. Never
+            // widened by anything a scan discovers.
+            "scope": data["scope"].clone(),
         })
     } else if mode == "inject" {
         // Active parameter injection (SQLi/XSS/cmdi/LFI). The endpoints carry the
@@ -62,6 +65,9 @@ pub async fn handle(env: OpEnv) {
             // Refuse private / reserved destinations at the resolver. The scan
             // mode has always forwarded this; the others silently dropped it.
             "block_internal": data["block_internal"].as_bool().unwrap_or(false),
+            // Destinations beyond the target the OPERATOR authorised. Never
+            // widened by anything a scan discovers.
+            "scope": data["scope"].clone(),
         })
     } else if mode == "fuzz" {
         // Structure / type fuzzing over the typed request shape (type confusion + mass assignment).
