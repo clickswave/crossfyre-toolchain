@@ -62,6 +62,11 @@ pub struct InjectParams {
     /// `tasks`, and clamped, because the target is someone's service.
     #[serde(default = "d_tasks")]
     pub tasks: usize,
+    /// Addresses other engines observed on this workspace's estate, for a
+    /// confirmed SSRF to be tested against. Addresses, deliberately, not
+    /// findings: see `chain`.
+    #[serde(default)]
+    pub internal_targets: Vec<crate::chain::InternalTarget>,
     /// Destinations beyond the scan target that the OPERATOR has asserted they
     /// may test. Empty is the historical behaviour exactly. See `scope`.
     #[serde(default, deserialize_with = "crate::probe::de_null_seq")]
@@ -501,6 +506,41 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
             )
         }));
     }
+    let authorised_arc = Arc::new(authorised);
+    // Scope is applied once, here, rather than inside the probe: a decision
+    // about what may be touched belongs in one place, and filtering here means
+    // the count of what was refused can be said out loud.
+    let offered = params.internal_targets.len();
+    let chain_targets: Vec<crate::chain::InternalTarget> = params
+        .internal_targets
+        .iter()
+        .filter(|t| authorised_arc.admits(&t.host, Some(t.port)))
+        .cloned()
+        .collect();
+    let refused_targets = offered - chain_targets.len();
+    if refused_targets > 0 {
+        let _ = tx.send(json!({
+            "type": "log",
+            "message": format!(
+                "{refused_targets} of {offered} address(es) other engines found are NOT in the \
+                 authorised scope, so a confirmed SSRF will not be pointed at them. Add them to \
+                 the workspace scope if you are authorised to test them."
+            )
+        }));
+    }
+    let chain_targets = Arc::new(chain_targets);
+    if !chain_targets.is_empty() {
+        let _ = tx.send(json!({
+            "type": "log",
+            "message": format!(
+                "{} address(es) other engines observed on this estate are available for a \
+                 confirmed SSRF to be tested against. Each is checked against the authorised \
+                 scope, and each is re-probed through the bug before it is reported: a pair of \
+                 findings on one network is not a chain.",
+                chain_targets.len()
+            )
+        }));
+    }
     let skips = Arc::new(AtomicUsize::new(0));
     let race_budget = Arc::new(AtomicUsize::new(if race.is_some() {
         MAX_RACE_ENDPOINTS
@@ -537,7 +577,7 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
     loop {
         while set.len() < tasks {
             let Some(ep) = queue.pop_front() else { break };
-            if !in_scope(&params.target, &ep.url, &authorised) {
+            if !in_scope(&params.target, &ep.url, &authorised_arc) {
                 let _ = tx.send(json!({
                     "type": "log",
                     "message": format!(
@@ -574,6 +614,7 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
                 rl_seen: Arc::clone(&rl_seen),
                 cors_seen: Arc::clone(&cors_seen),
                 found_seen: Arc::clone(&found_seen),
+                chain_targets: Arc::clone(&chain_targets),
                 race: race.clone(),
                 race_budget: Arc::clone(&race_budget),
                 skips: Arc::clone(&skips),
@@ -808,6 +849,9 @@ struct EndpointCtx {
     cors_seen: Arc<SeenSet>,
     found_seen: Arc<SeenSet>,
     xml_seen: Arc<SeenSet>,
+    /// Addresses other engines observed on this estate, for a confirmed SSRF to
+    /// be tested against. See `chain`.
+    chain_targets: Arc<Vec<crate::chain::InternalTarget>>,
     /// Present only when the caller named the `race` class. Carries what the
     /// race probe needs to build its own connections, because the shared client
     /// is paced against the host and pacing is the opposite of what this check
@@ -857,6 +901,7 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
         cors_seen,
         found_seen,
         xml_seen,
+        chain_targets,
         race,
         race_budget,
         skips,
@@ -1071,6 +1116,7 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
                     oast,
                     oob_reg.as_deref(),
                     Some(&oob_queue),
+                    &chain_targets,
                 ),
             )
             .await
@@ -1854,6 +1900,7 @@ fn looks_like_url(v: &str) -> bool {
 /// Blind SSRF: supply a URL pointing at our OAST listener in a URL-bearing param; if the server
 /// fetches it we get an out-of-band callback. OAST-confirmed = no false positives. Reuses the same
 /// managed/BYO OAST client the cmdi probe uses.
+#[allow(clippy::too_many_arguments)]
 async fn probe_ssrf(
     client: &Client,
     client_nr: Option<&Client>,
@@ -1861,6 +1908,8 @@ async fn probe_ssrf(
     oast: Option<&crate::oast::OastClient>,
     oob_reg: Option<&crate::oast::OastReg>,
     oob_queue: Option<&OobQueue>,
+    // Already filtered to what the operator authorised; see the driver.
+    chain_targets: &[crate::chain::InternalTarget],
 ) -> Option<Value> {
     let name = site.param.to_lowercase();
     let hinted = hint_matches(&name, SSRF_HINT);
@@ -1875,7 +1924,7 @@ async fn probe_ssrf(
     // addresses produces no callback by definition, so gating the internal
     // check on the external one meant the dangerous case could only be found
     // when the harmless one already had been.
-    if let Some(f) = probe_ssrf_reflected(client_nr.unwrap_or(client), site).await {
+    if let Some(f) = probe_ssrf_reflected(client_nr.unwrap_or(client), site, chain_targets).await {
         return Some(f);
     }
     let oc = oast?;
@@ -1940,7 +1989,11 @@ async fn probe_ssrf(
 /// Costs nothing on a parameter that is not an SSRF: the canary fetch and one
 /// payload, and it stops there unless the target's own page comes back through
 /// the parameter.
-async fn probe_ssrf_reflected(client: &Client, site: &Site) -> Option<Value> {
+async fn probe_ssrf_reflected(
+    client: &Client,
+    site: &Site,
+    chain_targets: &[crate::chain::InternalTarget],
+) -> Option<Value> {
     // A page of the target, fetched by us, so we know what it says before we
     // ask the server to say it.
     let root = origin_of(&site.url)?;
@@ -1953,6 +2006,7 @@ async fn probe_ssrf_reflected(client: &Client, site: &Site) -> Option<Value> {
         }
     };
     if candidates.is_empty() {
+        trace_ssrf(site, "no distinctive text on the site root to look for");
         return None;
     }
 
@@ -1960,10 +2014,23 @@ async fn probe_ssrf_reflected(client: &Client, site: &Site) -> Option<Value> {
     // nothing: site-wide chrome is on both pages whether or not anything was
     // fetched. Take the first candidate that is not.
     let base = send_site(client, site, &site.base_value).await?;
-    let token = candidates.into_iter().find(|t| !base.body.contains(t))?;
+    let Some(token) = candidates.iter().find(|t| !base.body.contains(*t)).cloned() else {
+        trace_ssrf(
+            site,
+            "every candidate token already appears in the ordinary answer",
+        );
+        return None;
+    };
 
     let hit = send_site(client, site, &root).await?;
     if !hit.body.contains(&token) {
+        trace_ssrf(
+            site,
+            &format!(
+                "asked it to fetch {root} and the answer did not carry `{token}` (got {} bytes)",
+                hit.body.len()
+            ),
+        );
         return None;
     }
 
@@ -1972,6 +2039,10 @@ async fn probe_ssrf_reflected(client: &Client, site: &Site) -> Option<Value> {
     // otherwise read as SSRF.
     let ctrl = send_site(client, site, crate::ssrf::CLOSED_INTERNAL).await?;
     if ctrl.body.contains(&token) {
+        trace_ssrf(
+            site,
+            "a closed port produced the token too, so it echoes rather than fetches",
+        );
         return None;
     }
 
@@ -2014,6 +2085,39 @@ async fn probe_ssrf_reflected(client: &Client, site: &Site) -> Option<Value> {
         crate::ssrf::remember_internal(&host, &reached);
     }
 
+    // The chain. Addresses another engine observed on this estate, each one
+    // re-tested through the SSRF just confirmed above. `ctrl` is control A: what
+    // this application says when a fetch cannot connect.
+    let mut chained: Vec<Value> = Vec::new();
+    // Control B is a property of the HOST, not of the port we were told about,
+    // so it is taken once per host however many addresses on it were observed.
+    let mut control_b: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for t in chain_targets.iter().take(crate::chain::MAX_TARGETS) {
+        let cb = match control_b.get(&t.host) {
+            Some(b) => b.clone(),
+            None => {
+                let Some(r) = fetch_through(client, site, &t.control_url()).await else {
+                    continue;
+                };
+                control_b.insert(t.host.clone(), r.body.clone());
+                r.body
+            }
+        };
+        let Some(hit) = fetch_through(client, site, &t.url()).await else {
+            continue;
+        };
+        if !crate::chain::answered(&hit.body, &ctrl.body, &cb) {
+            continue;
+        }
+        chained.push(crate::chain::reached_note(
+            t,
+            crate::chain::banner_echo(&t.banner, &hit.body),
+        ));
+    }
+    if !chained.is_empty() {
+        worst = "critical";
+    }
+
     let where_to = if reached.is_empty() {
         "No cloud metadata service answered, so this instance is either not in one or is running \
          IMDSv2, which requires a token this probe deliberately does not try to obtain. The bug is \
@@ -2029,6 +2133,31 @@ async fn probe_ssrf_reflected(client: &Client, site: &Site) -> Option<Value> {
             reached
                 .iter()
                 .filter_map(|v| v.get("service").and_then(|s| s.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    // The chain, stated as what was demonstrated rather than what it implies.
+    let chain_line = if chained.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Through this same parameter it also reached {}, each confirmed by asking for it and \
+             then asking for a closed port on the SAME host: the service answered and the closed \
+             port produced this application's ordinary fetch failure, so the difference is the \
+             service and not the network. These addresses were not guessed from the finding list - \
+             another engine observed them on this estate, they are inside the scope you authorised, \
+             and each one was re-tested through this bug before it was named.",
+            chained
+                .iter()
+                .map(|v| {
+                    let h = v.get("host").and_then(|x| x.as_str()).unwrap_or("?");
+                    let p = v.get("port").and_then(|x| x.as_u64()).unwrap_or(0);
+                    match v.get("service").and_then(|x| x.as_str()) {
+                        Some(svc) => format!("{h}:{p} ({svc})"),
+                        None => format!("{h}:{p}"),
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         )
@@ -2051,13 +2180,17 @@ async fn probe_ssrf_reflected(client: &Client, site: &Site) -> Option<Value> {
          and shows the answers, so every address reachable from it is reachable from outside - \
          loopback services with no authentication because \"only the app can reach them\", \
          internal admin panels, and the private ranges. Unlike the out-of-band case, this one \
-         needs no route to the internet, so a firewalled deployment does not mitigate it. {}",
+         needs no route to the internet, so a firewalled deployment does not mitigate it. {}{}",
         site.where_label(),
         site.param,
-        where_to
+        where_to,
+        chain_line
     ))
     .with("internal_reach", json!(reached));
-    if !reached.is_empty() {
+    if !chained.is_empty() {
+        f = f.with("reached_internal_services", json!(chained));
+    }
+    if !reached.is_empty() || !chained.is_empty() {
         f = f.with("chained", json!(true));
     }
     Some(f.build())
@@ -2436,6 +2569,41 @@ async fn probe_tampering(client: &Client, site: &Site, baseline: &Resp) -> Optio
         );
     }
     None
+}
+
+/// Why the reflected SSRF oracle declined, when `CORTEX_TRACE_SSRF` is set.
+///
+/// This oracle has four ways to say no and they mean completely different
+/// things: nothing distinctive on the site root, a token that was already in
+/// the baseline, a fetch that did not come back, and an endpoint that echoes
+/// whatever it is handed. Debugging it without knowing which one fired means
+/// re-deriving the whole chain by hand, which is an afternoon.
+fn trace_ssrf(site: &Site, why: &str) {
+    if std::env::var("CORTEX_TRACE_SSRF").is_ok() {
+        eprintln!("cortex: ssrf declined {} `{}`: {why}", site.url, site.param);
+    }
+}
+
+/// Ask the application to fetch one URL and hand back what it got.
+///
+/// The same request the SSRF oracle just proved works, pointed somewhere else.
+/// Bounded by the same short deadline as the metadata walk: an address that does
+/// not answer promptly is not worth a scan's time, and a long wait here is
+/// usually the network dropping packets rather than a service thinking.
+async fn fetch_through(client: &Client, site: &Site, url: &str) -> Option<Resp> {
+    let (u, body) = site.render(url);
+    tokio::time::timeout(
+        crate::chain::CHAIN_TIMEOUT,
+        probe::send(
+            client,
+            &site.method,
+            &u,
+            body.as_ref().map(|(b, c)| (b.as_str(), *c)),
+        ),
+    )
+    .await
+    .ok()
+    .flatten()
 }
 
 /// The site's own value as a number, when the field is numeric.
