@@ -1157,6 +1157,9 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
     let mut found = 0i64;
     let mut sites = 0usize;
     let mut starved = 0usize;
+    // What this endpoint looked like before anything was sent at it, so the pass
+    // can tell afterwards whether it did something to the target.
+    let mut first_baseline: Option<(u16, usize)> = None;
     if want("inventory") {
         for f in crate::probe::spent("inventory", probe_inventory(&client, &ep, &inv_seen)).await {
             let _ = tx.send(json!({"type":"finding","data":f}));
@@ -1308,6 +1311,11 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
             }
         }
         sites += 1;
+        if first_baseline.is_none() {
+            if let Some(b) = &baseline {
+                first_baseline = Some((b.status, b.body.len()));
+            }
+        }
         let Some(baseline) = baseline else {
             starved += 1;
             let n = skips.fetch_add(1, Ordering::Relaxed);
@@ -1477,6 +1485,85 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
         }
         found += hits as i64;
     }
+    // Did testing this endpoint change the application?
+    //
+    // Everything expensive found on 2026-09-11 was the scanner altering its own
+    // target and nothing noticing: a settings link that put a session into
+    // SSL-enforced mode, a password-change form that set a lab's admin password
+    // to the crawl's sample value, a security-level switch flipped mid-pass.
+    // Each showed up as fewer findings, which reads as a clean result. Guards
+    // now stop the ones that can be recognised in advance; this is for the rest.
+    //
+    // One request, at the end, against the same site that produced the first
+    // baseline. It cannot say what changed, only that something did, and that is
+    // worth saying out loud rather than discovering three runs later.
+    if let (Some((was_status, was_len)), Some(site)) =
+        (first_baseline, sites_for(&ep, &varying).into_iter().next())
+    {
+        // Twice, and both have to agree. A page that merely oscillates - a rotating
+        // banner, an ad slot, a counter - differs from its own baseline about half
+        // the time, and reporting that would put a warning on every scan of every
+        // application that carries one. A target that MOVED stays moved.
+        let after = send_site(&client, &site, &site.base_value).await;
+        let after2 = send_site(&client, &site, &site.base_value).await;
+        let verdict = |r: &Option<Resp>| -> Option<(u16, usize)> {
+            r.as_ref().map(|x| (x.status, x.body.len()))
+        };
+        let moved = |now: Option<(u16, usize)>| -> bool {
+            match now {
+                None => true,
+                Some((st, len)) => {
+                    let class_changed = (was_status / 100) != (st / 100);
+                    let grew = len.max(was_len) as f64;
+                    let shrank = len.min(was_len) as f64;
+                    let size_changed = grew > 0.0 && (grew - shrank) / grew > 0.25;
+                    class_changed || size_changed
+                }
+            }
+        };
+        let persistent = moved(verdict(&after)) && moved(verdict(&after2));
+        let changed = if !persistent {
+            None
+        } else {
+            match &after {
+                // Answering before and not now is the loudest version of this, and
+                // the one that actually happened: Mutillidae's session was switched
+                // to SSL-enforced mode, so every later request died in a handshake
+                // against a port that speaks no TLS, and each one was recorded as an
+                // endpoint that simply had nothing to say.
+                None => Some("it does not answer at all now".to_string()),
+                Some(now) => {
+                    let class_changed = (was_status / 100) != (now.status / 100);
+                    let grew = now.body.len().max(was_len) as f64;
+                    let shrank = now.body.len().min(was_len) as f64;
+                    // A quarter of the page is well past template noise and well
+                    // short of flagging a page that merely carries a timestamp.
+                    let size_changed = grew > 0.0 && (grew - shrank) / grew > 0.25;
+                    if class_changed || size_changed {
+                        Some(format!(
+                            "it answered {} in {} bytes and now answers {} in {} bytes",
+                            was_status,
+                            was_len,
+                            now.status,
+                            now.body.len()
+                        ))
+                    } else {
+                        None
+                    }
+                }
+            }
+        };
+        if let Some(how) = changed {
+            let _ = tx.send(json!({"type":"log","message": format!(
+                "{} {} does not answer the way it did before this pass: {how}, with no payload \
+                 either time. Something the pass sent changed the application rather than only \
+                 measuring it, so treat this endpoint's results, and anything tested after it on \
+                 the same session, as measured against a target that moved.",
+                ep.method, ep.url
+            )}));
+        }
+    }
+
     EndpointOutcome {
         found,
         starved: sites > 0 && starved == sites,
