@@ -202,6 +202,7 @@ enum Loc {
 }
 
 /// One fuzzable location on one endpoint.
+#[derive(Clone)]
 struct Site {
     method: String,
     url: String, // full URL (query included)
@@ -573,6 +574,15 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
         if done % 3 == 0 || done == total {
             let _ = tx.send(json!({"type":"progress","processed":done,"total":total}));
         }
+        // Report the cost as the pass goes, not only when it ends.
+        //
+        // Both Mutillidae measurements ran past their harness deadline, so the
+        // end-of-pass report never arrived and two runs produced no cost data at
+        // all - which is the one thing the meter exists to prevent. A number
+        // that only appears when everything went well is not a diagnostic.
+        if done > 0 && done % METER_EVERY == 0 {
+            report_cost(&tx, done, total);
+        }
     }
 
     // Out-of-band callbacks, collected once. Everything that was going to call
@@ -617,6 +627,7 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
     // is a defect; a scan that took an hour because it sent 41,000 requests is
     // a capacity decision. Only one of those can be acted on, and until this
     // was reported the difference was a guess.
+    report_cost(&tx, done, total);
     {
         let total_skips = skips.load(Ordering::Relaxed);
         if total_skips > SKIPS_SPELLED_OUT {
@@ -631,40 +642,48 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
                 )
             }));
         }
-        let (reqs, wait_ms, pace_ms, fails) = crate::probe::meter::snapshot();
-        if reqs > 0 {
-            let _ = tx.send(json!({
-                "type": "log",
-                "message": format!(
-                    "injection pass: {reqs} requests, {}s waiting on the target, {}s pacing \
-                     back-off, {fails} that never answered",
-                    wait_ms / 1000,
-                    pace_ms / 1000
-                )
-            }));
-            // And where it went. Engine-seconds, so the column sums past the
-            // pass duration - workers run concurrently - but the ranking is
-            // what decides which oracle is worth making cheaper.
-            let by_class = crate::probe::meter::by_class();
-            if !by_class.is_empty() {
-                let line = by_class
-                    .iter()
-                    .filter(|(_, ms, _)| *ms >= 1000)
-                    .take(8)
-                    .map(|(c, ms, n)| format!("{c} {}s/{n}", ms / 1000))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                if !line.is_empty() {
-                    let _ = tx.send(json!({
-                        "type": "log",
-                        "message": format!("injection pass, engine-seconds by class: {line}")
-                    }));
-                }
-            }
-        }
     }
 
     let _ = tx.send(json!({"type":"done","found":found}));
+}
+
+/// How often the pass reports what it has spent so far.
+const METER_EVERY: i64 = 5;
+
+/// Emit the cost meter: totals, then the most expensive classes.
+///
+/// Engine-seconds, not wall-clock: workers run concurrently, so the column sums
+/// past the pass duration. The ratios are the point, and they are what said the
+/// file-inclusion oracle was half of everything while the command-injection one
+/// everybody suspected was two percent.
+fn report_cost(tx: &mpsc::UnboundedSender<Value>, done: i64, total: i64) {
+    let (reqs, wait_ms, pace_ms, fails) = crate::probe::meter::snapshot();
+    if reqs == 0 {
+        return;
+    }
+    let _ = tx.send(json!({
+        "type": "log",
+        "message": format!(
+            "injection pass ({done}/{total} endpoints): {reqs} requests, {}s waiting on the \
+             target, {}s pacing back-off, {fails} that never answered",
+            wait_ms / 1000,
+            pace_ms / 1000
+        )
+    }));
+    let by_class = crate::probe::meter::by_class();
+    let line = by_class
+        .iter()
+        .filter(|(_, ms, _)| *ms >= 1000)
+        .take(8)
+        .map(|(c, ms, n)| format!("{c} {}s/{n}", ms / 1000))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if !line.is_empty() {
+        let _ = tx.send(json!({
+            "type": "log",
+            "message": format!("injection pass, engine-seconds by class: {line}")
+        }));
+    }
 }
 
 /// Hosts an injection pass is allowed to touch.
@@ -1317,6 +1336,39 @@ fn set_path_seg(url: &str, idx: usize, value: &str) -> String {
         segs[idx] = pct_encode(value);
     }
     format!("{scheme}{authority}{}{suffix}", segs.join("/"))
+}
+
+/// Ask a site several independent questions at once.
+///
+/// A class's payload list is a set of independent probes against one parameter,
+/// and they were being sent one round trip at a time. Measured on Mutillidae:
+/// the file-inclusion oracle alone accounted for 196 of a pass's 411
+/// engine-seconds, because that application takes about a second to reject each
+/// traversal it is handed and there are nine of them per site.
+///
+/// The per-host concurrency cap in `probe::pace` is untouched, so this does not
+/// hit the target any harder than before. It stops the cap from sitting idle
+/// between one worker's own sequential requests, which is a different thing
+/// entirely: the politeness limit is a ceiling, and the engine was nowhere near
+/// it while taking an hour.
+///
+/// Results come back in the order the payloads were given, so which payload
+/// fired stays deterministic and a reported finding names the one it means.
+async fn send_site_many(client: &Client, site: &Site, values: &[String]) -> Vec<Option<Resp>> {
+    let mut set = tokio::task::JoinSet::new();
+    for (i, v) in values.iter().enumerate() {
+        let client = client.clone();
+        let site = site.clone();
+        let v = v.clone();
+        set.spawn(async move { (i, send_site(&client, &site, &v).await) });
+    }
+    let mut out: Vec<Option<Resp>> = (0..values.len()).map(|_| None).collect();
+    while let Some(joined) = set.join_next().await {
+        if let Ok((i, r)) = joined {
+            out[i] = r;
+        }
+    }
+    out
 }
 
 async fn send_site(client: &Client, site: &Site, value: &str) -> Option<Resp> {
@@ -2645,12 +2697,14 @@ async fn probe_lfi(client: &Client, site: &Site, baseline: &Resp) -> Option<Valu
         "php://filter/convert.base64-encode/resource=index.php",
         "php://filter/resource=index.php",
     ];
-    for p in payloads {
-        // As in probe_ssti: a failed request costs that payload, not the rest.
-        // This is what actually hid Mutillidae's `?page=` file read - the probe
-        // aborted on a timeout while the same target was being hit by the
-        // time-based command-injection probe on another worker.
-        let Some(r) = send_site(client, site, p).await else {
+    // All nine at once. They are nine independent questions about one
+    // parameter; asking them in series was half this engine's time. A failed
+    // request still costs that payload and not the rest, which is what hid
+    // Mutillidae's `?page=` file read when the probe aborted on a timeout.
+    let values: Vec<String> = payloads.iter().map(|p| p.to_string()).collect();
+    let answers = send_site_many(client, site, &values).await;
+    for (p, r) in payloads.iter().zip(answers.into_iter()) {
+        let Some(r) = r else {
             continue;
         };
         if let Some(what) = lfi_leak(p, &r.body, &baseline.body) {
