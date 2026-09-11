@@ -135,6 +135,49 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked --no-fail-fast
 
+  oracles:
+    name: detection regression
+    runs-on: ubuntu-latest
+    # Every oracle, against a target that is vulnerable in one specific way and
+    # against one that is not. See tests/oracles/README.md.
+    #
+    # This job exists because the real guard against a detection regression used
+    # to be somebody remembering to run a ninety-minute benchmark that needs
+    # seventeen Docker containers, an account and a node. Nobody runs that on a
+    # pull request. These need a Python fixture, a binary and a socket.
+    #
+    # What it actually protects is SILENCE. Every expensive mistake in this
+    # engine has been an oracle that quietly stopped finding something, because a
+    # negative result gets no scrutiny, so each case asserts what must NOT be
+    # reported as well as what must.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --no-self-update
+          rustup default 1.88.0
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: oracles-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: oracles-${{ runner.os }}-
+
+      - name: Build the engines under test
+        run: cargo build --locked -p cortex -p mach
+
+      - name: Run the oracle cases
+        # The headless case needs a browser. ubuntu-latest ships Chrome, and the
+        # runner skips that case LOUDLY rather than passing quietly if it is ever
+        # absent, which is the same rule the engine follows.
+        run: python3 tests/oracles/run.py
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
