@@ -126,6 +126,21 @@ MUTATIONS = [
         "probing an address nobody said we could touch",
     ),
     (
+        # The control that the DVWA false positives cost us. Without it the
+        # oracle has only the true/false pair and the baseline, and an
+        # application that varies its own length between two requests looks
+        # exactly like one evaluating the payload.
+        "sqli-boolean-drops-the-inert-control",
+        "cortex/src/inject.rs",
+        """                    if boolean_differential(baseline, &a2, &b2, min_diff)
+                        && !inert_splits_the_same_way(client, site, base, t, f, baseline, min_diff)
+                            .await
+                    {""",
+        "                    if boolean_differential(baseline, &a2, &b2, min_diff) {",
+        ["sqli-negative-drifting-page"],
+        "calling a page that changes on its own a SQL injection",
+    ),
+    (
         # Same reasoning: the marker is confirmed twice, so removing one check
         # leaves the other doing the work. Both go.
         "proto-pollution-confirms-nothing",

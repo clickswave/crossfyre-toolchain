@@ -133,6 +133,21 @@ CASES = {
         ),
         "must_not": [{"class": "proto_pollution"}],
     },
+    # ------------------------------------------------- self-inflicted drift ---
+    "sqli-negative-drifting-page": {
+        "what": "a page that changes length on its own is not a SQL oracle",
+        "fixtures": [{"name": "app", "script": "self_inflicted_drift.py"}],
+        "request": lambda p: inject(
+            _u(p["app"], "/"), classes=["sqli"],
+            endpoints=[{"method": "GET", "url": _u(p["app"], "/page?q=1"),
+                        "params": ["q"]}],
+        ),
+        # Nothing behind this parameter reads a database, so any SQL finding is
+        # wrong by construction. It used to be reported anyway: nine times on
+        # DVWA, marked confirmed, because the application varied its own length
+        # between the true and false requests and the pair had no control.
+        "must_not": [{"class": "sqli"}],
+    },
     # -------------------------------------------------------------- opt-in ---
     "intrusive-classes-are-opt-in": {
         "what": "a default sweep runs none of the state-changing classes",
