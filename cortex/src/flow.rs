@@ -324,6 +324,76 @@ pub fn steps_after_still_worked(k: usize, clean: &[u16], variant: &[u16]) -> boo
     })
 }
 
+/// Values that differ between two identities' runs of the same flow.
+///
+/// These are the per-identity objects: the cart id, the order number, the
+/// account reference. A value that is the SAME in both runs is site furniture
+/// and carries no authorization, so substituting it would prove nothing.
+///
+/// Keyed by (step, name) so a substitution can be aimed at one place rather than
+/// at every occurrence of a string that might also be a coincidence elsewhere.
+pub fn per_identity_values(
+    a: &HashMap<(usize, String), String>,
+    b: &HashMap<(usize, String), String>,
+) -> Vec<(usize, String, String, String)> {
+    let mut out: Vec<(usize, String, String, String)> = a
+        .iter()
+        .filter_map(|((step, key), av)| {
+            let bv = b.get(&(*step, key.clone()))?;
+            // Present in both runs, different in each: that is what an object
+            // reference looks like. Equal means furniture.
+            (av != bv).then(|| (*step, key.clone(), av.clone(), bv.clone()))
+        })
+        .collect();
+    // Deterministic order so two runs of the same scan report the same way.
+    out.sort_by(|x, y| (x.0, &x.1).cmp(&(y.0, &y.1)));
+    out
+}
+
+/// Is this (step, name) actually read by a later step?
+///
+/// A response echoes plenty of values that nothing downstream consumes. Swapping
+/// one of those changes nothing that is ever sent, so the replay is identical to
+/// a clean one and reports as "accepted" while having tested nothing at all.
+/// That is a no-op dressed as a negative result, and it showed up the first time
+/// this ran: a cart id echoed by step two, where only step ONE reads it.
+pub fn is_consumed(steps: &[Step], step: usize, key: &str) -> bool {
+    (step + 1..steps.len()).any(|j| {
+        links_for(steps, j)
+            .iter()
+            .any(|l| l.sources.iter().any(|(s, k)| *s == step && k == key))
+    })
+}
+
+/// Values that only identity A ever produced, for corroborating that A's object
+/// actually came back.
+///
+/// This is the half that makes a cross-identity finding a finding. A request
+/// being ACCEPTED after an id was swapped proves only that it was accepted; the
+/// application may have ignored the id, or silently fallen back to the caller's
+/// own object. Seeing something that belongs to A in the answer is what proves
+/// the object was reached.
+pub fn only_in_a(
+    a: &HashMap<(usize, String), String>,
+    b: &HashMap<(usize, String), String>,
+) -> Vec<String> {
+    let b_values: std::collections::HashSet<&String> = b.values().collect();
+    let mut out: Vec<String> = a
+        .values()
+        .filter(|v| v.len() >= MIN_VALUE && !b_values.contains(*v))
+        .cloned()
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// How many per-identity values are worth testing in one run.
+///
+/// Each is a full replay of the flow, so this is the same quadratic cost the
+/// skip experiment has, against a real application.
+pub const MAX_IDENTITY_TESTS: usize = 4;
+
 /// How many steps a single flow is allowed to carry.
 ///
 /// Each skippable step costs a whole replay of the flow, so the work is
@@ -452,6 +522,71 @@ mod tests {
     }
 
     #[test]
+    fn only_values_that_differ_between_two_people_are_object_references() {
+        let mut a = HashMap::new();
+        let mut b = HashMap::new();
+        // An object: different for each of them.
+        a.insert((2usize, "cart_id".to_string()), "cart-aaaa11".to_string());
+        b.insert((2usize, "cart_id".to_string()), "cart-bbbb22".to_string());
+        // Furniture: the same for both, so swapping it proves nothing.
+        a.insert((2usize, "currency".to_string()), "GBP-STERLING".to_string());
+        b.insert((2usize, "currency".to_string()), "GBP-STERLING".to_string());
+        // Only one of them has it, so there is nothing to compare.
+        a.insert((3usize, "promo".to_string()), "SPRING-ONLY-A".to_string());
+
+        let c = per_identity_values(&a, &b);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].0, 2);
+        assert_eq!(c[0].1, "cart_id");
+        assert_eq!(
+            (c[0].2.as_str(), c[0].3.as_str()),
+            ("cart-aaaa11", "cart-bbbb22")
+        );
+    }
+
+    #[test]
+    fn a_value_nothing_downstream_reads_is_not_worth_swapping() {
+        let steps = vec![
+            step(
+                "/login",
+                "",
+                200,
+                r#"<input name="cart_id" value="cart-aaaa11">"#,
+            ),
+            step(
+                "/cart",
+                "cart_id=cart-aaaa11",
+                200,
+                r#"<input name="cart_id" value="cart-aaaa11">"#,
+            ),
+            step("/place", "confirm=yes", 200, "done"),
+        ];
+        // Step 0's cart_id is read by step 1, so swapping it tests something.
+        assert!(is_consumed(&steps, 0, "cart_id"));
+        // Step 1 echoes the same id, but nothing after step 1 carries it, so
+        // swapping THAT is a no-op that would look like a clean negative.
+        assert!(!is_consumed(&steps, 1, "cart_id"));
+    }
+
+    #[test]
+    fn corroborating_values_are_the_ones_the_other_user_never_saw() {
+        let mut a = HashMap::new();
+        let mut b = HashMap::new();
+        a.insert(
+            (1usize, "owner".to_string()),
+            "alice-account-91".to_string(),
+        );
+        a.insert((1usize, "brand".to_string()), "ACME-STORE".to_string());
+        b.insert((1usize, "owner".to_string()), "bob-account-22".to_string());
+        b.insert((1usize, "brand".to_string()), "ACME-STORE".to_string());
+
+        let only = only_in_a(&a, &b);
+        assert!(only.contains(&"alice-account-91".to_string()));
+        // Shared furniture cannot corroborate anything.
+        assert!(!only.contains(&"ACME-STORE".to_string()));
+    }
+
+    #[test]
     fn skipping_matters_only_when_the_later_steps_still_succeed() {
         // Clean replay: everything succeeded.
         let clean = vec![200, 200, 200, 200];
@@ -494,6 +629,15 @@ pub struct FlowParams {
     /// The flow, in the order it was recorded.
     #[serde(default)]
     pub steps: Vec<Step>,
+    /// The SAME flow recorded again as a different user, when the operator has
+    /// one. Its only purpose is to tell a per-identity object reference apart
+    /// from site furniture: a value that differs between two people doing the
+    /// same thing is an object, and a value that does not is decoration.
+    ///
+    /// Absent means the cross-identity experiment does not run, and the pass
+    /// says so rather than scoring a silent pass.
+    #[serde(default)]
+    pub other_steps: Vec<Step>,
     /// What the operator called it, for the finding to name.
     #[serde(default)]
     pub name: String,
@@ -562,6 +706,69 @@ async fn replay(p: &FlowParams, skip: Option<usize>) -> Option<Vec<u16>> {
         }
     }
     Some(statuses)
+}
+
+/// Replay a flow and return both its statuses and every value each step
+/// produced, so two identities' runs can be compared.
+///
+/// `swap` poisons one correlated value: after step `.0` answers, whatever it
+/// produced under name `.1` is replaced with `.2` before any later step reads
+/// it. That is how identity B is made to carry identity A's object reference.
+///
+/// Keyed on (step, name) rather than on the string, and that distinction is the
+/// whole mechanism. The first version replaced one RECORDED value with another
+/// recorded value, which finds nothing to replace: by the time a request goes
+/// out it carries the value THIS session just produced, not the one in the
+/// recording. The swap silently did nothing and every flow looked authorized.
+async fn replay_values(
+    p: &FlowParams,
+    steps: &[Step],
+    swap: Option<(usize, &str, &str)>,
+) -> Option<(Vec<u16>, HashMap<(usize, String), String>, Vec<String>)> {
+    let client: Client = probe::build_client(ClientOpts {
+        evasive: p.evasive,
+        identify: p.identify.clone(),
+        auth: None,
+        target: &p.target,
+        timeout_ms: p.timeout_ms,
+        min_timeout_ms: 0,
+        block_internal: p.block_internal,
+    })?;
+    let mut statuses = vec![0u16; steps.len()];
+    let mut fresh: HashMap<(usize, String), String> = HashMap::new();
+    let mut bodies: Vec<String> = Vec::new();
+
+    for (i, s) in steps.iter().enumerate() {
+        let links = links_for(steps, i);
+        let url = substitute(&s.url, &links, &fresh);
+        let body = substitute(&s.body, &links, &fresh);
+        let headers: Vec<(String, String)> = s
+            .headers
+            .iter()
+            .filter(|(k, _)| replayable_header(k))
+            .map(|(k, v)| (k.clone(), substitute(v, &links, &fresh)))
+            .collect();
+        let ctype = headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| "application/x-www-form-urlencoded".to_string());
+        let body_arg = (!body.is_empty()).then_some((body.as_str(), ctype.as_str()));
+        let r = probe::send_with(&client, &s.method, &url, body_arg, &headers).await?;
+        statuses[i] = r.status;
+        for (k, v) in values_from(&r.body) {
+            fresh.insert((i, k), v);
+        }
+        // Poison the one value under test, so every later step that correlates
+        // against it carries the other identity's object instead of its own.
+        if let Some((step, key, value)) = swap
+            && step == i
+        {
+            fresh.insert((i, key.to_string()), value.to_string());
+        }
+        bodies.push(r.body);
+    }
+    Some((statuses, fresh, bodies))
 }
 
 /// Run the flow experiments and stream what they found.
@@ -699,7 +906,180 @@ pub async fn run(p: FlowParams, tx: mpsc::UnboundedSender<Value>) {
         found += 1;
     }
 
+    // Experiment three: carry one identity's object reference into another's
+    // session. See `per_identity_values` and `only_in_a`.
+    found += cross_identity(&p, &label, &tx).await;
+
     let _ = tx.send(json!({"type":"done","found":found}));
+}
+
+/// Replay the flow as two different people and see whether one can act on the
+/// other's object.
+///
+/// This is the authorization matrix applied to a SEQUENCE rather than to an
+/// endpoint, and the sequence is what makes it different: the object under test
+/// is one the flow itself created a moment earlier, so there is no need to guess
+/// an id or to have been handed one.
+async fn cross_identity(p: &FlowParams, label: &str, tx: &mpsc::UnboundedSender<Value>) -> i64 {
+    if p.other_steps.is_empty() {
+        let _ = tx.send(json!({
+            "type": "log",
+            "message": format!(
+                "{label}: no second recording, so whether one user can act on another's objects \
+                 inside this flow was NOT tested. Record the same flow as a second user to \
+                 enable it; absence of a finding here is not evidence."
+            )
+        }));
+        return 0;
+    }
+    if p.other_steps.len() != p.steps.len() {
+        let _ = tx.send(json!({
+            "type": "log",
+            "message": format!(
+                "{label}: the second recording has {} steps against the first's {}, so the two \
+                 are not the same flow and were not compared. Record the same sequence as both \
+                 users.",
+                p.other_steps.len(),
+                p.steps.len()
+            )
+        }));
+        return 0;
+    }
+
+    // Both identities have to replay cleanly, for the same reason the first
+    // experiment needs a clean replay: otherwise a swap that "works" is
+    // indistinguishable from a replay that was already broken.
+    let Some((a_status, a_vals, _)) = replay_values(p, &p.steps, None).await else {
+        let _ = tx.send(json!({
+            "type": "log",
+            "message": format!("{label}: the first user's flow stopped answering, so the \
+                                cross-identity experiment was not run.")
+        }));
+        return 0;
+    };
+    if let Err(bad) = reproduced(&p.steps, &a_status) {
+        let _ = tx.send(json!({
+            "type": "log",
+            "message": format!(
+                "{label}: the first user's recording did not replay (diverged at step {}), so the \
+                 cross-identity experiment was not run.",
+                bad + 1
+            )
+        }));
+        return 0;
+    }
+    let Some((b_status, b_vals, _)) = replay_values(p, &p.other_steps, None).await else {
+        return 0;
+    };
+    if let Err(bad) = reproduced(&p.other_steps, &b_status) {
+        let _ = tx.send(json!({
+            "type": "log",
+            "message": format!(
+                "{label}: the second user's recording did not replay (diverged at step {}), so \
+                 the cross-identity experiment was not run.",
+                bad + 1
+            )
+        }));
+        return 0;
+    }
+
+    // Only values a later step actually reads. Swapping anything else is a
+    // no-op that would report as an untested "accepted".
+    let candidates: Vec<_> = per_identity_values(&a_vals, &b_vals)
+        .into_iter()
+        .filter(|(step, key, _, _)| is_consumed(&p.other_steps, *step, key))
+        .collect();
+    let a_only = only_in_a(&a_vals, &b_vals);
+    if candidates.is_empty() {
+        let _ = tx.send(json!({
+            "type": "log",
+            "message": format!(
+                "{label}: the two users' runs produced no differing values, so this flow exposes \
+                 no per-identity object reference to swap. Nothing to test."
+            )
+        }));
+        return 0;
+    }
+
+    let mut found = 0i64;
+    let mut accepted_without_evidence: Vec<String> = Vec::new();
+    let tried = candidates.len().min(MAX_IDENTITY_TESTS);
+    for (step, key, a_val, b_val) in candidates.into_iter().take(MAX_IDENTITY_TESTS) {
+        // Replay as the SECOND user, carrying the FIRST user's object.
+        let Some((sw_status, _, sw_bodies)) =
+            replay_values(p, &p.other_steps, Some((step, &key, &a_val))).await
+        else {
+            continue;
+        };
+        // It has to be accepted exactly where the second user's own run was.
+        if reproduced(&p.other_steps, &sw_status).is_err() {
+            continue;
+        }
+        // And the answer has to carry something that belongs to the first user.
+        // Acceptance alone proves only acceptance: the application may have
+        // ignored the id, or quietly fallen back to the caller's own object.
+        let corroboration = sw_bodies
+            .iter()
+            .skip(step)
+            .find_map(|b| a_only.iter().find(|v| b.contains(*v)).cloned());
+        let Some(evidence) = corroboration else {
+            // Accepted, but nothing in the answer belonged to the first user.
+            // Not reported, and not silent either: this is the shape a real
+            // finding has minus its evidence, and an operator looking at a flow
+            // they suspect should be told it came up.
+            accepted_without_evidence.push(key.clone());
+            continue;
+        };
+
+        let f = Finding::new(
+            "cortex-flow",
+            "bola",
+            "Broken object authorization inside a flow",
+            "critical",
+            &p.other_steps[step].url,
+        )
+        .method(&p.other_steps[step].method)
+        .param(&key)
+        .describe(format!(
+            "Two users were walked through {label} separately. Step {} handed each of them a \
+             different `{key}` ({} and {}), which is what an object reference looks like. \
+             Replaying the second user's flow while carrying the FIRST user's `{key}` was \
+             accepted exactly as their own run was, and the response came back carrying `{}` - a \
+             value that appeared only in the first user's run. So the second user did not merely \
+             have their request accepted, they were handed the first user's object. The flow \
+             creates the object a moment earlier, so an attacker needs no id from anywhere: they \
+             run the flow themselves and then change one field. Authorize the object against the \
+             caller at the point it is used, not at the point it is issued.",
+            step + 1,
+            a_val,
+            b_val,
+            evidence
+        ))
+        .with("step", json!(step + 1))
+        .with("owner_value", json!(a_val))
+        .with("caller_value", json!(b_val))
+        .with("evidence", json!(evidence))
+        .build();
+        let _ = tx.send(json!({"type":"finding","data":f}));
+        found += 1;
+    }
+    if found == 0 {
+        let msg = if accepted_without_evidence.is_empty() {
+            format!(
+                "{label}: {tried} per-identity value(s) were swapped between the two users and \
+                 every one was refused. Object authorization holds inside this flow."
+            )
+        } else {
+            format!(
+                "{label}: swapping {} was ACCEPTED, but nothing belonging to the first user came \
+                 back, so the application may be ignoring the value or falling back to the \
+                 caller's own object. Not reported as a finding, and worth a look by hand.",
+                accepted_without_evidence.join(", ")
+            )
+        };
+        let _ = tx.send(json!({"type": "log", "message": msg}));
+    }
+    found
 }
 
 /// Replay the flow, then send its last step a second time on the same session.
