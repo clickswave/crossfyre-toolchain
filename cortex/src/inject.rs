@@ -1624,11 +1624,30 @@ fn names_an_action(url: &str) -> Option<String> {
         "deauth",
         "drop",
     ];
+    // Same shape as the crawler's rule, and the same reason for its narrowness: a
+    // key that is a verb says it outright, while a verb in a VALUE only counts
+    // under a key that dispatches actions. `?category=archive` is content and
+    // skipping it costs a real endpoint; `?do=toggle-security` is not.
+    const DISPATCH_KEYS: &[&str] = &[
+        "do", "action", "act", "op", "cmd", "task", "mode", "func", "function", "method", "page",
+        "route", "view", "step", "event",
+    ];
+    let tokens = |s: &str| -> Vec<String> {
+        s.split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|t| !t.is_empty())
+            .map(|t| t.to_ascii_lowercase())
+            .collect()
+    };
     let q = url.split('?').nth(1)?;
     for pair in q.split('&') {
-        for half in pair.splitn(2, '=') {
-            for tok in half.split(|c: char| !c.is_ascii_alphanumeric()) {
-                let t = tok.to_ascii_lowercase();
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        for t in tokens(k) {
+            if VERBS.contains(&t.as_str()) {
+                return Some(t);
+            }
+        }
+        if DISPATCH_KEYS.contains(&k.to_ascii_lowercase().as_str()) {
+            for t in tokens(v) {
                 if VERBS.contains(&t.as_str()) {
                     return Some(t);
                 }
@@ -4291,5 +4310,17 @@ mod hint_tests {
         // A submit control that repeats its own name is a button, not a person.
         assert!(!is_identity_field("Login", "Login"));
         assert!(!is_identity_field("login", "login"));
+    }
+
+    #[test]
+    fn a_verb_in_an_ordinary_value_is_still_tested() {
+        for u in [
+            "http://h/posts?category=archive",
+            "http://h/items?status=archive&sort=date",
+            "http://h/ui?tab=lock",
+            "http://h/index.php?page=2",
+        ] {
+            assert_eq!(names_an_action(u), None, "{u}");
+        }
     }
 }

@@ -1482,6 +1482,14 @@ const STATE_VERBS: &[&str] = &[
     "drop",
 ];
 
+/// Query keys whose VALUE names what to do rather than what to show. These are
+/// the front controller's own dispatch parameters; everywhere else a value is
+/// content and must not be read as an instruction.
+const DISPATCH_KEYS: &[&str] = &[
+    "do", "action", "act", "op", "cmd", "task", "mode", "func", "function", "method", "page",
+    "route", "view", "step", "event",
+];
+
 /// Path segments that are an action on their own, whatever the query says. Kept
 /// deliberately short: `/password/reset` renders a form and is worth crawling,
 /// while `/logout` is not, and only the unambiguous ones belong here.
@@ -1516,10 +1524,23 @@ fn verb_tokens(s: &str) -> impl Iterator<Item = &str> {
 /// destructive endpoint exists is worth having. Requesting it is not ours to do.
 fn changes_state(url: &Url) -> Option<String> {
     for (k, v) in url.query_pairs() {
-        for tok in verb_tokens(&k).chain(verb_tokens(&v)) {
+        // A key that is itself a verb is the whole message: `?logout=1`.
+        for tok in verb_tokens(&k) {
             let t = tok.to_ascii_lowercase();
             if STATE_VERBS.contains(&t.as_str()) {
                 return Some(t);
+            }
+        }
+        // A verb in a VALUE only counts under a key that dispatches actions.
+        // Reading every value would cost real pages: `?category=archive` and
+        // `?tab=locked` are content, and a crawler that skips them is worse than
+        // one that never had the rule. `?do=toggle-security` is not content.
+        if DISPATCH_KEYS.contains(&k.to_ascii_lowercase().as_str()) {
+            for tok in verb_tokens(&v) {
+                let t = tok.to_ascii_lowercase();
+                if STATE_VERBS.contains(&t.as_str()) {
+                    return Some(t);
+                }
             }
         }
     }
@@ -1919,5 +1940,35 @@ mod template_tests {
             changes_state(&Url::parse("http://h/i.php?do=toggle-security").unwrap()),
             Some("toggle".to_string())
         );
+    }
+
+    #[test]
+    fn a_verb_in_an_ordinary_value_is_content() {
+        // These cost real pages if the rule reads every value as an instruction.
+        for u in [
+            "http://h/posts?category=archive",
+            "http://h/ui?tab=lock",
+            "http://h/items?status=archive&sort=date",
+            "http://h/search?q=how+to+delete+a+user",
+            "http://h/index.php?page=2",
+        ] {
+            assert_eq!(
+                changes_state(&Url::parse(u).unwrap()),
+                None,
+                "should still be crawled: {u}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_verb_under_a_dispatch_key_is_still_an_action() {
+        for u in [
+            "http://h/index.php?do=toggle-security",
+            "http://h/i.php?action=delete&id=1",
+            "http://h/index.php?page=logout.php",
+            "http://h/x?mode=reset",
+        ] {
+            assert!(changes_state(&Url::parse(u).unwrap()).is_some(), "{u}");
+        }
     }
 }
