@@ -68,6 +68,9 @@ pub async fn handle(env: OpEnv) {
             // Destinations beyond the target the OPERATOR authorised. Never
             // widened by anything a scan discovers.
             "scope": data["scope"].clone(),
+            // Addresses other engines observed on this estate, for a confirmed
+            // SSRF to be re-tested against. The engine scope-checks every one.
+            "internal_targets": data["internal_targets"].clone(),
         })
     } else if mode == "fuzz" {
         // Structure / type fuzzing over the typed request shape (type confusion + mass assignment).
