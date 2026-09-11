@@ -72,6 +72,21 @@ pub async fn handle(env: OpEnv) {
             // SSRF to be re-tested against. The engine scope-checks every one.
             "internal_targets": data["internal_targets"].clone(),
         })
+    } else if mode == "flow" {
+        // Replay a recorded multi-step flow and test whether its order is real.
+        // No credential: a recorded flow that begins with a login establishes
+        // its own session, and handing one in would hide the thing being tested.
+        serde_json::json!({
+            "operation": "flow",
+            "response": "stream",
+            "target": target,
+            "timeout_ms": data["timeout_ms"].as_i64().unwrap_or(15000),
+            "name": data["flow_name"].clone(),
+            "steps": data["steps"].clone(),
+            "evasive": data["evasive"].clone(),
+            "identify": data["identify"].clone(),
+            "block_internal": data["block_internal"].as_bool().unwrap_or(false),
+        })
     } else if mode == "fuzz" {
         // Structure / type fuzzing over the typed request shape (type confusion + mass assignment).
         serde_json::json!({
