@@ -2620,6 +2620,69 @@ static SENSITIVE_PATH: &[&str] = &[
     "password", "passwd", "reset", "forgot", "register", "signup", "sign-up", "recover",
 ];
 
+/// An identity that cannot exist, for bursts that might trip a lockout.
+///
+/// `.invalid` is reserved by RFC 2606 precisely so it can never resolve to
+/// anyone, and the prefix says who sent it if it turns up in a log.
+fn probe_identity() -> String {
+    // Unique per process so two concurrent scans of one target do not share a
+    // phantom account, and stable within a burst so the twenty attempts look
+    // like twenty attempts by one caller rather than twenty callers.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    static RUN: LazyLock<u64> = LazyLock::new(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    });
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("cfx-ratelimit-probe-{}-{n}@example.invalid", *RUN)
+}
+
+/// Is this field the thing an account lockout counts against?
+///
+/// The value matters as well as the name. DVWA's login form carries
+/// `Login=Login`, a submit control whose name happens to be one of these words;
+/// rewriting it would stop the form submitting at all and the burst would
+/// measure nothing. A control that repeats its own name is a button.
+fn is_identity_field(name: &str, value: &str) -> bool {
+    let n = name.to_ascii_lowercase().replace('-', "_");
+    if n.eq_ignore_ascii_case(value.trim()) {
+        return false;
+    }
+    matches!(
+        n.as_str(),
+        "username"
+            | "user_name"
+            | "email"
+            | "e_mail"
+            | "login"
+            | "login_name"
+            | "account"
+            | "userid"
+            | "user_id"
+            | "user"
+    )
+}
+
+/// Replace identity fields in a query string with one that belongs to nobody.
+fn anonymise_query(url: &str) -> String {
+    let Some((head, query)) = url.split_once('?') else {
+        return url.to_string();
+    };
+    let ident = probe_identity();
+    let rebuilt: Vec<String> = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((k, v)) if is_identity_field(k, v) => format!("{k}={ident}"),
+            _ => pair.to_string(),
+        })
+        .collect();
+    format!("{head}?{}", rebuilt.join("&"))
+}
+
 /// Missing rate limiting on a sensitive flow (OWASP API4). Fire a short burst of the baseline
 /// request; if none are throttled (429 / 503 / Retry-After) the endpoint accepts unlimited attempts.
 /// Deduped per (method, path) so a burst runs once, not per param.
@@ -2633,12 +2696,24 @@ async fn probe_ratelimit(client: &Client, ep: &InjEndpoint, seen: &SeenSet) -> O
         return None;
     }
     let method = ep.method.to_uppercase();
+    // Twenty rapid attempts against a login form is what this measures, and it is
+    // also how an account gets locked. The endpoints that reach here are exactly
+    // the ones that count failures: login, OTP, password reset. So the burst goes
+    // out under an identity that cannot exist, and any lockout lands on nobody.
+    // Rate limiting is nearly always per-IP or per-endpoint, which is what the
+    // finding claims, so the measurement is unchanged.
+    let burst_url = anonymise_query(&ep.url);
     // Build a representative body for write methods so the request is realistic.
     let body_owned: Option<(String, &'static str)> =
         if matches!(method.as_str(), "POST" | "PUT" | "PATCH") && !ep.body.is_empty() {
             let mut obj = serde_json::Map::new();
+            let ident = probe_identity();
             for f in &ep.body {
-                obj.insert(f.name.clone(), json_typed(&f.value, f.ty.as_deref()));
+                if is_identity_field(&f.name, &f.value) {
+                    obj.insert(f.name.clone(), json!(ident));
+                } else {
+                    obj.insert(f.name.clone(), json_typed(&f.value, f.ty.as_deref()));
+                }
             }
             Some((Value::Object(obj).to_string(), "application/json"))
         } else {
@@ -2649,7 +2724,7 @@ async fn probe_ratelimit(client: &Client, ep: &InjEndpoint, seen: &SeenSet) -> O
     let mut ok = 0u32;
     for _ in 0..BURST {
         let body_ref = body_owned.as_ref().map(|(b, ct)| (b.as_str(), *ct));
-        match probe::send(client, &method, &ep.url, body_ref).await {
+        match probe::send(client, &method, &burst_url, body_ref).await {
             Some(r) if r.status == 429 || r.status == 503 => throttled += 1,
             Some(_) => ok += 1,
             None => {}
@@ -4089,5 +4164,44 @@ mod hint_tests {
         ] {
             assert_eq!(names_an_action(u), None, "{u}");
         }
+    }
+
+    #[test]
+    fn the_rate_limit_burst_cannot_lock_a_real_account() {
+        let u = anonymise_query("http://h/login.php?username=admin&password=hunter2&Login=Login");
+        assert!(u.contains("username=cfx-ratelimit-probe-"), "{u}");
+        assert!(u.contains("example.invalid"), "{u}");
+        // Everything else survives: the request still has to look like the real one.
+        assert!(u.contains("password=hunter2"), "{u}");
+        assert!(u.contains("Login=Login"), "{u}");
+        assert!(u.starts_with("http://h/login.php?"), "{u}");
+    }
+
+    #[test]
+    fn a_url_without_an_identity_is_left_alone() {
+        let u = "http://h/auth/token?grant_type=client_credentials";
+        assert_eq!(anonymise_query(u), u);
+        assert_eq!(anonymise_query("http://h/login"), "http://h/login");
+    }
+
+    #[test]
+    fn identity_fields_are_recognised_and_others_are_not() {
+        for n in [
+            "username",
+            "user_name",
+            "email",
+            "login",
+            "account",
+            "user",
+            "userId",
+        ] {
+            assert!(is_identity_field(n, "alice"), "{n}");
+        }
+        for n in ["password", "token", "otp", "redirect", "id", "user_agent"] {
+            assert!(!is_identity_field(n, "alice"), "{n}");
+        }
+        // A submit control that repeats its own name is a button, not a person.
+        assert!(!is_identity_field("Login", "Login"));
+        assert!(!is_identity_field("login", "login"));
     }
 }
