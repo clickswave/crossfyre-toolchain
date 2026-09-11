@@ -48,16 +48,42 @@ impl Resp {
     }
 }
 
-/// Build an evasion-aware scan client. `min_timeout_ms` is the floor the operation needs (e.g. an
-/// injection SLEEP probe needs the timeout above the sleep); pass 0 when there is no such floor.
-pub fn build_client(
-    evasive: bool,
-    identify: Option<String>,
-    auth: Option<&AuthSpec>,
-    target: &str,
-    timeout_ms: u64,
-    min_timeout_ms: u64,
-) -> Option<Client> {
+/// Everything a scan client needs beyond the identity it will wear.
+///
+/// This was six positional arguments and is now a struct for one reason: a
+/// seventh was needed, and it was `block_internal`. A safety flag that arrives
+/// as the last of seven booleans and strings is a flag that gets dropped at a
+/// call site, which is exactly what had already happened - the template scanner
+/// honoured it and every other cortex operation silently did not.
+pub struct ClientOpts<'a> {
+    pub evasive: bool,
+    pub identify: Option<String>,
+    pub auth: Option<&'a AuthSpec>,
+    pub target: &'a str,
+    pub timeout_ms: u64,
+    /// The floor this operation needs, e.g. an injection SLEEP probe needs the
+    /// timeout above the sleep. Zero when there is no such floor. Ignored by
+    /// [`build_client_no_redirect`], which has no probe with a floor.
+    pub min_timeout_ms: u64,
+    /// Refuse private and reserved destinations at connect time, at the
+    /// resolver, so redirect hops and DNS rebinding are covered too. Off for an
+    /// authorised customer scan, where reaching their own internal network from
+    /// their own node is the product. On for anything an anonymous caller can
+    /// aim, where our egress is shared.
+    pub block_internal: bool,
+}
+
+/// Build an evasion-aware scan client.
+pub fn build_client(o: ClientOpts) -> Option<Client> {
+    let ClientOpts {
+        evasive,
+        identify,
+        auth,
+        target,
+        timeout_ms,
+        min_timeout_ms,
+        block_internal,
+    } = o;
     let mode = adaptive::identity::Mode::from_flags(evasive, identify);
     let seed = (!target.is_empty()).then_some(target);
     let browser = adaptive::identity::resolve(&mode, seed);
@@ -74,20 +100,23 @@ pub fn build_client(
         accept_invalid_certs: true,
         cookie_store: true,
         resolve: Vec::new(),
-        ..Default::default()
+        block_internal,
     })
     .ok()
 }
 
 /// Same as [`build_client`] but with redirects DISABLED, so the caller sees the raw 3xx + `Location`
 /// instead of the followed destination. The open-redirect / header-injection oracles need that.
-pub fn build_client_no_redirect(
-    evasive: bool,
-    identify: Option<String>,
-    auth: Option<&AuthSpec>,
-    target: &str,
-    timeout_ms: u64,
-) -> Option<Client> {
+pub fn build_client_no_redirect(o: ClientOpts) -> Option<Client> {
+    let ClientOpts {
+        evasive,
+        identify,
+        auth,
+        target,
+        timeout_ms,
+        block_internal,
+        ..
+    } = o;
     let mode = adaptive::identity::Mode::from_flags(evasive, identify);
     let seed = (!target.is_empty()).then_some(target);
     let browser = adaptive::identity::resolve(&mode, seed);
@@ -102,7 +131,7 @@ pub fn build_client_no_redirect(
         accept_invalid_certs: true,
         cookie_store: true,
         resolve: Vec::new(),
-        ..Default::default()
+        block_internal,
     })
     .ok()
 }

@@ -102,6 +102,9 @@ pub struct Recipe {
     pub auth: Option<AuthSpec>,
     pub target: String,
     pub timeout_ms: u64,
+    /// Carried from the pass, so a race burst cannot reach somewhere the rest of
+    /// the pass is forbidden to.
+    pub block_internal: bool,
 }
 
 /// A finding, or an explanation of why there is not one.
@@ -292,14 +295,15 @@ pub async fn probe(recipe: &Recipe, ep: &InjEndpoint) -> Outcome {
     // scheduling luck; separate clients are separate connections.
     let clients: Vec<Client> = (0..BURST)
         .filter_map(|_| {
-            crate::probe::build_client(
-                recipe.evasive,
-                recipe.identify.clone(),
-                recipe.auth.as_ref(),
-                &recipe.target,
-                recipe.timeout_ms,
-                0,
-            )
+            crate::probe::build_client(crate::probe::ClientOpts {
+                evasive: recipe.evasive,
+                identify: recipe.identify.clone(),
+                auth: recipe.auth.as_ref(),
+                target: &recipe.target,
+                timeout_ms: recipe.timeout_ms,
+                min_timeout_ms: 0,
+                block_internal: recipe.block_internal,
+            })
         })
         .collect();
     if clients.len() < MIN_ANSWERS {

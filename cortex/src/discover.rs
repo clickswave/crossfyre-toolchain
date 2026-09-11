@@ -39,6 +39,13 @@ pub struct DiscoverParams {
     pub identify: Option<String>,
     #[serde(default)]
     pub auth: Option<AuthSpec>,
+    /// Refuse private and reserved destinations at connect time. Absent = false,
+    /// which is what an authorised customer scan gets: reaching your own
+    /// internal network from your own node is the product. The free public
+    /// tools set it, because there the caller is anonymous and the egress is
+    /// ours.
+    #[serde(default)]
+    pub block_internal: bool,
 }
 fn d_timeout() -> u64 {
     12_000
@@ -77,14 +84,15 @@ pub async fn run(params: DiscoverParams, tx: mpsc::UnboundedSender<Value>) {
         let _ = tx.send(json!({"type":"done","found":0}));
         return;
     }
-    let client = match probe::build_client(
-        params.evasive,
-        params.identify.clone(),
-        params.auth.as_ref(),
-        &params.target,
-        params.timeout_ms,
-        0,
-    ) {
+    let client = match probe::build_client(probe::ClientOpts {
+        evasive: params.evasive,
+        identify: params.identify.clone(),
+        auth: params.auth.as_ref(),
+        target: &params.target,
+        timeout_ms: params.timeout_ms,
+        min_timeout_ms: 0,
+        block_internal: params.block_internal,
+    }) {
         Some(c) => c,
         None => {
             let _ = tx.send(json!({"type":"error","message":"client build failed"}));

@@ -43,6 +43,9 @@ pub async fn handle(env: OpEnv) {
             "timeout_ms": data["timeout_ms"].as_i64().unwrap_or(10000),
             "endpoints": data["endpoints"].clone(),
             "identities": resolved,
+            // Refuse private / reserved destinations at the resolver. The scan
+            // mode has always forwarded this; the others silently dropped it.
+            "block_internal": data["block_internal"].as_bool().unwrap_or(false),
         })
     } else if mode == "inject" {
         // Active parameter injection (SQLi/XSS/cmdi/LFI). The endpoints carry the
@@ -56,6 +59,9 @@ pub async fn handle(env: OpEnv) {
             "timeout_ms": data["timeout_ms"].as_i64().unwrap_or(12000),
             "endpoints": data["endpoints"].clone(),
             "classes": data["classes"].clone(),
+            // Refuse private / reserved destinations at the resolver. The scan
+            // mode has always forwarded this; the others silently dropped it.
+            "block_internal": data["block_internal"].as_bool().unwrap_or(false),
         })
     } else if mode == "fuzz" {
         // Structure / type fuzzing over the typed request shape (type confusion + mass assignment).
@@ -66,6 +72,9 @@ pub async fn handle(env: OpEnv) {
             "timeout_ms": data["timeout_ms"].as_i64().unwrap_or(12000),
             "endpoints": data["endpoints"].clone(),
             "classes": data["classes"].clone(),
+            // Refuse private / reserved destinations at the resolver. The scan
+            // mode has always forwarded this; the others silently dropped it.
+            "block_internal": data["block_internal"].as_bool().unwrap_or(false),
         })
     } else if mode == "discover" {
         // Request-shape discovery: cortex probes each endpoint (error-mining +
@@ -77,6 +86,9 @@ pub async fn handle(env: OpEnv) {
             "target": target,
             "timeout_ms": data["timeout_ms"].as_i64().unwrap_or(12000),
             "endpoints": data["endpoints"].clone(),
+            // Refuse private / reserved destinations at the resolver. The scan
+            // mode has always forwarded this; the others silently dropped it.
+            "block_internal": data["block_internal"].as_bool().unwrap_or(false),
         })
     } else if mode == "graphql" {
         // GraphQL: cortex live-introspects the endpoint and runs GraphQL-native checks
@@ -88,6 +100,9 @@ pub async fn handle(env: OpEnv) {
             "target": target,
             "endpoint": data["graphql_endpoint"].as_str().unwrap_or("/graphql"),
             "timeout_ms": data["timeout_ms"].as_i64().unwrap_or(12000),
+            // Refuse private / reserved destinations at the resolver. The scan
+            // mode has always forwarded this; the others silently dropped it.
+            "block_internal": data["block_internal"].as_bool().unwrap_or(false),
         })
     } else {
         // Standard vuln scan (templates).

@@ -33,6 +33,13 @@ pub struct FuzzParams {
     /// Which classes to run: "typefuzz" (type confusion) | "massassign"; empty/null = all.
     #[serde(default, deserialize_with = "crate::probe::de_null_seq")]
     pub classes: Vec<String>,
+    /// Refuse private and reserved destinations at connect time. Absent = false,
+    /// which is what an authorised customer scan gets: reaching your own
+    /// internal network from your own node is the product. The free public
+    /// tools set it, because there the caller is anonymous and the egress is
+    /// ours.
+    #[serde(default)]
+    pub block_internal: bool,
 }
 fn d_timeout() -> u64 {
     12_000
@@ -52,14 +59,15 @@ pub async fn run(params: FuzzParams, tx: mpsc::UnboundedSender<Value>) {
         return;
     }
     let want = |c: &str| params.classes.is_empty() || params.classes.iter().any(|x| x == c);
-    let client = match probe::build_client(
-        params.evasive,
-        params.identify.clone(),
-        params.auth.as_ref(),
-        &params.target,
-        params.timeout_ms,
-        3000,
-    ) {
+    let client = match probe::build_client(probe::ClientOpts {
+        evasive: params.evasive,
+        identify: params.identify.clone(),
+        auth: params.auth.as_ref(),
+        target: &params.target,
+        timeout_ms: params.timeout_ms,
+        min_timeout_ms: 3000,
+        block_internal: params.block_internal,
+    }) {
         Some(c) => c,
         None => {
             let _ = tx.send(json!({"type":"error","message":"client build failed"}));

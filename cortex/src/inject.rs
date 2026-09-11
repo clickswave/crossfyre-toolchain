@@ -62,6 +62,13 @@ pub struct InjectParams {
     /// `tasks`, and clamped, because the target is someone's service.
     #[serde(default = "d_tasks")]
     pub tasks: usize,
+    /// Refuse private and reserved destinations at connect time. Absent = false,
+    /// which is what an authorised customer scan gets: reaching your own
+    /// internal network from your own node is the product. The free public
+    /// tools set it, because there the caller is anonymous and the egress is
+    /// ours.
+    #[serde(default)]
+    pub block_internal: bool,
 }
 fn d_timeout() -> u64 {
     12_000
@@ -327,18 +334,19 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
         return;
     }
     // Injection probes send a benign SLEEP, so the timeout floor must clear it.
-    let client = match probe::build_client(
-        params.evasive,
-        params.identify.clone(),
-        params.auth.as_ref(),
-        &params.target,
-        params.timeout_ms,
+    let client = match probe::build_client(probe::ClientOpts {
+        evasive: params.evasive,
+        identify: params.identify.clone(),
+        auth: params.auth.as_ref(),
+        target: &params.target,
+        timeout_ms: params.timeout_ms,
+        block_internal: params.block_internal,
         // Room for the DOUBLED sleep the time-based oracle uses to prove the
         // delay tracks the number we asked for. Sized for one sleep, the
         // confirming request times out and every real time-based finding is
         // lost with the false ones.
-        SLEEP_SECS * 2 * 1000 + 3000,
-    ) {
+        min_timeout_ms: SLEEP_SECS * 2 * 1000 + 3000,
+    }) {
         Some(c) => c,
         None => {
             let _ = tx.send(json!({"type":"error","message":"client build failed"}));
@@ -352,14 +360,15 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
         .iter()
         .skip(1)
         .filter_map(|a| {
-            probe::build_client(
-                params.evasive,
-                params.identify.clone(),
-                Some(a),
-                &params.target,
-                params.timeout_ms,
-                SLEEP_SECS * 2 * 1000 + 3000,
-            )
+            probe::build_client(probe::ClientOpts {
+                evasive: params.evasive,
+                identify: params.identify.clone(),
+                auth: Some(a),
+                target: &params.target,
+                timeout_ms: params.timeout_ms,
+                min_timeout_ms: SLEEP_SECS * 2 * 1000 + 3000,
+                block_internal: params.block_internal,
+            })
         })
         .collect();
     if !session_clients.is_empty() {
@@ -375,13 +384,15 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
 
     // A redirect-following client hides the 3xx + Location the open-redirect oracle needs, so build a
     // second client with redirects disabled just for that probe.
-    let client_nr = probe::build_client_no_redirect(
-        params.evasive,
-        params.identify.clone(),
-        params.auth.as_ref(),
-        &params.target,
-        params.timeout_ms,
-    );
+    let client_nr = probe::build_client_no_redirect(probe::ClientOpts {
+        evasive: params.evasive,
+        identify: params.identify.clone(),
+        auth: params.auth.as_ref(),
+        target: &params.target,
+        timeout_ms: params.timeout_ms,
+        min_timeout_ms: 0,
+        block_internal: params.block_internal,
+    });
     let oast = match &params.oast {
         Some(s) if !s.domains.is_empty() && !s.api_url.is_empty() => {
             crate::oast::OastClient::from_spec(s.domains.clone(), &s.api_url)
@@ -456,6 +467,7 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
             auth: params.auth.clone(),
             target: params.target.clone(),
             timeout_ms: params.timeout_ms,
+            block_internal: params.block_internal,
         })
     });
     let skips = Arc::new(AtomicUsize::new(0));
