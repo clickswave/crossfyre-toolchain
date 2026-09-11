@@ -1046,6 +1046,18 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
                 emit(f, &mut hits);
             }
         }
+        // Named explicitly only. Steps one to three are ordinary in-domain
+        // requests, but the last one deliberately creates a valid-looking record
+        // with an invalid value, and on a real application that can be a credit
+        // rather than an error. That is a different kind of state change from a
+        // SQL payload that errors out.
+        if classes.iter().any(|c| c == "tampering") {
+            if let Some(f) =
+                crate::probe::spent("tampering", probe_tampering(&client, &site, &baseline)).await
+            {
+                emit(f, &mut hits);
+            }
+        }
         if want("deserialization") {
             if let Some(f) =
                 crate::probe::spent("deserialization", probe_deserialization(&client, &site)).await
@@ -2261,6 +2273,125 @@ async fn probe_ssti(client: &Client, site: &Site) -> Option<Value> {
 /// object and look for a result-set change (a match-everything `$gt:""` vs a match-nothing high
 /// sentinel). Confirmed by a reproducible boolean differential, so it does not fire on a field the
 /// server simply ignores. JSON bodies only (that is where operator objects are interpreted).
+/// A numeric input whose computed result has no floor.
+///
+/// See `tamper` for why the link is proved before it is tested. Costs nothing on
+/// a parameter that is not numeric, and two requests on one that is but computes
+/// nothing.
+async fn probe_tampering(client: &Client, site: &Site, baseline: &Resp) -> Option<Value> {
+    let v1 = numeric_base(site)?;
+    // A second in-domain value. Doubling keeps it obviously legitimate: an
+    // application asked for two of something instead of one has been asked a
+    // question it expects.
+    let v2 = if v1 == 0.0 { 2.0 } else { v1 * 2.0 };
+
+    let a = crate::tamper::read(&baseline.body);
+    let second = send_site(client, site, &fmt_num(v2)).await?;
+    let b = crate::tamper::read(&second.body);
+    let link = crate::tamper::find_link(&a, &b, v1, v2)?;
+    let at_v1 = a.numbers[link.index];
+
+    // The link has to be deterministic before anything is concluded from it.
+    // Asking the same question twice and getting the same number is what
+    // separates a computed total from a counter that happened to move.
+    let again = send_site(client, site, &fmt_num(v1)).await?;
+    let c = crate::tamper::read(&again.body);
+    if c.skeleton != a.skeleton || c.numbers.len() != a.numbers.len() {
+        return None;
+    }
+    if !crate::tamper::close(c.numbers[link.index], at_v1) {
+        return None;
+    }
+
+    for (name, bad) in crate::tamper::out_of_domain(v1) {
+        let Some(r) = send_site(client, site, &fmt_num(bad)).await else {
+            continue;
+        };
+        // Refused is correct behaviour, and an error page is a refusal.
+        if r.status >= 400 {
+            continue;
+        }
+        let d = crate::tamper::read(&r.body);
+        if d.skeleton != a.skeleton || d.numbers.len() != a.numbers.len() {
+            continue;
+        }
+        let got = d.numbers[link.index];
+        if !crate::tamper::followed_out(link.how, at_v1, v1, bad, got) {
+            continue;
+        }
+        return Some(
+            Finding::new(
+                "cortex-tamper",
+                "tampering",
+                "Business logic: a computed value follows an out-of-domain input",
+                "high",
+                &site.url,
+            )
+            .method(&site.method)
+            .param(&site.param)
+            .location(&site.where_label())
+            .describe(format!(
+                "`{}` is used in an arithmetic whose result the application then returns. Sending \
+                 {} instead of {} moved a value in the response from {} to {}, the original value \
+                 came back when the original input was re-sent, and then a {name} input ({}) \
+                 produced {} - a result the application accepted with {}. The field is not the \
+                 bug; the missing bound on what is done with it is. An attacker picks the number, \
+                 so they pick the total, the credit or the quantity reserved. Enforce the domain \
+                 where the arithmetic happens, server-side, and reject rather than clamp so the \
+                 attempt is visible.",
+                site.param,
+                fmt_num(v2),
+                fmt_num(v1),
+                fmt_num(at_v1),
+                fmt_num(b.numbers[link.index]),
+                fmt_num(bad),
+                fmt_num(got),
+                r.status
+            ))
+            .with("input_baseline", json!(v1))
+            .with("input_sent", json!(bad))
+            .with("computed_baseline", json!(at_v1))
+            .with("computed_result", json!(got))
+            .with(
+                "relation",
+                json!(match link.how {
+                    crate::tamper::Link::Scale => "scales with the input",
+                    crate::tamper::Link::Offset => "offsets with the input",
+                }),
+            )
+            .build(),
+        );
+    }
+    None
+}
+
+/// The site's own value as a number, when the field is numeric.
+///
+/// Either it parses, or a spec declared it `integer`/`number` and the value is
+/// a placeholder. A field that is not numeric has no arithmetic to abuse.
+fn numeric_base(site: &Site) -> Option<f64> {
+    if let Ok(n) = site.base_value.trim().parse::<f64>() {
+        return n.is_finite().then_some(n);
+    }
+    let declared = site
+        .body
+        .iter()
+        .find(|(k, _, _)| k == &site.param)
+        .and_then(|(_, _, ty)| ty.as_deref())?;
+    matches!(declared, "integer" | "number").then_some(1.0)
+}
+
+/// Render a number the way a form or a JSON body would carry it: no trailing
+/// `.0` on a whole number, because `quantity=2.0` is a different request from
+/// `quantity=2` to plenty of validators.
+fn fmt_num(v: f64) -> String {
+    if v.fract() == 0.0 && v.abs() < 1e15 {
+        format!("{}", v as i64)
+    } else {
+        format!("{v}")
+    }
+}
+
 /// Unsafe deserialization of a request parameter.
 ///
 /// One request asks the question; a second one answers it. See `deserial` for

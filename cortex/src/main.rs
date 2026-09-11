@@ -23,6 +23,7 @@ mod secrets;
 mod smuggle;
 mod solver;
 mod ssrf;
+mod tamper;
 mod template;
 mod xml;
 
