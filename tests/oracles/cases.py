@@ -133,6 +133,26 @@ CASES = {
         ),
         "must_not": [{"class": "proto_pollution"}],
     },
+    # ------------------------------------- a login form is not a change form ---
+    "login-is-tested-change-form-is-not": {
+        "what": "a password field is testable; a password field with a confirmation is not",
+        "fixtures": [{"name": "app", "script": "login_and_change.py"}],
+        "request": lambda p: inject(
+            _u(p["app"], "/"), classes=["sqli", "xss"],
+            endpoints=[
+                {"method": "GET", "url": _u(p["app"], "/login?username=x&password=y"),
+                 "params": ["username", "password"]},
+                {"method": "GET",
+                 "url": _u(p["app"], "/change?password_new=x&password_conf=x&Change=Change"),
+                 "params": ["password_new", "password_conf", "Change"]},
+            ],
+        ),
+        # The login form still gets tested, which is most of the value of the rule.
+        "must_find": [{"class": "sqli", "param": "username"}],
+        # /change reflects its input raw, so an XSS finding would mean it was
+        # submitted. Its absence says it was not.
+        "must_not": [{"class": "xss"}],
+    },
     # ----------------------------------------------- not pressing the button ---
     "crawl-does-not-press-the-settings": {
         "what": "a settings link is reported, never followed, and the crawl survives",

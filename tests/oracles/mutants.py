@@ -126,6 +126,18 @@ MUTATIONS = [
         "probing an address nobody said we could touch",
     ),
     (
+        # Without this, the pass submits the change form. The fixture reflects
+        # what it is given, so submitting it shows up as an XSS finding the case
+        # forbids: the mutation is caught by what the scanner DID, not by what it
+        # failed to find.
+        "inject-submits-credential-change-forms",
+        "cortex/src/inject.rs",
+        "        if let Some(which) = changes_a_credential(&names) {",
+        "        if let Some(which) = None::<String> {",
+        ["login-is-tested-change-form-is-not"],
+        "submitting a form that sets a credential instead of testing one",
+    ),
+    (
         # The guard that stops a crawl from disabling itself. Removing it should
         # cost the far side of the crawl, because the fixture breaks when the
         # link is used.
