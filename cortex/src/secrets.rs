@@ -217,3 +217,153 @@ mod tests {
         assert_eq!(traversal_style("/etc/passwd"), None);
     }
 }
+
+// ---------------------------------------------------------------------------
+// What a disclosed config names
+// ---------------------------------------------------------------------------
+
+/// Internal addresses named by a configuration file we just read.
+///
+/// A readable `.env` is a credential disclosure, and that is already reported.
+/// It is also a MAP: it names the database, the cache, the message broker and
+/// the internal service the application talks to, by address. Those addresses
+/// are the next hop, and they are the thing a confirmed SSRF on the same
+/// application can be pointed at to show that the next hop is real rather than
+/// theoretical.
+///
+/// Only hosts and ports come out of here. The values beside them are passwords,
+/// and this function exists in a file whose entire discipline is that secret
+/// VALUES never reach a finding, an export or a report.
+pub fn internal_hosts(body: &str) -> Vec<(String, u16)> {
+    let mut out: Vec<(String, u16)> = Vec::new();
+    for cap in HOSTISH.captures_iter(body) {
+        let host = cap.get(1).map(|m| m.as_str()).unwrap_or("").trim();
+        let port: u16 = match cap.get(2).and_then(|m| m.as_str().parse().ok()) {
+            Some(p) => p,
+            None => continue,
+        };
+        if !plausible_host(host) || port == 0 {
+            continue;
+        }
+        let h = host.to_lowercase();
+        if !out.iter().any(|(oh, op)| oh == &h && *op == port) {
+            out.push((h, port));
+        }
+        if out.len() >= MAX_HOSTS {
+            break;
+        }
+    }
+    out
+}
+
+/// How many addresses one file may contribute. A config naming forty things is
+/// a config, not a target list.
+const MAX_HOSTS: usize = 8;
+
+/// `host:port`, with or without a scheme and with or without credentials in
+/// front of it. The credential half is matched only so it can be stepped over:
+/// without that, `user:pass@db.internal:5432` yields the host `pass`.
+static HOSTISH: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r#"(?:[A-Za-z][A-Za-z0-9+.\-]*://)?(?:[^\s:/@"']{1,64}:[^\s:/@"']{0,64}@)?([A-Za-z0-9][A-Za-z0-9_.\-]{1,63}):(\d{1,5})"#,
+    )
+    .unwrap()
+});
+
+/// Is this a hostname or address rather than a word that happened to precede a
+/// colon and a number?
+fn plausible_host(h: &str) -> bool {
+    if h.len() < 3 || h.ends_with('.') || h.starts_with('.') {
+        return false;
+    }
+    if h.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    // Digits and dots that are not an address are a version number.
+    // `version=1.2:3` is not a service on port 3.
+    if h.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return false;
+    }
+    // A dotted name. A bare word with no dot is only accepted when it is one of
+    // the names a compose file gives a service, because "timeout:30" is not a
+    // host either.
+    if h.contains('.') {
+        return true;
+    }
+    matches!(
+        h,
+        "localhost"
+            | "db"
+            | "database"
+            | "postgres"
+            | "postgresql"
+            | "mysql"
+            | "mariadb"
+            | "redis"
+            | "cache"
+            | "memcached"
+            | "mongo"
+            | "mongodb"
+            | "rabbitmq"
+            | "kafka"
+            | "elasticsearch"
+            | "minio"
+            | "vault"
+            | "consul"
+    )
+}
+
+#[cfg(test)]
+mod host_tests {
+    use super::*;
+
+    #[test]
+    fn a_database_url_gives_up_its_host_and_not_its_password() {
+        let body = "DATABASE_URL=postgres://appuser:s3cr3t-pw@db.internal:5432/app\n";
+        let h = internal_hosts(body);
+        assert_eq!(h, vec![("db.internal".to_string(), 5432)]);
+        // The whole point of this file: the password is never carried out.
+        assert!(!format!("{h:?}").contains("s3cr3t"));
+        // And the credential half must not be mistaken for the host.
+        assert!(
+            !h.iter()
+                .any(|(x, _)| x.contains("s3cr3t") || x == "appuser")
+        );
+    }
+
+    #[test]
+    fn compose_service_names_count_but_ordinary_words_do_not() {
+        let h = internal_hosts("REDIS_URL=redis://redis:6379/0\nTIMEOUT=30\nRETRIES=5:3\n");
+        assert_eq!(h, vec![("redis".to_string(), 6379)]);
+        // "RETRIES=5:3" must not become a host.
+        assert!(!h.iter().any(|(x, _)| x == "5"));
+    }
+
+    #[test]
+    fn several_services_come_out_in_order_without_duplicates() {
+        let body = "DB=postgres://u:p@10.0.0.5:5432/x\n\
+                    CACHE=redis://10.0.0.6:6379\n\
+                    DB_REPLICA=postgres://u:p@10.0.0.5:5432/x\n";
+        let h = internal_hosts(body);
+        assert_eq!(
+            h,
+            vec![
+                ("10.0.0.5".to_string(), 5432),
+                ("10.0.0.6".to_string(), 6379)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_config_naming_everything_is_still_bounded() {
+        let body: String = (1..30)
+            .map(|i| format!("S{i}=http://10.0.0.{i}:8080\n"))
+            .collect();
+        assert_eq!(internal_hosts(&body).len(), MAX_HOSTS);
+    }
+
+    #[test]
+    fn nonsense_is_not_a_host() {
+        assert!(internal_hosts("ratio=3:4\nversion=1.2:3\n").is_empty());
+    }
+}

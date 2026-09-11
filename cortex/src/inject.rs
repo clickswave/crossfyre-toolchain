@@ -529,6 +529,10 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
         }));
     }
     let chain_targets = Arc::new(chain_targets);
+    // What the pass itself learns about the estate, and where it can be aimed.
+    let learned: Arc<std::sync::Mutex<Vec<crate::chain::InternalTarget>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let ssrf_sites: Arc<std::sync::Mutex<Vec<Site>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     if !chain_targets.is_empty() {
         let _ = tx.send(json!({
             "type": "log",
@@ -615,6 +619,8 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
                 cors_seen: Arc::clone(&cors_seen),
                 found_seen: Arc::clone(&found_seen),
                 chain_targets: Arc::clone(&chain_targets),
+                learned: Arc::clone(&learned),
+                ssrf_sites: Arc::clone(&ssrf_sites),
                 race: race.clone(),
                 race_budget: Arc::clone(&race_budget),
                 skips: Arc::clone(&skips),
@@ -707,6 +713,23 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
         oc.deregister(&client, reg).await;
     }
 
+    // The escalation pass. A file read that discloses a configuration file also
+    // discloses the addresses in it, and a confirmed SSRF is a way to reach
+    // them. Both halves come from probes this pass ran, but they can run in
+    // either order, so the crossing happens HERE rather than wherever the two
+    // happened to meet. Order deciding whether a chain is found is not a
+    // property a scanner should have.
+    found += escalate_learned(
+        &client,
+        client_nr.as_ref(),
+        &learned,
+        &ssrf_sites,
+        &authorised_arc,
+        &found_seen,
+        &tx,
+    )
+    .await;
+
     // What this pass cost, in the operator's terms. A scan that takes an hour
     // is a defect; a scan that took an hour because it sent 41,000 requests is
     // a capacity decision. Only one of those can be acted on, and until this
@@ -729,6 +752,205 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
     }
 
     let _ = tx.send(json!({"type":"done","found":found}));
+}
+
+/// Point a confirmed SSRF at the addresses a disclosed config file named.
+///
+/// Nothing here reads a finding list: the input is addresses learned from a file
+/// this pass actually read, and each one is re-tested through the bug before it
+/// is named, with the same two controls the estate-wide chain uses.
+#[allow(clippy::too_many_arguments)]
+async fn escalate_learned(
+    client: &Client,
+    client_nr: Option<&Client>,
+    learned: &std::sync::Mutex<Vec<crate::chain::InternalTarget>>,
+    ssrf_sites: &std::sync::Mutex<Vec<Site>>,
+    authorised: &crate::scope::Scope,
+    found_seen: &SeenSet,
+    tx: &mpsc::UnboundedSender<Value>,
+) -> i64 {
+    let targets: Vec<crate::chain::InternalTarget> = match learned.lock() {
+        Ok(l) => l.clone(),
+        Err(_) => return 0,
+    };
+    let sites: Vec<Site> = match ssrf_sites.lock() {
+        Ok(s) => s.clone(),
+        Err(_) => return 0,
+    };
+    if std::env::var("CORTEX_TRACE_CHAIN").is_ok() {
+        eprintln!(
+            "cortex escalation: {} learned address(es), {} confirmed fetch site(s)",
+            targets.len(),
+            sites.len()
+        );
+    }
+    if targets.is_empty() || sites.is_empty() {
+        // Say it only when there was something to cross. A pass with no file
+        // read and no SSRF has nothing to report here.
+        if !targets.is_empty() {
+            let _ = tx.send(json!({
+                "type": "log",
+                "message": format!(
+                    "a configuration file named {} internal address(es), but no server-side fetch \
+                     was confirmed on this target, so whether the application can reach them was \
+                     NOT established. They are recorded on the file-read finding.",
+                    targets.len()
+                )
+            }));
+        }
+        return 0;
+    }
+
+    let authorised_targets: Vec<&crate::chain::InternalTarget> = targets
+        .iter()
+        .filter(|t| authorised.admits(&t.host, Some(t.port)))
+        .collect();
+    let refused = targets.len() - authorised_targets.len();
+    if refused > 0 {
+        let _ = tx.send(json!({
+            "type": "log",
+            "message": format!(
+                "{refused} address(es) named by a disclosed configuration file are not in the \
+                 authorised scope, so the confirmed fetch was not pointed at them. A leaked \
+                 address is not an authorised one."
+            )
+        }));
+    }
+    if authorised_targets.is_empty() {
+        return 0;
+    }
+
+    let _ = tx.send(json!({
+        "type": "log",
+        "message": format!(
+            "escalation pass: a disclosed configuration named {} authorised address(es), and {} \
+             confirmed server-side fetch(es) can be pointed at them.",
+            authorised_targets.len(),
+            sites.len()
+        )
+    }));
+    for site in sites.iter().take(2) {
+        let _ = tx.send(json!({
+            "type": "log",
+            "message": format!(
+                "escalation pass: pointing `{}` on {} at {}",
+                site.param,
+                site.url,
+                authorised_targets
+                    .iter()
+                    .map(|t| t.url())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }));
+    }
+    let sender = client_nr.unwrap_or(client);
+    let mut found = 0i64;
+    let mut tested = 0usize;
+    // Kept apart from `found`: a chain that was reached but already reported is
+    // a completely different thing from one that was never reachable, and the
+    // first version said "nothing answered" for both.
+    let mut reached_any = 0usize;
+    for site in sites.iter().take(2) {
+        // Control A: what this application says when a fetch cannot connect.
+        let Some(ctrl) = fetch_through(sender, site, crate::ssrf::CLOSED_INTERNAL).await else {
+            continue;
+        };
+        let mut control_b: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut reached: Vec<Value> = Vec::new();
+        for t in authorised_targets.iter().take(crate::chain::MAX_TARGETS) {
+            let cb = match control_b.get(&t.host) {
+                Some(b) => b.clone(),
+                None => {
+                    let Some(r) = fetch_through(sender, site, &t.control_url()).await else {
+                        continue;
+                    };
+                    control_b.insert(t.host.clone(), r.body.clone());
+                    r.body
+                }
+            };
+            let Some(hit) = fetch_through(sender, site, &t.url()).await else {
+                continue;
+            };
+            tested += 1;
+            if std::env::var("CORTEX_TRACE_CHAIN").is_ok() {
+                let cut = |b: &str| b.chars().take(90).collect::<String>();
+                eprintln!(
+                    "cortex chain {}:\n  hit  = {}\n  ctrlA= {}\n  ctrlB= {}",
+                    t.url(),
+                    cut(&hit.body),
+                    cut(&ctrl.body),
+                    cut(&cb)
+                );
+            }
+            if !crate::chain::answered(&hit.body, &ctrl.body, &cb) {
+                continue;
+            }
+            reached.push(crate::chain::reached_note(t, None));
+        }
+        if reached.is_empty() {
+            continue;
+        }
+        reached_any += reached.len();
+        let named: Vec<String> = reached
+            .iter()
+            .map(|v| {
+                format!(
+                    "{}:{}",
+                    v.get("host").and_then(|x| x.as_str()).unwrap_or("?"),
+                    v.get("port").and_then(|x| x.as_u64()).unwrap_or(0)
+                )
+            })
+            .collect();
+        let f = Finding::new(
+            "cortex-chain",
+            // Its own class rather than `ssrf`, and not for tidiness: findings
+            // are deduplicated on class, path, parameter and location, so
+            // reusing `ssrf` here means this is silently dropped as a repeat of
+            // the SSRF finding that produced it. It is also a different claim -
+            // two bugs composing - and deserves to be searchable as one.
+            "chain",
+            "A disclosed config file's internal services are reachable through this application",
+            "critical",
+            &site.url,
+        )
+        .method(&site.method)
+        .param(&site.param)
+        .location(&site.where_label())
+        .describe(format!(
+            "Two bugs on this target compose into one path, and both halves were demonstrated \
+             rather than inferred. A file read on this application disclosed its own \
+             configuration, which named these internal addresses; this parameter makes the server \
+             fetch a URL and hand back the answer; and pointing it at those addresses reached {}. \
+             Each was confirmed the same way the estate-wide check does it: asked for, then asked \
+             for a closed port on the SAME host, so the difference is the service answering rather \
+             than the network. An attacker does not need to guess an internal address here, \
+             because the application told them, and does not need a route in, because the \
+             application is the route. The config file's credentials are for those exact services, \
+             so treat them as disclosed and rotate before fixing either parameter.",
+            named.join(", ")
+        ))
+        .with("reached_internal_services", json!(reached))
+        .with("chained", json!(true))
+        .build();
+        if seen_once(found_seen, finding_identity(&f)) {
+            let _ = tx.send(json!({"type":"finding","data": f}));
+            found += 1;
+        }
+    }
+    if found == 0 && reached_any == 0 {
+        let _ = tx.send(json!({
+            "type": "log",
+            "message": format!(
+                "escalation pass: {tested} address(es) were tried through the confirmed fetch and \
+                 none answered differently from a closed port on the same host, so the \
+                 application cannot reach what its own configuration names. The disclosure stands \
+                 on its own."
+            )
+        }));
+    }
+    found
 }
 
 /// How often the pass reports what it has spent so far.
@@ -852,6 +1074,13 @@ struct EndpointCtx {
     /// Addresses other engines observed on this estate, for a confirmed SSRF to
     /// be tested against. See `chain`.
     chain_targets: Arc<Vec<crate::chain::InternalTarget>>,
+    /// Addresses THIS pass learned, from configuration files a file-read
+    /// disclosed. Filled during the pass and drained afterwards, so the order
+    /// probes happened to run in cannot decide whether a chain is found.
+    learned: Arc<std::sync::Mutex<Vec<crate::chain::InternalTarget>>>,
+    /// Sites where a reflected SSRF was confirmed, kept so the escalation pass
+    /// has somewhere to point the addresses it learned later.
+    ssrf_sites: Arc<std::sync::Mutex<Vec<Site>>>,
     /// Present only when the caller named the `race` class. Carries what the
     /// race probe needs to build its own connections, because the shared client
     /// is paced against the host and pacing is the opposite of what this check
@@ -902,6 +1131,8 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
         found_seen,
         xml_seen,
         chain_targets,
+        learned,
+        ssrf_sites,
         race,
         race_budget,
         skips,
@@ -1117,6 +1348,7 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
                     oob_reg.as_deref(),
                     Some(&oob_queue),
                     &chain_targets,
+                    &ssrf_sites,
                 ),
             )
             .await
@@ -1130,7 +1362,8 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
             }
         }
         if want("lfi") {
-            if let Some(f) = crate::probe::spent("lfi", probe_lfi(&client, &site, &baseline)).await
+            if let Some(f) =
+                crate::probe::spent("lfi", probe_lfi(&client, &site, &baseline, &learned)).await
             {
                 emit(f, &mut hits);
             }
@@ -1910,6 +2143,7 @@ async fn probe_ssrf(
     oob_queue: Option<&OobQueue>,
     // Already filtered to what the operator authorised; see the driver.
     chain_targets: &[crate::chain::InternalTarget],
+    ssrf_sites: &std::sync::Mutex<Vec<Site>>,
 ) -> Option<Value> {
     let name = site.param.to_lowercase();
     let hinted = hint_matches(&name, SSRF_HINT);
@@ -1925,6 +2159,13 @@ async fn probe_ssrf(
     // check on the external one meant the dangerous case could only be found
     // when the harmless one already had been.
     if let Some(f) = probe_ssrf_reflected(client_nr.unwrap_or(client), site, chain_targets).await {
+        // Remember where the fetch works. Addresses learned later in the pass
+        // need somewhere to be aimed, and this is it.
+        if let Ok(mut v) = ssrf_sites.lock()
+            && !v.iter().any(|x| x.url == site.url && x.param == site.param)
+        {
+            v.push(site.clone());
+        }
         return Some(f);
     }
     let oc = oast?;
@@ -3046,7 +3287,12 @@ fn lfi_leak(payload: &str, body: &str, baseline: &str) -> Option<&'static str> {
     None
 }
 
-async fn probe_lfi(client: &Client, site: &Site, baseline: &Resp) -> Option<Value> {
+async fn probe_lfi(
+    client: &Client,
+    site: &Site,
+    baseline: &Resp,
+    learned: &std::sync::Mutex<Vec<crate::chain::InternalTarget>>,
+) -> Option<Value> {
     if is_passwd(&baseline.body) {
         return None;
     }
@@ -3122,7 +3368,7 @@ async fn probe_lfi(client: &Client, site: &Site, baseline: &Resp) -> Option<Valu
                 // `/etc/passwd` proves the bug and is worth nothing to an
                 // attacker. What it is worth is the file next to it, so look -
                 // briefly, and only now. See `secrets`.
-                let reached = lfi_reach_secrets(client, site, p, baseline).await;
+                let reached = lfi_reach_secrets(client, site, p, baseline, learned).await;
                 let severity = if reached.is_empty() {
                     "high"
                 } else {
@@ -3184,6 +3430,7 @@ async fn lfi_reach_secrets(
     site: &Site,
     worked: &str,
     baseline: &Resp,
+    learned: &std::sync::Mutex<Vec<crate::chain::InternalTarget>>,
 ) -> Vec<Value> {
     let Some(style) = crate::secrets::traversal_style(worked) else {
         // An absolute path proved the read without proving a traversal
@@ -3194,6 +3441,11 @@ async fn lfi_reach_secrets(
     // dozen URLs, and this escalation costs eighteen requests each time.
     let key = format!("{}|{}", host_of(&site.url), site.param);
     if let Some(cached) = crate::secrets::cached_reach(&key) {
+        // The cache is process-wide, so a second scan in the same daemon hits
+        // it. Re-learn the addresses from what it holds: the escalation pass
+        // reads that list, and a cache that skips the SIDE EFFECT quietly turns
+        // the chain off for every run after the first. It did exactly that.
+        learn_from(&cached, learned);
         return cached;
     }
     let mut out = Vec::new();
@@ -3204,18 +3456,59 @@ async fn lfi_reach_secrets(
                 continue;
             };
             if let Some(keys) = crate::secrets::is_the_file(f, &r.body, &baseline.body) {
+                // The file is a map as well as a disclosure: it names the
+                // database, the cache and the internal services by address.
+                // Those addresses go into the pass's learned list, where a
+                // confirmed SSRF can be pointed at them afterwards. Hosts only;
+                // the values beside them are passwords and never leave here.
+                let hosts = crate::secrets::internal_hosts(&r.body);
                 out.push(json!({
                     "file": f.label,
                     "path": payload,
                     // Names only. The values arrived; they are not written down.
                     "keys": keys,
+                    "names_internal": hosts
+                        .iter()
+                        .map(|(h, p)| format!("{h}:{p}"))
+                        .collect::<Vec<_>>(),
                 }));
                 break;
             }
         }
     }
     crate::secrets::remember_reach(&key, &out);
+    learn_from(&out, learned);
     out
+}
+
+/// Pull the addresses a config-file escalation recorded into the pass's learned
+/// list.
+///
+/// Reads them back out of the finding rather than off a second variable, so the
+/// cached path and the fresh path cannot disagree about what was learned.
+fn learn_from(reached: &[Value], learned: &std::sync::Mutex<Vec<crate::chain::InternalTarget>>) {
+    let Ok(mut l) = learned.lock() else { return };
+    for entry in reached {
+        let Some(names) = entry.get("names_internal").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for n in names.iter().filter_map(|v| v.as_str()) {
+            let Some((host, port)) = n.rsplit_once(':') else {
+                continue;
+            };
+            let Ok(port) = port.parse::<u16>() else {
+                continue;
+            };
+            if !l.iter().any(|t| t.host == host && t.port == port) {
+                l.push(crate::chain::InternalTarget {
+                    host: host.to_string(),
+                    port,
+                    service: String::new(),
+                    banner: String::new(),
+                });
+            }
+        }
+    }
 }
 
 /// The sentence a reachable config file adds to an LFI finding.
