@@ -106,6 +106,10 @@ async fn handle_connection(
                 handle_graphql(req.params, &mut writer).await?;
                 return Ok(());
             }
+            "flow" => {
+                handle_flow(req.params, &mut writer).await?;
+                return Ok(());
+            }
             other => {
                 write_line(
                     &mut writer,
@@ -292,6 +296,37 @@ async fn handle_fuzz(
     let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
     tokio::spawn(async move {
         crate::fuzz::run(fp, tx).await;
+    });
+
+    while let Some(ev) = rx.recv().await {
+        write_line(writer, &ev).await?;
+    }
+    Ok(())
+}
+
+/// Replay a recorded multi-step flow and test its order. See `flow`.
+async fn handle_flow(
+    params: Value,
+    writer: &mut OwnedWriteHalf,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let fp: crate::flow::FlowParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(e) => {
+            write_line(
+                writer,
+                &serde_json::json!({
+                    "type": "error",
+                    "message": format!("Invalid flow params: {}", e),
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
+    tokio::spawn(async move {
+        crate::flow::run(fp, tx).await;
     });
 
     while let Some(ev) = rx.recv().await {

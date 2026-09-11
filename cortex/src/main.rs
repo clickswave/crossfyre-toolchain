@@ -12,6 +12,7 @@ mod discover;
 mod dsl;
 mod engine;
 mod exposure;
+mod flow;
 mod fuzz;
 mod graphql;
 mod inject;
