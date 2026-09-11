@@ -195,6 +195,37 @@ fn visible_text(body: &str) -> String {
     out.trim().to_string()
 }
 
+/// How long to wait on an internal address before giving up.
+///
+/// A service inside the instance answers in milliseconds or is not there. The
+/// scan client's timeout is twelve seconds because a payloaded request to the
+/// TARGET can legitimately take that long, and applying it here meant each
+/// unroutable address - `169.254.169.254` on a machine with no link-local route,
+/// `metadata.google.internal` with no such name - burned the full twelve before
+/// the next one was tried. Four of those, once per injection site, is how a pass
+/// stops talking to the target entirely and sits blocked on addresses that were
+/// never going to answer.
+pub const INTERNAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Internal-reach results already computed, per host.
+///
+/// Which internal services an instance can reach is a property of the instance,
+/// not of the parameter that reached them, so this is asked once. Without it the
+/// answer was recomputed for every confirmed site.
+static REACH: OnceLock<Mutex<HashMap<String, Vec<Value>>>> = OnceLock::new();
+
+pub fn cached_internal(host: &str) -> Option<Vec<Value>> {
+    let m = REACH.get_or_init(|| Mutex::new(HashMap::new()));
+    let g = m.lock().unwrap_or_else(|e| e.into_inner());
+    g.get(host).cloned()
+}
+
+pub fn remember_internal(host: &str, v: &[Value]) {
+    let m = REACH.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+    g.insert(host.to_string(), v.to_vec());
+}
+
 /// Canary candidates for a host, computed once.
 ///
 /// Every parameter named `url`, `uri`, `link` or `callback` on a target is a

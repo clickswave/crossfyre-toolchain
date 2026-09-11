@@ -1890,31 +1890,43 @@ async fn probe_ssrf_reflected(client: &Client, site: &Site) -> Option<Value> {
         return None;
     }
 
-    // Confirmed. Now one request per internal address, and only now.
-    let mut reached = Vec::new();
-    let mut worst = "high";
-    for svc in crate::ssrf::INTERNAL {
-        let headers: Vec<(String, String)> = svc
-            .headers
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        let (url, body) = site.render(svc.url);
-        let Some(r) = probe::send_with(
-            client,
-            &site.method,
-            &url,
-            body.as_ref().map(|(b, c)| (b.as_str(), *c)),
-            &headers,
-        )
-        .await
-        else {
-            continue;
-        };
-        if crate::ssrf::identify(&r.body).is_some() {
-            reached.push(crate::ssrf::reach_note(svc));
-            worst = "critical";
+    // Confirmed. Now one request per internal address, once per host, with a
+    // short deadline - see `ssrf::INTERNAL_TIMEOUT`.
+    let host = host_of(&site.url);
+    let mut reached = crate::ssrf::cached_internal(&host).unwrap_or_default();
+    let mut worst = if reached.is_empty() {
+        "high"
+    } else {
+        "critical"
+    };
+    if crate::ssrf::cached_internal(&host).is_none() {
+        for svc in crate::ssrf::INTERNAL {
+            let headers: Vec<(String, String)> = svc
+                .headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let (url, body) = site.render(svc.url);
+            let sent = tokio::time::timeout(
+                crate::ssrf::INTERNAL_TIMEOUT,
+                probe::send_with(
+                    client,
+                    &site.method,
+                    &url,
+                    body.as_ref().map(|(b, c)| (b.as_str(), *c)),
+                    &headers,
+                ),
+            )
+            .await;
+            let Ok(Some(r)) = sent else {
+                continue;
+            };
+            if crate::ssrf::identify(&r.body).is_some() {
+                reached.push(crate::ssrf::reach_note(svc));
+                worst = "critical";
+            }
         }
+        crate::ssrf::remember_internal(&host, &reached);
     }
 
     let where_to = if reached.is_empty() {
@@ -2681,20 +2693,55 @@ async fn probe_lfi(client: &Client, site: &Site, baseline: &Resp) -> Option<Valu
         "php://filter/convert.base64-encode/resource=index.php",
         "php://filter/resource=index.php",
     ];
-    // Sequential, and measured to be the right choice. Sending all nine at once
-    // looked obviously better - nine independent questions about one parameter -
-    // and made the pass 75% SLOWER: 123s to 215s over the same five endpoints,
-    // with the pacer's back-off tripling from 26s to 82s and SQL injection
-    // going from 64 engine-seconds to 337 as everything queued behind the
-    // burst. The per-host ceiling of eight was not sitting idle; the pacer was
-    // already braking against it, and adding demand only made it brake harder.
+    // Four spellings first, the rest only if one of them moved the page.
+    //
+    // This oracle is the most expensive in the engine: measured over eight
+    // sites it was 59 of about 129 engine-seconds, because it is the longest
+    // payload list and every one of them is a round trip against a target that
+    // takes a quarter of a second to answer under a pass.
+    //
+    // The four cover the distinct techniques - unix relative, unix absolute, a
+    // PHP wrapper, Windows absolute - and the rule for spending the other six is
+    // that SOMETHING has to have happened. A parameter that is used to build a
+    // path cannot be handed `../../etc/passwd` and answer exactly as it did for
+    // its own value: it either includes something, or fails to, and either way
+    // the page changes. A parameter that answers identically is not a file path,
+    // and the encoding variants of a technique that produced no reaction at all
+    // are not going to produce one.
+    //
+    // The bypass variants stay reachable where they matter. An application that
+    // strips `../` still answers differently to `etc/passwd` than to its own
+    // value, so the door opens and `....//` gets its turn.
+    let first: &[&str] = &[
+        "../../../../../../../../etc/passwd",
+        "/etc/passwd",
+        "php://filter/convert.base64-encode/resource=index.php",
+        "C:\\windows\\win.ini",
+    ];
+    let mut moved = false;
+    let mut order: Vec<&str> = first.to_vec();
+    order.extend(payloads.iter().filter(|p| !first.contains(p)));
+    let cheap = first.len();
+
+    // Sending the list concurrently was tried and reverted: over the same five
+    // endpoints it took the pass from 123s to 215s, tripled the pacer's
+    // back-off and pushed SQL injection from 64 engine-seconds to 337 as
+    // everything queued behind the burst. The per-host ceiling was not idle.
     //
     // A failed request still costs that payload and not the rest, which is what
     // hid Mutillidae's `?page=` file read when the probe aborted on a timeout.
-    for p in payloads {
+    for (i, p) in order.iter().enumerate() {
+        if i == cheap && !moved {
+            // Nothing reacted to any technique. The remaining payloads are
+            // spellings of techniques that just produced no reaction.
+            break;
+        }
         let Some(r) = send_site(client, site, p).await else {
             continue;
         };
+        if !moved && page_reacted(&r, baseline) {
+            moved = true;
+        }
         if let Some(what) = lfi_leak(p, &r.body, &baseline.body) {
             let Some(again) = send_site(client, site, p).await else {
                 continue;
@@ -2735,6 +2782,23 @@ async fn probe_lfi(client: &Client, site: &Site, baseline: &Resp) -> Option<Valu
         }
     }
     None
+}
+
+/// Did the endpoint answer this payload differently from its own value?
+///
+/// Deliberately coarse: a different status, or a body whose size moved past the
+/// noise a dynamic page makes on its own. It is not evidence of a leak - that is
+/// `lfi_leak`'s job - only evidence that the parameter reaches something that
+/// cares what it says.
+fn page_reacted(r: &Resp, baseline: &Resp) -> bool {
+    if r.status != baseline.status {
+        return true;
+    }
+    let a = baseline.body.len() as i64;
+    let b = r.body.len() as i64;
+    // Tokens and timestamps wobble a page by a few bytes; 2% or 64 bytes,
+    // whichever is larger, is past that on any real page.
+    (a - b).abs() > (a / 50).max(64)
 }
 
 /// Follow a confirmed file read to the application's own configuration.
