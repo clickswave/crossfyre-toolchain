@@ -1248,6 +1248,29 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
             found += 1;
         }
     }
+    // Before anything is sent: is submitting this endpoint an action rather than
+    // a test? If so it is skipped whole, not per-parameter, because the other
+    // parameters ride along in the same request.
+    {
+        let mut names: Vec<String> = if ep.params.is_empty() {
+            query_param_names(&ep.url)
+        } else {
+            ep.params.clone()
+        };
+        names.extend(ep.body.iter().map(|b| b.name.clone()));
+        if let Some(which) = changes_a_credential(&names) {
+            let _ = tx.send(json!({"type":"log","message": format!(
+                "skipped {} {} without testing it: `{}` alongside a confirmation field makes this a \
+                 credential-change form, and submitting it would set the credential rather than test \
+                 it. Endpoints that change a secret are reported by the crawl and left alone here.",
+                ep.method, ep.url, which
+            )}));
+            return EndpointOutcome {
+                found,
+                starved: false,
+            };
+        }
+    }
     for site in sites_for(&ep, &varying) {
         // Every oracle on this site compares against the baseline, so losing it
         // loses the site - silently, which is the problem. One timed-out
@@ -1450,6 +1473,56 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
 
 /// Expand an endpoint into its fuzzable sites (query params, path segments,
 /// body fields). `varying` carries the positions the corpus proved variable.
+/// Would submitting this endpoint change a credential rather than test one?
+///
+/// DVWA's password-change exercise is a GET form:
+/// `/vulnerabilities/csrf/?password_new=X&password_conf=X&Change=Change`. The
+/// crawler found it, correctly, and the injection pass submitted it, which set
+/// the admin password to the crawl's own sample value. Every later run then
+/// failed to log in, and the findings that followed were measured against a
+/// login page. A scanner that breaks the thing it is measuring produces numbers
+/// nobody can use, and on a customer's application it is worse than useless.
+///
+/// The distinction that matters is between authenticating and changing. A login
+/// form's `password` is one of the best SQL injection targets there is and must
+/// stay testable. A form carrying a password AND a confirmation of it, or a
+/// `new_password`/`password_new` pair, is not a login form. That pairing is the
+/// whole rule, and it is deliberately narrow: nothing here guesses from a verb
+/// or a path, because a guess that skips an endpoint costs a real finding.
+fn changes_a_credential(names: &[String]) -> Option<String> {
+    let low: Vec<String> = names.iter().map(|n| n.to_ascii_lowercase()).collect();
+    let is_secret =
+        |n: &str| n.contains("password") || n.contains("passwd") || n.contains("secret");
+    let is_confirm = |n: &str| {
+        n.contains("conf")
+            || n.contains("confirm")
+            || n.contains("repeat")
+            || n.contains("retype")
+            || n.contains("again")
+            || n.contains("verify")
+            || n.ends_with("2")
+    };
+    let secret: Vec<&String> = low.iter().filter(|n| is_secret(n)).collect();
+    if secret.is_empty() {
+        return None;
+    }
+    // A secret paired with a confirmation of it: a change form, not a login.
+    if low.iter().any(|n| is_secret(n) && is_confirm(n)) {
+        return Some(secret[0].clone());
+    }
+    // `new_password` / `password_new` says so on its own.
+    if secret.iter().any(|n| n.contains("new")) {
+        return Some(
+            secret
+                .iter()
+                .find(|n| n.contains("new"))
+                .unwrap()
+                .to_string(),
+        );
+    }
+    None
+}
+
 fn sites_for(ep: &InjEndpoint, varying: &VaryingPaths) -> Vec<Site> {
     let method = ep.method.to_uppercase();
     let mut out = Vec::new();
@@ -3788,5 +3861,52 @@ mod hint_tests {
     fn ssrf_hints_are_words_and_behave_the_same() {
         assert!(hint_matches("callback_url", SSRF_HINT));
         assert!(!hint_matches("firstname", SSRF_HINT));
+    }
+
+    #[test]
+    fn a_login_form_is_still_tested() {
+        // The single best SQL injection target in most applications. Skipping it
+        // would cost more than the guard saves.
+        for names in [
+            vec!["username".to_string(), "password".to_string()],
+            vec![
+                "user".to_string(),
+                "passwd".to_string(),
+                "Login".to_string(),
+            ],
+            vec![
+                "email".to_string(),
+                "password".to_string(),
+                "remember".to_string(),
+            ],
+        ] {
+            assert_eq!(changes_a_credential(&names), None, "{names:?}");
+        }
+    }
+
+    #[test]
+    fn a_change_form_is_not_submitted() {
+        // The exact endpoint that set DVWA's admin password to the crawl's own
+        // sample value, and the shapes it appears in elsewhere.
+        let cases = [
+            vec![
+                "password_new".to_string(),
+                "password_conf".to_string(),
+                "Change".to_string(),
+            ],
+            vec!["new_password".to_string(), "confirm_password".to_string()],
+            vec!["password".to_string(), "password_confirmation".to_string()],
+            vec!["password1".to_string(), "password2".to_string()],
+            vec!["newPassword".to_string()],
+        ];
+        for names in cases {
+            assert!(changes_a_credential(&names).is_some(), "{names:?}");
+        }
+    }
+
+    #[test]
+    fn an_endpoint_with_no_secret_is_never_skipped() {
+        let names = vec!["id".to_string(), "Submit".to_string(), "page".to_string()];
+        assert_eq!(changes_a_credential(&names), None);
     }
 }
