@@ -585,6 +585,55 @@ async fn probe_field_injection(
         }
     }
 
+    // --- OS command injection, output reflected ---
+    //
+    // The same oracle the HTTP injector reaches for first, and for the same
+    // reasons: one request per separator, no sleeps, no OAST budget, and a match
+    // is proof rather than evidence. The payload carries `$((a*b))`
+    // un-evaluated, so the product can only appear if a shell computed it.
+    //
+    // This path had the blind oracle alone, which is a real gap rather than a
+    // stylistic one. dvga's `systemDebug(arg:)` runs `ps {arg}` through
+    // os.popen and returns the output in the GraphQL response, so `; echo`
+    // comes straight back; the blind oracle would only have found it if the
+    // container could reach an OAST host, which is a different question from
+    // whether the argument reaches a shell.
+    {
+        let prod = crate::inject::CMDI_ECHO_A * crate::inject::CMDI_ECHO_B;
+        let marker = format!("zZcx{prod}xcZz");
+        for sep in [";", "|", "&&", "$(", "`"] {
+            let close = match sep {
+                "$(" => ")",
+                "`" => "`",
+                _ => "",
+            };
+            let pl = format!(
+                "1{sep}echo zZcx$(({}*{}))xcZz{close}",
+                crate::inject::CMDI_ECHO_A,
+                crate::inject::CMDI_ECHO_B
+            );
+            if let Some(r) = post(client, url, &build_doc(field, arg, &pl)).await {
+                if r.body.contains(&marker) {
+                    return Some(
+                        finding(
+                            "cmdi",
+                            "OS command injection via GraphQL argument (output reflected)",
+                            "critical",
+                            url,
+                            "POST",
+                            &format!(
+                                "A shell-evaluated arithmetic marker injected into the `{arg}` argument of `{}` came back computed in the response (separator `{sep}`), while the payload only ever carries the un-evaluated expression: the value is executed by a shell.",
+                                field.name
+                            ),
+                        )
+                        .param(arg)
+                        .build(),
+                    );
+                }
+            }
+        }
+    }
+
     // --- blind OS command injection, OAST-confirmed ---
     //
     // Fire and park, for the reason inject.rs does: a schema of any size has

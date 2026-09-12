@@ -141,8 +141,8 @@ const SLEEP_THRESHOLD_MS: u128 = 3800;
 // Two large coprime factors for the reflected-cmdi echo oracle. Their product is a distinctive
 // 11-digit number that appears in the response only if a shell evaluated `$((A*B))`; the literal
 // payload never contains it. Chosen so the product is unlikely to occur naturally in any page.
-const CMDI_ECHO_A: u64 = 199_933;
-const CMDI_ECHO_B: u64 = 314_573;
+pub const CMDI_ECHO_A: u64 = 199_933;
+pub const CMDI_ECHO_B: u64 = 314_573;
 const MAX_ENDPOINTS: usize = 300;
 /// Endpoints probed at once. Injection is request-bound, not CPU-bound, and one
 /// endpoint at a time meant a scan of a few dozen endpoints across every class
