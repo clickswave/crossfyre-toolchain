@@ -262,13 +262,33 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
     // THIS identity (anon by default) without an authorization error are broken function-level
     // authorization: an unauthenticated or low-privilege caller can invoke an admin operation.
     if want("authz") && !fields.is_empty() {
+        // Privileged operations that were named and deliberately not invoked.
+        let mut declined: Vec<String> = Vec::new();
         for f in &fields {
             if !is_privileged_name(&f.name) {
                 continue;
             }
-            // Read-only queries are always safe to probe; a privileged mutation actually executes,
-            // so it is only invoked under the explicit test_writes opt-in.
-            if f.op == "mutation" && !params.test_writes {
+            // Whether invoking this is safe is decided by what it DOES, not by
+            // which GraphQL operation type it is filed under.
+            //
+            // The rule here used to be "read-only queries are always safe to
+            // probe", and GraphQL guarantees no such thing: a query is a query
+            // because the schema author said so. dvga files `systemUpdate`,
+            // `deleteAllPastes` and `systemDiagnostics(cmd:)` as queries;
+            // `systemUpdate` runs `python3 setup.py` through os.popen. Measured:
+            // a single `{systemUpdate}` hangs for 25 seconds and leaves the
+            // application answering in 3.2s where it answered in 3ms, and a full
+            // pass left it not answering at all. A scanner that does that to a
+            // customer's API has caused an outage to report a finding.
+            //
+            // So a field whose NAME names an action is treated exactly like a
+            // mutation: reported as present, never invoked, unless the caller
+            // opted into writes. The cost is honest and small - a destructive
+            // operation that is genuinely unprotected goes unconfirmed rather
+            // than unmentioned - and it is the same trade the crawler and the
+            // injector already make for links and endpoints.
+            if (f.op == "mutation" || executes_something(&f.name)) && !params.test_writes {
+                declined.push(f.name.clone());
                 continue;
             }
             let doc = build_doc(f, "", "1"); // benign args; we only care whether authz blocks it
@@ -284,6 +304,19 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
                     found += 1;
                 }
             }
+        }
+        if !declined.is_empty() {
+            declined.sort();
+            declined.dedup();
+            let _ = tx.send(json!({"type":"log","message": format!(
+                "{} privileged operation(s) were found and NOT invoked: {}. Their names say they \
+                 perform an action, and the only way to prove an authorization check is missing on \
+                 one is to call it, which on this schema means running it. Whether they are \
+                 protected is therefore untested here, not clean. Re-run with writes enabled \
+                 against a target you are willing to change.",
+                declined.len(),
+                declined.join(", ")
+            )}));
         }
     }
 
@@ -415,6 +448,61 @@ fn resolver_ran(body: &str, field: &str) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// Does this field's name say it performs an action rather than answering a
+/// question? Same vocabulary the crawler and the injector use, for the same
+/// reason: a verb is the only evidence a schema gives about side effects.
+fn executes_something(name: &str) -> bool {
+    const VERBS: &[&str] = &[
+        "delete",
+        "destroy",
+        "remove",
+        "drop",
+        "purge",
+        "truncate",
+        "wipe",
+        "reset",
+        "update",
+        "upgrade",
+        "install",
+        "import",
+        "restart",
+        "reboot",
+        "shutdown",
+        "revoke",
+        "disable",
+        "enable",
+        "toggle",
+        "deactivate",
+        "create",
+        "send",
+        "execute",
+        "run",
+        "exec",
+        "kill",
+        "clear",
+    ];
+    // camelCase and snake_case both split into words here: `deleteAllPastes`
+    // and `delete_all_pastes` give the same first token.
+    let mut words: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for ch in name.chars() {
+        if ch == '_' || ch == '-' {
+            if !cur.is_empty() {
+                words.push(std::mem::take(&mut cur));
+            }
+        } else if ch.is_ascii_uppercase() && !cur.is_empty() {
+            words.push(std::mem::take(&mut cur));
+            cur.push(ch.to_ascii_lowercase());
+        } else {
+            cur.push(ch.to_ascii_lowercase());
+        }
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    words.iter().any(|w| VERBS.contains(&w.as_str()))
 }
 
 fn resolve_url(target: &str, endpoint: &str) -> String {
@@ -730,5 +818,54 @@ mod tests {
             resolve_url("http://x.test", "https://y.test/graphql"),
             "https://y.test/graphql"
         );
+    }
+
+    #[test]
+    fn a_field_whose_name_performs_an_action_is_not_invoked() {
+        // Every one of these is filed as a QUERY in dvga's schema, and each one
+        // does something. That is the whole reason operation type is not the
+        // test: `systemUpdate` runs `python3 setup.py`.
+        for n in [
+            "systemUpdate",
+            "deleteAllPastes",
+            "importPaste",
+            "createUser",
+            "delete_all_pastes",
+            "resetDatabase",
+            "shutdown",
+            "revokeToken",
+        ] {
+            assert!(
+                executes_something(n),
+                "{n} should not be invoked by default"
+            );
+        }
+    }
+
+    #[test]
+    fn a_field_that_answers_a_question_is_still_probed() {
+        // Refusing these would cost the BFLA check its whole point.
+        for n in [
+            "audits",
+            "systemHealth",
+            "systemDiagnostics",
+            "me",
+            "users",
+            "pastes",
+            "paste",
+            "search",
+            "readAndBurn",
+            "systemDebug",
+        ] {
+            assert!(!executes_something(n), "{n} should still be probed");
+        }
+    }
+
+    #[test]
+    fn camel_and_snake_split_the_same_way() {
+        assert!(executes_something("deleteAllPastes"));
+        assert!(executes_something("delete_all_pastes"));
+        assert!(!executes_something("undeleted"));
+        assert!(!executes_something("createdAt"));
     }
 }
