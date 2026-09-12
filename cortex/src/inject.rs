@@ -1166,7 +1166,7 @@ struct EndpointOutcome {
 }
 
 /// Probe one endpoint end to end.
-async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
+async fn run_endpoint(mut ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
     let EndpointCtx {
         client,
         client_nr,
@@ -1314,16 +1314,48 @@ async fn run_endpoint(ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
             };
         }
         if let Some(which) = changes_a_credential(&names) {
+            // Drop the fields that could set the secret; keep the endpoint.
+            //
+            // The first version of this skipped the whole endpoint, on the
+            // reasoning that every parameter rides in the same request. True,
+            // and too blunt: RailsGoat's account form is `POST /users/1` with
+            // `user[password]`, `user[password_confirmation]` AND `user[id]`,
+            // and `user[id]` is a SQL injection. Refusing the endpoint traded a
+            // real high-severity finding for safety that did not need it.
+            //
+            // A request that does not carry a password field cannot set a
+            // password. So those fields leave - from the declared params, from
+            // the body, and from the URL's own query, which is where DVWA
+            // carries them - and everything else is tested as usual. If nothing
+            // survives, there was nothing here but the credential change.
+            let dropped: Vec<String> = names
+                .iter()
+                .filter(|n| is_credential_field(n))
+                .cloned()
+                .collect();
+            ep.params.retain(|n| !is_credential_field(n));
+            ep.body.retain(|f| !is_credential_field(&f.name));
+            for n in &dropped {
+                ep.url = drop_param(&ep.url, n);
+            }
+            let left = ep.params.len() + ep.body.len();
             let _ = tx.send(json!({"type":"log","message": format!(
-                "skipped {} {} without testing it: `{}` alongside a confirmation field makes this a \
-                 credential-change form, and submitting it would set the credential rather than test \
-                 it. Endpoints that change a secret are reported by the crawl and left alone here.",
-                ep.method, ep.url, which
+                "{} {}: `{which}` alongside a confirmation field makes this a credential-change \
+                 form, so {} field(s) that could set the secret were removed from the request \
+                 ({}). A request without them cannot change the credential. {}",
+                ep.method, ep.url, dropped.len(), dropped.join(", "),
+                if left == 0 {
+                    "Nothing else was declared here, so the endpoint is not tested.".to_string()
+                } else {
+                    format!("The remaining {left} field(s) are tested as usual.")
+                }
             )}));
-            return EndpointOutcome {
-                found,
-                starved: false,
-            };
+            if left == 0 {
+                return EndpointOutcome {
+                    found,
+                    starved: false,
+                };
+            }
         }
     }
     for site in sites_for(&ep, &varying) {
@@ -1692,6 +1724,31 @@ fn names_an_action(url: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// A field that could SET a credential if it rides in the request.
+fn is_credential_field(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.contains("password") || n.contains("passwd") || n.contains("pwd") || n.contains("secret")
+}
+
+/// Remove one parameter from a URL's query entirely.
+fn drop_param(url: &str, name: &str) -> String {
+    let Some((head, query)) = url.split_once('?') else {
+        return url.to_string();
+    };
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|pair| {
+            let k = pair.split_once('=').map(|(k, _)| k).unwrap_or(pair);
+            !k.eq_ignore_ascii_case(name)
+        })
+        .collect();
+    if kept.is_empty() {
+        head.to_string()
+    } else {
+        format!("{head}?{}", kept.join("&"))
+    }
 }
 
 /// Would submitting this endpoint change a credential rather than test one?
@@ -4430,5 +4487,43 @@ mod hint_tests {
         };
         let (url, _) = site.render("b");
         assert_eq!(url, "http://h/search?q=b", "{url}");
+    }
+
+    #[test]
+    fn credential_fields_are_identified_without_catching_neighbours() {
+        for n in [
+            "password",
+            "user[password]",
+            "user[password_confirmation]",
+            "password_new",
+            "passwd",
+            "pwd",
+            "client_secret",
+        ] {
+            assert!(is_credential_field(n), "{n}");
+        }
+        for n in ["user[id]", "username", "email", "token", "id", "Change"] {
+            assert!(!is_credential_field(n), "{n}");
+        }
+    }
+
+    #[test]
+    fn dropping_a_parameter_leaves_the_rest_of_the_query() {
+        let u = "http://h/v/csrf/?password_new=x&password_conf=x&Change=Change";
+        let a = drop_param(u, "password_new");
+        let b = drop_param(&a, "password_conf");
+        assert_eq!(b, "http://h/v/csrf/?Change=Change");
+        // A request with no password field cannot set a password, and the
+        // submit control survives so the endpoint is still reachable.
+        assert!(!b.contains("password"));
+    }
+
+    #[test]
+    fn dropping_the_only_parameter_leaves_a_bare_url() {
+        assert_eq!(
+            drop_param("http://h/x?password=1", "password"),
+            "http://h/x"
+        );
+        assert_eq!(drop_param("http://h/x", "password"), "http://h/x");
     }
 }
