@@ -12,8 +12,17 @@ http:
   - method: GET
     path:
       - "{{BaseURL}}/"
+    matchers-condition: and
     matchers:
       - type: word
         part: header
         words:
           - "Server: Apache"
+      # Apache-Coyote is Tomcat's connector, not the Apache HTTP Server. Matching
+      # "Server: Apache" as a substring renamed every Tomcat box to Apache httpd,
+      # which then points the CVE follow-ups at the wrong product entirely.
+      - type: word
+        part: header
+        negative: true
+        words:
+          - "Apache-Coyote"
