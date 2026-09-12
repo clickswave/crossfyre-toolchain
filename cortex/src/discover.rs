@@ -194,6 +194,10 @@ pub async fn run(params: DiscoverParams, tx: mpsc::UnboundedSender<Value>) {
 struct Baseline {
     status: u16,
     len: usize,
+    /// What the endpoint says when handed a field it does not know. The candidate
+    /// names are ordinary English words, so the reflection test is only evidence
+    /// when the word is NOT already here.
+    body: String,
 }
 async fn calibrate(
     client: &Client,
@@ -232,19 +236,57 @@ async fn calibrate(
     Some(Baseline {
         status: a.status,
         len: a.body.len(),
+        body: a.body,
     })
 }
 
 /// A candidate field looks accepted if its response deviates from the junk baseline: a different
 /// status, a materially different body length, or the field name echoed back.
+///
+/// "Echoed back" needs care, and did not get it. The candidates are ordinary
+/// English words - `id`, `name`, `to`, `url`, `date`, `code`, `page`, `key` - and
+/// a bare substring test against an HTML page matches almost all of them on
+/// almost any page. Measured against RailsGoat's `POST /password_resets`, which
+/// answers every request with the same redirect: 26 of the wordlist came back as
+/// discovered fields, and one of them was real. Inferred parameters feed the
+/// asset graph, so that is 25 fields a customer sees on an endpoint that has
+/// none, and 25 more sites for the injector to spend requests on.
+///
+/// The junk baseline is the control, and it was already being fetched. A word
+/// that is in the response AND in the response to a field the endpoint has never
+/// heard of is a word the page contains, not a field the endpoint took. The
+/// boundary check does the rest: without it `id` matches `video` and `to`
+/// matches almost everything.
 fn accepted(base: &Baseline, r: &Resp, cand: &str) -> bool {
     if r.status != base.status {
         return true;
     }
-    if r.body.contains(cand) {
+    if echoes_field(&r.body, cand) && !echoes_field(&base.body, cand) {
         return true;
     }
     (r.body.len() as i64 - base.len as i64).abs() > 40
+}
+
+/// Does `body` contain `field` as a word, rather than inside a longer one?
+fn echoes_field(body: &str, field: &str) -> bool {
+    let b = body.as_bytes();
+    let f = field.as_bytes();
+    if f.is_empty() {
+        return false;
+    }
+    let wordish = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut from = 0usize;
+    while let Some(rel) = body[from..].find(field) {
+        let i = from + rel;
+        let before_ok = i == 0 || !wordish(b[i - 1]);
+        let after = i + f.len();
+        let after_ok = after >= b.len() || !wordish(b[after]);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = i + 1;
+    }
+    false
 }
 
 fn discovery_event(
@@ -504,6 +546,7 @@ mod tests {
         let base = Baseline {
             status: 400,
             len: 100,
+            body: String::new(),
         };
         // same status + similar length + no reflection -> not accepted
         assert!(!accepted(
@@ -553,5 +596,55 @@ mod tests {
             },
             "email"
         ));
+    }
+
+    #[test]
+    fn a_word_the_page_already_contains_is_not_a_discovered_field() {
+        // RailsGoat's redirect body, and any HTML page, carries these words.
+        let page = "<a href=\"/login\">login</a> id name to url".to_string();
+        let base = Baseline {
+            status: 302,
+            len: page.len(),
+            body: page.clone(),
+        };
+        let same = Resp {
+            status: 302,
+            body: page,
+            elapsed_ms: 0,
+            location: None,
+            headers: Vec::new(),
+        };
+        for cand in ["id", "name", "to", "url"] {
+            assert!(
+                !accepted(&base, &same, cand),
+                "{cand} should not be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_word_the_endpoint_starts_echoing_is_a_discovered_field() {
+        let base = Baseline {
+            status: 400,
+            len: 40,
+            body: "missing required field".into(),
+        };
+        let echoed = Resp {
+            status: 400,
+            body: "missing required field: user".into(),
+            elapsed_ms: 0,
+            location: None,
+            headers: Vec::new(),
+        };
+        assert!(accepted(&base, &echoed, "user"));
+    }
+
+    #[test]
+    fn a_field_name_inside_a_longer_word_is_not_an_echo() {
+        assert!(!echoes_field("a video element", "id"));
+        assert!(!echoes_field("username", "user"));
+        assert!(echoes_field("field: user", "user"));
+        assert!(echoes_field("user_id=3", "user_id"));
+        assert!(echoes_field("\"to\": 1", "to"));
     }
 }
