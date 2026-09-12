@@ -227,6 +227,10 @@ struct Site {
     base_value: String, // its baseline value (keeps the request valid)
     // baseline body fields (for body sites): (name, value, declared JSON type)
     body: Vec<(String, String, Option<String>)>,
+    /// Every query field this endpoint declares, with a baseline value, so a GET
+    /// form is submitted the way a browser submits it: all of its fields, one of
+    /// them carrying the payload. Empty when the endpoint declared none.
+    query: Vec<(String, String)>,
     path_idx: usize, // which path segment (Loc::Path only)
 }
 
@@ -234,7 +238,22 @@ impl Site {
     /// Render (url, optional (body, content-type)) with `param` set to `value`.
     fn render(&self, value: &str) -> (String, Option<(String, &'static str)>) {
         match self.loc {
-            Loc::Query => (set_param(&self.url, &self.param, value), None),
+            Loc::Query => {
+                // Every declared field goes out, not only the fuzzed one. A GET
+                // form is a form: Mutillidae's user-info page runs its query only
+                // when `user-info-php-submit-button` is present, so sending
+                // `username` alone reaches a page that renders the form and
+                // executes nothing, and the endpoint reads as clean. The body
+                // path has always done this; the query path did not, and the
+                // asymmetry cost three answer-key entries.
+                let mut url = self.url.clone();
+                for (k, v) in &self.query {
+                    if k != &self.param && current_value(&url, k).is_none() {
+                        url = set_param(&url, k, v);
+                    }
+                }
+                (set_param(&url, &self.param, value), None)
+            }
             Loc::Path => (set_path_seg(&self.url, self.path_idx, value), None),
             // Header sites keep the URL + body untouched; the payload rides in a request header
             // instead (see `header_override`).
@@ -1715,11 +1734,26 @@ fn sites_for(ep: &InjEndpoint, varying: &VaryingPaths) -> Vec<Site> {
     } else {
         ep.params.clone()
     };
+    // Every declared query field with the value it would carry in an ordinary
+    // submission, so each site can send the whole form rather than its own field
+    // alone. A field already in the URL keeps that value; one the crawler found
+    // in a form and the URL does not carry gets a benign placeholder, which is
+    // enough for the `isset()` a PHP handler branches on.
+    let siblings: Vec<(String, String)> = qnames
+        .iter()
+        .map(|n| {
+            (
+                n.clone(),
+                current_value(&ep.url, n).unwrap_or_else(|| "1".to_string()),
+            )
+        })
+        .collect();
     for name in qnames {
         let base = current_value(&ep.url, &name).unwrap_or_else(|| "1".to_string());
         out.push(Site {
             method: method.clone(),
             url: ep.url.clone(),
+            query: siblings.clone(),
             loc: Loc::Query,
             param: name,
             base_value: base,
@@ -1759,6 +1793,7 @@ fn sites_for(ep: &InjEndpoint, varying: &VaryingPaths) -> Vec<Site> {
             out.push(Site {
                 method: method.clone(),
                 url: ep.url.clone(),
+                query: siblings.clone(),
                 loc: Loc::Path,
                 param: seg.to_string(),
                 base_value: seg.to_string(),
@@ -1799,6 +1834,7 @@ fn sites_for(ep: &InjEndpoint, varying: &VaryingPaths) -> Vec<Site> {
             out.push(Site {
                 method: bmethod.clone(),
                 url: ep.url.clone(),
+                query: siblings.clone(),
                 loc,
                 param: f.name.clone(),
                 base_value: base,
@@ -1819,6 +1855,7 @@ fn sites_for(ep: &InjEndpoint, varying: &VaryingPaths) -> Vec<Site> {
         out.push(Site {
             method: method.clone(),
             url: ep.url.clone(),
+            query: siblings.clone(),
             loc: Loc::Header,
             param: hname.to_string(),
             base_value: hbase.to_string(),
@@ -4120,6 +4157,7 @@ mod tests {
     fn json_body_keeps_baseline_fields_typed_and_fuzzes_as_string() {
         // name (string, fuzzed) + ownerId (integer) + enabled (boolean) + tags (array).
         let site = Site {
+            query: Vec::new(),
             method: "POST".into(),
             url: "https://api.x/pets".into(),
             loc: Loc::BodyJson,
@@ -4322,5 +4360,52 @@ mod hint_tests {
         ] {
             assert_eq!(names_an_action(u), None, "{u}");
         }
+    }
+
+    #[test]
+    fn a_get_form_is_submitted_whole() {
+        let site = Site {
+            method: "GET".into(),
+            url: "http://h/index.php?page=user-info.php".into(),
+            query: vec![
+                ("page".into(), "user-info.php".into()),
+                ("username".into(), "1".into()),
+                ("password".into(), "1".into()),
+                ("user-info-php-submit-button".into(), "1".into()),
+            ],
+            loc: Loc::Query,
+            param: "username".into(),
+            base_value: "1".into(),
+            body: Vec::new(),
+            path_idx: 0,
+        };
+        let (url, _) = site.render("x'");
+        // The payload is where it belongs.
+        assert!(
+            url.contains("username=x%27") || url.contains("username=x'"),
+            "{url}"
+        );
+        // And the rest of the form went with it, which is what makes the
+        // handler run at all.
+        assert!(url.contains("user-info-php-submit-button="), "{url}");
+        assert!(url.contains("password="), "{url}");
+        // The routing parameter keeps the value it had, not a placeholder.
+        assert!(url.contains("page=user-info.php"), "{url}");
+    }
+
+    #[test]
+    fn an_endpoint_with_no_declared_fields_is_unchanged() {
+        let site = Site {
+            method: "GET".into(),
+            url: "http://h/search?q=a".into(),
+            query: vec![("q".into(), "a".into())],
+            loc: Loc::Query,
+            param: "q".into(),
+            base_value: "a".into(),
+            body: Vec::new(),
+            path_idx: 0,
+        };
+        let (url, _) = site.render("b");
+        assert_eq!(url, "http://h/search?q=b", "{url}");
     }
 }
