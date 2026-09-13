@@ -79,6 +79,12 @@ jobs:
     # something that refuses to start on Debian 12 and Ubuntu 22.04, which is
     # most of the machines a scan node actually runs on.
     container: rust:bookworm
+    # The container's default shell is dash, which has no `pipefail`, so every
+    # `set -euo pipefail` step died before running anything. bash is present in
+    # the image; naming it here rather than per-step keeps the steps readable.
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -128,6 +134,9 @@ jobs:
       contents: write
       id-token: write
       attestations: write
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/download-artifact@v4
         with:
