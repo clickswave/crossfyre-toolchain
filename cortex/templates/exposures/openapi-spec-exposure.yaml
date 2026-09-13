@@ -3,6 +3,9 @@ info:
   name: OpenAPI/Swagger specification publicly exposed
   severity: low
   description: A machine-readable API specification is served without authentication, handing an attacker the full endpoint and parameter inventory.
+  tags: exposure,api,swagger,docs
+  metadata:
+    category: exposures
 http:
   - method: GET
     path:

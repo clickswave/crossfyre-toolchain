@@ -2,7 +2,11 @@ id: langflow-public-build-unauth-rce
 info:
   name: Langflow public build/playground endpoint exposed (unauthenticated RCE)
   severity: critical
-  description: The unauthenticated public build endpoint (/api/v1/build_public_tmp/{id}/flow) is present on a Langflow instance. Langflow instantiates attacker-supplied flow component code server-side when the build events stream is consumed, giving unauthenticated remote code execution. Confirmed non-destructively: the endpoint must both accept the unauthenticated request (2xx/422, not 404/401/403) AND return a Langflow-shaped response body -- a bare non-error status is not sufficient, so a generic app that returns 500/HTML for an unknown path is not misreported. Uses a vhost Host header for name-based routing.
+  description: >-
+    The unauthenticated public build endpoint (/api/v1/build_public_tmp/{id}/flow) is present on a Langflow instance. Langflow instantiates attacker-supplied flow component code server-side when the build events stream is consumed, giving unauthenticated remote code execution. Confirmed non-destructively: the endpoint must both accept the unauthenticated request (2xx/422, not 404/401/403) AND return a Langflow-shaped response body -- a bare non-error status is not sufficient, so a generic app that returns 500/HTML for an unknown path is not misreported. Uses a vhost Host header for name-based routing.
+  tags: cve,langflow,rce,unauth
+  metadata:
+    category: cves
 http:
   - method: POST
     path:

@@ -25,7 +25,7 @@ including wildcard TLS and the DNS records you need to add:
 sudo crossfyre oast setup --domain oob.yourdomain.com --email you@yourdomain.com
 ```
 
-See the [self-host guide](https://github.com/clickswave/crossfyre_toolchain) for the
+See the [self-host guide](https://github.com/clickswave/crossfyre-toolchain) for the
 full walk-through.
 
 ## Running the binary directly

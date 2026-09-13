@@ -90,6 +90,7 @@ pub async fn run(params: FpParams, tx: mpsc::UnboundedSender<Value>) {
         accept_invalid_certs: true,
         cookie_store: true,
         resolve: Vec::new(),
+        ..Default::default()
     }) {
         Ok(c) => c,
         Err(e) => {

@@ -219,6 +219,54 @@ pub async fn build_context(
     }
 }
 
+/// Names commonly used for a per-session anti-CSRF form token.
+const CSRF_FIELD_NAMES: [&str; 8] = [
+    "csrf_token",
+    "authenticity_token",
+    "user_token",
+    "_token",
+    "__RequestVerificationToken",
+    "csrfmiddlewaretoken",
+    "_csrf",
+    "csrf",
+];
+
+/// Pull a hidden form field's value out of an HTML page.
+///
+/// Handles both quoting styles and either attribute order, because real login
+/// pages are written by hand and use all four combinations:
+///   <input type="hidden" name="user_token" value="abc">
+///   <input value='abc' name='user_token' />
+fn extract_form_field(html: &str, field: &str) -> Option<String> {
+    for quote in ['"', '\''] {
+        let needle = format!("name={quote}{field}{quote}");
+        // name=... then value=...
+        if let Some(i) = html.find(&needle) {
+            let rest = &html[i + needle.len()..];
+            let stop = rest.find('>').unwrap_or(rest.len());
+            if let Some(v) = attr_after(&rest[..stop], "value", quote) {
+                return Some(v);
+            }
+        }
+        // value=... then name=..., so look back to the start of the tag
+        if let Some(i) = html.find(&needle) {
+            let start = html[..i].rfind('<').unwrap_or(0);
+            if let Some(v) = attr_after(&html[start..i], "value", quote) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+fn attr_after(fragment: &str, attr: &str, quote: char) -> Option<String> {
+    let needle = format!("{attr}={quote}");
+    let i = fragment.find(&needle)? + needle.len();
+    let rest = &fragment[i..];
+    let end = rest.find(quote)?;
+    Some(rest[..end].to_string())
+}
+
 /// Replay a form/JSON login and capture the session as a cookie and/or bearer
 /// token. Driven entirely by the credential's `config` (login_url, field names,
 /// success check, token extraction).
@@ -240,6 +288,16 @@ async fn login_flow(
     let username = cred.secret["username"].as_str().unwrap_or("");
     let password = cred.secret["password"].as_str().unwrap_or("");
 
+    // A cookie store lets us capture Set-Cookie session cookies from the login,
+    // and lets an anti-CSRF prefetch share the session the token was minted for.
+    let jar = std::sync::Arc::new(reqwest::cookie::Jar::default());
+    let client = reqwest::Client::builder()
+        .cookie_provider(jar.clone())
+        .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .unwrap_or_else(|_| http.clone());
+
     // Assemble the credential body plus any extra static fields.
     let mut form = serde_json::Map::new();
     form.insert(user_field.to_string(), json!(username));
@@ -252,14 +310,46 @@ async fn login_flow(
         }
     }
 
-    // A cookie store lets us capture Set-Cookie session cookies from the login.
-    let jar = std::sync::Arc::new(reqwest::cookie::Jar::default());
-    let client = reqwest::Client::builder()
-        .cookie_provider(jar.clone())
-        .timeout(Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .build()
-        .unwrap_or_else(|_| http.clone());
+    // Anti-CSRF form token.
+    //
+    // Server-rendered login forms very commonly carry a hidden, per-session
+    // token, and reject any POST without it. Static extra_fields cannot express
+    // that: the token is minted for the session that fetched the page. So when
+    // `csrf` is configured we GET the form first, on this same cookie jar, lift
+    // the token out, and send it with the credentials.
+    //
+    // Config:
+    //   "csrf": true                          fetch login_url, auto-detect the field
+    //   "csrf": {"field": "user_token"}       name the field explicitly
+    //   "csrf": {"url": "...", "field": ...}  fetch a different page for it
+    //
+    // Nothing here is app-specific: it is the mechanism every CSRF-protected
+    // form login uses, and it fails closed by leaving the token out.
+    let csrf_cfg = cfg.get("csrf");
+    let csrf_enabled =
+        matches!(csrf_cfg, Some(Value::Bool(true))) || matches!(csrf_cfg, Some(Value::Object(_)));
+    if csrf_enabled {
+        let form_url = csrf_cfg
+            .and_then(|c| c.get("url"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(login_url);
+        let named = csrf_cfg
+            .and_then(|c| c.get("field"))
+            .and_then(|v| v.as_str());
+        if let Ok(r) = client.get(form_url).send().await {
+            let page = r.text().await.unwrap_or_default();
+            let candidates: Vec<&str> = match named {
+                Some(f) => vec![f],
+                None => CSRF_FIELD_NAMES.to_vec(),
+            };
+            for field in candidates {
+                if let Some(tok) = extract_form_field(&page, field) {
+                    form.insert(field.to_string(), json!(tok));
+                    break;
+                }
+            }
+        }
+    }
 
     let as_json = cfg["content_type"]
         .as_str()
@@ -488,6 +578,60 @@ pub async fn resolve_identities(
 
 /// Resolve + build + cache in one call. Returns the `auth` JSON object to inject
 /// into an engine request, or an error string (logged by the caller).
+/// Resolve a credential into SEVERAL independent sessions.
+///
+/// One session is a bottleneck, not a convenience. PHP locks the session file
+/// for the duration of each request, so every worker sharing one cookie is
+/// serialised by the target: measured on Mutillidae, eight concurrent requests
+/// on one session produce a perfect staircase while eight without a session run
+/// flat. Add a time-based payload, which parks that lock for five or ten
+/// seconds, and the rest of the pass queues behind it and times out. Those
+/// timeouts are then reported as "the endpoint did not answer", so the symptom
+/// is missing coverage rather than slowness.
+///
+/// Only a `login_flow` credential can be multiplied: logging in again is what
+/// produces a genuinely separate session. A bearer token, an API key or a
+/// browser-brokered SSO session is the same value however many times it is
+/// asked for, so those return a single entry and the caller shares it - which
+/// is correct, because a stateless credential has no lock to contend on.
+///
+/// Bounded deliberately. Every extra session is a real login against someone
+/// else's application: it shows up in their audit log, it counts against
+/// lockout thresholds, and on a target with per-account rate limiting it is
+/// hostile. Four is enough to keep the workers busy and small enough to explain.
+pub async fn resolve_auth_pool(
+    http: &reqwest::Client,
+    api_url: &str,
+    node_api_key: &str,
+    credential_id: &str,
+    host: &str,
+    want: usize,
+) -> Result<Vec<Value>, String> {
+    let first = resolve_auth(http, api_url, node_api_key, credential_id, host).await?;
+    let want = want.clamp(1, 4);
+    if want == 1 {
+        return Ok(vec![first]);
+    }
+    let cred = resolve(http, api_url, node_api_key, credential_id, host).await?;
+    // Anything that is not a form login hands back the same material each time.
+    if cred.auth_type != "login_flow" || cred.resolved_auth.is_some() {
+        return Ok(vec![first]);
+    }
+    let mut out = vec![first];
+    for _ in 1..want {
+        match build_context(http, &cred).await {
+            Ok(ctx) => out.push(ctx.to_json()),
+            // A login that fails the second time is not fatal: the pass runs on
+            // the sessions it has. Silence would be, so it is reported.
+            Err(e) => {
+                eprintln!("[creds] extra session for {credential_id} failed: {e}");
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub async fn resolve_auth(
     http: &reqwest::Client,
     api_url: &str,

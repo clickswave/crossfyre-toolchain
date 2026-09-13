@@ -38,6 +38,8 @@ pub use reqwest::{Method, StatusCode, Url};
 mod auth;
 pub use auth::AuthSpec;
 
+pub mod guard;
+
 pub mod url;
 
 /// Build a [`HeaderMap`] from `(name, value)` string pairs, skipping any that
@@ -93,6 +95,18 @@ pub struct ClientConfig {
     /// `addr` while keeping `host` as the SNI + Host header. Origin discovery uses
     /// this to hit a candidate origin IP as if it were the fronted target host.
     pub resolve: Vec<(String, std::net::SocketAddr)>,
+    /// Refuse to connect to private / reserved addresses.
+    ///
+    /// Off by default, because reaching a customer's own RFC1918 network from a
+    /// node inside it is the product working. Turn it on for paths where the
+    /// caller is anonymous and the egress is shared, which today means the free
+    /// public tools: there, an unvetted stranger picks the destination and the
+    /// hop is ours, so the node must not be usable as a pivot.
+    ///
+    /// Enforced at the RESOLVER, so it also covers redirect hops and DNS
+    /// rebinding, neither of which a check at the call site can see. See
+    /// [`guard`].
+    pub block_internal: bool,
 }
 
 impl Default for ClientConfig {
@@ -107,6 +121,7 @@ impl Default for ClientConfig {
             extra_headers: HeaderMap::new(),
             emulate: false,
             resolve: Vec::new(),
+            block_internal: false,
         }
     }
 }
@@ -142,6 +157,11 @@ pub fn build_client(cfg: ClientConfig) -> Result<Client, Error> {
     }
 
     let mut b = Client::builder().default_headers(headers);
+    if cfg.block_internal {
+        // Both backends expose the same `dns_resolver` hook and an identical
+        // `Resolve` trait, so one value serves whichever is compiled.
+        b = b.dns_resolver(std::sync::Arc::new(guard::PublicOnlyResolver));
+    }
     if let Some(t) = cfg.timeout {
         b = b.timeout(t);
     }
@@ -241,6 +261,8 @@ pub struct ScanClient<'a> {
     pub accept_invalid_certs: bool,
     pub cookie_store: bool,
     pub resolve: Vec<(String, std::net::SocketAddr)>,
+    /// Refuse private / reserved destinations. See [`ClientConfig::block_internal`].
+    pub block_internal: bool,
 }
 
 impl<'a> Default for ScanClient<'a> {
@@ -256,6 +278,7 @@ impl<'a> Default for ScanClient<'a> {
             accept_invalid_certs: false,
             cookie_store: false,
             resolve: Vec::new(),
+            block_internal: false,
         }
     }
 }
@@ -285,6 +308,7 @@ pub fn build_scan_client(spec: ScanClient) -> Result<Client, Error> {
         extra_headers,
         emulate: spec.emulate,
         resolve: spec.resolve,
+        block_internal: spec.block_internal,
     })
 }
 

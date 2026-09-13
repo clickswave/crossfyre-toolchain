@@ -8,6 +8,7 @@ mod cve;
 mod daemon;
 mod fingerprint;
 mod libs;
+mod services;
 mod signatures;
 
 #[tokio::main]
@@ -28,6 +29,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
             send_stream(cli.port, req, cli.tui, args.target.clone()).await
         }
+        Some(Commands::Services(args)) => {
+            let req = serde_json::json!({
+                "operation": "services",
+                "response": "stream",
+                "targets": args.targets,
+                "auth_checks": !args.no_auth_checks,
+                "timeout_ms": args.timeout_ms,
+            });
+            let label = args.targets.join(", ");
+            send_stream(cli.port, req, cli.tui, label).await
+        }
         Some(Commands::Exec(args)) => {
             let mut payload: serde_json::Value =
                 serde_json::from_str(&args.json).map_err(|e| format!("Invalid JSON: {e}"))?;
@@ -39,7 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => {
             eprintln!(
-                "No command given. Use `scout fingerprint <target>`, `scout exec <json>`, or `scout --daemon`."
+                "No command given. Use `scout fingerprint <target>`, `scout services <host:port>...`, `scout exec <json>`, or `scout --daemon`."
             );
             std::process::exit(1);
         }

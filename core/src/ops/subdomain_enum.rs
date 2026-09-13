@@ -129,6 +129,11 @@ pub async fn handle(env: OpEnv) {
             "adaptive_rate": data["adaptive_rate"].as_bool().unwrap_or(false),
             "adaptive_resilience": data["adaptive_resilience"].as_bool().unwrap_or(false),
             "posture": data["posture"].as_str().unwrap_or("balanced"),
+            // Refuse private / reserved destinations when probing discovered
+            // hosts. Absent = false, the behaviour a customer-authorised enum
+            // gets: reaching your own internal network from your own node is
+            // the product.
+            "block_internal": data["block_internal"].as_bool().unwrap_or(false),
         });
 
         let conn =

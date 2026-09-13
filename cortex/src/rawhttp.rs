@@ -126,6 +126,42 @@ fn build_request(req: &RawReq, host: &str, port: u16, https: bool, target: &str)
     s
 }
 
+/// Send bytes exactly as given and time the answer.
+///
+/// `send` builds a well-formed request and manages Content-Length itself, which
+/// is right for everything that wants to be understood. Request smuggling is
+/// the opposite: the payload IS a request two parsers frame differently, so
+/// nothing may normalise it. This hands the caller the socket.
+///
+/// Returns (raw response bytes, elapsed). A timeout returns None with the
+/// elapsed time, because on this probe a hang IS the signal rather than a
+/// failure.
+pub async fn send_exact(
+    host: &str,
+    port: u16,
+    https: bool,
+    data: &[u8],
+    timeout: Duration,
+) -> (Option<Vec<u8>>, Duration) {
+    let start = std::time::Instant::now();
+    let out = tokio::time::timeout(timeout, async {
+        if https {
+            send_tls(host, port, data).await
+        } else {
+            send_plain(host, port, data).await
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+    (out, start.elapsed())
+}
+
+/// Split a URL for the raw senders: (https, host, port, request-target).
+pub fn split_url(url: &str) -> Option<(bool, String, u16, String)> {
+    split(url)
+}
+
 async fn send_plain(host: &str, port: u16, data: &[u8]) -> Option<Vec<u8>> {
     let mut stream = TcpStream::connect((host, port)).await.ok()?;
     stream.write_all(data).await.ok()?;

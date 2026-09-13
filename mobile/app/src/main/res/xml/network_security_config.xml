@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The default for targetSdk 28+ is already "no cleartext", but stating it makes the
+  rule visible where someone is looking for it, and gives the dev flavour something
+  to override rather than a silent platform default to fight.
+
+  Prod and staging talk to https origins, so nothing here needs relaxing. The dev
+  flavour ships its own copy of this file; see app/src/dev/res/xml/.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+</network-security-config>

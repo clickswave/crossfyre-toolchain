@@ -1,0 +1,19 @@
+[package]
+name = "cfx_mobile"
+version = "0.0.1"
+edition = "2021"
+description = "Crossfyre mobile tracer native core (JNI): reuses cfx_capture for the session CA + MITM leaves + egress, and (WIP) runs the TUN netstack that inspects captured flows into TraceEvents."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+cfx_capture = { path = "../../capture" }
+jni = "0.21"
+tokio = { version = "1.49", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }
+log = "0.4"
+android_logger = "0.14"
+ipstack = "1.0.1"
+serde_json = "1.0.151"
+futures = "0.3.34"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

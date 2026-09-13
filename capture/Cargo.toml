@@ -17,7 +17,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 webpki-roots = "0.26"
 log = "0.4"
+# Captured bodies arrive in whatever the server sent them in. Without these the
+# Requests tab shows mojibake for every compressed response, which is most of
+# them. Decoder-only use, on bytes we already hold in memory.
+flate2 = "1.1"
+brotli = { version = "8", default-features = false, features = ["std"] }
+zstd = "0.13"
 
 [dev-dependencies]
+flate2 = "1.1"
 tokio = { version = "1.49.0", features = ["net", "io-util", "rt", "rt-multi-thread", "macros", "sync", "time"] }
 rustls-pemfile = "2"

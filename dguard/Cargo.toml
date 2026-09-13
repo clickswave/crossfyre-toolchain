@@ -5,8 +5,12 @@ edition = "2024"
 authors = ["Crossfyre"]
 description = "Inbound listener policy for the Crossfyre engine daemons"
 homepage = "https://crossfyre.io"
-repository = "https://github.com/clickswave/crossfyre_toolchain"
+repository = "https://github.com/clickswave/crossfyre-toolchain"
 keywords = ["security"]
 
 [dependencies]
 serde_json = "1"
+tokio = { version = "1", features = ["time", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["time", "macros", "rt", "rt-multi-thread"] }

@@ -43,6 +43,12 @@ pub async fn handle(env: OpEnv) {
             "timeout_ms": data["timeout_ms"].as_i64().unwrap_or(10000),
             "endpoints": data["endpoints"].clone(),
             "identities": resolved,
+            // Refuse private / reserved destinations at the resolver. The scan
+            // mode has always forwarded this; the others silently dropped it.
+            "block_internal": data["block_internal"].as_bool().unwrap_or(false),
+            // Destinations beyond the target the OPERATOR authorised. Never
+            // widened by anything a scan discovers.
+            "scope": data["scope"].clone(),
         })
     } else if mode == "inject" {
         // Active parameter injection (SQLi/XSS/cmdi/LFI). The endpoints carry the
@@ -56,6 +62,32 @@ pub async fn handle(env: OpEnv) {
             "timeout_ms": data["timeout_ms"].as_i64().unwrap_or(12000),
             "endpoints": data["endpoints"].clone(),
             "classes": data["classes"].clone(),
+            // Refuse private / reserved destinations at the resolver. The scan
+            // mode has always forwarded this; the others silently dropped it.
+            "block_internal": data["block_internal"].as_bool().unwrap_or(false),
+            // Destinations beyond the target the OPERATOR authorised. Never
+            // widened by anything a scan discovers.
+            "scope": data["scope"].clone(),
+            // Addresses other engines observed on this estate, for a confirmed
+            // SSRF to be re-tested against. The engine scope-checks every one.
+            "internal_targets": data["internal_targets"].clone(),
+        })
+    } else if mode == "flow" {
+        // Replay a recorded multi-step flow and test whether its order is real.
+        // No credential: a recorded flow that begins with a login establishes
+        // its own session, and handing one in would hide the thing being tested.
+        serde_json::json!({
+            "operation": "flow",
+            "response": "stream",
+            "target": target,
+            "timeout_ms": data["timeout_ms"].as_i64().unwrap_or(15000),
+            "name": data["flow_name"].clone(),
+            "steps": data["steps"].clone(),
+            // The same flow as a second user, when one was marked.
+            "other_steps": data["other_steps"].clone(),
+            "evasive": data["evasive"].clone(),
+            "identify": data["identify"].clone(),
+            "block_internal": data["block_internal"].as_bool().unwrap_or(false),
         })
     } else if mode == "fuzz" {
         // Structure / type fuzzing over the typed request shape (type confusion + mass assignment).
@@ -66,6 +98,9 @@ pub async fn handle(env: OpEnv) {
             "timeout_ms": data["timeout_ms"].as_i64().unwrap_or(12000),
             "endpoints": data["endpoints"].clone(),
             "classes": data["classes"].clone(),
+            // Refuse private / reserved destinations at the resolver. The scan
+            // mode has always forwarded this; the others silently dropped it.
+            "block_internal": data["block_internal"].as_bool().unwrap_or(false),
         })
     } else if mode == "discover" {
         // Request-shape discovery: cortex probes each endpoint (error-mining +
@@ -77,6 +112,9 @@ pub async fn handle(env: OpEnv) {
             "target": target,
             "timeout_ms": data["timeout_ms"].as_i64().unwrap_or(12000),
             "endpoints": data["endpoints"].clone(),
+            // Refuse private / reserved destinations at the resolver. The scan
+            // mode has always forwarded this; the others silently dropped it.
+            "block_internal": data["block_internal"].as_bool().unwrap_or(false),
         })
     } else if mode == "graphql" {
         // GraphQL: cortex live-introspects the endpoint and runs GraphQL-native checks
@@ -88,6 +126,9 @@ pub async fn handle(env: OpEnv) {
             "target": target,
             "endpoint": data["graphql_endpoint"].as_str().unwrap_or("/graphql"),
             "timeout_ms": data["timeout_ms"].as_i64().unwrap_or(12000),
+            // Refuse private / reserved destinations at the resolver. The scan
+            // mode has always forwarded this; the others silently dropped it.
+            "block_internal": data["block_internal"].as_bool().unwrap_or(false),
         })
     } else {
         // Standard vuln scan (templates).
@@ -99,6 +140,24 @@ pub async fn handle(env: OpEnv) {
             "follow_redirects": data["follow_redirects"].as_bool().unwrap_or(true),
             "severity": sev_arr,
             "templates_dir": data["templates_dir"].clone(),
+            // Template-id allowlist. Empty/absent = every template the severity
+            // filter admits, which is the behaviour every existing workflow got.
+            // The public free tools set it so a checker that advertises one thing
+            // cannot fire an unrelated probe at a stranger's host.
+            // `as_array().unwrap_or_default()` rather than a bare clone: an absent
+            // key clones to JSON null, and serde's `default` only fills a MISSING
+            // field, so null would fail to deserialize into Vec<String>.
+            "only": data["only"].as_array().cloned().unwrap_or_default(),
+            // Passive header checks only, no template requests at all.
+            "passive_only": data["passive_only"].as_bool().unwrap_or(false),
+            // Announce ourselves under this exact User-Agent instead of
+            // presenting as a browser, and drop emulation with it. Empty leaves
+            // the engine's own posture, which is what every existing workflow
+            // gets. The public free tools set it.
+            "user_agent": data["user_agent"].as_str().unwrap_or(""),
+            // Refuse private / reserved destinations at connect time. Absent =
+            // false, which is the behaviour every existing workflow gets.
+            "block_internal": data["block_internal"].as_bool().unwrap_or(false),
         })
     };
 
@@ -107,12 +166,24 @@ pub async fn handle(env: OpEnv) {
     // resolves its own per-identity credentials, so it is skipped here.
     if mode != "authz" {
         if let Some(cid) = data["credential_id"].as_str().filter(|s| !s.is_empty()) {
-            match creds::resolve_auth(&http, &api_url, &api_key, cid, &host).await {
-                Ok(auth) => {
+            // Several independent sessions for the injection pass, one per
+            // worker. A single session is a bottleneck on any target that locks
+            // it per request, and the resulting timeouts are reported as
+            // "the endpoint did not answer" rather than as slowness.
+            //
+            // Only the injection mode benefits: template scanning is stateless
+            // per request, so it takes one session like before.
+            let want = if mode == "inject" { 4 } else { 1 };
+            match creds::resolve_auth_pool(&http, &api_url, &api_key, cid, &host, want).await {
+                Ok(pool) if !pool.is_empty() => {
                     if let Some(cr) = cortex_req.as_object_mut() {
-                        cr.insert("auth".into(), auth);
+                        cr.insert("auth".into(), pool[0].clone());
+                        if pool.len() > 1 {
+                            cr.insert("auth_pool".into(), serde_json::json!(pool));
+                        }
                     }
                 }
+                Ok(_) => {}
                 Err(e) => eprintln!("[op] vuln-scan credential resolve failed ({cid}): {e}"),
             }
         }
@@ -206,6 +277,12 @@ pub async fn handle(env: OpEnv) {
                             && t > total
                         {
                             total = t;
+                        }
+                    }
+                    // Coverage notes: what the engine could not test, and why.
+                    "log" => {
+                        if let Some(m) = event["message"].as_str() {
+                            relay.publish_note(m).await;
                         }
                     }
                     "done" => break,

@@ -1,0 +1,95 @@
+# F-Droid metadata for the Crossfyre Tracer.
+#
+# NOT SUBMITTED. This is the recipe, kept in-tree so it stays in step with the
+# build it describes. Submitting means opening a merge request against
+# gitlab.com/fdroid/fdroiddata with this file at
+# metadata/io.crossfyre.tracer.yml, and that has to be done by a person with an
+# account, under their own name.
+#
+# The important line is `Binaries`. It asks F-Droid to build from source, compare
+# byte-for-byte against OUR signed APK, and on a match distribute ours rather
+# than one signed with their key. Without it, an F-Droid install and a direct
+# download are different applications to Android and can never update each other,
+# which users discover when an update fails.
+#
+# That only works because the build is reproducible. Verify before submitting:
+# two clean builds must produce the same `contentSha256` (see
+# scripts/crossfyre_mobile.py). F-Droid's build server runs the equivalent check
+# in public, so a failure there is a public failure.
+
+Categories:
+  - Security
+  - Development
+
+License: Apache-2.0
+AuthorName: Clickswave Labs Private Limited
+AuthorEmail: team@crossfyre.io
+WebSite: https://crossfyre.io
+SourceCode: https://github.com/clickswave/crossfyre-toolchain
+IssueTracker: https://github.com/clickswave/crossfyre-toolchain/issues
+
+AutoName: Crossfyre Tracer
+
+Summary: Inspect your device's own HTTPS traffic, no root and no computer
+
+Description: |-
+    Crossfyre Tracer intercepts and inspects HTTPS traffic from your own device,
+    per-app or device-wide, without root and without a computer attached.
+
+    It runs as a local VpnService and terminates TLS using a certificate
+    generated on the device. This is not a VPN in the usual sense: nothing is
+    tunnelled to a remote server by that mechanism, and the app declares no such
+    capability.
+
+    What it does to your traffic, stated plainly, because you should not have to
+    infer it:
+
+    * The CA certificate is generated on the device and its private key never
+      leaves it. You install that CA yourself through the system dialog.
+    * For each connection the app presents a certificate minted from your CA,
+      reads the plaintext, and forwards it to the real destination.
+    * Captured data stays on the device unless you pair it with a Crossfyre
+      workspace. If you do, metadata is sent to the control plane whose URL you
+      supplied when pairing. Nothing is sent anywhere else, and nothing is sent
+      at all before you pair.
+    * Scope defaults to the whole device. You can narrow it to chosen apps
+      before starting.
+
+    Certificate-pinned apps reject even a trusted CA and will not work under
+    interception by default. Working around that requires rewriting the target
+    app, which the Tracer can request from a hosted service that needs an
+    account. That service is not open source; everything that runs on your phone
+    is.
+
+    Intercept only traffic you are entitled to intercept.
+
+RepoType: git
+Repo: https://github.com/clickswave/crossfyre-toolchain.git
+
+Builds:
+  - versionName: 0.1.0
+    versionCode: 1
+    commit: v0.1.0-tracer
+    subdir: mobile/app
+    gradle:
+      - yes
+    # The native core is Rust, cross-compiled before gradle runs. jniLibs is not
+    # committed, so without this step the APK builds without its native library,
+    # installs, and fails the moment capture starts.
+    sudodeps:
+      - rustup
+    prebuild:
+      - rustup target add aarch64-linux-android
+      - cargo install cargo-ndk --locked
+      - cd ../rust && cargo ndk -t arm64-v8a -o ../app/src/main/jniLibs build --release
+
+# Distribute OUR signed APK once the reproducible build is confirmed to match.
+# See the note at the top: this is the line that keeps a single install base.
+Binaries: https://bins.crossfyre.io/mobile/crossfyre-tracer-%v.apk
+
+AllowedAPKSigningKeys: 1f8b81ae5e5cc1f0f28343e216f20ea0431f6c68ad23bbfa3e5e18cb3be2e973
+
+AutoUpdateMode: None
+UpdateCheckMode: Tags
+CurrentVersion: 0.1.0
+CurrentVersionCode: 1

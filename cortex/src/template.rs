@@ -29,6 +29,21 @@ pub struct Info {
     pub severity: String,
     #[serde(default)]
     pub description: String,
+    /// nuclei-style comma-separated tags (`vuln,ssti,injection`). Read as the
+    /// template's own declaration of what class of bug it finds, so consumers
+    /// stop re-deriving that from the id: see `class_from_tags` below.
+    #[serde(default)]
+    pub tags: String,
+    #[serde(default)]
+    pub metadata: Meta,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct Meta {
+    /// The pack directory the template belongs to; the fallback class when a
+    /// template carries no tags.
+    #[serde(default)]
+    pub category: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,6 +128,8 @@ fn default_or() -> String {
 /// A confirmed template match.
 pub struct Match {
     pub template_id: String,
+    /// Canonical vulnerability class, from the template's own tags.
+    pub class: String,
     pub name: String,
     pub severity: String,
     pub description: String,
@@ -123,6 +140,9 @@ struct Resp {
     status: u16,
     headers: String,
     body: String,
+    /// The URL this response came from. Needed so a matcher can tell evidence
+    /// from an echo: see `matches_one`.
+    url: String,
 }
 
 const OOB_MARKERS: [&str; 2] = ["{{interactsh-url}}", "{{oast-url}}"];
@@ -143,6 +163,8 @@ pub async fn eval_template(
     base: &str,
     tmpl: &Template,
     oast: Option<&crate::oast::OastClient>,
+    oob_reg: Option<&crate::oast::OastReg>,
+    oob_queue: Option<&crate::inject::OobQueue>,
     evasive: bool,
 ) -> Vec<Match> {
     let mut out = Vec::new();
@@ -151,13 +173,14 @@ pub async fn eval_template(
 
         // Out-of-band request: only runnable when an OAST server is configured.
         if references_oob(req) {
-            let Some(oc) = oast else { continue };
-            // Register a fresh correlation (sealed to this scan's keypair) for this
-            // template, so callbacks are attributable and encrypted end to end.
-            let Some(reg) = oc.register(client).await else {
+            let (Some(oc), Some(reg), Some(q)) = (oast, oob_reg, oob_queue) else {
                 continue;
             };
-            let host = oc.host(&reg);
+            // One correlation for the whole scan, a marker for this template.
+            // Blocking six seconds here per out-of-band template was cheap next
+            // to what the injector was doing, but it is the same mistake and it
+            // is paid on every scan, so it goes the same way.
+            let (host, marker) = oc.host_marked(reg);
             let mut fired = false;
             for raw_path in &req.path {
                 for mut v in expand_request(req, raw_path, base, MAX_PAYLOAD_REQUESTS) {
@@ -167,42 +190,39 @@ pub async fn eval_template(
                 }
             }
             if !fired {
-                oc.deregister(client, &reg).await;
                 continue;
             }
-            // Poll for the callback: the target processes the payload asynchronously.
-            let mut hits = 0u64;
-            for _ in 0..4 {
-                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-                hits = oc.poll(client, &reg).await;
-                if hits > 0 {
-                    break;
-                }
-            }
-            oc.deregister(client, &reg).await;
-            if hits > 0 {
+            {
                 let base_desc = if tmpl.info.description.is_empty() {
                     tmpl.id.clone()
                 } else {
                     tmpl.info.description.clone()
                 };
-                out.push(Match {
-                    template_id: tmpl.id.clone(),
-                    name: if tmpl.info.name.is_empty() {
+                // Built now, released only if this template's marker calls back.
+                let finding = cfx_finding::Finding::new(
+                    "cortex",
+                    &class_from_tags(&tmpl.info.tags, &tmpl.id, &tmpl.info.metadata.category),
+                    if tmpl.info.name.is_empty() {
                         tmpl.id.clone()
                     } else {
                         tmpl.info.name.clone()
                     },
-                    severity: if tmpl.info.severity.is_empty() {
+                    if tmpl.info.severity.is_empty() {
                         "high".to_string()
                     } else {
                         tmpl.info.severity.clone()
                     },
-                    description: format!(
-                        "{base_desc} Confirmed out-of-band: {hits} callback(s) to {host}."
-                    ),
-                    matched_at: base.to_string(),
-                });
+                    base,
+                )
+                .template(tmpl.id.clone())
+                .describe(format!(
+                    "{base_desc} Confirmed out-of-band: the target called back to a host only this \
+                     scan knows, so the payload was processed."
+                ))
+                .build();
+                if let Ok(mut v) = q.lock() {
+                    v.push(crate::inject::PendingOob { marker, finding });
+                }
             }
             continue;
         }
@@ -266,6 +286,7 @@ pub async fn eval_template(
                 }
                 out.push(Match {
                     template_id: tmpl.id.clone(),
+                    class: class_from_tags(&tmpl.info.tags, &tmpl.id, &tmpl.info.metadata.category),
                     name: if tmpl.info.name.is_empty() {
                         tmpl.id.clone()
                     } else {
@@ -425,6 +446,7 @@ async fn fetch_raw(method: &str, v: &ReqVariant) -> Option<Resp> {
         status: r.status,
         headers: r.headers,
         body: r.body,
+        url: v.url.clone(),
     })
 }
 
@@ -470,6 +492,7 @@ async fn fetch(client: &Client, method: &str, v: &ReqVariant) -> Option<Resp> {
                     status,
                     headers,
                     body,
+                    url: v.url.clone(),
                 });
             }
             Err(_) => {
@@ -519,6 +542,48 @@ fn matches_all(req: &HttpReq, resp: &Resp) -> bool {
     if cond_and { all } else { any }
 }
 
+/// Does this response simply echo the requested path back into its body?
+///
+/// Catch-all handlers, soft 404s and "page not found" templates routinely do
+/// this. When they do, any matcher word that also appears in the request URL is
+/// worthless as evidence: the scanner put it there. A WebLogic template probing
+/// `/console/css/..%2fconsole.portal` and matching the word "console.portal"
+/// will otherwise fire on every app in the world that prints the path it could
+/// not find, which is how a 200-line Python app got reported as a critical
+/// Oracle WebLogic auth bypass.
+///
+/// Deliberately narrow. Evidence is only discounted on responses that provably
+/// echo, so a real WebLogic console still matches on "WebLogic" and
+/// "Deployment", and templates whose words legitimately appear in the path keep
+/// working everywhere else.
+fn echoes_request_path(resp: &Resp) -> bool {
+    let path = match resp.url.split_once("://") {
+        Some((_, rest)) => match rest.find('/') {
+            Some(i) => &rest[i..],
+            None => return false,
+        },
+        None => return false,
+    };
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    let trimmed = path.trim_matches('/');
+    if trimmed.len() < 4 {
+        return false;
+    }
+    let body = resp.body.to_lowercase();
+    let needle = trimmed.to_lowercase();
+    if body.contains(&needle) {
+        return true;
+    }
+    // Also catch the percent-decoded form, since a traversal payload is usually
+    // encoded on the wire and printed decoded.
+    let decoded = needle
+        .replace("%252e", ".")
+        .replace("%2e", ".")
+        .replace("%252f", "/")
+        .replace("%2f", "/");
+    decoded != needle && body.contains(&decoded)
+}
+
 fn matches_one(m: &Matcher, resp: &Resp) -> bool {
     let hay = part_text(&m.part, resp);
     match m.mtype.as_str() {
@@ -535,7 +600,15 @@ fn matches_one(m: &Matcher, resp: &Resp) -> bool {
             // case (e.g. "Server:", "X-Powered-By:"), which would otherwise miss.
             let header_part = matches!(m.part.as_str(), "header" | "all_headers");
             let hay_cmp = if header_part { hay.to_lowercase() } else { hay };
+            // On a response that echoes the request path, a word that is itself
+            // in the URL proves nothing. Only applied to body-ish parts, and
+            // only when the echo is demonstrated.
+            let discount_echo = !header_part && echoes_request_path(resp);
+            let url_lc = resp.url.to_lowercase();
             let contains = |w: &str| {
+                if discount_echo && url_lc.contains(&w.to_lowercase()) {
+                    return false;
+                }
                 if header_part {
                     hay_cmp.contains(&w.to_lowercase())
                 } else {
@@ -627,6 +700,7 @@ info:
   name: Exposed .git/config
   severity: medium
   description: A publicly readable .git/config can leak source, credentials, and internal remotes.
+  tags: exposure,git,source-code
 http:
   - method: GET
     path:
@@ -649,6 +723,7 @@ info:
   name: Exposed .env file
   severity: high
   description: A publicly readable .env file commonly exposes application secrets and DB credentials.
+  tags: exposure,config,credentials
 http:
   - method: GET
     path:
@@ -669,6 +744,7 @@ info:
   name: Exposed phpinfo()
   severity: low
   description: A reachable phpinfo() page discloses environment, paths, and module configuration.
+  tags: exposure,php,disclosure
 http:
   - method: GET
     path:
@@ -700,6 +776,7 @@ info:
   name: Exposed Apache server-status
   severity: low
   description: mod_status exposes request and worker information to unauthenticated clients.
+  tags: exposure,apache,disclosure
 http:
   - method: GET
     path:
@@ -720,6 +797,7 @@ info:
   name: Directory listing enabled
   severity: info
   description: An auto-index directory listing can expose files not meant to be enumerable.
+  tags: misconfig,disclosure
 http:
   - method: GET
     path:
@@ -751,6 +829,7 @@ info:
   name: Exposed .env backup
   severity: high
   description: A backup copy of the environment file can leak the same secrets as the live file.
+  tags: exposure,config,backup
 http:
   - method: GET
     path:
@@ -772,6 +851,7 @@ info:
   name: Exposed SSH/TLS private key
   severity: critical
   description: A publicly readable private key allows full server impersonation and compromise.
+  tags: exposure,credentials,secrets
 http:
   - method: GET
     path:
@@ -799,6 +879,7 @@ info:
   name: Exposed AWS credentials
   severity: critical
   description: AWS secret keys exposed in a reachable file grant direct access to cloud infrastructure.
+  tags: exposure,credentials,aws,cloud
 http:
   - method: GET
     path:
@@ -820,6 +901,7 @@ info:
   name: Application debug stack trace disclosed
   severity: medium
   description: A debug or exception page discloses framework internals, file paths, and sometimes secrets. Demonstrates the dsl matcher.
+  tags: exposure,disclosure,debug
 http:
   - method: GET
     path:
@@ -835,6 +917,7 @@ info:
   name: Local file inclusion / path traversal
   severity: high
   description: A path that returns the contents of /etc/passwd indicates local file inclusion. Demonstrates payload fuzzing.
+  tags: vuln,lfi,traversal
 http:
   - method: GET
     unsafe: true
@@ -862,6 +945,7 @@ info:
   name: Blind server-side request forgery (out-of-band)
   severity: high
   description: A parameter that makes the server fetch an attacker-controlled URL indicates SSRF. Requires a configured OAST server; confirmed by an out-of-band callback.
+  tags: vuln,ssrf,oast
 http:
   - method: GET
     path:
@@ -878,6 +962,7 @@ info:
   name: Exposed database backup
   severity: critical
   description: A downloadable SQL dump exposes the full database, including password hashes and credentials.
+  tags: exposure,backup,database
 http:
   - method: GET
     path:
@@ -953,8 +1038,122 @@ fn load_dir_into(dir: &std::path::Path, out: &mut Vec<Template>) {
     }
 }
 
+/// The class a template finding belongs to, from its own metadata.
+///
+/// Template findings used to carry no class at all, so every consumer that
+/// wanted one (dedupe, grouping, the benchmark scorer) re-derived it from the
+/// template id with its own private lookup table, and each table was wrong in a
+/// different way. The template already declares what it is in `info.tags`, so
+/// read that instead of guessing from the id.
+///
+/// A known CVE stays classed `cve` rather than as its underlying bug type: the
+/// CVE id in `template` is the precise identity, and the rest of the system
+/// (answer keys, the dashboard) treats "a known, published vulnerability" as
+/// its own class.
+pub fn class_from_tags(tags: &str, template_id: &str, category: &str) -> String {
+    let tags: Vec<String> = tags
+        .split(',')
+        .map(|t| t.trim().to_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let has = |t: &str| tags.iter().any(|x| x == t);
+
+    if template_id.to_uppercase().starts_with("CVE-") || has("cve") {
+        return "cve".into();
+    }
+
+    // Specific bug classes before the generic ones: a template tagged
+    // `ssti,injection,rce` is an SSTI finding, not an unspecified RCE.
+    for (tag, class) in [
+        ("sqli", "sqli"),
+        ("sql-injection", "sqli"),
+        ("nosql", "nosqli"),
+        ("xss", "xss"),
+        ("ssti", "ssti"),
+        ("ssrf", "ssrf"),
+        ("xxe", "xxe"),
+        ("crlf", "crlf"),
+        ("lfi", "lfi"),
+        ("traversal", "traversal"),
+        ("cmdi", "cmdi"),
+        ("command-injection", "cmdi"),
+        ("deserialization", "deserialization"),
+        ("redirect", "open_redirect"),
+        ("cors", "cors"),
+        ("auth-bypass", "auth_bypass"),
+        ("access-control", "access_control"),
+        ("default-login", "default_login"),
+        ("rce", "rce"),
+    ] {
+        if has(tag) {
+            return class.into();
+        }
+    }
+
+    for (tag, class) in [
+        ("panel", "panel"),
+        ("exposure", "exposure"),
+        ("disclosure", "exposure"),
+        ("misconfig", "misconfig"),
+        ("waf", "waf"),
+        ("tech", "tech"),
+    ] {
+        if has(tag) {
+            return class.into();
+        }
+    }
+
+    // Fall back to the pack directory the template lives in, which is always set.
+    match category {
+        "cves" => "cve",
+        "exposures" => "exposure",
+        "panels" => "panel",
+        "technologies" => "tech",
+        "default-logins" => "default_login",
+        "misconfigurations" => "misconfig",
+        "vulnerabilities" => "vuln",
+        _ => "vuln",
+    }
+    .into()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn template_class_comes_from_tags() {
+        use super::class_from_tags;
+        assert_eq!(
+            class_from_tags("vuln,ssti,injection,rce", "ssti-x", "vulnerabilities"),
+            "ssti"
+        );
+        assert_eq!(
+            class_from_tags("cve,cve2021,rce", "CVE-2021-44228", "cves"),
+            "cve"
+        );
+        assert_eq!(
+            class_from_tags("exposure,git,source-code", "git-head", "exposures"),
+            "exposure"
+        );
+        assert_eq!(
+            class_from_tags("", "spring-actuator-env", "misconfigurations"),
+            "misconfig"
+        );
+        // `credentials` is a modifier on an exposure ("this file holds secrets"),
+        // not a default-login finding.
+        assert_eq!(
+            class_from_tags("exposure,npm,credentials", "npmrc", "exposures"),
+            "exposure"
+        );
+        assert_eq!(
+            class_from_tags(
+                "default-login,tomcat,credentials",
+                "tomcat-manager-default",
+                "default-logins"
+            ),
+            "default_login"
+        );
+    }
+
     #[test]
     fn all_builtins_parse() {
         // Every embedded template must parse against the supported subset;
@@ -972,10 +1171,144 @@ mod tests {
         );
     }
 
+    fn walk_yaml(dir: &std::path::Path) -> usize {
+        let mut n = 0;
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                n += walk_yaml(&p);
+            } else if p
+                .extension()
+                .and_then(|x| x.to_str())
+                .map(|x| x == "yaml" || x == "yml")
+                .unwrap_or(false)
+            {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// A matcher word that the template itself put in the request can never be
+    /// evidence: the target only has to echo the request back to "prove" the
+    /// finding. That is how the Shellshock template reported critical RCE
+    /// against Mutillidae, which simply prints the User-Agent on its home page.
+    ///
+    /// The rule is mechanical, so it is enforced here rather than left to
+    /// review. A template that is genuinely about reflection (its whole point
+    /// being that the payload comes back) opts out with the `reflection` tag.
+    #[test]
+    fn no_template_matches_its_own_payload() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/templates");
+        let mut all: Vec<&super::Template> = super::BUILTIN.iter().collect();
+        let pack = super::load_dir(dir);
+        all.extend(pack.iter());
+        for t in all {
+            if t.info.tags.contains("reflection") {
+                continue;
+            }
+            for req in &t.http {
+                // What this request transmits OTHER than its path. A word the
+                // template puts in the path is already handled at runtime by
+                // the echo guard in `matches_one`, which discounts URL words on
+                // a response that echoes the path; nothing covers a header or
+                // body value that comes back in the page.
+                let mut sent = String::new();
+                for v in req.headers.values() {
+                    sent.push(' ');
+                    sent.push_str(v);
+                }
+                if let Some(b) = &req.body {
+                    sent.push(' ');
+                    sent.push_str(b);
+                }
+                for lists in req.payloads.values() {
+                    for v in lists {
+                        sent.push(' ');
+                        sent.push_str(v);
+                    }
+                }
+                let sent = sent.to_lowercase();
+                for m in &req.matchers {
+                    if m.mtype != "word" || m.negative {
+                        continue;
+                    }
+                    if matches!(m.part.as_str(), "header" | "all_headers") {
+                        continue;
+                    }
+                    for w in &m.words {
+                        let w_lc = w.to_lowercase();
+                        // Very short words are substrings of everything; the
+                        // rule is about distinctive markers.
+                        if w_lc.len() < 6 {
+                            continue;
+                        }
+                        assert!(
+                            !sent.contains(&w_lc),
+                            "template `{}` matches on `{w}`, which it sends itself - \
+                             an echo would satisfy it. Use a marker the target can only \
+                             produce by executing something, or tag the template `reflection`.",
+                            t.id
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_template_declares_its_class() {
+        // A template's tags are how a finding gets its `vuln_class`. A template
+        // with none would emit findings that fall through to the generic class,
+        // which is how consumers ended up re-deriving classes from template ids.
+        let mut all: Vec<(&str, &str, &str)> = super::BUILTIN
+            .iter()
+            .map(|t| {
+                (
+                    t.id.as_str(),
+                    t.info.tags.as_str(),
+                    t.info.metadata.category.as_str(),
+                )
+            })
+            .collect();
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/templates");
+        let pack = super::load_dir(dir);
+        // load_dir skips anything that fails to parse, which is how a broken
+        // CVE template sat in the pack unnoticed and never ran. Count the files
+        // so a skip is a test failure rather than a silently smaller pack.
+        let on_disk = walk_yaml(std::path::Path::new(dir));
+        assert_eq!(
+            pack.len(),
+            on_disk,
+            "{} template file(s) in the pack failed to parse and were skipped",
+            on_disk - pack.len()
+        );
+        all.extend(pack.iter().map(|t| {
+            (
+                t.id.as_str(),
+                t.info.tags.as_str(),
+                t.info.metadata.category.as_str(),
+            )
+        }));
+        assert!(all.len() > 12, "the on-disk pack did not load");
+        for (id, tags, category) in all {
+            assert!(!tags.is_empty(), "template `{id}` carries no tags");
+            let class = super::class_from_tags(tags, id, category);
+            assert_ne!(
+                class, "vuln",
+                "template `{id}` falls through to the generic class"
+            );
+        }
+    }
+
     #[test]
     fn dsl_matcher_wired() {
         // The dsl matcher path is reachable and evaluates the response context.
         let resp = super::Resp {
+            url: String::new(),
             status: 200,
             headers: "Server: nginx\n".to_string(),
             body: "Werkzeug Debugger traceback".to_string(),

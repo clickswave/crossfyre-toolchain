@@ -14,7 +14,7 @@
 use regex::Regex;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::LazyLock;
 use tokio::sync::mpsc;
 use transport::Client;
@@ -82,6 +82,19 @@ pub struct CrawlParams {
     /// node. Applied as default headers so every fetched page is authenticated.
     #[serde(default)]
     pub auth: Option<AuthSpec>,
+    /// Run the headless tier: drive a real browser and record what the running
+    /// application asks for. Off by default, because it needs a browser on the
+    /// node and most crawls do not need it. See `browser`.
+    #[serde(default)]
+    pub browser: bool,
+    /// How many pages the headless tier may visit. Each is a real browser
+    /// navigation, which costs seconds rather than milliseconds.
+    #[serde(default = "d_browser_pages")]
+    pub browser_pages: usize,
+}
+
+fn d_browser_pages() -> usize {
+    12
 }
 
 /// Request auth resolved from a credential. Shared across all engines via
@@ -166,6 +179,14 @@ impl CrawlEvent {
             ..Self::blank()
         }
     }
+    /// An operator-facing observation about the crawl itself (not a URL).
+    fn note(msg: String) -> Self {
+        Self {
+            kind: "log".into(),
+            message: Some(msg),
+            ..Self::blank()
+        }
+    }
     fn error(msg: String) -> Self {
         Self {
             kind: "error".into(),
@@ -244,6 +265,13 @@ impl CrawlEvent {
 // ---------------------------------------------------------------------------
 
 /// href/src/action attribute values. Skips pure-fragment and inline handlers.
+/// How many lazily-loaded chunks one bundle may contribute.
+///
+/// A chunk map can name hundreds of files, and each is a request against
+/// somebody's server. The aim is to reach the parts of the application a crawl
+/// cannot see, not to mirror the build output.
+const SPA_CHUNK_LIMIT: usize = 40;
+
 static RE_HTML_ATTR: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?i)(?:href|src|action)\s*=\s*["']([^"'][^"']*)["']"#).unwrap());
 /// `<input name="...">` for parameter collection.
@@ -264,6 +292,13 @@ static RE_JS_PATH: LazyLock<Regex> = LazyLock::new(|| {
 /// fetch()/axios()/.get()/.post()/.ajax() first string argument (URL only, method-agnostic).
 static RE_JS_CALL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)(?:fetch|axios(?:\.\w+)?|\.(?:get|post|put|delete|patch|ajax))\s*\(\s*["'`]([^"'`]+)["'`]"#).unwrap()
+});
+
+/// A backtick string that looks like a URL path, interpolations and all. Kept
+/// separate from `RE_JS_PATH` because that one deliberately excludes `$` and
+/// `{`, which is what made every interpolated URL invisible.
+static RE_JS_TEMPLATE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"`((?:\$\{[^`{}]{0,80}\})?/[A-Za-z0-9_./$\{\}\-]{1,200})`"#).unwrap()
 });
 
 /// Same call sites, but capturing the HTTP verb: `axios.post('/x')`, `http.put('/x')`, `.delete('/x')`.
@@ -298,6 +333,10 @@ struct Page {
     depth: u32,
     parent: Option<String>,
     status: u16,
+    /// Why the fetch produced no response, when it produced none. `status`
+    /// of 0 says a page came back empty; only this says whether that was
+    /// the server's answer or a connection that never delivered one.
+    error: Option<String>,
     content_type: String,
     links: Vec<String>,
     params: Vec<String>,
@@ -312,6 +351,313 @@ struct Page {
     /// sha256 of the response body for non-HTML text/code (js/json/xml). Empty otherwise. Lets the
     /// asset graph change-monitor JS/config bundles across scans without storing the body.
     content_hash: String,
+    /// Client-side routes a router config declared. Kept apart from `links`
+    /// because these are the pages the headless tier should NAVIGATE to: a SPA
+    /// serves its shell for all of them, so fetching them statically says
+    /// nothing, while loading one in a browser makes it fetch its own data.
+    client_routes: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Routing parameters
+// ---------------------------------------------------------------------------
+//
+// Dropping query VALUES from the dedup key is right for a data parameter:
+// /item?id=1 and /item?id=2 are one endpoint rendered twice, and crawling ten
+// thousand of them buys nothing. It is wrong for a ROUTING parameter, where the
+// value selects which page is served. Mutillidae hangs ~120 pages off
+// index.php?page=, and a value-dropping crawler sees exactly one of them; so do
+// plenty of real CMSes, admin consoles and legacy dispatchers.
+//
+// Neither can be assumed, so the crawler decides from evidence. For a parameter
+// it has not judged yet it admits a small probe budget of distinct values,
+// fingerprints the STRUCTURE of each response, and then decides:
+//
+//   same structure every time  -> data. Collapse it, drop the held values.
+//   structure differs          -> routing. Release everything it held.
+//
+// The fingerprint is deliberately structural (status, the set of link paths,
+// the set of form actions and field names) and not content, because two product
+// pages differ in their text while being the same page, and two dispatcher
+// pages differ in their forms and navigation while sharing text.
+
+/// Distinct values admitted for a parameter while its role is unknown. This is
+/// the cost of the decision: at most this many extra fetches per parameter.
+const ROUTE_PROBE_VALUES: usize = 3;
+/// Ceiling on how many values of a confirmed routing parameter we will crawl.
+const MAX_ROUTE_VALUES: usize = 200;
+/// Values held per parameter while undecided. Bounded so a page linking
+/// thousands of variants cannot grow the queue without limit.
+const MAX_HELD_VALUES: usize = 400;
+
+/// Ask for a path nothing could have registered, and see whether the error page
+/// is the application's own routing table.
+///
+/// Two outputs, and the second is not a bonus: an application serving a
+/// development error page has published its whole attack surface to anyone who
+/// mistypes a URL, and that is worth saying even when the routes turn out to be
+/// dull.
+#[allow(clippy::too_many_arguments)]
+async fn harvest_routes(
+    client: &transport::Client,
+    seed: &Url,
+    params: &CrawlParams,
+    seed_host: &str,
+    visited: &mut HashSet<String>,
+    frontier: &mut VecDeque<Queued>,
+    routes: &mut RouteSense,
+    tx: &mpsc::UnboundedSender<CrawlEvent>,
+) {
+    let Ok(probe) = seed.join(crate::routetable::PROBE_PATH) else {
+        return;
+    };
+    let Ok(resp) = client.get(probe.as_str()).send().await else {
+        return;
+    };
+    // A site that answers a made-up path with a 200 is answering everything
+    // that way, and nothing it says about routes means anything.
+    if resp.status().is_success() {
+        return;
+    }
+    let Ok(body) = resp.text().await else {
+        return;
+    };
+    let Some(h) = crate::routetable::parse(&body) else {
+        return;
+    };
+
+    let mut queued = 0usize;
+    let mut listed = 0usize;
+    for (method, path) in &h.routes {
+        let Ok(u) = seed.join(path) else { continue };
+        if resolve_and_scope(u.as_str(), seed, params, seed_host).is_none() {
+            continue;
+        }
+        listed += 1;
+        let mut ev = CrawlEvent::url_candidate(&u, Some("route table".into()), 0);
+        if !method.is_empty() {
+            ev.method = Some(method.clone());
+        }
+        let _ = tx.send(ev);
+        // Only fetchable routes join the frontier. A path with a `:id` segment
+        // is a real endpoint and is reported as one, but requesting it
+        // literally fetches nothing and costs a page from the budget.
+        let fetchable = !path.contains(':') && !path.contains('<');
+        let is_get = method.is_empty() || method == "GET";
+        if fetchable && is_get && visited.insert(routes.norm_key(&u)) {
+            frontier.push_back((u, 0, Some("route table".into())));
+            queued += 1;
+        }
+    }
+
+    let _ = tx.send(CrawlEvent::note(format!(
+        "{} published its routing table on an error page: {} in-scope route(s), {} queued to crawl. \
+         This is an exposure in its own right - a deployment answering an unknown path with a \
+         development error page has told every visitor its entire attack surface, including the \
+         endpoints nothing links to.",
+        h.framework, listed, queued
+    )));
+}
+
+/// A URL waiting in (or held back from) the frontier: where, how deep, and what
+/// linked to it.
+type Queued = (Url, u32, Option<String>);
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ParamRole {
+    Unknown,
+    Routing,
+    Data,
+}
+
+#[derive(Default)]
+struct RouteSense {
+    role: HashMap<String, ParamRole>,
+    /// key -> (value -> structural fingerprint of what that value served)
+    prints: HashMap<String, HashMap<String, u64>>,
+    /// key -> distinct values already admitted to the frontier
+    admitted: HashMap<String, HashSet<String>>,
+    /// key -> URLs held back until the role is decided
+    held: HashMap<String, Vec<Queued>>,
+}
+
+/// `scheme://host[:port]/path|param` - a parameter on one endpoint.
+fn param_key(url: &Url, param: &str) -> String {
+    let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+    format!(
+        "{}://{}{}{}|{}",
+        url.scheme(),
+        url.host_str().unwrap_or(""),
+        port,
+        url.path().trim_end_matches('/'),
+        param
+    )
+}
+
+impl RouteSense {
+    fn role(&self, key: &str) -> ParamRole {
+        *self.role.get(key).unwrap_or(&ParamRole::Unknown)
+    }
+
+    /// The dedup key. A data parameter contributes its name only (the historical
+    /// behaviour); anything else contributes name and value, so two routes are
+    /// two endpoints.
+    fn norm_key(&self, url: &Url) -> String {
+        let scheme = url.scheme();
+        let host = url.host_str().unwrap_or("");
+        let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+        let path = url.path().trim_end_matches('/');
+        let mut parts: Vec<String> = url
+            .query_pairs()
+            .map(|(k, v)| {
+                if self.role(&param_key(url, &k)) == ParamRole::Data {
+                    k.into_owned()
+                } else {
+                    format!("{k}={v}")
+                }
+            })
+            .collect();
+        parts.sort();
+        parts.dedup();
+        let q = if parts.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", parts.join("&"))
+        };
+        format!("{scheme}://{host}{port}{path}{q}")
+    }
+
+    /// Should this URL enter the frontier now, be held, or be dropped?
+    ///
+    /// Held rather than dropped, because a parameter that later proves to be
+    /// routing must not have lost the 117 pages that were discovered before the
+    /// third probe came back.
+    fn admit(&mut self, url: &Url, depth: u32, parent: &Option<String>) -> bool {
+        let pairs: Vec<(String, String)> = url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        for (k, v) in &pairs {
+            let key = param_key(url, k);
+            match self.role(&key) {
+                ParamRole::Data => continue,
+                ParamRole::Routing => {
+                    let seen = self.admitted.entry(key.clone()).or_default();
+                    if seen.contains(v) || seen.len() < MAX_ROUTE_VALUES {
+                        seen.insert(v.clone());
+                        continue;
+                    }
+                    return false; // past the ceiling: stop expanding this parameter
+                }
+                ParamRole::Unknown => {
+                    let seen = self.admitted.entry(key.clone()).or_default();
+                    if seen.contains(v) || seen.len() < ROUTE_PROBE_VALUES {
+                        seen.insert(v.clone());
+                        continue;
+                    }
+                    let held = self.held.entry(key).or_default();
+                    if held.len() < MAX_HELD_VALUES {
+                        held.push((url.clone(), depth, parent.clone()));
+                    }
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Record what a fetched page's parameter values served, and decide a role
+    /// once the probe budget is spent. Returns the URLs to release, and a note
+    /// worth telling the operator about.
+    fn observe(&mut self, url: &Url, structure: u64) -> (Vec<Queued>, Option<String>) {
+        let mut release: Vec<Queued> = Vec::new();
+        let mut note = None;
+        let pairs: Vec<(String, String)> = url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        for (k, v) in pairs {
+            let key = param_key(url, &k);
+            if self.role(&key) != ParamRole::Unknown {
+                continue;
+            }
+            self.prints
+                .entry(key.clone())
+                .or_default()
+                .insert(v, structure);
+            let prints = &self.prints[&key];
+            if prints.len() < ROUTE_PROBE_VALUES {
+                continue;
+            }
+            let distinct: HashSet<u64> = prints.values().copied().collect();
+            if distinct.len() > 1 {
+                self.role.insert(key.clone(), ParamRole::Routing);
+                if let Some(mut h) = self.held.remove(&key) {
+                    let seen = self.admitted.entry(key.clone()).or_default();
+                    h.retain(|(u, _, _)| {
+                        let val = u
+                            .query_pairs()
+                            .find(|(kk, _)| *kk == k)
+                            .map(|(_, vv)| vv.into_owned())
+                            .unwrap_or_default();
+                        seen.len() < MAX_ROUTE_VALUES && seen.insert(val)
+                    });
+                    note = Some(format!(
+                        "`{k}` on {} routes content: {} more value(s) queued",
+                        url.path(),
+                        h.len()
+                    ));
+                    release = h;
+                } else {
+                    note = Some(format!("`{k}` on {} routes content", url.path()));
+                }
+            } else {
+                self.role.insert(key.clone(), ParamRole::Data);
+                self.held.remove(&key);
+            }
+        }
+        (release, note)
+    }
+}
+
+/// A hash of what a page IS rather than what it says: status, the set of link
+/// paths, and the set of form actions and field names. Two renderings of one
+/// template hash the same however different their text; two different pages
+/// behind a dispatcher do not.
+fn structure_print(page: &Page) -> u64 {
+    use std::collections::BTreeSet;
+    let mut marks: BTreeSet<String> = BTreeSet::new();
+    for l in &page.links {
+        let raw = l.split('#').next().unwrap_or(l);
+        let path = raw.split('?').next().unwrap_or(raw);
+        // Keep the query KEYS: a dispatcher's pages differ by which parameters
+        // their own links carry, and that is signal.
+        let keys: Vec<&str> = raw
+            .split_once('?')
+            .map(|(_, q)| {
+                q.split('&')
+                    .filter_map(|kv| kv.split('=').next())
+                    .filter(|k| !k.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        marks.insert(format!("l:{path}?{}", keys.join(",")));
+    }
+    for (action, method, fields) in &page.forms {
+        let mut f = fields.clone();
+        f.sort();
+        marks.insert(format!("f:{method}:{action}:{}", f.join(",")));
+    }
+    let mut p = page.params.clone();
+    p.sort();
+    marks.insert(format!("p:{}", p.join(",")));
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    use std::hash::{Hash, Hasher};
+    page.status.hash(&mut h);
+    for m in marks {
+        m.hash(&mut h);
+    }
+    h.finish()
 }
 
 const MAX_VISITED: usize = 20_000;
@@ -348,6 +694,7 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
         accept_invalid_certs: true,
         cookie_store: true,
         resolve: Vec::new(),
+        ..Default::default()
     }) {
         Ok(c) => c,
         Err(e) => {
@@ -363,15 +710,43 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
     let _ = tx.send(CrawlEvent::ack(max_pages));
 
     let mut visited: HashSet<String> = HashSet::new();
-    let mut frontier: VecDeque<(Url, u32, Option<String>)> = VecDeque::new();
-    visited.insert(norm_key(&seed));
+    let mut frontier: VecDeque<Queued> = VecDeque::new();
+    // Which query parameters route content and which merely carry data; decided
+    // from the responses themselves as the crawl runs.
+    let mut routes = RouteSense::default();
+    // Client-side routes seen anywhere in the crawl, for the headless tier.
+    let mut client_routes: Vec<Url> = Vec::new();
+    visited.insert(routes.norm_key(&seed));
     frontier.push_back((seed.clone(), 0, None));
 
     let mut pages_crawled: u32 = 0;
+    // Links that name an action: reported, never requested, and the verbs that
+    // gave them away, so the crawl can say what it declined to touch.
+    let mut state_skipped: u32 = 0;
+    let mut state_verbs: Vec<String> = Vec::new();
+    // Fetches that came back with no response at all, by reason. A transport
+    // error is not an empty page, and a crawl that cannot tell the two apart
+    // reports a clean, confident, wrong result.
+    let mut fetch_errors: HashMap<String, u32> = HashMap::new();
+
+    // Before walking the links, ask whether the application will simply hand
+    // over its routing table. A crawl finds what is linked, and the routes worth
+    // attacking are often the ones nothing links to. See `routetable`.
+    harvest_routes(
+        &client,
+        &seed,
+        &params,
+        &seed_host,
+        &mut visited,
+        &mut frontier,
+        &mut routes,
+        &tx,
+    )
+    .await;
 
     while !frontier.is_empty() && pages_crawled < max_pages {
         // Take a wave of up to `tasks` URLs without exceeding the page budget.
-        let mut wave: Vec<(Url, u32, Option<String>)> = Vec::new();
+        let mut wave: Vec<Queued> = Vec::new();
         while wave.len() < tasks && pages_crawled + (wave.len() as u32) < max_pages {
             match frontier.pop_front() {
                 Some(x) => wave.push(x),
@@ -401,7 +776,23 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
                 Err(_) => continue,
             };
             pages_crawled += 1;
+            if let Some(reason) = &page.error {
+                *fetch_errors.entry(reason.clone()).or_insert(0) += 1;
+            }
             let _ = tx.send(CrawlEvent::url_fetched(&page));
+
+            // What did this page's parameter values actually serve?
+            let (release, note) = routes.observe(&page.url, structure_print(&page));
+            if let Some(n) = note {
+                let _ = tx.send(CrawlEvent::note(n));
+            }
+            for (u, d, parent) in release {
+                // Already registered in `visited` when the link was first seen -
+                // holding it back was a queueing decision, not a dedup one - so
+                // push straight to the frontier. `RouteSense` has already
+                // dropped duplicate values.
+                frontier.push_back((u, d, parent));
+            }
 
             for raw in &page.links {
                 if visited.len() >= MAX_VISITED {
@@ -411,8 +802,27 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
                     Some(c) => c,
                     None => continue,
                 };
-                let key = norm_key(&child);
+                // Never walk out of our own session.
+                if params.auth.is_some() && ends_session(&child) {
+                    continue;
+                }
+                let key = routes.norm_key(&child);
                 if !visited.insert(key) {
+                    continue;
+                }
+                // A link naming an action is a button someone drew as a link.
+                // Report it, so the operator knows the endpoint is there, and do
+                // not press it.
+                if let Some(verb) = changes_state(&child) {
+                    state_skipped += 1;
+                    if !state_verbs.contains(&verb) {
+                        state_verbs.push(verb);
+                    }
+                    let _ = tx.send(CrawlEvent::url_candidate(
+                        &child,
+                        Some(page.url.to_string()),
+                        page.depth + 1,
+                    ));
                     continue;
                 }
                 if is_static_asset(&child) {
@@ -431,11 +841,26 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
                 }
                 let child_depth = page.depth + 1;
                 let parent = Some(page.url.to_string());
-                if child_depth <= max_depth {
+                if child_depth > max_depth {
+                    let _ = tx.send(CrawlEvent::url_candidate(&child, parent, child_depth));
+                    continue;
+                }
+                // A value of a parameter we have not judged yet is held rather
+                // than queued once the probe budget is spent, and released if
+                // the parameter turns out to route content.
+                if routes.admit(&child, child_depth, &parent) {
                     frontier.push_back((child, child_depth, parent));
                     // Emitted when fetched (or drained as a candidate below).
-                } else {
-                    let _ = tx.send(CrawlEvent::url_candidate(&child, parent, child_depth));
+                }
+            }
+
+            // Client-side routes go to the headless tier rather than being fetched:
+            // a SPA answers all of them with the same shell.
+            for r in &page.client_routes {
+                if let Ok(u) = Url::parse(r)
+                    && !client_routes.contains(&u)
+                {
+                    client_routes.push(u);
                 }
             }
 
@@ -477,9 +902,47 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
         }
     }
 
+    // What the crawl declined to touch, and what it could not reach. Both are
+    // said out loud: a crawl that quietly returns less than it should is worse
+    // than one that returns nothing, because the number it returns gets believed.
+    if state_skipped > 0 {
+        state_verbs.sort();
+        let _ = tx.send(CrawlEvent::note(format!(
+            "skipped {state_skipped} link(s) that name an action rather than a page ({}). \
+             They are reported as endpoints but never requested: following one changes the \
+             application, and an application that draws its settings as links will happily let \
+             a crawler switch them.",
+            state_verbs.join(", ")
+        )));
+    }
+    let failed: u32 = fetch_errors.values().sum();
+    if failed > 0 {
+        let mut by: Vec<(&String, &u32)> = fetch_errors.iter().collect();
+        by.sort_by(|a, b| b.1.cmp(a.1));
+        let detail = by
+            .iter()
+            .map(|(r, n)| format!("{n} {r}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let share = (failed as f64 / pages_crawled.max(1) as f64 * 100.0).round() as u32;
+        let _ = tx.send(CrawlEvent::note(format!(
+            "{failed} of {pages_crawled} fetch(es) returned no response at all ({share}%): {detail}. \
+             Those pages contributed no links, no forms and no parameters, so treat this crawl's \
+             coverage as that much short of what it looks like.",
+        )));
+    }
+
     // Budget exhausted: surface the remaining known-but-unfetched URLs as candidates.
     while let Some((u, d, parent)) = frontier.pop_front() {
         let _ = tx.send(CrawlEvent::url_candidate(&u, parent, d));
+    }
+    // Values still held when the crawl ended (their parameter never got its
+    // third probe) are reported as candidates rather than dropped: undecided is
+    // not the same as uninteresting.
+    for (_, held) in std::mem::take(&mut routes.held) {
+        for (u, d, parent) in held {
+            let _ = tx.send(CrawlEvent::url_candidate(&u, parent, d));
+        }
     }
 
     // Probe API-spec locations AFTER the link crawl so the burst of probe requests
@@ -491,7 +954,114 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
         probe_specs(&client, &seed, &seed_host, &params, &tx).await;
     }
 
+    // The headless tier last, on the routes everything above discovered.
+    if params.browser {
+        run_browser_tier(&seed, &seed_host, &params, &client_routes, &tx).await;
+    }
+
     let _ = tx.send(CrawlEvent::done(pages_crawled));
+}
+
+/// Drive a real browser over the seed and the client-side routes, and report
+/// what the running application asked for.
+///
+/// Runs last, and never blocks the crawl: a node without a browser gets a note
+/// saying the tier did not run, which is a different result from it running and
+/// finding nothing. A scan that confuses those two is lying about its coverage.
+async fn run_browser_tier(
+    seed: &Url,
+    seed_host: &str,
+    params: &CrawlParams,
+    client_routes: &[Url],
+    tx: &mpsc::UnboundedSender<CrawlEvent>,
+) {
+    let Some(exe) = crate::browser::find_browser() else {
+        let _ = tx.send(CrawlEvent::note(
+            "the headless tier was requested but no browser was found. Set MACH_BROWSER to a \
+             Chrome or Chromium binary. Endpoints that only exist once the application is running \
+             were NOT looked for in this crawl."
+                .to_string(),
+        ));
+        return;
+    };
+    let no_sandbox = std::env::var("MACH_BROWSER_NO_SANDBOX").is_ok();
+    let browser = match crate::browser::Browser::launch(&exe, no_sandbox).await {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = tx.send(CrawlEvent::note(format!(
+                "the headless tier could not start a browser ({e}). Endpoints that only exist \
+                 once the application is running were NOT looked for in this crawl."
+            )));
+            return;
+        }
+    };
+    let mut cdp = match crate::browser::Cdp::connect(&browser.ws_url).await {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.send(CrawlEvent::note(format!(
+                "the headless tier could not attach to the browser ({e}). Endpoints that only \
+                 exist once the application is running were NOT looked for in this crawl."
+            )));
+            browser.shutdown().await;
+            return;
+        }
+    };
+
+    // The seed first, then the routes the static tiers recovered. Those routes
+    // are the lazily-loaded sections - the admin area, the reports section - and
+    // loading one makes the application fetch its own data, which is the whole
+    // reason to run a browser at all.
+    let mut plan: Vec<Url> = vec![seed.clone()];
+    for r in client_routes {
+        if plan.len() >= params.browser_pages {
+            break;
+        }
+        if !plan.contains(r) {
+            plan.push(r.clone());
+        }
+    }
+
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut visited = 0usize;
+    for url in &plan {
+        let Ok(v) = crate::browser::visit(&mut cdp, url.as_str()).await else {
+            continue;
+        };
+        visited += 1;
+        for (method, raw) in v.requests {
+            let Some(child) = resolve_and_scope(&raw, url, params, seed_host) else {
+                continue;
+            };
+            if !seen.insert((method.clone(), child.to_string())) {
+                continue;
+            }
+            let mut ev = CrawlEvent::url_candidate(&child, Some(url.to_string()), 1);
+            ev.method = Some(method);
+            let _ = tx.send(ev);
+        }
+        // The DOM the application built, which is where a client-rendered
+        // page's links live. They are not in the HTML the server sent.
+        if !v.dom.is_empty() {
+            let mut links = Vec::new();
+            extract_html(&v.dom, &mut links);
+            for raw in links {
+                let Some(child) = resolve_and_scope(&raw, url, params, seed_host) else {
+                    continue;
+                };
+                if !seen.insert(("GET".to_string(), child.to_string())) {
+                    continue;
+                }
+                let _ = tx.send(CrawlEvent::url_candidate(&child, Some(url.to_string()), 1));
+            }
+        }
+    }
+    browser.shutdown().await;
+    let _ = tx.send(CrawlEvent::note(format!(
+        "headless tier: loaded {visited} page(s) in a real browser and recorded {} request(s) the \
+         running application made. It navigates and never clicks, because a crawler that presses \
+         whatever it finds eventually presses \"delete\" on somebody's live data.",
+        seen.len()
+    )));
 }
 
 // ---------------------------------------------------------------------------
@@ -511,14 +1081,27 @@ async fn fetch_page(
         depth,
         parent,
         status: 0,
+        error: None,
         content_type: String::new(),
         links: Vec::new(),
         api_calls: Vec::new(),
         forms: Vec::new(),
         content_hash: String::new(),
+        client_routes: Vec::new(),
     };
 
-    match client.get(url.clone()).send().await {
+    // One retry, then the truth. A small application closing a pooled connection
+    // is ordinary and costs nothing to redo; a target that is genuinely gone says
+    // so twice. Either way the reason is kept, because a crawl that turns every
+    // transport failure into an empty page is the cheapest way to report that a
+    // site has nothing on it.
+    let mut attempt = client.get(url.clone()).send().await;
+    if attempt.is_err() {
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        attempt = client.get(url.clone()).send().await;
+    }
+
+    match attempt {
         Ok(resp) => {
             page.status = resp.status().as_u16();
             let ct = resp
@@ -557,11 +1140,46 @@ async fn fetch_page(
                         extract_js(&body, &mut page.links);
                         extract_js_calls(&body, &mut page.api_calls);
                     }
+                    // A source map is the bundle's original source, which is
+                    // what the minifier folded the readable paths out of. It is
+                    // queued rather than fetched here so it goes through the
+                    // same scope, budget and dedup as anything else.
+                    if parse_js && is_js {
+                        let here = url.as_str();
+                        if let Some(m) = crate::spa::source_map_url(here, &body) {
+                            page.links.push(m);
+                        }
+                        for c in crate::spa::chunk_urls(here, &body, SPA_CHUNK_LIMIT) {
+                            page.links.push(c);
+                        }
+                        for r in crate::spa::route_paths(&body) {
+                            if let Ok(u) = url.join(&r) {
+                                page.links.push(u.to_string());
+                                page.client_routes.push(u.to_string());
+                            }
+                        }
+                    }
+                    // A `.map` is JSON, so it never reaches the JS branch above.
+                    // Mining the sources it carries is the whole point of having
+                    // fetched it.
+                    if parse_js && path.ends_with(".map") {
+                        for src in crate::spa::sources_from_map(&body) {
+                            extract_js(&src, &mut page.links);
+                            extract_js_calls(&src, &mut page.api_calls);
+                            for r in crate::spa::route_paths(&src) {
+                                if let Ok(u) = url.join(&r) {
+                                    page.links.push(u.to_string());
+                                    page.client_routes.push(u.to_string());
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
-        Err(_) => {
+        Err(e) => {
             page.status = 0;
+            page.error = Some(fetch_reason(&e));
         }
     }
 
@@ -714,6 +1332,59 @@ fn extract_js(body: &str, out: &mut Vec<String>) {
             out.push(m.as_str().to_string());
         }
     }
+    extract_js_templates(body, out);
+}
+
+/// Template-literal URLs: `` fetch(`${API}/users/${id}/orders`) ``.
+///
+/// The other two patterns require a plain quoted string, so every URL a modern
+/// bundle builds by interpolation was invisible - and interpolation is how a
+/// bundle writes any URL with an id in it, which is most of the interesting
+/// ones. A crawl of an SPA saw the static asset paths and none of the API.
+///
+/// A leading `${...}` is a base-URL constant and is dropped; the rest has to
+/// start with `/` to be a path we can resolve. Interior interpolations become
+/// `1`, because a fetchable URL is what the frontier takes: `/users/{id}/orders`
+/// describes the endpoint better but nothing downstream of this event carries
+/// path-parameter metadata, and a URL nothing can request is worth less than one
+/// that answers.
+fn extract_js_templates(body: &str, out: &mut Vec<String>) {
+    for c in RE_JS_TEMPLATE.captures_iter(body) {
+        let Some(raw) = c.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+        if let Some(u) = template_to_path(raw) {
+            out.push(u);
+        }
+    }
+}
+
+/// `${API}/users/${id}/orders` -> `/users/1/orders`. `None` when the result is
+/// not a path we could ask for.
+fn template_to_path(raw: &str) -> Option<String> {
+    let mut s = raw.trim();
+    // A leading interpolation is a base-URL constant, not a segment.
+    if s.starts_with("${") {
+        let close = s.find('}')?;
+        s = &s[close + 1..];
+    }
+    if !s.starts_with('/') {
+        return None;
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(at) = rest.find("${") {
+        out.push_str(&rest[..at]);
+        let close = rest[at..].find('}')? + at;
+        out.push('1');
+        rest = &rest[close + 1..];
+    }
+    out.push_str(rest);
+    // Anything still carrying JS syntax was not a URL to begin with.
+    if out.contains(['$', '{', '}', ' ', '`']) || out.len() < 2 {
+        return None;
+    }
+    Some(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -735,6 +1406,176 @@ fn normalize_seed(seed: &str) -> Option<Url> {
 
 /// Resolve a raw link against the page URL and apply scope rules. Returns the
 /// canonical (fragment-stripped) URL if it should be part of the map.
+/// Does this URL end the session we are crawling with?
+///
+/// An authenticated crawl that follows a logout link destroys its own session
+/// and silently finishes the job as an anonymous one. Nothing errors: the
+/// remaining pages come back as the login form, they crawl fine, and the run
+/// looks successful while covering none of the authenticated surface. Measured
+/// against DVWA and bWAPP, that is exactly what happened - the injection pass
+/// that followed found 2 and 1 findings where it had found 9 and 7.
+///
+/// Only consulted when the crawl carries credentials. Without them there is no
+/// Reduce a transport failure to a short, countable reason.
+///
+/// The wording matters more than it looks. "141 fetches returned nothing" sends
+/// someone to read the crawler; "141 fetches failed to connect: TLS" sends them
+/// to the one link that switched the session to https on a plaintext port, which
+/// is where the fault actually was.
+fn fetch_reason(e: &reqwest::Error) -> String {
+    if e.is_timeout() {
+        return "timed out".into();
+    }
+    if e.is_redirect() {
+        return "too many redirects".into();
+    }
+    if e.is_connect() {
+        // A redirect onto https against a port that speaks plain HTTP fails here,
+        // and it is worth naming because a crawl can cause it to itself.
+        let s = e.to_string().to_ascii_lowercase();
+        if s.contains("tls") || s.contains("ssl") || s.contains("handshake") {
+            return "TLS handshake failed".into();
+        }
+        return "could not connect".into();
+    }
+    if e.is_body() || e.is_decode() {
+        return "response body unreadable".into();
+    }
+    "request failed".into()
+}
+
+/// Verbs that name an action rather than a destination. A link carrying one of
+/// these is a button someone drew as a link, and a crawler must not press it.
+const STATE_VERBS: &[&str] = &[
+    "toggle",
+    "enable",
+    "disable",
+    "activate",
+    "deactivate",
+    "delete",
+    "destroy",
+    "remove",
+    "reset",
+    "revoke",
+    "purge",
+    "truncate",
+    "wipe",
+    "shutdown",
+    "restart",
+    "reboot",
+    "install",
+    "uninstall",
+    "impersonate",
+    "approve",
+    "reject",
+    "publish",
+    "unpublish",
+    "ban",
+    "unban",
+    "lock",
+    "unlock",
+    "archive",
+    "logout",
+    "signout",
+    "logoff",
+    "deauth",
+    "drop",
+];
+
+/// Query keys whose VALUE names what to do rather than what to show. These are
+/// the front controller's own dispatch parameters; everywhere else a value is
+/// content and must not be read as an instruction.
+const DISPATCH_KEYS: &[&str] = &[
+    "do", "action", "act", "op", "cmd", "task", "mode", "func", "function", "method", "page",
+    "route", "view", "step", "event",
+];
+
+/// Path segments that are an action on their own, whatever the query says. Kept
+/// deliberately short: `/password/reset` renders a form and is worth crawling,
+/// while `/logout` is not, and only the unambiguous ones belong here.
+const STATE_PATHS: &[&str] = &[
+    "logout", "signout", "log-out", "sign-out", "logoff", "deauth", "destroy", "truncate",
+    "shutdown",
+];
+
+/// Split on anything that is not a letter or digit, so `toggle-enforce-ssl`
+/// yields `toggle`, and `password_resets` yields `resets` rather than `reset`.
+fn verb_tokens(s: &str) -> impl Iterator<Item = &str> {
+    s.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+}
+
+/// Does following this link change the application rather than navigate it?
+/// Returns the word that gave it away, for the note the operator reads.
+///
+/// This exists because of a measured failure, not a theory. Mutillidae draws its
+/// settings as links: one GET to `index.php?do=toggle-enforce-ssl` puts the
+/// session into SSL-enforced mode, after which every page 302s to `https` on a
+/// port that speaks only HTTP, so every later fetch dies in the TLS handshake.
+/// A crawl of 223 pages came back with 141 of them empty, and the scan that
+/// followed never saw the two forms carrying the answer key. The neighbouring
+/// link, `do=toggle-security`, raises the security level: the crawler hardens
+/// the very target it is about to test.
+///
+/// The rule is narrow on purpose. A verb in the QUERY is the classic
+/// GET-as-a-button (`?action=delete`, `?do=reset`); a verb in the PATH is
+/// usually just a noun in a URL, so only whole segments that cannot be anything
+/// else count. The link is still reported as a discovered endpoint. Knowing a
+/// destructive endpoint exists is worth having. Requesting it is not ours to do.
+fn changes_state(url: &Url) -> Option<String> {
+    for (k, v) in url.query_pairs() {
+        // A key that is itself a verb is the whole message: `?logout=1`.
+        for tok in verb_tokens(&k) {
+            let t = tok.to_ascii_lowercase();
+            if STATE_VERBS.contains(&t.as_str()) {
+                return Some(t);
+            }
+        }
+        // A verb in a VALUE only counts under a key that dispatches actions.
+        // Reading every value would cost real pages: `?category=archive` and
+        // `?tab=locked` are content, and a crawler that skips them is worse than
+        // one that never had the rule. `?do=toggle-security` is not content.
+        if DISPATCH_KEYS.contains(&k.to_ascii_lowercase().as_str()) {
+            for tok in verb_tokens(&v) {
+                let t = tok.to_ascii_lowercase();
+                if STATE_VERBS.contains(&t.as_str()) {
+                    return Some(t);
+                }
+            }
+        }
+    }
+    for seg in url.path().split('/') {
+        let s = seg
+            .trim_end_matches(".php")
+            .trim_end_matches(".aspx")
+            .to_ascii_lowercase();
+        if STATE_PATHS.contains(&s.as_str()) {
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// session to protect and a logout page is an ordinary page.
+fn ends_session(url: &Url) -> bool {
+    const MARKS: &[&str] = &[
+        "logout",
+        "log-out",
+        "log_out",
+        "signout",
+        "sign-out",
+        "sign_out",
+        "logoff",
+        "log-off",
+        "deauth",
+        "session/end",
+        "session/destroy",
+    ];
+    let path = url.path().to_ascii_lowercase();
+    let query = url.query().unwrap_or("").to_ascii_lowercase();
+    MARKS.iter().any(|m| path.contains(m) || query.contains(m))
+}
+
 fn resolve_and_scope(raw: &str, base: &Url, params: &CrawlParams, seed_host: &str) -> Option<Url> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -790,24 +1631,6 @@ fn resolve_and_scope(raw: &str, base: &Url, params: &CrawlParams, seed_host: &st
     }
 
     Some(url)
-}
-
-/// A canonical dedup key: scheme, host, path, and sorted query keys (values
-/// dropped so /x?id=1 and /x?id=2 collapse to the same endpoint).
-fn norm_key(url: &Url) -> String {
-    let scheme = url.scheme();
-    let host = url.host_str().unwrap_or("");
-    let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
-    let path = url.path().trim_end_matches('/');
-    let mut keys: Vec<String> = url.query_pairs().map(|(k, _)| k.into_owned()).collect();
-    keys.sort();
-    keys.dedup();
-    let q = if keys.is_empty() {
-        String::new()
-    } else {
-        format!("?{}", keys.join("&"))
-    };
-    format!("{scheme}://{host}{port}{path}{q}")
 }
 
 fn query_keys(url: &Url) -> Vec<String> {
@@ -867,5 +1690,285 @@ mod normalize_seed_tests {
     fn empty_is_none() {
         assert!(normalize_seed("").is_none());
         assert!(normalize_seed("   ").is_none());
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::{Url, ends_session};
+
+    #[test]
+    fn logout_shapes_are_refused() {
+        for u in [
+            "http://h/logout.php",
+            "http://h/users/sign_out",
+            "http://h/account/log-out",
+            "http://h/index.php?do=logout",
+            "http://h/auth/signout?next=/",
+            "http://h/session/destroy",
+        ] {
+            assert!(
+                ends_session(&Url::parse(u).unwrap()),
+                "{u} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_pages_are_not() {
+        for u in [
+            "http://h/products/logoutdoor-furniture",
+            "http://h/blog/how-we-handle-sessions",
+            "http://h/login",
+            "http://h/index.php?page=user-info.php",
+        ] {
+            let refused = ends_session(&Url::parse(u).unwrap());
+            if u.contains("logoutdoor") {
+                // A substring match costs us one page on a site that sells
+                // outdoor furniture. Recorded rather than hidden: losing a
+                // product page is cheaper than losing the whole session.
+                assert!(refused);
+            } else {
+                assert!(!refused, "{u} should be crawled");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod route_sense_tests {
+    use super::*;
+
+    fn u(s: &str) -> Url {
+        Url::parse(s).unwrap()
+    }
+
+    fn page(url: &str, links: &[&str], status: u16) -> Page {
+        Page {
+            url: u(url),
+            depth: 0,
+            parent: None,
+            status,
+            error: None,
+            content_type: "text/html".into(),
+            links: links.iter().map(|l| l.to_string()).collect(),
+            params: Vec::new(),
+            api_calls: Vec::new(),
+            forms: Vec::new(),
+            content_hash: String::new(),
+            client_routes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_parameter_serving_one_template_collapses() {
+        // /item?id=1..3 render the same page with different text: one endpoint.
+        let mut r = RouteSense::default();
+        for id in ["1", "2", "3"] {
+            let url = u(&format!("http://h/item?id={id}"));
+            assert!(
+                r.admit(&url, 1, &None),
+                "probe value {id} should be crawled"
+            );
+            let p = page(url.as_str(), &["/item?id=9", "/home"], 200);
+            r.observe(&url, structure_print(&p));
+        }
+        assert_eq!(
+            r.role(&param_key(&u("http://h/item?id=4"), "id")),
+            ParamRole::Data
+        );
+        // Now the value stops mattering, so a fourth id is the same endpoint.
+        assert_eq!(
+            r.norm_key(&u("http://h/item?id=4")),
+            r.norm_key(&u("http://h/item?id=5"))
+        );
+    }
+
+    #[test]
+    fn a_parameter_serving_different_pages_is_followed() {
+        let mut r = RouteSense::default();
+        let probes = [
+            ("home.php", vec!["/index.php?page=a", "/logout.php"]),
+            ("login.php", vec!["/index.php?page=b"]),
+            (
+                "lookup.php",
+                vec!["/index.php?page=c", "/help.php", "/x.php"],
+            ),
+        ];
+        // Everything discovered past the probe budget is held, not dropped.
+        for extra in 0..40 {
+            let url = u(&format!("http://h/index.php?page=extra{extra}.php"));
+            r.admit(&url, 1, &None);
+        }
+        let mut released = 0;
+        for (val, links) in probes {
+            let url = u(&format!("http://h/index.php?page={val}"));
+            let p = page(url.as_str(), &links, 200);
+            let (rel, _note) = r.observe(&url, structure_print(&p));
+            released += rel.len();
+        }
+        assert_eq!(
+            r.role(&param_key(&u("http://h/index.php?page=z"), "page")),
+            ParamRole::Routing
+        );
+        assert!(
+            released >= 37,
+            "held values must be released, got {released}"
+        );
+        assert_ne!(
+            r.norm_key(&u("http://h/index.php?page=a.php")),
+            r.norm_key(&u("http://h/index.php?page=b.php"))
+        );
+    }
+
+    #[test]
+    fn the_probe_budget_bounds_the_cost() {
+        let mut r = RouteSense::default();
+        let admitted = (0..50)
+            .filter(|i| r.admit(&u(&format!("http://h/x?q=v{i}")), 1, &None))
+            .count();
+        assert_eq!(admitted, ROUTE_PROBE_VALUES);
+    }
+
+    #[test]
+    fn structure_ignores_content_but_not_shape() {
+        let a = page("http://h/a", &["/one", "/two"], 200);
+        let b = page("http://h/b", &["/one", "/two"], 200);
+        let c = page("http://h/c", &["/one", "/two", "/three"], 200);
+        assert_eq!(structure_print(&a), structure_print(&b));
+        assert_ne!(structure_print(&a), structure_print(&c));
+    }
+}
+
+#[cfg(test)]
+mod template_tests {
+    use super::*;
+
+    fn found(js: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        extract_js_templates(js, &mut out);
+        out
+    }
+
+    #[test]
+    fn an_interpolated_api_url_becomes_a_fetchable_path() {
+        let js = "fetch(`${API_BASE}/users/${userId}/orders`)";
+        assert_eq!(found(js), vec!["/users/1/orders".to_string()]);
+    }
+
+    #[test]
+    fn a_plain_template_path_survives_unchanged() {
+        assert_eq!(
+            found("axios.get(`/api/v2/profile`)"),
+            vec!["/api/v2/profile"]
+        );
+    }
+
+    #[test]
+    fn several_interpolations_all_become_values() {
+        let js = "`/orgs/${org}/repos/${repo}/issues`";
+        assert_eq!(found(js), vec!["/orgs/1/repos/1/issues".to_string()]);
+    }
+
+    #[test]
+    fn a_template_that_is_not_a_path_is_not_offered_as_one() {
+        // Prose, a CSS rule and a relative reference are all backtick strings
+        // and none of them is a URL we could request.
+        assert!(found("`hello ${name}, welcome`").is_empty());
+        assert!(found("`translate(${x}px)`").is_empty());
+        assert!(found("`users/${id}`").is_empty());
+    }
+
+    #[test]
+    fn the_old_patterns_still_do_their_job() {
+        let mut out = Vec::new();
+        extract_js(
+            r#"fetch("/api/plain"); const p = "/static/app.js";"#,
+            &mut out,
+        );
+        assert!(out.iter().any(|u| u == "/api/plain"));
+        assert!(out.iter().any(|u| u == "/static/app.js"));
+    }
+
+    #[test]
+    fn action_links_are_not_followed() {
+        // The link that started this: one GET and the whole crawl is talking to a
+        // port that does not speak TLS.
+        for u in [
+            "http://h/index.php?do=toggle-enforce-ssl&page=home.php",
+            "http://h/index.php?do=toggle-security&page=home.php",
+            "http://h/app?action=delete&id=7",
+            "http://h/admin?op=reset",
+            "http://h/x?logout=1",
+            "http://h/logout",
+            "http://h/account/signout",
+            "http://h/index.php?page=logout.php",
+        ] {
+            assert!(
+                changes_state(&Url::parse(u).unwrap()).is_some(),
+                "should not be followed: {u}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_pages_are_still_followed() {
+        // Every one of these has a verb somewhere in it and is a page, not a
+        // button. A guard that blocks these costs more coverage than it saves.
+        for u in [
+            "http://h/password/reset",             // renders a form
+            "http://h/password_resets",            // RailsGoat's answer key lives here
+            "http://h/posts/how-to-delete-a-user", // a verb inside a slug
+            "http://h/clearance/policy",           // "clear" is not a token here
+            "http://h/index.php?page=user-info.php",
+            "http://h/index.php?page=dns-lookup.php",
+            "http://h/products?sort=name&page=2",
+            "http://h/archives/2026", // plural noun, not the verb
+            "http://h/api/v1/locks",  // plural noun
+        ] {
+            assert_eq!(
+                changes_state(&Url::parse(u).unwrap()),
+                None,
+                "should still be crawled: {u}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_verb_is_named_so_the_note_can_say_why() {
+        assert_eq!(
+            changes_state(&Url::parse("http://h/i.php?do=toggle-security").unwrap()),
+            Some("toggle".to_string())
+        );
+    }
+
+    #[test]
+    fn a_verb_in_an_ordinary_value_is_content() {
+        // These cost real pages if the rule reads every value as an instruction.
+        for u in [
+            "http://h/posts?category=archive",
+            "http://h/ui?tab=lock",
+            "http://h/items?status=archive&sort=date",
+            "http://h/search?q=how+to+delete+a+user",
+            "http://h/index.php?page=2",
+        ] {
+            assert_eq!(
+                changes_state(&Url::parse(u).unwrap()),
+                None,
+                "should still be crawled: {u}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_verb_under_a_dispatch_key_is_still_an_action() {
+        for u in [
+            "http://h/index.php?do=toggle-security",
+            "http://h/i.php?action=delete&id=1",
+            "http://h/index.php?page=logout.php",
+            "http://h/x?mode=reset",
+        ] {
+            assert!(changes_state(&Url::parse(u).unwrap()).is_some(), "{u}");
+        }
     }
 }

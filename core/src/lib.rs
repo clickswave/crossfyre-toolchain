@@ -418,22 +418,76 @@ async fn run_operation(cmd: serde_json::Value, ctx: OpCtx) {
             .send()
             .await;
 
-        let claimed = match claim_res {
+        // Losing the race and failing to ask are NOT the same thing, and treating
+        // them the same is what made a broken claim invisible.
+        //
+        // Both used to collapse into `false`, and the op was then dropped without
+        // a word. Losing the race is normal: another node runs it. A 401, a 500 or
+        // a dead socket means NOBODY runs it, and because the message is acked
+        // once this function returns, the operation vanished: `claimed_by` stayed
+        // null, no result ever arrived, and the workflow sat at "running" forever
+        // with nothing anywhere saying why. Single-node ops are `pre_claimed` and
+        // never come through here, so the whole failure mode hid in the one path
+        // that only multi-node scans exercise.
+        enum ClaimOutcome {
+            Won,
+            Lost,
+            Failed(String),
+        }
+        let outcome = match claim_res {
             Ok(res) if res.status().is_success() => {
                 let body: serde_json::Value = res.json().await.unwrap_or_default();
-                body["data"]["claimed"].as_bool().unwrap_or(false)
+                if body["data"]["claimed"].as_bool().unwrap_or(false) {
+                    ClaimOutcome::Won
+                } else {
+                    ClaimOutcome::Lost
+                }
             }
-            _ => false,
+            Ok(res) => {
+                let code = res.status();
+                let body = res.text().await.unwrap_or_default();
+                ClaimOutcome::Failed(format!("HTTP {code}: {}", body.trim()))
+            }
+            Err(e) => ClaimOutcome::Failed(e.to_string()),
         };
 
         use std::sync::atomic::Ordering;
-        if !claimed {
-            // Counter still tracked for the periodic
-            // snapshot below; per-event log dropped.
-            CLAIM_MISS.fetch_add(1, Ordering::Relaxed);
-            return;
+        match outcome {
+            ClaimOutcome::Won => {
+                CLAIM_OK.fetch_add(1, Ordering::Relaxed);
+            }
+            ClaimOutcome::Lost => {
+                // Someone else is running it. Nothing to say and nothing to do.
+                CLAIM_MISS.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            ClaimOutcome::Failed(why) => {
+                CLAIM_MISS.fetch_add(1, Ordering::Relaxed);
+                let short = workflow_id.get(..8).unwrap_or(&workflow_id);
+                eprintln!(
+                    "[scan {short}] claim FAILED for op {op_id}: {why}. \
+                     This node cannot run it and no other node will be told to; \
+                     reporting it so the workflow does not wait forever."
+                );
+                // Tell the controller. Without this the op is simply gone: the
+                // message is acked on return, so nothing redelivers it and
+                // nothing times it out. Reporting a completion with no findings
+                // lets the workflow finish instead of hanging, and the log line
+                // above says why it found nothing.
+                let failed = serde_json::json!({
+                    "type": "operation_completed",
+                    "operation_id": op_id,
+                    "workflow_id": workflow_id,
+                    "found_count": 0,
+                    "node_id": node_id,
+                    "error": format!("claim failed: {why}"),
+                });
+                let _ = pub_clone
+                    .publish(status_subj.clone(), failed.to_string().into())
+                    .await;
+                return;
+            }
         }
-        CLAIM_OK.fetch_add(1, Ordering::Relaxed);
     } else if pre_claimed {
         use std::sync::atomic::Ordering;
         CLAIM_OK.fetch_add(1, Ordering::Relaxed);
@@ -456,6 +510,8 @@ async fn run_operation(cmd: serde_json::Value, ctx: OpCtx) {
         ops::web_crawl::handle(env).await;
     } else if op_type.starts_with("subdomain-enum-") {
         ops::subdomain_enum::handle(env).await;
+    } else if op_type.starts_with("takeover-") {
+        ops::takeover::handle(env).await;
     } else if op_type.starts_with("origin-discovery-") {
         ops::origin_discovery::handle(env).await;
     } else if op_type.starts_with("network-scan-") {
@@ -1855,7 +1911,45 @@ pub async fn run_daemon(force: bool, paths: &NodePaths) -> Result<(), Box<dyn st
     // node per api_key" - so if it returns valid=false we abort instead of
     // falling through to a cached config (which would let two daemons race
     // for the same NATS subjects).
-    if let Err(e) = refresh_node_state(&mut config, &config_path, &paths.network_dir, force).await {
+    // Retry a control plane that is not up YET, rather than treating it as fatal.
+    //
+    // WHY: on a reboot the node service and the control plane start together, and
+    // the node usually wins the race. It used to call exit(1) on the resulting
+    // connection error; the supervisor then parked it as dead and "held until its
+    // config changes", i.e. forever. systemd never intervened either, because
+    // Restart=on-failure watches the SUPERVISOR, which stayed perfectly healthy
+    // holding a corpse. Net effect: every reboot silently killed the fleet until a
+    // human ran `systemctl restart` by hand, and the dashboard just said 0 nodes
+    // online without saying why.
+    //
+    // Only genuinely transient failures are retried. A deleted node, a revoked key
+    // or another daemon holding the same api_key are permanent and still exit
+    // immediately: retrying those would spin forever hiding a real problem.
+    const AUTH_RETRY_WINDOW_SECS: u64 = 600;
+    let auth_started = std::time::Instant::now();
+    let mut backoff = std::time::Duration::from_secs(2);
+    let refresh_result = loop {
+        match refresh_node_state(&mut config, &config_path, &paths.network_dir, force).await {
+            Ok(()) => break Ok(()),
+            Err(e) => {
+                let transient = e
+                    .downcast_ref::<reqwest::Error>()
+                    .map(|re| re.is_connect() || re.is_timeout() || re.is_request())
+                    .unwrap_or(false);
+                if !transient || auth_started.elapsed().as_secs() >= AUTH_RETRY_WINDOW_SECS {
+                    break Err(e);
+                }
+                eprintln!(
+                    "  Control plane not reachable yet ({e}); retrying in {}s",
+                    backoff.as_secs()
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
+            }
+        }
+    };
+
+    if let Err(e) = refresh_result {
         if e.downcast_ref::<NodeDeleted>().is_some() {
             eprintln!(
                 "\n  Node {} not found on the server (deleted in the dashboard, or its key was revoked).",

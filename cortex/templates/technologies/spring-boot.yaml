@@ -20,3 +20,25 @@ http:
           - "Whitelabel Error Page"
           - "There was an unexpected error"
         condition: and
+  # An API-only Spring Boot service has no Whitelabel page: its default error
+  # handler answers JSON. That shape - timestamp, status, error and path in one
+  # body - is Spring's, and it is what most Spring services in front of an API
+  # actually return, so without this the framework was invisible on exactly the
+  # deployments worth fingerprinting.
+  - method: GET
+    path:
+      - "{{BaseURL}}/this-path-should-not-exist-404"
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: body
+        words:
+          - '"timestamp"'
+          - '"status"'
+          - '"error"'
+          - '"path"'
+        condition: and
+      - type: word
+        part: header
+        words:
+          - "application/json"

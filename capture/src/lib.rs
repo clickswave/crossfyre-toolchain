@@ -11,11 +11,15 @@
 //! CA machinery is identical either way, which is the point: install one CA, trust every capture
 //! surface, and never diverge the certificate behavior between desktop and mobile.
 
+pub mod body;
+pub mod config;
 pub mod flow;
 pub mod reduce;
 
-pub use flow::serve_mitm_flow;
-pub use reduce::{TraceEvent, body_field_names, redact_url};
+pub use config::CaptureConfig;
+pub mod sni;
+pub use flow::{FlowOutcome, serve_mitm_flow};
+pub use reduce::{FullExchange, TraceEvent, body_field_names, redact_url};
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -230,6 +234,14 @@ pub trait InterceptGate: Send + Sync {
 pub struct CaptureCfg {
     pub full: bool,
     pub gate: Option<Arc<dyn InterceptGate>>,
+    /// Hosts to carry through WITHOUT interception (exact host or any subdomain).
+    ///
+    /// Interception is not free: a host that pins its certificate refuses ours
+    /// and the request fails, so capturing it does not just miss the traffic, it
+    /// breaks the feature under test. Relaying those hosts untouched keeps the
+    /// app working while everything else is still captured, which beats the
+    /// only alternative available before this, which was excluding the whole app.
+    pub bypass_hosts: Vec<String>,
 }
 
 impl std::fmt::Debug for CaptureCfg {
@@ -237,6 +249,7 @@ impl std::fmt::Debug for CaptureCfg {
         f.debug_struct("CaptureCfg")
             .field("full", &self.full)
             .field("gate", &self.gate.is_some())
+            .field("bypass_hosts", &self.bypass_hosts.len())
             .finish()
     }
 }

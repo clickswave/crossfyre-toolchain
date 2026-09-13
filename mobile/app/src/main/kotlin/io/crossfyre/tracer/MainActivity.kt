@@ -1,0 +1,1529 @@
+package io.crossfyre.tracer
+
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.ApplicationInfo
+import android.content.pm.PackageInstaller
+import android.net.Uri
+import android.net.VpnService
+import android.os.Build
+import android.os.Bundle
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
+import java.io.File
+import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
+import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
+
+/**
+ * Control surface for the Crossfyre mobile tracer. Pair to a workspace (QR), install the on-device CA,
+ * pick apps (or whole device), start/stop capture, and - the important part - watch a LIVE status panel
+ * that shows exactly what capture is doing: flows seen, certificate rejections (the tell-tale of an app
+ * that does not trust the CA), shapes captured, and shapes shipped. Styled to match the crossfyre web app.
+ */
+class MainActivity : ComponentActivity() {
+
+    private var running by mutableStateOf(false)
+    private var paired by mutableStateOf(false)
+    private val selectedApps = mutableStateListOf<String>()
+    // "all" = whole device, "only" = capture just selectedApps, "except" = capture all but selectedApps
+    // (the escape hatch for certificate-pinned apps that break under MITM).
+    private var scopeMode by mutableStateOf(TracerVpnService.MODE_ALL)
+
+    private val vpnConsent =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+            launchService(); running = true
+        }
+
+    // A scanned pairing waiting for the user to confirm the host. Scanning is not
+    // consent: this value decides where captured traffic goes and where a patched
+    // APK is fetched from, so the user is shown the host before anything is saved.
+    private var pendingPair by mutableStateOf<Pairing?>(null)
+    private var pairError by mutableStateOf("")
+
+    private val scan = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
+        if (res.resultCode == RESULT_OK) {
+            res.data?.getStringExtra(ScannerActivity.EXTRA_QR)?.let {
+                val parsed = Pairing.parseQr(it)
+                if (parsed == null) {
+                    pairError = "That QR code is not a valid Crossfyre pairing (it must use https)."
+                } else {
+                    pairError = ""
+                    pendingPair = parsed
+                }
+            }
+        }
+    }
+
+    /** Commit the pairing the user just approved. */
+    private fun confirmPairing() {
+        pendingPair?.let {
+            Pairing.persist(this, it)
+            paired = true
+        }
+        pendingPair = null
+    }
+
+    // Server-assisted patch flow state.
+    private var patching by mutableStateOf(false)
+    private var patchStatus by mutableStateOf("")
+    private var patchProgress by mutableStateOf<Float?>(0f) // 0..1 across the whole flow
+    private var creepJob: kotlinx.coroutines.Job? = null
+    private var pendingInstall: List<File>? = null
+    /** The last successfully patched APK(s), kept so they can be exported. */
+    private var exportable by mutableStateOf<List<File>?>(null)
+    private var exportPkg: String? = null
+    private var pendingPkg: String? = null
+    private val INSTALL_ACTION = "io.crossfyre.tracer.INSTALL_RESULT"
+    private val UNINSTALL_ACTION = "io.crossfyre.tracer.UNINSTALL_RESULT"
+
+    // Uninstall the original (its signature differs from our patched build) via PackageInstaller, and
+    // chain the install off the uninstall SUCCESS - not a fire-and-forget intent - so the old package
+    // is definitely gone first. Otherwise the install is treated as an UPDATE and fails with
+    // INSTALL_FAILED_UPDATE_INCOMPATIBLE (signatures do not match).
+    private fun requestUninstall(pkg: String) {
+        val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+        val pi = PendingIntent.getBroadcast(this, 2, Intent(UNINSTALL_ACTION).setPackage(packageName), flags)
+        packageManager.packageInstaller.uninstall(pkg, pi.intentSender)
+    }
+
+    // Handles both the uninstall and the install PackageInstaller results (a shared receiver).
+    private val installReceiver = object : BroadcastReceiver() {
+        override fun onReceive(c: Context, i: Intent) {
+            val status = i.getIntExtra(PackageInstaller.EXTRA_STATUS, -1)
+            if (status == PackageInstaller.STATUS_PENDING_USER_ACTION) {
+                // Only ever launch a handed-over Intent while WE have a patch in
+                // flight. Belt and braces with RECEIVER_NOT_EXPORTED: launching
+                // an arbitrary Intent from this context is the valuable half of
+                // an intent-redirection bug, so it should not be reachable at a
+                // moment when no install is pending either.
+                if (!patching) return
+                @Suppress("DEPRECATION")
+                val confirm = i.getParcelableExtra<Intent>(Intent.EXTRA_INTENT)
+                confirm?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                runCatching { startActivity(confirm) }
+                return
+            }
+            val msg = i.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE)
+            if (i.action == UNINSTALL_ACTION) {
+                if (status == PackageInstaller.STATUS_SUCCESS) {
+                    patchStatus = "Installing the patched build…"
+                    patchProgress = 0.995f
+                    pendingInstall?.let { doInstall(it) }
+                } else {
+                    patching = false
+                    patchStatus = "Couldn't remove the old app: ${msg ?: "cancelled"}"
+                }
+            } else { // INSTALL_ACTION
+                if (status == PackageInstaller.STATUS_SUCCESS) {
+                    patching = false
+                    patchProgress = 1f
+                    // Remember WHICH certificate this build trusts. Without it the
+                    // app cannot later tell a working patch from one invalidated by
+                    // a certificate reset, which is the difference between "ready"
+                    // and a TLS alert at capture time.
+                    // Hold on to what we built. The patched APK is the artefact of
+                    // this whole operation, and until now it was written to cache,
+                    // installed, and then unreachable: no way to keep it, hand it
+                    // to a colleague, or attach it to a report.
+                    exportable = pendingInstall
+                    exportPkg = pendingPkg
+                    patchingPkg?.let { pkg ->
+                        caFingerprint()?.let {
+                            PatchPrefs.record(
+                                this@MainActivity, pkg,
+                                PatchPrefs.join(it, signerOf(pkg)),
+                            )
+                        }
+                    }
+                    patchStatus = "Patched + installed. Start capture, then use the app: it trusts this device's certificate directly, so there is nothing to install."
+                } else {
+                    patching = false
+                    patchStatus = "Install failed: ${msg ?: "unknown"}"
+                }
+            }
+        }
+    }
+
+    /** The package currently being patched, so success can be attributed to it. */
+    private var patchingPkg: String? = null
+    /** The running patch, so it can be cancelled from the progress dialog.
+     *
+     * Compose state, because the Cancel button's presence follows it: once the
+     * coroutine hands off to the system installer there is nothing left for us
+     * to cancel, and offering a button that cannot do anything is worse than
+     * offering none.
+     */
+    private var patchJob by mutableStateOf<kotlinx.coroutines.Job?>(null)
+
+    /** Stop a running patch. Teardown lives in the coroutine's cancellation
+     *  handler so it runs no matter who cancels or why. */
+    /** Save the last patched APK somewhere the user picks. */
+    private fun exportPatchedApk() {
+        val files = exportable
+        if (files.isNullOrEmpty()) {
+            patchStatus = "Nothing to export yet: patch an app first."
+            return
+        }
+        val name = (exportPkg ?: "patched").substringAfterLast('.')
+        apkSave.launch("$name-patched.apk")
+    }
+
+    private fun cancelPatch() {
+        creepJob?.cancel(); creepJob = null
+        patchJob?.cancel()
+    }
+
+    private fun patchApp(pkg: String) {
+        patchingPkg = pkg
+        // buildPatched clears the scratch directory on entry, so anything left
+        // exportable from a previous patch is about to stop existing. Drop the
+        // offer now rather than letting it fail when taken up.
+        exportable = null
+        exportPkg = null
+        val pair = Pairing.load(this)
+        if (pair == null) { patchStatus = "Pair a workspace first."; return }
+        val ca = ensureCaFile()
+        if (ca == null) { patchStatus = "Could not create this device's certificate."; return }
+        patching = true
+        patchStatus = "Starting…"
+        patchProgress = null
+        patchJob = lifecycleScope.launch {
+            try {
+                val patched = Patcher.buildPatched(applicationContext, pkg, pair.apiUrl, pair.workflowId, pair.token, ca) { step ->
+                    patchStatus = step.label
+                    val f = step.fraction
+                    if (f != null) {
+                        // A real measured phase (upload/download): take it, stop any server-phase creep.
+                        creepJob?.cancel(); creepJob = null
+                        if (f > (patchProgress ?: 0f)) patchProgress = f // monotonic
+                    } else if (step.label.startsWith("Patching") && creepJob == null) {
+                        // Server phase has no feed: creep the same bar 0.45 -> 0.54 so it keeps moving.
+                        creepJob = lifecycleScope.launch {
+                            var v = (patchProgress ?: 0.45f).coerceAtLeast(0.45f)
+                            while (v < 0.54f) { delay(700); v += 0.01f; patchProgress = v }
+                        }
+                    }
+                }
+                creepJob?.cancel(); creepJob = null
+                pendingInstall = patched
+                pendingPkg = pkg
+                patchStatus = "Uninstalling the old build (you'll re-login), then installing the patched one…"
+                patchProgress = 0.99f
+                requestUninstall(pkg)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // Cancelling is a normal outcome, not a failure, and must not
+                // read like one. Leave nothing half-set: no pending install, no
+                // package waiting to be attributed, no stale progress bar.
+                creepJob?.cancel(); creepJob = null
+                patching = false
+                patchProgress = null
+                pendingInstall = null
+                pendingPkg = null
+                patchingPkg = null
+                Patcher.discardWorkspace(applicationContext)
+                patchStatus = "Patch cancelled. Nothing was installed or changed."
+                throw e
+            } catch (e: Exception) {
+                creepJob?.cancel(); creepJob = null
+                patching = false
+                patchProgress = null
+                patchingPkg = null
+                Patcher.discardWorkspace(applicationContext)
+                // e.message is null for plenty of exceptions, and "Patch failed: null" tells
+                // nobody anything. Patcher passes the server's own sentence through here.
+                patchStatus = "Patch failed: " + (e.message?.takeIf { it.isNotBlank() }
+                    ?: "something went wrong on the way to the server.")
+            } finally {
+                patchJob = null
+            }
+        }
+    }
+
+    private fun doInstall(splits: List<File>) {
+        val pi = packageManager.packageInstaller
+        val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL)
+        pendingPkg?.let { params.setAppPackageName(it) }
+        val sid = pi.createSession(params)
+        pi.openSession(sid).use { session ->
+            for (apk in splits) {
+                session.openWrite(apk.name, 0, apk.length()).use { out ->
+                    apk.inputStream().use { it.copyTo(out) }
+                    session.fsync(out)
+                }
+            }
+            val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+            val pending = PendingIntent.getBroadcast(this, sid, Intent(INSTALL_ACTION).setPackage(packageName), flags)
+            session.commit(pending.intentSender)
+        }
+        patchStatus = "Confirm the install…"
+    }
+
+    private var caStatus by mutableStateOf("")
+    // Shown after a certificate RESET: Android still trusts the old one until
+    // the user removes it by hand, and the key it vouched for is now gone.
+    private var showRemoveCaHint by mutableStateOf(false)
+    // Device-side consent for full capture; see FullCapturePrefs.
+    private var allowFullCapture by mutableStateOf(false)
+    /** Non-empty while a "this will not decrypt" warning is on screen. */
+    private var preflightWarnings by mutableStateOf<List<String>>(emptyList())
+    private var preflightAcknowledged = false
+    private var showResetCa by mutableStateOf(false)
+    /** Package whose details are on screen, if any. */
+    private var inspectPkg by mutableStateOf<String?>(null)
+    private var pendingCaPem: String? = null
+    /** Write the patched APK wherever the user chooses.
+     *
+     * A patch takes minutes of server time and produces the one artefact worth
+     * keeping: an APK of the target app that a proxy can read. It used to be
+     * installed and then lost. Exporting it means it can be kept for a report,
+     * handed to a colleague, or reinstalled later without patching again.
+     *
+     * Split APKs cannot be represented as one file, so the base is exported and
+     * the caller is told the rest were left behind rather than being handed a
+     * file that will not install.
+     */
+    private val apkSave =
+        registerForActivityResult(ActivityResultContracts.CreateDocument("application/vnd.android.package-archive")) { uri ->
+            val files = exportable
+            patchStatus = if (uri != null && !files.isNullOrEmpty()) {
+                runCatching {
+                    val base = files.maxByOrNull { it.length() }!!
+                    contentResolver.openOutputStream(uri)?.use { out ->
+                        base.inputStream().use { it.copyTo(out) }
+                    }
+                    if (files.size > 1)
+                        "Exported the base APK. This app ships ${files.size} splits, so the export " +
+                            "alone will not install: use Patch to install it here."
+                    else "Exported the patched APK."
+                }.getOrElse { "Export failed: ${it.message}" }
+            } else "Export cancelled."
+        }
+
+    private val caSave =
+        registerForActivityResult(ActivityResultContracts.CreateDocument("application/x-x509-ca-cert")) { uri ->
+            val pem = pendingCaPem
+            caStatus = if (uri != null && pem != null) {
+                runCatching {
+                    contentResolver.openOutputStream(uri)?.use { it.write(pem.toByteArray()) }
+                    "Saved. Install it: Settings > Security > Encryption & credentials > " +
+                        "Install a certificate > CA certificate."
+                }.getOrElse { "Error saving: ${it.message}" }
+            } else "Save cancelled."
+        }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        runCatching { Native.setStorageDir(filesDir.absolutePath) }
+        // A patch killed mid-flight (app swiped away, process reaped) leaves its
+        // staged APKs behind: tens to hundreds of megabytes of a phone's storage
+        // with nothing left that will ever read them. Nothing is patching at
+        // launch by definition, so anything still here is debris.
+        Patcher.discardWorkspace(this)
+        // Forget patch records for apps that are no longer installed, so the
+        // count of "patched apps" a certificate reset threatens stays honest.
+        PatchPrefs.all(this).keys.forEach { pkg ->
+            val gone = runCatching { packageManager.getApplicationInfo(pkg, 0) }.isFailure
+            if (gone) PatchPrefs.forget(this, pkg)
+        }
+        paired = Pairing.load(this) != null
+        allowFullCapture = FullCapturePrefs.allowed(this)
+        // Restore persisted scope so the operator's choice survives closing the app.
+        val (mode, apps) = ScopePrefs.load(this)
+        scopeMode = mode
+        selectedApps.clear()
+        selectedApps.addAll(apps)
+        // The foreground service keeps the process alive while capturing, so this static reflects the
+        // real capture state after the app was reopened.
+        running = TracerVpnService.active
+        // NOT_EXPORTED on every API level. minSdk is 26, and below API 33 a
+        // dynamically registered receiver defaults to EXPORTED with no
+        // permission, so any app could broadcast our own INSTALL_RESULT action
+        // with an arbitrary Intent in EXTRA_INTENT and have us launch it from
+        // this context (intent redirection). ContextCompat routes older levels
+        // through androidx's signature-permission shim.
+        androidx.core.content.ContextCompat.registerReceiver(
+            this,
+            installReceiver,
+            IntentFilter(INSTALL_ACTION).apply { addAction(UNINSTALL_ACTION) },
+            androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+        // Draw behind the system bars and force LIGHT icons on both, so the
+        // navigation bar stops rendering as a white slab under a black app.
+        // Transparent + dark style also stops the platform painting its own
+        // contrast scrim over the bottom of the screen.
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+        )
+        setContent { CrossfyreTheme { Screen() } }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        runCatching { unregisterReceiver(installReceiver) }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // If capture was stopped from the notification while the app was backgrounded, reflect it.
+        running = TracerVpnService.active
+    }
+
+    private fun persistScope() {
+        ScopePrefs.save(this, scopeMode, selectedApps.toSet())
+    }
+
+    /** Whether an app ships a Flutter engine.
+     *
+     * Flutter's Dart HTTP client speaks TLS through its OWN BoringSSL inside
+     * libflutter.so and never consults Android's trust store or the network
+     * security config. So an UNPATCHED Flutter app decrypts only its Java
+     * traffic (Firebase and friends) while its own API refuses the handshake,
+     * which reads as a half-broken capture rather than as two network stacks
+     * with different opinions.
+     *
+     * Patching now handles both: the server rewrites the security config for
+     * the Java stack AND neuters Flutter's own certificate check. Knowing an app
+     * is Flutter still matters, because it changes what an unpatched app can
+     * possibly show and what a refusal after patching means.
+     *
+     * Reading the APK can fail on a locked-down device; unknown is reported as
+     * "not Flutter" so this never invents a warning it cannot support.
+     */
+    private fun isFlutterApp(pkg: String): Boolean = flutterCache.getOrPut(pkg) {
+        runCatching {
+            val src = packageManager.getApplicationInfo(pkg, 0).sourceDir
+            java.util.zip.ZipFile(src).use { zip ->
+                zip.entries().asSequence().any { it.name.endsWith("/libflutter.so") }
+            }
+        }.getOrDefault(false)
+    }
+
+    private val flutterCache = mutableMapOf<String, Boolean>()
+
+    /** Per-app facts, filled off the main thread. Reading this during scroll is
+     *  a map lookup; computing it there was disk I/O per row per frame. */
+    private val insights = mutableStateMapOf<String, AppInsight>()
+
+    /** The current CA fingerprint, resolved once rather than per row. */
+    private var caFpCache by mutableStateOf<String?>(null)
+
+    /** Fill [insights] for [pkgs] in the background, nearest-first. */
+    private fun prefetchInsights(pkgs: List<Pair<String, String>>) {
+        lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            caFpCache = caFingerprint()
+            for ((pkg, label) in pkgs) {
+                if (insights.containsKey(pkg)) continue
+                val i = runCatching { AppInspector.inspect(this@MainActivity, pkg, label) }.getOrNull()
+                if (i != null) insights[pkg] = i
+            }
+        }
+    }
+
+    /** Patch state for a row, computed from cached values only. */
+    private fun rowPatchState(pkg: String): String {
+        val rec = PatchPrefs.caFor(this, pkg) ?: return "none"
+        val (ca, signer) = PatchPrefs.split(rec)
+        if (ca != caFpCache) return "stale"
+        if (signer == null) return "stale"
+        return if (signer == insightSigner(pkg)) "current" else "stale"
+    }
+
+    private val signerCache = mutableMapOf<String, String?>()
+    private fun insightSigner(pkg: String): String? =
+        signerCache.getOrPut(pkg) { AppInspector.signerOf(this, pkg) }
+
+    /** SHA-256 of the current CA, or null when there is no CA yet.
+     *
+     * Read straight off disk rather than through `generateCaPem()`, which MINTS
+     * a CA when none exists. Asking "which certificate am I on?" must never be
+     * the thing that creates one.
+     */
+    /** SHA-256 of the signing certificate of the INSTALLED build of [pkg].
+     *
+     * A patch is only real while the build that carries it is the one on the
+     * device. Recording the package and the CA was not enough: reinstalling the
+     * original app leaves both records intact, so Scope went on reporting
+     * "patched and ready" about a pristine build that decrypts nothing. Every
+     * patched build is re-signed by the patch service, so the signer identifies
+     * our build as surely as a version would, and unlike a version it cannot be
+     * reused by the vendor.
+     */
+    private fun signerOf(pkg: String): String? = runCatching {
+        val flags = android.content.pm.PackageManager.GET_SIGNING_CERTIFICATES
+        val info = packageManager.getPackageInfo(pkg, flags)
+        val sig = info.signingInfo?.apkContentsSigners?.firstOrNull() ?: return null
+        java.security.MessageDigest.getInstance("SHA-256").digest(sig.toByteArray())
+            .joinToString("") { "%02x".format(it) }
+    }.getOrNull()
+
+    /** True when [pkg] carries a patch made with the CURRENT certificate AND is
+     *  still the build we produced. */
+    private fun isPatchedAndCurrent(pkg: String): Boolean {
+        val rec = PatchPrefs.caFor(this, pkg) ?: return false
+        val (ca, signer) = PatchPrefs.split(rec)
+        if (ca != caFingerprint()) return false
+        // A record with no signer cannot be verified, so it does not count as
+        // ready. Being told to re-patch once is a small price; the alternative
+        // is what this replaced, where a pristine reinstall still reported
+        // "patched and ready" and quietly captured nothing.
+        return signer != null && signer == signerOf(pkg)
+    }
+
+    private fun caFingerprint(): String? = runCatching {
+        val pem = java.io.File(filesDir, "ca.pem").takeIf { it.exists() }?.readText() ?: return null
+        val der = java.util.Base64.getMimeDecoder().decode(
+            pem.substringAfter("-----BEGIN CERTIFICATE-----")
+                .substringBefore("-----END CERTIFICATE-----")
+        )
+        java.security.MessageDigest.getInstance("SHA-256").digest(der)
+            .joinToString("") { "%02x".format(it) }
+    }.getOrNull()
+
+    /** Packages patched with a CA that is not the current one. */
+    private fun stalePatches(): List<String> = PatchPrefs.stale(this, caFingerprint())
+
+    /** Unpair from the workspace. Deliberately does NOT touch the certificate.
+     *
+     * The CA is a device-local identity; the pairing is a workspace session.
+     * Coupling them meant unpairing silently invalidated every patched app,
+     * with no warning and no way back short of re-patching each one. Removing
+     * the certificate is its own explicit action now, which is also the only
+     * one that can state what it will break.
+     */
+    private fun unpair() {
+        if (running) toggleCapture()
+        Pairing.clear(this)
+        paired = false
+    }
+
+    /** Destroy the CA and forget every patch made with it.
+     *
+     * The security reason the old unpair did this is real: a trusted CA whose
+     * private key is still on the device should not outlive the user's intent.
+     * It just belongs behind a deliberate action that says so, rather than
+     * riding along with unpair.
+     */
+    private fun resetCertificate() {
+        if (running) toggleCapture()
+        runCatching { java.io.File(filesDir, "ca.pem").delete() }
+        runCatching { java.io.File(filesDir, "ca.key").delete() }
+        runCatching { java.io.File(getExternalFilesDir(null), caFileName()).delete() }
+        PatchPrefs.clear(this)
+        caStatus = ""
+        showRemoveCaHint = true
+    }
+
+    /** Filename for the exported CA certificate.
+     *
+     * Suffixed per environment, because all three builds can be installed at once
+     * and they each have a DIFFERENT certificate. Three files called
+     * "crossfyre-ca.crt" in Downloads, and three indistinguishable entries in the
+     * OS trust store, is how you end up importing the dev CA and wondering why
+     * production traffic will not decrypt.
+     */
+    private fun caFileName(): String = when {
+        packageName.endsWith(".dev") -> "crossfyre-ca-dev.crt"
+        packageName.endsWith(".staging") -> "crossfyre-ca-staging.crt"
+        else -> "crossfyre-ca.crt"
+    }
+
+    /** Open the OS security settings so the user can remove the trusted CA. */
+    private fun openSecuritySettings() {
+        runCatching {
+            startActivity(Intent(android.provider.Settings.ACTION_SECURITY_SETTINGS))
+        }
+        showRemoveCaHint = false
+    }
+
+    private fun launchService() {
+        persistScope()
+        startService(
+            Intent(this, TracerVpnService::class.java)
+                .setAction(TracerVpnService.ACTION_START)
+                .putExtra(TracerVpnService.EXTRA_MODE, scopeMode)
+                .putExtra(TracerVpnService.EXTRA_APPS, selectedApps.toTypedArray())
+        )
+    }
+
+    /** Apps that are in scope but will not decrypt, with the reason.
+     *
+     * Only meaningful for `only` mode, where the operator has named exactly what
+     * they intend to capture, so silence about a broken one is a wrong answer.
+     */
+    private fun scopeWarnings(): List<String> {
+        if (scopeMode != TracerVpnService.MODE_ONLY) return emptyList()
+        val current = caFingerprint()
+        return selectedApps.mapNotNull { pkg ->
+            when {
+                PatchPrefs.caFor(this, pkg) == null -> null // never patched
+                isPatchedAndCurrent(pkg) -> null
+                else -> "$pkg is no longer running the build we patched, or trusts an older certificate"
+            }
+        }
+    }
+
+    private fun toggleCapture() {
+        if (running) {
+            startService(Intent(this, TracerVpnService::class.java).setAction(TracerVpnService.ACTION_STOP))
+            running = false
+        } else {
+            // Refuse to start quietly broken. A stale patch fails as
+            // `CertificateUnknown` deep in a log, which reads as "capture is
+            // broken" rather than "this app trusts the wrong certificate".
+            val warnings = scopeWarnings()
+            if (warnings.isNotEmpty() && !preflightAcknowledged) {
+                preflightWarnings = warnings
+                return
+            }
+            preflightAcknowledged = false
+            val prepare = VpnService.prepare(this)
+            if (prepare != null) vpnConsent.launch(prepare) else { launchService(); running = true }
+        }
+    }
+
+    /** The CA as a file the patcher can upload, minting one if this device has
+     *  none yet. Returns null only if the certificate could not be created.
+     *
+     * Patching does not require the certificate to be installed into Android,
+     * so it must not require the button that installs it either. Requiring the
+     * exported file to already exist made "Generate + install CA" a prerequisite
+     * for patching, which is exactly the friction the patch path exists to
+     * avoid, and the error said "Generate + install the CA first" while the card
+     * beside it said installing was unnecessary.
+     */
+    private fun ensureCaFile(): java.io.File? {
+        val out = java.io.File(getExternalFilesDir(null), caFileName())
+        if (out.exists() && out.length() > 0) return out
+        val pem = runCatching { Native.generateCaPem() }.getOrNull() ?: return null
+        if (pem.startsWith("ERROR")) return null
+        return runCatching { out.writeText(pem); out }.getOrNull()
+    }
+
+    private fun installCa() {
+        val pem = runCatching { Native.generateCaPem() }.getOrElse { caStatus = "ERROR: ${it.message}"; return }
+        if (pem.startsWith("ERROR")) { caStatus = pem; return }
+        pendingCaPem = pem
+        runCatching { java.io.File(getExternalFilesDir(null), caFileName()).writeText(pem) }
+        caStatus = "Choose where to save the CA (Downloads is fine)…"
+        caSave.launch(caFileName())
+    }
+
+    private fun userApps(): List<Pair<String, String>> =
+        packageManager.getInstalledApplications(0)
+            .filter { it.flags and ApplicationInfo.FLAG_SYSTEM == 0 && it.packageName != packageName }
+            .map { it.packageName to packageManager.getApplicationLabel(it).toString() }
+            .sortedBy { it.second.lowercase() }
+
+    // ── UI ────────────────────────────────────────────────────────────────────
+
+    @OptIn(ExperimentalMaterial3Api::class)
+    @Composable
+    private fun Screen() {
+        var routing by remember { mutableStateOf("normal") }
+        var showPicker by remember { mutableStateOf(false) }
+        var showCaHelp by remember { mutableStateOf(false) }
+        val apps = remember { userApps() }
+        var stats by remember { mutableStateOf<Stats?>(null) }
+
+        // The pairing confirmation. The host is the whole point of this dialog:
+        // it is the one piece of information that distinguishes pairing with your
+        // own workspace from pairing with someone else's server.
+        pendingPair?.let { p ->
+            AlertDialog(
+                onDismissRequest = { pendingPair = null },
+                title = { Text("Pair with this server?") },
+                text = {
+                    Column {
+                        Text("Captured traffic from this device will be sent to:")
+                        Spacer(Modifier.height(8.dp))
+                        Text(Pairing.hostOf(p.apiUrl), style = MaterialTheme.typography.titleMedium)
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "Only continue if you recognise this address. Pairing also lets " +
+                                "this server supply app builds that you install.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                },
+                confirmButton = { TextButton(onClick = { confirmPairing() }) { Text("Pair") } },
+                dismissButton = { TextButton(onClick = { pendingPair = null }) { Text("Cancel") } }
+            )
+        }
+        if (showRemoveCaHint) {
+            AlertDialog(
+                onDismissRequest = { showRemoveCaHint = false },
+                title = { Text("Remove the Crossfyre certificate") },
+                text = {
+                    Text(
+                        "This app's certificate has been reset, but if you ever installed " +
+                            "the old one into Android it is still trusted there. Remove it under " +
+                            "Security > Encryption & credentials > User credentials."
+                    )
+                },
+                confirmButton = { TextButton(onClick = { openSecuritySettings() }) { Text("Open settings") } },
+                dismissButton = { TextButton(onClick = { showRemoveCaHint = false }) { Text("Later") } }
+            )
+        }
+        if (pairError.isNotEmpty()) {
+            AlertDialog(
+                onDismissRequest = { pairError = "" },
+                title = { Text("Could not pair") },
+                text = { Text(pairError) },
+                confirmButton = { TextButton(onClick = { pairError = "" }) { Text("OK") } }
+            )
+        }
+
+        // Poll the native counters while capturing so the panel stays live.
+        LaunchedEffect(running) {
+            if (!running) { stats = null; return@LaunchedEffect }
+            while (running) {
+                stats = withContext(Dispatchers.Default) { runCatching { Stats.parse(Native.captureStats()) }.getOrNull() }
+                delay(1000)
+            }
+        }
+
+        // Nothing works, and nothing should be offered, until this device belongs to
+        // a session.
+        //
+        // The whole app used to render unpaired: four numbered steps, the app
+        // picker, and a Patch button beside every installed app. Patching asks a
+        // server to rewrite one of your applications and hands it back to be
+        // installed, so offering it to someone who has not connected to anything
+        // is the wrong shape regardless of what the server does with the request.
+        // It also made the first screen a wall of controls that mostly did not
+        // work yet, when there is exactly one thing to do: scan the code.
+        if (!paired) {
+                Scaffold(containerColor = Cfx.bg, contentWindowInsets = WindowInsets(0, 0, 0, 0)) { _ ->
+                PairingGate(Modifier.windowInsetsPadding(WindowInsets.safeDrawing))
+            }
+            return
+        }
+
+        // contentWindowInsets = 0 so Scaffold does not inset the whole surface:
+        // the background should reach the screen edges. The insets are applied
+        // to the CONTENT instead, inside the scroll, so the first card clears
+        // the status bar and the last one clears the navigation bar while the
+        // list still scrolls under both.
+        //
+        // Applying them outside verticalScroll (as .padding(pad) did) shrinks
+        // the viewport rather than the content, which is what left the bottom of
+        // the page sitting under the navigation bar.
+        Scaffold(containerColor = Cfx.bg, contentWindowInsets = WindowInsets(0, 0, 0, 0)) { _ ->
+            // The two insets want opposite treatment, which is why one modifier for
+            // both was wrong.
+            //
+            // TOP goes OUTSIDE the scroll, so the viewport starts below the status
+            // bar and content never slides under the clock. BOTTOM goes INSIDE, so
+            // it is part of the content: the list scrolls all the way under the
+            // navigation bar and the last card still clears it. The Scaffold's
+            // background paints the full window either way, so the app still
+            // reaches both edges.
+            val bars = WindowInsets.safeDrawing.asPaddingValues()
+            Column(
+                Modifier
+                    .fillMaxSize()
+                    .padding(top = bars.calculateTopPadding())
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp)
+                    .padding(bottom = bars.calculateBottomPadding() + 24.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Header()
+                StatusCard(running, stats, hasCaHelp = { showCaHelp = true })
+
+                SectionCard("Workspace", step = "1") {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        OutlinedAccentButton(if (paired) "Re-pair" else "Scan QR") {
+                            scan.launch(Intent(this@MainActivity, ScannerActivity::class.java))
+                        }
+                        StatusPill(if (paired) "Paired" else "Not paired", if (paired) Cfx.success else Cfx.text3)
+                        if (paired) {
+                            Spacer(Modifier.weight(1f))
+                            TextButton(onClick = { unpair() }) { Text("Unpair", color = Cfx.text3) }
+                        }
+                    }
+                }
+
+                SectionCard("Certificate", step = "2") {
+                    // Installing this into Android is the most painful step in the
+                    // product (lock-screen PIN, five levels of Settings, a standing
+                    // "network may be monitored" warning) and patching an app does
+                    // NOT need it: the patch embeds this certificate directly. Say
+                    // so, rather than sending everyone through it by default.
+                    Text(
+                        "Capture terminates TLS with a certificate that stays on this device. Patching an app in Scope builds this certificate into it, so most testing needs nothing installed here.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "Install it into Android only for apps you cannot patch, and only if they trust user certificates.",
+                        style = MaterialTheme.typography.bodySmall, color = Cfx.text3
+                    )
+                    val stale = stalePatches()
+                    if (stale.isNotEmpty()) {
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "${stale.size} patched ${if (stale.size == 1) "app trusts" else "apps trust"} an older certificate and will not decrypt until re-patched.",
+                            style = MaterialTheme.typography.bodySmall, color = Cfx.warningLight
+                        )
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    PrimaryButton("Install into Android", fill = false) { installCa() }
+                    if (caStatus.isNotEmpty()) {
+                        Spacer(Modifier.height(8.dp))
+                        Text(caStatus, style = MaterialTheme.typography.bodySmall, color = Cfx.text2)
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    TextButton(onClick = { showCaHelp = !showCaHelp }, contentPadding = PaddingValues(0.dp)) {
+                        Text(if (showCaHelp) "Hide trust steps" else "Chrome won't work: how to trust it ›", color = Cfx.ember, fontSize = 13.sp)
+                    }
+                    if (showCaHelp) CaHelp()
+                    Spacer(Modifier.height(4.dp))
+                    TextButton(onClick = { showResetCa = true }, contentPadding = PaddingValues(0.dp)) {
+                        Text("Reset certificate", color = Cfx.text3, fontSize = 12.sp)
+                    }
+                }
+
+                SectionCard("Scope", step = "3") {
+                    val n = selectedApps.size
+                    val (title, sub) = when {
+                        scopeMode == TracerVpnService.MODE_ONLY && n > 0 -> "Only $n app(s)" to "capture just the selected apps"
+                        scopeMode == TracerVpnService.MODE_EXCEPT && n > 0 -> "All except $n app(s)" to "the selected apps bypass the tracer and keep working"
+                        else -> "Whole device" to "every app routes through the tracer"
+                    }
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f).padding(end = 8.dp)) {
+                            Text(title, style = MaterialTheme.typography.titleMedium, color = Cfx.text)
+                            Text(sub, style = MaterialTheme.typography.bodySmall)
+                        }
+                        OutlinedAccentButton("Choose") { showPicker = true }
+                    }
+                    if (scopeMode == TracerVpnService.MODE_ONLY && selectedApps.isNotEmpty()) {
+                        val current = caFingerprint()
+                        val ready = selectedApps.count { isPatchedAndCurrent(it) }
+                        val staleHere = selectedApps.count {
+                            val f = PatchPrefs.caFor(this@MainActivity, it); f != null && f != current
+                        }
+                        val flutterHere = selectedApps.count { isFlutterApp(it) }
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            when {
+                                staleHere > 0 -> "$staleHere of ${selectedApps.size} need re-patching before they will decrypt."
+                                flutterHere > 0 && ready < selectedApps.size -> "$flutterHere built with Flutter. Patch it: Flutter ships its own TLS stack, so an unpatched Flutter app decrypts nothing but its analytics."
+                                ready == selectedApps.size -> "All ${selectedApps.size} patched and ready."
+                                else -> "$ready of ${selectedApps.size} patched. Unpatched apps only decrypt if they trust user certificates."
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (staleHere > 0) Cfx.warningLight else Cfx.text3
+                        )
+                    }
+                    if (!exportable.isNullOrEmpty()) {
+                        Spacer(Modifier.height(8.dp))
+                        TextButton(onClick = { exportPatchedApk() }, contentPadding = PaddingValues(0.dp)) {
+                            Text("Export last patched APK", color = Cfx.ember, fontSize = 13.sp)
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "Pinned apps (banking, dating, etc.) reject the CA and can't be captured, so they may fail to connect while captured. Patch them here, or put them in \"All except\" to keep them working.",
+                        style = MaterialTheme.typography.bodySmall, color = Cfx.text3
+                    )
+                }
+
+                SectionCard("Egress routing", step = "4") {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        ChoiceChip("Normal", routing == "normal", true) { routing = "normal" }
+                        ChoiceChip("Through node (soon)", false, false) {}
+                    }
+                }
+
+                Spacer(Modifier.height(4.dp))
+
+                // Full capture is a device decision. The workspace can ask for it;
+                // this switch is what grants it, and the copy below states which
+                // of the two behaviours is actually in force.
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Switch(checked = allowFullCapture, enabled = !running, onCheckedChange = {
+                        allowFullCapture = it
+                        FullCapturePrefs.set(this@MainActivity, it)
+                    })
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        "Send full requests (headers and bodies)",
+                        style = MaterialTheme.typography.bodySmall, color = Cfx.text2
+                    )
+                }
+                if (allowFullCapture && running) {
+                    Text(
+                        "FULL CAPTURE IS ON. Headers and bodies, including credentials, are being uploaded.",
+                        style = MaterialTheme.typography.bodySmall, color = Cfx.danger
+                    )
+                }
+
+                Spacer(Modifier.height(4.dp))
+                PrimaryButton(if (running) "Stop capture" else "Start capture", enabled = paired, fill = true, danger = running) { toggleCapture() }
+                if (!paired) Text("Pair a workspace first.", style = MaterialTheme.typography.bodySmall, color = Cfx.text3)
+                Text(
+                    if (allowFullCapture)
+                        "Only capture apps and targets you are authorized to test. Full requests, including headers and bodies, are sent to your workspace."
+                    else
+                        "Only capture apps and targets you are authorized to test. Only request shape is sent: bodies and secrets stay on the device unless you turn on full requests above.",
+                    style = MaterialTheme.typography.bodySmall, color = Cfx.text3
+                )
+            }
+        }
+
+        if (showPicker) {
+            AppPickerSheet(apps, selectedApps, onDismiss = { persistScope(); showPicker = false })
+        }
+
+        // Patch progress / result.
+        if (patching) {
+            AlertDialog(
+                onDismissRequest = {},
+                // Only offered while there is something to stop. After the handoff
+                // to the system installer this disappears, because cancelling here
+                // could not undo an install Android is already carrying out.
+                confirmButton = {
+                    if (patchJob != null) {
+                        TextButton(onClick = { cancelPatch() }) {
+                            Text("Cancel", color = Cfx.text3)
+                        }
+                    }
+                },
+                containerColor = Cfx.surfaceRaised,
+                title = { Text("Patching app", color = Cfx.text) },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        val p = patchProgress
+                        if (p != null) {
+                            LinearProgressIndicator(progress = { p }, color = Cfx.ember, trackColor = Cfx.surfaceInput, modifier = Modifier.fillMaxWidth())
+                        } else {
+                            LinearProgressIndicator(color = Cfx.ember, trackColor = Cfx.surfaceInput, modifier = Modifier.fillMaxWidth())
+                        }
+                        Text(patchStatus, color = Cfx.text2, style = MaterialTheme.typography.bodySmall)
+                        Text(
+                            "The app is repackaged on the server to trust the CA, then reinstalled. You'll confirm an uninstall and an install.",
+                            color = Cfx.text3, style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+            )
+        } else if (patchStatus.isNotEmpty()) {
+            AlertDialog(
+                onDismissRequest = { patchStatus = "" },
+                containerColor = Cfx.surfaceRaised,
+                confirmButton = { TextButton(onClick = { patchStatus = "" }) { Text("OK", color = Cfx.ember) } },
+                // Offered at the moment the artefact exists, which is when
+                // someone actually wants it.
+                dismissButton = {
+                    if (!exportable.isNullOrEmpty()) {
+                        TextButton(onClick = { patchStatus = ""; exportPatchedApk() }) {
+                            Text("Export APK", color = Cfx.text3)
+                        }
+                    }
+                },
+                title = { Text("Patch", color = Cfx.text) },
+                text = { Text(patchStatus, color = Cfx.text2) }
+            )
+        }
+
+        // Named an app that cannot decrypt? Say so before capturing, not after.
+        if (preflightWarnings.isNotEmpty()) {
+            AlertDialog(
+                onDismissRequest = { preflightWarnings = emptyList() },
+                containerColor = Cfx.surfaceRaised,
+                title = { Text("These apps won't decrypt", color = Cfx.text) },
+                text = {
+                    Column {
+                        preflightWarnings.forEach {
+                            Text("- $it", color = Cfx.text2, fontSize = 13.sp)
+                            Spacer(Modifier.height(4.dp))
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            "Re-patch them from Scope, or start anyway and capture only what they send in the clear.",
+                            color = Cfx.text3, fontSize = 12.sp
+                        )
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        preflightWarnings = emptyList()
+                        preflightAcknowledged = true
+                        toggleCapture()
+                    }) { Text("Start anyway", color = Cfx.warningLight) }
+                },
+                dismissButton = {
+                    TextButton(onClick = { preflightWarnings = emptyList() }) {
+                        Text("Cancel", color = Cfx.text3)
+                    }
+                }
+            )
+        }
+
+        // What we know about one app, and what to expect from patching it.
+        inspectPkg?.let { pkg ->
+            val i = insights[pkg]
+            val patched = rowPatchState(pkg) == "current"
+            AlertDialog(
+                onDismissRequest = { inspectPkg = null },
+                containerColor = Cfx.surfaceRaised,
+                title = { Text(i?.label ?: pkg, color = Cfx.text) },
+                text = {
+                    Column(Modifier.verticalScroll(rememberScrollState())) {
+                        if (i == null) {
+                            Text("Reading the app…", color = Cfx.text3, fontSize = 13.sp)
+                        } else {
+                            InsightRow("Package", i.pkg)
+                            InsightRow("Size", "${i.sizeMb} MB")
+                            InsightRow("Framework", i.framework)
+                            InsightRow("Network stacks", buildList {
+                                if (i.flutter) add("Flutter (own TLS)")
+                                if (i.cronet) add("Cronet")
+                                add("Java/OkHttp")
+                            }.joinToString(", "))
+                            InsightRow("Patched", if (patched) "yes, with this certificate" else "no")
+                            InsightRow(
+                                "Resources",
+                                if (i.packed) "packed (relocated, unpacked at runtime)" else "normal",
+                            )
+                            if (i.shieldLibs.isNotEmpty()) {
+                                InsightRow(
+                                    "Shield indicators",
+                                    "${i.shieldLibs.size} machine-named libraries",
+                                )
+                            }
+                            Spacer(Modifier.height(10.dp))
+                            Text(
+                                i.outlook(patched),
+                                color = if (i.shielded) Cfx.dangerLight else Cfx.text2,
+                                fontSize = 13.sp,
+                            )
+                            if (i.nativeLibs.isNotEmpty()) {
+                                Spacer(Modifier.height(10.dp))
+                                Text(
+                                    "Native libraries",
+                                    color = Cfx.text3, fontSize = 11.sp, fontFamily = Cfx.mono,
+                                )
+                                Text(
+                                    i.nativeLibs.joinToString(", "),
+                                    color = Cfx.text3, fontSize = 10.sp, fontFamily = Cfx.mono,
+                                )
+                            }
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = { inspectPkg = null }) { Text("Close", color = Cfx.ember) }
+                }
+            )
+        }
+
+        // Removing the certificate is destructive in a way that is invisible
+        // until you next capture, so it states its blast radius up front.
+        if (showResetCa) {
+            val patchedCount = PatchPrefs.all(this).size
+            AlertDialog(
+                onDismissRequest = { showResetCa = false },
+                containerColor = Cfx.surfaceRaised,
+                title = { Text("Reset certificate?", color = Cfx.text) },
+                text = {
+                    Text(
+                        buildString {
+                            append("A new certificate is created the next time you capture. ")
+                            if (patchedCount > 0) {
+                                append("The ")
+                                append(patchedCount)
+                                append(if (patchedCount == 1) " app you have patched" else " apps you have patched")
+                                append(" trust the current one, so they will stop decrypting until you re-patch them. ")
+                            }
+                            append("Do this if you think the private key may have been exposed.")
+                        },
+                        color = Cfx.text2
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = { showResetCa = false; resetCertificate() }) {
+                        Text("Reset", color = Cfx.dangerLight)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showResetCa = false }) { Text("Cancel", color = Cfx.text3) }
+                }
+            )
+        }
+    }
+
+    /** The whole screen when this device is not connected to a session.
+     *
+     * Deliberately one thing: the code is the only way in, so the screen is the
+     * invitation to scan it and nothing else. No numbered steps to read past, no
+     * controls that cannot work yet.
+     */
+    @Composable
+    private fun PairingGate(modifier: Modifier = Modifier) {
+        Column(
+            modifier
+                .fillMaxSize()
+                .padding(horizontal = 32.dp),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Image(
+                painter = painterResource(R.drawable.cfx_wordmark),
+                contentDescription = "Crossfyre",
+                modifier = Modifier.height(30.dp)
+            )
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "Mobile Tracer",
+                fontFamily = Cfx.mono,
+                fontSize = 12.sp,
+                letterSpacing = 2.sp,
+                color = Cfx.text3
+            )
+
+            Spacer(Modifier.height(40.dp))
+
+            Text(
+                "Connect to a session",
+                style = MaterialTheme.typography.headlineSmall,
+                color = Cfx.text,
+                textAlign = TextAlign.Center
+            )
+            Spacer(Modifier.height(10.dp))
+            Text(
+                "Open a Web Tracer session in Crossfyre and scan the pairing code it shows you.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = Cfx.text2,
+                textAlign = TextAlign.Center
+            )
+
+            Spacer(Modifier.height(28.dp))
+
+            PrimaryButton("Scan pairing code", fill = true) {
+                scan.launch(Intent(this@MainActivity, ScannerActivity::class.java))
+            }
+
+            Spacer(Modifier.height(18.dp))
+            // Says what connecting actually means, on the screen where the choice
+            // is made rather than in a dialog after the fact.
+            Text(
+                "Captured traffic is sent to the workspace you pair with. You choose which apps, and you can unpair at any time.",
+                style = MaterialTheme.typography.bodySmall,
+                color = Cfx.text3,
+                textAlign = TextAlign.Center
+            )
+        }
+    }
+
+    @Composable
+    private fun Header() {
+        Column(Modifier.fillMaxWidth().padding(top = 18.dp, bottom = 2.dp)) {
+            Image(
+                painter = painterResource(R.drawable.cfx_wordmark),
+                contentDescription = "Crossfyre",
+                modifier = Modifier.height(26.dp)
+            )
+            Text("Mobile Tracer", fontFamily = Cfx.mono, fontSize = 12.sp, letterSpacing = 2.sp, color = Cfx.text3, modifier = Modifier.padding(start = 2.dp, top = 4.dp))
+        }
+    }
+
+    @Composable
+    private fun StatusCard(running: Boolean, s: Stats?, hasCaHelp: () -> Unit) {
+        // Whether anything in scope is a patched build changes what a refusal
+        // MEANS, so the panel needs to know.
+        val current = caFingerprint()
+        val patchedInScope = selectedApps.any { isPatchedAndCurrent(it) }
+        val flutterInScope = selectedApps.any { isFlutterApp(it) }
+        val diag = diagnose(running, s, patchedInScope, flutterInScope)
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(14.dp))
+                .background(Cfx.surface)
+                .border(1.dp, if (running) Cfx.emberLine else Cfx.line, RoundedCornerShape(14.dp))
+                .padding(16.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.size(10.dp).clip(CircleShape).background(if (running) Cfx.success else Cfx.text3))
+                Spacer(Modifier.width(8.dp))
+                Text(if (running) "CAPTURING" else "IDLE", fontFamily = Cfx.mono, fontWeight = FontWeight.Bold, letterSpacing = 2.sp, color = if (running) Cfx.text else Cfx.text2, fontSize = 14.sp)
+            }
+            Spacer(Modifier.height(14.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                StatCell("FLOWS", s?.flows, Modifier.weight(1f))
+                StatCell("TLS", s?.tlsFlows, Modifier.weight(1f))
+                StatCell("SHAPES", s?.events, Modifier.weight(1f), accent = (s?.events ?: 0) > 0)
+                StatCell("SENT", s?.ingestSent, Modifier.weight(1f), accent = (s?.ingestSent ?: 0) > 0)
+            }
+            if (s != null && !s.lastEvent.isNullOrBlank()) {
+                Spacer(Modifier.height(12.dp))
+                Text("last: ${s.lastEvent}", fontFamily = Cfx.mono, fontSize = 11.sp, color = Cfx.text2, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+            if (diag != null) {
+                Spacer(Modifier.height(12.dp))
+                DiagBanner(diag)
+            }
+        }
+    }
+
+    @Composable
+    private fun StatCell(label: String, value: Long?, modifier: Modifier = Modifier, accent: Boolean = false) {
+        Column(
+            modifier
+                .clip(RoundedCornerShape(10.dp))
+                .background(Cfx.surfaceRaised)
+                .padding(vertical = 12.dp, horizontal = 6.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(value?.toString() ?: "—", fontFamily = Cfx.mono, fontWeight = FontWeight.Bold, fontSize = 20.sp, color = if (accent) Cfx.ember else Cfx.text)
+            Spacer(Modifier.height(2.dp))
+            Text(label, fontFamily = Cfx.mono, fontSize = 10.sp, letterSpacing = 1.sp, color = Cfx.text3)
+        }
+    }
+
+    @Composable
+    private fun DiagBanner(d: Diag) {
+        val (bg, line, fg) = when (d.level) {
+            Level.SUCCESS -> Triple(Cfx.successTint, Cfx.success, Cfx.successLight)
+            Level.WARN -> Triple(Cfx.warningTint, Cfx.warning, Cfx.warningLight)
+            Level.INFO -> Triple(Cfx.emberTint, Cfx.emberLine, Cfx.emberLight)
+        }
+        Column(
+            Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(bg).border(1.dp, line, RoundedCornerShape(10.dp)).padding(12.dp)
+        ) {
+            Text(d.title, color = fg, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+            if (d.body.isNotEmpty()) {
+                Spacer(Modifier.height(4.dp))
+                Text(d.body, color = Cfx.text2, fontSize = 12.sp)
+            }
+        }
+    }
+
+    @Composable
+    private fun CaHelp() {
+        Column(Modifier.padding(top = 8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            val steps = listOf(
+                "Unrooted Android installs the CA as a USER cert. Since Android 7, most apps (including Chrome) IGNORE user CAs, so their HTTPS can't be captured.",
+                "Best test app: Firefox for Android. Open Firefox, go to about:config, search enterprise, set security.enterprise_roots.enabled = true.",
+                "Firefox now trusts the Android user CA store. Browse an HTTPS site in Firefox and shapes will appear here.",
+                "Whole-device capture across every app (incl. Chrome) needs a system CA, which requires root."
+            )
+            steps.forEachIndexed { i, t ->
+                Row {
+                    Text("${i + 1}.", fontFamily = Cfx.mono, color = Cfx.ember, fontSize = 12.sp, modifier = Modifier.width(20.dp))
+                    Text(t, color = Cfx.text2, fontSize = 12.sp)
+                }
+            }
+        }
+    }
+
+    @Composable
+    private fun InsightRow(label: String, value: String) {
+        Row(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
+            Text(label, color = Cfx.text3, fontSize = 12.sp, modifier = Modifier.width(120.dp))
+            Text(value, color = Cfx.text2, fontSize = 12.sp)
+        }
+    }
+
+    @OptIn(ExperimentalMaterial3Api::class)
+    @Composable
+    private fun AppPickerSheet(apps: List<Pair<String, String>>, selected: MutableList<String>, onDismiss: () -> Unit) {
+        val sheet = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+        // Read every app's APK once, in the background, so scrolling stays a
+        // map lookup. Selected apps first: those are the ones being judged.
+        LaunchedEffect(apps) {
+            prefetchInsights(apps.sortedByDescending { selected.contains(it.first) })
+        }
+        var query by remember { mutableStateOf("") }
+        val filtered = remember(query) {
+            if (query.isBlank()) apps else apps.filter { it.second.contains(query, true) || it.first.contains(query, true) }
+        }
+        ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheet, containerColor = Cfx.surfaceRaised, dragHandle = { BottomSheetDefaults.DragHandle() }) {
+            // A bottom sheet ends exactly where the navigation bar is, so its last
+            // row and the Done button sit under the bar without this.
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .windowInsetsPadding(WindowInsets.navigationBars)
+                    .padding(horizontal = 16.dp)
+                    .padding(bottom = 8.dp)
+            ) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    Text("Scope apps", style = MaterialTheme.typography.titleMedium, color = Cfx.text)
+                    TextButton(onClick = { scopeMode = TracerVpnService.MODE_ALL; selected.clear(); onDismiss() }) {
+                        Text("Whole device", color = Cfx.ember, fontSize = 13.sp)
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    ChoiceChip("Only these", scopeMode == TracerVpnService.MODE_ONLY, true) { scopeMode = TracerVpnService.MODE_ONLY }
+                    ChoiceChip("All except these", scopeMode == TracerVpnService.MODE_EXCEPT, true) { scopeMode = TracerVpnService.MODE_EXCEPT }
+                }
+                Text(
+                    if (scopeMode == TracerVpnService.MODE_EXCEPT) "Selected apps bypass the tracer (keep pinned apps here)."
+                    else "Capture only the selected apps.",
+                    style = MaterialTheme.typography.bodySmall, color = Cfx.text3, modifier = Modifier.padding(top = 6.dp)
+                )
+                OutlinedTextField(
+                    value = query, onValueChange = { query = it },
+                    placeholder = { Text("Search apps", color = Cfx.text3) },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = Cfx.emberLine, unfocusedBorderColor = Cfx.line,
+                        focusedTextColor = Cfx.text, unfocusedTextColor = Cfx.text1,
+                        cursorColor = Cfx.ember, focusedContainerColor = Cfx.surfaceInput, unfocusedContainerColor = Cfx.surfaceInput
+                    )
+                )
+                LazyColumn(Modifier.fillMaxWidth().heightIn(max = 420.dp)) {
+                    items(filtered, key = { it.first }) { (pkg, label) ->
+                        val checked = selected.contains(pkg)
+                        Row(
+                            Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp))
+                                .background(if (checked) Cfx.emberTint else Color.Transparent)
+                                .padding(vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Checkbox(
+                                checked = checked,
+                                onCheckedChange = {
+                                    if (it) {
+                                        selected.add(pkg)
+                                        if (scopeMode == TracerVpnService.MODE_ALL) scopeMode = TracerVpnService.MODE_ONLY
+                                    } else selected.remove(pkg)
+                                },
+                                colors = CheckboxDefaults.colors(checkedColor = Cfx.ember, uncheckedColor = Cfx.text3, checkmarkColor = Color.Black)
+                            )
+                            // Every value here is a cache read. This used to read a
+                            // certificate off disk, hash it, query PackageManager for a
+                            // signature and open the app's zip, per row per frame, which
+                            // is what made dragging the list feel like it ignored you.
+                            val state = rowPatchState(pkg)
+                            val insight = insights[pkg]
+                            val isPatched = state != "none"
+                            val isStale = state == "stale"
+
+                            Column(Modifier.weight(1f)) {
+                                Text(label, color = Cfx.text1, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(pkg, color = Cfx.text3, fontFamily = Cfx.mono, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                if (insight != null && insight.shielded) {
+                                    // The most useful sentence we can offer, said before
+                                    // ten minutes are spent rather than after.
+                                    Text(
+                                        "Shielded: may refuse to run once patched",
+                                        color = Cfx.dangerLight, fontSize = 10.sp, maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                } else if (insight != null && insight.flutter && !isPatched) {
+                                    Text(
+                                        "Flutter: patch it to read its API",
+                                        color = Cfx.text3, fontSize = 10.sp, maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                } else if (isStale) {
+                                    Text(
+                                        "Re-patch needed: trusts an old certificate",
+                                        color = Cfx.warningLight, fontSize = 10.sp, maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                } else if (isPatched) {
+                                    Text(
+                                        "Patched",
+                                        color = Cfx.successLight, fontSize = 10.sp, maxLines = 1
+                                    )
+                                }
+                            }
+                            // Look before you patch: a shielded or Cronet app is worth
+                            // knowing about before spending ten minutes on it.
+                            TextButton(onClick = { inspectPkg = pkg }, contentPadding = PaddingValues(horizontal = 6.dp)) {
+                                Text("Details", color = Cfx.text3, fontSize = 12.sp)
+                            }
+                            // Patch a pinned app on the server so it trusts the CA (unroot bypass).
+                            TextButton(onClick = { patchApp(pkg) }, enabled = !patching) {
+                                Text(
+                                    if (isPatched) "Re-patch" else "Patch",
+                                    color = if (isStale) Cfx.warningLight else Cfx.emberLight,
+                                    fontSize = 12.sp
+                                )
+                            }
+                        }
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                PrimaryButton("Done", fill = true) { onDismiss() }
+                Spacer(Modifier.height(12.dp))
+            }
+        }
+    }
+
+    // ── small reusable pieces ──────────────────────────────────────────────────
+
+    @Composable
+    private fun SectionCard(title: String, step: String, content: @Composable ColumnScope.() -> Unit) {
+        Column(
+            Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Cfx.surface).border(1.dp, Cfx.line, RoundedCornerShape(14.dp)).padding(16.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(bottom = 12.dp)) {
+                Box(Modifier.size(20.dp).clip(RoundedCornerShape(6.dp)).background(Cfx.emberTint).border(1.dp, Cfx.emberLine, RoundedCornerShape(6.dp)), contentAlignment = Alignment.Center) {
+                    Text(step, fontFamily = Cfx.mono, fontSize = 11.sp, color = Cfx.ember, fontWeight = FontWeight.Bold)
+                }
+                Spacer(Modifier.width(10.dp))
+                Text(title, fontFamily = Cfx.mono, fontSize = 12.sp, letterSpacing = 1.5.sp, color = Cfx.text2, fontWeight = FontWeight.SemiBold)
+            }
+            content()
+        }
+    }
+
+    @Composable
+    private fun PrimaryButton(text: String, enabled: Boolean = true, fill: Boolean, danger: Boolean = false, onClick: () -> Unit) {
+        Button(
+            onClick = onClick, enabled = enabled,
+            modifier = if (fill) Modifier.fillMaxWidth().height(52.dp) else Modifier.height(46.dp),
+            shape = RoundedCornerShape(10.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = if (danger) Cfx.danger else Cfx.ember,
+                contentColor = if (danger) Color.White else Color(0xFF14100E),
+                disabledContainerColor = Cfx.surfaceRaised, disabledContentColor = Cfx.text3
+            )
+        ) { Text(text, fontWeight = FontWeight.SemiBold, letterSpacing = 0.5.sp) }
+    }
+
+    @Composable
+    private fun OutlinedAccentButton(text: String, onClick: () -> Unit) {
+        OutlinedButton(
+            onClick = onClick, shape = RoundedCornerShape(10.dp),
+            border = androidx.compose.foundation.BorderStroke(1.dp, Cfx.emberLine),
+            colors = ButtonDefaults.outlinedButtonColors(contentColor = Cfx.emberLight)
+        ) { Text(text, fontWeight = FontWeight.Medium) }
+    }
+
+    @Composable
+    private fun ChoiceChip(text: String, selected: Boolean, enabled: Boolean, onClick: () -> Unit) {
+        val border = if (selected) Cfx.emberLine else Cfx.line
+        val bg = if (selected) Cfx.emberTint else Color.Transparent
+        val fg = when { !enabled -> Cfx.text3; selected -> Cfx.emberLight; else -> Cfx.text2 }
+        Box(
+            Modifier.clip(RoundedCornerShape(20.dp)).background(bg).border(1.dp, border, RoundedCornerShape(20.dp))
+                .then(if (enabled) Modifier.clickableNoRipple(onClick) else Modifier)
+                .padding(horizontal = 14.dp, vertical = 8.dp)
+        ) { Text(text, color = fg, fontSize = 13.sp, fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal) }
+    }
+
+    @Composable
+    private fun StatusPill(text: String, color: Color) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.size(7.dp).clip(CircleShape).background(color))
+            Spacer(Modifier.width(6.dp))
+            Text(text, color = Cfx.text2, fontSize = 13.sp, fontFamily = Cfx.mono)
+        }
+    }
+}
+
+// ── plumbing outside the Activity ──────────────────────────────────────────────
+
+private fun Modifier.clickableNoRipple(onClick: () -> Unit): Modifier =
+    this.clickable(onClick = onClick)
+
+private enum class Level { SUCCESS, WARN, INFO }
+private data class Diag(val level: Level, val title: String, val body: String)
+
+private data class Stats(
+    val flows: Long, val tlsFlows: Long, val caRejected: Long, val flowErrors: Long,
+    val events: Long, val ingestSent: Long, val ingestRejected: Long, val ingestFailed: Long,
+    val quicDropped: Long,
+    val lastEvent: String, val lastError: String
+) {
+    companion object {
+        fun parse(json: String): Stats {
+            val o = JSONObject(json)
+            return Stats(
+                o.optLong("flows"), o.optLong("tls_flows"), o.optLong("ca_rejected"), o.optLong("flow_errors"),
+                o.optLong("events"), o.optLong("ingest_sent"), o.optLong("ingest_rejected"), o.optLong("ingest_failed"),
+                o.optLong("quic_dropped"),
+                o.optString("last_event"), o.optString("last_error")
+            )
+        }
+    }
+}
+
+/** Turn the raw counters into one actionable message: the whole point of the panel. */
+private fun diagnose(running: Boolean, s: Stats?, patchedInScope: Boolean = false, flutterInScope: Boolean = false): Diag? {
+    if (!running || s == null) return null
+    if (s.events > 0 && s.ingestSent > 0)
+        return Diag(Level.SUCCESS, "Capturing and shipping shapes.", "Open the workflow in the web app to see the asset graph fill in.")
+    if (s.events > 0 && s.ingestRejected > 0)
+        return Diag(Level.WARN, "Server rejected the shapes.", "Likely a stale token: re-pair the QR (regenerating it rotates the token).")
+    if (s.events > 0 && s.ingestFailed > 0)
+        return Diag(Level.WARN, "Captured shapes but can't reach the server.", "Check the Ingest URL (base only, no path) and that the tunnel is up.")
+    // Two different refusals, and they need different advice. If OTHER hosts are
+    // decrypting, the app already trusts this certificate, so a host that still
+    // refuses is pinning its own API in code, and patching again will not help.
+    // Telling someone to patch an app they have already patched is worse than
+    // saying nothing: it sends them round a loop that cannot fix it. A patched
+    // app that still refuses is pinning its API in code, which patching does not
+    // touch, and that is the honest answer even though it is the unwelcome one.
+    if (s.caRejected > 0 && flutterInScope)
+        return Diag(Level.WARN, "A Flutter app is refusing the certificate.", "Flutter ships its own TLS stack, which only a patch can reach. Re-patch this app from Scope with the current build. ${s.lastError}")
+    if (s.caRejected > 0 && patchedInScope)
+        return Diag(Level.WARN, "This app is patched and still refusing.", "It pins its own API in code, which patching does not remove, so those requests cannot be decrypted. Other hosts in the app will still capture normally. ${s.lastError}")
+    if (s.caRejected > 0)
+        return Diag(Level.WARN, "Apps are refusing the certificate.", "They don't trust this device's certificate. Patch the app in Scope, or use one that trusts user certificates. Chrome ignores them entirely.")
+    // HTTP/3 cannot be intercepted, so it is dropped to force a TCP fallback. An
+    // app whose API is behind a CDN speaking h3 can sit there retrying QUIC for
+    // up to a minute first, and while it does, the only thing captured is the
+    // analytics traffic from SDKs that never tried h3. That looks exactly like
+    // "capture is broken", so name it rather than leaving the operator guessing.
+    if (s.quicDropped > 0 && s.events == 0L)
+        return Diag(Level.WARN, "Blocking HTTP/3 so traffic falls back to TCP.", "${s.quicDropped} QUIC flow(s) dropped. Apps behind an HTTP/3 CDN can stall up to a minute before retrying over TCP. Give it a moment, then repeat the action.")
+    if (s.flows > 0 && s.events == 0L)
+        return Diag(Level.INFO, "Seeing traffic, no shapes yet.", "Browse an HTTPS site in an app that trusts the CA (Firefox), or wait for a request.")
+    if (s.quicDropped > 0)
+        return Diag(Level.INFO, "Capturing. Some HTTP/3 was dropped.", "${s.quicDropped} QUIC flow(s) were blocked so the app would retry over TCP, where they can be decrypted.")
+    return Diag(Level.INFO, "No traffic captured yet.", "Make sure the app you're testing is in scope, then generate some requests.")
+}

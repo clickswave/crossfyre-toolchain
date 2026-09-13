@@ -8,6 +8,7 @@
 
 use crate::engine::{AuthSpec, OastSpec};
 use crate::probe::{self, de_null_seq, is_sql_error};
+use cfx_finding::Finding;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -38,6 +39,13 @@ pub struct GraphqlParams {
     /// read-only privileged queries are exercised, mirroring the REST authz engine's safety rail.
     #[serde(default)]
     pub test_writes: bool,
+    /// Refuse private and reserved destinations at connect time. Absent = false,
+    /// which is what an authorised customer scan gets: reaching your own
+    /// internal network from your own node is the product. The free public
+    /// tools set it, because there the caller is anonymous and the egress is
+    /// ours.
+    #[serde(default)]
+    pub block_internal: bool,
 }
 fn d_timeout() -> u64 {
     12_000
@@ -83,14 +91,15 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
     let _ = tx.send(json!({"type":"ack","target": url}));
     let want = |c: &str| params.classes.is_empty() || params.classes.iter().any(|x| x == c);
 
-    let client = match probe::build_client(
-        params.evasive,
-        params.identify.clone(),
-        params.auth.as_ref(),
-        &params.target,
-        params.timeout_ms,
-        8000,
-    ) {
+    let client = match probe::build_client(probe::ClientOpts {
+        evasive: params.evasive,
+        identify: params.identify.clone(),
+        auth: params.auth.as_ref(),
+        target: &params.target,
+        timeout_ms: params.timeout_ms,
+        min_timeout_ms: 8000,
+        block_internal: params.block_internal,
+    }) {
         Some(c) => c,
         None => {
             let _ = tx.send(json!({"type":"error","message":"client build failed"}));
@@ -104,6 +113,13 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
         }
         _ => crate::oast::OastClient::from_env(),
     };
+    // One correlation for the whole GraphQL pass, and one queue of findings
+    // waiting on it.
+    let oob_reg = match oast.as_ref() {
+        Some(oc) => oc.register(&client).await,
+        None => None,
+    };
+    let oob_queue: crate::inject::OobQueue = Default::default();
 
     let mut found = 0i64;
 
@@ -118,13 +134,13 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
         .is_some();
 
     if has_schema && want("introspection") {
-        let _ = tx.send(json!({"type":"finding","data": finding(
+        let _ = tx.send(finding(
             "graphql_introspection",
             "GraphQL introspection enabled",
             "medium",
             &url, "POST",
             "The server answered a full `__schema` introspection query in production. This hands an attacker the complete API map -- every type, field, argument, and mutation -- turning targeted attacks (injection, BOLA, hidden admin mutations) into a lookup. Disable introspection outside development."
-        )}));
+        ).event());
         found += 1;
     }
 
@@ -134,13 +150,13 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
         if let Some(r) = post(&client, &url, q).await {
             let low = r.body.to_lowercase();
             if low.contains("did you mean") {
-                let _ = tx.send(json!({"type":"finding","data": finding(
+                let _ = tx.send(finding(
                     "graphql_suggestions",
                     "GraphQL field-suggestion leakage",
                     "low",
                     &url, "POST",
                     "An unknown field triggered a 'Did you mean ...' suggestion. When introspection is disabled this still lets an attacker recover the schema field by field. Turn off field suggestions in production."
-                )}));
+                ).event());
                 found += 1;
             }
         }
@@ -164,13 +180,13 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
             let q = json!({ "query": format!("{{ {aliases} }}") }).to_string();
             if let Some(r) = post(&client, &url, &q).await {
                 if r.status == 200 && r.body.matches("\"a99\"").count() >= 1 {
-                    let _ = tx.send(json!({"type":"finding","data": finding(
+                    let _ = tx.send(finding(
                         "graphql_dos",
                         "GraphQL query-cost / alias amplification",
                         "medium",
                         &url, "POST",
                         &format!("A single request aliasing `{}` 100 times was fully resolved. With no query-cost, depth, or alias limit, one small request multiplies into thousands of resolver calls, enabling denial of service (OWASP API4). Enforce query cost / depth limits.", f.name)
-                    )}));
+                    ).event());
                     found += 1;
                 }
             }
@@ -187,13 +203,13 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
             if r.status == 200 {
                 if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(&r.body) {
                     if arr.len() >= 2 {
-                        let _ = tx.send(json!({"type":"finding","data": finding(
+                        let _ = tx.send(finding(
                             "graphql_batching",
                             "GraphQL query batching enabled",
                             "medium",
                             &url, "POST",
                             "The endpoint executed a JSON array of 10 operations in a single request. Query batching lets an attacker run thousands of login / OTP / password-reset attempts per request, defeating per-request rate limits (OWASP API4). Disable batching or count each batched op against the limit."
-                        )}));
+                        ).event());
                         found += 1;
                     }
                 }
@@ -229,13 +245,13 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
                 hits.sort();
                 hits.dedup();
                 hits.truncate(20);
-                let _ = tx.send(json!({"type":"finding","data": finding(
+                let _ = tx.send(finding(
                     "graphql_sensitive_field",
                     "Sensitive fields exposed in GraphQL schema",
                     "medium",
                     &url, "POST",
                     &format!("The schema exposes credential/secret fields that clients can request: {}. Query-able password/token/secret fields are a data-exposure and account-takeover risk - remove them from the API type or gate them behind field-level authorization.", hits.join(", ")),
-                )}));
+                ).event());
                 found += 1;
             }
         }
@@ -246,28 +262,61 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
     // THIS identity (anon by default) without an authorization error are broken function-level
     // authorization: an unauthenticated or low-privilege caller can invoke an admin operation.
     if want("authz") && !fields.is_empty() {
+        // Privileged operations that were named and deliberately not invoked.
+        let mut declined: Vec<String> = Vec::new();
         for f in &fields {
             if !is_privileged_name(&f.name) {
                 continue;
             }
-            // Read-only queries are always safe to probe; a privileged mutation actually executes,
-            // so it is only invoked under the explicit test_writes opt-in.
-            if f.op == "mutation" && !params.test_writes {
+            // Whether invoking this is safe is decided by what it DOES, not by
+            // which GraphQL operation type it is filed under.
+            //
+            // The rule here used to be "read-only queries are always safe to
+            // probe", and GraphQL guarantees no such thing: a query is a query
+            // because the schema author said so. dvga files `systemUpdate`,
+            // `deleteAllPastes` and `systemDiagnostics(cmd:)` as queries;
+            // `systemUpdate` runs `python3 setup.py` through os.popen. Measured:
+            // a single `{systemUpdate}` hangs for 25 seconds and leaves the
+            // application answering in 3.2s where it answered in 3ms, and a full
+            // pass left it not answering at all. A scanner that does that to a
+            // customer's API has caused an outage to report a finding.
+            //
+            // So a field whose NAME names an action is treated exactly like a
+            // mutation: reported as present, never invoked, unless the caller
+            // opted into writes. The cost is honest and small - a destructive
+            // operation that is genuinely unprotected goes unconfirmed rather
+            // than unmentioned - and it is the same trade the crawler and the
+            // injector already make for links and endpoints.
+            if (f.op == "mutation" || executes_something(&f.name)) && !params.test_writes {
+                declined.push(f.name.clone());
                 continue;
             }
             let doc = build_doc(f, "", "1"); // benign args; we only care whether authz blocks it
             if let Some(r) = post(&client, &url, &doc).await {
                 if r.status == 200 && !denied(&r.body) && resolver_ran(&r.body, &f.name) {
-                    let _ = tx.send(json!({"type":"finding","data": finding(
+                    let _ = tx.send(finding(
                         "graphql_bfla",
                         "Privileged GraphQL operation reachable without authorization",
                         "high",
                         &url, "POST",
                         &format!("The privileged {} `{}` resolved for an unauthenticated/low-privilege caller with no authorization error. Function-level access control is missing on a sensitive operation (OWASP API5: BFLA) - an attacker can invoke admin/destructive functionality directly.", f.op, f.name),
-                    )}));
+                    ).param(&f.name).event());
                     found += 1;
                 }
             }
+        }
+        if !declined.is_empty() {
+            declined.sort();
+            declined.dedup();
+            let _ = tx.send(json!({"type":"log","message": format!(
+                "{} privileged operation(s) were found and NOT invoked: {}. Their names say they \
+                 perform an action, and the only way to prove an authorization check is missing on \
+                 one is to call it, which on this schema means running it. Whether they are \
+                 protected is therefore untested here, not clean. Re-run with writes enabled \
+                 against a target you are willing to change.",
+                declined.len(),
+                declined.join(", ")
+            )}));
         }
     }
 
@@ -277,13 +326,49 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
     if want("injection") && !fields.is_empty() {
         for f in &fields {
             for arg in &f.string_args {
-                if let Some(fd) = probe_field_injection(&client, &url, f, arg, oast.as_ref()).await
+                if let Some(fd) = probe_field_injection(
+                    &client,
+                    &url,
+                    f,
+                    arg,
+                    oast.as_ref(),
+                    oob_reg.as_ref(),
+                    Some(&oob_queue),
+                )
+                .await
                 {
                     let _ = tx.send(json!({"type":"finding","data": fd}));
                     found += 1;
                 }
             }
         }
+    }
+
+    // Out-of-band callbacks, collected once for the whole pass.
+    if let (Some(oc), Some(reg)) = (oast.as_ref(), oob_reg.as_ref()) {
+        let pending: Vec<crate::inject::PendingOob> = oob_queue
+            .lock()
+            .map(|mut v| std::mem::take(&mut *v))
+            .unwrap_or_default();
+        if !pending.is_empty() {
+            let mut hosts: Vec<String> = Vec::new();
+            for wait in [0u64, 2000, 4000] {
+                if wait > 0 {
+                    tokio::time::sleep(Duration::from_millis(wait)).await;
+                }
+                hosts = oc.poll_hosts(&client, reg).await;
+                if !hosts.is_empty() {
+                    break;
+                }
+            }
+            for p in pending {
+                if hosts.iter().any(|h| h.contains(&p.marker)) {
+                    let _ = tx.send(json!({"type":"finding","data": p.finding}));
+                    found += 1;
+                }
+            }
+        }
+        oc.deregister(&client, reg).await;
     }
 
     let _ = tx.send(json!({"type":"done","found":found}));
@@ -363,6 +448,61 @@ fn resolver_ran(body: &str, field: &str) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// Does this field's name say it performs an action rather than answering a
+/// question? Same vocabulary the crawler and the injector use, for the same
+/// reason: a verb is the only evidence a schema gives about side effects.
+fn executes_something(name: &str) -> bool {
+    const VERBS: &[&str] = &[
+        "delete",
+        "destroy",
+        "remove",
+        "drop",
+        "purge",
+        "truncate",
+        "wipe",
+        "reset",
+        "update",
+        "upgrade",
+        "install",
+        "import",
+        "restart",
+        "reboot",
+        "shutdown",
+        "revoke",
+        "disable",
+        "enable",
+        "toggle",
+        "deactivate",
+        "create",
+        "send",
+        "execute",
+        "run",
+        "exec",
+        "kill",
+        "clear",
+    ];
+    // camelCase and snake_case both split into words here: `deleteAllPastes`
+    // and `delete_all_pastes` give the same first token.
+    let mut words: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for ch in name.chars() {
+        if ch == '_' || ch == '-' {
+            if !cur.is_empty() {
+                words.push(std::mem::take(&mut cur));
+            }
+        } else if ch.is_ascii_uppercase() && !cur.is_empty() {
+            words.push(std::mem::take(&mut cur));
+            cur.push(ch.to_ascii_lowercase());
+        } else {
+            cur.push(ch.to_ascii_lowercase());
+        }
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    words.iter().any(|w| VERBS.contains(&w.as_str()))
 }
 
 fn resolve_url(target: &str, endpoint: &str) -> String {
@@ -494,6 +634,8 @@ async fn probe_field_injection(
     field: &Field,
     arg: &str,
     oast: Option<&crate::oast::OastClient>,
+    oob_reg: Option<&crate::oast::OastReg>,
+    oob_queue: Option<&crate::inject::OobQueue>,
 ) -> Option<Value> {
     // --- error-based SQLi: a single quote that a well-formed value does not trigger ---
     let baseline = post(client, url, &build_doc(field, arg, "1")).await;
@@ -522,51 +664,110 @@ async fn probe_field_injection(
                         "An unbalanced quote in the `{arg}` argument of the `{}` {} produced a database error that a balanced quote did not: the argument reaches a SQL statement unparameterised.",
                         field.name, field.op
                     ),
-                ));
+                )
+                // The injected argument, so a consumer can reproduce it without
+                // parsing it back out of the prose.
+                .param(arg)
+                .build());
+            }
+        }
+    }
+
+    // --- OS command injection, output reflected ---
+    //
+    // The same oracle the HTTP injector reaches for first, and for the same
+    // reasons: one request per separator, no sleeps, no OAST budget, and a match
+    // is proof rather than evidence. The payload carries `$((a*b))`
+    // un-evaluated, so the product can only appear if a shell computed it.
+    //
+    // This path had the blind oracle alone, which is a real gap rather than a
+    // stylistic one. dvga's `systemDebug(arg:)` runs `ps {arg}` through
+    // os.popen and returns the output in the GraphQL response, so `; echo`
+    // comes straight back; the blind oracle would only have found it if the
+    // container could reach an OAST host, which is a different question from
+    // whether the argument reaches a shell.
+    {
+        let prod = crate::inject::CMDI_ECHO_A * crate::inject::CMDI_ECHO_B;
+        let marker = format!("zZcx{prod}xcZz");
+        for sep in [";", "|", "&&", "$(", "`"] {
+            let close = match sep {
+                "$(" => ")",
+                "`" => "`",
+                _ => "",
+            };
+            let pl = format!(
+                "1{sep}echo zZcx$(({}*{}))xcZz{close}",
+                crate::inject::CMDI_ECHO_A,
+                crate::inject::CMDI_ECHO_B
+            );
+            if let Some(r) = post(client, url, &build_doc(field, arg, &pl)).await {
+                if r.body.contains(&marker) {
+                    return Some(
+                        finding(
+                            "cmdi",
+                            "OS command injection via GraphQL argument (output reflected)",
+                            "critical",
+                            url,
+                            "POST",
+                            &format!(
+                                "A shell-evaluated arithmetic marker injected into the `{arg}` argument of `{}` came back computed in the response (separator `{sep}`), while the payload only ever carries the un-evaluated expression: the value is executed by a shell.",
+                                field.name
+                            ),
+                        )
+                        .param(arg)
+                        .build(),
+                    );
+                }
             }
         }
     }
 
     // --- blind OS command injection, OAST-confirmed ---
-    if let Some(oc) = oast {
-        if let Some(reg) = oc.register(client).await {
-            let host = oc.host(&reg);
-            for sep in [";", "|", "&&", "$(", "`"] {
-                let close = if sep == "$(" {
-                    ")"
-                } else if sep == "`" {
-                    "`"
-                } else {
-                    ""
-                };
-                let pl = format!("1{sep}curl http://{host}/g{close}");
-                let _ = post(client, url, &build_doc(field, arg, &pl)).await;
-                let pl2 = format!("1{sep}nslookup {host}{close}");
-                let _ = post(client, url, &build_doc(field, arg, &pl2)).await;
-            }
-            for _ in 0..4 {
-                tokio::time::sleep(Duration::from_millis(700)).await;
-                if oc.poll(client, &reg).await > 0 {
-                    oc.deregister(client, &reg).await;
-                    return Some(finding(
-                        "cmdi",
-                        "OS command injection via GraphQL argument (blind, OAST-confirmed)",
-                        "critical",
-                        url,
-                        "POST",
-                        &format!(
-                            "A shell metacharacter injected into the `{arg}` argument of `{}` produced an out-of-band callback: the value is passed to a shell.",
-                            field.name
-                        ),
-                    ));
-                }
-            }
-            oc.deregister(client, &reg).await;
+    //
+    // Fire and park, for the reason inject.rs does: a schema of any size has
+    // many (field, argument) pairs, and blocking four polls on each one to
+    // learn that almost none of them reach a shell is the whole scan's time
+    // spent waiting on nothing.
+    if let (Some(oc), Some(reg), Some(q)) = (oast, oob_reg, oob_queue) {
+        let (host, marker) = oc.host_marked(reg);
+        for sep in [";", "|", "&&", "$(", "`"] {
+            let close = if sep == "$(" {
+                ")"
+            } else if sep == "`" {
+                "`"
+            } else {
+                ""
+            };
+            let pl = format!("1{sep}{} http://{host}/g{close}", crate::inject::OOB_CURL);
+            let _ = post(client, url, &build_doc(field, arg, &pl)).await;
+            let pl2 = format!("1{sep}{} {host}{close}", crate::inject::OOB_NSLOOKUP);
+            let _ = post(client, url, &build_doc(field, arg, &pl2)).await;
+        }
+        if let Ok(mut v) = q.lock() {
+            v.push(crate::inject::PendingOob {
+                marker,
+                finding: finding(
+                    "cmdi",
+                    "OS command injection via GraphQL argument (blind, OAST-confirmed)",
+                    "critical",
+                    url,
+                    "POST",
+                    &format!(
+                        "A shell metacharacter injected into the `{arg}` argument of `{}` produced an out-of-band callback: the value is passed to a shell.",
+                        field.name
+                    ),
+                )
+                .param(arg)
+                .build(),
+            });
         }
     }
     None
 }
 
+/// A GraphQL finding, pre-filled with what every one of them shares. Call sites
+/// add what only they know (`.param(arg)` for an injected argument) and finish
+/// with `.event()` or `.build()`.
 fn finding(
     class: &str,
     name: &str,
@@ -574,20 +775,11 @@ fn finding(
     url: &str,
     method: &str,
     detail: &str,
-) -> Value {
-    json!({
-        "type": "vulnerability",
-        "vuln_class": class,
-        "name": name,
-        "severity": severity,
-        "confidence": "confirmed",
-        "target": url,
-        "url": url,
-        "method": method,
-        "location": "graphql",
-        "description": detail,
-        "source": "cortex-graphql",
-    })
+) -> Finding {
+    Finding::new("cortex-graphql", class, name, severity, url)
+        .method(method)
+        .location("graphql")
+        .describe(detail)
 }
 
 #[cfg(test)]
@@ -626,5 +818,54 @@ mod tests {
             resolve_url("http://x.test", "https://y.test/graphql"),
             "https://y.test/graphql"
         );
+    }
+
+    #[test]
+    fn a_field_whose_name_performs_an_action_is_not_invoked() {
+        // Every one of these is filed as a QUERY in dvga's schema, and each one
+        // does something. That is the whole reason operation type is not the
+        // test: `systemUpdate` runs `python3 setup.py`.
+        for n in [
+            "systemUpdate",
+            "deleteAllPastes",
+            "importPaste",
+            "createUser",
+            "delete_all_pastes",
+            "resetDatabase",
+            "shutdown",
+            "revokeToken",
+        ] {
+            assert!(
+                executes_something(n),
+                "{n} should not be invoked by default"
+            );
+        }
+    }
+
+    #[test]
+    fn a_field_that_answers_a_question_is_still_probed() {
+        // Refusing these would cost the BFLA check its whole point.
+        for n in [
+            "audits",
+            "systemHealth",
+            "systemDiagnostics",
+            "me",
+            "users",
+            "pastes",
+            "paste",
+            "search",
+            "readAndBurn",
+            "systemDebug",
+        ] {
+            assert!(!executes_something(n), "{n} should still be probed");
+        }
+    }
+
+    #[test]
+    fn camel_and_snake_split_the_same_way() {
+        assert!(executes_something("deleteAllPastes"));
+        assert!(executes_something("delete_all_pastes"));
+        assert!(!executes_something("undeleted"));
+        assert!(!executes_something("createdAt"));
     }
 }

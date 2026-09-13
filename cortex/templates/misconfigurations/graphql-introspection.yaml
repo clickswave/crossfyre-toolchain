@@ -3,6 +3,9 @@ info:
   name: GraphQL introspection enabled
   severity: medium
   description: The GraphQL endpoint answers introspection queries, exposing the full schema (types, fields, mutations) to unauthenticated clients. This aids attackers in mapping sensitive operations.
+  tags: misconfig,graphql,disclosure
+  metadata:
+    category: misconfigurations
 http:
   - method: GET
     path:

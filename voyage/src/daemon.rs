@@ -86,6 +86,11 @@ struct EnumParams {
     /// Controller posture: stealth | balanced | throughput.
     #[serde(default = "default_posture")]
     posture: String,
+    /// Refuse to connect to private / reserved addresses when probing. Set by
+    /// the public free tools; absent = false, which is what a customer-
+    /// authorised enum gets.
+    #[serde(default)]
+    block_internal: bool,
 }
 
 fn default_posture() -> String {
@@ -231,9 +236,17 @@ async fn handle_connection(
             Ok(r) => r,
         };
 
-        // Stream mode takes over the connection for the duration of the scan
+        // Stream mode takes over the connection for the duration of the scan.
+        // Routed by operation first: each stream handler parses its own params,
+        // so takeover requests must not reach the enum parser.
         if req.response == "stream" {
-            handle_stream_enum(req, writer, Arc::clone(&db)).await?;
+            match req.operation.as_str() {
+                "takeover" => handle_stream_takeover(req, writer).await?,
+                // Zone transfer: when a nameserver answers it, the zone lists
+                // every name it holds and the brute-force phase is redundant.
+                "axfr" => handle_stream_axfr(req, writer).await?,
+                _ => handle_stream_enum(req, writer, Arc::clone(&db)).await?,
+            }
             return Ok(());
         }
 
@@ -614,6 +627,7 @@ async fn prepare_enum(
         interval_ms: params.delay,
         exclude_passive_sources: params.exclude_passive_sources.clone(),
         exclude_active_techniques: params.exclude_active_techniques.clone(),
+        block_internal: params.block_internal,
         http_probing_ports: params.http_probing_ports.clone(),
         https_probing_ports: params.https_probing_ports.clone(),
         active_user_agent: params.active_user_agent.clone(),
@@ -692,4 +706,454 @@ async fn run_probe(params: ProbeParams, db: Arc<VoyageDb>) -> DaemonResponse {
         results: Some(serde_json::json!({ "found": found })),
         message: None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Stream mode: subdomain takeover
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct TakeoverParams {
+    /// Hosts to check. Takes precedence over `domain`.
+    #[serde(default)]
+    hosts: Vec<String>,
+    /// Enumerate this domain passively first, then check what it finds. Ignored
+    /// when `hosts` is non-empty.
+    #[serde(default)]
+    domain: String,
+    /// Ceiling on hosts checked in one run. A takeover check is a DNS lookup
+    /// plus at most one GET, but a domain with 40k names in CT is a real thing,
+    /// and an unbounded run behind an interactive request is a hang.
+    #[serde(default = "default_max_hosts")]
+    max_hosts: usize,
+    #[serde(default = "default_takeover_tasks")]
+    tasks: usize,
+    #[serde(default = "default_takeover_timeout")]
+    timeout_ms: u64,
+    /// Outbound User-Agent. The public tools set an identifying string that
+    /// points at the scanning-policy page, so an admin reading their logs can
+    /// find out who we are.
+    #[serde(default)]
+    user_agent: String,
+    /// DNS server to query. Empty uses the host's resolver.
+    #[serde(default)]
+    dns_server: String,
+    /// Refuse to connect to private / reserved addresses.
+    ///
+    /// Set by the public free tools. A takeover check follows a CNAME chain
+    /// chosen by whoever typed the domain, so without this an anonymous caller
+    /// can aim the confirmation fetch at our own network by pointing a record
+    /// inward.
+    #[serde(default)]
+    block_internal: bool,
+}
+
+fn default_max_hosts() -> usize {
+    250
+}
+fn default_takeover_tasks() -> usize {
+    24
+}
+fn default_takeover_timeout() -> u64 {
+    6000
+}
+
+/// Largest response body we will read when confirming a fingerprint.
+///
+/// The match strings all appear in a provider's small error page. Reading more
+/// than this buys nothing and hands a hostile target a cheap way to tie up the
+/// engine, which is the same reason the raw HTTP sender caps its reads.
+const MAX_BODY_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, serde::Deserialize)]
+struct AxfrParams {
+    /// The zone to ask for.
+    domain: String,
+    /// `ip` or `ip:port`. Empty asks the zone's own authoritative servers,
+    /// which is the usual case; naming one is how you reach an internal
+    /// resolver or a lab.
+    #[serde(default)]
+    dns_server: String,
+    #[serde(default = "default_axfr_timeout")]
+    timeout_ms: u64,
+}
+fn default_axfr_timeout() -> u64 {
+    8000
+}
+
+async fn handle_stream_axfr(
+    req: DaemonRequest,
+    mut writer: OwnedWriteHalf,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let operation_id = Uuid::new_v4().to_string();
+    let params: AxfrParams = match serde_json::from_value(req.params.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            write_json(
+                &mut writer,
+                &serde_json::json!({
+                    "type": "error",
+                    "operation_id": operation_id,
+                    "message": format!("Invalid axfr params: {}", e),
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let zone = params.domain.trim().trim_end_matches('.').to_string();
+    let timeout = std::time::Duration::from_millis(params.timeout_ms.clamp(500, 60_000));
+    // `map_err` to a String BEFORE any await: create_resolver's error is a bare
+    // `Box<dyn Error>`, which is not Send, and holding one across an await stops
+    // the whole connection future being spawnable.
+    let built = crate::libs::dns::create_resolver(if params.dns_server.trim().is_empty() {
+        None
+    } else {
+        Some(params.dns_server.as_str())
+    })
+    .map_err(|e| format!("DNS resolver error: {e}"));
+    let resolver = match built {
+        Ok(r) => r,
+        Err(msg) => {
+            write_json(
+                &mut writer,
+                &serde_json::json!({"type":"error","operation_id":operation_id,
+                                    "message": msg}),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    write_json(
+        &mut writer,
+        &serde_json::json!({"type":"ack","operation_id":operation_id,"domain":zone}),
+    )
+    .await?;
+
+    // An explicitly named server is asked directly; otherwise ask the zone's
+    // own authoritative servers, which is what a transfer is normally against.
+    let port = crate::libs::dns::server_addr(&params.dns_server)
+        .map(|a| a.port())
+        .unwrap_or(53);
+    let mut servers: Vec<(String, std::net::SocketAddr)> = Vec::new();
+    if let Some(explicit) = crate::libs::dns::server_addr(&params.dns_server) {
+        servers.push((params.dns_server.trim().to_string(), explicit));
+    }
+    for (host, addr) in crate::axfr::authoritative(&resolver, &zone, port).await {
+        if !servers.iter().any(|(_, a)| *a == addr) {
+            servers.push((host, addr));
+        }
+    }
+    if servers.is_empty() {
+        write_json(
+            &mut writer,
+            &serde_json::json!({"type":"error","operation_id":operation_id,
+                                "message": format!("no nameservers found for {zone}")}),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let mut total = 0usize;
+    for (label, addr) in servers {
+        let t = crate::axfr::transfer(&zone, addr, timeout).await;
+        if let Some(why) = &t.refused {
+            write_json(
+                &mut writer,
+                &serde_json::json!({"type":"log","operation_id":operation_id,
+                                    "message": format!("{label} ({addr}): {why}")}),
+            )
+            .await?;
+            continue;
+        }
+        total += t.names.len();
+        // The transfer itself is the finding: a zone anyone can copy.
+        write_json(
+            &mut writer,
+            &serde_json::json!({"type":"finding","data": {
+                "type": "vulnerability",
+                "vuln_class": "misconfig",
+                "name": "DNS zone transfer (AXFR) allowed",
+                "severity": "medium",
+                "confidence": "confirmed",
+                "source": "voyage-axfr",
+                "target": format!("{addr}"),
+                "url": format!("{addr}"),
+                "matched_at": format!("{addr}"),
+                "location": "service",
+                "description": format!(
+                    "The nameserver at {addr} transferred the whole `{zone}` zone to an \
+                     unauthenticated request: {} records, {} distinct names. That is the \
+                     complete internal inventory - hosts nobody links to, staging and admin \
+                     names, mail and VPN endpoints - handed over without a wordlist. Restrict \
+                     allow-transfer to the secondaries that need it.",
+                    t.names.len(), t.names.len()
+                ),
+            }}),
+        )
+        .await?;
+        for name in &t.names {
+            write_json(
+                &mut writer,
+                &serde_json::json!({"type":"result","operation_id":operation_id,
+                                    "subdomain": name, "source": "axfr",
+                                    "server": label}),
+            )
+            .await?;
+        }
+        // One successful transfer is the whole zone; asking the secondaries too
+        // would just repeat it.
+        break;
+    }
+
+    write_json(
+        &mut writer,
+        &serde_json::json!({"type":"done","operation_id":operation_id,"found":total}),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn handle_stream_takeover(
+    req: DaemonRequest,
+    mut writer: OwnedWriteHalf,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let operation_id = Uuid::new_v4().to_string();
+
+    let params: TakeoverParams = match serde_json::from_value(req.params.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            write_json(
+                &mut writer,
+                &serde_json::json!({
+                    "type": "error",
+                    "operation_id": operation_id,
+                    "message": format!("Invalid takeover params: {}", e),
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let ua = if params.user_agent.trim().is_empty() {
+        "Mozilla/5.0 (compatible; crossfyre)".to_string()
+    } else {
+        params.user_agent.trim().to_string()
+    };
+
+    // Plain reqwest with an explicit User-Agent, deliberately NOT the transport
+    // layer's browser-emulating identity. This path serves the public free
+    // tools, which reach hosts whose owners have not asked us to scan them; the
+    // only defensible posture there is to say who we are. Evasion belongs to
+    // scans a customer authorised on their own property.
+    let mut builder = reqwest::Client::builder()
+        .user_agent(&ua)
+        .timeout(std::time::Duration::from_millis(params.timeout_ms))
+        // No redirects on the guarded path: a followed redirect is a second
+        // destination the caller chose and we did not check. The confirmation
+        // fetch only needs the provider's own not-configured page, which is
+        // served directly, so nothing legitimate is lost.
+        .redirect(if params.block_internal {
+            reqwest::redirect::Policy::none()
+        } else {
+            reqwest::redirect::Policy::limited(3)
+        });
+    if params.block_internal {
+        builder = builder.dns_resolver(std::sync::Arc::new(transport::guard::PublicOnlyResolver));
+    }
+    let client = match builder.build() {
+        Ok(c) => c,
+        Err(e) => {
+            write_json(
+                &mut writer,
+                &serde_json::json!({
+                    "type": "error",
+                    "operation_id": operation_id,
+                    "message": format!("client build failed: {}", e),
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    // Resolve the host list. An explicit list wins; otherwise enumerate the
+    // domain passively, which is what makes "check my whole domain" one call.
+    let mut hosts: Vec<String> = if !params.hosts.is_empty() {
+        params.hosts.clone()
+    } else if !params.domain.trim().is_empty() {
+        let domain = params.domain.trim().to_lowercase();
+        let mut found: Vec<String> =
+            match crate::scanners::passive_scan::execute(&domain, &ua, &[]).await {
+                Ok(map) => map.into_keys().collect(),
+                Err(e) => {
+                    eprintln!("[takeover] passive enum failed for {domain}: {e}");
+                    vec![]
+                }
+            };
+        // The apex is checked too: a dangling CNAME on the apex is rarer but
+        // strictly worse than one on a subdomain.
+        found.push(domain);
+        found
+    } else {
+        write_json(
+            &mut writer,
+            &serde_json::json!({
+                "type": "error",
+                "operation_id": operation_id,
+                "message": "takeover needs either `hosts` or `domain`",
+            }),
+        )
+        .await?;
+        return Ok(());
+    };
+
+    hosts.sort();
+    hosts.dedup();
+    let truncated = hosts.len().saturating_sub(params.max_hosts);
+    hosts.truncate(params.max_hosts);
+
+    let total = hosts.len();
+    write_json(
+        &mut writer,
+        &serde_json::json!({
+            "type": "progress",
+            "operation_id": operation_id,
+            "processed": 0,
+            "total": total,
+            // Reported, never silent: a run that checked 250 of 900 names must
+            // not read as "your domain is clean".
+            "truncated": truncated,
+        }),
+    )
+    .await?;
+
+    // `map_err` to a String before any await: create_resolver's error is a bare
+    // `Box<dyn Error>`, which is not Send, and holding one across the write below
+    // makes the whole connection future non-Send.
+    let built = crate::libs::dns::create_resolver(if params.dns_server.trim().is_empty() {
+        None
+    } else {
+        Some(params.dns_server.trim())
+    })
+    .map_err(|e| e.to_string());
+    let resolver = match built {
+        Ok(r) => Arc::new(r),
+        Err(e) => {
+            write_json(
+                &mut writer,
+                &serde_json::json!({
+                    "type": "error",
+                    "operation_id": operation_id,
+                    "message": format!("resolver build failed: {}", e),
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let mut processed = 0usize;
+    let mut found_count = 0usize;
+
+    // Bounded concurrency: `tasks` in flight at a time. DNS dominates the wall
+    // clock here and it parallelises well, which is what keeps a 250-host run
+    // inside an interactive request.
+    for chunk in hosts.chunks(params.tasks.clamp(1, 64)) {
+        let mut set = tokio::task::JoinSet::new();
+        for host in chunk {
+            let host = host.clone();
+            let resolver = Arc::clone(&resolver);
+            let client = client.clone();
+            set.spawn(async move {
+                crate::takeover::check(&resolver, &host, |h| async move {
+                    // https first, then http: a host whose TLS is broken is
+                    // exactly the kind that has been abandoned, so falling back
+                    // is the difference between finding it and missing it.
+                    for scheme in ["https", "http"] {
+                        let Ok(resp) = client.get(format!("{scheme}://{h}/")).send().await else {
+                            continue;
+                        };
+                        let Ok(body) = resp.text().await else {
+                            continue;
+                        };
+                        let mut body = body;
+                        body.truncate(
+                            body.char_indices()
+                                .map(|(i, _)| i)
+                                .take_while(|i| *i < MAX_BODY_BYTES)
+                                .last()
+                                .map_or(0, |i| i + 1),
+                        );
+                        return Some(body);
+                    }
+                    None
+                })
+                .await
+            });
+        }
+
+        while let Some(joined) = set.join_next().await {
+            processed += 1;
+            let Ok(report) = joined else { continue };
+
+            if report.is_finding() {
+                found_count += 1;
+                write_json(
+                    &mut writer,
+                    &serde_json::json!({
+                        "type": "finding",
+                        "operation_id": operation_id,
+                        "data": {
+                            "target": report.host,
+                            "type": "takeover",
+                            "source": "voyage",
+                            "severity": report.severity(),
+                            "name": match report.service {
+                                Some(s) => format!("Dangling CNAME to {s}"),
+                                None => "Dangling CNAME".to_string(),
+                            },
+                            "matched_at": report.host,
+                            "description": report.detail,
+                            "confidence": "confirmed",
+                            "verdict": report.verdict.as_str(),
+                            "service": report.service,
+                            "claimability": report.status.map(|s| s.as_str()),
+                            "cname_chain": report.chain,
+                        }
+                    }),
+                )
+                .await?;
+            }
+
+            write_json(
+                &mut writer,
+                &serde_json::json!({
+                    "type": "progress",
+                    "operation_id": operation_id,
+                    "processed": processed,
+                    "total": total,
+                }),
+            )
+            .await?;
+        }
+    }
+
+    write_json(
+        &mut writer,
+        &serde_json::json!({
+            "type": "done",
+            "operation_id": operation_id,
+            "found": found_count,
+            "processed": processed,
+            "total": total,
+            "truncated": truncated,
+        }),
+    )
+    .await?;
+
+    Ok(())
 }

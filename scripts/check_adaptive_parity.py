@@ -39,6 +39,89 @@ def strip_line_comment(s: str) -> str:
     return s[:i] if i != -1 else s
 
 
+def norm(s: str) -> str:
+    """Put a declaration into one comparable shape.
+
+    Whitespace collapses, a trailing comma left by a member split goes, and so
+    does rustfmt's trailing comma before a closing bracket: `Backoff { a: u64,
+    b: bool, }` and `Backoff { a: u64, b: bool }` are the same variant, written
+    by the same formatter at two different line lengths.
+    """
+    s = re.sub(r"\s+", " ", s).strip().rstrip(",").strip()
+    s = re.sub(r",\s*([)\]}])", r"\1", s)
+    # Space around brackets is formatting. Remove it on both sides rather than
+    # trying to reproduce one crate's line-wrapping in the other.
+    s = re.sub(r"\s*([)\]}])", r"\1", s)
+    s = re.sub(r"([({\[])\s*", r"\1", s)
+    return s.strip()
+
+
+def unname_params(header: str) -> str:
+    """Drop the leading underscore from parameter names in a fn signature.
+
+    `fn resolve(mode: &Mode, _seed: Option<&str>)` and the same signature with
+    `seed` are one API: the underscore says the body ignores the argument, and
+    the open baseline ignores arguments the tuned drop-in uses. A caller cannot
+    tell the difference, so neither should this. Only parameter names are
+    touched; a struct field named `_x` IS part of the surface and is left alone.
+    """
+    if not re.match(r"^pub\s+(?:unsafe\s+)?(?:async\s+)?fn\b", header):
+        return header
+    open_paren = header.find("(")
+    if open_paren == -1:
+        return header
+    close = matching(header, open_paren)
+    if close == -1:
+        return header
+    params = re.sub(r"(^|[(,]\s*)_([A-Za-z][A-Za-z0-9_]*\s*:)", r"\1\2",
+                    header[open_paren:close + 1])
+    return header[:open_paren] + params + header[close + 1:]
+
+
+def matching(s: str, start: int) -> int:
+    """Index of the bracket closing the one at `start`, or -1."""
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    opener = s[start]
+    closer = pairs[opener]
+    depth = 0
+    for i in range(start, len(s)):
+        if s[i] == opener:
+            depth += 1
+        elif s[i] == closer:
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def split_top_level(body: str, sep: str) -> list:
+    """Split on `sep` at nesting depth zero, so a generic or a struct-variant
+    payload is not cut in half."""
+    parts, depth, buf = [], 0, ""
+    for ch in body:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == sep and depth == 0:
+            parts.append(buf)
+            buf = ""
+        else:
+            buf += ch
+    parts.append(buf)
+    return [p for p in (norm(x) for x in parts) if p]
+
+
+def strip_attrs(member: str) -> str:
+    """Remove `#[...]` attributes; they are not part of the surface here."""
+    while member.startswith("#"):
+        end = matching(member, member.find("["))
+        if end == -1:
+            break
+        member = member[end + 1:].strip()
+    return member
+
+
 def signatures(src_dir: str) -> set:
     """Extract the normalized set of public-API declarations from a crate's src.
 
@@ -84,35 +167,43 @@ def signatures(src_dir: str) -> set:
                 j += 1
                 buf += " " + lines[j].strip()
             # Header = everything up to the first terminator (the signature), normalized.
-            header = re.split(terms, buf, maxsplit=1)[0].strip()
-            header = re.sub(r"\s+", " ", header)
+            header = norm(re.split(terms, buf, maxsplit=1)[0])
+            header = unname_params(header)
             kind = header.split()[1] if len(header.split()) > 1 else header
             out.add(f"{rel}:: {header}")
-            # For struct/enum/trait, also record the public members inside the block.
-            if is_item and re.match(r"^\s*pub\s+(?:struct|enum|trait|union)\b", line) and "{" in buf:
-                depth = buf.count("{") - buf.count("}")
-                container = kind  # struct|enum|trait
-                k = j
-                while depth > 0 and k + 1 < len(lines):
-                    k += 1
-                    ml = lines[k]
-                    mt = ml.strip()
-                    depth += ml.count("{") - ml.count("}")
-                    if not mt or mt.startswith("#"):
+            # For struct/enum/trait, also record the members inside the block.
+            if (is_item and re.match(r"^\s*pub\s+(?:struct|enum|trait|union)\b", line)
+                    and "{" in buf):
+                # Take the whole body, then split it into members. Scanning line
+                # by line read a struct-variant's fields as if each were a
+                # variant of its own, so `Backoff { delay_ms: u64,
+                # rotate_identity: bool }` wrapped across four lines and the
+                # same variant on one line did not compare equal. That is
+                # rustfmt's choice about line length, not an API difference, and
+                # it is the kind of false alarm that gets a guard switched off.
+                text = "\n".join(lines[i:])
+                open_brace = text.find("{")
+                close = matching(text, open_brace)
+                if close == -1:
+                    i = j + 1
+                    continue
+                body = text[open_brace + 1:close]
+                container = kind
+                for member in split_top_level(body, ";" if container == "trait" else ","):
+                    member = strip_attrs(member)
+                    if not member:
                         continue
                     if container == "enum":
-                        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)", mt)
-                        if m:
-                            out.add(f"{rel}::{header}::variant {m.group(1)}")
-                    elif container == "struct":
-                        if mt.startswith("pub ") and not PUBCRATE.match(ml):
-                            fld = re.sub(r"\s+", " ", re.split(r"[,]", mt, maxsplit=1)[0]).strip()
-                            out.add(f"{rel}::{header}::field {fld}")
+                        out.add(f"{rel}::{header}::variant {member}")
+                    elif container in ("struct", "union"):
+                        if member.startswith("pub "):
+                            out.add(f"{rel}::{header}::field {member}")
                     elif container == "trait":
-                        if re.match(r"^(?:unsafe\s+)?(?:async\s+)?(?:fn|type|const)\b", mt):
-                            sig = re.split(r"[{;]", mt, maxsplit=1)[0].strip()
-                            out.add(f"{rel}::{header}::item {re.sub(r'\\s+', ' ', sig)}")
-                i = k + 1
+                        sig = norm(re.split(r"\{", member, maxsplit=1)[0])
+                        if re.match(r"^(?:unsafe\s+)?(?:async\s+)?(?:fn|type|const)\b", sig):
+                            sig = unname_params("pub " + sig)[4:]
+                            out.add(f"{rel}::{header}::item {sig}")
+                i = i + text[:close].count("\n") + 1
                 continue
             i = j + 1
     return out

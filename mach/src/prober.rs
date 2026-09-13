@@ -150,6 +150,7 @@ impl Prober {
             extra_headers: headers_map,
             emulate: config.evasive,
             resolve: Vec::new(),
+            ..Default::default()
         })
         .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
 

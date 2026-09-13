@@ -16,7 +16,7 @@ use hyper::header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, HOST, SERVER};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_rustls::TlsConnector;
 
@@ -41,6 +41,22 @@ static UPSTREAM_TLS: LazyLock<TlsConnector> = LazyLock::new(|| {
 /// netstack flow (mobile TUN) work. `target_host`/`target_port` is the flow's original destination and
 /// is used as the forwarding fallback when a request carries no Host header. Returns when the client
 /// closes the connection.
+/// What a finished flow turned out to be.
+///
+/// `tls` with zero `requests` is the signature of certificate pinning done in
+/// application code: the TLS handshake completes (the app trusts our CA at the
+/// platform level, which is what patching arranges), and then the pinner rejects
+/// the certificate and closes before sending a byte. Without this distinction
+/// that flow is indistinguishable from an idle connection, so a pinned API looks
+/// like "nothing happened" rather than "we were refused".
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FlowOutcome {
+    pub tls: bool,
+    pub requests: usize,
+    /// Carried through without interception, by operator choice.
+    pub bypassed: bool,
+}
+
 pub async fn serve_mitm_flow<C>(
     client: C,
     target_host: String,
@@ -49,7 +65,7 @@ pub async fn serve_mitm_flow<C>(
     egress: Egress,
     tx: UnboundedSender<TraceEvent>,
     cfg: CaptureCfg,
-) -> Result<(), BoxErr>
+) -> Result<FlowOutcome, BoxErr>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -59,17 +75,89 @@ where
     let mut first = [0u8; 1];
     let n = client.read(&mut first).await?;
     if n == 0 {
-        return Ok(());
+        return Ok(FlowOutcome::default());
     }
-    let stream = PrefixedIo::new(first[..n].to_vec(), client);
+    let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     if first[0] == 0x16 {
+        // Read the ClientHello before deciding. The server name is in it, in the
+        // clear, and it is the only thing that can distinguish two hosts sharing
+        // one CDN address. Whatever is read here is replayed verbatim, so the
+        // decision costs the connection nothing either way.
+        let mut head = first[..n].to_vec();
+        let mut probe = [0u8; 2048];
+        // One read is enough in practice (a ClientHello arrives in one segment)
+        // and a second could block a connection that has nothing more to send.
+        if let Ok(m) = client.read(&mut probe).await {
+            head.extend_from_slice(&probe[..m]);
+        }
+        let sni = crate::sni::server_name(&head);
+
+        // Name every TLS flow, decryptable or not. Until now a host we could not
+        // intercept appeared only as an IP in a error line, so "which host is
+        // refusing us?" had no answer at all: behind a CDN one address serves
+        // thousands of names. The ClientHello says it in the clear.
+        match sni.as_deref() {
+            Some(h) => log::info!("tls flow -> {h} ({target_host}:{target_port})"),
+            None => log::info!("tls flow -> {target_host}:{target_port} (no SNI)"),
+        }
+
+        if let Some(host) = sni.as_deref() {
+            if crate::sni::is_bypassed(host, &cfg.bypass_hosts) {
+                log::info!("bypass {host}: relaying untouched, not intercepting");
+                let mut upstream = egress.connect(target_host.as_str(), target_port).await?;
+                upstream.write_all(&head).await?;
+                let mut client = PrefixedIo::new(Vec::new(), client);
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                return Ok(FlowOutcome {
+                    tls: true,
+                    requests: 0,
+                    bypassed: true,
+                });
+            }
+        }
+
+        let stream = PrefixedIo::new(head, client);
         log::debug!("flow {target_host}:{target_port}: TLS detected, accepting (MITM handshake)");
         let tls = mitm_acceptor(ca).accept(stream).await?;
         log::debug!("flow {target_host}:{target_port}: TLS handshake done, serving HTTP");
-        serve_http(tls, "https", target_host, target_port, egress, tx, cfg).await
+        let ctx = ServeCtx {
+            egress,
+            tx,
+            cfg,
+            served: served.clone(),
+        };
+        serve_http(tls, "https", target_host, target_port, ctx).await?;
+        Ok(FlowOutcome {
+            tls: true,
+            requests: served.load(std::sync::atomic::Ordering::Relaxed),
+            bypassed: false,
+        })
     } else {
-        serve_http(stream, "http", target_host, target_port, egress, tx, cfg).await
+        let stream = PrefixedIo::new(first[..n].to_vec(), client);
+        let ctx = ServeCtx {
+            egress,
+            tx,
+            cfg,
+            served: served.clone(),
+        };
+        serve_http(stream, "http", target_host, target_port, ctx).await?;
+        Ok(FlowOutcome {
+            tls: false,
+            requests: served.load(std::sync::atomic::Ordering::Relaxed),
+            bypassed: false,
+        })
     }
+}
+
+/// What every request on one connection needs, so the count stays a property of
+/// the connection rather than another positional argument.
+struct ServeCtx {
+    egress: Egress,
+    tx: UnboundedSender<TraceEvent>,
+    cfg: CaptureCfg,
+    /// Requests actually served. Zero on a TLS connection means the client
+    /// refused our certificate rather than that it had nothing to say.
+    served: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Serve HTTP/1 over an (already TLS-terminated or plaintext) client stream, forwarding each request.
@@ -78,19 +166,24 @@ async fn serve_http<S>(
     scheme: &'static str,
     target_host: String,
     target_port: u16,
-    egress: Egress,
-    tx: UnboundedSender<TraceEvent>,
-    cfg: CaptureCfg,
+    ctx: ServeCtx,
 ) -> Result<(), BoxErr>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let host = Arc::new(target_host);
+    let ServeCtx {
+        egress,
+        tx,
+        cfg,
+        served,
+    } = ctx;
     let svc = service_fn(move |req: Request<Incoming>| {
         let egress = egress.clone();
         let tx = tx.clone();
         let host = host.clone();
         let cfg = cfg.clone();
+        served.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         async move { handle_request(req, scheme, host, target_port, egress, tx, cfg).await }
     });
     hyper::server::conn::http1::Builder::new()
@@ -301,12 +394,29 @@ async fn forward(
     if cfg.full {
         let req_hdr_arr: Vec<[String; 2]> =
             req_header_pairs.into_iter().map(|(k, v)| [k, v]).collect();
-        event.full_url = Some(full_url);
-        event.req_headers = Some(req_hdr_arr);
-        event.req_body = Some(String::from_utf8_lossy(&body_bytes).into_owned());
-        event.resp_headers = Some(resp_headers);
-        event.resp_body = Some(String::from_utf8_lossy(&resp_bytes).into_owned());
-        event.duration_ms = Some(duration_ms);
+        // Hand over the RAW bytes and let attach_full decode them. Doing the
+        // lossy conversion here is what turned every gzip response into
+        // mojibake, and it is unrecoverable once done.
+        event.attach_full(crate::FullExchange {
+            url: full_url,
+            req_headers: req_hdr_arr,
+            req_body: body_bytes.to_vec(),
+            resp_headers,
+            resp_body: resp_bytes.to_vec(),
+            duration_ms: Some(duration_ms),
+        });
+        // Full capture is the mode where "nothing showed up" is indistinguishable from
+        // "nothing was captured", so say what actually got attached per flow. Without
+        // this the only observable is a Requests tab that stays empty.
+        log::info!(
+            "full capture: {} {} req_headers={} req_body={}B resp_headers={} resp_body={}B",
+            event.method,
+            event.url,
+            event.req_headers.as_ref().map_or(0, |h| h.len()),
+            event.req_body.as_ref().map_or(0, |b| b.len()),
+            event.resp_headers.as_ref().map_or(0, |h| h.len()),
+            event.resp_body.as_ref().map_or(0, |b| b.len()),
+        );
     }
     let _ = tx.send(event);
 
@@ -434,5 +544,191 @@ mod tests {
         // The secret VALUES never appear anywhere in the event.
         let blob = format!("{ev:?}");
         assert!(!blob.contains("secret") && !blob.contains("Bearer") && !blob.contains("a@b"));
+    }
+
+    // Same flow with `full` on, asserted against the SERIALIZED event rather than the struct.
+    // The wire is where this can go wrong silently: the ingest endpoint decides whether a batch
+    // is worth storing by looking for the keys `req_headers` / `resp_headers` / `resp_body` in
+    // the JSON, so a field that is populated but named differently (or skipped when empty)
+    // produces exactly the failure we saw in the field, which is assets arriving normally and
+    // the Requests tab staying empty with nothing logged anywhere.
+    // A gzip response through the real flow, asserted on the serialized event.
+    // This is the exact path mobile capture takes, and it is where the bodies
+    // were arriving as mojibake: the proxy sees the compressed bytes, and
+    // from_utf8_lossy on a deflate stream is not reversible, so the decode has
+    // to happen before the event is built.
+    #[tokio::test]
+    async fn a_gzip_response_is_captured_as_readable_text() {
+        use std::io::Write as _;
+        let payload = r#"{"name":"projects/aculogic-405f8/installations/abc"}"#;
+        let gz = {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(payload.as_bytes()).unwrap();
+            e.finish().unwrap()
+        };
+
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_port = origin.local_addr().unwrap().port();
+        let gz2 = gz.clone();
+        tokio::spawn(async move {
+            let (mut s, _) = origin.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = s.read(&mut buf).await.unwrap();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+                gz2.len()
+            );
+            let _ = s.write_all(head.as_bytes()).await;
+            let _ = s.write_all(&gz2).await;
+            let _ = s.flush().await;
+        });
+
+        let ca = Arc::new(crate::generate_ca().unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TraceEvent>();
+        let mitm = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mitm_port = mitm.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (client, _) = mitm.accept().await.unwrap();
+            let _ = serve_mitm_flow(
+                client,
+                "127.0.0.1".into(),
+                origin_port,
+                ca,
+                Egress::Direct,
+                tx,
+                crate::CaptureCfg {
+                    full: true,
+                    gate: None,
+                    bypass_hosts: Vec::new(),
+                },
+            )
+            .await;
+        });
+
+        let tcp = TcpStream::connect(("127.0.0.1", mitm_port)).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/projects/aculogic-405f8/installations")
+            .header(HOST, "firebaseinstallations.googleapis.test")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        // The CLIENT still receives the original compressed bytes: capture
+        // observes, it does not rewrite the traffic it is proxying.
+        let got = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&got[..], &gz[..], "the proxied response must be untouched");
+
+        let ev = rx.recv().await.expect("a trace event");
+        let wire = serde_json::to_value(&ev).unwrap();
+        let body = wire.get("resp_body").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(body, payload, "captured body should be readable JSON");
+
+        // And the stored headers no longer claim an encoding the body has lost,
+        // which is what lets the Repeater replay the request as stored.
+        let hdrs = format!("{:?}", wire.get("resp_headers").unwrap()).to_lowercase();
+        assert!(
+            !hdrs.contains("content-encoding"),
+            "content-encoding should be dropped once decoded: {hdrs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_capture_puts_headers_and_bodies_on_the_wire() {
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_port = origin.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = origin.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = s.read(&mut buf).await.unwrap();
+            let body = r#"{"ok":true}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nServer: test-origin\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = s.write_all(resp.as_bytes()).await;
+            let _ = s.flush().await;
+        });
+
+        let ca = Arc::new(crate::generate_ca().unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TraceEvent>();
+        let mitm = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mitm_port = mitm.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (client, _) = mitm.accept().await.unwrap();
+            let _ = serve_mitm_flow(
+                client,
+                "127.0.0.1".into(),
+                origin_port,
+                ca,
+                Egress::Direct,
+                tx,
+                crate::CaptureCfg {
+                    full: true,
+                    gate: None,
+                    bypass_hosts: Vec::new(),
+                },
+            )
+            .await;
+        });
+
+        let tcp = TcpStream::connect(("127.0.0.1", mitm_port)).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/login?token=secret")
+            .header(HOST, "origin.test")
+            .header(CONTENT_TYPE, "application/json")
+            .header(AUTHORIZATION, "Bearer xyz")
+            .body(Full::new(Bytes::from_static(br#"{"email":"a@b"}"#)))
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let _ = resp.into_body().collect().await.unwrap();
+
+        let ev = rx.recv().await.expect("a trace event");
+        let wire = serde_json::to_value(&ev).unwrap();
+
+        // Exactly the three keys the ingest gate tests for, by their wire names.
+        assert!(
+            wire.get("req_headers").is_some(),
+            "req_headers missing from the wire event: {wire}"
+        );
+        assert!(
+            wire.get("resp_headers").is_some(),
+            "resp_headers missing from the wire event: {wire}"
+        );
+        assert!(
+            wire.get("resp_body").is_some(),
+            "resp_body missing from the wire event: {wire}"
+        );
+        // And a host to attribute the row to, without which the server skips it.
+        assert!(
+            wire.get("full_url").and_then(|v| v.as_str()).is_some(),
+            "full_url missing from the wire event: {wire}"
+        );
+
+        // Full capture means UNREDACTED: this is the whole point of the mode, and it is
+        // what separates a Requests row from the shape-only event beside it.
+        let body = wire.get("resp_body").and_then(|v| v.as_str()).unwrap();
+        assert!(body.contains("ok"), "response body not captured: {body:?}");
+        let req_hdrs = format!("{:?}", wire.get("req_headers").unwrap());
+        assert!(
+            req_hdrs.contains("authorization"),
+            "request headers did not survive: {req_hdrs}"
+        );
     }
 }

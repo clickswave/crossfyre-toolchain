@@ -4,20 +4,31 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 mod authz;
+mod chain;
 mod client_tui;
 mod daemon;
+mod deserial;
 mod discover;
 mod dsl;
 mod engine;
+mod exposure;
+mod flow;
 mod fuzz;
 mod graphql;
 mod inject;
 mod libs;
 mod oast;
 mod probe;
+mod race;
 mod rawhttp;
+mod scope;
+mod secrets;
+mod smuggle;
 mod solver;
+mod ssrf;
+mod tamper;
 mod template;
+mod xml;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -3,6 +3,9 @@ info:
   name: Path traversal via file parameter
   severity: high
   description: A file/download parameter is joined onto a base directory without containment, so ../ sequences escape it and read arbitrary local files (/etc/passwd).
+  tags: vuln,traversal,lfi
+  metadata:
+    category: vulnerabilities
 http:
   - method: GET
     path:

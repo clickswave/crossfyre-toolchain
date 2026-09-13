@@ -1,0 +1,24 @@
+# Build outputs
+/app/build/
+/build/
+/.gradle/
+rust/target/
+# Prebuilt native libs are produced by cargo-ndk (see build.sh); not committed.
+/app/src/main/jniLibs/
+# Local machine config
+local.properties
+.idea/
+*.iml
+
+# Kotlin incremental build state
+.kotlin/
+
+# Local patch debug output
+logs/
+
+# Release signing. The keystore identifies the app to Android permanently;
+# committing it would hand anyone the ability to ship a signed "update" to our
+# users. Keep it out of the repo and backed up somewhere that is not git.
+keystore.properties
+*.jks
+*.keystore

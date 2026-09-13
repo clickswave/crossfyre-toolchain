@@ -2,7 +2,18 @@ id: mass-assignment-privilege-escalation
 info:
   name: Mass assignment leads to privilege escalation
   severity: critical
-  description: The account-update endpoint binds request fields directly to the model, so a normal user can set privileged fields (role, balance) on themselves. The response reflects the elevated role, confirming self-escalation to admin.
+  description: >-
+    The account-update endpoint binds request fields directly to the model, so a
+    normal user can set privileged fields (role, balance) on themselves. The
+    oracle is the response reflecting the elevated role. That is weaker than it
+    looks - an API that simply echoes the request body satisfies it - so it is
+    tagged `reflection` and kept for the scan path only. The sound oracle is the
+    engine's own mass-assignment probe, which sends a control field alongside
+    and requires that one NOT to be reflected; prefer it wherever the endpoint
+    shape is known.
+  tags: vuln,mass-assignment,access-control,reflection
+  metadata:
+    category: vulnerabilities
 http:
   - method: PATCH
     path:

@@ -8,6 +8,9 @@ description = "Backend-agnostic outbound HTTP client for the Crossfyre engines. 
 # Default backend. Always compiled so the shared http/url types are available.
 reqwest = { version = "0.12.22", default-features = false, features = ["rustls-tls", "http2", "charset", "cookies", "gzip", "brotli", "deflate", "zstd", "json"] }
 
+# The connect-time destination guard resolves names on tokio's blocking pool.
+tokio = { version = "1", features = ["net"] }
+
 # `AuthSpec` deserializes straight from engine op params.
 serde = { version = "1", features = ["derive"] }
 
@@ -15,6 +18,9 @@ serde = { version = "1", features = ["derive"] }
 # C toolchain and never ships the emulation policy.
 wreq = { version = "5", optional = true, features = ["cookies", "gzip", "json"] }
 wreq-util = { version = "2", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "rt", "macros"] }
 
 [features]
 # Off by default: the open toolchain builds a plain reqwest client. First-party

@@ -3,6 +3,9 @@ info:
   name: OS command injection
   severity: critical
   description: A parameter is passed into a shell command; appending ';id' executes an injected command whose output (uid=..(..) gid=..) is returned in the response.
+  tags: vuln,cmdi,injection,rce
+  metadata:
+    category: vulnerabilities
 http:
   - method: POST
     path:

@@ -375,3 +375,98 @@ mod wordlist_tests {
         assert!(resolve_wordlist_in("   ", &[std::env::temp_dir()]).is_err());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Startup dependencies
+// ---------------------------------------------------------------------------
+
+/// Wait for a dependency the daemon cannot start without, instead of dying.
+///
+/// mach, pulse and voyage open Postgres at startup. When the database went away
+/// they exited, systemd restarted them, and they exited again: one host racked
+/// up 2,663 restarts over a day and the only symptom anyone saw was three
+/// engines being "down" with no reason attached. The database being briefly
+/// unreachable is not a reason to give up permanently, and a crash loop is the
+/// worst possible way to report it.
+///
+/// So retry with a capped backoff, and say what is being waited on and why
+/// every time, because a daemon that is quietly waiting looks exactly like a
+/// daemon that is quietly broken.
+///
+/// Returns once `attempt` succeeds. Gives up only after `give_up_after`, which
+/// is deliberately long: an operator restarting Postgres should not have to
+/// restart the engines afterwards.
+pub async fn wait_for<T, E, F, Fut>(
+    what: &str,
+    give_up_after: std::time::Duration,
+    mut attempt: F,
+) -> Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    let started = std::time::Instant::now();
+    let mut wait = std::time::Duration::from_secs(1);
+    let mut tries: u32 = 0;
+    loop {
+        match attempt().await {
+            Ok(v) => {
+                if tries > 0 {
+                    eprintln!(
+                        "[dguard] {what} is available again after {tries} attempt(s), {}s",
+                        started.elapsed().as_secs()
+                    );
+                }
+                return Ok(v);
+            }
+            Err(e) => {
+                tries += 1;
+                if started.elapsed() >= give_up_after {
+                    eprintln!(
+                        "[dguard] giving up on {what} after {}s: {e}",
+                        started.elapsed().as_secs()
+                    );
+                    return Err(e);
+                }
+                eprintln!(
+                    "[dguard] waiting for {what}: {e} (attempt {tries}, retrying in {}s)",
+                    wait.as_secs()
+                );
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(std::time::Duration::from_secs(30));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod wait_for_tests {
+    use super::wait_for;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn retries_until_the_dependency_comes_back() {
+        let calls = AtomicU32::new(0);
+        let got: Result<&str, String> = wait_for("test dep", Duration::from_secs(30), || async {
+            if calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                Err("not yet".to_string())
+            } else {
+                Ok("connected")
+            }
+        })
+        .await;
+        assert_eq!(got.unwrap(), "connected");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn eventually_gives_up_and_says_so() {
+        let got: Result<(), String> = wait_for("test dep", Duration::from_millis(1), || async {
+            Err("still down".to_string())
+        })
+        .await;
+        assert_eq!(got.unwrap_err(), "still down");
+    }
+}

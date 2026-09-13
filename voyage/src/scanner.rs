@@ -37,6 +37,13 @@ pub struct EnumConfig {
     pub evasive: bool,
     /// Attribution token for authorized programs (sent as X-Bug-Bounty).
     pub identify: Option<String>,
+    /// Refuse to connect to private / reserved addresses when probing.
+    ///
+    /// Set by the public free tools. Liveness probing dials whatever names the
+    /// passive sources returned for a domain the caller chose, so an attacker
+    /// who registers a domain with records pointing inward can otherwise aim
+    /// those probes at our own network.
+    pub block_internal: bool,
 }
 
 /// Events streamed from the daemon to the enum client over TCP.
@@ -256,6 +263,7 @@ async fn task_handle(
         }
     }
     let client = match transport::build_client(transport::ClientConfig {
+        block_internal: config.block_internal,
         timeout: Some(Duration::from_secs(10)),
         user_agent: Some(user_agent.clone()),
         emulate: config.evasive,
@@ -491,6 +499,7 @@ async fn adaptive_task_handle(
         }
     }
     let client = match transport::build_client(transport::ClientConfig {
+        block_internal: config.block_internal,
         timeout: Some(Duration::from_secs(10)),
         user_agent: Some(user_agent.clone()),
         emulate: config.evasive,

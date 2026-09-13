@@ -3,6 +3,9 @@ info:
   name: SQL injection (error-based) in login
   severity: critical
   description: The login email field is concatenated into a SQL statement; a single quote provokes a database engine error, proving injectable authentication (a bypass to admin is possible).
+  tags: vuln,sqli,injection,auth-bypass
+  metadata:
+    category: vulnerabilities
 http:
   - method: POST
     path:

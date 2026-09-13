@@ -1,9 +1,9 @@
 [package]
 name = "mach"
-version = "0.0.13"
+version = "0.0.14"
 edition = "2024"
 homepage = "https://clickswave.org"
-repository = "https://github.com/clickswave/crossfyre_toolchain"
+repository = "https://github.com/clickswave/crossfyre-toolchain"
 keywords = ["asset-discovery", "security", "red-teaming", "stateful"]
 authors = ["Clickswave <team@clickswave.org>"]
 
@@ -23,7 +23,7 @@ impersonate = ["transport/impersonate"]
 dguard = { path = "../dguard" }
 adaptive = { path = "../adaptive" }
 transport = { path = "../transport" }
-tokio = { version = "1.47.1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util"] }
+tokio = { version = "1.47.1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "process", "time"] }
 clap = { version = "4.5.42", features = ["derive"] }
 whoami = { version = "2.0.0-pre.2", features = [] }
 serde = { version = "1.0.219", features = ["derive"] }
@@ -42,3 +42,5 @@ base64 = "0.22.1"
 toml = "0.8"
 dirs = "5"
 dialoguer = "0.11"
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["sink"] }

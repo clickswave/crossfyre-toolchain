@@ -1,12 +1,12 @@
 <div align="center">
 
-<a href="https://crossfyre.io"><img src="https://crossfyre.io/og-landing.jpg" alt="Crossfyre" width="100%"></a>
+<a href="https://crossfyre.io"><img src="https://crossfyre.io/og/default.png" alt="Crossfyre" width="100%"></a>
 
 # Crossfyre Toolchain
 
-### Offensive security engines for your terminal.
+### Five standalone reconnaissance and scanning engines for offensive security, written in Rust.
 
-Run them standalone. Connect them to the [Crossfyre platform](https://crossfyre.io) when one machine isn't enough.
+`voyage` enumerates subdomains, `pulse` scans hosts and ports, `mach` does content discovery, `scout` fingerprints services and `cortex` tests for vulnerabilities. Run them on their own from the terminal, or connect them to the [Crossfyre platform](https://crossfyre.io) when one machine isn't enough.
 
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-1f6feb.svg)](LICENSE)
 [![Made with Rust](https://img.shields.io/badge/made%20with-Rust-b7410e.svg)](https://www.rust-lang.org)
@@ -94,8 +94,8 @@ The platform is optional. The tools never require it, and nothing here reports b
 You need a recent stable [Rust toolchain](https://rustup.rs).
 
 ```sh
-git clone https://github.com/clickswave/crossfyre_toolchain.git
-cd crossfyre_toolchain
+git clone https://github.com/clickswave/crossfyre-toolchain.git
+cd crossfyre-toolchain
 cargo build --release
 # binaries land in ./target/release/{crossfyre,node,mach,voyage,pulse,scout,cortex}
 ```
@@ -103,7 +103,7 @@ cargo build --release
 Install a single engine straight from the repo:
 
 ```sh
-cargo install --git https://github.com/clickswave/crossfyre_toolchain.git mach
+cargo install --git https://github.com/clickswave/crossfyre-toolchain.git mach
 ```
 
 ## Responsible use

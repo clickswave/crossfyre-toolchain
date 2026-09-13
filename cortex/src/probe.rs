@@ -48,16 +48,42 @@ impl Resp {
     }
 }
 
-/// Build an evasion-aware scan client. `min_timeout_ms` is the floor the operation needs (e.g. an
-/// injection SLEEP probe needs the timeout above the sleep); pass 0 when there is no such floor.
-pub fn build_client(
-    evasive: bool,
-    identify: Option<String>,
-    auth: Option<&AuthSpec>,
-    target: &str,
-    timeout_ms: u64,
-    min_timeout_ms: u64,
-) -> Option<Client> {
+/// Everything a scan client needs beyond the identity it will wear.
+///
+/// This was six positional arguments and is now a struct for one reason: a
+/// seventh was needed, and it was `block_internal`. A safety flag that arrives
+/// as the last of seven booleans and strings is a flag that gets dropped at a
+/// call site, which is exactly what had already happened - the template scanner
+/// honoured it and every other cortex operation silently did not.
+pub struct ClientOpts<'a> {
+    pub evasive: bool,
+    pub identify: Option<String>,
+    pub auth: Option<&'a AuthSpec>,
+    pub target: &'a str,
+    pub timeout_ms: u64,
+    /// The floor this operation needs, e.g. an injection SLEEP probe needs the
+    /// timeout above the sleep. Zero when there is no such floor. Ignored by
+    /// [`build_client_no_redirect`], which has no probe with a floor.
+    pub min_timeout_ms: u64,
+    /// Refuse private and reserved destinations at connect time, at the
+    /// resolver, so redirect hops and DNS rebinding are covered too. Off for an
+    /// authorised customer scan, where reaching their own internal network from
+    /// their own node is the product. On for anything an anonymous caller can
+    /// aim, where our egress is shared.
+    pub block_internal: bool,
+}
+
+/// Build an evasion-aware scan client.
+pub fn build_client(o: ClientOpts) -> Option<Client> {
+    let ClientOpts {
+        evasive,
+        identify,
+        auth,
+        target,
+        timeout_ms,
+        min_timeout_ms,
+        block_internal,
+    } = o;
     let mode = adaptive::identity::Mode::from_flags(evasive, identify);
     let seed = (!target.is_empty()).then_some(target);
     let browser = adaptive::identity::resolve(&mode, seed);
@@ -74,19 +100,23 @@ pub fn build_client(
         accept_invalid_certs: true,
         cookie_store: true,
         resolve: Vec::new(),
+        block_internal,
     })
     .ok()
 }
 
 /// Same as [`build_client`] but with redirects DISABLED, so the caller sees the raw 3xx + `Location`
 /// instead of the followed destination. The open-redirect / header-injection oracles need that.
-pub fn build_client_no_redirect(
-    evasive: bool,
-    identify: Option<String>,
-    auth: Option<&AuthSpec>,
-    target: &str,
-    timeout_ms: u64,
-) -> Option<Client> {
+pub fn build_client_no_redirect(o: ClientOpts) -> Option<Client> {
+    let ClientOpts {
+        evasive,
+        identify,
+        auth,
+        target,
+        timeout_ms,
+        block_internal,
+        ..
+    } = o;
     let mode = adaptive::identity::Mode::from_flags(evasive, identify);
     let seed = (!target.is_empty()).then_some(target);
     let browser = adaptive::identity::resolve(&mode, seed);
@@ -101,11 +131,397 @@ pub fn build_client_no_redirect(
         accept_invalid_certs: true,
         cookie_store: true,
         resolve: Vec::new(),
+        block_internal,
     })
     .ok()
 }
 
 /// Send one request with an optional `(body, content-type)` and read the capped response.
+/// Per-host pacing, so the scanner does not knock over what it is measuring.
+///
+/// This exists because of a measured failure, not a theory. Batching the
+/// out-of-band callbacks removed the only thing that had been spacing our
+/// requests out: the blocking polls between injection points were accidental
+/// rate limiting. With them gone, an injection point fires ten payloads back to
+/// back, six points run at once, and a small PHP application ran out of worker
+/// processes. The pass that followed skipped almost every site with "the
+/// endpoint did not answer", and reported seven findings where it had reported
+/// fifteen. Nothing was wrong with the target: it answers in 8ms when asked
+/// alone.
+///
+/// Accidental throttling is not a design. This is the deliberate version:
+/// additive-increase on success, multiplicative-decrease on transport failure,
+/// per host, with a floor of one in-flight request and a delay that decays as
+/// the target recovers.
+/// How many requests this process has sent, and how long it spent waiting on
+/// them. Reported at the end of a pass.
+///
+/// Added because "the scan took 69 minutes" is not actionable and "the scan
+/// sent 41,000 requests and spent 55 minutes in transport" is. Guessing at
+/// where a scan's time goes cost several hours today; this is the cheap way to
+/// stop guessing.
+pub mod meter {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{LazyLock, Mutex};
+
+    pub static REQUESTS: AtomicU64 = AtomicU64::new(0);
+    pub static WAIT_MS: AtomicU64 = AtomicU64::new(0);
+    pub static PACE_MS: AtomicU64 = AtomicU64::new(0);
+    pub static FAILURES: AtomicU64 = AtomicU64::new(0);
+
+    pub fn snapshot() -> (u64, u64, u64, u64) {
+        (
+            REQUESTS.load(Ordering::Relaxed),
+            WAIT_MS.load(Ordering::Relaxed),
+            PACE_MS.load(Ordering::Relaxed),
+            FAILURES.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn reset() {
+        REQUESTS.store(0, Ordering::Relaxed);
+        WAIT_MS.store(0, Ordering::Relaxed);
+        PACE_MS.store(0, Ordering::Relaxed);
+        FAILURES.store(0, Ordering::Relaxed);
+        CLASSES.lock().unwrap().clear();
+    }
+
+    /// Engine-time per detection class, and how many times each one ran.
+    ///
+    /// "The scan sent 41,000 requests" says the pass was expensive. It does not
+    /// say which check was expensive, and the difference decides whether the
+    /// answer is a faster oracle, a cheaper one, or not running it at all. The
+    /// first attempt at this problem was three hours of guessing.
+    ///
+    /// These are engine-seconds, not wall-clock: classes run concurrently
+    /// across workers, so the column sums to more than the pass took. The
+    /// ratios are the point.
+    static CLASSES: LazyLock<Mutex<BTreeMap<&'static str, (u64, u64)>>> =
+        LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+    pub fn charge(class: &'static str, d: std::time::Duration) {
+        let mut g = CLASSES.lock().unwrap();
+        let e = g.entry(class).or_insert((0, 0));
+        e.0 += d.as_millis() as u64;
+        e.1 += 1;
+    }
+
+    /// (class, milliseconds, calls), most expensive first.
+    pub fn by_class() -> Vec<(&'static str, u64, u64)> {
+        let mut v: Vec<_> = CLASSES
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, (ms, n))| (*k, *ms, *n))
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v
+    }
+}
+
+/// Run one class's probe and charge the meter for what it took.
+pub async fn spent<T>(class: &'static str, fut: impl std::future::Future<Output = T>) -> T {
+    let t0 = Instant::now();
+    let out = fut.await;
+    meter::charge(class, t0.elapsed());
+    out
+}
+
+pub mod pace {
+    use std::collections::HashMap;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+    use tokio::sync::Semaphore;
+
+    /// Ceiling on concurrent requests to one host. FIXED, deliberately.
+    ///
+    /// The first version of this adapted the ceiling by permanently forgetting
+    /// semaphore permits on failure. It stalled a scan dead: permits consumed,
+    /// growth gated behind successes that could no longer happen, and the
+    /// engine sat on idle connections issuing nothing at 0.2% CPU. Capacity
+    /// that can only shrink is a deadlock waiting for the right sequence of
+    /// failures.
+    ///
+    /// Rate is controlled by delay instead. Delay cannot strand anything: the
+    /// worst case is slow, and slow recovers on its own.
+    const MAX_INFLIGHT: usize = 8;
+    /// Consecutive transport failures before we brake.
+    const SHRINK_AFTER: u64 = 2;
+    /// Consecutive successes before we ease off.
+    const GROW_AFTER: u64 = 20;
+    const MAX_DELAY_MS: u64 = 1500;
+
+    /// Consecutive failures before we stop overlapping requests entirely.
+    const SERIALISE_AFTER: u64 = 4;
+    /// Successes before we allow overlap again.
+    const UNSERIALISE_AFTER: u64 = 40;
+
+    /// How many recent unpayloaded responses the latency window keeps.
+    ///
+    /// Enough that one slow answer does not move the picture, few enough that
+    /// the picture is of NOW: a target that has been under a scan for twenty
+    /// minutes is not the target that was idle when the pass started, and the
+    /// number the time-based oracles need is what normal costs under the load
+    /// we are ourselves applying.
+    const LATENCY_WINDOW: usize = 64;
+
+    /// How long a host's pacing survives without a request before it is thrown
+    /// away. Pacing is a statement about conditions right now, and conditions go
+    /// stale: a target that was overloaded ten minutes ago is not overloaded.
+    const IDLE_RESET_MS: u64 = 60_000;
+
+    pub struct HostPace {
+        sem: Arc<Semaphore>,
+        /// Held for the whole request when the host is judged to be serialising
+        /// us anyway. Reversible, unlike consuming capacity.
+        gate: tokio::sync::Mutex<()>,
+        serial: std::sync::atomic::AtomicBool,
+        fails: AtomicU64,
+        oks: AtomicU64,
+        delay_ms: AtomicU64,
+        /// Round-trip times for requests that carried no payload, in ms.
+        latency: Mutex<VecDeque<u128>>,
+        /// Milliseconds since the epoch at the last request to this host, so an
+        /// idle gap can retire the brake instead of carrying it forever.
+        last_ms: AtomicU64,
+    }
+
+    impl HostPace {
+        fn new() -> Self {
+            Self {
+                sem: Arc::new(Semaphore::new(MAX_INFLIGHT)),
+                gate: tokio::sync::Mutex::new(()),
+                serial: std::sync::atomic::AtomicBool::new(false),
+                fails: AtomicU64::new(0),
+                oks: AtomicU64::new(0),
+                delay_ms: AtomicU64::new(0),
+                latency: Mutex::new(VecDeque::new()),
+                last_ms: AtomicU64::new(0),
+            }
+        }
+
+        /// Retire pacing that describes a moment that has passed.
+        ///
+        /// This state lives in the daemon, keyed by host, for the life of the
+        /// process. Without this, one pass that pushed a small target into
+        /// serialising left every later scan of that host crawling: measured on
+        /// Mutillidae, one class on one parameter took over 200 seconds on a
+        /// daemon that had run a long pass earlier, and 2.7 seconds on a freshly
+        /// started one. Same engine, same target, same request. The target
+        /// answers a hand request in 9ms throughout.
+        ///
+        /// Recovery through successes alone cannot do this. A serialising host
+        /// runs one request at a time, each waiting out the delay, so the forty
+        /// consecutive successes that would clear it are themselves the thing
+        /// the delay makes slow. Time is the honest signal: no requests for a
+        /// minute means whatever was true then is not evidence about now.
+        #[cfg(test)]
+        pub fn new_for_test() -> Self {
+            Self::new()
+        }
+
+        /// Put the pacer into the state a saturating pass leaves behind.
+        #[cfg(test)]
+        pub fn set_for_test(&self, delay: u64, serial: bool) {
+            self.delay_ms.store(delay, Ordering::Relaxed);
+            self.serial.store(serial, Ordering::Relaxed);
+            self.last_ms.store(now_ms(), Ordering::Relaxed);
+        }
+
+        /// Pretend the last request to this host was `ago_ms` ago, then do what
+        /// `for_url` does.
+        #[cfg(test)]
+        pub fn touch_for_test(&self, ago_ms: u64) {
+            self.last_ms
+                .store(now_ms().saturating_sub(ago_ms), Ordering::Relaxed);
+            self.expire_if_idle();
+        }
+
+        fn expire_if_idle(&self) {
+            let now = now_ms();
+            let prev = self.last_ms.swap(now, Ordering::Relaxed);
+            if prev != 0 && now.saturating_sub(prev) >= IDLE_RESET_MS {
+                self.delay_ms.store(0, Ordering::Relaxed);
+                self.serial.store(false, Ordering::Relaxed);
+                self.fails.store(0, Ordering::Relaxed);
+                self.oks.store(0, Ordering::Relaxed);
+                self.latency
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+            }
+        }
+
+        /// Record what an ordinary request to this host cost.
+        ///
+        /// Only baseline sends feed this. A payload request is the thing being
+        /// measured against the window, so letting it into the window would let
+        /// a real five-second sleep raise the bar it has to clear.
+        pub fn observe(&self, ms: u128) {
+            let mut w = self.latency.lock().unwrap_or_else(|e| e.into_inner());
+            if w.len() == LATENCY_WINDOW {
+                w.pop_front();
+            }
+            w.push_back(ms);
+        }
+
+        /// What a slow-but-ordinary response costs here: the 90th percentile of
+        /// the window, or `None` until there is enough of a window to mean
+        /// anything.
+        pub fn slow_normal_ms(&self) -> Option<u128> {
+            let w = self.latency.lock().unwrap_or_else(|e| e.into_inner());
+            if w.len() < 8 {
+                return None;
+            }
+            let mut v: Vec<u128> = w.iter().copied().collect();
+            v.sort_unstable();
+            Some(v[(v.len() * 9) / 10])
+        }
+
+        pub fn delay(&self) -> u64 {
+            self.delay_ms.load(Ordering::Relaxed)
+        }
+
+        pub fn sem(&self) -> Arc<Semaphore> {
+            Arc::clone(&self.sem)
+        }
+
+        pub fn serialising(&self) -> bool {
+            self.serial.load(Ordering::Relaxed)
+        }
+
+        pub fn gate(&self) -> &tokio::sync::Mutex<()> {
+            &self.gate
+        }
+
+        /// A request came back. Ease off the brake, slowly.
+        pub fn ok(&self) {
+            self.fails.store(0, Ordering::Relaxed);
+            let n = self.oks.fetch_add(1, Ordering::Relaxed) + 1;
+            if n >= GROW_AFTER {
+                let d = self.delay_ms.load(Ordering::Relaxed);
+                self.delay_ms
+                    .store(d.saturating_sub(d / 4), Ordering::Relaxed);
+            }
+            if n >= UNSERIALISE_AFTER {
+                self.oks.store(0, Ordering::Relaxed);
+                self.serial.store(false, Ordering::Relaxed);
+            } else if n >= GROW_AFTER {
+                self.oks.store(0, Ordering::Relaxed);
+            }
+        }
+
+        /// A request did not come back at all. Brake, hard.
+        pub fn failed(&self) {
+            self.oks.store(0, Ordering::Relaxed);
+            let n = self.fails.fetch_add(1, Ordering::Relaxed) + 1;
+            if n >= SHRINK_AFTER {
+                let d = self.delay_ms.load(Ordering::Relaxed);
+                self.delay_ms
+                    .store(((d * 2) + 100).min(MAX_DELAY_MS), Ordering::Relaxed);
+            }
+            // Requests that never come back, repeatedly, mean overlapping is
+            // not working here. The usual cause is not the target being small:
+            // it is that WE hold a session the target locks per request, and a
+            // time-based payload parks that lock for five or ten seconds while
+            // everything else queues behind it and times out. Measured on
+            // Mutillidae: eight concurrent requests on one session serialise
+            // into a perfect staircase, while eight without a session run flat.
+            //
+            // So stop overlapping. The target was serialising us anyway; all
+            // the parallelism bought was timeouts, and a timeout is read as
+            // "the endpoint did not answer", which silently skips real work.
+            if n >= SERIALISE_AFTER {
+                self.fails.store(0, Ordering::Relaxed);
+                self.serial.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    static HOSTS: OnceLock<Mutex<HashMap<String, Arc<HostPace>>>> = OnceLock::new();
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub fn idle_reset_ms_for_test() -> u64 {
+        IDLE_RESET_MS
+    }
+
+    pub fn for_url(url: &str) -> Arc<HostPace> {
+        let host = url
+            .split("://")
+            .nth(1)
+            .unwrap_or(url)
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .to_string();
+        let map = HOSTS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut m = map.lock().unwrap_or_else(|e| e.into_inner());
+        let pace = Arc::clone(m.entry(host).or_insert_with(|| Arc::new(HostPace::new())));
+        pace.expire_if_idle();
+        pace
+    }
+}
+
+/// What a time-based oracle is allowed to treat as a delay on this host, and
+/// whether it can conclude anything here at all.
+pub enum Timing {
+    /// A response slower than this many milliseconds is a candidate. Everything
+    /// below is the application being itself.
+    Above(u128),
+    /// The target's own ordinary responses already run at or past the sleep we
+    /// would inject, so no delay measured here could distinguish a sleeping
+    /// database from a busy one. `slow_normal_ms` is what normal costs.
+    Hopeless { slow_normal_ms: u128 },
+}
+
+/// Decide the bar from what this host is actually doing right now.
+///
+/// A fixed threshold is what turned a 45-endpoint application into a 69-minute
+/// scan. It is correct in isolation - a five-second sleep does cross 3.8
+/// seconds - but it says nothing about whether crossing 3.8 seconds MEANS
+/// anything on a target whose own pages take four. Every response that drifted
+/// over the line entered the confirmation sequence: control, retry, and a
+/// doubled sleep, ten-odd seconds each, five separators deep, on parameters
+/// with no shell behind them.
+///
+/// The bar is now the host's own slow-normal plus half the sleep we injected,
+/// never below the fixed floor. A target answering in 8ms keeps the old
+/// behaviour exactly; a target answering in four seconds stops volunteering
+/// every page for a confirmation it was never going to pass.
+///
+/// This does NOT relax any confirmation. The control, the reproduction and the
+/// scaling check all still have to pass; the change is which responses are
+/// worth spending them on. Weakening the scaling check was the tempting fix and
+/// it is the wrong one: that check exists because the oracle was reading load
+/// the scanner itself created as proof of a shell.
+pub fn timing(url: &str, sleep_secs: u64, floor_ms: u128) -> Timing {
+    let sleep_ms = sleep_secs as u128 * 1000;
+    let Some(slow) = pace::for_url(url).slow_normal_ms() else {
+        // Nothing measured yet: the floor is the only honest answer.
+        return Timing::Above(floor_ms);
+    };
+    if slow >= sleep_ms {
+        return Timing::Hopeless {
+            slow_normal_ms: slow,
+        };
+    }
+    Timing::Above(floor_ms.max(slow + sleep_ms / 2))
+}
+
+/// Record what an ordinary, unpayloaded request to this URL's host cost.
+pub fn observe_latency(url: &str, ms: u128) {
+    pace::for_url(url).observe(ms);
+}
+
 pub async fn send(
     client: &Client,
     method: &str,
@@ -124,22 +540,71 @@ pub async fn send_with(
     body: Option<(&str, &str)>,
     extra_headers: &[(String, String)],
 ) -> Option<Resp> {
-    let mut rb = match method {
-        "POST" => client.post(url),
-        "PUT" => client.put(url),
-        "DELETE" => client.delete(url),
-        "PATCH" => client.patch(url),
-        _ => client.get(url),
+    // Pace against this host: hold a permit for the request, and wait out any
+    // backoff the host has earned. See `pace`.
+    let pacer = pace::for_url(url);
+    let sem = pacer.sem();
+    let _permit = sem.acquire().await.ok()?;
+    // When the host has shown it cannot overlap, take the gate so this request
+    // has it to itself. Reversible: sustained success releases the mode.
+    let _gate = if pacer.serialising() {
+        Some(pacer.gate().lock().await)
+    } else {
+        None
     };
-    for (k, v) in extra_headers {
-        rb = rb.header(k.as_str(), v.as_str());
+    let d = pacer.delay();
+    if d > 0 {
+        meter::PACE_MS.fetch_add(d, std::sync::atomic::Ordering::Relaxed);
+        tokio::time::sleep(std::time::Duration::from_millis(d)).await;
     }
-    if let Some((b, ctype)) = body {
-        rb = rb.header("content-type", ctype).body(b.to_string());
-    }
+
+    // A connection-level failure is not an answer about the endpoint, so it is
+    // retried once on a fresh connection before it counts as one.
+    //
+    // This is the keep-alive race, and it is not rare: Apache's default
+    // MaxKeepAliveRequests is 100, so a pooled connection is closed by the
+    // server exactly when a scanner is most likely to be reusing it. Measured
+    // against Mutillidae, it arrived in bursts - 59 failures inside one second
+    // - and every one of them was reported as "the endpoint did not answer a
+    // baseline request", which skipped the site and read as a detection
+    // failure. Hand-testing never reproduced it, because a hand test opens a
+    // fresh connection every time.
     let t0 = Instant::now();
-    match rb.send().await {
+    let mut attempt = 0;
+    let outcome = loop {
+        let mut rb = match method {
+            "POST" => client.post(url),
+            "PUT" => client.put(url),
+            "DELETE" => client.delete(url),
+            "PATCH" => client.patch(url),
+            _ => client.get(url),
+        };
+        for (k, v) in extra_headers {
+            rb = rb.header(k.as_str(), v.as_str());
+        }
+        if let Some((b, ctype)) = body {
+            rb = rb.header("content-type", ctype).body(b.to_string());
+        }
+        let r = rb.send().await;
+        let retryable = r
+            .as_ref()
+            .err()
+            .map(|e| e.is_connect() && !e.is_timeout())
+            .unwrap_or(false);
+        if retryable && attempt == 0 {
+            attempt += 1;
+            continue;
+        }
+        break r;
+    };
+    meter::REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    meter::WAIT_MS.fetch_add(
+        t0.elapsed().as_millis() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    match outcome {
         Ok(r) => {
+            pacer.ok();
             let status = r.status().as_u16();
             let headers: Vec<(String, String)> = r
                 .headers()
@@ -163,7 +628,26 @@ pub async fn send_with(
                 headers,
             })
         }
-        Err(_) => None,
+        Err(e) => {
+            // Say WHY. "The endpoint did not answer" has been reported hundreds
+            // of times in a single pass while the same URL answered a hand
+            // request in 8ms, and without the reason there is nothing to act
+            // on: a connect refusal, a read timeout and a body error are three
+            // different problems wearing one message.
+            if std::env::var("CORTEX_TRACE_FAIL").is_ok() {
+                eprintln!(
+                    "cortex: request failed {} {} :: timeout={} connect={} request={} :: {e}",
+                    method,
+                    url,
+                    e.is_timeout(),
+                    e.is_connect(),
+                    e.is_request(),
+                );
+            }
+            meter::FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            pacer.failed();
+            None
+        }
     }
 }
 
@@ -290,5 +774,80 @@ mod tests {
         );
         assert_eq!(json_typed("42", Some("integer")), Value::from(42i64));
         assert_eq!(json_typed("true", Some("boolean")), Value::Bool(true));
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+
+    fn feed(url: &str, samples: &[u128]) {
+        for ms in samples {
+            observe_latency(url, *ms);
+        }
+    }
+
+    #[test]
+    fn a_fast_target_keeps_the_old_bar() {
+        let url = "http://timing-fast.test/x";
+        feed(url, &[6, 7, 8, 8, 9, 10, 11, 12, 9, 8]);
+        match timing(url, 5, 3800) {
+            Timing::Above(ms) => assert_eq!(ms, 3800),
+            Timing::Hopeless { .. } => panic!("a target answering in 8ms is not hopeless"),
+        }
+    }
+
+    #[test]
+    fn a_slow_target_raises_the_bar_instead_of_confirming_noise() {
+        // Pages that take about three seconds. A four-second answer used to be
+        // a command-injection candidate here, and cost ten seconds to disprove.
+        let url = "http://timing-slow.test/x";
+        feed(
+            url,
+            &[2900, 3000, 3100, 2800, 3200, 3050, 2950, 3300, 3000, 3100],
+        );
+        match timing(url, 5, 3800) {
+            // slow-normal (~3300) plus half the injected sleep.
+            Timing::Above(ms) => assert!(ms > 5000, "bar was {ms}, expected above 5000"),
+            Timing::Hopeless { .. } => panic!("three seconds is slow, not unmeasurable"),
+        }
+    }
+
+    #[test]
+    fn a_target_slower_than_the_sleep_cannot_be_measured_this_way() {
+        let url = "http://timing-hopeless.test/x";
+        feed(
+            url,
+            &[5200, 5400, 6000, 5100, 7000, 5500, 5300, 5900, 6100, 5800],
+        );
+        match timing(url, 5, 3800) {
+            Timing::Hopeless { slow_normal_ms } => assert!(slow_normal_ms >= 5000),
+            Timing::Above(ms) => panic!("bar {ms} pretends a 5s sleep is detectable here"),
+        }
+    }
+
+    #[test]
+    fn with_nothing_measured_the_floor_is_the_answer() {
+        match timing("http://timing-unknown.test/x", 5, 3800) {
+            Timing::Above(ms) => assert_eq!(ms, 3800),
+            Timing::Hopeless { .. } => panic!("no samples is not evidence of slowness"),
+        }
+    }
+
+    #[test]
+    fn pacing_is_retired_when_a_host_goes_idle() {
+        let p = pace::HostPace::new_for_test();
+        // A pass that pushed this host into the brake.
+        p.set_for_test(1500, true);
+        assert_eq!(p.delay(), 1500);
+        assert!(p.serialising());
+        // Still inside the window: the brake stays on, because the host may
+        // still be under the load that earned it.
+        p.touch_for_test(pace::idle_reset_ms_for_test() - 1_000);
+        assert_eq!(p.delay(), 1500, "a recent pass is still evidence");
+        // Past the window: whatever was true then says nothing about now.
+        p.touch_for_test(pace::idle_reset_ms_for_test() + 1_000);
+        assert_eq!(p.delay(), 0, "an idle host should not inherit a brake");
+        assert!(!p.serialising());
     }
 }

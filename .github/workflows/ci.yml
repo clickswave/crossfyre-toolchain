@@ -21,9 +21,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
-    branches: [main]
+    branches: [main, dev]
   workflow_dispatch:
   # Advisories land independently of our commits, so a push-only trigger means a
   # new one sits undetected until someone happens to push. See the audit job.
@@ -134,6 +134,94 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --locked --no-fail-fast
+
+  oracles:
+    name: detection regression
+    runs-on: ubuntu-latest
+    # mach's daemon mode talks to postgres, so the mach cases need one. Without
+    # it they failed on every run with "Cannot read toolchain config", and
+    # because CI only triggers on main they had never run at all: they were
+    # written on dev, sat there for two weeks, and first executed on the release
+    # pull request that promoted 115 commits.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: crossfyre
+          POSTGRES_PASSWORD: crossfyre
+          POSTGRES_DB: crossfyre
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    # Every oracle, against a target that is vulnerable in one specific way and
+    # against one that is not. See tests/oracles/README.md.
+    #
+    # This job exists because the real guard against a detection regression used
+    # to be somebody remembering to run a ninety-minute benchmark that needs
+    # seventeen Docker containers, an account and a node. Nobody runs that on a
+    # pull request. These need a Python fixture, a binary and a socket.
+    #
+    # What it actually protects is SILENCE. Every expensive mistake in this
+    # engine has been an oracle that quietly stopped finding something, because a
+    # negative result gets no scrutiny, so each case asserts what must NOT be
+    # reported as well as what must.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --no-self-update
+          rustup default 1.88.0
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: oracles-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: oracles-${{ runner.os }}-
+
+      - name: Build the engines under test
+        run: cargo build --locked -p cortex -p mach
+
+      - name: Write the toolchain config
+        # mach, pulse and voyage refuse to start in daemon mode without this and
+        # tell you to run `crossfyre init`. The CLI that would write it is not
+        # in this repo, and standalone terminal use never reads it, so the file
+        # is the whole dependency. Matches the postgres service above.
+        run: |
+          mkdir -p ~/.config/crossfyre
+          cat > ~/.config/crossfyre/config.toml <<'TOML'
+          [postgres]
+          host = "127.0.0.1"
+          port = 5432
+          user = "crossfyre"
+          password = "crossfyre"
+          db_name = "crossfyre"
+          TOML
+
+      - name: Run the oracle cases
+        # The headless case needs a browser. ubuntu-latest ships Chrome, and the
+        # runner skips that case LOUDLY rather than passing quietly if it is ever
+        # absent, which is the same rule the engine follows.
+        #
+        # NO_SANDBOX because Chrome's setuid sandbox does not work on the hosted
+        # runners. Without it the browser is found and then refuses to launch,
+        # mach falls back to static extraction, and the case fails as two
+        # missing URLs rather than as the browser problem it is.
+        env:
+          MACH_BROWSER_NO_SANDBOX: '1'
+          # The default 20s is marginal here. The same commit launched inside it
+          # on one run and missed it on another running at the same time, which
+          # reported as a detection regression rather than as a slow machine.
+          MACH_BROWSER_LAUNCH_TIMEOUT_SECS: '90'
+        run: python3 tests/oracles/run.py
 
   fmt:
     name: rustfmt

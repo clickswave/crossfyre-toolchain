@@ -48,6 +48,13 @@ pub struct AuthzParams {
     /// allow-list the traffic.
     #[serde(default)]
     pub identify: Option<String>,
+    /// Refuse private and reserved destinations at connect time. Absent = false,
+    /// which is what an authorised customer scan gets: reaching your own
+    /// internal network from your own node is the product. The free public
+    /// tools set it, because there the caller is anonymous and the egress is
+    /// ours.
+    #[serde(default)]
+    pub block_internal: bool,
 }
 fn d_true() -> bool {
     true

@@ -87,6 +87,12 @@ async fn handle_connection(
                 handle_fingerprint(req.params, &mut writer).await?;
                 return Ok(());
             }
+            // Non-HTTP service identification: what is really listening on a
+            // port, and whether it lets anyone in.
+            "services" => {
+                handle_services(req.params, &mut writer).await?;
+                return Ok(());
+            }
             other => {
                 write_line(
                     &mut writer,
@@ -125,6 +131,36 @@ async fn handle_fingerprint(
     let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
     tokio::spawn(async move {
         fingerprint::run(fp, tx).await;
+    });
+
+    while let Some(ev) = rx.recv().await {
+        write_line(writer, &ev).await?;
+    }
+    Ok(())
+}
+
+async fn handle_services(
+    params: Value,
+    writer: &mut OwnedWriteHalf,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let sp: crate::services::SvcParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(e) => {
+            write_line(
+                writer,
+                &serde_json::json!({
+                    "type": "error",
+                    "message": format!("Invalid services params: {}", e),
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
+    tokio::spawn(async move {
+        crate::services::run(sp, tx).await;
     });
 
     while let Some(ev) = rx.recv().await {

@@ -41,3 +41,7 @@ Thumbs.db
 # commit: the committed baseline.rs is the open no-oracle build. cortex/build.rs
 # compiles this if present.
 /cortex/src/authz/private.rs
+
+# Python bytecode from the oracle regression harness.
+__pycache__/
+*.pyc

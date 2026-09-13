@@ -1,0 +1,12 @@
+[package]
+name = "cfx_finding"
+version = "0.1.0"
+edition = "2024"
+homepage = "https://clickswave.org"
+repository = "https://github.com/clickswave/crossfyre-toolchain"
+keywords = ["security", "findings"]
+authors = ["Clickswave <team@clickswave.org>"]
+description = "The one shape every crossfyre engine reports a finding in."
+
+[dependencies]
+serde_json = "1.0.142"

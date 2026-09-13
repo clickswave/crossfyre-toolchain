@@ -28,6 +28,9 @@ pub struct Cli {
 pub enum Commands {
     /// Fingerprint a single target through the running daemon
     Fingerprint(FpArgs),
+    /// Identify non-HTTP services on host:port targets, and whether they let
+    /// anyone in
+    Services(SvcArgs),
     /// Send a raw JSON op to the daemon and print the streamed events
     Exec(ExecArgs),
 }
@@ -36,6 +39,21 @@ pub enum Commands {
 pub struct FpArgs {
     /// Target URL or host[:port] (e.g. https://example.com, example.com:8443)
     pub target: String,
+}
+
+#[derive(Parser, Clone)]
+pub struct SvcArgs {
+    /// One or more `host:port` targets
+    #[arg(required = true)]
+    pub targets: Vec<String>,
+
+    /// Skip the single anonymous/default-account check per service
+    #[arg(long, default_value_t = false)]
+    pub no_auth_checks: bool,
+
+    /// Per-operation timeout in milliseconds
+    #[arg(long, default_value_t = 5000)]
+    pub timeout_ms: u64,
 }
 
 #[derive(Parser, Clone)]

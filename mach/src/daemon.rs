@@ -192,6 +192,7 @@ pub async fn run(port: u16, db: MachDb) -> Result<(), Box<dyn std::error::Error>
         extra_headers: transport::HeaderMap::new(),
         emulate: true,
         resolve: Vec::new(),
+        ..Default::default()
     })?);
     // Second client that does NOT follow redirects, for the wizard's
     // "Follow Redirects = off" probes (reqwest sets redirect policy per-client).
@@ -207,6 +208,7 @@ pub async fn run(port: u16, db: MachDb) -> Result<(), Box<dyn std::error::Error>
         extra_headers: transport::HeaderMap::new(),
         emulate: true,
         resolve: Vec::new(),
+        ..Default::default()
     })?);
 
     // Background task: delete expired probe_results + GC old scans every 5 min.
