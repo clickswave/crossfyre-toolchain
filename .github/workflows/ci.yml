@@ -210,6 +210,13 @@ jobs:
         # The headless case needs a browser. ubuntu-latest ships Chrome, and the
         # runner skips that case LOUDLY rather than passing quietly if it is ever
         # absent, which is the same rule the engine follows.
+        #
+        # NO_SANDBOX because Chrome's setuid sandbox does not work on the hosted
+        # runners. Without it the browser is found and then refuses to launch,
+        # mach falls back to static extraction, and the case fails as two
+        # missing URLs rather than as the browser problem it is.
+        env:
+          MACH_BROWSER_NO_SANDBOX: '1'
         run: python3 tests/oracles/run.py
 
   fmt:

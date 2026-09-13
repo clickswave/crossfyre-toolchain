@@ -212,6 +212,12 @@ def run_case(name: str, case: dict, bins: dict) -> tuple[bool, list[str]]:
         if problems:
             problems.append("  --- what it actually reported ---")
             problems += [f"      {describe(f)}" for f in findings] or ["      (nothing)"]
+            notes = [m for m in logs if any(
+                w in m.lower() for w in
+                ("could not", "no browser", "not looked for", "skipped", "unavailable"))]
+            if notes:
+                problems.append("  --- what the engine said about it ---")
+                problems += [f"      {m[:200]}" for m in notes[:5]]
     except Exception as e:  # a fixture or engine that would not start
         problems.append(f"ERROR    {type(e).__name__}: {e}")
     finally:
