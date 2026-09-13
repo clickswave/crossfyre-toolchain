@@ -1,6 +1,6 @@
 <div align="center">
 
-<a href="https://crossfyre.io"><img src="https://crossfyre.io/og-landing.jpg" alt="Crossfyre" width="100%"></a>
+<a href="https://crossfyre.io"><img src="https://crossfyre.io/og/default.png" alt="Crossfyre" width="100%"></a>
 
 # Crossfyre Toolchain
 
