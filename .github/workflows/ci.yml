@@ -21,9 +21,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
-    branches: [main]
+    branches: [main, dev]
   workflow_dispatch:
   # Advisories land independently of our commits, so a push-only trigger means a
   # new one sits undetected until someone happens to push. See the audit job.
@@ -138,6 +138,24 @@ jobs:
   oracles:
     name: detection regression
     runs-on: ubuntu-latest
+    # mach's daemon mode talks to postgres, so the mach cases need one. Without
+    # it they failed on every run with "Cannot read toolchain config", and
+    # because CI only triggers on main they had never run at all: they were
+    # written on dev, sat there for two weeks, and first executed on the release
+    # pull request that promoted 115 commits.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: crossfyre
+          POSTGRES_PASSWORD: crossfyre
+          POSTGRES_DB: crossfyre
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     # Every oracle, against a target that is vulnerable in one specific way and
     # against one that is not. See tests/oracles/README.md.
     #
@@ -171,6 +189,22 @@ jobs:
 
       - name: Build the engines under test
         run: cargo build --locked -p cortex -p mach
+
+      - name: Write the toolchain config
+        # mach, pulse and voyage refuse to start in daemon mode without this and
+        # tell you to run `crossfyre init`. The CLI that would write it is not
+        # in this repo, and standalone terminal use never reads it, so the file
+        # is the whole dependency. Matches the postgres service above.
+        run: |
+          mkdir -p ~/.config/crossfyre
+          cat > ~/.config/crossfyre/config.toml <<'TOML'
+          [postgres]
+          host = "127.0.0.1"
+          port = 5432
+          user = "crossfyre"
+          password = "crossfyre"
+          db_name = "crossfyre"
+          TOML
 
       - name: Run the oracle cases
         # The headless case needs a browser. ubuntu-latest ships Chrome, and the
