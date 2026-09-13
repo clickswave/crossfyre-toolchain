@@ -96,6 +96,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # `core` pulls in pyo3 for the .cfx playbook runtime, so the final link
+      # wants libpython. rust:bookworm has the interpreter but not the headers,
+      # and every crate compiled fine before the link failed on -lpython3.11.
+      # Debian bookworm ships 3.11, which is why the version is pinned here.
+      - name: Install the libpython the link needs
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends libpython3.11-dev
+          python3 --version
+
       - name: Build the workspace binaries
         run: |
           set -euo pipefail
