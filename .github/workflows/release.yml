@@ -1,0 +1,192 @@
+name: Release
+
+# Publishes the OPEN build, and is careful to say so.
+#
+# WHAT THIS IS NOT. These artifacts are not the binaries `get.crossfyre.io`
+# installs. This repo is open-core: `cortex/src/authz/private.rs`,
+# `core/src/egress/private.rs` and `adaptive-private/` are git-ignored and absent
+# from any public checkout, so `build.rs` compiles the `baseline.rs` stubs
+# instead. A release built here therefore has no authorization oracle, no
+# isolated egress and no tuned pacing. The first-party build does, and nobody
+# outside this company can reproduce it.
+#
+# Saying that plainly is the point. A release that quietly shipped a reduced
+# binary under the same name as the distributed one would be worse than no
+# release at all, so the notes below state the difference and the CI job that
+# proves no private drop-in leaked into the tag runs before anything is built.
+#
+# WHAT IT BUYS. Integrity was already covered: the installer fetches
+# manifest.json and checks SHA256 before it installs anything. What was missing
+# is PROVENANCE, the claim that a given byte string came from a commit anyone can
+# read. `actions/attest-build-provenance` binds each artifact to this workflow
+# run and this commit, so `gh attestation verify` answers that without trusting
+# us. That is the whole reason this file exists.
+
+on:
+  push:
+    tags: ["v*"]
+  # Lets a release be rehearsed against a branch without cutting a tag first.
+  # Produces artifacts and attestations but never a GitHub Release.
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  # Refuses to build at all if a private drop-in is present in the tagged tree.
+  # Duplicated from ci.yml rather than referenced, because a release is exactly
+  # the moment a leak would become permanent and public, and this job must not
+  # depend on someone remembering that CI also ran.
+  boundary:
+    name: open-core boundary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Private drop-ins must not be in the tag
+        run: |
+          set -euo pipefail
+          fail=0
+          for p in adaptive-private .cargo/config.toml \
+                   core/src/egress/private.rs cortex/src/authz/private.rs; do
+            if [ -e "$p" ]; then
+              echo "::error::$p is present in a clean checkout of this tag"
+              fail=1
+            fi
+          done
+          exit $fail
+
+      - name: The open baseline is what gets compiled
+        run: |
+          set -euo pipefail
+          test -e cortex/src/authz/baseline.rs
+          test -e core/src/egress/baseline.rs
+          echo "open baseline present; build.rs will select it"
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: boundary
+    runs-on: ${{ matrix.runner }}
+    # Built in bookworm so the binaries link against the same glibc the
+    # distributed ones do. Building on the runner's own image would produce
+    # something that refuses to start on Debian 12 and Ubuntu 22.04, which is
+    # most of the machines a scan node actually runs on.
+    container: rust:bookworm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the workspace binaries
+        run: |
+          set -euo pipefail
+          cargo build --release --locked \
+            -p crossfyre -p cortex -p mach -p voyage -p pulse -p scout -p node -p oast
+
+      - name: Stage the artifacts
+        id: stage
+        run: |
+          set -euo pipefail
+          out="dist/${{ matrix.target }}"
+          mkdir -p "$out"
+          for b in crossfyre cortex mach voyage pulse scout node oast; do
+            cp "target/release/$b" "$out/$b"
+          done
+          strip "$out"/* 2>/dev/null || true
+          tar -C "$out" -czf "crossfyre-toolchain-${{ matrix.target }}.tar.gz" .
+          sha256sum "crossfyre-toolchain-${{ matrix.target }}.tar.gz" \
+            > "crossfyre-toolchain-${{ matrix.target }}.tar.gz.sha256"
+          cat "crossfyre-toolchain-${{ matrix.target }}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: crossfyre-toolchain-${{ matrix.target }}.tar.gz*
+          if-no-files-found: error
+
+  publish:
+    name: attest and publish
+    needs: build
+    runs-on: ubuntu-latest
+    # `id-token` and `attestations` are what let the provenance be signed. They
+    # are granted here and nowhere else in the file, so the build job that
+    # compiles third-party code cannot mint an attestation.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+
+      - name: One checksum file for the whole release
+        run: |
+          set -euo pipefail
+          cat ./*.tar.gz.sha256 > SHA256SUMS
+          rm -f ./*.tar.gz.sha256
+          cat SHA256SUMS
+
+      # The piece that removes "trust us". Verify with:
+      #   gh attestation verify <file> --repo clickswave/crossfyre-toolchain
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: "*.tar.gz"
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            *.tar.gz
+            SHA256SUMS
+          fail_on_unmatched_files: true
+          body: |
+            ## What this is
+
+            The **open build** of the Crossfyre toolchain, compiled by GitHub
+            Actions from this tag. Engines and templates are Apache-2.0.
+
+            ## What this is not
+
+            This is **not** the binary `get.crossfyre.io` installs. The repo is
+            open-core, and three things are absent from any public checkout:
+
+            | absent | effect on this build |
+            |---|---|
+            | `cortex/src/authz/private.rs` | no BOLA/BFLA/BOPLA authorization oracle |
+            | `core/src/egress/private.rs` | no per-node egress isolation |
+            | `adaptive-private/` | untuned pacing, not the shipped governor |
+
+            `build.rs` selects the `baseline.rs` stubs instead. The distributed
+            binary includes the real implementations and cannot be reproduced
+            from this source. That difference is the point of publishing this
+            separately rather than pretending the two are the same artifact.
+
+            ## Verifying it
+
+            Provenance is attested, so you do not have to take our word for where
+            these came from:
+
+            ```
+            gh attestation verify crossfyre-toolchain-x86_64-unknown-linux-gnu.tar.gz \
+              --repo clickswave/crossfyre-toolchain
+            sha256sum -c SHA256SUMS
+            ```
+
+            Or skip us entirely: clone the tag and `cargo build --release`.
