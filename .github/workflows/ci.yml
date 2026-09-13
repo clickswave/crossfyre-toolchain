@@ -217,6 +217,10 @@ jobs:
         # missing URLs rather than as the browser problem it is.
         env:
           MACH_BROWSER_NO_SANDBOX: '1'
+          # The default 20s is marginal here. The same commit launched inside it
+          # on one run and missed it on another running at the same time, which
+          # reported as a detection regression rather than as a slow machine.
+          MACH_BROWSER_LAUNCH_TIMEOUT_SECS: '90'
         run: python3 tests/oracles/run.py
 
   fmt:

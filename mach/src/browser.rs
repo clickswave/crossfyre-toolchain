@@ -46,7 +46,25 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
 /// How long to wait for the browser to say it is listening.
-const LAUNCH_TIMEOUT: Duration = Duration::from_secs(20);
+///
+/// 20s is right on a workstation: long enough for a cold start, short enough
+/// that a browser which is never going to answer fails fast. It is marginal on
+/// a loaded CI runner, where the same commit launched inside the budget on one
+/// run and took longer than 20s on another running concurrently, which reads as
+/// a detection regression rather than as a slow machine.
+///
+/// `MACH_BROWSER_LAUNCH_TIMEOUT_SECS` raises it where that is the known cost,
+/// rather than making every user wait longer for a browser that is broken.
+const LAUNCH_TIMEOUT_DEFAULT_SECS: u64 = 20;
+
+fn launch_timeout() -> Duration {
+    std::env::var("MACH_BROWSER_LAUNCH_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(LAUNCH_TIMEOUT_DEFAULT_SECS))
+}
 /// How long one navigation may take before it is abandoned.
 pub const NAV_TIMEOUT: Duration = Duration::from_secs(20);
 /// After load fires, how long to keep recording. An SPA's first data fetches
@@ -158,7 +176,7 @@ impl Browser {
 
         let stderr = child.stderr.take().ok_or("no stderr from the browser")?;
         let mut lines = BufReader::new(stderr).lines();
-        let deadline = tokio::time::Instant::now() + LAUNCH_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + launch_timeout();
         let ws_url = loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
