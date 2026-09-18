@@ -1699,7 +1699,7 @@ async fn run_endpoint(mut ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome 
 /// POST is absent on purpose. It is the main injection surface and what it
 /// creates is usually recoverable; the other three are not, and for them the
 /// request is the damage rather than a test of it.
-fn destroys_a_resource(method: &str) -> bool {
+pub(crate) fn destroys_a_resource(method: &str) -> bool {
     matches!(
         method.to_ascii_uppercase().as_str(),
         "DELETE" | "PUT" | "PATCH"
