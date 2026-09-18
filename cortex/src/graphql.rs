@@ -1064,7 +1064,26 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
     // Runs LAST: it is the slow phase (a blind-cmdi OAST poll per string arg), so the fast
     // schema-level checks above always emit even if a per-field OAST wait runs long.
     if want("injection") && !fields.is_empty() {
+        // The same gate the authorization probe has, for the same reason, and it
+        // was missing here. This loop put payloads into every argument of every
+        // field including mutations, so with `test_writes` off it still ran them.
+        // Measured against a schema that records what it executes: 42
+        // state-changing resolver calls in one pass, 28 of them creating
+        // objects. That is defect 5 again, where the authorization matrix
+        // ignored `test_writes` and destroyed things, and defect 6, where the
+        // first fix for it missed a verb.
+        //
+        // The trade is the same one the authorization probe makes and states: an
+        // injectable argument on a destructive operation goes unconfirmed rather
+        // than uninvoked, and the run says which ones.
+        let mut injection_declined: Vec<String> = Vec::new();
         for f in &fields {
+            if (f.op == "mutation" || executes_something(&f.name)) && !params.test_writes {
+                if !f.string_args.is_empty() {
+                    injection_declined.push(f.path_name());
+                }
+                continue;
+            }
             for arg in &f.string_args {
                 if let Some(fd) = probe_field_injection(
                     &client,
@@ -1081,6 +1100,18 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
                     found += 1;
                 }
             }
+        }
+        if !injection_declined.is_empty() {
+            injection_declined.sort();
+            injection_declined.dedup();
+            let _ = tx.send(json!({"type":"log","message": format!(
+                "{} operation(s) with injectable arguments were NOT tested for injection: {}. \
+                 Each one performs an action, and putting a payload in its arguments means \
+                 running it. Whether they are injectable is untested here, not clean. Re-run \
+                 with writes enabled against a target you are willing to change.",
+                injection_declined.len(),
+                injection_declined.join(", ")
+            )}));
         }
     }
 
