@@ -54,7 +54,7 @@ fn d_true() -> bool {
     true
 }
 
-const INTROSPECT: &str = r#"{"query":"{ __schema { queryType { name fields { name args { name type { kind name ofType { kind name ofType { kind name } } } } type { kind name ofType { kind name } } } } mutationType { name fields { name args { name type { kind name ofType { kind name ofType { kind name } } } } type { kind name ofType { kind name } } } } types { name kind fields { name } } } }"}"#;
+const INTROSPECT: &str = r#"{"query":"{ __schema { queryType { name fields { name args { name type { kind name ofType { kind name ofType { kind name } } } } type { kind name ofType { kind name } } } } mutationType { name fields { name args { name type { kind name ofType { kind name ofType { kind name } } } } type { kind name ofType { kind name } } } } types { name kind fields { name args { name type { kind name ofType { kind name ofType { kind name } } } } type { kind name ofType { kind name ofType { kind name } } } } } } }"}"#;
 
 /// Field names that should never be exposed in a schema/response (credentials + secrets).
 static SENSITIVE_FIELD: &[&str] = &[
@@ -79,11 +79,43 @@ static SENSITIVE_FIELD: &[&str] = &[
 
 /// One root field we can exercise: its operation type, name, string/ID args, and whether its return
 /// type needs a `{ __typename }` selection set (object-ish) or must be bare (scalar/enum).
+#[derive(Clone)]
 struct Field {
     op: &'static str, // "query" | "mutation"
     name: String,
+    /// The named object type this field returns, when it returns one. Needed to
+    /// look the type up in the schema and decide whether it is data or a
+    /// namespace.
+    ret_type_name: Option<String>,
+    /// The namespace this operation lives inside, when it is not a root field.
+    /// Mature GraphQL APIs group operations by domain, so the thing worth
+    /// calling is `system { info }` rather than a root field of its own.
+    parent: Option<String>,
+    /// A real scalar field of the return type, to select instead of
+    /// `__typename`. Selecting `__typename` asks the server to name a type and
+    /// proves nothing was read: Wiki.js authorizes the scalar leaves of
+    /// `SystemInfo`, so `system { info { __typename } }` answers an anonymous
+    /// caller with data while `system { info { hostname } }` is refused.
+    selection: Option<String>,
+    /// Whether the field takes any arguments at all. A field that takes
+    /// arguments is an operation, never a namespace: a container has nothing to
+    /// parameterise. Without this, a Relay-style mutation payload (an object
+    /// wrapping the created record) looks exactly like a namespace, and dvga's
+    /// `createUser(username, email, password)` was walked into as one.
+    has_args: bool,
     string_args: Vec<String>,
     needs_selection: bool,
+}
+
+impl Field {
+    /// How to name this operation to a human, and the shape its response path
+    /// takes: `system.info` for a namespaced one, `audits` for a root field.
+    fn path_name(&self) -> String {
+        match &self.parent {
+            Some(p) => format!("{p}.{}", self.name),
+            None => self.name.clone(),
+        }
+    }
 }
 
 pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
@@ -313,10 +345,11 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
         });
         // Privileged operations that were named and deliberately not invoked.
         let mut declined: Vec<String> = Vec::new();
-        for f in &fields {
-            if !is_privileged_name(&f.name) {
-                continue;
-            }
+        let probes = schema_json
+            .as_ref()
+            .map(|sj| authz_probes(sj, &fields))
+            .unwrap_or_default();
+        for f in &probes {
             // Whether invoking this is safe is decided by what it DOES, not by
             // which GraphQL operation type it is filed under.
             //
@@ -337,20 +370,21 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
             // than unmentioned - and it is the same trade the crawler and the
             // injector already make for links and endpoints.
             if (f.op == "mutation" || executes_something(&f.name)) && !params.test_writes {
-                declined.push(f.name.clone());
+                declined.push(f.path_name());
                 continue;
             }
             let Some(anon) = anon.as_ref() else { continue };
             let doc = build_doc(f, "", "1"); // benign args; we only care whether authz blocks it
             if let Some(r) = post(anon, &url, &doc).await {
-                if r.status == 200 && !denied(&r.body) && resolver_ran(&r.body, &f.name) {
+                let name = f.path_name();
+                if r.status == 200 && !denied(&r.body) && resolver_ran(&r.body, f) {
                     let _ = tx.send(finding(
                         "graphql_bfla",
                         "Privileged GraphQL operation reachable without authorization",
                         "high",
                         &url, "POST",
-                        &format!("The privileged {} `{}` resolved for a caller sending no credential at all, with no authorization error. Function-level access control is missing on a sensitive operation (OWASP API5: BFLA) - anyone who can reach the endpoint can invoke admin/destructive functionality directly.", f.op, f.name),
-                    ).param(&f.name).event());
+                        &format!("The privileged {} `{}` resolved for a caller sending no credential at all, with no authorization error. Function-level access control is missing on a sensitive operation (OWASP API5: BFLA) - anyone who can reach the endpoint can invoke admin/destructive functionality directly.", f.op, name),
+                    ).param(&name).event());
                     found += 1;
                 }
             }
@@ -554,13 +588,23 @@ fn error_is_denial(e: &Value) -> bool {
 /// (parse, validation, variable coercion) carries no `path` at all, because no
 /// execution happened for it to have a path in. That distinction is structural,
 /// so it is the one to test.
-fn error_blames_field(e: &Value, field: &str) -> bool {
-    e.get("path")
-        .and_then(|p| p.as_array())
-        .and_then(|p| p.first())
-        .and_then(|p| p.as_str())
-        .map(|first| first == field)
-        .unwrap_or(false)
+fn error_blames_field(e: &Value, field: &Field) -> bool {
+    let Some(path) = e.get("path").and_then(|p| p.as_array()) else {
+        return false;
+    };
+    // The path a namespaced operation errors at is ["system", "info", ...], so
+    // the namespace has to match too. An error at `system.flags` says nothing
+    // about whether `system.info` ran.
+    let want: Vec<&str> = match &field.parent {
+        Some(ns) => vec![ns.as_str(), field.name.as_str()],
+        None => vec![field.name.as_str()],
+    };
+    if path.len() < want.len() {
+        return false;
+    }
+    want.iter()
+        .zip(path.iter())
+        .all(|(w, got)| got.as_str() == Some(*w))
 }
 
 /// The GraphQL response denied the operation (authorization error), so it is NOT a BFLA hit.
@@ -582,15 +626,16 @@ fn denied(body: &str) -> bool {
 
 /// The named resolver actually ran (returned data, or errored on something other than authorization -
 /// e.g. a validation/type error means auth let the call THROUGH to the resolver).
-fn resolver_ran(body: &str, field: &str) -> bool {
+fn resolver_ran(body: &str, field: &Field) -> bool {
     let Ok(v) = serde_json::from_str::<Value>(body) else {
         return false;
     };
+    let ptr = match &field.parent {
+        Some(ns) => format!("/data/{ns}/{}", field.name),
+        None => format!("/data/{}", field.name),
+    };
     // The unambiguous case: the field answered.
-    if v.pointer(&format!("/data/{field}"))
-        .map(|d| !d.is_null())
-        .unwrap_or(false)
-    {
+    if v.pointer(&ptr).map(|d| !d.is_null()).unwrap_or(false) {
         return true;
     }
     // Otherwise the only thing that proves execution reached the resolver is an
@@ -614,6 +659,22 @@ fn resolver_ran(body: &str, field: &str) -> bool {
                 .any(|e| error_blames_field(e, field) && !error_is_denial(e))
         })
         .unwrap_or(false)
+}
+
+/// A `Field` standing for a bare root operation, for the tests and for anywhere
+/// only the name is known.
+#[cfg(test)]
+fn root_field(name: &str) -> Field {
+    Field {
+        op: "query",
+        name: name.to_string(),
+        ret_type_name: None,
+        parent: None,
+        selection: None,
+        has_args: false,
+        string_args: Vec::new(),
+        needs_selection: false,
+    }
 }
 
 /// Does this field's name say it performs an action rather than answering a
@@ -731,11 +792,22 @@ fn parse_fields(schema: &Value) -> Vec<Field> {
                     }
                 }
             }
-            let (ret_kind, _ret_name) = f.get("type").map(unwrap_type).unwrap_or_default();
+            let (ret_kind, ret_name) = f.get("type").map(unwrap_type).unwrap_or_default();
             let needs_selection = matches!(ret_kind.as_str(), "OBJECT" | "INTERFACE" | "UNION");
+            let has_args = f
+                .get("args")
+                .and_then(|a| a.as_array())
+                .is_some_and(|a| !a.is_empty());
             out.push(Field {
                 op,
                 name: name.to_string(),
+                ret_type_name: (!ret_name.is_empty()).then_some(ret_name),
+                parent: None,
+                // Filled in by `authz_probes`, which has the type index. Left
+                // empty here so the injection phase keeps the document it has
+                // always sent.
+                selection: None,
+                has_args,
                 string_args,
                 needs_selection,
             });
@@ -746,6 +818,135 @@ fn parse_fields(schema: &Value) -> Vec<Field> {
 
 /// Build a GraphQL document exercising `field` with `value` placed in `inj_arg` (other string args
 /// get a benign filler so required args are satisfied).
+/// The first field of this type that returns a scalar or an enum, which is the
+/// only kind of selection that proves something was read.
+///
+/// Its absence is the other half of the rule. An object type with no scalar
+/// anywhere in it is not data, it is a namespace: its fields are the operations.
+/// `SystemQuery` in Wiki.js is `flags`, `info`, `extensions`, `exportStatus`,
+/// and not one scalar among them.
+fn scalar_leaf(t: &Value) -> Option<String> {
+    let fields = t.get("fields")?.as_array()?;
+    fields.iter().find_map(|f| {
+        let name = f.get("name")?.as_str()?;
+        if name.starts_with("__") {
+            return None;
+        }
+        // A scalar behind arguments is not a free read, so it is no use as a
+        // selection.
+        if f.get("args")
+            .and_then(|a| a.as_array())
+            .is_some_and(|a| !a.is_empty())
+        {
+            return None;
+        }
+        let (kind, _) = f.get("type").map(unwrap_type).unwrap_or_default();
+        matches!(kind.as_str(), "SCALAR" | "ENUM").then(|| name.to_string())
+    })
+}
+
+/// The operations an authorization probe should actually call.
+///
+/// Two things were wrong with probing root fields directly, and both were found
+/// by pointing the engine at Wiki.js 2.5.307, whose entire administrative API is
+/// GraphQL. Of its 35 root fields exactly one matched the privileged-name
+/// vocabulary, and that one was `system`, a namespace. So the engine produced one
+/// false positive and examined none of the operations that actually check
+/// anything.
+///
+/// A root field is an operation when it returns data, or when it takes arguments,
+/// because a container has nothing to parameterise. Otherwise the operations are
+/// one level inside it, and the privilege is carried by the namespace rather than
+/// the leaf: `system { info }` is privileged because of `system`, while `info`
+/// says nothing on its own. A privileged namespace therefore lends its privilege
+/// to every leaf it contains.
+///
+/// Whatever is probed gets a real scalar selected out of it, because the earlier
+/// `__typename` asked the server to name a type rather than to return anything.
+/// Wiki.js authorizes the scalar leaves of `SystemInfo`, so `system { info {
+/// __typename } }` answers an anonymous caller and `system { info { hostname } }`
+/// does not: selecting `__typename` turned a correct refusal into a finding one
+/// level deeper than the first one.
+fn authz_probes(schema: &Value, roots: &[Field]) -> Vec<Field> {
+    let empty = Vec::new();
+    let types: &Vec<Value> = schema
+        .pointer("/data/__schema/types")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+    let type_by_name = |want: &str| -> Option<&Value> {
+        types
+            .iter()
+            .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(want))
+    };
+    // What to select out of a field, given the type it returns.
+    let selection_for = |ret: Option<&String>| -> Option<String> {
+        ret.and_then(|n| type_by_name(n)).and_then(scalar_leaf)
+    };
+
+    let mut out = Vec::new();
+    for r in roots {
+        if !is_privileged_name(&r.name) {
+            continue;
+        }
+        let ret = r.ret_type_name.as_ref().and_then(|n| type_by_name(n));
+        // A scalar or enum return is data, always. Only an object can be a
+        // namespace, and `needs_selection` is already the test for that: without
+        // it, `debugConfig: String` looked up the `String` type, found it has no
+        // fields and therefore no scalar leaf, and was classified as a namespace
+        // with nothing in it. It was then dropped entirely, which took the
+        // benchmark's positive control with it.
+        let is_namespace =
+            !r.has_args && r.needs_selection && ret.is_some_and(|t| scalar_leaf(t).is_none());
+        if !is_namespace {
+            let mut f = r.clone();
+            f.selection = selection_for(r.ret_type_name.as_ref());
+            out.push(f);
+            continue;
+        }
+        let Some(leaves) = ret.and_then(|t| t.get("fields")).and_then(|f| f.as_array()) else {
+            continue;
+        };
+        for leaf in leaves {
+            let Some(name) = leaf.get("name").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if name.starts_with("__") {
+                continue;
+            }
+            let mut string_args = Vec::new();
+            if let Some(args) = leaf.get("args").and_then(|v| v.as_array()) {
+                for a in args {
+                    let an = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let (_k, tn) = a.get("type").map(unwrap_type).unwrap_or_default();
+                    if !an.is_empty() && (tn == "String" || tn == "ID") {
+                        string_args.push(an.to_string());
+                    }
+                }
+            }
+            let (kind, leaf_ret) = leaf.get("type").map(unwrap_type).unwrap_or_default();
+            let leaf_ret = (!leaf_ret.is_empty()).then_some(leaf_ret);
+            out.push(Field {
+                op: r.op,
+                name: name.to_string(),
+                selection: selection_for(leaf_ret.as_ref()),
+                ret_type_name: leaf_ret,
+                parent: Some(r.name.clone()),
+                has_args: leaf
+                    .get("args")
+                    .and_then(|a| a.as_array())
+                    .is_some_and(|a| !a.is_empty()),
+                string_args,
+                needs_selection: matches!(kind.as_str(), "OBJECT" | "INTERFACE" | "UNION"),
+            });
+        }
+    }
+    // A namespace can be wide, and this probe sends one request per operation as
+    // an unauthenticated caller. Enough to be useful, bounded enough not to look
+    // like a flood.
+    out.truncate(120);
+    out
+}
+
 fn build_doc(field: &Field, inj_arg: &str, value: &str) -> String {
     let args: String = field
         .string_args
@@ -761,17 +962,21 @@ fn build_doc(field: &Field, inj_arg: &str, value: &str) -> String {
     } else {
         format!("{}({})", field.name, args)
     };
-    let sel = if field.needs_selection {
-        " { __typename }"
-    } else {
-        ""
+    let sel = match (field.needs_selection, field.selection.as_deref()) {
+        (true, Some(leaf)) => format!(" {{ {leaf} }}"),
+        (true, None) => " { __typename }".to_string(),
+        (false, _) => String::new(),
     };
     let op_kw = if field.op == "mutation" {
         "mutation"
     } else {
         "query"
     };
-    json!({ "query": format!("{op_kw} {{ {call}{sel} }}") }).to_string()
+    let body = match &field.parent {
+        Some(ns) => format!("{ns} {{ {call}{sel} }}"),
+        None => format!("{call}{sel}"),
+    };
+    json!({ "query": format!("{op_kw} {{ {body} }}") }).to_string()
 }
 
 /// Does a GraphQL JSON response carry an error whose message looks like a SQL engine error?
@@ -961,6 +1166,10 @@ mod tests {
     #[test]
     fn builds_query_with_selection_and_escapes() {
         let f = Field {
+            ret_type_name: None,
+            parent: None,
+            selection: None,
+            has_args: false,
             op: "query",
             name: "paste".into(),
             string_args: vec!["id".into()],
@@ -1089,7 +1298,7 @@ mod tests {
             r#"{"errors":[{"message":"Syntax Error: Expected Name, found }"}]}"#,
         ] {
             assert!(
-                !resolver_ran(body, "adminUsers"),
+                !resolver_ran(body, &root_field("adminUsers")),
                 "validation happens before execution: {body}"
             );
         }
@@ -1106,7 +1315,7 @@ mod tests {
             r#"{"errors":[{"message":"Signature has expired","path":["adminUsers"]}]}"#,
         ] {
             assert!(
-                !resolver_ran(body, "adminUsers"),
+                !resolver_ran(body, &root_field("adminUsers")),
                 "a refused call did not reach the resolver: {body}"
             );
         }
@@ -1115,7 +1324,7 @@ mod tests {
         // carry the ones the prose misses.
         let by_code = r#"{"data":null,"errors":[{"message":"nope","path":["adminUsers"],"extensions":{"code":"FORBIDDEN"}}]}"#;
         assert!(denied(by_code), "extensions.code FORBIDDEN is a refusal");
-        assert!(!resolver_ran(by_code, "adminUsers"));
+        assert!(!resolver_ran(by_code, &root_field("adminUsers")));
     }
 
     #[test]
@@ -1123,22 +1332,22 @@ mod tests {
         // The whole point of the probe. None of the tightening above may cost it.
         assert!(resolver_ran(
             r#"{"data":{"audits":[{"__typename":"AuditObject"}]}}"#,
-            "audits"
+            &root_field("audits")
         ));
         assert!(resolver_ran(
             r#"{"data":{"systemHealth":"System Load: 0.92\n"}}"#,
-            "systemHealth"
+            &root_field("systemHealth")
         ));
         // A resolver that ran and then failed on its own account: the server
         // blames the field by path, and the reason is not a refusal.
         assert!(resolver_ran(
             r#"{"data":{"adminUsers":null},"errors":[{"message":"Database connection failed","path":["adminUsers"]}]}"#,
-            "adminUsers"
+            &root_field("adminUsers")
         ));
         // Data for the field wins even alongside an unrelated error elsewhere.
         assert!(resolver_ran(
             r#"{"data":{"audits":[1]},"errors":[{"message":"whatever","path":["other"]}]}"#,
-            "audits"
+            &root_field("audits")
         ));
     }
 
@@ -1146,7 +1355,188 @@ mod tests {
     fn an_error_blaming_a_different_field_says_nothing_about_this_one() {
         assert!(!resolver_ran(
             r#"{"data":{"audits":null},"errors":[{"message":"Database connection failed","path":["pastes"]}]}"#,
-            "audits"
+            &root_field("audits")
         ));
+    }
+
+    /// The shape Wiki.js 2.5.307 actually returns: every operation lives inside a
+    /// domain namespace, and `SystemQuery` has four fields and not one scalar.
+    fn wikijs_schema() -> Value {
+        json!({"data":{"__schema":{
+            "queryType":{"name":"Query","fields":[
+                {"name":"system","args":[],"type":{"kind":"OBJECT","name":"SystemQuery","ofType":null}},
+                {"name":"pages","args":[],"type":{"kind":"OBJECT","name":"PageQuery","ofType":null}}
+            ]},
+            "mutationType":{"name":"Mutation","fields":[]},
+            "types":[
+                {"name":"SystemQuery","kind":"OBJECT","fields":[
+                    {"name":"flags","args":[],"type":{"kind":"LIST","name":null,"ofType":{"kind":"OBJECT","name":"SystemFlag"}}},
+                    {"name":"info","args":[],"type":{"kind":"OBJECT","name":"SystemInfo","ofType":null}},
+                    {"name":"extensions","args":[],"type":{"kind":"LIST","name":null,"ofType":{"kind":"OBJECT","name":"SystemExtension"}}},
+                    {"name":"exportStatus","args":[],"type":{"kind":"OBJECT","name":"SystemExportStatus","ofType":null}}
+                ]},
+                {"name":"SystemInfo","kind":"OBJECT","fields":[
+                    {"name":"currentVersion","args":[],"type":{"kind":"SCALAR","name":"String","ofType":null}},
+                    {"name":"hostname","args":[],"type":{"kind":"SCALAR","name":"String","ofType":null}}
+                ]}
+            ]
+        }}})
+    }
+
+    #[test]
+    fn a_namespace_is_walked_into_rather_than_reported() {
+        let schema = wikijs_schema();
+        let roots = parse_fields(&schema);
+        let probes = authz_probes(&schema, &roots);
+        let names: Vec<String> = probes.iter().map(|f| f.path_name()).collect();
+        // `system` is the only privileged root, and it is a container, so the
+        // operations are its four leaves and the container itself is not one.
+        assert_eq!(
+            names,
+            vec![
+                "system.flags",
+                "system.info",
+                "system.extensions",
+                "system.exportStatus"
+            ],
+            "got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "system"),
+            "the container answers everybody and proves nothing"
+        );
+    }
+
+    #[test]
+    fn a_namespaced_probe_asks_for_the_right_document() {
+        let schema = wikijs_schema();
+        let roots = parse_fields(&schema);
+        let probes = authz_probes(&schema, &roots);
+        let info = probes.iter().find(|f| f.name == "info").expect("info");
+        // A real scalar out of SystemInfo, not `__typename`. Wiki.js answers
+        // `__typename` to anybody and refuses `hostname`, so the document that
+        // asks for a type name cannot tell a refusal from a leak.
+        assert_eq!(
+            build_doc(info, "", "1"),
+            r#"{"query":"query { system { info { currentVersion } } }"}"#
+        );
+        // The namespace's other leaves have no scalar to reach for, so they are
+        // asked about directly and `__typename` is the honest fallback.
+        let flags = probes.iter().find(|f| f.name == "flags").unwrap();
+        assert_eq!(
+            build_doc(flags, "", "1"),
+            r#"{"query":"query { system { flags { __typename } } }"}"#
+        );
+    }
+
+    #[test]
+    fn a_scalar_returning_field_is_never_a_namespace() {
+        // Every one of these returns a scalar. `String` has no `fields`, so a
+        // namespace test that only asks "has this type a scalar leaf" says yes
+        // to all of them and drops them.
+        let schema = json!({"data":{"__schema":{
+            "queryType":{"name":"Query","fields":[
+                {"name":"debugConfig","args":[],"type":{"kind":"SCALAR","name":"String","ofType":null}},
+                {"name":"systemHealth","args":[],"type":{"kind":"SCALAR","name":"String","ofType":null}},
+                {"name":"systemUpdate","args":[],"type":{"kind":"SCALAR","name":"String","ofType":null}}
+            ]},
+            "mutationType":{"name":"Mutation","fields":[]},
+            "types":[{"name":"String","kind":"SCALAR","fields":null}]
+        }}});
+        let roots = parse_fields(&schema);
+        let probes = authz_probes(&schema, &roots);
+        let names: Vec<String> = probes.iter().map(|f| f.path_name()).collect();
+        assert_eq!(
+            names,
+            vec!["debugConfig", "systemHealth", "systemUpdate"],
+            "got {names:?}"
+        );
+        // And they are asked about bare, with no selection set.
+        for f in &probes {
+            assert_eq!(
+                build_doc(f, "", "1"),
+                format!(r#"{{"query":"query {{ {} }}"}}"#, f.name)
+            );
+        }
+    }
+
+    #[test]
+    fn a_field_with_arguments_is_an_operation_not_a_namespace() {
+        // dvga's `createUser` returns a payload object wrapping the record it
+        // made, which has no scalar of its own, so it looked exactly like a
+        // namespace and was walked into as `createUser.user`. It takes three
+        // arguments, and a container has nothing to parameterise.
+        let schema = json!({"data":{"__schema":{
+            "queryType":{"name":"Query","fields":[]},
+            "mutationType":{"name":"Mutation","fields":[
+                {"name":"createUser","args":[
+                    {"name":"username","type":{"kind":"SCALAR","name":"String","ofType":null}},
+                    {"name":"email","type":{"kind":"SCALAR","name":"String","ofType":null}},
+                    {"name":"password","type":{"kind":"SCALAR","name":"String","ofType":null}}
+                ],"type":{"kind":"OBJECT","name":"CreateUserResult","ofType":null}}
+            ]},
+            "types":[
+                {"name":"CreateUserResult","kind":"OBJECT","fields":[
+                    {"name":"user","args":[],"type":{"kind":"OBJECT","name":"UserObject","ofType":null}}
+                ]},
+                {"name":"UserObject","kind":"OBJECT","fields":[
+                    {"name":"id","args":[],"type":{"kind":"SCALAR","name":"Int","ofType":null}}
+                ]}
+            ]
+        }}});
+        let roots = parse_fields(&schema);
+        let probes = authz_probes(&schema, &roots);
+        let names: Vec<String> = probes.iter().map(|f| f.path_name()).collect();
+        assert_eq!(names, vec!["createUser"], "got {names:?}");
+    }
+
+    #[test]
+    fn a_namespaced_refusal_is_attributed_to_the_right_operation() {
+        let schema = wikijs_schema();
+        let roots = parse_fields(&schema);
+        let probes = authz_probes(&schema, &roots);
+        let info = probes.iter().find(|f| f.name == "info").unwrap();
+        let flags = probes.iter().find(|f| f.name == "flags").unwrap();
+
+        // What Wiki.js answers an anonymous caller. The code is generic, so the
+        // refusal is only readable as prose, which is why the phrase list is kept.
+        let forbidden = r#"{"errors":[{"message":"Forbidden","path":["system","info"],"extensions":{"code":"INTERNAL_SERVER_ERROR"}}],"data":{"system":{"info":null}}}"#;
+        assert!(denied(forbidden));
+        assert!(!resolver_ran(forbidden, info));
+        // And an error at a sibling says nothing about this operation.
+        assert!(!resolver_ran(forbidden, flags));
+
+        // The container answering is not the operation answering.
+        let container_only = r#"{"data":{"system":{"__typename":"SystemQuery"}}}"#;
+        assert!(!resolver_ran(container_only, info));
+
+        // A leaf that really did answer.
+        let leaked = r#"{"data":{"system":{"info":{"__typename":"SystemInfo"}}}}"#;
+        assert!(resolver_ran(leaked, info));
+    }
+
+    #[test]
+    fn a_root_field_that_returns_data_is_still_the_operation() {
+        // The control target's shape: privileged roots returning lists of objects
+        // and scalars, with no namespace anywhere. Walking must not change these.
+        let schema = json!({"data":{"__schema":{
+            "queryType":{"name":"Query","fields":[
+                {"name":"adminUsers","args":[],"type":{"kind":"LIST","name":null,"ofType":{"kind":"OBJECT","name":"User"}}},
+                {"name":"debugConfig","args":[],"type":{"kind":"SCALAR","name":"String","ofType":null}},
+                {"name":"me","args":[],"type":{"kind":"OBJECT","name":"User","ofType":null}}
+            ]},
+            "mutationType":{"name":"Mutation","fields":[]},
+            "types":[
+                {"name":"User","kind":"OBJECT","fields":[
+                    {"name":"id","args":[],"type":{"kind":"SCALAR","name":"String","ofType":null}},
+                    {"name":"email","args":[],"type":{"kind":"SCALAR","name":"String","ofType":null}}
+                ]}
+            ]
+        }}});
+        let roots = parse_fields(&schema);
+        let probes = authz_probes(&schema, &roots);
+        let names: Vec<String> = probes.iter().map(|f| f.path_name()).collect();
+        assert_eq!(names, vec!["adminUsers", "debugConfig"], "got {names:?}");
+        assert!(probes.iter().all(|f| f.parent.is_none()));
     }
 }
