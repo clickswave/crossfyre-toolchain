@@ -97,6 +97,12 @@ struct Field {
     /// `SystemInfo`, so `system { info { __typename } }` answers an anonymous
     /// caller with data while `system { info { hostname } }` is refused.
     selection: Option<String>,
+    /// Further scalar leaves to fall back on, because the first one may not be
+    /// readable for a reason that has nothing to do with authorization. Directus
+    /// answers `settings { id }` with a pathless INTERNAL_SERVER_ERROR while
+    /// `settings { project_name }` returns data, so a probe that committed to the
+    /// first leaf read an unauthorized anonymous read as a refusal.
+    alt_selections: Vec<String>,
     /// Whether the field takes any arguments at all. A field that takes
     /// arguments is an operation, never a namespace: a container has nothing to
     /// parameterise. Without this, a Relay-style mutation payload (an object
@@ -104,6 +110,14 @@ struct Field {
     /// `createUser(username, email, password)` was walked into as one.
     has_args: bool,
     string_args: Vec<String>,
+    /// The subset of `string_args` the schema marks NON_NULL. Only these get a
+    /// placeholder value. Filling an OPTIONAL argument invents a value the server
+    /// then has to interpret, and Directus answers
+    /// `settings(version: "1")` with `FORBIDDEN`, because it goes looking for
+    /// version "1" in a collection an anonymous caller cannot read. The probe
+    /// read that as the target refusing, when it was the target refusing the
+    /// probe's own made-up argument, and the real finding underneath it was lost.
+    req_args: Vec<String>,
     needs_selection: bool,
 }
 
@@ -345,6 +359,10 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
         });
         // Privileged operations that were named and deliberately not invoked.
         let mut declined: Vec<String> = Vec::new();
+        // Operations that answered without either refusing or returning
+        // anything, on every selection tried. Named rather than dropped, for the
+        // reason zero coverage is never reported as zero findings.
+        let mut inconclusive: Vec<String> = Vec::new();
         let probes = schema_json
             .as_ref()
             .map(|sj| authz_probes(sj, &fields))
@@ -374,10 +392,37 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
                 continue;
             }
             let Some(anon) = anon.as_ref() else { continue };
-            let doc = build_doc(f, "", "1"); // benign args; we only care whether authz blocks it
-            if let Some(r) = post(anon, &url, &doc).await {
-                let name = f.path_name();
-                if r.status == 200 && !denied(&r.body) && resolver_ran(&r.body, f) {
+            let name = f.path_name();
+
+            // Ask with each candidate selection until one of them settles the
+            // question. A selection that cannot be read tells us nothing about
+            // authorization, and treating it as a refusal is how a real
+            // unauthorized read went unreported: Directus answers
+            // `settings { id }` with a pathless INTERNAL_SERVER_ERROR and
+            // `settings { project_name }` with the data.
+            let mut probe = f.clone();
+            let mut candidates: Vec<Option<String>> = Vec::new();
+            if f.needs_selection {
+                candidates.push(f.selection.clone());
+                candidates.extend(f.alt_selections.iter().cloned().map(Some));
+            } else {
+                candidates.push(None);
+            }
+
+            let mut settled = false;
+            for cand in candidates {
+                probe.selection = cand;
+                let Some(r) = post(anon, &url, &build_doc(&probe, "", "1")).await else {
+                    // No response at all says nothing either way.
+                    continue;
+                };
+                if r.status != 200 || denied(&r.body) {
+                    // Refused, or refused before GraphQL saw it. Settled, and not
+                    // a finding.
+                    settled = true;
+                    break;
+                }
+                if resolver_ran(&r.body, &probe) {
                     let _ = tx.send(finding(
                         "graphql_bfla",
                         "Privileged GraphQL operation reachable without authorization",
@@ -386,7 +431,14 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
                         &format!("The privileged {} `{}` resolved for a caller sending no credential at all, with no authorization error. Function-level access control is missing on a sensitive operation (OWASP API5: BFLA) - anyone who can reach the endpoint can invoke admin/destructive functionality directly.", f.op, name),
                     ).param(&name).event());
                     found += 1;
+                    settled = true;
+                    break;
                 }
+                // Answered 200, refused nothing, returned nothing. Inconclusive:
+                // try the next selection.
+            }
+            if !settled {
+                inconclusive.push(name);
             }
         }
         if anon.is_none() {
@@ -406,6 +458,17 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
                  which this job does not carry. Treat privilege escalation between roles as \
                  untested here rather than absent."
             }));
+        }
+        if !inconclusive.is_empty() {
+            inconclusive.sort();
+            inconclusive.dedup();
+            let _ = tx.send(json!({"type":"log","message": format!(
+                "{} privileged operation(s) could not be settled either way: {}. Each answered 200 \
+                 without refusing and without returning anything readable, on every field this \
+                 probe knew how to ask for. Whether they are protected is untested here, not clean.",
+                inconclusive.len(),
+                inconclusive.join(", ")
+            )}));
         }
         if !declined.is_empty() {
             declined.sort();
@@ -671,6 +734,8 @@ fn root_field(name: &str) -> Field {
         ret_type_name: None,
         parent: None,
         selection: None,
+        alt_selections: Vec::new(),
+        req_args: Vec::new(),
         has_args: false,
         string_args: Vec::new(),
         needs_selection: false,
@@ -748,6 +813,12 @@ async fn post(client: &Client, url: &str, body: &str) -> Option<probe::Resp> {
     probe::send(client, "POST", url, Some((body, "application/json"))).await
 }
 
+/// Is this argument required? NON_NULL at the top of the type ref, which is the
+/// one thing `unwrap_type` deliberately throws away.
+fn arg_is_required(t: &Value) -> bool {
+    t.get("kind").and_then(|k| k.as_str()) == Some("NON_NULL")
+}
+
 /// Unwrap a GraphQL type ref (NON_NULL / LIST wrappers) to the underlying (kind, name).
 fn unwrap_type(t: &Value) -> (String, String) {
     let mut cur = t;
@@ -783,12 +854,16 @@ fn parse_fields(schema: &Value) -> Vec<Field> {
                 continue;
             }
             let mut string_args = Vec::new();
+            let mut req_args = Vec::new();
             if let Some(args) = f.get("args").and_then(|v| v.as_array()) {
                 for a in args {
                     let an = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
                     let (_k, tn) = a.get("type").map(unwrap_type).unwrap_or_default();
                     if !an.is_empty() && (tn == "String" || tn == "ID") {
                         string_args.push(an.to_string());
+                        if a.get("type").is_some_and(arg_is_required) {
+                            req_args.push(an.to_string());
+                        }
                     }
                 }
             }
@@ -807,6 +882,8 @@ fn parse_fields(schema: &Value) -> Vec<Field> {
                 // empty here so the injection phase keeps the document it has
                 // always sent.
                 selection: None,
+                alt_selections: Vec::new(),
+                req_args,
                 has_args,
                 string_args,
                 needs_selection,
@@ -826,23 +903,37 @@ fn parse_fields(schema: &Value) -> Vec<Field> {
 /// `SystemQuery` in Wiki.js is `flags`, `info`, `extensions`, `exportStatus`,
 /// and not one scalar among them.
 fn scalar_leaf(t: &Value) -> Option<String> {
-    let fields = t.get("fields")?.as_array()?;
-    fields.iter().find_map(|f| {
-        let name = f.get("name")?.as_str()?;
-        if name.starts_with("__") {
-            return None;
-        }
-        // A scalar behind arguments is not a free read, so it is no use as a
-        // selection.
-        if f.get("args")
-            .and_then(|a| a.as_array())
-            .is_some_and(|a| !a.is_empty())
-        {
-            return None;
-        }
-        let (kind, _) = f.get("type").map(unwrap_type).unwrap_or_default();
-        matches!(kind.as_str(), "SCALAR" | "ENUM").then(|| name.to_string())
-    })
+    scalar_leaves(t).into_iter().next()
+}
+
+/// Every freely readable scalar or enum field of this type, in schema order,
+/// capped at a few. More than one is needed because the first is not always
+/// readable: it is very often `id`, and `id` is the field most likely to be
+/// special-cased, computed, or to blow up on a singleton.
+fn scalar_leaves(t: &Value) -> Vec<String> {
+    let Some(fields) = t.get("fields").and_then(|f| f.as_array()) else {
+        return Vec::new();
+    };
+    fields
+        .iter()
+        .filter_map(|f| {
+            let name = f.get("name")?.as_str()?;
+            if name.starts_with("__") {
+                return None;
+            }
+            // A scalar behind arguments is not a free read, so it is no use as a
+            // selection.
+            if f.get("args")
+                .and_then(|a| a.as_array())
+                .is_some_and(|a| !a.is_empty())
+            {
+                return None;
+            }
+            let (kind, _) = f.get("type").map(unwrap_type).unwrap_or_default();
+            matches!(kind.as_str(), "SCALAR" | "ENUM").then(|| name.to_string())
+        })
+        .take(4)
+        .collect()
 }
 
 /// The operations an authorization probe should actually call.
@@ -879,8 +970,10 @@ fn authz_probes(schema: &Value, roots: &[Field]) -> Vec<Field> {
             .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(want))
     };
     // What to select out of a field, given the type it returns.
-    let selection_for = |ret: Option<&String>| -> Option<String> {
-        ret.and_then(|n| type_by_name(n)).and_then(scalar_leaf)
+    let selections_for = |ret: Option<&String>| -> Vec<String> {
+        ret.and_then(|n| type_by_name(n))
+            .map(scalar_leaves)
+            .unwrap_or_default()
     };
 
     let mut out = Vec::new();
@@ -899,7 +992,9 @@ fn authz_probes(schema: &Value, roots: &[Field]) -> Vec<Field> {
             !r.has_args && r.needs_selection && ret.is_some_and(|t| scalar_leaf(t).is_none());
         if !is_namespace {
             let mut f = r.clone();
-            f.selection = selection_for(r.ret_type_name.as_ref());
+            let mut cands = selections_for(r.ret_type_name.as_ref());
+            f.selection = (!cands.is_empty()).then(|| cands.remove(0));
+            f.alt_selections = cands;
             out.push(f);
             continue;
         }
@@ -914,23 +1009,31 @@ fn authz_probes(schema: &Value, roots: &[Field]) -> Vec<Field> {
                 continue;
             }
             let mut string_args = Vec::new();
+            let mut req_args = Vec::new();
             if let Some(args) = leaf.get("args").and_then(|v| v.as_array()) {
                 for a in args {
                     let an = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
                     let (_k, tn) = a.get("type").map(unwrap_type).unwrap_or_default();
                     if !an.is_empty() && (tn == "String" || tn == "ID") {
                         string_args.push(an.to_string());
+                        if a.get("type").is_some_and(arg_is_required) {
+                            req_args.push(an.to_string());
+                        }
                     }
                 }
             }
             let (kind, leaf_ret) = leaf.get("type").map(unwrap_type).unwrap_or_default();
             let leaf_ret = (!leaf_ret.is_empty()).then_some(leaf_ret);
+            let mut cands = selections_for(leaf_ret.as_ref());
+            let first = (!cands.is_empty()).then(|| cands.remove(0));
             out.push(Field {
                 op: r.op,
                 name: name.to_string(),
-                selection: selection_for(leaf_ret.as_ref()),
+                selection: first,
+                alt_selections: cands,
                 ret_type_name: leaf_ret,
                 parent: Some(r.name.clone()),
+                req_args,
                 has_args: leaf
                     .get("args")
                     .and_then(|a| a.as_array())
@@ -951,6 +1054,10 @@ fn build_doc(field: &Field, inj_arg: &str, value: &str) -> String {
     let args: String = field
         .string_args
         .iter()
+        // The argument under test always goes in. Everything else goes in only
+        // if the schema requires it: a placeholder in an optional argument is a
+        // value we invented, and the server's answer to it is about us.
+        .filter(|a| *a == inj_arg || field.req_args.contains(a))
         .map(|a| {
             let v = if a == inj_arg { value } else { "1" };
             format!("{a}: {}", json!(v)) // json! escapes the string literal safely
@@ -1169,10 +1276,12 @@ mod tests {
             ret_type_name: None,
             parent: None,
             selection: None,
+            alt_selections: Vec::new(),
             has_args: false,
             op: "query",
             name: "paste".into(),
             string_args: vec!["id".into()],
+            req_args: Vec::new(),
             needs_selection: true,
         };
         let doc = build_doc(&f, "id", "1\" or \"1");
@@ -1427,6 +1536,42 @@ mod tests {
             build_doc(flags, "", "1"),
             r#"{"query":"query { system { flags { __typename } } }"}"#
         );
+    }
+
+    #[test]
+    fn an_optional_argument_is_left_out_rather_than_invented() {
+        // Directus `settings(version: String)`. Filling it sent the server
+        // looking for version "1" in a collection an anonymous caller cannot
+        // read, which came back FORBIDDEN, and the probe read its own invented
+        // argument as the target's authorization decision.
+        let optional = Field {
+            op: "query",
+            name: "settings".into(),
+            ret_type_name: Some("directus_settings".into()),
+            parent: None,
+            selection: Some("project_name".into()),
+            alt_selections: Vec::new(),
+            string_args: vec!["version".into()],
+            req_args: Vec::new(),
+            has_args: true,
+            needs_selection: true,
+        };
+        assert_eq!(
+            build_doc(&optional, "", "1"),
+            r#"{"query":"query { settings { project_name } }"}"#
+        );
+
+        // Required is different: leaving it out is an invalid document, which
+        // proves nothing at all.
+        let mut required = optional.clone();
+        required.req_args = vec!["version".into()];
+        let doc = build_doc(&required, "", "1");
+        assert!(doc.contains("settings(version:"), "{doc}");
+        assert!(doc.contains("project_name"), "{doc}");
+
+        // And the argument being injected always goes in, optional or not,
+        // because placing a payload in it is the entire point.
+        assert!(build_doc(&optional, "version", "1' or '1").contains("version:"));
     }
 
     #[test]
