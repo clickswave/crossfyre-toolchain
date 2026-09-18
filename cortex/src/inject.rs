@@ -55,6 +55,25 @@ pub struct InjectParams {
     pub auth_pool: Vec<AuthSpec>,
     #[serde(default)]
     pub oast: Option<OastSpec>,
+    /// Opt-in to injecting into methods that overwrite or destroy a resource
+    /// (DELETE, PUT, PATCH). Off by default, which is the same rail the
+    /// authorization engine states: read-only is the safe default.
+    ///
+    /// This engine already refuses a URL whose query names an action, and the
+    /// comment beside that refusal says testing a button "can also log the scan
+    /// out, harden the target, or delete a customer's data; the second outcome is
+    /// not worth the first". That reasoning applies word for word to a `DELETE`
+    /// endpoint and was not being applied to it. Measured against Memos: a
+    /// single DELETE endpoint in the list, 118 requests, and the record was gone.
+    /// The pass noticed afterwards and said the endpoint "does not answer the way
+    /// it did before", which is worth having and is not the same as not doing it.
+    ///
+    /// POST is deliberately NOT gated. It is the main injection surface (forms,
+    /// search, login) and what it usually creates is recoverable, where an
+    /// overwrite and a delete are not. Narrowing it to nothing would trade most
+    /// of this engine's value for safety it does not need.
+    #[serde(default)]
+    pub test_writes: bool,
     /// Which classes to run (sqli/xss/cmdi/lfi); empty/null = all.
     #[serde(default, deserialize_with = "crate::probe::de_null_seq")]
     pub classes: Vec<String>,
@@ -657,6 +676,7 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
             };
             spawned += 1;
             let ctx = EndpointCtx {
+                test_writes: params.test_writes,
                 client: worker_client,
                 client_nr: client_nr.clone(),
                 oast: oast.clone(),
@@ -1117,6 +1137,8 @@ struct EndpointCtx {
     /// oracle's whole claim is "an anonymous caller gets this", so it must not
     /// run when the request carries a session.
     unauthenticated: bool,
+    /// Opt-in to injecting into a method that overwrites or destroys.
+    test_writes: bool,
     inv_seen: Arc<SeenSet>,
     rl_seen: Arc<SeenSet>,
     cors_seen: Arc<SeenSet>,
@@ -1168,6 +1190,7 @@ struct EndpointOutcome {
 /// Probe one endpoint end to end.
 async fn run_endpoint(mut ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome {
     let EndpointCtx {
+        test_writes,
         client,
         client_nr,
         oast,
@@ -1192,6 +1215,23 @@ async fn run_endpoint(mut ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome 
     let want = |c: &str| classes.is_empty() || classes.iter().any(|x| x == c);
     let oast = oast.as_deref();
     let mut found = 0i64;
+    // Before anything is sent. The first version of this check sat further down,
+    // after the inventory, rate-limit, CORS and XXE probes had already run, so
+    // the endpoint was hit 118 times and the record was still gone. A gate that
+    // is not the first thing in the function is not a gate.
+    if destroys_a_resource(&ep.method) && !test_writes {
+        let _ = tx.send(json!({"type":"log","message": format!(
+            "skipped {} {} without sending anything at it: the method itself overwrites or \
+             destroys the resource, so the request IS the damage and there is no version of it \
+             that is only a test. Whether it is injectable is untested here, not clean. Re-run \
+             with writes enabled against a target you are willing to change.",
+            ep.method, ep.url
+        )}));
+        return EndpointOutcome {
+            found: 0,
+            starved: false,
+        };
+    }
     let mut sites = 0usize;
     let mut starved = 0usize;
     // What this endpoint looked like before anything was sent at it, so the pass
@@ -1654,6 +1694,18 @@ async fn run_endpoint(mut ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome 
 ///
 /// Same rule as the crawler's, and same reasoning: a verb in the query is a
 /// button (`?do=toggle-security`, `?action=delete`), a verb in a path is usually
+/// Does the method itself overwrite or destroy the resource?
+///
+/// POST is absent on purpose. It is the main injection surface and what it
+/// creates is usually recoverable; the other three are not, and for them the
+/// request is the damage rather than a test of it.
+fn destroys_a_resource(method: &str) -> bool {
+    matches!(
+        method.to_ascii_uppercase().as_str(),
+        "DELETE" | "PUT" | "PATCH"
+    )
+}
+
 /// a noun. Testing a button can find a real bug, and it can also log the scan
 /// out, harden the target, or delete a customer's data; the second outcome is
 /// not worth the first.
@@ -4315,6 +4367,23 @@ mod hint_tests {
             ],
         ] {
             assert_eq!(changes_a_credential(&names), None, "{names:?}");
+        }
+    }
+
+    #[test]
+    fn a_method_that_destroys_is_not_a_test() {
+        // Measured against Memos: one DELETE endpoint in the list, 118 requests,
+        // and the record was gone. The pass noticed afterwards and said the
+        // endpoint "does not answer the way it did before", which is worth
+        // having and is not the same as not doing it.
+        for m in ["DELETE", "PUT", "PATCH", "delete", "Patch"] {
+            assert!(destroys_a_resource(m), "{m} overwrites or destroys");
+        }
+        // POST stays. It is the main injection surface, forms and search and
+        // login, and what it creates is usually recoverable. Gating it would
+        // trade most of this engine's value for safety it does not need.
+        for m in ["GET", "POST", "HEAD", "OPTIONS", "post"] {
+            assert!(!destroys_a_resource(m), "{m} must still be tested");
         }
     }
 
