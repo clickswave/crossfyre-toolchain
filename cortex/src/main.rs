@@ -28,6 +28,10 @@ mod solver;
 mod ssrf;
 mod tamper;
 mod template;
+// One test for the rail five engines each had to learn separately. Not a module
+// with anything in it: the test IS the artefact.
+#[cfg(test)]
+mod writes_rail;
 mod xml;
 
 #[tokio::main]
