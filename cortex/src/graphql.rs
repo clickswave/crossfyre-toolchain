@@ -533,7 +533,32 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
                 }
             }
 
+            // The required arguments of a named mutation, already filled. Only
+            // the required ones: a placeholder in an optional argument is a
+            // value we invented and the server's answer to it is about us.
+            let required_args = |name: &str, canary: &str| -> Vec<(String, String)> {
+                schema_json
+                    .as_ref()
+                    .and_then(|sj| sj.pointer("/data/__schema/mutationType/fields"))
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| {
+                        a.iter()
+                            .find(|m| m.get("name").and_then(|n| n.as_str()) == Some(name))
+                    })
+                    .map(|m| {
+                        field_args(m)
+                            .into_iter()
+                            .filter(|(n, _, req)| *req && !id_shaped_arg(n))
+                            .filter_map(|(n, t, _)| arg_literal(&t, canary).map(|v| (n, v)))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+
             let mut examined = 0usize;
+            // Operations where no disposable object could be made, so the write
+            // side was not tested. Named rather than dropped.
+            let mut no_throwaway: Vec<String> = Vec::new();
             for p in &pairs {
                 // What each identity can enumerate for itself.
                 let mut owned: Vec<(usize, Vec<Value>)> = Vec::new();
@@ -616,6 +641,178 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
                         }
                     }
                 }
+            }
+            // --- write side, opt-in ------------------------------------------
+            //
+            // Safe by construction, and the construction is the whole argument:
+            // the only object this ever writes to is one it created itself, in
+            // this run, for this purpose. A pre-existing object is never
+            // addressed, so there is nothing of the customer's to lose. Where a
+            // throwaway cannot be made, the probe says so and stops rather than
+            // reaching for something real, which is the lesson of the matrix
+            // that ignored `test_writes` and destroyed objects.
+            if params.test_writes {
+                for p in &pairs {
+                    let Some(create) = p.create.as_ref() else {
+                        no_throwaway.push(p.fetch.path_name());
+                        continue;
+                    };
+                    if p.update.is_none() && p.remove.is_none() {
+                        continue;
+                    }
+                    let (owner_role, oclient) = &clients[0];
+                    let peers: Vec<&(&str, Client)> = clients.iter().skip(1).collect();
+                    if peers.is_empty() {
+                        continue;
+                    }
+
+                    // The owner makes something disposable.
+                    let canary = format!("cfx-{}", rand_token());
+                    // Find the new object by asking the owner what it has,
+                    // before and after. Reading the id out of the mutation's own
+                    // answer would mean knowing where in the payload it put the
+                    // object, and a wrapper like `PageResponse { responseResult,
+                    // page }` is the norm rather than the exception. The list is
+                    // already known to work, because the read side used it.
+                    let before_ids = ids_for(oclient, &url, p).await;
+                    let cdoc = mutation_doc(
+                        create,
+                        &required_args(&create.name, &canary),
+                        &[mutation_ack_field(create, schema_json.as_ref())],
+                    );
+                    let _ = post(oclient, &url, &cdoc).await;
+                    let after_ids = ids_for(oclient, &url, p).await;
+                    let fresh: Vec<&Value> = after_ids
+                        .iter()
+                        .filter(|id| !before_ids.contains(id))
+                        .collect();
+                    // Exactly one, or we do not know which object is ours, and
+                    // writing to an object we are not certain we made is the one
+                    // thing this probe must never do.
+                    let Some(throwaway) = (fresh.len() == 1).then(|| fresh[0].clone()) else {
+                        no_throwaway.push(p.fetch.path_name());
+                        continue;
+                    };
+
+                    // It has to be readable by its owner, or nothing below can
+                    // be told apart from the object never having existed.
+                    let ptr = fetch_ptr(p);
+                    let before = post(oclient, &url, &fetch_doc(p, &throwaway))
+                        .await
+                        .and_then(|r| serde_json::from_str::<Value>(&r.body).ok())
+                        .and_then(|v| v.pointer(&ptr).cloned())
+                        .filter(|d| !d.is_null());
+                    if before.is_none() {
+                        no_throwaway.push(p.fetch.path_name());
+                        continue;
+                    }
+
+                    let mut destroyed = false;
+                    for (prole, pclient) in &peers {
+                        // Rewrite it as somebody else.
+                        if let Some(upd) = p.update.as_ref() {
+                            let mark = format!("cfx-{}", rand_token());
+                            let mut args = vec![(
+                                upd.string_args
+                                    .iter()
+                                    .find(|n| id_shaped_arg(n))
+                                    .cloned()
+                                    .unwrap_or_else(|| "id".into()),
+                                throwaway.to_string(),
+                            )];
+                            if let Some(target) =
+                                upd.string_args.iter().find(|n| !id_shaped_arg(n)).cloned()
+                            {
+                                args.push((target.clone(), json!(mark).to_string()));
+                                let doc = mutation_doc(upd, &args, &[p.list_id_field.clone()]);
+                                let _ = post(pclient, &url, &doc).await;
+                                // The owner is the one who says whether it changed.
+                                let after = post(oclient, &url, &fetch_doc(p, &throwaway))
+                                    .await
+                                    .and_then(|r| serde_json::from_str::<Value>(&r.body).ok())
+                                    .and_then(|v| v.pointer(&ptr).cloned());
+                                let changed =
+                                    after.as_ref().and_then(|o| o.as_object()).is_some_and(|o| {
+                                        o.values().any(|v| v.as_str() == Some(mark.as_str()))
+                                    });
+                                if changed {
+                                    let name = upd.name.clone();
+                                    let _ = tx.send(finding(
+                                        "graphql_bola_write",
+                                        "GraphQL object writable by an identity that does not own it",
+                                        "critical",
+                                        &url, "POST",
+                                        &format!("`{name}({target}: ...)` let `{prole}` rewrite an object created by `{owner_role}`, and the change was confirmed by reading it back as its owner. Object-level authorization is missing on the write path (OWASP API1): the id is the only thing between one account and editing another account's data."),
+                                    ).param(&format!("{name}({})", target)).event());
+                                    found += 1;
+                                }
+                            }
+                        }
+
+                        // Destroy it as somebody else.
+                        if let Some(del) = p.remove.as_ref() {
+                            let idarg = del
+                                .string_args
+                                .iter()
+                                .find(|n| id_shaped_arg(n))
+                                .cloned()
+                                .unwrap_or_else(|| "id".into());
+                            let doc = mutation_doc(
+                                del,
+                                &[(idarg, throwaway.to_string())],
+                                &[p.list_id_field.clone()],
+                            );
+                            let _ = post(pclient, &url, &doc).await;
+                            let still = post(oclient, &url, &fetch_doc(p, &throwaway))
+                                .await
+                                .and_then(|r| serde_json::from_str::<Value>(&r.body).ok())
+                                .and_then(|v| v.pointer(&ptr).cloned())
+                                .filter(|d| !d.is_null());
+                            if still.is_none() {
+                                destroyed = true;
+                                let name = del.name.clone();
+                                let _ = tx.send(finding(
+                                    "graphql_bola_delete",
+                                    "GraphQL object deletable by an identity that does not own it",
+                                    "critical",
+                                    &url, "POST",
+                                    &format!("`{name}` let `{prole}` destroy an object created by `{owner_role}`, and its absence was confirmed by reading it back as its owner. Object-level authorization is missing on the delete path (OWASP API1). This probe only ever addressed an object it created for the purpose, so nothing of yours was lost proving it."),
+                                ).param(&name).event());
+                                found += 1;
+                                break;
+                            }
+                        }
+                    }
+
+                    // Tidy up after ourselves, unless a peer already did.
+                    if !destroyed {
+                        if let Some(del) = p.remove.as_ref() {
+                            let idarg = del
+                                .string_args
+                                .iter()
+                                .find(|n| id_shaped_arg(n))
+                                .cloned()
+                                .unwrap_or_else(|| "id".into());
+                            let doc = mutation_doc(
+                                del,
+                                &[(idarg, throwaway.to_string())],
+                                &[p.list_id_field.clone()],
+                            );
+                            let _ = post(oclient, &url, &doc).await;
+                        }
+                    }
+                }
+            }
+
+            if !no_throwaway.is_empty() {
+                no_throwaway.sort();
+                no_throwaway.dedup();
+                let _ = tx.send(json!({"type":"log","message": format!(
+                    "the write side of object-level authorization was not tested on {}: no \
+                     disposable object could be created for it, and this probe never addresses \
+                     an object it did not make. Untested there, not clean.",
+                    no_throwaway.join(", ")
+                )}));
             }
             if examined == 0 {
                 let _ = tx.send(json!({"type":"log","message": format!(
@@ -1295,6 +1492,12 @@ struct ObjectPair {
     id_arg: String,
     list_id_field: String,
     fetch_selection: Vec<String>,
+    /// Mutations that address the same type, for the write side. Reading
+    /// somebody else's invoice is bad; rewriting or destroying it is worse, and
+    /// the REST engine's numbers put delete-by-id at the top of the yield.
+    create: Option<Field>,
+    update: Option<Field>,
+    remove: Option<Field>,
 }
 
 fn object_pairs(schema: &Value, roots: &[Field]) -> Vec<ObjectPair> {
@@ -1482,16 +1685,242 @@ fn object_pairs(schema: &Value, roots: &[Field]) -> Vec<ObjectPair> {
             .and_then(|n| by_name(n))
             .and_then(id_field_of)
             .expect("checked above");
+        // Mutations addressing the same type. Matched on the return type first,
+        // because that is the fact rather than the convention, with the verb in
+        // the name as the second condition so `notes` does not look like a way
+        // to create one.
+        // Root mutations, plus one level into each mutation namespace, because
+        // `pages.create` is inside `pages` exactly as `pages.single` is.
+        let mut muts: Vec<(Option<String>, &Value)> = Vec::new();
+        if let Some(roots) = schema
+            .pointer("/data/__schema/mutationType/fields")
+            .and_then(|v| v.as_array())
+        {
+            for m in roots {
+                muts.push((None, m));
+                let (_k, ret) = m.get("type").map(unwrap_type).unwrap_or_default();
+                let Some(t) = (!ret.is_empty()).then_some(ret).and_then(|n| by_name(&n)) else {
+                    continue;
+                };
+                let arg_count = m
+                    .get("args")
+                    .and_then(|a| a.as_array())
+                    .map_or(0, |a| a.len());
+                if arg_count > 0 || scalar_leaf(t).is_some() {
+                    continue; // returns data, so it is an operation not a namespace
+                }
+                let Some(name) = m.get("name").and_then(|n| n.as_str()) else {
+                    continue;
+                };
+                if let Some(leaves) = t.get("fields").and_then(|f| f.as_array()) {
+                    for leaf in leaves {
+                        muts.push((Some(name.to_string()), leaf));
+                    }
+                }
+            }
+        }
+        // Matched on namespace, verb and whether it takes an object reference.
+        // NOT on return type: a mutation almost always returns a payload wrapper
+        // (`PageResponse { responseResult, page }`) rather than the object, so
+        // requiring the types to match found nothing on real software.
+        let find_mut = |verbs: &[&str], wants_id: bool| -> Option<Field> {
+            let want_type = fetch
+                .ret_type_name
+                .clone()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let want_name = fetch.name.to_ascii_lowercase();
+            let usable: Vec<(usize, &(Option<String>, &Value))> = muts
+                .iter()
+                .enumerate()
+                .filter(|(_, (ns, m))| {
+                    let Some(name) = m.get("name").and_then(|n| n.as_str()) else {
+                        return false;
+                    };
+                    let low = name.to_ascii_lowercase();
+                    if !verbs.iter().any(|v| low.starts_with(v)) {
+                        return false;
+                    }
+                    if ns.as_deref() != fetch.parent.as_deref() {
+                        return false;
+                    }
+                    let args = field_args(m);
+                    if args.iter().any(|(n, _, _)| id_shaped_arg(n)) != wants_id {
+                        return false;
+                    }
+                    // Every required argument has to be one we can supply
+                    // without inventing anything.
+                    !args.iter().any(|(n, t, req)| {
+                        *req && !id_shaped_arg(n) && arg_literal(t, "x").is_none()
+                    })
+                })
+                .collect();
+            // Is this mutation about the type we are testing? Requiring the
+            // return type to match found nothing on real software, because a
+            // payload wrapper is the norm. Dropping the requirement entirely was
+            // worse: `invoice` then paired with `createNote`, the first create in
+            // the namespace, and wrote to the wrong collection.
+            let evidence = |m: &Value| -> i32 {
+                let (_k, ret) = m.get("type").map(unwrap_type).unwrap_or_default();
+                if !want_type.is_empty() && ret.to_ascii_lowercase() == want_type {
+                    return 2;
+                }
+                let low = m
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if (!want_type.is_empty() && low.contains(&want_type))
+                    || (!want_name.is_empty() && low.contains(&want_name))
+                {
+                    return 1;
+                }
+                0
+            };
+            let best = usable.iter().map(|(_, (_, m))| evidence(m)).max()?;
+            // Nothing says this mutation is about this type, and there is more
+            // than one it could be. Guessing writes to somebody else's
+            // collection, so decline and say the write side was not tested.
+            if best == 0 && usable.len() > 1 {
+                return None;
+            }
+            usable
+                .into_iter()
+                .filter(|(_, (_, m))| evidence(m) == best)
+                .min_by_key(|(i, _)| *i)
+                .and_then(|(_, (ns, m))| {
+                    let name = m.get("name")?.as_str()?;
+                    let (kind, ret) = m.get("type").map(unwrap_type).unwrap_or_default();
+                    let args = field_args(m);
+                    Some(Field {
+                        op: "mutation",
+                        name: name.to_string(),
+                        ret_type_name: (!ret.is_empty()).then_some(ret),
+                        parent: ns.clone(),
+                        selection: None,
+                        alt_selections: Vec::new(),
+                        req_args: args
+                            .iter()
+                            .filter(|(_, _, r)| *r)
+                            .map(|(n, _, _)| n.clone())
+                            .collect(),
+                        returns_list: m.get("type").is_some_and(type_is_list),
+                        has_args: !args.is_empty(),
+                        string_args: args.iter().map(|(n, _, _)| n.clone()).collect(),
+                        needs_selection: matches!(kind.as_str(), "OBJECT" | "INTERFACE" | "UNION"),
+                    })
+                })
+        };
         out.push(ObjectPair {
             list: list.clone(),
             fetch: fetch.clone(),
             id_arg,
             list_id_field,
             fetch_selection: sel,
+            create: find_mut(&["create", "add", "new"], false),
+            update: find_mut(&["update", "edit", "modify", "patch"], true),
+            remove: find_mut(&["delete", "remove", "destroy"], true),
         });
     }
     out.truncate(12);
     out
+}
+
+/// A short unique marker, so a value this probe wrote is recognisable as its own
+/// and cannot be confused with anything the application produced.
+fn rand_token() -> String {
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{:x}", n & 0xffff_ffff_ffff)
+}
+
+/// A literal for a required argument, chosen by its type. Returns None for
+/// anything we would be guessing at: a custom scalar, an input object, an ID we
+/// have no value for. Guessing produces a document the server has to interpret,
+/// and its answer is then about us rather than about its authorization, which is
+/// defect 26.
+fn arg_literal(t: &Value, canary: &str) -> Option<String> {
+    let (kind, name) = unwrap_type(t);
+    if type_is_list(t) {
+        return None;
+    }
+    match (kind.as_str(), name.as_str()) {
+        ("SCALAR", "String") => Some(json!(canary).to_string()),
+        ("SCALAR", "Int") => Some("1".into()),
+        ("SCALAR", "Float") => Some("1.0".into()),
+        ("SCALAR", "Boolean") => Some("false".into()),
+        _ => None,
+    }
+}
+
+/// Every argument of a field, with its type, in declaration order.
+fn field_args(def: &Value) -> Vec<(String, Value, bool)> {
+    def.get("args")
+        .and_then(|a| a.as_array())
+        .map(|args| {
+            args.iter()
+                .filter_map(|a| {
+                    let n = a.get("name")?.as_str()?.to_string();
+                    let t = a.get("type")?.clone();
+                    let req = arg_is_required(&t);
+                    Some((n, t, req))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A mutation document, with only the arguments we were asked to supply.
+fn mutation_doc(field: &Field, args: &[(String, String)], selection: &[String]) -> String {
+    let arglist = args
+        .iter()
+        .map(|(k, v)| format!("{k}: {v}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let call = if arglist.is_empty() {
+        field.name.clone()
+    } else {
+        format!("{}({arglist})", field.name)
+    };
+    let sel = if selection.is_empty() {
+        String::new()
+    } else {
+        format!(" {{ {} }}", selection.join(" "))
+    };
+    let body = match &field.parent {
+        Some(ns) => format!("{ns} {{ {call}{sel} }}"),
+        None => format!("{call}{sel}"),
+    };
+    json!({ "query": format!("mutation {{ {body} }}") }).to_string()
+}
+
+/// Something valid to select out of a mutation's return type, without caring
+/// what it is. A mutation answers with a payload wrapper as often as with the
+/// object, so the safe request is any one of its own scalar fields, and
+/// `__typename` when it has none.
+fn mutation_ack_field(field: &Field, schema: Option<&Value>) -> String {
+    let leaf = field
+        .ret_type_name
+        .as_ref()
+        .and_then(|n| {
+            schema?
+                .pointer("/data/__schema/types")?
+                .as_array()?
+                .iter()
+                .find(|t| t.get("name").and_then(|x| x.as_str()) == Some(n))
+        })
+        .and_then(scalar_leaf);
+    leaf.unwrap_or_else(|| "__typename".to_string())
+}
+
+/// Where a mutation's answer lives in the response.
+fn mutation_ptr(field: &Field) -> String {
+    match &field.parent {
+        Some(ns) => format!("/data/{ns}/{}", field.name),
+        None => format!("/data/{}", field.name),
+    }
 }
 
 /// `{ ns { field(arg: <raw>) { a b c } } }`, with the id emitted as the JSON
@@ -2335,5 +2764,170 @@ mod tests {
             &peer,
             &["id".into(), "title".into(), "viewedAt".into()]
         ));
+    }
+
+    /// A flat schema with two owned collections and mutations for both, which is
+    /// where the write side gets dangerous: pick the wrong create and the probe
+    /// writes to a collection it is not testing and then fails to clean up after
+    /// itself, because its delete is for the other one.
+    fn two_collections_schema() -> Value {
+        let obj = |n: &str| json!({"kind":"OBJECT","name":n,"ofType":null});
+        let list = |n: &str| json!({"kind":"LIST","name":null,"ofType":obj(n)});
+        let sarg =
+            |n: &str| json!({"name":n,"type":{"kind":"SCALAR","name":"String","ofType":null}});
+        let iarg = |n: &str| json!({"name":n,"type":{"kind":"SCALAR","name":"Int","ofType":null}});
+        let fields = |n: &str| {
+            json!([
+                {"name":"id","args":[],"type":{"kind":"SCALAR","name":"Int","ofType":null}},
+                {"name":n,"args":[],"type":{"kind":"SCALAR","name":"String","ofType":null}}
+            ])
+        };
+        json!({"data":{"__schema":{
+            "queryType":{"name":"Query","fields":[
+                {"name":"notes","args":[],"type": list("Note")},
+                {"name":"note","args":[iarg("id")],"type": obj("Note")},
+                {"name":"invoices","args":[],"type": list("Invoice")},
+                {"name":"invoice","args":[iarg("id")],"type": obj("Invoice")},
+                // A collection with no mutations of its own at all.
+                {"name":"announcements","args":[],"type": list("Announcement")},
+                {"name":"announcement","args":[iarg("id")],"type": obj("Announcement")}
+            ]},
+            "mutationType":{"name":"Mutation","fields":[
+                // Declared FIRST, so anything that takes the earliest candidate
+                // picks this one for every collection.
+                {"name":"createNote","args":[sarg("title")],"type": obj("Note")},
+                {"name":"updateNote","args":[iarg("id"),sarg("title")],"type": obj("Note")},
+                {"name":"deleteNote","args":[iarg("id")],"type": obj("Note")},
+                {"name":"createInvoice","args":[sarg("reference")],"type": obj("Invoice")},
+                {"name":"updateInvoice","args":[iarg("id"),sarg("reference")],"type": obj("Invoice")},
+                {"name":"deleteInvoice","args":[iarg("id")],"type": obj("Invoice")}
+            ]},
+            "types":[
+                {"name":"Note","kind":"OBJECT","fields": fields("title")},
+                {"name":"Invoice","kind":"OBJECT","fields": fields("reference")},
+                {"name":"Announcement","kind":"OBJECT","fields": fields("body")}
+            ]
+        }}})
+    }
+
+    #[test]
+    fn a_mutation_is_matched_to_the_collection_it_is_actually_about() {
+        let schema = two_collections_schema();
+        let roots = parse_fields(&schema);
+        let pairs = object_pairs(&schema, &roots);
+        let get = |n: &str| {
+            pairs
+                .iter()
+                .find(|p| p.fetch.name == n)
+                .unwrap_or_else(|| panic!("no pair for {n}"))
+        };
+
+        let inv = get("invoice");
+        assert_eq!(
+            inv.create.as_ref().map(|f| f.name.as_str()),
+            Some("createInvoice")
+        );
+        assert_eq!(
+            inv.update.as_ref().map(|f| f.name.as_str()),
+            Some("updateInvoice")
+        );
+        assert_eq!(
+            inv.remove.as_ref().map(|f| f.name.as_str()),
+            Some("deleteInvoice")
+        );
+
+        let note = get("note");
+        assert_eq!(
+            note.create.as_ref().map(|f| f.name.as_str()),
+            Some("createNote")
+        );
+        assert_eq!(
+            note.remove.as_ref().map(|f| f.name.as_str()),
+            Some("deleteNote")
+        );
+
+        // Nothing in the schema says any mutation is about announcements, and
+        // there is more than one it could be. Guessing writes to a collection we
+        // are not testing, and then cleans up with the wrong delete and leaves
+        // the object behind. Measured: that is exactly what happened, and it
+        // left two notes in the target.
+        let ann = get("announcement");
+        assert!(
+            ann.create.is_none(),
+            "guessed {:?}",
+            ann.create.as_ref().map(|f| &f.name)
+        );
+        assert!(
+            ann.update.is_none(),
+            "guessed {:?}",
+            ann.update.as_ref().map(|f| &f.name)
+        );
+        assert!(
+            ann.remove.is_none(),
+            "guessed {:?}",
+            ann.remove.as_ref().map(|f| &f.name)
+        );
+    }
+
+    #[test]
+    fn a_required_argument_we_cannot_supply_rules_the_mutation_out() {
+        // Filling a required argument with something invented makes the server's
+        // answer about us, so a create we cannot build honestly is no create at
+        // all. A String we can do; a custom scalar or an input object we cannot.
+        assert!(
+            arg_literal(&json!({"kind":"SCALAR","name":"String","ofType":null}), "c").is_some()
+        );
+        assert!(arg_literal(&json!({"kind":"SCALAR","name":"Int","ofType":null}), "c").is_some());
+        assert!(
+            arg_literal(
+                &json!({"kind":"SCALAR","name":"DateTime","ofType":null}),
+                "c"
+            )
+            .is_none()
+        );
+        assert!(
+            arg_literal(
+                &json!({"kind":"INPUT_OBJECT","name":"NoteInput","ofType":null}),
+                "c"
+            )
+            .is_none()
+        );
+        // A list of strings is still a guess about how many and which.
+        assert!(
+            arg_literal(
+                &json!({"kind":"LIST","name":null,
+                        "ofType":{"kind":"SCALAR","name":"String","ofType":null}}),
+                "c"
+            )
+            .is_none()
+        );
+        // And NON_NULL<String> is a String.
+        assert!(
+            arg_literal(
+                &json!({"kind":"NON_NULL","name":null,
+                        "ofType":{"kind":"SCALAR","name":"String","ofType":null}}),
+                "c"
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn a_mutation_document_names_its_namespace_and_omits_what_it_was_not_given() {
+        let schema = two_collections_schema();
+        let roots = parse_fields(&schema);
+        let pairs = object_pairs(&schema, &roots);
+        let inv = pairs.iter().find(|p| p.fetch.name == "invoice").unwrap();
+        let del = inv.remove.as_ref().unwrap();
+        assert_eq!(
+            mutation_doc(del, &[("id".into(), "7".into())], &["id".into()]),
+            r#"{"query":"mutation { deleteInvoice(id: 7) { id } }"}"#
+        );
+        // No arguments at all is a valid mutation, and the optional ones stay out.
+        let create = inv.create.as_ref().unwrap();
+        assert_eq!(
+            mutation_doc(create, &[], &["id".into()]),
+            r#"{"query":"mutation { createInvoice { id } }"}"#
+        );
     }
 }
