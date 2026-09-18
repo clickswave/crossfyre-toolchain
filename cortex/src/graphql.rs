@@ -91,6 +91,25 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
     let _ = tx.send(json!({"type":"ack","target": url}));
     let want = |c: &str| params.classes.is_empty() || params.classes.iter().any(|x| x == c);
 
+    // Every field on GraphqlParams has a default, so a job that loses its
+    // target (a renamed field, a null, params nested one level too deep)
+    // deserializes cleanly into a scan of nothing. It then reaches the end and
+    // reports `found: 0`, which is recorded downstream as a clean target. This
+    // engine was the only one that could do that: the other five need
+    // endpoints or identities they cannot default, so they already refuse.
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        let _ = tx.send(json!({
+            "type": "log",
+            "message": format!(
+                "no GraphQL endpoint to test: target {:?} and endpoint {:?} resolve to {url:?}, \
+                 which is not an absolute URL. Nothing was run, so this is not a clean result.",
+                params.target, params.endpoint
+            )
+        }));
+        let _ = tx.send(json!({"type":"done","found":0}));
+        return;
+    }
+
     let client = match probe::build_client(probe::ClientOpts {
         evasive: params.evasive,
         identify: params.identify.clone(),
@@ -259,9 +278,39 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
 
     // --- 6b. Function-level authorization (BFLA, API5): privileged operations reachable ---------
     // Root fields whose name reads privileged (admin/delete/system/createUser/...) that resolve for
-    // THIS identity (anon by default) without an authorization error are broken function-level
-    // authorization: an unauthenticated or low-privilege caller can invoke an admin operation.
+    // an UNAUTHENTICATED caller without an authorization error are broken function-level
+    // authorization: anybody at all can invoke an admin operation.
+    //
+    // The probe used to send these with whatever credential the job supplied,
+    // and then report every privileged field that answered. Give it an admin
+    // token, which is an ordinary thing to do on an authenticated scan and what
+    // the REST authz engine asks for, and it reports the administrator for
+    // administering: measured against a correctly-authorized schema, six
+    // privileged fields produced six high-severity findings as `admin` and one
+    // as `user`, and the one was the deliberately unprotected field. Five of the
+    // six were the API working exactly as designed, each described as having
+    // "resolved for an unauthenticated/low-privilege caller", which was not
+    // true of the caller the engine had used.
+    //
+    // A single identity cannot support that claim. The REST engine settles it
+    // with a role-labelled identity matrix; GraphQL params carry one unlabelled
+    // credential, so there is no way to know whether this caller is supposed to
+    // hold these rights. What can be decided from one request is whether a
+    // caller holding NO credential can invoke the operation, and that is the
+    // claim the finding makes, so that is the request to send.
     if want("authz") && !fields.is_empty() {
+        // Deliberately credential-free, whatever the job supplied. The schema
+        // above is still harvested with the job's auth, because plenty of APIs
+        // will not introspect for a stranger.
+        let anon = probe::build_client(probe::ClientOpts {
+            evasive: params.evasive,
+            identify: params.identify.clone(),
+            auth: None,
+            target: &params.target,
+            timeout_ms: params.timeout_ms,
+            min_timeout_ms: 8000,
+            block_internal: params.block_internal,
+        });
         // Privileged operations that were named and deliberately not invoked.
         let mut declined: Vec<String> = Vec::new();
         for f in &fields {
@@ -291,19 +340,38 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
                 declined.push(f.name.clone());
                 continue;
             }
+            let Some(anon) = anon.as_ref() else { continue };
             let doc = build_doc(f, "", "1"); // benign args; we only care whether authz blocks it
-            if let Some(r) = post(&client, &url, &doc).await {
+            if let Some(r) = post(anon, &url, &doc).await {
                 if r.status == 200 && !denied(&r.body) && resolver_ran(&r.body, &f.name) {
                     let _ = tx.send(finding(
                         "graphql_bfla",
                         "Privileged GraphQL operation reachable without authorization",
                         "high",
                         &url, "POST",
-                        &format!("The privileged {} `{}` resolved for an unauthenticated/low-privilege caller with no authorization error. Function-level access control is missing on a sensitive operation (OWASP API5: BFLA) - an attacker can invoke admin/destructive functionality directly.", f.op, f.name),
+                        &format!("The privileged {} `{}` resolved for a caller sending no credential at all, with no authorization error. Function-level access control is missing on a sensitive operation (OWASP API5: BFLA) - anyone who can reach the endpoint can invoke admin/destructive functionality directly.", f.op, f.name),
                     ).param(&f.name).event());
                     found += 1;
                 }
             }
+        }
+        if anon.is_none() {
+            let _ = tx.send(json!({"type":"log","message":
+                "function-level authorization was not tested: the unauthenticated client could not \
+                 be built, and this probe has nothing to say without one. Nothing was run, so this \
+                 is not a clean result."
+            }));
+        } else if params.auth.as_ref().is_some_and(|a| a.is_meaningful()) {
+            // Narrowing the question is fine. Letting the narrowed question read
+            // as the whole answer is not.
+            let _ = tx.send(json!({"type":"log","message":
+                "a credential was supplied, and the privileged operations above were still called \
+                 without it. What is reported is what an anonymous caller can reach. Whether the \
+                 supplied identity holds more rights than it should is a different question, and \
+                 answering it needs identities labelled with the role each one is meant to have, \
+                 which this job does not carry. Treat privilege escalation between roles as \
+                 untested here rather than absent."
+            }));
         }
         if !declined.is_empty() {
             declined.sort();
@@ -415,39 +483,137 @@ fn is_privileged_name(name: &str) -> bool {
     PRIV_NAME.iter().any(|k| low.contains(k))
 }
 
+/// Machine-readable refusals. Apollo, graphql-js and the server frameworks built
+/// on them put a stable code in `extensions.code`, which is worth more than any
+/// amount of reading the message, because it does not change with the wording,
+/// the locale, or the framework's release notes.
+static AUTH_CODE: &[&str] = &[
+    "unauthenticated",
+    "unauthorized",
+    "forbidden",
+    "permission_denied",
+    "permissiondenied",
+    "access_denied",
+    "accessdenied",
+    "insufficient_permissions",
+    "insufficient_scope",
+    "not_authorized",
+    "auth_not_authenticated",
+    "auth_not_authorized",
+];
+
+/// Refusal wordings. This list is a convenience and not the boundary: it can only
+/// ever hold the phrasings someone has already seen, so nothing that decides
+/// whether to report a finding may depend on it alone.
+static DENY_PHRASE: &[&str] = &[
+    "unauthorized",
+    "unauthorised",
+    "forbidden",
+    "not authorized",
+    "not authorised",
+    "must be logged in",
+    "authentication required",
+    "requires authentication",
+    "permission denied",
+    "do not have permission",
+    "does not have permission",
+    "no permission",
+    "insufficient permission",
+    "insufficient privileges",
+    "not permitted",
+    "access denied",
+    "login required",
+    "not allowed",
+    "not accessible",
+    "missing or invalid token",
+    "invalid token",
+    "token expired",
+    "signature has expired",
+];
+
+/// Does this one error entry read as a refusal?
+fn error_is_denial(e: &Value) -> bool {
+    let code = e
+        .pointer("/extensions/code")
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if AUTH_CODE.contains(&code.as_str()) {
+        return true;
+    }
+    let msg = e
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    DENY_PHRASE.iter().any(|p| msg.contains(p))
+}
+
+/// Is the server blaming this specific field for the error? Per the GraphQL spec a
+/// field error carries the response `path` it occurred at, and a request error
+/// (parse, validation, variable coercion) carries no `path` at all, because no
+/// execution happened for it to have a path in. That distinction is structural,
+/// so it is the one to test.
+fn error_blames_field(e: &Value, field: &str) -> bool {
+    e.get("path")
+        .and_then(|p| p.as_array())
+        .and_then(|p| p.first())
+        .and_then(|p| p.as_str())
+        .map(|first| first == field)
+        .unwrap_or(false)
+}
+
 /// The GraphQL response denied the operation (authorization error), so it is NOT a BFLA hit.
 fn denied(body: &str) -> bool {
-    let low = body.to_lowercase();
-    low.contains("unauthorized")
-        || low.contains("forbidden")
-        || low.contains("not authorized")
-        || low.contains("must be logged in")
-        || low.contains("authentication required")
-        || low.contains("permission denied")
-        || low.contains("access denied")
-        || low.contains("login required")
-        || low.contains("not allowed")
+    match serde_json::from_str::<Value>(body) {
+        Ok(v) => v
+            .get("errors")
+            .and_then(|e| e.as_array())
+            .map(|errs| errs.iter().any(error_is_denial))
+            .unwrap_or(false),
+        // Not JSON at all, so fall back to reading it. A WAF or a reverse proxy
+        // can refuse in HTML before the GraphQL server ever sees the request.
+        Err(_) => {
+            let low = body.to_ascii_lowercase();
+            DENY_PHRASE.iter().any(|p| low.contains(p))
+        }
+    }
 }
 
 /// The named resolver actually ran (returned data, or errored on something other than authorization -
 /// e.g. a validation/type error means auth let the call THROUGH to the resolver).
 fn resolver_ran(body: &str, field: &str) -> bool {
-    match serde_json::from_str::<Value>(body) {
-        Ok(v) => {
-            let data_present = v
-                .pointer(&format!("/data/{field}"))
-                .map(|d| !d.is_null())
-                .unwrap_or(false);
-            // a non-auth error still means auth did not block the call
-            let non_auth_error = v
-                .get("errors")
-                .and_then(|e| e.as_array())
-                .map(|_| !denied(body))
-                .unwrap_or(false);
-            data_present || non_auth_error
-        }
-        Err(_) => false,
+    let Ok(v) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    // The unambiguous case: the field answered.
+    if v.pointer(&format!("/data/{field}"))
+        .map(|d| !d.is_null())
+        .unwrap_or(false)
+    {
+        return true;
     }
+    // Otherwise the only thing that proves execution reached the resolver is an
+    // error the server attributes to this field and does not describe as a
+    // refusal.
+    //
+    // This used to accept any error the phrase list did not recognise, on the
+    // reasoning that a validation or type error means authorization let the call
+    // through to the resolver. In GraphQL that reasoning does not hold, because
+    // validation is a phase that completes before execution begins: a validation
+    // error is proof the resolver did NOT run. It also made the phrase list
+    // load-bearing in the fail-open direction, so an API that refused in wording
+    // nobody had written down yet was read as an API that had not refused.
+    // Measured against six real refusal wordings and four validation errors, all
+    // ten came back as `true`, which on any correctly secured GraphQL API is one
+    // confirmed high-severity BFLA per privileged-looking field in the schema.
+    v.get("errors")
+        .and_then(|e| e.as_array())
+        .map(|errs| {
+            errs.iter()
+                .any(|e| error_blames_field(e, field) && !error_is_denial(e))
+        })
+        .unwrap_or(false)
 }
 
 /// Does this field's name say it performs an action rather than answering a
@@ -867,5 +1033,120 @@ mod tests {
         assert!(executes_something("delete_all_pastes"));
         assert!(!executes_something("undeleted"));
         assert!(!executes_something("createdAt"));
+    }
+
+    /// A job with no usable endpoint must refuse, not finish quietly. This ran
+    /// to completion and reported `found: 0` against the URL `/graphql`, which
+    /// is the same wire output as a GraphQL API with nothing wrong with it.
+    #[tokio::test]
+    async fn a_job_with_no_endpoint_refuses_instead_of_reporting_clean() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        run(
+            GraphqlParams {
+                target: String::new(),
+                endpoint: "/graphql".into(),
+                timeout_ms: 12_000,
+                evasive: false,
+                identify: None,
+                auth: None,
+                oast: None,
+                classes: vec![],
+                test_writes: false,
+                block_internal: false,
+            },
+            tx,
+        )
+        .await;
+
+        let mut msgs = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            msgs.push(m);
+        }
+        let said = msgs.iter().any(|m| {
+            m["type"] == "log"
+                && m["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("not a clean result")
+        });
+        assert!(said, "must say the result is not clean: {msgs:?}");
+        assert!(
+            !msgs.iter().any(|m| m["type"] == "finding"),
+            "nothing was reachable, so nothing can be found: {msgs:?}"
+        );
+    }
+
+    /// Ten bodies that all read as "the resolver ran" before this was fixed. Four
+    /// are validation errors, which in GraphQL happen before execution starts, so
+    /// they prove the opposite. Six are real refusals from real APIs, whose
+    /// wording the phrase list did not happen to contain.
+    #[test]
+    fn a_request_level_error_is_not_evidence_the_resolver_ran() {
+        for body in [
+            r#"{"errors":[{"message":"Field \"adminUsers\" argument \"first\" of type \"Int!\" is required but not provided.","locations":[{"line":1,"column":9}]}]}"#,
+            r#"{"errors":[{"message":"Cannot query field \"adminSettings\" on type \"Query\". Did you mean \"settings\"?"}]}"#,
+            r#"{"errors":[{"message":"Expected type \"RoleEnum\", found \"1\"."}]}"#,
+            r#"{"errors":[{"message":"Syntax Error: Expected Name, found }"}]}"#,
+        ] {
+            assert!(
+                !resolver_ran(body, "adminUsers"),
+                "validation happens before execution: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refusal_is_recognised_however_it_is_worded() {
+        for body in [
+            r#"{"data":{"adminUsers":null},"errors":[{"message":"You do not have permission to perform this action.","path":["adminUsers"]}]}"#,
+            r#"{"data":null,"errors":[{"message":"Resource not accessible by integration","path":["adminUsers"]}]}"#,
+            r#"{"errors":[{"message":"Insufficient permissions","path":["adminUsers"]}]}"#,
+            r#"{"errors":[{"message":"requires authentication","path":["adminUsers"]}]}"#,
+            r#"{"errors":[{"message":"Missing or invalid token","path":["adminUsers"]}]}"#,
+            r#"{"errors":[{"message":"Signature has expired","path":["adminUsers"]}]}"#,
+        ] {
+            assert!(
+                !resolver_ran(body, "adminUsers"),
+                "a refused call did not reach the resolver: {body}"
+            );
+        }
+        // "Resource not accessible by integration" is in no phrase list anyone
+        // would write from first principles, so the machine-readable code has to
+        // carry the ones the prose misses.
+        let by_code = r#"{"data":null,"errors":[{"message":"nope","path":["adminUsers"],"extensions":{"code":"FORBIDDEN"}}]}"#;
+        assert!(denied(by_code), "extensions.code FORBIDDEN is a refusal");
+        assert!(!resolver_ran(by_code, "adminUsers"));
+    }
+
+    #[test]
+    fn a_field_that_answered_is_still_a_hit() {
+        // The whole point of the probe. None of the tightening above may cost it.
+        assert!(resolver_ran(
+            r#"{"data":{"audits":[{"__typename":"AuditObject"}]}}"#,
+            "audits"
+        ));
+        assert!(resolver_ran(
+            r#"{"data":{"systemHealth":"System Load: 0.92\n"}}"#,
+            "systemHealth"
+        ));
+        // A resolver that ran and then failed on its own account: the server
+        // blames the field by path, and the reason is not a refusal.
+        assert!(resolver_ran(
+            r#"{"data":{"adminUsers":null},"errors":[{"message":"Database connection failed","path":["adminUsers"]}]}"#,
+            "adminUsers"
+        ));
+        // Data for the field wins even alongside an unrelated error elsewhere.
+        assert!(resolver_ran(
+            r#"{"data":{"audits":[1]},"errors":[{"message":"whatever","path":["other"]}]}"#,
+            "audits"
+        ));
+    }
+
+    #[test]
+    fn an_error_blaming_a_different_field_says_nothing_about_this_one() {
+        assert!(!resolver_ran(
+            r#"{"data":{"audits":null},"errors":[{"message":"Database connection failed","path":["pastes"]}]}"#,
+            "audits"
+        ));
     }
 }
