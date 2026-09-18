@@ -32,7 +32,13 @@ pub struct GraphqlParams {
     pub auth: Option<AuthSpec>,
     #[serde(default)]
     pub oast: Option<OastSpec>,
-    /// introspection | suggestions | dos | batching | sensitive | authz | injection ; empty/null = all.
+    /// Identities to compare, each a role plus resolved auth. Two or more makes
+    /// object-level authorization testable: the question "can this caller read
+    /// that caller's object" needs no vocabulary and no guess about intent,
+    /// which is what every other check here has needed.
+    #[serde(default, deserialize_with = "de_null_seq")]
+    pub identities: Vec<crate::authz::Identity>,
+    /// introspection | suggestions | dos | batching | sensitive | authz | bola | injection ; empty/null = all.
     #[serde(default, deserialize_with = "de_null_seq")]
     pub classes: Vec<String>,
     /// Allow the BFLA probe to invoke privileged MUTATIONS (state-changing). Off by default: only
@@ -54,7 +60,7 @@ fn d_true() -> bool {
     true
 }
 
-const INTROSPECT: &str = r#"{"query":"{ __schema { queryType { name fields { name args { name type { kind name ofType { kind name ofType { kind name } } } } type { kind name ofType { kind name } } } } mutationType { name fields { name args { name type { kind name ofType { kind name ofType { kind name } } } } type { kind name ofType { kind name } } } } types { name kind fields { name args { name type { kind name ofType { kind name ofType { kind name } } } } type { kind name ofType { kind name ofType { kind name } } } } } } }"}"#;
+const INTROSPECT: &str = r#"{"query":"{ __schema { queryType { name fields { name args { name type { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name } } } } } } } } type { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name } } } } } } } } } mutationType { name fields { name args { name type { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name } } } } } } } } type { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name } } } } } } } } } types { name kind fields { name args { name type { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name } } } } } } } } type { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name } } } } } } } } } } }"}"#;
 
 /// Field names that should never be exposed in a schema/response (credentials + secrets).
 static SENSITIVE_FIELD: &[&str] = &[
@@ -103,6 +109,8 @@ struct Field {
     /// `settings { project_name }` returns data, so a probe that committed to the
     /// first leaf read an unauthorized anonymous read as a refusal.
     alt_selections: Vec<String>,
+    /// Whether the field returns a list of things rather than one thing.
+    returns_list: bool,
     /// Whether the field takes any arguments at all. A field that takes
     /// arguments is an operation, never a namespace: a container has nothing to
     /// parameterise. Without this, a Relay-style mutation payload (an object
@@ -485,6 +493,141 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
         }
     }
 
+    // --- 6c. Object-level authorization (BOLA, API1) -------------------------------------------
+    if want("bola") && !fields.is_empty() {
+        let pairs = schema_json
+            .as_ref()
+            .map(|sj| object_pairs(sj, &fields))
+            .unwrap_or_default();
+
+        let named: Vec<&crate::authz::Identity> = params
+            .identities
+            .iter()
+            .filter(|i| i.auth.is_meaningful())
+            .collect();
+
+        if named.len() < 2 {
+            if !pairs.is_empty() {
+                let _ = tx.send(json!({"type":"log","message": format!(
+                    "object-level authorization was not tested. {} operation pair(s) that would \
+                     support it were found, and the question needs at least two identities to \
+                     compare: it is whether one caller can read another caller's object, and one \
+                     caller cannot answer it. Untested here, not clean.",
+                    pairs.len()
+                )}));
+            }
+        } else {
+            // A client per identity, all of them honest about who they are.
+            let mut clients: Vec<(&str, Client)> = Vec::new();
+            for id in &named {
+                if let Some(c) = probe::build_client(probe::ClientOpts {
+                    evasive: params.evasive,
+                    identify: params.identify.clone(),
+                    auth: Some(&id.auth),
+                    target: &params.target,
+                    timeout_ms: params.timeout_ms,
+                    min_timeout_ms: 8000,
+                    block_internal: params.block_internal,
+                }) {
+                    clients.push((id.role.as_str(), c));
+                }
+            }
+
+            let mut examined = 0usize;
+            for p in &pairs {
+                // What each identity can enumerate for itself.
+                let mut owned: Vec<(usize, Vec<Value>)> = Vec::new();
+                for (i, (_role, c)) in clients.iter().enumerate() {
+                    owned.push((i, ids_for(c, &url, p).await));
+                }
+                if owned.iter().all(|(_, ids)| ids.is_empty()) {
+                    continue;
+                }
+
+                for (oi, ids) in &owned {
+                    for id in ids {
+                        // Exclusive to this identity: nobody else's list has it.
+                        // Two identities that can both enumerate an object are
+                        // not evidence of anything, which is the lesson of
+                        // shared org-scoped resources.
+                        let exclusive = owned
+                            .iter()
+                            .all(|(j, other)| j == oi || !other.contains(id));
+                        if !exclusive {
+                            continue;
+                        }
+
+                        let (_orole, oclient) = &clients[*oi];
+                        let Some(a) = post(oclient, &url, &fetch_doc(p, id)).await else {
+                            continue;
+                        };
+                        let Ok(av) = serde_json::from_str::<Value>(&a.body) else {
+                            continue;
+                        };
+                        let ptr = fetch_ptr(p);
+                        let Some(owner_obj) = av.pointer(&ptr).filter(|d| !d.is_null()).cloned()
+                        else {
+                            continue; // the owner cannot read it either
+                        };
+                        // Second read by the same identity, to learn which fields
+                        // move on their own.
+                        let volatile = match post(oclient, &url, &fetch_doc(p, id)).await {
+                            Some(b) => serde_json::from_str::<Value>(&b.body)
+                                .ok()
+                                .and_then(|bv| bv.pointer(&ptr).cloned())
+                                .map(|bo| volatile_keys(&owner_obj, &bo))
+                                .unwrap_or_default(),
+                            None => Vec::new(),
+                        };
+                        examined += 1;
+
+                        for (pi, (prole, pclient)) in clients.iter().enumerate() {
+                            if pi == *oi {
+                                continue;
+                            }
+                            let Some(r) = post(pclient, &url, &fetch_doc(p, id)).await else {
+                                continue;
+                            };
+                            if r.status != 200 || denied(&r.body) {
+                                continue;
+                            }
+                            let Ok(rv) = serde_json::from_str::<Value>(&r.body) else {
+                                continue;
+                            };
+                            let Some(peer_obj) = rv.pointer(&ptr).filter(|d| !d.is_null()) else {
+                                continue;
+                            };
+                            if !same_object(&owner_obj, peer_obj, &volatile) {
+                                continue;
+                            }
+                            let owner_role = clients[*oi].0;
+                            let path = p.fetch.path_name();
+                            let _ = tx.send(finding(
+                                "graphql_bola",
+                                "GraphQL object readable by an identity that does not own it",
+                                "critical",
+                                &url, "POST",
+                                &format!(
+                                    "`{path}({}: {id})` returned the same object to `{prole}` as it did to `{owner_role}`, and only `{owner_role}` can enumerate that object. Object-level authorization is missing (OWASP API1: BOLA): the id is the only thing standing between one account and another account's data.",
+                                    p.id_arg
+                                ),
+                            ).param(&format!("{path}({})", p.id_arg)).event());
+                            found += 1;
+                        }
+                    }
+                }
+            }
+            if examined == 0 {
+                let _ = tx.send(json!({"type":"log","message": format!(
+                    "object-level authorization found nothing to compare. {} operation pair(s) \
+                     looked usable, and no identity could enumerate an object that the others \
+                     could not, so there was no owner to impersonate. Untested here, not clean.",
+                    pairs.len()
+                )}));
+            }
+        }
+    }
+
     // --- 7. Argument injection (SQLi error-based, cmdi OAST-confirmed) -------------------------
     // Runs LAST: it is the slow phase (a blind-cmdi OAST poll per string arg), so the fast
     // schema-level checks above always emit even if a per-field OAST wait runs long.
@@ -736,6 +879,7 @@ fn root_field(name: &str) -> Field {
         selection: None,
         alt_selections: Vec::new(),
         req_args: Vec::new(),
+        returns_list: false,
         has_args: false,
         string_args: Vec::new(),
         needs_selection: false,
@@ -813,6 +957,24 @@ async fn post(client: &Client, url: &str, body: &str) -> Option<probe::Resp> {
     probe::send(client, "POST", url, Some((body, "application/json"))).await
 }
 
+/// Does this type ref contain a LIST anywhere in its wrappers? The other thing
+/// `unwrap_type` throws away, and the id source for an object-level test has to
+/// be a list: `pages.version` returns one object and would yield no ids at all,
+/// while looking exactly like a candidate once the wrappers are gone.
+fn type_is_list(t: &Value) -> bool {
+    let mut cur = t;
+    for _ in 0..8 {
+        if cur.get("kind").and_then(|k| k.as_str()) == Some("LIST") {
+            return true;
+        }
+        match cur.get("ofType") {
+            Some(inner) if !inner.is_null() => cur = inner,
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// Is this argument required? NON_NULL at the top of the type ref, which is the
 /// one thing `unwrap_type` deliberately throws away.
 fn arg_is_required(t: &Value) -> bool {
@@ -884,6 +1046,7 @@ fn parse_fields(schema: &Value) -> Vec<Field> {
                 selection: None,
                 alt_selections: Vec::new(),
                 req_args,
+                returns_list: f.get("type").is_some_and(type_is_list),
                 has_args,
                 string_args,
                 needs_selection,
@@ -1034,6 +1197,7 @@ fn authz_probes(schema: &Value, roots: &[Field]) -> Vec<Field> {
                 ret_type_name: leaf_ret,
                 parent: Some(r.name.clone()),
                 req_args,
+                returns_list: leaf.get("type").is_some_and(type_is_list),
                 has_args: leaf
                     .get("args")
                     .and_then(|a| a.as_array())
@@ -1084,6 +1248,328 @@ fn build_doc(field: &Field, inj_arg: &str, value: &str) -> String {
         None => format!("{call}{sel}"),
     };
     json!({ "query": format!("{op_kw} {{ {body} }}") }).to_string()
+}
+
+// --- Object-level authorization (BOLA, API1) -------------------------------------------------
+//
+// Every other check in this engine has needed a guess about intent. The
+// privileged-name vocabulary is a guess, and it is now the binding limit: of
+// Wiki.js's 35 root namespaces exactly one matched it, so the engine examined
+// four operations and said nothing about the rest.
+//
+// This question needs no guess. Given two callers of the same standing, can one
+// of them read an object that belongs to the other? Nothing about the schema has
+// to be interpreted, because the comparison is between two identities the caller
+// supplied and told us are separate people.
+
+/// Does this argument name an object reference?
+fn id_shaped_arg(name: &str) -> bool {
+    let low = name.to_ascii_lowercase();
+    low == "id" || low.ends_with("id") && low.len() <= 24
+}
+
+/// The scalar field on a type that carries its identity.
+fn id_field_of(t: &Value) -> Option<String> {
+    let fields = t.get("fields")?.as_array()?;
+    let named = |want: &str| {
+        fields.iter().find_map(|f| {
+            let n = f.get("name")?.as_str()?;
+            (n.eq_ignore_ascii_case(want)).then(|| n.to_string())
+        })
+    };
+    named("id").or_else(|| {
+        fields.iter().find_map(|f| {
+            let n = f.get("name")?.as_str()?;
+            let (kind, _) = f.get("type").map(unwrap_type).unwrap_or_default();
+            (id_shaped_arg(n) && matches!(kind.as_str(), "SCALAR" | "ENUM")).then(|| n.to_string())
+        })
+    })
+}
+
+/// One operation that lists objects and one that fetches a single object by id.
+/// They routinely return DIFFERENT types: Wiki.js lists `PageListItem` and
+/// fetches `Page`, so pairing them by return type would find nothing.
+struct ObjectPair {
+    list: Field,
+    fetch: Field,
+    id_arg: String,
+    list_id_field: String,
+    fetch_selection: Vec<String>,
+}
+
+fn object_pairs(schema: &Value, roots: &[Field]) -> Vec<ObjectPair> {
+    let empty = Vec::new();
+    let types: &Vec<Value> = schema
+        .pointer("/data/__schema/types")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+    let by_name = |want: &str| -> Option<&Value> {
+        types
+            .iter()
+            .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(want))
+    };
+
+    // Everything callable, root fields and one level into each namespace, since
+    // `pages.single` is inside `pages` and that is where real APIs keep it.
+    //
+    // The arguments are read from the schema here rather than taken from
+    // `roots`, whose `string_args` holds only String and ID because that is what
+    // the injection phase needs. An object reference is an `Int` as often as
+    // not, so a root field like `invoice(id: Int)` was invisible: the pairs were
+    // found inside namespaces, where this function had always built its own arg
+    // list, and missed at the root of every flat schema.
+    let arg_names = |f: &Value| -> (Vec<String>, Vec<String>) {
+        let mut all = Vec::new();
+        let mut req = Vec::new();
+        if let Some(args) = f.get("args").and_then(|v| v.as_array()) {
+            for a in args {
+                let an = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                if an.is_empty() {
+                    continue;
+                }
+                all.push(an.to_string());
+                if a.get("type").is_some_and(arg_is_required) {
+                    req.push(an.to_string());
+                }
+            }
+        }
+        (all, req)
+    };
+    let root_defs: Vec<&Value> = schema
+        .pointer("/data/__schema/queryType/fields")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    let def_for = |name: &str| -> Option<&Value> {
+        root_defs
+            .iter()
+            .copied()
+            .find(|f| f.get("name").and_then(|n| n.as_str()) == Some(name))
+    };
+
+    let mut ops: Vec<Field> = Vec::new();
+    for r in roots {
+        if r.op != "query" {
+            continue;
+        }
+        let mut root = r.clone();
+        if let Some(def) = def_for(&r.name) {
+            let (all, req) = arg_names(def);
+            root.string_args = all;
+            root.req_args = req;
+        }
+        ops.push(root);
+        let Some(t) = r.ret_type_name.as_ref().and_then(|n| by_name(n)) else {
+            continue;
+        };
+        if r.has_args || scalar_leaf(t).is_some() {
+            continue; // returns data, so it is an operation and not a namespace
+        }
+        let Some(leaves) = t.get("fields").and_then(|f| f.as_array()) else {
+            continue;
+        };
+        for leaf in leaves {
+            let Some(name) = leaf.get("name").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if name.starts_with("__") {
+                continue;
+            }
+            let (kind, ret) = leaf.get("type").map(unwrap_type).unwrap_or_default();
+            let mut args = Vec::new();
+            let mut req = Vec::new();
+            if let Some(a) = leaf.get("args").and_then(|v| v.as_array()) {
+                for arg in a {
+                    let an = arg.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    if an.is_empty() {
+                        continue;
+                    }
+                    args.push(an.to_string());
+                    if arg.get("type").is_some_and(arg_is_required) {
+                        req.push(an.to_string());
+                    }
+                }
+            }
+            ops.push(Field {
+                op: "query",
+                name: name.to_string(),
+                ret_type_name: (!ret.is_empty()).then_some(ret),
+                parent: Some(r.name.clone()),
+                selection: None,
+                alt_selections: Vec::new(),
+                req_args: req,
+                returns_list: leaf.get("type").is_some_and(type_is_list),
+                has_args: !args.is_empty(),
+                string_args: args,
+                needs_selection: matches!(kind.as_str(), "OBJECT" | "INTERFACE" | "UNION"),
+            });
+        }
+    }
+
+    // A list is any object-returning field with no REQUIRED argument whose item
+    // type carries an id. A fetch is any object-returning field whose only
+    // argument is an object reference.
+    let mut out = Vec::new();
+    for fetch in &ops {
+        // One object, addressed by one reference. A list is not a fetch.
+        if fetch.string_args.len() != 1 || !fetch.needs_selection || fetch.returns_list {
+            continue;
+        }
+        let id_arg = fetch.string_args[0].clone();
+        if !id_shaped_arg(&id_arg) {
+            continue;
+        }
+        let Some(fetch_t) = fetch.ret_type_name.as_ref().and_then(|n| by_name(n)) else {
+            continue;
+        };
+        let sel = scalar_leaves(fetch_t);
+        if sel.is_empty() {
+            continue;
+        }
+        // Which list enumerates the objects this fetch addresses. Taking the
+        // first candidate in the namespace is not good enough: at the root of a
+        // flat schema that is whatever happens to be declared earliest, so
+        // `invoice(id)` was paired with `adminUsers` and handed ids that address
+        // nothing. Score instead, and take the best.
+        let list = ops
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| {
+                l.parent == fetch.parent
+                    && l.name != fetch.name
+                    && l.needs_selection
+                    && l.returns_list
+                    && l.req_args.is_empty()
+                    && l.ret_type_name
+                        .as_ref()
+                        .and_then(|n| by_name(n))
+                        .and_then(id_field_of)
+                        .is_some()
+            })
+            // Earliest wins a tie, because `max_by_key` keeps the LAST maximum
+            // and every plain sibling scores the same. Without the Reverse,
+            // `pages.single` paired with `pages.tags` rather than `pages.list`,
+            // and tag ids address no page at all.
+            .max_by_key(|(i, l)| {
+                let score = if l.ret_type_name == fetch.ret_type_name {
+                    // Returning the same type is the strongest evidence that
+                    // these two operations are about the same objects.
+                    3
+                } else {
+                    // Then the naming convention: `invoices` enumerates
+                    // `invoice`.
+                    let (ln, fname) =
+                        (l.name.to_ascii_lowercase(), fetch.name.to_ascii_lowercase());
+                    if ln == format!("{fname}s")
+                        || ln == format!("{fname}es")
+                        || fname == format!("{ln}s")
+                    {
+                        2
+                    } else {
+                        // Otherwise it is only a sibling, which is what pairs
+                        // `pages.list` with `pages.single`: different types,
+                        // unrelated names, and still the right answer.
+                        1
+                    }
+                };
+                (score, std::cmp::Reverse(*i))
+            })
+            .map(|(_, l)| l);
+        let Some(list) = list else { continue };
+        let list_id_field = list
+            .ret_type_name
+            .as_ref()
+            .and_then(|n| by_name(n))
+            .and_then(id_field_of)
+            .expect("checked above");
+        out.push(ObjectPair {
+            list: list.clone(),
+            fetch: fetch.clone(),
+            id_arg,
+            list_id_field,
+            fetch_selection: sel,
+        });
+    }
+    out.truncate(12);
+    out
+}
+
+/// `{ ns { field(arg: <raw>) { a b c } } }`, with the id emitted as the JSON
+/// value it arrived as. It is very often an Int, and quoting it is a type error
+/// rather than a finding.
+fn fetch_doc(p: &ObjectPair, id: &Value) -> String {
+    let sel = p.fetch_selection.join(" ");
+    let call = format!("{}({}: {}) {{ {sel} }}", p.fetch.name, p.id_arg, id);
+    let body = match &p.fetch.parent {
+        Some(ns) => format!("{ns} {{ {call} }}"),
+        None => call,
+    };
+    json!({ "query": format!("query {{ {body} }}") }).to_string()
+}
+
+fn list_doc(p: &ObjectPair) -> String {
+    let call = format!("{} {{ {} }}", p.list.name, p.list_id_field);
+    let body = match &p.list.parent {
+        Some(ns) => format!("{ns} {{ {call} }}"),
+        None => call,
+    };
+    json!({ "query": format!("query {{ {body} }}") }).to_string()
+}
+
+/// Where the answer to a fetch lives in the response.
+fn fetch_ptr(p: &ObjectPair) -> String {
+    match &p.fetch.parent {
+        Some(ns) => format!("/data/{ns}/{}", p.fetch.name),
+        None => format!("/data/{}", p.fetch.name),
+    }
+}
+
+/// Ids this identity can enumerate for itself.
+async fn ids_for(client: &Client, url: &str, p: &ObjectPair) -> Vec<Value> {
+    let Some(r) = post(client, url, &list_doc(p)).await else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&r.body) else {
+        return Vec::new();
+    };
+    let ptr = match &p.list.parent {
+        Some(ns) => format!("/data/{ns}/{}", p.list.name),
+        None => format!("/data/{}", p.list.name),
+    };
+    v.pointer(&ptr)
+        .and_then(|d| d.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|it| it.get(&p.list_id_field).cloned())
+                .filter(|id| !id.is_null())
+                .take(25)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Keys whose value changes between two reads by the SAME identity, so a
+/// difference in them says nothing about who asked.
+fn volatile_keys(a: &Value, b: &Value) -> Vec<String> {
+    let (Some(a), Some(b)) = (a.as_object(), b.as_object()) else {
+        return Vec::new();
+    };
+    a.keys()
+        .filter(|k| a.get(*k) != b.get(*k))
+        .cloned()
+        .collect()
+}
+
+fn same_object(owner: &Value, peer: &Value, volatile: &[String]) -> bool {
+    let (Some(o), Some(p)) = (owner.as_object(), peer.as_object()) else {
+        return false;
+    };
+    let stable: Vec<&String> = o.keys().filter(|k| !volatile.contains(k)).collect();
+    if stable.is_empty() {
+        return false;
+    }
+    stable.iter().all(|k| o.get(*k) == p.get(*k))
 }
 
 /// Does a GraphQL JSON response carry an error whose message looks like a SQL engine error?
@@ -1282,6 +1768,7 @@ mod tests {
             name: "paste".into(),
             string_args: vec!["id".into()],
             req_args: Vec::new(),
+            returns_list: false,
             needs_selection: true,
         };
         let doc = build_doc(&f, "id", "1\" or \"1");
@@ -1369,6 +1856,7 @@ mod tests {
                 auth: None,
                 oast: None,
                 classes: vec![],
+                identities: vec![],
                 test_writes: false,
                 block_internal: false,
             },
@@ -1553,6 +2041,7 @@ mod tests {
             alt_selections: Vec::new(),
             string_args: vec!["version".into()],
             req_args: Vec::new(),
+            returns_list: false,
             has_args: true,
             needs_selection: true,
         };
@@ -1572,6 +2061,44 @@ mod tests {
         // And the argument being injected always goes in, optional or not,
         // because placing a payload in it is the entire point.
         assert!(build_doc(&optional, "version", "1' or '1").contains("version:"));
+    }
+
+    #[test]
+    fn a_non_null_list_of_non_null_objects_resolves() {
+        // Wiki.js types `pages.list` as NON_NULL<LIST<NON_NULL<PageListItem>>>,
+        // which is four levels, and most code-generated schemas do the same. The
+        // introspection query used to fetch two or three, so the innermost name
+        // came back null: the field then read as returning a NON_NULL of nothing,
+        // `needs_selection` was false, and the probe sent a document with no
+        // selection set on an object type, which is invalid.
+        let deep = json!({
+            "kind":"NON_NULL","name":null,
+            "ofType":{"kind":"LIST","name":null,
+            "ofType":{"kind":"NON_NULL","name":null,
+            "ofType":{"kind":"OBJECT","name":"PageListItem","ofType":null}}}
+        });
+        assert_eq!(
+            unwrap_type(&deep),
+            ("OBJECT".to_string(), "PageListItem".to_string())
+        );
+
+        let schema = json!({"data":{"__schema":{
+            "queryType":{"name":"Query","fields":[
+                {"name":"adminAudits","args":[],"type": deep}
+            ]},
+            "mutationType":{"name":"Mutation","fields":[]},
+            "types":[
+                {"name":"PageListItem","kind":"OBJECT","fields":[
+                    {"name":"id","args":[],"type":{"kind":"SCALAR","name":"Int","ofType":null}},
+                    {"name":"path","args":[],"type":{"kind":"SCALAR","name":"String","ofType":null}}
+                ]}
+            ]
+        }}});
+        let roots = parse_fields(&schema);
+        assert!(roots[0].needs_selection, "an object list needs a selection");
+        let probes = authz_probes(&schema, &roots);
+        let doc = build_doc(&probes[0], "", "1");
+        assert!(doc.contains("adminAudits { id }"), "{doc}");
     }
 
     #[test]
@@ -1683,5 +2210,130 @@ mod tests {
         let names: Vec<String> = probes.iter().map(|f| f.path_name()).collect();
         assert_eq!(names, vec!["adminUsers", "debugConfig"], "got {names:?}");
         assert!(probes.iter().all(|f| f.parent.is_none()));
+    }
+
+    /// The Wiki.js page surface, which is the shape that matters: the list and
+    /// the fetch return DIFFERENT types (`PageListItem` and `Page`), their names
+    /// say nothing about each other, the id is an `Int`, and several siblings
+    /// also return lists carrying an id.
+    fn wikijs_pages_schema() -> Value {
+        let pages_query =
+            |name: &str, args: Value, ty: Value| json!({"name": name, "args": args, "type": ty});
+        let list_of = |t: &str| {
+            json!({
+                "kind":"NON_NULL","name":null,
+                "ofType":{"kind":"LIST","name":null,
+                "ofType":{"kind":"NON_NULL","name":null,
+                "ofType":{"kind":"OBJECT","name":t,"ofType":null}}}
+            })
+        };
+        let int_arg =
+            |n: &str| json!({"name": n, "type":{"kind":"SCALAR","name":"Int","ofType":null}});
+        json!({"data":{"__schema":{
+            "queryType":{"name":"Query","fields":[
+                {"name":"pages","args":[],"type":{"kind":"OBJECT","name":"PageQuery","ofType":null}}
+            ]},
+            "mutationType":{"name":"Mutation","fields":[]},
+            "types":[
+                {"name":"PageQuery","kind":"OBJECT","fields":[
+                    pages_query("history", json!([int_arg("id")]), json!({"kind":"OBJECT","name":"PageHistoryResult","ofType":null})),
+                    pages_query("list", json!([int_arg("limit")]), list_of("PageListItem")),
+                    pages_query("single", json!([int_arg("id")]), json!({"kind":"OBJECT","name":"Page","ofType":null})),
+                    // A sibling that also returns a list with an id in it, and
+                    // is declared AFTER `list`. Tag ids address no page.
+                    pages_query("tags", json!([]), list_of("PageTag"))
+                ]},
+                {"name":"PageListItem","kind":"OBJECT","fields":[
+                    {"name":"id","args":[],"type":{"kind":"SCALAR","name":"Int","ofType":null}},
+                    {"name":"path","args":[],"type":{"kind":"SCALAR","name":"String","ofType":null}}
+                ]},
+                {"name":"PageTag","kind":"OBJECT","fields":[
+                    {"name":"id","args":[],"type":{"kind":"SCALAR","name":"Int","ofType":null}},
+                    {"name":"tag","args":[],"type":{"kind":"SCALAR","name":"String","ofType":null}}
+                ]},
+                {"name":"Page","kind":"OBJECT","fields":[
+                    {"name":"id","args":[],"type":{"kind":"SCALAR","name":"Int","ofType":null}},
+                    {"name":"path","args":[],"type":{"kind":"SCALAR","name":"String","ofType":null}},
+                    {"name":"title","args":[],"type":{"kind":"SCALAR","name":"String","ofType":null}}
+                ]},
+                {"name":"PageHistoryResult","kind":"OBJECT","fields":[
+                    {"name":"total","args":[],"type":{"kind":"SCALAR","name":"Int","ofType":null}}
+                ]}
+            ]
+        }}})
+    }
+
+    #[test]
+    fn the_list_that_enumerates_the_fetch_is_the_one_chosen() {
+        let schema = wikijs_pages_schema();
+        let roots = parse_fields(&schema);
+        let pairs = object_pairs(&schema, &roots);
+        let single = pairs
+            .iter()
+            .find(|p| p.fetch.name == "single")
+            .expect("pages.single is a fetch");
+        // `pages.tags` also returns a list with an id and is declared later.
+        // Ties go to the earliest, because max_by_key keeps the LAST maximum and
+        // without that the probe paired `single` with `tags` and asked for pages
+        // by tag id.
+        assert_eq!(single.list.name, "list", "paired with {}", single.list.name);
+        assert_eq!(single.list_id_field, "id");
+        assert_eq!(single.id_arg, "id");
+        // The selection has to be real scalars off the FETCH's type, not the
+        // list's.
+        assert_eq!(single.fetch_selection, vec!["id", "path", "title"]);
+    }
+
+    #[test]
+    fn an_int_id_is_not_quoted_and_a_namespace_is_kept() {
+        let schema = wikijs_pages_schema();
+        let roots = parse_fields(&schema);
+        let pairs = object_pairs(&schema, &roots);
+        let p = pairs.iter().find(|p| p.fetch.name == "single").unwrap();
+        assert_eq!(
+            fetch_doc(p, &json!(7)),
+            r#"{"query":"query { pages { single(id: 7) { id path title } } }"}"#
+        );
+        // A string id keeps its quotes, because that is what the list handed us.
+        assert!(fetch_doc(p, &json!("abc")).contains(r#"single(id: \"abc\")"#));
+        assert_eq!(
+            list_doc(p),
+            r#"{"query":"query { pages { list { id } } }"}"#
+        );
+        assert_eq!(fetch_ptr(p), "/data/pages/single");
+    }
+
+    #[test]
+    fn a_list_is_never_mistaken_for_a_fetch() {
+        let schema = wikijs_pages_schema();
+        let roots = parse_fields(&schema);
+        let pairs = object_pairs(&schema, &roots);
+        // `history(id)` takes one id-shaped arg but its type has no scalar
+        // selection worth comparing, and `list(limit)` returns many things.
+        for p in &pairs {
+            assert!(!p.fetch.returns_list, "{} returns a list", p.fetch.name);
+            assert!(p.list.returns_list, "{} is not a list", p.list.name);
+        }
+    }
+
+    #[test]
+    fn two_reads_that_differ_only_in_a_moving_field_are_the_same_object() {
+        let first = json!({"id":1,"title":"Alpha","viewedAt":"10:00"});
+        let again = json!({"id":1,"title":"Alpha","viewedAt":"10:01"});
+        let vol = volatile_keys(&first, &again);
+        assert_eq!(vol, vec!["viewedAt"]);
+        // The peer got the same object, and only the moving field differs.
+        let peer = json!({"id":1,"title":"Alpha","viewedAt":"10:02"});
+        assert!(same_object(&first, &peer, &vol));
+        // A genuinely different object is not the same one.
+        let other = json!({"id":2,"title":"Beta","viewedAt":"10:02"});
+        assert!(!same_object(&first, &other, &vol));
+        // And if EVERY field moves there is nothing stable left to compare, so
+        // no claim can be made.
+        assert!(!same_object(
+            &first,
+            &peer,
+            &["id".into(), "title".into(), "viewedAt".into()]
+        ));
     }
 }
