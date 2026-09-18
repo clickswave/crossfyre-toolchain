@@ -62,7 +62,14 @@ fn d_true() -> bool {
 
 const INTROSPECT: &str = r#"{"query":"{ __schema { queryType { name fields { name args { name type { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name } } } } } } } } type { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name } } } } } } } } } mutationType { name fields { name args { name type { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name } } } } } } } } type { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name } } } } } } } } } types { name kind fields { name args { name type { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name } } } } } } } } type { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name } } } } } } } } } } }"}"#;
 
-/// Field names that should never be exposed in a schema/response (credentials + secrets).
+/// Field names that name a credential on their own.
+///
+/// `hash` and `salt` used to be here and are not, because neither is a
+/// credential by itself. Wiki.js types `Page.hash` as the SHA1 of the page
+/// content, and a bare `hash` is as likely to be an ETag, a checksum or a commit
+/// id. They are still caught when compounded with something that is a
+/// credential, which is what `password_hash` and `pwSalt` are, and that is
+/// handled by `sensitive_field_name` rather than by this list.
 static SENSITIVE_FIELD: &[&str] = &[
     "password",
     "passwd",
@@ -75,13 +82,175 @@ static SENSITIVE_FIELD: &[&str] = &[
     "access_token",
     "privatekey",
     "private_key",
-    "hash",
-    "salt",
     "ssn",
     "creditcard",
     "credit_card",
     "cvv",
 ];
+
+/// Does this field name a credential? An exact match against the list, or one of
+/// the two ambiguous words compounded with something that is unambiguous.
+fn sensitive_field_name(field: &str) -> bool {
+    let low = field.to_ascii_lowercase().replace(['_', '-'], "");
+    if SENSITIVE_FIELD.iter().any(|s| low == s.replace('_', "")) {
+        return true;
+    }
+    // `passwordHash` and `pw_salt` are credentials. `hash` and `salt` are not.
+    // `pw` earns its place only here, in a compound. On its own it is two
+    // letters and would match half the schema.
+    (low.contains("hash") || low.contains("salt"))
+        && [
+            "password",
+            "passwd",
+            "pwd",
+            "pw",
+            "secret",
+            "token",
+            "credential",
+        ]
+        .iter()
+        .any(|k| low.contains(k))
+}
+
+/// Every type a QUERY can return, following object fields transitively.
+///
+/// A type reachable only as a mutation's payload is the caller's own answer to
+/// its own action: Directus types the login response `auth_tokens { access_token
+/// }` and the TOTP enrolment `users_me_tfa_generate_data { secret }`, and a
+/// caller receiving its own credential after asking for it is not an exposure.
+/// Reporting those was defect 1's shape in a different engine.
+fn query_reachable_types(schema: &Value) -> std::collections::HashSet<String> {
+    let empty = Vec::new();
+    let types: &Vec<Value> = schema
+        .pointer("/data/__schema/types")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+    let by_name = |want: &str| -> Option<&Value> {
+        types
+            .iter()
+            .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(want))
+    };
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut queue: Vec<String> = schema
+        .pointer("/data/__schema/queryType/fields")
+        .and_then(|v| v.as_array())
+        .map(|fs| {
+            fs.iter()
+                .filter_map(|f| {
+                    let (_k, n) = f.get("type").map(unwrap_type).unwrap_or_default();
+                    (!n.is_empty()).then_some(n)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    while let Some(n) = queue.pop() {
+        if !seen.insert(n.clone()) {
+            continue;
+        }
+        let Some(t) = by_name(&n) else { continue };
+        if let Some(fs) = t.get("fields").and_then(|f| f.as_array()) {
+            for f in fs {
+                let (_k, inner) = f.get("type").map(unwrap_type).unwrap_or_default();
+                if !inner.is_empty() && !seen.contains(&inner) {
+                    queue.push(inner);
+                }
+            }
+        }
+    }
+    seen
+}
+
+/// Put a leaf selection at the end of a query path: `pages { list }` plus
+/// `hash` becomes `pages { list { hash } }`, and a bare `users` becomes
+/// `users { password }`.
+fn inject_leaf(path: &str, leaf: &str) -> String {
+    match path.rfind('{') {
+        Some(_) => {
+            let trimmed = path.trim_end();
+            let body = trimmed.strip_suffix('}').unwrap_or(trimmed).trim_end();
+            format!("{body} {{ {leaf} }} }}")
+        }
+        None => format!("{path} {{ {leaf} }}"),
+    }
+}
+
+/// Is this value a real secret, or a placeholder standing in for one?
+///
+/// dvga declares `UserObject.password` and answers `******`. The REST engine
+/// learned this as defect 12: a field that is declared but masked, empty or null
+/// is not an exposure, and reporting one is reporting the absence of a leak.
+fn is_trivial_secret(v: &Value) -> bool {
+    let Some(t) = v.as_str() else {
+        return v.is_null();
+    };
+    let t = t.trim();
+    if t.is_empty() {
+        return true;
+    }
+    if t.chars()
+        .all(|c| matches!(c, '*' | 'x' | 'X' | '.' | '\u{2022}' | '-'))
+    {
+        return true;
+    }
+    matches!(
+        t.to_ascii_lowercase().as_str(),
+        "null" | "none" | "nil" | "redacted" | "hidden" | "masked" | "n/a"
+    )
+}
+
+/// A query that returns this type, needing no arguments we would have to invent,
+/// paired with where its answer lands. Root fields first, then one level into a
+/// namespace, which is where a real API keeps them.
+fn reader_for_type(schema: &Value, want: &str) -> Option<(String, String, bool)> {
+    let empty = Vec::new();
+    let types: &Vec<Value> = schema
+        .pointer("/data/__schema/types")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+    let by_name = |n: &str| -> Option<&Value> {
+        types
+            .iter()
+            .find(|t| t.get("name").and_then(|x| x.as_str()) == Some(n))
+    };
+    let no_required = |f: &Value| -> bool {
+        f.get("args")
+            .and_then(|a| a.as_array())
+            .is_none_or(|a| !a.iter().any(|x| x.get("type").is_some_and(arg_is_required)))
+    };
+    let roots = schema
+        .pointer("/data/__schema/queryType/fields")
+        .and_then(|v| v.as_array())?;
+    for rf in roots {
+        let rname = rf.get("name").and_then(|n| n.as_str())?;
+        let (_k, ret) = rf.get("type").map(unwrap_type).unwrap_or_default();
+        if ret == want && no_required(rf) {
+            return Some((
+                rname.to_string(),
+                format!("/data/{rname}"),
+                rf.get("type").is_some_and(type_is_list),
+            ));
+        }
+        let Some(t) = by_name(&ret) else { continue };
+        if !no_required(rf) || scalar_leaf(t).is_some() {
+            continue;
+        }
+        let Some(leaves) = t.get("fields").and_then(|f| f.as_array()) else {
+            continue;
+        };
+        for leaf in leaves {
+            let lname = leaf.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            let (_k, lret) = leaf.get("type").map(unwrap_type).unwrap_or_default();
+            if lret == want && no_required(leaf) && !lname.is_empty() {
+                return Some((
+                    format!("{rname} {{ {lname} }}"),
+                    format!("/data/{rname}/{lname}"),
+                    leaf.get("type").is_some_and(type_is_list),
+                ));
+            }
+        }
+    }
+    None
+}
 
 /// One root field we can exercise: its operation type, name, string/ID args, and whether its return
 /// type needs a `{ __typename }` selection set (object-ish) or must be bare (scalar/enum).
@@ -239,12 +408,17 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
 
     // --- 4. Alias-based amplification (DoS surface) --------------------------------------------
     if want("dos") && !fields.is_empty() {
-        // A cheap, no-arg-friendly field aliased many times: if the server resolves all of them in
-        // one request it has no query-cost limit, so a single request can be amplified into
-        // thousands of resolver calls (batching/alias DoS).
-        if let Some(f) = fields
-            .iter()
-            .find(|f| f.op == "query" && f.string_args.is_empty())
+        // `__typename` aliased a hundred times. It is the cheapest field in any
+        // schema and resolving it costs the server nothing, which is the point:
+        // this asks whether there is an ALIAS LIMIT, and it asks without making
+        // the server do any work.
+        //
+        // Do not "improve" this by aliasing a real field. The description used
+        // to name one, `systemUpdate` on dvga, which is the field that runs
+        // `python3 setup.py` through os.popen, and a reader would reasonably
+        // conclude the scanner had invoked it a hundred times. It had not, and
+        // it must not: a single call to it hangs for 25 seconds and a full pass
+        // once left dvga answering nothing at all.
         {
             let aliases: String = (0..100)
                 .map(|i| format!("a{i}: __typename"))
@@ -258,7 +432,8 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
                         "GraphQL query-cost / alias amplification",
                         "medium",
                         &url, "POST",
-                        &format!("A single request aliasing `{}` 100 times was fully resolved. With no query-cost, depth, or alias limit, one small request multiplies into thousands of resolver calls, enabling denial of service (OWASP API4). Enforce query cost / depth limits.", f.name)
+                        "A single request aliasing `__typename` 100 times was fully resolved, so there is no limit on how many aliases one document may carry. `__typename` was chosen because it costs the server nothing to answer, which keeps this test harmless: what it demonstrates is the absence of a limit, not that any work was done. The same document pointed at an expensive field is a denial of service (OWASP API4), and nothing here stops a caller writing that. Enforce a query cost or depth limit."
+
                     ).event());
                     found += 1;
                 }
@@ -294,25 +469,85 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
     if want("sensitive") {
         if let Some(schema) = &schema_json {
             let mut hits: Vec<String> = Vec::new();
+            let reachable = query_reachable_types(schema);
             if let Some(types) = schema
                 .pointer("/data/__schema/types")
                 .and_then(|v| v.as_array())
             {
                 for t in types {
                     let tname = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    if tname.starts_with("__") {
+                    if tname.starts_with("__") || !reachable.contains(tname) {
                         continue;
                     }
                     if let Some(tfields) = t.get("fields").and_then(|v| v.as_array()) {
                         for f in tfields {
                             let fname = f.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                            let low = fname.to_lowercase().replace(['_', '-'], "");
-                            if SENSITIVE_FIELD.iter().any(|s| low == s.replace('_', "")) {
+                            if sensitive_field_name(fname) {
                                 hits.push(format!("{tname}.{fname}"));
                             }
                         }
                     }
                 }
+            }
+            // A declaration is not a leak. Ask for the field as a caller with
+            // no credential at all, and report only what actually came back with
+            // something in it. dvga declares `UserObject.password` and answers
+            // `******`, which is the absence of a leak being reported as one.
+            let anon_read = probe::build_client(probe::ClientOpts {
+                evasive: params.evasive,
+                identify: params.identify.clone(),
+                auth: None,
+                target: &params.target,
+                timeout_ms: params.timeout_ms,
+                min_timeout_ms: 8000,
+                block_internal: params.block_internal,
+            });
+            let mut confirmed: Vec<String> = Vec::new();
+            let mut unread: Vec<String> = Vec::new();
+            if let Some(anon) = anon_read.as_ref() {
+                for hit in &hits {
+                    let Some((tname, fname)) = hit.split_once('.') else {
+                        continue;
+                    };
+                    let Some((path, ptr, is_list)) = reader_for_type(schema, tname) else {
+                        unread.push(hit.clone());
+                        continue;
+                    };
+                    let doc = json!({
+                        "query": format!("query {{ {} }}", inject_leaf(&path, fname))
+                    })
+                    .to_string();
+                    let Some(r) = post(anon, &url, &doc).await else {
+                        unread.push(hit.clone());
+                        continue;
+                    };
+                    let got = serde_json::from_str::<Value>(&r.body)
+                        .ok()
+                        .and_then(|v| v.pointer(&ptr).cloned());
+                    let leaked = match got {
+                        Some(Value::Array(items)) if is_list => items
+                            .iter()
+                            .any(|it| it.get(fname).is_some_and(|v| !is_trivial_secret(v))),
+                        Some(Value::Object(o)) => {
+                            o.get(fname).is_some_and(|v| !is_trivial_secret(v))
+                        }
+                        _ => false,
+                    };
+                    if leaked {
+                        confirmed.push(hit.clone());
+                    }
+                }
+            }
+            hits = confirmed;
+            if !unread.is_empty() {
+                unread.sort();
+                unread.dedup();
+                let _ = tx.send(json!({"type":"log","message": format!(
+                    "{} credential field(s) are declared on queryable types and were not read: \
+                     {}. No argument-free query returns that type, so whether an unauthenticated \
+                     caller can get a value out of them is untested here, not clean.",
+                    unread.len(), unread.join(", ")
+                )}));
             }
             if !hits.is_empty() {
                 hits.sort();
@@ -320,10 +555,10 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
                 hits.truncate(20);
                 let _ = tx.send(finding(
                     "graphql_sensitive_field",
-                    "Sensitive fields exposed in GraphQL schema",
-                    "medium",
+                    "Credential field readable by an unauthenticated caller",
+                    "high",
                     &url, "POST",
-                    &format!("The schema exposes credential/secret fields that clients can request: {}. Query-able password/token/secret fields are a data-exposure and account-takeover risk - remove them from the API type or gate them behind field-level authorization.", hits.join(", ")),
+                    &format!("A caller sending no credential at all read these credential fields and got a real value back: {}. Confirmed by asking for them, not inferred from the schema, and a masked, empty or null value does not count. Remove them from the queryable type, or gate them behind field-level authorization.", hits.join(", ")),
                 ).event());
                 found += 1;
             }
@@ -2928,6 +3163,115 @@ mod tests {
         assert_eq!(
             mutation_doc(create, &[], &["id".into()]),
             r#"{"query":"mutation { createInvoice { id } }"}"#
+        );
+    }
+
+    #[test]
+    fn a_content_hash_is_not_a_credential() {
+        // Wiki.js types `Page.hash` as the SHA1 of the page content, and a bare
+        // `hash` is as likely to be an ETag, a checksum or a commit id. Same for
+        // `salt`. Both were in the name list and both produced a finding on real
+        // software.
+        for ordinary in [
+            "hash",
+            "salt",
+            "contentHash",
+            "etag",
+            "checksum",
+            "commit_hash",
+        ] {
+            assert!(
+                !sensitive_field_name(ordinary),
+                "{ordinary} is not a credential"
+            );
+        }
+        // Compounded with something that IS a credential, they are.
+        for real in [
+            "password_hash",
+            "passwordHash",
+            "pwSalt",
+            "secret_hash",
+            "tokenHash",
+        ] {
+            assert!(sensitive_field_name(real), "{real} is a credential");
+        }
+        // And the unambiguous ones are unchanged.
+        for real in [
+            "password",
+            "apiKey",
+            "api_key",
+            "accessToken",
+            "privateKey",
+            "cvv",
+        ] {
+            assert!(sensitive_field_name(real), "{real} is a credential");
+        }
+    }
+
+    #[test]
+    fn a_type_only_a_mutation_returns_is_not_an_exposure() {
+        // Directus types the login response `auth_tokens { access_token }` and
+        // TOTP enrolment `users_me_tfa_generate_data { secret }`. A caller
+        // receiving its own token after asking for it is not an exposure, and
+        // neither type is reachable from a query at all. Reporting them was
+        // defect 1's shape in a different engine.
+        let schema = json!({"data":{"__schema":{
+            "queryType":{"name":"Query","fields":[
+                {"name":"me","args":[],"type":{"kind":"OBJECT","name":"User","ofType":null}}
+            ]},
+            "mutationType":{"name":"Mutation","fields":[
+                {"name":"login","args":[],"type":{"kind":"OBJECT","name":"auth_tokens","ofType":null}}
+            ]},
+            "types":[
+                {"name":"User","kind":"OBJECT","fields":[
+                    {"name":"id","args":[],"type":{"kind":"SCALAR","name":"Int","ofType":null}},
+                    {"name":"profile","args":[],"type":{"kind":"OBJECT","name":"Profile","ofType":null}}
+                ]},
+                {"name":"Profile","kind":"OBJECT","fields":[
+                    {"name":"apiKey","args":[],"type":{"kind":"SCALAR","name":"String","ofType":null}}
+                ]},
+                {"name":"auth_tokens","kind":"OBJECT","fields":[
+                    {"name":"access_token","args":[],"type":{"kind":"SCALAR","name":"String","ofType":null}}
+                ]}
+            ]
+        }}});
+        let reach = query_reachable_types(&schema);
+        assert!(reach.contains("User"));
+        // Transitively, or a credential one level down is missed.
+        assert!(reach.contains("Profile"), "reachability must follow fields");
+        assert!(
+            !reach.contains("auth_tokens"),
+            "a mutation payload is not query-reachable"
+        );
+    }
+
+    #[test]
+    fn a_masked_value_is_the_absence_of_a_leak() {
+        // dvga declares `UserObject.password` and answers `******`. Reporting
+        // that is reporting the absence of a leak, which is defect 12.
+        for masked in [
+            json!("******"),
+            json!(""),
+            json!("   "),
+            json!(null),
+            json!("xxxxxxx"),
+            json!("REDACTED"),
+            json!("........"),
+        ] {
+            assert!(is_trivial_secret(&masked), "{masked} is not a secret");
+        }
+        for real in [json!("sk_live_9f2a41"), json!("hunter2"), json!("a")] {
+            assert!(!is_trivial_secret(&real), "{real} is a secret");
+        }
+    }
+
+    #[test]
+    fn the_credential_read_goes_through_a_namespace() {
+        // The leaf has to land inside the innermost selection, not after it.
+        assert_eq!(inject_leaf("users", "password"), "users { password }");
+        assert_eq!(
+            inject_leaf("pages { list }", "hash"),
+            "pages { list { hash } }"
         );
     }
 }
