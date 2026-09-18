@@ -17,6 +17,21 @@
 //! working, which is the failure a safety test is least able to notice.
 //!
 //! Adding an operation that takes endpoints means adding it here.
+//!
+//! # Why the authorization engine is not in it
+//!
+//! It was, briefly, on the reasoning that the engine which already had the rail
+//! should be the one guarded against losing it. Then its rail was taken down and
+//! the test still passed, so the case was proving nothing: on a socket that
+//! answers every request with the same object, that engine declines for reasons
+//! of its own long before the method matters, and its write probes are safe by
+//! construction anyway, creating a throwaway and declining when they cannot.
+//!
+//! A case that passes whether or not the thing it guards is present is worse
+//! than no case, because it reads as coverage. So it is out, and the
+//! authorization write path is covered where it can actually be exercised: the
+//! silence bench plants a real cross-identity write and a real cross-identity
+//! delete against a live wger.
 
 use serde_json::json;
 use std::sync::Arc;
@@ -25,11 +40,17 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
-/// A listener that answers everything and counts what it was asked.
+/// A listener that answers everything and counts the requests whose METHOD
+/// overwrites or destroys.
 ///
-/// Returns its address and the counter. It answers a small JSON body so an
-/// engine gets far enough to try everything it has, and it keeps serving until
-/// the test drops it.
+/// Counting every request would be the wrong measure and it showed: the
+/// authorization engine sends one request at a DELETE-declared endpoint even
+/// with writes off, and that request is a GET, which is exactly what it should
+/// do. The claim being tested is not "nothing was sent", it is "nothing that
+/// changes the resource was sent".
+///
+/// It answers a small JSON body so an engine gets far enough to try everything
+/// it has, and keeps serving until the test drops it.
 async fn counting_target() -> (String, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -49,15 +70,23 @@ async fn counting_target() -> (String, Arc<AtomicUsize>) {
                     // is the thing being counted.
                     match sock.read(&mut buf).await {
                         Ok(0) | Err(_) => return,
-                        Ok(_) => {
-                            seen.fetch_add(1, Ordering::SeqCst);
+                        Ok(n) => {
+                            let head = String::from_utf8_lossy(&buf[..n]);
+                            let method = head
+                                .split_whitespace()
+                                .next()
+                                .unwrap_or("")
+                                .to_ascii_uppercase();
+                            if matches!(method.as_str(), "DELETE" | "PUT" | "PATCH") {
+                                seen.fetch_add(1, Ordering::SeqCst);
+                            }
                             let body = br#"{"ok":true,"id":1,"role":"user"}"#;
-                            let head = format!(
+                            let resp = format!(
                                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
                                  Content-Length: {}\r\nConnection: keep-alive\r\n\r\n",
                                 body.len()
                             );
-                            if sock.write_all(head.as_bytes()).await.is_err()
+                            if sock.write_all(resp.as_bytes()).await.is_err()
                                 || sock.write_all(body).await.is_err()
                             {
                                 return;
@@ -71,8 +100,8 @@ async fn counting_target() -> (String, Arc<AtomicUsize>) {
     (format!("http://{addr}"), seen)
 }
 
-/// Run one operation to completion and report how many requests reached the
-/// target.
+/// Run one operation to completion and report how many DESTROYING requests
+/// reached the target.
 async fn requests_sent<F, Fut>(op: F) -> usize
 where
     F: FnOnce(String, mpsc::UnboundedSender<serde_json::Value>) -> Fut,
@@ -157,7 +186,7 @@ async fn no_engine_sends_a_destroying_method_by_default() {
         .collect();
     assert!(
         broke.is_empty(),
-        "these sent requests at a DELETE endpoint with writes off: {}",
+        "these sent a destroying method with writes off: {}",
         broke.join(", ")
     );
 }

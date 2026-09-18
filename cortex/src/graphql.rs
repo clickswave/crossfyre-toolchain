@@ -2181,14 +2181,6 @@ fn mutation_ack_field(field: &Field, schema: Option<&Value>) -> String {
     leaf.unwrap_or_else(|| "__typename".to_string())
 }
 
-/// Where a mutation's answer lives in the response.
-fn mutation_ptr(field: &Field) -> String {
-    match &field.parent {
-        Some(ns) => format!("/data/{ns}/{}", field.name),
-        None => format!("/data/{}", field.name),
-    }
-}
-
 /// `{ ns { field(arg: <raw>) { a b c } } }`, with the id emitted as the JSON
 /// value it arrived as. It is very often an Int, and quoting it is a type error
 /// rather than a finding.
