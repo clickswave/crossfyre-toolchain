@@ -871,7 +871,7 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
                                     "`{path}({}: {id})` returned the same object to `{prole}` as it did to `{owner_role}`, and only `{owner_role}` can enumerate that object. Object-level authorization is missing (OWASP API1: BOLA): the id is the only thing standing between one account and another account's data.",
                                     p.id_arg
                                 ),
-                            ).param(&format!("{path}({})", p.id_arg)).event());
+                            ).param(format!("{path}({})", p.id_arg)).event());
                             found += 1;
                         }
                     }
@@ -978,7 +978,7 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
                                         "critical",
                                         &url, "POST",
                                         &format!("`{name}({target}: ...)` let `{prole}` rewrite an object created by `{owner_role}`, and the change was confirmed by reading it back as its owner. Object-level authorization is missing on the write path (OWASP API1): the id is the only thing between one account and editing another account's data."),
-                                    ).param(&format!("{name}({})", target)).event());
+                                    ).param(format!("{name}({target})")).event());
                                     found += 1;
                                 }
                             }
