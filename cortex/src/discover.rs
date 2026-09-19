@@ -46,6 +46,19 @@ pub struct DiscoverParams {
     /// ours.
     #[serde(default)]
     pub block_internal: bool,
+    /// Opt-in to endpoints whose method overwrites or destroys (DELETE, PUT,
+    /// PATCH). Off by default, the same rail the injection, scan and
+    /// authorization engines state.
+    ///
+    /// The module note above says discovery sends real requests including
+    /// writes and that the caller has opted into that. The writes are inherent
+    /// and that part is honest: body fields only exist on a request that has a
+    /// body, which is why a GET is promoted to POST here. What was not honest
+    /// is the opt-in, because nothing in this schema ever asked for one.
+    /// Measured against a target that records what it receives: one DELETE
+    /// endpoint in the list produced 59 DELETE requests at the same resource.
+    #[serde(default)]
+    pub test_writes: bool,
 }
 fn d_timeout() -> u64 {
     12_000
@@ -105,6 +118,15 @@ pub async fn run(params: DiscoverParams, tx: mpsc::UnboundedSender<Value>) {
     let mut done = 0i64;
 
     for ep in params.endpoints.iter().take(MAX_ENDPOINTS) {
+        if crate::inject::destroys_a_resource(&ep.method) && !params.test_writes {
+            let _ = tx.send(json!({"type":"log","message": format!(
+                "skipped {} {} without sending anything at it: discovery learns a body shape by                  sending bodies, and on a method that overwrites or destroys the resource every                  one of those is the damage rather than a test. Its shape is untested here, not                  clean. Re-run with writes enabled against a target you are willing to change.",
+                ep.method, ep.url
+            )}));
+            done += 1;
+            let _ = tx.send(json!({"type":"progress","processed": done, "total": total}));
+            continue;
+        }
         let is_json = ep.content_type.eq_ignore_ascii_case("json");
         let method = {
             let m = ep.method.to_uppercase();

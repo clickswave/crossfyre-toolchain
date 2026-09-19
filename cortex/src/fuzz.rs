@@ -33,6 +33,12 @@ pub struct FuzzParams {
     /// Which classes to run: "typefuzz" (type confusion) | "massassign"; empty/null = all.
     #[serde(default, deserialize_with = "crate::probe::de_null_seq")]
     pub classes: Vec<String>,
+    /// Opt-in to endpoints whose method overwrites or destroys (DELETE, PUT,
+    /// PATCH). Off by default, the same rail the other engines state. Fuzzing a
+    /// DELETE cannot learn anything the body would tell it, and it destroys the
+    /// resource: measured at four requests to one endpoint.
+    #[serde(default)]
+    pub test_writes: bool,
     /// Refuse private and reserved destinations at connect time. Absent = false,
     /// which is what an authorised customer scan gets: reaching your own
     /// internal network from your own node is the product. The free public
@@ -80,6 +86,15 @@ pub async fn run(params: FuzzParams, tx: mpsc::UnboundedSender<Value>) {
     let total = params.endpoints.len().min(MAX_ENDPOINTS) as i64;
 
     for ep in params.endpoints.iter().take(MAX_ENDPOINTS) {
+        if crate::inject::destroys_a_resource(&ep.method) && !params.test_writes {
+            let _ = tx.send(json!({"type":"log","message": format!(
+                "skipped {} {} without sending anything at it: the method overwrites or destroys                  the resource, so every mutated body is the damage rather than a test of how the                  server binds it. Untested here, not clean. Re-run with writes enabled against a                  target you are willing to change.",
+                ep.method, ep.url
+            )}));
+            done += 1;
+            let _ = tx.send(json!({"type":"progress","processed": done, "total": total}));
+            continue;
+        }
         // A JSON body shape is required to build a valid baseline to mutate against.
         if ep.body_type.eq_ignore_ascii_case("json") && !ep.body.is_empty() {
             if want("typefuzz") {

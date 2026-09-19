@@ -39,6 +39,27 @@ pub struct ScanParams {
     /// Only run passive header checks (no template requests).
     #[serde(default)]
     pub passive_only: bool,
+    /// Opt-in to templates whose method overwrites or destroys a resource
+    /// (PUT, PATCH, DELETE). Off by default, the same rail the injection and
+    /// authorization engines state.
+    ///
+    /// The built-in set is all GET, so a default `cortex scan` was already
+    /// harmless: 12 templates, 23 requests, nothing state-changing. An external
+    /// pack is a different matter, and pointing `templates_dir` at one is what
+    /// the documentation tells people to do. Measured against a target that
+    /// records what it is sent, with our own 112-template pack loaded: 194
+    /// requests, 15 of them state-changing, and one of those is
+    ///
+    ///     PATCH /api/v1/account {"role":"admin","balance_cents":-99999}
+    ///
+    /// which does not test whether privilege escalation is possible, it performs
+    /// it and then looks for the echo. That template's own description calls the
+    /// oracle weak and says the engine's own mass-assignment probe is the sound
+    /// one. The other fourteen are POST and are exploit confirmations of the
+    /// ordinary kind: a login attempt with bad credentials, a command-injection
+    /// marker, an SSRF callback, an XXE entity, a PHP eval. Those stay.
+    #[serde(default)]
+    pub test_writes: bool,
     /// Announce ourselves under this exact User-Agent instead of presenting as a
     /// browser.
     ///
@@ -453,12 +474,21 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
             }
         }
         let oob_queue: crate::inject::OobQueue = Default::default();
+        // Templates held back because their method changes the target. Named
+        // rather than dropped, so a shorter run is not mistaken for a clean one.
+        let mut write_templates: Vec<String> = Vec::new();
 
         for tmpl in template::BUILTIN.iter().chain(external.iter()) {
             // Skipped before the progress counter, because `total` above counts
             // only id-allowed templates. The severity filter stays inside the
             // loop, where it has always been counted as work done.
             if !allow_id(&tmpl.id) {
+                continue;
+            }
+            // A template that overwrites or destroys is not a test of whether it
+            // could. POST stays, for the reason the injection engine states.
+            if !params.test_writes && template_changes_target(tmpl) {
+                write_templates.push(tmpl.id.clone());
                 continue;
             }
             let sev = if tmpl.info.severity.is_empty() {
@@ -490,6 +520,18 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
             done += 1;
             let _ = tx.send(json!({"type":"progress","processed": done, "total": total}));
         }
+        if !write_templates.is_empty() {
+            write_templates.sort();
+            write_templates.dedup();
+            let _ = tx.send(json!({"type":"log","message": format!(
+                "{} template(s) were NOT run: {}. Each one uses a method that overwrites or \
+                 destroys the resource, so sending it IS the change rather than a test of \
+                 whether it is possible. Whatever they check is untested here, not clean. \
+                 Re-run with writes enabled against a target you are willing to change.",
+                write_templates.len(),
+                write_templates.join(", ")
+            )}));
+        }
 
         // Out-of-band template callbacks, collected once for the whole scan.
         if let (Some(oc), Some(reg)) = (oast.as_ref(), oob_reg.as_ref()) {
@@ -520,6 +562,20 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
     }
 
     let _ = tx.send(json!({"type":"done","found": found}));
+}
+
+/// Does running this template change the target rather than test it?
+///
+/// Any request in it whose method overwrites or destroys. POST is not counted,
+/// for the reason the injection engine states: it is the main surface and what
+/// it creates is usually recoverable. The one template this holds back in our
+/// own pack is `mass-assignment-privilege-escalation`, which PATCHes
+/// `{"role":"admin","balance_cents":-99999}` at an account endpoint and then
+/// looks for the echo, and whose own description calls that oracle weak.
+fn template_changes_target(tmpl: &template::Template) -> bool {
+    tmpl.http
+        .iter()
+        .any(|r| crate::inject::destroys_a_resource(&r.method))
 }
 
 /// Passive security-header checks. Returns (name, template-id, severity, description).
@@ -619,6 +675,71 @@ fn normalize_base(t: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The one template in our own pack that changes the target instead of
+    /// testing it, and the shapes that must keep running.
+    #[test]
+    fn a_template_that_rewrites_an_account_is_held_back() {
+        let parse = |y: &str| serde_yaml::from_str::<crate::template::Template>(y).expect("yaml");
+
+        let privesc = parse(
+            r#"
+id: mass-assignment-privilege-escalation
+http:
+  - method: PATCH
+    path: ["{{BaseURL}}/api/v1/account"]
+    body: "{\"role\":\"admin\",\"balance_cents\":-99999}"
+"#,
+        );
+        assert!(
+            template_changes_target(&privesc),
+            "a PATCH of role:admin is the change, not a test of it"
+        );
+
+        // Exploit confirmations of the ordinary kind. A login attempt with bad
+        // credentials, a command-injection marker, an XXE entity: all POST, all
+        // still run, because refusing them would leave the scanner unable to
+        // confirm anything.
+        for yaml in [
+            r#"
+id: sqli-error-based-login
+http:
+  - method: POST
+    path: ["{{BaseURL}}/api/v1/auth/login"]
+    body: "{\"email\":\"'\",\"password\":\"x\"}"
+"#,
+            r#"
+id: os-command-injection
+http:
+  - method: POST
+    path: ["{{BaseURL}}/api/v1/tools/ping"]
+    body: "{\"host\":\"127.0.0.1;id\"}"
+"#,
+            r#"
+id: git-config-exposed
+http:
+  - method: GET
+    path: ["{{BaseURL}}/.git/config"]
+"#,
+        ] {
+            let t = parse(yaml);
+            assert!(!template_changes_target(&t), "{} must still run", t.id);
+        }
+
+        // And a DELETE anywhere in a multi-request template counts, not just
+        // the first one.
+        let mixed = parse(
+            r#"
+id: probe-then-delete
+http:
+  - method: GET
+    path: ["{{BaseURL}}/a"]
+  - method: DELETE
+    path: ["{{BaseURL}}/a/1"]
+"#,
+        );
+        assert!(template_changes_target(&mixed));
+    }
     use super::*;
     use adaptive::identity::Mode;
 

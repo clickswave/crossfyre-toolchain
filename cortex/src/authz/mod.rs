@@ -55,6 +55,20 @@ pub struct AuthzParams {
     /// ours.
     #[serde(default)]
     pub block_internal: bool,
+    /// How long to wait for the server to act on a configuration object the
+    /// escalation pass created, in seconds.
+    ///
+    /// The effect does not arrive in the response. A signal handler is
+    /// immediate, a queued worker takes a moment, and a scheduled automation
+    /// waits for its next beat, which is commonly an hour in production and a
+    /// minute in a lab. The default suits a worker; raise it when the target
+    /// schedules rather than reacts, because a wait that is too short reports
+    /// nothing and reads exactly like a clean result.
+    #[serde(default = "d_settle")]
+    pub escalation_settle_secs: u64,
+}
+fn d_settle() -> u64 {
+    20
 }
 fn d_true() -> bool {
     true

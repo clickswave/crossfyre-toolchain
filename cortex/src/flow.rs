@@ -833,6 +833,22 @@ pub async fn run(p: FlowParams, tx: mpsc::UnboundedSender<Value>) {
             p.steps.len()
         )
     }));
+    // What the operator consented to is replaying a flow they recorded. What
+    // they may not have worked out is the multiplier: the control plus one
+    // replay per step tested, and if the flow is a checkout then each of those
+    // is an order. The constant's own comment says every request here is a real
+    // state change on somebody's application, and the run never said so. The
+    // race probe announces exactly this and this did not.
+    let replays = 1 + (p.steps.len() - 1).min(MAX_SKIP_TESTS);
+    let _ = tx.send(json!({
+        "type": "log",
+        "message": format!(
+            "this will replay the flow {replays} time(s) in total, the control plus one per step \
+             tested for being skippable, and every request in every replay is a real change on \
+             the application. If the recording is a checkout, that is {replays} checkouts. There \
+             is no version of this experiment that asks the question without doing so."
+        )
+    }));
 
     let mut found = 0i64;
 

@@ -30,7 +30,10 @@ Thumbs.db
 
 # Private tuned drop-in for the `adaptive` crate + its local paths-override.
 # NEVER commit these: the committed `adaptive/` is the open baseline that ships.
-/adaptive-private/
+# No trailing slash on purpose. With one, the pattern matches a directory only,
+# and the drop-in is now a symlink into its private origin, so it went back to
+# showing up as untracked in this public repository.
+/adaptive-private
 /.cargo/
 
 # Private isolated-egress drop-in (netns/tunnel/tor). NEVER commit: the committed
