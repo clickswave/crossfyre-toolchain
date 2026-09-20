@@ -175,8 +175,19 @@ pub async fn run(port: u16, db: MachDb) -> Result<(), Box<dyn std::error::Error>
     // Loopback unless an operator opts out: this channel has no per-request
     // credential of its own, so the bind address is the boundary.
     let addr = dguard::bind_addr(port);
-    let gate = dguard::Gate::from_env();
     let listener = TcpListener::bind(addr).await?;
+    run_on(listener, db).await
+}
+
+/// Serve on an already-bound listener.
+///
+/// Split out so the daemon can bind before its database is reachable. Binding
+/// late meant a database problem presented as "extension not running", which is
+/// indistinguishable from a crashed engine and made every web_crawl fail with
+/// nothing useful attached.
+pub async fn run_on(listener: TcpListener, db: MachDb) -> Result<(), Box<dyn std::error::Error>> {
+    let addr = listener.local_addr()?;
+    let gate = dguard::Gate::from_env();
     gate.announce("Mach", addr);
 
     let db = Arc::new(db);
