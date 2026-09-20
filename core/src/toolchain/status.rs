@@ -85,7 +85,20 @@ pub fn nodes(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
             Some(pid) if Path::new(&format!("/proc/{pid}")).exists() => {
                 (check(), format!("{GREEN}running{RESET}"), pid.to_string())
             }
-            Some(_) => (bang(), format!("{YELLOW}stale pid{RESET}"), "-".to_string()),
+            // A pid file naming a process that no longer exists is leftover
+            // runtime state, not user data. Reporting it forever with no way to
+            // act on it is how a host ends up with three of four nodes reading
+            // "stale pid" indefinitely, so clear it and say that is what
+            // happened.
+            Some(_) => {
+                let cleared = std::fs::remove_file(&paths.pid).is_ok();
+                let label = if cleared {
+                    format!("{YELLOW}stale pid, cleared{RESET}")
+                } else {
+                    format!("{YELLOW}stale pid{RESET}")
+                };
+                (bang(), label, "-".to_string())
+            }
             None => (dot(), dim("stopped"), "-".to_string()),
         };
         let mid = if pid == "-" {
