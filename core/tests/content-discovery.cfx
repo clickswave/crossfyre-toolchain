@@ -1,10 +1,36 @@
+import os
 import targets
 import extensions
 import cfxs
 
+# Wordlists may only be read from a small set of directories, because the path
+# and the target are both caller-controlled and an unrestricted path turns a
+# scan into an arbitrary file read. Look in the permitted ones rather than
+# hard-coding a single path that may not exist on this host.
+WORDLIST_CANDIDATES = [
+    "/opt/crossfyre/wordlists/common.txt",
+    "/usr/share/wordlists/dirb/common.txt",
+    "/usr/share/seclists/Discovery/Web-Content/common.txt",
+]
+
+
+def find_wordlist():
+    for path in WORDLIST_CANDIDATES:
+        if os.path.isfile(path):
+            return path
+    raise FileNotFoundError(
+        "no wordlist found. Looked in:\n  "
+        + "\n  ".join(WORDLIST_CANDIDATES)
+        + "\nPut one in a permitted directory, or add its directory to "
+        "CFX_WORDLIST_ROOTS (colon-separated)."
+    )
+
+
 def run():
     server = cfxs.connect()
     mach = extensions.get("mach")
+    wordlist = find_wordlist()
+    print(f"using wordlist {wordlist}")
 
     for t in targets.get_all():
         if t.type != "url":
@@ -13,16 +39,17 @@ def run():
 
         server.log(f"Starting content discovery on {t.value}")
 
-        # Run a streamed scan via the mach daemon.
-        # The endpoint should contain ::FUZZ:: where the wordlist entry goes.
-        # If the target URL doesn't have it, append it.
+        # The endpoint must contain ::FUZZ:: where the wordlist entry goes.
         endpoint = t.value
         if "::FUZZ::" not in endpoint:
             endpoint = endpoint.rstrip("/") + "/::FUZZ::"
 
+        # scan() raises if the daemon reports an error or stops without
+        # finishing, so a scan that did not run cannot look like one that found
+        # nothing.
         events = mach.scan({
             "endpoint": endpoint,
-            "wordlist": "/opt/crossfyre/wordlists/common.txt",
+            "wordlist": wordlist,
             "method": "GET",
             "tasks": 10,
             "success_status_codes": [200, 201, 301, 302, 403],
@@ -32,6 +59,7 @@ def run():
         for event in events:
             if event.get("type") == "result" and event.get("status") == "found":
                 found_count += 1
+                print(f"  {event.get('code')}  {event.get('url')}")
                 server.send_result({
                     "target": event.get("url", t.value),
                     "type": "endpoint",
