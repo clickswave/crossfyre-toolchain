@@ -198,9 +198,15 @@ enum NodeAction {
         #[arg(long)]
         force: bool,
 
-        /// API base URL for the Crossfyre control plane
-        #[arg(long, default_value = cfx_core::auth::DEFAULT_API_URL)]
-        api_url: String,
+        /// API base URL for the Crossfyre control plane.
+        ///
+        /// Defaults to the control plane this data directory is already signed
+        /// in to, and only then to the build's default. Taking the build default
+        /// first meant `login` and `node init` could disagree: logging in to a
+        /// local instance and then enrolling sent the node key to whatever the
+        /// binary was compiled against, which for a plain build is production.
+        #[arg(long)]
+        api_url: Option<String>,
 
         /// Skip installing the node OS service (run `crossfyre node up` manually)
         #[arg(long)]
@@ -422,6 +428,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 node_key,
                 no_prompt,
             } => {
+                // Explicit flag wins; then the session saved in this data
+                // directory; then the build default.
+                let api_url = api_url
+                    .or_else(|| cfx_core::auth::load_account(&base).map(|a| a.api_url))
+                    .unwrap_or_else(|| cfx_core::auth::DEFAULT_API_URL.to_string());
                 cfx_core::run_init(force, &api_url, &base, no_service, node_key, no_prompt).await?;
             }
             NodeAction::Remove {

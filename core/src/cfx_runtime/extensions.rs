@@ -169,8 +169,32 @@ impl DaemonExtension {
     ///       "tasks": 10
     ///   })
     fn scan(&self, py: Python<'_>, params: Bound<'_, PyDict>) -> PyResult<Py<PyAny>> {
+        self.stream_op(py, params, Some("scan"))
+    }
+
+    /// Run any stream-mode operation and return every event.
+    ///
+    ///   events = voyage.stream({"operation": "takeover", "domain": "example.com"})
+    ///
+    /// `scan()` is this with `operation` forced to "scan". Several daemons have
+    /// stream-only operations that were unreachable from a script without it,
+    /// because `send()` reads a single line and `scan()` overwrote the
+    /// operation. Raises on an engine error or a stream that ends without
+    /// `done`, exactly as `scan()` does.
+    fn stream(&self, py: Python<'_>, params: Bound<'_, PyDict>) -> PyResult<Py<PyAny>> {
+        self.stream_op(py, params, None)
+    }
+
+    fn stream_op(
+        &self,
+        py: Python<'_>,
+        params: Bound<'_, PyDict>,
+        force_operation: Option<&str>,
+    ) -> PyResult<Py<PyAny>> {
         let mut value: serde_json::Value = pythonize::depythonize(&params)?;
-        value["operation"] = serde_json::json!("scan");
+        if let Some(op) = force_operation {
+            value["operation"] = serde_json::json!(op);
+        }
         value["response"] = serde_json::json!("stream");
 
         let port = self.port;
