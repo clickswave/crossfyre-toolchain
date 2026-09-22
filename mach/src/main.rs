@@ -141,24 +141,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
         tokio::pin!(db_fut);
 
-        let mach_db = loop {
-            tokio::select! {
-                res = &mut db_fut => break res?,
-                accepted = listener.accept() => {
-                    if let Ok((mut sock, _)) = accepted {
-                        tokio::spawn(async move {
-                            use tokio::io::AsyncWriteExt;
-                            let msg = serde_json::json!({
-                                "type": "error",
-                                "message": "mach is not ready: waiting for its \
-                                            database. Create it with `crossfyre db up`.",
+        // Do not answer yet. An ordinary start reaches the database in well
+        // under a second, and a caller arriving inside that window should be
+        // served, not refused. The port is already bound, so such a caller
+        // waits in the listen backlog for a moment and is then served for real.
+        //
+        // Answering immediately made every start a race the caller usually
+        // lost. The oracle harness treats an accepted connection as readiness,
+        // so it connected the instant the port opened, got the not-ready error,
+        // and four mach cases failed reporting nothing at all. The node's
+        // extension check reads that same signal, so in production it would
+        // call mach healthy and then collect errors from it.
+        //
+        // Once the grace is gone this is an outage rather than a slow start,
+        // and then saying why beats making anyone wait.
+        const READY_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+        let mach_db = match tokio::time::timeout(READY_GRACE, &mut db_fut).await {
+            Ok(res) => res?,
+            Err(_) => loop {
+                tokio::select! {
+                    res = &mut db_fut => break res?,
+                    accepted = listener.accept() => {
+                        if let Ok((mut sock, _)) = accepted {
+                            tokio::spawn(async move {
+                                use tokio::io::AsyncWriteExt;
+                                let msg = serde_json::json!({
+                                    "type": "error",
+                                    "message": "mach is not ready: waiting for its \
+                                                database. Create it with `crossfyre db up`.",
+                                });
+                                let _ = sock.write_all(format!("{msg}\n").as_bytes()).await;
+                                let _ = sock.flush().await;
                             });
-                            let _ = sock.write_all(format!("{msg}\n").as_bytes()).await;
-                            let _ = sock.flush().await;
-                        });
+                        }
                     }
                 }
-            }
+            },
         };
 
         return daemon::run_on(listener, mach_db).await;
