@@ -25,6 +25,34 @@ pub fn overview(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Print which control plane this data directory is signed in to.
+///
+/// Without it the only way to tell production from a local stack is to read
+/// auth.toml by hand, and `node init` enrols against whatever it says. A host
+/// with no nodes yet is exactly when someone is about to run it.
+fn control_plane(base: &Path) {
+    use super::ui::*;
+
+    println!();
+    section("Control plane");
+    match crate::auth::load_account(base) {
+        Some(account) => {
+            let url = account.api_url.trim_end_matches('/').to_string();
+            let local = url.contains("localhost") || url.contains("127.0.0.1");
+            let marker = if local {
+                dim("local")
+            } else {
+                format!("{YELLOW}live{RESET}")
+            };
+            println!("{}", row(&check(), &url, &marker, &dim(&account.username)));
+        }
+        None => {
+            println!("{}", row(&dot(), "-", "", &dim("not signed in")));
+            hint("Run crossfyre login to choose one.");
+        }
+    }
+}
+
 /// `crossfyre node status` - registered nodes on this machine.
 pub fn nodes(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
     use super::ui::*;
@@ -36,6 +64,7 @@ pub fn nodes(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
             section("Nodes");
             println!("{}", row(&dot(), "-", "", &dim("no nodes registered")));
             hint(&e.to_string());
+            control_plane(base);
             end();
             return Ok(());
         }
@@ -56,7 +85,20 @@ pub fn nodes(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
             Some(pid) if Path::new(&format!("/proc/{pid}")).exists() => {
                 (check(), format!("{GREEN}running{RESET}"), pid.to_string())
             }
-            Some(_) => (bang(), format!("{YELLOW}stale pid{RESET}"), "-".to_string()),
+            // A pid file naming a process that no longer exists is leftover
+            // runtime state, not user data. Reporting it forever with no way to
+            // act on it is how a host ends up with three of four nodes reading
+            // "stale pid" indefinitely, so clear it and say that is what
+            // happened.
+            Some(_) => {
+                let cleared = std::fs::remove_file(&paths.pid).is_ok();
+                let label = if cleared {
+                    format!("{YELLOW}stale pid, cleared{RESET}")
+                } else {
+                    format!("{YELLOW}stale pid{RESET}")
+                };
+                (bang(), label, "-".to_string())
+            }
             None => (dot(), dim("stopped"), "-".to_string()),
         };
         let mid = if pid == "-" {
@@ -66,6 +108,8 @@ pub fn nodes(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
         };
         println!("{}", row(&sym, &id, &mid, &state));
     }
+
+    control_plane(base);
 
     println!();
     section("Service");

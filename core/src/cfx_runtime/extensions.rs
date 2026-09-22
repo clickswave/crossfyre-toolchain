@@ -169,8 +169,32 @@ impl DaemonExtension {
     ///       "tasks": 10
     ///   })
     fn scan(&self, py: Python<'_>, params: Bound<'_, PyDict>) -> PyResult<Py<PyAny>> {
+        self.stream_op(py, params, Some("scan"))
+    }
+
+    /// Run any stream-mode operation and return every event.
+    ///
+    ///   events = voyage.stream({"operation": "takeover", "domain": "example.com"})
+    ///
+    /// `scan()` is this with `operation` forced to "scan". Several daemons have
+    /// stream-only operations that were unreachable from a script without it,
+    /// because `send()` reads a single line and `scan()` overwrote the
+    /// operation. Raises on an engine error or a stream that ends without
+    /// `done`, exactly as `scan()` does.
+    fn stream(&self, py: Python<'_>, params: Bound<'_, PyDict>) -> PyResult<Py<PyAny>> {
+        self.stream_op(py, params, None)
+    }
+
+    fn stream_op(
+        &self,
+        py: Python<'_>,
+        params: Bound<'_, PyDict>,
+        force_operation: Option<&str>,
+    ) -> PyResult<Py<PyAny>> {
         let mut value: serde_json::Value = pythonize::depythonize(&params)?;
-        value["operation"] = serde_json::json!("scan");
+        if let Some(op) = force_operation {
+            value["operation"] = serde_json::json!(op);
+        }
         value["response"] = serde_json::json!("stream");
 
         let port = self.port;
@@ -187,6 +211,8 @@ impl DaemonExtension {
 
                 let reader = std::io::BufReader::new(&stream);
                 let mut results = Vec::new();
+                let mut saw_done = false;
+                let mut engine_error: Option<String> = None;
 
                 for line in reader.lines() {
                     let line = line?;
@@ -194,21 +220,56 @@ impl DaemonExtension {
                         continue;
                     }
                     if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
-                        let is_done = event["type"].as_str() == Some("done");
-                        results.push(event);
-                        if is_done {
-                            break;
+                        match event["type"].as_str() {
+                            Some("done") => {
+                                saw_done = true;
+                                results.push(event);
+                                break;
+                            }
+                            Some("error") => {
+                                // The daemons emit this and stop. Keep the first
+                                // message: later ones are usually consequences.
+                                if engine_error.is_none() {
+                                    engine_error = Some(
+                                        event["message"]
+                                            .as_str()
+                                            .unwrap_or("engine reported an error")
+                                            .to_string(),
+                                    );
+                                }
+                                results.push(event);
+                            }
+                            _ => results.push(event),
                         }
                     }
                 }
 
-                Ok(results)
+                Ok((results, saw_done, engine_error))
             })
             .map_err(|e| {
                 pyo3::exceptions::PyConnectionError::new_err(format!(
                     "{name} daemon not reachable on port {port}: {e}"
                 ))
             })?;
+
+        // A scan that did not run must not look like a scan that found nothing.
+        // The daemon reports a fatal problem as an `error` event and then stops
+        // without sending `done`; both of those used to be handed back as an
+        // ordinary (usually empty) list, so a rejected scan returned no results
+        // and the caller reported success. Raise instead, and say why.
+        let (events, saw_done, engine_error) = events;
+        if let Some(message) = engine_error {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{name} scan failed: {message}"
+            )));
+        }
+        if !saw_done {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{name} scan ended after {} event(s) without completing; the daemon \
+                 closed the connection early",
+                events.len()
+            )));
+        }
 
         pythonize::pythonize(py, &events)
             .map(|b| b.unbind())

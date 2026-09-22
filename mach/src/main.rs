@@ -105,23 +105,82 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // would restart us straight into the same failure, which is how one
         // host logged 2,663 restarts and reported nothing but "down". Wait for
         // it, saying so each time, and start as soon as it answers.
-        let mach_db =
-            dguard::wait_for("postgres", std::time::Duration::from_secs(3600), || async {
-                let db = libs::mach_db::MachDb::init(
-                    &toolchain_cfg.postgres.host,
-                    toolchain_cfg.postgres.port,
-                    &toolchain_cfg.postgres.user,
-                    toolchain_cfg.postgres.password.as_deref(),
-                    &dummy_config,
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-                db.create_tables().await.map_err(|e| e.to_string())?;
-                Ok::<_, String>(db)
-            })
-            .await?;
+        // Bind before the database is reachable, and answer while waiting.
+        //
+        // Binding after the database meant a database problem looked exactly
+        // like a dead engine: the port was closed, the node reported the
+        // extension as not running, and every web_crawl failed with nothing to
+        // go on. Binding early on its own would be worse, because the node
+        // would call mach healthy while requests silently queued. So bind,
+        // accept, and tell each caller precisely what is wrong until the
+        // database answers.
+        let addr = dguard::bind_addr(cli.port);
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        eprintln!("Mach daemon listening on {addr} (waiting for database)");
 
-        return daemon::run(cli.port, mach_db).await;
+        // Name the endpoint and the fix. "pool timed out while waiting for an
+        // open connection" is true and useless: it does not say which host,
+        // which port, or that the container may simply not have been created on
+        // this machine yet.
+        let db_label = format!(
+            "postgres at {}:{} (create it with `crossfyre db up`)",
+            toolchain_cfg.postgres.host, toolchain_cfg.postgres.port
+        );
+        let db_fut = dguard::wait_for(&db_label, std::time::Duration::from_secs(3600), || async {
+            let db = libs::mach_db::MachDb::init(
+                &toolchain_cfg.postgres.host,
+                toolchain_cfg.postgres.port,
+                &toolchain_cfg.postgres.user,
+                toolchain_cfg.postgres.password.as_deref(),
+                &dummy_config,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            db.create_tables().await.map_err(|e| e.to_string())?;
+            Ok::<_, String>(db)
+        });
+        tokio::pin!(db_fut);
+
+        // Do not answer yet. An ordinary start reaches the database in well
+        // under a second, and a caller arriving inside that window should be
+        // served, not refused. The port is already bound, so such a caller
+        // waits in the listen backlog for a moment and is then served for real.
+        //
+        // Answering immediately made every start a race the caller usually
+        // lost. The oracle harness treats an accepted connection as readiness,
+        // so it connected the instant the port opened, got the not-ready error,
+        // and four mach cases failed reporting nothing at all. The node's
+        // extension check reads that same signal, so in production it would
+        // call mach healthy and then collect errors from it.
+        //
+        // Once the grace is gone this is an outage rather than a slow start,
+        // and then saying why beats making anyone wait.
+        const READY_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+        let mach_db = match tokio::time::timeout(READY_GRACE, &mut db_fut).await {
+            Ok(res) => res?,
+            Err(_) => loop {
+                tokio::select! {
+                    res = &mut db_fut => break res?,
+                    accepted = listener.accept() => {
+                        if let Ok((mut sock, _)) = accepted {
+                            tokio::spawn(async move {
+                                use tokio::io::AsyncWriteExt;
+                                let msg = serde_json::json!({
+                                    "type": "error",
+                                    "message": "mach is not ready: waiting for its \
+                                                database. Create it with `crossfyre db up`.",
+                                });
+                                let _ = sock.write_all(format!("{msg}\n").as_bytes()).await;
+                                let _ = sock.flush().await;
+                            });
+                        }
+                    }
+                }
+            },
+        };
+
+        return daemon::run_on(listener, mach_db).await;
     }
 
     // -----------------------------------------------------------------------

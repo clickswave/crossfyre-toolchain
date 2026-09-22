@@ -122,7 +122,27 @@ impl Default for ToolchainConfig {
 
 /// `~/.config/crossfyre` of the *invoking* user (honors SUDO_USER), the same
 /// root that holds `nodes.d/`.
+/// Process-wide override for the toolchain directory, set once from `--data-dir`.
+///
+/// `--data-dir` is documented as "the directory that holds `nodes.d` and
+/// `config.toml`" and exists so an operator can run an isolated set of nodes.
+/// It used to reach only the auth and node files, because the config path was
+/// resolved independently here and silently ignored it. Two "isolated" node
+/// sets would then share one `config.toml`, which means one database and one
+/// set of engine ports: exactly what the flag is meant to prevent.
+static TOOLCHAIN_DIR_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Point every toolchain path at `dir`. Called once during CLI startup, before
+/// any command runs. Later calls are ignored so a command cannot move the root
+/// out from under itself half way through.
+pub fn set_toolchain_dir(dir: PathBuf) {
+    let _ = TOOLCHAIN_DIR_OVERRIDE.set(dir);
+}
+
 pub fn get_toolchain_dir() -> PathBuf {
+    if let Some(dir) = TOOLCHAIN_DIR_OVERRIDE.get() {
+        return dir.clone();
+    }
     super::sudo_user::invoking_user_config_dir().join("crossfyre")
 }
 

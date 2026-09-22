@@ -198,9 +198,15 @@ enum NodeAction {
         #[arg(long)]
         force: bool,
 
-        /// API base URL for the Crossfyre control plane
-        #[arg(long, default_value = cfx_core::auth::DEFAULT_API_URL)]
-        api_url: String,
+        /// API base URL for the Crossfyre control plane.
+        ///
+        /// Defaults to the control plane this data directory is already signed
+        /// in to, and only then to the build's default. Taking the build default
+        /// first meant `login` and `node init` could disagree: logging in to a
+        /// local instance and then enrolling sent the node key to whatever the
+        /// binary was compiled against, which for a plain build is production.
+        #[arg(long)]
+        api_url: Option<String>,
 
         /// Skip installing the node OS service (run `crossfyre node up` manually)
         #[arg(long)]
@@ -371,6 +377,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let base = cfx_core::resolve_data_dir(cli.data_dir.as_deref())?;
+    // Make --data-dir mean what it says: config.toml lives under the same root
+    // as nodes.d and auth.toml, so an isolated node set gets its own database
+    // and its own engine ports rather than quietly sharing the global ones.
+    cfx_core::toolchain::config::set_toolchain_dir(base.clone());
 
     // No account gate here on purpose. The engines are free, and every command
     // that isn't node enrolment is either local or served from the PUBLIC
@@ -418,6 +428,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 node_key,
                 no_prompt,
             } => {
+                // Explicit flag wins; then the session saved in this data
+                // directory; then the build default.
+                let api_url = api_url
+                    .or_else(|| cfx_core::auth::load_account(&base).map(|a| a.api_url))
+                    .unwrap_or_else(|| cfx_core::auth::DEFAULT_API_URL.to_string());
                 cfx_core::run_init(force, &api_url, &base, no_service, node_key, no_prompt).await?;
             }
             NodeAction::Remove {

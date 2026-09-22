@@ -171,12 +171,18 @@ fn default_follow_redirects() -> bool {
 // Entry point
 // ---------------------------------------------------------------------------
 
-pub async fn run(port: u16, db: MachDb) -> Result<(), Box<dyn std::error::Error>> {
-    // Loopback unless an operator opts out: this channel has no per-request
-    // credential of its own, so the bind address is the boundary.
-    let addr = dguard::bind_addr(port);
+/// Serve on an already-bound listener.
+///
+/// The only entry point: `main` binds before opening the database so a database
+/// problem does not present as "extension not running", which is
+/// indistinguishable from a crashed engine and made every web_crawl fail with
+/// nothing useful attached. It owns the bind because it answers on the socket
+/// while it waits, so there is deliberately no variant here that binds for you.
+/// Loopback unless an operator opts out: this channel carries no per-request
+/// credential of its own, so the bind address is the boundary.
+pub async fn run_on(listener: TcpListener, db: MachDb) -> Result<(), Box<dyn std::error::Error>> {
+    let addr = listener.local_addr()?;
     let gate = dguard::Gate::from_env();
-    let listener = TcpListener::bind(addr).await?;
     gate.announce("Mach", addr);
 
     let db = Arc::new(db);
