@@ -126,22 +126,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "postgres at {}:{} (create it with `crossfyre db up`)",
             toolchain_cfg.postgres.host, toolchain_cfg.postgres.port
         );
-        let db_fut = dguard::wait_for(
-                &db_label,
-                std::time::Duration::from_secs(3600),
-                || async {
-                let db = libs::mach_db::MachDb::init(
-                    &toolchain_cfg.postgres.host,
-                    toolchain_cfg.postgres.port,
-                    &toolchain_cfg.postgres.user,
-                    toolchain_cfg.postgres.password.as_deref(),
-                    &dummy_config,
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-                db.create_tables().await.map_err(|e| e.to_string())?;
-                Ok::<_, String>(db)
-            });
+        let db_fut = dguard::wait_for(&db_label, std::time::Duration::from_secs(3600), || async {
+            let db = libs::mach_db::MachDb::init(
+                &toolchain_cfg.postgres.host,
+                toolchain_cfg.postgres.port,
+                &toolchain_cfg.postgres.user,
+                toolchain_cfg.postgres.password.as_deref(),
+                &dummy_config,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            db.create_tables().await.map_err(|e| e.to_string())?;
+            Ok::<_, String>(db)
+        });
         tokio::pin!(db_fut);
 
         let mach_db = loop {

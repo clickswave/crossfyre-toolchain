@@ -63,18 +63,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // would restart us straight into the same failure, which is how one
         // host logged 2,663 restarts and reported nothing but "down". Wait for
         // it, saying so each time, and start as soon as it answers.
-        let voyage_db =
-            dguard::wait_for(
-                // Name the endpoint and the fix. "pool timed out while waiting
-                // for an open connection" is true and useless: it does not say
-                // which host, which port, or that the container may simply not
-                // have been created on this machine yet.
-                &format!(
-                    "postgres at {}:{} (create it with `crossfyre db up`)",
-                    toolchain_cfg.postgres.host, toolchain_cfg.postgres.port
-                ),
-                std::time::Duration::from_secs(3600),
-                || async {
+        let voyage_db = dguard::wait_for(
+            // Name the endpoint and the fix. "pool timed out while waiting
+            // for an open connection" is true and useless: it does not say
+            // which host, which port, or that the container may simply not
+            // have been created on this machine yet.
+            &format!(
+                "postgres at {}:{} (create it with `crossfyre db up`)",
+                toolchain_cfg.postgres.host, toolchain_cfg.postgres.port
+            ),
+            std::time::Duration::from_secs(3600),
+            || async {
                 let db = libs::voyage_db::VoyageDb::init(
                     &toolchain_cfg.postgres.host,
                     toolchain_cfg.postgres.port,
@@ -85,8 +84,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|e| e.to_string())?;
                 db.create_tables().await.map_err(|e| e.to_string())?;
                 Ok::<_, String>(db)
-            })
-            .await?;
+            },
+        )
+        .await?;
 
         return daemon::run(cli.port, voyage_db).await;
     }
