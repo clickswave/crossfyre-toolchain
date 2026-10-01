@@ -157,10 +157,34 @@ pub async fn run(params: DiscoverParams, tx: mpsc::UnboundedSender<Value>) {
             // it those parameters took SQL injection from 0/9 to 4/9 with no
             // other change.
             let known: HashSet<String> = ep.known_fields.iter().cloned().collect();
-            if let Some(base) = calibrate_query(&client, &orig, &ep.url, &known).await {
+            let cal = calibrate_query(&client, &orig, &ep.url, &known).await;
+            if let QueryCal::EchoesAnything = cal {
+                // Report one usable name rather than nothing. Any name reaches
+                // the sink here, so the first candidate is as true as any other
+                // and it gives the injector an injection point to work. Without
+                // this the endpoint looks parameterless and is never tested.
+                if let Some(cand) = QUERY_WORDLIST.first() {
+                    let u = render_query_probe(&ep.url, &known, cand, QUERY_MARKER);
+                    let evidence = probe::send(&client, &orig, &u, None)
+                        .await
+                        .map(|r| r.body)
+                        .unwrap_or_default();
+                    let _ = tx.send(discovery_event(
+                        &orig,
+                        &ep.url,
+                        cand,
+                        "medium",
+                        "query-echoes-any-name",
+                        &evidence,
+                        "query",
+                    ));
+                    found += 1;
+                }
+            }
+            if let QueryCal::Stable(base) = cal {
                 let mut new_here = 0usize;
                 let mut hits: Vec<(String, String)> = Vec::new();
-                for cand in WORDLIST {
+                for cand in QUERY_WORDLIST {
                     if new_here >= MAX_NEW_PER_EP {
                         break;
                     }
@@ -524,28 +548,51 @@ fn render_query_probe(url: &str, known: &HashSet<String>, candidate: &str, value
 /// will then read as a hit. Measured on OWASP VulnerableApp, its PersistentXSS
 /// levels store on each request, so a probe without this check claimed
 /// thirty-five parameters on each of them.
+/// What a query-string calibration concluded.
+enum QueryCal {
+    /// A stable control to diff candidates against.
+    Stable(Baseline),
+    /// The endpoint reflected the marker under a name it has never seen, so it
+    /// takes a value under ANY name. There is nothing to discover and that is
+    /// not the same as nothing to report: an endpoint that reflects arbitrary
+    /// input is an injection point, reachable with any name at all. Dropping
+    /// this was why VulnerableApp's XSSWithHtmlTagInjection levels, which
+    /// answer `<div>$value<div>` to every parameter, produced no injection
+    /// point and scored zero on five reflected-XSS cases.
+    EchoesAnything,
+    /// No usable control: the endpoint answers differently to equivalent
+    /// requests, or echoes the parameter NAME so the name test is meaningless.
+    Unusable,
+}
+
 async fn calibrate_query(
     client: &Client,
     method: &str,
     url: &str,
     known: &HashSet<String>,
-) -> Option<Baseline> {
-    let a = probe::send(
+) -> QueryCal {
+    let Some(a) = probe::send(
         client,
         method,
         &render_query_probe(url, known, "cfxjunkparamaa", QUERY_MARKER),
         None,
     )
-    .await?;
-    let b = probe::send(
+    .await
+    else {
+        return QueryCal::Unusable;
+    };
+    let Some(b) = probe::send(
         client,
         method,
         &render_query_probe(url, known, "cfxjunkparambb", QUERY_MARKER),
         None,
     )
-    .await?;
+    .await
+    else {
+        return QueryCal::Unusable;
+    };
     if a.status != b.status {
-        return None;
+        return QueryCal::Unusable;
     }
     // Two ways an endpoint can echo something it never recognised, and both
     // make the oracle unusable. Checking only one of them was a regression I
@@ -554,19 +601,19 @@ async fn calibrate_query(
     // The value: a response carrying the marker for a parameter the endpoint has
     // never heard of carries it for anything.
     if a.body.contains(QUERY_MARKER) || b.body.contains(QUERY_MARKER) {
-        return None;
+        return QueryCal::EchoesAnything;
     }
     // The name: xssmaze's /realworld/level5/ answers `?amount=x` with
     // "Parameters: amount", so the name-echo test in `accepted` fires for every
     // candidate. Dropping this check made that one endpoint report all 39
     // wordlist entries, which was every false positive in a 1007-endpoint pass.
     if a.body.contains("cfxjunkparamaa") || b.body.contains("cfxjunkparambb") {
-        return None;
+        return QueryCal::Unusable;
     }
     if (a.body.len() as i64 - b.body.len() as i64).abs() > 24 {
-        return None; // not stable enough to diff against
+        return QueryCal::Unusable; // not stable enough to diff against
     }
-    Some(Baseline {
+    QueryCal::Stable(Baseline {
         status: a.status,
         len: a.body.len(),
         body: a.body,
@@ -730,6 +777,116 @@ static MINE_RES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 });
 
 /// Common request field names, for calibrated brute-force when error-mining is unproductive.
+/// Candidate names for QUERY-string discovery, which is a different vocabulary
+/// from the body one below.
+///
+/// `WORDLIST` is a CRUD body shape: `first_name`, `order_id`, `verified`,
+/// `currency`. Those are rare in a query string, and the names that are common
+/// there were absent, so query discovery was probing for the wrong things.
+/// Measured against xssmaze's 1007 GET endpoints, which declare their own
+/// parameters: the body list covers 89.6% of parameter instances and 10 of 52
+/// distinct names, this one covers 96.9% and 31 of 52.
+///
+/// Built from what is common in query strings generally, not from what this
+/// benchmark happens to use. xssmaze's `wsurl`, `shortname`, `bio`, `q1`, `a`,
+/// `b` and the rest of its long tail are deliberately absent: adding them would
+/// raise the score here and nothing else, which is the definition of tuning to
+/// the test. The redirect family is over-represented on purpose, because
+/// open-redirect and SSRF live there.
+const QUERY_WORDLIST: &[&str] = &[
+    // value carriers
+    "q",
+    "s",
+    "v",
+    "id",
+    "query",
+    "search",
+    "term",
+    "keyword",
+    "value",
+    "text",
+    "input",
+    "data",
+    "name",
+    "key",
+    "msg",
+    "message",
+    "comment",
+    "note",
+    "title",
+    "desc",
+    "description",
+    // resources and paths
+    "url",
+    "uri",
+    "src",
+    "href",
+    "file",
+    "filename",
+    "path",
+    "page",
+    "doc",
+    "template",
+    "include",
+    "img",
+    "image",
+    // the redirect family
+    "redirect",
+    "redirect_uri",
+    "redirect_url",
+    "return",
+    "return_to",
+    "returnUrl",
+    "next",
+    "continue",
+    "goto",
+    "dest",
+    "destination",
+    "target",
+    "ref",
+    "referer",
+    "callback",
+    "callback_url",
+    "jsonp",
+    // presentation
+    "lang",
+    "locale",
+    "theme",
+    "color",
+    "format",
+    "output",
+    "view",
+    "mode",
+    "style",
+    // listing
+    "sort",
+    "order",
+    "filter",
+    "limit",
+    "offset",
+    "start",
+    "end",
+    "count",
+    "type",
+    "tag",
+    "category",
+    "slug",
+    // identity
+    "user",
+    "username",
+    "email",
+    "token",
+    "password",
+    "session",
+    "api_key",
+    // diagnostics
+    "debug",
+    "error",
+    "error_description",
+    "test",
+    "seed",
+];
+
 const WORDLIST: &[&str] = &[
     "id",
     "name",
