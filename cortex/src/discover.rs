@@ -159,6 +159,7 @@ pub async fn run(params: DiscoverParams, tx: mpsc::UnboundedSender<Value>) {
             let known: HashSet<String> = ep.known_fields.iter().cloned().collect();
             if let Some(base) = calibrate_query(&client, &orig, &ep.url, &known).await {
                 let mut new_here = 0usize;
+                let mut hits: Vec<(String, String)> = Vec::new();
                 for cand in WORDLIST {
                     if new_here >= MAX_NEW_PER_EP {
                         break;
@@ -187,17 +188,57 @@ pub async fn run(params: DiscoverParams, tx: mpsc::UnboundedSender<Value>) {
                     if !same {
                         continue;
                     }
-                    let _ = tx.send(discovery_event(
-                        &orig,
-                        &ep.url,
-                        cand,
-                        "medium",
-                        "query-brute-force",
-                        &r.body,
-                        "query",
-                    ));
-                    found += 1;
+                    // Buffered rather than emitted, because whether any of this
+                    // is trustworthy is only knowable once the pass is over.
+                    hits.push(((*cand).to_string(), r.body.clone()));
                     new_here += 1;
+                }
+
+                // Re-probe the control. A baseline is captured once, and that is
+                // only valid if probing does not change the thing being probed.
+                // VulnerableApp's PersistentXSS levels store the value under any
+                // name and append a record per request, so every candidate after
+                // the first few deviates from a stale baseline purely because
+                // earlier candidates grew the store: 21 reported parameters on an
+                // endpoint whose name is not among them. If the control has moved,
+                // the pass changed the endpoint and nothing it found can be
+                // separated from that, so it is discarded rather than reported.
+                let drifted = probe::send(
+                    &client,
+                    &orig,
+                    &render_query_probe(&ep.url, &known, "cfxjunkparamcc", QUERY_MARKER),
+                    None,
+                )
+                .await
+                .map(|x| {
+                    x.status != base.status
+                        || (x.body.len() as i64 - base.len as i64).abs() > len_delta_floor()
+                        || x.body.contains(QUERY_MARKER)
+                })
+                .unwrap_or(true);
+
+                if drifted {
+                    if !hits.is_empty() {
+                        let _ = tx.send(json!({"type":"log","message": format!(
+                            "{} {}: discarded {} candidate parameter(s). The control response moved \
+                             during the pass, so this endpoint changes with each request and a \
+                             deviation cannot be told apart from that.",
+                            orig, ep.url, hits.len()
+                        )}));
+                    }
+                } else {
+                    for (cand, evidence) in &hits {
+                        let _ = tx.send(discovery_event(
+                            &orig,
+                            &ep.url,
+                            cand,
+                            "medium",
+                            "query-brute-force",
+                            evidence,
+                            "query",
+                        ));
+                        found += 1;
+                    }
                 }
             }
             done += 1;
