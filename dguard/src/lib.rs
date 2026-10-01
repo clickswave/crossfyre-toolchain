@@ -214,6 +214,67 @@ pub fn encode_with(req: &serde_json::Value, token: Option<&str>) -> String {
     req.to_string()
 }
 
+/// True when a daemon reply line is a terminal error.
+///
+/// One definition, in one place. Each client used to spell this itself, and the
+/// unauthorized reply matched none of them, so a rejected request read as an
+/// ordinary line and the client waited for a terminator that never arrived.
+pub fn is_error(line: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    // Two spellings are in the wild. Stream events use `type`, and so do
+    // scout and cortex throughout; `status` is what every pulse reply uses and
+    // what mach and voyage use for their invalid-JSON reply. Both carry the
+    // detail in `message`, so only the discriminator differs. Accept either: a
+    // client that understands one of them exits 0 on half the failures, which
+    // is how `pulse exec` reported success on an unknown operation.
+    ["type", "status"]
+        .iter()
+        .filter_map(|k| v.get(*k))
+        .filter_map(|x| x.as_str())
+        .any(|x| x == "error")
+}
+
+#[cfg(test)]
+mod is_error_tests {
+    use super::*;
+
+    #[test]
+    fn the_error_envelope_is_recognised() {
+        assert!(is_error(r#"{"type":"error","message":"unauthorized"}"#));
+        assert!(is_error(
+            r#"{"type":"error","message":"Unknown operation: x"}"#
+        ));
+    }
+
+    #[test]
+    fn the_status_spelling_is_recognised_too() {
+        // pulse uses this for every reply, and mach and voyage for invalid JSON.
+        assert!(is_error(
+            r#"{"status":"error","message":"Unknown operation: x"}"#
+        ));
+        assert!(is_error(
+            r#"{"status":"error","message":"Invalid JSON: eof"}"#
+        ));
+    }
+
+    #[test]
+    fn a_non_error_status_is_not_an_error() {
+        // `status` also carries port state, which must not read as a failure.
+        assert!(!is_error(r#"{"status":"open","port":443}"#));
+        assert!(!is_error(r#"{"status":"closed","port":22}"#));
+    }
+
+    #[test]
+    fn ordinary_events_are_not_errors() {
+        assert!(!is_error(r#"{"type":"ack","total":10}"#));
+        assert!(!is_error(r#"{"type":"done"}"#));
+        assert!(!is_error("not json at all"));
+        assert!(!is_error(""));
+    }
+}
+
 #[cfg(test)]
 mod encode_tests {
     use super::*;

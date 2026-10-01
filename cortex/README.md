@@ -22,6 +22,9 @@ cortex scan https://example.com
 cortex --tui scan https://example.com
 ```
 
+`--no-tui` is accepted for symmetry with the other engines; here JSON is
+already the default.
+
 `--tui` brings up the shared toolchain dashboard, with findings ordered by
 severity so a critical sits at the top the moment it is confirmed. It is
 ignored when output is piped, so the node and any scripts still get JSON.

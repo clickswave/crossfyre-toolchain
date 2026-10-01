@@ -1,4 +1,4 @@
-use crate::libs::cli_args::{Cli, Commands, DbArgs, ScanExecArgs};
+use crate::libs::cli_args::{Cli, Commands, DbArgs, ExecArgs};
 use crate::scanner::StreamEvent;
 use clap::Parser;
 use serde::Deserialize;
@@ -97,9 +97,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // -----------------------------------------------------------------------
-    // ScanExec subcommand - send raw JSON to daemon
+    // Exec subcommand - send raw JSON to daemon
     // -----------------------------------------------------------------------
-    if let Some(Commands::ScanExec(exec_args)) = &cli.command {
+    if let Some(Commands::Exec(exec_args)) = &cli.command {
         return handle_scan_exec(exec_args.clone(), cli.port).await;
     }
 
@@ -110,7 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Scan(args)) => args,
         _ => {
             eprintln!(
-                "No command given. Use `pulse scan`, `pulse scan-exec`, `pulse db`, or `pulse --daemon`. Try --help."
+                "No command given. Use `pulse scan`, `pulse exec`, `pulse db`, or `pulse --daemon`. Try --help."
             );
             std::process::exit(1);
         }
@@ -147,7 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let (reader, mut writer) = tokio::io::split(stream);
-    let mut req_str = serde_json::to_string(&request)?;
+    let mut req_str = dguard::encode(&request);
     req_str.push('\n');
     writer.write_all(req_str.as_bytes()).await?;
 
@@ -168,22 +168,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let total = ack.total.unwrap_or(0);
     let poll_timeout = scan_args.event_poll_timeout;
 
-    // Spawn background reader for stream events
-    let (tx, rx) = mpsc::unbounded_channel::<StreamEvent>();
-    tokio::spawn(async move {
-        while let Ok(Some(line)) = lines.next_line().await {
-            if let Ok(ev) = serde_json::from_str::<StreamEvent>(&line) {
-                let done = ev.kind == "done";
-                let _ = tx.send(ev);
-                if done {
-                    break;
+    if cfx_tui::wanted(cli.tui, cli.no_tui, true) {
+        let (tx, rx) = mpsc::unbounded_channel::<StreamEvent>();
+        tokio::spawn(async move {
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Ok(ev) = serde_json::from_str::<StreamEvent>(&line) {
+                    let done = ev.kind == "done";
+                    let _ = tx.send(ev);
+                    if done {
+                        break;
+                    }
                 }
             }
-        }
-    });
+        });
 
-    // Run the TUI
-    client_tui::run(rx, operation_id, total, poll_timeout).await?;
+        // Blocks until the user quits or the run completes.
+        client_tui::run(rx, operation_id, total, poll_timeout).await?;
+        return Ok(());
+    }
+
+    // No terminal, or --no-tui: forward the daemon's own newline-delimited JSON
+    // so the output stays parseable. The ack is part of that stream, so it goes
+    // out too rather than being swallowed by the line that read it.
+    println!("{ack_line}");
+    while let Some(line) = lines.next_line().await? {
+        println!("{line}");
+        if dguard::is_error(&line) {
+            std::process::exit(1);
+        }
+        if serde_json::from_str::<StreamEvent>(&line).is_ok_and(|ev| ev.kind == "done") {
+            break;
+        }
+    }
 
     Ok(())
 }
@@ -204,7 +220,7 @@ async fn handle_db(args: DbArgs, port: u16) -> Result<(), Box<dyn std::error::Er
 
     let request = serde_json::json!({ "operation": "db_reset", "response": "instant" });
     let (reader, mut writer) = tokio::io::split(stream);
-    let mut req_str = serde_json::to_string(&request)?;
+    let mut req_str = dguard::encode(&request);
     req_str.push('\n');
     writer.write_all(req_str.as_bytes()).await?;
 
@@ -220,12 +236,21 @@ async fn handle_db(args: DbArgs, port: u16) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-async fn handle_scan_exec(args: ScanExecArgs, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+async fn handle_scan_exec(args: ExecArgs, port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let mut payload: serde_json::Value =
         serde_json::from_str(&args.json).map_err(|e| format!("Invalid JSON: {e}"))?;
 
-    payload["operation"] = serde_json::json!("probe");
-    payload["response"] = serde_json::json!("instant");
+    // Must be an object. Indexing a non-object panicked inside serde_json, so
+    // `exec '[1,2]'` aborted with a library backtrace instead of an error.
+    let Some(obj) = payload.as_object_mut() else {
+        return Err("JSON payload must be an object".into());
+    };
+    // Default rather than overwrite. These were assigned unconditionally, so an
+    // `operation` the caller asked for was accepted and then silently dropped.
+    obj.entry("operation")
+        .or_insert_with(|| serde_json::json!("probe"));
+    obj.entry("response")
+        .or_insert_with(|| serde_json::json!("instant"));
 
     let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
         .await
@@ -237,13 +262,19 @@ async fn handle_scan_exec(args: ScanExecArgs, port: u16) -> Result<(), Box<dyn s
     let _ = stream.set_nodelay(true);
 
     let (reader, mut writer) = tokio::io::split(stream);
-    let mut req_str = serde_json::to_string(&payload)?;
+    let mut req_str = dguard::encode(&payload);
     req_str.push('\n');
     writer.write_all(req_str.as_bytes()).await?;
 
     let mut lines = BufReader::new(reader).lines();
     if let Some(line) = lines.next_line().await? {
         println!("{line}");
+        // The reply already says what went wrong, so exit non-zero without
+        // printing a second time: stdout stays pure JSON for the caller, and a
+        // script can read `$?` instead of parsing it.
+        if dguard::is_error(&line) {
+            std::process::exit(1);
+        }
     }
 
     Ok(())

@@ -22,11 +22,17 @@ voyage scan -d example.com -w ./subdomains.txt --disable-passive-enum
 
 Resumes by default; pass `--fresh-start` to run clean.
 
-`scan-exec` checks a single subdomain and prints the result, for scripting:
+`exec` checks a single subdomain and prints the result, for scripting. It takes
+one JSON argument:
 
 ```sh
-voyage scan-exec --subdomain api.example.com
+voyage exec '{"domain":"api.example.com","volatility":0}'
 ```
+
+The dashboard is on by default when stdout is a terminal, and off when it is
+not, so piping or redirecting a scan gives you the daemon's newline-delimited
+JSON rather than escape sequences. `--no-tui` forces the JSON path even in a
+terminal, and `--tui` is accepted for symmetry with the other engines.
 
 ## Handy flags
 

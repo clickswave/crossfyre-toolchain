@@ -22,21 +22,28 @@ pub struct Cli {
     /// not a terminal, so piping still produces parseable output.
     #[arg(long, default_value_t = false)]
     pub tui: bool,
+
+    /// Never draw the dashboard; stream newline-delimited JSON instead.
+    #[arg(long, default_value_t = false)]
+    pub no_tui: bool,
 }
 
 #[derive(Subcommand, Clone)]
 pub enum Commands {
-    /// Fingerprint a single target through the running daemon
-    Fingerprint(FpArgs),
+    /// Scan a single target through the running daemon: fingerprint its web
+    /// stack and report what it is running
+    #[command(alias = "fingerprint")]
+    Scan(ScanArgs),
+    /// Send a JSON op to the daemon and print the streamed events. `operation` is
+    /// required: this is the raw interface the node uses.
+    Exec(ExecArgs),
     /// Identify non-HTTP services on host:port targets, and whether they let
     /// anyone in
     Services(SvcArgs),
-    /// Send a raw JSON op to the daemon and print the streamed events
-    Exec(ExecArgs),
 }
 
 #[derive(Parser, Clone)]
-pub struct FpArgs {
+pub struct ScanArgs {
     /// Target URL or host[:port] (e.g. https://example.com, example.com:8443)
     pub target: String,
 }

@@ -21,13 +21,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     match cli.command {
-        Some(Commands::Fingerprint(args)) => {
+        Some(Commands::Scan(args)) => {
             let req = serde_json::json!({
                 "operation": "fingerprint",
                 "response": "stream",
                 "target": args.target,
             });
-            send_stream(cli.port, req, cli.tui, args.target.clone()).await
+            send_stream(
+                cli.port,
+                req,
+                cfx_tui::wanted(cli.tui, cli.no_tui, false),
+                args.target.clone(),
+            )
+            .await
         }
         Some(Commands::Services(args)) => {
             let req = serde_json::json!({
@@ -38,7 +44,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "timeout_ms": args.timeout_ms,
             });
             let label = args.targets.join(", ");
-            send_stream(cli.port, req, cli.tui, label).await
+            send_stream(
+                cli.port,
+                req,
+                cfx_tui::wanted(cli.tui, cli.no_tui, false),
+                label,
+            )
+            .await
         }
         Some(Commands::Exec(args)) => {
             let mut payload: serde_json::Value =
@@ -47,11 +59,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 payload["response"] = serde_json::json!("stream");
             }
             let target = payload["target"].as_str().unwrap_or("").to_string();
-            send_stream(cli.port, payload, cli.tui, target).await
+            send_stream(
+                cli.port,
+                payload,
+                cfx_tui::wanted(cli.tui, cli.no_tui, false),
+                target,
+            )
+            .await
         }
         None => {
             eprintln!(
-                "No command given. Use `scout fingerprint <target>`, `scout services <host:port>...`, `scout exec <json>`, or `scout --daemon`."
+                "No command given. Use `scout scan <target>`, `scout services <host:port>...`, `scout exec <json>`, or `scout --daemon`."
             );
             std::process::exit(1);
         }
@@ -72,15 +90,17 @@ async fn send_stream(
             )
         })?;
     let (reader, mut writer) = tokio::io::split(stream);
-    let mut s = serde_json::to_string(&req)?;
+    let mut s = dguard::encode(&req);
     s.push('\n');
     writer.write_all(s.as_bytes()).await?;
 
     let mut lines = BufReader::new(reader).lines();
+    // Set when the daemon reports an error, so the exit code can carry it.
+    let mut failed = false;
 
     // Only take over the terminal when there is one. Under the node stdout is
     // a pipe, and drawing into it would put escape sequences in a log file.
-    if tui && cfx_tui::available() {
+    if tui {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let dashboard = tokio::spawn(client_tui::run(rx, target));
 
@@ -88,6 +108,9 @@ async fn send_stream(
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
                 let t = v["type"].as_str().unwrap_or("").to_string();
                 let _ = tx.send(v);
+                if t == "error" {
+                    failed = true;
+                }
                 if t == "done" || t == "error" {
                     break;
                 }
@@ -97,17 +120,28 @@ async fn send_stream(
         // read the results for as long as they want before it returns.
         drop(tx);
         dashboard.await??;
+        if failed {
+            std::process::exit(1);
+        }
         return Ok(());
     }
 
     while let Some(line) = lines.next_line().await? {
         println!("{line}");
+        if dguard::is_error(&line) {
+            failed = true;
+            break;
+        }
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-            let t = v["type"].as_str().unwrap_or("");
-            if t == "done" || t == "error" {
+            if v["type"].as_str() == Some("done") {
                 break;
             }
         }
+    }
+    // Exit non-zero without a second message: the error line is already on
+    // stdout, and the caller should be able to read `$?` instead of parsing it.
+    if failed {
+        std::process::exit(1);
     }
     Ok(())
 }

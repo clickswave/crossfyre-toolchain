@@ -148,9 +148,11 @@ pub async fn handle(env: OpEnv) {
                                     }
                                 }
                             }
-                            if resp.get("results").is_none()
-                                && resp.get("status").and_then(|s| s.as_str()) != Some("error")
-                            {
+                            // `dguard::is_error` rather than a local `status` check: the
+                            // daemons spell the discriminator two ways, and the
+                            // unauthorized reply uses `type`, so a local check on one
+                            // of them logged a rejected request as a malformed one.
+                            if resp.get("results").is_none() && !dguard::is_error(&line) {
                                 eprintln!(
                                     "[ds {} {}:{}] WEIRD response (no results field): {}",
                                     short_op,

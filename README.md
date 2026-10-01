@@ -73,7 +73,20 @@ voyage scan --domain example.com --wordlist-path ./subdomains.txt
 pulse scan --targets 10.0.0.0/24 --ports top-1000 --service-detection
 ```
 
-The scan engines bring up a live dashboard as they run and write findings to a local store, so a scan you interrupt can be resumed later. The daemon engines (`scout`, `cortex`) stream results as JSON and show the same dashboard on `--tui`.
+Every engine is a daemon plus a client: start it with `--daemon` and the client subcommands talk to it over loopback. All five take `scan` for a run you drive and `exec` for a raw JSON op, and `mach`, `voyage` and `pulse` keep findings in a local store, so a run you interrupt can be resumed.
+
+Output is newline-delimited JSON, one event per line, each carrying a `type`. A dashboard is drawn instead when stdout is a terminal: on by default for `mach`, `voyage` and `pulse`, where a run is long enough to want progress, and on `--tui` for `scout` and `cortex`. Either way, redirecting or piping gives you the JSON, and `--no-tui` forces it in a terminal. A run that ends in a `type: "error"` event exits non-zero, so a script can read `$?` without parsing the stream.
+
+### The daemon boundary
+
+The daemons speak unauthenticated newline-delimited JSON with no session or handshake, so **the bind address is the security boundary**. They listen on loopback only, which is all the node needs, and two environment variables move that:
+
+| Variable | Effect |
+|---|---|
+| `CFX_DAEMON_BIND` | Binds the listener to this IP instead of loopback. A value that is not an IP falls back to loopback rather than widening the listener. |
+| `CFX_DAEMON_TOKEN` | Requires a matching token on every request. Set it on the daemon and on anything that talks to it; the clients and the node read the same variable and stamp it automatically. |
+
+Binding off loopback without a token is allowed, for operators who have put the port behind a firewall, but it is announced on every start. `mach`'s wordlist parameter is a filesystem path, so an exposed daemon is also a file-read primitive: if you move the listener, set the token.
 
 ## Standalone, or part of the platform
 

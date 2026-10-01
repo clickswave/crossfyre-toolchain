@@ -22,8 +22,13 @@ pulse scan -t 192.168.1.0/24 -p top-100 --technique syn
 SYN scanning needs raw-socket privileges, so run it with sudo (or the right
 capability) when you use `--technique syn`.
 
-For scripted single probes, `scan-exec` takes a JSON payload and runs it through the
+For scripted single probes, `exec` takes a JSON payload and runs it through the
 daemon.
+
+The dashboard is on by default when stdout is a terminal, and off when it is
+not, so piping or redirecting a scan gives you the daemon's newline-delimited
+JSON rather than escape sequences. `--no-tui` forces the JSON path even in a
+terminal, and `--tui` is accepted for symmetry with the other engines.
 
 ## Handy flags
 

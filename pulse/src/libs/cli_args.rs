@@ -17,14 +17,25 @@ pub struct Cli {
     /// TCP port to bind (daemon) or connect to (client)
     #[arg(long, default_value_t = 4443)]
     pub port: u16,
+
+    /// Show the live dashboard instead of streaming JSON. Ignored when stdout is
+    /// not a terminal, so piping still produces parseable output.
+    #[arg(long, default_value_t = false)]
+    pub tui: bool,
+
+    /// Never draw the dashboard; stream newline-delimited JSON instead.
+    #[arg(long, default_value_t = false)]
+    pub no_tui: bool,
 }
 
 #[derive(Subcommand, Clone)]
 pub enum Commands {
     /// Run a network scan
     Scan(ScanArgs),
-    /// Execute a single probe via the daemon (JSON payload)
-    ScanExec(ScanExecArgs),
+    /// Send a JSON op to the daemon and print the reply. `operation` defaults to
+    /// `probe`, which runs a single probe with no dashboard.
+    #[command(alias = "scan-exec")]
+    Exec(ExecArgs),
     /// Database management
     Db(DbArgs),
 }
@@ -74,7 +85,7 @@ pub struct ScanArgs {
 }
 
 #[derive(Parser, Clone)]
-pub struct ScanExecArgs {
+pub struct ExecArgs {
     /// Raw JSON payload to send to the daemon
     pub json: String,
 }

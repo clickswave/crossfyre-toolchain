@@ -49,16 +49,27 @@ pub struct Cli {
     /// Port for daemon mode
     #[arg(long, default_value_t = 4442)]
     pub port: u16,
+
+    /// Show the live dashboard instead of streaming JSON. Ignored when stdout is
+    /// not a terminal, so piping still produces parseable output.
+    #[arg(long, default_value_t = false)]
+    pub tui: bool,
+
+    /// Never draw the dashboard; stream newline-delimited JSON instead.
+    #[arg(long, default_value_t = false)]
+    pub no_tui: bool,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     /// Scan for subdomains with a live TUI
     Scan(ScanArgs),
+    /// Send a JSON op to the daemon and print the reply. `operation` defaults to
+    /// `probe`, which checks a single subdomain with no dashboard.
+    #[command(alias = "scan-exec")]
+    Exec(ExecArgs),
     /// Database management
     Db(DbArgs),
-    /// Probe a single subdomain instantly (no TUI - for high-volume scripted use)
-    ScanExec(ScanExecArgs),
     /// Discover a target's real origin IP behind a CDN/WAF
     Origin(OriginArgs),
     /// Try a DNS zone transfer (AXFR) and print every name the zone gives up
@@ -101,7 +112,7 @@ pub struct OriginArgs {
 }
 
 #[derive(ClapArgs, Clone, Debug)]
-pub struct ScanExecArgs {
+pub struct ExecArgs {
     /// JSON payload: {"domain":"sub.example.com","volatility":0}
     pub json: String,
 }

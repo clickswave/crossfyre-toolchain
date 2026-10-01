@@ -61,10 +61,14 @@ async fn handle_connection(
                 .and_then(|v| v.get("token"))
                 .and_then(|t| t.as_str()),
         ) {
+            // Same `type`/`message` envelope as every other reply: a client that
+            // breaks on `type == "error"` has to recognise this one, or it waits
+            // for a line that never comes. Then close, rather than leaving an
+            // unauthenticated peer a socket to retry on.
             let _ = writer
-                .write_all(b"{\"status\":\"error\",\"error\":\"unauthorized\"}\n")
+                .write_all(b"{\"type\":\"error\",\"message\":\"unauthorized\"}\n")
                 .await;
-            continue;
+            break;
         }
 
         let req: DaemonRequest = match serde_json::from_str(&line) {
