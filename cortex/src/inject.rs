@@ -4274,6 +4274,31 @@ fn boolean_differential(baseline: &Resp, t: &Resp, f: &Resp, min_diff: i64) -> b
     if !(200..500).contains(&t.status) || !(200..500).contains(&f.status) {
         return false;
     }
+    // Exact-match path, for the endpoint that answers in one word.
+    //
+    // The length test below cannot see a JSON API. VulnerableApp's blind level 1
+    // answers `{ "isCarPresent": true}` to a true clause and `false` to a false
+    // one, which is a one-byte split against a floor of sixteen, so a textbook
+    // boolean-based blind injection was invisible. That is the modern shape of
+    // this bug, not the exception.
+    //
+    // Sound because it asks for more than a difference. Exactly one side must be
+    // byte-identical to the baseline, which excludes the three ways a
+    // non-injectable endpoint can differ: one that echoes the payload has
+    // neither side matching, one that ignores the parameter has both matching,
+    // and one that rejects both has the two sides equal to each other. The
+    // statuses must agree too, so a filter that blocks `1=2` and allows `1=1`
+    // shows up as the status change it is rather than as an oracle. On top of
+    // that the caller re-tests the split and runs `inert_splits_the_same_way`,
+    // which is what actually guards this: two inert values of the same length
+    // that split the same way mean the endpoint is the cause, not the injection.
+    if t.body != f.body && t.status == f.status {
+        let t_is_base = t.body == baseline.body;
+        let f_is_base = f.body == baseline.body;
+        if t_is_base != f_is_base {
+            return true;
+        }
+    }
     let lb = baseline.body.len() as i64;
     let (lt, lf) = (t.body.len() as i64, f.body.len() as i64);
     let diff = (lt - lf).abs();
@@ -4436,6 +4461,81 @@ mod scope_tests {
     #[test]
     fn no_target_means_the_caller_is_trusted() {
         assert!(in_scope("", "https://anything.example/", &none()));
+    }
+}
+
+#[cfg(test)]
+mod boolean_oracle_tests {
+    use super::*;
+
+    fn r(status: u16, body: &str) -> Resp {
+        Resp {
+            status,
+            body: body.to_string(),
+            elapsed_ms: 0,
+            location: None,
+            headers: Vec::new(),
+        }
+    }
+
+    /// The case that was invisible: a one-byte split on a JSON API.
+    #[test]
+    fn a_json_api_answering_true_or_false_is_an_oracle() {
+        let base = r(200, "{ \"isCarPresent\": true}");
+        let t = r(200, "{ \"isCarPresent\": true}");
+        let f = r(200, "{ \"isCarPresent\": false}");
+        assert!(boolean_differential(&base, &t, &f, 24));
+    }
+
+    /// The three ways a non-injectable endpoint differs, all excluded.
+    #[test]
+    fn an_endpoint_that_echoes_the_payload_is_not_an_oracle() {
+        // Neither side matches the baseline, because both carry their payload.
+        let base = r(200, "you searched for: 1");
+        let t = r(200, "you searched for: 1 AND 1=1");
+        let f = r(200, "you searched for: 1 AND 1=2");
+        assert!(!boolean_differential(&base, &t, &f, 24));
+    }
+
+    #[test]
+    fn an_endpoint_that_ignores_the_parameter_is_not_an_oracle() {
+        let base = r(200, "{ \"isCarPresent\": true}");
+        let t = r(200, "{ \"isCarPresent\": true}");
+        let f = r(200, "{ \"isCarPresent\": true}");
+        assert!(!boolean_differential(&base, &t, &f, 24));
+    }
+
+    #[test]
+    fn an_endpoint_that_rejects_both_is_not_an_oracle() {
+        let base = r(200, "{ \"isCarPresent\": true}");
+        let t = r(200, "{ \"error\": \"id must be numeric\"}");
+        let f = r(200, "{ \"error\": \"id must be numeric\"}");
+        assert!(!boolean_differential(&base, &t, &f, 24));
+    }
+
+    /// A filter that blocks one clause and allows the other changes the status,
+    /// which is what it is, and must not read as an oracle.
+    #[test]
+    fn a_filter_blocking_one_clause_is_not_an_oracle() {
+        let base = r(200, "{ \"isCarPresent\": true}");
+        let t = r(200, "{ \"isCarPresent\": true}");
+        let f = r(403, "blocked");
+        assert!(!boolean_differential(&base, &t, &f, 24));
+    }
+
+    /// The length path still works where it always did, and still refuses a
+    /// difference below the floor when neither side matches the baseline.
+    #[test]
+    fn the_length_path_is_unchanged() {
+        let base = r(200, &"x".repeat(900));
+        let t = r(200, &"x".repeat(900));
+        let f = r(200, &"x".repeat(200));
+        assert!(boolean_differential(&base, &t, &f, 24));
+
+        let b2 = r(200, &"x".repeat(900));
+        let t2 = r(200, &format!("{}y", "x".repeat(895)));
+        let f2 = r(200, &format!("{}z", "x".repeat(896)));
+        assert!(!boolean_differential(&b2, &t2, &f2, 24));
     }
 }
 
