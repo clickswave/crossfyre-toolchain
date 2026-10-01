@@ -127,11 +127,66 @@ pub async fn run(params: DiscoverParams, tx: mpsc::UnboundedSender<Value>) {
             let _ = tx.send(json!({"type":"progress","processed": done, "total": total}));
             continue;
         }
+        let orig = ep.method.to_uppercase();
+        if orig == "GET" || orig == "HEAD" {
+            // A GET carries its parameters in the query string, so that is where
+            // to look. Turning it into a POST and probing a body, which is what
+            // this did, can only learn a shape the endpoint does not have.
+            //
+            // Measured against OWASP VulnerableApp, whose levels are GET
+            // endpoints each taking one undocumented query parameter: discovery
+            // found none of them, so the injector had nothing to inject into and
+            // scored 0 of 117, every finding it did report being passive. Handing
+            // it those parameters took SQL injection from 0/9 to 4/9 with no
+            // other change.
+            let known: HashSet<String> = ep.known_fields.iter().cloned().collect();
+            if let Some(base) = calibrate_query(&client, &orig, &ep.url, &known).await {
+                let mut new_here = 0usize;
+                for cand in WORDLIST {
+                    if new_here >= MAX_NEW_PER_EP {
+                        break;
+                    }
+                    if known.contains(*cand) {
+                        continue;
+                    }
+                    let u = render_query_probe(&ep.url, &known, cand);
+                    let Some(r) = probe::send(&client, &orig, &u, None).await else {
+                        continue;
+                    };
+                    if !accepted(&base, &r, cand) {
+                        continue;
+                    }
+                    // Confirm, as the body path does: reissue and require the
+                    // same deviation, so one flaky response is not a parameter.
+                    let same = probe::send(&client, &orig, &u, None)
+                        .await
+                        .map(|x| accepted(&base, &x, cand))
+                        .unwrap_or(false);
+                    if !same {
+                        continue;
+                    }
+                    let _ = tx.send(discovery_event(
+                        &orig,
+                        &ep.url,
+                        cand,
+                        "medium",
+                        "query-brute-force",
+                        &r.body,
+                        "query",
+                    ));
+                    found += 1;
+                    new_here += 1;
+                }
+            }
+            done += 1;
+            if done % 3 == 0 || done == total {
+                let _ = tx.send(json!({"type":"progress","processed":done,"total":total}));
+            }
+            continue;
+        }
+
         let is_json = ep.content_type.eq_ignore_ascii_case("json");
-        let method = {
-            let m = ep.method.to_uppercase();
-            if m == "GET" { "POST".to_string() } else { m }
-        };
+        let method = orig;
         // fields we treat as satisfied (known + discovered) so the next round reaches deeper.
         let mut known: HashSet<String> = ep.known_fields.iter().cloned().collect();
         let mut discovered: Vec<(String, &'static str)> = Vec::new(); // (field, confidence)
@@ -154,6 +209,7 @@ pub async fn run(params: DiscoverParams, tx: mpsc::UnboundedSender<Value>) {
                         "high",
                         "error-mining",
                         &r.body,
+                        "body",
                     ));
                     found += 1;
                     added = true;
@@ -191,6 +247,7 @@ pub async fn run(params: DiscoverParams, tx: mpsc::UnboundedSender<Value>) {
                                 "medium",
                                 "brute-force",
                                 &r.body,
+                                "body",
                             ));
                             found += 1;
                             if discovered.len() >= MAX_NEW_PER_EP {
@@ -318,6 +375,7 @@ fn discovery_event(
     confidence: &str,
     how: &str,
     evidence: &str,
+    location: &str,
 ) -> Value {
     // a short evidence snippet (never the whole body)
     let snippet: String = evidence.chars().take(200).collect();
@@ -333,11 +391,76 @@ fn discovery_event(
             "method": method,
             "url": url,
             "field": field,
-            "location": "body",
+            "location": location,
             "confidence": confidence,
             "source": how,
             "evidence": snippet,
         }
+    })
+}
+
+/// Render `url` with the known query parameters plus one candidate.
+///
+/// Keeps anything already in the query string: an endpoint reached as
+/// `/thing?lang=en` may only answer properly with it, and dropping it changes
+/// the baseline rather than the parameter under test.
+fn render_query_probe(url: &str, known: &HashSet<String>, candidate: &str) -> String {
+    let mut out = String::from(url);
+    let mut sep = if url.contains('?') { '&' } else { '?' };
+    let mut names: Vec<&String> = known.iter().collect();
+    names.sort();
+    for n in names {
+        out.push(sep);
+        out.push_str(&pct(n));
+        out.push_str("=1");
+        sep = '&';
+    }
+    out.push(sep);
+    out.push_str(&pct(candidate));
+    out.push_str("=1");
+    out
+}
+
+/// The body calibration, against the query string.
+///
+/// Same discipline and for the same reason: two junk names that disagree mean
+/// the endpoint answers differently to equivalent requests, and every candidate
+/// will then read as a hit. Measured on OWASP VulnerableApp, its PersistentXSS
+/// levels store on each request, so a probe without this check claimed
+/// thirty-five parameters on each of them.
+async fn calibrate_query(
+    client: &Client,
+    method: &str,
+    url: &str,
+    known: &HashSet<String>,
+) -> Option<Baseline> {
+    let a = probe::send(
+        client,
+        method,
+        &render_query_probe(url, known, "cfxjunkparamaa"),
+        None,
+    )
+    .await?;
+    let b = probe::send(
+        client,
+        method,
+        &render_query_probe(url, known, "cfxjunkparambb"),
+        None,
+    )
+    .await?;
+    if a.status != b.status {
+        return None;
+    }
+    if a.body.contains("cfxjunkparamaa") || b.body.contains("cfxjunkparambb") {
+        return None; // echoes anything handed to it, so reflection proves nothing
+    }
+    if (a.body.len() as i64 - b.body.len() as i64).abs() > 24 {
+        return None; // not stable enough to diff against
+    }
+    Some(Baseline {
+        status: a.status,
+        len: a.body.len(),
+        body: a.body,
     })
 }
 
