@@ -3731,6 +3731,57 @@ async fn probe_crlf(client: &Client, site: &Site) -> Option<Value> {
     None
 }
 
+/// Whether attacker-controlled bytes in this response can execute in a browser.
+///
+/// Reflected markup only matters if something runs it. xssmaze makes the point
+/// with four endpoints that reflect a payload raw and are still not
+/// vulnerable, because the response is served as `application/json` or
+/// `text/plain`: its own note says reporting XSS there is a false positive.
+/// Measured on 2026-10-02 those four were four of our nine false positives
+/// against its 27 precision controls.
+///
+/// The first version of this asked whether the response is parsed as a
+/// document, and that was the wrong question. It cost four true positives,
+/// all JSONP served as `application/javascript`: nothing parses those as a
+/// document, and they execute anyway in any page that includes the URL with a
+/// script tag, which is exactly what xssmaze's notes on callback-level1 and
+/// json-xss-level1 describe. Script types belong on this list.
+///
+/// A missing or unparseable Content-Type counts as executable. That is the
+/// conservative direction: a browser with nothing to go on may sniff, and a
+/// missed finding is worse here than a reported one.
+fn executes_in_browser(r: &Resp) -> bool {
+    let Some(ct) = r.header("content-type") else {
+        return true;
+    };
+    let ct = ct
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if ct.is_empty() {
+        return true;
+    }
+    // Two ways to execute. Parsed as a document: HTML, XHTML, SVG and XML all
+    // carry script. Loaded as a script: a JSONP response is included with a
+    // script tag and runs, whatever its bytes look like as markup. JSON, plain
+    // text and everything else do neither.
+    matches!(
+        ct.as_str(),
+        "text/html"
+            | "application/xhtml+xml"
+            | "image/svg+xml"
+            | "application/xml"
+            | "text/xml"
+            | "application/javascript"
+            | "text/javascript"
+            | "application/x-javascript"
+            | "application/ecmascript"
+            | "text/ecmascript"
+    )
+}
+
 async fn probe_xss(client: &Client, site: &Site) -> Option<Value> {
     let marker = format!("cfx{}z{}", site.url.len(), site.param.len());
     let plain = send_site(client, site, &marker).await?;
@@ -3765,9 +3816,15 @@ async fn probe_xss(client: &Client, site: &Site) -> Option<Value> {
     ];
     for (ctx, payload, detector) in &cases {
         let r = send_site(client, site, payload).await;
-        if r.map(|x| x.body.contains(detector.as_str()))
-            .unwrap_or(false)
-        {
+        let reflected = r
+            .as_ref()
+            .map(|x| x.body.contains(detector.as_str()))
+            .unwrap_or(false);
+        // A tag that reflects raw into a response nothing parses as a document
+        // is not an XSS. Checked here rather than before the payloads, because
+        // the content type of the reflecting response is the one that matters
+        // and an endpoint can answer differently under injection.
+        if reflected && r.as_ref().is_some_and(executes_in_browser) {
             let again = send_site(client, site, payload).await;
             if again
                 .map(|x| x.body.contains(detector.as_str()))
