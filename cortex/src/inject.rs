@@ -180,6 +180,15 @@ pub const OOB_NSLOOKUP: &str = "nslookup -timeout=2";
 
 pub const CMDI_ECHO_A: u64 = 199_933;
 pub const CMDI_ECHO_B: u64 = 314_573;
+/// Endpoints tested in one pass. A cap belongs here, because a caller can hand
+/// over an asset graph with thousands of endpoints and every one of them is
+/// real traffic at somebody's service.
+///
+/// What did not belong here was taking it silently. `total` was the capped
+/// number, so a pass handed 1040 endpoints reported "300/300 endpoints" and
+/// looked complete, and the 740 it never touched were indistinguishable from
+/// 740 clean ones. Measured against xssmaze that is the difference between 29%
+/// recall and a pass that only ever saw 29% of the target.
 const MAX_ENDPOINTS: usize = 300;
 /// Endpoints probed at once. Injection is request-bound, not CPU-bound, and one
 /// endpoint at a time meant a scan of a few dozen endpoints across every class
@@ -479,7 +488,21 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
         _ => crate::oast::OastClient::from_env(),
     };
 
-    let total = params.endpoints.len().min(MAX_ENDPOINTS) as i64;
+    let handed_in = params.endpoints.len();
+    let total = handed_in.min(MAX_ENDPOINTS) as i64;
+    if handed_in > MAX_ENDPOINTS {
+        let _ = tx.send(json!({
+            "type": "log",
+            "message": format!(
+                "endpoint list truncated: {handed_in} handed in, {MAX_ENDPOINTS} will be \
+                 tested, {} dropped. The dropped endpoints were not examined, so they are \
+                 not evidence about the target. Split the list across passes to cover them.",
+                handed_in - MAX_ENDPOINTS
+            ),
+            "endpoints_handed_in": handed_in,
+            "endpoints_tested": MAX_ENDPOINTS,
+        }));
+    }
 
     // Positions the corpus proves variable, computed once over every endpoint
     // we were given rather than per endpoint: the evidence for `/users/alice`
