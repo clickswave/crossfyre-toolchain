@@ -3731,6 +3731,81 @@ async fn probe_crlf(client: &Client, site: &Site) -> Option<Value> {
     None
 }
 
+/// Source-list tokens that permit nothing on their own.
+///
+/// `'unsafe-eval'` allows `eval()` but names no place a script may come from,
+/// so a list holding only these admits no script at all. Same for
+/// `'unsafe-hashes'` with no hash beside it, and `'strict-dynamic'`, which
+/// relaxes host matching for scripts already trusted rather than trusting any.
+const CSP_INERT: [&str; 6] = [
+    "'unsafe-eval'",
+    "'unsafe-hashes'",
+    "'strict-dynamic'",
+    "'report-sample'",
+    "'wasm-unsafe-eval'",
+    "'none'",
+];
+
+/// True when the response's CSP permits no script to run at all, so a reflected
+/// payload cannot execute by any route.
+///
+/// Deliberately narrow, and the wider rule was tried and rejected with data.
+/// "CSP has no 'unsafe-inline', therefore an injected event handler cannot
+/// run" is true of the handler and false of the endpoint. Measured against
+/// xssmaze on 2026-10-02 it would have suppressed six exploitable endpoints to
+/// silence four controls, because blocking inline does not block exploitation:
+///
+///   csp-bypass-level2   'nonce-abc123' is fixed, so an injected script can carry it
+///   nonce-level1        the nonce is per-request, but the reflection lands INSIDE
+///                       the nonce'd script, so breaking the JS string runs under it
+///   cspbypass-level6    script-src * blocks inline and allows any external script
+///   modern-bypass-12    the value lands in a quoted <script src>, so it picks the URL
+///
+/// The discriminator is where the reflection lands relative to script the page
+/// already trusts, and this oracle does not measure that: it proves a tag
+/// reflected raw, not the context it reflected into. So the only safe test left
+/// is whether anything can run at all, which catches csp-bypass-level3
+/// (`script-src 'unsafe-eval'`, no source of any kind) and nothing exploitable.
+///
+/// Report-only headers are ignored, because they do not enforce. Several
+/// enforcing headers all apply, so any one of them admitting nothing is enough.
+fn csp_admits_no_script(r: &Resp) -> bool {
+    for (name, value) in &r.headers {
+        if name != "content-security-policy" {
+            continue;
+        }
+        for policy in value.split(',') {
+            // Highest-ranking directive present wins: script-src-elem over
+            // script-src over default-src.
+            let mut best = (0u8, Vec::<String>::new());
+            for directive in policy.split(';') {
+                let mut it = directive.split_whitespace();
+                let Some(key) = it.next() else { continue };
+                let rank = match key.to_ascii_lowercase().as_str() {
+                    "script-src-elem" => 3,
+                    "script-src" => 2,
+                    "default-src" => 1,
+                    _ => continue,
+                };
+                if rank > best.0 {
+                    best = (rank, it.map(|t| t.to_ascii_lowercase()).collect());
+                }
+            }
+            if best.0 == 0 {
+                continue; // nothing here governs script
+            }
+            // Every enforcing policy has to allow a script for it to run, so one
+            // that allows none settles it. Returning false on the first
+            // permissive policy instead was wrong and a test caught it: two
+            // headers, the second dead, and script cannot run.
+            if best.1.iter().all(|t| CSP_INERT.contains(&t.as_str())) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Whether attacker-controlled bytes in this response can execute in a browser.
 ///
 /// Reflected markup only matters if something runs it. xssmaze makes the point
@@ -3824,7 +3899,10 @@ async fn probe_xss(client: &Client, site: &Site) -> Option<Value> {
         // is not an XSS. Checked here rather than before the payloads, because
         // the content type of the reflecting response is the one that matters
         // and an endpoint can answer differently under injection.
-        if reflected && r.as_ref().is_some_and(executes_in_browser) {
+        let runnable = r
+            .as_ref()
+            .is_some_and(|x| executes_in_browser(x) && !csp_admits_no_script(x));
+        if reflected && runnable {
             let again = send_site(client, site, payload).await;
             if again
                 .map(|x| x.body.contains(detector.as_str()))
@@ -4358,6 +4436,92 @@ mod scope_tests {
     #[test]
     fn no_target_means_the_caller_is_trusted() {
         assert!(in_scope("", "https://anything.example/", &none()));
+    }
+}
+
+#[cfg(test)]
+mod csp_tests {
+    use super::*;
+
+    fn resp_with(headers: &[(&str, &str)]) -> Resp {
+        Resp {
+            status: 200,
+            body: String::new(),
+            elapsed_ms: 0,
+            location: None,
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    /// Every policy below is one xssmaze actually serves, with the verdict its
+    /// own notes give. The four `admits_nothing` cases are the only ones this
+    /// may suppress; everything else is exploitable and must survive.
+    #[test]
+    fn only_a_policy_that_can_run_nothing_suppresses() {
+        // csp-bypass-level3: a source list with no source in it.
+        assert!(csp_admits_no_script(&resp_with(&[(
+            "content-security-policy",
+            "default-src 'self'; script-src 'unsafe-eval'"
+        )])));
+
+        // Exploitable, and all of these would be lost by a broader rule.
+        for policy in [
+            "default-src 'self'; script-src 'nonce-abc123'", // fixed nonce
+            "default-src 'self'; script-src *",              // any external script
+            "default-src 'self'; script-src 'self' https://ajax.googleapis.com",
+            "script-src 'nonce-110cf35c283b5f8f25347a079160d0d2'",
+            "script-src 'self'",
+            "default-src 'self'; script-src 'unsafe-inline'",
+            "require-trusted-types-for 'script'; trusted-types default",
+        ] {
+            assert!(
+                !csp_admits_no_script(&resp_with(&[("content-security-policy", policy)])),
+                "wrongly suppressed: {policy}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_policy_suppresses_nothing() {
+        assert!(!csp_admits_no_script(&resp_with(&[])));
+        assert!(!csp_admits_no_script(&resp_with(&[(
+            "content-type",
+            "text/html"
+        )])));
+    }
+
+    #[test]
+    fn report_only_does_not_enforce() {
+        // It reports and permits, so it can never be grounds for suppressing.
+        assert!(!csp_admits_no_script(&resp_with(&[(
+            "content-security-policy-report-only",
+            "script-src 'unsafe-eval'"
+        )])));
+    }
+
+    #[test]
+    fn script_src_wins_over_default_src() {
+        // default-src would admit nothing, script-src admits 'self'.
+        assert!(!csp_admits_no_script(&resp_with(&[(
+            "content-security-policy",
+            "default-src 'none'; script-src 'self'"
+        )])));
+        // The other way round: default-src is permissive, script-src is dead.
+        assert!(csp_admits_no_script(&resp_with(&[(
+            "content-security-policy",
+            "default-src 'self'; script-src 'none'"
+        )])));
+    }
+
+    #[test]
+    fn any_one_enforcing_header_admitting_nothing_is_enough() {
+        assert!(csp_admits_no_script(&resp_with(&[
+            ("content-security-policy", "script-src 'self'"),
+            ("content-security-policy", "script-src 'none'"),
+        ])));
     }
 }
 
