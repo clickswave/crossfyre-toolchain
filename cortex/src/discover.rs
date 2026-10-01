@@ -86,6 +86,10 @@ pub struct DiscEndpoint {
     pub known_fields: Vec<String>,
 }
 
+/// As in `inject.rs` and `fuzz.rs`, and announced for the same reason: a capped
+/// `total` reads as a completed pass. Handing this all 1007 of xssmaze's GET
+/// endpoints reported 200 of 200 and looked like 16% recall, when it was 83% of
+/// the 200 it actually examined.
 const MAX_ENDPOINTS: usize = 200;
 const ERR_MINE_ROUNDS: usize = 5;
 const MAX_NEW_PER_EP: usize = 40;
@@ -114,7 +118,20 @@ pub async fn run(params: DiscoverParams, tx: mpsc::UnboundedSender<Value>) {
     };
 
     let mut found = 0i64;
-    let total = params.endpoints.len().min(MAX_ENDPOINTS) as i64;
+    let handed_in = params.endpoints.len();
+    let total = handed_in.min(MAX_ENDPOINTS) as i64;
+    if handed_in > MAX_ENDPOINTS {
+        let _ = tx.send(json!({
+            "type": "log",
+            "message": format!(
+                "endpoint list truncated: {handed_in} handed in, {MAX_ENDPOINTS} will be \
+                 probed, {} dropped and not examined.",
+                handed_in - MAX_ENDPOINTS
+            ),
+            "endpoints_handed_in": handed_in,
+            "endpoints_tested": MAX_ENDPOINTS,
+        }));
+    }
     let mut done = 0i64;
 
     for ep in params.endpoints.iter().take(MAX_ENDPOINTS) {
@@ -149,18 +166,23 @@ pub async fn run(params: DiscoverParams, tx: mpsc::UnboundedSender<Value>) {
                     if known.contains(*cand) {
                         continue;
                     }
-                    let u = render_query_probe(&ep.url, &known, cand);
+                    let u = render_query_probe(&ep.url, &known, cand, QUERY_MARKER);
                     let Some(r) = probe::send(&client, &orig, &u, None).await else {
                         continue;
                     };
-                    if !accepted(&base, &r, cand) {
+                    // The marker coming back is the strong signal: the endpoint
+                    // took the value somewhere. Status and length deviation stay
+                    // as the fallback for a parameter that changes behaviour
+                    // without echoing, which is most of them.
+                    let took_it = r.body.contains(QUERY_MARKER) || accepted(&base, &r, cand);
+                    if !took_it {
                         continue;
                     }
                     // Confirm, as the body path does: reissue and require the
                     // same deviation, so one flaky response is not a parameter.
                     let same = probe::send(&client, &orig, &u, None)
                         .await
-                        .map(|x| accepted(&base, &x, cand))
+                        .map(|x| x.body.contains(QUERY_MARKER) || accepted(&base, &x, cand))
                         .unwrap_or(false);
                     if !same {
                         continue;
@@ -343,7 +365,25 @@ fn accepted(base: &Baseline, r: &Resp, cand: &str) -> bool {
     if echoes_field(&r.body, cand) && !echoes_field(&base.body, cand) {
         return true;
     }
-    (r.body.len() as i64 - base.len as i64).abs() > 40
+    (r.body.len() as i64 - base.len as i64).abs() > len_delta_floor()
+}
+
+/// How far a response length must move from the junk control before the
+/// candidate counts as accepted.
+///
+/// Overridable so it can be calibrated against the lab rather than guessed.
+/// xssmaze declares the parameters of all 1007 of its GET endpoints, which
+/// makes it ground truth for both halves of this: a name discovery reports that
+/// the endpoint does not declare is a false parameter, and a declared name it
+/// misses is the threshold's cost. Inferred parameters feed the asset graph and
+/// then the injector, so a false one is a site a customer sees and the engine
+/// spends requests on.
+fn len_delta_floor() -> i64 {
+    std::env::var("CFX_DISCOVER_LEN_DELTA")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v >= 0)
+        .unwrap_or(40)
 }
 
 /// Does `body` contain `field` as a word, rather than inside a longer one?
@@ -404,7 +444,21 @@ fn discovery_event(
 /// Keeps anything already in the query string: an endpoint reached as
 /// `/thing?lang=en` may only answer properly with it, and dropping it changes
 /// the baseline rather than the parameter under test.
-fn render_query_probe(url: &str, known: &HashSet<String>, candidate: &str) -> String {
+/// The value a query probe sends.
+///
+/// Not `1`, which is what this did and the reason it found almost nothing.
+/// Measured against xssmaze's /advanced/level1/: the junk control answers in 91
+/// bytes, `?query=1` in 92, so the response moves by a single byte and no
+/// threshold above 1 can see it. The parameter name never appears in the body
+/// either, so the name-echo test the body path relies on cannot fire.
+///
+/// A distinctive value fixes both. The same endpoint answers `?query=<marker>`
+/// in 100 bytes and the marker is in the body, which is unambiguous: it is not
+/// an English word, so unlike a candidate name it cannot be on the page by
+/// accident. That is what the body path needs its baseline control for.
+const QUERY_MARKER: &str = "cfxprm7m4zz";
+
+fn render_query_probe(url: &str, known: &HashSet<String>, candidate: &str, value: &str) -> String {
     let mut out = String::from(url);
     let mut sep = if url.contains('?') { '&' } else { '?' };
     let mut names: Vec<&String> = known.iter().collect();
@@ -417,7 +471,8 @@ fn render_query_probe(url: &str, known: &HashSet<String>, candidate: &str) -> St
     }
     out.push(sep);
     out.push_str(&pct(candidate));
-    out.push_str("=1");
+    out.push('=');
+    out.push_str(&pct(value));
     out
 }
 
@@ -437,22 +492,35 @@ async fn calibrate_query(
     let a = probe::send(
         client,
         method,
-        &render_query_probe(url, known, "cfxjunkparamaa"),
+        &render_query_probe(url, known, "cfxjunkparamaa", QUERY_MARKER),
         None,
     )
     .await?;
     let b = probe::send(
         client,
         method,
-        &render_query_probe(url, known, "cfxjunkparambb"),
+        &render_query_probe(url, known, "cfxjunkparambb", QUERY_MARKER),
         None,
     )
     .await?;
     if a.status != b.status {
         return None;
     }
+    // Two ways an endpoint can echo something it never recognised, and both
+    // make the oracle unusable. Checking only one of them was a regression I
+    // made here and the benchmark caught it.
+    //
+    // The value: a response carrying the marker for a parameter the endpoint has
+    // never heard of carries it for anything.
+    if a.body.contains(QUERY_MARKER) || b.body.contains(QUERY_MARKER) {
+        return None;
+    }
+    // The name: xssmaze's /realworld/level5/ answers `?amount=x` with
+    // "Parameters: amount", so the name-echo test in `accepted` fires for every
+    // candidate. Dropping this check made that one endpoint report all 39
+    // wordlist entries, which was every false positive in a 1007-endpoint pass.
     if a.body.contains("cfxjunkparamaa") || b.body.contains("cfxjunkparambb") {
-        return None; // echoes anything handed to it, so reflection proves nothing
+        return None;
     }
     if (a.body.len() as i64 - b.body.len() as i64).abs() > 24 {
         return None; // not stable enough to diff against
@@ -462,6 +530,43 @@ async fn calibrate_query(
         len: a.body.len(),
         body: a.body,
     })
+}
+
+#[cfg(test)]
+mod query_probe_tests {
+    use super::*;
+
+    #[test]
+    fn the_candidate_carries_the_marker_and_known_params_carry_filler() {
+        let known: HashSet<String> = ["lang".to_string()].into_iter().collect();
+        let u = render_query_probe("http://h/p", &known, "id", QUERY_MARKER);
+        assert_eq!(u, format!("http://h/p?lang=1&id={QUERY_MARKER}"));
+    }
+
+    #[test]
+    fn an_existing_query_string_is_kept() {
+        // An endpoint reached as /p?v=1 may only answer properly with it, so
+        // dropping it would move the baseline rather than test the parameter.
+        let known = HashSet::new();
+        let u = render_query_probe("http://h/p?v=1", &known, "id", QUERY_MARKER);
+        assert_eq!(u, format!("http://h/p?v=1&id={QUERY_MARKER}"));
+    }
+
+    #[test]
+    fn the_marker_is_not_a_word_a_page_could_hold_by_accident() {
+        // The point of a marker over a candidate name: `id` and `to` are on
+        // half the pages on the web, this is on none of them.
+        assert!(QUERY_MARKER.len() >= 8);
+        assert!(!QUERY_MARKER.chars().all(|c| c.is_ascii_alphabetic()));
+    }
+
+    #[test]
+    fn the_length_floor_defaults_to_the_tuned_value() {
+        // Overridable for calibration against the lab, but the default is the
+        // value body discovery was tuned to after it reported 26 fields on a
+        // RailsGoat endpoint that has one.
+        assert_eq!(len_delta_floor(), 40);
+    }
 }
 
 /// Render a JSON/form body from a set of field names, each with a benign placeholder. When `only`
