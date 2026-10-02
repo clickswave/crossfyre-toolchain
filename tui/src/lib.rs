@@ -115,43 +115,6 @@ pub fn wanted_from(tui: bool, no_tui: bool, default_on: bool, available: bool) -
     asked && available
 }
 
-#[cfg(test)]
-mod wanted_tests {
-    use super::wanted_from;
-
-    #[test]
-    fn a_pipe_never_gets_a_dashboard() {
-        for (tui, no_tui, default_on) in [
-            (false, false, true),
-            (true, false, true),
-            (false, false, false),
-            (true, false, false),
-        ] {
-            assert!(
-                !wanted_from(tui, no_tui, default_on, false),
-                "piped stdout drew a dashboard for ({tui}, {no_tui}, {default_on})"
-            );
-        }
-    }
-
-    #[test]
-    fn no_tui_beats_tui_and_the_default() {
-        assert!(!wanted_from(true, true, true, true));
-        assert!(!wanted_from(false, true, true, true));
-    }
-
-    #[test]
-    fn the_engine_default_applies_when_neither_flag_is_given() {
-        assert!(wanted_from(false, false, true, true));
-        assert!(!wanted_from(false, false, false, true));
-    }
-
-    #[test]
-    fn tui_opts_in_where_the_default_is_off() {
-        assert!(wanted_from(true, false, false, true));
-    }
-}
-
 /// Drive a dashboard until the user quits.
 ///
 /// `pump` is called every tick to drain whatever the tool is receiving into
@@ -344,4 +307,41 @@ fn header<D: Dashboard>(frame: &mut Frame, dashboard: &mut D, active: char, area
         Paragraph::new(Line::from(spans)).block(Block::default().borders(Borders::ALL)),
         area,
     );
+}
+
+#[cfg(test)]
+mod wanted_tests {
+    use super::wanted_from;
+
+    #[test]
+    fn a_pipe_never_gets_a_dashboard() {
+        for (tui, no_tui, default_on) in [
+            (false, false, true),
+            (true, false, true),
+            (false, false, false),
+            (true, false, false),
+        ] {
+            assert!(
+                !wanted_from(tui, no_tui, default_on, false),
+                "piped stdout drew a dashboard for ({tui}, {no_tui}, {default_on})"
+            );
+        }
+    }
+
+    #[test]
+    fn no_tui_beats_tui_and_the_default() {
+        assert!(!wanted_from(true, true, true, true));
+        assert!(!wanted_from(false, true, true, true));
+    }
+
+    #[test]
+    fn the_engine_default_applies_when_neither_flag_is_given() {
+        assert!(wanted_from(false, false, true, true));
+        assert!(!wanted_from(false, false, false, true));
+    }
+
+    #[test]
+    fn tui_opts_in_where_the_default_is_off() {
+        assert!(wanted_from(true, false, false, true));
+    }
 }
