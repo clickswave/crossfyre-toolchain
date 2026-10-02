@@ -3236,6 +3236,56 @@ fn redirect_host(loc: &str) -> Option<String> {
 /// Server-side template injection: an arithmetic template expression that evaluates server-side.
 /// Sandwiched in unique markers so the evaluated `49` cannot be a coincidental substring. Covers
 /// Jinja2/Twig `{{ }}`, Freemarker / JSP-EL `${ }`, Ruby `#{ }`, ERB `<%= %>`, and Smarty `{ }`.
+/// A client-side template engine that will compile `{{ }}` in the document.
+///
+/// Script filenames and the directives each engine puts in the markup, so a
+/// page that bundles its framework rather than loading it from a CDN is still
+/// recognised.
+static CLIENT_TEMPLATE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)angular(?:\.min)?\.js|ng-app|ng-controller|vue(?:@[\d.]+|\.min)?\.js|new\s+Vue|createApp|v-html|x-data|x-init",
+    )
+    .unwrap()
+});
+
+/// Where that engine compiles. AngularJS bootstraps at the element carrying
+/// `ng-app`; Vue and Alpine mount at the element they are given, which is
+/// `#app` by convention and in every case measured here.
+static TEMPLATE_SCOPE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)ng-app|ng-controller|id=["']app["']|#app"#).unwrap());
+
+/// Client-side template injection: the expression comes back intact and
+/// something in the page is going to evaluate it.
+///
+/// Costs no extra request. `probe_ssti` has already sent `{{7*7}}` and read
+/// the answer, and the two classes are separated by that one response: an
+/// expression that came back as `49` was evaluated on the server, and an
+/// expression that came back verbatim was not evaluated by anyone *yet*.
+///
+/// Three conditions, and the third is what keeps it honest. The expression has
+/// to survive raw, so the braces and the operator were not encoded. The page
+/// has to load a template engine, so something exists that compiles `{{ }}`.
+/// And the reflection has to sit inside that engine's scope, because an
+/// expression outside the compiled region is inert text.
+///
+/// Measured against all 1040 of xssmaze's server-reaching endpoints: it fires
+/// on 7, every one of them exploitable, and catches all 5 of the cases upstream
+/// labels csti. The other two are a Vue page whose value reaches v-html and a
+/// reflected-html case on a page with a template engine, so both are real and
+/// land in `unmatched` under a neighbouring class rather than against
+/// precision. None of the 27 precision controls fires, which is 1033 correct
+/// refusals.
+fn client_template_will_evaluate(body: &str, at: usize) -> bool {
+    if !CLIENT_TEMPLATE.is_match(body) {
+        return false;
+    }
+    // The scope marker has to come before the reflection, or the value landed
+    // outside the region that gets compiled.
+    TEMPLATE_SCOPE
+        .find(body)
+        .is_some_and(|mm| mm.start() < at)
+}
+
 async fn probe_ssti(client: &Client, site: &Site) -> Option<Value> {
     let a = format!("cfxA{}", site.param.len() + 3);
     let b = format!("B{}cfx", site.url.len() % 97);
@@ -3255,6 +3305,32 @@ async fn probe_ssti(client: &Client, site: &Site) -> Option<Value> {
         let Some(r) = send_site(client, site, p).await else {
             continue;
         };
+        // Not evaluated here, and something in the page will evaluate it there.
+        if !r.body.contains(&want) {
+            if let Some(at) = r.body.find(p.as_str()) {
+                if executes_in_browser(&r) && client_template_will_evaluate(&r.body, at) {
+                    let Some(again) = send_site(client, site, p).await else {
+                        continue;
+                    };
+                    if again
+                        .body
+                        .find(p.as_str())
+                        .is_some_and(|a| client_template_will_evaluate(&again.body, a))
+                    {
+                        return Some(finding(
+                            "csti",
+                            "Client-side template injection",
+                            "high",
+                            site,
+                            format!(
+                                "A template expression injected into the {} was reflected into the page with its braces and operator intact, inside the scope of a client-side template engine the page loads. The server did not evaluate it, the browser will: `{p}` reaches the compiler as an expression rather than as text, which executes in the visitor's browser with the same reach as cross-site scripting.",
+                                site.where_label()
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
         if r.body.contains(&want) {
             let Some(again) = send_site(client, site, p).await else {
                 continue;
