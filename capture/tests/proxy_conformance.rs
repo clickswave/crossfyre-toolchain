@@ -205,23 +205,34 @@ async fn front(origin_port: u16, cfg: CaptureCfg, flows: usize) -> Front {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let ca2 = ca.clone();
+    // Each accepted flow is SPAWNED, not awaited in turn. A front end that served one
+    // flow to completion before accepting the next would pass every single-flow test in
+    // this file while being useless, and would hide the one property a GUI depends on:
+    // that a flow parked on a human does not stop the others.
     let outcome = tokio::spawn(async move {
-        let mut out = Vec::new();
+        let mut tasks = Vec::new();
         for _ in 0..flows {
             let Ok((client, _)) = listener.accept().await else {
                 break;
             };
-            let r = serve_mitm_flow(
-                client,
-                "127.0.0.1".into(),
-                origin_port,
-                ca2.clone(),
-                Egress::Direct,
-                tx.clone(),
-                cfg.clone(),
-            )
-            .await;
-            out.push(r.map_err(|e| e.to_string()));
+            let (ca, tx, cfg) = (ca2.clone(), tx.clone(), cfg.clone());
+            tasks.push(tokio::spawn(async move {
+                serve_mitm_flow(
+                    client,
+                    "127.0.0.1".into(),
+                    origin_port,
+                    ca,
+                    Egress::Direct,
+                    tx,
+                    cfg,
+                )
+                .await
+                .map_err(|e| e.to_string())
+            }));
+        }
+        let mut out = Vec::new();
+        for t in tasks {
+            out.push(t.await.expect("the flow task did not panic"));
         }
         out
     });
@@ -864,4 +875,60 @@ async fn an_edited_body_shorter_than_the_stale_length_still_arrives() {
         "the forwarded length is the body's, not the operator's leftover, got:\n{seen}"
     );
     assert!(seen.ends_with("tiny"), "got:\n{seen}");
+}
+
+/// A gate that parks for `delay` before answering, which is what a GUI gate does: it waits
+/// for a human. Appendix B of the desktop plan lists "can `serve_mitm_flow` be driven with
+/// a gate that resolves from a GUI without deadlocking the flow" as a claim read off the
+/// code once and never run. This is that claim, run.
+struct SlowGate {
+    delay: Duration,
+}
+
+impl InterceptGate for SlowGate {
+    fn decide<'a>(
+        &'a self,
+        _method: &'a str,
+        _url: &'a str,
+        _headers: &'a [(String, String)],
+        _body: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = InterceptDecision> + Send + 'a>> {
+        let delay = self.delay;
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            InterceptDecision::Forward
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_flow_parked_on_the_gate_does_not_hold_up_another_flow() {
+    // The desktop case this stands in for: two tabs load at once, the operator is staring
+    // at the first request in an intercept pane, and the second request must still be
+    // able to reach its own pane rather than queueing behind a decision nobody has made.
+    const PARK: Duration = Duration::from_millis(600);
+    let (op, olog) = origin(ok_response("concurrent"));
+    let cfg = CaptureCfg {
+        full: false,
+        gate: Some(Arc::new(SlowGate { delay: PARK })),
+        bypass_hosts: Vec::new(),
+    };
+    let f = front(op, cfg, 2).await;
+
+    let started = std::time::Instant::now();
+    let (a, b) = tokio::join!(
+        plain_request(f.port, get("/tab-one", "origin.test")),
+        plain_request(f.port, get("/tab-two", "origin.test")),
+    );
+    let elapsed = started.elapsed();
+
+    assert_eq!((a.0, b.0), (200, 200), "both flows completed");
+    assert_eq!(olog.connections(), 2);
+    // Serialised, this is two parks back to back. The threshold sits between one and two
+    // so it fails on serialisation rather than on a slow machine.
+    assert!(
+        elapsed < PARK * 2,
+        "the two flows overlapped: {elapsed:?} against a {PARK:?} park each, so a flow \
+         waiting on the gate blocked the other one"
+    );
 }
