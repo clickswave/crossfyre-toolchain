@@ -4809,6 +4809,75 @@ mod hint_tests {
         }
     }
 
+    fn resp_with(ct: Option<&str>) -> Resp {
+        Resp {
+            status: 200,
+            body: "<img src=x onerror=alert(1)>".to_string(),
+            elapsed_ms: 1,
+            location: None,
+            headers: ct
+                .map(|v| vec![("content-type".to_string(), v.to_string())])
+                .unwrap_or_default(),
+        }
+    }
+
+    #[test]
+    fn only_a_response_something_runs_is_an_xss() {
+        // Two ways to execute: parsed as a document, or loaded as a script.
+        for ct in [
+            "text/html",
+            "text/html;charset=UTF-8",
+            "TEXT/HTML; charset=utf-8",
+            "application/xhtml+xml",
+            "image/svg+xml",
+            "application/xml",
+            "text/xml",
+            // JSONP: included with a script tag and run, whatever its bytes
+            // look like as markup. Suppressing these cost four true positives.
+            "application/javascript",
+            "text/javascript",
+        ] {
+            assert!(executes_in_browser(&resp_with(Some(ct))), "{ct} executes");
+        }
+        // A tag reflected raw into something nothing parses as a document is
+        // not an XSS. xssmaze's bugbounty-level10 is exactly this and is a
+        // precision control: an HTML body served as application/json.
+        for ct in [
+            "application/json",
+            "text/plain",
+            "text/plain;charset=UTF-8",
+            "text/csv",
+            "application/pdf",
+            "image/png",
+            "application/octet-stream",
+        ] {
+            assert!(!executes_in_browser(&resp_with(Some(ct))), "{ct} does not");
+        }
+        // No content type, or an empty one, means the browser sniffs it, and
+        // it sniffs an HTML body as HTML. Permissive on purpose.
+        assert!(executes_in_browser(&resp_with(None)));
+        assert!(executes_in_browser(&resp_with(Some(""))));
+    }
+
+    #[test]
+    fn the_accept_header_decides_what_the_content_type_is() {
+        // Not a test of our code, a note about why it has to send a browser's
+        // Accept header, kept next to the gate it would otherwise defeat.
+        //
+        // VulnerableApp's ErrorBasedSQLInjection levels answer the same
+        // request with text/plain to a bare client and text/html to a browser,
+        // and they reflect the payload raw either way. Asked without an Accept
+        // header, all four look like a non-executing reflection and are
+        // suppressed; asked the way a victim's browser asks, all four are a
+        // live XSS. The content type is a property of the request, so the
+        // oracle has to ask the question a victim would ask.
+        //
+        // A hand check with curl said these four were false positives. They
+        // are not, and this is the test that would have said so first.
+        assert!(!executes_in_browser(&resp_with(Some("text/plain;charset=UTF-8"))));
+        assert!(executes_in_browser(&resp_with(Some("text/html;charset=UTF-8"))));
+    }
+
     #[test]
     fn a_method_nobody_named_needs_asking_first() {
         // This is an allowlist, not a denylist of the three destructive verbs,
