@@ -344,11 +344,11 @@ static RE_JSON_BODY: LazyLock<Regex> = LazyLock::new(|| {
 /// The keys of an object literal passed to `JSON.stringify`, which are the body
 /// field names. Only the top level, and only plain identifier or quoted keys:
 /// anything computed is not a name a scanner can send.
-static RE_STRINGIFY_KEYS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?is)JSON\s*\.\s*stringify\s*\(\s*\{(.{0,400}?)\}"#).unwrap()
+static RE_STRINGIFY_KEYS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?is)JSON\s*\.\s*stringify\s*\(\s*\{(.{0,400}?)\}"#).unwrap());
+static RE_OBJ_KEY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?:^|,)\s*["']?([A-Za-z_$][A-Za-z0-9_$]{0,63})["']?\s*:"#).unwrap()
 });
-static RE_OBJ_KEY: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"(?:^|,)\s*["']?([A-Za-z_$][A-Za-z0-9_$]{0,63})["']?\s*:"#).unwrap());
 
 /// How far after a call site to look for the header and body that belong to it.
 ///
@@ -2139,8 +2139,10 @@ mod template_tests {
         "#;
         let mut out = Vec::new();
         extract_js_calls(js, &mut out);
-        let mut got: Vec<(String, String)> =
-            out.iter().map(|c| (c.method.clone(), c.url.clone())).collect();
+        let mut got: Vec<(String, String)> = out
+            .iter()
+            .map(|c| (c.method.clone(), c.url.clone()))
+            .collect();
         got.sort();
         assert_eq!(
             got,

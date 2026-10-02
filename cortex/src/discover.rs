@@ -214,8 +214,7 @@ pub async fn run(params: DiscoverParams, tx: mpsc::UnboundedSender<Value>) {
                         location: r.location.clone(),
                         headers: r.headers.clone(),
                     };
-                    let took_it = r.body.contains(mark.as_str())
-                        || accepted(&base, &clean, cand);
+                    let took_it = r.body.contains(mark.as_str()) || accepted(&base, &clean, cand);
                     if !took_it {
                         continue;
                     }

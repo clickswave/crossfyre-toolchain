@@ -423,7 +423,8 @@ pub mod pace {
                 // a second, which is the 100x swing that made this look like
                 // target behaviour rather than arithmetic.
                 let step = (d / 4).max(1);
-                self.delay_ms.store(d.saturating_sub(step), Ordering::Relaxed);
+                self.delay_ms
+                    .store(d.saturating_sub(step), Ordering::Relaxed);
             }
             if n >= UNSERIALISE_AFTER {
                 self.oks.store(0, Ordering::Relaxed);
@@ -607,8 +608,7 @@ pub async fn send_with(
         // A method that is not a valid HTTP token still falls back to GET,
         // because there is nothing else to send and refusing the request would
         // turn a caller's typo into a dropped endpoint.
-        let m = transport::Method::from_bytes(method.as_bytes())
-            .unwrap_or(transport::Method::GET);
+        let m = transport::Method::from_bytes(method.as_bytes()).unwrap_or(transport::Method::GET);
         let mut rb = client.request(m, url);
         for (k, v) in extra_headers {
             rb = rb.header(k.as_str(), v.as_str());
