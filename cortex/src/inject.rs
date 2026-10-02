@@ -1722,11 +1722,31 @@ async fn run_endpoint(mut ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome 
 /// POST is absent on purpose. It is the main injection surface and what it
 /// creates is usually recoverable; the other three are not, and for them the
 /// request is the damage rather than a test of it.
-pub(crate) fn destroys_a_resource(method: &str) -> bool {
+/// Methods this engine will send without `test_writes`, and the list is
+/// deliberately the allowlist rather than a denylist of the destructive ones.
+///
+/// It used to be the denylist: DELETE, PUT and PATCH were destructive and
+/// everything else was safe. That was sound only because the request builder
+/// quietly turned every other method into a GET, so an unrecognised verb could
+/// not do anything. Now that the caller's method is actually sent, a denylist
+/// means a WebDAV MOVE, a cache PURGE or any vendor verb is treated as a
+/// read. Inverting it costs nothing real: a method nobody has heard of needs
+/// `test_writes` to be sent, which is the rail the option already states.
+///
+/// QUERY is here because reading with a body is its entire purpose (it is the
+/// safe, cacheable counterpart to a POST-for-search), and it is the only
+/// reason five of xssmaze's endpoints exist. POST is here because it is the
+/// main injection surface and what it creates is usually recoverable, which is
+/// the trade-off `test_writes` documents.
+fn reads_only(method: &str) -> bool {
     matches!(
         method.to_ascii_uppercase().as_str(),
-        "DELETE" | "PUT" | "PATCH"
+        "GET" | "HEAD" | "OPTIONS" | "POST" | "QUERY" | ""
     )
+}
+
+pub(crate) fn destroys_a_resource(method: &str) -> bool {
+    !reads_only(method)
 }
 
 /// a noun. Testing a button can find a real bug, and it can also log the scan
@@ -3857,10 +3877,26 @@ fn executes_in_browser(r: &Resp) -> bool {
     )
 }
 
+/// `needle` in `hay`, ignoring case, without lowercasing a whole response body
+/// unless it has to. The exact check is the common path and allocates nothing;
+/// the fallback only runs where a target transformed what it echoed.
+fn contains_ci(hay: &str, needle: &str) -> bool {
+    hay.contains(needle)
+        || hay
+            .to_ascii_lowercase()
+            .contains(&needle.to_ascii_lowercase())
+}
+
 async fn probe_xss(client: &Client, site: &Site) -> Option<Value> {
     let marker = format!("cfx{}z{}", site.url.len(), site.param.len());
     let plain = send_site(client, site, &marker).await?;
-    if !plain.body.contains(&marker) {
+    // Case-insensitively, because a target that upper-cases, title-cases or
+    // swaps the case of what it echoes is still echoing it. This check is the
+    // gate on sending any payload at all, so an exact match here abandoned the
+    // whole probe before it started: xssmaze's casemanip family and
+    // encodingedge-level4 reflect every payload raw and were never sent one.
+    // The marker is lowercase with digits, so lowercasing the body is enough.
+    if !contains_ci(&plain.body, &marker) {
         return None; // not reflected at all
     }
     // SOUND oracle: every payload injects a full HTML TAG carrying an event handler, and the detector
@@ -3872,14 +3908,26 @@ async fn probe_xss(client: &Client, site: &Site) -> Option<Value> {
     // verbatim and produced a FALSE POSITIVE; requiring the intact `<tag ...>` makes the app's encoding
     // of `<`/`>` the discriminator, which is exactly what determines exploitability.
     let m = &marker;
-    // Four payloads, all of which require the WHOLE tag back intact, which is
+    // Five payloads, all of which require the WHOLE tag back intact, which is
     // what keeps the oracle sound. The fourth is the same breakout in mixed
     // case, because a filter that pattern-matches `<img`, `<svg` or `<script`
     // in lowercase is common and cheap to write, and nothing in the first three
     // gets past it. VulnerableApp's XSSWithHtmlTagInjection level 2 is exactly
     // that: `<svg onload=...>` and `<script>` come back empty, and
     // `<ImG SrC=x OnErRoR=...>` comes back raw inside the div.
-    let cases: [(&str, String, String); 4] = [
+    //
+    // The fifth is a plain `<script>`, and it is last because it only costs a
+    // request where all four others already failed. Every one of the first four
+    // carries an event handler on a non-script tag, so a filter that strips
+    // handler attributes by name, or denies `img` and `svg` by tag name, takes
+    // all four and leaves `<script>` untouched. Measured on xssmaze: 23
+    // endpoints reflect `<script>alert(...)</script>` raw while none of the
+    // first four come back intact, including the whole attrname, mutfilter,
+    // obfuscation, payloadfilt and whitespace families. The detector is the
+    // same shape as the others, the opening tag and the closing tag back raw,
+    // so it holds the oracle's line: a target that encodes `<` or `>` cannot
+    // produce it.
+    let cases: [(&str, String, String); 5] = [
         (
             "HTML",
             format!("{m}\"'><img src=x onerror=alert({m})>"),
@@ -3900,12 +3948,29 @@ async fn probe_xss(client: &Client, site: &Site) -> Option<Value> {
             format!("{m}\"'><ImG SrC=x OnErRoR=alert({m})>"),
             format!("<ImG SrC=x OnErRoR=alert({m})>"),
         ),
+        (
+            "HTML",
+            format!("{m}\"'><script>alert({m})</script>"),
+            format!("<script>alert({m})</script>"),
+        ),
     ];
     for (ctx, payload, detector) in &cases {
         let r = send_site(client, site, payload).await;
+        // Case-insensitive on purpose, and it does not weaken the oracle. What
+        // makes the detector sound is that `<`, `>`, the tag name and the
+        // handler all come back raw, and HTML tag and attribute names are
+        // case-insensitive, so `<IMG SRC=X ONERROR=...>` is parsed as a tag
+        // exactly as the lowercase form is. A target that encodes `<` or `>`
+        // still cannot produce either.
+        //
+        // What the case does change is whether this particular payload's
+        // JavaScript would run, since `ALERT` is not `alert`. The finding is
+        // that markup injection is possible, which is true and is what the
+        // report says; xssmaze's own answer for casemanip-level3 is to send
+        // the payload upper-cased so the target's swap produces lowercase.
         let reflected = r
             .as_ref()
-            .map(|x| x.body.contains(detector.as_str()))
+            .map(|x| contains_ci(&x.body, detector.as_str()))
             .unwrap_or(false);
         // A tag that reflects raw into a response nothing parses as a document
         // is not an XSS. Checked here rather than before the payloads, because
@@ -3917,7 +3982,7 @@ async fn probe_xss(client: &Client, site: &Site) -> Option<Value> {
         if reflected && runnable {
             let again = send_site(client, site, payload).await;
             if again
-                .map(|x| x.body.contains(detector.as_str()))
+                .map(|x| contains_ci(&x.body, detector.as_str()))
                 .unwrap_or(false)
             {
                 return Some(finding(
@@ -4738,8 +4803,29 @@ mod hint_tests {
         // POST stays. It is the main injection surface, forms and search and
         // login, and what it creates is usually recoverable. Gating it would
         // trade most of this engine's value for safety it does not need.
-        for m in ["GET", "POST", "HEAD", "OPTIONS", "post"] {
+        // QUERY stays because reading with a body is the whole point of it.
+        for m in ["GET", "POST", "HEAD", "OPTIONS", "QUERY", "post", "query"] {
             assert!(!destroys_a_resource(m), "{m} must still be tested");
+        }
+    }
+
+    #[test]
+    fn a_method_nobody_named_needs_asking_first() {
+        // This is an allowlist, not a denylist of the three destructive verbs,
+        // and the distinction only started to matter when the request builder
+        // stopped turning every unrecognised method into a GET. While it did,
+        // a denylist was safe by accident: a verb nobody had listed could not
+        // reach the target as itself. Now it can, so anything outside the
+        // read-only set waits for `test_writes`.
+        for m in [
+            "MOVE", "COPY", "LOCK", "UNLOCK", "MKCOL", "PROPPATCH", // WebDAV
+            "PURGE",     // Varnish and friends: drops cached objects
+            "WIPE", "RESET", "TRUNCATE", // vendor verbs, seen in the wild
+        ] {
+            assert!(
+                destroys_a_resource(m),
+                "{m} is not a method we know is a read, so it needs asking"
+            );
         }
     }
 

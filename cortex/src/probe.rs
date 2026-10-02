@@ -572,13 +572,24 @@ pub async fn send_with(
     let t0 = Instant::now();
     let mut attempt = 0;
     let outcome = loop {
-        let mut rb = match method {
-            "POST" => client.post(url),
-            "PUT" => client.put(url),
-            "DELETE" => client.delete(url),
-            "PATCH" => client.patch(url),
-            _ => client.get(url),
-        };
+        // Any method, not a list of five. This was a match on POST/PUT/DELETE/
+        // PATCH with `_ => client.get(url)`, so every other method was silently
+        // sent as a GET: the caller's body went out attached to a GET, the
+        // server ignored it, and the endpoint reported clean. An engine saying
+        // "tested, nothing found" about a request it never made is the worst
+        // shape a negative result can take.
+        //
+        // xssmaze's querymethod family is five endpoints that only answer HTTP
+        // QUERY, and all five read as detection failures. The same silence
+        // covered every API verb outside the five, which for a JSON API is
+        // routine.
+        //
+        // A method that is not a valid HTTP token still falls back to GET,
+        // because there is nothing else to send and refusing the request would
+        // turn a caller's typo into a dropped endpoint.
+        let m = transport::Method::from_bytes(method.as_bytes())
+            .unwrap_or(transport::Method::GET);
+        let mut rb = client.request(m, url);
         for (k, v) in extra_headers {
             rb = rb.header(k.as_str(), v.as_str());
         }
