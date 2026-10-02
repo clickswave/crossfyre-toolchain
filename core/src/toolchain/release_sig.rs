@@ -44,10 +44,20 @@
 //! # Key handling
 //!
 //! The signing key never appears in this repository, in CI, or in any build image. It
-//! lives offline and the publish step reads it from a path given at run time. Rotation is
-//! by shipping the next public key in the current release, so a compromised bucket cannot
-//! roll the key forward on its own: an attacker who can rewrite the manifest still cannot
-//! make an already-installed binary trust a new key.
+//! lives offline and the publish step reads it from a path given at run time.
+//!
+//! Rotation is by shipping the next public key in the current release, which is why a
+//! build accepts TWO keys: `CROSSFYRE_MANIFEST_PUBKEY` and, when set,
+//! `CROSSFYRE_MANIFEST_PUBKEY_NEXT`. The sequence is that release N trusts K1 and K2 while
+//! manifests are still signed with K1, then release N+1 trusts K2 and K3 and manifests
+//! move to K2. An install of release N keeps updating across the change, because the
+//! manifests it is asked to trust are signed with a key it already carries.
+//!
+//! A compromised bucket cannot roll the key forward on its own: whoever can rewrite the
+//! manifest still cannot make an already-installed binary trust a key it was not built
+//! with. The flip side is the reason the second slot exists at all. With one key, losing
+//! it or needing to retire it leaves every installed binary unable to accept any further
+//! update, and the only remedy is asking users to reinstall by hand.
 //!
 //! Signing lives in the `relsign` dev tool, not here. This module verifies and nothing
 //! else, so the shipped binary carries no code path that produces a signature.
@@ -59,15 +69,32 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 /// this is a build-time rather than a runtime decision.
 const MANIFEST_PUBKEY: Option<&str> = option_env!("CROSSFYRE_MANIFEST_PUBKEY");
 
+/// Base64 of the key the NEXT release will sign with, shipped one release early so a
+/// rotation does not strand anything already installed. See the module note on rotation.
+const MANIFEST_PUBKEY_NEXT: Option<&str> = option_env!("CROSSFYRE_MANIFEST_PUBKEY_NEXT");
+
 /// Where the detached signature sits, relative to the manifest.
 pub const SIG_SUFFIX: &str = ".sig";
+
+/// Every key this build will accept a manifest from, current first.
+///
+/// Accepting two is not a weakening, because both are ours and a signature still has to
+/// come from one of them. It is what makes a rotation survivable: an installed binary
+/// trusting only one key can be updated only by manifests signed with that key, so losing
+/// it, or needing to retire it, would leave every install unable to take another update.
+fn trusted_keys() -> Vec<&'static str> {
+    [MANIFEST_PUBKEY, MANIFEST_PUBKEY_NEXT]
+        .into_iter()
+        .flatten()
+        .collect()
+}
 
 /// Does this build demand a signed manifest?
 ///
 /// Callers use this to decide whether a missing signature file is fatal or simply absent,
 /// so the error a user sees names the real problem rather than a 404.
 pub fn required() -> bool {
-    MANIFEST_PUBKEY.is_some()
+    !trusted_keys().is_empty()
 }
 
 /// Decode a base64 ed25519 public key into a verifying key.
@@ -89,10 +116,34 @@ fn parse_pubkey(b64: &str) -> Result<VerifyingKey, String> {
 /// parsed value. Round-tripping through a JSON parser reorders keys and changes
 /// whitespace, and the signature is over bytes.
 pub fn verify(manifest: &[u8], sig_b64: &str) -> Result<(), String> {
-    let Some(pk_b64) = MANIFEST_PUBKEY else {
+    let keys = trusted_keys();
+    if keys.is_empty() {
         return Ok(()); // unkeyed build: nothing to verify against
-    };
-    verify_with(pk_b64, manifest, sig_b64)
+    }
+    verify_with_any(&keys, manifest, sig_b64)
+}
+
+/// Verify against the first of `keys` that accepts the signature.
+///
+/// The signature is decoded once, before any key is tried, so a malformed signature file
+/// reports as malformed instead of as "did not verify against any key", which would send
+/// whoever reads it looking for a rotation problem that is not there.
+pub fn verify_with_any(keys: &[&str], manifest: &[u8], sig_b64: &str) -> Result<(), String> {
+    let sig = parse_sig(sig_b64)?;
+    for k in keys {
+        // A key that does not parse is a build misconfiguration, not a bad manifest, and
+        // silently skipping it would turn one into the other.
+        if parse_pubkey(k)?.verify(manifest, &sig).is_ok() {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "release manifest signature does not verify against any of this build's {} \
+         public key(s). Refusing to install anything described by it. Either the manifest \
+         was modified in transit or on the release origin, or this binary predates a key \
+         rotation and needs replacing from a trusted source.",
+        keys.len()
+    ))
 }
 
 /// Verify against an explicitly given public key.
@@ -103,18 +154,17 @@ pub fn verify(manifest: &[u8], sig_b64: &str) -> Result<(), String> {
 /// signing and verifying with itself, which proves the two halves agree with each other
 /// and nothing about whether they agree with the signer that ships releases.
 pub fn verify_with(pk_b64: &str, manifest: &[u8], sig_b64: &str) -> Result<(), String> {
-    let key = parse_pubkey(pk_b64)?;
+    verify_with_any(&[pk_b64], manifest, sig_b64)
+}
+
+/// Decode a detached signature. Separate from verification so the "this file is not a
+/// signature" case is reported once rather than once per trusted key.
+fn parse_sig(sig_b64: &str) -> Result<Signature, String> {
     let raw = b64_decode(sig_b64.trim()).ok_or("signature is not valid base64")?;
     let bytes: [u8; 64] = raw
         .try_into()
         .map_err(|_| "signature is not 64 bytes".to_string())?;
-    let sig = Signature::from_bytes(&bytes);
-    key.verify(manifest, &sig).map_err(|_| {
-        "release manifest signature does not verify against this build's public key. \
-         Refusing to install anything described by it. Either the manifest was modified \
-         in transit or on the release origin, or this binary is older than a key rotation."
-            .to_string()
-    })
+    Ok(Signature::from_bytes(&bytes))
 }
 
 /// Minimal standard-alphabet base64 decoder, padding optional.
@@ -168,12 +218,24 @@ mod tests {
     // secret key for this vector is a test key and is in the test below, which is why it
     // must never be used for a real release.
     const TEST_SEED_B64: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+    /// A second test key, for the rotation cases. Same warning as the first: the secret
+    /// is right here, so it must never sign a real release.
+    const TEST_SEED_NEXT_B64: &str = "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=";
     const TEST_MANIFEST: &[u8] = br#"{"components":{"mach":{"version":"0.0.14"}}}"#;
 
     fn test_keypair() -> ed25519_dalek::SigningKey {
-        let seed = b64_decode(TEST_SEED_B64).expect("seed decodes");
+        keypair_from(TEST_SEED_B64)
+    }
+
+    fn keypair_from(seed_b64: &str) -> ed25519_dalek::SigningKey {
+        let seed = b64_decode(seed_b64).expect("seed decodes");
         let bytes: [u8; 32] = seed.try_into().expect("32-byte seed");
         ed25519_dalek::SigningKey::from_bytes(&bytes)
+    }
+
+    /// Base64 of a signing key's public half, in the form the build constants carry.
+    fn pubkey_b64(sk: &ed25519_dalek::SigningKey) -> String {
+        b64_encode(sk.verifying_key().as_bytes())
     }
 
     fn b64_encode(data: &[u8]) -> String {
@@ -305,5 +367,84 @@ mod tests {
                 .is_err(),
             "nor an all-zero signature, which is the shape an attacker would try"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Rotation: a build trusts the current key and the next one
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn a_manifest_signed_by_either_trusted_key_verifies() {
+        use ed25519_dalek::Signer;
+        let current = test_keypair();
+        let next = keypair_from(TEST_SEED_NEXT_B64);
+        let trusted = [pubkey_b64(&current), pubkey_b64(&next)];
+        let trusted: Vec<&str> = trusted.iter().map(String::as_str).collect();
+
+        // Release N signs with the current key. This is the ordinary case.
+        let by_current = b64_encode(&current.sign(TEST_MANIFEST).to_bytes());
+        assert!(verify_with_any(&trusted, TEST_MANIFEST, &by_current).is_ok());
+
+        // Release N+1 signs with what was the next key. An install of release N has to
+        // accept this, or the rotation strands it on whatever it last installed.
+        let by_next = b64_encode(&next.sign(TEST_MANIFEST).to_bytes());
+        assert!(
+            verify_with_any(&trusted, TEST_MANIFEST, &by_next).is_ok(),
+            "the next key is what makes a rotation survivable"
+        );
+    }
+
+    #[test]
+    fn a_third_key_is_refused_and_the_error_says_how_many_were_tried() {
+        use ed25519_dalek::Signer;
+        let current = test_keypair();
+        let next = keypair_from(TEST_SEED_NEXT_B64);
+        let trusted = [pubkey_b64(&current), pubkey_b64(&next)];
+        let trusted: Vec<&str> = trusted.iter().map(String::as_str).collect();
+
+        // Someone else's key, which is the case that matters: whoever can rewrite the
+        // manifest cannot make an installed binary trust a key it was not built with.
+        let attacker = keypair_from("f39Ri29s9OTEHMiNIk74ZPe8AlhRHUNRaDFPtKPYIKk=");
+        let forged = b64_encode(&attacker.sign(TEST_MANIFEST).to_bytes());
+        let err = verify_with_any(&trusted, TEST_MANIFEST, &forged)
+            .expect_err("a signature from an untrusted key must be refused");
+        assert!(
+            err.contains('2'),
+            "the count tells an operator whether a rotation is in flight, got: {err}"
+        );
+        assert!(err.contains("Refusing to install"), "got: {err}");
+    }
+
+    #[test]
+    fn a_malformed_signature_is_not_reported_as_a_rotation_problem() {
+        let current = test_keypair();
+        let next = keypair_from(TEST_SEED_NEXT_B64);
+        let trusted = [pubkey_b64(&current), pubkey_b64(&next)];
+        let trusted: Vec<&str> = trusted.iter().map(String::as_str).collect();
+
+        // A truncated or garbled signature file is a different problem from a key
+        // mismatch, and saying "did not verify against any of 2 keys" would send whoever
+        // reads it hunting a rotation that is not happening.
+        for bad in ["", "!!!!", "YWJj"] {
+            let err = verify_with_any(&trusted, TEST_MANIFEST, bad)
+                .expect_err("a malformed signature must be refused");
+            assert!(
+                err.contains("signature is not"),
+                "expected a message about the signature itself for {bad:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_build_with_no_next_key_still_works_with_one() {
+        use ed25519_dalek::Signer;
+        let current = test_keypair();
+        let only = [pubkey_b64(&current)];
+        let only: Vec<&str> = only.iter().map(String::as_str).collect();
+        let sig = b64_encode(&current.sign(TEST_MANIFEST).to_bytes());
+        assert!(verify_with_any(&only, TEST_MANIFEST, &sig).is_ok());
+        // And `verify_with`, which install.rs and the relsign integration test use, is
+        // the same path with one key.
+        assert!(verify_with(only[0], TEST_MANIFEST, &sig).is_ok());
     }
 }
