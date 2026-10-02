@@ -674,6 +674,7 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
         }));
     }
     let skips = Arc::new(AtomicUsize::new(0));
+    let answered = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let race_budget = Arc::new(AtomicUsize::new(if race.is_some() {
         MAX_RACE_ENDPOINTS
     } else {
@@ -699,6 +700,22 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
     // a statement about how hard we were pushing, not about the endpoint.
     let mut starved: Vec<InjEndpoint> = Vec::new();
     let mut retrying = false;
+    /// Endpoints that answered nothing at all, from the start of the pass,
+    /// before the target is called down rather than busy.
+    ///
+    /// The signal is "not one baseline has succeeded anywhere", which is why it
+    /// can be this blunt. A target that is merely overloaded answers something
+    /// eventually, and the first endpoint that does disarms this for the rest
+    /// of the pass. A target that is down answers nothing, and every endpoint
+    /// after that costs four sites times three baseline attempts times the full
+    /// timeout, with the pacer serialising on top.
+    ///
+    /// Four. A full width of workers is eight, but with the baseline retries
+    /// skipped on a host that has never answered, four endpoints is already
+    /// dozens of requests and every one of them came back with nothing.
+    const DEAD_HOST_STREAK: u32 = 4;
+    let mut dead_streak: u32 = 0;
+    let mut ever_answered = false;
     let mut queue = params
         .endpoints
         .iter()
@@ -753,6 +770,7 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
                 race: race.clone(),
                 race_budget: Arc::clone(&race_budget),
                 skips: Arc::clone(&skips),
+                answered: Arc::clone(&answered),
                 xml_seen: Arc::clone(&xml_seen),
                 tx: tx.clone(),
             };
@@ -767,6 +785,49 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
                 done += 1;
                 if outcome.starved && !retrying {
                     starved.push(ep);
+                }
+                // A target that has answered nothing at all is down, not
+                // busy, and every endpoint after that is a full timeout per
+                // baseline attempt for an oracle that cannot run.
+                //
+                // Measured against juice-shop, which wedges under an injection
+                // pass and then answers nothing: 445 endpoints, every one
+                // starving, the engine at 0% CPU with every request waiting out
+                // its timeout. From the caller's side that is a hang.
+                //
+                // The first version of this only looked while `retrying`, on
+                // the reasoning that the single-file retry is where a fair
+                // chance has already been given. It never fired, because the
+                // pacer serialises after four consecutive failures and the
+                // wide first phase was already one request at a time: against
+                // 40 endpoints on a silent target the pass had not reached the
+                // retry after ten minutes. The signal has to be phase
+                // agnostic, so it is this: not one baseline has succeeded
+                // anywhere yet.
+                if !outcome.starved {
+                    ever_answered = true;
+                }
+                if !ever_answered {
+                    dead_streak += 1;
+                    if dead_streak >= DEAD_HOST_STREAK {
+                        let left = queue.len() + set.len();
+                        let _ = tx.send(json!({
+                            "type": "log",
+                            "message": format!(
+                                "the target is not answering: {DEAD_HOST_STREAK} endpoints in \
+                                 and not one baseline request has succeeded, so no oracle has \
+                                 been able to run. Abandoning this pass with {left} endpoint(s) \
+                                 untested rather than spending a timeout on each. They were not \
+                                 examined, so they are not evidence about the target. Check that \
+                                 the host is up and reachable from this node and run it again."
+                            ),
+                            "endpoints_untested": left,
+                            "reason": "target not answering",
+                        }));
+                        queue.clear();
+                        set.abort_all();
+                        break;
+                    }
                 }
             }
             Some(Err(_)) => done += 1,
@@ -1231,11 +1292,21 @@ struct EndpointCtx {
     /// by the same sentence repeated eighty-six times. Loud and repetitive is
     /// its own kind of silent.
     skips: Arc<AtomicUsize>,
+    /// Set the first time any baseline request anywhere on this host comes
+    /// back. Until it is set, the retries below are skipped: a target that has
+    /// never answered is not a target that is busy.
+    answered: Arc<std::sync::atomic::AtomicBool>,
     tx: mpsc::UnboundedSender<Value>,
 }
 
 /// How many skipped sites are named individually before they are counted.
 const SKIPS_SPELLED_OUT: usize = 5;
+
+/// Sites to try on one endpoint before giving up on it, while nothing on the
+/// host has answered anything yet. Four, because four sites that each went
+/// unanswered through the full timeout is already the answer, and the cap on
+/// sites per endpoint is sixteen.
+const SITES_BEFORE_GIVING_UP: usize = 4;
 
 /// What one endpoint's pass produced.
 struct EndpointOutcome {
@@ -1268,6 +1339,7 @@ async fn run_endpoint(mut ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome 
         race,
         race_budget,
         skips,
+        answered,
         tx,
     } = ctx;
     let want = |c: &str| classes.is_empty() || classes.iter().any(|x| x == c);
@@ -1466,13 +1538,25 @@ async fn run_endpoint(mut ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome 
         // Retry before giving up, and when it still fails, say which endpoint
         // was skipped instead of leaving a hole that reads as "nothing here".
         let mut baseline = None;
-        for attempt in 0..3 {
+        // Three attempts while the host is known to be alive, one while it has
+        // never answered anything. The retries are for a live target whose
+        // worker pool is momentarily exhausted, which is a real case and the
+        // reason they exist. They are waste on a target that is down, and the
+        // waste is what turns a pass into hours: every site pays three
+        // timeouts, three escalating sleeps and the pacer's delay on top, so
+        // one endpoint with sixteen sites costs minutes and an endpoint list
+        // costs an afternoon. Measured against a peer that accepts and never
+        // answers: one endpoint, one worker, a one-second timeout, and the pass
+        // had not produced a single outcome after 280 seconds.
+        let attempts = if answered.load(Ordering::Relaxed) { 3 } else { 1 };
+        for attempt in 0..attempts {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_millis(500 * attempt)).await;
             }
             if let Some(r) =
                 crate::probe::spent("baseline", send_site(&client, &site, &site.base_value)).await
             {
+                answered.store(true, Ordering::Relaxed);
                 // The site's own value, no payload: this is what "normal" costs
                 // here, and it is what the time-based oracles measure against.
                 crate::probe::observe_latency(&site.url, r.elapsed_ms);
@@ -1488,6 +1572,21 @@ async fn run_endpoint(mut ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome 
         }
         let Some(baseline) = baseline else {
             starved += 1;
+            // Stop walking this endpoint's sites once it is clear the host is
+            // not answering any of them. Sixteen sites each paying a full
+            // timeout is most of what a doomed endpoint costs, and the
+            // remaining twelve cannot say anything the first four did not.
+            // Only while nothing on the host has ever answered: on a live
+            // target a site that does not answer is about that site.
+            if !answered.load(Ordering::Relaxed) && starved >= SITES_BEFORE_GIVING_UP {
+                let _ = tx.send(json!({"type":"log","message": format!(
+                    "stopped testing {} {} after {starved} sites: the host has not answered a \
+                     single baseline request, so the rest of its sites would each cost a \
+                     timeout to learn the same thing.",
+                    ep.method, ep.url
+                )}));
+                break;
+            }
             let n = skips.fetch_add(1, Ordering::Relaxed);
             if n < SKIPS_SPELLED_OUT {
                 let _ = tx.send(json!({
