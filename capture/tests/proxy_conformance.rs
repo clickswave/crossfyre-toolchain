@@ -148,6 +148,32 @@ async fn read_reply<S: AsyncReadExt + Unpin>(s: &mut S) -> Vec<u8> {
     out
 }
 
+/// The single `Content-Length` the origin was given, as a number.
+///
+/// Parsed rather than matched as a substring, because a substring is how this check first
+/// went vacuous: `"content-length: 4096"` contains `"content-length: 4"`, so a test that
+/// asserted a four-byte body had a four-byte length passed while the wire said 4096.
+/// Panics on anything other than exactly one header, since two is itself the framing bug.
+fn declared_length(raw: &str) -> usize {
+    let values: Vec<&str> = raw
+        .lines()
+        .filter_map(|l| {
+            let (name, value) = l.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then_some(value.trim())
+        })
+        .collect();
+    assert_eq!(
+        values.len(),
+        1,
+        "expected exactly one content-length, saw {values:?} in:\n{raw}"
+    );
+    values[0]
+        .parse()
+        .unwrap_or_else(|_| panic!("content-length {:?} is not a number", values[0]))
+}
+
 fn ok_response(body: &str) -> Vec<u8> {
     format!(
         "HTTP/1.1 200 OK\r\nServer: conformance-origin\r\nContent-Length: {}\r\n\r\n{}",
@@ -744,4 +770,98 @@ async fn an_upstream_that_answers_with_http2_is_reported_not_hung() {
     );
     assert_eq!(olog.connections(), 1);
     assert!(f.events.try_recv().is_err());
+}
+
+/// An operator who edits a body by hand and leaves the original `Content-Length` behind.
+/// This is not a hypothetical: it is what happens every time someone changes a value in an
+/// intercept pane, and the header is the one field nobody remembers to recount.
+///
+/// The edited path forwards `ed.headers` verbatim, so whatever is asserted here is the
+/// contract the intercept UI has to meet. Measured before the fix: hyper honours an
+/// explicit `Content-Length` by truncating the body to it, so a 25-byte edit behind a
+/// stale `content-length: 5` left as five bytes. Not a smuggling primitive, since the
+/// remainder is dropped rather than sent, and the connection is new per request. Worse in
+/// one way: the request is well formed, the origin answers it, and the operator reads that
+/// answer as evidence about the body they typed.
+#[tokio::test]
+async fn an_edited_body_is_forwarded_with_a_length_that_matches_it() {
+    let (op, olog) = origin(ok_response("edited"));
+    let body = b"operator-made-this-longer".to_vec();
+    let (cfg, _seen) = gated(InterceptDecision::ForwardModified(EditedRequest {
+        method: "POST".into(),
+        path: "/edited".into(),
+        headers: vec![
+            ("host".into(), "origin.test".into()),
+            // Stale on purpose: the original body was 5 bytes, the new one is 25.
+            ("content-length".into(), "5".into()),
+        ],
+        body: body.clone(),
+    }));
+    let f = front(op, cfg, 1).await;
+
+    let (status, _) = plain_request(
+        f.port,
+        Request::builder()
+            .method("POST")
+            .uri("/original")
+            .header("host", "origin.test")
+            .body(Full::new(Bytes::from_static(b"short")))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let seen = String::from_utf8_lossy(&olog.first()).to_string();
+    assert_eq!(
+        declared_length(&seen),
+        body.len(),
+        "the forwarded length describes the forwarded body, got:\n{seen}"
+    );
+    assert!(
+        seen.ends_with(&String::from_utf8_lossy(&body).to_string()),
+        "the whole edited body arrived, got:\n{seen}"
+    );
+}
+
+/// The other direction of the same mistake: a stale length LARGER than the edited body.
+/// On the wire that is `content-length: 4096` followed by four bytes, which leaves a real
+/// origin waiting for 4092 more until its own read timeout.
+///
+/// The origin in this file is deliberately lenient and answers once the request stops
+/// arriving, so what this asserts is the wire and not how any particular server reacts to
+/// it. The assertion is the declared length, for that reason.
+#[tokio::test]
+async fn an_edited_body_shorter_than_the_stale_length_still_arrives() {
+    let (op, olog) = origin(ok_response("edited"));
+    let body = b"tiny".to_vec();
+    let (cfg, _seen) = gated(InterceptDecision::ForwardModified(EditedRequest {
+        method: "POST".into(),
+        path: "/edited".into(),
+        headers: vec![
+            ("host".into(), "origin.test".into()),
+            ("content-length".into(), "4096".into()),
+        ],
+        body: body.clone(),
+    }));
+    let f = front(op, cfg, 1).await;
+
+    let (status, _) = plain_request(
+        f.port,
+        Request::builder()
+            .method("POST")
+            .uri("/original")
+            .header("host", "origin.test")
+            .body(Full::new(Bytes::from_static(b"x")))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200, "the exchange completed rather than stalling");
+
+    let seen = String::from_utf8_lossy(&olog.first()).to_string();
+    assert_eq!(
+        declared_length(&seen),
+        body.len(),
+        "the forwarded length is the body's, not the operator's leftover, got:\n{seen}"
+    );
+    assert!(seen.ends_with("tiny"), "got:\n{seen}");
 }

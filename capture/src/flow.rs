@@ -12,7 +12,7 @@ use std::sync::{Arc, LazyLock};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
-use hyper::header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, HOST, SERVER};
+use hyper::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, SERVER};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
@@ -336,8 +336,28 @@ async fn forward(
             .method(ed.method.as_str())
             .uri(ed.path.as_str());
         for (k, v) in &ed.headers {
+            // The operator's framing headers are dropped and recomputed below, because
+            // an intercept pane is exactly where a body changes and its length does not.
+            // Both directions were measured, and neither reports anything: a 25-byte edit
+            // behind a stale `content-length: 5` reached the origin as five bytes, hyper
+            // having truncated it to the length it was given, and a 4-byte edit behind a
+            // stale 4096 went out declaring 4096, leaving the origin waiting for the rest.
+            //
+            // Reachable, not hypothetical. `mobile/rust/src/intercept.rs` builds the
+            // edited request's headers from the captured request's own `req_headers`,
+            // which carry its original Content-Length, and pairs them with the body the
+            // operator retyped. So every length-changing edit was silently wrong, and the
+            // first case is the worse one: the request is well formed, the origin answers
+            // it, and that answer gets read as evidence about a body nobody sent.
+            if k.eq_ignore_ascii_case("content-length")
+                || k.eq_ignore_ascii_case("transfer-encoding")
+            {
+                continue;
+            }
             b = b.header(k.as_str(), v.as_str());
         }
+        // The one length that is true by construction.
+        b = b.header(CONTENT_LENGTH, ed.body.len());
         b.body(Full::new(Bytes::from(ed.body.clone())))?
     } else {
         let mut b = Request::builder()
