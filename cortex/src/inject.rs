@@ -3877,6 +3877,69 @@ fn executes_in_browser(r: &Resp) -> bool {
     )
 }
 
+/// Where a reflected value landed, as far as an HTML parser is concerned.
+///
+/// This is the discriminator the XSS oracle was missing, and the reason a
+/// bare-attribute payload was ruled out rather than written. A string like
+/// `onmouseover=alert(1)` reflects verbatim out of any app that encodes `<`
+/// and `>`, so matching it alone reports every echoed value in an error page.
+/// Asking *where* it landed separates the two: measured against xssmaze, 72
+/// endpoints reflect it outside any start tag and are not findings, and 33
+/// reflect it into a tag's attribute area and are.
+#[derive(Debug, PartialEq, Eq)]
+enum Spot {
+    /// Not inside an element start tag. Text, a comment, an attribute of a tag
+    /// that has already closed: nothing an injected attribute can reach.
+    Elsewhere,
+    /// Inside a start tag with no quote open, so an injected `onX=` is a new
+    /// attribute on that element.
+    Unquoted,
+    /// Inside an attribute value opened by this quote. An injected `onX=` is
+    /// more text in the value and does nothing; closing the quote first is
+    /// what makes it a handler, and a target that encodes the quote has
+    /// nothing to exploit.
+    Quoted(char),
+}
+
+fn attr_spot(body: &str, idx: usize) -> Spot {
+    if idx > body.len() || !body.is_char_boundary(idx) {
+        return Spot::Elsewhere;
+    }
+    let head = &body[..idx];
+    let Some(lt) = head.rfind('<') else {
+        return Spot::Elsewhere;
+    };
+    // A `>` after the last `<` means that tag already closed.
+    if head.rfind('>').is_some_and(|gt| gt > lt) {
+        return Spot::Elsewhere;
+    }
+    // `<` has to open an element, so `<!--`, `</` and a stray `<` in text are
+    // all Elsewhere. An element name starts with an ASCII letter.
+    if !body[lt..]
+        .chars()
+        .nth(1)
+        .is_some_and(|c| c.is_ascii_alphabetic())
+    {
+        return Spot::Elsewhere;
+    }
+    // Track which quote is open, so an inner quote inside a double-quoted
+    // handler is not mistaken for the attribute's own: in
+    // `<div onclick="handle('VALUE` the attribute quote is the double, and
+    // injecting a single one closes the JS string without leaving the value.
+    let mut open: Option<char> = None;
+    for c in body[lt..idx].chars() {
+        match open {
+            None if c == '"' || c == '\'' => open = Some(c),
+            Some(q) if c == q => open = None,
+            _ => {}
+        }
+    }
+    match open {
+        Some(q) => Spot::Quoted(q),
+        None => Spot::Unquoted,
+    }
+}
+
 /// `needle` in `hay`, ignoring case, without lowercasing a whole response body
 /// unless it has to. The exact check is the common path and allocates nothing;
 /// the fallback only runs where a target transformed what it echoed.
@@ -3885,6 +3948,80 @@ fn contains_ci(hay: &str, needle: &str) -> bool {
         || hay
             .to_ascii_lowercase()
             .contains(&needle.to_ascii_lowercase())
+}
+
+/// Reflected XSS where `<` is unavailable but the value lands inside a tag.
+///
+/// Tried only after every tag payload has failed, so it costs one request on
+/// the endpoints that need it and none anywhere else. This is the whole
+/// inattr, charlimit, encodingedge and sanitizer-edge shape: angle brackets
+/// stripped or encoded, quotes left alone, the value sitting in
+/// `<input value="HERE">`. No tag can be opened and the endpoint is still
+/// exploitable, which is why 33 of them read as detection failures.
+///
+/// Sound for the same reason the tag payloads are. There, the app's encoding
+/// of `<` and `>` is the discriminator. Here it is the app's encoding of the
+/// attribute's own quote, plus the position: the detector has to come back
+/// inside a start tag with no quote still open, which is the definition of a
+/// new attribute on that element. An app that encodes `"` cannot produce it,
+/// and 3 of xssmaze's endpoints do exactly that and are correctly silent.
+async fn probe_xss_attribute(
+    client: &Client,
+    site: &Site,
+    marker: &str,
+    plain: &Resp,
+) -> Option<Value> {
+    if !executes_in_browser(plain) || csp_admits_no_script(plain) {
+        return None;
+    }
+    // Where the plain marker landed, which is where a payload will land. Free:
+    // this is the baseline response the caller already has.
+    let idx = plain.body.find(marker)?;
+    // `onmouseover` needs a mouse, and that is a property of this payload
+    // rather than of the bug. A handler attribute on an attacker-controlled
+    // element is the finding; which event fires it is the report's problem.
+    let (payload, detector, ctx) = match attr_spot(&plain.body, idx) {
+        Spot::Elsewhere => return None,
+        Spot::Unquoted => (
+            format!("{marker} onmouseover=alert({marker}) x"),
+            format!(" onmouseover=alert({marker})"),
+            "an unquoted attribute slot",
+        ),
+        Spot::Quoted(q) => (
+            format!("{marker}{q} onmouseover=alert({marker}) x"),
+            format!("{q} onmouseover=alert({marker})"),
+            "a quoted attribute value",
+        ),
+    };
+
+    let landed = |body: &str| -> bool {
+        body.find(detector.as_str())
+            // One past the detector's first character, which for the quoted
+            // case is the quote that closes the value. Outside it, the slot is
+            // the tag's attribute area or this is not a handler.
+            .is_some_and(|j| attr_spot(body, j + 1) == Spot::Unquoted)
+    };
+
+    let r = send_site(client, site, &payload).await?;
+    if !(executes_in_browser(&r) && !csp_admits_no_script(&r)) || !landed(&r.body) {
+        return None;
+    }
+    let again = send_site(client, site, &payload).await?;
+    if !landed(&again.body) {
+        return None;
+    }
+    Some(finding(
+        "xss",
+        "Reflected cross-site scripting (XSS)",
+        "high",
+        site,
+        format!(
+            "A payload injected into the {} was reflected into {} with the quoting intact (`{}` appears raw), so it closes out of the value and becomes an event-handler attribute on that element. No `<` is needed: the tag is already there and the injected value adds an attribute to it.",
+            site.where_label(),
+            ctx,
+            detector.trim()
+        ),
+    ))
 }
 
 async fn probe_xss(client: &Client, site: &Site) -> Option<Value> {
@@ -4000,7 +4137,9 @@ async fn probe_xss(client: &Client, site: &Site) -> Option<Value> {
             }
         }
     }
-    None
+    // Every tag payload failed, so either the app encodes `<` or it filters
+    // tag names. If the value sits inside a tag, it can still carry a handler.
+    probe_xss_attribute(client, site, m, &plain).await
 }
 
 // ---------------------------------------------------------------- LFI / traversal
@@ -4819,6 +4958,60 @@ mod hint_tests {
                 .map(|v| vec![("content-type".to_string(), v.to_string())])
                 .unwrap_or_default(),
         }
+    }
+
+    #[test]
+    fn where_a_reflection_landed_decides_whether_it_is_a_handler() {
+        let at = |hay: &str| {
+            let i = hay.find("HERE").expect("marker");
+            attr_spot(hay, i)
+        };
+        // Not in a tag. These are the ones a bare `onmouseover=` payload
+        // reports without the position check, and 72 of xssmaze's endpoints
+        // are this shape: an echoed value in text.
+        for hay in [
+            "<div>HERE</div>",
+            "<p class=\"a\">x</p> HERE",
+            "plain HERE text",
+            "<!-- HERE -->",
+            "</div HERE",
+            "<3 HERE",
+            "HERE",
+        ] {
+            assert_eq!(at(hay), Spot::Elsewhere, "{hay}");
+        }
+        // In the attribute area with nothing open: an injected onX= is a new
+        // attribute on that element.
+        for hay in [
+            "<div HERE>",
+            "<input type=text HERE >",
+            "<a href=/x HERE",
+            "<img src=a alt=b HERE",
+            // A closed value before the slot leaves nothing open.
+            "<div class=\"a\" HERE>",
+            "<div class='a' HERE>",
+        ] {
+            assert_eq!(at(hay), Spot::Unquoted, "{hay}");
+        }
+        // Inside a value: an injected onX= is more text in the value, and the
+        // quote has to be closed first.
+        assert_eq!(at("<input value=\"HERE\">"), Spot::Quoted('"'));
+        assert_eq!(at("<div class='HERE'>"), Spot::Quoted('\''));
+        assert_eq!(at("<meta content=\"a HERE b\">"), Spot::Quoted('"'));
+        // The attribute's own quote, not an inner one. In
+        // `<div onclick="handle('HERE` a single quote closes the JS string and
+        // leaves the value, so the attribute quote is the double. xssmaze's
+        // edge-level4 and scriptgadget-level5 are exactly this.
+        assert_eq!(at("<div onclick=\"handle('HERE')\">"), Spot::Quoted('"'));
+        assert_eq!(at("<div onclick='handle(\"HERE\")'>"), Spot::Quoted('\''));
+        // A multi-byte character before the slot must not panic or shift the
+        // answer, since the walk is over bytes.
+        assert_eq!(at("<div title=\"café HERE\">"), Spot::Quoted('"'));
+        assert_eq!(at("<div>café HERE</div>"), Spot::Elsewhere);
+        // An index that is not a character boundary, or past the end, is not a
+        // position in a tag.
+        assert_eq!(attr_spot("<div title=\"é\">", 13), Spot::Elsewhere);
+        assert_eq!(attr_spot("<div ", 99), Spot::Elsewhere);
     }
 
     #[test]
