@@ -15,6 +15,7 @@ pub mod db;
 pub mod doctor;
 pub mod install;
 pub mod oast;
+pub mod release_sig;
 pub mod service;
 pub mod status;
 pub mod sudo_user;

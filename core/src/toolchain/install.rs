@@ -1,8 +1,15 @@
 // Download, verify, and install extension binaries (and the crossfyre binary
-// itself) from the release CDN. Every artifact is resolved through a signed-
-// by-checksum manifest: manifest.json maps component -> version -> per-
-// platform artifact file + SHA256. Nothing is installed without a checksum
-// match.
+// itself) from the release CDN. Every artifact is resolved through manifest.json,
+// which maps component -> version -> per-platform artifact file + SHA256, and
+// nothing is installed without a checksum match.
+//
+// The checksum proves the artifact matches what the manifest says. It proves
+// nothing about the manifest, so in a build carrying CROSSFYRE_MANIFEST_PUBKEY
+// the manifest itself must also carry a valid ed25519 signature. See
+// `release_sig` for why the key's presence is the switch and why that makes the
+// rollout safe. This comment used to describe the file as a "signed-by-checksum
+// manifest", which conflated the two and read as a stronger guarantee than the
+// code gave.
 
 use super::config::{ext_bin_path, ext_file_name, get_bin_dir};
 use super::service;
@@ -89,11 +96,45 @@ pub async fn fetch_manifest() -> Result<Manifest, Box<dyn std::error::Error>> {
         )
         .into());
     }
-    let manifest: Manifest = resp
-        .json()
+    // The BYTES, not a parsed value: the signature is over what was served, and
+    // re-serialising a parsed manifest reorders keys and rewrites whitespace.
+    let body = resp
+        .bytes()
         .await
-        .map_err(|e| format!("release manifest is malformed: {e}"))?;
+        .map_err(|e| format!("could not read release manifest body: {e}"))?;
+
+    if super::release_sig::required() {
+        let sig_url = format!("{url}{}", super::release_sig::SIG_SUFFIX);
+        let sig = fetch_signature(&sig_url).await?;
+        super::release_sig::verify(&body, &sig)?;
+    }
+
+    let manifest: Manifest =
+        serde_json::from_slice(&body).map_err(|e| format!("release manifest is malformed: {e}"))?;
     Ok(manifest)
+}
+
+/// Fetch the detached signature. Only called by a build that requires one, so a 404 here
+/// is a release-pipeline failure and the message says so rather than reading as a
+/// network problem.
+async fn fetch_signature(url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let resp = reqwest::get(url)
+        .await
+        .map_err(|e| format!("could not fetch the release manifest signature ({url}): {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "this build requires a signed release manifest and {} returned {}. Nothing will \
+             be installed. If you built this binary yourself, build without \
+             CROSSFYRE_MANIFEST_PUBKEY to use an unsigned manifest.",
+            url,
+            resp.status()
+        )
+        .into());
+    }
+    Ok(resp
+        .text()
+        .await
+        .map_err(|e| format!("could not read the release manifest signature: {e}"))?)
 }
 
 fn resolve_artifact<'m>(
