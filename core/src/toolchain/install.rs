@@ -220,17 +220,37 @@ fn extract_zip(zip_path: &Path, extract_dir: &Path) -> Result<(), Box<dyn std::e
 }
 
 /// Atomically place `src` at `dest` (write-next-to + rename), 0755 on unix.
+///
+/// The mode is set on the temporary file BEFORE the rename, which is what makes the claim
+/// in that first line true. Doing it after left a window in which `dest` existed carrying
+/// whatever mode `fs::copy` brought over from the archive, and an artifact unpacked as
+/// 0644 is the normal case rather than a strange one. A process killed in that window, or
+/// an update interrupted by a reboot, leaves a binary that is installed, current, and not
+/// executable, and the next run reports it as missing rather than as broken.
 fn place_binary(src: &Path, dest: &Path) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp_path = dest.with_extension("new");
+    // Appended, not `with_extension`, which REPLACES whatever follows the last dot:
+    // a component placed as `cortex-0.1.2` would stage itself at `cortex-0.1.new` and
+    // collide with any sibling that differs only after that dot.
+    let tmp_path = match dest.file_name() {
+        Some(name) => dest.with_file_name(format!("{}.new", name.to_string_lossy())),
+        None => return Err(format!("{} is not a file path", dest.display()).into()),
+    };
     fs::copy(src, &tmp_path)?;
-    fs::rename(&tmp_path, dest)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(dest, fs::Permissions::from_mode(0o755))?;
+        if let Err(e) = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o755)) {
+            // Leave nothing half-staged behind for a later run to trip over.
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
+    }
+    if let Err(e) = fs::rename(&tmp_path, dest) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e.into());
     }
     Ok(())
 }
@@ -850,6 +870,116 @@ mod tests {
         assert!(
             !key.contains("macos"),
             "macos must be spelled darwin in a manifest key, got {key}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Placing a binary
+    // ---------------------------------------------------------------------------
+
+    /// A scratch directory under the system temp dir, removed on drop.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!(
+                "cfx-install-test-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = fs::remove_dir_all(&p);
+            fs::create_dir_all(&p).expect("scratch dir");
+            Self(p)
+        }
+        fn join(&self, n: &str) -> std::path::PathBuf {
+            self.0.join(n)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    fn mode_of(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(p).expect("metadata").permissions().mode() & 0o777
+    }
+
+    /// Note what this does and does not check. It pins the end state, that an artifact
+    /// unpacked 0644 is installed 0755, which is worth a regression test on its own. It
+    /// does NOT check that the mode is set before the rename rather than after, because
+    /// both orders reach the same end state and the difference is only visible to a
+    /// process that dies inside the window. That reasoning lives on `place_binary`.
+    #[test]
+    fn a_placed_binary_is_executable_even_when_the_archive_was_not() {
+        let s = Scratch::new("mode");
+        let src = s.join("mach-unpacked");
+        fs::write(&src, b"#!/bin/sh\necho hi\n").expect("write src");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // What an artifact unpacked out of a zip normally looks like.
+            fs::set_permissions(&src, fs::Permissions::from_mode(0o644)).expect("chmod src");
+        }
+
+        let dest = s.join("bin").join("mach");
+        place_binary(&src, &dest).expect("place");
+        assert!(dest.exists(), "the parent directory is created");
+        #[cfg(unix)]
+        assert_eq!(mode_of(&dest), 0o755, "an 0644 artifact is installed 0755");
+        assert_eq!(
+            fs::read(&dest).expect("read"),
+            fs::read(&src).expect("read")
+        );
+        assert!(
+            !s.join("bin").join("mach.new").exists(),
+            "nothing is left staged next to the destination"
+        );
+    }
+
+    #[test]
+    fn placing_over_an_existing_binary_replaces_it() {
+        let s = Scratch::new("replace");
+        let dest = s.join("mach");
+        fs::write(&dest, b"the-old-one").expect("write old");
+        let src = s.join("new-mach");
+        fs::write(&src, b"the-new-one").expect("write new");
+
+        place_binary(&src, &dest).expect("place");
+        assert_eq!(fs::read(&dest).expect("read"), b"the-new-one");
+        #[cfg(unix)]
+        assert_eq!(mode_of(&dest), 0o755);
+    }
+
+    #[test]
+    fn staging_appends_to_the_name_instead_of_replacing_its_extension() {
+        // `with_extension("new")` does not append, it REPLACES whatever follows the last
+        // dot, so placing `cortex-0.1.2` used to stage through `cortex-0.1.new`. That is
+        // a path belonging to something else.
+        //
+        // The oracle is a bystander: a real file already sitting at the old staging name.
+        // Staging through it copies over the bystander and then renames it away, so the
+        // file is destroyed. Asserting the placement succeeded would not have caught
+        // this, and did not: an earlier version of this test passed against the unfixed
+        // code because both placements still worked.
+        let s = Scratch::new("stage");
+        let src = s.join("payload");
+        fs::write(&src, b"x").expect("write src");
+
+        let bystander = s.join("cortex-0.1.new");
+        fs::write(&bystander, b"somebody-elses-file").expect("write bystander");
+
+        let dest = s.join("cortex-0.1.2");
+        place_binary(&src, &dest).expect("place");
+
+        assert!(dest.exists(), "the binary was placed");
+        assert_eq!(
+            fs::read(&bystander).ok().as_deref(),
+            Some(&b"somebody-elses-file"[..]),
+            "staging must not go through a path that belongs to another name"
         );
     }
 }
