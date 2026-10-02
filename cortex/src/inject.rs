@@ -1548,7 +1548,11 @@ async fn run_endpoint(mut ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome 
         // costs an afternoon. Measured against a peer that accepts and never
         // answers: one endpoint, one worker, a one-second timeout, and the pass
         // had not produced a single outcome after 280 seconds.
-        let attempts = if answered.load(Ordering::Relaxed) { 3 } else { 1 };
+        let attempts = if answered.load(Ordering::Relaxed) {
+            3
+        } else {
+            1
+        };
         for attempt in 0..attempts {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_millis(500 * attempt)).await;
@@ -3415,9 +3419,7 @@ fn client_template_will_evaluate(body: &str, at: usize) -> bool {
     }
     // The scope marker has to come before the reflection, or the value landed
     // outside the region that gets compiled.
-    TEMPLATE_SCOPE
-        .find(body)
-        .is_some_and(|mm| mm.start() < at)
+    TEMPLATE_SCOPE.find(body).is_some_and(|mm| mm.start() < at)
 }
 
 async fn probe_ssti(client: &Client, site: &Site) -> Option<Value> {
@@ -4150,6 +4152,21 @@ fn attr_spot(body: &str, idx: usize) -> Spot {
     }
 }
 
+/// Would a payload reflected into this response actually run in a browser?
+///
+/// Two conditions, and both have cost a false positive in the past. The response has to
+/// be something a browser parses as a document or loads as a script, which is
+/// `executes_in_browser`. And its own Content-Security-Policy has to admit a script
+/// source at all, which is `csp_admits_no_script` inverted.
+///
+/// Extracted because it was written out in five places in three different arrangements,
+/// including two spelled `!(a && !b)`, which clippy flagged and was right to: a negated
+/// conjunction with an inner negation is a sentence nobody reads correctly twice. Naming
+/// it also means the next oracle that needs the question asks it the same way.
+fn runs_in_browser(r: &Resp) -> bool {
+    executes_in_browser(r) && !csp_admits_no_script(r)
+}
+
 /// `needle` in `hay`, ignoring case, without lowercasing a whole response body
 /// unless it has to. The exact check is the common path and allocates nothing;
 /// the fallback only runs where a target transformed what it echoed.
@@ -4225,9 +4242,7 @@ async fn persisted(client: &Client, read_url: &str, detector: &str, marker: &str
         if sets_cookie_with(&r, marker) {
             return false;
         }
-        if !(executes_in_browser(&r) && !csp_admits_no_script(&r))
-            || !contains_ci(&r.body, detector)
-        {
+        if !runs_in_browser(&r) || !contains_ci(&r.body, detector) {
             return false;
         }
     }
@@ -4271,9 +4286,7 @@ async fn probe_xss_encoded(
             let Some(r) = send_site(client, site, &wire).await else {
                 continue;
             };
-            if !(executes_in_browser(&r) && !csp_admits_no_script(&r))
-                || !contains_ci(&r.body, detector)
-            {
+            if !runs_in_browser(&r) || !contains_ci(&r.body, detector) {
                 continue;
             }
             let again = send_site(client, site, &wire).await;
@@ -4322,7 +4335,7 @@ async fn probe_xss_attribute(
     marker: &str,
     plain: &Resp,
 ) -> Option<Value> {
-    if !executes_in_browser(plain) || csp_admits_no_script(plain) {
+    if !runs_in_browser(plain) {
         return None;
     }
     // Where the plain marker landed, which is where a payload will land. Free:
@@ -4354,7 +4367,7 @@ async fn probe_xss_attribute(
     };
 
     let r = send_site(client, site, &payload).await?;
-    if !(executes_in_browser(&r) && !csp_admits_no_script(&r)) || !landed(&r.body) {
+    if !runs_in_browser(&r) || !landed(&r.body) {
         return None;
     }
     let again = send_site(client, site, &payload).await?;
@@ -4497,9 +4510,7 @@ async fn probe_xss(client: &Client, site: &Site) -> Option<Value> {
         // is not an XSS. Checked here rather than before the payloads, because
         // the content type of the reflecting response is the one that matters
         // and an endpoint can answer differently under injection.
-        let runnable = r
-            .as_ref()
-            .is_some_and(|x| executes_in_browser(x) && !csp_admits_no_script(x));
+        let runnable = r.as_ref().is_some_and(runs_in_browser);
         if reflected && runnable {
             // The same observation is two different findings. A detector in
             // the response to the request that carried it is reflected XSS;
@@ -5626,8 +5637,10 @@ mod hint_tests {
         //
         // A hand check with curl said these four were false positives. They
         // are not, and this is the test that would have said so first.
-        assert!(!executes_in_browser(&resp_with(Some("text/plain;charset=UTF-8"))));
-        assert!(executes_in_browser(&resp_with(Some("text/html;charset=UTF-8"))));
+        let plain = resp_with(Some("text/plain;charset=UTF-8"));
+        let html = resp_with(Some("text/html;charset=UTF-8"));
+        assert!(!executes_in_browser(&plain));
+        assert!(executes_in_browser(&html));
     }
 
     #[test]
@@ -5638,10 +5651,20 @@ mod hint_tests {
         // a denylist was safe by accident: a verb nobody had listed could not
         // reach the target as itself. Now it can, so anything outside the
         // read-only set waits for `test_writes`.
+        // Six WebDAV verbs, one cache verb that drops objects, and three vendor
+        // verbs seen in the wild. Named in a sentence rather than in trailing
+        // comments because rustfmt breaks a commented array one item per line.
         for m in [
-            "MOVE", "COPY", "LOCK", "UNLOCK", "MKCOL", "PROPPATCH", // WebDAV
-            "PURGE",     // Varnish and friends: drops cached objects
-            "WIPE", "RESET", "TRUNCATE", // vendor verbs, seen in the wild
+            "MOVE",
+            "COPY",
+            "LOCK",
+            "UNLOCK",
+            "MKCOL",
+            "PROPPATCH",
+            "PURGE",
+            "WIPE",
+            "RESET",
+            "TRUNCATE",
         ] {
             assert!(
                 destroys_a_resource(m),
