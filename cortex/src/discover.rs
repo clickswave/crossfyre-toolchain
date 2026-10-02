@@ -164,7 +164,7 @@ pub async fn run(params: DiscoverParams, tx: mpsc::UnboundedSender<Value>) {
                 // and it gives the injector an injection point to work. Without
                 // this the endpoint looks parameterless and is never tested.
                 if let Some(cand) = QUERY_WORDLIST.first() {
-                    let u = render_query_probe(&ep.url, &known, cand, QUERY_MARKER);
+                    let u = render_query_probe(&ep.url, &known, cand, &candidate_marker(cand));
                     let evidence = probe::send(&client, &orig, &u, None)
                         .await
                         .map(|r| r.body)
@@ -181,9 +181,12 @@ pub async fn run(params: DiscoverParams, tx: mpsc::UnboundedSender<Value>) {
                     found += 1;
                 }
             }
-            if let QueryCal::Stable(base) = cal {
+            if let QueryCal::Stable(mut base) = cal {
                 let mut new_here = 0usize;
                 let mut hits: Vec<(String, String)> = Vec::new();
+                // Every marker sent on this endpoint, so our own footprint can
+                // be subtracted from the control comparison at the end.
+                let mut sent: Vec<String> = Vec::new();
                 for cand in QUERY_WORDLIST {
                     if new_here >= MAX_NEW_PER_EP {
                         break;
@@ -191,15 +194,28 @@ pub async fn run(params: DiscoverParams, tx: mpsc::UnboundedSender<Value>) {
                     if known.contains(*cand) {
                         continue;
                     }
-                    let u = render_query_probe(&ep.url, &known, cand, QUERY_MARKER);
+                    let mark = candidate_marker(cand);
+                    let u = render_query_probe(&ep.url, &known, cand, &mark);
+                    sent.push(mark.clone());
                     let Some(r) = probe::send(&client, &orig, &u, None).await else {
                         continue;
                     };
-                    // The marker coming back is the strong signal: the endpoint
-                    // took the value somewhere. Status and length deviation stay
-                    // as the fallback for a parameter that changes behaviour
-                    // without echoing, which is most of them.
-                    let took_it = r.body.contains(QUERY_MARKER) || accepted(&base, &r, cand);
+                    // This candidate's own marker coming back is the strong
+                    // signal: the endpoint took this name's value somewhere.
+                    // Status and length deviation stay as the fallback for a
+                    // parameter that changes behaviour without echoing, which
+                    // is most of them, and that comparison is made against the
+                    // body with our own markers taken out so an accumulating
+                    // store cannot supply the deviation.
+                    let clean = Resp {
+                        status: r.status,
+                        body: without_markers(&r.body, &sent),
+                        elapsed_ms: r.elapsed_ms,
+                        location: r.location.clone(),
+                        headers: r.headers.clone(),
+                    };
+                    let took_it = r.body.contains(mark.as_str())
+                        || accepted(&base, &clean, cand);
                     if !took_it {
                         continue;
                     }
@@ -207,7 +223,16 @@ pub async fn run(params: DiscoverParams, tx: mpsc::UnboundedSender<Value>) {
                     // same deviation, so one flaky response is not a parameter.
                     let same = probe::send(&client, &orig, &u, None)
                         .await
-                        .map(|x| x.body.contains(QUERY_MARKER) || accepted(&base, &x, cand))
+                        .map(|x| {
+                            let c = Resp {
+                                status: x.status,
+                                body: without_markers(&x.body, &sent),
+                                elapsed_ms: x.elapsed_ms,
+                                location: x.location.clone(),
+                                headers: x.headers.clone(),
+                            };
+                            x.body.contains(mark.as_str()) || accepted(&base, &c, cand)
+                        })
                         .unwrap_or(false);
                     if !same {
                         continue;
@@ -216,6 +241,39 @@ pub async fn run(params: DiscoverParams, tx: mpsc::UnboundedSender<Value>) {
                     // is trustworthy is only knowable once the pass is over.
                     hits.push(((*cand).to_string(), r.body.clone()));
                     new_here += 1;
+
+                    // Re-baseline, because this hit may have changed the
+                    // endpoint. Stripping our markers out of the comparison is
+                    // not enough on an endpoint that stores: VulnerableApp's
+                    // PersistentXSSInHTMLTag levels wrap each stored value in
+                    // its own `<div id="comments">`, so the body keeps growing
+                    // by the wrapper even with the markers removed, and every
+                    // candidate after the first hit deviates from a stale
+                    // baseline for a reason that has nothing to do with it.
+                    // 40 reported parameters on an endpoint that has one, and
+                    // then the whole pass discarded.
+                    //
+                    // Measuring each candidate against a control taken after
+                    // the last thing that changed the endpoint is what makes
+                    // the comparison mean anything. It costs one request per
+                    // hit, not per candidate, because nothing needs
+                    // re-baselining until something has actually landed.
+                    let rebase_mark = candidate_marker("cfxjunkparamdd");
+                    if let Some(c) = probe::send(
+                        &client,
+                        &orig,
+                        &render_query_probe(&ep.url, &known, "cfxjunkparamdd", &rebase_mark),
+                        None,
+                    )
+                    .await
+                    {
+                        let clean = without_markers(&c.body, &sent);
+                        base = Baseline {
+                            status: c.status,
+                            len: clean.len(),
+                            body: clean,
+                        };
+                    }
                 }
 
                 // Re-probe the control. A baseline is captured once, and that is
@@ -227,17 +285,27 @@ pub async fn run(params: DiscoverParams, tx: mpsc::UnboundedSender<Value>) {
                 // endpoint whose name is not among them. If the control has moved,
                 // the pass changed the endpoint and nothing it found can be
                 // separated from that, so it is discarded rather than reported.
+                let ctrl_mark = candidate_marker("cfxjunkparamcc");
                 let drifted = probe::send(
                     &client,
                     &orig,
-                    &render_query_probe(&ep.url, &known, "cfxjunkparamcc", QUERY_MARKER),
+                    &render_query_probe(&ep.url, &known, "cfxjunkparamcc", &ctrl_mark),
                     None,
                 )
                 .await
                 .map(|x| {
+                    // Our own markers come out before the length is compared.
+                    // They are the whole reason this endpoint looks different
+                    // from its baseline: discovery stored a value under the one
+                    // name that works, and every response since has carried it.
+                    // Subtracting them is the difference between finding the
+                    // parameter and discarding the pass, and it costs nothing
+                    // in strictness, because an endpoint that moved for any
+                    // other reason still trips the comparison.
+                    let clean = without_markers(&x.body, &sent);
                     x.status != base.status
-                        || (x.body.len() as i64 - base.len as i64).abs() > len_delta_floor()
-                        || x.body.contains(QUERY_MARKER)
+                        || (clean.len() as i64 - base.len as i64).abs() > len_delta_floor()
+                        || x.body.contains(ctrl_mark.as_str())
                 })
                 .unwrap_or(true);
 
@@ -523,6 +591,50 @@ fn discovery_event(
 /// accident. That is what the body path needs its baseline control for.
 const QUERY_MARKER: &str = "cfxprm7m4zz";
 
+/// A marker unique to one candidate name.
+///
+/// One shared marker is enough right up to the point where the endpoint keeps
+/// what it is sent. VulnerableApp's PersistentXSSInHTMLTag levels take a
+/// `comment` parameter, store its value and serve the accumulated store on
+/// every later response, so with a shared marker every candidate probed after
+/// `comment` finds the marker in the body and looks like a hit: 22 of 30 names
+/// on an endpoint that has one. The marker is no longer evidence about the
+/// candidate, it is evidence that some earlier candidate worked.
+///
+/// A marker derived from the candidate's own name fixes that outright. Only
+/// the probe that sent it can produce it, so an accumulating store cannot
+/// manufacture a hit for a name the endpoint has never heard of, and the same
+/// token is what lets the control re-probe below tell our own footprint apart
+/// from the endpoint drifting on its own.
+///
+/// FNV-1a, which is not a security property: it needs to be stable across
+/// runs so a reported parameter is reproducible, and distinct across a
+/// wordlist of a hundred entries.
+fn candidate_marker(cand: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in cand.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("{QUERY_MARKER}{h:012x}")
+}
+
+/// The body with every marker this pass sent removed.
+///
+/// What is left is the endpoint's own content, so a length comparison against
+/// a baseline captured before the pass measures the endpoint changing rather
+/// than measuring the probes. Without this, one stored value makes every
+/// subsequent length deviation meaningless and the whole pass gets discarded.
+fn without_markers(body: &str, sent: &[String]) -> String {
+    let mut out = body.to_string();
+    for m in sent {
+        if out.contains(m.as_str()) {
+            out = out.replace(m.as_str(), "");
+        }
+    }
+    out
+}
+
 fn render_query_probe(url: &str, known: &HashSet<String>, candidate: &str, value: &str) -> String {
     let mut out = String::from(url);
     let mut sep = if url.contains('?') { '&' } else { '?' };
@@ -571,10 +683,18 @@ async fn calibrate_query(
     url: &str,
     known: &HashSet<String>,
 ) -> QueryCal {
+    // Each junk name carries its own marker, and the check below looks for
+    // that marker rather than for the shared prefix every marker starts with.
+    // An endpoint that stores what it is sent keeps the markers from the last
+    // run, so a prefix check reads one of those as "this endpoint echoes any
+    // name" and reports a parameter that does not exist, on a target that had
+    // simply been scanned before.
+    let mark_a = candidate_marker("cfxjunkparamaa");
+    let mark_b = candidate_marker("cfxjunkparambb");
     let Some(a) = probe::send(
         client,
         method,
-        &render_query_probe(url, known, "cfxjunkparamaa", QUERY_MARKER),
+        &render_query_probe(url, known, "cfxjunkparamaa", &mark_a),
         None,
     )
     .await
@@ -584,7 +704,7 @@ async fn calibrate_query(
     let Some(b) = probe::send(
         client,
         method,
-        &render_query_probe(url, known, "cfxjunkparambb", QUERY_MARKER),
+        &render_query_probe(url, known, "cfxjunkparambb", &mark_b),
         None,
     )
     .await
@@ -600,7 +720,7 @@ async fn calibrate_query(
     //
     // The value: a response carrying the marker for a parameter the endpoint has
     // never heard of carries it for anything.
-    if a.body.contains(QUERY_MARKER) || b.body.contains(QUERY_MARKER) {
+    if a.body.contains(mark_a.as_str()) || b.body.contains(mark_b.as_str()) {
         return QueryCal::EchoesAnything;
     }
     // The name: xssmaze's /realworld/level5/ answers `?amount=x` with
@@ -613,10 +733,14 @@ async fn calibrate_query(
     if (a.body.len() as i64 - b.body.len() as i64).abs() > 24 {
         return QueryCal::Unusable; // not stable enough to diff against
     }
+    // The baseline the whole pass is diffed against. Markers a previous run
+    // stored come out of it, so this run's `without_markers` comparisons are
+    // against the same content on both sides.
+    let a_clean = without_markers(&a.body, &[mark_a, mark_b]);
     QueryCal::Stable(Baseline {
         status: a.status,
-        len: a.body.len(),
-        body: a.body,
+        len: a_clean.len(),
+        body: a_clean,
     })
 }
 
@@ -645,6 +769,42 @@ mod query_probe_tests {
         // The point of a marker over a candidate name: `id` and `to` are on
         // half the pages on the web, this is on none of them.
         assert!(QUERY_MARKER.len() >= 8);
+    }
+
+    #[test]
+    fn a_candidate_marker_belongs_to_one_candidate() {
+        // Distinct across the wordlist, or an endpoint that stores what it is
+        // sent manufactures hits for names it has never heard of.
+        let mut seen = std::collections::HashSet::new();
+        for c in QUERY_WORDLIST {
+            let m = candidate_marker(c);
+            assert!(m.starts_with(QUERY_MARKER), "{c} -> {m}");
+            assert!(m.len() >= 16, "{c} -> {m}");
+            assert!(
+                m.chars().all(|ch| ch.is_ascii_alphanumeric()),
+                "{c} -> {m} must survive a target that strips punctuation"
+            );
+            assert!(seen.insert(m.clone()), "duplicate marker for {c}: {m}");
+        }
+        // Stable across runs, so a reported parameter is reproducible.
+        assert_eq!(candidate_marker("comment"), candidate_marker("comment"));
+        assert_ne!(candidate_marker("comment"), candidate_marker("content"));
+    }
+
+    #[test]
+    fn our_own_footprint_comes_out_of_a_length_comparison() {
+        let a = candidate_marker("comment");
+        let b = candidate_marker("title");
+        let sent = vec![a.clone(), b.clone()];
+        let body = format!("<p>{a}</p><p>{b}</p><p>x</p>");
+        assert_eq!(without_markers(&body, &sent), "<p></p><p></p><p>x</p>");
+        // A marker that was never sent stays, because it is not ours and its
+        // presence is something about the endpoint.
+        let other = candidate_marker("never-sent");
+        let body = format!("<p>{other}</p>");
+        assert_eq!(without_markers(&body, &sent), body);
+        // Nothing sent, nothing removed.
+        assert_eq!(without_markers("plain", &[]), "plain");
         assert!(!QUERY_MARKER.chars().all(|c| c.is_ascii_alphabetic()));
     }
 

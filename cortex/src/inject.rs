@@ -3960,17 +3960,61 @@ fn read_back_url(url: &str) -> String {
     url[..cut].to_string()
 }
 
+/// Did the target hand the payload back to us to re-send?
+///
+/// This is the line between stored XSS and self-XSS, and the read-back cannot
+/// see it on its own. The probe client keeps cookies, so an application that
+/// round-trips a value through `Set-Cookie` gets its own payload sent back on
+/// the next request and reflects it, and a read-back that carried no payload
+/// in its URL has carried one in its headers. Nothing is stored on the server
+/// and nobody but the tester is affected: an attacker cannot set a victim's
+/// cookie by asking for a page.
+///
+/// xssmaze's realworld_input-level6 is the case, and its own note says so:
+/// "the lang parameter reflects on the same request and is also stored in a
+/// cookie that reflects on later requests". It was being reported as stored,
+/// which is a more severe class than the truth and the kind of thing a
+/// customer would rightly bounce.
+///
+/// The marker rather than the whole detector, because the cookie carries the
+/// value whether or not the tag survived the round trip intact.
+fn sets_cookie_with(r: &Resp, needle: &str) -> bool {
+    r.headers
+        .iter()
+        .any(|(k, v)| k == "set-cookie" && contains_ci(v, needle))
+}
+
+/// Is a read-back worth a request on this site?
+///
+/// A form body is the obvious place a payload gets stored, and it was the
+/// only place this asked. That was an assumption about applications rather
+/// than about the protocol: OWASP VulnerableApp's PersistentXSSInHTMLTag
+/// levels store the value of a `comment` *query* parameter and serve the
+/// accumulated store to everyone, which is stored XSS delivered by a GET.
+///
+/// Header and path sites are left out. Neither is a place an application
+/// collects content from a user, so the read-back would be a request spent on
+/// every endpoint in a pass to cover a shape nothing has.
+fn stores_from_here(site: &Site) -> bool {
+    matches!(site.loc, Loc::BodyForm | Loc::BodyJson | Loc::Query)
+}
+
 /// Did the payload survive into a request that did not carry it?
 ///
 /// Two bare GETs, both of which have to show the detector. One would be
 /// enough to prove it came back; two also prove it stayed, which is the
 /// difference between a stored payload and a server that echoed the last
 /// thing it saw to whoever asked next.
-async fn persisted(client: &Client, read_url: &str, detector: &str) -> bool {
+async fn persisted(client: &Client, read_url: &str, detector: &str, marker: &str) -> bool {
     for _ in 0..2 {
         let Some(r) = probe::send(client, "GET", read_url, None).await else {
             return false;
         };
+        // A read-back that is handed the value again is reading our own state
+        // back, whichever request set it.
+        if sets_cookie_with(&r, marker) {
+            return false;
+        }
         if !(executes_in_browser(&r) && !csp_admits_no_script(&r))
             || !contains_ci(&r.body, detector)
         {
@@ -4214,8 +4258,15 @@ async fn probe_xss(client: &Client, site: &Site) -> Option<Value> {
             format!("<details open ontoggle=alert({m})>"),
         ),
     ];
+    // Set by any payload whose value the application handed back in a cookie.
+    // Once that has happened the read-back is carrying the payload itself and
+    // cannot say anything about the server's own state.
+    let mut cookie_echo = false;
     for (ctx, payload, detector) in &cases {
         let r = send_site(client, site, payload).await;
+        if r.as_ref().is_some_and(|x| sets_cookie_with(x, m)) {
+            cookie_echo = true;
+        }
         // Case-insensitive on purpose, and it does not weaken the oracle. What
         // makes the detector sound is that `<`, `>`, the tag name and the
         // handler all come back raw, and HTML tag and attribute names are
@@ -4253,9 +4304,9 @@ async fn probe_xss(client: &Client, site: &Site) -> Option<Value> {
             // that hid behind this, because its POST response re-renders the
             // whole list and the reflection is visible without a follow-up
             // GET, so the reflected branch answered first every time.
-            if matches!(site.loc, Loc::BodyForm | Loc::BodyJson) {
+            if stores_from_here(site) && !cookie_echo {
                 let read = read_back_url(&site.url);
-                if persisted(client, &read, detector).await {
+                if persisted(client, &read, detector, m).await {
                     return Some(finding(
                         "xss_stored",
                         "Stored cross-site scripting (XSS)",
@@ -4303,10 +4354,10 @@ async fn probe_xss(client: &Client, site: &Site) -> Option<Value> {
     // the page anyway. An application that answers a POST with a redirect or a
     // bare 201 shows nothing at the point of injection, which is the common
     // shape for a real form and the one a reflected-only oracle cannot see.
-    if matches!(site.loc, Loc::BodyForm | Loc::BodyJson) {
+    if stores_from_here(site) && !cookie_echo {
         let read = read_back_url(&site.url);
         for (_ctx, _payload, detector) in &cases {
-            if persisted(client, &read, detector).await {
+            if persisted(client, &read, detector, m).await {
                 return Some(finding(
                     "xss_stored",
                     "Stored cross-site scripting (XSS)",
@@ -5141,6 +5192,46 @@ mod hint_tests {
                 .map(|v| vec![("content-type".to_string(), v.to_string())])
                 .unwrap_or_default(),
         }
+    }
+
+    #[test]
+    fn a_value_handed_back_in_a_cookie_is_not_stored() {
+        let with = |hs: Vec<(&str, &str)>| Resp {
+            status: 200,
+            body: String::new(),
+            elapsed_ms: 1,
+            location: None,
+            headers: hs
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        };
+        // The shape that was being reported as stored XSS: the application
+        // puts the value in a cookie and the client sends it back.
+        assert!(sets_cookie_with(
+            &with(vec![(
+                "set-cookie",
+                "lang=cfx12z5'><img src=x onerror=alert(cfx12z5)>; path=/"
+            )]),
+            "cfx12z5"
+        ));
+        // Case does not matter; a target may normalise what it stores.
+        assert!(sets_cookie_with(
+            &with(vec![("set-cookie", "L=CFX12Z5")]),
+            "cfx12z5"
+        ));
+        // A cookie that carries something else is not our footprint.
+        assert!(!sets_cookie_with(
+            &with(vec![("set-cookie", "session=abc123; HttpOnly")]),
+            "cfx12z5"
+        ));
+        // Nor is the marker appearing anywhere other than a Set-Cookie: in the
+        // body it is the finding.
+        assert!(!sets_cookie_with(
+            &with(vec![("content-type", "text/html"), ("x-echo", "cfx12z5")]),
+            "cfx12z5"
+        ));
+        assert!(!sets_cookie_with(&with(vec![]), "cfx12z5"));
     }
 
     #[test]
