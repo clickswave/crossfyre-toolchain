@@ -3950,6 +3950,36 @@ fn contains_ci(hay: &str, needle: &str) -> bool {
             .contains(&needle.to_ascii_lowercase())
 }
 
+/// The same page, asked for with nothing injected into it.
+///
+/// Query and fragment stripped, because the whole point is a request that
+/// carries no payload: if the detector comes back from this, it came out of
+/// storage rather than out of the request.
+fn read_back_url(url: &str) -> String {
+    let cut = url.find(['?', '#']).unwrap_or(url.len());
+    url[..cut].to_string()
+}
+
+/// Did the payload survive into a request that did not carry it?
+///
+/// Two bare GETs, both of which have to show the detector. One would be
+/// enough to prove it came back; two also prove it stayed, which is the
+/// difference between a stored payload and a server that echoed the last
+/// thing it saw to whoever asked next.
+async fn persisted(client: &Client, read_url: &str, detector: &str) -> bool {
+    for _ in 0..2 {
+        let Some(r) = probe::send(client, "GET", read_url, None).await else {
+            return false;
+        };
+        if !(executes_in_browser(&r) && !csp_admits_no_script(&r))
+            || !contains_ci(&r.body, detector)
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// Reflected XSS where the filter runs before the app's own decoding.
 ///
 /// An app that checks for `<` and then URL-decodes the value has checked the
@@ -4210,6 +4240,36 @@ async fn probe_xss(client: &Client, site: &Site) -> Option<Value> {
             .as_ref()
             .is_some_and(|x| executes_in_browser(x) && !csp_admits_no_script(x));
         if reflected && runnable {
+            // The same observation is two different findings. A detector in
+            // the response to the request that carried it is reflected XSS;
+            // the same detector coming back from a request that carried
+            // nothing is stored, which is worse and is what the report should
+            // say. So ask about persistence before settling for reflected.
+            //
+            // Nothing extra is written to get this. Every payload has already
+            // gone to the body site by the time this runs, so whatever a POST
+            // stores is stored either way: the only thing that was missing is
+            // reading it back. xssmaze's stored-level1 is exactly the case
+            // that hid behind this, because its POST response re-renders the
+            // whole list and the reflection is visible without a follow-up
+            // GET, so the reflected branch answered first every time.
+            if matches!(site.loc, Loc::BodyForm | Loc::BodyJson) {
+                let read = read_back_url(&site.url);
+                if persisted(client, &read, detector).await {
+                    return Some(finding(
+                        "xss_stored",
+                        "Stored cross-site scripting (XSS)",
+                        "critical",
+                        site,
+                        format!(
+                            "A payload injected into the {} was stored and served back on a plain GET of {} that carried no payload at all, with `{}` raw and unescaped. Two separate requests returned it, so it is persisted rather than echoed, and it reaches every visitor to that page rather than only someone following a crafted link.",
+                            site.where_label(),
+                            read,
+                            detector
+                        ),
+                    ));
+                }
+            }
             let again = send_site(client, site, payload).await;
             if again
                 .map(|x| contains_ci(&x.body, detector.as_str()))
@@ -4236,7 +4296,33 @@ async fn probe_xss(client: &Client, site: &Site) -> Option<Value> {
         return Some(f);
     }
     // Or the filter saw a string the sink never sees.
-    probe_xss_encoded(client, site, &cases).await
+    if let Some(f) = probe_xss_encoded(client, site, &cases).await {
+        return Some(f);
+    }
+    // Or nothing came back in the write response and the payload is sitting on
+    // the page anyway. An application that answers a POST with a redirect or a
+    // bare 201 shows nothing at the point of injection, which is the common
+    // shape for a real form and the one a reflected-only oracle cannot see.
+    if matches!(site.loc, Loc::BodyForm | Loc::BodyJson) {
+        let read = read_back_url(&site.url);
+        for (_ctx, _payload, detector) in &cases {
+            if persisted(client, &read, detector).await {
+                return Some(finding(
+                    "xss_stored",
+                    "Stored cross-site scripting (XSS)",
+                    "critical",
+                    site,
+                    format!(
+                        "A payload injected into the {} produced nothing in the response to that request, and came back on a plain GET of {} carrying no payload, with `{}` raw and unescaped. Two separate requests returned it, so it is persisted and reaches every visitor to that page.",
+                        site.where_label(),
+                        read,
+                        detector
+                    ),
+                ));
+            }
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------- LFI / traversal
@@ -5054,6 +5140,23 @@ mod hint_tests {
             headers: ct
                 .map(|v| vec![("content-type".to_string(), v.to_string())])
                 .unwrap_or_default(),
+        }
+    }
+
+    #[test]
+    fn a_read_back_request_carries_nothing() {
+        // The oracle for stored XSS is a request with no payload in it, so the
+        // query has to go. Leaving it on would ask the endpoint to reflect the
+        // payload again and call the answer storage.
+        for (url, want) in [
+            ("http://h/x/", "http://h/x/"),
+            ("http://h/x/?q=%3Cimg%3E", "http://h/x/"),
+            ("http://h/x/?a=1&b=2", "http://h/x/"),
+            ("http://h/x#frag", "http://h/x"),
+            ("http://h/x/?q=1#frag", "http://h/x/"),
+            ("http://h", "http://h"),
+        ] {
+            assert_eq!(read_back_url(url), want, "{url}");
         }
     }
 
