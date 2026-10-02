@@ -165,19 +165,38 @@ async fn download_verified(
         return Err(format!("download failed: {} returned {}", url, resp.status()).into());
     }
     let bytes = resp.bytes().await?;
+    verify_artifact_bytes(artifact, &bytes)?;
+    // Written only after the checksum agrees, so a rejected artifact leaves nothing
+    // behind that a later run could mistake for an install.
+    fs::write(dest, &bytes)?;
+    Ok(())
+}
 
+/// Does `bytes` match the SHA256 the manifest recorded for this artifact?
+///
+/// Split out of the download because this is the decision, and `BASE_URL` is a build-time
+/// constant, so nothing that goes through `reqwest` can be reached from a test. Keeping
+/// the check pure means the refusal is testable and the download stays thin glue.
+fn verify_artifact_bytes(artifact: &Artifact, bytes: &[u8]) -> Result<(), String> {
+    // An artifact with no recorded checksum is refused rather than waved through. A
+    // manifest can be hand-edited and a missing field deserialises to an empty string;
+    // comparing against it would otherwise mean "no checksum, no check".
+    if artifact.sha256.trim().is_empty() {
+        return Err(format!(
+            "release manifest records no sha256 for {} - refusing to install an \
+             unverifiable artifact",
+            artifact.file
+        ));
+    }
     let mut hasher = Sha256::new();
-    hasher.update(&bytes);
+    hasher.update(bytes);
     let got = format!("{:x}", hasher.finalize());
-    if !got.eq_ignore_ascii_case(&artifact.sha256) {
+    if !got.eq_ignore_ascii_case(artifact.sha256.trim()) {
         return Err(format!(
             "checksum mismatch for {} (expected {}, got {}) - refusing to install",
             artifact.file, artifact.sha256, got
-        )
-        .into());
+        ));
     }
-
-    fs::write(dest, &bytes)?;
     Ok(())
 }
 
@@ -704,4 +723,133 @@ pub async fn ensure_node_installed() -> Result<(), Box<dyn std::error::Error>> {
     let manifest = fetch_manifest().await?;
     download_node(&manifest, false, false).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A manifest as it arrives: parsed from JSON, because the types only derive
+    /// `Deserialize` and because the parse is part of what is being checked.
+    fn manifest(json: &str) -> Manifest {
+        serde_json::from_str(json).expect("manifest parses")
+    }
+
+    fn artifact(file: &str, sha: &str) -> Artifact {
+        serde_json::from_value(serde_json::json!({"file": file, "sha256": sha}))
+            .expect("artifact parses")
+    }
+
+    /// sha256 of `b"hello"`, so the expectation in these tests is a value an operator
+    /// could reproduce with `sha256sum` rather than one copied out of a failure.
+    const HELLO_SHA: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+
+    #[test]
+    fn matching_bytes_are_accepted_and_one_changed_byte_is_not() {
+        let a = artifact("mach-linux-x86_64.zip", HELLO_SHA);
+        assert!(verify_artifact_bytes(&a, b"hello").is_ok());
+
+        let err = verify_artifact_bytes(&a, b"hellp").expect_err("one byte changed");
+        assert!(err.contains("checksum mismatch"), "got: {err}");
+        assert!(
+            err.contains("refusing to install"),
+            "the message has to say what it did, not only what it saw: {err}"
+        );
+    }
+
+    #[test]
+    fn an_uppercase_checksum_in_the_manifest_still_matches() {
+        // The publish pipeline writes lowercase hex, but a hand-edited manifest or a
+        // different tool may not, and a case mismatch refusing a correct artifact would
+        // look exactly like a compromised bucket.
+        let a = artifact("mach.zip", &HELLO_SHA.to_ascii_uppercase());
+        assert!(verify_artifact_bytes(&a, b"hello").is_ok());
+    }
+
+    #[test]
+    fn an_artifact_with_no_checksum_is_refused_rather_than_trusted() {
+        // The failure mode this guards: `sha256` absent or blanked in the manifest
+        // deserialises to an empty string, and a plain comparison against it means every
+        // byte sequence is wrong, which is correct by accident. Being explicit also makes
+        // the message say why instead of printing a mismatch against nothing.
+        for blank in ["", "   "] {
+            let a = artifact("mach.zip", blank);
+            let err = verify_artifact_bytes(&a, b"hello")
+                .expect_err("an artifact with no checksum must be refused");
+            assert!(
+                err.contains("records no sha256"),
+                "expected the message to name the missing checksum, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_artifact_is_still_checked() {
+        // Zero bytes has a sha256 like anything else. A truncated download that arrives
+        // as an empty 200 must not pass because there is nothing to hash.
+        let empty_sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let a = artifact("mach.zip", empty_sha);
+        assert!(verify_artifact_bytes(&a, b"").is_ok());
+        let b = artifact("mach.zip", HELLO_SHA);
+        assert!(verify_artifact_bytes(&b, b"").is_err());
+    }
+
+    #[test]
+    fn a_manifest_missing_the_component_or_the_platform_says_which() {
+        let key = platform_key();
+        let m = manifest(&format!(
+            r#"{{"components":{{"mach":{{"version":"0.0.14","artifacts":{{"{key}":{{"file":"f","sha256":"{HELLO_SHA}"}}}}}}}}}}"#
+        ));
+        assert!(resolve_artifact(&m, "mach").is_ok());
+
+        let err = resolve_artifact(&m, "cortex")
+            .expect_err("a component that is not there")
+            .to_string();
+        assert!(err.contains("cortex"), "got: {err}");
+
+        // A component that exists with no artifact for this host is a different problem
+        // from one that does not exist, and the two messages were worth separating.
+        let other = manifest(
+            r#"{"components":{"mach":{"version":"0.0.14","artifacts":{"solaris-sparc":{"file":"f","sha256":"x"}}}}}"#,
+        );
+        let err = resolve_artifact(&other, "mach")
+            .expect_err("no artifact for this platform")
+            .to_string();
+        assert!(err.contains(&key), "the message names the platform: {err}");
+    }
+
+    #[test]
+    fn a_manifest_with_fields_we_do_not_know_still_parses() {
+        // Forward compatibility, and it is load bearing: the publish pipeline adding a
+        // field must not stop older installed binaries from reading the manifest, or an
+        // additive change becomes a fleet-wide update failure.
+        let key = platform_key();
+        let m = manifest(&format!(
+            r#"{{"generated":"2026-10-03","components":{{"mach":{{"version":"0.0.14","channel":"stable","artifacts":{{"{key}":{{"file":"f","sha256":"{HELLO_SHA}","size":1234}}}}}}}}}}"#
+        ));
+        let (c, a) = resolve_artifact(&m, "mach").expect("unknown fields are ignored");
+        assert_eq!(c.version, "0.0.14");
+        assert_eq!(a.sha256, HELLO_SHA);
+        assert_eq!(manifest_version(&m, "mach"), "0.0.14");
+        assert_eq!(
+            manifest_version(&m, "nope"),
+            "",
+            "an absent component reports no version rather than panicking"
+        );
+    }
+
+    #[test]
+    fn the_platform_key_is_one_of_the_shapes_the_manifest_uses() {
+        let key = platform_key();
+        let (os, arch) = key.split_once('-').expect("os-arch");
+        assert!(
+            ["linux", "darwin", "windows"].contains(&os),
+            "unexpected os segment in {key}"
+        );
+        assert!(!arch.is_empty(), "no arch segment in {key}");
+        assert!(
+            !key.contains("macos"),
+            "macos must be spelled darwin in a manifest key, got {key}"
+        );
+    }
 }
