@@ -36,6 +36,80 @@ static UPSTREAM_TLS: LazyLock<TlsConnector> = LazyLock::new(|| {
     TlsConnector::from(Arc::new(config))
 });
 
+/// The same leg, accepting whatever certificate the origin presents.
+///
+/// For targets behind a corporate CA or a self-signed certificate, which is a large share
+/// of the internal applications this tool exists to test. Until this existed the webpki
+/// roots were the only trust anchor, so such a target could not be forwarded to at all:
+/// the client leg succeeded, the forward leg refused, and the operator saw a 502 with no
+/// explanation. Meanwhile `cortex`, `scout` and `voyage` have always accepted invalid
+/// certificates, so the product disagreed with itself.
+///
+/// Reached only when a flow's [`CaptureCfg::trust_any_upstream_cert`] is set, which is
+/// off by default and a per-project decision the operator makes deliberately. It is a real
+/// loss of protection and not a convenience: with it on, a machine-in-the-middle between
+/// the proxy and the origin is indistinguishable from the origin. That is the same trade
+/// Burp makes, and the reason it belongs to a project rather than to a build.
+static UPSTREAM_TLS_TRUST_ANY: LazyLock<TlsConnector> = LazyLock::new(|| {
+    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    let config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(TrustAnyServerCert(Arc::new(provider))))
+        .with_no_client_auth();
+    TlsConnector::from(Arc::new(config))
+});
+
+/// Accepts any server certificate. Signature checking is still real: only the question of
+/// WHO the certificate belongs to is skipped, because that is the question a private CA
+/// cannot answer to a public root store.
+#[derive(Debug)]
+struct TrustAnyServerCert(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for TrustAnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
 /// Serve one captured client flow: MITM-terminate it, then inspect + forward every request on it.
 /// Generic over the client stream so both a tokio `TcpStream` (desktop CONNECT proxy) and a userspace
 /// netstack flow (mobile TUN) work. `target_host`/`target_port` is the flow's original destination and
@@ -387,7 +461,12 @@ async fn forward(
     let started = std::time::Instant::now();
     let (status, tech, resp_headers, resp_bytes) = if scheme == "https" {
         let server_name = rustls::pki_types::ServerName::try_from(sni_host.to_string())?;
-        let stream = UPSTREAM_TLS.connect(server_name, tcp).await?;
+        let connector = if cfg.trust_any_upstream_cert {
+            &*UPSTREAM_TLS_TRUST_ANY
+        } else {
+            &*UPSTREAM_TLS
+        };
+        let stream = connector.connect(server_name, tcp).await?;
         send_upstream(stream, up_req).await?
     } else {
         send_upstream(tcp, up_req).await?

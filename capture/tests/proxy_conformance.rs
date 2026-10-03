@@ -933,25 +933,71 @@ async fn a_flow_parked_on_the_gate_does_not_hold_up_another_flow() {
     );
 }
 
-/// What happens when the origin's certificate is not signed by a public CA.
+/// An origin whose certificate no public CA signed, with the default settings.
 ///
-/// This pins the current posture rather than asserting a desired one, because the posture
-/// is inconsistent across the product and the choice is not this test's to make.
-/// `flow.rs` builds its upstream client from `webpki_roots` and nothing else, and the
-/// desktop local proxy sets `danger_accept_invalid_certs(false)`, so a target presenting a
-/// private-CA or self-signed certificate cannot be forwarded to at all. Meanwhile
-/// `cortex`, `scout` and `voyage` all set `accept_invalid_certs: true`, which is right for
-/// a scanner pointed at somebody's staging box.
-///
-/// So an engagement against an internal app behind a corporate CA scans fine and captures
-/// nothing, and the operator is told only that the upstream failed. Internal apps are a
-/// large share of what this tool is for, so the gap is worth a test that goes red the day
-/// somebody decides the other way.
+/// Decided 2026-10-03: refusing stays the DEFAULT, and an operator opts in per project.
+/// So this is no longer a placeholder for an undecided question, it is the default half of
+/// a deliberate pair, and the opt-in half is the test after it. Both matter. A default
+/// that silently accepted anything would make the proxy a machine-in-the-middle that
+/// cannot tell an attacker from the origin, and a default that refused with no way out
+/// would leave the tool unusable against the corporate-CA internal applications that are
+/// a large share of what it is for.
 #[tokio::test]
-async fn an_origin_with_a_private_ca_cannot_be_forwarded_to_today() {
-    cfx_capture::install_default_crypto_provider();
+async fn by_default_an_origin_with_a_private_ca_is_refused() {
+    let (origin_port, reached) = self_signed_origin(ok_response("internal-app")).await;
 
-    // A TLS origin with its own self-signed leaf, the way an internal service looks.
+    let mut f = front(origin_port, CaptureCfg::default(), 1).await;
+    let (status, _) = tls_request_through(&mut f, "/x").await;
+    assert_eq!(
+        status, 502,
+        "the default upstream leg refuses a certificate no public CA signed"
+    );
+    assert_eq!(
+        reached.load(Ordering::Relaxed),
+        0,
+        "the refusal is at our end: the origin never completed a handshake"
+    );
+
+    let outcomes = within("the flow", f.outcome).await.unwrap();
+    let o = outcomes[0].as_ref().expect("the flow completed");
+    assert!(o.tls);
+    assert_eq!(o.requests, 1);
+    assert!(f.events.try_recv().is_err(), "no exchange, so no event");
+}
+
+#[tokio::test]
+async fn with_the_project_setting_on_a_private_ca_origin_is_captured() {
+    // The other half. An internal application behind a corporate CA is the case this
+    // exists for, and the oracle is that the origin COMPLETES a handshake, which it never
+    // does under the default.
+    let (origin_port, reached) = self_signed_origin(ok_response("internal-app")).await;
+    let cfg = CaptureCfg {
+        full: true,
+        trust_any_upstream_cert: true,
+        ..Default::default()
+    };
+    let mut f = front(origin_port, cfg, 1).await;
+
+    let (status, body) = tls_request_through(&mut f, "/internal").await;
+    assert_eq!(status, 200, "the exchange completed through the private CA");
+    assert_eq!(&body[..], b"internal-app");
+    assert_eq!(
+        reached.load(Ordering::Relaxed),
+        1,
+        "the origin completed a TLS handshake, which is the whole difference"
+    );
+
+    let ev = within("the event", f.events.recv())
+        .await
+        .expect("an event");
+    assert_eq!(ev.status, Some(200));
+    assert_eq!(ev.resp_body.as_deref(), Some("internal-app"));
+}
+
+/// A TLS origin presenting its own self-signed leaf, the way an internal service does.
+/// Returns its port and a counter of handshakes it completed.
+async fn self_signed_origin(reply: Vec<u8>) -> (u16, Arc<AtomicUsize>) {
+    cfx_capture::install_default_crypto_provider();
     let leaf_key = rcgen::KeyPair::generate().expect("key");
     let mut params =
         rcgen::CertificateParams::new(vec!["origin.test".to_string()]).expect("params");
@@ -968,27 +1014,32 @@ async fn an_origin_with_a_private_ca_cannot_be_forwarded_to_today() {
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let origin_port = listener.local_addr().unwrap().port();
+    let port = listener.local_addr().unwrap().port();
     let reached = Arc::new(AtomicUsize::new(0));
     let reached2 = reached.clone();
     tokio::spawn(async move {
         while let Ok((sock, _)) = listener.accept().await {
             let acceptor = acceptor.clone();
             let reached = reached2.clone();
+            let reply = reply.clone();
             tokio::spawn(async move {
-                // A completed handshake here would mean the proxy accepted the certificate.
+                // A completed handshake means the proxy accepted the certificate.
                 if let Ok(mut tls) = acceptor.accept(sock).await {
                     reached.fetch_add(1, Ordering::Relaxed);
                     let _ = read_until_quiet(&mut tls, ORIGIN_IDLE).await;
-                    let _ = tls.write_all(&ok_response("internal-app")).await;
+                    let _ = tls.write_all(&reply).await;
                     let _ = tls.flush().await;
                 }
             });
         }
     });
+    (port, reached)
+}
 
-    let mut f = front(origin_port, CaptureCfg::default(), 1).await;
-
+/// One request over a real TLS client leg that trusts the session CA, returning
+/// (status, body). The client half is always ours, so it succeeds either way; what the
+/// tests differ on is whether the FORWARD leg does.
+async fn tls_request_through(f: &mut Front, path: &str) -> (u16, bytes::Bytes) {
     let mut roots = rustls::RootCertStore::empty();
     for c in rustls_pemfile::certs(&mut f.ca.pem.as_bytes()) {
         roots.add(c.unwrap()).unwrap();
@@ -1002,7 +1053,7 @@ async fn an_origin_with_a_private_ca_cannot_be_forwarded_to_today() {
     let name = rustls::pki_types::ServerName::try_from("origin.test").unwrap();
     let tls = within("the client handshake", connector.connect(name, tcp))
         .await
-        .expect("the client leg still succeeds: that half is ours");
+        .expect("the client leg is ours and always succeeds");
 
     let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
         .await
@@ -1010,24 +1061,12 @@ async fn an_origin_with_a_private_ca_cannot_be_forwarded_to_today() {
     tokio::spawn(async move {
         let _ = conn.await;
     });
-    let resp = within("the request", sender.send_request(get("/x", "origin.test")))
+    let resp = within("the request", sender.send_request(get(path, "origin.test")))
         .await
         .unwrap();
-    assert_eq!(
-        resp.status(),
-        502,
-        "today the upstream leg refuses a certificate no public CA signed"
-    );
-    assert_eq!(
-        reached.load(Ordering::Relaxed),
-        0,
-        "the refusal is at our end: the origin never completed a handshake"
-    );
+    let status = resp.status().as_u16();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    // Hyper keeps the connection alive, so the flow serves until the client hangs up.
     drop(sender);
-
-    let outcomes = within("the flow", f.outcome).await.unwrap();
-    let o = outcomes[0].as_ref().expect("the flow completed");
-    assert!(o.tls);
-    assert_eq!(o.requests, 1);
-    assert!(f.events.try_recv().is_err(), "no exchange, so no event");
+    (status, body)
 }

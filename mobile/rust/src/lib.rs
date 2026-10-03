@@ -248,6 +248,10 @@ pub extern "system" fn Java_io_crossfyre_tracer_Native_startCapture<'local>(
             // No local store on the phone yet. Captured exchanges go to the control plane
             // through `tx`, which is what the mobile app has always done.
             sink: None,
+            // The phone has no project settings to carry this, and an app that silently
+            // accepted any origin certificate would be a worse trade here than on a
+            // desktop: the operator is not the only person using the handset.
+            trust_any_upstream_cert: false,
         };
         if let Err(e) = netstack::run(tun_fd, ca, egress, tx, capture_cfg).await {
             log::error!("netstack ended: {e}");

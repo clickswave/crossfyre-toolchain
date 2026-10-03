@@ -292,6 +292,14 @@ pub struct CaptureCfg {
     /// Where to record each exchange locally, with bodies as bytes. `None` keeps the
     /// historic behaviour, which is that nothing is stored on this machine.
     pub sink: Option<Arc<dyn ExchangeSink>>,
+    /// Forward to an origin whose certificate no public CA signed.
+    ///
+    /// Off by default, and deliberately so: with it on, a machine-in-the-middle between
+    /// this proxy and the origin cannot be told apart from the origin. It exists because
+    /// an internal application behind a corporate CA could not be captured at all
+    /// otherwise, and those are a large share of what this tool is for. A per-project
+    /// decision an operator makes knowingly, never a build-time default.
+    pub trust_any_upstream_cert: bool,
 }
 
 impl std::fmt::Debug for CaptureCfg {
@@ -301,6 +309,7 @@ impl std::fmt::Debug for CaptureCfg {
             .field("gate", &self.gate.is_some())
             .field("bypass_hosts", &self.bypass_hosts.len())
             .field("sink", &self.sink.is_some())
+            .field("trust_any_upstream_cert", &self.trust_any_upstream_cert)
             .finish()
     }
 }
