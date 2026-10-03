@@ -1540,7 +1540,14 @@ fn normalize_seed(seed: &str) -> Option<Url> {
 /// someone to read the crawler; "141 fetches failed to connect: TLS" sends them
 /// to the one link that switched the session to https on a plaintext port, which
 /// is where the fault actually was.
-fn fetch_reason(e: &reqwest::Error) -> String {
+///
+/// Takes `transport::Error`, not `reqwest::Error`. Those are the same type only in
+/// the default build: with `impersonate` on, `transport` re-exports wreq and
+/// naming reqwest here stops mach compiling at all. It was written as
+/// `&reqwest::Error` on 2026-09-11 and no release build succeeded after that,
+/// because the only thing that compiles with the feature is the release script
+/// and CI does not.
+fn fetch_reason(e: &transport::Error) -> String {
     if e.is_timeout() {
         return "timed out".into();
     }
