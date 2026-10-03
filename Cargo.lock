@@ -696,6 +696,7 @@ dependencies = [
  "bytes",
  "cfx_capture",
  "cfx_project",
+ "cfx_session",
  "http-body-util",
  "hyper",
  "hyper-util",
