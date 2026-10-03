@@ -372,7 +372,6 @@ async fn forward(
     let (parts, body) = req.into_parts();
     let body_bytes = body.collect().await?.to_bytes();
     let body_params = body_field_names(content_type.as_deref(), &body_bytes);
-    let url = redact_url(&format!("{scheme}://{host_hdr}{pq}"));
     let full_url = format!("{scheme}://{host_hdr}{pq}");
 
     // Ordered [name, value] header pairs, captured once (used for the gate + full capture).
@@ -478,52 +477,58 @@ async fn forward(
     // bytes. This deliberately does not go through the event: `TraceEvent` carries
     // full-capture bodies as lossily-converted `String`, which cannot be replayed. See
     // `RawExchange`.
+    // What actually went upstream. Where the gate modified the request, that is the
+    // operator's version, because the exchange worth keeping is the one that happened.
+    //
+    // ALL of it, not just the body. An earlier version recorded the edited body and
+    // headers next to the original method and URL, so a request retargeted from
+    // `/original` to `/edited` was stored as having gone to `/original`. Evidence that
+    // disagrees with what left the machine is worse than none.
+    //
+    // Worked out here rather than inside the sink block, because the TRACE EVENT had the
+    // same problem and for the same reason: it was built from the request as it arrived.
+    // That event feeds the asset graph, so an edited request was being filed against the
+    // operation it was retargeted away from.
+    let (sent_method, sent_path, sent_headers, sent_body) = match &edited {
+        Some(ed) => (
+            ed.method.clone(),
+            ed.path.clone(),
+            ed.headers.clone(),
+            ed.body.clone(),
+        ),
+        None => (
+            method.clone(),
+            pq.clone(),
+            req_header_pairs.clone(),
+            body_bytes.to_vec(),
+        ),
+    };
+    // The destination is fixed by the already-open flow, so an edited Host is what the
+    // origin was told rather than where the bytes went. Recorded as sent either way.
+    let sent_host = sent_headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_else(|| host_hdr.clone());
+    let sent_full_url = format!("{scheme}://{sent_host}{sent_path}");
+
     if let Some(sink) = &cfg.sink {
-        // What actually went upstream. Where the gate modified the request, that is the
-        // operator's version, because the exchange worth keeping is the one that happened.
-        //
-        // ALL of it, not just the body. The first version of this recorded the edited body
-        // and headers next to the original method and URL, so a request the operator
-        // retargeted from `/original` to `/edited` was stored as having gone to
-        // `/original`. A history pane is evidence, and evidence that disagrees with what
-        // left the machine is worse than none.
-        let (sent_method, sent_path, sent_headers, sent_body) = match &edited {
-            Some(ed) => (
-                ed.method.clone(),
-                ed.path.clone(),
-                ed.headers.clone(),
-                ed.body.clone(),
-            ),
-            None => (
-                method.clone(),
-                pq.clone(),
-                req_header_pairs.clone(),
-                body_bytes.to_vec(),
-            ),
-        };
-        // The destination is fixed by the already-open flow, so an edited Host is what the
-        // origin was told rather than where the bytes went. Recorded as sent either way.
-        let sent_host = sent_headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("host"))
-            .map(|(_, v)| v.clone())
-            .unwrap_or_else(|| host_hdr.clone());
         let raw = crate::RawExchange {
             at_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0),
-            method: sent_method,
-            url: format!("{scheme}://{sent_host}{sent_path}"),
+            method: sent_method.clone(),
+            url: sent_full_url.clone(),
             host: sent_host.clone(),
+            req_headers: sent_headers.clone(),
             status,
             duration_ms,
-            req_headers: sent_headers,
             resp_headers: resp_headers
                 .iter()
                 .map(|[k, v]| (k.clone(), v.clone()))
                 .collect(),
-            req_body: sent_body,
+            req_body: sent_body.clone(),
             resp_body: resp_bytes.to_vec(),
         };
         sink.record(&raw).await;
@@ -531,8 +536,8 @@ async fn forward(
 
     // Base privacy-safe event; enriched with full bytes only when full capture is on.
     let mut event = TraceEvent {
-        method,
-        url,
+        method: sent_method,
+        url: redact_url(&sent_full_url),
         status: Some(status),
         tech,
         authed,
@@ -546,15 +551,21 @@ async fn forward(
         duration_ms: None,
     };
     if cfg.full {
-        let req_hdr_arr: Vec<[String; 2]> =
-            req_header_pairs.into_iter().map(|(k, v)| [k, v]).collect();
+        // The headers that went, matching the url and method above. Taking these from the
+        // request as it arrived while the url described the request as it left is exactly
+        // the half-and-half record this test exists to stop.
+        let req_hdr_arr: Vec<[String; 2]> = sent_headers
+            .iter()
+            .map(|(k, v)| [k.clone(), v.clone()])
+            .collect();
         // Hand over the RAW bytes and let attach_full decode them. Doing the
         // lossy conversion here is what turned every gzip response into
         // mojibake, and it is unrecoverable once done.
         event.attach_full(crate::FullExchange {
-            url: full_url,
+            // The request that went, like everything else on this event.
+            url: sent_full_url,
             req_headers: req_hdr_arr,
-            req_body: body_bytes.to_vec(),
+            req_body: sent_body,
             resp_headers,
             resp_body: resp_bytes.to_vec(),
             duration_ms: Some(duration_ms),

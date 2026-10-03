@@ -1175,3 +1175,57 @@ async fn a_request_dropped_at_the_local_gate_never_reaches_the_origin() {
         "the whole promise of Drop: the origin was never dialled"
     );
 }
+
+#[tokio::test]
+async fn the_trace_event_describes_the_request_that_was_actually_sent() {
+    // The event feeds the asset graph. Built from the request as it ARRIVED, an edited
+    // request is filed against the operation it was retargeted away from, so the graph
+    // records an endpoint nobody called and misses the one somebody did.
+    let (op, olog) = origin(ok_response("edited-through"));
+    let (cfg, _seen) = gated(InterceptDecision::ForwardModified(EditedRequest {
+        method: "PUT".into(),
+        path: "/retargeted?to=here".into(),
+        headers: vec![("host".into(), "elsewhere.test".into())],
+        body: b"operator body".to_vec(),
+    }));
+    let mut f = front(op, cfg, 1).await;
+
+    let (status, _) = plain_request(
+        f.port,
+        Request::builder()
+            .method("GET")
+            .uri("/original?from=there")
+            .header("host", "origin.test")
+            .body(Full::new(Bytes::from_static(b"client body")))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let ev = within("the event", f.events.recv())
+        .await
+        .expect("an event");
+    assert_eq!(
+        ev.method, "PUT",
+        "the method that went, not the one that came"
+    );
+    assert_eq!(
+        ev.url, "http://elsewhere.test/retargeted?to=",
+        "the path and host that went, with the query value redacted as always"
+    );
+    assert_eq!(
+        ev.full_url.as_deref(),
+        Some("http://elsewhere.test/retargeted?to=here"),
+        "and full capture agrees with it"
+    );
+    assert_eq!(
+        ev.req_body.as_deref(),
+        Some("operator body"),
+        "the body that went"
+    );
+
+    // And the origin really did receive that request, so the event is not describing
+    // something that never happened either.
+    let seen = String::from_utf8_lossy(&olog.first()).to_string();
+    assert!(seen.starts_with("PUT /retargeted?to=here "), "got:\n{seen}");
+}
