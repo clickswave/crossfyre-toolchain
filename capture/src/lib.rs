@@ -213,6 +213,53 @@ pub enum InterceptDecision {
     Drop,
 }
 
+/// One exchange as it actually happened, with its bodies as bytes.
+///
+/// Deliberately not [`TraceEvent`]. That type carries full-capture bodies as `String`, via
+/// `String::from_utf8_lossy`, which is irreversible: a fifteen-byte PNG fragment comes out
+/// twenty-three bytes long with four replacement characters in it. Fine for a privacy-safe
+/// shape and for searching text, useless for anything that has to REPLAY the request or
+/// hand the operator back the bytes a server sent. A local store exists to do both, so it
+/// is fed from here instead.
+///
+/// The request recorded is the one that went upstream. Where an intercept gate modified
+/// it, that is the operator's version and not what the client first sent, because the
+/// exchange that happened is the one worth keeping. Framing headers are the exception:
+/// `Content-Length` is recomputed on the wire from the body being sent, so the headers
+/// here are the set that was chosen rather than the exact bytes of the request line.
+#[derive(Debug, Clone, Default)]
+pub struct RawExchange {
+    /// Unix milliseconds, taken when the exchange completed.
+    pub at_ms: i64,
+    pub method: String,
+    /// Full URL, values included. A local store is the full-capture surface.
+    pub url: String,
+    pub host: String,
+    pub status: i64,
+    pub duration_ms: u64,
+    pub req_headers: Vec<(String, String)>,
+    pub resp_headers: Vec<(String, String)>,
+    pub req_body: Vec<u8>,
+    pub resp_body: Vec<u8>,
+}
+
+/// Somewhere local that an exchange is recorded with its bodies intact.
+///
+/// The capture core defines the trait and does not know what implements it, so the
+/// dependency runs one way: a project store depends on `capture`, never the reverse.
+///
+/// Called on the request's own task, so a slow implementation slows that one flow and no
+/// others. An implementation that cannot keep up should buffer internally rather than
+/// block, and one that fails should log rather than propagate: losing a row from the store
+/// is worse than losing it, but it is not worth failing the request the operator is
+/// watching.
+pub trait ExchangeSink: Send + Sync {
+    fn record<'a>(
+        &'a self,
+        ex: &'a RawExchange,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+}
+
 /// A hook the host (mobile app / desktop proxy) implements to gate a request in MANUAL intercept
 /// mode. The capture core calls `decide` before forwarding; the implementation parks the request with
 /// the control plane and blocks until a human forwards or drops it. Returning `Forward` on any error
@@ -242,6 +289,9 @@ pub struct CaptureCfg {
     /// app working while everything else is still captured, which beats the
     /// only alternative available before this, which was excluding the whole app.
     pub bypass_hosts: Vec<String>,
+    /// Where to record each exchange locally, with bodies as bytes. `None` keeps the
+    /// historic behaviour, which is that nothing is stored on this machine.
+    pub sink: Option<Arc<dyn ExchangeSink>>,
 }
 
 impl std::fmt::Debug for CaptureCfg {
@@ -250,6 +300,7 @@ impl std::fmt::Debug for CaptureCfg {
             .field("full", &self.full)
             .field("gate", &self.gate.is_some())
             .field("bypass_hosts", &self.bypass_hosts.len())
+            .field("sink", &self.sink.is_some())
             .finish()
     }
 }

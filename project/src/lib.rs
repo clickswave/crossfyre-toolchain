@@ -35,6 +35,9 @@ use sqlx::{Row, SqlitePool};
 
 pub mod blob;
 pub mod schema;
+pub mod sink;
+
+pub use sink::ProjectSink;
 
 /// Bodies at or below this stay in the row; above it they go to the blob directory.
 ///

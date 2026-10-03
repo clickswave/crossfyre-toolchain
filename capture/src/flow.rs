@@ -395,6 +395,38 @@ async fn forward(
     let duration_ms = started.elapsed().as_millis() as u64;
     log::debug!("upstream {target_host}:{target_port} -> {status}");
 
+    // Record the exchange to a local store, if one is attached, while the bodies are still
+    // bytes. This deliberately does not go through the event: `TraceEvent` carries
+    // full-capture bodies as lossily-converted `String`, which cannot be replayed. See
+    // `RawExchange`.
+    if let Some(sink) = &cfg.sink {
+        // What actually went upstream. Where the gate modified the request, that is the
+        // operator's version, because the exchange worth keeping is the one that happened.
+        let (sent_headers, sent_body) = match &edited {
+            Some(ed) => (ed.headers.clone(), ed.body.clone()),
+            None => (req_header_pairs.clone(), body_bytes.to_vec()),
+        };
+        let raw = crate::RawExchange {
+            at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
+            method: method.clone(),
+            url: full_url.clone(),
+            host: host_hdr.clone(),
+            status,
+            duration_ms,
+            req_headers: sent_headers,
+            resp_headers: resp_headers
+                .iter()
+                .map(|[k, v]| (k.clone(), v.clone()))
+                .collect(),
+            req_body: sent_body,
+            resp_body: resp_bytes.to_vec(),
+        };
+        sink.record(&raw).await;
+    }
+
     // Base privacy-safe event; enriched with full bytes only when full capture is on.
     let mut event = TraceEvent {
         method,
@@ -619,8 +651,7 @@ mod tests {
                 tx,
                 crate::CaptureCfg {
                     full: true,
-                    gate: None,
-                    bypass_hosts: Vec::new(),
+                    ..Default::default()
                 },
             )
             .await;
@@ -693,8 +724,7 @@ mod tests {
                 tx,
                 crate::CaptureCfg {
                     full: true,
-                    gate: None,
-                    bypass_hosts: Vec::new(),
+                    ..Default::default()
                 },
             )
             .await;

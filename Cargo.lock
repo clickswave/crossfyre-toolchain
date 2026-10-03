@@ -680,6 +680,7 @@ dependencies = [
 name = "cfx_project"
 version = "0.0.1"
 dependencies = [
+ "cfx_capture",
  "log",
  "serde",
  "serde_json",

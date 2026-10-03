@@ -567,7 +567,7 @@ fn gated(decision: InterceptDecision) -> (CaptureCfg, Arc<Mutex<Vec<String>>>) {
             decision,
             seen: seen.clone(),
         })),
-        bypass_hosts: Vec::new(),
+        ..Default::default()
     };
     (cfg, seen)
 }
@@ -911,7 +911,7 @@ async fn a_flow_parked_on_the_gate_does_not_hold_up_another_flow() {
     let cfg = CaptureCfg {
         full: false,
         gate: Some(Arc::new(SlowGate { delay: PARK })),
-        bypass_hosts: Vec::new(),
+        ..Default::default()
     };
     let f = front(op, cfg, 2).await;
 

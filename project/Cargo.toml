@@ -9,6 +9,10 @@ description = "The local project store: one SQLite database plus a content-addre
 # feature flag rather than a dependency. rustls to match mach and voyage; pulse
 # asks for native-tls and Cargo unifies the two, which is a wart worth knowing
 # about but not one this crate introduces.
+# The sink implements the capture core's `ExchangeSink`. One direction only: a store
+# depends on capture, never the reverse, so capture does not know what records its
+# exchanges.
+cfx_capture = { path = "../capture" }
 sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "sqlite", "chrono"] }
 tokio = { version = "1.49.0", features = ["rt", "fs", "macros", "sync"] }
 serde = { version = "1", features = ["derive"] }
@@ -17,4 +21,4 @@ sha2 = "0.10"
 log = "0.4"
 
 [dev-dependencies]
-tokio = { version = "1.49.0", features = ["rt", "rt-multi-thread", "fs", "macros", "sync", "time", "process"] }
+tokio = { version = "1.49.0", features = ["rt", "rt-multi-thread", "fs", "macros", "sync", "time", "process", "net", "io-util"] }
