@@ -690,6 +690,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "cfx_session"
+version = "0.0.1"
+dependencies = [
+ "bytes",
+ "cfx_capture",
+ "cfx_project",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "log",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
 name = "cfx_tui"
 version = "0.1.0"
 dependencies = [

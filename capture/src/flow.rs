@@ -445,11 +445,11 @@ async fn forward(
 
     // Dial the flow's ACTUAL destination through the routing egress. For upstream TLS SNI, use the
     // request Host so the origin serves the right certificate; fall back to the dial target.
-    let sni_host = if host_hdr.is_empty() {
+    let sni_host = sni_name(if host_hdr.is_empty() {
         target_host
     } else {
         host_hdr.as_str()
-    };
+    });
     // Path only, never the query: `pq` carries `?access_token=...` and friends,
     // and this line runs for every forwarded request.
     let path_only = pq.split('?').next().unwrap_or("");
@@ -481,18 +481,41 @@ async fn forward(
     if let Some(sink) = &cfg.sink {
         // What actually went upstream. Where the gate modified the request, that is the
         // operator's version, because the exchange worth keeping is the one that happened.
-        let (sent_headers, sent_body) = match &edited {
-            Some(ed) => (ed.headers.clone(), ed.body.clone()),
-            None => (req_header_pairs.clone(), body_bytes.to_vec()),
+        //
+        // ALL of it, not just the body. The first version of this recorded the edited body
+        // and headers next to the original method and URL, so a request the operator
+        // retargeted from `/original` to `/edited` was stored as having gone to
+        // `/original`. A history pane is evidence, and evidence that disagrees with what
+        // left the machine is worse than none.
+        let (sent_method, sent_path, sent_headers, sent_body) = match &edited {
+            Some(ed) => (
+                ed.method.clone(),
+                ed.path.clone(),
+                ed.headers.clone(),
+                ed.body.clone(),
+            ),
+            None => (
+                method.clone(),
+                pq.clone(),
+                req_header_pairs.clone(),
+                body_bytes.to_vec(),
+            ),
         };
+        // The destination is fixed by the already-open flow, so an edited Host is what the
+        // origin was told rather than where the bytes went. Recorded as sent either way.
+        let sent_host = sent_headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| host_hdr.clone());
         let raw = crate::RawExchange {
             at_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0),
-            method: method.clone(),
-            url: full_url.clone(),
-            host: host_hdr.clone(),
+            method: sent_method,
+            url: format!("{scheme}://{sent_host}{sent_path}"),
+            host: sent_host.clone(),
             status,
             duration_ms,
             req_headers: sent_headers,
@@ -556,6 +579,42 @@ async fn forward(
         .body(Full::new(resp_bytes))?)
 }
 
+/// The server name to offer upstream, taken from a `Host` header.
+///
+/// A `Host` carries a port whenever it is not the scheme's default; a TLS server name
+/// never does. This was passing the header through unchanged, and rustls rejects
+/// `example.com:8443` outright, so EVERY https target on a non-standard port failed to
+/// forward and the operator saw a 502. Staging and internal services on `:8443` are
+/// exactly where that lands, and the symptom reads as the target refusing the connection.
+///
+/// Found while building the first end-to-end capture test, which necessarily used an
+/// origin on an ephemeral port and so was the first thing here ever to try one.
+fn sni_name(host: &str) -> &str {
+    let h = host.trim();
+    // `[::1]` or `[::1]:8443`: the brackets exist precisely because the colons are not a
+    // port separator, and a server name wants the address without them.
+    if let Some(rest) = h.strip_prefix('[') {
+        return match rest.find(']') {
+            Some(end) => &rest[..end],
+            None => h,
+        };
+    }
+    match h.rsplit_once(':') {
+        // A trailing all-digit segment is a port. The `!head.contains(':')` guard keeps a
+        // bare IPv6 address, which is malformed in a Host header but should not be
+        // truncated into something different if one arrives.
+        Some((head, tail))
+            if !head.is_empty()
+                && !tail.is_empty()
+                && tail.bytes().all(|b| b.is_ascii_digit())
+                && !head.contains(':') =>
+        {
+            head
+        }
+        _ => h,
+    }
+}
+
 /// HTTP/1 client handshake over an already-connected (optionally TLS) stream: send `req`, return
 /// (status, Server banner, response headers as [name,value] pairs, response body bytes).
 async fn send_upstream<S>(
@@ -596,6 +655,39 @@ mod tests {
     // at it, and assert (a) the client gets the origin's response and (b) a correctly-reduced
     // TraceEvent is emitted. This exercises TLS termination + reduction + forward + event end to end
     // on loopback, with no device or TUN.
+    #[test]
+    fn a_host_header_with_a_port_is_not_a_server_name() {
+        // Every one of these used to reach rustls verbatim, and rustls rejects anything
+        // carrying a port, so the forward leg failed and the client got a 502.
+        assert_eq!(sni_name("example.com"), "example.com");
+        assert_eq!(sni_name("example.com:8443"), "example.com");
+        assert_eq!(sni_name("localhost:38231"), "localhost");
+        assert_eq!(sni_name("127.0.0.1:8443"), "127.0.0.1");
+        assert_eq!(sni_name("127.0.0.1"), "127.0.0.1");
+        assert_eq!(sni_name("[::1]:8443"), "::1");
+        assert_eq!(sni_name("[2001:db8::1]"), "2001:db8::1");
+        assert_eq!(sni_name("  example.com:443  "), "example.com");
+
+        // Not a port, so not truncated. A bare IPv6 is malformed in a Host header, and
+        // turning `::1` into `::` would offer a different address entirely.
+        assert_eq!(sni_name("::1"), "::1");
+        // A trailing colon is not a port either.
+        assert_eq!(sni_name("example.com:"), "example.com:");
+        // And what comes out is something rustls will actually take.
+        for h in [
+            "example.com:8443",
+            "localhost:38231",
+            "127.0.0.1:8443",
+            "[::1]:8443",
+        ] {
+            let name = sni_name(h);
+            assert!(
+                rustls::pki_types::ServerName::try_from(name.to_string()).is_ok(),
+                "{h} reduced to {name}, which rustls still refuses"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn mitm_flow_reduces_and_forwards() {
         // 1. HTTP origin.

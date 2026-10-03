@@ -1,0 +1,22 @@
+[package]
+name = "cfx_session"
+version = "0.0.1"
+edition = "2024"
+description = "A runnable local capture session: a CONNECT proxy front end that hands each flow to the capture core, records it to a local project, and optionally parks it at an in-process intercept gate. The layer a desktop workbench drives, with no control plane involved."
+
+[dependencies]
+cfx_capture = { path = "../capture" }
+cfx_project = { path = "../project" }
+tokio = { version = "1.49.0", features = ["rt", "net", "io-util", "macros", "sync", "time"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+log = "0.4"
+
+[dev-dependencies]
+tokio = { version = "1.49.0", features = ["rt", "rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }
+rustls = { version = "0.23", features = ["aws_lc_rs"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+rcgen = "0.13"
