@@ -4,15 +4,15 @@
 //! (anti-drain); the interactions themselves are already sealed to the client's
 //! key, so this service holds no plaintext and can be internet-reachable.
 
-use crate::store::Store;
 use crate::Config;
+use crate::store::Store;
 use axum::{
+    Json, Router,
     extract::{Query, State},
     routing::{get, post},
-    Json, Router,
 };
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::sync::Arc;
 

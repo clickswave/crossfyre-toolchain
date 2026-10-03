@@ -17,9 +17,9 @@ mod stats;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cfx_capture::{Egress, SessionCa, TraceEvent};
+use jni::JNIEnv;
 use jni::objects::{JClass, JString};
 use jni::sys::{jboolean, jint, jstring};
-use jni::JNIEnv;
 
 /// The session CA generated on-device by `generateCaPem` and reused by `startCapture`. The private
 /// key never leaves native code.

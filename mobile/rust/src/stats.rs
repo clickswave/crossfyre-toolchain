@@ -8,8 +8,8 @@
 //! All counters are process-global atomics, reset at the start of each capture. `snapshot_json` renders
 //! them for the JNI `captureStats` call the UI polls.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 macro_rules! counters {
     ($($name:ident),* $(,)?) => {

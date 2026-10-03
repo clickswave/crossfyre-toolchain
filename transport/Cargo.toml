@@ -1,7 +1,7 @@
 [package]
 name = "transport"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "Backend-agnostic outbound HTTP client for the Crossfyre engines. Default = reqwest (rustls). The `impersonate` feature swaps in wreq (BoringSSL) for browser TLS/HTTP2 fingerprint parity."
 
 [dependencies]

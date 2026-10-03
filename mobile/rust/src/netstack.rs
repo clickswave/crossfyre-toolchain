@@ -169,7 +169,9 @@ pub async fn run(
                             crate::stats::set_last_error(format!(
                                 "{dst} accepted the handshake then sent nothing (pinned?)"
                             ));
-                            log::info!("flow -> {dst} refused our certificate after the handshake (likely pinned)");
+                            log::info!(
+                                "flow -> {dst} refused our certificate after the handshake (likely pinned)"
+                            );
                         }
                         Ok(_) => log::info!("flow -> {dst} closed cleanly"),
                         Err(e) => {
@@ -197,7 +199,9 @@ pub async fn run(
                     // release, so the traffic vanished and so did any hint that it had: the one
                     // thing worse than dropping traffic is dropping it silently.
                     crate::stats::inc(&crate::stats::QUIC_DROPPED);
-                    log::info!("dropped QUIC/h3 -> {dst} (forcing TCP+TLS fallback; app may stall briefly)");
+                    log::info!(
+                        "dropped QUIC/h3 -> {dst} (forcing TCP+TLS fallback; app may stall briefly)"
+                    );
                 } else {
                     // Relay other UDP (crucially DNS on :53) transparently, or the phone can't resolve
                     // anything and nothing browses. The app is excluded from the VPN, so this socket

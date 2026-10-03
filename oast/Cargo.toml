@@ -1,7 +1,7 @@
 [package]
 name = "oast"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 homepage = "https://clickswave.org"
 repository = "https://github.com/clickswave/crossfyre-toolchain"
 description = "Self-hosted OAST (out-of-band application security testing) interaction server for Crossfyre: captures HTTP(S)/DNS callbacks and exposes an encrypted, token-scoped poll API so cortex can confirm blind vulnerabilities."

@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use crate::header::{HeaderMap, HeaderName, HeaderValue, COOKIE};
+use crate::header::{COOKIE, HeaderMap, HeaderName, HeaderValue};
 
 /// Request auth resolved from a credential: custom headers + an optional Cookie.
 /// Deserialized straight from the engine op params (`#[serde(default)] auth`).
