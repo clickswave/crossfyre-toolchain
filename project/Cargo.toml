@@ -1,0 +1,20 @@
+[package]
+name = "cfx_project"
+version = "0.0.1"
+edition = "2024"
+description = "The local project store: one SQLite database plus a content-addressed blob directory, holding a capture session's exchanges so the workbench works with no control plane and no network."
+
+[dependencies]
+# Already in the lock graph via sqlx's driver set, so the `sqlite` feature adds a
+# feature flag rather than a dependency. rustls to match mach and voyage; pulse
+# asks for native-tls and Cargo unifies the two, which is a wart worth knowing
+# about but not one this crate introduces.
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "sqlite", "chrono"] }
+tokio = { version = "1.49.0", features = ["rt", "fs", "macros", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+log = "0.4"
+
+[dev-dependencies]
+tokio = { version = "1.49.0", features = ["rt", "rt-multi-thread", "fs", "macros", "sync", "time", "process"] }
