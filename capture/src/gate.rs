@@ -50,6 +50,11 @@ struct State {
     /// Set by [`LocalGate::shutdown`]. Everything already waiting is dropped and anything
     /// arriving afterwards is dropped on arrival rather than parked for a UI that has gone.
     closed: bool,
+    /// Whether requests are actually held. A gate that exists but is off forwards
+    /// everything, which is what lets a UI offer interception as a switch rather than as
+    /// something you have to stop and restart the proxy to change. A toggle that silently
+    /// does nothing until the next restart is worse than no toggle.
+    enabled: bool,
 }
 
 pub struct LocalGate {
@@ -74,6 +79,7 @@ impl LocalGate {
             state: Mutex::new(State {
                 waiting: VecDeque::new(),
                 closed: false,
+                enabled: true,
             }),
             arrived: Notify::new(),
             next_id: AtomicU64::new(1),
@@ -173,6 +179,31 @@ impl LocalGate {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).closed
     }
 
+    pub fn is_enabled(&self) -> bool {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).enabled
+    }
+
+    /// Turn holding on or off while the proxy keeps running.
+    ///
+    /// Switching OFF forwards everything already waiting rather than dropping it. The
+    /// operator just said they want traffic flowing, and answering that by discarding the
+    /// requests they were about to look at would be the opposite of what they asked for.
+    /// Returns how many were released.
+    pub fn set_enabled(&self, on: bool) -> usize {
+        {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if st.enabled == on {
+                return 0;
+            }
+            st.enabled = on;
+        }
+        if on {
+            0
+        } else {
+            self.resolve_all(InterceptDecision::Forward)
+        }
+    }
+
     /// Take a hold back out of the queue without answering it, for the timeout path.
     fn forget(&self, id: u64) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -213,6 +244,12 @@ impl InterceptGate for LocalGate {
                 let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 if st.closed {
                     return InterceptDecision::Drop;
+                }
+                // Off: straight through, and nothing is queued for a pane that is not
+                // showing. Checked under the same lock as the queue so a request cannot
+                // slip in between the switch flipping and the queue being drained.
+                if !st.enabled {
+                    return InterceptDecision::Forward;
                 }
                 let (tx, rx) = oneshot::channel();
                 st.waiting.push_back((held, tx));

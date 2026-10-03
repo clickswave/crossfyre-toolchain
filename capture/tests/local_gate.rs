@@ -279,3 +279,57 @@ async fn a_decision_beats_a_timeout_that_has_not_expired() {
         InterceptDecision::Forward
     );
 }
+
+#[tokio::test]
+async fn switching_the_gate_off_releases_what_was_waiting() {
+    // The toggle a UI offers. Turning interception off has to forward what is already
+    // held: the operator just asked for traffic to flow, and discarding the requests they
+    // were about to look at is the opposite of that.
+    let gate = Arc::new(LocalGate::new());
+    assert!(gate.is_enabled(), "a gate holds by default");
+
+    let a = hold(gate.clone(), "GET", "https://x.test/a");
+    let b = hold(gate.clone(), "GET", "https://x.test/b");
+    until_pending(&gate, 2).await;
+
+    assert_eq!(gate.set_enabled(false), 2, "both were released");
+    assert_eq!(a.await.unwrap(), InterceptDecision::Forward);
+    assert_eq!(b.await.unwrap(), InterceptDecision::Forward);
+    assert_eq!(gate.pending_count(), 0);
+    assert!(!gate.is_enabled());
+
+    // And while off, nothing queues: a request goes straight through rather than waiting
+    // for a pane that is not showing.
+    let c = hold(gate.clone(), "GET", "https://x.test/c");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), c)
+            .await
+            .expect("it did not wait")
+            .unwrap(),
+        InterceptDecision::Forward
+    );
+    assert_eq!(gate.pending_count(), 0);
+
+    // Back on, and it holds again.
+    assert_eq!(gate.set_enabled(true), 0);
+    let d = hold(gate.clone(), "GET", "https://x.test/d");
+    until_pending(&gate, 1).await;
+    assert_eq!(gate.pending_count(), 1);
+    gate.resolve_all(InterceptDecision::Forward);
+    d.await.unwrap();
+}
+
+#[tokio::test]
+async fn setting_the_gate_to_what_it_already_is_changes_nothing() {
+    let gate = Arc::new(LocalGate::new());
+    let held = hold(gate.clone(), "GET", "https://x.test/a");
+    until_pending(&gate, 1).await;
+
+    // A UI that re-sends its state on every status refresh must not release the queue
+    // each time it does.
+    assert_eq!(gate.set_enabled(true), 0);
+    assert_eq!(gate.pending_count(), 1, "still held");
+
+    gate.resolve_all(InterceptDecision::Drop);
+    assert_eq!(held.await.unwrap(), InterceptDecision::Drop);
+}

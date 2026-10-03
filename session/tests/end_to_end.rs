@@ -60,7 +60,7 @@ async fn a_browse_through_the_session_lands_in_the_project() {
     let (session, project, ca_pem) = session_over(&s, false).await;
 
     assert!(session.port() > 0, "a port was bound");
-    assert!(session.gate().is_none(), "not intercepting unless asked");
+    assert!(!session.intercepting(), "not intercepting unless asked");
 
     let payload = binary_payload(0x11);
     let (status, body) = through_proxy(
@@ -115,7 +115,7 @@ async fn an_intercepting_session_holds_a_request_until_the_operator_decides() {
     let s = Scratch::new("intercept");
     let (origin_port, _) = tls_origin(ok_response("released")).await;
     let (session, project, ca_pem) = session_over(&s, true).await;
-    let gate = session.gate().expect("intercepting").clone();
+    let gate = session.gate().clone();
     let port = session.port();
 
     let browse = tokio::spawn(async move {
@@ -176,7 +176,7 @@ async fn stopping_a_session_drops_what_the_operator_was_still_looking_at() {
     let s = Scratch::new("stop");
     let (origin_port, handshakes) = tls_origin(ok_response("never")).await;
     let (session, project, ca_pem) = session_over(&s, true).await;
-    let gate = session.gate().expect("intercepting").clone();
+    let gate = session.gate().clone();
     let port = session.port();
 
     let browse = tokio::spawn(async move {
@@ -229,5 +229,67 @@ async fn a_plaintext_proxy_request_says_what_is_wrong_rather_than_failing_vaguel
         got.contains("CONNECT") && got.contains("not forwarded yet"),
         "the reply has to say it is us and not the target, got:\n{got}"
     );
+    session.stop().await;
+}
+
+#[tokio::test]
+async fn interception_can_be_switched_without_stopping_the_proxy() {
+    // The toggle in the window. Before this the gate only existed if interception was on
+    // when the proxy started, so ticking the box mid-session did nothing at all and said
+    // nothing about it.
+    let s = Scratch::new("toggle");
+    let (origin_port, _) = tls_origin(ok_response("through")).await;
+    let (session, project, ca_pem) = session_over(&s, false).await;
+    assert!(
+        !session.intercepting(),
+        "starts off because that is what was asked"
+    );
+
+    // Off: a request goes straight through and nothing queues.
+    let (status, _) = through_proxy(
+        session.port(),
+        origin_port,
+        &ca_pem,
+        "GET",
+        "/before",
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(session.gate().pending_count(), 0);
+
+    // On, without restarting anything.
+    session.set_intercept(true);
+    assert!(session.intercepting());
+    let port = session.port();
+    let pem = ca_pem.clone();
+    let browse = tokio::spawn(async move {
+        through_proxy(port, origin_port, &pem, "GET", "/after", Vec::new()).await
+    });
+    tokio::time::timeout(Duration::from_secs(10), session.gate().arrival())
+        .await
+        .expect("the request is held now");
+    assert_eq!(session.gate().pending_count(), 1);
+
+    // And off again releases it rather than dropping it: the operator asked for traffic
+    // to flow, not for their queue to be thrown away.
+    assert_eq!(
+        session.set_intercept(false),
+        1,
+        "the held request was forwarded"
+    );
+    let (status, body) = tokio::time::timeout(Duration::from_secs(10), browse)
+        .await
+        .expect("it completed")
+        .expect("no panic");
+    assert_eq!(status, 200);
+    assert_eq!(&body[..], b"through");
+
+    let p = project.clone();
+    eventually("both exchanges recorded", || {
+        let p = p.clone();
+        async move { p.count().await.unwrap_or(0) >= 2 }
+    })
+    .await;
     session.stop().await;
 }

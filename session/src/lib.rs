@@ -80,7 +80,7 @@ impl SessionConfig {
 /// A listening capture session. Dropping it stops accepting; [`Session::stop`] also waits.
 pub struct Session {
     port: u16,
-    gate: Option<Arc<LocalGate>>,
+    gate: Arc<LocalGate>,
     project: Arc<Project>,
     stop: tokio::sync::watch::Sender<bool>,
     accepting: tokio::task::JoinHandle<()>,
@@ -93,15 +93,17 @@ impl Session {
         let listener = TcpListener::bind(cfg.bind).await?;
         let port = listener.local_addr()?.port();
 
-        let gate = cfg.intercept.then(|| Arc::new(LocalGate::new()));
+        // Always built, switched rather than conditional. A gate that only exists when
+        // interception was on at start is why the UI's toggle could not work without
+        // stopping the proxy.
+        let gate = Arc::new(LocalGate::new());
+        gate.set_enabled(cfg.intercept);
         let sink = Arc::new(ProjectSink::new(cfg.project.clone()));
         let capture = CaptureCfg {
             // The local store is the full-capture surface by definition: a workbench
             // exists to show the operator the bytes.
             full: true,
-            gate: gate
-                .clone()
-                .map(|g| g as Arc<dyn cfx_capture::InterceptGate>),
+            gate: Some(gate.clone() as Arc<dyn cfx_capture::InterceptGate>),
             bypass_hosts: cfg.bypass_hosts.clone(),
             sink: Some(sink),
             trust_any_upstream_cert: cfg.trust_any_upstream_cert,
@@ -157,9 +159,20 @@ impl Session {
         self.port
     }
 
-    /// The intercept queue, when this session was started with `intercept`.
-    pub fn gate(&self) -> Option<&Arc<LocalGate>> {
-        self.gate.as_ref()
+    /// The intercept queue. Always present; ask it whether it is holding.
+    pub fn gate(&self) -> &Arc<LocalGate> {
+        &self.gate
+    }
+
+    /// Whether requests are being held right now.
+    pub fn intercepting(&self) -> bool {
+        self.gate.is_enabled()
+    }
+
+    /// Turn interception on or off without stopping the proxy. Returns how many held
+    /// requests were released, which is non-zero only when switching off.
+    pub fn set_intercept(&self, on: bool) -> usize {
+        self.gate.set_enabled(on)
     }
 
     pub fn project(&self) -> &Arc<Project> {
@@ -172,11 +185,9 @@ impl Session {
     /// at, and releasing it to the target after they closed the session is the one outcome
     /// nobody asked for.
     pub async fn stop(self) {
-        if let Some(g) = &self.gate {
-            let dropped = g.shutdown();
-            if dropped > 0 {
-                log::info!("session stopping: dropped {dropped} request(s) still held");
-            }
+        let dropped = self.gate.shutdown();
+        if dropped > 0 {
+            log::info!("session stopping: dropped {dropped} request(s) still held");
         }
         let _ = self.stop.send(true);
         self.accepting.abort();
@@ -188,7 +199,7 @@ impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Session")
             .field("port", &self.port)
-            .field("intercepting", &self.gate.is_some())
+            .field("intercepting", &self.gate.is_enabled())
             .field("project", &self.project.path())
             .finish()
     }
