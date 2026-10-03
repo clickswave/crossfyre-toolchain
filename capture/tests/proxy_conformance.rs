@@ -932,3 +932,102 @@ async fn a_flow_parked_on_the_gate_does_not_hold_up_another_flow() {
          waiting on the gate blocked the other one"
     );
 }
+
+/// What happens when the origin's certificate is not signed by a public CA.
+///
+/// This pins the current posture rather than asserting a desired one, because the posture
+/// is inconsistent across the product and the choice is not this test's to make.
+/// `flow.rs` builds its upstream client from `webpki_roots` and nothing else, and the
+/// desktop local proxy sets `danger_accept_invalid_certs(false)`, so a target presenting a
+/// private-CA or self-signed certificate cannot be forwarded to at all. Meanwhile
+/// `cortex`, `scout` and `voyage` all set `accept_invalid_certs: true`, which is right for
+/// a scanner pointed at somebody's staging box.
+///
+/// So an engagement against an internal app behind a corporate CA scans fine and captures
+/// nothing, and the operator is told only that the upstream failed. Internal apps are a
+/// large share of what this tool is for, so the gap is worth a test that goes red the day
+/// somebody decides the other way.
+#[tokio::test]
+async fn an_origin_with_a_private_ca_cannot_be_forwarded_to_today() {
+    cfx_capture::install_default_crypto_provider();
+
+    // A TLS origin with its own self-signed leaf, the way an internal service looks.
+    let leaf_key = rcgen::KeyPair::generate().expect("key");
+    let mut params =
+        rcgen::CertificateParams::new(vec!["origin.test".to_string()]).expect("params");
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "origin.test");
+    let leaf = params.self_signed(&leaf_key).expect("self-signed leaf");
+    let certs = vec![rustls::pki_types::CertificateDer::from(leaf.der().to_vec())];
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(leaf_key.serialize_der().into());
+    let server_cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .expect("server config");
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin_port = listener.local_addr().unwrap().port();
+    let reached = Arc::new(AtomicUsize::new(0));
+    let reached2 = reached.clone();
+    tokio::spawn(async move {
+        while let Ok((sock, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            let reached = reached2.clone();
+            tokio::spawn(async move {
+                // A completed handshake here would mean the proxy accepted the certificate.
+                if let Ok(mut tls) = acceptor.accept(sock).await {
+                    reached.fetch_add(1, Ordering::Relaxed);
+                    let _ = read_until_quiet(&mut tls, ORIGIN_IDLE).await;
+                    let _ = tls.write_all(&ok_response("internal-app")).await;
+                    let _ = tls.flush().await;
+                }
+            });
+        }
+    });
+
+    let mut f = front(origin_port, CaptureCfg::default(), 1).await;
+
+    let mut roots = rustls::RootCertStore::empty();
+    for c in rustls_pemfile::certs(&mut f.ca.pem.as_bytes()) {
+        roots.add(c.unwrap()).unwrap();
+    }
+    let mut ccfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    ccfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(ccfg));
+    let tcp = TcpStream::connect(("127.0.0.1", f.port)).await.unwrap();
+    let name = rustls::pki_types::ServerName::try_from("origin.test").unwrap();
+    let tls = within("the client handshake", connector.connect(name, tcp))
+        .await
+        .expect("the client leg still succeeds: that half is ours");
+
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let resp = within("the request", sender.send_request(get("/x", "origin.test")))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        502,
+        "today the upstream leg refuses a certificate no public CA signed"
+    );
+    assert_eq!(
+        reached.load(Ordering::Relaxed),
+        0,
+        "the refusal is at our end: the origin never completed a handshake"
+    );
+    drop(sender);
+
+    let outcomes = within("the flow", f.outcome).await.unwrap();
+    let o = outcomes[0].as_ref().expect("the flow completed");
+    assert!(o.tls);
+    assert_eq!(o.requests, 1);
+    assert!(f.events.try_recv().is_err(), "no exchange, so no event");
+}
