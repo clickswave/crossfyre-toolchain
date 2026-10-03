@@ -36,6 +36,9 @@ use hyper::{Method, Request, Response};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
+#[cfg(feature = "testing")]
+pub mod testing;
+
 use cfx_capture::{CaptureCfg, Egress, LocalGate, SessionCa, TraceEvent, serve_mitm_flow};
 use cfx_project::{Project, ProjectSink};
 
@@ -85,7 +88,7 @@ pub struct Session {
 
 impl Session {
     pub async fn start(cfg: SessionConfig) -> std::io::Result<Self> {
-        cfx_capture::install_default_crypto_provider();
+        install_crypto();
 
         let listener = TcpListener::bind(cfg.bind).await?;
         let port = listener.local_addr()?.port();
@@ -268,4 +271,10 @@ async fn proxy(req: Request<hyper::body::Incoming>, ctx: FlowCtx) -> Response<Fu
 
     // 200 lets the browser go ahead with the handshake this session then intercepts.
     Response::new(Full::new(Bytes::new()))
+}
+
+/// Install the rustls crypto provider. Idempotent, and in one place so the session and the
+/// test helper cannot install different ones.
+pub(crate) fn install_crypto() {
+    cfx_capture::install_default_crypto_provider();
 }

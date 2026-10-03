@@ -8,13 +8,49 @@ description = "A runnable local capture session: a CONNECT proxy front end that 
 cfx_capture = { path = "../capture" }
 cfx_project = { path = "../project" }
 tokio = { version = "1.49.0", features = ["rt", "net", "io-util", "macros", "sync", "time"] }
-hyper = { version = "1", features = ["server", "http1"] }
+# `client` is here for the `testing` helper rather than for the session, which only
+# serves. Not optional: Cargo unifies hyper's features across the graph anyway, so a
+# second renamed entry would buy nothing and read as two dependencies.
+hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1"
 log = "0.4"
 
+[features]
+# Test support: a TLS origin and a client that speaks a browser's CONNECT sequence.
+# Behind a feature because it pulls a client stack the session itself does not need, and
+# because it is for tests in THIS repo and in the private workbench, which would otherwise
+# hand-roll the same client a third time and get it subtly different.
+testing = [
+    "dep:rustls",
+    "dep:tokio-rustls",
+    "dep:rustls-pemfile",
+    "dep:rcgen",
+]
+
+[dependencies.rustls]
+version = "0.23"
+features = ["aws_lc_rs"]
+optional = true
+
+[dependencies.tokio-rustls]
+version = "0.26"
+optional = true
+
+[dependencies.rustls-pemfile]
+version = "2"
+optional = true
+
+[dependencies.rcgen]
+version = "0.13"
+optional = true
+
 [dev-dependencies]
+# A dev dependency on itself, which is how a crate turns its own feature on for its own
+# tests. Without it the helpers in `testing` would be invisible here and the tests would
+# need `--features testing` passed by hand, which CI would forget.
+cfx_session = { path = ".", features = ["testing"] }
 tokio = { version = "1.49.0", features = ["rt", "rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }
 rustls = { version = "0.23", features = ["aws_lc_rs"] }
 tokio-rustls = "0.26"
