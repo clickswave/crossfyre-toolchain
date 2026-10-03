@@ -1070,3 +1070,108 @@ async fn tls_request_through(f: &mut Front, path: &str) -> (u16, bytes::Bytes) {
     drop(sender);
     (status, body)
 }
+
+// ---------------------------------------------------------------------------
+// The in-process gate, driven through a real flow
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_request_held_by_the_local_gate_can_be_edited_and_released() {
+    // The workbench path: a request parks, the operator sees it, changes the body, and
+    // forwards. Worth driving through the proxy rather than only through the gate, because
+    // what the origin receives is the part that matters and only this can see it.
+    let (op, olog) = origin(ok_response("edited-through"));
+    let gate = Arc::new(cfx_capture::LocalGate::new());
+    let cfg = CaptureCfg {
+        full: true,
+        gate: Some(gate.clone()),
+        ..Default::default()
+    };
+    let f = front(op, cfg, 1).await;
+    let port = f.port;
+
+    // Sent on its own task, because it will not come back until the gate is answered.
+    let request = tokio::spawn(async move {
+        plain_request(
+            port,
+            Request::builder()
+                .method("POST")
+                .uri("/original")
+                .header("host", "origin.test")
+                .body(Full::new(Bytes::from_static(b"what the client sent")))
+                .unwrap(),
+        )
+        .await
+    });
+
+    // What a UI does instead of polling.
+    within("the arrival signal", gate.arrival()).await;
+    let waiting = gate.pending();
+    assert_eq!(waiting.len(), 1, "exactly one request is held");
+    assert_eq!(waiting[0].method, "POST");
+    assert_eq!(waiting[0].url, "http://origin.test/original");
+    assert_eq!(waiting[0].body, b"what the client sent");
+    assert_eq!(
+        olog.connections(),
+        0,
+        "and nothing has reached the origin yet"
+    );
+
+    assert!(gate.resolve(
+        waiting[0].id,
+        InterceptDecision::ForwardModified(EditedRequest {
+            method: "PUT".into(),
+            path: "/edited".into(),
+            headers: vec![("host".into(), "origin.test".into())],
+            body: b"what the operator sent instead".to_vec(),
+        })
+    ));
+
+    let (status, body) = within("the response", request).await.expect("no panic");
+    assert_eq!(status, 200);
+    assert_eq!(&body[..], b"edited-through");
+
+    let seen = String::from_utf8_lossy(&olog.first()).to_string();
+    assert!(seen.starts_with("PUT /edited "), "got:\n{seen}");
+    assert!(
+        seen.ends_with("what the operator sent instead"),
+        "got:\n{seen}"
+    );
+    assert!(
+        !seen.contains("what the client sent"),
+        "the original body did not also go out, got:\n{seen}"
+    );
+    // The length describes the edited body, which is the fix the earlier tests pin. Here
+    // it is reached through the gate a real operator would use rather than a stub.
+    assert_eq!(
+        declared_length(&seen),
+        "what the operator sent instead".len()
+    );
+}
+
+#[tokio::test]
+async fn a_request_dropped_at_the_local_gate_never_reaches_the_origin() {
+    let (op, olog) = origin(ok_response("should-never-be-sent"));
+    let gate = Arc::new(cfx_capture::LocalGate::new());
+    let cfg = CaptureCfg {
+        gate: Some(gate.clone()),
+        ..Default::default()
+    };
+    let f = front(op, cfg, 1).await;
+    let port = f.port;
+
+    let request =
+        tokio::spawn(async move { plain_request(port, get("/dropped", "origin.test")).await });
+    within("the arrival signal", gate.arrival()).await;
+    let id = gate.pending()[0].id;
+    assert!(gate.resolve(id, InterceptDecision::Drop));
+
+    let (status, body) = within("the response", request).await.expect("no panic");
+    assert_eq!(status, 403);
+    assert_eq!(&body[..], b"dropped by interceptor");
+    assert_eq!(
+        olog.connections(),
+        0,
+        "the whole promise of Drop: the origin was never dialled"
+    );
+}

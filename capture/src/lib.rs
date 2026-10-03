@@ -14,11 +14,13 @@
 pub mod body;
 pub mod config;
 pub mod flow;
+pub mod gate;
 pub mod reduce;
 
 pub use config::CaptureConfig;
 pub mod sni;
 pub use flow::{FlowOutcome, serve_mitm_flow};
+pub use gate::{Held, LocalGate};
 pub use reduce::{FullExchange, TraceEvent, body_field_names, redact_url};
 
 use std::collections::HashMap;
