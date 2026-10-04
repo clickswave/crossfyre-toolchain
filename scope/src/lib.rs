@@ -152,9 +152,23 @@ fn parse_one(raw: &str) -> Option<Rule> {
         }
         return Some(Rule::HostPort(host.to_string(), port));
     }
-    if !e.contains('.') && e != "localhost" {
-        // A single label that is not localhost is almost always a typo, and a
-        // typo in an authorisation list should be loud.
+    // A single label is a destination. `jira`, `intranet`, `wiki`, `gitlab`: on an
+    // internal engagement these are the most common scope entries there are, and
+    // refusing them made the fence unusable on exactly the networks it matters most on.
+    //
+    // This used to be refused on the grounds that a single label is almost always a typo
+    // and a typo in an authorisation list should be loud. That reasoning was written for
+    // a scanner, where the operator names one target they have already resolved. It is
+    // wrong here, and it is wrong in the direction that blocks work rather than the
+    // direction that leaks: a label that IS a typo becomes a rule matching nothing, which
+    // narrows the fence and can never widen it. Refusing it, by contrast, left an
+    // operator on an internal network with no way to write their scope down at all.
+    //
+    // The loudness moves to where it belongs, which is a list the operator reads back.
+    if !e
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_')
+    {
         return None;
     }
     Some(Rule::Host(e))
@@ -521,6 +535,55 @@ mod tests {
     // ----- Policy: the three states, and why two of them must not be one -----
 
     #[test]
+    fn a_single_label_internal_name_is_a_destination() {
+        // The names an engagement on an internal network is actually written against.
+        // Refusing these left an operator there unable to write a scope down at all,
+        // which is a worse failure than the typo this once guarded against: a label that
+        // IS a typo becomes a rule matching nothing, and a rule matching nothing narrows
+        // the fence and can never widen it.
+        for name in [
+            "jira",
+            "intranet",
+            "wiki",
+            "gitlab",
+            "build-01",
+            "app_server",
+        ] {
+            let (p, rejected) = Policy::from_entries(&[name.to_string()]);
+            assert!(rejected.is_empty(), "{name} was refused: {rejected:?}");
+            assert!(
+                p.admits(name, 443),
+                "{name} is not admitted by its own rule"
+            );
+            assert!(p.admits(name, 8080), "any port, since none was named");
+        }
+        // And it is still exactly what it says. A bare label does not become a suffix.
+        let (p, _) = Policy::from_entries(&["jira".to_string()]);
+        assert!(!p.admits("jira.example.com", 443));
+        assert!(!p.admits("notjira", 443));
+    }
+
+    #[test]
+    fn an_entry_that_is_not_a_hostname_is_still_refused() {
+        // Loosening the single-label rule must not turn this into a parser that accepts
+        // anything. What it takes is a destination, and these are not destinations.
+        for bad in [
+            "hello world",
+            "https://x",
+            "a/b",
+            "*",
+            "*.com",
+            "x:notaport",
+            "name!",
+            "a,b",
+            "<script>",
+        ] {
+            let (_, rejected) = Policy::from_entries(&[bad.to_string()]);
+            assert_eq!(rejected, vec![bad.to_string()], "{bad} should be refused");
+        }
+    }
+
+    #[test]
     fn nothing_written_down_admits_everything() {
         // A project that has never had a scope set must carry everything. If this
         // refused, turning the feature on would brick every project anybody already has
@@ -761,7 +824,7 @@ mod tests {
                 "not a host",          // whitespace
                 "",                    // empty
                 "localhost:notaport",  // bad port
-                "admin",               // bare label, almost certainly a typo
+                "name!",               // not a hostname
             ]
             .iter()
             .map(|s| s.to_string())
@@ -769,6 +832,13 @@ mod tests {
         );
         assert!(s.is_empty(), "nothing in that list is an authorisation");
         assert_eq!(refused.len(), 9, "and every one of them is reported");
+        // `admin` used to be in this list, on the grounds that a bare label is almost
+        // always a typo. It is also `jira`, `intranet` and every other internal name an
+        // engagement is written against, and refusing those left an operator on such a
+        // network unable to write a scope at all. See
+        // `a_single_label_internal_name_is_a_destination` for why the trade runs the
+        // other way: a label that is a typo matches nothing, and a rule that matches
+        // nothing can only narrow a fence.
     }
 
     #[test]
