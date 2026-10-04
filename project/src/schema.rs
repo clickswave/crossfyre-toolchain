@@ -10,7 +10,7 @@ use sqlx::{Row, SqlitePool};
 
 /// Bumped whenever the statements below change. An older build opening a newer file
 /// refuses rather than guessing, which is the whole reason this is checked.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Exchanges, their out-of-line bodies, and a full-text index over the parts a human
 /// searches.
@@ -86,6 +86,10 @@ const STEPS: &[Step] = &[
         version: 2,
         statements: V2_RUNS,
     },
+    Step {
+        version: 3,
+        statements: V3_SCOPE,
+    },
 ];
 
 /// Version 2: a capture session is a thing, and every exchange belongs to one.
@@ -108,6 +112,32 @@ const V2_RUNS: &[&str] = &[
     )",
     "ALTER TABLE exchange ADD COLUMN run_id INTEGER REFERENCES run(id)",
     "CREATE INDEX exchange_run ON exchange(run_id)",
+];
+
+/// Version 3: what the operator said they may reach, and what was refused.
+///
+/// `setting` is a general key-value table rather than a scope column, because the next
+/// three things that belong to a project rather than to a launch (match-and-replace
+/// rules, an upstream proxy, a client certificate) have the same shape and none of them
+/// is worth a migration of its own.
+///
+/// `refusal` is a table and not an exchange. The 502 path records a synthetic exchange
+/// for a request that failed on the way out, and copying that here would put requests
+/// that were never sent into the table the operation model and coverage are derived from.
+/// It also answers the question an authorisation boundary exists for: months later, from
+/// the project file alone, did this tool touch something it should not have.
+const V3_SCOPE: &[&str] = &[
+    "CREATE TABLE setting (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    "CREATE TABLE refusal (
+        id     INTEGER PRIMARY KEY AUTOINCREMENT,
+        at_ms  INTEGER NOT NULL,
+        run_id INTEGER REFERENCES run(id),
+        host   TEXT NOT NULL,
+        port   INTEGER NOT NULL,
+        point  TEXT NOT NULL,
+        detail TEXT
+    )",
+    "CREATE INDEX refusal_at ON refusal(at_ms)",
 ];
 
 /// Bring a file up to date, applying only the steps it has not seen.

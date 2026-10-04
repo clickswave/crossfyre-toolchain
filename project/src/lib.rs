@@ -33,6 +33,9 @@ use std::path::{Path, PathBuf};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Row, SqlitePool};
 
+/// Where the scope lives in `setting`.
+pub const SCOPE_SETTING: &str = "scope";
+
 pub mod blob;
 pub mod schema;
 pub mod sink;
@@ -529,6 +532,99 @@ impl Project {
             out.push(r.try_get::<String, _>(0)?);
         }
         Ok(out.join("; "))
+    }
+
+    // -----------------------------------------------------------------
+    // Settings and the scope
+    // -----------------------------------------------------------------
+
+    /// One value that belongs to the project rather than to a launch.
+    pub async fn setting(&self, key: &str) -> Result<Option<String>, Error> {
+        let row = sqlx::query("SELECT value FROM setting WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get::<String, _>("value")))
+    }
+
+    pub async fn set_setting(&self, key: &str, value: &str) -> Result<(), Error> {
+        sqlx::query("INSERT INTO setting(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+            .bind(key)
+            .bind(value)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The scope, as the lines an operator typed.
+    ///
+    /// Newline-joined in one value rather than a table, which is lossless because the
+    /// parser refuses any entry containing whitespace. A table would buy ordering and
+    /// per-entry metadata, and neither is wanted: the list IS the thing the operator
+    /// reads and edits, and it round trips exactly.
+    pub async fn scope_entries(&self) -> Result<Vec<String>, Error> {
+        Ok(self
+            .setting(SCOPE_SETTING)
+            .await?
+            .map(|v| v.lines().map(|l| l.to_string()).collect())
+            .unwrap_or_default())
+    }
+
+    pub async fn set_scope_entries(&self, entries: &[String]) -> Result<(), Error> {
+        self.set_setting(SCOPE_SETTING, &entries.join("\n")).await
+    }
+
+    /// A destination that was not reached, against the capture session it happened in.
+    ///
+    /// Durable on purpose. The guard keeps a ring for the window; this is the answer
+    /// months later, from the file alone, to whether this tool ever touched something it
+    /// should not have.
+    pub async fn record_refusal(&self, r: &cfx_scope::Refusal) -> Result<i64, Error> {
+        let res = sqlx::query(
+            "INSERT INTO refusal(at_ms, run_id, host, port, point, detail) VALUES(?,?,?,?,?,?)",
+        )
+        .bind(r.at_ms)
+        // The capture session it happened in, or none when the proxy is stopped: a
+        // Repeater send is still an egress and still gets a row.
+        .bind(self.current_run())
+        .bind(&r.host)
+        .bind(r.port as i64)
+        .bind(r.point.as_str())
+        .bind(r.detail.as_deref())
+        .execute(&self.pool)
+        .await?;
+        Ok(res.last_insert_rowid())
+    }
+
+    /// Newest first, which is the order somebody reads them in.
+    pub async fn refusals(&self, limit: i64) -> Result<Vec<cfx_scope::Refusal>, Error> {
+        let rows = sqlx::query(
+            "SELECT at_ms, host, port, point, detail FROM refusal ORDER BY id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| cfx_scope::Refusal {
+                at_ms: r.get("at_ms"),
+                host: r.get("host"),
+                port: r.get::<i64, _>("port") as u16,
+                // A row this crate wrote, so an unknown value means the file was edited
+                // by something else. Named as a request rather than dropped: a refusal
+                // that vanished from the audit trail is the one failure this table has.
+                point: cfx_scope::Point::parse(r.get::<String, _>("point").as_str())
+                    .unwrap_or(cfx_scope::Point::Request),
+                detail: r.get("detail"),
+            })
+            .collect())
+    }
+
+    pub async fn refusal_count(&self) -> Result<i64, Error> {
+        let row = sqlx::query("SELECT COUNT(*) AS n FROM refusal")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.get("n"))
     }
 
     pub async fn count(&self) -> Result<i64, Error> {

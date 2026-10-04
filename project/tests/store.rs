@@ -601,12 +601,24 @@ async fn a_version_one_project_upgrades_without_losing_anything() {
         }
         p.close().await;
     }
-    // Put the file back to version 1 and drop what version 2 added, which is what a file
-    // from the previous build looks like.
+    // Put the file back to version 1 by undoing every step above it, which is what a file
+    // from an older build looks like. Each new version adds its undo here: that is the
+    // cost of testing the upgrade path against a real old file rather than a simulated
+    // one, and it is cheaper than the alternative, which is finding out from somebody
+    // else's project that the upgrade never worked.
     {
         use sqlx::sqlite::SqliteConnectOptions;
         let opts = SqliteConnectOptions::new().filename(s.path().join("project.db"));
         let pool = sqlx::SqlitePool::connect_with(opts).await.expect("connect");
+        // Version 3.
+        for stmt in [
+            "DROP INDEX refusal_at",
+            "DROP TABLE refusal",
+            "DROP TABLE setting",
+        ] {
+            sqlx::query(stmt).execute(&pool).await.expect(stmt);
+        }
+        // Version 2.
         sqlx::query("DROP INDEX IF EXISTS exchange_run")
             .execute(&pool)
             .await
@@ -636,6 +648,16 @@ async fn a_version_one_project_upgrades_without_losing_anything() {
         p.search("WIDGET-1", 10).await.expect("search").len(),
         1,
         "and the index still answers"
+    );
+    // And the file really has the shape it now claims. A step that silently no-ops stamps
+    // a version the file does not have, and every query against the new table then fails
+    // at runtime against a file that looks migrated.
+    p.set_setting("probe", "value")
+        .await
+        .expect("v3 setting table exists");
+    assert_eq!(
+        p.setting("probe").await.expect("read back"),
+        Some("value".to_string())
     );
 
     // The new session machinery works on the upgraded file.
@@ -874,4 +896,88 @@ async fn a_quote_in_the_search_box_is_a_search_and_not_an_error() {
     }
     // And the one that should match still does.
     assert_eq!(p.search("WIDGET-7", 10).await.expect("search").len(), 1);
+}
+
+/// The scope, and the refusals it produced, survive closing the project.
+///
+/// Both halves matter and they fail differently. A scope that did not persist means an
+/// operator who closes the window at the end of a day reopens it with no fence at all,
+/// which is the worst possible default because it looks exactly like the fence they set.
+/// A refusal that did not persist means the audit answer is only ever "since this window
+/// opened", which is not an answer.
+#[tokio::test]
+async fn the_scope_and_what_it_refused_survive_a_reopen() {
+    let s = Scratch::new("scope-persist");
+    let written = vec![
+        "api.example.com".to_string(),
+        "*.staging.example.com".to_string(),
+        "10.0.0.0/8".to_string(),
+    ];
+    {
+        let p = Project::open(s.path(), Cap::default()).await.expect("open");
+        p.set_scope_entries(&written).await.expect("save the scope");
+        p.begin_run(1_700_000_000_000, Some("a sitting"))
+            .await
+            .expect("run");
+        p.record_refusal(&cfx_scope::Refusal {
+            at_ms: 1_700_000_000_123,
+            host: "out.example".into(),
+            port: 8443,
+            point: cfx_scope::Point::Connect,
+            detail: None,
+        })
+        .await
+        .expect("record");
+        p.record_refusal(&cfx_scope::Refusal {
+            at_ms: 1_700_000_000_456,
+            host: "other.example".into(),
+            port: 80,
+            point: cfx_scope::Point::Request,
+            detail: Some("GET /admin".into()),
+        })
+        .await
+        .expect("record");
+        p.close().await;
+    }
+
+    let p = Project::open(s.path(), Cap::default())
+        .await
+        .expect("reopen");
+    assert_eq!(
+        p.scope_entries().await.expect("read back"),
+        written,
+        "the entries round trip exactly, in order, as text"
+    );
+    // And they still mean the same thing, which is the claim text alone does not make.
+    let (policy, rejected) = cfx_scope::Policy::from_entries(&p.scope_entries().await.unwrap());
+    assert!(rejected.is_empty());
+    assert!(policy.admits("api.example.com", 443));
+    assert!(policy.admits("a.staging.example.com", 443));
+    assert!(policy.admits("10.1.2.3", 22));
+    assert!(!policy.admits("example.com", 443));
+
+    let back = p.refusals(10).await.expect("refusals");
+    assert_eq!(back.len(), 2);
+    assert_eq!(back[0].host, "other.example", "newest first");
+    assert_eq!(back[0].point, cfx_scope::Point::Request);
+    assert_eq!(back[0].detail.as_deref(), Some("GET /admin"));
+    assert_eq!(back[1].point, cfx_scope::Point::Connect);
+    assert_eq!(back[1].port, 8443);
+    assert_eq!(p.refusal_count().await.expect("count"), 2);
+}
+
+/// An empty list clears the fence rather than leaving the old one in force.
+#[tokio::test]
+async fn clearing_the_scope_is_saved_as_clearing_it() {
+    let s = Scratch::new("scope-clear");
+    let p = Project::open(s.path(), Cap::default()).await.expect("open");
+    p.set_scope_entries(&["api.example.com".to_string()])
+        .await
+        .expect("set");
+    p.set_scope_entries(&[]).await.expect("clear");
+    assert!(
+        p.scope_entries().await.expect("read").is_empty(),
+        "an operator who deletes every line means it, and the stored value has to agree \
+         or the window and the proxy disagree about what is fenced"
+    );
 }

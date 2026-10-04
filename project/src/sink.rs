@@ -20,11 +20,22 @@ use crate::{Exchange, Project};
 /// cap exists to solve.
 pub const CHECK_CAP_EVERY: usize = 64;
 
+/// What goes down the writer channel.
+///
+/// One channel and one writer, rather than a second task for refusals, so a refusal keeps
+/// its order against the exchanges around it and one `flush()` still means everything is
+/// on disk. Two writers would make "the proxy was carrying this when it refused that" a
+/// question the file could not answer.
+enum Write {
+    Exchange(Box<RawExchange>),
+    Refusal(cfx_scope::Refusal),
+}
+
 pub struct ProjectSink {
     project: Arc<Project>,
-    /// Exchanges handed over and not yet written. Unbounded because dropping a capture to
-    /// keep a queue short would defeat the point of having one.
-    tx: tokio::sync::mpsc::UnboundedSender<RawExchange>,
+    /// Handed over and not yet written. Unbounded because dropping a capture to keep a
+    /// queue short would defeat the point of having one.
+    tx: tokio::sync::mpsc::UnboundedSender<Write>,
     /// How many are still in flight, so `flush` knows when there is nothing left.
     pending: Arc<AtomicUsize>,
     drained: Arc<tokio::sync::Notify>,
@@ -37,7 +48,7 @@ impl ProjectSink {
 
     /// Mostly for tests, which want the cap to act at a known point.
     pub fn with_check_interval(project: Arc<Project>, check_every: usize) -> Self {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RawExchange>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Write>();
         let pending = Arc::new(AtomicUsize::new(0));
         let drained = Arc::new(tokio::sync::Notify::new());
         let check_every = check_every.max(1);
@@ -50,19 +61,38 @@ impl ProjectSink {
             let drained = drained.clone();
             tokio::spawn(async move {
                 let mut since_check = 0usize;
-                while let Some(ex) = rx.recv().await {
+                while let Some(item) = rx.recv().await {
                     // Logged, never propagated. A store that cannot take a row has lost
                     // that row, which is bad, and there is nobody here to tell: the
                     // request it belonged to finished some time ago. A capture that
                     // quietly stops recording is the failure this logging exists to make
                     // visible, so it is an error line and not a debug one.
-                    if let Err(e) = project.insert(&from_raw(&ex)).await {
-                        log::error!("project store: dropping {} {}: {e}", ex.method, ex.url);
-                    } else {
-                        since_check += 1;
-                        if since_check >= check_every {
-                            since_check = 0;
-                            check_cap(&project).await;
+                    match item {
+                        Write::Exchange(ex) => {
+                            if let Err(e) = project.insert(&from_raw(&ex)).await {
+                                log::error!(
+                                    "project store: dropping {} {}: {e}",
+                                    ex.method,
+                                    ex.url
+                                );
+                            } else {
+                                since_check += 1;
+                                if since_check >= check_every {
+                                    since_check = 0;
+                                    check_cap(&project).await;
+                                }
+                            }
+                        }
+                        // A refusal that failed to write is the one row whose absence
+                        // reads as "nothing was refused", so it says so loudly.
+                        Write::Refusal(r) => {
+                            if let Err(e) = project.record_refusal(&r).await {
+                                log::error!(
+                                    "project store: a refusal of {}:{} was not recorded: {e}",
+                                    r.host,
+                                    r.port
+                                );
+                            }
                         }
                     }
                     if pending.fetch_sub(1, Ordering::AcqRel) == 1 {
@@ -120,7 +150,7 @@ impl ExchangeSink for ProjectSink {
         // Counted BEFORE it is sent, so a `flush` that arrives between the two cannot
         // conclude there is nothing left to wait for.
         self.pending.fetch_add(1, Ordering::AcqRel);
-        if self.tx.send(ex).is_err() {
+        if self.tx.send(Write::Exchange(Box::new(ex))).is_err() {
             // The writer is gone, which happens only after the runtime is shutting down.
             self.pending.fetch_sub(1, Ordering::AcqRel);
             log::error!("project store: the writer has stopped; an exchange was lost");
@@ -140,6 +170,28 @@ impl ExchangeSink for ProjectSink {
                 waiter.await;
             }
         })
+    }
+}
+
+/// The same writer takes refusals.
+///
+/// Synchronous and infallible, like `record`, because the guard calls it from paths that
+/// cannot await: the middle of a CONNECT decision, and the middle of a request. A boundary
+/// whose recording could block the decision would be a boundary that sometimes does not
+/// make it.
+impl cfx_scope::RefusalSink for ProjectSink {
+    fn refused(&self, r: &cfx_scope::Refusal) {
+        // Not counted in `pending`. `flush()` exists so stopping a capture can promise the
+        // exchanges are on disk, and a refusal is not an exchange; counting it would let a
+        // refusal arriving during shutdown hold the stop open. It still goes down the same
+        // channel, so its ORDER against the exchanges is kept either way.
+        if self.tx.send(Write::Refusal(r.clone())).is_err() {
+            log::error!(
+                "project store: the writer has stopped; a refusal of {}:{} was lost",
+                r.host,
+                r.port
+            );
+        }
     }
 }
 
