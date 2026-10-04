@@ -15,7 +15,9 @@
 //! - [`scope`], because there are three host-scope implementations in this product and
 //!   two of them disagree about whether a wildcard admits the apex. A credential's host
 //!   scope is an authorisation boundary, so that disagreement is a defect rather than a
-//!   style difference, and the way out is one implementation.
+//!   style difference, and the way out is one implementation. It now lives in `cfx_scope`
+//!   and is re-exported here under its old name: the proxy needs it too, and nothing
+//!   under the capture core can depend on this crate to get it.
 //! - [`race`], for the check-then-write window, which needs careful ordering and is
 //!   worth exactly nothing reimplemented casually somewhere else.
 
@@ -37,7 +39,7 @@ mod oast;
 mod probe;
 pub mod race;
 pub mod rawhttp;
-pub mod scope;
+pub use cfx_scope as scope;
 mod secrets;
 mod smuggle;
 mod solver;

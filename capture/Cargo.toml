@@ -5,6 +5,7 @@ edition = "2024"
 description = "Shared traffic-capture core (session CA, per-SNI MITM leaves, egress, per-flow inspect+forward, privacy-safe reduction) for the Web Tracer family: desktop proxy and mobile VpnService netstack."
 
 [dependencies]
+cfx_scope = { path = "../scope" }
 rustls = { version = "0.23", features = ["aws_lc_rs"] }
 tokio-rustls = "0.26"
 rcgen = "0.13"

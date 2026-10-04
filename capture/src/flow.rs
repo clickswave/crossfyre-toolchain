@@ -133,6 +133,11 @@ pub struct FlowOutcome {
     pub requests: usize,
     /// Carried through without interception, by operator choice.
     pub bypassed: bool,
+    /// Out of scope. Nothing was dialled, no certificate was minted, and the guard has
+    /// already written it down. Named separately from a flow that simply carried no
+    /// requests, because a caller that cannot tell them apart reports a refusal as
+    /// certificate pinning.
+    pub refused: bool,
 }
 
 pub async fn serve_mitm_flow<C>(
@@ -179,6 +184,22 @@ where
             None => log::info!("tls flow -> {target_host}:{target_port} (no SNI)"),
         }
 
+        // Scope BEFORE bypass, and both before the handshake.
+        //
+        // `bypass_hosts` answers "do not intercept this". Scope answers "do not reach
+        // this". They are allowed to disagree and scope wins, because the bypass branch
+        // below relays the flow with copy_bidirectional and returns: there is no
+        // per-request gate behind it, nothing is parsed and nothing is recorded. A bypass
+        // entry that outranked scope would be the one path in the product that carries
+        // invisible traffic to a destination the operator never authorised.
+        if !admit_flow(&cfg, sni.as_deref(), &target_host, target_port) {
+            return Ok(FlowOutcome {
+                tls: true,
+                refused: true,
+                ..Default::default()
+            });
+        }
+
         if let Some(host) = sni.as_deref() {
             if crate::sni::is_bypassed(host, &cfg.bypass_hosts) {
                 log::info!("bypass {host}: relaying untouched, not intercepting");
@@ -190,6 +211,7 @@ where
                     tls: true,
                     requests: 0,
                     bypassed: true,
+                    refused: false,
                 });
             }
         }
@@ -209,6 +231,7 @@ where
             tls: true,
             requests: served.load(std::sync::atomic::Ordering::Relaxed),
             bypassed: false,
+            refused: false,
         })
     } else {
         let stream = PrefixedIo::new(first[..n].to_vec(), client);
@@ -219,12 +242,51 @@ where
             served: served.clone(),
         };
         serve_http(stream, "http", target_host, target_port, ctx).await?;
+        // No scope check here. The plaintext branch carries absolute-form requests that
+        // can each name a different host, so the only honest gate is per request, and it
+        // is in handle_request. Checking the connection's destination as well would refuse
+        // on the proxy's own address.
         Ok(FlowOutcome {
             tls: false,
             requests: served.load(std::sync::atomic::Ordering::Relaxed),
             bypassed: false,
+            refused: false,
         })
     }
+}
+
+/// Every destination this TLS flow will use, as one decision.
+///
+/// The name the client asked for is what is judged: the SNI, or the flow's destination
+/// when there is none. When the destination is a different NAME from the SNI, both are
+/// judged, because both are destinations.
+///
+/// When the destination is a bare ADDRESS it is not judged separately. It is the
+/// resolver's answer for a name that was already admitted, and requiring it to match a
+/// rule of its own would refuse every flow on the mobile front end, where the client
+/// names a host and the device supplies the address. What that leaves is a client that
+/// lies in SNI reaching an address the operator did not list; the client here is the
+/// operator's own browser, and an address can always be listed explicitly.
+fn admit_flow(cfg: &CaptureCfg, sni: Option<&str>, target_host: &str, target_port: u16) -> bool {
+    let asked = sni.unwrap_or(target_host);
+    if !cfg.admit(asked, target_port, cfx_scope::Point::Connect, None) {
+        log::warn!("out of scope: refused tls flow to {asked}:{target_port}");
+        return false;
+    }
+    let dest_is_name = target_host.parse::<std::net::IpAddr>().is_err();
+    if dest_is_name && !target_host.eq_ignore_ascii_case(asked) {
+        let why = format!("asked for {asked}");
+        if !cfg.admit(
+            target_host,
+            target_port,
+            cfx_scope::Point::Connect,
+            Some(&why),
+        ) {
+            log::warn!("out of scope: refused tls flow to {target_host}:{target_port} ({why})");
+            return false;
+        }
+    }
+    true
 }
 
 /// What every request on one connection needs, so the count stays a property of
@@ -412,6 +474,42 @@ async fn handle_request(
         .iter()
         .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
+
+    // The destination, which is where the bytes go: the flow's for a tunnel, and the
+    // request's own authority for absolute-form plaintext, which the session resolved
+    // before calling here. Not the Host header: that is text inside the request and does
+    // not route. Refusing on it would make virtual-host routing and cache-poisoning tests
+    // impossible, which is the same separation the Repeater makes between a destination
+    // and the bytes sent to it.
+    //
+    // Not a repeat of the CONNECT check. Successive absolute-form requests on one proxy
+    // connection can each name a different host, so this is the only gate an http://
+    // target ever passes, and it is per request for that reason.
+    //
+    // Before forward, so a refused request never parks at the intercept gate: an operator
+    // must not be shown a Forward button for something out of scope.
+    //
+    // Nothing is recorded as an exchange. The 502 arm below writes a synthetic one, and
+    // copying that here would put requests that were never sent into the table the
+    // operation model and coverage are derived from. A refusal gets its own row.
+    let what = format!("{failed_method} {failed_pq}");
+    if !cfg.admit(
+        &target_host,
+        target_port,
+        cfx_scope::Point::Request,
+        Some(&what),
+    ) {
+        log::warn!("out of scope: refused {what} to {target_host}:{target_port}");
+        return Ok(Response::builder()
+            .status(403)
+            .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+            .header("x-crossfyre-scope", "refused")
+            .body(fixed_body(cfx_scope::refusal_text(
+                &target_host,
+                target_port,
+            )))
+            .unwrap());
+    }
 
     match forward(req, scheme, &target_host, target_port, egress, tx, &cfg).await {
         Ok(resp) => Ok(resp),

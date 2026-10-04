@@ -18,6 +18,9 @@ pub mod flow;
 pub mod gate;
 pub mod reduce;
 
+/// Re-exported so the proxy session, the workbench and this crate all name one type. Two
+/// copies of an authorisation boundary is how they come to disagree.
+pub use cfx_scope;
 pub use config::CaptureConfig;
 pub mod sni;
 pub use flow::{FlowOutcome, serve_mitm_flow};
@@ -327,6 +330,33 @@ pub struct CaptureCfg {
     /// otherwise, and those are a large share of what this tool is for. A per-project
     /// decision an operator makes knowingly, never a build-time default.
     pub trust_any_upstream_cert: bool,
+    /// What the operator said they may reach.
+    ///
+    /// `None` is unrestricted, which is what every front end did before this existed; the
+    /// desktop workbench always sets one. The guard rather than a plain `Scope` because an
+    /// operator narrows a scope the moment they notice traffic they should not be seeing,
+    /// and making them restart the proxy to do it means it keeps flowing while they work
+    /// out how.
+    pub scope: Option<Arc<cfx_scope::Guard>>,
+}
+
+impl CaptureCfg {
+    /// The one place in this crate a destination is refused.
+    ///
+    /// `true` carries on; `false` means the guard already recorded it, so no call site has
+    /// to remember to. Every egress point goes through here rather than reaching into the
+    /// guard, so there is one answer to "where is this checked" rather than four.
+    pub fn admit(
+        &self,
+        host: &str,
+        port: u16,
+        point: cfx_scope::Point,
+        detail: Option<&str>,
+    ) -> bool {
+        self.scope
+            .as_ref()
+            .is_none_or(|g| g.admit(host, port, point, detail))
+    }
 }
 
 impl std::fmt::Debug for CaptureCfg {
@@ -337,6 +367,7 @@ impl std::fmt::Debug for CaptureCfg {
             .field("bypass_hosts", &self.bypass_hosts.len())
             .field("sink", &self.sink.is_some())
             .field("trust_any_upstream_cert", &self.trust_any_upstream_cert)
+            .field("scope", &self.scope.as_ref().and_then(|g| g.rules()))
             .finish()
     }
 }

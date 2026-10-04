@@ -86,6 +86,11 @@ pub struct SessionConfig {
     /// Forward to origins whose certificate no public CA signed. A per-project decision;
     /// see `CaptureCfg::trust_any_upstream_cert` for what it costs.
     pub trust_any_upstream_cert: bool,
+    /// What the operator said they may reach.
+    ///
+    /// Shared rather than copied in, so narrowing the scope takes effect on the running
+    /// proxy. Defaults to unrestricted, which is what every session did before this.
+    pub scope: Arc<cfx_capture::cfx_scope::Guard>,
 }
 
 impl SessionConfig {
@@ -97,6 +102,7 @@ impl SessionConfig {
             intercept: false,
             bypass_hosts: Vec::new(),
             trust_any_upstream_cert: false,
+            scope: cfx_capture::cfx_scope::Guard::unrestricted(),
         }
     }
 }
@@ -109,6 +115,7 @@ pub struct Session {
     sink: Arc<ProjectSink>,
     port: u16,
     gate: Arc<LocalGate>,
+    scope: Arc<cfx_capture::cfx_scope::Guard>,
     project: Arc<Project>,
     stop: tokio::sync::watch::Sender<bool>,
     accepting: tokio::task::JoinHandle<()>,
@@ -136,6 +143,7 @@ impl Session {
             bypass_hosts: cfg.bypass_hosts.clone(),
             sink: Some(sink),
             trust_any_upstream_cert: cfg.trust_any_upstream_cert,
+            scope: Some(cfg.scope.clone()),
         };
 
         // The capture core also emits privacy-safe events on a channel, which a session
@@ -178,10 +186,18 @@ impl Session {
             sink: flushable,
             port,
             gate,
+            scope: cfg.scope,
             project: cfg.project,
             stop,
             accepting,
         })
+    }
+
+    /// The live scope, so it can be narrowed without stopping the proxy. An operator
+    /// narrows one the moment they notice traffic they should not be seeing, and a
+    /// restart means it keeps flowing while they work out how.
+    pub fn scope(&self) -> &Arc<cfx_capture::cfx_scope::Guard> {
+        &self.scope
     }
 
     /// The port actually bound, which is what a browser is pointed at.
@@ -246,6 +262,21 @@ struct FlowCtx {
     capture: CaptureCfg,
 }
 
+/// The same as `text` for a body built at runtime. A refusal names the destination, so it
+/// cannot be a `&'static str`.
+fn text_owned(status: u16, body: String) -> Response<UnsyncBoxBody<Bytes, BoxErr>> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "text/plain; charset=utf-8")
+        .header("x-crossfyre-scope", "refused")
+        .body(
+            Full::new(Bytes::from(body))
+                .map_err(|e: std::convert::Infallible| match e {})
+                .boxed_unsync(),
+        )
+        .unwrap()
+}
+
 fn text(status: u16, body: &'static str) -> Response<UnsyncBoxBody<Bytes, BoxErr>> {
     Response::builder()
         .status(status)
@@ -305,6 +336,21 @@ async fn proxy(
     // a plaintext port and look like the target refusing TLS.
     let port = authority.port_u16().unwrap_or(443);
 
+    // The only place an https destination can be refused without intercepting it. Past
+    // this line the answer is 200, the browser begins a handshake against our leaf, and a
+    // refusal then reaches the operator as a certificate warning about a site they were
+    // never allowed to test. Nothing is dialled and no tunnel is opened.
+    //
+    // Through CaptureCfg rather than the guard directly, so this crate and the capture
+    // core cannot drift into two different answers.
+    if !ctx
+        .capture
+        .admit(&host, port, cfx_capture::cfx_scope::Point::Connect, None)
+    {
+        log::warn!("out of scope: refused CONNECT {host}:{port}");
+        return text_owned(403, cfx_capture::cfx_scope::refusal_text(&host, port));
+    }
+
     tokio::spawn(async move {
         let upgraded = match hyper::upgrade::on(req).await {
             Ok(u) => u,
@@ -330,7 +376,7 @@ async fn proxy(
                 // A TLS flow that served no request is the signature of certificate
                 // pinning in application code, and is worth distinguishing from an idle
                 // connection or the operator never visiting the site.
-                if outcome.tls && outcome.requests == 0 && !outcome.bypassed {
+                if outcome.tls && outcome.requests == 0 && !outcome.bypassed && !outcome.refused {
                     log::info!(
                         "{host}:{port} completed a TLS handshake and then sent nothing, which \
                          is what pinning looks like"

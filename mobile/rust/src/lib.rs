@@ -252,6 +252,10 @@ pub extern "system" fn Java_io_crossfyre_tracer_Native_startCapture<'local>(
             // accepted any origin certificate would be a worse trade here than on a
             // desktop: the operator is not the only person using the handset.
             trust_any_upstream_cert: false,
+            // Unrestricted, which is what the phone has always been. The scope belongs to
+            // a project and the mobile app has none yet; when it gets one this becomes the
+            // guard that project owns, not a second list to keep in step.
+            scope: None,
         };
         if let Err(e) = netstack::run(tun_fd, ca, egress, tx, capture_cfg).await {
             log::error!("netstack ended: {e}");

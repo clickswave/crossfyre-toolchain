@@ -603,6 +603,7 @@ version = "0.0.1"
 dependencies = [
  "brotli",
  "bytes",
+ "cfx_scope",
  "flate2",
  "http-body-util",
  "hyper",
@@ -687,6 +688,13 @@ dependencies = [
  "sha2",
  "sqlx",
  "tokio",
+]
+
+[[package]]
+name = "cfx_scope"
+version = "0.0.1"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -1008,6 +1016,7 @@ dependencies = [
  "base64 0.22.1",
  "boring2",
  "cfx_finding",
+ "cfx_scope",
  "cfx_tui",
  "clap",
  "dguard",

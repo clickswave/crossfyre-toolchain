@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["capture", "core", "node", "crossfyre", "tui", "mach", "voyage", "pulse", "scout", "cortex", "finding", "oast", "transport", "dguard", "mobile/rust", "relsign", "project", "session", "spec", "surface"]
+members = ["capture", "core", "node", "crossfyre", "tui", "mach", "voyage", "pulse", "scout", "cortex", "finding", "oast", "transport", "dguard", "mobile/rust", "relsign", "project", "scope", "session", "spec", "surface"]
 
 # `relsign` signs the release manifest and is a BUILD-HOST tool, not a shipped
 # component: it is absent from COMPONENTS in scripts/crossfyre_build.py, so it is
