@@ -65,30 +65,97 @@ const DDL: &[&str] = &[
     "CREATE VIRTUAL TABLE IF NOT EXISTS exchange_fts USING fts5(url, headers, body)",
 ];
 
-/// Create the tables if they are absent, and refuse a file from a newer build.
+/// One version's worth of change, applied as a unit.
+pub struct Step {
+    pub version: i64,
+    pub statements: &'static [&'static str],
+}
+
+/// Every version in order. A new version appends a step; it never edits an old one,
+/// because an old step is the only description of what a file in the wild already has.
+///
+/// Step 1 is `CREATE ... IF NOT EXISTS` because it is also the create path for a file
+/// that does not exist yet. Later steps will be `ALTER TABLE` and must not be, since a
+/// step that silently does nothing is the bug this runner was written to stop.
+const STEPS: &[Step] = &[Step {
+    version: 1,
+    statements: DDL,
+}];
+
+/// Bring a file up to date, applying only the steps it has not seen.
+///
+/// The previous version of this ran the whole DDL array unconditionally and then stamped
+/// `user_version`. Because the array is all `CREATE TABLE IF NOT EXISTS`, that worked for
+/// exactly one version and no more: adding a column at version 2 would run a create that
+/// no-ops against the existing table, add nothing, and then stamp the file as version 2.
+/// The file would claim a shape it did not have, and every query touching the new column
+/// would fail at runtime against a file that looked migrated. Nothing caught it because
+/// the only test covered the refusal direction.
 pub async fn migrate(pool: &SqlitePool) -> Result<(), super::Error> {
+    apply(pool, STEPS).await
+}
+
+/// The version a step table ends at. Exposed so the invariant below is checkable.
+pub fn target_version(steps: &[Step]) -> i64 {
+    steps.last().map(|s| s.version).unwrap_or(0)
+}
+
+/// The runner, taking its steps as an argument so a test can drive a second version
+/// without this crate having to have one yet.
+pub async fn apply(pool: &SqlitePool, steps: &[Step]) -> Result<(), super::Error> {
     let found: i64 = sqlx::query("PRAGMA user_version")
         .fetch_one(pool)
         .await?
         .try_get(0)?;
 
-    if found > SCHEMA_VERSION {
+    let target = target_version(steps);
+    if found > target {
         return Err(super::Error::NewerSchema {
             found,
-            supported: SCHEMA_VERSION,
+            supported: target,
         });
     }
 
-    for stmt in DDL {
-        sqlx::query(stmt).execute(pool).await?;
-    }
-
-    if found != SCHEMA_VERSION {
-        // Interpolated because PRAGMA does not take a bind parameter. The value is a
-        // constant in this file and never comes from a caller.
-        sqlx::query(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
-            .execute(pool)
+    // One transaction for the whole upgrade. A file half way between two versions is a
+    // file nobody can reason about, and this one is a document the user owns: there is
+    // no operator to go and repair it.
+    let mut tx = pool.begin().await?;
+    for step in steps.iter().filter(|s| s.version > found) {
+        for stmt in step.statements {
+            sqlx::query(stmt).execute(&mut *tx).await?;
+        }
+        // Interpolated because PRAGMA does not take a bind parameter. The value comes
+        // from this file's own step table and never from a caller.
+        sqlx::query(&format!("PRAGMA user_version = {}", step.version))
+            .execute(&mut *tx)
             .await?;
     }
+    tx.commit().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_declared_version_matches_the_steps() {
+        // Adding a step and forgetting to bump the constant would mean a file is written
+        // with the new shape and stamped with the old number, which is the same class of
+        // lie the runner was rewritten to stop, arriving by a different door.
+        assert_eq!(
+            SCHEMA_VERSION,
+            target_version(STEPS),
+            "SCHEMA_VERSION and the last step disagree"
+        );
+    }
+
+    #[test]
+    fn the_steps_are_in_order_and_start_at_one() {
+        let mut expected = 1;
+        for step in STEPS {
+            assert_eq!(step.version, expected, "steps must be consecutive from 1");
+            expected += 1;
+        }
+    }
 }

@@ -395,6 +395,139 @@ async fn a_project_from_a_newer_build_is_refused_rather_than_opened() {
     );
 }
 
+#[tokio::test]
+async fn a_later_version_actually_changes_an_existing_file() {
+    // The bug this was written for: `migrate` used to run the whole DDL array
+    // unconditionally and then stamp `user_version`. Every statement in that array is
+    // `CREATE ... IF NOT EXISTS`, so against a file that already had the tables it did
+    // nothing at all, and then stamped the file as the new version. The file claimed a
+    // shape it did not have, and the first query touching a new column would fail at
+    // runtime against a file that looked migrated.
+    //
+    // Driven through `apply` with a synthetic second step, because the crate is still on
+    // version 1 and the defect is in the runner rather than in any particular step.
+    use sqlx::Row;
+    use sqlx::sqlite::SqliteConnectOptions;
+
+    let s = Scratch::new("upgrade");
+    {
+        let p = Project::open(s.path(), Cap::default()).await.expect("open");
+        p.insert(&exchange(1)).await.expect("insert");
+        p.close().await;
+    }
+
+    let opts = SqliteConnectOptions::new().filename(s.path().join("project.db"));
+    let pool = sqlx::SqlitePool::connect_with(opts).await.expect("connect");
+
+    let steps: &[cfx_project::schema::Step] = &[
+        cfx_project::schema::Step {
+            version: 1,
+            statements: &[],
+        },
+        cfx_project::schema::Step {
+            version: 2,
+            statements: &["ALTER TABLE exchange ADD COLUMN run_id INTEGER"],
+        },
+    ];
+    cfx_project::schema::apply(&pool, steps)
+        .await
+        .expect("the upgrade applies");
+
+    let cols: Vec<String> = sqlx::query("PRAGMA table_info(exchange)")
+        .fetch_all(&pool)
+        .await
+        .expect("table_info")
+        .iter()
+        .map(|r| r.get::<String, _>(1))
+        .collect();
+    assert!(
+        cols.iter().any(|c| c == "run_id"),
+        "the version 2 statement did not reach the file: {cols:?}"
+    );
+
+    let stamped: i64 = sqlx::query("PRAGMA user_version")
+        .fetch_one(&pool)
+        .await
+        .expect("read")
+        .try_get(0)
+        .expect("int");
+    assert_eq!(stamped, 2, "and the file says so");
+
+    // Running it again is a no-op rather than an error, because opening a project twice
+    // is the normal case and ALTER TABLE is not idempotent.
+    cfx_project::schema::apply(&pool, steps)
+        .await
+        .expect("applying an already-current file does nothing");
+
+    // The row written at version 1 is still there. A migration that loses the user's
+    // captures is worse than one that refuses to run.
+    let n: i64 = sqlx::query("SELECT COUNT(*) FROM exchange")
+        .fetch_one(&pool)
+        .await
+        .expect("count")
+        .try_get(0)
+        .expect("int");
+    assert_eq!(n, 1);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn a_failing_step_leaves_the_file_on_its_old_version() {
+    // Half-migrated is the state nobody can reason about, and this is a document the
+    // user owns: there is no operator to go and repair it.
+    use sqlx::Row;
+    use sqlx::sqlite::SqliteConnectOptions;
+
+    let s = Scratch::new("halfway");
+    {
+        let p = Project::open(s.path(), Cap::default()).await.expect("open");
+        p.close().await;
+    }
+    let opts = SqliteConnectOptions::new().filename(s.path().join("project.db"));
+    let pool = sqlx::SqlitePool::connect_with(opts).await.expect("connect");
+
+    let steps: &[cfx_project::schema::Step] = &[
+        cfx_project::schema::Step {
+            version: 1,
+            statements: &[],
+        },
+        cfx_project::schema::Step {
+            version: 2,
+            statements: &[
+                "ALTER TABLE exchange ADD COLUMN good INTEGER",
+                "ALTER TABLE exchange ADD COLUMN good INTEGER",
+            ],
+        },
+    ];
+    cfx_project::schema::apply(&pool, steps)
+        .await
+        .expect_err("the duplicate column must fail");
+
+    let stamped: i64 = sqlx::query("PRAGMA user_version")
+        .fetch_one(&pool)
+        .await
+        .expect("read")
+        .try_get(0)
+        .expect("int");
+    assert_eq!(
+        stamped, 1,
+        "the version must not advance past a failed step"
+    );
+
+    let cols: Vec<String> = sqlx::query("PRAGMA table_info(exchange)")
+        .fetch_all(&pool)
+        .await
+        .expect("table_info")
+        .iter()
+        .map(|r| r.get::<String, _>(1))
+        .collect();
+    assert!(
+        !cols.iter().any(|c| c == "good"),
+        "the partial change was not rolled back: {cols:?}"
+    );
+    pool.close().await;
+}
+
 // ---------------------------------------------------------------------------
 // Indexed text
 // ---------------------------------------------------------------------------
