@@ -41,9 +41,9 @@ pub async fn send(req: RawReq<'_>) -> Option<RawResp> {
     let request = build_request(&req, &host, port, https, &target);
     let raw = tokio::time::timeout(req.timeout, async {
         if https {
-            send_tls(&host, port, request.as_bytes()).await
+            send_tls(&host, port, request.as_bytes(), ReadUntil::Closed).await
         } else {
-            send_plain(&host, port, request.as_bytes()).await
+            send_plain(&host, port, request.as_bytes(), ReadUntil::Closed).await
         }
     })
     .await
@@ -136,6 +136,146 @@ fn build_request(req: &RawReq, host: &str, port: u16, https: bool, target: &str)
 /// Returns (raw response bytes, elapsed). A timeout returns None with the
 /// elapsed time, because on this probe a hang IS the signal rather than a
 /// failure.
+/// Where to stop reading a response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadUntil {
+    /// The connection closes.
+    ///
+    /// What a scanner wants, and deliberately so: bytes arriving after a response is
+    /// framed-complete are the signal for request smuggling, and a reader that stopped at
+    /// the declared length would throw the finding away. The cost is that a server
+    /// keeping the connection alive, which is nearly all of them, is only finished with
+    /// when the timeout expires.
+    Closed,
+    /// The response is complete by its own framing, plus a short grace period.
+    ///
+    /// What an interactive tool wants, because thirty seconds of "Sending" against a
+    /// perfectly healthy keep-alive server is indistinguishable from a hung tool. The
+    /// grace read is there so the smuggling signal is not lost either: anything that
+    /// arrives after the framed response is still returned, it is simply not waited for
+    /// indefinitely.
+    Framed,
+}
+
+/// How long to keep listening after a response is framed-complete, for bytes that should
+/// not be there.
+const GRACE: Duration = Duration::from_millis(250);
+
+/// Read one response, stopping where its own framing says it ends.
+async fn read_framed<S>(s: &mut S) -> Option<Vec<u8>>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut tmp = [0u8; 16 * 1024];
+
+    // Headers first, because nothing about the body is knowable until they are in.
+    let head_end = loop {
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i + 4;
+        }
+        let n = s.read(&mut tmp).await.ok()?;
+        if n == 0 {
+            // Closed before the headers finished. Return what there is: a truncated
+            // response is a result, and often the interesting one.
+            return Some(buf);
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.len() as u64 > MAX_RESPONSE_BYTES {
+            return Some(buf);
+        }
+    };
+
+    let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse::<u16>().ok())
+        .unwrap_or(0);
+
+    // These have no body whatever their headers claim, and waiting for one is how a
+    // 304 hangs a tool for thirty seconds.
+    if (100..200).contains(&status) || status == 204 || status == 304 {
+        return Some(buf);
+    }
+
+    if head.contains("transfer-encoding:") && head.contains("chunked") {
+        // The terminal chunk. Not a perfect chunked parser: this is looking for the end
+        // of a stream, not decoding it, and the decoded body is somebody else's job.
+        loop {
+            if buf[head_end..].windows(5).any(|w| w == b"0\r\n\r\n") {
+                break;
+            }
+            let n = s.read(&mut tmp).await.ok()?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.len() as u64 > MAX_RESPONSE_BYTES {
+                break;
+            }
+        }
+    } else if let Some(len) = head
+        .split("content-length:")
+        .nth(1)
+        .and_then(|rest| rest.split(['\r', '\n']).next())
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        let want = head_end.saturating_add(len);
+        while buf.len() < want {
+            let n = s.read(&mut tmp).await.ok()?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.len() as u64 > MAX_RESPONSE_BYTES {
+                break;
+            }
+        }
+    } else {
+        // Neither length nor chunking, which means the body ends when the connection
+        // does. This is the HTTP/1.0 shape and the one case where waiting is correct.
+        loop {
+            let n = s.read(&mut tmp).await.ok()?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.len() as u64 > MAX_RESPONSE_BYTES {
+                break;
+            }
+        }
+        return Some(buf);
+    }
+
+    // A grace read for bytes that should not be there. A second response queued behind
+    // the first is what a successful desync looks like, and dropping it because the
+    // first one was complete would throw away the finding.
+    let before = buf.len();
+    let _ = tokio::time::timeout(GRACE, async {
+        loop {
+            match s.read(&mut tmp).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.len() as u64 > MAX_RESPONSE_BYTES {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    if buf.len() > before {
+        eprintln!(
+            "rawhttp: {} byte(s) arrived after the response was complete",
+            buf.len() - before
+        );
+    }
+    Some(buf)
+}
+
 pub async fn send_exact(
     host: &str,
     port: u16,
@@ -143,12 +283,24 @@ pub async fn send_exact(
     data: &[u8],
     timeout: Duration,
 ) -> (Option<Vec<u8>>, Duration) {
+    send_until(host, port, https, data, timeout, ReadUntil::Closed).await
+}
+
+/// Send these bytes and stop reading where the caller says to.
+pub async fn send_until(
+    host: &str,
+    port: u16,
+    https: bool,
+    data: &[u8],
+    timeout: Duration,
+    until: ReadUntil,
+) -> (Option<Vec<u8>>, Duration) {
     let start = std::time::Instant::now();
     let out = tokio::time::timeout(timeout, async {
         if https {
-            send_tls(host, port, data).await
+            send_tls(host, port, data, until).await
         } else {
-            send_plain(host, port, data).await
+            send_plain(host, port, data, until).await
         }
     })
     .await
@@ -162,10 +314,13 @@ pub fn split_url(url: &str) -> Option<(bool, String, u16, String)> {
     split(url)
 }
 
-async fn send_plain(host: &str, port: u16, data: &[u8]) -> Option<Vec<u8>> {
+async fn send_plain(host: &str, port: u16, data: &[u8], until: ReadUntil) -> Option<Vec<u8>> {
     let mut stream = TcpStream::connect((host, port)).await.ok()?;
     stream.write_all(data).await.ok()?;
     stream.flush().await.ok()?;
+    if until == ReadUntil::Framed {
+        return read_framed(&mut stream).await;
+    }
     let mut buf = Vec::new();
     stream
         .take(MAX_RESPONSE_BYTES)
@@ -178,13 +333,16 @@ async fn send_plain(host: &str, port: u16, data: &[u8]) -> Option<Vec<u8>> {
 // Open build: rustls handshake (accept-any-cert). Its ClientHello is the
 // fingerprint a WAF flags, but the open toolchain ships no browser emulation.
 #[cfg(not(feature = "impersonate"))]
-async fn send_tls(host: &str, port: u16, data: &[u8]) -> Option<Vec<u8>> {
+async fn send_tls(host: &str, port: u16, data: &[u8], until: ReadUntil) -> Option<Vec<u8>> {
     let connector = tokio_rustls::TlsConnector::from(tls_config());
     let server_name = rustls::pki_types::ServerName::try_from(host.to_string()).ok()?;
     let stream = TcpStream::connect((host, port)).await.ok()?;
     let mut tls = connector.connect(server_name, stream).await.ok()?;
     tls.write_all(data).await.ok()?;
     tls.flush().await.ok()?;
+    if until == ReadUntil::Framed {
+        return read_framed(&mut tls).await;
+    }
     let mut buf = Vec::new();
     tls.take(MAX_RESPONSE_BYTES)
         .read_to_end(&mut buf)
@@ -200,7 +358,7 @@ async fn send_tls(host: &str, port: u16, data: &[u8]) -> Option<Vec<u8>> {
 // but a genuine BoringSSL browser-shaped handshake. Cert verification is off, to
 // match the rest of cortex (it scans hosts with self-signed / mismatched certs).
 #[cfg(feature = "impersonate")]
-async fn send_tls(host: &str, port: u16, data: &[u8]) -> Option<Vec<u8>> {
+async fn send_tls(host: &str, port: u16, data: &[u8], until: ReadUntil) -> Option<Vec<u8>> {
     use boring2::ssl::{SslConnector, SslMethod, SslVerifyMode};
 
     let mut b = SslConnector::builder(SslMethod::tls_client()).ok()?;
@@ -222,6 +380,9 @@ async fn send_tls(host: &str, port: u16, data: &[u8]) -> Option<Vec<u8>> {
     let mut tls = tokio_boring2::connect(cfg, host, stream).await.ok()?;
     tls.write_all(data).await.ok()?;
     tls.flush().await.ok()?;
+    if until == ReadUntil::Framed {
+        return read_framed(&mut tls).await;
+    }
     let mut buf = Vec::new();
     tls.take(MAX_RESPONSE_BYTES)
         .read_to_end(&mut buf)
