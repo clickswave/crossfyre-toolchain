@@ -166,6 +166,13 @@ pub struct Project {
     root: PathBuf,
     blobs: PathBuf,
     cap: Cap,
+    /// The capture session everything inserted right now belongs to, or 0 for none.
+    ///
+    /// Carried on the project rather than passed to `insert`, because every caller in
+    /// the path would otherwise have to thread it through and the one that forgot would
+    /// write an exchange belonging to no run, which is indistinguishable from an
+    /// exchange written before runs existed.
+    run: std::sync::atomic::AtomicI64,
 }
 
 /// Hand-written rather than derived: a pool prints as its internal state, which is noise,
@@ -215,7 +222,54 @@ impl Project {
             root,
             blobs,
             cap,
+            run: std::sync::atomic::AtomicI64::new(0),
         })
+    }
+
+    /// Open a capture session. Everything inserted afterwards belongs to it.
+    ///
+    /// `started_ms` comes from the caller for the same reason `Exchange::at_ms` does:
+    /// the layer that knows when the capture actually began is the one that should say,
+    /// and a test needs to be able to say too.
+    pub async fn begin_run(&self, started_ms: i64, label: Option<&str>) -> Result<i64, Error> {
+        let id: i64 =
+            sqlx::query("INSERT INTO run (started_ms, label) VALUES (?1, ?2) RETURNING id")
+                .bind(started_ms)
+                .bind(label)
+                .fetch_one(&self.pool)
+                .await?
+                .try_get(0)?;
+        self.run.store(id, std::sync::atomic::Ordering::Relaxed);
+        Ok(id)
+    }
+
+    /// Close the current session. Inserts after this belong to no run again.
+    pub async fn end_run(&self, ended_ms: i64) -> Result<(), Error> {
+        let id = self.run.swap(0, std::sync::atomic::Ordering::Relaxed);
+        if id == 0 {
+            return Ok(());
+        }
+        sqlx::query("UPDATE run SET ended_ms = ?1 WHERE id = ?2")
+            .bind(ended_ms)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The pool, for tests that need to assert on a column this crate has no reader for
+    /// yet. Not for callers: everything a front end needs has a method.
+    #[doc(hidden)]
+    pub fn pool_for_test(&self) -> &SqlitePool {
+        &self.pool
+    }
+
+    /// The session inserts are currently attributed to, if any.
+    pub fn current_run(&self) -> Option<i64> {
+        match self.run.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            id => Some(id),
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -268,8 +322,8 @@ impl Project {
             "INSERT INTO exchange
                (at_ms, method, url, host, status, duration_ms,
                 req_headers, resp_headers, req_body, resp_body,
-                req_blob, resp_blob, req_len, resp_len)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+                req_blob, resp_blob, req_len, resp_len, run_id)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
              RETURNING id",
         )
         .bind(ex.at_ms)
@@ -286,6 +340,7 @@ impl Project {
         .bind(&resp_hash)
         .bind(ex.req_body.len() as i64)
         .bind(ex.resp_body.len() as i64)
+        .bind(self.current_run())
         .fetch_one(&mut *tx)
         .await?
         .try_get(0)?;

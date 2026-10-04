@@ -10,7 +10,7 @@ use sqlx::{Row, SqlitePool};
 
 /// Bumped whenever the statements below change. An older build opening a newer file
 /// refuses rather than guessing, which is the whole reason this is checked.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Exchanges, their out-of-line bodies, and a full-text index over the parts a human
 /// searches.
@@ -77,10 +77,38 @@ pub struct Step {
 /// Step 1 is `CREATE ... IF NOT EXISTS` because it is also the create path for a file
 /// that does not exist yet. Later steps will be `ALTER TABLE` and must not be, since a
 /// step that silently does nothing is the bug this runner was written to stop.
-const STEPS: &[Step] = &[Step {
-    version: 1,
-    statements: DDL,
-}];
+const STEPS: &[Step] = &[
+    Step {
+        version: 1,
+        statements: DDL,
+    },
+    Step {
+        version: 2,
+        statements: V2_RUNS,
+    },
+];
+
+/// Version 2: a capture session is a thing, and every exchange belongs to one.
+///
+/// Without this an exchange has a timestamp and nothing else to say which sitting it
+/// came from, and three features in the plan are impossible rather than merely unbuilt:
+/// coverage cannot say which run tested what, a retest cannot diff this engagement
+/// against the last one, and "what changed" has nothing to compare. It is also the
+/// cheapest row in the schema, which is why it goes in before the things that need it
+/// rather than with them.
+///
+/// `run_id` is nullable on purpose. Exchanges captured before version 2 belong to no run
+/// and saying so is more honest than inventing one for them.
+const V2_RUNS: &[&str] = &[
+    "CREATE TABLE run (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        started_ms INTEGER NOT NULL,
+        ended_ms   INTEGER,
+        label      TEXT
+    )",
+    "ALTER TABLE exchange ADD COLUMN run_id INTEGER REFERENCES run(id)",
+    "CREATE INDEX exchange_run ON exchange(run_id)",
+];
 
 /// Bring a file up to date, applying only the steps it has not seen.
 ///

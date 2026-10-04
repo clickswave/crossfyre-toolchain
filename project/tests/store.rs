@@ -419,17 +419,20 @@ async fn a_later_version_actually_changes_an_existing_file() {
     let opts = SqliteConnectOptions::new().filename(s.path().join("project.db"));
     let pool = sqlx::SqlitePool::connect_with(opts).await.expect("connect");
 
-    let steps: &[cfx_project::schema::Step] = &[
+    // Relative to whatever the crate is on, so shipping a real new version does not
+    // break this test, and a column name a real step will never use.
+    let here = cfx_project::schema::SCHEMA_VERSION;
+    let steps = vec![
         cfx_project::schema::Step {
-            version: 1,
+            version: here,
             statements: &[],
         },
         cfx_project::schema::Step {
-            version: 2,
-            statements: &["ALTER TABLE exchange ADD COLUMN run_id INTEGER"],
+            version: here + 1,
+            statements: &["ALTER TABLE exchange ADD COLUMN probe_marker INTEGER"],
         },
     ];
-    cfx_project::schema::apply(&pool, steps)
+    cfx_project::schema::apply(&pool, &steps)
         .await
         .expect("the upgrade applies");
 
@@ -441,8 +444,8 @@ async fn a_later_version_actually_changes_an_existing_file() {
         .map(|r| r.get::<String, _>(1))
         .collect();
     assert!(
-        cols.iter().any(|c| c == "run_id"),
-        "the version 2 statement did not reach the file: {cols:?}"
+        cols.iter().any(|c| c == "probe_marker"),
+        "the later step did not reach the file: {cols:?}"
     );
 
     let stamped: i64 = sqlx::query("PRAGMA user_version")
@@ -451,11 +454,11 @@ async fn a_later_version_actually_changes_an_existing_file() {
         .expect("read")
         .try_get(0)
         .expect("int");
-    assert_eq!(stamped, 2, "and the file says so");
+    assert_eq!(stamped, here + 1, "and the file says so");
 
     // Running it again is a no-op rather than an error, because opening a project twice
     // is the normal case and ALTER TABLE is not idempotent.
-    cfx_project::schema::apply(&pool, steps)
+    cfx_project::schema::apply(&pool, &steps)
         .await
         .expect("applying an already-current file does nothing");
 
@@ -486,20 +489,21 @@ async fn a_failing_step_leaves_the_file_on_its_old_version() {
     let opts = SqliteConnectOptions::new().filename(s.path().join("project.db"));
     let pool = sqlx::SqlitePool::connect_with(opts).await.expect("connect");
 
-    let steps: &[cfx_project::schema::Step] = &[
+    let here = cfx_project::schema::SCHEMA_VERSION;
+    let steps = vec![
         cfx_project::schema::Step {
-            version: 1,
+            version: here,
             statements: &[],
         },
         cfx_project::schema::Step {
-            version: 2,
+            version: here + 1,
             statements: &[
                 "ALTER TABLE exchange ADD COLUMN good INTEGER",
                 "ALTER TABLE exchange ADD COLUMN good INTEGER",
             ],
         },
     ];
-    cfx_project::schema::apply(&pool, steps)
+    cfx_project::schema::apply(&pool, &steps)
         .await
         .expect_err("the duplicate column must fail");
 
@@ -510,7 +514,7 @@ async fn a_failing_step_leaves_the_file_on_its_old_version() {
         .try_get(0)
         .expect("int");
     assert_eq!(
-        stamped, 1,
+        stamped, here,
         "the version must not advance past a failed step"
     );
 
@@ -526,6 +530,120 @@ async fn a_failing_step_leaves_the_file_on_its_old_version() {
         "the partial change was not rolled back: {cols:?}"
     );
     pool.close().await;
+}
+
+#[tokio::test]
+async fn exchanges_are_attributed_to_the_capture_session_that_produced_them() {
+    // The cheapest row in the schema and the one three later features need. Without it
+    // an exchange has a timestamp and nothing else to say which sitting it came from, so
+    // coverage cannot say which run tested what and a retest has nothing to diff
+    // against.
+    use sqlx::Row;
+
+    let s = Scratch::new("runs");
+    let p = Project::open(s.path(), Cap::default()).await.expect("open");
+
+    // Before any session, an exchange belongs to no run and says so rather than being
+    // invented into one.
+    assert_eq!(p.current_run(), None);
+    let orphan = p.insert(&exchange(1)).await.expect("insert");
+
+    let run = p
+        .begin_run(1_700_000_000_000, Some("acme, day one"))
+        .await
+        .expect("begin");
+    assert_eq!(p.current_run(), Some(run));
+    let during = p.insert(&exchange(2)).await.expect("insert");
+
+    p.end_run(1_700_000_060_000).await.expect("end");
+    assert_eq!(p.current_run(), None, "the session closed");
+    let after = p.insert(&exchange(3)).await.expect("insert");
+
+    let run_of = |id: i64| {
+        let pool = p.pool_for_test();
+        async move {
+            sqlx::query("SELECT run_id FROM exchange WHERE id = ?1")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .expect("row")
+                .try_get::<Option<i64>, _>(0)
+                .expect("col")
+        }
+    };
+    assert_eq!(run_of(orphan).await, None, "written before the session");
+    assert_eq!(run_of(during).await, Some(run), "written during it");
+    assert_eq!(run_of(after).await, None, "written after it closed");
+
+    // And the session records when it ran, which is what a retest compares.
+    let (started, ended): (i64, Option<i64>) =
+        sqlx::query("SELECT started_ms, ended_ms FROM run WHERE id = ?1")
+            .bind(run)
+            .fetch_one(p.pool_for_test())
+            .await
+            .map(|r| (r.get(0), r.get(1)))
+            .expect("the run row");
+    assert_eq!(started, 1_700_000_000_000);
+    assert_eq!(ended, Some(1_700_000_060_000));
+}
+
+#[tokio::test]
+async fn a_version_one_project_upgrades_without_losing_anything() {
+    // The first real exercise of the step runner, against the shape that actually exists
+    // in the wild: a file written before runs existed. Its exchanges keep their bodies
+    // and their searchability, and they belong to no run, which is the truth about them.
+    let s = Scratch::new("v1-upgrade");
+    {
+        let p = Project::open(s.path(), Cap::default()).await.expect("open");
+        for i in 1..=3 {
+            p.insert(&exchange(i)).await.expect("insert");
+        }
+        p.close().await;
+    }
+    // Put the file back to version 1 and drop what version 2 added, which is what a file
+    // from the previous build looks like.
+    {
+        use sqlx::sqlite::SqliteConnectOptions;
+        let opts = SqliteConnectOptions::new().filename(s.path().join("project.db"));
+        let pool = sqlx::SqlitePool::connect_with(opts).await.expect("connect");
+        sqlx::query("DROP INDEX IF EXISTS exchange_run")
+            .execute(&pool)
+            .await
+            .expect("drop index");
+        sqlx::query("ALTER TABLE exchange DROP COLUMN run_id")
+            .execute(&pool)
+            .await
+            .expect("drop column");
+        sqlx::query("DROP TABLE run")
+            .execute(&pool)
+            .await
+            .expect("drop run");
+        sqlx::query("PRAGMA user_version = 1")
+            .execute(&pool)
+            .await
+            .expect("stamp");
+        pool.close().await;
+    }
+
+    let p = Project::open(s.path(), Cap::default())
+        .await
+        .expect("a version 1 file opens and upgrades");
+    assert_eq!(p.count().await.expect("count"), 3, "nothing was lost");
+    let got = p.get(1).await.expect("get").expect("still there");
+    assert!(!got.exchange.resp_body.is_empty(), "bodies survived");
+    assert_eq!(
+        p.search("WIDGET-1", 10).await.expect("search").len(),
+        1,
+        "and the index still answers"
+    );
+
+    // The new session machinery works on the upgraded file.
+    let run = p
+        .begin_run(42, None)
+        .await
+        .expect("begin on an upgraded file");
+    let fresh = p.insert(&exchange(9)).await.expect("insert");
+    assert!(run > 0 && fresh > 0);
 }
 
 // ---------------------------------------------------------------------------
