@@ -1,0 +1,14 @@
+[package]
+name = "cfx_spec"
+version = "0.0.1"
+edition = "2024"
+homepage = "https://clickswave.org"
+repository = "https://github.com/clickswave/crossfyre-toolchain"
+keywords = ["openapi", "swagger", "postman", "har", "api"]
+description = "Parse API descriptions (OpenAPI, Swagger, Postman, HAR, Insomnia) into a flat list of operations and their request shapes."
+authors = ["Clickswave <team@clickswave.org>"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"

@@ -709,6 +709,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cfx_spec"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "serde_yaml",
+]
+
+[[package]]
 name = "cfx_tui"
 version = "0.1.0"
 dependencies = [
