@@ -16,15 +16,22 @@
 //!
 //! # Scope of this first version
 //!
-//! CONNECT only. A browser sends CONNECT for every https destination, which is nearly all
-//! real traffic, and the upgraded socket is exactly what `serve_mitm_flow` wants: it does
-//! its own first-byte peek, SNI read, bypass decision and MITM handshake.
+//! Two shapes arrive here and both are carried.
 //!
-//! An absolute-form plaintext request (`GET http://host/path`) arrives on the proxy
-//! connection instead of on a per-destination stream, and successive ones can name
-//! different hosts, so it cannot simply be handed over the same way. It answers 501 with a
-//! message saying so rather than failing in a way that looks like the target's fault. That
-//! is a gap and it is written down here rather than discovered.
+//! A browser sends CONNECT for every https destination, which is nearly all real traffic,
+//! and the upgraded socket is exactly what `serve_mitm_flow` wants: it does its own
+//! first-byte peek, SNI read, bypass decision and MITM handshake.
+//!
+//! A plaintext target arrives in absolute form instead, `GET http://host/path`, on the
+//! proxy connection rather than on a per-destination stream, and successive ones can name
+//! different hosts. There is no tunnel and nothing to MITM because there is no TLS, so the
+//! request is forwarded and recorded directly.
+//!
+//! This answered 501 for a while, with a message explaining the limitation, and a test
+//! asserted the explanation. The limitation was real and the message was honest, and what
+//! it meant in practice is that no `http://` target was carried at all: an internal
+//! network full of them looked like a proxy that was not working. The capture core could
+//! do it the whole time. Nothing called the code.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -229,19 +236,39 @@ fn text(status: u16, body: &'static str) -> Response<Full<Bytes>> {
 
 /// One request on the proxy connection.
 async fn proxy(req: Request<hyper::body::Incoming>, ctx: FlowCtx) -> Response<Full<Bytes>> {
+    // A plaintext target reaches a proxy in absolute form: `GET http://host/path`, with
+    // no CONNECT and nothing to MITM because there is no TLS. The capture core has always
+    // been able to carry these; this refused before reaching it, so every http:// target
+    // on an internal network was simply not carried.
     if req.method() != Method::CONNECT {
-        // See the module note. Saying what is wrong matters: a bare failure here reads as
-        // the target being unreachable, which sends the operator to look at the target.
-        log::warn!(
-            "proxy: {} {} is a plaintext proxy request, which this session does not carry yet",
-            req.method(),
-            req.uri()
-        );
-        return text(
-            501,
-            "This capture session carries CONNECT (https) only. A plaintext \
-             http:// request through the proxy is not forwarded yet.",
-        );
+        let Some(authority) = req.uri().authority().cloned() else {
+            // Origin form at a proxy port. There is no destination in the request at all,
+            // so there is nothing to forward to, and the reply has to say it is us.
+            log::warn!(
+                "proxy: {} {} arrived with no destination in it",
+                req.method(),
+                req.uri()
+            );
+            return text(
+                400,
+                "This is a proxy port. That request carried no destination: it needs \
+                 either CONNECT host:port for https, or an absolute http:// URL.",
+            );
+        };
+        let host = authority.host().to_string();
+        // 80 here and 443 for CONNECT below, each the default for the scheme that got it
+        // here. Guessing the other way sends every flow to the wrong port and looks like
+        // the target refusing the connection.
+        let port = authority.port_u16().unwrap_or(80);
+        return cfx_capture::flow::serve_plain_request(
+            req,
+            host,
+            port,
+            Egress::Direct,
+            ctx.tx,
+            ctx.capture,
+        )
+        .await;
     }
 
     let Some(authority) = req.uri().authority().cloned() else {

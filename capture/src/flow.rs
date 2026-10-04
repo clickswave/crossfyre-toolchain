@@ -331,6 +331,42 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Carry one absolute-form proxy request, capturing it like any other.
+///
+/// `GET http://example.test/a HTTP/1.1` sent straight to the proxy port, which is how
+/// every plaintext target reaches a proxy. A CONNECT tunnel does not happen for these and
+/// there is nothing to MITM, because there is no TLS: the request arrives already parsed
+/// and only needs forwarding and recording.
+///
+/// The capture core could always do this, and the session in front of it answered 501
+/// instead, so every `http://` target on an internal network was simply not carried. The
+/// path was there; nothing called it.
+pub async fn serve_plain_request(
+    req: Request<Incoming>,
+    target_host: String,
+    target_port: u16,
+    egress: Egress,
+    tx: UnboundedSender<TraceEvent>,
+    cfg: CaptureCfg,
+) -> Response<Full<Bytes>> {
+    match handle_request(
+        req,
+        "http",
+        Arc::new(target_host),
+        target_port,
+        egress,
+        tx,
+        cfg,
+    )
+    .await
+    {
+        Ok(r) => r,
+        // handle_request is infallible by construction; this arm exists so the signature
+        // does not export an error nobody can produce.
+        Err(e) => match e {},
+    }
+}
+
 async fn handle_request(
     req: Request<Incoming>,
     scheme: &'static str,

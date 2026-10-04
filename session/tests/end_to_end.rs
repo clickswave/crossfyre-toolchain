@@ -11,7 +11,9 @@ use std::time::Duration;
 
 use cfx_capture::{EditedRequest, InterceptDecision, generate_ca};
 use cfx_project::{Cap, Project};
-use cfx_session::testing::{binary_payload, eventually, ok_response, through_proxy, tls_origin};
+use cfx_session::testing::{
+    binary_payload, eventually, ok_response, plain_origin, through_proxy, tls_origin,
+};
 use cfx_session::{Session, SessionConfig};
 
 struct Scratch(std::path::PathBuf);
@@ -206,17 +208,72 @@ async fn stopping_a_session_drops_what_the_operator_was_still_looking_at() {
 }
 
 #[tokio::test]
-async fn a_plaintext_proxy_request_says_what_is_wrong_rather_than_failing_vaguely() {
-    // The known gap. It matters that the message names it: a bare failure here reads as
-    // the target being unreachable and sends the operator to look at the target.
+async fn a_plaintext_http_target_is_carried_and_captured() {
+    // This used to answer 501 and say so politely, and a test asserted the politeness.
+    // The limitation was real and the explanation was good, but what it meant in practice
+    // is that every http:// target on an internal network was not carried at all: the
+    // capture core had handled plaintext since the beginning and the session in front of
+    // it refused before reaching the code that could.
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let s = Scratch::new("plaintext");
+    let (origin_port, _) = plain_origin("hello-over-http").await;
+    let (session, project, _ca) = session_over(&s, false).await;
+
+    // Absolute form, which is how a plaintext target reaches a proxy. No CONNECT.
+    let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", session.port()))
+        .await
+        .expect("connect");
+    tcp.write_all(
+        format!(
+            "GET http://127.0.0.1:{origin_port}/admin HTTP/1.1\r\nHost: 127.0.0.1:{origin_port}\r\nConnection: close\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await
+    .expect("send");
+    tcp.flush().await.expect("flush");
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(10), tcp.read_to_end(&mut buf)).await;
+    let got = String::from_utf8_lossy(&buf).to_string();
+
+    assert!(got.starts_with("HTTP/1.1 200"), "got:\n{got}");
+    assert!(
+        got.contains("hello-over-http"),
+        "the body came back:\n{got}"
+    );
+
+    let p = project.clone();
+    eventually("the plaintext exchange was recorded", || {
+        let p = p.clone();
+        async move { p.count().await.unwrap_or(0) > 0 }
+    })
+    .await;
+
+    let stored = project.get(1).await.expect("get").expect("the exchange");
+    assert_eq!(stored.exchange.method, "GET");
+    assert_eq!(
+        stored.exchange.url,
+        format!("http://127.0.0.1:{origin_port}/admin"),
+        "http, not https, and the path it actually asked for"
+    );
+    assert_eq!(stored.exchange.status, Some(200));
+
+    session.stop().await;
+}
+
+#[tokio::test]
+async fn a_proxy_request_with_no_destination_says_so() {
+    // Origin form straight at the proxy port, with no CONNECT and no absolute URL. There
+    // is no destination in it, so there is nothing to forward to, and the reply has to
+    // say that it is us rather than the target.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let s = Scratch::new("no-destination");
     let (session, _project, _ca) = session_over(&s, false).await;
 
     let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", session.port()))
         .await
         .expect("connect");
-    tcp.write_all(b"GET http://example.test/x HTTP/1.1\r\nHost: example.test\r\n\r\n")
+    tcp.write_all(b"GET /just-a-path HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n")
         .await
         .expect("send");
     tcp.flush().await.expect("flush");
@@ -224,10 +281,10 @@ async fn a_plaintext_proxy_request_says_what_is_wrong_rather_than_failing_vaguel
     let _ = tokio::time::timeout(Duration::from_secs(5), tcp.read_to_end(&mut buf)).await;
     let got = String::from_utf8_lossy(&buf).to_string();
 
-    assert!(got.starts_with("HTTP/1.1 501"), "got:\n{got}");
+    assert!(got.starts_with("HTTP/1.1 400"), "got:\n{got}");
     assert!(
-        got.contains("CONNECT") && got.contains("not forwarded yet"),
-        "the reply has to say it is us and not the target, got:\n{got}"
+        got.contains("no destination"),
+        "the reply has to name what is missing, got:\n{got}"
     );
     session.stop().await;
 }

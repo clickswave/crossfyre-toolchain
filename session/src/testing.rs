@@ -28,6 +28,35 @@ use tokio::net::{TcpListener, TcpStream};
 /// Returns the port and a count of handshakes it COMPLETED. That count is the oracle worth
 /// having: a status code cannot tell "the proxy refused the certificate" from "the proxy
 /// could not connect", and a handshake either happened or it did not.
+/// A plaintext origin, for the half of the proxy that carries `http://`.
+///
+/// Deliberately not the TLS one with the encryption switched off: a plaintext target is a
+/// different path through the session (absolute form, no CONNECT, no handshake) and a
+/// helper that could not distinguish them would not be testing it.
+pub async fn plain_origin(body: &str) -> (u16, Arc<AtomicUsize>) {
+    let reply = ok_response(body);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let served = Arc::new(AtomicUsize::new(0));
+    let counter = served.clone();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let counter = counter.clone();
+            let reply = reply.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 16 * 1024];
+                if sock.read(&mut buf).await.unwrap_or(0) > 0 {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    let _ = sock.write_all(&reply).await;
+                    let _ = sock.flush().await;
+                }
+            });
+        }
+    });
+    (port, served)
+}
+
 pub async fn tls_origin(reply: Vec<u8>) -> (u16, Arc<AtomicUsize>) {
     crate::install_crypto();
     let key = rcgen::KeyPair::generate().expect("keypair");
