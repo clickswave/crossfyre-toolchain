@@ -33,6 +33,24 @@ use std::path::{Path, PathBuf};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Row, SqlitePool};
 
+/// How many refusals are kept.
+///
+/// Bounded because the exchange cap counts BYTES, and `size_bytes` is the whole file:
+/// a browser whose telemetry hosts are out of scope writes a refusal per request, and an
+/// unbounded log would push a capped project over its limit, at which point eviction
+/// deletes every unpinned exchange and the project is still over. The traffic that is
+/// refused is exactly the traffic nobody asked for, so it is also the traffic most likely
+/// to be voluminous.
+///
+/// Fifty thousand rows is a few megabytes and is far more than an engagement produces.
+/// The count of what was dropped is kept, so the audit answer stays true: "this is all
+/// of them" and "these are the most recent of more" are different statements and the
+/// file has to be able to make the second one.
+pub const REFUSAL_MAX: i64 = 50_000;
+
+/// How many refusals have been trimmed, in `setting`.
+pub const REFUSALS_DROPPED: &str = "refusals_dropped";
+
 /// Where the scope lives in `setting`.
 pub const SCOPE_SETTING: &str = "scope";
 
@@ -593,7 +611,47 @@ impl Project {
         .bind(r.detail.as_deref())
         .execute(&self.pool)
         .await?;
+
+        // Trimmed on the way past rather than on a timer, so there is one place this can
+        // grow and one place it is bounded.
+        self.trim_refusals(REFUSAL_MAX).await?;
         Ok(res.last_insert_rowid())
+    }
+
+    /// Keep the newest `max` refusals and count what went.
+    ///
+    /// The oldest go, because the recent ones are what somebody is looking at when a
+    /// target stops working. Takes the bound as an argument so a test can drive it at a
+    /// size it can actually write: at the real bound the only thing a test measures is
+    /// how long fifty thousand inserts take.
+    pub async fn trim_refusals(&self, max: i64) -> Result<i64, Error> {
+        let n: i64 = sqlx::query("SELECT COUNT(*) AS n FROM refusal")
+            .fetch_one(&self.pool)
+            .await?
+            .get("n");
+        if n <= max {
+            return Ok(0);
+        }
+        let over = n - max;
+        sqlx::query(
+            "DELETE FROM refusal WHERE id IN (SELECT id FROM refusal ORDER BY id ASC LIMIT ?)",
+        )
+        .bind(over)
+        .execute(&self.pool)
+        .await?;
+        let dropped = self.refusals_dropped().await? + over;
+        self.set_setting(REFUSALS_DROPPED, &dropped.to_string())
+            .await?;
+        Ok(over)
+    }
+
+    /// How many refusals were trimmed away, so a report can say the log is partial.
+    pub async fn refusals_dropped(&self) -> Result<i64, Error> {
+        Ok(self
+            .setting(REFUSALS_DROPPED)
+            .await?
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0))
     }
 
     /// Newest first, which is the order somebody reads them in.

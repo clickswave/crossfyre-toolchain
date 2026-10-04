@@ -981,3 +981,107 @@ async fn clearing_the_scope_is_saved_as_clearing_it() {
          or the window and the proxy disagree about what is fenced"
     );
 }
+
+/// The refusal log is bounded, and says how much it dropped.
+///
+/// The cap counts BYTES, and `size_bytes` is the whole file. An unbounded refusal log
+/// pushes a capped project over its limit on traffic nobody asked for, at which point
+/// eviction deletes every unpinned exchange and the project is still over. The traffic
+/// that gets refused is exactly the traffic most likely to be voluminous: a browser's
+/// telemetry hosts, once per request, for as long as the proxy runs.
+#[tokio::test]
+async fn the_refusal_log_is_bounded_and_admits_what_it_dropped() {
+    let s = Scratch::new("refusal-cap");
+    let p = Project::open(s.path(), Cap::default()).await.expect("open");
+
+    // Driven at a bound the test can actually write past. At the real one the only thing
+    // measured is how long fifty thousand inserts take; the SQL is the same either way,
+    // and that the real bound is the one wired in is asserted separately below.
+    let max = 20i64;
+    let over = 5i64;
+    for i in 0..(max + over) {
+        p.record_refusal(&cfx_scope::Refusal {
+            at_ms: 1_700_000_000_000 + i,
+            host: format!("h{i}.example"),
+            port: 443,
+            point: cfx_scope::Point::Connect,
+            detail: None,
+        })
+        .await
+        .expect("record");
+    }
+
+    // Nothing was dropped yet: the real bound is far above this.
+    assert_eq!(p.refusal_count().await.expect("count"), max + over);
+    assert_eq!(p.refusals_dropped().await.expect("dropped"), 0);
+
+    assert_eq!(p.trim_refusals(max).await.expect("trim"), over);
+    assert_eq!(
+        p.refusal_count().await.expect("count"),
+        max,
+        "the log stopped growing"
+    );
+    assert_eq!(
+        p.refusals_dropped().await.expect("dropped"),
+        over,
+        "and it says how many it lost, so a report can say the log is partial rather \
+         than claiming to be complete"
+    );
+    // The newest survived, which is what somebody looking at a target that stopped
+    // working needs.
+    let newest = p.refusals(1).await.expect("refusals");
+    assert_eq!(newest[0].host, format!("h{}.example", max + over - 1));
+    // Trimming again when it is already under the bound does nothing and says so.
+    assert_eq!(p.trim_refusals(max).await.expect("trim"), 0);
+    assert_eq!(p.refusals_dropped().await.expect("dropped"), over);
+}
+
+/// And `record_refusal` is the thing that applies the bound.
+///
+/// Separate from the test above because that one calls `trim_refusals` directly, so it
+/// passes even with the trim never wired into the insert path, which is the whole defect.
+/// This one goes through the real call at the real bound, with the filling done in one
+/// statement: fifty thousand round trips would be measuring sqlx rather than this.
+#[tokio::test]
+async fn recording_a_refusal_is_what_applies_the_bound() {
+    let s = Scratch::new("refusal-wired");
+    let p = Project::open(s.path(), Cap::default()).await.expect("open");
+
+    // Straight into the table, which is fair here: what is under test is the trim on the
+    // way past, not the insert.
+    sqlx::query(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?)
+         INSERT INTO refusal(at_ms, host, port, point)
+         SELECT 1700000000000 + i, 'h' || i || '.example', 443, 'connect' FROM n",
+    )
+    .bind(cfx_project::REFUSAL_MAX)
+    .execute(p.pool_for_test())
+    .await
+    .expect("fill");
+    assert_eq!(
+        p.refusal_count().await.expect("count"),
+        cfx_project::REFUSAL_MAX,
+        "at the bound, not over it"
+    );
+
+    p.record_refusal(&cfx_scope::Refusal {
+        at_ms: 1_800_000_000_000,
+        host: "newest.example".into(),
+        port: 8443,
+        point: cfx_scope::Point::Request,
+        detail: Some("GET /admin".into()),
+    })
+    .await
+    .expect("record");
+
+    assert_eq!(
+        p.refusal_count().await.expect("count"),
+        cfx_project::REFUSAL_MAX,
+        "one in, one out"
+    );
+    assert_eq!(p.refusals_dropped().await.expect("dropped"), 1);
+    assert_eq!(
+        p.refusals(1).await.expect("refusals")[0].host,
+        "newest.example"
+    );
+}
