@@ -588,6 +588,103 @@ async fn the_response_headers_reach_the_client_and_match_what_was_recorded() {
 }
 
 #[tokio::test]
+async fn header_names_reach_the_origin_in_the_case_they_were_written() {
+    // A proxy that normalises header names cannot be used to find the bugs that live in
+    // how servers disagree about parsing them. Smuggling, header injection and a good
+    // deal of WAF evasion all turn on exactly which bytes arrive, and real stacks do
+    // treat `Content-Length` and `content-length` differently despite the specification
+    // saying they must not.
+    //
+    // The operator types `X-Original-Case` in a Repeater pane; the origin has to see
+    // `X-Original-Case`. If the tool silently lowercases it, a negative result means
+    // nothing, which is worse than no result because it gets believed.
+    //
+    // Written as raw bytes on a socket rather than through a client library, because
+    // every HTTP client normalises on the way out: a hyper-based client would lowercase
+    // these before the proxy ever saw them, and the test would be measuring the test.
+    let (origin_port, log) = origin(ok_response("fine"));
+    let f = front(origin_port, CaptureCfg::default(), 1).await;
+
+    let mut tcp = TcpStream::connect(("127.0.0.1", f.port)).await.unwrap();
+    tcp.write_all(
+        format!(
+            "GET /casing HTTP/1.1\r\nHost: 127.0.0.1:{origin_port}\r\n\
+             X-Original-Case: kept\r\nsEcOnD-oDdItY: also kept\r\n\
+             Connection: close\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    tcp.flush().await.unwrap();
+    let _ = read_reply(&mut tcp).await;
+
+    let seen = String::from_utf8_lossy(&log.first()).to_string();
+    assert!(
+        seen.contains("X-Original-Case"),
+        "the origin saw a normalised header name, so byte-exact work is impossible \
+         through this proxy. Got:\n{seen}"
+    );
+    assert!(
+        seen.contains("sEcOnD-oDdItY"),
+        "and mixed case has to survive too, not just a conventional one. Got:\n{seen}"
+    );
+    // The Host header is rewritten on the way out by design, so it is not asserted here.
+}
+
+#[tokio::test]
+async fn an_edited_request_cannot_keep_its_header_casing_yet_and_this_pins_that() {
+    // The pass-through path keeps header casing. The EDITED path, which is the one an
+    // operator uses when they retype a request by hand, cannot, and that is the path
+    // where casing matters most.
+    //
+    // The reason is not an oversight that can be patched here. hyper keeps original
+    // spellings in an extension whose type is `pub(crate)` with no public constructor,
+    // even under its `ffi` feature. A forwarded request carries that extension across
+    // because it arrived with one. A request assembled from text the operator typed has
+    // no such extension and no way to make one.
+    //
+    // The real answer is to stop going through a client library for edited requests and
+    // write the bytes, which is what a raw Repeater mode needs anyway and what
+    // `cortex::rawhttp` already does. Until then this test exists so the limitation is
+    // visible and so the day it is fixed is a visible change rather than a silent one.
+    let (origin_port, log) = origin(ok_response("edited"));
+    let (cfg, _seen) = gated(InterceptDecision::ForwardModified(EditedRequest {
+        method: "GET".into(),
+        path: "/edited".into(),
+        headers: vec![
+            ("Host".into(), format!("127.0.0.1:{origin_port}")),
+            ("X-Operator-Typed".into(), "mixed case".into()),
+        ],
+        body: Vec::new(),
+    }));
+    let f = front(origin_port, cfg, 1).await;
+
+    let (status, _body) = plain_request(
+        f.port,
+        get("/original", &format!("127.0.0.1:{origin_port}")),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let seen = String::from_utf8_lossy(&log.first()).to_string();
+    assert!(
+        seen.contains("/edited"),
+        "the edit was applied at all: {seen}"
+    );
+    assert!(
+        seen.to_lowercase().contains("x-operator-typed"),
+        "the header reached the origin in some casing: {seen}"
+    );
+    assert!(
+        !seen.contains("X-Operator-Typed"),
+        "If this now fails, the edited path has learned to keep casing. That is the \
+         intended outcome: delete this test and assert the opposite in the one above. \
+         Got:\n{seen}"
+    );
+}
+
+#[tokio::test]
 async fn an_upgrade_is_refused_rather_than_recorded_as_a_working_tunnel() {
     // A WebSocket handshake goes out as an ordinary GET with `Upgrade: websocket`, and
     // every request header is forwarded verbatim, so the origin answers 101 and means it.

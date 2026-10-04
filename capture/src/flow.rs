@@ -261,6 +261,14 @@ where
         async move { handle_request(req, scheme, host, target_port, egress, tx, cfg).await }
     });
     hyper::server::conn::http1::Builder::new()
+        // A proxy that normalises header names cannot be used to find the bugs that live
+        // in how servers disagree about parsing them. Smuggling, header injection and a
+        // good deal of WAF evasion all turn on exactly which bytes arrive, and real
+        // stacks do treat `Content-Length` and `content-length` differently despite the
+        // specification. hyper keeps the original casing in an extension when asked, and
+        // the client leg below re-emits it, so what the operator wrote is what the origin
+        // reads.
+        .preserve_header_case(true)
         .serve_connection(TokioIo::new(io), svc)
         .await?;
     Ok(())
@@ -542,7 +550,12 @@ async fn forward(
         for (k, v) in parts.headers.iter() {
             b = b.header(k, v);
         }
-        b.body(Full::new(body_bytes.clone()))?
+        let mut req = b.body(Full::new(body_bytes.clone()))?;
+        // The original header casing lives in an extension that hyper owns and does not
+        // export, so it cannot be read or rebuilt here. Carrying the extensions across is
+        // the only way the client leg can re-emit what arrived.
+        *req.extensions_mut() = parts.extensions.clone();
+        req
     };
 
     // Dial the flow's ACTUAL destination through the routing egress. For upstream TLS SNI, use the
@@ -871,7 +884,10 @@ async fn send_upstream<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
+    let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+        .preserve_header_case(true)
+        .handshake(TokioIo::new(stream))
+        .await?;
     tokio::spawn(async move {
         let _ = conn.await;
     });
@@ -980,7 +996,9 @@ mod tests {
         //    legs; the peek routes this to the plaintext path. The TLS-termination path is the same
         //    code wrapped in a rustls accept and is exercised on-device.
         let tcp = TcpStream::connect(("127.0.0.1", mitm_port)).await.unwrap();
-        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .preserve_header_case(true)
+            .handshake(TokioIo::new(tcp))
             .await
             .unwrap();
         tokio::spawn(async move {
@@ -1076,7 +1094,9 @@ mod tests {
         });
 
         let tcp = TcpStream::connect(("127.0.0.1", mitm_port)).await.unwrap();
-        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .preserve_header_case(true)
+            .handshake(TokioIo::new(tcp))
             .await
             .unwrap();
         tokio::spawn(async move {
@@ -1149,7 +1169,9 @@ mod tests {
         });
 
         let tcp = TcpStream::connect(("127.0.0.1", mitm_port)).await.unwrap();
-        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .preserve_header_case(true)
+            .handshake(TokioIo::new(tcp))
             .await
             .unwrap();
         tokio::spawn(async move {
