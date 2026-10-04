@@ -339,6 +339,10 @@ pub enum Point {
     Request,
     /// A Repeater send, which egresses with no proxy running at all.
     Repeater,
+    /// A send made on the operator's behalf as one of several identities, rather than one
+    /// request they typed and watched. Named apart because several go out from one click,
+    /// so a refusal here is one of a set and reads differently from a single send.
+    Replay,
 }
 
 impl Point {
@@ -347,6 +351,7 @@ impl Point {
             Point::Connect => "connect",
             Point::Request => "request",
             Point::Repeater => "repeater",
+            Point::Replay => "replay",
         }
     }
 
@@ -357,6 +362,7 @@ impl Point {
             "connect" => Some(Point::Connect),
             "request" => Some(Point::Request),
             "repeater" => Some(Point::Repeater),
+            "replay" => Some(Point::Replay),
             _ => None,
         }
     }
@@ -745,6 +751,22 @@ mod tests {
              longer be read and the safe answer to that is no"
         );
         assert_eq!(g.refused_total(), 1, "and it is still recorded");
+    }
+
+    #[test]
+    fn every_point_survives_the_round_trip_through_its_text() {
+        // The text is what goes in a column and comes back out of one. A variant added
+        // without its string reads back as something else, and the audit record then says
+        // the wrong thing about where a destination was refused.
+        for p in [
+            Point::Connect,
+            Point::Request,
+            Point::Repeater,
+            Point::Replay,
+        ] {
+            assert_eq!(Point::parse(p.as_str()), Some(p), "{p:?} round trips");
+        }
+        assert_eq!(Point::parse("something-else"), None);
     }
 
     #[test]
