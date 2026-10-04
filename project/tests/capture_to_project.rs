@@ -153,6 +153,19 @@ async fn a_captured_exchange_lands_in_the_project_with_its_bytes_intact() {
     );
 
     // And now the point: it is in the project, byte for byte.
+    //
+    // Waited for rather than asserted outright, because responses stream now. The record
+    // is written when the response body ends, and hyper does not always poll a body it
+    // already knows the length of to its final frame: it writes the bytes and drops it.
+    // So the write lands on the drop path, a moment after the client has everything. The
+    // contract is "recorded shortly after the response completes", measured at a sixth of
+    // a millisecond, not "recorded before the client sees the last byte".
+    for _ in 0..50 {
+        if project.count().await.unwrap_or(0) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert_eq!(project.count().await.expect("count"), 1);
     let stored = project
         .get(1)

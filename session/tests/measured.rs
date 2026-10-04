@@ -94,6 +94,7 @@ fn exchange(i: usize) -> Exchange {
             "lorem ipsum dolor sit amet ".repeat(8)
         )
         .into_bytes(),
+        resp_len: None,
     }
 }
 
@@ -177,14 +178,24 @@ async fn what_the_project_store_costs() {
 #[tokio::test]
 #[ignore = "measurement, not a gate: cargo test -- --ignored --nocapture"]
 async fn what_a_large_response_costs_in_memory() {
-    // The whole response body is collected before a byte reaches the client. That is
-    // simple and it is what makes the exchange recordable, and it also means the proxy
-    // holds the entire thing. A pentester downloading a backup, a video or a disk image
-    // through here is the ordinary case, not a contrived one.
+    // A pentester downloading a backup, a video or an APK through here is the ordinary
+    // case, not a contrived one.
     //
-    // This measures what one does to resident memory. The number matters more than the
-    // ratio: an operator does not care that it is linear, they care whether their laptop
-    // survives it.
+    // READ THIS BEFORE QUOTING THE NUMBER. The origin, the proxy and the client all run
+    // in this process, so what follows is the whole rig and not the proxy. The origin
+    // holds the reply and clones it per connection; the client collects the response into
+    // a Vec that doubles as it grows. Either can dominate.
+    //
+    // It was 2.0x when the proxy collected whole bodies and 3.2x after it started
+    // streaming them, which is the wrong direction and is probably the client reallocating
+    // against a stream of small frames rather than one buffer. "Probably" is the problem:
+    // this instrument cannot attribute memory to a component, so it cannot answer the
+    // question it was written for.
+    //
+    // What IS attributable is asserted instead, in the end-to-end suite: a response past
+    // the cap is delivered whole and recorded short, so what the proxy RETAINS is bounded
+    // by construction rather than by hope. Treat the figure below as an upper bound on
+    // the rig, and replace it with an out-of-process measurement before publishing it.
     const MB: usize = 64;
 
     let s = Scratch::new("bigbody");
@@ -233,9 +244,13 @@ async fn what_a_large_response_costs_in_memory() {
     );
     let ratio = (peak as f64 - before as f64) / (MB as f64 * 1e6);
     println!(
-        "  that is about {ratio:.1}x the body size held at once. A one-gigabyte download \
-         would therefore need roughly {:.1} GB.",
-        ratio.max(1.0)
+        "  that is {ratio:.1}x the body size across the WHOLE RIG (origin + proxy + \
+         client in one process), which is an upper bound and not the proxy's share."
+    );
+    println!(
+        "  what the proxy retains is bounded at {} MB by RECORDED_BODY_MAX, asserted in \
+         a_body_past_the_cap_is_delivered_whole_and_recorded_short.",
+        cfx_capture::flow::RECORDED_BODY_MAX / (1024 * 1024)
     );
 
     session.stop().await;

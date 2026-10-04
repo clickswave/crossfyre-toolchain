@@ -117,7 +117,10 @@ pub struct Exchange {
     pub req_headers: Vec<[String; 2]>,
     pub resp_headers: Vec<[String; 2]>,
     pub req_body: Vec<u8>,
+    /// As much of the response body as was kept.
     pub resp_body: Vec<u8>,
+    /// The response's real length when `resp_body` is only a prefix. `None` means whole.
+    pub resp_len: Option<usize>,
 }
 
 /// An exchange read back out, with its bodies wherever they were kept.
@@ -339,7 +342,7 @@ impl Project {
         .bind(&req_hash)
         .bind(&resp_hash)
         .bind(ex.req_body.len() as i64)
-        .bind(ex.resp_body.len() as i64)
+        .bind(ex.resp_len.unwrap_or(ex.resp_body.len()) as i64)
         .bind(self.current_run())
         .fetch_one(&mut *tx)
         .await?
@@ -366,7 +369,7 @@ impl Project {
     pub async fn get(&self, id: i64) -> Result<Option<Stored>, Error> {
         let Some(row) = sqlx::query(
             "SELECT id, at_ms, method, url, host, status, duration_ms, req_headers,
-                    resp_headers, req_body, resp_body, req_blob, resp_blob, pinned
+                    resp_headers, req_body, resp_body, req_blob, resp_blob, resp_len, pinned
              FROM exchange WHERE id = ?1",
         )
         .bind(id)
@@ -405,6 +408,10 @@ impl Project {
                 resp_headers: headers_from(row.try_get("resp_headers")?),
                 req_body,
                 resp_body,
+                // Read back, the stored `resp_len` is already the true length and the
+                // body is whatever was kept. Saying `None` here would claim a prefix is
+                // whole, which is the lie this field exists to stop.
+                resp_len: Some(row.try_get::<i64, _>("resp_len")? as usize),
             },
         }))
     }

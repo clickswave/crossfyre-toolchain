@@ -984,23 +984,63 @@ async fn a_three_megabyte_response_survives_byte_for_byte() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn an_origin_that_closes_mid_body_answers_502_rather_than_hanging() {
+async fn an_origin_that_stops_mid_body_is_reported_rather_than_hidden() {
     // Declares 4096 bytes, sends 16, closes. The failure this guards against is the proxy
     // waiting for the rest forever, which on a desktop looks like a frozen tab.
+    //
+    // This used to answer 502 and emit no event, because the whole body was collected
+    // before anything went to the client, so a body that stopped early could still be
+    // turned into a clean error. Responses stream now, and once `200 OK` has gone out it
+    // cannot be retracted: the client sees a response that ends early, which is what
+    // actually happened.
+    //
+    // The better half of the change is the record. A target that declares 4096 and sends
+    // 16 is doing something worth knowing about, and the old path threw that away: no
+    // event, nothing in the history, nothing to notice. Now the exchange is recorded with
+    // what arrived.
     let mut reply = b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\n".to_vec();
     reply.extend_from_slice(b"only-sixteen-byt");
     let (op, olog) = origin(reply);
-    let mut f = front(op, CaptureCfg::default(), 1).await;
+    let cfg = CaptureCfg {
+        full: true,
+        ..CaptureCfg::default()
+    };
+    let mut f = front(op, cfg, 1).await;
 
-    let (status, _body) = plain_request(f.port, get("/truncated", "origin.test")).await;
-    assert_eq!(
-        status, 502,
-        "a body that stops early is an upstream error, not a 200 with a short body"
+    // Raw, because a client library treats an early close as an error on the whole
+    // exchange and this test is about what reached the wire.
+    let mut tcp = TcpStream::connect(("127.0.0.1", f.port)).await.unwrap();
+    tcp.write_all(b"GET /truncated HTTP/1.1\r\nHost: origin.test\r\n\r\n")
+        .await
+        .unwrap();
+    tcp.flush().await.unwrap();
+    // The real assertion: this returns. Before any of this existed it hung forever.
+    let raw = within(
+        "the truncated reply",
+        read_until_quiet(&mut tcp, CLIENT_IDLE),
+    )
+    .await;
+    let text = String::from_utf8_lossy(&raw).to_string();
+
+    assert!(
+        text.starts_with("HTTP/1.1 200"),
+        "the status line went out before the body stopped, and cannot be taken back: {text}"
+    );
+    assert!(
+        text.contains("only-sixteen-byt"),
+        "what did arrive reached the client: {text}"
     );
     assert_eq!(olog.connections(), 1);
-    assert!(
-        f.events.try_recv().is_err(),
-        "no event for an exchange that never completed"
+
+    // And it is in the history, which is the part that used to be silently missing.
+    let ev = within("the event for a partial transfer", f.events.recv())
+        .await
+        .expect("a partial transfer is still an exchange");
+    assert_eq!(ev.status, Some(200));
+    assert_eq!(
+        ev.resp_body.as_deref(),
+        Some("only-sixteen-byt"),
+        "the record says what actually arrived, not what was promised"
     );
 }
 

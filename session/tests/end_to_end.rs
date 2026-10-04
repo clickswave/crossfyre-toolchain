@@ -262,6 +262,72 @@ async fn a_plaintext_http_target_is_carried_and_captured() {
 }
 
 #[tokio::test]
+async fn a_body_past_the_cap_is_delivered_whole_and_recorded_short() {
+    // The property the streaming change exists for, asserted rather than inferred from a
+    // memory figure. The client gets everything the target sent. The project keeps a
+    // bounded prefix and says how long the thing really was, so a reader can tell a
+    // complete small response from the first slice of a large one.
+    //
+    // Both halves matter and they fail in opposite directions. Keeping it all is how a
+    // disk image takes the machine down. Keeping a prefix and reporting its length as the
+    // response length would understate a gigabyte download as sixteen megabytes and read
+    // as a complete capture, which is the worse of the two because it is believed.
+    use cfx_capture::flow::RECORDED_BODY_MAX;
+    let over = RECORDED_BODY_MAX + 1_000_000;
+
+    let s = Scratch::new("overcap");
+    let body = "A".repeat(over);
+    let reply = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {over}\r\n\r\n{body}"
+    )
+    .into_bytes();
+    drop(body);
+    let (origin_port, _) = tls_origin(reply).await;
+    let (session, project, ca_pem) = session_over(&s, false).await;
+
+    let (status, got) = through_proxy(
+        session.port(),
+        origin_port,
+        &ca_pem,
+        "GET",
+        "/disk.img",
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        got.len(),
+        over,
+        "the client gets everything: a proxy that truncates a download is not a proxy"
+    );
+
+    let p = project.clone();
+    eventually("the oversized exchange was recorded", || {
+        let p = p.clone();
+        async move { p.count().await.unwrap_or(0) > 0 }
+    })
+    .await;
+
+    let stored = project.get(1).await.expect("get").expect("the exchange");
+    assert_eq!(
+        stored.exchange.resp_body.len(),
+        RECORDED_BODY_MAX,
+        "exactly the cap is kept, not the whole body"
+    );
+    assert_eq!(
+        stored.exchange.resp_len,
+        Some(over),
+        "and the record says how long it really was"
+    );
+    assert!(
+        stored.exchange.resp_body.iter().all(|b| *b == b'A'),
+        "what was kept is the real prefix, not a placeholder"
+    );
+
+    session.stop().await;
+}
+
+#[tokio::test]
 async fn a_proxy_request_with_no_destination_says_so() {
     // Origin form straight at the proxy port, with no CONNECT and no absolute URL. There
     // is no destination in it, so there is nothing to forward to, and the reply has to

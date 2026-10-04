@@ -51,6 +51,7 @@ fn exchange(n: usize) -> Exchange {
         resp_headers: vec![["content-type".into(), "application/json".into()]],
         req_body: format!(r#"{{"sku":"WIDGET-{n}","qty":2}}"#).into_bytes(),
         resp_body: format!(r#"{{"order":{n},"state":"confirmed"}}"#).into_bytes(),
+        resp_len: None,
     }
 }
 

@@ -243,7 +243,16 @@ pub struct RawExchange {
     pub req_headers: Vec<(String, String)>,
     pub resp_headers: Vec<(String, String)>,
     pub req_body: Vec<u8>,
+    /// As much of the response body as is kept. Bounded, because a target chooses how
+    /// many bytes to send and a proxy that holds all of them is a proxy a target can
+    /// take down.
     pub resp_body: Vec<u8>,
+    /// How long the response actually was, when `resp_body` is only a prefix of it.
+    ///
+    /// `None` means it is whole. Carried separately so a truncated record reports the
+    /// real size rather than the size of what was kept, which would understate a
+    /// gigabyte download as sixteen megabytes and read as a complete capture.
+    pub resp_len: Option<usize>,
 }
 
 /// Somewhere local that an exchange is recorded with its bodies intact.

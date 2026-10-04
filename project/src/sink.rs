@@ -114,6 +114,7 @@ fn from_raw(ex: &RawExchange) -> Exchange {
         resp_headers: pairs(&ex.resp_headers),
         req_body: ex.req_body.clone(),
         resp_body: ex.resp_body.clone(),
+        resp_len: ex.resp_len,
     }
 }
 

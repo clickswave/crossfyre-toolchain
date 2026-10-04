@@ -10,6 +10,10 @@ use std::error::Error;
 use std::sync::{Arc, LazyLock};
 
 use bytes::Bytes;
+// Unsync, because hyper does not require a response body to be Sync and the sink's
+// write future does not promise it. Demanding Sync here would mean widening a trait
+// signature across the crate to satisfy a bound nothing needs.
+use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, SERVER};
@@ -356,7 +360,7 @@ pub async fn serve_plain_request(
     egress: Egress,
     tx: UnboundedSender<TraceEvent>,
     cfg: CaptureCfg,
-) -> Response<Full<Bytes>> {
+) -> Response<UnsyncBoxBody<Bytes, BoxErr>> {
     match handle_request(
         req,
         "http",
@@ -383,7 +387,7 @@ async fn handle_request(
     egress: Egress,
     tx: UnboundedSender<TraceEvent>,
     cfg: CaptureCfg,
-) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
+) -> Result<Response<UnsyncBoxBody<Bytes, BoxErr>>, std::convert::Infallible> {
     // Read what identifies the request before forwarding consumes it, so a failure still
     // has something to record. Without this a request that never reached the target left
     // no row at all: the operator browsed, got a bare 502 in the browser, and found an
@@ -438,13 +442,14 @@ async fn handle_request(
                     ],
                     req_body: Vec::new(),
                     resp_body: body.clone().into_bytes(),
+                    resp_len: None,
                 };
                 sink.record(&ex).await;
             }
             Ok(Response::builder()
                 .status(502)
                 .header(CONTENT_TYPE, "text/plain")
-                .body(Full::new(Bytes::from(body)))
+                .body(fixed_body(body))
                 .unwrap())
         }
     }
@@ -458,7 +463,7 @@ async fn forward(
     egress: Egress,
     tx: UnboundedSender<TraceEvent>,
     cfg: &CaptureCfg,
-) -> Result<Response<Full<Bytes>>, BoxErr> {
+) -> Result<Response<UnsyncBoxBody<Bytes, BoxErr>>, BoxErr> {
     let method = req.method().to_string();
     let pq = req
         .uri()
@@ -505,7 +510,7 @@ async fn forward(
                 );
                 return Ok(Response::builder()
                     .status(403)
-                    .body(Full::new(Bytes::from_static(b"dropped by interceptor")))?);
+                    .body(fixed_body(Bytes::from_static(b"dropped by interceptor")))?);
             }
             InterceptDecision::Forward => {}
             InterceptDecision::ForwardModified(ed) => edited = Some(ed),
@@ -573,7 +578,7 @@ async fn forward(
     let tcp = egress.connect(target_host, target_port).await?;
     log::debug!("dialed {target_host}:{target_port}");
     let started = std::time::Instant::now();
-    let (status, tech, resp_headers, resp_bytes) = if scheme == "https" {
+    let (status, tech, resp_headers, upstream_body) = if scheme == "https" {
         let server_name = rustls::pki_types::ServerName::try_from(sni_host.to_string())?;
         let connector = if cfg.trust_any_upstream_cert {
             &*UPSTREAM_TLS_TRUST_ANY
@@ -626,25 +631,6 @@ async fn forward(
         .map(|(_, v)| v.clone())
         .unwrap_or_else(|| host_hdr.clone());
     let sent_full_url = format!("{scheme}://{sent_host}{sent_path}");
-
-    if let Some(sink) = &cfg.sink {
-        let raw = crate::RawExchange {
-            at_ms: now_ms(),
-            method: sent_method.clone(),
-            url: sent_full_url.clone(),
-            host: sent_host.clone(),
-            req_headers: sent_headers.clone(),
-            status,
-            duration_ms,
-            resp_headers: resp_headers
-                .iter()
-                .map(|[k, v]| (k.clone(), v.clone()))
-                .collect(),
-            req_body: sent_body.clone(),
-            resp_body: resp_bytes.to_vec(),
-        };
-        sink.record(&raw).await;
-    }
 
     // An upgrade the connection cannot carry.
     //
@@ -720,6 +706,7 @@ async fn forward(
                     .collect(),
                 req_body: sent_body,
                 resp_body: body.clone().into_bytes(),
+                resp_len: None,
             };
             sink.record(&raw).await;
         }
@@ -728,7 +715,7 @@ async fn forward(
             .status(501)
             .header(CONTENT_TYPE, "text/plain")
             .header("x-crossfyre-proxy-error", "upgrade not carried")
-            .body(Full::new(Bytes::from(body)))?);
+            .body(fixed_body(body))?);
     }
 
     // What goes back to the client.
@@ -763,8 +750,8 @@ async fn forward(
     }
 
     // Base privacy-safe event; enriched with full bytes only when full capture is on.
-    let mut event = TraceEvent {
-        method: sent_method,
+    let event = TraceEvent {
+        method: sent_method.clone(),
         url: redact_url(&sent_full_url),
         status: Some(status),
         tech,
@@ -778,42 +765,264 @@ async fn forward(
         resp_body: None,
         duration_ms: None,
     };
-    if cfg.full {
-        // The headers that went, matching the url and method above. Taking these from the
-        // request as it arrived while the url described the request as it left is exactly
-        // the half-and-half record this test exists to stop.
-        let req_hdr_arr: Vec<[String; 2]> = sent_headers
-            .iter()
-            .map(|(k, v)| [k.clone(), v.clone()])
-            .collect();
-        // Hand over the RAW bytes and let attach_full decode them. Doing the
-        // lossy conversion here is what turned every gzip response into
-        // mojibake, and it is unrecoverable once done.
-        event.attach_full(crate::FullExchange {
-            // The request that went, like everything else on this event.
-            url: sent_full_url,
-            req_headers: req_hdr_arr,
-            req_body: sent_body,
-            resp_headers,
-            resp_body: resp_bytes.to_vec(),
-            duration_ms: Some(duration_ms),
-        });
-        // Full capture is the mode where "nothing showed up" is indistinguishable from
-        // "nothing was captured", so say what actually got attached per flow. Without
-        // this the only observable is a Requests tab that stays empty.
-        log::info!(
-            "full capture: {} {} req_headers={} req_body={}B resp_headers={} resp_body={}B",
-            event.method,
-            event.url,
-            event.req_headers.as_ref().map_or(0, |h| h.len()),
-            event.req_body.as_ref().map_or(0, |b| b.len()),
-            event.resp_headers.as_ref().map_or(0, |h| h.len()),
-            event.resp_body.as_ref().map_or(0, |b| b.len()),
-        );
-    }
-    let _ = tx.send(event);
+    // The event and the record are finished by the BODY, when the body ends, because
+    // until then there is nothing to say about it. Everything they need is taken here,
+    // where it is still in scope.
+    Ok(reply.body(
+        RecordingBody::new(
+            upstream_body,
+            Finish {
+                cfg: cfg.clone(),
+                tx,
+                event,
+                full_url: sent_full_url,
+                method: sent_method,
+                host: sent_host,
+                req_headers: sent_headers,
+                req_body: sent_body,
+                resp_headers,
+                status,
+                duration_ms,
+            },
+        )
+        .boxed_unsync(),
+    )?)
+}
 
-    Ok(reply.body(Full::new(resp_bytes))?)
+// ---------------------------------------------------------------------------
+// Recording the response without holding it
+// ---------------------------------------------------------------------------
+
+/// A reply this proxy wrote itself, in the same shape as a streamed one.
+///
+/// `Full`'s error type is `Infallible` and a streamed upstream body's is not, so the two
+/// need reconciling before they can share a return type. The match on an empty enum is
+/// how you promise a compiler that a value cannot exist.
+fn fixed_body(bytes: impl Into<Bytes>) -> UnsyncBoxBody<Bytes, BoxErr> {
+    Full::new(bytes.into())
+        .map_err(|e: std::convert::Infallible| match e {})
+        .boxed_unsync()
+}
+
+/// How much of a response body is kept for the record.
+///
+/// Everything above this is carried to the client and not stored. The number is a
+/// judgement about what an operator reads versus what they merely download: a page, an
+/// API response or a script is far under it, and a disk image, a video or an APK is far
+/// over. Sixteen megabytes is generous for the first and useless for the second, which is
+/// the right shape, because keeping the second has never helped anybody find a bug.
+pub const RECORDED_BODY_MAX: usize = 16 * 1024 * 1024;
+
+/// A response body on its way to the client, keeping a bounded prefix for the record.
+///
+/// This replaced collecting the whole body before answering. That was simple and it meant
+/// the proxy held every byte a target chose to send, twice: once as the collected body
+/// and again as the copy the record owned. Measured, a sixty-four megabyte response cost
+/// a hundred and thirty megabytes of resident memory, so a gigabyte download needed two
+/// gigabytes and a disk image took the machine with it.
+///
+/// Worse than the size, nothing bounded it. The number of bytes came from the target,
+/// which in this product is by definition hostile, so a response that never ended was a
+/// denial of service against the operator's own tool.
+///
+/// The record fires once, when the body ends or when it is dropped. Dropped matters for
+/// two reasons. A client that disconnects halfway through a download still made a
+/// request, and an exchange missing from the history because somebody pressed stop is a
+/// history that cannot be trusted to be complete. And it is the ordinary path rather than
+/// the exceptional one: hyper does not reliably poll a body whose length it already knows
+/// to its final frame, it writes the bytes and drops it.
+///
+/// So the contract is that an exchange is recorded SHORTLY AFTER its response completes,
+/// not before. Measured, the write is about a sixth of a millisecond. The collecting
+/// version this replaced had the stronger property for free, and losing it is the price
+/// of not holding a four-gigabyte download in memory.
+///
+/// The remaining gap, written down rather than discovered: a process that exits inside
+/// that window loses the last exchange. The fix is a write queue in the sink that
+/// `Project::close` drains, so closing a project means every capture is on disk. That is
+/// worth doing before anybody relies on a project file as evidence.
+struct RecordingBody {
+    inner: Incoming,
+    kept: Vec<u8>,
+    /// Everything that arrived, whether it was kept or not.
+    total: usize,
+    /// Taken on the first emit, so a body that ends and is then dropped records once.
+    finish: Option<Box<Finish>>,
+    /// The record write, while it is still in flight. The body does not end until it
+    /// completes.
+    writing: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
+}
+
+/// What the record needs, captured before the body starts flowing.
+struct Finish {
+    cfg: CaptureCfg,
+    tx: UnboundedSender<TraceEvent>,
+    event: TraceEvent,
+    full_url: String,
+    method: String,
+    host: String,
+    req_headers: Vec<(String, String)>,
+    req_body: Vec<u8>,
+    resp_headers: Vec<[String; 2]>,
+    status: i64,
+    duration_ms: u64,
+}
+
+impl RecordingBody {
+    fn new(inner: Incoming, finish: Finish) -> Self {
+        Self {
+            inner,
+            kept: Vec::new(),
+            total: 0,
+            finish: Some(Box::new(finish)),
+            writing: None,
+        }
+    }
+
+    /// Emit the event, and hand back the record write if there is a sink.
+    ///
+    /// Once, because a body that ends and is then dropped must not record twice.
+    fn emit(&mut self) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> {
+        let f = self.finish.take()?;
+        let kept = std::mem::take(&mut self.kept);
+        let total = self.total;
+        let truncated = total > kept.len();
+
+        let mut event = f.event;
+        if f.cfg.full {
+            event.attach_full(crate::FullExchange {
+                url: f.full_url.clone(),
+                req_headers: f
+                    .req_headers
+                    .iter()
+                    .map(|(k, v)| [k.clone(), v.clone()])
+                    .collect(),
+                req_body: f.req_body.clone(),
+                resp_headers: f.resp_headers.clone(),
+                resp_body: kept.clone(),
+                duration_ms: Some(f.duration_ms),
+            });
+            log::info!(
+                "full capture: {} {} req_headers={} req_body={}B resp_headers={} resp_body={}B{}",
+                event.method,
+                event.url,
+                f.req_headers.len(),
+                f.req_body.len(),
+                f.resp_headers.len(),
+                total,
+                if truncated {
+                    format!(" (kept {})", kept.len())
+                } else {
+                    String::new()
+                },
+            );
+        }
+        let _ = f.tx.send(event);
+
+        let sink = f.cfg.sink.clone()?;
+        let raw = crate::RawExchange {
+            at_ms: now_ms(),
+            method: f.method,
+            url: f.full_url,
+            host: f.host,
+            req_headers: f.req_headers,
+            status: f.status,
+            duration_ms: f.duration_ms,
+            resp_headers: f
+                .resp_headers
+                .iter()
+                .map(|[k, v]| (k.clone(), v.clone()))
+                .collect(),
+            req_body: f.req_body,
+            resp_body: kept,
+            resp_len: truncated.then_some(total),
+        };
+        Some(Box::pin(async move {
+            sink.record(&raw).await;
+        }))
+    }
+}
+
+impl hyper::body::Body for RecordingBody {
+    type Data = Bytes;
+    type Error = BoxErr;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        use std::task::Poll;
+        let me = &mut *self;
+
+        // The record is written before the body is allowed to END, not after. That costs
+        // the client a fraction of a millisecond on the last frame and keeps the property
+        // the collecting version had for free: by the time a response is complete, the
+        // exchange proving it is on disk. For a tool whose output is evidence, a window
+        // where the browser has rendered a page that the project file has never heard of
+        // is not worth the microseconds.
+        if let Some(write) = me.writing.as_mut() {
+            return match write.as_mut().poll(cx) {
+                Poll::Ready(()) => {
+                    me.writing = None;
+                    Poll::Ready(None)
+                }
+                Poll::Pending => Poll::Pending,
+            };
+        }
+
+        match std::pin::Pin::new(&mut me.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    me.total += data.len();
+                    let room = RECORDED_BODY_MAX.saturating_sub(me.kept.len());
+                    if room > 0 {
+                        me.kept.extend_from_slice(&data[..room.min(data.len())]);
+                    }
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                // The transfer failed partway. What arrived is still evidence about the
+                // target, and silence is not, so it is recorded before the error goes on.
+                if let Some(mut write) = me.emit() {
+                    if write.as_mut().poll(cx).is_pending() {
+                        me.writing = Some(write);
+                    }
+                }
+                Poll::Ready(Some(Err(e.into())))
+            }
+            Poll::Ready(None) => match me.emit() {
+                Some(mut write) => match write.as_mut().poll(cx) {
+                    Poll::Ready(()) => Poll::Ready(None),
+                    Poll::Pending => {
+                        me.writing = Some(write);
+                        Poll::Pending
+                    }
+                },
+                None => Poll::Ready(None),
+            },
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for RecordingBody {
+    fn drop(&mut self) {
+        // A client that went away mid-download still made the request, and an exchange
+        // missing from the history because somebody pressed stop is a history that cannot
+        // be trusted to be complete.
+        //
+        // Spawned rather than awaited, because a destructor cannot wait. This is the one
+        // path where the write is not durable by the time anything observes the response,
+        // and it is the path where nothing is observing it.
+        if let Some(write) = self.emit() {
+            tokio::spawn(write);
+        }
+    }
 }
 
 /// Say what a forward-leg failure actually means, in a sentence that names the fix.
@@ -927,7 +1136,7 @@ fn sni_name(host: &str) -> &str {
 async fn send_upstream<S>(
     stream: S,
     req: Request<Full<Bytes>>,
-) -> Result<(i64, Option<String>, Vec<[String; 2]>, Bytes), BoxErr>
+) -> Result<(i64, Option<String>, Vec<[String; 2]>, Incoming), BoxErr>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -950,8 +1159,7 @@ where
         .iter()
         .map(|(k, v)| [k.to_string(), v.to_str().unwrap_or("").to_string()])
         .collect();
-    let bytes = resp.into_body().collect().await?.to_bytes();
-    Ok((status, tech, resp_headers, bytes))
+    Ok((status, tech, resp_headers, resp.into_body()))
 }
 
 #[cfg(test)]

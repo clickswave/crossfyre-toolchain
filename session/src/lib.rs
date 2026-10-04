@@ -37,7 +37,14 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http_body_util::Full;
+// Unsync, because hyper does not require a response body to be Sync and the sink's
+// write future does not promise it. Demanding Sync here would mean widening a trait
+// signature across the crate to satisfy a bound nothing needs.
+use http_body_util::combinators::UnsyncBoxBody;
+use http_body_util::{BodyExt, Full};
+
+/// The error a streamed upstream body can produce, which every reply here shares.
+type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response};
 use hyper_util::rt::TokioIo;
@@ -227,15 +234,22 @@ struct FlowCtx {
     capture: CaptureCfg,
 }
 
-fn text(status: u16, body: &'static str) -> Response<Full<Bytes>> {
+fn text(status: u16, body: &'static str) -> Response<UnsyncBoxBody<Bytes, BoxErr>> {
     Response::builder()
         .status(status)
-        .body(Full::new(Bytes::from_static(body.as_bytes())))
+        .body(
+            Full::new(Bytes::from_static(body.as_bytes()))
+                .map_err(|e: std::convert::Infallible| match e {})
+                .boxed_unsync(),
+        )
         .unwrap()
 }
 
 /// One request on the proxy connection.
-async fn proxy(req: Request<hyper::body::Incoming>, ctx: FlowCtx) -> Response<Full<Bytes>> {
+async fn proxy(
+    req: Request<hyper::body::Incoming>,
+    ctx: FlowCtx,
+) -> Response<UnsyncBoxBody<Bytes, BoxErr>> {
     // A plaintext target reaches a proxy in absolute form: `GET http://host/path`, with
     // no CONNECT and nothing to MITM because there is no TLS. The capture core has always
     // been able to carry these; this refused before reaching it, so every http:// target
@@ -316,7 +330,12 @@ async fn proxy(req: Request<hyper::body::Incoming>, ctx: FlowCtx) -> Response<Fu
     });
 
     // 200 lets the browser go ahead with the handshake this session then intercepts.
-    Response::new(Full::new(Bytes::new()))
+    // A CONNECT answer has no body; it is the signal that the tunnel may begin.
+    Response::new(
+        Full::new(Bytes::new())
+            .map_err(|e: std::convert::Infallible| match e {})
+            .boxed_unsync(),
+    )
 }
 
 /// Install the rustls crypto provider. Idempotent, and in one place so the session and the
