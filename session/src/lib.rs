@@ -36,7 +36,13 @@ use hyper::{Method, Request, Response};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
-pub mod browser;
+/// Launching a browser at the proxy.
+///
+/// It lives in `cfx_capture` and is re-exported here, because the CLI's web tracer wants
+/// exactly the same thing and depends on `capture` but not on this crate. Two copies of
+/// the quiet-profile settings is how one of them ends up years out of date, which is
+/// what had already happened.
+pub use cfx_capture::browser;
 
 #[cfg(feature = "testing")]
 pub mod testing;

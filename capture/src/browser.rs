@@ -73,6 +73,33 @@ pub fn installed() -> Vec<Browser> {
     out
 }
 
+impl Browser {
+    /// A browser the caller has already located, named on a command line rather than
+    /// chosen from a list.
+    ///
+    /// The family is inferred from the binary's name, which is what decides whether this
+    /// launch speaks prefs or flags. Anything not recognisably Firefox is treated as
+    /// Chromium, because that is the larger family and the flags it takes are ignored by
+    /// most things that are neither.
+    pub fn at(binary: impl Into<PathBuf>) -> Self {
+        let binary = binary.into();
+        let name = binary
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| binary.display().to_string());
+        let family = if name.to_ascii_lowercase().contains("firefox") {
+            Family::Firefox
+        } else {
+            Family::Chromium
+        };
+        Self {
+            name,
+            binary,
+            family,
+        }
+    }
+}
+
 /// Resolve a command name on PATH. No shell, so a name cannot become an invocation.
 fn which(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
@@ -119,8 +146,9 @@ pub enum Trust {
 ///
 /// Separate from spawning so the arguments can be asserted in a test without launching a
 /// browser, which is the part that is easy to get silently wrong.
-pub fn prepare(l: &Launch<'_>) -> std::io::Result<(Vec<String>, Trust)> {
+pub fn prepare(l: &Launch<'_>) -> std::io::Result<Prepared> {
     std::fs::create_dir_all(l.profile)?;
+    let env = launch_env(l.browser.family);
     match l.browser.family {
         Family::Firefox => {
             let trust = if trust_ca_in_profile(l.profile, l.ca_pem) {
@@ -129,29 +157,46 @@ pub fn prepare(l: &Launch<'_>) -> std::io::Result<(Vec<String>, Trust)> {
                 Trust::None
             };
             std::fs::write(l.profile.join("user.js"), firefox_prefs(l.proxy_port))?;
-            Ok((
-                vec![
+            Ok(Prepared {
+                args: vec![
                     "--no-remote".into(),
                     "--profile".into(),
                     l.profile.display().to_string(),
                     l.start_url.into(),
                 ],
+                env,
                 trust,
-            ))
+            })
         }
         Family::Chromium => {
             seed_chromium_prefs(l.profile)?;
-            Ok((chromium_args(l), Trust::CheckingDisabled))
+            Ok(Prepared {
+                args: chromium_args(l),
+                env,
+                trust: Trust::CheckingDisabled,
+            })
         }
     }
 }
 
+/// Everything needed to spawn, in one value.
+///
+/// The environment is in here rather than left to the caller because forgetting it is
+/// invisible and expensive: `MOZ_REMOTE_SETTINGS_DEVTOOLS` is the difference between four
+/// captures for a page and twenty-eight, and nothing about a launch without it looks
+/// wrong. A caller that spawns from this struct cannot leave it out.
+pub struct Prepared {
+    pub args: Vec<String>,
+    pub env: &'static [(&'static str, &'static str)],
+    pub trust: Trust,
+}
+
 /// Launch it. The child is returned so the caller can decide whether to wait on it.
 pub fn launch(l: &Launch<'_>) -> std::io::Result<(std::process::Child, Trust)> {
-    let (args, trust) = prepare(l)?;
+    let p = prepare(l)?;
     let mut cmd = std::process::Command::new(&l.browser.binary);
-    cmd.args(&args);
-    for (k, v) in launch_env(l.browser.family) {
+    cmd.args(&p.args);
+    for (k, v) in p.env {
         cmd.env(k, v);
     }
     let child = cmd
@@ -160,7 +205,7 @@ pub fn launch(l: &Launch<'_>) -> std::io::Result<(std::process::Child, Trust)> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()?;
-    Ok((child, trust))
+    Ok((child, p.trust))
 }
 
 /// Pre-trust the CA in a Firefox profile's own NSS store, so nothing has to be imported
@@ -421,6 +466,21 @@ mod tests {
     }
 
     #[test]
+    fn firefox_carries_the_variable_its_prefs_depend_on() {
+        // `services.settings.server` is read only when this says it may, on a release
+        // build. Without it the pref is ignored and the compiled-in address is used, so
+        // the setting silently does nothing and one page of browsing produced
+        // twenty-eight captures. It is returned with the arguments for that reason.
+        let env = launch_env(Family::Firefox);
+        assert!(
+            env.iter()
+                .any(|(k, v)| *k == "MOZ_REMOTE_SETTINGS_DEVTOOLS" && *v == "1"),
+            "got: {env:?}"
+        );
+        assert!(launch_env(Family::Chromium).is_empty());
+    }
+
+    #[test]
     fn firefox_is_told_the_same_thing_in_its_own_language() {
         // Firefox ignores Chromium's flags entirely, which is why this is prefs and not
         // arguments, and why passing the wrong family's settings captures nothing.
@@ -433,6 +493,21 @@ mod tests {
             "the loopback equivalent"
         );
         assert!(prefs.contains("toolkit.telemetry.enabled\", false"));
+        // Not the empty string. These take a URL, so "" is not one, the component falls
+        // back to its built-in default and the pref silences nothing while looking as
+        // though it did. The CLI's tracer shipped that version for weeks.
+        for pref in [
+            "services.settings.server",
+            "toolkit.telemetry.server",
+            "app.update.url",
+            "media.gmp-manager.url",
+        ] {
+            assert!(
+                !prefs.contains(&format!("{pref}\", \"\")")),
+                "{pref} is set to the empty string, which does nothing"
+            );
+            assert!(prefs.contains(pref), "{pref} is not set at all");
+        }
         // Every line is a complete pref, or Firefox discards the rest of the file.
         for line in prefs.lines().filter(|l| !l.trim().is_empty()) {
             assert!(
@@ -455,8 +530,14 @@ mod tests {
             profile: &dir,
             start_url: "about:blank",
         };
-        let (_, trust) = prepare(&l).expect("prepare");
-        assert_eq!(trust, Trust::CheckingDisabled);
+        let p = prepare(&l).expect("prepare");
+        assert_eq!(p.trust, Trust::CheckingDisabled);
+        // And the environment travels with the arguments, so a caller spawning from this
+        // cannot leave out the one variable that decides whether the capture is readable.
+        assert!(
+            p.env.is_empty(),
+            "chromium needs nothing here, unlike firefox"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -484,6 +565,27 @@ mod tests {
         let after = std::fs::read_to_string(dir.join("Default").join("Preferences")).expect("read");
         assert_eq!(after, "{\"mine\":true}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_browser_named_on_a_command_line_gets_the_right_family() {
+        // The CLI takes `--browser <name>` and resolves it to a path, so the family has
+        // to come from the path. Getting it wrong is silent: Firefox accepts Chromium's
+        // flags and ignores them, so the browser opens, works, and captures nothing.
+        assert_eq!(Browser::at("/usr/bin/firefox").family, Family::Firefox);
+        assert_eq!(Browser::at("/usr/bin/firefox-esr").family, Family::Firefox);
+        assert_eq!(Browser::at("/opt/Firefox/firefox").family, Family::Firefox);
+        assert_eq!(Browser::at("/usr/bin/chromium").family, Family::Chromium);
+        assert_eq!(
+            Browser::at("/usr/bin/google-chrome-stable").family,
+            Family::Chromium
+        );
+        assert_eq!(
+            Browser::at("/usr/bin/brave-browser").family,
+            Family::Chromium
+        );
+        // And the name is the binary's, not the whole path, because it is shown.
+        assert_eq!(Browser::at("/usr/bin/chromium").name, "chromium");
     }
 
     #[test]

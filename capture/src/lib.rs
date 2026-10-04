@@ -12,6 +12,7 @@
 //! surface, and never diverge the certificate behavior between desktop and mobile.
 
 pub mod body;
+pub mod browser;
 pub mod config;
 pub mod flow;
 pub mod gate;

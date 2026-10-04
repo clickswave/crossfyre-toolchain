@@ -40,33 +40,6 @@ fn empty() -> Body {
     Empty::<Bytes>::new().boxed()
 }
 
-/// Chromium flags that suppress Google/Chrome background traffic so the capture is the operator's
-/// browsing, not the browser phoning home (safebrowsing, optimization hints, account sync, component
-/// and spellcheck-dictionary downloads, metrics, GCM, hyperlink auditing). Mirrors the quiet profile
-/// Burp's embedded browser launches with.
-const CHROMIUM_QUIET_FLAGS: &[&str] = &[
-    "--no-first-run",
-    "--no-default-browser-check",
-    "--disable-background-networking",
-    "--disable-component-update",
-    "--disable-sync",
-    "--disable-domain-reliability",
-    "--disable-client-side-phishing-detection",
-    "--safebrowsing-disable-auto-update",
-    "--disable-default-apps",
-    "--disable-breakpad",
-    "--metrics-recording-only",
-    "--no-pings",
-    "--no-service-autorun",
-    "--password-store=basic",
-    "--use-mock-keychain",
-    "--disable-component-extensions-with-background-pages",
-    "--disable-search-engine-choice-screen",
-    "--disable-features=OptimizationHints,OptimizationGuideModelDownloading,Translate,MediaRouter,\
-DialMediaRouteProvider,InterestFeedContentSuggestions,CalculateNativeWinOcclusion,\
-AutofillServerCommunication,CertificateTransparencyComponentUpdater",
-];
-
 // ---------------------------------------------------------------------------
 // Session CA + on-the-fly per-host leaf certs
 // ---------------------------------------------------------------------------
@@ -116,27 +89,6 @@ fn load_or_generate_ca() -> Result<SessionCa, BoxErr> {
         }
     }
     Ok(ca)
-}
-
-/// Pre-trust the session CA in a Firefox profile's NSS store via `certutil`, so the operator never
-/// has to import it by hand. Each launch uses a throwaway profile that would otherwise start with an
-/// empty trust store (which is why a persistent CA alone was not enough: the profile, not the CA, was
-/// the thing being thrown away). Best-effort: returns false when `certutil` (from nss) is absent, and
-/// the caller falls back to printing the manual-install steps.
-fn firefox_trust_ca(profile: &std::path::Path, ca_pem: &std::path::Path) -> bool {
-    use std::process::Command;
-    let db = format!("sql:{}", profile.display());
-    // A fresh profile has no NSS db yet; create one with an empty password (a no-op if it exists).
-    let _ = Command::new("certutil")
-        .args(["-N", "-d", &db, "--empty-password"])
-        .output();
-    Command::new("certutil")
-        .args(["-A", "-n", "Crossfyre Web Tracer CA", "-t", "C,,", "-i"])
-        .arg(ca_pem)
-        .args(["-d", &db])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
 }
 
 // The per-SNI resolver + leaf minting now live in `capture` (shared with the mobile netstack); the
@@ -717,135 +669,69 @@ pub async fn run_proxy(cfg: TraceConfig) -> Result<(), BoxErr> {
     };
     tokio::spawn(serve(listener, ctx));
 
-    // Launch a browser pointed at the proxy, isolated so it can't clobber the user's real profile.
-    // --ignore-certificate-errors means the launched browser trusts our MITM cert without installing
-    // the CA (it's an ephemeral, operator-controlled profile).
+    // Launch a browser pointed at the proxy, in a throwaway profile so it cannot touch
+    // the operator's real one. Every detail of how that is done, for both families, lives
+    // in `capture::browser`: this used to carry its own copy and the copy had drifted.
+    // Firefox only reads `services.settings.server` when an environment variable says it
+    // may, so the pref this file set to silence Remote Settings silenced nothing, and a
+    // single page of browsing arrived here as twenty-eight captures.
     let mut browser_child = None;
     if let Some(browser) = &cfg.browser {
-        let bin = super::trace::browser_binary(browser);
-        // Firefox and Chromium point at a proxy in completely different ways:
-        // Chromium takes CLI flags, Firefox takes profile prefs and ignores the
-        // Chromium flags entirely (which is why `--browser firefox*` captured
-        // nothing before). Branch on the family.
-        let is_firefox = bin.contains("firefox");
+        let found = capture::browser::Browser::at(super::trace::browser_binary(browser));
         let profile =
             std::env::temp_dir().join(format!("cfx-trace-profile-{}", std::process::id()));
-        let mut cmd = tokio::process::Command::new(&bin);
-        let mut ca_trusted = false;
-        if is_firefox {
-            // Firefox: an isolated profile whose prefs route through the proxy.
-            // `allow_hijacking_localhost` is the key one - Firefox, like Chromium,
-            // bypasses loopback by default, so without it a http://localhost
-            // target never reaches the proxy. HTTPS needs the CA trusted; Firefox has
-            // its own trust store with no --ignore-certificate-errors equivalent, so
-            // we pre-install the CA into this profile via certutil below.
-            let _ = std::fs::create_dir_all(&profile);
-            ca_trusted = firefox_trust_ca(&profile, &ca_path);
-            // `bound` is "127.0.0.1:<port>"; pull the port for the profile prefs.
-            let port = bound
-                .rsplit(':')
-                .next()
-                .and_then(|s| s.parse::<u16>().ok())
-                .unwrap_or_default();
-            // Proxy prefs, then the Firefox equivalent of CHROMIUM_QUIET_FLAGS:
-            // silence captive-portal detection (detectportal success.txt), the
-            // connectivity checks (success.txt?ipv4/ipv6, generate_204), Remote
-            // Settings, safebrowsing updates, telemetry, update pings, region +
-            // discovery services and Activity Stream feeds - so the capture is the
-            // operator's browsing, not Firefox phoning home.
-            let prefs = format!(
-                "user_pref(\"network.proxy.type\", 1);\n\
-                 user_pref(\"network.proxy.http\", \"127.0.0.1\");\n\
-                 user_pref(\"network.proxy.http_port\", {port});\n\
-                 user_pref(\"network.proxy.ssl\", \"127.0.0.1\");\n\
-                 user_pref(\"network.proxy.ssl_port\", {port});\n\
-                 user_pref(\"network.proxy.allow_hijacking_localhost\", true);\n\
-                 user_pref(\"network.proxy.no_proxies_on\", \"\");\n\
-                 user_pref(\"security.enterprise_roots.enabled\", true);\n\
-                 user_pref(\"browser.shell.checkDefaultBrowser\", false);\n\
-                 user_pref(\"network.captive-portal-service.enabled\", false);\n\
-                 user_pref(\"network.connectivity-service.enabled\", false);\n\
-                 user_pref(\"captivedetect.canonicalURL\", \"\");\n\
-                 user_pref(\"services.settings.server\", \"\");\n\
-                 user_pref(\"browser.safebrowsing.malware.enabled\", false);\n\
-                 user_pref(\"browser.safebrowsing.phishing.enabled\", false);\n\
-                 user_pref(\"browser.safebrowsing.downloads.enabled\", false);\n\
-                 user_pref(\"browser.safebrowsing.provider.google4.updateURL\", \"\");\n\
-                 user_pref(\"browser.safebrowsing.provider.mozilla.updateURL\", \"\");\n\
-                 user_pref(\"extensions.blocklist.enabled\", false);\n\
-                 user_pref(\"app.update.enabled\", false);\n\
-                 user_pref(\"app.update.auto\", false);\n\
-                 user_pref(\"browser.region.network.url\", \"\");\n\
-                 user_pref(\"browser.region.update.enabled\", false);\n\
-                 user_pref(\"browser.discovery.enabled\", false);\n\
-                 user_pref(\"browser.ping-centre.telemetry\", false);\n\
-                 user_pref(\"browser.newtabpage.activity-stream.feeds.telemetry\", false);\n\
-                 user_pref(\"browser.newtabpage.activity-stream.telemetry\", false);\n\
-                 user_pref(\"browser.newtabpage.activity-stream.feeds.snippets\", false);\n\
-                 user_pref(\"browser.newtabpage.activity-stream.feeds.section.topstories\", false);\n\
-                 user_pref(\"browser.newtabpage.activity-stream.default.sites\", \"\");\n\
-                 user_pref(\"dom.push.enabled\", false);\n\
-                 user_pref(\"extensions.getAddons.cache.enabled\", false);\n\
-                 user_pref(\"extensions.systemAddon.update.enabled\", false);\n\
-                 user_pref(\"network.prefetch-next\", false);\n\
-                 user_pref(\"datareporting.healthreport.uploadEnabled\", false);\n\
-                 user_pref(\"datareporting.policy.dataSubmissionEnabled\", false);\n\
-                 user_pref(\"toolkit.telemetry.enabled\", false);\n\
-                 user_pref(\"toolkit.telemetry.unified\", false);\n\
-                 user_pref(\"toolkit.telemetry.archive.enabled\", false);\n\
-                 user_pref(\"toolkit.telemetry.server\", \"\");\n\
-                 user_pref(\"app.normandy.enabled\", false);\n\
-                 user_pref(\"app.normandy.first_run\", false);\n\
-                 user_pref(\"app.shield.optoutstudies.enabled\", false);\n\
-                 user_pref(\"browser.aboutwelcome.enabled\", false);\n\
-                 user_pref(\"browser.startup.homepage_override.mstone\", \"ignore\");\n"
-            );
-            let _ = std::fs::write(profile.join("user.js"), &prefs);
-            cmd.arg("--no-remote")
-                .arg("--profile")
-                .arg(&profile)
-                .arg("about:blank");
-        } else {
-            // Chromium family: --proxy-server routes both HTTP and HTTPS (via
-            // CONNECT). --proxy-bypass-list=<-loopback> is essential for testing a
-            // local app - Chromium bypasses loopback by default, so without it a
-            // http://localhost target never hits the proxy. --ignore-certificate
-            // -errors lets the ephemeral profile trust our MITM cert without
-            // installing the CA.
-            cmd.arg(format!("--proxy-server={bound}"))
-                .arg("--proxy-bypass-list=<-loopback>")
-                .arg(format!("--user-data-dir={}", profile.display()))
-                .arg("--ignore-certificate-errors");
-            // Silence background/telemetry traffic (safebrowsing, optimization
-            // hints, account sync, component/dictionary downloads, the New Tab
-            // Page's promos/doodles, GCM, metrics) so the capture is the operator's
-            // browsing, not Google phoning home - the same reason Burp's embedded
-            // browser is quiet.
-            for flag in CHROMIUM_QUIET_FLAGS {
-                cmd.arg(flag);
-            }
-            cmd.arg("about:blank");
-        }
-        cmd.stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        match cmd.spawn() {
-            Ok(c) => {
-                println!("  launched {bin} through the proxy (isolated profile)");
-                if is_firefox {
-                    if ca_trusted {
-                        println!(
-                            "  firefox: CA auto-trusted in this profile - HTTPS captures immediately, nothing to import"
-                        );
-                    } else {
-                        println!(
-                            "  firefox: HTTP captures now; for HTTPS import the CA above (Settings -> Privacy -> Certificates), or install `certutil` (nss) so it auto-trusts next time"
-                        );
-                    }
+        let port = bound
+            .rsplit(':')
+            .next()
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or_default();
+        let launch = capture::browser::Launch {
+            browser: &found,
+            proxy_port: port,
+            ca_pem: &ca_path,
+            profile: &profile,
+            start_url: "about:blank",
+        };
+        match capture::browser::prepare(&launch) {
+            Ok(p) => {
+                let mut cmd = tokio::process::Command::new(&found.binary);
+                cmd.args(&p.args);
+                for (k, v) in p.env {
+                    cmd.env(k, v);
                 }
-                browser_child = Some(c);
+                cmd.stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                match cmd.spawn() {
+                    Ok(c) => {
+                        println!(
+                            "  launched {} through the proxy (isolated profile)",
+                            found.binary.display()
+                        );
+                        match p.trust {
+                            capture::browser::Trust::Installed => println!(
+                                "  {}: CA trusted in this profile - HTTPS captures immediately, nothing to import",
+                                found.name
+                            ),
+                            capture::browser::Trust::CheckingDisabled => println!(
+                                "  {}: certificate checking is OFF in this throwaway profile. It trusts ANY certificate, not only this proxy's. Close it when you are done.",
+                                found.name
+                            ),
+                            capture::browser::Trust::None => println!(
+                                "  {}: HTTP captures now; for HTTPS import the CA above (Settings -> Privacy -> Certificates), or install `certutil` (nss) so it auto-trusts next time",
+                                found.name
+                            ),
+                        }
+                        browser_child = Some(c);
+                    }
+                    Err(e) => eprintln!(
+                        "  could not launch {} ({e}); point your browser at http://{bound} and trust the CA above",
+                        found.binary.display()
+                    ),
+                }
             }
             Err(e) => eprintln!(
-                "  could not launch {bin} ({e}); point your browser at http://{bound} and trust the CA above"
+                "  could not prepare a profile for {} ({e}); point your browser at http://{bound} and trust the CA above",
+                found.binary.display()
             ),
         }
     } else {
