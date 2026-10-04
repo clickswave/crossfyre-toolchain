@@ -10,7 +10,7 @@ use sqlx::{Row, SqlitePool};
 
 /// Bumped whenever the statements below change. An older build opening a newer file
 /// refuses rather than guessing, which is the whole reason this is checked.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Exchanges, their out-of-line bodies, and a full-text index over the parts a human
 /// searches.
@@ -90,6 +90,30 @@ const STEPS: &[Step] = &[
         version: 3,
         statements: V3_SCOPE,
     },
+    Step {
+        version: 4,
+        statements: V4_ORIGIN,
+    },
+];
+
+/// Version 4: an exchange says whether somebody made it or watched it happen.
+///
+/// Only the proxy ever wrote a row, so the file recorded the browsing and not the
+/// testing: the sends an operator makes by hand, which are the interesting ones, were
+/// exactly the ones it had nothing about. A report built from it would have described
+/// the wrong half of the engagement.
+///
+/// `origin` defaults to `proxy` so every row that already exists keeps the only meaning
+/// it could have had. `actor` is the identity a replay went out as, and is null for
+/// everything else, including the anonymous leg of a replay: anonymous is the absence of
+/// an identity rather than one more of them, and giving it a name here would make it
+/// sortable alongside real ones.
+const V4_ORIGIN: &[&str] = &[
+    "ALTER TABLE exchange ADD COLUMN origin TEXT NOT NULL DEFAULT 'proxy'",
+    "ALTER TABLE exchange ADD COLUMN actor TEXT",
+    // Eviction reads this on every pass, and so does any question about what was sent
+    // by hand.
+    "CREATE INDEX exchange_origin ON exchange(origin, at_ms)",
 ];
 
 /// Version 2: a capture session is a thing, and every exchange belongs to one.

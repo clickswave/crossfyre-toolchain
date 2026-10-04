@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use cfx_project::{Cap, Exchange, INLINE_MAX, Project, searchable_text};
+use cfx_project::{Cap, Exchange, INLINE_MAX, Origin, Project, searchable_text};
 
 /// A project directory under the system temp dir, removed on drop.
 struct Scratch(PathBuf);
@@ -52,6 +52,9 @@ fn exchange(n: usize) -> Exchange {
         req_body: format!(r#"{{"sku":"WIDGET-{n}","qty":2}}"#).into_bytes(),
         resp_body: format!(r#"{{"order":{n},"state":"confirmed"}}"#).into_bytes(),
         resp_len: None,
+        // What the helper has always meant: a row the proxy watched.
+        origin: Origin::Proxy,
+        actor: None,
     }
 }
 
@@ -262,6 +265,90 @@ async fn a_body_whose_file_vanished_is_an_error_and_not_an_empty_body() {
 // ---------------------------------------------------------------------------
 // The cap
 // ---------------------------------------------------------------------------
+
+/// A send somebody made by hand survives a cap pass that takes everything around it.
+///
+/// The cap is there because captured traffic is unbounded, and it evicted oldest-first
+/// among whatever was not pinned. A Repeater or replay row is the opposite kind of thing:
+/// there are a handful of them, somebody made each one deliberately, and they are what a
+/// report is built from. Letting more browsing push them out would mean the file kept the
+/// part nobody needs and dropped the part that is evidence.
+#[tokio::test]
+async fn the_cap_never_takes_a_send_somebody_made() {
+    let s = Scratch::new("cap-origin");
+    let cap = Cap {
+        max_exchanges: Some(3),
+        max_bytes: None,
+    };
+    let p = Project::open(s.path(), cap).await.expect("open");
+
+    // Oldest, so oldest-first eviction reaches it before anything else.
+    let mut hand = exchange(0);
+    hand.origin = Origin::Repeater;
+    p.insert(&hand).await.expect("insert");
+    let mut replayed = exchange(1);
+    replayed.origin = Origin::Replay;
+    replayed.actor = Some("alice".into());
+    p.insert(&replayed).await.expect("insert");
+
+    for i in 2..12 {
+        p.insert(&exchange(i)).await.expect("insert");
+    }
+
+    let ev = p.enforce_cap().await.expect("enforce");
+    assert!(ev.exchanges > 0, "it did evict something");
+
+    let one = p
+        .get(1)
+        .await
+        .expect("get")
+        .expect("the repeated send survived");
+    assert_eq!(one.exchange.origin, Origin::Repeater);
+    let two = p
+        .get(2)
+        .await
+        .expect("get")
+        .expect("the replayed send survived");
+    assert_eq!(two.exchange.origin, Origin::Replay);
+    assert_eq!(two.exchange.actor.as_deref(), Some("alice"));
+
+    // And it was not simply that the cap was never reached: everything left over is
+    // either hand-made or newer than what went.
+    let left = p.count().await.expect("count");
+    assert!(
+        left <= 5,
+        "the proxy's rows were still evicted around them, got {left} left"
+    );
+}
+
+/// A project held over its cap entirely by hand-made rows says so rather than spinning.
+///
+/// The same answer pinning already gets. Worth its own test because the reason is now
+/// reachable without anybody having pinned anything, so a project can be over its cap
+/// with nothing in it that anyone chose to keep.
+#[tokio::test]
+async fn a_cap_that_cannot_be_met_reports_instead_of_looping() {
+    let s = Scratch::new("cap-unmeetable");
+    let cap = Cap {
+        max_exchanges: Some(2),
+        max_bytes: None,
+    };
+    let p = Project::open(s.path(), cap).await.expect("open");
+
+    for i in 0..6 {
+        let mut e = exchange(i);
+        e.origin = Origin::Repeater;
+        p.insert(&e).await.expect("insert");
+    }
+
+    let ev = p
+        .enforce_cap()
+        .await
+        .expect("enforce returns rather than hanging");
+    assert_eq!(ev.exchanges, 0, "there was nothing it was allowed to take");
+    assert_eq!(ev.kept_pinned, 6, "and it says how many it had to keep");
+    assert_eq!(p.count().await.expect("count"), 6);
+}
 
 #[tokio::test]
 async fn the_cap_evicts_the_oldest_and_never_a_pinned_exchange() {
@@ -610,6 +697,14 @@ async fn a_version_one_project_upgrades_without_losing_anything() {
         use sqlx::sqlite::SqliteConnectOptions;
         let opts = SqliteConnectOptions::new().filename(s.path().join("project.db"));
         let pool = sqlx::SqlitePool::connect_with(opts).await.expect("connect");
+        // Version 4.
+        for stmt in [
+            "DROP INDEX exchange_origin",
+            "ALTER TABLE exchange DROP COLUMN actor",
+            "ALTER TABLE exchange DROP COLUMN origin",
+        ] {
+            sqlx::query(stmt).execute(&pool).await.expect(stmt);
+        }
         // Version 3.
         for stmt in [
             "DROP INDEX refusal_at",
@@ -659,6 +754,20 @@ async fn a_version_one_project_upgrades_without_losing_anything() {
         p.setting("probe").await.expect("read back"),
         Some("value".to_string())
     );
+    // Version 4 the same way. The rows that were already there have to come back as the
+    // proxy's, because that is the only thing they could have been and a NULL here would
+    // put every pre-upgrade exchange into an unknown kind.
+    assert_eq!(
+        got.exchange.origin,
+        Origin::Proxy,
+        "a row written before the column existed is the proxy's"
+    );
+    assert!(got.exchange.actor.is_none());
+    let mut hand = exchange(99);
+    hand.origin = Origin::Repeater;
+    p.insert(&hand).await.expect("v4 columns accept a write");
+    let back = p.get(4).await.expect("get").expect("there");
+    assert_eq!(back.exchange.origin, Origin::Repeater);
 
     // The new session machinery works on the upgraded file.
     let run = p

@@ -217,6 +217,10 @@ fn from_raw(ex: &RawExchange) -> Exchange {
         // a reader will compare against 200 and 404.
         status: (ex.status > 0).then_some(ex.status),
         duration_ms: Some(ex.duration_ms as i64),
+        // The proxy is what this function is for: it converts what the capture core
+        // watched going past. A hand-made send does not come through here.
+        origin: crate::Origin::Proxy,
+        actor: None,
         req_headers: pairs(&ex.req_headers),
         resp_headers: pairs(&ex.resp_headers),
         req_body: ex.req_body.clone(),

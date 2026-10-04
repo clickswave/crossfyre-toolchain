@@ -122,6 +122,60 @@ impl From<std::io::Error> for Error {
     }
 }
 
+/// Who made an exchange happen.
+///
+/// The store held only the proxy's rows, so a project file described what somebody
+/// browsed and said nothing about what they tested. These are different kinds of
+/// evidence and a report wants to tell them apart: a captured request is the application
+/// behaving, and a repeated or replayed one is the operator asking a question.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Origin {
+    /// Watched going past. The default, because it is what every row written before this
+    /// column existed was.
+    #[default]
+    Proxy,
+    /// Typed and sent by hand.
+    Repeater,
+    /// One leg of a send-as-each-identity.
+    Replay,
+}
+
+impl Origin {
+    /// The wire form, which is what the column holds.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Origin::Proxy => "proxy",
+            Origin::Repeater => "repeater",
+            Origin::Replay => "replay",
+        }
+    }
+
+    /// Anything unrecognised reads as the proxy.
+    ///
+    /// A newer build writing a kind this one does not know is the case that matters, and
+    /// the choice is between hiding the row and mislabelling it. Mislabelled is better:
+    /// the row is still there, still searchable, and still in the history, which is where
+    /// somebody would go looking for it.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "repeater" => Origin::Repeater,
+            "replay" => Origin::Replay,
+            _ => Origin::Proxy,
+        }
+    }
+
+    /// Whether eviction may take this row.
+    ///
+    /// The cap exists because captured traffic is unbounded and a project that quietly
+    /// reaches tens of gigabytes is the thing it was written against. A send somebody
+    /// made by hand is not that: it is bounded by how fast a person can press a button,
+    /// and it is the half of the file a report is built from. Throwing it away to make
+    /// room for more browsing is the wrong trade in every case.
+    pub fn evictable(self) -> bool {
+        matches!(self, Origin::Proxy)
+    }
+}
+
 /// One captured exchange, as handed to the store.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Exchange {
@@ -142,6 +196,11 @@ pub struct Exchange {
     pub resp_body: Vec<u8>,
     /// The response's real length when `resp_body` is only a prefix. `None` means whole.
     pub resp_len: Option<usize>,
+    /// Who made it happen. Defaults to the proxy, which is what every caller meant before
+    /// there was anything else to mean.
+    pub origin: Origin,
+    /// The identity a replay went out as. `None` for everything else.
+    pub actor: Option<String>,
 }
 
 /// An exchange read back out, with its bodies wherever they were kept.
@@ -164,6 +223,9 @@ pub struct Summary {
     pub req_len: i64,
     pub resp_len: i64,
     pub pinned: bool,
+    pub origin: Origin,
+    /// The identity a replay went out as.
+    pub actor: Option<String>,
 }
 
 /// What a project is allowed to grow to.
@@ -181,7 +243,12 @@ pub struct Cap {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Evicted {
     pub exchanges: usize,
-    /// Exchanges that were over the cap but pinned, so they stayed.
+    /// Exchanges that were over the cap and could not be taken, so they stayed.
+    ///
+    /// Two reasons now, and they are not worth separating: pinned, which somebody asked
+    /// for, and made by hand, which the store protects on their behalf. What a caller
+    /// does with this is say the cap could not be met, and that sentence is the same
+    /// either way.
     pub kept_pinned: usize,
 }
 
@@ -346,8 +413,8 @@ impl Project {
             "INSERT INTO exchange
                (at_ms, method, url, host, status, duration_ms,
                 req_headers, resp_headers, req_body, resp_body,
-                req_blob, resp_blob, req_len, resp_len, run_id)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+                req_blob, resp_blob, req_len, resp_len, run_id, origin, actor)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
              RETURNING id",
         )
         .bind(ex.at_ms)
@@ -365,6 +432,8 @@ impl Project {
         .bind(ex.req_body.len() as i64)
         .bind(ex.resp_len.unwrap_or(ex.resp_body.len()) as i64)
         .bind(self.current_run())
+        .bind(ex.origin.as_str())
+        .bind(ex.actor.as_deref())
         .fetch_one(&mut *tx)
         .await?
         .try_get(0)?;
@@ -390,7 +459,8 @@ impl Project {
     pub async fn get(&self, id: i64) -> Result<Option<Stored>, Error> {
         let Some(row) = sqlx::query(
             "SELECT id, at_ms, method, url, host, status, duration_ms, req_headers,
-                    resp_headers, req_body, resp_body, req_blob, resp_blob, resp_len, pinned
+                    resp_headers, req_body, resp_body, req_blob, resp_blob, resp_len, pinned,
+                    origin, actor
              FROM exchange WHERE id = ?1",
         )
         .bind(id)
@@ -433,6 +503,8 @@ impl Project {
                 // body is whatever was kept. Saying `None` here would claim a prefix is
                 // whole, which is the lie this field exists to stop.
                 resp_len: Some(row.try_get::<i64, _>("resp_len")? as usize),
+                origin: Origin::parse(&row.try_get::<String, _>("origin")?),
+                actor: row.try_get("actor")?,
             },
         }))
     }
@@ -440,7 +512,8 @@ impl Project {
     /// Newest first.
     pub async fn recent(&self, limit: i64) -> Result<Vec<Summary>, Error> {
         let rows = sqlx::query(
-            "SELECT id, at_ms, method, url, host, status, req_len, resp_len, pinned
+            "SELECT id, at_ms, method, url, host, status, req_len, resp_len, pinned,
+                    origin, actor
              FROM exchange ORDER BY at_ms DESC, id DESC LIMIT ?1",
         )
         .bind(limit)
@@ -467,7 +540,7 @@ impl Project {
     pub async fn search_fts(&self, query: &str, limit: i64) -> Result<Vec<Summary>, Error> {
         let rows = sqlx::query(
             "SELECT e.id, e.at_ms, e.method, e.url, e.host, e.status, e.req_len, e.resp_len,
-                    e.pinned
+                    e.pinned, e.origin, e.actor
              FROM exchange_fts f JOIN exchange e ON e.id = f.rowid
              WHERE exchange_fts MATCH ?1
              ORDER BY e.at_ms DESC, e.id DESC LIMIT ?2",
@@ -717,8 +790,14 @@ impl Project {
                 return Ok(out);
             }
 
+            // Only what the proxy watched. See `Origin::evictable`: a send somebody made
+            // by hand is the record of the engagement, and it is bounded by how fast a
+            // person can press a button, so it is never the thing standing between this
+            // file and its cap.
             let victim: Option<i64> = sqlx::query(
-                "SELECT id FROM exchange WHERE pinned = 0 ORDER BY at_ms ASC, id ASC LIMIT 1",
+                "SELECT id FROM exchange
+                   WHERE pinned = 0 AND origin = 'proxy'
+                   ORDER BY at_ms ASC, id ASC LIMIT 1",
             )
             .fetch_optional(&self.pool)
             .await?
@@ -751,6 +830,8 @@ fn summary_from(row: sqlx::sqlite::SqliteRow) -> Result<Summary, Error> {
         req_len: row.try_get("req_len")?,
         resp_len: row.try_get("resp_len")?,
         pinned: row.try_get::<i64, _>("pinned")? != 0,
+        origin: Origin::parse(&row.try_get::<String, _>("origin")?),
+        actor: row.try_get("actor")?,
     })
 }
 

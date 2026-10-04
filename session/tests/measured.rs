@@ -95,6 +95,8 @@ fn exchange(i: usize) -> Exchange {
         )
         .into_bytes(),
         resp_len: None,
+        // What this benchmark measures is the capture path, so these are the proxy's.
+        ..Default::default()
     }
 }
 
