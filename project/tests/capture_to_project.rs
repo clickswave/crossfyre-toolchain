@@ -249,8 +249,12 @@ async fn the_sink_enforces_the_cap_without_being_asked_every_request() {
             duration_ms: 1,
             ..Default::default()
         };
-        sink.record(&ex).await;
+        sink.record(ex);
     }
+    // Handing over is synchronous and the write is not, so the cap cannot be asserted
+    // until the queue has drained. That is the contract the sink exists to offer: a
+    // caller that needs the file to be complete says so.
+    sink.flush().await;
 
     // Four went in, the cap is three, and the fourth record triggered the check.
     assert_eq!(

@@ -444,7 +444,7 @@ async fn handle_request(
                     resp_body: body.clone().into_bytes(),
                     resp_len: None,
                 };
-                sink.record(&ex).await;
+                sink.record(ex);
             }
             Ok(Response::builder()
                 .status(502)
@@ -708,7 +708,7 @@ async fn forward(
                 resp_body: body.clone().into_bytes(),
                 resp_len: None,
             };
-            sink.record(&raw).await;
+            sink.record(raw);
         }
         let _ = tx.send(ev);
         return Ok(Response::builder()
@@ -848,9 +848,6 @@ struct RecordingBody {
     total: usize,
     /// Taken on the first emit, so a body that ends and is then dropped records once.
     finish: Option<Box<Finish>>,
-    /// The record write, while it is still in flight. The body does not end until it
-    /// completes.
-    writing: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
 }
 
 /// What the record needs, captured before the body starts flowing.
@@ -875,15 +872,16 @@ impl RecordingBody {
             kept: Vec::new(),
             total: 0,
             finish: Some(Box::new(finish)),
-            writing: None,
         }
     }
 
     /// Emit the event, and hand back the record write if there is a sink.
     ///
     /// Once, because a body that ends and is then dropped must not record twice.
-    fn emit(&mut self) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> {
-        let f = self.finish.take()?;
+    fn emit(&mut self) {
+        let Some(f) = self.finish.take() else {
+            return;
+        };
         let kept = std::mem::take(&mut self.kept);
         let total = self.total;
         let truncated = total > kept.len();
@@ -919,8 +917,10 @@ impl RecordingBody {
         }
         let _ = f.tx.send(event);
 
-        let sink = f.cfg.sink.clone()?;
-        let raw = crate::RawExchange {
+        let Some(sink) = f.cfg.sink.as_ref() else {
+            return;
+        };
+        sink.record(crate::RawExchange {
             at_ms: now_ms(),
             method: f.method,
             url: f.full_url,
@@ -936,10 +936,7 @@ impl RecordingBody {
             req_body: f.req_body,
             resp_body: kept,
             resp_len: truncated.then_some(total),
-        };
-        Some(Box::pin(async move {
-            sink.record(&raw).await;
-        }))
+        });
     }
 }
 
@@ -953,23 +950,6 @@ impl hyper::body::Body for RecordingBody {
     ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
         use std::task::Poll;
         let me = &mut *self;
-
-        // The record is written before the body is allowed to END, not after. That costs
-        // the client a fraction of a millisecond on the last frame and keeps the property
-        // the collecting version had for free: by the time a response is complete, the
-        // exchange proving it is on disk. For a tool whose output is evidence, a window
-        // where the browser has rendered a page that the project file has never heard of
-        // is not worth the microseconds.
-        if let Some(write) = me.writing.as_mut() {
-            return match write.as_mut().poll(cx) {
-                Poll::Ready(()) => {
-                    me.writing = None;
-                    Poll::Ready(None)
-                }
-                Poll::Pending => Poll::Pending,
-            };
-        }
-
         match std::pin::Pin::new(&mut me.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
@@ -983,24 +963,15 @@ impl hyper::body::Body for RecordingBody {
             }
             Poll::Ready(Some(Err(e))) => {
                 // The transfer failed partway. What arrived is still evidence about the
-                // target, and silence is not, so it is recorded before the error goes on.
-                if let Some(mut write) = me.emit() {
-                    if write.as_mut().poll(cx).is_pending() {
-                        me.writing = Some(write);
-                    }
-                }
+                // target, and silence is not, so it is handed over before the error goes
+                // on to the client.
+                me.emit();
                 Poll::Ready(Some(Err(e.into())))
             }
-            Poll::Ready(None) => match me.emit() {
-                Some(mut write) => match write.as_mut().poll(cx) {
-                    Poll::Ready(()) => Poll::Ready(None),
-                    Poll::Pending => {
-                        me.writing = Some(write);
-                        Poll::Pending
-                    }
-                },
-                None => Poll::Ready(None),
-            },
+            Poll::Ready(None) => {
+                me.emit();
+                Poll::Ready(None)
+            }
             Poll::Pending => Poll::Pending,
         }
     }
@@ -1016,12 +987,11 @@ impl Drop for RecordingBody {
         // missing from the history because somebody pressed stop is a history that cannot
         // be trusted to be complete.
         //
-        // Spawned rather than awaited, because a destructor cannot wait. This is the one
-        // path where the write is not durable by the time anything observes the response,
-        // and it is the path where nothing is observing it.
-        if let Some(write) = self.emit() {
-            tokio::spawn(write);
-        }
+        // This is also the ORDINARY path rather than the exceptional one: hyper does not
+        // reliably poll a body whose length it already knows to its final frame, it writes
+        // the bytes and drops it. Handing over is synchronous, so a destructor can do it,
+        // which is the whole reason the sink takes exchanges rather than futures.
+        self.emit();
     }
 }
 

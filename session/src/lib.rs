@@ -61,7 +61,9 @@ pub use cfx_capture::browser;
 #[cfg(feature = "testing")]
 pub mod testing;
 
-use cfx_capture::{CaptureCfg, Egress, LocalGate, SessionCa, TraceEvent, serve_mitm_flow};
+use cfx_capture::{
+    CaptureCfg, Egress, ExchangeSink, LocalGate, SessionCa, TraceEvent, serve_mitm_flow,
+};
 use cfx_project::{Project, ProjectSink};
 
 /// How a session should behave.
@@ -101,6 +103,10 @@ impl SessionConfig {
 
 /// A listening capture session. Dropping it stops accepting; [`Session::stop`] also waits.
 pub struct Session {
+    /// The sink, kept only so stopping can wait for it. An exchange handed over and not
+    /// yet written is one a project file would be missing, and a session that stopped
+    /// without saying so is how that happens quietly.
+    sink: Arc<ProjectSink>,
     port: u16,
     gate: Arc<LocalGate>,
     project: Arc<Project>,
@@ -121,6 +127,7 @@ impl Session {
         let gate = Arc::new(LocalGate::new());
         gate.set_enabled(cfg.intercept);
         let sink = Arc::new(ProjectSink::new(cfg.project.clone()));
+        let flushable = sink.clone();
         let capture = CaptureCfg {
             // The local store is the full-capture surface by definition: a workbench
             // exists to show the operator the bytes.
@@ -168,6 +175,7 @@ impl Session {
         });
 
         Ok(Self {
+            sink: flushable,
             port,
             gate,
             project: cfg.project,
@@ -214,6 +222,10 @@ impl Session {
         let _ = self.stop.send(true);
         self.accepting.abort();
         let _ = self.accepting.await;
+        // Drain before returning. A response finishes and hands its exchange over
+        // synchronously, but the write happens on the store's own task, so stopping
+        // without waiting would be a race with the last few captures of the session.
+        self.sink.flush().await;
     }
 }
 

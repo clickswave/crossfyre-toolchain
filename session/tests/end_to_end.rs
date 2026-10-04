@@ -328,6 +328,45 @@ async fn a_body_past_the_cap_is_delivered_whole_and_recorded_short() {
 }
 
 #[tokio::test]
+async fn stopping_a_session_leaves_nothing_unwritten() {
+    // The property, asserted with no waiting anywhere: once `stop` returns, every
+    // exchange of the session is in the file.
+    //
+    // It is worth a test of its own because it was briefly untrue. Responses stream now,
+    // so the record is handed over as a body ends, and the write happens on the store's
+    // own task. Without a drain, closing a project was a race with that queue, and the
+    // captures most likely to be lost were the last ones, which are the ones somebody was
+    // looking at when they stopped.
+    const N: usize = 25;
+
+    let s = Scratch::new("drain");
+    let (origin_port, _) = tls_origin(ok_response("written")).await;
+    let (session, project, ca_pem) = session_over(&s, false).await;
+
+    for i in 0..N {
+        let (status, _) = through_proxy(
+            session.port(),
+            origin_port,
+            &ca_pem,
+            "GET",
+            &format!("/item/{i}"),
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, 200);
+    }
+
+    session.stop().await;
+
+    // No eventually, no sleep, no retry. If this is flaky the drain is wrong.
+    assert_eq!(
+        project.count().await.expect("count"),
+        N as i64,
+        "stop returned with exchanges still queued"
+    );
+}
+
+#[tokio::test]
 async fn a_proxy_request_with_no_destination_says_so() {
     // Origin form straight at the proxy port, with no CONNECT and no absolute URL. There
     // is no destination in it, so there is nothing to forward to, and the reply has to

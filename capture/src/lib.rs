@@ -266,10 +266,25 @@ pub struct RawExchange {
 /// is worse than losing it, but it is not worth failing the request the operator is
 /// watching.
 pub trait ExchangeSink: Send + Sync {
-    fn record<'a>(
-        &'a self,
-        ex: &'a RawExchange,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+    /// Hand over a completed exchange. Must not block and cannot fail.
+    ///
+    /// Synchronous on purpose. It is called from the response body as that body ends,
+    /// which is a place that cannot await, and the shape before this, an async call
+    /// spawned onto the runtime, meant a process exiting in the moment after a response
+    /// completed lost the exchange proving it happened. For a tool whose output is
+    /// evidence that is not an acceptable way to lose a row.
+    ///
+    /// So an implementation queues here and writes elsewhere, and [`flush`] is how a
+    /// caller waits for the queue to drain before closing the file.
+    ///
+    /// [`flush`]: ExchangeSink::flush
+    fn record(&self, ex: RawExchange);
+
+    /// Wait until everything handed over has been written.
+    ///
+    /// Called when a session stops and when a project closes. Without it, closing is a
+    /// race against a queue, which is the same defect wearing a different hat.
+    fn flush<'a>(&'a self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
 }
 
 /// A hook the host (mobile app / desktop proxy) implements to gate a request in MANUAL intercept
