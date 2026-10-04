@@ -36,6 +36,8 @@ use hyper::{Method, Request, Response};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
+pub mod browser;
+
 #[cfg(feature = "testing")]
 pub mod testing;
 
