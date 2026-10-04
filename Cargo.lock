@@ -718,6 +718,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cfx_surface"
+version = "0.0.1"
+dependencies = [
+ "hex",
+ "regex",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "cfx_tui"
 version = "0.1.0"
 dependencies = [
