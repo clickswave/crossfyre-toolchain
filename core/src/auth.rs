@@ -35,7 +35,7 @@ const TOS_NOTICE: &str = "\
   is illegal and strictly prohibited.";
 
 /// Persisted account session. Stored at `<data_dir>/auth.toml`.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Account {
     /// Control-plane origin this session authenticates against.
     pub api_url: String,
@@ -60,13 +60,32 @@ pub fn save_account(data_dir: &Path, account: &Account) -> Result<(), Box<dyn st
         std::fs::create_dir_all(data_dir)?;
     }
     let path = account_path(data_dir);
-    std::fs::write(&path, toml::to_string(account)?)?;
-    // Keep it owner-readable only; it holds a credential.
+    // The mode goes on a fresh file BEFORE the key does. Writing and then chmodding, which
+    // is what this did, leaves a window in which the credential exists at the process
+    // umask, and a key that leaked during it has leaked.
+    //
+    // Worth being honest about what the tests below can and cannot say. Neither observes
+    // that window: it is a race, it is gone by the time anything can stat the file, and
+    // the old code reached the same final mode. They guard the two things that ARE
+    // observable, which is that the mode is set at all and that a short write leaves none
+    // of a long one. `fs::write` truncated for free; `OpenOptions` does not, so the
+    // explicit truncate guards a hazard this approach introduced rather than one it
+    // removed. The argument for the change is structural rather than empirical.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)?;
+        f.write_all(toml::to_string(account)?.as_bytes())?;
+        f.flush()?;
     }
+    #[cfg(not(unix))]
+    std::fs::write(&path, toml::to_string(account)?)?;
     // Hand ownership back to the invoking user if we ran under sudo.
     crate::toolchain::sudo_user::chown_to_invoking_user(&path);
     Ok(())
@@ -334,7 +353,19 @@ pub async fn perform_login(
         username: user.1,
         email: user.2,
     };
-    save_account(data_dir, &account)?;
+    // The server hands the key over exactly once: the first poll that collects it nulls
+    // the stored copy and marks the row collected. So a failure here is not "try again",
+    // it is a key that has been issued and is now gone, and the message has to say that
+    // rather than leaving somebody to retry a login the server believes already happened.
+    save_account(data_dir, &account).map_err(|e| -> Box<dyn std::error::Error> {
+        format!(
+            "Signed in, but the session could not be saved to {}: {e}\n\
+             The key issued for this login cannot be handed over a second time, so it is \
+             gone. Fix whatever stopped the write and sign in again.",
+            account_path(data_dir).display()
+        )
+        .into()
+    })?;
     Ok(account)
 }
 
@@ -446,18 +477,48 @@ async fn browser_login(
 
     // 2. Poll until approved / denied / expired / timeout.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(expires_in);
+    // A transient failure is not an answer. The device code is minted once and is only
+    // usable from this loop, so dropping out on one refused connection throws away a login
+    // the operator has already approved, and the browser tab then says it worked. Counted
+    // rather than unbounded: a control plane that is actually down should be said so
+    // rather than polled at for ten minutes.
+    const GIVE_UP_AFTER: u32 = 5;
+    let mut consecutive_failures: u32 = 0;
+    // Polled first, slept second. The other order charges a full interval for an approval
+    // that had already happened before the first request went out, which on the common
+    // path is the whole of the wait the operator sees.
     loop {
         if std::time::Instant::now() > deadline {
             return Err("Login timed out before it was approved.".into());
         }
-        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
 
-        let res = client
+        let answer = client
             .post(format!("{api_url}/api/v1/cli/device/poll"))
             .json(&serde_json::json!({ "device_code": device_code }))
             .send()
-            .await?;
-        let body: serde_json::Value = res.json().await.unwrap_or(serde_json::json!({}));
+            .await;
+
+        let body = match answer {
+            Ok(res) => {
+                consecutive_failures = 0;
+                res.json::<serde_json::Value>()
+                    .await
+                    .unwrap_or(serde_json::json!({}))
+            }
+            Err(e) => {
+                consecutive_failures += 1;
+                if consecutive_failures >= GIVE_UP_AFTER {
+                    return Err(format!(
+                        "Could not reach {api_url} to finish signing in, after \
+                         {GIVE_UP_AFTER} attempts: {e}"
+                    )
+                    .into());
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                continue;
+            }
+        };
+
         let status = body["data"]["status"].as_str().unwrap_or("");
         match status {
             "approved" => {
@@ -471,7 +532,24 @@ async fn browser_login(
             "denied" => return Err("Login was denied in the browser.".into()),
             "expired" => return Err("Login request expired. Run `crossfyre login` again.".into()),
             "unknown" => return Err("Login request was not found.".into()),
-            _ => { /* pending: keep polling */ }
+            // The server says "error" for its own 500. Treated as pending it polls for the
+            // full ten minutes against something that is broken and saying so, and the
+            // operator watches a spinner rather than reading the reason.
+            "error" => {
+                consecutive_failures += 1;
+                if consecutive_failures >= GIVE_UP_AFTER {
+                    return Err(format!(
+                        "{api_url} answered with an error {GIVE_UP_AFTER} times while \
+                         finishing the login. Try again in a moment."
+                    )
+                    .into());
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+            }
+            _ => {
+                // Pending, which is the ordinary case: wait and ask again.
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+            }
         }
     }
 }
@@ -635,4 +713,96 @@ pub async fn ensure_logged_in(
     }
     step("Not logged in yet; signing in first.");
     perform_login(data_dir, flags).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The account file is owner-only.
+    ///
+    /// It holds a revocable account API key. This asserts the mode that ends up on the
+    /// file and nothing about the window between creating it and setting that mode, which
+    /// is the thing the implementation was changed to close: the window is a race and is
+    /// over before anything here could look. Dropping the mode entirely is what this
+    /// catches, and that is worth catching on its own.
+    #[cfg(unix)]
+    #[test]
+    fn the_account_file_is_created_private_rather_than_made_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "cfx-auth-mode-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let account = Account {
+            api_url: "https://example.test".into(),
+            api_key: "cfk_secret".into(),
+            user_id: "u1".into(),
+            username: "someone".into(),
+            email: "someone@example.test".into(),
+        };
+        save_account(&dir, &account).expect("save");
+
+        let mode = std::fs::metadata(account_path(&dir))
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "the key file is owner-only, got {mode:o}");
+
+        // And it round trips, because a mode fix that broke the write would pass the
+        // assertion above and lose the session.
+        assert_eq!(load_account(&dir).as_ref(), Some(&account));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Writing a shorter account over a longer one leaves nothing of the longer one.
+    ///
+    /// This guards a hazard the current implementation has and the previous one did not.
+    /// `fs::write` truncates; `OpenOptions::write` does not, so without the explicit
+    /// truncate the tail of a previous key survives past the end of the new document.
+    /// TOML still parses, because the leftovers sit after the last newline, and the file
+    /// quietly holds a fragment of a credential that was supposed to be gone.
+    #[cfg(unix)]
+    #[test]
+    fn a_shorter_account_does_not_leave_the_tail_of_a_longer_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "cfx-auth-trunc-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let long = Account {
+            api_url: "https://example.test".into(),
+            api_key: "cfk_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            user_id: "user-with-a-long-identifier".into(),
+            username: "somebody-with-a-long-name".into(),
+            email: "somebody-with-a-long-name@example.test".into(),
+        };
+        save_account(&dir, &long).expect("save long");
+
+        let short = Account {
+            api_url: "https://e.test".into(),
+            api_key: "cfk_b".into(),
+            user_id: "u".into(),
+            username: "s".into(),
+            email: "s@e.test".into(),
+        };
+        save_account(&dir, &short).expect("save short");
+
+        let raw = std::fs::read_to_string(account_path(&dir)).expect("read");
+        assert!(
+            !raw.contains("cfk_aaaa"),
+            "the old key survived the overwrite:\n{raw}"
+        );
+        assert_eq!(load_account(&dir).as_ref(), Some(&short));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
