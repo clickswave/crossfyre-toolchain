@@ -39,15 +39,26 @@ const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 pub async fn send(req: RawReq<'_>) -> Option<RawResp> {
     let (https, host, port, target) = split(req.url)?;
     let request = build_request(&req, &host, port, https, &target);
+    // A template probe, so Verify::Any: cortex scans hosts whose certificates are
+    // expired, self-signed or for another name, and refusing to look at them would
+    // remove most internal applications from what it can test.
     let raw = tokio::time::timeout(req.timeout, async {
         if https {
-            send_tls(&host, port, request.as_bytes(), ReadUntil::Closed).await
+            send_tls(
+                &host,
+                port,
+                request.as_bytes(),
+                ReadUntil::Closed,
+                Verify::Any,
+            )
+            .await
         } else {
             send_plain(&host, port, request.as_bytes(), ReadUntil::Closed).await
         }
     })
     .await
-    .ok()??;
+    .ok()?
+    .ok()?;
     parse_response(&raw)
 }
 
@@ -155,6 +166,56 @@ pub enum ReadUntil {
     /// arrives after the framed response is still returned, it is simply not waited for
     /// indefinitely.
     Framed,
+}
+
+/// Whether the origin has to prove who it is.
+///
+/// cortex scans hosts with self-signed, expired and mismatched certificates on purpose,
+/// so the scanners want [`Verify::Any`] and always have. An interactive send is a
+/// different thing: it carries whatever the operator put in the request, which for a
+/// replay is a stored credential for somebody else's account. Sending that to whatever
+/// answers on the host, over a connection that accepts any certificate, is a
+/// machine-in-the-middle's whole job done for it.
+///
+/// So the choice belongs to the caller rather than to this module. The capture proxy has
+/// had exactly this setting per project since it existed; this is the same decision
+/// reaching the paths that egress without it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verify {
+    /// Accept whatever the origin presents. Signature checking is still real; only the
+    /// question of who the certificate belongs to is skipped.
+    Any,
+    /// The Mozilla webpki roots, and the hostname.
+    WebPki,
+}
+
+/// Why a send produced no response.
+///
+/// An enum rather than a string because the caller is the one that knows what to suggest:
+/// a TLS failure means something different to a scanner sweeping a range than it does to
+/// an operator who just turned certificate checking on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendFail {
+    /// No TCP connection.
+    Connect(String),
+    /// The TLS handshake failed. Under [`Verify::WebPki`] this is usually the
+    /// certificate, and usually the point.
+    Tls(String),
+    /// Connected and sent, and nothing complete came back in time.
+    Timeout,
+    /// The exchange failed part way through.
+    Io(String),
+}
+
+impl std::fmt::Display for SendFail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SendFail::Connect(e) => write!(f, "could not connect: {e}"),
+            SendFail::Tls(e) => write!(f, "TLS handshake failed: {e}"),
+            SendFail::Timeout => write!(f, "no response before the deadline"),
+            SendFail::Io(e) => write!(f, "the connection failed mid-exchange: {e}"),
+        }
+    }
 }
 
 /// How long to keep listening after a response is framed-complete, for bytes that should
@@ -276,6 +337,10 @@ where
     Some(buf)
 }
 
+/// The scanners' sender: read to close, and accept any certificate.
+///
+/// Both of those are deliberate and neither is a default worth changing here. See
+/// [`ReadUntil::Closed`] and [`Verify::Any`].
 pub async fn send_exact(
     host: &str,
     port: u16,
@@ -283,10 +348,25 @@ pub async fn send_exact(
     data: &[u8],
     timeout: Duration,
 ) -> (Option<Vec<u8>>, Duration) {
-    send_until(host, port, https, data, timeout, ReadUntil::Closed).await
+    let (out, took) = send_until(
+        host,
+        port,
+        https,
+        data,
+        timeout,
+        ReadUntil::Closed,
+        Verify::Any,
+    )
+    .await;
+    (out.ok(), took)
 }
 
 /// Send these bytes and stop reading where the caller says to.
+///
+/// Returns why rather than nothing. A caller that puts the result in front of a person
+/// has to be able to tell "nothing is listening there" from "the certificate did not
+/// check out", because those send them to completely different places, and under
+/// [`Verify::WebPki`] the second one is newly possible.
 pub async fn send_until(
     host: &str,
     port: u16,
@@ -294,18 +374,21 @@ pub async fn send_until(
     data: &[u8],
     timeout: Duration,
     until: ReadUntil,
-) -> (Option<Vec<u8>>, Duration) {
+    verify: Verify,
+) -> (Result<Vec<u8>, SendFail>, Duration) {
     let start = std::time::Instant::now();
-    let out = tokio::time::timeout(timeout, async {
+    let out = match tokio::time::timeout(timeout, async {
         if https {
-            send_tls(host, port, data, until).await
+            send_tls(host, port, data, until, verify).await
         } else {
             send_plain(host, port, data, until).await
         }
     })
     .await
-    .ok()
-    .flatten();
+    {
+        Ok(r) => r,
+        Err(_) => Err(SendFail::Timeout),
+    };
     (out, start.elapsed())
 }
 
@@ -314,41 +397,72 @@ pub fn split_url(url: &str) -> Option<(bool, String, u16, String)> {
     split(url)
 }
 
-async fn send_plain(host: &str, port: u16, data: &[u8], until: ReadUntil) -> Option<Vec<u8>> {
-    let mut stream = TcpStream::connect((host, port)).await.ok()?;
-    stream.write_all(data).await.ok()?;
-    stream.flush().await.ok()?;
+async fn send_plain(
+    host: &str,
+    port: u16,
+    data: &[u8],
+    until: ReadUntil,
+) -> Result<Vec<u8>, SendFail> {
+    let mut stream = TcpStream::connect((host, port))
+        .await
+        .map_err(|e| SendFail::Connect(e.to_string()))?;
+    stream
+        .write_all(data)
+        .await
+        .map_err(|e| SendFail::Io(e.to_string()))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| SendFail::Io(e.to_string()))?;
     if until == ReadUntil::Framed {
-        return read_framed(&mut stream).await;
+        return read_framed(&mut stream)
+            .await
+            .ok_or_else(|| SendFail::Io("the response could not be read".into()));
     }
     let mut buf = Vec::new();
     stream
         .take(MAX_RESPONSE_BYTES)
         .read_to_end(&mut buf)
         .await
-        .ok()?;
-    Some(buf)
+        .map_err(|e| SendFail::Io(e.to_string()))?;
+    Ok(buf)
 }
 
 // Open build: rustls handshake (accept-any-cert). Its ClientHello is the
 // fingerprint a WAF flags, but the open toolchain ships no browser emulation.
 #[cfg(not(feature = "impersonate"))]
-async fn send_tls(host: &str, port: u16, data: &[u8], until: ReadUntil) -> Option<Vec<u8>> {
-    let connector = tokio_rustls::TlsConnector::from(tls_config());
-    let server_name = rustls::pki_types::ServerName::try_from(host.to_string()).ok()?;
-    let stream = TcpStream::connect((host, port)).await.ok()?;
-    let mut tls = connector.connect(server_name, stream).await.ok()?;
-    tls.write_all(data).await.ok()?;
-    tls.flush().await.ok()?;
+async fn send_tls(
+    host: &str,
+    port: u16,
+    data: &[u8],
+    until: ReadUntil,
+    verify: Verify,
+) -> Result<Vec<u8>, SendFail> {
+    let connector = tokio_rustls::TlsConnector::from(tls_config(verify));
+    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|e| SendFail::Tls(format!("{host} is not a usable server name: {e}")))?;
+    let stream = TcpStream::connect((host, port))
+        .await
+        .map_err(|e| SendFail::Connect(e.to_string()))?;
+    let mut tls = connector
+        .connect(server_name, stream)
+        .await
+        .map_err(|e| SendFail::Tls(e.to_string()))?;
+    tls.write_all(data)
+        .await
+        .map_err(|e| SendFail::Io(e.to_string()))?;
+    tls.flush().await.map_err(|e| SendFail::Io(e.to_string()))?;
     if until == ReadUntil::Framed {
-        return read_framed(&mut tls).await;
+        return read_framed(&mut tls)
+            .await
+            .ok_or_else(|| SendFail::Io("the response could not be read".into()));
     }
     let mut buf = Vec::new();
     tls.take(MAX_RESPONSE_BYTES)
         .read_to_end(&mut buf)
         .await
-        .ok()?;
-    Some(buf)
+        .map_err(|e| SendFail::Io(e.to_string()))?;
+    Ok(buf)
 }
 
 // First-party build: BoringSSL handshake with GREASE and a browser cipher/curve
@@ -358,11 +472,22 @@ async fn send_tls(host: &str, port: u16, data: &[u8], until: ReadUntil) -> Optio
 // but a genuine BoringSSL browser-shaped handshake. Cert verification is off, to
 // match the rest of cortex (it scans hosts with self-signed / mismatched certs).
 #[cfg(feature = "impersonate")]
-async fn send_tls(host: &str, port: u16, data: &[u8], until: ReadUntil) -> Option<Vec<u8>> {
+async fn send_tls(
+    host: &str,
+    port: u16,
+    data: &[u8],
+    until: ReadUntil,
+    verify: Verify,
+) -> Result<Vec<u8>, SendFail> {
     use boring2::ssl::{SslConnector, SslMethod, SslVerifyMode};
 
-    let mut b = SslConnector::builder(SslMethod::tls_client()).ok()?;
-    b.set_verify(SslVerifyMode::NONE);
+    let mut b =
+        SslConnector::builder(SslMethod::tls_client()).map_err(|e| SendFail::Tls(e.to_string()))?;
+    // The builder already loads the platform's trust store, so WebPki here means
+    // leaving its verification alone rather than configuring anything.
+    if verify == Verify::Any {
+        b.set_verify(SslVerifyMode::NONE);
+    }
     b.set_grease_enabled(true);
     let _ = b.set_cipher_list(
         "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:\
@@ -374,38 +499,67 @@ async fn send_tls(host: &str, port: u16, data: &[u8], until: ReadUntil) -> Optio
     let _ = b.set_curves_list("X25519:P-256:P-384");
     let _ = b.set_alpn_protos(b"\x08http/1.1");
     let connector = b.build();
-    let mut cfg = connector.configure().ok()?;
-    cfg.set_verify_hostname(false);
-    let stream = TcpStream::connect((host, port)).await.ok()?;
-    let mut tls = tokio_boring2::connect(cfg, host, stream).await.ok()?;
-    tls.write_all(data).await.ok()?;
-    tls.flush().await.ok()?;
+    let mut cfg = connector
+        .configure()
+        .map_err(|e| SendFail::Tls(e.to_string()))?;
+    if verify == Verify::Any {
+        cfg.set_verify_hostname(false);
+    }
+    let stream = TcpStream::connect((host, port))
+        .await
+        .map_err(|e| SendFail::Connect(e.to_string()))?;
+    let mut tls = tokio_boring2::connect(cfg, host, stream)
+        .await
+        .map_err(|e| SendFail::Tls(e.to_string()))?;
+    tls.write_all(data)
+        .await
+        .map_err(|e| SendFail::Io(e.to_string()))?;
+    tls.flush().await.map_err(|e| SendFail::Io(e.to_string()))?;
     if until == ReadUntil::Framed {
-        return read_framed(&mut tls).await;
+        return read_framed(&mut tls)
+            .await
+            .ok_or_else(|| SendFail::Io("the response could not be read".into()));
     }
     let mut buf = Vec::new();
     tls.take(MAX_RESPONSE_BYTES)
         .read_to_end(&mut buf)
         .await
-        .ok()?;
-    Some(buf)
+        .map_err(|e| SendFail::Io(e.to_string()))?;
+    Ok(buf)
 }
 
 #[cfg(not(feature = "impersonate"))]
-fn tls_config() -> Arc<rustls::ClientConfig> {
+fn tls_config(verify: Verify) -> Arc<rustls::ClientConfig> {
     use std::sync::OnceLock;
-    static CFG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
-    CFG.get_or_init(|| {
-        let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::aws_lc_rs::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .expect("tls protocol versions")
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerify))
-        .with_no_client_auth();
-        Arc::new(cfg)
-    })
+    // One cache per policy. Built once each, because a handshake config is expensive to
+    // assemble and neither of these ever changes after the first call.
+    static ANY: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+    static WEBPKI: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+    match verify {
+        Verify::Any => ANY.get_or_init(|| {
+            let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::aws_lc_rs::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .expect("tls protocol versions")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
+            .with_no_client_auth();
+            Arc::new(cfg)
+        }),
+        Verify::WebPki => WEBPKI.get_or_init(|| {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::aws_lc_rs::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .expect("tls protocol versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+            Arc::new(cfg)
+        }),
+    }
     .clone()
 }
 
