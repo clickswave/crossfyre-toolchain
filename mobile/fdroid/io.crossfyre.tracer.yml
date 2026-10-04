@@ -66,22 +66,51 @@ Description: |-
 RepoType: git
 Repo: https://github.com/clickswave/crossfyre-toolchain.git
 
+# Four things were wrong with the entry below and each one of them was enough on
+# its own to stop a build. They are written down because the file read as ready
+# and was not, and "already prepared" was being weighed against other release
+# channels as though F-Droid were a channel we had.
+#
+#   1. `commit: v0.1.0-tracer` named a tag that was never created. There are no
+#      tags in this repository at all, which also left `UpdateCheckMode: Tags`
+#      with nothing to check.
+#   2. It described 0.1.0 / versionCode 1 against a shipped 0.1.22 / 23.
+#   3. `gradle: [yes]` means "this app has no product flavours". It has had
+#      three since 2026-09-04, so `assembleRelease` builds three APKs and the
+#      recipe never said which one is the release.
+#   4. The APK packages two ABIs and the prebuild cross-compiled one, so
+#      F-Droid's build would have been missing x86_64/libcfx_mobile.so and its
+#      contentSha256 could not match ours. The whole point of the `Binaries`
+#      line is that those two hashes agree, so this one guaranteed the public
+#      failure the note at the top warns about.
+#
+# STILL REQUIRED BEFORE SUBMITTING: the tag below has to exist in the public
+# repository. F-Droid clones from `Repo` and checks out `commit`, so a tag that
+# only exists on a laptop fails on their builder and nowhere else.
 Builds:
-  - versionName: 0.1.0
-    versionCode: 1
-    commit: v0.1.0-tracer
+  - versionName: 0.1.22
+    versionCode: 23
+    commit: v0.1.22-tracer
     subdir: mobile/app
+    # The release flavour. `prod` is the one with no applicationId suffix, so it
+    # is the identity every existing install already has; building `staging` or
+    # `dev` here would publish a second app to the same install base.
     gradle:
-      - yes
+      - prod
     # The native core is Rust, cross-compiled before gradle runs. jniLibs is not
     # committed, so without this step the APK builds without its native library,
     # installs, and fails the moment capture starts.
+    #
+    # Both ABIs, matching `abiFilters` in mobile/app/build.gradle.kts. These two
+    # lists have to stay equal: a target here that the APK does not package is
+    # wasted build time, and one the APK packages that is missing here makes the
+    # reproducible comparison fail by construction.
     sudodeps:
       - rustup
     prebuild:
-      - rustup target add aarch64-linux-android
+      - rustup target add aarch64-linux-android x86_64-linux-android
       - cargo install cargo-ndk --locked
-      - cd ../rust && cargo ndk -t arm64-v8a -o ../app/src/main/jniLibs build --release
+      - cd ../rust && cargo ndk -t arm64-v8a -t x86_64 -o ../app/src/main/jniLibs build --release
 
 # Distribute OUR signed APK once the reproducible build is confirmed to match.
 # See the note at the top: this is the line that keeps a single install base.
@@ -90,6 +119,8 @@ Binaries: https://bins.crossfyre.io/mobile/crossfyre-tracer-%v.apk
 AllowedAPKSigningKeys: 1f8b81ae5e5cc1f0f28343e216f20ea0431f6c68ad23bbfa3e5e18cb3be2e973
 
 AutoUpdateMode: None
-UpdateCheckMode: Tags
-CurrentVersion: 0.1.0
-CurrentVersionCode: 1
+# None, not Tags. `Binaries` means every release needs a hand-written Builds
+# entry anyway, and Tags was pointing at a tag set that does not exist.
+UpdateCheckMode: None
+CurrentVersion: 0.1.22
+CurrentVersionCode: 23

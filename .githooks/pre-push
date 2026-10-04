@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Pre-push guard for the crossfyre toolchain.
 #
+# Both checks here are for things no CI run can see. The first needs a file that
+# never leaves this machine; the second describes a build that only ever runs on
+# somebody else's server.
+#
 # The open `adaptive` crate and the git-ignored `adaptive-private` tuned drop-in
 # are swapped at build time by `.cargo/config.toml`. They must expose the SAME
 # public API surface or the swap silently breaks one of the two builds. Neither
@@ -11,11 +15,31 @@
 set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
-checker="$repo_root/scripts/check_adaptive_parity.py"
 
+fail=0
+
+checker="$repo_root/scripts/check_adaptive_parity.py"
 if [ -f "$checker" ]; then
   if ! python3 "$checker"; then
-    echo "pre-push: adaptive API parity check failed - see above. Push aborted." >&2
-    exit 1
+    echo "pre-push: adaptive API parity check failed - see above." >&2
+    fail=1
   fi
+fi
+
+# The F-Droid recipe describes a build nothing here runs, so it can only be
+# wrong in public, on their builder. It had drifted four ways at once before
+# this check existed.
+checker="$repo_root/scripts/check_fdroid_recipe.py"
+if [ -f "$checker" ]; then
+  if ! python3 "$checker"; then
+    echo "pre-push: the F-Droid recipe disagrees with the app - see above." >&2
+    fail=1
+  fi
+fi
+
+# Both checks run before anything is refused, because being told about one
+# problem per push is how two-problem pushes take two pushes.
+if [ "$fail" -ne 0 ]; then
+  echo "pre-push: push aborted." >&2
+  exit 1
 fi
