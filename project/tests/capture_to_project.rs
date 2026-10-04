@@ -266,3 +266,38 @@ async fn the_sink_enforces_the_cap_without_being_asked_every_request() {
     assert!(project.get(1).await.expect("get").is_none());
     assert!(project.get(4).await.expect("get").is_some());
 }
+
+#[tokio::test]
+async fn flush_waits_for_refusals_as_well_as_exchanges() {
+    // `refused` is synchronous, so a tight loop hands over two thousand rows without once
+    // yielding to the writer task. That is the whole point: it makes the race the real
+    // thing rather than a timing hope. Anything the flush does not wait for is a row the
+    // file does not have, and these rows are the audit record of destinations this tool
+    // declined to reach.
+    use cfx_capture::ExchangeSink;
+    use cfx_scope::{Point, Refusal, RefusalSink};
+
+    let s = Scratch::new("flush-refusals");
+    let project = Arc::new(Project::open(s.path(), Cap::default()).await.expect("open"));
+    let sink = ProjectSink::new(project.clone());
+
+    const N: usize = 2000;
+    for i in 0..N {
+        sink.refused(&Refusal {
+            at_ms: 1_700_000_000_000 + i as i64,
+            host: format!("h{i}.example"),
+            port: 443,
+            point: Point::Connect,
+            detail: None,
+        });
+    }
+    sink.flush().await;
+
+    assert_eq!(
+        project.refusal_count().await.expect("count") as usize,
+        N,
+        "every refusal handed over before the flush is on disk. Uncounted, flush returns \
+         while the queue is still full and a caller that drained before closing drained \
+         nothing"
+    );
+}

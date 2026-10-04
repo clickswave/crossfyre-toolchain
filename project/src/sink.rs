@@ -181,11 +181,18 @@ impl ExchangeSink for ProjectSink {
 /// make it.
 impl cfx_scope::RefusalSink for ProjectSink {
     fn refused(&self, r: &cfx_scope::Refusal) {
-        // Not counted in `pending`. `flush()` exists so stopping a capture can promise the
-        // exchanges are on disk, and a refusal is not an exchange; counting it would let a
-        // refusal arriving during shutdown hold the stop open. It still goes down the same
-        // channel, so its ORDER against the exchanges is kept either way.
+        // Counted in `pending`, like an exchange.
+        //
+        // It was not, on the reasoning that `flush` exists to promise the exchanges are on
+        // disk and a refusal arriving during shutdown should not hold the stop open. That
+        // reasoning does not survive being written down: a refusal is the audit record of
+        // a destination this tool declined to reach, it is one small insert, and the same
+        // argument would apply to an exchange. Uncounted, `flush` returned while refusals
+        // were still queued, so every caller that drained before closing was draining
+        // nothing.
+        self.pending.fetch_add(1, Ordering::AcqRel);
         if self.tx.send(Write::Refusal(r.clone())).is_err() {
+            self.pending.fetch_sub(1, Ordering::AcqRel);
             log::error!(
                 "project store: the writer has stopped; a refusal of {}:{} was lost",
                 r.host,

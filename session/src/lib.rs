@@ -91,6 +91,14 @@ pub struct SessionConfig {
     /// Shared rather than copied in, so narrowing the scope takes effect on the running
     /// proxy. Defaults to unrestricted, which is what every session did before this.
     pub scope: Arc<cfx_capture::cfx_scope::Guard>,
+    /// The store to write into, when the caller already has one.
+    ///
+    /// `None` builds its own, which is what every caller did before this and is right for
+    /// anything whose only writer is the session. A caller that ALSO writes through the
+    /// same project, which the desktop workbench does for scope refusals, has to pass its
+    /// own: two sinks over one project are two writer tasks, so ordering between what they
+    /// write is lost and `stop` flushes only one of them.
+    pub sink: Option<Arc<ProjectSink>>,
 }
 
 impl SessionConfig {
@@ -103,6 +111,7 @@ impl SessionConfig {
             bypass_hosts: Vec::new(),
             trust_any_upstream_cert: false,
             scope: cfx_capture::cfx_scope::Guard::unrestricted(),
+            sink: None,
         }
     }
 }
@@ -133,7 +142,10 @@ impl Session {
         // stopping the proxy.
         let gate = Arc::new(LocalGate::new());
         gate.set_enabled(cfg.intercept);
-        let sink = Arc::new(ProjectSink::new(cfg.project.clone()));
+        let sink = cfg
+            .sink
+            .clone()
+            .unwrap_or_else(|| Arc::new(ProjectSink::new(cfg.project.clone())));
         let flushable = sink.clone();
         let capture = CaptureCfg {
             // The local store is the full-capture surface by definition: a workbench
