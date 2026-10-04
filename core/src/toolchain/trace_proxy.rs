@@ -99,21 +99,11 @@ fn load_or_generate_ca() -> Result<SessionCa, BoxErr> {
 // ---------------------------------------------------------------------------
 
 /// Headers that must not be forwarded across a proxy hop.
-fn is_hop_header(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "connection"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "te"
-            | "trailer"
-            | "transfer-encoding"
-            | "upgrade"
-            | "content-length"
-            | "host"
-    )
-}
+///
+/// One list, in `capture`, because the MITM path needs exactly the same one and a second
+/// copy here is how the two drift. The browser launcher in this file was two copies for
+/// weeks and the drifted one shipped.
+use super::capture::flow::is_hop_header;
 
 /// Shared bits every connection/request handler needs.
 #[derive(Clone)]

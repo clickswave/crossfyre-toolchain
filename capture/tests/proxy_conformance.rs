@@ -183,6 +183,16 @@ fn ok_response(body: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+/// An origin reply carrying the headers that actually matter to a browser.
+fn response_with_headers(extra: &[(&str, &str)], body: &str) -> Vec<u8> {
+    let mut out = String::from("HTTP/1.1 200 OK\r\nServer: conformance-origin\r\n");
+    for (k, v) in extra {
+        out.push_str(&format!("{k}: {v}\r\n"));
+    }
+    out.push_str(&format!("Content-Length: {}\r\n\r\n{}", body.len(), body));
+    out.into_bytes()
+}
+
 // ---------------------------------------------------------------------------
 // The capture front end under test
 // ---------------------------------------------------------------------------
@@ -245,6 +255,34 @@ async fn front(origin_port: u16, cfg: CaptureCfg, flows: usize) -> Front {
 }
 
 /// One plaintext HTTP/1 request through `port`, returning (status, body).
+/// Status, response headers and body, for the cases where the headers are the point.
+///
+/// `plain_request` throws the headers away, which is exactly why nothing in this suite
+/// noticed that none of them were reaching the client.
+async fn plain_request_full(
+    port: u16,
+    req: Request<Full<Bytes>>,
+) -> (u16, Vec<(String, String)>, Bytes) {
+    let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let resp = within("the request", sender.send_request(req))
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let headers: Vec<(String, String)> = resp
+        .headers()
+        .iter()
+        .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+        .collect();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, headers, body)
+}
+
 async fn plain_request(port: u16, req: Request<Full<Bytes>>) -> (u16, Bytes) {
     let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
@@ -461,6 +499,93 @@ async fn a_host_not_on_the_bypass_list_is_intercepted_instead() {
 // ---------------------------------------------------------------------------
 // 3. Chunked bodies, both directions
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_response_headers_reach_the_client_and_match_what_was_recorded() {
+    // The defect this was written for: the forward leg built a reply out of a status and
+    // a body and nothing else, so every response through the proxy arrived with no
+    // Content-Type, no Set-Cookie and no Location. A browser cannot log in through that,
+    // and worse for a tool whose output is evidence, the stored exchange carried headers
+    // the client never saw. The record and the behaviour disagreed.
+    let reply = response_with_headers(
+        &[
+            ("Content-Type", "application/json; charset=utf-8"),
+            ("Set-Cookie", "session=abc123; HttpOnly; Path=/"),
+            ("Location", "/after-login"),
+            ("Cache-Control", "no-store"),
+            ("X-Request-Id", "7f3c1a9e"),
+        ],
+        "{\"ok\":true}",
+    );
+    let (origin_port, _log) = origin(reply);
+    // Full capture, because half of this test is that the RECORD agrees with what the
+    // client got, and the record only carries headers in that mode.
+    let cfg = CaptureCfg {
+        full: true,
+        ..CaptureCfg::default()
+    };
+    let mut f = front(origin_port, cfg, 1).await;
+
+    let (status, headers, body) =
+        plain_request_full(f.port, get("/login", &format!("127.0.0.1:{origin_port}"))).await;
+    assert_eq!(status, 200);
+    assert_eq!(&body[..], b"{\"ok\":true}");
+
+    let got = |name: &str| {
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+
+    assert_eq!(
+        got("content-type").as_deref(),
+        Some("application/json; charset=utf-8"),
+        "without this a browser sniffs the type and often gets it wrong, got: {headers:?}"
+    );
+    assert_eq!(
+        got("set-cookie").as_deref(),
+        Some("session=abc123; HttpOnly; Path=/"),
+        "without this nobody can log in through the proxy, got: {headers:?}"
+    );
+    assert_eq!(
+        got("location").as_deref(),
+        Some("/after-login"),
+        "without this redirects do not happen, got: {headers:?}"
+    );
+    assert_eq!(got("cache-control").as_deref(), Some("no-store"));
+    assert_eq!(got("x-request-id").as_deref(), Some("7f3c1a9e"));
+
+    // Hop-by-hop headers belong to the connection we read them on and must not be
+    // relayed onto a different one.
+    assert!(
+        got("connection").is_none() && got("transfer-encoding").is_none(),
+        "hop-by-hop headers were relayed, got: {headers:?}"
+    );
+
+    // And the length has to describe the body actually being sent, not the one the
+    // origin framed, because the body was reassembled on the way through.
+    assert_eq!(
+        got("content-length").as_deref(),
+        Some(body.len().to_string().as_str()),
+        "got: {headers:?}"
+    );
+
+    // The recorded exchange and the delivered one agree, which is the whole point.
+    let ev = f.events.recv().await.expect("an event");
+    let recorded = ev.resp_headers.expect("the event carries response headers");
+    for name in ["content-type", "set-cookie", "location"] {
+        let stored = recorded
+            .iter()
+            .find(|[k, _]| k.eq_ignore_ascii_case(name))
+            .map(|[_, v]| v.clone());
+        assert_eq!(
+            stored,
+            got(name),
+            "{name}: the stored evidence disagrees with what the client received"
+        );
+    }
+}
 
 #[tokio::test]
 async fn a_chunked_response_is_reassembled_for_the_client_and_the_event() {

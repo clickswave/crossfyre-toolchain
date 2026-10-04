@@ -598,6 +598,37 @@ async fn forward(
         sink.record(&raw).await;
     }
 
+    // What goes back to the client.
+    //
+    // This used to be a status and a body and nothing else. Every response through the
+    // proxy therefore arrived with no Content-Type, no Set-Cookie, no Location and no
+    // Cache-Control, so a browser could not complete a login and could not follow a
+    // redirect. Worse for a tool whose output is evidence: the exchange was stored WITH
+    // its headers, so the record and the thing the client actually received disagreed,
+    // and nothing in the conformance suite noticed because its client helper threw the
+    // headers away.
+    //
+    // `append` rather than `insert`, because `Set-Cookie` legitimately repeats and
+    // inserting would keep only the last one, which silently loses sessions.
+    let mut reply = Response::builder().status(status as u16);
+    if let Some(out) = reply.headers_mut() {
+        for [k, v] in &resp_headers {
+            // Hop-by-hop headers describe the connection they were read on. Relaying them
+            // onto a different connection is a framing bug waiting to happen, and
+            // `content-length` in particular would describe the origin's framing rather
+            // than the body we reassembled. hyper sets the real one.
+            if is_hop_header(k) {
+                continue;
+            }
+            if let (Ok(name), Ok(val)) = (
+                hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                hyper::header::HeaderValue::from_str(v),
+            ) {
+                out.append(name, val);
+            }
+        }
+    }
+
     // Base privacy-safe event; enriched with full bytes only when full capture is on.
     let mut event = TraceEvent {
         method: sent_method,
@@ -649,9 +680,29 @@ async fn forward(
     }
     let _ = tx.send(event);
 
-    Ok(Response::builder()
-        .status(status as u16)
-        .body(Full::new(resp_bytes))?)
+    Ok(reply.body(Full::new(resp_bytes))?)
+}
+
+/// Headers that belong to one connection and must not be relayed onto another.
+///
+/// `content-length` and `host` are in here for a reason beyond the RFC's list: the body
+/// is reassembled on the way through, so the origin's length describes a framing that no
+/// longer applies, and the host belongs to the hop being made rather than the one that
+/// was read.
+pub fn is_hop_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "content-length"
+            | "host"
+    )
 }
 
 /// The server name to offer upstream, taken from a `Host` header.
