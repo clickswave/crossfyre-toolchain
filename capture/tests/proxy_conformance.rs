@@ -588,6 +588,73 @@ async fn the_response_headers_reach_the_client_and_match_what_was_recorded() {
 }
 
 #[tokio::test]
+async fn an_upgrade_is_refused_rather_than_recorded_as_a_working_tunnel() {
+    // A WebSocket handshake goes out as an ordinary GET with `Upgrade: websocket`, and
+    // every request header is forwarded verbatim, so the origin answers 101 and means it.
+    //
+    // This connection is not built to carry what comes next. Hyper is serving without
+    // upgrades, so passing the 101 back told the client the tunnel was open when nothing
+    // would ever be relayed through it: the socket opens, the first frame goes nowhere,
+    // and the application hangs. Meanwhile the history showed a 101 that reads like a
+    // successful handshake, so the one place an operator would look to find out says the
+    // opposite of what happened.
+    //
+    // Refusing is worse product and better behaviour. A WebSocket that fails immediately
+    // sends somebody to read this message; one that hangs sends them to debug the target.
+    let reply = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n".to_vec();
+    let (origin_port, _log) = origin(reply);
+    let cfg = CaptureCfg {
+        full: true,
+        ..CaptureCfg::default()
+    };
+    let mut f = front(origin_port, cfg, 1).await;
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/socket")
+        .header("host", format!("127.0.0.1:{origin_port}"))
+        .header("upgrade", "websocket")
+        .header("connection", "Upgrade")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let (status, headers, body) = plain_request_full(f.port, req).await;
+
+    assert_ne!(
+        status, 101,
+        "a 101 here claims a tunnel this connection cannot carry"
+    );
+    assert_eq!(
+        status, 501,
+        "and the refusal has to be ours, not something that looks like the origin's"
+    );
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("crossfyre"),
+        "the message has to name whose answer this is, or it reads as the target's: {text}"
+    );
+    assert!(
+        text.contains("upgrade") && text.contains("websocket"),
+        "and name what was refused, including which protocol: {text}"
+    );
+    assert!(
+        headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("x-crossfyre-proxy-error")),
+        "and be labelled as the proxy's own answer, got: {headers:?}"
+    );
+
+    // The record agrees with what happened rather than with what the origin said.
+    let ev = f.events.recv().await.expect("an event");
+    assert_eq!(
+        ev.status,
+        Some(501),
+        "the history must not show a 101 that never became a tunnel"
+    );
+}
+
+#[tokio::test]
 async fn a_chunked_response_is_reassembled_for_the_client_and_the_event() {
     let reply = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n\
                  5\r\nhello\r\n1\r\n-\r\n5\r\nworld\r\n0\r\n\r\n";

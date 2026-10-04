@@ -634,6 +634,91 @@ async fn forward(
         sink.record(&raw).await;
     }
 
+    // An upgrade the connection cannot carry.
+    //
+    // A WebSocket handshake is an ordinary GET with `Upgrade: websocket`, and every
+    // request header is forwarded verbatim, so an origin that speaks WebSockets answers
+    // 101 and means it. This connection is served without hyper's upgrade support, so
+    // nothing would ever be relayed: passing the 101 back opens a socket in the
+    // application whose first frame goes nowhere, and it hangs.
+    //
+    // The record was the worse half. An exchange stored with status 101 reads like a
+    // successful handshake, so the one place an operator would look to find out why their
+    // socket is dead said the opposite of what happened.
+    //
+    // Refusing is worse product and better behaviour. A WebSocket that fails at once
+    // sends somebody to read this message; one that hangs sends them to debug the target.
+    // When upgrades are carried for real this branch goes away, and the exchange it
+    // records is the row that will say when that happened.
+    if status == 101 {
+        let body = format!(
+            "crossfyre did not carry this upgrade.\n\nThe target accepted a protocol \
+             upgrade ({}), and this capture session does not relay the connection that \
+             follows one yet. Passing the acceptance back would open a socket that never \
+             carries anything, which fails later and somewhere else.\n\nThe request and \
+             the target's response headers are recorded. The frames after them are not.\n",
+            resp_headers
+                .iter()
+                .find(|[k, _]| k.eq_ignore_ascii_case("upgrade"))
+                .map(|[_, v]| v.as_str())
+                .unwrap_or("unnamed protocol"),
+        );
+        let mut ev = TraceEvent {
+            method: sent_method.clone(),
+            url: redact_url(&sent_full_url),
+            status: Some(501),
+            tech,
+            authed,
+            content_type,
+            body_params,
+            full_url: None,
+            req_headers: None,
+            req_body: None,
+            resp_headers: None,
+            resp_body: None,
+            duration_ms: Some(duration_ms),
+        };
+        if cfg.full {
+            ev.attach_full(crate::FullExchange {
+                url: sent_full_url.clone(),
+                req_headers: sent_headers
+                    .iter()
+                    .map(|(k, v)| [k.clone(), v.clone()])
+                    .collect(),
+                req_body: sent_body.clone(),
+                // The target's own headers, kept, because what it offered is evidence
+                // even though the tunnel was refused.
+                resp_headers: resp_headers.clone(),
+                resp_body: body.clone().into_bytes(),
+                duration_ms: Some(duration_ms),
+            });
+        }
+        if let Some(sink) = &cfg.sink {
+            let raw = crate::RawExchange {
+                at_ms: now_ms(),
+                method: sent_method,
+                url: sent_full_url,
+                host: sent_host,
+                req_headers: sent_headers,
+                status: 501,
+                duration_ms,
+                resp_headers: resp_headers
+                    .iter()
+                    .map(|[k, v]| (k.clone(), v.clone()))
+                    .collect(),
+                req_body: sent_body,
+                resp_body: body.clone().into_bytes(),
+            };
+            sink.record(&raw).await;
+        }
+        let _ = tx.send(ev);
+        return Ok(Response::builder()
+            .status(501)
+            .header(CONTENT_TYPE, "text/plain")
+            .header("x-crossfyre-proxy-error", "upgrade not carried")
+            .body(Full::new(Bytes::from(body)))?);
+    }
+
     // What goes back to the client.
     //
     // This used to be a status and a body and nothing else. Every response through the
