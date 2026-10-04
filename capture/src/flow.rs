@@ -416,12 +416,11 @@ async fn handle_request(
             // The body says whose answer this is. "upstream error" in a browser tab tells
             // the operator nothing, and the common cause here is one they can fix from the
             // window: a target behind its own CA needs the trust toggle.
+            let detail = e.to_string();
             let body = format!(
                 "crossfyre could not reach the target. This page came from the proxy; \
-                 nothing was received from the target.\n\nA target behind its own \
-                 certificate authority needs \"trust any target cert\" switched on in the \
-                 window. A target that is simply down needs nothing from you here.\n\n\
-                 The error was:\n{e}\n"
+                 nothing was received from the target.\n\n{}\n\nThe error was:\n{detail}\n",
+                why_it_failed(&detail),
             );
             if let Some(sink) = &cfg.sink {
                 let ex = crate::RawExchange {
@@ -817,6 +816,54 @@ async fn forward(
     Ok(reply.body(Full::new(resp_bytes))?)
 }
 
+/// Say what a forward-leg failure actually means, in a sentence that names the fix.
+///
+/// The raw error is kept either way, because the exact text matters to whoever has to
+/// debug an unusual case. What it is not is readable: an operator meeting
+/// `InvalidCertificate(Other(OtherError(CaUsedAsEndEntity)))` for the first time learns
+/// that something is wrong with a certificate, and nothing about which certificate,
+/// whose, or what to do. That sends them to look at the target, which is the wrong place
+/// for most of these.
+fn why_it_failed(detail: &str) -> &'static str {
+    let e = detail.to_ascii_lowercase();
+    if e.contains("certificaterequired") || e.contains("certificate required") {
+        return "The target asked for a client certificate and this proxy has none to offer. \
+                Mutual TLS is not configured here yet, so this target cannot be reached \
+                through it at all.";
+    }
+    if e.contains("notvalidforname") {
+        return "The target's certificate does not cover the name it was asked for. That is \
+                usually a service served under a different hostname, or an address used \
+                where a name was expected.";
+    }
+    if e.contains("expired") {
+        return "The target's certificate has expired. If that is expected on this target, \
+                \"trust any target cert\" in the window carries it anyway.";
+    }
+    if e.contains("unknownissuer")
+        || e.contains("invalid peer certificate")
+        || e.contains("self-signed")
+        || e.contains("selfsigned")
+    {
+        return "The target's certificate was not signed by any public authority, which is \
+                what an internal service behind a corporate or self-signed CA looks like. \
+                Switch on \"trust any target cert\" in the window to carry it.";
+    }
+    if e.contains("connection refused") {
+        return "Nothing is listening on that port. The target is down, or the port is wrong.";
+    }
+    if e.contains("failed to lookup") || e.contains("name or service not known") {
+        return "That hostname does not resolve from this machine. A name that only exists \
+                inside a VPN needs the VPN up.";
+    }
+    if e.contains("timed out") || e.contains("timeout") {
+        return "The target accepted nothing within the timeout. A firewall dropping the \
+                connection looks exactly like this.";
+    }
+    "A target behind its own certificate authority needs \"trust any target cert\" \
+     switched on in the window. A target that is simply down needs nothing from you here."
+}
+
 /// Headers that belong to one connection and must not be relayed onto another.
 ///
 /// `content-length` and `host` are in here for a reason beyond the RFC's list: the body
@@ -918,6 +965,50 @@ mod tests {
     // at it, and assert (a) the client gets the origin's response and (b) a correctly-reduced
     // TraceEvent is emitted. This exercises TLS termination + reduction + forward + event end to end
     // on loopback, with no device or TUN.
+    #[test]
+    fn a_forward_failure_is_explained_in_terms_of_what_to_do() {
+        // Each of these is a real rustls or io error string, and each one used to reach
+        // the operator exactly as written. The raw text is still shown below the
+        // explanation; this is what goes above it.
+        let cases = [
+            (
+                "received fatal alert: CertificateRequired",
+                "client certificate",
+            ),
+            (
+                "invalid peer certificate: Other(OtherError(CaUsedAsEndEntity))",
+                "not signed by any public authority",
+            ),
+            (
+                "invalid peer certificate: NotValidForName",
+                "does not cover the name",
+            ),
+            ("invalid peer certificate: Expired", "has expired"),
+            ("Connection refused (os error 111)", "Nothing is listening"),
+            (
+                "failed to lookup address information: Name or service not known",
+                "does not resolve",
+            ),
+            ("operation timed out", "within the timeout"),
+        ];
+        for (raw, expected) in cases {
+            let said = why_it_failed(raw);
+            assert!(
+                said.contains(expected),
+                "{raw:?} should be explained with {expected:?}, got: {said}"
+            );
+        }
+
+        // Anything unrecognised still gets a sentence, because the raw error on its own
+        // is the thing this exists to stop.
+        let unknown = why_it_failed("something nobody has seen before");
+        assert!(
+            unknown.contains("trust any target cert"),
+            "the fallback names the control by its label in the window, so it can be \
+             found rather than searched for: {unknown}"
+        );
+    }
+
     #[test]
     fn a_host_header_with_a_port_is_not_a_server_name() {
         // Every one of these used to reach rustls verbatim, and rustls rejects anything
