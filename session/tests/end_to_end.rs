@@ -233,6 +233,72 @@ async fn a_plaintext_proxy_request_says_what_is_wrong_rather_than_failing_vaguel
 }
 
 #[tokio::test]
+async fn a_request_that_never_reached_the_target_is_still_in_the_history() {
+    // The silent failure. The proxy answers 502 and the browser shows an error, but with
+    // nothing recorded the window stayed empty, so the operator had a target that looked
+    // broken, a proxy that looked dead, and no way from the window to tell which. An
+    // untrusted target certificate is the common way in: it behaves exactly like a proxy
+    // that is not listening.
+    let s = Scratch::new("upstream-fail");
+    let (origin_port, _) = tls_origin(ok_response("never seen")).await;
+
+    let project = Arc::new(Project::open(s.path(), Cap::default()).await.expect("open"));
+    let ca = Arc::new(generate_ca().expect("ca"));
+    let ca_pem = ca.pem.clone();
+    let mut cfg = SessionConfig::new(project.clone(), ca);
+    // The one difference from every other test here: the self-signed origin is NOT
+    // trusted, which is what an internal service behind a corporate CA looks like.
+    cfg.trust_any_upstream_cert = false;
+    let session = Session::start(cfg).await.expect("session starts");
+
+    let (status, body) = through_proxy(
+        session.port(),
+        origin_port,
+        &ca_pem,
+        "GET",
+        "/internal/admin",
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, 502, "the client is told, as a proxy should");
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("could not reach the target"),
+        "and told whose answer it is rather than given a bare two words, got: {text}"
+    );
+    assert!(
+        text.contains("trust any target cert"),
+        "including the fix, which is a switch in the same window, got: {text}"
+    );
+
+    let p = project.clone();
+    eventually("the failure was recorded", || {
+        let p = p.clone();
+        async move { p.count().await.unwrap_or(0) > 0 }
+    })
+    .await;
+
+    let stored = project.get(1).await.expect("get").expect("the row");
+    assert_eq!(stored.exchange.method, "GET");
+    assert_eq!(
+        stored.exchange.url,
+        format!("https://localhost:{origin_port}/internal/admin"),
+        "the row says what was asked for, which is the point of having it"
+    );
+    assert_eq!(stored.exchange.status, Some(502));
+    assert!(
+        stored
+            .exchange
+            .resp_headers
+            .iter()
+            .any(|[k, _]| k == "x-crossfyre-proxy-error"),
+        "and the response is labelled as the proxy's own, because nothing came back"
+    );
+
+    session.stop().await;
+}
+
+#[tokio::test]
 async fn interception_can_be_switched_without_stopping_the_proxy() {
     // The toggle in the window. Before this the gate only existed if interception was on
     // when the proxy started, so ticking the box mid-session did nothing at all and said

@@ -321,6 +321,16 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedIo<S> {
     }
 }
 
+/// Unix milliseconds. Both the recorded exchange and the recorded failure want it, and
+/// one of them having a different idea of the clock than the other would put rows out of
+/// order in the history for no visible reason.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 async fn handle_request(
     req: Request<Incoming>,
     scheme: &'static str,
@@ -330,13 +340,70 @@ async fn handle_request(
     tx: UnboundedSender<TraceEvent>,
     cfg: CaptureCfg,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
+    // Read what identifies the request before forwarding consumes it, so a failure still
+    // has something to record. Without this a request that never reached the target left
+    // no row at all: the operator browsed, got a bare 502 in the browser, and found an
+    // empty history with nothing anywhere saying a request had been made. An untrusted
+    // target certificate behaves exactly like a proxy that is not listening.
+    let started = std::time::Instant::now();
+    let failed_method = req.method().to_string();
+    let failed_pq = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/")
+        .to_string();
+    let failed_host = req
+        .headers()
+        .get(HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or(&target_host)
+        .to_string();
+    let failed_req_headers: Vec<(String, String)> = req
+        .headers()
+        .iter()
+        .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+        .collect();
+
     match forward(req, scheme, &target_host, target_port, egress, tx, &cfg).await {
         Ok(resp) => Ok(resp),
         // A dead/unreachable origin must not kill the client connection: answer 502 like a proxy.
-        Err(_) => Ok(Response::builder()
-            .status(502)
-            .body(Full::new(Bytes::from_static(b"upstream error")))
-            .unwrap()),
+        Err(e) => {
+            // The body says whose answer this is. "upstream error" in a browser tab tells
+            // the operator nothing, and the common cause here is one they can fix from the
+            // window: a target behind its own CA needs the trust toggle.
+            let body = format!(
+                "crossfyre could not reach the target. This page came from the proxy; \
+                 nothing was received from the target.\n\nA target behind its own \
+                 certificate authority needs \"trust any target cert\" switched on in the \
+                 window. A target that is simply down needs nothing from you here.\n\n\
+                 The error was:\n{e}\n"
+            );
+            if let Some(sink) = &cfg.sink {
+                let ex = crate::RawExchange {
+                    at_ms: now_ms(),
+                    method: failed_method,
+                    url: format!("{scheme}://{failed_host}{failed_pq}"),
+                    host: failed_host,
+                    status: 502,
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    req_headers: failed_req_headers,
+                    // Our own, and labelled as ours. Nothing came back to report.
+                    resp_headers: vec![
+                        ("content-type".into(), "text/plain".into()),
+                        ("x-crossfyre-proxy-error".into(), e.to_string()),
+                    ],
+                    req_body: Vec::new(),
+                    resp_body: body.clone().into_bytes(),
+                };
+                sink.record(&ex).await;
+            }
+            Ok(Response::builder()
+                .status(502)
+                .header(CONTENT_TYPE, "text/plain")
+                .body(Full::new(Bytes::from(body)))
+                .unwrap())
+        }
     }
 }
 
@@ -514,10 +581,7 @@ async fn forward(
 
     if let Some(sink) = &cfg.sink {
         let raw = crate::RawExchange {
-            at_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0),
+            at_ms: now_ms(),
             method: sent_method.clone(),
             url: sent_full_url.clone(),
             host: sent_host.clone(),
