@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use cfx_project::{Cap, Exchange, INLINE_MAX, Origin, Project, searchable_text};
+use cfx_project::{Cap, Exchange, Finding, INLINE_MAX, Origin, Project, Severity, searchable_text};
 
 /// A project directory under the system temp dir, removed on drop.
 struct Scratch(PathBuf);
@@ -319,6 +319,140 @@ async fn the_cap_never_takes_a_send_somebody_made() {
         left <= 5,
         "the proxy's rows were still evicted around them, got {left} left"
     );
+}
+
+/// Evidence a finding stands on outlives the cap.
+///
+/// This is the one that would be found by somebody else. A finding cites an exchange, the
+/// capture keeps running, the cap comes round, and the oldest unpinned row goes: the
+/// finding is still in the file and the request that proved it is not. The report then
+/// describes something it cannot show, and nothing anywhere said so, because deleting the
+/// row is exactly what the cap is for.
+#[tokio::test]
+async fn an_exchange_a_finding_cites_is_not_evictable() {
+    let s = Scratch::new("cap-evidence");
+    let cap = Cap {
+        max_exchanges: Some(3),
+        max_bytes: None,
+    };
+    let p = Project::open(s.path(), cap).await.expect("open");
+
+    // The oldest rows, so oldest-first eviction reaches them before anything else, and
+    // ordinary captured traffic, so nothing else is protecting them.
+    for i in 0..10 {
+        p.insert(&exchange(i)).await.expect("insert");
+    }
+    p.add_finding(&Finding {
+        at_ms: 1_700_000_000_000,
+        title: "the vehicle endpoint answers for somebody else".into(),
+        severity: Severity::Critical,
+        affected: "GET /v1/vehicles/{id}/location".into(),
+        evidence: vec![1, 2],
+        ..Default::default()
+    })
+    .await
+    .expect("finding");
+
+    p.enforce_cap().await.expect("enforce");
+
+    assert!(
+        p.get(1).await.expect("get").is_some(),
+        "the request the finding stands on is still there"
+    );
+    assert!(
+        p.get(2).await.expect("get").is_some(),
+        "and so is the second one"
+    );
+    assert!(
+        p.get(3).await.expect("get").is_none(),
+        "while the traffic around it still went, so this is the cap working rather than \
+         a cap that stopped"
+    );
+}
+
+/// Deleting a finding releases its evidence rather than taking the exchanges with it.
+#[tokio::test]
+async fn deleting_a_finding_leaves_the_traffic_it_cited() {
+    let s = Scratch::new("finding-delete");
+    let p = Project::open(s.path(), Cap::default()).await.expect("open");
+    for i in 0..3 {
+        p.insert(&exchange(i)).await.expect("insert");
+    }
+    let id = p
+        .add_finding(&Finding {
+            title: "t".into(),
+            severity: Severity::Low,
+            evidence: vec![1],
+            ..Default::default()
+        })
+        .await
+        .expect("finding");
+
+    assert!(p.delete_finding(id).await.expect("delete"));
+    assert_eq!(p.finding_count().await.expect("count"), 0);
+    assert!(
+        p.get(1).await.expect("get").is_some(),
+        "the exchange belongs to the capture, not to the claim"
+    );
+    assert!(
+        !p.delete_finding(id).await.expect("delete again"),
+        "and deleting it twice says it was not there rather than reporting success"
+    );
+}
+
+/// A finding cannot cite an exchange that is not in this project.
+#[tokio::test]
+async fn a_finding_cannot_cite_an_exchange_that_does_not_exist() {
+    let s = Scratch::new("finding-bad-ref");
+    let p = Project::open(s.path(), Cap::default()).await.expect("open");
+    p.insert(&exchange(0)).await.expect("insert");
+
+    let out = p
+        .add_finding(&Finding {
+            title: "t".into(),
+            severity: Severity::High,
+            evidence: vec![1, 999],
+            ..Default::default()
+        })
+        .await;
+    assert!(out.is_err(), "999 is not an exchange here");
+    assert_eq!(
+        p.finding_count().await.expect("count"),
+        0,
+        "and the finding did not land half written: a claim whose evidence link failed \
+         is a claim with nothing behind it"
+    );
+}
+
+/// Worst first, because that is the order a report leads with and the order somebody
+/// reading the list wants.
+#[tokio::test]
+async fn findings_come_back_worst_first() {
+    let s = Scratch::new("finding-order");
+    let p = Project::open(s.path(), Cap::default()).await.expect("open");
+    for (title, sev) in [
+        ("a", Severity::Low),
+        ("b", Severity::Critical),
+        ("c", Severity::Medium),
+        ("d", Severity::Info),
+        ("e", Severity::High),
+    ] {
+        p.add_finding(&Finding {
+            title: title.into(),
+            severity: sev,
+            ..Default::default()
+        })
+        .await
+        .expect("finding");
+    }
+    let got: Vec<String> = p
+        .findings()
+        .await
+        .expect("findings")
+        .into_iter()
+        .map(|f| f.title)
+        .collect();
+    assert_eq!(got, vec!["b", "e", "c", "a", "d"]);
 }
 
 /// A project held over its cap entirely by hand-made rows says so rather than spinning.
@@ -697,6 +831,15 @@ async fn a_version_one_project_upgrades_without_losing_anything() {
         use sqlx::sqlite::SqliteConnectOptions;
         let opts = SqliteConnectOptions::new().filename(s.path().join("project.db"));
         let pool = sqlx::SqlitePool::connect_with(opts).await.expect("connect");
+        // Version 5.
+        for stmt in [
+            "DROP INDEX finding_evidence_exchange",
+            "DROP INDEX finding_at",
+            "DROP TABLE finding_evidence",
+            "DROP TABLE finding",
+        ] {
+            sqlx::query(stmt).execute(&pool).await.expect(stmt);
+        }
         // Version 4.
         for stmt in [
             "DROP INDEX exchange_origin",
@@ -768,6 +911,17 @@ async fn a_version_one_project_upgrades_without_losing_anything() {
     p.insert(&hand).await.expect("v4 columns accept a write");
     let back = p.get(4).await.expect("get").expect("there");
     assert_eq!(back.exchange.origin, Origin::Repeater);
+    // Version 5 the same way.
+    let id = p
+        .add_finding(&Finding {
+            title: "probe".into(),
+            severity: Severity::High,
+            evidence: vec![1],
+            ..Default::default()
+        })
+        .await
+        .expect("v5 finding tables exist");
+    assert_eq!(p.findings().await.expect("read back")[0].id, id);
 
     // The new session machinery works on the upgraded file.
     let run = p

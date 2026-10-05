@@ -55,6 +55,7 @@ pub const REFUSALS_DROPPED: &str = "refusals_dropped";
 pub const SCOPE_SETTING: &str = "scope";
 
 pub mod blob;
+pub mod report;
 pub mod schema;
 pub mod sink;
 
@@ -226,6 +227,65 @@ pub struct Summary {
     pub origin: Origin,
     /// The identity a replay went out as.
     pub actor: Option<String>,
+}
+
+/// How bad a finding is, in the vocabulary the engine templates already use.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Severity {
+    /// Worth saying, not worth fixing on its own.
+    #[default]
+    Info,
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl Severity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Severity::Info => "info",
+            Severity::Low => "low",
+            Severity::Medium => "medium",
+            Severity::High => "high",
+            Severity::Critical => "critical",
+        }
+    }
+
+    /// Anything unrecognised is `info`, which understates rather than overstates. A report
+    /// that quietly promoted an unknown word to critical would be the worse direction.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "low" => Severity::Low,
+            "medium" | "med" => Severity::Medium,
+            "high" => Severity::High,
+            "critical" | "crit" => Severity::Critical,
+            _ => Severity::Info,
+        }
+    }
+}
+
+/// A claim about the target, and the exchanges that make it believable.
+///
+/// The thing a client is handed is a report, and a project file held traffic and no claim
+/// about it. The evidence list is what separates this from an assertion: a report that
+/// says an endpoint leaks another user's data and cannot show the requests that
+/// demonstrate it is somebody's opinion.
+#[derive(Debug, Clone, Default)]
+pub struct Finding {
+    pub id: i64,
+    pub at_ms: i64,
+    pub title: String,
+    pub severity: Severity,
+    /// What it is about: an operation, a URL, a host. Free text, because the operation
+    /// model is not in this store yet and a column that pretended otherwise would have to
+    /// be migrated twice.
+    pub affected: String,
+    pub description: String,
+    pub repro: String,
+    pub remediation: String,
+    /// Exchange ids. These rows are not evictable while they are cited.
+    pub evidence: Vec<i64>,
 }
 
 /// What a project is allowed to grow to.
@@ -771,6 +831,111 @@ impl Project {
     /// deliberately kept would make pinning worthless, so a project held over its cap
     /// entirely by pinned rows stays over it and says so through [`Evicted::kept_pinned`]
     /// rather than quietly breaking the promise.
+    /// Record a claim, with the exchanges that prove it.
+    ///
+    /// The finding and its links go in together. A finding whose evidence links were not
+    /// yet written is a claim with nothing behind it, and that is the state a report would
+    /// render if it read between the two writes.
+    pub async fn add_finding(&self, f: &Finding) -> Result<i64, Error> {
+        let mut tx = self.pool.begin().await?;
+        let id: i64 = sqlx::query(
+            "INSERT INTO finding (at_ms, run_id, title, severity, affected, description,
+                                  repro, remediation)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+             RETURNING id",
+        )
+        .bind(f.at_ms)
+        .bind(self.current_run())
+        .bind(&f.title)
+        .bind(f.severity.as_str())
+        .bind(&f.affected)
+        .bind(&f.description)
+        .bind(&f.repro)
+        .bind(&f.remediation)
+        .fetch_one(&mut *tx)
+        .await?
+        .try_get(0)?;
+
+        for ex in &f.evidence {
+            // The foreign key is the check: an id that is not an exchange in this project
+            // is refused here rather than producing a finding that cites nothing.
+            sqlx::query("INSERT INTO finding_evidence (finding_id, exchange_id) VALUES (?1,?2)")
+                .bind(id)
+                .bind(ex)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    /// Every finding, worst first, then newest.
+    ///
+    /// Ordered here rather than by the caller because every caller wants the same order:
+    /// a report leads with the worst thing, and so does a list somebody is reading to
+    /// decide what to write up next.
+    pub async fn findings(&self) -> Result<Vec<Finding>, Error> {
+        let rows = sqlx::query(
+            "SELECT id, at_ms, title, severity, affected, description, repro, remediation
+             FROM finding
+             ORDER BY CASE severity
+                        WHEN 'critical' THEN 0
+                        WHEN 'high'     THEN 1
+                        WHEN 'medium'   THEN 2
+                        WHEN 'low'      THEN 3
+                        ELSE 4
+                      END ASC,
+                      at_ms DESC, id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let id: i64 = r.try_get("id")?;
+            let evidence = sqlx::query(
+                "SELECT exchange_id FROM finding_evidence
+                 WHERE finding_id = ?1 ORDER BY exchange_id ASC",
+            )
+            .bind(id)
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|e| e.try_get::<i64, _>(0))
+            .collect::<Result<Vec<_>, _>>()?;
+
+            out.push(Finding {
+                id,
+                at_ms: r.try_get("at_ms")?,
+                title: r.try_get("title")?,
+                severity: Severity::parse(&r.try_get::<String, _>("severity")?),
+                affected: r.try_get("affected")?,
+                description: r.try_get("description")?,
+                repro: r.try_get("repro")?,
+                remediation: r.try_get("remediation")?,
+                evidence,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Remove a finding. Its evidence links go with it; the exchanges do not.
+    pub async fn delete_finding(&self, id: i64) -> Result<bool, Error> {
+        let n = sqlx::query("DELETE FROM finding WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(n > 0)
+    }
+
+    pub async fn finding_count(&self) -> Result<i64, Error> {
+        Ok(sqlx::query("SELECT COUNT(*) FROM finding")
+            .fetch_one(&self.pool)
+            .await?
+            .try_get(0)?)
+    }
+
     pub async fn enforce_cap(&self) -> Result<Evicted, Error> {
         let mut out = Evicted::default();
         if self.cap.max_bytes.is_none() && self.cap.max_exchanges.is_none() {
@@ -796,7 +961,9 @@ impl Project {
             // file and its cap.
             let victim: Option<i64> = sqlx::query(
                 "SELECT id FROM exchange
-                   WHERE pinned = 0 AND origin = 'proxy'
+                   WHERE pinned = 0
+                     AND origin = 'proxy'
+                     AND id NOT IN (SELECT exchange_id FROM finding_evidence)
                    ORDER BY at_ms ASC, id ASC LIMIT 1",
             )
             .fetch_optional(&self.pool)

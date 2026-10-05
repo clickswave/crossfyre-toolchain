@@ -10,7 +10,7 @@ use sqlx::{Row, SqlitePool};
 
 /// Bumped whenever the statements below change. An older build opening a newer file
 /// refuses rather than guessing, which is the whole reason this is checked.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// Exchanges, their out-of-line bodies, and a full-text index over the parts a human
 /// searches.
@@ -94,6 +94,45 @@ const STEPS: &[Step] = &[
         version: 4,
         statements: V4_ORIGIN,
     },
+    Step {
+        version: 5,
+        statements: V5_FINDINGS,
+    },
+];
+
+/// Version 5: a finding, and the exchanges that prove it.
+///
+/// The thing a client is handed is a report, and nothing here could describe one: the
+/// file held traffic and no claim about it. A finding is the claim, and the link table is
+/// the reason the claim can be believed, because a report that says "the vehicle endpoint
+/// leaks another user's location" and cannot show the two requests that demonstrate it is
+/// an assertion rather than a finding.
+///
+/// `ON DELETE CASCADE` on the link, so deleting a finding takes its links and leaves the
+/// exchanges, which belong to the capture rather than to the claim. There is deliberately
+/// no cascade the other way: an exchange cited by a finding is not deletable by eviction
+/// at all, which is enforced where eviction chooses rather than left to the database to
+/// discover.
+const V5_FINDINGS: &[&str] = &[
+    "CREATE TABLE finding (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        at_ms       INTEGER NOT NULL,
+        run_id      INTEGER REFERENCES run(id),
+        title       TEXT    NOT NULL,
+        severity    TEXT    NOT NULL,
+        affected    TEXT    NOT NULL DEFAULT '',
+        description TEXT    NOT NULL DEFAULT '',
+        repro       TEXT    NOT NULL DEFAULT '',
+        remediation TEXT    NOT NULL DEFAULT ''
+    )",
+    "CREATE TABLE finding_evidence (
+        finding_id  INTEGER NOT NULL REFERENCES finding(id) ON DELETE CASCADE,
+        exchange_id INTEGER NOT NULL REFERENCES exchange(id),
+        PRIMARY KEY (finding_id, exchange_id)
+    )",
+    "CREATE INDEX finding_at ON finding(at_ms)",
+    // Eviction asks this on every pass: is anything claiming this row as evidence.
+    "CREATE INDEX finding_evidence_exchange ON finding_evidence(exchange_id)",
 ];
 
 /// Version 4: an exchange says whether somebody made it or watched it happen.
