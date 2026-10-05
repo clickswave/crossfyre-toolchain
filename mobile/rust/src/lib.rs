@@ -252,6 +252,9 @@ pub extern "system" fn Java_io_crossfyre_tracer_Native_startCapture<'local>(
             // accepted any origin certificate would be a worse trade here than on a
             // desktop: the operator is not the only person using the handset.
             trust_any_upstream_cert: false,
+            // None. A client certificate belongs to a project and the mobile app has none
+            // yet, which is the same reason the scope below is unrestricted.
+            client_identity: None,
             // Straight out, which is what the phone has always done. An upstream proxy is
             // a desktop answer to a corporate network; a handset on one reaches the
             // internet through its carrier instead.

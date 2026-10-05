@@ -30,6 +30,9 @@ zstd = "0.13"
 # One header, Proxy-Authorization, and a hand-rolled encoder for it is the kind of thing
 # that is wrong in one corner and silently refuses every credential.
 base64 = "0.22"
+# Reading the operator's client certificate and key. Already a dev-dependency for the test
+# origin; a client identity makes it a real one.
+rustls-pemfile = "2"
 
 [dev-dependencies]
 flate2 = "1.1"
