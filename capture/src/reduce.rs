@@ -121,6 +121,58 @@ impl TraceEvent {
 /// Redact a URL down to a safe shape: strip `user:pass@` userinfo, drop the `#fragment`, and keep
 /// query parameter KEYS while blanking their VALUES (`?a=secret&b=2` -> `?a=&b=`). Pure and robust to
 /// malformed input.
+/// Does a query or form part that carried no `=` look like a parameter NAME, rather than a
+/// value somebody passed bare?
+///
+/// The default capture mode promises it records no values. A part with an `=` is
+/// unambiguous: the key is a name and the value is blanked. A part WITHOUT one is
+/// syntactically a name with no value, and that is how this was treated, so it was kept
+/// verbatim. Measured: `?eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abc123signature`
+/// came back unchanged, and `api_switch`'s asset graph then stores each query name as a
+/// `param` asset, so the token was persisted and shown in the UI by the mode that promises
+/// not to do that. A bare high-entropy part also mints a new `param` asset per request,
+/// which pollutes the graph quite apart from the privacy of it.
+///
+/// So the question is answered conservatively, because the two cases cannot be told apart
+/// with certainty and the costs are not symmetric: keeping a token is a privacy breach,
+/// while dropping an unusually long flag name loses one piece of request shape.
+///
+/// What this does NOT catch, stated because a reader will otherwise assume it does: a
+/// SHORT high-entropy value, say a sixteen-character bare token with mixed case, satisfies
+/// every test here and is kept. Closing that would mean guessing at entropy, and a rule
+/// that silently drops real parameter names is its own kind of wrong. Flags are short and
+/// word-shaped, and that is what this recognises.
+///
+/// Note also that this only ever sees parts with no `=` at all. A bare token carrying
+/// base64 padding, `?YWJjZA==`, splits into a key and a value and never reaches here, so
+/// that case is handled at the call site instead.
+fn looks_like_a_param_name(p: &str) -> bool {
+    // Flags are short. The ones that actually occur are `debug`, `pretty`, `raw`, `force`,
+    // `nocache`, `include_deleted`: under twenty characters with room to spare. The first
+    // version of this allowed twenty-four and let through a measured
+    // `eyJ0b2tlbiI6InNlY3JldCJ9`, which is exactly twenty-four, so the bound was doing
+    // nothing for the one case it was written for. Past twenty, a part with no value is
+    // far more likely to be data than a name.
+    if p.is_empty() || p.len() > 20 {
+        return false;
+    }
+    // Characters that belong to encodings and credentials, not to names.
+    if p.bytes()
+        .any(|b| matches!(b, b'%' | b'+' | b'/' | b'=' | b':' | b'@'))
+    {
+        return false;
+    }
+    if !p
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'[' | b']' | b'~'))
+    {
+        return false;
+    }
+    // A long run of hex is an id or a digest. `?deadbeef` is short enough to be a name and
+    // is left alone; sixteen or more is not something anybody named a parameter.
+    !(p.len() >= 16 && p.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 pub fn redact_url(raw: &str) -> String {
     let no_frag = raw.split('#').next().unwrap_or(raw);
     let (base, query) = match no_frag.split_once('?') {
@@ -135,9 +187,15 @@ pub fn redact_url(raw: &str) -> String {
             let blanked: Vec<String> = q
                 .split('&')
                 .filter(|p| !p.is_empty())
-                .map(|p| match p.split_once('=') {
-                    Some((k, _)) => format!("{k}="),
-                    None => p.to_string(),
+                .filter_map(|p| match p.split_once('=') {
+                    // A "value" made only of `=` is base64 padding, which means the split
+                    // landed inside a bare token and `k` is the token rather than a name.
+                    // `?YWJjZA==` was coming back as `?YWJjZA=`.
+                    Some((_, v)) if !v.is_empty() && v.bytes().all(|b| b == b'=') => None,
+                    Some((k, _)) => Some(format!("{k}=")),
+                    // No `=`, so there is no way to show this is a name. Dropped rather
+                    // than carried, unless it looks like one.
+                    None => looks_like_a_param_name(p).then(|| p.to_string()),
                 })
                 .collect();
             if blanked.is_empty() {
@@ -183,7 +241,14 @@ pub fn body_field_names(content_type: Option<&str>, body: &[u8]) -> Vec<String> 
         return s
             .split('&')
             .filter(|p| !p.is_empty())
-            .map(|p| p.split_once('=').map(|(k, _)| k).unwrap_or(p).to_string())
+            .filter_map(|p| match p.split_once('=') {
+                Some((_, v)) if !v.is_empty() && v.bytes().all(|b| b == b'=') => None,
+                Some((k, _)) => Some(k.to_string()),
+                // Same reasoning as the query string: a form part with no `=` is not
+                // demonstrably a field name, and `["eyJ0b2tlbiI6InNlY3JldCJ9"]` was being
+                // reported as one.
+                None => looks_like_a_param_name(p).then(|| p.to_string()),
+            })
             .collect();
     }
     Vec::new()
@@ -212,5 +277,153 @@ mod tests {
         );
         assert_eq!(f, vec!["user".to_string(), "pw".to_string()]);
         assert!(body_field_names(Some("text/plain"), b"whatever").is_empty());
+    }
+
+    /// The leak this rule exists for, in the exact form it was measured.
+    const JWT: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abc123signature";
+
+    #[test]
+    fn a_bare_token_in_the_query_is_not_carried_as_a_name() {
+        // Before the rule, this came back byte for byte, and the asset graph then stored
+        // it as a `param` asset, so the credential was persisted by the mode whose whole
+        // promise is that it records no values.
+        let out = redact_url(&format!("https://ex.com/a?{JWT}"));
+        assert_eq!(out, "https://ex.com/a");
+        assert!(!out.contains("eyJ"), "no part of the token survives: {out}");
+    }
+
+    #[test]
+    fn a_short_flag_with_no_value_is_still_kept() {
+        // The cost of being conservative has to stay bounded: `?debug` is real request
+        // shape and dropping it would make the rule worse than the leak for common URLs.
+        for flag in [
+            // Each of these is within the bound, which is itself part of the claim.
+            "debug",
+            "pretty",
+            "verbose",
+            "include_deleted",
+            "a",
+            "x-1.2",
+            "deadbeef",
+        ] {
+            assert_eq!(
+                redact_url(&format!("https://ex.com/a?{flag}")),
+                format!("https://ex.com/a?{flag}"),
+                "{flag} is name-shaped and should survive"
+            );
+        }
+    }
+
+    #[test]
+    fn the_things_that_give_a_value_away() {
+        for value in [
+            // Long, which is the primary signal.
+            "a-very-long-parameter-name-that-is-really-a-token",
+            // Sixteen or more hex characters is an id or a digest.
+            "0123456789abcdef",
+            "d41d8cd98f00b204e9800998ecf8427e",
+            // Characters that belong to encodings and credentials.
+            "AbCdEf%2Bgh",
+            "a+b",
+            "a/b",
+            "user@host",
+            "a:b",
+        ] {
+            let out = redact_url(&format!("https://ex.com/a?{value}"));
+            assert_eq!(
+                out, "https://ex.com/a",
+                "{value} should not be carried as a parameter name"
+            );
+        }
+    }
+
+    #[test]
+    fn dropping_a_valueless_part_leaves_the_others_alone() {
+        assert_eq!(
+            redact_url(&format!("https://ex.com/a?page=2&{JWT}&debug")),
+            "https://ex.com/a?page=&debug",
+            "a keyed param keeps its key, the token goes, the flag stays"
+        );
+        // And when every part drops, the `?` goes with them rather than being left bare.
+        assert_eq!(
+            redact_url(&format!("https://ex.com/a?{JWT}")),
+            "https://ex.com/a"
+        );
+    }
+
+    #[test]
+    fn a_keyed_parameter_is_unaffected_however_long_its_value() {
+        // The rule applies ONLY to parts with no `=`. A keyed param was never the problem
+        // and must not start being treated as one, or every signed CDN URL loses its shape.
+        assert_eq!(
+            redact_url(
+                "https://cdn.ex.com/f.js?v=3&Expires=1699999999&Signature=AbCdEf%2Bgh%2F123%3D"
+            ),
+            "https://cdn.ex.com/f.js?v=&Expires=&Signature="
+        );
+        assert_eq!(
+            redact_url(&format!("https://ex.com/a?Policy={JWT}")),
+            "https://ex.com/a?Policy="
+        );
+    }
+
+    #[test]
+    fn a_form_body_with_no_equals_reports_no_field_names() {
+        // Measured: this returned `["eyJ0b2tlbiI6InNlY3JldCJ9"]`, a token presented as a
+        // field name, which the asset graph records as a body param.
+        let got = body_field_names(
+            Some("application/x-www-form-urlencoded"),
+            b"eyJ0b2tlbiI6InNlY3JldCJ9",
+        );
+        assert!(got.is_empty(), "got: {got:?}");
+
+        // A flag among real fields still comes through, and the real fields are untouched.
+        let got = body_field_names(
+            Some("application/x-www-form-urlencoded"),
+            format!("user=admin&dry_run&pw=hunter2&{JWT}").as_bytes(),
+        );
+        assert_eq!(got, vec!["user", "dry_run", "pw"]);
+    }
+
+    #[test]
+    fn full_capture_is_a_different_promise_and_keeps_the_real_url() {
+        // Worth pinning so nobody reads the rule above as covering everything. Full
+        // capture exists to record real bytes for the Requests tab, and `full_url` is
+        // supposed to carry the token. The privacy guarantee there is the workflow opting
+        // in, not redaction.
+        let mut ev = TraceEvent::default();
+        ev.attach_full(FullExchange {
+            url: format!("https://ex.com/a?{JWT}"),
+            ..Default::default()
+        });
+        assert_eq!(
+            ev.full_url.as_deref(),
+            Some(format!("https://ex.com/a?{JWT}").as_str())
+        );
+    }
+
+    #[test]
+    fn a_bare_token_with_base64_padding_is_dropped_rather_than_split() {
+        // `?YWJjZA==` splits into key `YWJjZA` and value `=`, so the keyed branch used to
+        // keep the token's own prefix as a parameter name and emit `?YWJjZA=`. A value
+        // made only of `=` is padding, which is the signal that the split landed inside a
+        // value rather than between a name and one.
+        assert_eq!(redact_url("https://ex.com/a?YWJjZA=="), "https://ex.com/a");
+        assert_eq!(
+            redact_url("https://ex.com/a?page=2&YWJjZA==&debug"),
+            "https://ex.com/a?page=&debug"
+        );
+        assert!(
+            body_field_names(
+                Some("application/x-www-form-urlencoded"),
+                b"eyJ0b2tlbiI6InNlY3JldCJ9=="
+            )
+            .is_empty()
+        );
+        // An ordinary param with no value is NOT padding and keeps its name.
+        assert_eq!(
+            redact_url("https://ex.com/a?token="),
+            "https://ex.com/a?token="
+        );
     }
 }

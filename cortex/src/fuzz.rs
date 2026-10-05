@@ -54,6 +54,8 @@ fn d_true() -> bool {
     true
 }
 
+/// As in `inject.rs`, including the reason it is announced rather than taken
+/// quietly: a capped `total` reads as a completed pass.
 const MAX_ENDPOINTS: usize = 300;
 const MAX_FIELDS_PER_EP: usize = 24;
 
@@ -83,7 +85,20 @@ pub async fn run(params: FuzzParams, tx: mpsc::UnboundedSender<Value>) {
 
     let mut found = 0i64;
     let mut done = 0i64;
-    let total = params.endpoints.len().min(MAX_ENDPOINTS) as i64;
+    let handed_in = params.endpoints.len();
+    let total = handed_in.min(MAX_ENDPOINTS) as i64;
+    if handed_in > MAX_ENDPOINTS {
+        let _ = tx.send(json!({
+            "type": "log",
+            "message": format!(
+                "endpoint list truncated: {handed_in} handed in, {MAX_ENDPOINTS} will be \
+                 tested, {} dropped and not examined.",
+                handed_in - MAX_ENDPOINTS
+            ),
+            "endpoints_handed_in": handed_in,
+            "endpoints_tested": MAX_ENDPOINTS,
+        }));
+    }
 
     for ep in params.endpoints.iter().take(MAX_ENDPOINTS) {
         if crate::inject::destroys_a_resource(&ep.method) && !params.test_writes {

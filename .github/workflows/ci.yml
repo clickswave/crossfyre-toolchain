@@ -275,6 +275,23 @@ jobs:
             -p mach -p voyage -p pulse \
             --features mach/tuning,voyage/tuning,pulse/tuning -- -D warnings
 
+      # The impersonate feature swaps the engines' HTTP client from reqwest to
+      # wreq, so `transport::Error` becomes a different type and anything naming
+      # reqwest directly stops compiling. Nothing else here builds that
+      # combination, and the only other thing that does is the release script, so
+      # for three weeks from 2026-09-11 `mach` could not be released at all:
+      # `fetch_reason` took a `&reqwest::Error` and the default build resolved it
+      # against mach's own direct reqwest dependency. Found by a release failing,
+      # which is the wrong way to find it.
+      #
+      # This builds BoringSSL and is therefore slow. Worth it: the artifacts we
+      # actually ship are built with this feature on.
+      - name: build (impersonate feature, which is what ships)
+        run: |
+          cargo build --locked \
+            -p mach -p voyage -p scout -p cortex \
+            --features mach/impersonate,voyage/impersonate,scout/impersonate,cortex/impersonate
+
   audit:
     name: dependency advisories
     runs-on: ubuntu-latest

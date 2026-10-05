@@ -26,9 +26,9 @@ use std::time::Duration;
 
 // Backend-specific types (differ between reqwest and wreq).
 #[cfg(not(feature = "impersonate"))]
-pub use reqwest::{redirect, Client, ClientBuilder, Error, Proxy, RequestBuilder, Response};
+pub use reqwest::{Client, ClientBuilder, Error, Proxy, RequestBuilder, Response, redirect};
 #[cfg(feature = "impersonate")]
-pub use wreq::{redirect, Client, ClientBuilder, Error, Proxy, RequestBuilder, Response};
+pub use wreq::{Client, ClientBuilder, Error, Proxy, RequestBuilder, Response, redirect};
 
 // Shared http/url types (identical regardless of backend).
 pub use reqwest::header;

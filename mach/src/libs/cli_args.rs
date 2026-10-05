@@ -94,6 +94,15 @@ pub struct Cli {
     /// Port for daemon mode
     #[arg(long, default_value_t = 4441)]
     pub port: u16,
+
+    /// Show the live dashboard instead of streaming JSON. Ignored when stdout is
+    /// not a terminal, so piping still produces parseable output.
+    #[arg(long, default_value_t = false)]
+    pub tui: bool,
+
+    /// Never draw the dashboard; stream newline-delimited JSON instead.
+    #[arg(long, default_value_t = false)]
+    pub no_tui: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -104,14 +113,16 @@ pub struct Cli {
 pub enum Commands {
     /// Scan URLs using a wordlist
     Scan(ScanArgs),
+    /// Send a JSON op to the daemon and print the reply. `operation` defaults to
+    /// `probe`, which checks a single URL with no wordlist and no dashboard.
+    #[command(alias = "scan-exec")]
+    Exec(ExecArgs),
     /// Database management
     Db(DbArgs),
-    /// Probe a single URL instantly (no TUI, no wordlist - for high-volume scripted use)
-    ScanExec(ScanExecArgs),
 }
 
 #[derive(ClapArgs, Clone, Debug)]
-pub struct ScanExecArgs {
+pub struct ExecArgs {
     /// JSON payload: {"operation_id":"<uuid>","url":"<url>","success_codes":[200],"method":"get"}
     pub json: String,
 }

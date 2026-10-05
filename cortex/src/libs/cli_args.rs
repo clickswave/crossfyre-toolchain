@@ -22,13 +22,18 @@ pub struct Cli {
     /// not a terminal, so piping still produces parseable output.
     #[arg(long, default_value_t = false)]
     pub tui: bool,
+
+    /// Never draw the dashboard; stream newline-delimited JSON instead.
+    #[arg(long, default_value_t = false)]
+    pub no_tui: bool,
 }
 
 #[derive(Subcommand, Clone)]
 pub enum Commands {
     /// Scan a single target through the running daemon
     Scan(ScanArgs),
-    /// Send a raw JSON op to the daemon and print the streamed events
+    /// Send a JSON op to the daemon and print the streamed events. `operation` is
+    /// required: this is the raw interface the node uses.
     Exec(ExecArgs),
 }
 

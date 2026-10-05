@@ -17,9 +17,9 @@ mod stats;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cfx_capture::{Egress, SessionCa, TraceEvent};
+use jni::JNIEnv;
 use jni::objects::{JClass, JString};
 use jni::sys::{jboolean, jint, jstring};
-use jni::JNIEnv;
 
 /// The session CA generated on-device by `generateCaPem` and reused by `startCapture`. The private
 /// key never leaves native code.
@@ -245,6 +245,17 @@ pub extern "system" fn Java_io_crossfyre_tracer_Native_startCapture<'local>(
             full,
             gate,
             bypass_hosts: session_cfg.bypass_hosts,
+            // No local store on the phone yet. Captured exchanges go to the control plane
+            // through `tx`, which is what the mobile app has always done.
+            sink: None,
+            // The phone has no project settings to carry this, and an app that silently
+            // accepted any origin certificate would be a worse trade here than on a
+            // desktop: the operator is not the only person using the handset.
+            trust_any_upstream_cert: false,
+            // Unrestricted, which is what the phone has always been. The scope belongs to
+            // a project and the mobile app has none yet; when it gets one this becomes the
+            // guard that project owns, not a second list to keep in step.
+            scope: None,
         };
         if let Err(e) = netstack::run(tun_fd, ca, egress, tx, capture_cfg).await {
             log::error!("netstack ended: {e}");

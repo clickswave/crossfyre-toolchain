@@ -180,6 +180,15 @@ pub const OOB_NSLOOKUP: &str = "nslookup -timeout=2";
 
 pub const CMDI_ECHO_A: u64 = 199_933;
 pub const CMDI_ECHO_B: u64 = 314_573;
+/// Endpoints tested in one pass. A cap belongs here, because a caller can hand
+/// over an asset graph with thousands of endpoints and every one of them is
+/// real traffic at somebody's service.
+///
+/// What did not belong here was taking it silently. `total` was the capped
+/// number, so a pass handed 1040 endpoints reported "300/300 endpoints" and
+/// looked complete, and the 740 it never touched were indistinguishable from
+/// 740 clean ones. Measured against xssmaze that is the difference between 29%
+/// recall and a pass that only ever saw 29% of the target.
 const MAX_ENDPOINTS: usize = 300;
 /// Endpoints probed at once. Injection is request-bound, not CPU-bound, and one
 /// endpoint at a time meant a scan of a few dozen endpoints across every class
@@ -405,7 +414,7 @@ impl Site {
     }
 }
 
-pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
+pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
     let _ = tx.send(json!({"type":"ack","target": params.target}));
     if params.endpoints.is_empty() {
         let _ = tx.send(json!({"type":"error","message":"injection testing needs at least one endpoint (run a crawl first, or provide endpoints)"}));
@@ -479,7 +488,56 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
         _ => crate::oast::OastClient::from_env(),
     };
 
-    let total = params.endpoints.len().min(MAX_ENDPOINTS) as i64;
+    let handed_in = params.endpoints.len();
+    // Endpoints that have somewhere to inject go first, because the cap below
+    // throws the rest away and until now it threw away whatever happened to be
+    // at the end of the caller's list.
+    //
+    // Measured end to end: mach's crawl of xssmaze returns 2328 endpoints and
+    // 1259 of them carry no parameter at all, so in discovery order a capped
+    // pass spends about half its budget where there is nothing to inject into.
+    // Handing the same list over, the cap tested 207 findings' worth of
+    // endpoints before this and 250 after, on the same 300-endpoint budget.
+    //
+    // The hit rates are what make it worth sorting rather than the timings: 7
+    // findings from 300 parameterless endpoints against 250 from 300 with a
+    // parameter. Wall time on this target is not a usable comparison, because
+    // it is dominated by the pacer rather than by the work (see the note on
+    // pacing variance in limeyard's xssmaze truth).
+    //
+    // A stable partition rather than a sort, so a caller that ordered its list
+    // deliberately keeps that order inside each group. Nothing is dropped that
+    // would not have been dropped anyway, and under the cap the set tested is
+    // identical.
+    let mut endpoints = std::mem::take(&mut params.endpoints);
+    let injectable = |e: &InjEndpoint| {
+        !e.params.is_empty()
+            || !e.body.is_empty()
+            || !e.path_params.is_empty()
+            || !query_param_names(&e.url).is_empty()
+    };
+    endpoints.sort_by_key(|e| !injectable(e));
+    let with_surface = endpoints.iter().filter(|e| injectable(e)).count();
+    params.endpoints = endpoints;
+
+    let total = handed_in.min(MAX_ENDPOINTS) as i64;
+    if handed_in > MAX_ENDPOINTS {
+        let _ = tx.send(json!({
+            "type": "log",
+            "message": format!(
+                "endpoint list truncated: {handed_in} handed in, {MAX_ENDPOINTS} will be \
+                 tested, {} dropped. {with_surface} of the {handed_in} carry a parameter, a \
+                 body field or a path parameter, and those were moved to the front so the \
+                 cap falls on the ones with nowhere to inject first. The dropped endpoints \
+                 were not examined, so they are not evidence about the target. Split the \
+                 list across passes to cover them.",
+                handed_in - MAX_ENDPOINTS
+            ),
+            "endpoints_handed_in": handed_in,
+            "endpoints_tested": MAX_ENDPOINTS,
+            "endpoints_with_injection_surface": with_surface,
+        }));
+    }
 
     // Positions the corpus proves variable, computed once over every endpoint
     // we were given rather than per endpoint: the evidence for `/users/alice`
@@ -616,6 +674,7 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
         }));
     }
     let skips = Arc::new(AtomicUsize::new(0));
+    let answered = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let race_budget = Arc::new(AtomicUsize::new(if race.is_some() {
         MAX_RACE_ENDPOINTS
     } else {
@@ -641,6 +700,22 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
     // a statement about how hard we were pushing, not about the endpoint.
     let mut starved: Vec<InjEndpoint> = Vec::new();
     let mut retrying = false;
+    /// Endpoints that answered nothing at all, from the start of the pass,
+    /// before the target is called down rather than busy.
+    ///
+    /// The signal is "not one baseline has succeeded anywhere", which is why it
+    /// can be this blunt. A target that is merely overloaded answers something
+    /// eventually, and the first endpoint that does disarms this for the rest
+    /// of the pass. A target that is down answers nothing, and every endpoint
+    /// after that costs four sites times three baseline attempts times the full
+    /// timeout, with the pacer serialising on top.
+    ///
+    /// Four. A full width of workers is eight, but with the baseline retries
+    /// skipped on a host that has never answered, four endpoints is already
+    /// dozens of requests and every one of them came back with nothing.
+    const DEAD_HOST_STREAK: u32 = 4;
+    let mut dead_streak: u32 = 0;
+    let mut ever_answered = false;
     let mut queue = params
         .endpoints
         .iter()
@@ -695,6 +770,7 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
                 race: race.clone(),
                 race_budget: Arc::clone(&race_budget),
                 skips: Arc::clone(&skips),
+                answered: Arc::clone(&answered),
                 xml_seen: Arc::clone(&xml_seen),
                 tx: tx.clone(),
             };
@@ -709,6 +785,49 @@ pub async fn run(params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
                 done += 1;
                 if outcome.starved && !retrying {
                     starved.push(ep);
+                }
+                // A target that has answered nothing at all is down, not
+                // busy, and every endpoint after that is a full timeout per
+                // baseline attempt for an oracle that cannot run.
+                //
+                // Measured against juice-shop, which wedges under an injection
+                // pass and then answers nothing: 445 endpoints, every one
+                // starving, the engine at 0% CPU with every request waiting out
+                // its timeout. From the caller's side that is a hang.
+                //
+                // The first version of this only looked while `retrying`, on
+                // the reasoning that the single-file retry is where a fair
+                // chance has already been given. It never fired, because the
+                // pacer serialises after four consecutive failures and the
+                // wide first phase was already one request at a time: against
+                // 40 endpoints on a silent target the pass had not reached the
+                // retry after ten minutes. The signal has to be phase
+                // agnostic, so it is this: not one baseline has succeeded
+                // anywhere yet.
+                if !outcome.starved {
+                    ever_answered = true;
+                }
+                if !ever_answered {
+                    dead_streak += 1;
+                    if dead_streak >= DEAD_HOST_STREAK {
+                        let left = queue.len() + set.len();
+                        let _ = tx.send(json!({
+                            "type": "log",
+                            "message": format!(
+                                "the target is not answering: {DEAD_HOST_STREAK} endpoints in \
+                                 and not one baseline request has succeeded, so no oracle has \
+                                 been able to run. Abandoning this pass with {left} endpoint(s) \
+                                 untested rather than spending a timeout on each. They were not \
+                                 examined, so they are not evidence about the target. Check that \
+                                 the host is up and reachable from this node and run it again."
+                            ),
+                            "endpoints_untested": left,
+                            "reason": "target not answering",
+                        }));
+                        queue.clear();
+                        set.abort_all();
+                        break;
+                    }
                 }
             }
             Some(Err(_)) => done += 1,
@@ -1173,11 +1292,21 @@ struct EndpointCtx {
     /// by the same sentence repeated eighty-six times. Loud and repetitive is
     /// its own kind of silent.
     skips: Arc<AtomicUsize>,
+    /// Set the first time any baseline request anywhere on this host comes
+    /// back. Until it is set, the retries below are skipped: a target that has
+    /// never answered is not a target that is busy.
+    answered: Arc<std::sync::atomic::AtomicBool>,
     tx: mpsc::UnboundedSender<Value>,
 }
 
 /// How many skipped sites are named individually before they are counted.
 const SKIPS_SPELLED_OUT: usize = 5;
+
+/// Sites to try on one endpoint before giving up on it, while nothing on the
+/// host has answered anything yet. Four, because four sites that each went
+/// unanswered through the full timeout is already the answer, and the cap on
+/// sites per endpoint is sixteen.
+const SITES_BEFORE_GIVING_UP: usize = 4;
 
 /// What one endpoint's pass produced.
 struct EndpointOutcome {
@@ -1210,6 +1339,7 @@ async fn run_endpoint(mut ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome 
         race,
         race_budget,
         skips,
+        answered,
         tx,
     } = ctx;
     let want = |c: &str| classes.is_empty() || classes.iter().any(|x| x == c);
@@ -1408,13 +1538,29 @@ async fn run_endpoint(mut ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome 
         // Retry before giving up, and when it still fails, say which endpoint
         // was skipped instead of leaving a hole that reads as "nothing here".
         let mut baseline = None;
-        for attempt in 0..3 {
+        // Three attempts while the host is known to be alive, one while it has
+        // never answered anything. The retries are for a live target whose
+        // worker pool is momentarily exhausted, which is a real case and the
+        // reason they exist. They are waste on a target that is down, and the
+        // waste is what turns a pass into hours: every site pays three
+        // timeouts, three escalating sleeps and the pacer's delay on top, so
+        // one endpoint with sixteen sites costs minutes and an endpoint list
+        // costs an afternoon. Measured against a peer that accepts and never
+        // answers: one endpoint, one worker, a one-second timeout, and the pass
+        // had not produced a single outcome after 280 seconds.
+        let attempts = if answered.load(Ordering::Relaxed) {
+            3
+        } else {
+            1
+        };
+        for attempt in 0..attempts {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_millis(500 * attempt)).await;
             }
             if let Some(r) =
                 crate::probe::spent("baseline", send_site(&client, &site, &site.base_value)).await
             {
+                answered.store(true, Ordering::Relaxed);
                 // The site's own value, no payload: this is what "normal" costs
                 // here, and it is what the time-based oracles measure against.
                 crate::probe::observe_latency(&site.url, r.elapsed_ms);
@@ -1430,6 +1576,21 @@ async fn run_endpoint(mut ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome 
         }
         let Some(baseline) = baseline else {
             starved += 1;
+            // Stop walking this endpoint's sites once it is clear the host is
+            // not answering any of them. Sixteen sites each paying a full
+            // timeout is most of what a doomed endpoint costs, and the
+            // remaining twelve cannot say anything the first four did not.
+            // Only while nothing on the host has ever answered: on a live
+            // target a site that does not answer is about that site.
+            if !answered.load(Ordering::Relaxed) && starved >= SITES_BEFORE_GIVING_UP {
+                let _ = tx.send(json!({"type":"log","message": format!(
+                    "stopped testing {} {} after {starved} sites: the host has not answered a \
+                     single baseline request, so the rest of its sites would each cost a \
+                     timeout to learn the same thing.",
+                    ep.method, ep.url
+                )}));
+                break;
+            }
             let n = skips.fetch_add(1, Ordering::Relaxed);
             if n < SKIPS_SPELLED_OUT {
                 let _ = tx.send(json!({
@@ -1699,11 +1860,31 @@ async fn run_endpoint(mut ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome 
 /// POST is absent on purpose. It is the main injection surface and what it
 /// creates is usually recoverable; the other three are not, and for them the
 /// request is the damage rather than a test of it.
-pub(crate) fn destroys_a_resource(method: &str) -> bool {
+/// Methods this engine will send without `test_writes`, and the list is
+/// deliberately the allowlist rather than a denylist of the destructive ones.
+///
+/// It used to be the denylist: DELETE, PUT and PATCH were destructive and
+/// everything else was safe. That was sound only because the request builder
+/// quietly turned every other method into a GET, so an unrecognised verb could
+/// not do anything. Now that the caller's method is actually sent, a denylist
+/// means a WebDAV MOVE, a cache PURGE or any vendor verb is treated as a
+/// read. Inverting it costs nothing real: a method nobody has heard of needs
+/// `test_writes` to be sent, which is the rail the option already states.
+///
+/// QUERY is here because reading with a body is its entire purpose (it is the
+/// safe, cacheable counterpart to a POST-for-search), and it is the only
+/// reason five of xssmaze's endpoints exist. POST is here because it is the
+/// main injection surface and what it creates is usually recoverable, which is
+/// the trade-off `test_writes` documents.
+fn reads_only(method: &str) -> bool {
     matches!(
         method.to_ascii_uppercase().as_str(),
-        "DELETE" | "PUT" | "PATCH"
+        "GET" | "HEAD" | "OPTIONS" | "POST" | "QUERY" | ""
     )
+}
+
+pub(crate) fn destroys_a_resource(method: &str) -> bool {
+    !reads_only(method)
 }
 
 /// a noun. Testing a button can find a real bug, and it can also log the scan
@@ -3193,6 +3374,54 @@ fn redirect_host(loc: &str) -> Option<String> {
 /// Server-side template injection: an arithmetic template expression that evaluates server-side.
 /// Sandwiched in unique markers so the evaluated `49` cannot be a coincidental substring. Covers
 /// Jinja2/Twig `{{ }}`, Freemarker / JSP-EL `${ }`, Ruby `#{ }`, ERB `<%= %>`, and Smarty `{ }`.
+/// A client-side template engine that will compile `{{ }}` in the document.
+///
+/// Script filenames and the directives each engine puts in the markup, so a
+/// page that bundles its framework rather than loading it from a CDN is still
+/// recognised.
+static CLIENT_TEMPLATE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)angular(?:\.min)?\.js|ng-app|ng-controller|vue(?:@[\d.]+|\.min)?\.js|new\s+Vue|createApp|v-html|x-data|x-init",
+    )
+    .unwrap()
+});
+
+/// Where that engine compiles. AngularJS bootstraps at the element carrying
+/// `ng-app`; Vue and Alpine mount at the element they are given, which is
+/// `#app` by convention and in every case measured here.
+static TEMPLATE_SCOPE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)ng-app|ng-controller|id=["']app["']|#app"#).unwrap());
+
+/// Client-side template injection: the expression comes back intact and
+/// something in the page is going to evaluate it.
+///
+/// Costs no extra request. `probe_ssti` has already sent `{{7*7}}` and read
+/// the answer, and the two classes are separated by that one response: an
+/// expression that came back as `49` was evaluated on the server, and an
+/// expression that came back verbatim was not evaluated by anyone *yet*.
+///
+/// Three conditions, and the third is what keeps it honest. The expression has
+/// to survive raw, so the braces and the operator were not encoded. The page
+/// has to load a template engine, so something exists that compiles `{{ }}`.
+/// And the reflection has to sit inside that engine's scope, because an
+/// expression outside the compiled region is inert text.
+///
+/// Measured against all 1040 of xssmaze's server-reaching endpoints: it fires
+/// on 7, every one of them exploitable, and catches all 5 of the cases upstream
+/// labels csti. The other two are a Vue page whose value reaches v-html and a
+/// reflected-html case on a page with a template engine, so both are real and
+/// land in `unmatched` under a neighbouring class rather than against
+/// precision. None of the 27 precision controls fires, which is 1033 correct
+/// refusals.
+fn client_template_will_evaluate(body: &str, at: usize) -> bool {
+    if !CLIENT_TEMPLATE.is_match(body) {
+        return false;
+    }
+    // The scope marker has to come before the reflection, or the value landed
+    // outside the region that gets compiled.
+    TEMPLATE_SCOPE.find(body).is_some_and(|mm| mm.start() < at)
+}
+
 async fn probe_ssti(client: &Client, site: &Site) -> Option<Value> {
     let a = format!("cfxA{}", site.param.len() + 3);
     let b = format!("B{}cfx", site.url.len() % 97);
@@ -3212,6 +3441,32 @@ async fn probe_ssti(client: &Client, site: &Site) -> Option<Value> {
         let Some(r) = send_site(client, site, p).await else {
             continue;
         };
+        // Not evaluated here, and something in the page will evaluate it there.
+        if !r.body.contains(&want) {
+            if let Some(at) = r.body.find(p.as_str()) {
+                if executes_in_browser(&r) && client_template_will_evaluate(&r.body, at) {
+                    let Some(again) = send_site(client, site, p).await else {
+                        continue;
+                    };
+                    if again
+                        .body
+                        .find(p.as_str())
+                        .is_some_and(|a| client_template_will_evaluate(&again.body, a))
+                    {
+                        return Some(finding(
+                            "csti",
+                            "Client-side template injection",
+                            "high",
+                            site,
+                            format!(
+                                "A template expression injected into the {} was reflected into the page with its braces and operator intact, inside the scope of a client-side template engine the page loads. The server did not evaluate it, the browser will: `{p}` reaches the compiler as an expression rather than as text, which executes in the visitor's browser with the same reach as cross-site scripting.",
+                                site.where_label()
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
         if r.body.contains(&want) {
             let Some(again) = send_site(client, site, p).await else {
                 continue;
@@ -3708,10 +3963,441 @@ async fn probe_crlf(client: &Client, site: &Site) -> Option<Value> {
     None
 }
 
+/// Source-list tokens that permit nothing on their own.
+///
+/// `'unsafe-eval'` allows `eval()` but names no place a script may come from,
+/// so a list holding only these admits no script at all. Same for
+/// `'unsafe-hashes'` with no hash beside it, and `'strict-dynamic'`, which
+/// relaxes host matching for scripts already trusted rather than trusting any.
+const CSP_INERT: [&str; 6] = [
+    "'unsafe-eval'",
+    "'unsafe-hashes'",
+    "'strict-dynamic'",
+    "'report-sample'",
+    "'wasm-unsafe-eval'",
+    "'none'",
+];
+
+/// True when the response's CSP permits no script to run at all, so a reflected
+/// payload cannot execute by any route.
+///
+/// Deliberately narrow, and the wider rule was tried and rejected with data.
+/// "CSP has no 'unsafe-inline', therefore an injected event handler cannot
+/// run" is true of the handler and false of the endpoint. Measured against
+/// xssmaze on 2026-10-02 it would have suppressed six exploitable endpoints to
+/// silence four controls, because blocking inline does not block exploitation:
+///
+///   csp-bypass-level2   'nonce-abc123' is fixed, so an injected script can carry it
+///   nonce-level1        the nonce is per-request, but the reflection lands INSIDE
+///                       the nonce'd script, so breaking the JS string runs under it
+///   cspbypass-level6    script-src * blocks inline and allows any external script
+///   modern-bypass-12    the value lands in a quoted <script src>, so it picks the URL
+///
+/// The discriminator is where the reflection lands relative to script the page
+/// already trusts, and this oracle does not measure that: it proves a tag
+/// reflected raw, not the context it reflected into. So the only safe test left
+/// is whether anything can run at all, which catches csp-bypass-level3
+/// (`script-src 'unsafe-eval'`, no source of any kind) and nothing exploitable.
+///
+/// Report-only headers are ignored, because they do not enforce. Several
+/// enforcing headers all apply, so any one of them admitting nothing is enough.
+fn csp_admits_no_script(r: &Resp) -> bool {
+    for (name, value) in &r.headers {
+        if name != "content-security-policy" {
+            continue;
+        }
+        for policy in value.split(',') {
+            // Highest-ranking directive present wins: script-src-elem over
+            // script-src over default-src.
+            let mut best = (0u8, Vec::<String>::new());
+            for directive in policy.split(';') {
+                let mut it = directive.split_whitespace();
+                let Some(key) = it.next() else { continue };
+                let rank = match key.to_ascii_lowercase().as_str() {
+                    "script-src-elem" => 3,
+                    "script-src" => 2,
+                    "default-src" => 1,
+                    _ => continue,
+                };
+                if rank > best.0 {
+                    best = (rank, it.map(|t| t.to_ascii_lowercase()).collect());
+                }
+            }
+            if best.0 == 0 {
+                continue; // nothing here governs script
+            }
+            // Every enforcing policy has to allow a script for it to run, so one
+            // that allows none settles it. Returning false on the first
+            // permissive policy instead was wrong and a test caught it: two
+            // headers, the second dead, and script cannot run.
+            if best.1.iter().all(|t| CSP_INERT.contains(&t.as_str())) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether attacker-controlled bytes in this response can execute in a browser.
+///
+/// Reflected markup only matters if something runs it. xssmaze makes the point
+/// with four endpoints that reflect a payload raw and are still not
+/// vulnerable, because the response is served as `application/json` or
+/// `text/plain`: its own note says reporting XSS there is a false positive.
+/// Measured on 2026-10-02 those four were four of our nine false positives
+/// against its 27 precision controls.
+///
+/// The first version of this asked whether the response is parsed as a
+/// document, and that was the wrong question. It cost four true positives,
+/// all JSONP served as `application/javascript`: nothing parses those as a
+/// document, and they execute anyway in any page that includes the URL with a
+/// script tag, which is exactly what xssmaze's notes on callback-level1 and
+/// json-xss-level1 describe. Script types belong on this list.
+///
+/// A missing or unparseable Content-Type counts as executable. That is the
+/// conservative direction: a browser with nothing to go on may sniff, and a
+/// missed finding is worse here than a reported one.
+fn executes_in_browser(r: &Resp) -> bool {
+    let Some(ct) = r.header("content-type") else {
+        return true;
+    };
+    let ct = ct
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if ct.is_empty() {
+        return true;
+    }
+    // Two ways to execute. Parsed as a document: HTML, XHTML, SVG and XML all
+    // carry script. Loaded as a script: a JSONP response is included with a
+    // script tag and runs, whatever its bytes look like as markup. JSON, plain
+    // text and everything else do neither.
+    matches!(
+        ct.as_str(),
+        "text/html"
+            | "application/xhtml+xml"
+            | "image/svg+xml"
+            | "application/xml"
+            | "text/xml"
+            | "application/javascript"
+            | "text/javascript"
+            | "application/x-javascript"
+            | "application/ecmascript"
+            | "text/ecmascript"
+    )
+}
+
+/// Where a reflected value landed, as far as an HTML parser is concerned.
+///
+/// This is the discriminator the XSS oracle was missing, and the reason a
+/// bare-attribute payload was ruled out rather than written. A string like
+/// `onmouseover=alert(1)` reflects verbatim out of any app that encodes `<`
+/// and `>`, so matching it alone reports every echoed value in an error page.
+/// Asking *where* it landed separates the two: measured against xssmaze, 72
+/// endpoints reflect it outside any start tag and are not findings, and 33
+/// reflect it into a tag's attribute area and are.
+#[derive(Debug, PartialEq, Eq)]
+enum Spot {
+    /// Not inside an element start tag. Text, a comment, an attribute of a tag
+    /// that has already closed: nothing an injected attribute can reach.
+    Elsewhere,
+    /// Inside a start tag with no quote open, so an injected `onX=` is a new
+    /// attribute on that element.
+    Unquoted,
+    /// Inside an attribute value opened by this quote. An injected `onX=` is
+    /// more text in the value and does nothing; closing the quote first is
+    /// what makes it a handler, and a target that encodes the quote has
+    /// nothing to exploit.
+    Quoted(char),
+}
+
+fn attr_spot(body: &str, idx: usize) -> Spot {
+    if idx > body.len() || !body.is_char_boundary(idx) {
+        return Spot::Elsewhere;
+    }
+    let head = &body[..idx];
+    let Some(lt) = head.rfind('<') else {
+        return Spot::Elsewhere;
+    };
+    // A `>` after the last `<` means that tag already closed.
+    if head.rfind('>').is_some_and(|gt| gt > lt) {
+        return Spot::Elsewhere;
+    }
+    // `<` has to open an element, so `<!--`, `</` and a stray `<` in text are
+    // all Elsewhere. An element name starts with an ASCII letter.
+    if !body[lt..]
+        .chars()
+        .nth(1)
+        .is_some_and(|c| c.is_ascii_alphabetic())
+    {
+        return Spot::Elsewhere;
+    }
+    // Track which quote is open, so an inner quote inside a double-quoted
+    // handler is not mistaken for the attribute's own: in
+    // `<div onclick="handle('VALUE` the attribute quote is the double, and
+    // injecting a single one closes the JS string without leaving the value.
+    let mut open: Option<char> = None;
+    for c in body[lt..idx].chars() {
+        match open {
+            None if c == '"' || c == '\'' => open = Some(c),
+            Some(q) if c == q => open = None,
+            _ => {}
+        }
+    }
+    match open {
+        Some(q) => Spot::Quoted(q),
+        None => Spot::Unquoted,
+    }
+}
+
+/// Would a payload reflected into this response actually run in a browser?
+///
+/// Two conditions, and both have cost a false positive in the past. The response has to
+/// be something a browser parses as a document or loads as a script, which is
+/// `executes_in_browser`. And its own Content-Security-Policy has to admit a script
+/// source at all, which is `csp_admits_no_script` inverted.
+///
+/// Extracted because it was written out in five places in three different arrangements,
+/// including two spelled `!(a && !b)`, which clippy flagged and was right to: a negated
+/// conjunction with an inner negation is a sentence nobody reads correctly twice. Naming
+/// it also means the next oracle that needs the question asks it the same way.
+fn runs_in_browser(r: &Resp) -> bool {
+    executes_in_browser(r) && !csp_admits_no_script(r)
+}
+
+/// `needle` in `hay`, ignoring case, without lowercasing a whole response body
+/// unless it has to. The exact check is the common path and allocates nothing;
+/// the fallback only runs where a target transformed what it echoed.
+fn contains_ci(hay: &str, needle: &str) -> bool {
+    hay.contains(needle)
+        || hay
+            .to_ascii_lowercase()
+            .contains(&needle.to_ascii_lowercase())
+}
+
+/// The same page, asked for with nothing injected into it.
+///
+/// Query and fragment stripped, because the whole point is a request that
+/// carries no payload: if the detector comes back from this, it came out of
+/// storage rather than out of the request.
+fn read_back_url(url: &str) -> String {
+    let cut = url.find(['?', '#']).unwrap_or(url.len());
+    url[..cut].to_string()
+}
+
+/// Did the target hand the payload back to us to re-send?
+///
+/// This is the line between stored XSS and self-XSS, and the read-back cannot
+/// see it on its own. The probe client keeps cookies, so an application that
+/// round-trips a value through `Set-Cookie` gets its own payload sent back on
+/// the next request and reflects it, and a read-back that carried no payload
+/// in its URL has carried one in its headers. Nothing is stored on the server
+/// and nobody but the tester is affected: an attacker cannot set a victim's
+/// cookie by asking for a page.
+///
+/// xssmaze's realworld_input-level6 is the case, and its own note says so:
+/// "the lang parameter reflects on the same request and is also stored in a
+/// cookie that reflects on later requests". It was being reported as stored,
+/// which is a more severe class than the truth and the kind of thing a
+/// customer would rightly bounce.
+///
+/// The marker rather than the whole detector, because the cookie carries the
+/// value whether or not the tag survived the round trip intact.
+fn sets_cookie_with(r: &Resp, needle: &str) -> bool {
+    r.headers
+        .iter()
+        .any(|(k, v)| k == "set-cookie" && contains_ci(v, needle))
+}
+
+/// Is a read-back worth a request on this site?
+///
+/// A form body is the obvious place a payload gets stored, and it was the
+/// only place this asked. That was an assumption about applications rather
+/// than about the protocol: OWASP VulnerableApp's PersistentXSSInHTMLTag
+/// levels store the value of a `comment` *query* parameter and serve the
+/// accumulated store to everyone, which is stored XSS delivered by a GET.
+///
+/// Header and path sites are left out. Neither is a place an application
+/// collects content from a user, so the read-back would be a request spent on
+/// every endpoint in a pass to cover a shape nothing has.
+fn stores_from_here(site: &Site) -> bool {
+    matches!(site.loc, Loc::BodyForm | Loc::BodyJson | Loc::Query)
+}
+
+/// Did the payload survive into a request that did not carry it?
+///
+/// Two bare GETs, both of which have to show the detector. One would be
+/// enough to prove it came back; two also prove it stayed, which is the
+/// difference between a stored payload and a server that echoed the last
+/// thing it saw to whoever asked next.
+async fn persisted(client: &Client, read_url: &str, detector: &str, marker: &str) -> bool {
+    for _ in 0..2 {
+        let Some(r) = probe::send(client, "GET", read_url, None).await else {
+            return false;
+        };
+        // A read-back that is handed the value again is reading our own state
+        // back, whichever request set it.
+        if sets_cookie_with(&r, marker) {
+            return false;
+        }
+        if !runs_in_browser(&r) || !contains_ci(&r.body, detector) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Reflected XSS where the filter runs before the app's own decoding.
+///
+/// An app that checks for `<` and then URL-decodes the value has checked the
+/// wrong string. Sending the payload one encoding layer up steps over the
+/// check: `%253C` passes a `<` test and arrives at the sink as `%3C`, which
+/// the app decodes to `<`. Same for a parameter the app base64-decodes, where
+/// a raw payload never reaches the sink at all and the app answers a fixed
+/// error.
+///
+/// Nothing about the oracle changes. Only the wire encoding of the payload
+/// moves; the detector is still the whole tag back raw in the response, so a
+/// target that encodes `<` on the way out cannot produce it.
+///
+/// Two payloads and three layers, and it runs only where the marker reflected
+/// and every payload came back filtered, which is the one place the requests
+/// are worth spending. Measured against xssmaze: 3 endpoints want base64, 3
+/// want a second URL layer and 1 wants a third.
+async fn probe_xss_encoded(
+    client: &Client,
+    site: &Site,
+    cases: &[(&str, String, String)],
+) -> Option<Value> {
+    use base64::Engine as _;
+    for (ctx, payload, detector) in cases.iter().take(2) {
+        let once = probe::pct_encode(payload);
+        let layers = [
+            ("a second URL-encoding layer", once.clone()),
+            ("a third URL-encoding layer", probe::pct_encode(&once)),
+            (
+                "base64",
+                base64::engine::general_purpose::STANDARD.encode(payload),
+            ),
+        ];
+        for (how, wire) in layers {
+            let Some(r) = send_site(client, site, &wire).await else {
+                continue;
+            };
+            if !runs_in_browser(&r) || !contains_ci(&r.body, detector) {
+                continue;
+            }
+            let again = send_site(client, site, &wire).await;
+            if !again
+                .map(|x| contains_ci(&x.body, detector))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            return Some(finding(
+                "xss",
+                "Reflected cross-site scripting (XSS)",
+                "high",
+                site,
+                format!(
+                    "A payload injected into the {} was rejected as sent and accepted through {}: `{}` appears raw and unescaped in the {} response. The filter runs before the application's own decoding, so it inspects a string the sink never sees.",
+                    site.where_label(),
+                    how,
+                    detector,
+                    ctx
+                ),
+            ));
+        }
+    }
+    None
+}
+
+/// Reflected XSS where `<` is unavailable but the value lands inside a tag.
+///
+/// Tried only after every tag payload has failed, so it costs one request on
+/// the endpoints that need it and none anywhere else. This is the whole
+/// inattr, charlimit, encodingedge and sanitizer-edge shape: angle brackets
+/// stripped or encoded, quotes left alone, the value sitting in
+/// `<input value="HERE">`. No tag can be opened and the endpoint is still
+/// exploitable, which is why 33 of them read as detection failures.
+///
+/// Sound for the same reason the tag payloads are. There, the app's encoding
+/// of `<` and `>` is the discriminator. Here it is the app's encoding of the
+/// attribute's own quote, plus the position: the detector has to come back
+/// inside a start tag with no quote still open, which is the definition of a
+/// new attribute on that element. An app that encodes `"` cannot produce it,
+/// and 3 of xssmaze's endpoints do exactly that and are correctly silent.
+async fn probe_xss_attribute(
+    client: &Client,
+    site: &Site,
+    marker: &str,
+    plain: &Resp,
+) -> Option<Value> {
+    if !runs_in_browser(plain) {
+        return None;
+    }
+    // Where the plain marker landed, which is where a payload will land. Free:
+    // this is the baseline response the caller already has.
+    let idx = plain.body.find(marker)?;
+    // `onmouseover` needs a mouse, and that is a property of this payload
+    // rather than of the bug. A handler attribute on an attacker-controlled
+    // element is the finding; which event fires it is the report's problem.
+    let (payload, detector, ctx) = match attr_spot(&plain.body, idx) {
+        Spot::Elsewhere => return None,
+        Spot::Unquoted => (
+            format!("{marker} onmouseover=alert({marker}) x"),
+            format!(" onmouseover=alert({marker})"),
+            "an unquoted attribute slot",
+        ),
+        Spot::Quoted(q) => (
+            format!("{marker}{q} onmouseover=alert({marker}) x"),
+            format!("{q} onmouseover=alert({marker})"),
+            "a quoted attribute value",
+        ),
+    };
+
+    let landed = |body: &str| -> bool {
+        body.find(detector.as_str())
+            // One past the detector's first character, which for the quoted
+            // case is the quote that closes the value. Outside it, the slot is
+            // the tag's attribute area or this is not a handler.
+            .is_some_and(|j| attr_spot(body, j + 1) == Spot::Unquoted)
+    };
+
+    let r = send_site(client, site, &payload).await?;
+    if !runs_in_browser(&r) || !landed(&r.body) {
+        return None;
+    }
+    let again = send_site(client, site, &payload).await?;
+    if !landed(&again.body) {
+        return None;
+    }
+    Some(finding(
+        "xss",
+        "Reflected cross-site scripting (XSS)",
+        "high",
+        site,
+        format!(
+            "A payload injected into the {} was reflected into {} with the quoting intact (`{}` appears raw), so it closes out of the value and becomes an event-handler attribute on that element. No `<` is needed: the tag is already there and the injected value adds an attribute to it.",
+            site.where_label(),
+            ctx,
+            detector.trim()
+        ),
+    ))
+}
+
 async fn probe_xss(client: &Client, site: &Site) -> Option<Value> {
     let marker = format!("cfx{}z{}", site.url.len(), site.param.len());
     let plain = send_site(client, site, &marker).await?;
-    if !plain.body.contains(&marker) {
+    // Case-insensitively, because a target that upper-cases, title-cases or
+    // swaps the case of what it echoes is still echoing it. This check is the
+    // gate on sending any payload at all, so an exact match here abandoned the
+    // whole probe before it started: xssmaze's casemanip family and
+    // encodingedge-level4 reflect every payload raw and were never sent one.
+    // The marker is lowercase with digits, so lowercasing the body is enough.
+    if !contains_ci(&plain.body, &marker) {
         return None; // not reflected at all
     }
     // SOUND oracle: every payload injects a full HTML TAG carrying an event handler, and the detector
@@ -3723,7 +4409,34 @@ async fn probe_xss(client: &Client, site: &Site) -> Option<Value> {
     // verbatim and produced a FALSE POSITIVE; requiring the intact `<tag ...>` makes the app's encoding
     // of `<`/`>` the discriminator, which is exactly what determines exploitability.
     let m = &marker;
-    let cases: [(&str, String, String); 3] = [
+    // Five payloads, all of which require the WHOLE tag back intact, which is
+    // what keeps the oracle sound. The fourth is the same breakout in mixed
+    // case, because a filter that pattern-matches `<img`, `<svg` or `<script`
+    // in lowercase is common and cheap to write, and nothing in the first three
+    // gets past it. VulnerableApp's XSSWithHtmlTagInjection level 2 is exactly
+    // that: `<svg onload=...>` and `<script>` come back empty, and
+    // `<ImG SrC=x OnErRoR=...>` comes back raw inside the div.
+    //
+    // Seven in total, and the last three were each chosen by measuring the
+    // marginal gain of a candidate rather than by picking well-known payloads.
+    // Sixteen candidates were tried against the endpoints the first four
+    // missed, including the usual marquee, autofocus, audio, nested-tag and
+    // context-break shapes; fourteen of them recovered nothing the other two
+    // did not already cover. Adding all sixteen would have been sixteen extra
+    // requests per site for the benefit of two payloads.
+    //
+    // The fifth is a plain `<script>`, and it is last because it only costs a
+    // request where all four others already failed. Every one of the first four
+    // carries an event handler on a non-script tag, so a filter that strips
+    // handler attributes by name, or denies `img` and `svg` by tag name, takes
+    // all four and leaves `<script>` untouched. Measured on xssmaze: 23
+    // endpoints reflect `<script>alert(...)</script>` raw while none of the
+    // first four come back intact, including the whole attrname, mutfilter,
+    // obfuscation, payloadfilt and whitespace families. The detector is the
+    // same shape as the others, the opening tag and the closing tag back raw,
+    // so it holds the oracle's line: a target that encodes `<` or `>` cannot
+    // produce it.
+    let cases: [(&str, String, String); 7] = [
         (
             "HTML",
             format!("{m}\"'><img src=x onerror=alert({m})>"),
@@ -3739,15 +4452,99 @@ async fn probe_xss(client: &Client, site: &Site) -> Option<Value> {
             format!("{m}</script><svg onload=alert({m})>"),
             format!("</script><svg onload=alert({m})>"),
         ),
+        (
+            "HTML",
+            format!("{m}\"'><ImG SrC=x OnErRoR=alert({m})>"),
+            format!("<ImG SrC=x OnErRoR=alert({m})>"),
+        ),
+        (
+            "HTML",
+            format!("{m}\"'><script>alert({m})</script>"),
+            format!("<script>alert({m})</script>"),
+        ),
+        // Entity-encoded parentheses, for a filter that strips `(` and `)` and
+        // leaves everything else. A browser decodes entities in an attribute
+        // value before the handler is compiled, so this runs exactly as the
+        // literal form would, and the detector still needs the whole tag back.
+        (
+            "HTML",
+            format!("{m}\"'><img src=x onerror=alert&lpar;{m}&rpar;>"),
+            format!("<img src=x onerror=alert&lpar;{m}&rpar;>"),
+        ),
+        // An unlisted handler on a tag that fires it without the user doing
+        // anything. `open` makes `ontoggle` run on parse, which matters: a
+        // payload needing a click is a weaker finding, and that is why this is
+        // `details` rather than any of the dozen other spare handlers.
+        (
+            "HTML",
+            format!("{m}\"'><details open ontoggle=alert({m})>"),
+            format!("<details open ontoggle=alert({m})>"),
+        ),
     ];
+    // Set by any payload whose value the application handed back in a cookie.
+    // Once that has happened the read-back is carrying the payload itself and
+    // cannot say anything about the server's own state.
+    let mut cookie_echo = false;
     for (ctx, payload, detector) in &cases {
         let r = send_site(client, site, payload).await;
-        if r.map(|x| x.body.contains(detector.as_str()))
-            .unwrap_or(false)
-        {
+        if r.as_ref().is_some_and(|x| sets_cookie_with(x, m)) {
+            cookie_echo = true;
+        }
+        // Case-insensitive on purpose, and it does not weaken the oracle. What
+        // makes the detector sound is that `<`, `>`, the tag name and the
+        // handler all come back raw, and HTML tag and attribute names are
+        // case-insensitive, so `<IMG SRC=X ONERROR=...>` is parsed as a tag
+        // exactly as the lowercase form is. A target that encodes `<` or `>`
+        // still cannot produce either.
+        //
+        // What the case does change is whether this particular payload's
+        // JavaScript would run, since `ALERT` is not `alert`. The finding is
+        // that markup injection is possible, which is true and is what the
+        // report says; xssmaze's own answer for casemanip-level3 is to send
+        // the payload upper-cased so the target's swap produces lowercase.
+        let reflected = r
+            .as_ref()
+            .map(|x| contains_ci(&x.body, detector.as_str()))
+            .unwrap_or(false);
+        // A tag that reflects raw into a response nothing parses as a document
+        // is not an XSS. Checked here rather than before the payloads, because
+        // the content type of the reflecting response is the one that matters
+        // and an endpoint can answer differently under injection.
+        let runnable = r.as_ref().is_some_and(runs_in_browser);
+        if reflected && runnable {
+            // The same observation is two different findings. A detector in
+            // the response to the request that carried it is reflected XSS;
+            // the same detector coming back from a request that carried
+            // nothing is stored, which is worse and is what the report should
+            // say. So ask about persistence before settling for reflected.
+            //
+            // Nothing extra is written to get this. Every payload has already
+            // gone to the body site by the time this runs, so whatever a POST
+            // stores is stored either way: the only thing that was missing is
+            // reading it back. xssmaze's stored-level1 is exactly the case
+            // that hid behind this, because its POST response re-renders the
+            // whole list and the reflection is visible without a follow-up
+            // GET, so the reflected branch answered first every time.
+            if stores_from_here(site) && !cookie_echo {
+                let read = read_back_url(&site.url);
+                if persisted(client, &read, detector, m).await {
+                    return Some(finding(
+                        "xss_stored",
+                        "Stored cross-site scripting (XSS)",
+                        "critical",
+                        site,
+                        format!(
+                            "A payload injected into the {} was stored and served back on a plain GET of {} that carried no payload at all, with `{}` raw and unescaped. Two separate requests returned it, so it is persisted rather than echoed, and it reaches every visitor to that page rather than only someone following a crafted link.",
+                            site.where_label(),
+                            read,
+                            detector
+                        ),
+                    ));
+                }
+            }
             let again = send_site(client, site, payload).await;
             if again
-                .map(|x| x.body.contains(detector.as_str()))
+                .map(|x| contains_ci(&x.body, detector.as_str()))
                 .unwrap_or(false)
             {
                 return Some(finding(
@@ -3759,6 +4556,38 @@ async fn probe_xss(client: &Client, site: &Site) -> Option<Value> {
                         "A payload injected into the {} was reflected into the {} response with `<`, `>` and the tag intact (`{}` appears raw and unescaped), so the injected markup executes in the victim's browser.",
                         site.where_label(),
                         ctx,
+                        detector
+                    ),
+                ));
+            }
+        }
+    }
+    // Every tag payload failed, so either the app encodes `<` or it filters
+    // tag names. If the value sits inside a tag, it can still carry a handler.
+    if let Some(f) = probe_xss_attribute(client, site, m, &plain).await {
+        return Some(f);
+    }
+    // Or the filter saw a string the sink never sees.
+    if let Some(f) = probe_xss_encoded(client, site, &cases).await {
+        return Some(f);
+    }
+    // Or nothing came back in the write response and the payload is sitting on
+    // the page anyway. An application that answers a POST with a redirect or a
+    // bare 201 shows nothing at the point of injection, which is the common
+    // shape for a real form and the one a reflected-only oracle cannot see.
+    if stores_from_here(site) && !cookie_echo {
+        let read = read_back_url(&site.url);
+        for (_ctx, _payload, detector) in &cases {
+            if persisted(client, &read, detector, m).await {
+                return Some(finding(
+                    "xss_stored",
+                    "Stored cross-site scripting (XSS)",
+                    "critical",
+                    site,
+                    format!(
+                        "A payload injected into the {} produced nothing in the response to that request, and came back on a plain GET of {} carrying no payload, with `{}` raw and unescaped. Two separate requests returned it, so it is persisted and reaches every visitor to that page.",
+                        site.where_label(),
+                        read,
                         detector
                     ),
                 ));
@@ -4116,6 +4945,31 @@ fn boolean_differential(baseline: &Resp, t: &Resp, f: &Resp, min_diff: i64) -> b
     if !(200..500).contains(&t.status) || !(200..500).contains(&f.status) {
         return false;
     }
+    // Exact-match path, for the endpoint that answers in one word.
+    //
+    // The length test below cannot see a JSON API. VulnerableApp's blind level 1
+    // answers `{ "isCarPresent": true}` to a true clause and `false` to a false
+    // one, which is a one-byte split against a floor of sixteen, so a textbook
+    // boolean-based blind injection was invisible. That is the modern shape of
+    // this bug, not the exception.
+    //
+    // Sound because it asks for more than a difference. Exactly one side must be
+    // byte-identical to the baseline, which excludes the three ways a
+    // non-injectable endpoint can differ: one that echoes the payload has
+    // neither side matching, one that ignores the parameter has both matching,
+    // and one that rejects both has the two sides equal to each other. The
+    // statuses must agree too, so a filter that blocks `1=2` and allows `1=1`
+    // shows up as the status change it is rather than as an oracle. On top of
+    // that the caller re-tests the split and runs `inert_splits_the_same_way`,
+    // which is what actually guards this: two inert values of the same length
+    // that split the same way mean the endpoint is the cause, not the injection.
+    if t.body != f.body && t.status == f.status {
+        let t_is_base = t.body == baseline.body;
+        let f_is_base = f.body == baseline.body;
+        if t_is_base != f_is_base {
+            return true;
+        }
+    }
     let lb = baseline.body.len() as i64;
     let (lt, lf) = (t.body.len() as i64, f.body.len() as i64);
     let diff = (lt - lf).abs();
@@ -4282,6 +5136,167 @@ mod scope_tests {
 }
 
 #[cfg(test)]
+mod boolean_oracle_tests {
+    use super::*;
+
+    fn r(status: u16, body: &str) -> Resp {
+        Resp {
+            status,
+            body: body.to_string(),
+            elapsed_ms: 0,
+            location: None,
+            headers: Vec::new(),
+        }
+    }
+
+    /// The case that was invisible: a one-byte split on a JSON API.
+    #[test]
+    fn a_json_api_answering_true_or_false_is_an_oracle() {
+        let base = r(200, "{ \"isCarPresent\": true}");
+        let t = r(200, "{ \"isCarPresent\": true}");
+        let f = r(200, "{ \"isCarPresent\": false}");
+        assert!(boolean_differential(&base, &t, &f, 24));
+    }
+
+    /// The three ways a non-injectable endpoint differs, all excluded.
+    #[test]
+    fn an_endpoint_that_echoes_the_payload_is_not_an_oracle() {
+        // Neither side matches the baseline, because both carry their payload.
+        let base = r(200, "you searched for: 1");
+        let t = r(200, "you searched for: 1 AND 1=1");
+        let f = r(200, "you searched for: 1 AND 1=2");
+        assert!(!boolean_differential(&base, &t, &f, 24));
+    }
+
+    #[test]
+    fn an_endpoint_that_ignores_the_parameter_is_not_an_oracle() {
+        let base = r(200, "{ \"isCarPresent\": true}");
+        let t = r(200, "{ \"isCarPresent\": true}");
+        let f = r(200, "{ \"isCarPresent\": true}");
+        assert!(!boolean_differential(&base, &t, &f, 24));
+    }
+
+    #[test]
+    fn an_endpoint_that_rejects_both_is_not_an_oracle() {
+        let base = r(200, "{ \"isCarPresent\": true}");
+        let t = r(200, "{ \"error\": \"id must be numeric\"}");
+        let f = r(200, "{ \"error\": \"id must be numeric\"}");
+        assert!(!boolean_differential(&base, &t, &f, 24));
+    }
+
+    /// A filter that blocks one clause and allows the other changes the status,
+    /// which is what it is, and must not read as an oracle.
+    #[test]
+    fn a_filter_blocking_one_clause_is_not_an_oracle() {
+        let base = r(200, "{ \"isCarPresent\": true}");
+        let t = r(200, "{ \"isCarPresent\": true}");
+        let f = r(403, "blocked");
+        assert!(!boolean_differential(&base, &t, &f, 24));
+    }
+
+    /// The length path still works where it always did, and still refuses a
+    /// difference below the floor when neither side matches the baseline.
+    #[test]
+    fn the_length_path_is_unchanged() {
+        let base = r(200, &"x".repeat(900));
+        let t = r(200, &"x".repeat(900));
+        let f = r(200, &"x".repeat(200));
+        assert!(boolean_differential(&base, &t, &f, 24));
+
+        let b2 = r(200, &"x".repeat(900));
+        let t2 = r(200, &format!("{}y", "x".repeat(895)));
+        let f2 = r(200, &format!("{}z", "x".repeat(896)));
+        assert!(!boolean_differential(&b2, &t2, &f2, 24));
+    }
+}
+
+#[cfg(test)]
+mod csp_tests {
+    use super::*;
+
+    fn resp_with(headers: &[(&str, &str)]) -> Resp {
+        Resp {
+            status: 200,
+            body: String::new(),
+            elapsed_ms: 0,
+            location: None,
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    /// Every policy below is one xssmaze actually serves, with the verdict its
+    /// own notes give. The four `admits_nothing` cases are the only ones this
+    /// may suppress; everything else is exploitable and must survive.
+    #[test]
+    fn only_a_policy_that_can_run_nothing_suppresses() {
+        // csp-bypass-level3: a source list with no source in it.
+        assert!(csp_admits_no_script(&resp_with(&[(
+            "content-security-policy",
+            "default-src 'self'; script-src 'unsafe-eval'"
+        )])));
+
+        // Exploitable, and all of these would be lost by a broader rule.
+        for policy in [
+            "default-src 'self'; script-src 'nonce-abc123'", // fixed nonce
+            "default-src 'self'; script-src *",              // any external script
+            "default-src 'self'; script-src 'self' https://ajax.googleapis.com",
+            "script-src 'nonce-110cf35c283b5f8f25347a079160d0d2'",
+            "script-src 'self'",
+            "default-src 'self'; script-src 'unsafe-inline'",
+            "require-trusted-types-for 'script'; trusted-types default",
+        ] {
+            assert!(
+                !csp_admits_no_script(&resp_with(&[("content-security-policy", policy)])),
+                "wrongly suppressed: {policy}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_policy_suppresses_nothing() {
+        assert!(!csp_admits_no_script(&resp_with(&[])));
+        assert!(!csp_admits_no_script(&resp_with(&[(
+            "content-type",
+            "text/html"
+        )])));
+    }
+
+    #[test]
+    fn report_only_does_not_enforce() {
+        // It reports and permits, so it can never be grounds for suppressing.
+        assert!(!csp_admits_no_script(&resp_with(&[(
+            "content-security-policy-report-only",
+            "script-src 'unsafe-eval'"
+        )])));
+    }
+
+    #[test]
+    fn script_src_wins_over_default_src() {
+        // default-src would admit nothing, script-src admits 'self'.
+        assert!(!csp_admits_no_script(&resp_with(&[(
+            "content-security-policy",
+            "default-src 'none'; script-src 'self'"
+        )])));
+        // The other way round: default-src is permissive, script-src is dead.
+        assert!(csp_admits_no_script(&resp_with(&[(
+            "content-security-policy",
+            "default-src 'self'; script-src 'none'"
+        )])));
+    }
+
+    #[test]
+    fn any_one_enforcing_header_admitting_nothing_is_enough() {
+        assert!(csp_admits_no_script(&resp_with(&[
+            ("content-security-policy", "script-src 'self'"),
+            ("content-security-policy", "script-src 'none'"),
+        ])));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -4382,8 +5397,279 @@ mod hint_tests {
         // POST stays. It is the main injection surface, forms and search and
         // login, and what it creates is usually recoverable. Gating it would
         // trade most of this engine's value for safety it does not need.
-        for m in ["GET", "POST", "HEAD", "OPTIONS", "post"] {
+        // QUERY stays because reading with a body is the whole point of it.
+        for m in ["GET", "POST", "HEAD", "OPTIONS", "QUERY", "post", "query"] {
             assert!(!destroys_a_resource(m), "{m} must still be tested");
+        }
+    }
+
+    fn resp_with(ct: Option<&str>) -> Resp {
+        Resp {
+            status: 200,
+            body: "<img src=x onerror=alert(1)>".to_string(),
+            elapsed_ms: 1,
+            location: None,
+            headers: ct
+                .map(|v| vec![("content-type".to_string(), v.to_string())])
+                .unwrap_or_default(),
+        }
+    }
+
+    #[test]
+    fn a_value_handed_back_in_a_cookie_is_not_stored() {
+        let with = |hs: Vec<(&str, &str)>| Resp {
+            status: 200,
+            body: String::new(),
+            elapsed_ms: 1,
+            location: None,
+            headers: hs
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        };
+        // The shape that was being reported as stored XSS: the application
+        // puts the value in a cookie and the client sends it back.
+        assert!(sets_cookie_with(
+            &with(vec![(
+                "set-cookie",
+                "lang=cfx12z5'><img src=x onerror=alert(cfx12z5)>; path=/"
+            )]),
+            "cfx12z5"
+        ));
+        // Case does not matter; a target may normalise what it stores.
+        assert!(sets_cookie_with(
+            &with(vec![("set-cookie", "L=CFX12Z5")]),
+            "cfx12z5"
+        ));
+        // A cookie that carries something else is not our footprint.
+        assert!(!sets_cookie_with(
+            &with(vec![("set-cookie", "session=abc123; HttpOnly")]),
+            "cfx12z5"
+        ));
+        // Nor is the marker appearing anywhere other than a Set-Cookie: in the
+        // body it is the finding.
+        assert!(!sets_cookie_with(
+            &with(vec![("content-type", "text/html"), ("x-echo", "cfx12z5")]),
+            "cfx12z5"
+        ));
+        assert!(!sets_cookie_with(&with(vec![]), "cfx12z5"));
+    }
+
+    #[test]
+    fn the_cap_falls_on_endpoints_with_nowhere_to_inject() {
+        // The ordering that decides what a truncated pass actually tests.
+        // mach's crawl of xssmaze returns 2328 endpoints and 1259 of them carry
+        // no parameter, so in discovery order half of a 300-endpoint budget
+        // went on endpoints with no injection surface.
+        let ep = |url: &str, params: Vec<&str>, body: Vec<&str>| InjEndpoint {
+            method: "GET".into(),
+            url: url.into(),
+            params: params.into_iter().map(String::from).collect(),
+            body: body
+                .into_iter()
+                .map(|n| BodyField {
+                    name: n.into(),
+                    value: "1".into(),
+                    ty: None,
+                })
+                .collect(),
+            body_type: "form".into(),
+            path_params: Vec::new(),
+        };
+        let injectable = |e: &InjEndpoint| {
+            !e.params.is_empty()
+                || !e.body.is_empty()
+                || !e.path_params.is_empty()
+                || !query_param_names(&e.url).is_empty()
+        };
+        // A declared param, a body field, and a param already in the URL all
+        // count. A bare path does not.
+        assert!(injectable(&ep("http://h/a", vec!["q"], vec![])));
+        assert!(injectable(&ep("http://h/a", vec![], vec!["note"])));
+        assert!(injectable(&ep("http://h/a?q=1", vec![], vec![])));
+        assert!(!injectable(&ep("http://h/a", vec![], vec![])));
+        assert!(!injectable(&ep("http://h/a#frag", vec![], vec![])));
+
+        let mut list = vec![
+            ep("http://h/bare1", vec![], vec![]),
+            ep("http://h/q?x=1", vec![], vec![]),
+            ep("http://h/bare2", vec![], vec![]),
+            ep("http://h/p", vec!["id"], vec![]),
+            ep("http://h/bare3", vec![], vec![]),
+        ];
+        list.sort_by_key(|e| !injectable(e));
+        let urls: Vec<&str> = list.iter().map(|e| e.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec![
+                "http://h/q?x=1",
+                "http://h/p",
+                "http://h/bare1",
+                "http://h/bare2",
+                "http://h/bare3"
+            ],
+            "injectable first, and stable within each group so a caller that \
+             ordered its list on purpose keeps that order"
+        );
+    }
+
+    #[test]
+    fn a_read_back_request_carries_nothing() {
+        // The oracle for stored XSS is a request with no payload in it, so the
+        // query has to go. Leaving it on would ask the endpoint to reflect the
+        // payload again and call the answer storage.
+        for (url, want) in [
+            ("http://h/x/", "http://h/x/"),
+            ("http://h/x/?q=%3Cimg%3E", "http://h/x/"),
+            ("http://h/x/?a=1&b=2", "http://h/x/"),
+            ("http://h/x#frag", "http://h/x"),
+            ("http://h/x/?q=1#frag", "http://h/x/"),
+            ("http://h", "http://h"),
+        ] {
+            assert_eq!(read_back_url(url), want, "{url}");
+        }
+    }
+
+    #[test]
+    fn where_a_reflection_landed_decides_whether_it_is_a_handler() {
+        let at = |hay: &str| {
+            let i = hay.find("HERE").expect("marker");
+            attr_spot(hay, i)
+        };
+        // Not in a tag. These are the ones a bare `onmouseover=` payload
+        // reports without the position check, and 72 of xssmaze's endpoints
+        // are this shape: an echoed value in text.
+        for hay in [
+            "<div>HERE</div>",
+            "<p class=\"a\">x</p> HERE",
+            "plain HERE text",
+            "<!-- HERE -->",
+            "</div HERE",
+            "<3 HERE",
+            "HERE",
+        ] {
+            assert_eq!(at(hay), Spot::Elsewhere, "{hay}");
+        }
+        // In the attribute area with nothing open: an injected onX= is a new
+        // attribute on that element.
+        for hay in [
+            "<div HERE>",
+            "<input type=text HERE >",
+            "<a href=/x HERE",
+            "<img src=a alt=b HERE",
+            // A closed value before the slot leaves nothing open.
+            "<div class=\"a\" HERE>",
+            "<div class='a' HERE>",
+        ] {
+            assert_eq!(at(hay), Spot::Unquoted, "{hay}");
+        }
+        // Inside a value: an injected onX= is more text in the value, and the
+        // quote has to be closed first.
+        assert_eq!(at("<input value=\"HERE\">"), Spot::Quoted('"'));
+        assert_eq!(at("<div class='HERE'>"), Spot::Quoted('\''));
+        assert_eq!(at("<meta content=\"a HERE b\">"), Spot::Quoted('"'));
+        // The attribute's own quote, not an inner one. In
+        // `<div onclick="handle('HERE` a single quote closes the JS string and
+        // leaves the value, so the attribute quote is the double. xssmaze's
+        // edge-level4 and scriptgadget-level5 are exactly this.
+        assert_eq!(at("<div onclick=\"handle('HERE')\">"), Spot::Quoted('"'));
+        assert_eq!(at("<div onclick='handle(\"HERE\")'>"), Spot::Quoted('\''));
+        // A multi-byte character before the slot must not panic or shift the
+        // answer, since the walk is over bytes.
+        assert_eq!(at("<div title=\"café HERE\">"), Spot::Quoted('"'));
+        assert_eq!(at("<div>café HERE</div>"), Spot::Elsewhere);
+        // An index that is not a character boundary, or past the end, is not a
+        // position in a tag.
+        assert_eq!(attr_spot("<div title=\"é\">", 13), Spot::Elsewhere);
+        assert_eq!(attr_spot("<div ", 99), Spot::Elsewhere);
+    }
+
+    #[test]
+    fn only_a_response_something_runs_is_an_xss() {
+        // Two ways to execute: parsed as a document, or loaded as a script.
+        for ct in [
+            "text/html",
+            "text/html;charset=UTF-8",
+            "TEXT/HTML; charset=utf-8",
+            "application/xhtml+xml",
+            "image/svg+xml",
+            "application/xml",
+            "text/xml",
+            // JSONP: included with a script tag and run, whatever its bytes
+            // look like as markup. Suppressing these cost four true positives.
+            "application/javascript",
+            "text/javascript",
+        ] {
+            assert!(executes_in_browser(&resp_with(Some(ct))), "{ct} executes");
+        }
+        // A tag reflected raw into something nothing parses as a document is
+        // not an XSS. xssmaze's bugbounty-level10 is exactly this and is a
+        // precision control: an HTML body served as application/json.
+        for ct in [
+            "application/json",
+            "text/plain",
+            "text/plain;charset=UTF-8",
+            "text/csv",
+            "application/pdf",
+            "image/png",
+            "application/octet-stream",
+        ] {
+            assert!(!executes_in_browser(&resp_with(Some(ct))), "{ct} does not");
+        }
+        // No content type, or an empty one, means the browser sniffs it, and
+        // it sniffs an HTML body as HTML. Permissive on purpose.
+        assert!(executes_in_browser(&resp_with(None)));
+        assert!(executes_in_browser(&resp_with(Some(""))));
+    }
+
+    #[test]
+    fn the_accept_header_decides_what_the_content_type_is() {
+        // Not a test of our code, a note about why it has to send a browser's
+        // Accept header, kept next to the gate it would otherwise defeat.
+        //
+        // VulnerableApp's ErrorBasedSQLInjection levels answer the same
+        // request with text/plain to a bare client and text/html to a browser,
+        // and they reflect the payload raw either way. Asked without an Accept
+        // header, all four look like a non-executing reflection and are
+        // suppressed; asked the way a victim's browser asks, all four are a
+        // live XSS. The content type is a property of the request, so the
+        // oracle has to ask the question a victim would ask.
+        //
+        // A hand check with curl said these four were false positives. They
+        // are not, and this is the test that would have said so first.
+        let plain = resp_with(Some("text/plain;charset=UTF-8"));
+        let html = resp_with(Some("text/html;charset=UTF-8"));
+        assert!(!executes_in_browser(&plain));
+        assert!(executes_in_browser(&html));
+    }
+
+    #[test]
+    fn a_method_nobody_named_needs_asking_first() {
+        // This is an allowlist, not a denylist of the three destructive verbs,
+        // and the distinction only started to matter when the request builder
+        // stopped turning every unrecognised method into a GET. While it did,
+        // a denylist was safe by accident: a verb nobody had listed could not
+        // reach the target as itself. Now it can, so anything outside the
+        // read-only set waits for `test_writes`.
+        // Six WebDAV verbs, one cache verb that drops objects, and three vendor
+        // verbs seen in the wild. Named in a sentence rather than in trailing
+        // comments because rustfmt breaks a commented array one item per line.
+        for m in [
+            "MOVE",
+            "COPY",
+            "LOCK",
+            "UNLOCK",
+            "MKCOL",
+            "PROPPATCH",
+            "PURGE",
+            "WIPE",
+            "RESET",
+            "TRUNCATE",
+        ] {
+            assert!(
+                destroys_a_resource(m),
+                "{m} is not a method we know is a read, so it needs asking"
+            );
         }
     }
 

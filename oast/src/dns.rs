@@ -6,8 +6,8 @@
 //! The parser is deliberately small and bounds-checked; any malformed packet is
 //! dropped without a response rather than trusted.
 
-use crate::store::{now_unix, Interaction, Store};
 use crate::Config;
+use crate::store::{Interaction, Store, now_unix};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 

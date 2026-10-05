@@ -603,6 +603,7 @@ version = "0.0.1"
 dependencies = [
  "brotli",
  "bytes",
+ "cfx_scope",
  "flate2",
  "http-body-util",
  "hyper",
@@ -631,6 +632,7 @@ dependencies = [
  "dguard",
  "dialoguer 0.12.0",
  "dirs 6.0.0",
+ "ed25519-dalek",
  "futures-util",
  "http-body-util",
  "hyper",
@@ -673,6 +675,65 @@ dependencies = [
  "reqwest 0.12.28",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "cfx_project"
+version = "0.0.1"
+dependencies = [
+ "cfx_capture",
+ "cfx_scope",
+ "log",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
+name = "cfx_scope"
+version = "0.0.1"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "cfx_session"
+version = "0.0.1"
+dependencies = [
+ "bytes",
+ "cfx_capture",
+ "cfx_project",
+ "cfx_session",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "log",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
+name = "cfx_spec"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "serde_yaml",
+]
+
+[[package]]
+name = "cfx_surface"
+version = "0.0.1"
+dependencies = [
+ "hex",
+ "regex",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -949,18 +1010,20 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "cortex"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "adaptive",
  "aes-gcm",
  "base64 0.22.1",
  "boring2",
  "cfx_finding",
+ "cfx_scope",
  "cfx_tui",
  "clap",
  "dguard",
  "rand 0.8.7",
  "ratatui",
+ "rcgen",
  "regex",
  "reqwest 0.12.28",
  "rsa",
@@ -974,6 +1037,7 @@ dependencies = [
  "tokio-rustls",
  "transport",
  "uuid",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -1069,7 +1133,7 @@ checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 
 [[package]]
 name = "crossfyre"
-version = "0.1.28"
+version = "0.1.30"
 dependencies = [
  "cfx_core",
  "clap",
@@ -1168,6 +1232,7 @@ dependencies = [
  "fiat-crypto",
  "rustc_version",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -1394,6 +1459,7 @@ version = "2.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "115531babc129696a58c64a4fef0a8bf9e9698629fb97e9e40767d235cfbcd53"
 dependencies = [
+ "pkcs8",
  "signature",
 ]
 
@@ -1405,9 +1471,12 @@ checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
 dependencies = [
  "curve25519-dalek",
  "ed25519",
+ "rand_core 0.6.4",
+ "serde",
  "sha2",
  "signature",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -2571,6 +2640,7 @@ version = "0.30.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2e99fb7a497b1e3339bc746195567ed8d3e24945ecd636e3619d20b9de9e9149"
 dependencies = [
+ "cc",
  "pkg-config",
  "vcpkg",
 ]
@@ -2853,7 +2923,7 @@ dependencies = [
 
 [[package]]
 name = "node"
-version = "0.1.39"
+version = "0.1.40"
 dependencies = [
  "cfx_core",
  "clap",
@@ -3862,6 +3932,14 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "relsign"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "rand_core 0.6.4",
+]
 
 [[package]]
 name = "reqwest"

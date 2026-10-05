@@ -15,12 +15,15 @@ scout is a daemon. Start it, then send it targets:
 # start the daemon (default port 4444)
 scout --daemon
 
-# fingerprint a target through the running daemon
-scout fingerprint https://example.com
+# scan a target through the running daemon
+scout scan https://example.com
 
 # same run, with the live dashboard instead of JSON
-scout --tui fingerprint https://example.com
+scout --tui scan https://example.com
 ```
+
+`--no-tui` is accepted for symmetry with the other engines; here JSON is
+already the default.
 
 `--tui` brings up the shared toolchain dashboard: findings sorted into
 technologies, services and CVE leads as they arrive. It is ignored when output

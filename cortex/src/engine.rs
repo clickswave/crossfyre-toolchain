@@ -50,7 +50,9 @@ pub struct ScanParams {
     /// records what it is sent, with our own 112-template pack loaded: 194
     /// requests, 15 of them state-changing, and one of those is
     ///
-    ///     PATCH /api/v1/account {"role":"admin","balance_cents":-99999}
+    /// ```text
+    /// PATCH /api/v1/account {"role":"admin","balance_cents":-99999}
+    /// ```
     ///
     /// which does not test whether privilege escalation is possible, it performs
     /// it and then looks for the echo. That template's own description calls the

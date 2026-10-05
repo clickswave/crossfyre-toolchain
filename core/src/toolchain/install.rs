@@ -1,8 +1,15 @@
 // Download, verify, and install extension binaries (and the crossfyre binary
-// itself) from the release CDN. Every artifact is resolved through a signed-
-// by-checksum manifest: manifest.json maps component -> version -> per-
-// platform artifact file + SHA256. Nothing is installed without a checksum
-// match.
+// itself) from the release CDN. Every artifact is resolved through manifest.json,
+// which maps component -> version -> per-platform artifact file + SHA256, and
+// nothing is installed without a checksum match.
+//
+// The checksum proves the artifact matches what the manifest says. It proves
+// nothing about the manifest, so in a build carrying CROSSFYRE_MANIFEST_PUBKEY
+// the manifest itself must also carry a valid ed25519 signature. See
+// `release_sig` for why the key's presence is the switch and why that makes the
+// rollout safe. This comment used to describe the file as a "signed-by-checksum
+// manifest", which conflated the two and read as a stronger guarantee than the
+// code gave.
 
 use super::config::{ext_bin_path, ext_file_name, get_bin_dir};
 use super::service;
@@ -89,11 +96,45 @@ pub async fn fetch_manifest() -> Result<Manifest, Box<dyn std::error::Error>> {
         )
         .into());
     }
-    let manifest: Manifest = resp
-        .json()
+    // The BYTES, not a parsed value: the signature is over what was served, and
+    // re-serialising a parsed manifest reorders keys and rewrites whitespace.
+    let body = resp
+        .bytes()
         .await
-        .map_err(|e| format!("release manifest is malformed: {e}"))?;
+        .map_err(|e| format!("could not read release manifest body: {e}"))?;
+
+    if super::release_sig::required() {
+        let sig_url = format!("{url}{}", super::release_sig::SIG_SUFFIX);
+        let sig = fetch_signature(&sig_url).await?;
+        super::release_sig::verify(&body, &sig)?;
+    }
+
+    let manifest: Manifest =
+        serde_json::from_slice(&body).map_err(|e| format!("release manifest is malformed: {e}"))?;
     Ok(manifest)
+}
+
+/// Fetch the detached signature. Only called by a build that requires one, so a 404 here
+/// is a release-pipeline failure and the message says so rather than reading as a
+/// network problem.
+async fn fetch_signature(url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let resp = reqwest::get(url)
+        .await
+        .map_err(|e| format!("could not fetch the release manifest signature ({url}): {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "this build requires a signed release manifest and {} returned {}. Nothing will \
+             be installed. If you built this binary yourself, build without \
+             CROSSFYRE_MANIFEST_PUBKEY to use an unsigned manifest.",
+            url,
+            resp.status()
+        )
+        .into());
+    }
+    Ok(resp
+        .text()
+        .await
+        .map_err(|e| format!("could not read the release manifest signature: {e}"))?)
 }
 
 fn resolve_artifact<'m>(
@@ -124,19 +165,38 @@ async fn download_verified(
         return Err(format!("download failed: {} returned {}", url, resp.status()).into());
     }
     let bytes = resp.bytes().await?;
+    verify_artifact_bytes(artifact, &bytes)?;
+    // Written only after the checksum agrees, so a rejected artifact leaves nothing
+    // behind that a later run could mistake for an install.
+    fs::write(dest, &bytes)?;
+    Ok(())
+}
 
+/// Does `bytes` match the SHA256 the manifest recorded for this artifact?
+///
+/// Split out of the download because this is the decision, and `BASE_URL` is a build-time
+/// constant, so nothing that goes through `reqwest` can be reached from a test. Keeping
+/// the check pure means the refusal is testable and the download stays thin glue.
+fn verify_artifact_bytes(artifact: &Artifact, bytes: &[u8]) -> Result<(), String> {
+    // An artifact with no recorded checksum is refused rather than waved through. A
+    // manifest can be hand-edited and a missing field deserialises to an empty string;
+    // comparing against it would otherwise mean "no checksum, no check".
+    if artifact.sha256.trim().is_empty() {
+        return Err(format!(
+            "release manifest records no sha256 for {} - refusing to install an \
+             unverifiable artifact",
+            artifact.file
+        ));
+    }
     let mut hasher = Sha256::new();
-    hasher.update(&bytes);
+    hasher.update(bytes);
     let got = format!("{:x}", hasher.finalize());
-    if !got.eq_ignore_ascii_case(&artifact.sha256) {
+    if !got.eq_ignore_ascii_case(artifact.sha256.trim()) {
         return Err(format!(
             "checksum mismatch for {} (expected {}, got {}) - refusing to install",
             artifact.file, artifact.sha256, got
-        )
-        .into());
+        ));
     }
-
-    fs::write(dest, &bytes)?;
     Ok(())
 }
 
@@ -160,17 +220,37 @@ fn extract_zip(zip_path: &Path, extract_dir: &Path) -> Result<(), Box<dyn std::e
 }
 
 /// Atomically place `src` at `dest` (write-next-to + rename), 0755 on unix.
+///
+/// The mode is set on the temporary file BEFORE the rename, which is what makes the claim
+/// in that first line true. Doing it after left a window in which `dest` existed carrying
+/// whatever mode `fs::copy` brought over from the archive, and an artifact unpacked as
+/// 0644 is the normal case rather than a strange one. A process killed in that window, or
+/// an update interrupted by a reboot, leaves a binary that is installed, current, and not
+/// executable, and the next run reports it as missing rather than as broken.
 fn place_binary(src: &Path, dest: &Path) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp_path = dest.with_extension("new");
+    // Appended, not `with_extension`, which REPLACES whatever follows the last dot:
+    // a component placed as `cortex-0.1.2` would stage itself at `cortex-0.1.new` and
+    // collide with any sibling that differs only after that dot.
+    let tmp_path = match dest.file_name() {
+        Some(name) => dest.with_file_name(format!("{}.new", name.to_string_lossy())),
+        None => return Err(format!("{} is not a file path", dest.display()).into()),
+    };
     fs::copy(src, &tmp_path)?;
-    fs::rename(&tmp_path, dest)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(dest, fs::Permissions::from_mode(0o755))?;
+        if let Err(e) = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o755)) {
+            // Leave nothing half-staged behind for a later run to trip over.
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
+    }
+    if let Err(e) = fs::rename(&tmp_path, dest) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e.into());
     }
     Ok(())
 }
@@ -663,4 +743,243 @@ pub async fn ensure_node_installed() -> Result<(), Box<dyn std::error::Error>> {
     let manifest = fetch_manifest().await?;
     download_node(&manifest, false, false).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A manifest as it arrives: parsed from JSON, because the types only derive
+    /// `Deserialize` and because the parse is part of what is being checked.
+    fn manifest(json: &str) -> Manifest {
+        serde_json::from_str(json).expect("manifest parses")
+    }
+
+    fn artifact(file: &str, sha: &str) -> Artifact {
+        serde_json::from_value(serde_json::json!({"file": file, "sha256": sha}))
+            .expect("artifact parses")
+    }
+
+    /// sha256 of `b"hello"`, so the expectation in these tests is a value an operator
+    /// could reproduce with `sha256sum` rather than one copied out of a failure.
+    const HELLO_SHA: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+
+    #[test]
+    fn matching_bytes_are_accepted_and_one_changed_byte_is_not() {
+        let a = artifact("mach-linux-x86_64.zip", HELLO_SHA);
+        assert!(verify_artifact_bytes(&a, b"hello").is_ok());
+
+        let err = verify_artifact_bytes(&a, b"hellp").expect_err("one byte changed");
+        assert!(err.contains("checksum mismatch"), "got: {err}");
+        assert!(
+            err.contains("refusing to install"),
+            "the message has to say what it did, not only what it saw: {err}"
+        );
+    }
+
+    #[test]
+    fn an_uppercase_checksum_in_the_manifest_still_matches() {
+        // The publish pipeline writes lowercase hex, but a hand-edited manifest or a
+        // different tool may not, and a case mismatch refusing a correct artifact would
+        // look exactly like a compromised bucket.
+        let a = artifact("mach.zip", &HELLO_SHA.to_ascii_uppercase());
+        assert!(verify_artifact_bytes(&a, b"hello").is_ok());
+    }
+
+    #[test]
+    fn an_artifact_with_no_checksum_is_refused_rather_than_trusted() {
+        // The failure mode this guards: `sha256` absent or blanked in the manifest
+        // deserialises to an empty string, and a plain comparison against it means every
+        // byte sequence is wrong, which is correct by accident. Being explicit also makes
+        // the message say why instead of printing a mismatch against nothing.
+        for blank in ["", "   "] {
+            let a = artifact("mach.zip", blank);
+            let err = verify_artifact_bytes(&a, b"hello")
+                .expect_err("an artifact with no checksum must be refused");
+            assert!(
+                err.contains("records no sha256"),
+                "expected the message to name the missing checksum, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_artifact_is_still_checked() {
+        // Zero bytes has a sha256 like anything else. A truncated download that arrives
+        // as an empty 200 must not pass because there is nothing to hash.
+        let empty_sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let a = artifact("mach.zip", empty_sha);
+        assert!(verify_artifact_bytes(&a, b"").is_ok());
+        let b = artifact("mach.zip", HELLO_SHA);
+        assert!(verify_artifact_bytes(&b, b"").is_err());
+    }
+
+    #[test]
+    fn a_manifest_missing_the_component_or_the_platform_says_which() {
+        let key = platform_key();
+        let m = manifest(&format!(
+            r#"{{"components":{{"mach":{{"version":"0.0.14","artifacts":{{"{key}":{{"file":"f","sha256":"{HELLO_SHA}"}}}}}}}}}}"#
+        ));
+        assert!(resolve_artifact(&m, "mach").is_ok());
+
+        let err = resolve_artifact(&m, "cortex")
+            .expect_err("a component that is not there")
+            .to_string();
+        assert!(err.contains("cortex"), "got: {err}");
+
+        // A component that exists with no artifact for this host is a different problem
+        // from one that does not exist, and the two messages were worth separating.
+        let other = manifest(
+            r#"{"components":{"mach":{"version":"0.0.14","artifacts":{"solaris-sparc":{"file":"f","sha256":"x"}}}}}"#,
+        );
+        let err = resolve_artifact(&other, "mach")
+            .expect_err("no artifact for this platform")
+            .to_string();
+        assert!(err.contains(&key), "the message names the platform: {err}");
+    }
+
+    #[test]
+    fn a_manifest_with_fields_we_do_not_know_still_parses() {
+        // Forward compatibility, and it is load bearing: the publish pipeline adding a
+        // field must not stop older installed binaries from reading the manifest, or an
+        // additive change becomes a fleet-wide update failure.
+        let key = platform_key();
+        let m = manifest(&format!(
+            r#"{{"generated":"2026-10-03","components":{{"mach":{{"version":"0.0.14","channel":"stable","artifacts":{{"{key}":{{"file":"f","sha256":"{HELLO_SHA}","size":1234}}}}}}}}}}"#
+        ));
+        let (c, a) = resolve_artifact(&m, "mach").expect("unknown fields are ignored");
+        assert_eq!(c.version, "0.0.14");
+        assert_eq!(a.sha256, HELLO_SHA);
+        assert_eq!(manifest_version(&m, "mach"), "0.0.14");
+        assert_eq!(
+            manifest_version(&m, "nope"),
+            "",
+            "an absent component reports no version rather than panicking"
+        );
+    }
+
+    #[test]
+    fn the_platform_key_is_one_of_the_shapes_the_manifest_uses() {
+        let key = platform_key();
+        let (os, arch) = key.split_once('-').expect("os-arch");
+        assert!(
+            ["linux", "darwin", "windows"].contains(&os),
+            "unexpected os segment in {key}"
+        );
+        assert!(!arch.is_empty(), "no arch segment in {key}");
+        assert!(
+            !key.contains("macos"),
+            "macos must be spelled darwin in a manifest key, got {key}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Placing a binary
+    // ---------------------------------------------------------------------------
+
+    /// A scratch directory under the system temp dir, removed on drop.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!(
+                "cfx-install-test-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = fs::remove_dir_all(&p);
+            fs::create_dir_all(&p).expect("scratch dir");
+            Self(p)
+        }
+        fn join(&self, n: &str) -> std::path::PathBuf {
+            self.0.join(n)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    fn mode_of(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(p).expect("metadata").permissions().mode() & 0o777
+    }
+
+    /// Note what this does and does not check. It pins the end state, that an artifact
+    /// unpacked 0644 is installed 0755, which is worth a regression test on its own. It
+    /// does NOT check that the mode is set before the rename rather than after, because
+    /// both orders reach the same end state and the difference is only visible to a
+    /// process that dies inside the window. That reasoning lives on `place_binary`.
+    #[test]
+    fn a_placed_binary_is_executable_even_when_the_archive_was_not() {
+        let s = Scratch::new("mode");
+        let src = s.join("mach-unpacked");
+        fs::write(&src, b"#!/bin/sh\necho hi\n").expect("write src");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // What an artifact unpacked out of a zip normally looks like.
+            fs::set_permissions(&src, fs::Permissions::from_mode(0o644)).expect("chmod src");
+        }
+
+        let dest = s.join("bin").join("mach");
+        place_binary(&src, &dest).expect("place");
+        assert!(dest.exists(), "the parent directory is created");
+        #[cfg(unix)]
+        assert_eq!(mode_of(&dest), 0o755, "an 0644 artifact is installed 0755");
+        assert_eq!(
+            fs::read(&dest).expect("read"),
+            fs::read(&src).expect("read")
+        );
+        assert!(
+            !s.join("bin").join("mach.new").exists(),
+            "nothing is left staged next to the destination"
+        );
+    }
+
+    #[test]
+    fn placing_over_an_existing_binary_replaces_it() {
+        let s = Scratch::new("replace");
+        let dest = s.join("mach");
+        fs::write(&dest, b"the-old-one").expect("write old");
+        let src = s.join("new-mach");
+        fs::write(&src, b"the-new-one").expect("write new");
+
+        place_binary(&src, &dest).expect("place");
+        assert_eq!(fs::read(&dest).expect("read"), b"the-new-one");
+        #[cfg(unix)]
+        assert_eq!(mode_of(&dest), 0o755);
+    }
+
+    #[test]
+    fn staging_appends_to_the_name_instead_of_replacing_its_extension() {
+        // `with_extension("new")` does not append, it REPLACES whatever follows the last
+        // dot, so placing `cortex-0.1.2` used to stage through `cortex-0.1.new`. That is
+        // a path belonging to something else.
+        //
+        // The oracle is a bystander: a real file already sitting at the old staging name.
+        // Staging through it copies over the bystander and then renames it away, so the
+        // file is destroyed. Asserting the placement succeeded would not have caught
+        // this, and did not: an earlier version of this test passed against the unfixed
+        // code because both placements still worked.
+        let s = Scratch::new("stage");
+        let src = s.join("payload");
+        fs::write(&src, b"x").expect("write src");
+
+        let bystander = s.join("cortex-0.1.new");
+        fs::write(&bystander, b"somebody-elses-file").expect("write bystander");
+
+        let dest = s.join("cortex-0.1.2");
+        place_binary(&src, &dest).expect("place");
+
+        assert!(dest.exists(), "the binary was placed");
+        assert_eq!(
+            fs::read(&bystander).ok().as_deref(),
+            Some(&b"somebody-elses-file"[..]),
+            "staging must not go through a path that belongs to another name"
+        );
+    }
 }

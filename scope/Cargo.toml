@@ -1,0 +1,17 @@
+[package]
+name = "cfx_scope"
+version = "0.0.1"
+edition = "2024"
+homepage = "https://clickswave.org"
+repository = "https://github.com/clickswave/crossfyre-toolchain"
+keywords = ["scope", "authorisation", "proxy", "pentest"]
+description = "The destinations an operator has asserted they are allowed to test, and the guard that refuses everything else."
+authors = ["Clickswave <team@clickswave.org>"]
+
+# A leaf on purpose. This is an authorisation boundary, so it has to be reachable from
+# the capture core and the proxy session, and `cortex`, where it started, pulls reqwest,
+# boring2, ratatui and the engine crates. Nothing under capture can depend on that, and
+# the direction would be backwards anyway: a scanner binary is not a thing a proxy sits
+# on top of.
+[dependencies]
+serde = { version = "1", features = ["derive"] }

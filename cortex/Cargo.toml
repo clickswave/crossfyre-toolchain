@@ -1,6 +1,6 @@
 [package]
 name = "cortex"
-version = "0.0.21"
+version = "0.0.22"
 edition = "2024"
 homepage = "https://clickswave.org"
 repository = "https://github.com/clickswave/crossfyre-toolchain"
@@ -10,6 +10,7 @@ authors = ["Clickswave <team@clickswave.org>"]
 [dependencies]
 dguard = { path = "../dguard" }
 cfx_finding = { path = "../finding" }
+cfx_scope = { path = "../scope" }
 cfx_tui = { path = "../tui" }
 ratatui = { version = "0.30.0-alpha.5", features = ["crossterm"] }
 tokio = { version = "1.47.1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "time"] }
@@ -26,6 +27,9 @@ reqwest = { version = "0.12.22", default-features = false, features = ["rustls-t
 # already in the tree (reqwest), so no new native build.
 rustls = "0.23"
 tokio-rustls = "0.26"
+# For Verify::WebPki in rawhttp: the same pure-Rust root store the capture crate
+# uses, so the two legs trust the same set and it cross-compiles to Android.
+webpki-roots = "0.26"
 # Under `impersonate`, the raw sender's TLS uses BoringSSL (GREASE + a browser
 # cipher/curve profile) instead of rustls, so even the verbatim-path probes
 # present a browser-like handshake rather than the flagged rustls fingerprint.
@@ -40,6 +44,11 @@ rand = "0.8"
 base64 = "0.22"
 regex = "1"
 uuid = { version = "1.18.0", features = ["v4"] }
+
+[dev-dependencies]
+# To mint a certificate nothing trusts, which is what the certificate-policy test needs
+# an origin to present.
+rcgen = "0.13"
 
 [features]
 # First-party builds enable this to swap the outward scan client to wreq

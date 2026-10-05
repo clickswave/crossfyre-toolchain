@@ -1,15 +1,15 @@
 //! HTTP(S) callback capture. A catch-all fallback logs every inbound request that
 //! targets our OAST domain, keyed by the Host header (which carries the token).
 
-use crate::poll::{api_router, Ctx};
-use crate::store::{now_unix, Interaction, Store};
 use crate::Config;
+use crate::poll::{Ctx, api_router};
+use crate::store::{Interaction, Store, now_unix};
 use axum::{
+    Router,
     body::{Body, Bytes},
     extract::{ConnectInfo, State},
     http::Request,
     response::IntoResponse,
-    Router,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;

@@ -201,7 +201,7 @@ mod tests {
 
 #[cfg(test)]
 mod client_tests {
-    use crate::{build_client, ClientConfig, Redirect};
+    use crate::{ClientConfig, Redirect, build_client};
 
     /// End-to-end through a real built client: the guard must stop the request
     /// at resolution, not merely exist as a filter function.

@@ -90,6 +90,31 @@ pub fn available() -> bool {
     io::stdout().is_terminal()
 }
 
+/// Whether to draw a dashboard, given the flags and the engine's own default.
+///
+/// `--no-tui` wins over `--tui`, and with neither flag `default_on` decides, so
+/// the long-running engines can default to a dashboard and the single-target
+/// ones to JSON. A non-terminal stdout overrides all three: no caller who piped
+/// us wanted escape sequences, and the engines used to draw anyway.
+pub fn wanted(tui: bool, no_tui: bool, default_on: bool) -> bool {
+    wanted_from(tui, no_tui, default_on, available())
+}
+
+/// The decision, without asking the terminal. See [`wanted`].
+///
+/// Split out so the policy is testable: under a test harness stdout is never a
+/// terminal, so [`available`] would answer the question before the flags did.
+pub fn wanted_from(tui: bool, no_tui: bool, default_on: bool, available: bool) -> bool {
+    let asked = if no_tui {
+        false
+    } else if tui {
+        true
+    } else {
+        default_on
+    };
+    asked && available
+}
+
 /// Drive a dashboard until the user quits.
 ///
 /// `pump` is called every tick to drain whatever the tool is receiving into
@@ -282,4 +307,41 @@ fn header<D: Dashboard>(frame: &mut Frame, dashboard: &mut D, active: char, area
         Paragraph::new(Line::from(spans)).block(Block::default().borders(Borders::ALL)),
         area,
     );
+}
+
+#[cfg(test)]
+mod wanted_tests {
+    use super::wanted_from;
+
+    #[test]
+    fn a_pipe_never_gets_a_dashboard() {
+        for (tui, no_tui, default_on) in [
+            (false, false, true),
+            (true, false, true),
+            (false, false, false),
+            (true, false, false),
+        ] {
+            assert!(
+                !wanted_from(tui, no_tui, default_on, false),
+                "piped stdout drew a dashboard for ({tui}, {no_tui}, {default_on})"
+            );
+        }
+    }
+
+    #[test]
+    fn no_tui_beats_tui_and_the_default() {
+        assert!(!wanted_from(true, true, true, true));
+        assert!(!wanted_from(false, true, true, true));
+    }
+
+    #[test]
+    fn the_engine_default_applies_when_neither_flag_is_given() {
+        assert!(wanted_from(false, false, true, true));
+        assert!(!wanted_from(false, false, false, true));
+    }
+
+    #[test]
+    fn tui_opts_in_where_the_default_is_off() {
+        assert!(wanted_from(true, false, false, true));
+    }
 }

@@ -3,10 +3,10 @@
 //! a WAF could blocklist), each with its own wildcard cert, served on one 443
 //! listener. rustls picks the right cert per TLS SNI.
 
+use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
-use rustls::ServerConfig;
 use std::sync::Arc;
 
 #[derive(Debug)]

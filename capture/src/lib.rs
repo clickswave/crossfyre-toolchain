@@ -12,13 +12,19 @@
 //! surface, and never diverge the certificate behavior between desktop and mobile.
 
 pub mod body;
+pub mod browser;
 pub mod config;
 pub mod flow;
+pub mod gate;
 pub mod reduce;
 
+/// Re-exported so the proxy session, the workbench and this crate all name one type. Two
+/// copies of an authorisation boundary is how they come to disagree.
+pub use cfx_scope;
 pub use config::CaptureConfig;
 pub mod sni;
 pub use flow::{FlowOutcome, serve_mitm_flow};
+pub use gate::{Held, LocalGate};
 pub use reduce::{FullExchange, TraceEvent, body_field_names, redact_url};
 
 use std::collections::HashMap;
@@ -213,6 +219,77 @@ pub enum InterceptDecision {
     Drop,
 }
 
+/// One exchange as it actually happened, with its bodies as bytes.
+///
+/// Deliberately not [`TraceEvent`]. That type carries full-capture bodies as `String`, via
+/// `String::from_utf8_lossy`, which is irreversible: a fifteen-byte PNG fragment comes out
+/// twenty-three bytes long with four replacement characters in it. Fine for a privacy-safe
+/// shape and for searching text, useless for anything that has to REPLAY the request or
+/// hand the operator back the bytes a server sent. A local store exists to do both, so it
+/// is fed from here instead.
+///
+/// The request recorded is the one that went upstream. Where an intercept gate modified
+/// it, that is the operator's version and not what the client first sent, because the
+/// exchange that happened is the one worth keeping. Framing headers are the exception:
+/// `Content-Length` is recomputed on the wire from the body being sent, so the headers
+/// here are the set that was chosen rather than the exact bytes of the request line.
+#[derive(Debug, Clone, Default)]
+pub struct RawExchange {
+    /// Unix milliseconds, taken when the exchange completed.
+    pub at_ms: i64,
+    pub method: String,
+    /// Full URL, values included. A local store is the full-capture surface.
+    pub url: String,
+    pub host: String,
+    pub status: i64,
+    pub duration_ms: u64,
+    pub req_headers: Vec<(String, String)>,
+    pub resp_headers: Vec<(String, String)>,
+    pub req_body: Vec<u8>,
+    /// As much of the response body as is kept. Bounded, because a target chooses how
+    /// many bytes to send and a proxy that holds all of them is a proxy a target can
+    /// take down.
+    pub resp_body: Vec<u8>,
+    /// How long the response actually was, when `resp_body` is only a prefix of it.
+    ///
+    /// `None` means it is whole. Carried separately so a truncated record reports the
+    /// real size rather than the size of what was kept, which would understate a
+    /// gigabyte download as sixteen megabytes and read as a complete capture.
+    pub resp_len: Option<usize>,
+}
+
+/// Somewhere local that an exchange is recorded with its bodies intact.
+///
+/// The capture core defines the trait and does not know what implements it, so the
+/// dependency runs one way: a project store depends on `capture`, never the reverse.
+///
+/// Called on the request's own task, so a slow implementation slows that one flow and no
+/// others. An implementation that cannot keep up should buffer internally rather than
+/// block, and one that fails should log rather than propagate: losing a row from the store
+/// is worse than losing it, but it is not worth failing the request the operator is
+/// watching.
+pub trait ExchangeSink: Send + Sync {
+    /// Hand over a completed exchange. Must not block and cannot fail.
+    ///
+    /// Synchronous on purpose. It is called from the response body as that body ends,
+    /// which is a place that cannot await, and the shape before this, an async call
+    /// spawned onto the runtime, meant a process exiting in the moment after a response
+    /// completed lost the exchange proving it happened. For a tool whose output is
+    /// evidence that is not an acceptable way to lose a row.
+    ///
+    /// So an implementation queues here and writes elsewhere, and [`flush`] is how a
+    /// caller waits for the queue to drain before closing the file.
+    ///
+    /// [`flush`]: ExchangeSink::flush
+    fn record(&self, ex: RawExchange);
+
+    /// Wait until everything handed over has been written.
+    ///
+    /// Called when a session stops and when a project closes. Without it, closing is a
+    /// race against a queue, which is the same defect wearing a different hat.
+    fn flush<'a>(&'a self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+}
+
 /// A hook the host (mobile app / desktop proxy) implements to gate a request in MANUAL intercept
 /// mode. The capture core calls `decide` before forwarding; the implementation parks the request with
 /// the control plane and blocks until a human forwards or drops it. Returning `Forward` on any error
@@ -242,6 +319,44 @@ pub struct CaptureCfg {
     /// app working while everything else is still captured, which beats the
     /// only alternative available before this, which was excluding the whole app.
     pub bypass_hosts: Vec<String>,
+    /// Where to record each exchange locally, with bodies as bytes. `None` keeps the
+    /// historic behaviour, which is that nothing is stored on this machine.
+    pub sink: Option<Arc<dyn ExchangeSink>>,
+    /// Forward to an origin whose certificate no public CA signed.
+    ///
+    /// Off by default, and deliberately so: with it on, a machine-in-the-middle between
+    /// this proxy and the origin cannot be told apart from the origin. It exists because
+    /// an internal application behind a corporate CA could not be captured at all
+    /// otherwise, and those are a large share of what this tool is for. A per-project
+    /// decision an operator makes knowingly, never a build-time default.
+    pub trust_any_upstream_cert: bool,
+    /// What the operator said they may reach.
+    ///
+    /// `None` is unrestricted, which is what every front end did before this existed; the
+    /// desktop workbench always sets one. The guard rather than a plain `Scope` because an
+    /// operator narrows a scope the moment they notice traffic they should not be seeing,
+    /// and making them restart the proxy to do it means it keeps flowing while they work
+    /// out how.
+    pub scope: Option<Arc<cfx_scope::Guard>>,
+}
+
+impl CaptureCfg {
+    /// The one place in this crate a destination is refused.
+    ///
+    /// `true` carries on; `false` means the guard already recorded it, so no call site has
+    /// to remember to. Every egress point goes through here rather than reaching into the
+    /// guard, so there is one answer to "where is this checked" rather than four.
+    pub fn admit(
+        &self,
+        host: &str,
+        port: u16,
+        point: cfx_scope::Point,
+        detail: Option<&str>,
+    ) -> bool {
+        self.scope
+            .as_ref()
+            .is_none_or(|g| g.admit(host, port, point, detail))
+    }
 }
 
 impl std::fmt::Debug for CaptureCfg {
@@ -250,6 +365,9 @@ impl std::fmt::Debug for CaptureCfg {
             .field("full", &self.full)
             .field("gate", &self.gate.is_some())
             .field("bypass_hosts", &self.bypass_hosts.len())
+            .field("sink", &self.sink.is_some())
+            .field("trust_any_upstream_cert", &self.trust_any_upstream_cert)
+            .field("scope", &self.scope.as_ref().and_then(|g| g.rules()))
             .finish()
     }
 }

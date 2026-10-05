@@ -86,6 +86,10 @@ pub struct DiscEndpoint {
     pub known_fields: Vec<String>,
 }
 
+/// As in `inject.rs` and `fuzz.rs`, and announced for the same reason: a capped
+/// `total` reads as a completed pass. Handing this all 1007 of xssmaze's GET
+/// endpoints reported 200 of 200 and looked like 16% recall, when it was 83% of
+/// the 200 it actually examined.
 const MAX_ENDPOINTS: usize = 200;
 const ERR_MINE_ROUNDS: usize = 5;
 const MAX_NEW_PER_EP: usize = 40;
@@ -114,7 +118,20 @@ pub async fn run(params: DiscoverParams, tx: mpsc::UnboundedSender<Value>) {
     };
 
     let mut found = 0i64;
-    let total = params.endpoints.len().min(MAX_ENDPOINTS) as i64;
+    let handed_in = params.endpoints.len();
+    let total = handed_in.min(MAX_ENDPOINTS) as i64;
+    if handed_in > MAX_ENDPOINTS {
+        let _ = tx.send(json!({
+            "type": "log",
+            "message": format!(
+                "endpoint list truncated: {handed_in} handed in, {MAX_ENDPOINTS} will be \
+                 probed, {} dropped and not examined.",
+                handed_in - MAX_ENDPOINTS
+            ),
+            "endpoints_handed_in": handed_in,
+            "endpoints_tested": MAX_ENDPOINTS,
+        }));
+    }
     let mut done = 0i64;
 
     for ep in params.endpoints.iter().take(MAX_ENDPOINTS) {
@@ -127,11 +144,203 @@ pub async fn run(params: DiscoverParams, tx: mpsc::UnboundedSender<Value>) {
             let _ = tx.send(json!({"type":"progress","processed": done, "total": total}));
             continue;
         }
+        let orig = ep.method.to_uppercase();
+        if orig == "GET" || orig == "HEAD" {
+            // A GET carries its parameters in the query string, so that is where
+            // to look. Turning it into a POST and probing a body, which is what
+            // this did, can only learn a shape the endpoint does not have.
+            //
+            // Measured against OWASP VulnerableApp, whose levels are GET
+            // endpoints each taking one undocumented query parameter: discovery
+            // found none of them, so the injector had nothing to inject into and
+            // scored 0 of 117, every finding it did report being passive. Handing
+            // it those parameters took SQL injection from 0/9 to 4/9 with no
+            // other change.
+            let known: HashSet<String> = ep.known_fields.iter().cloned().collect();
+            let cal = calibrate_query(&client, &orig, &ep.url, &known).await;
+            if let QueryCal::EchoesAnything = cal {
+                // Report one usable name rather than nothing. Any name reaches
+                // the sink here, so the first candidate is as true as any other
+                // and it gives the injector an injection point to work. Without
+                // this the endpoint looks parameterless and is never tested.
+                if let Some(cand) = QUERY_WORDLIST.first() {
+                    let u = render_query_probe(&ep.url, &known, cand, &candidate_marker(cand));
+                    let evidence = probe::send(&client, &orig, &u, None)
+                        .await
+                        .map(|r| r.body)
+                        .unwrap_or_default();
+                    let _ = tx.send(discovery_event(
+                        &orig,
+                        &ep.url,
+                        cand,
+                        "medium",
+                        "query-echoes-any-name",
+                        &evidence,
+                        "query",
+                    ));
+                    found += 1;
+                }
+            }
+            if let QueryCal::Stable(mut base) = cal {
+                let mut new_here = 0usize;
+                let mut hits: Vec<(String, String)> = Vec::new();
+                // Every marker sent on this endpoint, so our own footprint can
+                // be subtracted from the control comparison at the end.
+                let mut sent: Vec<String> = Vec::new();
+                for cand in QUERY_WORDLIST {
+                    if new_here >= MAX_NEW_PER_EP {
+                        break;
+                    }
+                    if known.contains(*cand) {
+                        continue;
+                    }
+                    let mark = candidate_marker(cand);
+                    let u = render_query_probe(&ep.url, &known, cand, &mark);
+                    sent.push(mark.clone());
+                    let Some(r) = probe::send(&client, &orig, &u, None).await else {
+                        continue;
+                    };
+                    // This candidate's own marker coming back is the strong
+                    // signal: the endpoint took this name's value somewhere.
+                    // Status and length deviation stay as the fallback for a
+                    // parameter that changes behaviour without echoing, which
+                    // is most of them, and that comparison is made against the
+                    // body with our own markers taken out so an accumulating
+                    // store cannot supply the deviation.
+                    let clean = Resp {
+                        status: r.status,
+                        body: without_markers(&r.body, &sent),
+                        elapsed_ms: r.elapsed_ms,
+                        location: r.location.clone(),
+                        headers: r.headers.clone(),
+                    };
+                    let took_it = r.body.contains(mark.as_str()) || accepted(&base, &clean, cand);
+                    if !took_it {
+                        continue;
+                    }
+                    // Confirm, as the body path does: reissue and require the
+                    // same deviation, so one flaky response is not a parameter.
+                    let same = probe::send(&client, &orig, &u, None)
+                        .await
+                        .map(|x| {
+                            let c = Resp {
+                                status: x.status,
+                                body: without_markers(&x.body, &sent),
+                                elapsed_ms: x.elapsed_ms,
+                                location: x.location.clone(),
+                                headers: x.headers.clone(),
+                            };
+                            x.body.contains(mark.as_str()) || accepted(&base, &c, cand)
+                        })
+                        .unwrap_or(false);
+                    if !same {
+                        continue;
+                    }
+                    // Buffered rather than emitted, because whether any of this
+                    // is trustworthy is only knowable once the pass is over.
+                    hits.push(((*cand).to_string(), r.body.clone()));
+                    new_here += 1;
+
+                    // Re-baseline, because this hit may have changed the
+                    // endpoint. Stripping our markers out of the comparison is
+                    // not enough on an endpoint that stores: VulnerableApp's
+                    // PersistentXSSInHTMLTag levels wrap each stored value in
+                    // its own `<div id="comments">`, so the body keeps growing
+                    // by the wrapper even with the markers removed, and every
+                    // candidate after the first hit deviates from a stale
+                    // baseline for a reason that has nothing to do with it.
+                    // 40 reported parameters on an endpoint that has one, and
+                    // then the whole pass discarded.
+                    //
+                    // Measuring each candidate against a control taken after
+                    // the last thing that changed the endpoint is what makes
+                    // the comparison mean anything. It costs one request per
+                    // hit, not per candidate, because nothing needs
+                    // re-baselining until something has actually landed.
+                    let rebase_mark = candidate_marker("cfxjunkparamdd");
+                    if let Some(c) = probe::send(
+                        &client,
+                        &orig,
+                        &render_query_probe(&ep.url, &known, "cfxjunkparamdd", &rebase_mark),
+                        None,
+                    )
+                    .await
+                    {
+                        let clean = without_markers(&c.body, &sent);
+                        base = Baseline {
+                            status: c.status,
+                            len: clean.len(),
+                            body: clean,
+                        };
+                    }
+                }
+
+                // Re-probe the control. A baseline is captured once, and that is
+                // only valid if probing does not change the thing being probed.
+                // VulnerableApp's PersistentXSS levels store the value under any
+                // name and append a record per request, so every candidate after
+                // the first few deviates from a stale baseline purely because
+                // earlier candidates grew the store: 21 reported parameters on an
+                // endpoint whose name is not among them. If the control has moved,
+                // the pass changed the endpoint and nothing it found can be
+                // separated from that, so it is discarded rather than reported.
+                let ctrl_mark = candidate_marker("cfxjunkparamcc");
+                let drifted = probe::send(
+                    &client,
+                    &orig,
+                    &render_query_probe(&ep.url, &known, "cfxjunkparamcc", &ctrl_mark),
+                    None,
+                )
+                .await
+                .map(|x| {
+                    // Our own markers come out before the length is compared.
+                    // They are the whole reason this endpoint looks different
+                    // from its baseline: discovery stored a value under the one
+                    // name that works, and every response since has carried it.
+                    // Subtracting them is the difference between finding the
+                    // parameter and discarding the pass, and it costs nothing
+                    // in strictness, because an endpoint that moved for any
+                    // other reason still trips the comparison.
+                    let clean = without_markers(&x.body, &sent);
+                    x.status != base.status
+                        || (clean.len() as i64 - base.len as i64).abs() > len_delta_floor()
+                        || x.body.contains(ctrl_mark.as_str())
+                })
+                .unwrap_or(true);
+
+                if drifted {
+                    if !hits.is_empty() {
+                        let _ = tx.send(json!({"type":"log","message": format!(
+                            "{} {}: discarded {} candidate parameter(s). The control response moved \
+                             during the pass, so this endpoint changes with each request and a \
+                             deviation cannot be told apart from that.",
+                            orig, ep.url, hits.len()
+                        )}));
+                    }
+                } else {
+                    for (cand, evidence) in &hits {
+                        let _ = tx.send(discovery_event(
+                            &orig,
+                            &ep.url,
+                            cand,
+                            "medium",
+                            "query-brute-force",
+                            evidence,
+                            "query",
+                        ));
+                        found += 1;
+                    }
+                }
+            }
+            done += 1;
+            if done % 3 == 0 || done == total {
+                let _ = tx.send(json!({"type":"progress","processed":done,"total":total}));
+            }
+            continue;
+        }
+
         let is_json = ep.content_type.eq_ignore_ascii_case("json");
-        let method = {
-            let m = ep.method.to_uppercase();
-            if m == "GET" { "POST".to_string() } else { m }
-        };
+        let method = orig;
         // fields we treat as satisfied (known + discovered) so the next round reaches deeper.
         let mut known: HashSet<String> = ep.known_fields.iter().cloned().collect();
         let mut discovered: Vec<(String, &'static str)> = Vec::new(); // (field, confidence)
@@ -154,6 +363,7 @@ pub async fn run(params: DiscoverParams, tx: mpsc::UnboundedSender<Value>) {
                         "high",
                         "error-mining",
                         &r.body,
+                        "body",
                     ));
                     found += 1;
                     added = true;
@@ -191,6 +401,7 @@ pub async fn run(params: DiscoverParams, tx: mpsc::UnboundedSender<Value>) {
                                 "medium",
                                 "brute-force",
                                 &r.body,
+                                "body",
                             ));
                             found += 1;
                             if discovered.len() >= MAX_NEW_PER_EP {
@@ -286,7 +497,25 @@ fn accepted(base: &Baseline, r: &Resp, cand: &str) -> bool {
     if echoes_field(&r.body, cand) && !echoes_field(&base.body, cand) {
         return true;
     }
-    (r.body.len() as i64 - base.len as i64).abs() > 40
+    (r.body.len() as i64 - base.len as i64).abs() > len_delta_floor()
+}
+
+/// How far a response length must move from the junk control before the
+/// candidate counts as accepted.
+///
+/// Overridable so it can be calibrated against the lab rather than guessed.
+/// xssmaze declares the parameters of all 1007 of its GET endpoints, which
+/// makes it ground truth for both halves of this: a name discovery reports that
+/// the endpoint does not declare is a false parameter, and a declared name it
+/// misses is the threshold's cost. Inferred parameters feed the asset graph and
+/// then the injector, so a false one is a site a customer sees and the engine
+/// spends requests on.
+fn len_delta_floor() -> i64 {
+    std::env::var("CFX_DISCOVER_LEN_DELTA")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v >= 0)
+        .unwrap_or(40)
 }
 
 /// Does `body` contain `field` as a word, rather than inside a longer one?
@@ -318,6 +547,7 @@ fn discovery_event(
     confidence: &str,
     how: &str,
     evidence: &str,
+    location: &str,
 ) -> Value {
     // a short evidence snippet (never the whole body)
     let snippet: String = evidence.chars().take(200).collect();
@@ -333,12 +563,257 @@ fn discovery_event(
             "method": method,
             "url": url,
             "field": field,
-            "location": "body",
+            "location": location,
             "confidence": confidence,
             "source": how,
             "evidence": snippet,
         }
     })
+}
+
+/// Render `url` with the known query parameters plus one candidate.
+///
+/// Keeps anything already in the query string: an endpoint reached as
+/// `/thing?lang=en` may only answer properly with it, and dropping it changes
+/// the baseline rather than the parameter under test.
+/// The value a query probe sends.
+///
+/// Not `1`, which is what this did and the reason it found almost nothing.
+/// Measured against xssmaze's /advanced/level1/: the junk control answers in 91
+/// bytes, `?query=1` in 92, so the response moves by a single byte and no
+/// threshold above 1 can see it. The parameter name never appears in the body
+/// either, so the name-echo test the body path relies on cannot fire.
+///
+/// A distinctive value fixes both. The same endpoint answers `?query=<marker>`
+/// in 100 bytes and the marker is in the body, which is unambiguous: it is not
+/// an English word, so unlike a candidate name it cannot be on the page by
+/// accident. That is what the body path needs its baseline control for.
+const QUERY_MARKER: &str = "cfxprm7m4zz";
+
+/// A marker unique to one candidate name.
+///
+/// One shared marker is enough right up to the point where the endpoint keeps
+/// what it is sent. VulnerableApp's PersistentXSSInHTMLTag levels take a
+/// `comment` parameter, store its value and serve the accumulated store on
+/// every later response, so with a shared marker every candidate probed after
+/// `comment` finds the marker in the body and looks like a hit: 22 of 30 names
+/// on an endpoint that has one. The marker is no longer evidence about the
+/// candidate, it is evidence that some earlier candidate worked.
+///
+/// A marker derived from the candidate's own name fixes that outright. Only
+/// the probe that sent it can produce it, so an accumulating store cannot
+/// manufacture a hit for a name the endpoint has never heard of, and the same
+/// token is what lets the control re-probe below tell our own footprint apart
+/// from the endpoint drifting on its own.
+///
+/// FNV-1a, which is not a security property: it needs to be stable across
+/// runs so a reported parameter is reproducible, and distinct across a
+/// wordlist of a hundred entries.
+fn candidate_marker(cand: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in cand.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("{QUERY_MARKER}{h:012x}")
+}
+
+/// The body with every marker this pass sent removed.
+///
+/// What is left is the endpoint's own content, so a length comparison against
+/// a baseline captured before the pass measures the endpoint changing rather
+/// than measuring the probes. Without this, one stored value makes every
+/// subsequent length deviation meaningless and the whole pass gets discarded.
+fn without_markers(body: &str, sent: &[String]) -> String {
+    let mut out = body.to_string();
+    for m in sent {
+        if out.contains(m.as_str()) {
+            out = out.replace(m.as_str(), "");
+        }
+    }
+    out
+}
+
+fn render_query_probe(url: &str, known: &HashSet<String>, candidate: &str, value: &str) -> String {
+    let mut out = String::from(url);
+    let mut sep = if url.contains('?') { '&' } else { '?' };
+    let mut names: Vec<&String> = known.iter().collect();
+    names.sort();
+    for n in names {
+        out.push(sep);
+        out.push_str(&pct(n));
+        out.push_str("=1");
+        sep = '&';
+    }
+    out.push(sep);
+    out.push_str(&pct(candidate));
+    out.push('=');
+    out.push_str(&pct(value));
+    out
+}
+
+/// The body calibration, against the query string.
+///
+/// Same discipline and for the same reason: two junk names that disagree mean
+/// the endpoint answers differently to equivalent requests, and every candidate
+/// will then read as a hit. Measured on OWASP VulnerableApp, its PersistentXSS
+/// levels store on each request, so a probe without this check claimed
+/// thirty-five parameters on each of them.
+/// What a query-string calibration concluded.
+enum QueryCal {
+    /// A stable control to diff candidates against.
+    Stable(Baseline),
+    /// The endpoint reflected the marker under a name it has never seen, so it
+    /// takes a value under ANY name. There is nothing to discover and that is
+    /// not the same as nothing to report: an endpoint that reflects arbitrary
+    /// input is an injection point, reachable with any name at all. Dropping
+    /// this was why VulnerableApp's XSSWithHtmlTagInjection levels, which
+    /// answer `<div>$value<div>` to every parameter, produced no injection
+    /// point and scored zero on five reflected-XSS cases.
+    EchoesAnything,
+    /// No usable control: the endpoint answers differently to equivalent
+    /// requests, or echoes the parameter NAME so the name test is meaningless.
+    Unusable,
+}
+
+async fn calibrate_query(
+    client: &Client,
+    method: &str,
+    url: &str,
+    known: &HashSet<String>,
+) -> QueryCal {
+    // Each junk name carries its own marker, and the check below looks for
+    // that marker rather than for the shared prefix every marker starts with.
+    // An endpoint that stores what it is sent keeps the markers from the last
+    // run, so a prefix check reads one of those as "this endpoint echoes any
+    // name" and reports a parameter that does not exist, on a target that had
+    // simply been scanned before.
+    let mark_a = candidate_marker("cfxjunkparamaa");
+    let mark_b = candidate_marker("cfxjunkparambb");
+    let Some(a) = probe::send(
+        client,
+        method,
+        &render_query_probe(url, known, "cfxjunkparamaa", &mark_a),
+        None,
+    )
+    .await
+    else {
+        return QueryCal::Unusable;
+    };
+    let Some(b) = probe::send(
+        client,
+        method,
+        &render_query_probe(url, known, "cfxjunkparambb", &mark_b),
+        None,
+    )
+    .await
+    else {
+        return QueryCal::Unusable;
+    };
+    if a.status != b.status {
+        return QueryCal::Unusable;
+    }
+    // Two ways an endpoint can echo something it never recognised, and both
+    // make the oracle unusable. Checking only one of them was a regression I
+    // made here and the benchmark caught it.
+    //
+    // The value: a response carrying the marker for a parameter the endpoint has
+    // never heard of carries it for anything.
+    if a.body.contains(mark_a.as_str()) || b.body.contains(mark_b.as_str()) {
+        return QueryCal::EchoesAnything;
+    }
+    // The name: xssmaze's /realworld/level5/ answers `?amount=x` with
+    // "Parameters: amount", so the name-echo test in `accepted` fires for every
+    // candidate. Dropping this check made that one endpoint report all 39
+    // wordlist entries, which was every false positive in a 1007-endpoint pass.
+    if a.body.contains("cfxjunkparamaa") || b.body.contains("cfxjunkparambb") {
+        return QueryCal::Unusable;
+    }
+    if (a.body.len() as i64 - b.body.len() as i64).abs() > 24 {
+        return QueryCal::Unusable; // not stable enough to diff against
+    }
+    // The baseline the whole pass is diffed against. Markers a previous run
+    // stored come out of it, so this run's `without_markers` comparisons are
+    // against the same content on both sides.
+    let a_clean = without_markers(&a.body, &[mark_a, mark_b]);
+    QueryCal::Stable(Baseline {
+        status: a.status,
+        len: a_clean.len(),
+        body: a_clean,
+    })
+}
+
+#[cfg(test)]
+mod query_probe_tests {
+    use super::*;
+
+    #[test]
+    fn the_candidate_carries_the_marker_and_known_params_carry_filler() {
+        let known: HashSet<String> = ["lang".to_string()].into_iter().collect();
+        let u = render_query_probe("http://h/p", &known, "id", QUERY_MARKER);
+        assert_eq!(u, format!("http://h/p?lang=1&id={QUERY_MARKER}"));
+    }
+
+    #[test]
+    fn an_existing_query_string_is_kept() {
+        // An endpoint reached as /p?v=1 may only answer properly with it, so
+        // dropping it would move the baseline rather than test the parameter.
+        let known = HashSet::new();
+        let u = render_query_probe("http://h/p?v=1", &known, "id", QUERY_MARKER);
+        assert_eq!(u, format!("http://h/p?v=1&id={QUERY_MARKER}"));
+    }
+
+    #[test]
+    fn the_marker_is_not_a_word_a_page_could_hold_by_accident() {
+        // The point of a marker over a candidate name: `id` and `to` are on
+        // half the pages on the web, this is on none of them.
+        assert!(QUERY_MARKER.len() >= 8);
+    }
+
+    #[test]
+    fn a_candidate_marker_belongs_to_one_candidate() {
+        // Distinct across the wordlist, or an endpoint that stores what it is
+        // sent manufactures hits for names it has never heard of.
+        let mut seen = std::collections::HashSet::new();
+        for c in QUERY_WORDLIST {
+            let m = candidate_marker(c);
+            assert!(m.starts_with(QUERY_MARKER), "{c} -> {m}");
+            assert!(m.len() >= 16, "{c} -> {m}");
+            assert!(
+                m.chars().all(|ch| ch.is_ascii_alphanumeric()),
+                "{c} -> {m} must survive a target that strips punctuation"
+            );
+            assert!(seen.insert(m.clone()), "duplicate marker for {c}: {m}");
+        }
+        // Stable across runs, so a reported parameter is reproducible.
+        assert_eq!(candidate_marker("comment"), candidate_marker("comment"));
+        assert_ne!(candidate_marker("comment"), candidate_marker("content"));
+    }
+
+    #[test]
+    fn our_own_footprint_comes_out_of_a_length_comparison() {
+        let a = candidate_marker("comment");
+        let b = candidate_marker("title");
+        let sent = vec![a.clone(), b.clone()];
+        let body = format!("<p>{a}</p><p>{b}</p><p>x</p>");
+        assert_eq!(without_markers(&body, &sent), "<p></p><p></p><p>x</p>");
+        // A marker that was never sent stays, because it is not ours and its
+        // presence is something about the endpoint.
+        let other = candidate_marker("never-sent");
+        let body = format!("<p>{other}</p>");
+        assert_eq!(without_markers(&body, &sent), body);
+        // Nothing sent, nothing removed.
+        assert_eq!(without_markers("plain", &[]), "plain");
+        assert!(!QUERY_MARKER.chars().all(|c| c.is_ascii_alphabetic()));
+    }
+
+    #[test]
+    fn the_length_floor_defaults_to_the_tuned_value() {
+        // Overridable for calibration against the lab, but the default is the
+        // value body discovery was tuned to after it reported 26 fields on a
+        // RailsGoat endpoint that has one.
+        assert_eq!(len_delta_floor(), 40);
+    }
 }
 
 /// Render a JSON/form body from a set of field names, each with a benign placeholder. When `only`
@@ -461,6 +936,116 @@ static MINE_RES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 });
 
 /// Common request field names, for calibrated brute-force when error-mining is unproductive.
+/// Candidate names for QUERY-string discovery, which is a different vocabulary
+/// from the body one below.
+///
+/// `WORDLIST` is a CRUD body shape: `first_name`, `order_id`, `verified`,
+/// `currency`. Those are rare in a query string, and the names that are common
+/// there were absent, so query discovery was probing for the wrong things.
+/// Measured against xssmaze's 1007 GET endpoints, which declare their own
+/// parameters: the body list covers 89.6% of parameter instances and 10 of 52
+/// distinct names, this one covers 96.9% and 31 of 52.
+///
+/// Built from what is common in query strings generally, not from what this
+/// benchmark happens to use. xssmaze's `wsurl`, `shortname`, `bio`, `q1`, `a`,
+/// `b` and the rest of its long tail are deliberately absent: adding them would
+/// raise the score here and nothing else, which is the definition of tuning to
+/// the test. The redirect family is over-represented on purpose, because
+/// open-redirect and SSRF live there.
+const QUERY_WORDLIST: &[&str] = &[
+    // value carriers
+    "q",
+    "s",
+    "v",
+    "id",
+    "query",
+    "search",
+    "term",
+    "keyword",
+    "value",
+    "text",
+    "input",
+    "data",
+    "name",
+    "key",
+    "msg",
+    "message",
+    "comment",
+    "note",
+    "title",
+    "desc",
+    "description",
+    // resources and paths
+    "url",
+    "uri",
+    "src",
+    "href",
+    "file",
+    "filename",
+    "path",
+    "page",
+    "doc",
+    "template",
+    "include",
+    "img",
+    "image",
+    // the redirect family
+    "redirect",
+    "redirect_uri",
+    "redirect_url",
+    "return",
+    "return_to",
+    "returnUrl",
+    "next",
+    "continue",
+    "goto",
+    "dest",
+    "destination",
+    "target",
+    "ref",
+    "referer",
+    "callback",
+    "callback_url",
+    "jsonp",
+    // presentation
+    "lang",
+    "locale",
+    "theme",
+    "color",
+    "format",
+    "output",
+    "view",
+    "mode",
+    "style",
+    // listing
+    "sort",
+    "order",
+    "filter",
+    "limit",
+    "offset",
+    "start",
+    "end",
+    "count",
+    "type",
+    "tag",
+    "category",
+    "slug",
+    // identity
+    "user",
+    "username",
+    "email",
+    "token",
+    "password",
+    "session",
+    "api_key",
+    // diagnostics
+    "debug",
+    "error",
+    "error_description",
+    "test",
+    "seed",
+];
+
 const WORDLIST: &[&str] = &[
     "id",
     "name",

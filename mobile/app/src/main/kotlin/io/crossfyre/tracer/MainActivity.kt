@@ -5,8 +5,10 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.Manifest
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageInstaller
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.net.VpnService
 import android.os.Build
@@ -63,6 +65,15 @@ import org.json.JSONObject
  */
 class MainActivity : ComponentActivity() {
 
+    private companion object {
+        /// How long a start gets before the panel stops saying STARTING.
+        ///
+        /// The service builds a tunnel, asks Android for the interface and brings the
+        /// native stack up. On a cold start that is comfortably under a second; this is
+        /// the point at which silence means something went wrong rather than slowly.
+        const val START_GRACE_MS = 8_000L
+    }
+
     private var running by mutableStateOf(false)
     private var paired by mutableStateOf(false)
     private val selectedApps = mutableStateListOf<String>()
@@ -74,6 +85,67 @@ class MainActivity : ComponentActivity() {
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
             launchService(); running = true
         }
+
+    /** True when capture is running and Android is dropping its notification. */
+    private var notificationsBlocked by mutableStateOf(false)
+
+    /// Capture has three states and the panel used to have two.
+    ///
+    /// `running` is what was asked for. `serviceActive` is what the service reached,
+    /// which is a tunnel built and a native stack brought up, and that takes a moment.
+    /// Showing only `running` meant the panel said CAPTURING before anything was, and
+    /// showing only `serviceActive` would have said IDLE in the gap. Both are claims
+    /// about somebody's traffic, so the gap gets its own word.
+    private var serviceActive by mutableStateOf(false)
+
+    /// When a start was asked for, so a start that never arrives can be said out loud.
+    /// `elapsedRealtime` rather than wall clock, because this measures a duration and
+    /// the wall clock can move under it.
+    private var startAskedAt = 0L
+
+    /// Set when the grace below passed with the service still not up.
+    private var startFailed by mutableStateOf(false)
+
+    // POST_NOTIFICATIONS has been a runtime permission since Android 13, and the
+    // manifest entry alone does nothing: it has to be asked for. Nothing asked, so
+    // on every Android 13 and newer device the capture notification was dropped.
+    //
+    // A foreground service starts anyway, which is what made this quiet. The service
+    // ran, capture worked, and the one thing on screen that says a capture is running
+    // and offers to stop it never appeared. For a tool that sits in the middle of
+    // somebody's traffic that is the wrong way round: the notification is not a
+    // nicety, it is how the capture admits to existing.
+    //
+    // Asked before the VPN consent rather than after, because the VPN dialog is the
+    // one that matters and a permission sheet stacked on top of its result reads like
+    // the app is still asking for things after being told yes.
+    private val notificationConsent =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+            // The answer is read back from the system rather than from this callback's
+            // argument, because they disagree when the user has permanently denied:
+            // no sheet appears, the callback reports false, and asking again never
+            // shows anything. Either way the question is the same one.
+            askForVpnConsent()
+        }
+
+    /** Does Android need to be asked before it will show the capture notification? */
+    private fun notificationConsentNeeded(): Boolean =
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+
+    /** The VPN consent, and the capture behind it. */
+    private fun askForVpnConsent() {
+        startAskedAt = android.os.SystemClock.elapsedRealtime()
+        startFailed = false
+        // Recomputed here so it is right on both paths: granted just now, granted on
+        // an earlier run, or refused. Capture is never blocked on this answer, since
+        // a missing notification is a reason to say so and not a reason to refuse to
+        // work.
+        notificationsBlocked = notificationConsentNeeded()
+        val prepare = VpnService.prepare(this)
+        if (prepare != null) vpnConsent.launch(prepare) else { launchService(); running = true }
+    }
 
     // A scanned pairing waiting for the user to confirm the host. Scanning is not
     // consent: this value decides where captured traffic goes and where a patched
@@ -608,6 +680,8 @@ class MainActivity : ComponentActivity() {
         if (running) {
             startService(Intent(this, TracerVpnService::class.java).setAction(TracerVpnService.ACTION_STOP))
             running = false
+            startAskedAt = 0L
+            startFailed = false
         } else {
             // Refuse to start quietly broken. A stale patch fails as
             // `CertificateUnknown` deep in a log, which reads as "capture is
@@ -618,8 +692,11 @@ class MainActivity : ComponentActivity() {
                 return
             }
             preflightAcknowledged = false
-            val prepare = VpnService.prepare(this)
-            if (prepare != null) vpnConsent.launch(prepare) else { launchService(); running = true }
+            if (notificationConsentNeeded()) {
+                notificationConsent.launch(Manifest.permission.POST_NOTIFICATIONS)
+            } else {
+                askForVpnConsent()
+            }
         }
     }
 
@@ -715,12 +792,46 @@ class MainActivity : ComponentActivity() {
             )
         }
 
-        // Poll the native counters while capturing so the panel stays live.
-        LaunchedEffect(running) {
-            if (!running) { stats = null; return@LaunchedEffect }
-            while (running) {
-                stats = withContext(Dispatchers.Default) { runCatching { Stats.parse(Native.captureStats()) }.getOrNull() }
-                delay(1000)
+        // Poll the native counters, and reconcile what the panel claims with what the
+        // service is actually doing.
+        //
+        // `running` was set when capture was asked for and then read back once, in
+        // onResume. Those run in the wrong order: the activity result from the VPN
+        // consent dialog is delivered first, onResume runs after it, and it overwrote
+        // the asked-for `true` with `TracerVpnService.active`, which is still false
+        // because the service has only just been handed its start intent. So the panel
+        // said IDLE over a capture that was running and intercepting, and stayed wrong
+        // until the app was backgrounded and reopened, which was the only thing that
+        // read the flag again.
+        //
+        // Keyed on Unit so it lives as long as the screen and converges both ways: a
+        // capture that comes up is admitted to a tick later, and one that died or was
+        // stopped from its own notification stops being claimed.
+        LaunchedEffect(Unit) {
+            while (true) {
+                val live = TracerVpnService.active
+                serviceActive = live
+                if (live) {
+                    running = true
+                    startAskedAt = 0L
+                    startFailed = false
+                } else if (startAskedAt > 0L) {
+                    // Still coming up, until it has had long enough that it is not.
+                    val waited = android.os.SystemClock.elapsedRealtime() - startAskedAt
+                    if (waited > START_GRACE_MS) {
+                        startAskedAt = 0L
+                        startFailed = true
+                        running = false
+                    }
+                } else {
+                    running = false
+                }
+                stats = if (live) {
+                    withContext(Dispatchers.Default) { runCatching { Stats.parse(Native.captureStats()) }.getOrNull() }
+                } else {
+                    null
+                }
+                delay(500)
             }
         }
 
@@ -1189,9 +1300,45 @@ class MainActivity : ComponentActivity() {
                 .padding(16.dp)
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Box(Modifier.size(10.dp).clip(CircleShape).background(if (running) Cfx.success else Cfx.text3))
+                // Three words for three states. The dot is only green for the one that
+                // means traffic is being intercepted right now.
+                val label = when {
+                    serviceActive -> "CAPTURING"
+                    running -> "STARTING"
+                    else -> "IDLE"
+                }
+                val dot = when {
+                    serviceActive -> Cfx.success
+                    running -> Cfx.warningLight
+                    else -> Cfx.text3
+                }
+                Box(Modifier.size(10.dp).clip(CircleShape).background(dot))
                 Spacer(Modifier.width(8.dp))
-                Text(if (running) "CAPTURING" else "IDLE", fontFamily = Cfx.mono, fontWeight = FontWeight.Bold, letterSpacing = 2.sp, color = if (running) Cfx.text else Cfx.text2, fontSize = 14.sp)
+                Text(label, fontFamily = Cfx.mono, fontWeight = FontWeight.Bold, letterSpacing = 2.sp, color = if (running) Cfx.text else Cfx.text2, fontSize = 14.sp)
+            }
+            if (startFailed) {
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    "Capture did not come up. Check the log for a pairing or tunnel " +
+                        "error, then try again.",
+                    fontSize = 11.sp,
+                    lineHeight = 15.sp,
+                    color = Cfx.warningLight
+                )
+            }
+            // Said here because the usual place to say it is the notification that is
+            // missing. The system VPN key is still in the status bar, so the capture is
+            // not invisible, but nothing names this app or offers to stop it.
+            if (serviceActive && notificationsBlocked) {
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    "Notifications are off for this app, so the capture notification is " +
+                        "not showing. Capture is running. Turn notifications on in " +
+                        "Android settings to get it back, with its stop button.",
+                    fontSize = 11.sp,
+                    lineHeight = 15.sp,
+                    color = Cfx.warningLight
+                )
             }
             Spacer(Modifier.height(14.dp))
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1220,7 +1367,9 @@ class MainActivity : ComponentActivity() {
                 .padding(vertical = 12.dp, horizontal = 6.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Text(value?.toString() ?: "—", fontFamily = Cfx.mono, fontWeight = FontWeight.Bold, fontSize = 20.sp, color = if (accent) Cfx.ember else Cfx.text)
+            // A plain hyphen: no number yet is not the same as zero, and a reader
+            // scanning a row of counts should not have to tell a dash from a digit.
+            Text(value?.toString() ?: "-", fontFamily = Cfx.mono, fontWeight = FontWeight.Bold, fontSize = 20.sp, color = if (accent) Cfx.ember else Cfx.text)
             Spacer(Modifier.height(2.dp))
             Text(label, fontFamily = Cfx.mono, fontSize = 10.sp, letterSpacing = 1.sp, color = Cfx.text3)
         }

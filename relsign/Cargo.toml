@@ -1,0 +1,10 @@
+[package]
+name = "relsign"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Release-manifest signing for Crossfyre. A build-host tool: it is not a shipped component and is not listed in the release manifest."
+
+[dependencies]
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }

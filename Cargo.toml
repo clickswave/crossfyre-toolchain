@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["capture", "core", "node", "crossfyre", "tui", "mach", "voyage", "pulse", "scout", "cortex", "finding", "oast", "transport", "dguard", "mobile/rust"]
+members = ["capture", "core", "node", "crossfyre", "tui", "mach", "voyage", "pulse", "scout", "cortex", "finding", "oast", "transport", "dguard", "mobile/rust", "relsign", "project", "scope", "session", "spec", "surface"]
+
+# `relsign` signs the release manifest and is a BUILD-HOST tool, not a shipped
+# component: it is absent from COMPONENTS in scripts/crossfyre_build.py, so it is
+# never packaged, uploaded or listed in the manifest. It is a workspace member so
+# CI compiles and lints it like everything else, because a signing tool that
+# silently stopped building would be discovered at a release.
 # `adaptive` is a path dependency of the engines, not a workspace member: the
 # .cargo/config.toml `paths` override swaps it for the git-ignored tuned drop-in
 # `adaptive-private` in first-party builds, and Cargo cannot override a member.

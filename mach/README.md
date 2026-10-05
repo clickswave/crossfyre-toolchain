@@ -23,12 +23,18 @@ mach scan -u https://example.com/::FUZZ:: -w ./words.txt --success-status-codes 
 A stopped scan resumes by default. Use `--fresh-start` if you want to ignore prior
 state and run the whole list again.
 
-For one-off checks in a script, `scan-exec` probes a single URL and prints the result
-without the TUI or a wordlist:
+For one-off checks in a script, `exec` probes a single URL and prints the result
+without the TUI or a wordlist. It takes one JSON argument, and fills in the
+operation itself:
 
 ```sh
-mach scan-exec --url https://example.com/robots.txt
+mach exec '{"url":"https://example.com/robots.txt","success_codes":[200],"method":"get"}'
 ```
+
+The dashboard is on by default when stdout is a terminal, and off when it is
+not, so piping or redirecting a scan gives you the daemon's newline-delimited
+JSON rather than escape sequences. `--no-tui` forces the JSON path even in a
+terminal, and `--tui` is accepted for symmetry with the other engines.
 
 ## Handy flags
 

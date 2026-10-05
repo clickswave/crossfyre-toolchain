@@ -283,7 +283,7 @@ pub fn corr_from_any(host: &str, domains: &[String]) -> Option<String> {
 
 #[cfg(test)]
 mod corr_tests {
-    use super::{corr_from_any, corr_from_host, CORR_LEN};
+    use super::{CORR_LEN, corr_from_any, corr_from_host};
 
     // A 20-char correlation id followed by 13 random chars = the label under the domain.
     const CORR: &str = "abcdefghij0123456789";

@@ -144,6 +144,12 @@ pub struct CrawlEvent {
     /// the URL query - which is what reaches SQLi/cmdi/etc. behind HTML form submissions.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub body_params: Vec<String>,
+    /// How the body is encoded: "json" when the call declares or sends JSON,
+    /// absent for the default form encoding. The injection engine builds the
+    /// request from this, and a JSON field fuzzed as a form encoding never
+    /// reaches the handler.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discovered_from: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -251,6 +257,7 @@ impl CrawlEvent {
             content_hash: None,
             params: Vec::new(),
             body_params: Vec::new(),
+            body_type: None,
             discovered_from: None,
             depth: None,
             processed: None,
@@ -307,19 +314,122 @@ static RE_JS_CALL_METHOD: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)(?:\w+\.(get|post|put|delete|patch)|\.(get|post|put|delete|patch))\s*\(\s*["'`]([^"'`]+)["'`]"#).unwrap()
 });
 
-/// Mine `(method, url)` from JS API calls that name a non-GET verb, so the SPA's write endpoints are
-/// recorded with the right method (a param-less GET is untestable by the fuzz/discover engines).
-fn extract_js_calls(body: &str, out: &mut Vec<(String, String)>) {
+/// `xhr.open('POST', '/url')`, where the verb is the FIRST ARGUMENT rather than
+/// the method name.
+///
+/// RE_JS_CALL_METHOD above cannot see this: it keys on `.post(` and friends, so
+/// an application that talks to its own API through XMLHttpRequest is mined as
+/// nothing at all. Measured against xssmaze, that is the whole postmethod and
+/// querymethod surface, and in the wild it is every page that predates fetch or
+/// uses a wrapper built on XHR.
+static RE_XHR_OPEN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?i)\.open\s*\(\s*["'`](GET|POST|PUT|PATCH|DELETE|QUERY)["'`]\s*,\s*["'`]([^"'`]+)["'`]"#,
+    )
+    .unwrap()
+});
+
+/// A JSON request body, declared by a header or betrayed by what is sent.
+///
+/// Which one matters, because the engine builds the request from it: a field
+/// sent as `application/json` and fuzzed as a form encoding never reaches the
+/// code under test, and the endpoint reads as clean.
+static RE_JSON_BODY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?i)setRequestHeader\s*\(\s*["']content-type["']\s*,\s*["'][^"']*json|["']content-type["']\s*:\s*["'][^"']*json|JSON\s*\.\s*stringify"#,
+    )
+    .unwrap()
+});
+
+/// The keys of an object literal passed to `JSON.stringify`, which are the body
+/// field names. Only the top level, and only plain identifier or quoted keys:
+/// anything computed is not a name a scanner can send.
+static RE_STRINGIFY_KEYS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?is)JSON\s*\.\s*stringify\s*\(\s*\{(.{0,400}?)\}"#).unwrap());
+static RE_OBJ_KEY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?:^|,)\s*["']?([A-Za-z_$][A-Za-z0-9_$]{0,63})["']?\s*:"#).unwrap()
+});
+
+/// How far after a call site to look for the header and body that belong to it.
+///
+/// An XHR is set up across several statements, so the content type and the
+/// payload are near the `open()` rather than inside it. Bounded so the next
+/// call's setup cannot be read as this one's: the shape being matched is a
+/// handful of lines.
+const CALL_WINDOW: usize = 400;
+
+/// One API call mined from JS, with enough of its request shape to be testable.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApiCall {
+    pub method: String,
+    pub url: String,
+    /// "json" when the call declares or sends a JSON body; None means the
+    /// default form encoding.
+    pub body_type: Option<String>,
+    /// Body field names, when the call hands an object literal to
+    /// `JSON.stringify` where they can be read.
+    pub body_params: Vec<String>,
+}
+
+/// What the call sends, read from the window of code after it.
+fn body_shape(body: &str, after: usize) -> (Option<String>, Vec<String>) {
+    let end = body.len().min(after + CALL_WINDOW);
+    let win = &body[after.min(body.len())..end];
+    if !RE_JSON_BODY.is_match(win) {
+        return (None, Vec::new());
+    }
+    let mut fields = Vec::new();
+    if let Some(c) = RE_STRINGIFY_KEYS.captures(win) {
+        if let Some(inner) = c.get(1) {
+            for k in RE_OBJ_KEY.captures_iter(inner.as_str()) {
+                if let Some(name) = k.get(1) {
+                    let n = name.as_str().to_string();
+                    if !fields.contains(&n) {
+                        fields.push(n);
+                    }
+                }
+            }
+        }
+    }
+    (Some("json".to_string()), fields)
+}
+
+/// Mine API calls that name a non-GET verb, so the SPA's write endpoints are
+/// recorded with the right method (a param-less GET is untestable by the
+/// fuzz/discover engines) and with the body shape the endpoint expects.
+fn extract_js_calls(body: &str, out: &mut Vec<ApiCall>) {
+    let mut push = |method: String, url: String, at: usize| {
+        if method == "GET" {
+            return;
+        }
+        let (body_type, body_params) = body_shape(body, at);
+        let call = ApiCall {
+            method,
+            url,
+            body_type,
+            body_params,
+        };
+        if !out.contains(&call) {
+            out.push(call);
+        }
+    };
     for c in RE_JS_CALL_METHOD.captures_iter(body) {
         let verb = c
             .get(1)
             .or_else(|| c.get(2))
             .map(|m| m.as_str().to_uppercase());
         let url = c.get(3).map(|m| m.as_str().to_string());
+        let at = c.get(0).map(|m| m.end()).unwrap_or(0);
         if let (Some(v), Some(u)) = (verb, url) {
-            if v != "GET" {
-                out.push((v, u));
-            }
+            push(v, u, at);
+        }
+    }
+    for c in RE_XHR_OPEN.captures_iter(body) {
+        let verb = c.get(1).map(|m| m.as_str().to_uppercase());
+        let url = c.get(2).map(|m| m.as_str().to_string());
+        let at = c.get(0).map(|m| m.end()).unwrap_or(0);
+        if let (Some(v), Some(u)) = (verb, url) {
+            push(v, u, at);
         }
     }
 }
@@ -343,7 +453,7 @@ struct Page {
     /// (method, url) pairs mined from `fetch()/axios.post()/.put()...` calls in JS: the SPA's real
     /// API surface with its verb, so a mined `axios.post('/api/x')` becomes a POST operation the
     /// shape-discovery and injection engines can then work, not a param-less GET.
-    api_calls: Vec<(String, String)>,
+    api_calls: Vec<ApiCall>,
     /// (raw_action, METHOD, field_names) per `<form>` on the page: a form's action becomes a testable
     /// operation carrying its fields as body params (write forms) or query params (GET forms), so the
     /// injection engine reaches SQLi/cmdi/etc. behind form submissions.
@@ -867,13 +977,19 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
             // Mined write-verb API calls (axios.post/.put/...): surface each with its real method so
             // the asset graph records a POST/PUT/... operation the shape-discovery and injection
             // engines can then exercise, instead of a param-less GET they skip.
-            for (method, raw) in &page.api_calls {
-                let Some(child) = resolve_and_scope(raw, &page.url, &params, &seed_host) else {
+            for call in &page.api_calls {
+                let Some(child) = resolve_and_scope(&call.url, &page.url, &params, &seed_host)
+                else {
                     continue;
                 };
                 let mut ev =
                     CrawlEvent::url_candidate(&child, Some(page.url.to_string()), page.depth + 1);
-                ev.method = Some(method.clone());
+                ev.method = Some(call.method.clone());
+                // The body shape travels with the call, because a field sent as
+                // JSON and fuzzed as a form encoding never reaches the code
+                // under test and the endpoint reads as clean.
+                ev.body_type = call.body_type.clone();
+                ev.body_params = call.body_params.clone();
                 let _ = tx.send(ev);
             }
 
@@ -1185,7 +1301,9 @@ async fn fetch_page(
 
     dedup(&mut page.links);
     dedup(&mut page.params);
-    page.api_calls.sort();
+    // Already deduped as they are mined, and ApiCall has no meaningful order.
+    page.api_calls
+        .sort_by(|a, b| (&a.method, &a.url).cmp(&(&b.method, &b.url)));
     page.api_calls.dedup();
     page
 }
@@ -1422,7 +1540,14 @@ fn normalize_seed(seed: &str) -> Option<Url> {
 /// someone to read the crawler; "141 fetches failed to connect: TLS" sends them
 /// to the one link that switched the session to https on a plaintext port, which
 /// is where the fault actually was.
-fn fetch_reason(e: &reqwest::Error) -> String {
+///
+/// Takes `transport::Error`, not `reqwest::Error`. Those are the same type only in
+/// the default build: with `impersonate` on, `transport` re-exports wreq and
+/// naming reqwest here stops mach compiling at all. It was written as
+/// `&reqwest::Error` on 2026-09-11 and no release build succeeded after that,
+/// because the only thing that compiles with the feature is the release script
+/// and CI does not.
+fn fetch_reason(e: &transport::Error) -> String {
     if e.is_timeout() {
         return "timed out".into();
     }
@@ -1970,5 +2095,89 @@ mod template_tests {
         ] {
             assert!(changes_state(&Url::parse(u).unwrap()).is_some(), "{u}");
         }
+    }
+
+    #[test]
+    fn an_xhr_call_is_mined_with_its_verb_and_body() {
+        // The exact shape xssmaze serves on /postmethod/level3/, and the shape
+        // every page that predates fetch serves. The verb is the first argument
+        // to open(), so the axios/fetch pattern cannot see it: this surface was
+        // mined as nothing at all.
+        let js = r#"
+          <form id='f'><input type='text' name='query' value='a'></form>
+          <script>function send(){var x=new XMLHttpRequest();
+            x.open('POST','/postmethod/level3/');
+            x.setRequestHeader('Content-Type','application/json;charset=UTF-8');
+            x.send(JSON.stringify({query:document.querySelector('input').value}));}
+          </script>"#;
+        let mut out = Vec::new();
+        extract_js_calls(js, &mut out);
+        assert_eq!(out.len(), 1, "one call, got {out:?}");
+        assert_eq!(out[0].method, "POST");
+        assert_eq!(out[0].url, "/postmethod/level3/");
+        assert_eq!(
+            out[0].body_type.as_deref(),
+            Some("json"),
+            "the header says JSON, and a form encoding would never reach the handler"
+        );
+        assert_eq!(out[0].body_params, vec!["query".to_string()]);
+    }
+
+    #[test]
+    fn a_form_encoded_call_is_not_marked_json() {
+        // No JSON anywhere, so body_type stays absent and the engine uses the
+        // default form encoding. Marking this json would break it the other way.
+        let js = "var x=new XMLHttpRequest(); x.open('POST','/save'); x.send('a=1&b=2');";
+        let mut out = Vec::new();
+        extract_js_calls(js, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].body_type, None, "no JSON signal, so no json claim");
+        assert!(out[0].body_params.is_empty());
+    }
+
+    #[test]
+    fn the_axios_and_fetch_shapes_still_work_and_get_is_skipped() {
+        let js = r#"
+          axios.post('/api/orders', {id: 1});
+          fetch('/api/list');
+          http.put('/api/items/3');
+          xhr.open('GET','/api/noop');
+          api.delete('/api/items/4');
+        "#;
+        let mut out = Vec::new();
+        extract_js_calls(js, &mut out);
+        let mut got: Vec<(String, String)> = out
+            .iter()
+            .map(|c| (c.method.clone(), c.url.clone()))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("DELETE".to_string(), "/api/items/4".to_string()),
+                ("POST".to_string(), "/api/orders".to_string()),
+                ("PUT".to_string(), "/api/items/3".to_string()),
+            ],
+            "write verbs only, and a GET open() is not a finding"
+        );
+    }
+
+    #[test]
+    fn a_later_calls_body_is_not_read_as_this_ones() {
+        // Two calls in one file, only the second sending JSON. The window after
+        // a call site is bounded so the second one's setup cannot be attributed
+        // to the first.
+        let filler = " ".repeat(500);
+        let js = format!(
+            "x.open('POST','/first');x.send('a=1');{filler}             y.open('POST','/second');y.setRequestHeader('Content-Type','application/json');             y.send(JSON.stringify({{note:1}}));"
+        );
+        let mut out = Vec::new();
+        extract_js_calls(&js, &mut out);
+        assert_eq!(out.len(), 2, "got {out:?}");
+        let first = out.iter().find(|c| c.url == "/first").expect("first");
+        let second = out.iter().find(|c| c.url == "/second").expect("second");
+        assert_eq!(first.body_type, None, "the far JSON is not this call's");
+        assert_eq!(second.body_type.as_deref(), Some("json"));
+        assert_eq!(second.body_params, vec!["note".to_string()]);
     }
 }

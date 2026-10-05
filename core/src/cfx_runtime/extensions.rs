@@ -305,7 +305,7 @@ impl DaemonExtension {
             .and_then(|mut stream| {
                 use std::io::{BufRead, Write};
                 stream.set_nodelay(true)?;
-                let mut req_str = serde_json::to_string(&payload).unwrap();
+                let mut req_str = dguard::encode(&payload);
                 req_str.push('\n');
                 stream.write_all(req_str.as_bytes())?;
                 stream.flush()?;

@@ -10,12 +10,12 @@
 //! works without putting a captured request on screen.
 
 use crate::store::Envelope;
-use cfx_tui::{widgets, Dashboard, Logs, Stat, View};
+use cfx_tui::{Dashboard, Logs, Stat, View, widgets};
 use ratatui::{
+    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::Style,
     widgets::{Block, Borders, Cell, Row, Table, TableState},
-    Frame,
 };
 
 const FEED: char = 'f';

@@ -402,8 +402,29 @@ pub mod pace {
             let n = self.oks.fetch_add(1, Ordering::Relaxed) + 1;
             if n >= GROW_AFTER {
                 let d = self.delay_ms.load(Ordering::Relaxed);
+                // At least 1ms off, or the brake never comes off at all.
+                //
+                // This was `d - d / 4`, and integer division means `d / 4` is
+                // 0 for any delay of 3ms or less. The decay therefore converges
+                // on exactly 3 and stays there: from the 1500ms ceiling, forty
+                // decays land on 3, and every decay after that subtracts
+                // nothing. A host that was braked once pays 3ms on every
+                // request for the rest of the daemon's life, or until the idle
+                // reset above retires it.
+                //
+                // 3ms is invisible per request and enormous per pass. Measured
+                // end to end against xssmaze: a 300-endpoint injection pass
+                // sends about 22,000 requests, and the engine's own log
+                // attributed 65 of its 95 seconds to pacing back-off while
+                // reporting 0 seconds waiting on the target and 0 requests that
+                // never answered. Every one of the nine progress lines in that
+                // pass matches 3ms times the request count to within a second.
+                // The same pass on a daemon that had never braked ran in under
+                // a second, which is the 100x swing that made this look like
+                // target behaviour rather than arithmetic.
+                let step = (d / 4).max(1);
                 self.delay_ms
-                    .store(d.saturating_sub(d / 4), Ordering::Relaxed);
+                    .store(d.saturating_sub(step), Ordering::Relaxed);
             }
             if n >= UNSERIALISE_AFTER {
                 self.oks.store(0, Ordering::Relaxed);
@@ -572,13 +593,23 @@ pub async fn send_with(
     let t0 = Instant::now();
     let mut attempt = 0;
     let outcome = loop {
-        let mut rb = match method {
-            "POST" => client.post(url),
-            "PUT" => client.put(url),
-            "DELETE" => client.delete(url),
-            "PATCH" => client.patch(url),
-            _ => client.get(url),
-        };
+        // Any method, not a list of five. This was a match on POST/PUT/DELETE/
+        // PATCH with `_ => client.get(url)`, so every other method was silently
+        // sent as a GET: the caller's body went out attached to a GET, the
+        // server ignored it, and the endpoint reported clean. An engine saying
+        // "tested, nothing found" about a request it never made is the worst
+        // shape a negative result can take.
+        //
+        // xssmaze's querymethod family is five endpoints that only answer HTTP
+        // QUERY, and all five read as detection failures. The same silence
+        // covered every API verb outside the five, which for a JSON API is
+        // routine.
+        //
+        // A method that is not a valid HTTP token still falls back to GET,
+        // because there is nothing else to send and refusing the request would
+        // turn a caller's typo into a dropped endpoint.
+        let m = transport::Method::from_bytes(method.as_bytes()).unwrap_or(transport::Method::GET);
+        let mut rb = client.request(m, url);
         for (k, v) in extra_headers {
             rb = rb.header(k.as_str(), v.as_str());
         }
@@ -832,6 +863,53 @@ mod timing_tests {
             Timing::Above(ms) => assert_eq!(ms, 3800),
             Timing::Hopeless { .. } => panic!("no samples is not evidence of slowness"),
         }
+    }
+
+    #[test]
+    fn the_brake_comes_all_the_way_off() {
+        let p = pace::HostPace::new_for_test();
+        p.set_for_test(1500, false);
+        // Successes, in GROW_AFTER-sized groups, until the delay stops moving.
+        let mut last = p.delay();
+        let mut stalled = 0;
+        for _ in 0..4_000 {
+            p.ok();
+            let d = p.delay();
+            if d == last {
+                stalled += 1;
+            } else {
+                stalled = 0;
+                last = d;
+            }
+            if d == 0 {
+                break;
+            }
+            // 2000 calls with no movement at all means it has converged on a
+            // floor, which is the bug: `d - d / 4` subtracts nothing once d is
+            // 3 or less, so the brake stays on for the life of the daemon.
+            assert!(
+                stalled < 2_000,
+                "the delay stopped decaying at {d}ms and will never reach 0"
+            );
+        }
+        assert_eq!(p.delay(), 0, "a host that keeps answering owes no delay");
+    }
+
+    #[test]
+    fn three_milliseconds_is_a_minute_over_a_pass() {
+        // Why the floor mattered, in the shape it was found in. A 300-endpoint
+        // injection pass against xssmaze sends about 22,000 requests, and the
+        // engine's own pass log reported 65 seconds of pacing back-off with 0
+        // seconds spent waiting on the target.
+        let requests = 21_935u64;
+        assert_eq!(requests * 3 / 1000, 65, "3ms a request is 65s a pass");
+        // And the ceiling decays to exactly that floor, which is why it was a
+        // permanent 3ms rather than an occasional one.
+        let mut d: u64 = 1500;
+        for _ in 0..40 {
+            d -= d / 4;
+        }
+        assert_eq!(d, 3, "the old decay converges on 3ms from the ceiling");
     }
 
     #[test]
