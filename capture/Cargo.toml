@@ -2,6 +2,8 @@
 name = "cfx_capture"
 version = "0.0.1"
 edition = "2024"
+license.workspace = true
+publish.workspace = true
 description = "Shared traffic-capture core (session CA, per-SNI MITM leaves, egress, per-flow inspect+forward, privacy-safe reduction) for the Web Tracer family: desktop proxy and mobile VpnService netstack."
 
 [dependencies]

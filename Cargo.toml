@@ -14,6 +14,15 @@ members = ["capture", "core", "node", "crossfyre", "tui", "mach", "voyage", "pul
 # still built as a dependency but not as a standalone member.
 exclude = ["adaptive", "adaptive-private"]
 
+# Every crate here is Apache-2.0, the licence in LICENSE, and none is published to
+# crates.io. A publish there is permanent and would fix a name and a licence for good,
+# so it is refused until a crate is deliberately made a release channel, under a
+# crossfyre-* name rather than the cfx_* names, which belong to CitizenFX there. This
+# table sits after every [workspace] key on purpose: a key below it would land in it.
+[workspace.package]
+license = "Apache-2.0"
+publish = false
+
 # `mobile/rust` (cfx_mobile) is the Android Tracer's native core: a JNI cdylib
 # that reuses `capture`. It is a full member, with no CI carve-out.
 #

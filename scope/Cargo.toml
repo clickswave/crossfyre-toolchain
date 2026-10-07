@@ -2,6 +2,8 @@
 name = "cfx_scope"
 version = "0.0.1"
 edition = "2024"
+license.workspace = true
+publish.workspace = true
 homepage = "https://clickswave.org"
 repository = "https://github.com/clickswave/crossfyre-toolchain"
 keywords = ["scope", "authorisation", "proxy", "pentest"]

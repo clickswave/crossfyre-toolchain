@@ -2,6 +2,8 @@
 name = "pulse"
 version = "0.0.7"
 edition = "2024"
+license.workspace = true
+publish.workspace = true
 homepage = "https://clickswave.org"
 repository = "https://github.com/clickswave/crossfyre-toolchain"
 keywords = ["network-discovery", "port-scanning", "security", "red-teaming"]

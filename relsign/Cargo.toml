@@ -2,6 +2,7 @@
 name = "relsign"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 publish = false
 description = "Release-manifest signing for Crossfyre. A build-host tool: it is not a shipped component and is not listed in the release manifest."
 

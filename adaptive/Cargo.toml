@@ -4,7 +4,10 @@ version = "0.0.1"
 edition = "2024"
 homepage = "https://clickswave.org"
 description = "Reusable adaptive rate-limiting and resilience control for Crossfyre workflows"
-license = "MIT"
+license = "Apache-2.0"
+# Not a workspace member (the root excludes it, so first-party builds can swap in the
+# tuned drop-in), so it cannot inherit these two fields and states them itself.
+publish = false
 
 [dependencies]
 serde = { version = "1.0.219", features = ["derive"] }
