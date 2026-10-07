@@ -96,11 +96,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # `core` pulls in pyo3 for the .cfx playbook runtime, so the final link
-      # wants libpython. rust:bookworm has the interpreter but not the headers,
-      # and every crate compiled fine before the link failed on -lpython3.11.
-      # Debian bookworm ships 3.11, which is why the version is pinned here.
-      - name: Install the libpython the link needs
+      # cfx-script, the .cfx runner, embeds Python and so links libpython; it is
+      # the only binary here that does, which is what lets the CLI and node start
+      # on any Linux. rust:bookworm has the interpreter but not the headers, so the
+      # link fails on -lpython3.11 without this. Debian bookworm ships 3.11, so a
+      # host that runs .cfx scripts needs libpython3.11.
+      - name: Install the libpython cfx-script links
         run: |
           apt-get update -qq
           apt-get install -y --no-install-recommends libpython3.11-dev
@@ -110,7 +111,8 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --release --locked \
-            -p crossfyre -p cortex -p mach -p voyage -p pulse -p scout -p node -p oast
+            -p crossfyre -p cortex -p mach -p voyage -p pulse -p scout -p node -p oast \
+            -p cfx-script
 
       - name: Stage the artifacts
         id: stage
@@ -118,7 +120,7 @@ jobs:
           set -euo pipefail
           out="dist/${{ matrix.target }}"
           mkdir -p "$out"
-          for b in crossfyre cortex mach voyage pulse scout node oast; do
+          for b in crossfyre cortex mach voyage pulse scout node oast cfx-script; do
             cp "target/release/$b" "$out/$b"
           done
           strip "$out"/* 2>/dev/null || true

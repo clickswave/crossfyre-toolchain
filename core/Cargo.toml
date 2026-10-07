@@ -52,5 +52,3 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 tokio-rustls = "0.26"
 toml = "1.0.3"
-pyo3 = { version = "0.29", features = ["auto-initialize"] }
-pythonize = "0.29"

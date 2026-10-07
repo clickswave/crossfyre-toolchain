@@ -8,7 +8,6 @@ use sysinfo::System;
 use tokio::sync::Semaphore;
 
 pub mod auth;
-pub mod cfx_runtime;
 pub mod creds;
 mod egress;
 pub mod executor;

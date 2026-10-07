@@ -24,13 +24,13 @@ pub fn inject_defaults() {
     map.insert(
         "mach".to_string(),
         ExtensionKind::Daemon {
-            port: crate::toolchain::config::engine_port("mach"),
+            port: cfx_core::toolchain::config::engine_port("mach"),
         },
     );
     map.insert(
         "voyage".to_string(),
         ExtensionKind::Daemon {
-            port: crate::toolchain::config::engine_port("voyage"),
+            port: cfx_core::toolchain::config::engine_port("voyage"),
         },
     );
 
