@@ -678,43 +678,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "cfx_project"
-version = "0.0.1"
-dependencies = [
- "cfx_capture",
- "cfx_scope",
- "log",
- "serde",
- "serde_json",
- "sha2",
- "sqlx",
- "tokio",
-]
-
-[[package]]
 name = "cfx_scope"
 version = "0.0.1"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "cfx_session"
-version = "0.0.1"
-dependencies = [
- "bytes",
- "cfx_capture",
- "cfx_project",
- "cfx_session",
- "http-body-util",
- "hyper",
- "hyper-util",
- "log",
- "rcgen",
- "rustls",
- "rustls-pemfile",
- "tokio",
- "tokio-rustls",
 ]
 
 [[package]]
@@ -2640,7 +2607,6 @@ version = "0.30.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2e99fb7a497b1e3339bc746195567ed8d3e24945ecd636e3619d20b9de9e9149"
 dependencies = [
- "cc",
  "pkg-config",
  "vcpkg",
 ]
