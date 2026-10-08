@@ -1362,6 +1362,77 @@ async fn run_endpoint(mut ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome 
             starved: false,
         };
     }
+    // Before anything is sent: is submitting this endpoint an action rather than
+    // a test? If so it is skipped whole, not per-parameter, because the other
+    // parameters ride along in the same request. This and the credential check
+    // below sat after the inventory, rate-limit, CORS, XXE and exposure probes,
+    // which send the endpoint's URL as recorded, so a `?action=delete` link was
+    // requested and DVWA's password-change link went out with its password
+    // fields on it before either guard ran (action_rail.rs holds both).
+    {
+        let mut names: Vec<String> = if ep.params.is_empty() {
+            query_param_names(&ep.url)
+        } else {
+            ep.params.clone()
+        };
+        names.extend(ep.body.iter().map(|b| b.name.clone()));
+        if let Some(verb) = names_an_action(&ep.url) {
+            let _ = tx.send(json!({"type":"log","message": format!(
+                "skipped {} {} without testing it: `{}` in the query names an action, and requesting \
+                 it performs that action. The crawler reports these and does not follow them; neither \
+                 does this. A finding behind a button is not worth logging the scan out to reach.",
+                ep.method, ep.url, verb
+            )}));
+            return EndpointOutcome {
+                found,
+                starved: false,
+            };
+        }
+        if let Some(which) = changes_a_credential(&names) {
+            // Drop the fields that could set the secret; keep the endpoint.
+            //
+            // The first version of this skipped the whole endpoint, on the
+            // reasoning that every parameter rides in the same request. True,
+            // and too blunt: RailsGoat's account form is `POST /users/1` with
+            // `user[password]`, `user[password_confirmation]` AND `user[id]`,
+            // and `user[id]` is a SQL injection. Refusing the endpoint traded a
+            // real high-severity finding for safety that did not need it.
+            //
+            // A request that does not carry a password field cannot set a
+            // password. So those fields leave - from the declared params, from
+            // the body, and from the URL's own query, which is where DVWA
+            // carries them - and everything else is tested as usual. If nothing
+            // survives, there was nothing here but the credential change.
+            let dropped: Vec<String> = names
+                .iter()
+                .filter(|n| is_credential_field(n))
+                .cloned()
+                .collect();
+            ep.params.retain(|n| !is_credential_field(n));
+            ep.body.retain(|f| !is_credential_field(&f.name));
+            for n in &dropped {
+                ep.url = drop_param(&ep.url, n);
+            }
+            let left = ep.params.len() + ep.body.len();
+            let _ = tx.send(json!({"type":"log","message": format!(
+                "{} {}: `{which}` alongside a confirmation field makes this a credential-change \
+                 form, so {} field(s) that could set the secret were removed from the request \
+                 ({}). A request without them cannot change the credential. {}",
+                ep.method, ep.url, dropped.len(), dropped.join(", "),
+                if left == 0 {
+                    "Nothing else was declared here, so the endpoint is not tested.".to_string()
+                } else {
+                    format!("The remaining {left} field(s) are tested as usual.")
+                }
+            )}));
+            if left == 0 {
+                return EndpointOutcome {
+                    found,
+                    starved: false,
+                };
+            }
+        }
+    }
     let mut sites = 0usize;
     let mut starved = 0usize;
     // What this endpoint looked like before anything was sent at it, so the pass
@@ -1459,73 +1530,6 @@ async fn run_endpoint(mut ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome 
         {
             let _ = tx.send(json!({"type":"finding","data":f}));
             found += 1;
-        }
-    }
-    // Before anything is sent: is submitting this endpoint an action rather than
-    // a test? If so it is skipped whole, not per-parameter, because the other
-    // parameters ride along in the same request.
-    {
-        let mut names: Vec<String> = if ep.params.is_empty() {
-            query_param_names(&ep.url)
-        } else {
-            ep.params.clone()
-        };
-        names.extend(ep.body.iter().map(|b| b.name.clone()));
-        if let Some(verb) = names_an_action(&ep.url) {
-            let _ = tx.send(json!({"type":"log","message": format!(
-                "skipped {} {} without testing it: `{}` in the query names an action, and requesting \
-                 it performs that action. The crawler reports these and does not follow them; neither \
-                 does this. A finding behind a button is not worth logging the scan out to reach.",
-                ep.method, ep.url, verb
-            )}));
-            return EndpointOutcome {
-                found,
-                starved: false,
-            };
-        }
-        if let Some(which) = changes_a_credential(&names) {
-            // Drop the fields that could set the secret; keep the endpoint.
-            //
-            // The first version of this skipped the whole endpoint, on the
-            // reasoning that every parameter rides in the same request. True,
-            // and too blunt: RailsGoat's account form is `POST /users/1` with
-            // `user[password]`, `user[password_confirmation]` AND `user[id]`,
-            // and `user[id]` is a SQL injection. Refusing the endpoint traded a
-            // real high-severity finding for safety that did not need it.
-            //
-            // A request that does not carry a password field cannot set a
-            // password. So those fields leave - from the declared params, from
-            // the body, and from the URL's own query, which is where DVWA
-            // carries them - and everything else is tested as usual. If nothing
-            // survives, there was nothing here but the credential change.
-            let dropped: Vec<String> = names
-                .iter()
-                .filter(|n| is_credential_field(n))
-                .cloned()
-                .collect();
-            ep.params.retain(|n| !is_credential_field(n));
-            ep.body.retain(|f| !is_credential_field(&f.name));
-            for n in &dropped {
-                ep.url = drop_param(&ep.url, n);
-            }
-            let left = ep.params.len() + ep.body.len();
-            let _ = tx.send(json!({"type":"log","message": format!(
-                "{} {}: `{which}` alongside a confirmation field makes this a credential-change \
-                 form, so {} field(s) that could set the secret were removed from the request \
-                 ({}). A request without them cannot change the credential. {}",
-                ep.method, ep.url, dropped.len(), dropped.join(", "),
-                if left == 0 {
-                    "Nothing else was declared here, so the endpoint is not tested.".to_string()
-                } else {
-                    format!("The remaining {left} field(s) are tested as usual.")
-                }
-            )}));
-            if left == 0 {
-                return EndpointOutcome {
-                    found,
-                    starved: false,
-                };
-            }
         }
     }
     for site in sites_for(&ep, &varying) {

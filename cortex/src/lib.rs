@@ -50,6 +50,8 @@ mod template;
 // with anything in it: the test IS the artefact.
 #[cfg(test)]
 mod writes_rail;
+#[cfg(test)]
+mod action_rail;
 mod xml;
 
 use crate::libs::cli_args::{Cli, Commands};
