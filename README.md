@@ -4,7 +4,7 @@
 
 # Crossfyre Toolchain
 
-### Five standalone reconnaissance and scanning engines for offensive security, written in Rust.
+### Five standalone recon and vulnerability scanning engines, written in Rust, for systems you are authorized to test.
 
 `voyage` enumerates subdomains, `pulse` scans hosts and ports, `mach` does content discovery, `scout` fingerprints services and `cortex` tests for vulnerabilities. Run them on their own from the terminal, or connect them to the [Crossfyre platform](https://crossfyre.io) when one machine isn't enough.
 
@@ -121,7 +121,7 @@ cargo install --git https://github.com/clickswave/crossfyre-toolchain.git mach
 
 ## Responsible use
 
-These are offensive-security tools. **Only scan systems you own or have explicit, written permission to test.** Unauthorized scanning is illegal in most jurisdictions and can disrupt the systems you point it at. How you use them is on you.
+These are security testing tools. **Only scan systems you own or have explicit, written permission to test.** Unauthorized scanning is illegal in most jurisdictions and can disrupt the systems you point it at. How you use them is on you.
 
 ## Contributing
 
