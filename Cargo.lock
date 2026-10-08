@@ -603,6 +603,7 @@ version = "0.1.0"
 dependencies = [
  "cfx_core",
  "dguard",
+ "libc",
  "pyo3",
  "pythonize",
  "serde",

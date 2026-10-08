@@ -16,8 +16,14 @@ use super::service;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+/// The helper that runs .cfx scripts (see `crate::executor`). It goes beside node, where
+/// node and the CLI look for it. It is the one component that links libpython, so it is
+/// optional: on a host without the Python it was built against it cannot start, and
+/// then only .cfx scripts are unavailable.
+const CFX_SCRIPT: &str = "cfx-script";
 
 // The bins origin this binary fetches releases from. Baked at build time so a
 // dev/staging build pulls from its own bucket: crossfyre_build sets
@@ -228,6 +234,13 @@ fn extract_zip(zip_path: &Path, extract_dir: &Path) -> Result<(), Box<dyn std::e
 /// an update interrupted by a reboot, leaves a binary that is installed, current, and not
 /// executable, and the next run reports it as missing rather than as broken.
 fn place_binary(src: &Path, dest: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let staged = stage_binary(src, dest)?;
+    commit_staged(&staged, dest)
+}
+
+/// Copy `src` beside `dest` as `<name>.new`, 0755 on unix, and return that path. Renaming
+/// it over `dest` is `commit_staged`.
+fn stage_binary(src: &Path, dest: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -248,11 +261,150 @@ fn place_binary(src: &Path, dest: &Path) -> Result<(), Box<dyn std::error::Error
             return Err(e.into());
         }
     }
-    if let Err(e) = fs::rename(&tmp_path, dest) {
-        let _ = fs::remove_file(&tmp_path);
+    Ok(tmp_path)
+}
+
+/// Move a binary that `stage_binary` staged into place at `dest`.
+fn commit_staged(staged: &Path, dest: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if let Err(e) = fs::rename(staged, dest) {
+        let _ = fs::remove_file(staged);
         return Err(e.into());
     }
     Ok(())
+}
+
+/// Does the cfx-script at `path` start on this host? Given an empty stdin it refuses the
+/// job with exit status 2, which proves that the binary and its libpython loaded. Any
+/// other status, usually 127 from the dynamic loader, is a failure, returned with what
+/// it wrote to stderr. The installer makes the same check.
+fn helper_starts(path: &Path) -> Result<(), String> {
+    let mut busy = 0;
+    let out = loop {
+        let run = Command::new(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output();
+        match run {
+            // The copy was open for writing a moment ago, and a process that another
+            // thread forked in that moment holds it open until it execs.
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && busy < 100 => {
+                busy += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => return Err(e.to_string()),
+            Ok(out) => break out,
+        }
+    };
+    if out.status.code() == Some(2) {
+        return Ok(());
+    }
+    let said = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if said.is_empty() {
+        Err(format!("it exited with {}", out.status))
+    } else {
+        Err(said)
+    }
+}
+
+/// Put the cfx-script at `src` at `dest`, but only if it starts here. It is staged
+/// beside `dest` and run from there, as the installer does, because the temp directory
+/// may be on a filesystem mounted noexec. `Some(output)` when it cannot start: the
+/// staged copy is removed and `dest` is left as it was.
+fn place_helper_if_it_starts(
+    src: &Path,
+    dest: &Path,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let staged = stage_binary(src, dest)?;
+    if let Err(output) = helper_starts(&staged) {
+        let _ = fs::remove_file(&staged);
+        return Ok(Some(output));
+    }
+    commit_staged(&staged, dest)?;
+    Ok(None)
+}
+
+/// What `install_cfx_script` did.
+#[derive(Debug)]
+pub enum HelperOutcome {
+    /// The release has no cfx-script for this platform, so nothing changed.
+    NotInRelease,
+    /// The installed cfx-script is the release's version.
+    Current { version: String },
+    /// The release's cfx-script was installed. `replaced` is the version recorded for the
+    /// one it replaced, if there was one.
+    Installed {
+        version: String,
+        replaced: Option<String>,
+    },
+    /// The release's cfx-script cannot start on this host, so it was not installed and
+    /// whatever was there before is left as it was. `output` is what it wrote.
+    CannotStart { version: String, output: String },
+}
+
+/// Install or refresh the cfx-script helper from the release manifest: download it,
+/// check its sha256, unpack it beside node and run it once before it replaces anything.
+/// Its version is recorded in `cfx-script.version`, as node's is in `node.version`, so a
+/// later update can tell whether it is current. A cfx-script that the installer placed
+/// has no such record and is replaced once.
+pub async fn install_cfx_script(
+    manifest: &Manifest,
+    force: bool,
+) -> Result<HelperOutcome, Box<dyn std::error::Error>> {
+    let Ok((comp, artifact)) = resolve_artifact(manifest, CFX_SCRIPT) else {
+        return Ok(HelperOutcome::NotInRelease);
+    };
+    let version = comp.version.clone();
+    let dest = ext_bin_path(CFX_SCRIPT);
+    let replaced = installed_ext_version(CFX_SCRIPT).filter(|_| dest.exists());
+    if replaced.as_deref() == Some(version.as_str()) && !force {
+        return Ok(HelperOutcome::Current { version });
+    }
+
+    let tmp_dir = tempfile::tempdir()?;
+    let zip_path = tmp_dir.path().join(&artifact.file);
+    download_verified(artifact, &zip_path).await?;
+    let extract_dir = tmp_dir.path().join("extracted");
+    extract_zip(&zip_path, &extract_dir)?;
+    let extracted = extract_dir.join(ext_file_name(CFX_SCRIPT));
+    if !extracted.exists() {
+        return Err("cfx-script binary not found inside its zip".into());
+    }
+    if let Some(output) = place_helper_if_it_starts(&extracted, &dest)? {
+        return Ok(HelperOutcome::CannotStart { version, output });
+    }
+    let _ = fs::write(ext_version_file(CFX_SCRIPT), &version);
+    Ok(HelperOutcome::Installed { version, replaced })
+}
+
+/// What is left to run .cfx scripts when a new cfx-script was not installed.
+fn without_new_helper() -> &'static str {
+    if ext_bin_path(CFX_SCRIPT).exists() {
+        "the cfx-script already installed stays in use"
+    } else {
+        ".cfx scripts will not run; scans and everything else work"
+    }
+}
+
+/// Say what became of the cfx-script helper, in the plain lines `node init` and the node's
+/// own update print.
+fn report_cfx_script(result: Result<HelperOutcome, Box<dyn std::error::Error>>) {
+    match result {
+        Ok(HelperOutcome::Installed { version, .. }) => println!(
+            "[+] Installed cfx-script {version} to {} (runs .cfx scripts)",
+            ext_bin_path(CFX_SCRIPT).display()
+        ),
+        Ok(HelperOutcome::CannotStart { version, output }) => eprintln!(
+            "[!] cfx-script {version} cannot start here, so it was not installed and {}. \
+             {output}",
+            without_new_helper()
+        ),
+        Ok(HelperOutcome::Current { .. } | HelperOutcome::NotInRelease) => {}
+        Err(e) => eprintln!(
+            "[!] could not install cfx-script: {e}. Until it installs, {}.",
+            without_new_helper()
+        ),
+    }
 }
 
 /// Install one or more extensions ("mach" | "all"). Download + verify +
@@ -562,6 +714,68 @@ pub async fn update(
                 }
             }
         }
+
+        // The cfx-script helper beside node. Optional, as in the installer, so a failure
+        // is a warning, and a release without one is passed over in silence. A new one
+        // needs no restart: every job starts it afresh.
+        let hwant = manifest_version(&manifest, CFX_SCRIPT);
+        let helper_ok = ext_bin_path(CFX_SCRIPT).exists()
+            && installed_ext_version(CFX_SCRIPT).as_deref() == Some(hwant.as_str());
+        if !hwant.is_empty() {
+            if helper_ok && !force {
+                println!(
+                    "{}",
+                    row(&check(), CFX_SCRIPT, &ver(&hwant), &dim("up to date"))
+                );
+                current += 1;
+            } else {
+                print!("    {} {:<10} {}", dot(), CFX_SCRIPT, dim("updating…"));
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                let line = match install_cfx_script(&manifest, force).await {
+                    Ok(HelperOutcome::Installed { version, replaced }) => {
+                        let mid = match &replaced {
+                            Some(old) if !old.is_empty() && *old != version => {
+                                format!("{DIM}{old} \u{2192}{RESET} {version}")
+                            }
+                            _ => version.clone(),
+                        };
+                        changed += 1;
+                        row(
+                            &check(),
+                            CFX_SCRIPT,
+                            &mid,
+                            &format!("{GREEN}updated{RESET}"),
+                        )
+                    }
+                    Ok(HelperOutcome::Current { .. } | HelperOutcome::NotInRelease) => {
+                        current += 1;
+                        row(&check(), CFX_SCRIPT, &ver(&hwant), &dim("up to date"))
+                    }
+                    Ok(HelperOutcome::CannotStart { output, .. }) => row(
+                        &bang(),
+                        CFX_SCRIPT,
+                        "",
+                        &format!(
+                            "{YELLOW}skipped{RESET} {}",
+                            dim(&format!(
+                                "it cannot start here, so it was not installed and {}. {output}",
+                                without_new_helper()
+                            ))
+                        ),
+                    ),
+                    Err(e) => row(
+                        &bang(),
+                        CFX_SCRIPT,
+                        "",
+                        &format!(
+                            "{YELLOW}failed{RESET} {}",
+                            dim(&format!("{e}. Until it installs, {}", without_new_helper()))
+                        ),
+                    ),
+                };
+                println!("\r{line}          ");
+            }
+        }
         println!();
     }
 
@@ -722,27 +936,78 @@ pub async fn download_node(
     Ok(true)
 }
 
-/// Ensure the `node` worker binary is present next to crossfyre. Prefers a
-/// sibling of the running binary (fresh install / dev checkout) and falls back
-/// to downloading it from the release manifest. Called during `node init` so
-/// the service's ExecStart resolves.
+/// Ensure the `node` worker binary is present next to crossfyre, and the cfx-script
+/// helper next to it. A missing one is copied from beside the running binary when it is
+/// there (fresh install, release tarball, dev checkout) and downloaded from the release
+/// manifest when it is not. An installed helper is also refreshed from the manifest when
+/// its recorded version is not the release's. Called during `node init` so the
+/// service's ExecStart resolves. A helper that cannot be installed is a warning, not an
+/// error, since only .cfx scripts need it.
 pub async fn ensure_node_installed() -> Result<(), Box<dyn std::error::Error>> {
     let stable = get_bin_dir().join(ext_file_name("node"));
-    if stable.exists() {
-        return Ok(());
+    let mut manifest = None;
+    if !stable.exists() {
+        if let Some(sib) = sibling_of_this_binary("node") {
+            place_binary(&sib, &stable)?;
+            println!("[+] Installed node binary to {}", stable.display());
+        } else {
+            let m = fetch_manifest().await?;
+            download_node(&m, false, false).await?;
+            manifest = Some(m);
+        }
     }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(sib) = exe.parent().map(|d| d.join(ext_file_name("node")))
-        && sib.exists()
-        && sib != stable
+
+    let helper = ext_bin_path(CFX_SCRIPT);
+    if !helper.exists()
+        && let Some(sib) = sibling_of_this_binary(CFX_SCRIPT)
     {
-        place_binary(&sib, &stable)?;
-        println!("[+] Installed node binary to {}", stable.display());
+        // From the same build as a node beside it. Its version is unknown, so none is
+        // recorded, and the next update replaces it with the manifest's.
+        let _ = fs::remove_file(ext_version_file(CFX_SCRIPT));
+        match place_helper_if_it_starts(&sib, &helper) {
+            Ok(None) => println!(
+                "[+] Installed cfx-script to {} (runs .cfx scripts)",
+                helper.display()
+            ),
+            Ok(Some(output)) => eprintln!(
+                "[!] {} cannot start here, so it was not installed and {}. {output}",
+                sib.display(),
+                without_new_helper()
+            ),
+            Err(e) => report_cfx_script(Err(e)),
+        }
         return Ok(());
     }
-    let manifest = fetch_manifest().await?;
-    download_node(&manifest, false, false).await?;
+    let manifest = match manifest {
+        Some(m) => m,
+        None => match fetch_manifest().await {
+            Ok(m) => m,
+            Err(e) => {
+                report_cfx_script(Err(e));
+                return Ok(());
+            }
+        },
+    };
+    report_cfx_script(install_cfx_script(&manifest, false).await);
     Ok(())
+}
+
+/// `name` in the directory of the running binary, when it is there and is not the
+/// installed copy itself.
+fn sibling_of_this_binary(name: &str) -> Option<PathBuf> {
+    let installed = get_bin_dir().join(ext_file_name(name));
+    let exe = std::env::current_exe().ok()?;
+    let sib = exe.parent()?.join(ext_file_name(name));
+    (sib.exists() && sib != installed).then_some(sib)
+}
+
+/// The update the dashboard asks a node for: the crossfyre CLI and the cfx-script helper,
+/// from the release manifest. True when the CLI was replaced and the node should restart
+/// to run it. A new helper needs no restart, since every job starts it afresh.
+pub async fn update_for_dashboard() -> Result<bool, Box<dyn std::error::Error>> {
+    let manifest = fetch_manifest().await?;
+    report_cfx_script(install_cfx_script(&manifest, false).await);
+    self_update(&manifest, &installed_cli_version(), false, false).await
 }
 
 #[cfg(test)]
@@ -981,5 +1246,68 @@ mod tests {
             Some(&b"somebody-elses-file"[..]),
             "staging must not go through a path that belongs to another name"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Placing cfx-script
+    // ---------------------------------------------------------------------------
+
+    /// A stand-in cfx-script: a shell script that reads its stdin and exits as told.
+    #[cfg(unix)]
+    fn fake_helper(s: &Scratch, name: &str, body: &str) -> std::path::PathBuf {
+        let p = s.join(name);
+        fs::write(&p, format!("#!/bin/sh\ncat >/dev/null\n{body}\n")).expect("write helper");
+        p
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_helper_that_refuses_an_empty_job_is_placed() {
+        // Exit status 2 on an empty stdin is how cfx-script refuses a job that is not
+        // there, and getting that far means it loaded.
+        let s = Scratch::new("helper-ok");
+        let src = fake_helper(&s, "unpacked", "exit 2");
+        let dest = s.join("bin").join("cfx-script");
+        let failed = place_helper_if_it_starts(&src, &dest).expect("place");
+        assert_eq!(failed, None);
+        assert_eq!(
+            fs::read(&dest).expect("read"),
+            fs::read(&src).expect("read")
+        );
+        assert_eq!(mode_of(&dest), 0o755);
+        assert!(!s.join("bin").join("cfx-script.new").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_helper_that_cannot_start_is_not_placed_and_the_old_one_stays() {
+        let s = Scratch::new("helper-broken");
+        let src = fake_helper(
+            &s,
+            "unpacked",
+            "echo 'cfx-script: error while loading shared libraries: libpython3.11.so.1.0' >&2\nexit 127",
+        );
+        let dest = s.join("cfx-script");
+        fs::write(&dest, b"the-old-one").expect("write old");
+        let failed = place_helper_if_it_starts(&src, &dest).expect("place");
+        let output = failed.expect("a helper exiting 127 cannot start");
+        assert!(output.contains("libpython3.11.so.1.0"), "{output}");
+        assert_eq!(fs::read(&dest).expect("read"), b"the-old-one");
+        assert!(!s.join("cfx-script.new").exists(), "nothing is left staged");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_helper_that_ran_a_job_it_was_never_given_is_not_placed() {
+        // Exit 0 on an empty stdin is not cfx-script refusing a missing job, so it is
+        // not proof that it loaded. Whatever it printed is all there is to say.
+        let s = Scratch::new("helper-zero");
+        let src = fake_helper(&s, "unpacked", "exit 0");
+        let dest = s.join("cfx-script");
+        let output = place_helper_if_it_starts(&src, &dest)
+            .expect("place")
+            .expect("exit 0 is not the refusal");
+        assert!(output.contains("exit status: 0"), "{output}");
+        assert!(!dest.exists());
     }
 }

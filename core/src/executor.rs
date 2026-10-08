@@ -32,8 +32,24 @@ pub enum ExecutionResult {
 
 const HELPER: &str = "cfx-script";
 
+/// The version of the protocol between the caller and the helper, sent as `protocol` in
+/// every job. The helper refuses a job that names another and says why, so a node and a
+/// cfx-script from releases that speak differently fail loudly instead of misreading
+/// each other. Raise it whenever either side changes what the other reads.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// The variable that hands the helper the caller's toolchain directory, so engine ports
+/// come from the same config.toml. Not part of the job JSON, because a path need not be
+/// UTF-8 and a JSON string must be: building the job with such a path in it panicked.
+pub const TOOLCHAIN_DIR_ENV: &str = "CFX_SCRIPT_TOOLCHAIN_DIR";
+
 /// How many of the helper's last stderr lines are kept to explain a failure.
 const STDERR_TAIL: usize = 20;
+
+/// How long the stderr reader may go on after the helper has exited before the job ends
+/// without it. Everything the helper wrote is in the pipe by then, and the reader takes
+/// it in well within this.
+const STDERR_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Where the helper is: `CROSSFYRE_CFX_SCRIPT` when set, else beside this binary
 /// (the installer puts it next to `node` and the CLI), else on PATH.
@@ -64,6 +80,27 @@ fn as_message(line: &str) -> Option<serde_json::Value> {
     match v.get("type").and_then(|t| t.as_str()) {
         Some("result" | "log" | "completed") => Some(v),
         _ => None,
+    }
+}
+
+/// Read the next line into `buf`, as bytes and without its line ending. False at EOF or
+/// on a read error.
+async fn read_line(
+    reader: &mut BufReader<impl tokio::io::AsyncRead + Unpin>,
+    buf: &mut Vec<u8>,
+) -> bool {
+    buf.clear();
+    match reader.read_until(b'\n', buf).await {
+        Ok(0) | Err(_) => false,
+        Ok(_) => {
+            if buf.last() == Some(&b'\n') {
+                buf.pop();
+                if buf.last() == Some(&b'\r') {
+                    buf.pop();
+                }
+            }
+            true
+        }
     }
 }
 
@@ -102,7 +139,12 @@ pub async fn run_helper(
     toolchain_dir: Option<&Path>,
     mut on_message: impl FnMut(serde_json::Value),
 ) -> (ExecutionResult, bool) {
-    let mut child = match tokio::process::Command::new(helper)
+    let mut command = tokio::process::Command::new(helper);
+    match toolchain_dir {
+        Some(dir) => command.env(TOOLCHAIN_DIR_ENV, dir),
+        None => command.env_remove(TOOLCHAIN_DIR_ENV),
+    };
+    let mut child = match command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -136,12 +178,19 @@ pub async fn run_helper(
     // The helper's stderr is the script's own output: pass it through as it comes,
     // and keep the end of it in case it explains a failure. Read before the job is
     // written, so a helper that writes to stderr first can never block on a full pipe.
+    //
+    // Read to EOF whatever arrives. This used tokio's `lines()`, which ends with an
+    // error at the first line that is not UTF-8, such as a Latin-1 header a tool
+    // echoed. The reader stopped there and closed the pipe, the helper's next write to
+    // stderr failed, and the script died of it.
     let tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL)));
     let stderr_task = child.stderr.take().map(|stderr| {
         let tail = Arc::clone(&tail);
         tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
+            let mut reader = BufReader::new(stderr);
+            let mut buf = Vec::new();
+            while read_line(&mut reader, &mut buf).await {
+                let line = String::from_utf8_lossy(&buf).into_owned();
                 eprintln!("{line}");
                 let mut t = tail.lock().unwrap_or_else(|p| p.into_inner());
                 if t.len() == STDERR_TAIL {
@@ -153,11 +202,11 @@ pub async fn run_helper(
     });
 
     let job = serde_json::json!({
+        "protocol": PROTOCOL_VERSION,
         "node_id": ctx.node_id,
         "job_id": ctx.job_id,
         "script": ctx.script,
         "targets": ctx.targets,
-        "toolchain_dir": toolchain_dir,
     });
     if let Some(mut stdin) = child.stdin.take() {
         // A helper that dies before reading the job closes the pipe; that failure is
@@ -168,12 +217,17 @@ pub async fn run_helper(
 
     let mut completed: Option<i32> = None;
     if let Some(stdout) = child.stdout.take() {
-        let mut lines = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
+        let mut reader = BufReader::new(stdout);
+        let mut buf = Vec::new();
+        while read_line(&mut reader, &mut buf).await {
+            let line = String::from_utf8_lossy(&buf);
             if line.trim().is_empty() {
                 continue;
             }
-            let msg = as_message(&line).unwrap_or_else(|| {
+            // A line that is not UTF-8 cannot be a message. It is reported like any
+            // other stray line, and reading goes on to the helper's `completed`.
+            let parsed = std::str::from_utf8(&buf).ok().and_then(as_message);
+            let msg = parsed.unwrap_or_else(|| {
                 serde_json::json!({
                     "type": "log",
                     "job_id": ctx.job_id,
@@ -191,7 +245,11 @@ pub async fn run_helper(
 
     let status = child.wait().await.ok();
     if let Some(task) = stderr_task {
-        let _ = task.await;
+        // A process the script started in the background inherits the helper's stderr,
+        // and the pipe stays open for as long as that process runs, so reading it to EOF
+        // held the job until the process exited, or for good. After the grace the reader
+        // is left running by itself, and still passes on whatever that process writes.
+        let _ = tokio::time::timeout(STDERR_GRACE, task).await;
     }
 
     match completed {
@@ -349,9 +407,33 @@ mod tests {
     }
 
     async fn collect(helper: &Path) -> (ExecutionResult, bool, Vec<serde_json::Value>) {
-        let mut seen = Vec::new();
-        let (r, ended) = run_helper(helper, &ctx(), None, |m| seen.push(m)).await;
-        (r, ended, seen)
+        collect_with(helper, None).await
+    }
+
+    /// Run the helper and gather what it sends, trying the spawn again while it fails
+    /// with ETXTBSY.
+    ///
+    /// Each test writes its fake helper and then executes it while other tests fork. A
+    /// child forked while the file was open for writing holds that descriptor until it
+    /// execs, and executing the file in that window fails with "Text file busy". The
+    /// window closes once those children exec. A lock around the write and the spawn
+    /// would not close it, because any test in this binary that forks opens it.
+    async fn collect_with(
+        helper: &Path,
+        toolchain_dir: Option<&Path>,
+    ) -> (ExecutionResult, bool, Vec<serde_json::Value>) {
+        let busy = std::io::Error::from_raw_os_error(libc::ETXTBSY).to_string();
+        for _ in 0..100 {
+            let mut seen = Vec::new();
+            let (r, ended) = run_helper(helper, &ctx(), toolchain_dir, |m| seen.push(m)).await;
+            match &r {
+                ExecutionResult::Error { message } if message.ends_with(&busy) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                _ => return (r, ended, seen),
+            }
+        }
+        panic!("{} was still busy after a second", helper.display());
     }
 
     #[tokio::test]
@@ -385,6 +467,22 @@ echo '{"type":"completed","job_id":"j1","code":0}'"#,
             seen[0]["message"], "yes",
             "the helper did not get the job: {seen:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn the_job_names_the_protocol_it_speaks() {
+        // The helper refuses a job from another protocol, so every job has to say which
+        // one it speaks.
+        let h = fake_helper(
+            "protocol",
+            r#"cat >"$(dirname "$0")/job.json"
+echo '{"type":"completed","job_id":"j1","code":0}'"#,
+        );
+        let (r, _, _) = collect(&h).await;
+        assert!(matches!(r, ExecutionResult::Completed { code: 0 }), "{r:?}");
+        let job: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(h.with_file_name("job.json")).unwrap()).unwrap();
+        assert_eq!(job["protocol"], PROTOCOL_VERSION, "{job}");
     }
 
     #[tokio::test]
@@ -451,6 +549,127 @@ exit 1"#,
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_stderr_line_that_is_not_utf8_does_not_stop_the_reader() {
+        // A tool's Latin-1 output, such as a server header that curl -v echoes. The
+        // reader used to stop at that line and close the pipe, so the helper's next
+        // write to stderr failed and the script died of it.
+        let h = fake_helper(
+            "latin1-stderr",
+            r#"cat >/dev/null
+printf 'Server: caf\351\n' >&2
+sleep 0.2
+echo 'progress: 50%' >&2
+echo '{"type":"result","job_id":"j1","data":{"n":2}}'
+echo '{"type":"completed","job_id":"j1","code":0}'"#,
+        );
+        let (r, ended, seen) = collect(&h).await;
+        assert!(matches!(r, ExecutionResult::Completed { code: 0 }), "{r:?}");
+        assert!(ended);
+        let types: Vec<&str> = seen.iter().map(|m| m["type"].as_str().unwrap()).collect();
+        assert_eq!(types, ["result", "completed"]);
+    }
+
+    #[tokio::test]
+    async fn a_stdout_line_that_is_not_utf8_is_a_stray_line_and_reading_goes_on() {
+        let h = fake_helper(
+            "latin1-stdout",
+            r#"cat >/dev/null
+printf 'title: caf\351\n'
+echo '{"type":"result","job_id":"j1","data":{"n":2}}'
+echo '{"type":"completed","job_id":"j1","code":0}'"#,
+        );
+        let (r, ended, seen) = collect(&h).await;
+        assert!(matches!(r, ExecutionResult::Completed { code: 0 }), "{r:?}");
+        assert!(ended);
+        let types: Vec<&str> = seen.iter().map(|m| m["type"].as_str().unwrap()).collect();
+        assert_eq!(types, ["log", "result", "completed"]);
+        let stray = seen[0]["message"].as_str().unwrap();
+        assert!(stray.contains("title: caf\u{fffd}"), "{stray}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_toolchain_dir_that_is_not_utf8_reaches_the_helper_unchanged() {
+        // A home directory need not be UTF-8. Building the job JSON with such a path in
+        // it panicked, and the job task died before it published anything.
+        use std::os::unix::ffi::OsStrExt;
+        let dir = Path::new(std::ffi::OsStr::from_bytes(
+            b"/home/jos\xe9/.config/crossfyre",
+        ));
+        let h = fake_helper(
+            "nonutf8-dir",
+            r#"cat >/dev/null
+want=$(printf '/home/jos\351/.config/crossfyre')
+[ "$CFX_SCRIPT_TOOLCHAIN_DIR" = "$want" ] && got=yes || got=no
+echo "{\"type\":\"log\",\"job_id\":\"j1\",\"message\":\"$got\"}"
+echo '{"type":"completed","job_id":"j1","code":0}'"#,
+        );
+        let (r, ended, seen) = collect_with(&h, Some(dir)).await;
+        assert!(matches!(r, ExecutionResult::Completed { code: 0 }), "{r:?}");
+        assert!(ended);
+        assert_eq!(
+            seen[0]["message"], "yes",
+            "the helper did not get the directory: {seen:?}"
+        );
+    }
+
+    /// Stop the background process a fake helper left, whose pid it wrote beside itself.
+    fn stop_holder(helper: &Path) {
+        if let Ok(pid) = std::fs::read_to_string(helper.with_file_name("holder.pid")) {
+            let _ = std::process::Command::new("kill").arg(pid.trim()).status();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_process_left_running_on_the_helpers_stderr_does_not_hold_up_the_job() {
+        // A script's tool started in the background inherits the helper's stderr, and
+        // holds the pipe open for as long as it runs. The caller read that pipe to EOF
+        // after the helper exited, so the job waited for the tool.
+        let h = fake_helper(
+            "holder-ok",
+            r#"cat >/dev/null
+sleep 20 >/dev/null &
+echo $! >"$(dirname "$0")/holder.pid"
+echo '{"type":"result","job_id":"j1","data":{"n":1}}'
+echo '{"type":"completed","job_id":"j1","code":0}'"#,
+        );
+        let started = std::time::Instant::now();
+        let (r, ended, seen) = collect(&h).await;
+        let took = started.elapsed();
+        stop_holder(&h);
+        assert!(matches!(r, ExecutionResult::Completed { code: 0 }), "{r:?}");
+        assert!(ended);
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(took < std::time::Duration::from_secs(10), "took {took:?}");
+    }
+
+    #[tokio::test]
+    async fn a_helper_that_dies_with_a_process_on_its_stderr_still_says_why() {
+        // The same, for a helper that never sent `completed`: what it wrote before it
+        // exited still explains the failure.
+        let h = fake_helper(
+            "holder-dies",
+            r#"cat >/dev/null
+echo 'something broke' >&2
+sleep 20 >/dev/null &
+echo $! >"$(dirname "$0")/holder.pid"
+exit 3"#,
+        );
+        let started = std::time::Instant::now();
+        let (r, ended, _) = collect(&h).await;
+        let took = started.elapsed();
+        stop_holder(&h);
+        assert!(!ended);
+        match r {
+            ExecutionResult::Error { message } => {
+                assert!(message.contains("something broke"), "{message}")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(took < std::time::Duration::from_secs(10), "took {took:?}");
     }
 
     #[tokio::test]

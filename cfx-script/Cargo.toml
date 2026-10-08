@@ -12,6 +12,8 @@ description = "Runs one .cfx script in an embedded Python interpreter, for the n
 cfx_core = { path = "../core" }
 # The wire encoding the engine daemons speak, for extensions.get("mach") and the like.
 dguard = { path = "../dguard" }
+# dup2, to move the messages off fd 1 before Python starts.
+libc = "0.2"
 pyo3 = { version = "0.29", features = ["auto-initialize"] }
 pythonize = "0.29"
 serde = { version = "1.0.228", features = ["derive"] }

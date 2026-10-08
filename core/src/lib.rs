@@ -2766,13 +2766,7 @@ pub async fn run_daemon(force: bool, paths: &NodePaths) -> Result<(), Box<dyn st
                                 // Restart=on-failure brings us back up as the new
                                 // version (a clean exit would stay down).
                                 println!("\n[update] Updating crossfyre from the release manifest...");
-                                let updated = match toolchain::install::fetch_manifest().await {
-                                    Ok(manifest) => {
-                                        let cur = toolchain::install::installed_cli_version();
-                                        toolchain::install::self_update(&manifest, &cur, false, false).await
-                                    }
-                                    Err(e) => Err(e),
-                                };
+                                let updated = toolchain::install::update_for_dashboard().await;
 
                                 let (success, restarting) = match &updated {
                                     Ok(true) => (true, true),
