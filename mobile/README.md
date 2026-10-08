@@ -21,10 +21,10 @@ installing it, so here is one.
   the app declares no such capability.
 - For each connection it presents a certificate minted from your CA, reads the
   plaintext, and forwards it to the real destination.
-- Captured data is held on the device unless you pair it with a workspace. If
-  you do, request and response metadata are sent to the control plane you paired
-  with, which is a URL you supplied in the pairing QR. Nothing is sent anywhere
-  else, and nothing is sent at all before you pair.
+- Capture starts only after you pair the app with a workspace by scanning its
+  pairing QR. Request and response metadata then go to the control plane named
+  in that QR, and headers and bodies go too only if you switch on full capture
+  on the device. Nothing is sent anywhere else.
 - Scope defaults to the whole device. Narrow it (**Scope → Only these**) before
   starting if you would rather it did not see everything.
 
