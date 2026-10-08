@@ -204,8 +204,9 @@ pub struct ScanParams {
     /// Hard ceiling on adaptive concurrency (defaults to the governor envelope).
     #[serde(default)]
     pub max_concurrency: Option<usize>,
-    /// Adaptive posture: stealth | balanced | throughput. Picks how aggressive
-    /// the governor may get (its concurrency ceiling + retry budget).
+    /// Adaptive posture: gentle | balanced | throughput (stealth is the same as
+    /// gentle). Picks how aggressive the governor may get (its concurrency ceiling
+    /// + retry budget).
     #[serde(default)]
     pub posture: Option<String>,
 }
@@ -408,7 +409,7 @@ async fn run_adaptive_scan(
     // is the middle, Throughput lets it fully open up on a healthy path. It sets
     // the concurrency ceiling and retry budget; the governor still adapts within.
     match params.posture.as_deref() {
-        Some("stealth") => {
+        Some("gentle" | "stealth") => {
             limits.conc_ceil = 64;
             limits.retry_ceil = 4;
         }

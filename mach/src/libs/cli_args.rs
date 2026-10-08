@@ -273,7 +273,8 @@ pub struct ScanArgs {
     #[arg(long, default_value_t = false)]
     pub adaptive_resilience: bool,
 
-    /// Controller posture when adaptive is on: stealth | balanced | throughput.
+    /// Controller posture when adaptive is on: gentle | balanced | throughput
+    /// (stealth is the same as gentle).
     #[arg(long, default_value_t = format!("balanced"))]
     pub posture: String,
 }

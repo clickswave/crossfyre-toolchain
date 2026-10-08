@@ -104,4 +104,16 @@ mod tests {
         let back: Posture = serde_json::from_str("\"stealth\"").unwrap();
         assert_eq!(back, Posture::Stealth);
     }
+
+    #[test]
+    fn gentle_is_the_quietest_posture_by_another_name() {
+        assert_eq!(Posture::from_str_lenient("gentle"), Posture::Stealth);
+        assert_eq!(Posture::from_str_lenient(" Gentle "), Posture::Stealth);
+        let back: Posture = serde_json::from_str("\"gentle\"").unwrap();
+        assert_eq!(back, Posture::Stealth);
+        let c = AdaptiveConfig::from_engine_json(&serde_json::json!({
+            "adaptiveRate": { "enabled": true, "posture": "gentle" }
+        }));
+        assert_eq!(c.posture, Posture::Stealth);
+    }
 }

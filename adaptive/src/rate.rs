@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Posture {
-    /// Quietest: best finding quality.
+    /// Quietest: best finding quality. `gentle` names the same posture.
+    #[serde(alias = "gentle")]
     Stealth,
     /// A healthy balance of speed and load.
     #[default]
@@ -27,7 +28,7 @@ impl Posture {
     /// Parse leniently from a wire string; unknown → [`Posture::Balanced`].
     pub fn from_str_lenient(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
-            "stealth" => Posture::Stealth,
+            "gentle" | "stealth" => Posture::Stealth,
             "throughput" => Posture::Throughput,
             _ => Posture::Balanced,
         }
