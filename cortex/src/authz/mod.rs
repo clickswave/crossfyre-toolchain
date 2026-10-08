@@ -35,6 +35,11 @@ pub struct AuthzParams {
     pub timeout_ms: u64,
     #[serde(default)]
     pub target: String,
+    /// Destinations beyond the target that the operator authorised, as on the
+    /// injection pass. `run` below drops an endpoint on any other host before
+    /// either implementation sees it.
+    #[serde(default)]
+    pub scope: Vec<String>,
     /// Opt-in to the state-changing mass-assignment probe (POST/PUT/PATCH with an
     /// injected privileged body). Off by default: read-only is the safe default,
     /// per the plan's safety rails.
@@ -104,4 +109,20 @@ pub struct Identity {
 #[cfg_attr(not(authz_private), path = "baseline.rs")]
 mod imp;
 
-pub use imp::run;
+/// Run the authorization pass on the endpoints inside the scan's scope.
+///
+/// The fence is applied here rather than in either implementation, so the open
+/// baseline and the first-party oracle both get it and neither can drop it.
+pub async fn run(
+    mut params: AuthzParams,
+    tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+) {
+    params.endpoints = crate::inject::keep_in_scope(
+        &params.target,
+        &params.scope,
+        std::mem::take(&mut params.endpoints),
+        |e| &e.url,
+        &tx,
+    );
+    imp::run(params, tx).await
+}

@@ -52,6 +52,8 @@ mod template;
 mod writes_rail;
 #[cfg(test)]
 mod action_rail;
+#[cfg(test)]
+mod scope_rail;
 mod xml;
 
 use crate::libs::cli_args::{Cli, Commands};

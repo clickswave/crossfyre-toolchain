@@ -33,6 +33,10 @@ pub struct DiscoverParams {
     pub timeout_ms: u64,
     #[serde(default)]
     pub target: String,
+    /// Destinations beyond the target that the operator authorised, as on the
+    /// injection pass. An endpoint on any other host is dropped before the run.
+    #[serde(default)]
+    pub scope: Vec<String>,
     #[serde(default = "d_true")]
     pub evasive: bool,
     #[serde(default)]
@@ -94,8 +98,15 @@ const MAX_ENDPOINTS: usize = 200;
 const ERR_MINE_ROUNDS: usize = 5;
 const MAX_NEW_PER_EP: usize = 40;
 
-pub async fn run(params: DiscoverParams, tx: mpsc::UnboundedSender<Value>) {
+pub async fn run(mut params: DiscoverParams, tx: mpsc::UnboundedSender<Value>) {
     let _ = tx.send(json!({"type":"ack","target": params.target}));
+    params.endpoints = crate::inject::keep_in_scope(
+        &params.target,
+        &params.scope,
+        std::mem::take(&mut params.endpoints),
+        |e| &e.url,
+        &tx,
+    );
     if params.endpoints.is_empty() {
         let _ = tx.send(json!({"type":"error","message":"discovery needs at least one endpoint"}));
         let _ = tx.send(json!({"type":"done","found":0}));

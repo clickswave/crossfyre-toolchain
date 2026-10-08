@@ -1198,6 +1198,36 @@ fn report_cost(tx: &mpsc::UnboundedSender<Value>, done: i64, total: i64) {
 /// `extra` widens it, and only an operator can put anything in there. See
 /// `scope`: nothing a scan discovers is ever added, because "the scanner found
 /// this" and "you may attack this" are different sentences.
+/// Drop every endpoint whose host is outside the scan's scope, saying so for each.
+///
+/// The injection pass checks endpoint by endpoint as it goes. Structure fuzzing,
+/// request-shape discovery and authorization testing take the same kind of list
+/// and filter it here before anything is sent, so all four keep to one fence:
+/// the target's host, and what the operator put on the workspace scope list.
+pub(crate) fn keep_in_scope<T>(
+    target: &str,
+    scope: &[String],
+    endpoints: Vec<T>,
+    url_of: impl Fn(&T) -> &str,
+    tx: &mpsc::UnboundedSender<Value>,
+) -> Vec<T> {
+    let (authorised, _refused) = crate::scope::parse(scope);
+    endpoints
+        .into_iter()
+        .filter(|ep| {
+            let url = url_of(ep);
+            let ok = in_scope(target, url, &authorised);
+            if !ok {
+                let _ = tx.send(json!({"type": "log", "message": format!(
+                    "skipping {url}: its host is neither the scan target ({target}) nor on the \
+                     workspace scope list, so nothing is sent at it."
+                )}));
+            }
+            ok
+        })
+        .collect()
+}
+
 fn in_scope(target: &str, url: &str, extra: &crate::scope::Scope) -> bool {
     let scope = host_of(target);
     if scope.is_empty() {
