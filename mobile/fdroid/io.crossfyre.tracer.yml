@@ -13,9 +13,8 @@
 # which users discover when an update fails.
 #
 # That only works because the build is reproducible. Verify before submitting:
-# two clean builds must produce the same `contentSha256` (see
-# scripts/crossfyre_mobile.py). F-Droid's build server runs the equivalent check
-# in public, so a failure there is a public failure.
+# two clean builds must produce the same `contentSha256`. F-Droid's build server
+# runs the equivalent check in public, so a failure there is a public failure.
 
 Categories:
   - Security
