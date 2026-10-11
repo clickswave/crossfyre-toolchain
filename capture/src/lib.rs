@@ -435,20 +435,25 @@ impl ClientIdentity {
                     .to_string()
             })?;
 
+        // The provider is named here rather than taken from the process. A build that
+        // links both rustls backends has no process default until a program installs one,
+        // and builder() would panic in any program that had not.
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let mut roots = rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let strict = rustls::ClientConfig::builder()
+        let strict = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .map_err(|e| format!("no TLS version is available: {e}"))?
             .with_root_certificates(roots)
             .with_client_auth_cert(chain.clone(), key.clone_key())
             // The one failure that is about the pair rather than about either half.
             .map_err(|e| format!("the key does not go with the certificate: {e}"))?;
 
-        let provider = rustls::crypto::aws_lc_rs::default_provider();
-        let any = rustls::ClientConfig::builder()
+        let any = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .map_err(|e| format!("no TLS version is available: {e}"))?
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(flow::TrustAnyServerCert(Arc::new(
-                provider,
-            ))))
+            .with_custom_certificate_verifier(Arc::new(flow::TrustAnyServerCert(provider)))
             .with_client_auth_cert(chain, key)
             .map_err(|e| format!("the key does not go with the certificate: {e}"))?;
 
