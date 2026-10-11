@@ -38,7 +38,24 @@ The Crossfyre toolchain is a set of standalone reconnaissance and scanning engin
 | [**`plessor`**](plessor/) | Vulnerability-scanning engine: a nuclei-compatible template and matcher pipeline with active fuzzing and out-of-band confirmation, so every finding is verified before it is reported. |
 | [**`oast`**](oast/) | Out-of-band interaction server. Run your own so `plessor` can confirm blind bugs (SSRF, blind RCE) against your own domain instead of the hosted pool. |
 | [**`node`**](node/) | The Crossfyre node agent. Runs the engines on your machine and, optionally, connects to the platform. |
-| [**`crossfyre`**](crossfyre/) | The CLI that ties it together: install engines, run scans, manage nodes. |
+| [**`crossfyre`**](crossfyre/) | The CLI that ties it together: installs the engines, manages nodes, runs `.cfx` scripts, and runs the Web Tracer's local capture proxy (`crossfyre trace`). |
+| [**`cfx-script`**](cfx-script/) | Runs one `.cfx` script in an embedded Python interpreter, for `node` and `crossfyre`. It is a binary of its own so that neither of them links libpython. |
+| [**`mobile`**](mobile/) | An Android app that inspects the device's own HTTPS traffic through a `VpnService`, without root, and its native core in `mobile/rust`. |
+| [**`relsign`**](relsign/) | Signs the release manifest. A tool for the machine that builds releases: it is not shipped and not listed in the manifest. |
+
+The libraries they share:
+
+| Crate | What it does |
+| --- | --- |
+| [**`core`**](core/) | Code `crossfyre` and `node` share: signing in, installing and updating the engines, checking the release manifest's signature, the node service, and the Web Tracer. |
+| [**`capture`**](capture/) | The Web Tracer's capture core, used by the desktop proxy and the Android app: a session CA that issues a certificate per host, forwarding, and a redacted shape of each request. |
+| [**`tui`**](tui/) | The terminal dashboard every engine draws. |
+| [**`finding`**](finding/) | The one shape every engine reports a finding in. |
+| [**`transport`**](transport/) | The outbound HTTP client the engines use, reqwest with rustls. The optional `impersonate` feature swaps in a client that presents a browser's TLS and HTTP/2 fingerprint. |
+| [**`dguard`**](dguard/) | Listener policy for the engine daemons: loopback unless told otherwise, and an optional token (see [The daemon boundary](#the-daemon-boundary)). |
+| [**`scope`**](scope/) | The destinations an operator has said they may test, and the guard that refuses everything else. |
+| [**`spec`**](spec/) | Reads OpenAPI, Swagger, Postman, HAR and Insomnia files into a flat list of operations and their request shapes. |
+| [**`surface`**](surface/) | Turns what a scan saw into a stable description of the attack surface: hosts, endpoint templates, content hashes and typed diffs. |
 
 Also in the workspace: **`adaptive`**, an open reference library the engines use to pace themselves and decide retries. It ships an untuned baseline; the tuned pacing is a platform feature (see [`adaptive/README.md`](adaptive/README.md)).
 
