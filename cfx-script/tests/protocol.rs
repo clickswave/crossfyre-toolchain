@@ -217,7 +217,7 @@ def run():
 #[test]
 fn the_toolchain_dir_comes_from_the_environment_even_when_it_is_not_utf8() {
     // JSON cannot carry a path that is not UTF-8, so the directory arrives in the
-    // environment. The config.toml there moves mach to 5999, and a script sees it.
+    // environment. The config.toml there moves ambulo to 5999, and a script sees it.
     use std::os::unix::ffi::OsStrExt;
     let base = std::env::temp_dir().join(format!("cfx-script-dir-{}", std::process::id()));
     let dir = base.join(std::ffi::OsStr::from_bytes(b"jos\xe9"));
@@ -238,6 +238,33 @@ fn the_toolchain_dir_comes_from_the_environment_even_when_it_is_not_utf8() {
     assert_eq!(r.status, 0, "stderr: {}", r.stderr);
     assert_eq!(types(&r), ["result", "completed"]);
     assert_eq!(r.messages[0]["data"]["port"], 5999);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_script_reaches_an_engine_by_its_new_name_and_by_its_old_one() {
+    // Scripts saved before the rename ask for `mach`; new ones ask for `ambulo`.
+    // Both are the same daemon, on the port config.toml gives it under either key.
+    let dir = std::env::temp_dir().join(format!("cfx-script-renamed-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.toml"),
+        "[postgres]\nhost = \"localhost\"\nport = 4440\nuser = \"postgres\"\n\
+         db_name = \"crossfyre\"\n\n[container]\n\n[extensions]\nambulo = 5998\n",
+    )
+    .unwrap();
+    let r = run_with_env(
+        &job("import cfxs, extensions\ndef run():\n    \
+             cfxs.connect().send_result({'new': extensions.get('ambulo').port, \
+             'old': extensions.get('mach').port})\n"),
+        &[("CFX_SCRIPT_TOOLCHAIN_DIR", dir.as_os_str())],
+        LIMIT,
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(r.status, 0, "stderr: {}", r.stderr);
+    assert_eq!(types(&r), ["result", "completed"]);
+    assert_eq!(r.messages[0]["data"]["new"], 5998);
+    assert_eq!(r.messages[0]["data"]["old"], 5998);
 }
 
 #[test]

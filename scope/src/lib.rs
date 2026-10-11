@@ -25,7 +25,7 @@
 //! Empty scope reproduces today's behaviour exactly, so every existing scan is
 //! unaffected by this file existing.
 //!
-//! This started inside `cortex` and moved out when the workbench proxy needed it. The
+//! This started inside `plessor` and moved out when the workbench proxy needed it. The
 //! proxy is where the stakes are highest: a scanner that probes out of scope sends some
 //! requests somewhere it should not, while a proxy that carries out of scope records
 //! somebody else's traffic and signs the operator's name to it. `Guard` below is the

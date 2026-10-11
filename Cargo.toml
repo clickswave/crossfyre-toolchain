@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["capture", "core", "node", "crossfyre", "tui", "mach", "voyage", "pulse", "scout", "cortex", "finding", "oast", "transport", "dguard", "mobile/rust", "relsign", "scope", "spec", "surface", "cfx-script"]
+members = ["capture", "core", "node", "crossfyre", "tui", "ambulo", "voyage", "doorward", "toolmark", "plessor", "finding", "oast", "transport", "dguard", "mobile/rust", "relsign", "scope", "spec", "surface", "cfx-script"]
 
 # `relsign` signs the release manifest and is a BUILD-HOST tool, not a shipped
 # component: the release build does not package it, so it is never uploaded or

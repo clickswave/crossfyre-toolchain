@@ -94,6 +94,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "ambulo"
+version = "0.0.15"
+dependencies = [
+ "adaptive",
+ "base64 0.22.1",
+ "cfx_tui",
+ "clap",
+ "crossterm",
+ "csv",
+ "dguard",
+ "dialoguer 0.11.0",
+ "dirs 5.0.1",
+ "futures-util",
+ "rand 0.9.5",
+ "ratatui",
+ "regex",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "tokio",
+ "tokio-tungstenite",
+ "toml 0.8.23",
+ "transport",
+ "uuid",
+ "whoami 2.1.2",
+]
+
+[[package]]
 name = "android_log-sys"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -988,38 +1018,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
-name = "cortex"
-version = "0.0.22"
-dependencies = [
- "adaptive",
- "aes-gcm",
- "base64 0.22.1",
- "boring2",
- "cfx_finding",
- "cfx_scope",
- "cfx_tui",
- "clap",
- "dguard",
- "rand 0.8.7",
- "ratatui",
- "rcgen",
- "regex",
- "reqwest 0.12.28",
- "rsa",
- "rustls",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "tokio",
- "tokio-boring2",
- "tokio-rustls",
- "transport",
- "uuid",
- "webpki-roots 0.26.11",
-]
-
-[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1112,7 +1110,7 @@ checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 
 [[package]]
 name = "crossfyre"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "cfx_core",
  "clap",
@@ -1418,6 +1416,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4b8a88685455ed29a21542a33abd9cb6510b6b129abadabdcef0f4c55bc8f61"
 dependencies = [
  "litrs",
+]
+
+[[package]]
+name = "doorward"
+version = "0.0.8"
+dependencies = [
+ "adaptive",
+ "cfx_tui",
+ "clap",
+ "crossterm",
+ "csv",
+ "dguard",
+ "dialoguer 0.11.0",
+ "dirs 5.0.1",
+ "rand 0.9.5",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "tokio",
+ "toml 0.8.23",
+ "uuid",
 ]
 
 [[package]]
@@ -2712,36 +2733,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mach"
-version = "0.0.14"
-dependencies = [
- "adaptive",
- "base64 0.22.1",
- "cfx_tui",
- "clap",
- "crossterm",
- "csv",
- "dguard",
- "dialoguer 0.11.0",
- "dirs 5.0.1",
- "futures-util",
- "rand 0.9.5",
- "ratatui",
- "regex",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sha2",
- "sqlx",
- "tokio",
- "tokio-tungstenite",
- "toml 0.8.23",
- "transport",
- "uuid",
- "whoami 2.1.2",
-]
-
-[[package]]
 name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2901,7 +2892,7 @@ dependencies = [
 
 [[package]]
 name = "node"
-version = "0.1.40"
+version = "0.1.41"
 dependencies = [
  "cfx_core",
  "clap",
@@ -3378,6 +3369,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
+name = "plessor"
+version = "0.0.23"
+dependencies = [
+ "adaptive",
+ "aes-gcm",
+ "base64 0.22.1",
+ "boring2",
+ "cfx_finding",
+ "cfx_scope",
+ "cfx_tui",
+ "clap",
+ "dguard",
+ "rand 0.8.7",
+ "ratatui",
+ "rcgen",
+ "regex",
+ "reqwest 0.12.28",
+ "rsa",
+ "rustls",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "tokio",
+ "tokio-boring2",
+ "tokio-rustls",
+ "transport",
+ "uuid",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
 name = "polyval"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3453,29 +3476,6 @@ checksum = "6f42ea446cab60335f76979ec15e12619a2165b5ae2c12166bef27d283a9fadf"
 dependencies = [
  "idna",
  "psl-types",
-]
-
-[[package]]
-name = "pulse"
-version = "0.0.7"
-dependencies = [
- "adaptive",
- "cfx_tui",
- "clap",
- "crossterm",
- "csv",
- "dguard",
- "dialoguer 0.11.0",
- "dirs 5.0.1",
- "rand 0.9.5",
- "ratatui",
- "serde",
- "serde_json",
- "sha2",
- "sqlx",
- "tokio",
- "toml 0.8.23",
- "uuid",
 ]
 
 [[package]]
@@ -4196,27 +4196,6 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
-
-[[package]]
-name = "scout"
-version = "0.0.6"
-dependencies = [
- "adaptive",
- "base64 0.22.1",
- "cfx_finding",
- "cfx_tui",
- "clap",
- "dguard",
- "md5",
- "ratatui",
- "regex",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tokio",
- "transport",
- "uuid",
-]
 
 [[package]]
 name = "security-framework"
@@ -5300,6 +5279,27 @@ name = "toml_writer"
 version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
+
+[[package]]
+name = "toolmark"
+version = "0.0.7"
+dependencies = [
+ "adaptive",
+ "base64 0.22.1",
+ "cfx_finding",
+ "cfx_tui",
+ "clap",
+ "dguard",
+ "md5",
+ "ratatui",
+ "regex",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "transport",
+ "uuid",
+]
 
 [[package]]
 name = "tower"

@@ -46,7 +46,7 @@ static UPSTREAM_TLS: LazyLock<TlsConnector> = LazyLock::new(|| {
 /// of the internal applications this tool exists to test. Until this existed the webpki
 /// roots were the only trust anchor, so such a target could not be forwarded to at all:
 /// the client leg succeeded, the forward leg refused, and the operator saw a 502 with no
-/// explanation. Meanwhile `cortex`, `scout` and `voyage` have always accepted invalid
+/// explanation. Meanwhile `plessor`, `toolmark` and `voyage` have always accepted invalid
 /// certificates, so the product disagreed with itself.
 ///
 /// Reached only when a flow's [`CaptureCfg::trust_any_upstream_cert`] is set, which is

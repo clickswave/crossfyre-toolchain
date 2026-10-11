@@ -2,7 +2,7 @@
 //!
 //! Every engine takes a user-supplied target (`example.com`, `example.com:8443`,
 //! `https://example.com/x`) and has to infer a scheme and port before it can
-//! build a URL. cortex (`normalize_base`) and scout (`normalize_target`) carried
+//! build a URL. plessor (`normalize_base`) and toolmark (`normalize_target`) carried
 //! byte-identical copies of that inference, differing only in what they returned.
 //! [`normalize_target`] does the inference once; [`Target`] exposes both shapes.
 
@@ -15,7 +15,7 @@ pub struct Target {
     /// The fully parsed, normalized URL string.
     pub url: String,
     /// The port only when it was explicit in the input, so [`Target::base`] can
-    /// omit a default port exactly as cortex's `normalize_base` did.
+    /// omit a default port exactly as plessor's `normalize_base` did.
     explicit_port: Option<u16>,
 }
 
@@ -90,7 +90,7 @@ mod tests {
         let t = normalize_target("example.com").unwrap();
         assert_eq!(t.scheme, "http");
         assert_eq!(t.port, 80);
-        // Default port is omitted from base() (matches cortex normalize_base).
+        // Default port is omitted from base() (matches plessor normalize_base).
         assert_eq!(t.base(), "http://example.com");
 
         let t = normalize_target("example.com:8443").unwrap();

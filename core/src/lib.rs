@@ -158,7 +158,7 @@ pub fn mark_op_done(op_id: &str) {
 /// the next op only after one finishes or fails. The semaphore is fair-FIFO
 /// so messages drain in order.
 ///
-/// Hard ceiling: pulse can't handle more than ~100 concurrent probes anyway,
+/// Hard ceiling: doorward can't handle more than ~100 concurrent probes anyway,
 /// so we clamp on the upper end regardless of what the user typed.
 static WORKFLOW_SEMAPHORES: OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, Arc<Semaphore>>>,
@@ -210,7 +210,7 @@ impl TargetPace {
     }
 
     /// Record one probe outcome and, every so often, advance the controller and
-    /// republish the delay + concurrency. Latency isn't available from the mach
+    /// republish the delay + concurrency. Latency isn't available from the ambulo
     /// stream, so health is driven by response codes only.
     pub fn observe(&self, class: adaptive::ProbeClass) {
         use std::sync::atomic::Ordering;
@@ -268,8 +268,8 @@ pub fn target_pace(
         .clone()
 }
 
-/// Classify a mach stream event into a health class from its status verdict and
-/// HTTP code. `status` is mach's finding verdict ("found" | "not_found" | "error").
+/// Classify an ambulo stream event into a health class from its status verdict and
+/// HTTP code. `status` is ambulo's finding verdict ("found" | "not_found" | "error").
 pub fn classify_event(status: &str, code: i64) -> adaptive::ProbeClass {
     use adaptive::ProbeClass;
     if status == "error" {
@@ -553,7 +553,8 @@ pub struct Config {
     nats_url: String,
     nats_nkey_seed: Option<String>,
     nats_user_jwt: Option<String>,
-    /// Extensions installed on this node (e.g. ["mach", "voyage"])
+    /// Extensions installed on this node, as engine ids (e.g. ["mach", "voyage"]),
+    /// which is what the API sends and what never changes.
     #[serde(default)]
     extensions: Vec<String>,
     /// Deploy-time network identity (tunnel selection + OPSEC toggles).
@@ -2012,7 +2013,7 @@ pub async fn run_daemon(force: bool, paths: &NodePaths) -> Result<(), Box<dyn st
     );
 
     // rustls needs an explicit CryptoProvider when more than one is compiled in.
-    // Both aws-lc-rs and ring are pulled into this workspace (cortex uses one,
+    // Both aws-lc-rs and ring are pulled into this workspace (plessor uses one,
     // oast the other), so the TLS handshake to nexus would otherwise panic with
     // "could not automatically determine the process-level CryptoProvider" - the
     // node comes up but never connects. Idempotent: ignore if already installed.

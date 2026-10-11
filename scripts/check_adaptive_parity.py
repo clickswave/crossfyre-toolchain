@@ -4,7 +4,7 @@
 `adaptive/` (committed, open baseline) and `adaptive-private/` (git-ignored tuned
 drop-in) share a package name and are swapped at build time by the `.cargo/config.toml`
 `[paths]` override. For that swap to stay sound, the two crates MUST expose the
-*same public API surface* - dependents (core, mach, pulse, voyage) compile against
+*same public API surface* - dependents (core, ambulo, doorward, voyage) compile against
 whichever is present, so a `pub` item that drifts in one but not the other breaks
 either the first-party build or the public build, and the break shows up far from
 the edit.

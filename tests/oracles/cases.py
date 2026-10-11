@@ -9,7 +9,7 @@ could be wrong, and several of them caught a real bug the day they were written.
 from urllib.parse import quote
 
 # The intrusive classes never run in a default sweep, so the cases that exercise
-# them have to name them. See the module docs in cortex for why each is opt-in.
+# them have to name them. See the module docs in plessor for why each is opt-in.
 INTRUSIVE = ["race", "tampering", "smuggling", "proto_pollution"]
 
 
@@ -170,7 +170,7 @@ CASES = {
     # ----------------------------------------------- not pressing the button ---
     "crawl-does-not-press-the-settings": {
         "what": "a settings link is reported, never followed, and the crawl survives",
-        "engine": "mach",
+        "engine": "ambulo",
         "fixtures": [{"name": "app", "script": "settings_as_links.py"}],
         "request": lambda p: crawl(_u(p["app"], "/"), max_depth=5),
         # /step4 is four links deep and only reachable if the crawl never
@@ -304,10 +304,10 @@ CASES = {
     # ---------------------------------------------------------------- flow ---
     # Flow cases are driven by `flow_cases.py`, which records the flow against
     # the fixture first: a recording is the input, so it cannot be a literal.
-    # ---------------------------------------------------------------- mach ---
+    # ---------------------------------------------------------------- ambulo ---
     "spa-static": {
         "what": "source maps, lazy chunks and route tables, without a browser",
-        "engine": "mach",
+        "engine": "ambulo",
         "fixtures": [{"name": "app", "script": "spa.py"}],
         "request": lambda p: crawl(_u(p["app"], "/")),
         "must_find": [
@@ -320,7 +320,7 @@ CASES = {
     },
     "headless-runtime": {
         "what": "URLs assembled at runtime, which exist in no served file",
-        "engine": "mach",
+        "engine": "ambulo",
         "fixtures": [{"name": "app", "script": "runtime.py"}],
         "request": lambda p: crawl(_u(p["app"], "/"), browser=True),
         "must_find": [
@@ -331,8 +331,8 @@ CASES = {
     },
     "headless-absent-is-loud": {
         "what": "no browser means a named gap, not a silent pass",
-        "engine": "mach",
-        "env": {"MACH_BROWSER": "/nonexistent/chrome", "PATH": "/nonexistent"},
+        "engine": "ambulo",
+        "env": {"AMBULO_BROWSER": "/nonexistent/chrome", "PATH": "/nonexistent"},
         "fixtures": [{"name": "app", "script": "runtime.py"}],
         "request": lambda p: crawl(_u(p["app"], "/"), browser=True),
         "must_say": ["no browser was found"],

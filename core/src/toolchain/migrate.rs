@@ -401,6 +401,33 @@ mod tests {
         .expect("drop-in");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_machine_on_the_old_names_moves_to_the_new_ones() {
+        // The real table, on a machine as 0.1.30 left it.
+        let s = Scratch::new("real");
+        fs::write(s.bin("cortex"), b"engine").expect("binary");
+        fs::write(s.0.join("bin/cortex.version"), b"0.0.23").expect("sidecar");
+        fs::create_dir_all(s.unit("crossfyre-cortex.service.d")).expect("drop-in dir");
+        fs::write(s.unit("crossfyre-cortex.service.d/oast.conf"), b"x").expect("drop-in");
+        fs::write(s.bin("voyage"), b"engine").expect("an engine never renamed");
+        let units = Recorder::with(&["cortex", "voyage"]);
+
+        let out = migrate_in(super::super::ENGINES, &s.layout(), &units);
+
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!((out[0].from, out[0].to), ("cortex", "plessor"));
+        assert!(units.position("stop cortex") < units.position("start plessor"));
+        assert!(is_regular_file(&s.bin("plessor")));
+        assert_eq!(
+            fs::read_link(s.bin("cortex")).expect("link"),
+            PathBuf::from("plessor")
+        );
+        assert!(s.unit("crossfyre-plessor.service.d/oast.conf").exists());
+        assert!(is_regular_file(&s.bin("voyage")), "voyage is left as it is");
+        assert!(!units.calls().iter().any(|c| c.ends_with("voyage")));
+    }
+
     #[test]
     fn the_legacy_unit_is_stopped_before_the_new_one_starts() {
         let s = Scratch::new("order");

@@ -68,8 +68,9 @@ enum Commands {
         action: NodeAction,
     },
 
-    /// Manage toolchain extensions (mach, voyage, pulse): list, install, remove,
-    /// update, and control their daemons. All extension commands live under here.
+    /// Manage toolchain extensions (ambulo, voyage, doorward, toolmark, plessor):
+    /// list, install, remove, update, and control their daemons. All extension
+    /// commands live under here.
     #[command(alias = "ext")]
     Extension {
         #[command(subcommand)]
@@ -316,8 +317,8 @@ enum OastAction {
 enum ExtensionAction {
     /// List extensions with install state and daemon health.
     List,
-    /// Install an extension (mach, voyage, pulse, all): download, verify against
-    /// the release manifest, enable and start its daemon.
+    /// Install an extension (ambulo, voyage, doorward, toolmark, plessor, all):
+    /// download, verify against the release manifest, enable and start its daemon.
     Install {
         name: Option<String>,
         /// Force reinstall even if already installed

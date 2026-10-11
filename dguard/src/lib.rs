@@ -4,7 +4,7 @@
 //! no handshake and no per-connection state, so **the bind address is the
 //! security boundary**. They used to bind `0.0.0.0`, which put an unauthenticated
 //! command channel on every interface: anyone who could reach the port could
-//! drive a scan, and `mach`'s wordlist parameter is a filesystem path, so they
+//! drive a scan, and `ambulo`'s wordlist parameter is a filesystem path, so they
 //! could also read files off the host one line at a time.
 //!
 //! Loopback is now the default. That costs nothing in the normal deployment,
@@ -224,11 +224,11 @@ pub fn is_error(line: &str) -> bool {
         return false;
     };
     // Two spellings are in the wild. Stream events use `type`, and so do
-    // scout and cortex throughout; `status` is what every pulse reply uses and
-    // what mach and voyage use for their invalid-JSON reply. Both carry the
+    // toolmark and plessor throughout; `status` is what every doorward reply uses and
+    // what ambulo and voyage use for their invalid-JSON reply. Both carry the
     // detail in `message`, so only the discriminator differs. Accept either: a
     // client that understands one of them exits 0 on half the failures, which
-    // is how `pulse exec` reported success on an unknown operation.
+    // is how `doorward exec` reported success on an unknown operation.
     ["type", "status"]
         .iter()
         .filter_map(|k| v.get(*k))
@@ -250,7 +250,7 @@ mod is_error_tests {
 
     #[test]
     fn the_status_spelling_is_recognised_too() {
-        // pulse uses this for every reply, and mach and voyage for invalid JSON.
+        // doorward uses this for every reply, and ambulo and voyage for invalid JSON.
         assert!(is_error(
             r#"{"status":"error","message":"Unknown operation: x"}"#
         ));
@@ -443,7 +443,7 @@ mod wordlist_tests {
 
 /// Wait for a dependency the daemon cannot start without, instead of dying.
 ///
-/// mach, pulse and voyage open Postgres at startup. When the database went away
+/// ambulo, doorward and voyage open Postgres at startup. When the database went away
 /// they exited, systemd restarted them, and they exited again: one host racked
 /// up 2,663 restarts over a day and the only symptom anyone saw was three
 /// engines being "down" with no reason attached. The database being briefly

@@ -110,9 +110,12 @@ mod tests {
         for mode in [Mode::Evasive, Mode::Fast] {
             let id = resolve(&mode, Some("example.com"));
             assert!(id.user_agent.starts_with("Mozilla/5.0"));
-            assert!(!id.user_agent.to_lowercase().contains("cortex"));
-            assert!(!id.user_agent.to_lowercase().contains("scout"));
-            assert!(!id.user_agent.to_lowercase().contains("mach"));
+            // The engines' names, and the names they had before.
+            for tell in [
+                "plessor", "toolmark", "ambulo", "doorward", "cortex", "scout", "mach",
+            ] {
+                assert!(!id.user_agent.to_lowercase().contains(tell), "{tell}");
+            }
             assert!(!id.user_agent.contains("clickswave"));
             assert!(!id.headers.is_empty());
         }

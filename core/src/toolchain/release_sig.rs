@@ -221,7 +221,7 @@ mod tests {
     /// A second test key, for the rotation cases. Same warning as the first: the secret
     /// is right here, so it must never sign a real release.
     const TEST_SEED_NEXT_B64: &str = "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=";
-    const TEST_MANIFEST: &[u8] = br#"{"components":{"mach":{"version":"0.0.14"}}}"#;
+    const TEST_MANIFEST: &[u8] = br#"{"components":{"ambulo":{"version":"0.0.14"}}}"#;
 
     fn test_keypair() -> ed25519_dalek::SigningKey {
         keypair_from(TEST_SEED_B64)

@@ -1,13 +1,13 @@
-//! Service-enum op: scout-driven service/tech identification.
+//! Service-enum op: toolmark-driven service/tech identification.
 //!
 //! Two shapes, because "what is on this port" has two answers depending on
 //! whether the port speaks HTTP:
 //!
-//!   * a URL or host -> scout `fingerprint`, the web stack behind it.
-//!   * `host:port` entries -> scout `services`, which speaks Redis, MongoDB,
+//!   * a URL or host -> toolmark `fingerprint`, the web stack behind it.
+//!   * `host:port` entries -> toolmark `services`, which speaks Redis, MongoDB,
 //!     memcached, MySQL, Postgres, FTP, SMTP, SSH and LDAP, names the version,
 //!     and says whether the service lets an anonymous caller in. A port scan
-//!     produces exactly this shape, so a pipeline that has already run pulse
+//!     produces exactly this shape, so a pipeline that has already run doorward
 //!     can hand its open ports straight here.
 //!
 //! A single target on a port conventionally used by one of those services takes
@@ -30,8 +30,8 @@ pub async fn handle(env: OpEnv) {
         api_key,
     } = env;
 
-    // Web/service fingerprinting via the scout daemon (port 4444).
-    // Scout streams `finding` events whose `data` is the finding
+    // Web/service fingerprinting via the toolmark daemon (port 4444).
+    // Toolmark streams `finding` events whose `data` is the finding
     // verbatim; the node just stamps operation_id and relays them.
     let target = data["target"]
         .as_str()
@@ -64,7 +64,7 @@ pub async fn handle(env: OpEnv) {
             "timeout_ms": data["timeout_ms"].as_i64().unwrap_or(5000),
             "auth_checks": data["auth_checks"].as_bool().unwrap_or(true),
         });
-        run_scout(
+        run_toolmark(
             req,
             &op_id,
             &workflow_id,
@@ -77,7 +77,7 @@ pub async fn handle(env: OpEnv) {
         return;
     }
 
-    let mut scout_req = serde_json::json!({
+    let mut toolmark_req = serde_json::json!({
         "operation": "fingerprint",
         "response": "stream",
         "target": target,
@@ -88,12 +88,12 @@ pub async fn handle(env: OpEnv) {
     });
 
     // Authenticated fingerprinting: resolve an attached credential
-    // into request auth and hand it to scout.
+    // into request auth and hand it to toolmark.
     if let Some(cid) = data["credential_id"].as_str().filter(|s| !s.is_empty()) {
         let host = target_host(&target);
         match creds::resolve_auth(&http, &api_url, &api_key, cid, &host).await {
             Ok(auth) => {
-                if let Some(cr) = scout_req.as_object_mut() {
+                if let Some(cr) = toolmark_req.as_object_mut() {
                     cr.insert("auth".into(), auth);
                 }
             }
@@ -101,8 +101,8 @@ pub async fn handle(env: OpEnv) {
         }
     }
 
-    run_scout(
-        scout_req,
+    run_toolmark(
+        toolmark_req,
         &op_id,
         &workflow_id,
         &node_id,
@@ -113,14 +113,14 @@ pub async fn handle(env: OpEnv) {
     .await;
 }
 
-/// `host:port`, scheme stripped, path dropped: what scout's services pass takes.
+/// `host:port`, scheme stripped, path dropped: what toolmark's services pass takes.
 fn strip_scheme(t: &str) -> String {
     let t = t.split_once("://").map(|(_, rest)| rest).unwrap_or(t);
     t.split('/').next().unwrap_or(t).to_string()
 }
 
 /// Ports where a non-HTTP service is the convention. Only used to choose which
-/// scout pass to run; scout itself never trusts the port number for identity.
+/// toolmark pass to run; toolmark itself never trusts the port number for identity.
 fn is_service_port(target: &str) -> bool {
     let hp = strip_scheme(target);
     let Some((_, p)) = hp.rsplit_once(':') else {
@@ -148,9 +148,9 @@ fn is_service_port(target: &str) -> bool {
     )
 }
 
-/// Send one request to the scout daemon and relay what it streams back.
+/// Send one request to the toolmark daemon and relay what it streams back.
 #[allow(clippy::too_many_arguments)]
-async fn run_scout(
+async fn run_toolmark(
     req: serde_json::Value,
     op_id: &str,
     workflow_id: &str,
@@ -235,7 +235,7 @@ async fn run_scout(
                     "done" => break,
                     "error" => {
                         eprintln!(
-                            "[op] FAIL scout error: {}",
+                            "[op] FAIL toolmark error: {}",
                             event["message"].as_str().unwrap_or("unknown")
                         );
                         break;
@@ -246,7 +246,7 @@ async fn run_scout(
         }
         Err(e) => {
             eprintln!(
-                "[op] FAIL scout daemon unreachable on {} ({e}). Is `scout --daemon` running?",
+                "[op] FAIL toolmark daemon unreachable on {} ({e}). Is `toolmark --daemon` running?",
                 crate::toolchain::config::engine_addr("scout")
             );
             relay.publish_failed().await;

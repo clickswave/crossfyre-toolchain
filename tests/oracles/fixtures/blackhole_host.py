@@ -16,7 +16,7 @@ import sys
 import threading
 import time
 
-CONTROL_PORT = 47113  # keep in step with cortex chain::CONTROL_PORT
+CONTROL_PORT = 47113  # keep in step with plessor chain::CONTROL_PORT
 
 
 def swallow(port: int) -> None:

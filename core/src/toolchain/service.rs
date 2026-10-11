@@ -2,7 +2,7 @@
 //
 // Two kinds of services:
 //
-// 1. Extension daemons (mach, voyage, pulse) - long-lived *per-user* daemons:
+// 1. Extension daemons (ambulo, voyage, doorward) - long-lived *per-user* daemons:
 //      Linux   -> systemd user units      (~/.config/systemd/user, systemctl --user)
 //      macOS   -> launchd user agents     (~/Library/LaunchAgents, launchctl)
 //      Windows -> Task Scheduler tasks    (schtasks, ONLOGON trigger)

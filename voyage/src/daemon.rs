@@ -50,7 +50,7 @@ struct EnumParams {
     wordlist: String,
     #[serde(default = "default_tasks")]
     tasks: usize,
-    /// Per-task wait between requests in ms. Same semantic as pulse's
+    /// Per-task wait between requests in ms. Same semantic as doorward's
     /// `delay` and as voyage's CLI `--interval`. cfx_node passes this from
     /// the wizard's "Delay between probes" setting.
     #[serde(default)]

@@ -15,7 +15,7 @@ crossfyre node init             # register this host as a node
 crossfyre node up / down        # bring the node online / offline
 
 crossfyre extension list        # engines and their daemon health
-crossfyre extension install cortex
+crossfyre extension install plessor
 crossfyre update                # update the CLI and installed engines from the release manifest
 
 crossfyre status                # overview: daemons, engines, database

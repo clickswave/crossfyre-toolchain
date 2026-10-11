@@ -302,7 +302,7 @@ fn stage_binary(src: &Path, dest: &Path) -> Result<PathBuf, Box<dyn std::error::
         fs::create_dir_all(parent)?;
     }
     // Appended, not `with_extension`, which REPLACES whatever follows the last dot:
-    // a component placed as `cortex-0.1.2` would stage itself at `cortex-0.1.new` and
+    // a component placed as `plessor-0.1.2` would stage itself at `plessor-0.1.new` and
     // collide with any sibling that differs only after that dot.
     let tmp_path = match dest.file_name() {
         Some(name) => dest.with_file_name(format!("{}.new", name.to_string_lossy())),
@@ -464,7 +464,7 @@ fn report_cfx_script(result: Result<HelperOutcome, Box<dyn std::error::Error>>) 
     }
 }
 
-/// Install one or more extensions ("mach" | "all"). Download + verify +
+/// Install one or more extensions ("ambulo" | "all"). Download + verify +
 /// register the daemon service. The service is created but only started by
 /// `install_and_start` (or an explicit `crossfyre service start`).
 pub async fn install(extension: &str, force: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -1105,7 +1105,7 @@ mod tests {
 
     #[test]
     fn matching_bytes_are_accepted_and_one_changed_byte_is_not() {
-        let a = artifact("mach-linux-x86_64.zip", HELLO_SHA);
+        let a = artifact("ambulo-linux-x86_64.zip", HELLO_SHA);
         assert!(verify_artifact_bytes(&a, b"hello").is_ok());
 
         let err = verify_artifact_bytes(&a, b"hellp").expect_err("one byte changed");
@@ -1121,7 +1121,7 @@ mod tests {
         // The publish pipeline writes lowercase hex, but a hand-edited manifest or a
         // different tool may not, and a case mismatch refusing a correct artifact would
         // look exactly like a compromised bucket.
-        let a = artifact("mach.zip", &HELLO_SHA.to_ascii_uppercase());
+        let a = artifact("ambulo.zip", &HELLO_SHA.to_ascii_uppercase());
         assert!(verify_artifact_bytes(&a, b"hello").is_ok());
     }
 
@@ -1132,7 +1132,7 @@ mod tests {
         // byte sequence is wrong, which is correct by accident. Being explicit also makes
         // the message say why instead of printing a mismatch against nothing.
         for blank in ["", "   "] {
-            let a = artifact("mach.zip", blank);
+            let a = artifact("ambulo.zip", blank);
             let err = verify_artifact_bytes(&a, b"hello")
                 .expect_err("an artifact with no checksum must be refused");
             assert!(
@@ -1147,9 +1147,9 @@ mod tests {
         // Zero bytes has a sha256 like anything else. A truncated download that arrives
         // as an empty 200 must not pass because there is nothing to hash.
         let empty_sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        let a = artifact("mach.zip", empty_sha);
+        let a = artifact("ambulo.zip", empty_sha);
         assert!(verify_artifact_bytes(&a, b"").is_ok());
-        let b = artifact("mach.zip", HELLO_SHA);
+        let b = artifact("ambulo.zip", HELLO_SHA);
         assert!(verify_artifact_bytes(&b, b"").is_err());
     }
 
@@ -1157,21 +1157,21 @@ mod tests {
     fn a_manifest_missing_the_component_or_the_platform_says_which() {
         let key = platform_key();
         let m = manifest(&format!(
-            r#"{{"components":{{"mach":{{"version":"0.0.14","artifacts":{{"{key}":{{"file":"f","sha256":"{HELLO_SHA}"}}}}}}}}}}"#
+            r#"{{"components":{{"ambulo":{{"version":"0.0.14","artifacts":{{"{key}":{{"file":"f","sha256":"{HELLO_SHA}"}}}}}}}}}}"#
         ));
-        assert!(resolve_artifact(&m, "mach").is_ok());
+        assert!(resolve_artifact(&m, "ambulo").is_ok());
 
-        let err = resolve_artifact(&m, "cortex")
+        let err = resolve_artifact(&m, "plessor")
             .expect_err("a component that is not there")
             .to_string();
-        assert!(err.contains("cortex"), "got: {err}");
+        assert!(err.contains("plessor"), "got: {err}");
 
         // A component that exists with no artifact for this host is a different problem
         // from one that does not exist, and the two messages were worth separating.
         let other = manifest(
-            r#"{"components":{"mach":{"version":"0.0.14","artifacts":{"solaris-sparc":{"file":"f","sha256":"x"}}}}}"#,
+            r#"{"components":{"ambulo":{"version":"0.0.14","artifacts":{"solaris-sparc":{"file":"f","sha256":"x"}}}}}"#,
         );
-        let err = resolve_artifact(&other, "mach")
+        let err = resolve_artifact(&other, "ambulo")
             .expect_err("no artifact for this platform")
             .to_string();
         assert!(err.contains(&key), "the message names the platform: {err}");
@@ -1184,17 +1184,43 @@ mod tests {
         // additive change becomes a fleet-wide update failure.
         let key = platform_key();
         let m = manifest(&format!(
-            r#"{{"generated":"2026-10-03","components":{{"mach":{{"version":"0.0.14","channel":"stable","artifacts":{{"{key}":{{"file":"f","sha256":"{HELLO_SHA}","size":1234}}}}}}}}}}"#
+            r#"{{"generated":"2026-10-03","components":{{"ambulo":{{"version":"0.0.14","channel":"stable","artifacts":{{"{key}":{{"file":"f","sha256":"{HELLO_SHA}","size":1234}}}}}}}}}}"#
         ));
-        let (c, a) = resolve_artifact(&m, "mach").expect("unknown fields are ignored");
+        let (c, a) = resolve_artifact(&m, "ambulo").expect("unknown fields are ignored");
         assert_eq!(c.version, "0.0.14");
         assert_eq!(a.sha256, HELLO_SHA);
-        assert_eq!(manifest_version(&m, "mach"), "0.0.14");
+        assert_eq!(manifest_version(&m, "ambulo"), "0.0.14");
         assert_eq!(
             manifest_version(&m, "nope"),
             "",
             "an absent component reports no version rather than panicking"
         );
+    }
+
+    #[test]
+    fn an_engine_resolves_under_its_new_key_and_falls_back_to_its_old_one() {
+        let key = platform_key();
+        let entry = |v: &str| {
+            format!(
+                r#"{{"version":"{v}","artifacts":{{"{key}":{{"file":"f-{v}","sha256":"{HELLO_SHA}"}}}}}}"#
+            )
+        };
+        // The release manifest carries the new key and, for one release, the old one
+        // as an alias. The new key is the one taken.
+        let both = manifest(&format!(
+            r#"{{"components":{{"cortex":{},"plessor":{}}}}}"#,
+            entry("0.0.22"),
+            entry("0.0.23")
+        ));
+        assert_eq!(manifest_version(&both, "cortex"), "0.0.23");
+        assert_eq!(manifest_version(&both, "plessor"), "0.0.23");
+        // A manifest that has not gained the new key yet still installs the engine.
+        let old = manifest(&format!(
+            r#"{{"components":{{"cortex":{}}}}}"#,
+            entry("0.0.22")
+        ));
+        assert_eq!(manifest_version(&old, "cortex"), "0.0.22");
+        assert_eq!(manifest_version(&old, "plessor"), "0.0.22");
     }
 
     /// An engine that was renamed, as the table describes one.
@@ -1319,7 +1345,7 @@ mod tests {
     #[test]
     fn a_placed_binary_is_executable_even_when_the_archive_was_not() {
         let s = Scratch::new("mode");
-        let src = s.join("mach-unpacked");
+        let src = s.join("ambulo-unpacked");
         fs::write(&src, b"#!/bin/sh\necho hi\n").expect("write src");
         #[cfg(unix)]
         {
@@ -1328,7 +1354,7 @@ mod tests {
             fs::set_permissions(&src, fs::Permissions::from_mode(0o644)).expect("chmod src");
         }
 
-        let dest = s.join("bin").join("mach");
+        let dest = s.join("bin").join("ambulo");
         place_binary(&src, &dest).expect("place");
         assert!(dest.exists(), "the parent directory is created");
         #[cfg(unix)]
@@ -1338,7 +1364,7 @@ mod tests {
             fs::read(&src).expect("read")
         );
         assert!(
-            !s.join("bin").join("mach.new").exists(),
+            !s.join("bin").join("ambulo.new").exists(),
             "nothing is left staged next to the destination"
         );
     }
@@ -1346,9 +1372,9 @@ mod tests {
     #[test]
     fn placing_over_an_existing_binary_replaces_it() {
         let s = Scratch::new("replace");
-        let dest = s.join("mach");
+        let dest = s.join("ambulo");
         fs::write(&dest, b"the-old-one").expect("write old");
-        let src = s.join("new-mach");
+        let src = s.join("new-ambulo");
         fs::write(&src, b"the-new-one").expect("write new");
 
         place_binary(&src, &dest).expect("place");
@@ -1360,7 +1386,7 @@ mod tests {
     #[test]
     fn staging_appends_to_the_name_instead_of_replacing_its_extension() {
         // `with_extension("new")` does not append, it REPLACES whatever follows the last
-        // dot, so placing `cortex-0.1.2` used to stage through `cortex-0.1.new`. That is
+        // dot, so placing `plessor-0.1.2` used to stage through `plessor-0.1.new`. That is
         // a path belonging to something else.
         //
         // The oracle is a bystander: a real file already sitting at the old staging name.
@@ -1372,10 +1398,10 @@ mod tests {
         let src = s.join("payload");
         fs::write(&src, b"x").expect("write src");
 
-        let bystander = s.join("cortex-0.1.new");
+        let bystander = s.join("plessor-0.1.new");
         fs::write(&bystander, b"somebody-elses-file").expect("write bystander");
 
-        let dest = s.join("cortex-0.1.2");
+        let dest = s.join("plessor-0.1.2");
         place_binary(&src, &dest).expect("place");
 
         assert!(dest.exists(), "the binary was placed");

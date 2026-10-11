@@ -9,7 +9,7 @@ use std::sync::Mutex;
 enum ExtensionKind {
     /// Shell out to a binary (subfinder, httpx, nuclei, etc.)
     Cli { binary: String },
-    /// Talk to a Crossfyre extension daemon over TCP JSON protocol (mach, voyage)
+    /// Talk to a Crossfyre extension daemon over TCP JSON protocol (ambulo, voyage)
     Daemon { port: u16 },
 }
 
@@ -103,7 +103,7 @@ impl Extension {
     }
 }
 
-/// Wraps a Crossfyre extension daemon (mach, voyage).
+/// Wraps a Crossfyre extension daemon (ambulo, voyage).
 /// Communicates over TCP with newline-delimited JSON.
 #[pyclass(skip_from_py_object)]
 #[derive(Clone)]
@@ -116,8 +116,8 @@ pub struct DaemonExtension {
 impl DaemonExtension {
     /// Send a raw JSON request to the daemon and return the response.
     ///
-    ///   mach = extensions.get("mach")
-    ///   mach.send({"operation": "probe", "url": "https://example.com", ...})
+    ///   ambulo = extensions.get("ambulo")
+    ///   ambulo.send({"operation": "probe", "url": "https://example.com", ...})
     fn send(&self, py: Python<'_>, request: Bound<'_, PyDict>) -> PyResult<Py<PyAny>> {
         let value: serde_json::Value = pythonize::depythonize(&request)?;
         let port = self.port;
@@ -159,7 +159,7 @@ impl DaemonExtension {
     /// Convenience: run a scan operation (stream mode).
     /// Returns a list of all result events.
     ///
-    ///   results = mach.scan({
+    ///   results = ambulo.scan({
     ///       "endpoint": "https://example.com/::FUZZ::",
     ///       "wordlist": "/path/to/wordlist.txt",
     ///       "method": "GET",
@@ -275,7 +275,7 @@ impl DaemonExtension {
 
     /// Convenience: single-URL probe (instant mode).
     ///
-    ///   result = mach.probe("https://example.com/admin", method="GET")
+    ///   result = ambulo.probe("https://example.com/admin", method="GET")
     #[pyo3(signature = (url, method="GET", success_codes=None, volatility=0))]
     fn probe(
         &self,

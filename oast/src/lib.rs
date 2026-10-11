@@ -6,7 +6,7 @@
 //!   - Poll API         (on 443 with capture, or :8085 plaintext for dev/localhost):
 //!     register a correlation + public key, drain sealed interactions.
 //!
-//! cortex embeds `<corr><rand>.OAST_DOMAIN` in an OOB payload and polls; any callback
+//! plessor embeds `<corr><rand>.OAST_DOMAIN` in an OOB payload and polls; any callback
 //! confirms the blind vulnerability fired. Interactions are sealed to the scan's
 //! public key, so the server never holds plaintext (see `crypto` + `store`).
 //!

@@ -7,7 +7,7 @@ failed probe is worth trying again.
 ## Open baseline
 
 This crate is the open reference implementation. It defines the interface the engines
-(`pulse`, `mach`, `voyage`, and the core) use, and ships a conservative baseline so the
+(`doorward`, `ambulo`, `voyage`, and the core) use, and ships a conservative baseline so the
 open toolchain builds and runs on its own, with nothing missing.
 
 The baseline is intentionally plain: safe, steady defaults, not fast. The tuned pacing

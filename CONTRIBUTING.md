@@ -1,6 +1,6 @@
 # Contributing to the Crossfyre Toolchain
 
-Thanks for taking the time to contribute. This repo holds the open-source recon and scanning engines (`mach`, `voyage`, `pulse`, `scout`, `cortex`), the out-of-band server (`oast`), the node agent (`node`), and the `crossfyre` CLI.
+Thanks for taking the time to contribute. This repo holds the open-source recon and scanning engines (`ambulo`, `voyage`, `doorward`, `toolmark`, `plessor`), the out-of-band server (`oast`), the node agent (`node`), and the `crossfyre` CLI.
 
 ## Ground rules
 
@@ -15,7 +15,7 @@ Every commit in a pull request from outside Clickswave Labs needs a `Signed-off-
 
 Open an issue and include:
 
-- The tool and version (`mach --version`).
+- The tool and version (`ambulo --version`).
 - The exact command you ran.
 - What you expected, and what happened instead.
 - Your OS and architecture.

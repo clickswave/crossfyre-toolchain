@@ -284,7 +284,8 @@ pub fn engine_addr(ext: &str) -> String {
 }
 
 /// Merge server-provided port overrides into the host `config.toml`. The JSON
-/// is a flat map of service name to port, keyed by engine id, e.g.
+/// is a flat map of service name to port, keyed by engine id (the ids are the
+/// engines' original names), e.g.
 /// `{ "postgres": 4440, "mach": 4441, "pulse": 4443 }` - "postgres" targets the
 /// database, every other key an engine daemon. A public name is accepted in place
 /// of an id. Missing/unknown keys keep their current value. Ensures `config.toml` exists first, and only writes when
@@ -421,6 +422,67 @@ mod tests {
             .collect();
         let names: Vec<&str> = ENGINES.iter().map(|e| e.name).collect();
         assert_eq!(keys, names);
+    }
+
+    #[test]
+    fn a_config_written_before_the_rename_keeps_its_ports() {
+        let p = ports("[extensions]\ncortex = 5001\nmach = 5002\npulse = 5003\nscout = 5004\n");
+        assert_eq!(
+            [
+                p.get("cortex"),
+                p.get("mach"),
+                p.get("pulse"),
+                p.get("scout")
+            ],
+            [5001, 5002, 5003, 5004]
+        );
+        // Reached by the new names as well, since a port is the engine's.
+        assert_eq!(p.get("plessor"), 5001);
+    }
+
+    #[test]
+    fn a_config_written_after_the_rename_uses_the_new_names() {
+        let p = ports("[extensions]\nplessor = 5001\nambulo = 5002\n");
+        assert_eq!((p.get("cortex"), p.get("mach")), (5001, 5002));
+        let cfg = ToolchainConfig {
+            extensions: p,
+            ..ToolchainConfig::default()
+        };
+        let text = toml::to_string(&cfg).expect("serialises");
+        assert!(
+            text.contains("plessor = 5001") && text.contains("ambulo = 5002"),
+            "{text}"
+        );
+        for old in ["cortex", "mach", "pulse", "scout"] {
+            assert!(!text.contains(old), "{old} written back: {text}");
+        }
+    }
+
+    #[test]
+    fn the_migration_rewrites_old_keys_and_leaves_a_current_file_alone() {
+        let dir = std::env::temp_dir().join(format!("cfx-config-rewrite-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("config.toml");
+        fs::write(
+            &path,
+            "[postgres]\nhost = \"localhost\"\nport = 4440\nuser = \"postgres\"\n\
+             db_name = \"crossfyre\"\n\n[container]\n\n[extensions]\ncortex = 5001\n",
+        )
+        .expect("old config");
+
+        assert!(rewrite_legacy_keys(&path).expect("rewrites"));
+        let text = fs::read_to_string(&path).expect("read");
+        assert!(
+            text.contains("plessor = 5001") && !text.contains("cortex"),
+            "{text}"
+        );
+        assert!(
+            !rewrite_legacy_keys(&path).expect("reads"),
+            "a current file is not written"
+        );
+        assert!(!rewrite_legacy_keys(&dir.join("absent.toml")).expect("absent is fine"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The alias reading against a table in which an engine was renamed.

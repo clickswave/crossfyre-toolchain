@@ -53,7 +53,7 @@ def wait_listening(port: int, proc: subprocess.Popen, what: str) -> None:
 
 
 class Engine:
-    """A cortex or mach daemon, on a port nobody else is using."""
+    """A plessor or ambulo daemon, on a port nobody else is using."""
 
     def __init__(self, binary: Path, env: dict | None = None):
         self.port = free_port()
@@ -89,8 +89,8 @@ class Engine:
                     continue
                 t = v.get("type")
                 # Two engine shapes, deliberately handled without an engine
-                # switch. cortex wraps a finding as {"type":"finding","data":{..}};
-                # mach streams flat crawl events with `url` at the top level. A
+                # switch. plessor wraps a finding as {"type":"finding","data":{..}};
+                # ambulo streams flat crawl events with `url` at the top level. A
                 # case should be able to assert on either without knowing which.
                 if t == "finding":
                     findings.append(v["data"])
@@ -168,8 +168,8 @@ def describe(f: dict) -> str:
 
 
 def have_browser() -> bool:
-    if os.environ.get("MACH_BROWSER"):
-        return Path(os.environ["MACH_BROWSER"]).is_file()
+    if os.environ.get("AMBULO_BROWSER"):
+        return Path(os.environ["AMBULO_BROWSER"]).is_file()
     for name in ("chromium", "chromium-browser", "google-chrome",
                  "google-chrome-stable", "chrome"):
         for d in os.environ.get("PATH", "").split(os.pathsep):
@@ -187,7 +187,7 @@ def run_case(name: str, case: dict, bins: dict) -> tuple[bool, list[str]]:
             fixtures.append(fx)
             ports[spec["name"]] = fx.port
 
-        engine = Engine(bins[case.get("engine", "cortex")], case.get("env"))
+        engine = Engine(bins[case.get("engine", "plessor")], case.get("env"))
         try:
             request = case["request"](ports)
             findings, logs = engine.run(request)
@@ -234,14 +234,14 @@ def main() -> int:
         return 0
 
     bins = {
-        "cortex": Path(os.environ.get("CORTEX_BIN", ROOT / "target/debug/cortex")),
-        "mach": Path(os.environ.get("MACH_BIN", ROOT / "target/debug/mach")),
+        "plessor": Path(os.environ.get("PLESSOR_BIN", ROOT / "target/debug/plessor")),
+        "ambulo": Path(os.environ.get("AMBULO_BIN", ROOT / "target/debug/ambulo")),
     }
     selected = {n: c for n, c in CASES.items() if not args or n in args}
     if not selected:
         print(f"no such case: {', '.join(args)}", file=sys.stderr)
         return 2
-    needed = {c.get("engine", "cortex") for c in selected.values()}
+    needed = {c.get("engine", "plessor") for c in selected.values()}
     for eng in needed:
         if not bins[eng].exists():
             print(f"missing binary: {bins[eng]}  (build it, or set {eng.upper()}_BIN)",
@@ -255,7 +255,7 @@ def main() -> int:
             # Named, never silent. A case that quietly does not run is the exact
             # failure mode this suite exists to catch.
             print(f"SKIP {name:22}   -.-s  {case.get('what','')}  "
-                  f"(no browser; set MACH_BROWSER)", flush=True)
+                  f"(no browser; set AMBULO_BROWSER)", flush=True)
             skipped += 1
             continue
         t0 = time.time()

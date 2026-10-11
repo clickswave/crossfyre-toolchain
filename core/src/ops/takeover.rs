@@ -1,7 +1,7 @@
 //! Takeover op: dangling-CNAME detection via the voyage daemon.
 //!
 //! Sibling of `subdomain_enum` (same daemon, same port), split out because the
-//! event vocabulary differs: voyage's takeover stream speaks cortex-shaped
+//! event vocabulary differs: voyage's takeover stream speaks plessor-shaped
 //! `finding` events rather than the enum's `subdomain` events, so the relay
 //! below matches the vuln-scan handler rather than the enum one.
 

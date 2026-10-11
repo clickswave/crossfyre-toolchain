@@ -6,7 +6,7 @@
 
 ### Five standalone recon and vulnerability scanning engines, written in Rust, for systems you are authorized to test.
 
-`voyage` enumerates subdomains, `pulse` scans hosts and ports, `mach` does content discovery, `scout` fingerprints services and `cortex` tests for vulnerabilities. Run them on their own from the terminal, or connect them to the [Crossfyre platform](https://crossfyre.io) when one machine isn't enough.
+`voyage` enumerates subdomains, `doorward` scans hosts and ports, `ambulo` does content discovery, `toolmark` fingerprints services and `plessor` tests for vulnerabilities. Run them on their own from the terminal, or connect them to the [Crossfyre platform](https://crossfyre.io) when one machine isn't enough.
 
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-1f6feb.svg)](LICENSE)
 [![Made with Rust](https://img.shields.io/badge/made%20with-Rust-b7410e.svg)](https://www.rust-lang.org)
@@ -21,7 +21,7 @@ The Crossfyre toolchain is a set of standalone reconnaissance and scanning engin
 
 ## Highlights
 
-- **Standalone first.** Use `mach`, `voyage`, and `pulse` like any other CLI. Nothing phones home unless you ask it to.
+- **Standalone first.** Use `ambulo`, `voyage`, and `doorward` like any other CLI. Nothing phones home unless you ask it to.
 - **Stateful and resumable.** Findings are written as they're discovered, so a scan you stop picks up exactly where it left off.
 - **Live in the terminal.** Every engine shares one terminal dashboard: progress, hits and throughput as they happen, the same keys and layout across all of them. The scan tools show it by default; the daemon tools take `--tui`.
 - **One coherent CLI.** `crossfyre` installs the engines, runs scans, and manages nodes from a single command.
@@ -31,16 +31,31 @@ The Crossfyre toolchain is a set of standalone reconnaissance and scanning engin
 
 | Tool | What it does |
 | --- | --- |
-| [**`mach`**](mach/) | HTTP fuzzing and content-discovery engine. Stateful and resumable. |
+| [**`ambulo`**](ambulo/) | HTTP fuzzing and content-discovery engine. Stateful and resumable. |
 | [**`voyage`**](voyage/) | Subdomain enumeration engine: passive sources plus active wordlist brute-forcing. |
-| [**`pulse`**](pulse/) | Host and port-scanning engine (connect and SYN techniques, service detection). |
-| [**`scout`**](scout/) | Service enumeration and web fingerprinting engine: identifies technologies and versions, and flags version-based CVE leads. |
-| [**`cortex`**](cortex/) | Vulnerability-scanning engine: a nuclei-compatible template and matcher pipeline with active fuzzing and out-of-band confirmation, so every finding is verified before it is reported. |
-| [**`oast`**](oast/) | Out-of-band interaction server. Run your own so `cortex` can confirm blind bugs (SSRF, blind RCE) against your own domain instead of the hosted pool. |
+| [**`doorward`**](doorward/) | Host and port-scanning engine (connect and SYN techniques, service detection). |
+| [**`toolmark`**](toolmark/) | Service enumeration and web fingerprinting engine: identifies technologies and versions, and flags version-based CVE leads. |
+| [**`plessor`**](plessor/) | Vulnerability-scanning engine: a nuclei-compatible template and matcher pipeline with active fuzzing and out-of-band confirmation, so every finding is verified before it is reported. |
+| [**`oast`**](oast/) | Out-of-band interaction server. Run your own so `plessor` can confirm blind bugs (SSRF, blind RCE) against your own domain instead of the hosted pool. |
 | [**`node`**](node/) | The Crossfyre node agent. Runs the engines on your machine and, optionally, connects to the platform. |
 | [**`crossfyre`**](crossfyre/) | The CLI that ties it together: install engines, run scans, manage nodes. |
 
 Also in the workspace: **`adaptive`**, an open reference library the engines use to pace themselves and decide retries. It ships an untuned baseline; the tuned pacing is a platform feature (see [`adaptive/README.md`](adaptive/README.md)).
+
+## Renamed in 0.1.31
+
+Four engines took new names in 0.1.31:
+
+| Now | Before |
+|---|---|
+| `ambulo` | `mach` |
+| `doorward` | `pulse` |
+| `toolmark` | `scout` |
+| `plessor` | `cortex` |
+
+The first `crossfyre update` or `crossfyre node init` after upgrading moves an existing install over: it stops the old service, moves the binary and any systemd drop-in directory, and starts the service under the new name. The old commands keep working through links until the next release, and so do the old environment variables (`CORTEX_OAST_DOMAIN`, `MACH_BROWSER` and the rest), with a notice naming the new one. `crossfyre extension install cortex` keeps working for good.
+
+The old names stay where a value is stored or sent between a node and the platform, because they are identifiers rather than names: the engine ids, a finding's `source` (`mach`, `scout`, `scout-cve`, `scout-services`), finding tool ids such as `cortex-inject`, template ids such as `cortex:waf-challenge`, and the local scan databases `mach` and `pulse`.
 
 ## Quick start
 
@@ -64,18 +79,18 @@ Prebuilt binaries for each release are on the [Releases](../../releases) page, o
 
 ```sh
 # Content discovery: fuzz a path with a wordlist
-mach scan --url https://example.com/::FUZZ:: --wordlist-path ./wordlist.txt
+ambulo scan --url https://example.com/::FUZZ:: --wordlist-path ./wordlist.txt
 
 # Subdomain enumeration: passive sources + active brute-force
 voyage scan --domain example.com --wordlist-path ./subdomains.txt
 
 # Port scan a network range, with service detection
-pulse scan --targets 10.0.0.0/24 --ports top-1000 --service-detection
+doorward scan --targets 10.0.0.0/24 --ports top-1000 --service-detection
 ```
 
-Every engine is a daemon plus a client: start it with `--daemon` and the client subcommands talk to it over loopback. All five take `scan` for a run you drive and `exec` for a raw JSON op, and `mach`, `voyage` and `pulse` keep findings in a local store, so a run you interrupt can be resumed.
+Every engine is a daemon plus a client: start it with `--daemon` and the client subcommands talk to it over loopback. All five take `scan` for a run you drive and `exec` for a raw JSON op, and `ambulo`, `voyage` and `doorward` keep findings in a local store, so a run you interrupt can be resumed.
 
-Output is newline-delimited JSON, one event per line, each carrying a `type`. A dashboard is drawn instead when stdout is a terminal: on by default for `mach`, `voyage` and `pulse`, where a run is long enough to want progress, and on `--tui` for `scout` and `cortex`. Either way, redirecting or piping gives you the JSON, and `--no-tui` forces it in a terminal. A run that ends in a `type: "error"` event exits non-zero, so a script can read `$?` without parsing the stream.
+Output is newline-delimited JSON, one event per line, each carrying a `type`. A dashboard is drawn instead when stdout is a terminal: on by default for `ambulo`, `voyage` and `doorward`, where a run is long enough to want progress, and on `--tui` for `toolmark` and `plessor`. Either way, redirecting or piping gives you the JSON, and `--no-tui` forces it in a terminal. A run that ends in a `type: "error"` event exits non-zero, so a script can read `$?` without parsing the stream.
 
 ### The daemon boundary
 
@@ -86,7 +101,7 @@ The daemons speak unauthenticated newline-delimited JSON with no session or hand
 | `CFX_DAEMON_BIND` | Binds the listener to this IP instead of loopback. A value that is not an IP falls back to loopback rather than widening the listener. |
 | `CFX_DAEMON_TOKEN` | Requires a matching token on every request. Set it on the daemon and on anything that talks to it; the clients and the node read the same variable and stamp it automatically. |
 
-Binding off loopback without a token is allowed, for operators who have put the port behind a firewall, but it is announced on every start. `mach`'s wordlist parameter is a filesystem path, so an exposed daemon is also a file-read primitive: if you move the listener, set the token.
+Binding off loopback without a token is allowed, for operators who have put the port behind a firewall, but it is announced on every start. `ambulo`'s wordlist parameter is a filesystem path, so an exposed daemon is also a file-read primitive: if you move the listener, set the token.
 
 ## Standalone, or part of the platform
 
@@ -110,13 +125,13 @@ You need a recent stable [Rust toolchain](https://rustup.rs).
 git clone https://github.com/clickswave/crossfyre-toolchain.git
 cd crossfyre-toolchain
 cargo build --release
-# binaries land in ./target/release/{crossfyre,node,mach,voyage,pulse,scout,cortex}
+# binaries land in ./target/release/{crossfyre,node,ambulo,voyage,doorward,toolmark,plessor}
 ```
 
 Install a single engine straight from the repo:
 
 ```sh
-cargo install --git https://github.com/clickswave/crossfyre-toolchain.git mach
+cargo install --git https://github.com/clickswave/crossfyre-toolchain.git ambulo
 ```
 
 ## Responsible use

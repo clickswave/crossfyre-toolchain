@@ -3,8 +3,8 @@
 // Formerly the standalone `orion` CLI (OrionChain). Merged into the node
 // binary so `crossfyre node init` can install extensions, provision the Postgres
 // container, and register OS services without piping a remote install script
-// into a shell. Extensions (mach, voyage, pulse) remain separate closed-source
-// daemon binaries downloaded from bins.crossfyre.io.
+// into a shell. Extensions (ambulo, voyage, doorward, toolmark, plessor) remain
+// separate daemon binaries downloaded from bins.crossfyre.io.
 
 // The traffic-capture core (session CA, per-SNI MITM leaves, egress) is its own crate so the mobile
 // VpnService netstack can reuse it without pulling in the rest of cfx_core. Re-exported here so the
@@ -26,6 +26,9 @@ pub mod ui;
 pub mod uninstall;
 
 /// One scan engine installable as a node extension.
+///
+/// The ids are the engines' original names and are historical: they stay as they
+/// are, whatever the engines are called.
 ///
 /// Each engine has two names. `id` is the stored and wire identifier: the database,
 /// the NATS commands, the ports map pushed to nodes, the heartbeat, `nodes.d` and a
@@ -56,8 +59,8 @@ impl Engine {
 pub const ENGINES: &[Engine] = &[
     Engine {
         id: "mach",
-        name: "mach",
-        legacy: None,
+        name: "ambulo",
+        legacy: Some("mach"),
         port: 4441,
         about: "HTTP fuzzer, content-discovery and web-crawl engine",
     },
@@ -70,22 +73,22 @@ pub const ENGINES: &[Engine] = &[
     },
     Engine {
         id: "pulse",
-        name: "pulse",
-        legacy: None,
+        name: "doorward",
+        legacy: Some("pulse"),
         port: 4443,
         about: "Network host and port-scanning engine",
     },
     Engine {
         id: "scout",
-        name: "scout",
-        legacy: None,
+        name: "toolmark",
+        legacy: Some("scout"),
         port: 4444,
         about: "Service enumeration and web fingerprinting engine",
     },
     Engine {
         id: "cortex",
-        name: "cortex",
-        legacy: None,
+        name: "plessor",
+        legacy: Some("cortex"),
         port: 4445,
         about: "Vulnerability detection engine",
     },
@@ -225,6 +228,44 @@ mod tests {
         let err = resolve_in(TABLE, "nope").unwrap_err();
         assert!(err.contains("fresh, voyage, or all"), "{err}");
         assert!(!err.contains("cortex"), "ids are not offered: {err}");
+    }
+
+    /// Old name, new name, for every engine that was renamed.
+    const RENAMES: [(&str, &str); 4] = [
+        ("mach", "ambulo"),
+        ("pulse", "doorward"),
+        ("scout", "toolmark"),
+        ("cortex", "plessor"),
+    ];
+
+    #[test]
+    fn every_old_cli_argument_still_resolves_to_the_renamed_engine() {
+        // `crossfyre extension install cortex`, and every other command taking an
+        // engine, keeps working, and lands on the same engine as the new name.
+        for (old, new) in RENAMES {
+            assert_eq!(resolve_extensions(old).unwrap(), vec![old], "{old}");
+            assert_eq!(resolve_extensions(new).unwrap(), vec![old], "{new}");
+        }
+        let err = resolve_extensions("nope").unwrap_err().to_string();
+        assert!(
+            err.contains("ambulo, voyage, doorward, toolmark, plessor, or all"),
+            "{err}"
+        );
+        for (old, _) in RENAMES {
+            assert!(!err.contains(old), "an old name is not offered: {err}");
+        }
+    }
+
+    #[test]
+    fn an_engine_is_printed_by_its_new_name_and_keeps_its_id() {
+        for (old, new) in RENAMES {
+            let e = engine(old).expect("known by its old name");
+            assert_eq!((e.id, e.name, e.legacy), (old, new, Some(old)));
+            assert_eq!(engine(new), Some(e));
+            assert_eq!(public_name(old), new);
+        }
+        assert_eq!(public_name("voyage"), "voyage");
+        assert_eq!(engine("voyage").unwrap().legacy, None);
     }
 
     #[test]

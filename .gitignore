@@ -41,8 +41,11 @@ Thumbs.db
 /core/src/egress/private.rs
 
 # Private authorization-oracle drop-in (BOLA/BFLA/BOPLA differential engine). NEVER
-# commit: the committed baseline.rs is the open no-oracle build. cortex/build.rs
-# compiles this if present.
+# commit: the committed baseline.rs is the open no-oracle build. plessor/build.rs
+# compiles this if present. The engine's directory was `cortex/` before 0.1.31, and
+# a checkout made before then may still have the drop-in there, so both paths are
+# ignored for one more release.
+/plessor/src/authz/private.rs
 /cortex/src/authz/private.rs
 
 # Python bytecode from the oracle regression harness.
