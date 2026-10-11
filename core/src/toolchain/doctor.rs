@@ -3,7 +3,7 @@
 // plane, leftover OrionChain installs.
 
 use super::ui::{dim, done, error, fail, ok, section, step, title, warn};
-use super::{EXTENSION_PORTS, config};
+use super::{ENGINES, config};
 use std::path::Path;
 
 /// Render one check as a styled status line. Returns true when the check
@@ -93,18 +93,18 @@ pub async fn run(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
     // -- Daemons ------------------------------------------------------------
     section("Daemons");
-    for (ext, port) in EXTENSION_PORTS {
-        if config::is_extension_installed(ext) {
-            let label = format!("{ext} daemon listening on {port}");
+    for e in ENGINES {
+        if config::is_extension_installed(e.id) {
+            let label = format!("{} daemon listening on {}", e.name, e.port);
             if !check(
                 &label,
-                port_open(*port),
-                &format!("crossfyre extension start {ext}"),
+                port_open(e.port),
+                &format!("crossfyre extension start {}", e.name),
             ) {
                 failed += 1;
             }
         } else {
-            step(&format!("{} {}", ext, dim("not installed")));
+            step(&format!("{} {}", e.name, dim("not installed")));
         }
     }
     if let Ok(c) = config::load_config() {

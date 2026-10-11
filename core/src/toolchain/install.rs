@@ -11,7 +11,9 @@
 // manifest", which conflated the two and read as a stronger guarantee than the
 // code gave.
 
-use super::config::{ext_bin_path, ext_file_name, get_bin_dir};
+use super::config::{
+    ext_bin_path, ext_file_name, file_name, get_bin_dir, is_regular_file, legacy_bin_path,
+};
 use super::service;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -45,14 +47,58 @@ fn origin_host() -> &'static str {
 
 /// Sidecar recording an installed extension's version (mirrors node.version),
 /// so `update` can tell "already current" from "needs update" without a reinstall.
+/// Named by the public name, as the binary is.
 fn ext_version_file(ext: &str) -> std::path::PathBuf {
-    get_bin_dir().join(format!("{ext}.version"))
+    get_bin_dir().join(format!("{}.version", super::public_name(ext)))
+}
+
+/// The sidecar an engine's binary had under its legacy name, if it was renamed.
+fn legacy_version_file(ext: &str) -> Option<std::path::PathBuf> {
+    let legacy = super::engine(ext)?.legacy?;
+    Some(get_bin_dir().join(format!("{legacy}.version")))
 }
 
 fn installed_ext_version(ext: &str) -> Option<String> {
-    fs::read_to_string(ext_version_file(ext))
-        .ok()
-        .map(|s| s.trim().to_string())
+    let read = |p: std::path::PathBuf| fs::read_to_string(p).ok().map(|s| s.trim().to_string());
+    if ext_bin_path(ext).exists() {
+        return read(ext_version_file(ext));
+    }
+    // Installed under the legacy name only: the migration has not run here yet.
+    match (legacy_bin_path(ext), legacy_version_file(ext)) {
+        (Some(bin), Some(v)) if is_regular_file(&bin) => read(v),
+        _ => read(ext_version_file(ext)),
+    }
+}
+
+/// The manifest keys `component` may be published under, in the order to try them: an
+/// engine's public name first, then its legacy name and its id. A manifest from before
+/// the rename has only the legacy key, and one from after it has both, so the CLI does
+/// not depend on the order in which the manifest gains keys. Any other component is
+/// published under its own name.
+fn manifest_keys(component: &str) -> Vec<&str> {
+    keys_for(super::engine(component), component)
+}
+
+fn keys_for<'a>(engine: Option<&'a super::Engine>, component: &'a str) -> Vec<&'a str> {
+    let Some(e) = engine else {
+        return vec![component];
+    };
+    let mut keys = vec![e.name];
+    for k in e.legacy.into_iter().chain([e.id]) {
+        if !keys.contains(&k) {
+            keys.push(k);
+        }
+    }
+    keys
+}
+
+/// The file inside an unpacked artifact that is `component`'s binary: one named by any
+/// of its manifest keys, public name first. An alias artifact published under the
+/// legacy key carries the binary under the legacy name.
+fn find_member(extract_dir: &Path, keys: &[&str]) -> Option<PathBuf> {
+    keys.iter()
+        .map(|k| extract_dir.join(file_name(k)))
+        .find(|p| p.exists())
 }
 
 /// The version string in `resolve_artifact` for a component, or "" if absent.
@@ -147,14 +193,25 @@ fn resolve_artifact<'m>(
     manifest: &'m Manifest,
     component: &str,
 ) -> Result<(&'m Component, &'m Artifact), Box<dyn std::error::Error>> {
-    let comp = manifest
-        .components
-        .get(component)
-        .ok_or_else(|| format!("component '{component}' not in release manifest"))?;
+    resolve_keys(manifest, &manifest_keys(component))
+}
+
+/// The first of `keys` the manifest has a component for, and that component's artifact
+/// for this platform. The error names the first key, which is the public name.
+fn resolve_keys<'m>(
+    manifest: &'m Manifest,
+    keys: &[&str],
+) -> Result<(&'m Component, &'m Artifact), Box<dyn std::error::Error>> {
+    let shown = keys.first().copied().unwrap_or("");
+    let comp = keys
+        .iter()
+        .find_map(|k| manifest.components.get(*k))
+        .ok_or_else(|| format!("component '{shown}' not in release manifest"))?;
     let key = platform_key();
-    let artifact = comp.artifacts.get(&key).ok_or_else(|| {
-        format!("no '{component}' artifact for platform {key} in release manifest")
-    })?;
+    let artifact = comp
+        .artifacts
+        .get(&key)
+        .ok_or_else(|| format!("no '{shown}' artifact for platform {key} in release manifest"))?;
     Ok((comp, artifact))
 }
 
@@ -411,6 +468,9 @@ fn report_cfx_script(result: Result<HelperOutcome, Box<dyn std::error::Error>>) 
 /// register the daemon service. The service is created but only started by
 /// `install_and_start` (or an explicit `crossfyre service start`).
 pub async fn install(extension: &str, force: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // Before anything is placed: an engine still installed under its legacy name
+    // would otherwise end up with a second unit on its port.
+    super::migrate::renamed_engines();
     let manifest = fetch_manifest().await?;
     for ext in super::resolve_extensions(extension)? {
         install_one(&manifest, ext, force, false).await?;
@@ -426,15 +486,16 @@ async fn install_one(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use super::ui::*;
     let bin_path = ext_bin_path(ext);
+    let name = super::public_name(ext);
 
     if !quiet {
-        title("Crossfyre extension install", ext);
+        title("Crossfyre extension install", name);
     }
 
-    if bin_path.exists() && !force {
+    if super::config::is_extension_installed(ext) && !force {
         if !quiet {
             warn(&format!(
-                "{ext} is already installed {}",
+                "{name} is already installed {}",
                 dim("(use --force to reinstall)")
             ));
             end();
@@ -442,9 +503,10 @@ async fn install_one(
         return Ok(());
     }
 
-    let (comp, artifact) = resolve_artifact(manifest, ext)?;
+    let keys = manifest_keys(ext);
+    let (comp, artifact) = resolve_keys(manifest, &keys)?;
     if !quiet {
-        working(&format!("Downloading {ext} {}", dim(&comp.version)));
+        working(&format!("Downloading {name} {}", dim(&comp.version)));
     }
 
     let tmp_dir = tempfile::tempdir().map_err(|e| format!("Failed to create temp dir: {e}"))?;
@@ -457,14 +519,13 @@ async fn install_one(
     let extract_dir = tmp_dir.path().join("extracted");
     extract_zip(&zip_path, &extract_dir)?;
 
-    let extracted_binary = extract_dir.join(ext_file_name(ext));
-    if !extracted_binary.exists() {
+    let Some(extracted_binary) = find_member(&extract_dir, &keys) else {
         return Err(format!("Binary '{}' not found inside zip", ext_file_name(ext)).into());
-    }
+    };
 
     // Stop the running daemon (if any) before replacing the binary - on
     // Windows the file is locked while the task runs. Best-effort, OS-aware.
-    if bin_path.exists() {
+    if super::config::is_extension_installed(ext) {
         service::try_stop(ext);
     }
 
@@ -473,7 +534,7 @@ async fn install_one(
     // node.version). Best-effort: a missing sidecar just triggers one reinstall.
     let _ = fs::write(ext_version_file(ext), &comp.version);
     if !quiet {
-        ok(&format!("{ext} {} installed", comp.version));
+        ok(&format!("{name} {} installed", comp.version));
     }
 
     if let Err(e) = service::create_service_file(ext)
@@ -514,23 +575,33 @@ pub fn remove(extension: &str) -> Result<(), Box<dyn std::error::Error>> {
 fn remove_one(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
     use super::ui::*;
     let bin_path = ext_bin_path(ext);
+    let name = super::public_name(ext);
+    // The legacy path, whether it is the binary itself (not migrated yet) or the
+    // link the migration left there.
+    let legacy = legacy_bin_path(ext).filter(|p| fs::symlink_metadata(p).is_ok());
 
-    title("Crossfyre extension remove", ext);
+    title("Crossfyre extension remove", name);
 
-    if !bin_path.exists() {
-        warn(&format!("{ext} is not installed, nothing to remove"));
+    if !bin_path.exists() && legacy.is_none() {
+        warn(&format!("{name} is not installed, nothing to remove"));
         end();
         return Ok(());
     }
 
-    step(&format!("Stopping {ext} service"));
-    let _ = service::stop(ext);
-    step(&format!("Disabling {ext} service"));
-    let _ = service::disable(ext);
+    step(&format!("Stopping and disabling {name} service"));
+    service::try_stop_and_disable_all(ext);
     service::remove_service_file(ext)?;
 
-    fs::remove_file(&bin_path)?;
-    ok(&format!("{ext} removed"));
+    if bin_path.exists() {
+        fs::remove_file(&bin_path)?;
+    }
+    if let Some(p) = &legacy {
+        fs::remove_file(p)?;
+    }
+    for v in std::iter::once(ext_version_file(ext)).chain(legacy_version_file(ext)) {
+        let _ = fs::remove_file(v);
+    }
+    ok(&format!("{name} removed"));
     end();
     Ok(())
 }
@@ -543,6 +614,8 @@ pub async fn update(
     current_version: &str,
     force: bool,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    // First, so what follows sees every engine under its public name.
+    super::migrate::renamed_engines();
     let manifest = fetch_manifest().await?;
     let mut self_updated = false;
 
@@ -569,17 +642,18 @@ pub async fn update(
     if !exts.is_empty() {
         println!("  {}", dim("Extensions"));
         for ext in &exts {
+            let name = super::public_name(ext);
             let want = manifest_version(&manifest, ext);
             let have = installed_ext_version(ext);
             let up_to_date = ext_bin_path(ext).exists()
                 && !want.is_empty()
                 && have.as_deref() == Some(want.as_str());
             if up_to_date && !force {
-                println!("{}", row(&check(), ext, &ver(&want), &dim("up to date")));
+                println!("{}", row(&check(), name, &ver(&want), &dim("up to date")));
                 current += 1;
                 continue;
             }
-            print!("    {} {ext:<10} {}", dot(), dim("updating…"));
+            print!("    {} {name:<10} {}", dot(), dim("updating…"));
             let _ = std::io::Write::flush(&mut std::io::stdout());
             match install_one(&manifest, ext, true, true).await {
                 Ok(()) => {
@@ -592,7 +666,7 @@ pub async fn update(
                     };
                     println!(
                         "\r{}          ",
-                        row(&check(), ext, &mid, &format!("{GREEN}updated{RESET}"))
+                        row(&check(), name, &mid, &format!("{GREEN}updated{RESET}"))
                     );
                     changed += 1;
                 }
@@ -601,7 +675,7 @@ pub async fn update(
                         "\r{}          ",
                         row(
                             &bang(),
-                            ext,
+                            name,
                             "",
                             &format!("{YELLOW}failed{RESET} {}", dim(&e.to_string()))
                         )
@@ -1120,6 +1194,70 @@ mod tests {
             manifest_version(&m, "nope"),
             "",
             "an absent component reports no version rather than panicking"
+        );
+    }
+
+    /// An engine that was renamed, as the table describes one.
+    const RENAMED: crate::toolchain::Engine = crate::toolchain::Engine {
+        id: "cortex",
+        name: "fresh",
+        legacy: Some("cortex"),
+        port: 4445,
+        about: "",
+    };
+
+    #[test]
+    fn a_renamed_engine_is_looked_up_under_its_public_name_then_its_legacy_one() {
+        assert_eq!(keys_for(Some(&RENAMED), "cortex"), ["fresh", "cortex"]);
+        assert_eq!(keys_for(None, "crossfyre"), ["crossfyre"]);
+        let key = platform_key();
+        let entry = |v: &str| {
+            format!(
+                r#"{{"version":"{v}","artifacts":{{"{key}":{{"file":"f-{v}","sha256":"{HELLO_SHA}"}}}}}}"#
+            )
+        };
+
+        // A manifest from before the rename has only the legacy key.
+        let old = manifest(&format!(
+            r#"{{"components":{{"cortex":{}}}}}"#,
+            entry("0.0.22")
+        ));
+        let (c, _) = resolve_keys(&old, &keys_for(Some(&RENAMED), "cortex")).expect("falls back");
+        assert_eq!(c.version, "0.0.22");
+
+        // One from after it carries both, and the public name is taken.
+        let both = manifest(&format!(
+            r#"{{"components":{{"cortex":{},"fresh":{}}}}}"#,
+            entry("0.0.22"),
+            entry("0.0.23")
+        ));
+        let (c, a) = resolve_keys(&both, &keys_for(Some(&RENAMED), "cortex")).expect("found");
+        assert_eq!(
+            (c.version.as_str(), a.file.as_str()),
+            ("0.0.23", "f-0.0.23")
+        );
+
+        let err = resolve_keys(&manifest(r#"{"components":{}}"#), &["fresh", "cortex"])
+            .expect_err("in neither")
+            .to_string();
+        assert!(
+            err.contains("'fresh'"),
+            "the public name is the one reported: {err}"
+        );
+    }
+
+    #[test]
+    fn the_binary_inside_an_artifact_may_carry_either_name() {
+        let s = Scratch::new("member");
+        let keys = keys_for(Some(&RENAMED), "cortex");
+        assert_eq!(find_member(&s.0, &keys), None);
+        fs::write(s.join(&file_name("cortex")), b"alias").expect("legacy member");
+        assert_eq!(find_member(&s.0, &keys), Some(s.join(&file_name("cortex"))));
+        fs::write(s.join(&file_name("fresh")), b"new").expect("public member");
+        assert_eq!(
+            find_member(&s.0, &keys),
+            Some(s.join(&file_name("fresh"))),
+            "the public name first"
         );
     }
 

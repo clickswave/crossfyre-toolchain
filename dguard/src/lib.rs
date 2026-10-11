@@ -531,3 +531,95 @@ mod wait_for_tests {
         assert_eq!(got.unwrap_err(), "still down");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Settings whose environment variable was renamed.
+//
+// An engine's user-facing variables carry the engine's name, so renaming an engine
+// renames them. Machines set them in places nobody revisits (systemd drop-ins, shell
+// profiles, CI), and a scanner that silently stops reading one keeps scanning and
+// reports less, which reads as a clean target. So the old name is still read, after
+// the new one, and saying so is the only side effect.
+// ---------------------------------------------------------------------------
+
+/// The value of `new`, or else of `old`, the name the same setting had before. Reading
+/// `old` prints one line to stderr naming `new`, once per variable per process.
+pub fn env_renamed(new: &str, old: &str) -> Option<String> {
+    static NOTICED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let (value, notice) = pick_renamed(new, old, |k| std::env::var(k).ok());
+    if let Some(line) = notice {
+        let mut seen = NOTICED.lock().unwrap_or_else(|p| p.into_inner());
+        if !seen.iter().any(|s| s == old) {
+            seen.push(old.to_string());
+            eprintln!("{line}");
+        }
+    }
+    value
+}
+
+/// The decision behind [`env_renamed`], over any lookup: the value, and the notice to
+/// print when it came from the old name.
+fn pick_renamed(
+    new: &str,
+    old: &str,
+    get: impl Fn(&str) -> Option<String>,
+) -> (Option<String>, Option<String>) {
+    if let Some(v) = get(new) {
+        return (Some(v), None);
+    }
+    match get(old) {
+        Some(v) => (
+            Some(v),
+            Some(format!(
+                "note: {old} is now {new}. The old name is still read for this release; \
+                 set {new} instead."
+            )),
+        ),
+        None => (None, None),
+    }
+}
+
+#[cfg(test)]
+mod env_renamed_tests {
+    use super::pick_renamed;
+
+    fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| {
+            vars.iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn the_new_name_is_read_first_and_says_nothing() {
+        let (v, notice) = pick_renamed("NEW_X", "OLD_X", env(&[("NEW_X", "a"), ("OLD_X", "b")]));
+        assert_eq!(v.as_deref(), Some("a"));
+        assert_eq!(notice, None);
+    }
+
+    #[test]
+    fn the_old_name_still_works_and_names_the_new_one() {
+        let (v, notice) = pick_renamed("NEW_X", "OLD_X", env(&[("OLD_X", "b")]));
+        assert_eq!(v.as_deref(), Some("b"));
+        let notice = notice.expect("reading the old name says so");
+        assert!(
+            notice.contains("OLD_X") && notice.contains("NEW_X"),
+            "{notice}"
+        );
+    }
+
+    #[test]
+    fn neither_set_is_unset() {
+        assert_eq!(pick_renamed("NEW_X", "OLD_X", env(&[])), (None, None));
+    }
+
+    #[test]
+    fn an_empty_new_value_still_wins() {
+        // Set-but-empty is how a person turns a setting off; falling through to the
+        // old name would turn it back on behind their back.
+        let (v, notice) = pick_renamed("NEW_X", "OLD_X", env(&[("NEW_X", ""), ("OLD_X", "b")]));
+        assert_eq!(v.as_deref(), Some(""));
+        assert_eq!(notice, None);
+    }
+}
