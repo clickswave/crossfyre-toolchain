@@ -189,11 +189,52 @@ def run():
     }
 }
 
+/// Descriptors above 2 that this test process holds open without close-on-exec. The
+/// helper inherits these from whatever started the tests, a CI runner for one, so they
+/// say nothing about the helper.
+fn inherited_from_outside() -> Vec<i64> {
+    #[cfg(target_os = "linux")]
+    {
+        const O_CLOEXEC: u64 = 0o2000000;
+        let mut fds = Vec::new();
+        for entry in std::fs::read_dir("/proc/self/fd")
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let Some(fd) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<i64>().ok())
+            else {
+                continue;
+            };
+            let Ok(info) = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")) else {
+                continue;
+            };
+            let flags = info
+                .lines()
+                .find_map(|l| l.strip_prefix("flags:"))
+                .and_then(|v| u64::from_str_radix(v.trim(), 8).ok());
+            if fd > 2 && flags.is_some_and(|f| f & O_CLOEXEC == 0) {
+                fds.push(fd);
+            }
+        }
+        fds
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Vec::new()
+    }
+}
+
 #[test]
 fn a_child_process_inherits_no_descriptor_but_0_1_and_2() {
     // The messages travel on a descriptor of their own, and it must close on exec. A child
     // that held it could write among the messages, and would hold the pipe open after the
-    // helper exits.
+    // helper exits. Descriptors that were already inheritable before the helper started
+    // came from outside it and are left out.
+    let outside = inherited_from_outside();
     let r = run(&job(r#"
 import cfxs, fcntl, os
 def run():
@@ -210,7 +251,18 @@ def run():
 "#));
     assert_eq!(r.status, 0, "stderr: {}", r.stderr);
     assert_eq!(types(&r), ["result", "completed"]);
-    assert_eq!(r.messages[0]["data"]["inherited"], serde_json::json!([]));
+    let held: Vec<i64> = r.messages[0]["data"]["inherited"]
+        .as_array()
+        .expect("a list of descriptors")
+        .iter()
+        .filter_map(|v| v.as_i64())
+        .filter(|fd| !outside.contains(fd))
+        .collect();
+    assert_eq!(
+        held,
+        Vec::<i64>::new(),
+        "inherited from outside: {outside:?}"
+    );
 }
 
 #[cfg(unix)]
