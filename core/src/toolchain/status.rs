@@ -2,8 +2,8 @@
 // something is off. Read-only: probes ports, pid files, and the container,
 // never mutates state.
 
-use super::config::{ext_bin_path, is_extension_installed, load_config};
-use super::{EXTENSION_PORTS, service};
+use super::config::{is_extension_installed, load_config};
+use super::{ENGINES, service};
 use std::path::Path;
 
 fn port_open(port: u16) -> bool {
@@ -137,10 +137,11 @@ pub fn extensions() -> Result<(), Box<dyn std::error::Error>> {
 
     title(
         "Crossfyre extensions",
-        &format!("{} available", EXTENSION_PORTS.len()),
+        &format!("{} available", ENGINES.len()),
     );
     section("Extensions");
-    for (ext, port) in EXTENSION_PORTS {
+    for e in ENGINES {
+        let (ext, port) = (e.id, &e.port);
         let installed = is_extension_installed(ext);
         let daemon = if installed {
             service::daemon_status(ext)
@@ -169,7 +170,7 @@ pub fn extensions() -> Result<(), Box<dyn std::error::Error>> {
                 other => (dot(), format!("{}  {}", dim(other), listen_note)),
             }
         };
-        println!("{}", row(&sym, ext, &mid, &status));
+        println!("{}", row(&sym, e.name, &mid, &status));
     }
     end();
     Ok(())
@@ -195,7 +196,7 @@ pub fn db() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  container: none recorded - `crossfyre db up` to create one");
             }
             // Extension binaries are useless without the db; nudge if it's down.
-            if !listening && super::EXTENSIONS.iter().any(|e| ext_bin_path(e).exists()) {
+            if !listening && super::EXTENSIONS.iter().any(|e| is_extension_installed(e)) {
                 println!(
                     "  hint: extensions are installed but the database is down - `crossfyre db start`"
                 );

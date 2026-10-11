@@ -241,7 +241,7 @@ pub fn build_client(cfg: ClientConfig) -> Result<Client, Error> {
 ///
 /// [`build_scan_client`] turns this into a [`Client`], centralizing the ~15-line
 /// "identity headers -> browser_headers, auth -> app headers, Identify token ->
-/// `x-bug-bounty`" assembly that cortex (inject/authz), mach and scout each
+/// `x-bug-bounty`" assembly that plessor (inject/authz), ambulo and toolmark each
 /// reimplemented around [`build_client`]. The caller still resolves the identity,
 /// so the `adaptive` dependency stays out of `transport`.
 pub struct ScanClient<'a> {

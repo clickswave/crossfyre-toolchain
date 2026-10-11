@@ -3,7 +3,7 @@ name: Release
 # Publishes the OPEN build, and is careful to say so.
 #
 # WHAT THIS IS NOT. These artifacts are not the binaries `get.crossfyre.io`
-# installs. This repo is open-core: `cortex/src/authz/private.rs`,
+# installs. This repo is open-core: `plessor/src/authz/private.rs`,
 # `core/src/egress/private.rs` and `adaptive-private/` are git-ignored and absent
 # from any public checkout, so `build.rs` compiles the `baseline.rs` stubs
 # instead. A release built here therefore has no authorization oracle, no
@@ -54,8 +54,11 @@ jobs:
         run: |
           set -euo pipefail
           fail=0
+          # The authz drop-in sat under cortex/ before 0.1.31; both paths are checked
+          # for one more release.
           for p in adaptive-private .cargo/config.toml \
-                   core/src/egress/private.rs cortex/src/authz/private.rs; do
+                   core/src/egress/private.rs plessor/src/authz/private.rs \
+                   cortex/src/authz/private.rs; do
             if [ -e "$p" ]; then
               echo "::error::$p is present in a clean checkout of this tag"
               fail=1
@@ -66,7 +69,7 @@ jobs:
       - name: The open baseline is what gets compiled
         run: |
           set -euo pipefail
-          test -e cortex/src/authz/baseline.rs
+          test -e plessor/src/authz/baseline.rs
           test -e core/src/egress/baseline.rs
           echo "open baseline present; build.rs will select it"
 
@@ -96,11 +99,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # `core` pulls in pyo3 for the .cfx playbook runtime, so the final link
-      # wants libpython. rust:bookworm has the interpreter but not the headers,
-      # and every crate compiled fine before the link failed on -lpython3.11.
-      # Debian bookworm ships 3.11, which is why the version is pinned here.
-      - name: Install the libpython the link needs
+      # cfx-script, the .cfx runner, embeds Python and so links libpython; it is
+      # the only binary here that does, which is what lets the CLI and node start
+      # on any Linux. rust:bookworm has the interpreter but not the headers, so the
+      # link fails on -lpython3.11 without this. Debian bookworm ships 3.11, so a
+      # host that runs .cfx scripts needs libpython3.11.
+      - name: Install the libpython cfx-script links
         run: |
           apt-get update -qq
           apt-get install -y --no-install-recommends libpython3.11-dev
@@ -110,7 +114,8 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --release --locked \
-            -p crossfyre -p cortex -p mach -p voyage -p pulse -p scout -p node -p oast
+            -p crossfyre -p plessor -p ambulo -p voyage -p doorward -p toolmark -p node -p oast \
+            -p cfx-script
 
       - name: Stage the artifacts
         id: stage
@@ -118,7 +123,7 @@ jobs:
           set -euo pipefail
           out="dist/${{ matrix.target }}"
           mkdir -p "$out"
-          for b in crossfyre cortex mach voyage pulse scout node oast; do
+          for b in crossfyre plessor ambulo voyage doorward toolmark node oast cfx-script; do
             cp "target/release/$b" "$out/$b"
           done
           strip "$out"/* 2>/dev/null || true
@@ -188,7 +193,7 @@ jobs:
 
             | absent | effect on this build |
             |---|---|
-            | `cortex/src/authz/private.rs` | no BOLA/BFLA/BOPLA authorization oracle |
+            | `plessor/src/authz/private.rs` | no BOLA/BFLA/BOPLA authorization oracle |
             | `core/src/egress/private.rs` | no per-node egress isolation |
             | `adaptive-private/` | untuned pacing, not the shipped governor |
 

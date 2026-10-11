@@ -8,7 +8,6 @@ use sysinfo::System;
 use tokio::sync::Semaphore;
 
 pub mod auth;
-pub mod cfx_runtime;
 pub mod creds;
 mod egress;
 pub mod executor;
@@ -159,7 +158,7 @@ pub fn mark_op_done(op_id: &str) {
 /// the next op only after one finishes or fails. The semaphore is fair-FIFO
 /// so messages drain in order.
 ///
-/// Hard ceiling: pulse can't handle more than ~100 concurrent probes anyway,
+/// Hard ceiling: doorward can't handle more than ~100 concurrent probes anyway,
 /// so we clamp on the upper end regardless of what the user typed.
 static WORKFLOW_SEMAPHORES: OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, Arc<Semaphore>>>,
@@ -211,7 +210,7 @@ impl TargetPace {
     }
 
     /// Record one probe outcome and, every so often, advance the controller and
-    /// republish the delay + concurrency. Latency isn't available from the mach
+    /// republish the delay + concurrency. Latency isn't available from the ambulo
     /// stream, so health is driven by response codes only.
     pub fn observe(&self, class: adaptive::ProbeClass) {
         use std::sync::atomic::Ordering;
@@ -269,8 +268,8 @@ pub fn target_pace(
         .clone()
 }
 
-/// Classify a mach stream event into a health class from its status verdict and
-/// HTTP code. `status` is mach's finding verdict ("found" | "not_found" | "error").
+/// Classify an ambulo stream event into a health class from its status verdict and
+/// HTTP code. `status` is ambulo's finding verdict ("found" | "not_found" | "error").
 pub fn classify_event(status: &str, code: i64) -> adaptive::ProbeClass {
     use adaptive::ProbeClass;
     if status == "error" {
@@ -554,7 +553,8 @@ pub struct Config {
     nats_url: String,
     nats_nkey_seed: Option<String>,
     nats_user_jwt: Option<String>,
-    /// Extensions installed on this node (e.g. ["mach", "voyage"])
+    /// Extensions installed on this node, as engine ids (e.g. ["mach", "voyage"]),
+    /// which is what the API sends and what never changes.
     #[serde(default)]
     extensions: Vec<String>,
     /// Deploy-time network identity (tunnel selection + OPSEC toggles).
@@ -919,6 +919,9 @@ pub async fn run_boot(
 
     // Pull a pre-nodes.d single-node install into the new layout if present.
     migrate_legacy_config(base);
+    // Engines still installed under the names they had before: carry them over
+    // before any node starts using them.
+    toolchain::migrate::renamed_engines();
 
     let node_ids = discover_nodes(base)?;
     if node_ids.is_empty() {
@@ -1489,7 +1492,11 @@ pub async fn run_init(
     if selected_extensions.is_empty() {
         field("Extensions", "none assigned");
     } else {
-        field("Extensions", &selected_extensions.join(", "));
+        let names: Vec<&str> = selected_extensions
+            .iter()
+            .map(|e| toolchain::public_name(e))
+            .collect();
+        field("Extensions", &names.join(", "));
     }
 
     // Extract NATS URL from server response (falls back to localhost for dev)
@@ -1539,6 +1546,7 @@ pub async fn run_init(
     // One-time migration: clean up a pre-merge OrionChain install so the old
     // orion services and binaries don't fight the new ones.
     toolchain::uninstall::cleanup_legacy_orionchain();
+    toolchain::migrate::renamed_engines();
 
     // Put the crossfyre binary at its stable path so OS services have a
     // fixed ExecStart (no-op when already running from /opt/crossfyre/bin).
@@ -1579,18 +1587,19 @@ pub async fn run_init(
     // the release manifest, enable and start its daemon. The package manager
     // is built in - no external installer involved.
     for ext in &selected_extensions {
+        let name = toolchain::public_name(ext);
         if toolchain::config::is_extension_installed(ext) {
-            ok(&format!("{ext} already installed"));
+            ok(&format!("{name} already installed"));
             let _ = toolchain::service::enable(ext);
             let _ = toolchain::service::start(ext);
             continue;
         }
-        working(&format!("Installing {ext}"));
+        working(&format!("Installing {name}"));
         match toolchain::install::install_and_start(ext).await {
-            Ok(()) => ok(&format!("{ext} installed and started")),
+            Ok(()) => ok(&format!("{name} installed and started")),
             Err(e) => {
-                fail(&format!("{ext} install failed: {e}"));
-                hint(&format!("Run manually: crossfyre extension install {ext}"));
+                fail(&format!("{name} install failed: {e}"));
+                hint(&format!("Run manually: crossfyre extension install {name}"));
             }
         }
     }
@@ -2004,7 +2013,7 @@ pub async fn run_daemon(force: bool, paths: &NodePaths) -> Result<(), Box<dyn st
     );
 
     // rustls needs an explicit CryptoProvider when more than one is compiled in.
-    // Both aws-lc-rs and ring are pulled into this workspace (cortex uses one,
+    // Both aws-lc-rs and ring are pulled into this workspace (plessor uses one,
     // oast the other), so the TLS handshake to nexus would otherwise panic with
     // "could not automatically determine the process-level CryptoProvider" - the
     // node comes up but never connects. Idempotent: ignore if already installed.
@@ -2720,13 +2729,15 @@ pub async fn run_daemon(force: bool, paths: &NodePaths) -> Result<(), Box<dyn st
                             }
                             Some("install_extension") => {
                                 let ext = cmd["extension"].as_str().unwrap_or("").to_string();
-                                println!("\n[install] Installing extension: {ext}");
+                                // Printed by public name; `ext` stays the id the API sent, for the reply.
+                                let name = toolchain::public_name(&ext).to_string();
+                                println!("\n[install] Installing extension: {name}");
 
                                 // Built-in package manager: download + verify +
                                 // enable + start in one call.
                                 let msg = match toolchain::install::install_and_start(&ext).await {
                                     Ok(()) => {
-                                        println!("[install] OK {ext} installed and started");
+                                        println!("[install] OK {name} installed and started");
                                         serde_json::json!({
                                             "type": "extension_installed",
                                             "extension": ext,
@@ -2735,7 +2746,7 @@ pub async fn run_daemon(force: bool, paths: &NodePaths) -> Result<(), Box<dyn st
                                         })
                                     }
                                     Err(e) => {
-                                        eprintln!("[install] FAIL Failed to install {ext}: {e}");
+                                        eprintln!("[install] FAIL Failed to install {name}: {e}");
                                         serde_json::json!({
                                             "type": "extension_install_failed",
                                             "extension": ext,
@@ -2767,13 +2778,7 @@ pub async fn run_daemon(force: bool, paths: &NodePaths) -> Result<(), Box<dyn st
                                 // Restart=on-failure brings us back up as the new
                                 // version (a clean exit would stay down).
                                 println!("\n[update] Updating crossfyre from the release manifest...");
-                                let updated = match toolchain::install::fetch_manifest().await {
-                                    Ok(manifest) => {
-                                        let cur = toolchain::install::installed_cli_version();
-                                        toolchain::install::self_update(&manifest, &cur, false, false).await
-                                    }
-                                    Err(e) => Err(e),
-                                };
+                                let updated = toolchain::install::update_for_dashboard().await;
 
                                 let (success, restarting) = match &updated {
                                     Ok(true) => (true, true),
@@ -2801,11 +2806,13 @@ pub async fn run_daemon(force: bool, paths: &NodePaths) -> Result<(), Box<dyn st
                             }
                             Some("remove_extension") => {
                                 let ext = cmd["extension"].as_str().unwrap_or("").to_string();
-                                println!("\n[remove] Removing extension: {ext}");
+                                // Printed by public name; `ext` stays the id the API sent, for the reply.
+                                let name = toolchain::public_name(&ext).to_string();
+                                println!("\n[remove] Removing extension: {name}");
 
                                 let remove_ok = match toolchain::install::remove(&ext) {
-                                    Ok(()) => { println!("[remove] OK {ext} removed"); true }
-                                    Err(e) => { eprintln!("[remove] FAIL Failed to remove {ext}: {e}"); false }
+                                    Ok(()) => { println!("[remove] OK {name} removed"); true }
+                                    Err(e) => { eprintln!("[remove] FAIL Failed to remove {name}: {e}"); false }
                                 };
 
                                 let msg = serde_json::json!({
@@ -2818,11 +2825,13 @@ pub async fn run_daemon(force: bool, paths: &NodePaths) -> Result<(), Box<dyn st
                             }
                             Some("restart_extension") => {
                                 let ext = cmd["extension"].as_str().unwrap_or("").to_string();
-                                println!("\n[restart] Restarting extension: {ext}");
+                                // Printed by public name; `ext` stays the id the API sent, for the reply.
+                                let name = toolchain::public_name(&ext).to_string();
+                                println!("\n[restart] Restarting extension: {name}");
 
                                 let msg = match toolchain::service::restart(&ext) {
                                     Ok(()) => {
-                                        println!("[restart] OK {ext} restarted");
+                                        println!("[restart] OK {name} restarted");
                                         serde_json::json!({
                                             "type": "extension_restarted",
                                             "extension": ext,
@@ -2831,7 +2840,7 @@ pub async fn run_daemon(force: bool, paths: &NodePaths) -> Result<(), Box<dyn st
                                         })
                                     }
                                     Err(e) => {
-                                        eprintln!("[restart] FAIL Failed to restart {ext}: {e}");
+                                        eprintln!("[restart] FAIL Failed to restart {name}: {e}");
                                         serde_json::json!({
                                             "type": "extension_restart_failed",
                                             "extension": ext,
@@ -2844,16 +2853,18 @@ pub async fn run_daemon(force: bool, paths: &NodePaths) -> Result<(), Box<dyn st
                             }
                             Some("reinstall_extension") => {
                                 let ext = cmd["extension"].as_str().unwrap_or("").to_string();
-                                println!("\n[reinstall] Reinstalling extension: {ext}");
+                                // Printed by public name; `ext` stays the id the API sent, for the reply.
+                                let name = toolchain::public_name(&ext).to_string();
+                                println!("\n[reinstall] Reinstalling extension: {name}");
 
                                 let success = match toolchain::install::install(&ext, true).await {
                                     Ok(()) => {
-                                        println!("[reinstall] OK {ext} reinstalled, starting service...");
+                                        println!("[reinstall] OK {name} reinstalled, starting service...");
                                         let _ = toolchain::service::start(&ext);
                                         true
                                     }
                                     Err(e) => {
-                                        eprintln!("[reinstall] FAIL Failed to reinstall {ext}: {e}");
+                                        eprintln!("[reinstall] FAIL Failed to reinstall {name}: {e}");
                                         false
                                     }
                                 };
@@ -2868,11 +2879,13 @@ pub async fn run_daemon(force: bool, paths: &NodePaths) -> Result<(), Box<dyn st
                             }
                             Some("stop_extension") => {
                                 let ext = cmd["extension"].as_str().unwrap_or("").to_string();
-                                println!("\n[stop] Stopping extension: {ext}");
+                                // Printed by public name; `ext` stays the id the API sent, for the reply.
+                                let name = toolchain::public_name(&ext).to_string();
+                                println!("\n[stop] Stopping extension: {name}");
 
                                 let success = match toolchain::service::stop(&ext) {
-                                    Ok(()) => { println!("[stop] OK {ext} stopped"); true }
-                                    Err(e) => { eprintln!("[stop] FAIL Failed to stop {ext}: {e}"); false }
+                                    Ok(()) => { println!("[stop] OK {name} stopped"); true }
+                                    Err(e) => { eprintln!("[stop] FAIL Failed to stop {name}: {e}"); false }
                                 };
 
                                 let msg = serde_json::json!({

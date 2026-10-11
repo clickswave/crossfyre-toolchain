@@ -37,7 +37,7 @@ ROOT = HERE.parents[1]
 MUTATIONS = [
     (
         "race-gate-removed",
-        "cortex/src/inject.rs",
+        "plessor/src/inject.rs",
         'let race = classes.iter().any(|c| c == "race").then(|| {',
         "let race = Some(()).map(|_| {",
         ["intrusive-classes-are-opt-in"],
@@ -45,7 +45,7 @@ MUTATIONS = [
     ),
     (
         "race-accepts-one",
-        "cortex/src/race.rs",
+        "plessor/src/race.rs",
         "if accepted.len() < MIN_ACCEPTED {",
         "if false {",
         ["race-negatives"],
@@ -53,7 +53,7 @@ MUTATIONS = [
     ),
     (
         "race-ignores-rate-limiting",
-        "cortex/src/race.rs",
+        "plessor/src/race.rs",
         "if control.status == 429 || control.retry_after {",
         "if false {",
         ["race-negatives"],
@@ -61,7 +61,7 @@ MUTATIONS = [
     ),
     (
         "tampering-skips-determinism-check",
-        "cortex/src/inject.rs",
+        "plessor/src/inject.rs",
         "if !crate::tamper::close(c.numbers[link.index], at_v1) {",
         "if false {",
         ["tampering-negatives"],
@@ -73,7 +73,7 @@ MUTATIONS = [
         # This removes both, which is the only way to tell redundant protection
         # apart from absent protection.
         "tampering-accepts-anything-out-of-domain",
-        "cortex/src/tamper.rs",
+        "plessor/src/tamper.rs",
         """pub fn followed_out(how: Link, at_v1: f64, v1: f64, v_bad: f64, observed: f64) -> bool {""",
         """pub fn followed_out(how: Link, at_v1: f64, v1: f64, v_bad: f64, observed: f64) -> bool {
     if true { let _ = (how, at_v1, v1, v_bad, observed); return true; }""",
@@ -90,7 +90,7 @@ MUTATIONS = [
         # `tampering-accepts-anything-out-of-domain` does and the suite catches.
         # A surviving mutant is a question, not a verdict.
         "tampering-ignores-clamping[redundant]",
-        "cortex/src/tamper.rs",
+        "plessor/src/tamper.rs",
         """    let Some(want) = predict(how, at_v1, v1, v_bad) else {
         return false;
     };
@@ -103,7 +103,7 @@ MUTATIONS = [
     ),
     (
         "smuggling-drops-the-unambiguous-control",
-        "cortex/src/smuggle.rs",
+        "plessor/src/smuggle.rs",
         "if unambiguous_time >= control_time + DESYNC_GAP {",
         "if false {",
         ["smuggling-negatives"],
@@ -111,7 +111,7 @@ MUTATIONS = [
     ),
     (
         "chain-drops-same-host-control",
-        "cortex/src/chain.rs",
+        "plessor/src/chain.rs",
         "shape(observed) != shape(control_b)",
         "true",
         ["chain-black-holed-host"],
@@ -119,7 +119,7 @@ MUTATIONS = [
     ),
     (
         "chain-ignores-authorised-scope",
-        "cortex/src/inject.rs",
+        "plessor/src/inject.rs",
         ".filter(|t| authorised.admits(&t.host, Some(t.port)))",
         ".filter(|_t| true)",
         ["chain-needs-authorised-scope"],
@@ -129,7 +129,7 @@ MUTATIONS = [
         # Removing the end-of-pass re-check restores the silence that made every
         # expensive failure of 2026-09-11 look like a clean result.
         "inject-never-checks-whether-it-moved-the-target",
-        "cortex/src/inject.rs",
+        "plessor/src/inject.rs",
         "        let persistent = moved(verdict(&after)) && moved(verdict(&after2));",
         "        let persistent = false;",
         ["the-pass-says-when-it-moved-the-target"],
@@ -141,7 +141,7 @@ MUTATIONS = [
         # forbids: the mutation is caught by what the scanner DID, not by what it
         # failed to find.
         "inject-submits-credential-change-forms",
-        "cortex/src/inject.rs",
+        "plessor/src/inject.rs",
         "        if let Some(which) = changes_a_credential(&names) {",
         "        if let Some(which) = None::<String> {",
         ["login-is-tested-change-form-is-not"],
@@ -152,7 +152,7 @@ MUTATIONS = [
         # cost the far side of the crawl, because the fixture breaks when the
         # link is used.
         "crawler-follows-action-links",
-        "mach/src/crawler.rs",
+        "ambulo/src/crawler.rs",
         """                if let Some(verb) = changes_state(&child) {""",
         "                if let Some(verb) = None::<String> {",
         ["crawl-does-not-press-the-settings"],
@@ -164,7 +164,7 @@ MUTATIONS = [
         # application that varies its own length between two requests looks
         # exactly like one evaluating the payload.
         "sqli-boolean-drops-the-inert-control",
-        "cortex/src/inject.rs",
+        "plessor/src/inject.rs",
         """                    if boolean_differential(baseline, &a2, &b2, min_diff)
                         && !inert_splits_the_same_way(client, site, base, t, f, baseline, min_diff)
                             .await
@@ -177,7 +177,7 @@ MUTATIONS = [
         # Same reasoning: the marker is confirmed twice, so removing one check
         # leaves the other doing the work. Both go.
         "proto-pollution-confirms-nothing",
-        "cortex/src/inject.rs",
+        "plessor/src/inject.rs",
         """        if !after
             .as_ref()
             .map(|r| r.body.contains(&marker))
@@ -198,7 +198,7 @@ MUTATIONS = [
         # other doing the work. `proto-pollution-confirms-nothing` removes both
         # and IS caught, which is what tells redundancy apart from absence.
         "proto-pollution-skips-confirmation[redundant]",
-        "cortex/src/inject.rs",
+        "plessor/src/inject.rs",
         """        if !after
             .as_ref()
             .map(|r| r.body.contains(&marker))
@@ -212,7 +212,7 @@ MUTATIONS = [
     ),
     (
         "spa-ignores-source-maps",
-        "mach/src/spa.rs",
+        "ambulo/src/spa.rs",
         "let m = RE_SOURCEMAP.captures(body)?.get(1)?.as_str().trim();",
         "let m = \"\"; let _ = RE_SOURCEMAP.captures(body);",
         ["spa-static"],
@@ -220,7 +220,7 @@ MUTATIONS = [
     ),
     (
         "spa-ignores-lazy-chunks",
-        "mach/src/spa.rs",
+        "ambulo/src/spa.rs",
         "for c in RE_CHUNK_MAP.captures_iter(body) {",
         "for c in RE_CHUNK_MAP.captures_iter(\"\") {",
         ["spa-static"],
@@ -256,7 +256,7 @@ def main() -> int:
     # refreshed, and this harness does exactly that to every file it touches. It
     # blocked its own next run on a file that was byte-identical to HEAD.
     run(["git", "update-index", "--refresh"])
-    dirty = run(["git", "diff", "--name-only", "--", "cortex/src", "mach/src"]).stdout.strip()
+    dirty = run(["git", "diff", "--name-only", "--", "plessor/src", "ambulo/src"]).stdout.strip()
     if dirty:
         print("engine sources have uncommitted changes; commit or stash before "
               "mutating, or a failure will not mean what it says:\n" + dirty,
@@ -269,7 +269,7 @@ def main() -> int:
         t0 = time.time()
         original = apply_mutation(path, find, replace)
         try:
-            build = run(["cargo", "build", "--locked", "-p", "cortex", "-p", "mach"],
+            build = run(["cargo", "build", "--locked", "-p", "plessor", "-p", "ambulo"],
                         env={**__import__("os").environ, "CARGO_INCREMENTAL": "0"})
             if build.returncode != 0:
                 # A mutation that will not compile proves nothing either way.
@@ -299,7 +299,7 @@ def main() -> int:
             survived.append((name, why))
 
     # Rebuild clean so the tree is left as it was found.
-    run(["cargo", "build", "--locked", "-p", "cortex", "-p", "mach"])
+    run(["cargo", "build", "--locked", "-p", "plessor", "-p", "ambulo"])
 
     graded = [m for m in chosen if not m[0].endswith("[redundant]")]
     print(f"\n{len(graded) - len(survived)}/{len(graded)} mutations caught"

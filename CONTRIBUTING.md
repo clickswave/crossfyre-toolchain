@@ -1,17 +1,21 @@
 # Contributing to the Crossfyre Toolchain
 
-Thanks for taking the time to contribute. This repo holds the open-source recon and scanning engines (`mach`, `voyage`, `pulse`, `scout`, `cortex`), the out-of-band server (`oast`), the node agent (`node`), and the `crossfyre` CLI.
+Thanks for taking the time to contribute. This repo holds the open-source recon and scanning engines (`ambulo`, `voyage`, `doorward`, `toolmark`, `plessor`), the out-of-band server (`oast`), the node agent (`node`), and the `crossfyre` CLI.
 
 ## Ground rules
 
 - Be respectful. We follow the standard expectation of professional, harassment-free conduct.
-- Only contribute code you have the right to contribute. By opening a pull request, you agree your contribution is licensed under the same [Apache-2.0](LICENSE) terms as the project.
+- Only contribute code you have the right to contribute. By opening a pull request, you agree your contribution is licensed under the same [Apache-2.0](LICENSE) terms as the project, and you sign each commit off as described below.
+
+## Signing off
+
+Every commit in a pull request from outside Clickswave Labs needs a `Signed-off-by:` line with your real name and the email you commit with. `git commit -s` adds it. The line certifies the [Developer Certificate of Origin 1.1](https://developercertificate.org/): that you wrote the change, or otherwise have the right to submit it under this project's licence, and that you understand it and your sign-off are recorded publicly. A pull request with a commit that is not signed off is not merged until it is; `git rebase --signoff dev` fixes a branch in one step.
 
 ## Reporting bugs
 
 Open an issue and include:
 
-- The tool and version (`mach --version`).
+- The tool and version (`ambulo --version`).
 - The exact command you ran.
 - What you expected, and what happened instead.
 - Your OS and architecture.
@@ -29,7 +33,7 @@ Development happens on `dev`; `main` tracks the latest release. Branch your work
 
 ## Development
 
-You need a recent stable [Rust toolchain](https://rustup.rs).
+You need [rustup](https://rustup.rs). `rust-toolchain.toml` pins Rust 1.88.0, the version CI uses, and rustup installs it on first use; rustfmt's output differs between versions, so formatting on another one produces diffs CI rejects.
 
 ```sh
 cargo build            # build the whole workspace

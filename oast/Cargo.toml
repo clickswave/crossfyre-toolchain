@@ -2,14 +2,15 @@
 name = "oast"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
+publish.workspace = true
 homepage = "https://clickswave.org"
 repository = "https://github.com/clickswave/crossfyre-toolchain"
-description = "Self-hosted OAST (out-of-band application security testing) interaction server for Crossfyre: captures HTTP(S)/DNS callbacks and exposes an encrypted, token-scoped poll API so cortex can confirm blind vulnerabilities."
+description = "Self-hosted OAST (out-of-band application security testing) interaction server for Crossfyre: captures HTTP(S)/DNS callbacks and exposes an encrypted, token-scoped poll API so plessor can confirm blind vulnerabilities."
 authors = ["Clickswave <team@clickswave.org>"]
-license = "Apache-2.0"
 
 # Built as both a library (so `crossfyre oast serve` can run it in-process) and a
-# standalone `oast` binary. Self-hosters bring their own domain + box; cortex reaches
+# standalone `oast` binary. Self-hosters bring their own domain + box; plessor reaches
 # the server via the same encrypted register/poll protocol the managed pool uses.
 
 [lib]

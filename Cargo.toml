@@ -1,18 +1,27 @@
 [workspace]
 resolver = "3"
-members = ["capture", "core", "node", "crossfyre", "tui", "mach", "voyage", "pulse", "scout", "cortex", "finding", "oast", "transport", "dguard", "mobile/rust", "relsign", "project", "scope", "session", "spec", "surface"]
+members = ["capture", "core", "node", "crossfyre", "tui", "ambulo", "voyage", "doorward", "toolmark", "plessor", "finding", "oast", "transport", "dguard", "mobile/rust", "relsign", "scope", "spec", "surface", "cfx-script"]
 
 # `relsign` signs the release manifest and is a BUILD-HOST tool, not a shipped
-# component: it is absent from COMPONENTS in scripts/crossfyre_build.py, so it is
-# never packaged, uploaded or listed in the manifest. It is a workspace member so
-# CI compiles and lints it like everything else, because a signing tool that
-# silently stopped building would be discovered at a release.
+# component: the release build does not package it, so it is never uploaded or
+# listed in the manifest. It is a workspace member so CI compiles and lints it
+# like everything else, because a signing tool that silently stopped building
+# would be discovered at a release.
 # `adaptive` is a path dependency of the engines, not a workspace member: the
 # .cargo/config.toml `paths` override swaps it for the git-ignored tuned drop-in
 # `adaptive-private` in first-party builds, and Cargo cannot override a member.
 # Both are excluded so a member (the stub or the drop-in, same package name) is
 # still built as a dependency but not as a standalone member.
 exclude = ["adaptive", "adaptive-private"]
+
+# Every crate here is Apache-2.0, the licence in LICENSE, and none is published to
+# crates.io. A publish there is permanent and would fix a name and a licence for good,
+# so it is refused until a crate is deliberately made a release channel, under a
+# crossfyre-* name rather than the cfx_* names, which belong to CitizenFX there. This
+# table sits after every [workspace] key on purpose: a key below it would land in it.
+[workspace.package]
+license = "Apache-2.0"
+publish = false
 
 # `mobile/rust` (cfx_mobile) is the Android Tracer's native core: a JNI cdylib
 # that reuses `capture`. It is a full member, with no CI carve-out.
@@ -24,8 +33,8 @@ exclude = ["adaptive", "adaptive-private"]
 # build --all-targets, test, fmt --check, clippy -D warnings), all green.
 #
 # So CI proves the crate compiles and lints, but NOT that it cross-compiles for
-# Android. That gap is real and is covered by the reproducible-build check in
-# scripts/crossfyre_mobile.py instead, which does a genuine `cargo ndk` build.
+# Android. That gap is real and is covered by the release's reproducible-build
+# check instead, which does a genuine `cargo ndk` build.
 # If a future change makes this host-hostile, exclude it from the build job
 # rather than dropping it from the workspace: the `cfx_capture` path dependency
 # resolves because it is a member.

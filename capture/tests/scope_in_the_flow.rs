@@ -1,8 +1,8 @@
 //! Scope inside the flow itself, with no proxy session in front of it.
 //!
-//! `cfx_session` refuses an out-of-scope CONNECT before the flow is ever reached, so the
-//! session's own tests cannot see this ordering: remove the check here and they all still
-//! pass. The mobile netstack has no CONNECT to be gated at, and neither will anything else
+//! The desktop session layer, which lives outside this repository, refuses an out-of-scope
+//! CONNECT before the flow is ever reached, so its own tests cannot see this ordering:
+//! remove the check here and they all still pass. The mobile netstack has no CONNECT to be gated at, and neither will anything else
 //! that hands a flow straight to the capture core, so the check inside the flow is the
 //! only one those paths get.
 //!

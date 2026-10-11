@@ -2,6 +2,8 @@
 name = "cfx_mobile"
 version = "0.0.1"
 edition = "2024"
+license.workspace = true
+publish.workspace = true
 description = "Crossfyre mobile tracer native core (JNI): reuses cfx_capture for the session CA + MITM leaves + egress, and (WIP) runs the TUN netstack that inspects captured flows into TraceEvents."
 
 [lib]

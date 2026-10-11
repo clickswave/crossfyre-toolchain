@@ -46,7 +46,7 @@ static UPSTREAM_TLS: LazyLock<TlsConnector> = LazyLock::new(|| {
 /// of the internal applications this tool exists to test. Until this existed the webpki
 /// roots were the only trust anchor, so such a target could not be forwarded to at all:
 /// the client leg succeeded, the forward leg refused, and the operator saw a 502 with no
-/// explanation. Meanwhile `cortex`, `scout` and `voyage` have always accepted invalid
+/// explanation. Meanwhile `plessor`, `toolmark` and `voyage` have always accepted invalid
 /// certificates, so the product disagreed with itself.
 ///
 /// Reached only when a flow's [`CaptureCfg::trust_any_upstream_cert`] is set, which is
@@ -67,7 +67,7 @@ static UPSTREAM_TLS_TRUST_ANY: LazyLock<TlsConnector> = LazyLock::new(|| {
 /// WHO the certificate belongs to is skipped, because that is the question a private CA
 /// cannot answer to a public root store.
 #[derive(Debug)]
-struct TrustAnyServerCert(Arc<rustls::crypto::CryptoProvider>);
+pub(crate) struct TrustAnyServerCert(pub(crate) Arc<rustls::crypto::CryptoProvider>);
 
 impl rustls::client::danger::ServerCertVerifier for TrustAnyServerCert {
     fn verify_server_cert(
@@ -678,10 +678,13 @@ async fn forward(
     let started = std::time::Instant::now();
     let (status, tech, resp_headers, upstream_body) = if scheme == "https" {
         let server_name = rustls::pki_types::ServerName::try_from(sni_host.to_string())?;
-        let connector = if cfg.trust_any_upstream_cert {
-            &*UPSTREAM_TLS_TRUST_ANY
-        } else {
-            &*UPSTREAM_TLS
+        // The project's own certificate when it has one, which is the only way to reach a
+        // target that asks for mutual TLS. Both of its connectors were built when it was
+        // set, so this is a choice rather than a handshake's worth of key parsing.
+        let connector = match &cfg.client_identity {
+            Some(id) => id.connector(cfg.trust_any_upstream_cert),
+            None if cfg.trust_any_upstream_cert => &*UPSTREAM_TLS_TRUST_ANY,
+            None => &*UPSTREAM_TLS,
         };
         let stream = connector.connect(server_name, tcp).await?;
         send_upstream(stream, up_req).await?

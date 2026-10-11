@@ -34,8 +34,8 @@ def run():
     print(f"    echo_test.run() -> {result.strip()}")
 
     # Show daemon extensions
-    mach = extensions.get("mach")
-    print(f"    mach extension: {mach} (port={mach.port})")
+    ambulo = extensions.get("ambulo")
+    print(f"    ambulo extension: {ambulo} (port={ambulo.port})")
     voyage = extensions.get("voyage")
     print(f"    voyage extension: {voyage} (port={voyage.port})")
     print()

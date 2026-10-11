@@ -12,8 +12,8 @@ Part of the [Crossfyre toolchain](../).
 When you enrol a host, the node registers with the control plane, installs the engines
 that host is meant to run, and keeps their daemons alive. From then on it pulls
 operations (a crawl, a port scan, a vuln scan), hands each to the right engine, and
-relays findings back. Everything is engine-local, so a node with the `mach` and
-`pulse` daemons running can take that work whether or not it can reach anything else.
+relays findings back. Everything is engine-local, so a node with the `ambulo` and
+`doorward` daemons running can take that work whether or not it can reach anything else.
 
 ## Using it
 
@@ -34,5 +34,5 @@ falls back to a foreground supervisor when no service is installed.
 ## Notes
 
 The node is only useful with an account and the platform. If you just want to run the
-engines on one box, you do not need it: use `mach`, `voyage`, `pulse`, `scout` and
-`cortex` directly.
+engines on one box, you do not need it: use `ambulo`, `voyage`, `doorward`, `toolmark` and
+`plessor` directly.

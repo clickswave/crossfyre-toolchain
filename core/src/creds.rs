@@ -542,7 +542,7 @@ async fn oauth2_token(
     })
 }
 
-/// Resolve an identity matrix (each `{role, credential_id?}`) into the cortex
+/// Resolve an identity matrix (each `{role, credential_id?}`) into the plessor
 /// `identities` shape: `[{"role":.., "auth":{headers,cookies}}]`. An entry with
 /// no `credential_id` is treated as the anonymous identity (empty auth). Entries
 /// whose credential fails to resolve are skipped (logged) so a partial matrix

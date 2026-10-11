@@ -37,8 +37,8 @@ everything.
     python3 tests/oracles/run.py race tampering # named cases
     python3 tests/oracles/run.py --list
 
-The runner builds nothing. Point it at binaries with `CORTEX_BIN` / `MACH_BIN`,
-or let it default to `target/debug/{cortex,mach}`.
+The runner builds nothing. Point it at binaries with `PLESSOR_BIN` / `AMBULO_BIN`,
+or let it default to `target/debug/{plessor,ambulo}`.
 
 Exit status is 0 only when every case matched exactly: every `must_find` seen and
 every `must_not` absent. Anything else is a failure with the diff printed.

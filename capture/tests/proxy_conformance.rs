@@ -646,7 +646,7 @@ async fn an_edited_request_cannot_keep_its_header_casing_yet_and_this_pins_that(
     //
     // The real answer is to stop going through a client library for edited requests and
     // write the bytes, which is what a raw Repeater mode needs anyway and what
-    // `cortex::rawhttp` already does. Until then this test exists so the limitation is
+    // `plessor::rawhttp` already does. Until then this test exists so the limitation is
     // visible and so the day it is fixed is a visible change rather than a silent one.
     let (origin_port, log) = origin(ok_response("edited"));
     let (cfg, _seen) = gated(InterceptDecision::ForwardModified(EditedRequest {

@@ -1,4 +1,4 @@
-//! Vuln-scan op: cortex-driven template matching.
+//! Vuln-scan op: plessor-driven template matching.
 //!
 //! Extracted verbatim from the run_operation() dispatcher in lib.rs.
 use super::{OpEnv, Relay};
@@ -18,8 +18,8 @@ pub async fn handle(env: OpEnv) {
         api_key,
     } = env;
 
-    // Vulnerability detection via the cortex daemon (port 4445).
-    // Cortex streams already-confirmed `finding` events; the node
+    // Vulnerability detection via the plessor daemon (port 4445).
+    // Plessor streams already-confirmed `finding` events; the node
     // stamps operation_id and relays them into the asset graph.
     let target = data["target"]
         .as_str()
@@ -31,9 +31,9 @@ pub async fn handle(env: OpEnv) {
 
     let host = target_host(&target);
     let mode = data["mode"].as_str().unwrap_or("scan");
-    let mut cortex_req = if mode == "authz" {
+    let mut plessor_req = if mode == "authz" {
         // Authorization testing (BOLA/BFLA): resolve the identity
-        // matrix and hand cortex the endpoints + identities.
+        // matrix and hand plessor the endpoints + identities.
         let idents = data["identities"].as_array().cloned().unwrap_or_default();
         let resolved = creds::resolve_identities(&http, &api_url, &api_key, &idents, &host).await;
         serde_json::json!({
@@ -53,7 +53,7 @@ pub async fn handle(env: OpEnv) {
     } else if mode == "inject" {
         // Active parameter injection (SQLi/XSS/cmdi/LFI). The endpoints carry the
         // request shape (method, url, query params, typed body fields) built by
-        // api_switch from the asset graph, so cortex fuzzes real body + query + path
+        // api_switch from the asset graph, so plessor fuzzes real body + query + path
         // sites - not just whatever it can parse off the URL.
         serde_json::json!({
             "operation": "inject",
@@ -103,7 +103,7 @@ pub async fn handle(env: OpEnv) {
             "block_internal": data["block_internal"].as_bool().unwrap_or(false),
         })
     } else if mode == "discover" {
-        // Request-shape discovery: cortex probes each endpoint (error-mining +
+        // Request-shape discovery: plessor probes each endpoint (error-mining +
         // calibrated field brute-force) and streams the body fields it learns as
         // `shape_field` findings, which the control plane ingests as inferred params.
         serde_json::json!({
@@ -117,7 +117,7 @@ pub async fn handle(env: OpEnv) {
             "block_internal": data["block_internal"].as_bool().unwrap_or(false),
         })
     } else if mode == "graphql" {
-        // GraphQL: cortex live-introspects the endpoint and runs GraphQL-native checks
+        // GraphQL: plessor live-introspects the endpoint and runs GraphQL-native checks
         // (introspection exposure, suggestion leak, argument injection, alias DoS). No
         // per-endpoint request shapes needed - just the GraphQL route on the target.
         serde_json::json!({
@@ -176,7 +176,7 @@ pub async fn handle(env: OpEnv) {
             let want = if mode == "inject" { 4 } else { 1 };
             match creds::resolve_auth_pool(&http, &api_url, &api_key, cid, &host, want).await {
                 Ok(pool) if !pool.is_empty() => {
-                    if let Some(cr) = cortex_req.as_object_mut() {
+                    if let Some(cr) = plessor_req.as_object_mut() {
                         cr.insert("auth".into(), pool[0].clone());
                         if pool.len() > 1 {
                             cr.insert("auth_pool".into(), serde_json::json!(pool));
@@ -188,12 +188,12 @@ pub async fn handle(env: OpEnv) {
             }
         }
         // OAST endpoint for out-of-band (blind) confirmation. Default ("" / "managed") resolves to
-        // the managed pool; a UUID to a BYO endpoint; "off" disables OOB. The node hands cortex the
-        // resolved { domains, api_url }; cortex registers/polls directly.
+        // the managed pool; a UUID to a BYO endpoint; "off" disables OOB. The node hands plessor the
+        // resolved { domains, api_url }; plessor registers/polls directly.
         let oast_ep = data["oast_endpoint_id"].as_str().unwrap_or("");
         match oast::resolve(&http, &api_url, &api_key, oast_ep).await {
             Ok(Some((domains, poll_url))) => {
-                if let Some(cr) = cortex_req.as_object_mut() {
+                if let Some(cr) = plessor_req.as_object_mut() {
                     cr.insert(
                         "oast".into(),
                         serde_json::json!({ "domains": domains, "api_url": poll_url }),
@@ -206,13 +206,13 @@ pub async fn handle(env: OpEnv) {
     }
 
     // Forward the Evasiveness switch + attribution token when the workflow set them,
-    // so the operator's posture reaches cortex (which otherwise defaults to
+    // so the operator's posture reaches plessor (which otherwise defaults to
     // evasive=true / identify=none) for both the scan and authz operations.
     if let Some(ev) = data["evasive"].as_bool() {
-        cortex_req["evasive"] = serde_json::json!(ev);
+        plessor_req["evasive"] = serde_json::json!(ev);
     }
     if let Some(tok) = data["identify"].as_str().filter(|s| !s.is_empty()) {
-        cortex_req["identify"] = serde_json::json!(tok);
+        plessor_req["identify"] = serde_json::json!(tok);
     }
 
     let relay = Relay {
@@ -234,7 +234,7 @@ pub async fn handle(env: OpEnv) {
         Ok(stream) => {
             use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
             let (reader, mut writer) = stream.into_split();
-            let mut req_str = dguard::encode(&cortex_req);
+            let mut req_str = dguard::encode(&plessor_req);
             req_str.push('\n');
             let _ = writer.write_all(req_str.as_bytes()).await;
 
@@ -288,7 +288,7 @@ pub async fn handle(env: OpEnv) {
                     "done" => break,
                     "error" => {
                         eprintln!(
-                            "[op] FAIL cortex error: {}",
+                            "[op] FAIL plessor error: {}",
                             event["message"].as_str().unwrap_or("unknown")
                         );
                         break;
@@ -314,7 +314,7 @@ pub async fn handle(env: OpEnv) {
         }
         Err(e) => {
             eprintln!(
-                "[op] FAIL cortex daemon unreachable on {} ({e}). Is `cortex --daemon` running?",
+                "[op] FAIL plessor daemon unreachable on {} ({e}). Is `plessor --daemon` running?",
                 crate::toolchain::config::engine_addr("cortex")
             );
             relay.publish_failed().await;

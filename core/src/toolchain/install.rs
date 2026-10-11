@@ -11,13 +11,21 @@
 // manifest", which conflated the two and read as a stronger guarantee than the
 // code gave.
 
-use super::config::{ext_bin_path, ext_file_name, get_bin_dir};
+use super::config::{
+    ext_bin_path, ext_file_name, file_name, get_bin_dir, is_regular_file, legacy_bin_path,
+};
 use super::service;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+/// The helper that runs .cfx scripts (see `crate::executor`). It goes beside node, where
+/// node and the CLI look for it. It is the one component that links libpython, so it is
+/// optional: on a host without the Python it was built against it cannot start, and
+/// then only .cfx scripts are unavailable.
+const CFX_SCRIPT: &str = "cfx-script";
 
 // The bins origin this binary fetches releases from. Baked at build time so a
 // dev/staging build pulls from its own bucket: crossfyre_build sets
@@ -39,14 +47,58 @@ fn origin_host() -> &'static str {
 
 /// Sidecar recording an installed extension's version (mirrors node.version),
 /// so `update` can tell "already current" from "needs update" without a reinstall.
+/// Named by the public name, as the binary is.
 fn ext_version_file(ext: &str) -> std::path::PathBuf {
-    get_bin_dir().join(format!("{ext}.version"))
+    get_bin_dir().join(format!("{}.version", super::public_name(ext)))
+}
+
+/// The sidecar an engine's binary had under its legacy name, if it was renamed.
+fn legacy_version_file(ext: &str) -> Option<std::path::PathBuf> {
+    let legacy = super::engine(ext)?.legacy?;
+    Some(get_bin_dir().join(format!("{legacy}.version")))
 }
 
 fn installed_ext_version(ext: &str) -> Option<String> {
-    fs::read_to_string(ext_version_file(ext))
-        .ok()
-        .map(|s| s.trim().to_string())
+    let read = |p: std::path::PathBuf| fs::read_to_string(p).ok().map(|s| s.trim().to_string());
+    if ext_bin_path(ext).exists() {
+        return read(ext_version_file(ext));
+    }
+    // Installed under the legacy name only: the migration has not run here yet.
+    match (legacy_bin_path(ext), legacy_version_file(ext)) {
+        (Some(bin), Some(v)) if is_regular_file(&bin) => read(v),
+        _ => read(ext_version_file(ext)),
+    }
+}
+
+/// The manifest keys `component` may be published under, in the order to try them: an
+/// engine's public name first, then its legacy name and its id. A manifest from before
+/// the rename has only the legacy key, and one from after it has both, so the CLI does
+/// not depend on the order in which the manifest gains keys. Any other component is
+/// published under its own name.
+fn manifest_keys(component: &str) -> Vec<&str> {
+    keys_for(super::engine(component), component)
+}
+
+fn keys_for<'a>(engine: Option<&'a super::Engine>, component: &'a str) -> Vec<&'a str> {
+    let Some(e) = engine else {
+        return vec![component];
+    };
+    let mut keys = vec![e.name];
+    for k in e.legacy.into_iter().chain([e.id]) {
+        if !keys.contains(&k) {
+            keys.push(k);
+        }
+    }
+    keys
+}
+
+/// The file inside an unpacked artifact that is `component`'s binary: one named by any
+/// of its manifest keys, public name first. An alias artifact published under the
+/// legacy key carries the binary under the legacy name.
+fn find_member(extract_dir: &Path, keys: &[&str]) -> Option<PathBuf> {
+    keys.iter()
+        .map(|k| extract_dir.join(file_name(k)))
+        .find(|p| p.exists())
 }
 
 /// The version string in `resolve_artifact` for a component, or "" if absent.
@@ -141,14 +193,25 @@ fn resolve_artifact<'m>(
     manifest: &'m Manifest,
     component: &str,
 ) -> Result<(&'m Component, &'m Artifact), Box<dyn std::error::Error>> {
-    let comp = manifest
-        .components
-        .get(component)
-        .ok_or_else(|| format!("component '{component}' not in release manifest"))?;
+    resolve_keys(manifest, &manifest_keys(component))
+}
+
+/// The first of `keys` the manifest has a component for, and that component's artifact
+/// for this platform. The error names the first key, which is the public name.
+fn resolve_keys<'m>(
+    manifest: &'m Manifest,
+    keys: &[&str],
+) -> Result<(&'m Component, &'m Artifact), Box<dyn std::error::Error>> {
+    let shown = keys.first().copied().unwrap_or("");
+    let comp = keys
+        .iter()
+        .find_map(|k| manifest.components.get(*k))
+        .ok_or_else(|| format!("component '{shown}' not in release manifest"))?;
     let key = platform_key();
-    let artifact = comp.artifacts.get(&key).ok_or_else(|| {
-        format!("no '{component}' artifact for platform {key} in release manifest")
-    })?;
+    let artifact = comp
+        .artifacts
+        .get(&key)
+        .ok_or_else(|| format!("no '{shown}' artifact for platform {key} in release manifest"))?;
     Ok((comp, artifact))
 }
 
@@ -228,11 +291,18 @@ fn extract_zip(zip_path: &Path, extract_dir: &Path) -> Result<(), Box<dyn std::e
 /// an update interrupted by a reboot, leaves a binary that is installed, current, and not
 /// executable, and the next run reports it as missing rather than as broken.
 fn place_binary(src: &Path, dest: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let staged = stage_binary(src, dest)?;
+    commit_staged(&staged, dest)
+}
+
+/// Copy `src` beside `dest` as `<name>.new`, 0755 on unix, and return that path. Renaming
+/// it over `dest` is `commit_staged`.
+fn stage_binary(src: &Path, dest: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
     // Appended, not `with_extension`, which REPLACES whatever follows the last dot:
-    // a component placed as `cortex-0.1.2` would stage itself at `cortex-0.1.new` and
+    // a component placed as `plessor-0.1.2` would stage itself at `plessor-0.1.new` and
     // collide with any sibling that differs only after that dot.
     let tmp_path = match dest.file_name() {
         Some(name) => dest.with_file_name(format!("{}.new", name.to_string_lossy())),
@@ -248,17 +318,159 @@ fn place_binary(src: &Path, dest: &Path) -> Result<(), Box<dyn std::error::Error
             return Err(e.into());
         }
     }
-    if let Err(e) = fs::rename(&tmp_path, dest) {
-        let _ = fs::remove_file(&tmp_path);
+    Ok(tmp_path)
+}
+
+/// Move a binary that `stage_binary` staged into place at `dest`.
+fn commit_staged(staged: &Path, dest: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if let Err(e) = fs::rename(staged, dest) {
+        let _ = fs::remove_file(staged);
         return Err(e.into());
     }
     Ok(())
 }
 
-/// Install one or more extensions ("mach" | "all"). Download + verify +
+/// Does the cfx-script at `path` start on this host? Given an empty stdin it refuses the
+/// job with exit status 2, which proves that the binary and its libpython loaded. Any
+/// other status, usually 127 from the dynamic loader, is a failure, returned with what
+/// it wrote to stderr. The installer makes the same check.
+fn helper_starts(path: &Path) -> Result<(), String> {
+    let mut busy = 0;
+    let out = loop {
+        let run = Command::new(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output();
+        match run {
+            // The copy was open for writing a moment ago, and a process that another
+            // thread forked in that moment holds it open until it execs.
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && busy < 100 => {
+                busy += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => return Err(e.to_string()),
+            Ok(out) => break out,
+        }
+    };
+    if out.status.code() == Some(2) {
+        return Ok(());
+    }
+    let said = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if said.is_empty() {
+        Err(format!("it exited with {}", out.status))
+    } else {
+        Err(said)
+    }
+}
+
+/// Put the cfx-script at `src` at `dest`, but only if it starts here. It is staged
+/// beside `dest` and run from there, as the installer does, because the temp directory
+/// may be on a filesystem mounted noexec. `Some(output)` when it cannot start: the
+/// staged copy is removed and `dest` is left as it was.
+fn place_helper_if_it_starts(
+    src: &Path,
+    dest: &Path,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let staged = stage_binary(src, dest)?;
+    if let Err(output) = helper_starts(&staged) {
+        let _ = fs::remove_file(&staged);
+        return Ok(Some(output));
+    }
+    commit_staged(&staged, dest)?;
+    Ok(None)
+}
+
+/// What `install_cfx_script` did.
+#[derive(Debug)]
+pub enum HelperOutcome {
+    /// The release has no cfx-script for this platform, so nothing changed.
+    NotInRelease,
+    /// The installed cfx-script is the release's version.
+    Current { version: String },
+    /// The release's cfx-script was installed. `replaced` is the version recorded for the
+    /// one it replaced, if there was one.
+    Installed {
+        version: String,
+        replaced: Option<String>,
+    },
+    /// The release's cfx-script cannot start on this host, so it was not installed and
+    /// whatever was there before is left as it was. `output` is what it wrote.
+    CannotStart { version: String, output: String },
+}
+
+/// Install or refresh the cfx-script helper from the release manifest: download it,
+/// check its sha256, unpack it beside node and run it once before it replaces anything.
+/// Its version is recorded in `cfx-script.version`, as node's is in `node.version`, so a
+/// later update can tell whether it is current. A cfx-script that the installer placed
+/// has no such record and is replaced once.
+pub async fn install_cfx_script(
+    manifest: &Manifest,
+    force: bool,
+) -> Result<HelperOutcome, Box<dyn std::error::Error>> {
+    let Ok((comp, artifact)) = resolve_artifact(manifest, CFX_SCRIPT) else {
+        return Ok(HelperOutcome::NotInRelease);
+    };
+    let version = comp.version.clone();
+    let dest = ext_bin_path(CFX_SCRIPT);
+    let replaced = installed_ext_version(CFX_SCRIPT).filter(|_| dest.exists());
+    if replaced.as_deref() == Some(version.as_str()) && !force {
+        return Ok(HelperOutcome::Current { version });
+    }
+
+    let tmp_dir = tempfile::tempdir()?;
+    let zip_path = tmp_dir.path().join(&artifact.file);
+    download_verified(artifact, &zip_path).await?;
+    let extract_dir = tmp_dir.path().join("extracted");
+    extract_zip(&zip_path, &extract_dir)?;
+    let extracted = extract_dir.join(ext_file_name(CFX_SCRIPT));
+    if !extracted.exists() {
+        return Err("cfx-script binary not found inside its zip".into());
+    }
+    if let Some(output) = place_helper_if_it_starts(&extracted, &dest)? {
+        return Ok(HelperOutcome::CannotStart { version, output });
+    }
+    let _ = fs::write(ext_version_file(CFX_SCRIPT), &version);
+    Ok(HelperOutcome::Installed { version, replaced })
+}
+
+/// What is left to run .cfx scripts when a new cfx-script was not installed.
+fn without_new_helper() -> &'static str {
+    if ext_bin_path(CFX_SCRIPT).exists() {
+        "the cfx-script already installed stays in use"
+    } else {
+        ".cfx scripts will not run; scans and everything else work"
+    }
+}
+
+/// Say what became of the cfx-script helper, in the plain lines `node init` and the node's
+/// own update print.
+fn report_cfx_script(result: Result<HelperOutcome, Box<dyn std::error::Error>>) {
+    match result {
+        Ok(HelperOutcome::Installed { version, .. }) => println!(
+            "[+] Installed cfx-script {version} to {} (runs .cfx scripts)",
+            ext_bin_path(CFX_SCRIPT).display()
+        ),
+        Ok(HelperOutcome::CannotStart { version, output }) => eprintln!(
+            "[!] cfx-script {version} cannot start here, so it was not installed and {}. \
+             {output}",
+            without_new_helper()
+        ),
+        Ok(HelperOutcome::Current { .. } | HelperOutcome::NotInRelease) => {}
+        Err(e) => eprintln!(
+            "[!] could not install cfx-script: {e}. Until it installs, {}.",
+            without_new_helper()
+        ),
+    }
+}
+
+/// Install one or more extensions ("ambulo" | "all"). Download + verify +
 /// register the daemon service. The service is created but only started by
 /// `install_and_start` (or an explicit `crossfyre service start`).
 pub async fn install(extension: &str, force: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // Before anything is placed: an engine still installed under its legacy name
+    // would otherwise end up with a second unit on its port.
+    super::migrate::renamed_engines();
     let manifest = fetch_manifest().await?;
     for ext in super::resolve_extensions(extension)? {
         install_one(&manifest, ext, force, false).await?;
@@ -274,15 +486,16 @@ async fn install_one(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use super::ui::*;
     let bin_path = ext_bin_path(ext);
+    let name = super::public_name(ext);
 
     if !quiet {
-        title("Crossfyre extension install", ext);
+        title("Crossfyre extension install", name);
     }
 
-    if bin_path.exists() && !force {
+    if super::config::is_extension_installed(ext) && !force {
         if !quiet {
             warn(&format!(
-                "{ext} is already installed {}",
+                "{name} is already installed {}",
                 dim("(use --force to reinstall)")
             ));
             end();
@@ -290,9 +503,10 @@ async fn install_one(
         return Ok(());
     }
 
-    let (comp, artifact) = resolve_artifact(manifest, ext)?;
+    let keys = manifest_keys(ext);
+    let (comp, artifact) = resolve_keys(manifest, &keys)?;
     if !quiet {
-        working(&format!("Downloading {ext} {}", dim(&comp.version)));
+        working(&format!("Downloading {name} {}", dim(&comp.version)));
     }
 
     let tmp_dir = tempfile::tempdir().map_err(|e| format!("Failed to create temp dir: {e}"))?;
@@ -305,14 +519,13 @@ async fn install_one(
     let extract_dir = tmp_dir.path().join("extracted");
     extract_zip(&zip_path, &extract_dir)?;
 
-    let extracted_binary = extract_dir.join(ext_file_name(ext));
-    if !extracted_binary.exists() {
+    let Some(extracted_binary) = find_member(&extract_dir, &keys) else {
         return Err(format!("Binary '{}' not found inside zip", ext_file_name(ext)).into());
-    }
+    };
 
     // Stop the running daemon (if any) before replacing the binary - on
     // Windows the file is locked while the task runs. Best-effort, OS-aware.
-    if bin_path.exists() {
+    if super::config::is_extension_installed(ext) {
         service::try_stop(ext);
     }
 
@@ -321,7 +534,7 @@ async fn install_one(
     // node.version). Best-effort: a missing sidecar just triggers one reinstall.
     let _ = fs::write(ext_version_file(ext), &comp.version);
     if !quiet {
-        ok(&format!("{ext} {} installed", comp.version));
+        ok(&format!("{name} {} installed", comp.version));
     }
 
     if let Err(e) = service::create_service_file(ext)
@@ -362,23 +575,33 @@ pub fn remove(extension: &str) -> Result<(), Box<dyn std::error::Error>> {
 fn remove_one(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
     use super::ui::*;
     let bin_path = ext_bin_path(ext);
+    let name = super::public_name(ext);
+    // The legacy path, whether it is the binary itself (not migrated yet) or the
+    // link the migration left there.
+    let legacy = legacy_bin_path(ext).filter(|p| fs::symlink_metadata(p).is_ok());
 
-    title("Crossfyre extension remove", ext);
+    title("Crossfyre extension remove", name);
 
-    if !bin_path.exists() {
-        warn(&format!("{ext} is not installed, nothing to remove"));
+    if !bin_path.exists() && legacy.is_none() {
+        warn(&format!("{name} is not installed, nothing to remove"));
         end();
         return Ok(());
     }
 
-    step(&format!("Stopping {ext} service"));
-    let _ = service::stop(ext);
-    step(&format!("Disabling {ext} service"));
-    let _ = service::disable(ext);
+    step(&format!("Stopping and disabling {name} service"));
+    service::try_stop_and_disable_all(ext);
     service::remove_service_file(ext)?;
 
-    fs::remove_file(&bin_path)?;
-    ok(&format!("{ext} removed"));
+    if bin_path.exists() {
+        fs::remove_file(&bin_path)?;
+    }
+    if let Some(p) = &legacy {
+        fs::remove_file(p)?;
+    }
+    for v in std::iter::once(ext_version_file(ext)).chain(legacy_version_file(ext)) {
+        let _ = fs::remove_file(v);
+    }
+    ok(&format!("{name} removed"));
     end();
     Ok(())
 }
@@ -391,6 +614,8 @@ pub async fn update(
     current_version: &str,
     force: bool,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    // First, so what follows sees every engine under its public name.
+    super::migrate::renamed_engines();
     let manifest = fetch_manifest().await?;
     let mut self_updated = false;
 
@@ -417,17 +642,18 @@ pub async fn update(
     if !exts.is_empty() {
         println!("  {}", dim("Extensions"));
         for ext in &exts {
+            let name = super::public_name(ext);
             let want = manifest_version(&manifest, ext);
             let have = installed_ext_version(ext);
             let up_to_date = ext_bin_path(ext).exists()
                 && !want.is_empty()
                 && have.as_deref() == Some(want.as_str());
             if up_to_date && !force {
-                println!("{}", row(&check(), ext, &ver(&want), &dim("up to date")));
+                println!("{}", row(&check(), name, &ver(&want), &dim("up to date")));
                 current += 1;
                 continue;
             }
-            print!("    {} {ext:<10} {}", dot(), dim("updating…"));
+            print!("    {} {name:<10} {}", dot(), dim("updating…"));
             let _ = std::io::Write::flush(&mut std::io::stdout());
             match install_one(&manifest, ext, true, true).await {
                 Ok(()) => {
@@ -440,7 +666,7 @@ pub async fn update(
                     };
                     println!(
                         "\r{}          ",
-                        row(&check(), ext, &mid, &format!("{GREEN}updated{RESET}"))
+                        row(&check(), name, &mid, &format!("{GREEN}updated{RESET}"))
                     );
                     changed += 1;
                 }
@@ -449,7 +675,7 @@ pub async fn update(
                         "\r{}          ",
                         row(
                             &bang(),
-                            ext,
+                            name,
                             "",
                             &format!("{YELLOW}failed{RESET} {}", dim(&e.to_string()))
                         )
@@ -560,6 +786,68 @@ pub async fn update(
                         )
                     );
                 }
+            }
+        }
+
+        // The cfx-script helper beside node. Optional, as in the installer, so a failure
+        // is a warning, and a release without one is passed over in silence. A new one
+        // needs no restart: every job starts it afresh.
+        let hwant = manifest_version(&manifest, CFX_SCRIPT);
+        let helper_ok = ext_bin_path(CFX_SCRIPT).exists()
+            && installed_ext_version(CFX_SCRIPT).as_deref() == Some(hwant.as_str());
+        if !hwant.is_empty() {
+            if helper_ok && !force {
+                println!(
+                    "{}",
+                    row(&check(), CFX_SCRIPT, &ver(&hwant), &dim("up to date"))
+                );
+                current += 1;
+            } else {
+                print!("    {} {:<10} {}", dot(), CFX_SCRIPT, dim("updating…"));
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                let line = match install_cfx_script(&manifest, force).await {
+                    Ok(HelperOutcome::Installed { version, replaced }) => {
+                        let mid = match &replaced {
+                            Some(old) if !old.is_empty() && *old != version => {
+                                format!("{DIM}{old} \u{2192}{RESET} {version}")
+                            }
+                            _ => version.clone(),
+                        };
+                        changed += 1;
+                        row(
+                            &check(),
+                            CFX_SCRIPT,
+                            &mid,
+                            &format!("{GREEN}updated{RESET}"),
+                        )
+                    }
+                    Ok(HelperOutcome::Current { .. } | HelperOutcome::NotInRelease) => {
+                        current += 1;
+                        row(&check(), CFX_SCRIPT, &ver(&hwant), &dim("up to date"))
+                    }
+                    Ok(HelperOutcome::CannotStart { output, .. }) => row(
+                        &bang(),
+                        CFX_SCRIPT,
+                        "",
+                        &format!(
+                            "{YELLOW}skipped{RESET} {}",
+                            dim(&format!(
+                                "it cannot start here, so it was not installed and {}. {output}",
+                                without_new_helper()
+                            ))
+                        ),
+                    ),
+                    Err(e) => row(
+                        &bang(),
+                        CFX_SCRIPT,
+                        "",
+                        &format!(
+                            "{YELLOW}failed{RESET} {}",
+                            dim(&format!("{e}. Until it installs, {}", without_new_helper()))
+                        ),
+                    ),
+                };
+                println!("\r{line}          ");
             }
         }
         println!();
@@ -722,27 +1010,78 @@ pub async fn download_node(
     Ok(true)
 }
 
-/// Ensure the `node` worker binary is present next to crossfyre. Prefers a
-/// sibling of the running binary (fresh install / dev checkout) and falls back
-/// to downloading it from the release manifest. Called during `node init` so
-/// the service's ExecStart resolves.
+/// Ensure the `node` worker binary is present next to crossfyre, and the cfx-script
+/// helper next to it. A missing one is copied from beside the running binary when it is
+/// there (fresh install, release tarball, dev checkout) and downloaded from the release
+/// manifest when it is not. An installed helper is also refreshed from the manifest when
+/// its recorded version is not the release's. Called during `node init` so the
+/// service's ExecStart resolves. A helper that cannot be installed is a warning, not an
+/// error, since only .cfx scripts need it.
 pub async fn ensure_node_installed() -> Result<(), Box<dyn std::error::Error>> {
     let stable = get_bin_dir().join(ext_file_name("node"));
-    if stable.exists() {
-        return Ok(());
+    let mut manifest = None;
+    if !stable.exists() {
+        if let Some(sib) = sibling_of_this_binary("node") {
+            place_binary(&sib, &stable)?;
+            println!("[+] Installed node binary to {}", stable.display());
+        } else {
+            let m = fetch_manifest().await?;
+            download_node(&m, false, false).await?;
+            manifest = Some(m);
+        }
     }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(sib) = exe.parent().map(|d| d.join(ext_file_name("node")))
-        && sib.exists()
-        && sib != stable
+
+    let helper = ext_bin_path(CFX_SCRIPT);
+    if !helper.exists()
+        && let Some(sib) = sibling_of_this_binary(CFX_SCRIPT)
     {
-        place_binary(&sib, &stable)?;
-        println!("[+] Installed node binary to {}", stable.display());
+        // From the same build as a node beside it. Its version is unknown, so none is
+        // recorded, and the next update replaces it with the manifest's.
+        let _ = fs::remove_file(ext_version_file(CFX_SCRIPT));
+        match place_helper_if_it_starts(&sib, &helper) {
+            Ok(None) => println!(
+                "[+] Installed cfx-script to {} (runs .cfx scripts)",
+                helper.display()
+            ),
+            Ok(Some(output)) => eprintln!(
+                "[!] {} cannot start here, so it was not installed and {}. {output}",
+                sib.display(),
+                without_new_helper()
+            ),
+            Err(e) => report_cfx_script(Err(e)),
+        }
         return Ok(());
     }
-    let manifest = fetch_manifest().await?;
-    download_node(&manifest, false, false).await?;
+    let manifest = match manifest {
+        Some(m) => m,
+        None => match fetch_manifest().await {
+            Ok(m) => m,
+            Err(e) => {
+                report_cfx_script(Err(e));
+                return Ok(());
+            }
+        },
+    };
+    report_cfx_script(install_cfx_script(&manifest, false).await);
     Ok(())
+}
+
+/// `name` in the directory of the running binary, when it is there and is not the
+/// installed copy itself.
+fn sibling_of_this_binary(name: &str) -> Option<PathBuf> {
+    let installed = get_bin_dir().join(ext_file_name(name));
+    let exe = std::env::current_exe().ok()?;
+    let sib = exe.parent()?.join(ext_file_name(name));
+    (sib.exists() && sib != installed).then_some(sib)
+}
+
+/// The update the dashboard asks a node for: the crossfyre CLI and the cfx-script helper,
+/// from the release manifest. True when the CLI was replaced and the node should restart
+/// to run it. A new helper needs no restart, since every job starts it afresh.
+pub async fn update_for_dashboard() -> Result<bool, Box<dyn std::error::Error>> {
+    let manifest = fetch_manifest().await?;
+    report_cfx_script(install_cfx_script(&manifest, false).await);
+    self_update(&manifest, &installed_cli_version(), false, false).await
 }
 
 #[cfg(test)]
@@ -766,7 +1105,7 @@ mod tests {
 
     #[test]
     fn matching_bytes_are_accepted_and_one_changed_byte_is_not() {
-        let a = artifact("mach-linux-x86_64.zip", HELLO_SHA);
+        let a = artifact("ambulo-linux-x86_64.zip", HELLO_SHA);
         assert!(verify_artifact_bytes(&a, b"hello").is_ok());
 
         let err = verify_artifact_bytes(&a, b"hellp").expect_err("one byte changed");
@@ -782,7 +1121,7 @@ mod tests {
         // The publish pipeline writes lowercase hex, but a hand-edited manifest or a
         // different tool may not, and a case mismatch refusing a correct artifact would
         // look exactly like a compromised bucket.
-        let a = artifact("mach.zip", &HELLO_SHA.to_ascii_uppercase());
+        let a = artifact("ambulo.zip", &HELLO_SHA.to_ascii_uppercase());
         assert!(verify_artifact_bytes(&a, b"hello").is_ok());
     }
 
@@ -793,7 +1132,7 @@ mod tests {
         // byte sequence is wrong, which is correct by accident. Being explicit also makes
         // the message say why instead of printing a mismatch against nothing.
         for blank in ["", "   "] {
-            let a = artifact("mach.zip", blank);
+            let a = artifact("ambulo.zip", blank);
             let err = verify_artifact_bytes(&a, b"hello")
                 .expect_err("an artifact with no checksum must be refused");
             assert!(
@@ -808,9 +1147,9 @@ mod tests {
         // Zero bytes has a sha256 like anything else. A truncated download that arrives
         // as an empty 200 must not pass because there is nothing to hash.
         let empty_sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        let a = artifact("mach.zip", empty_sha);
+        let a = artifact("ambulo.zip", empty_sha);
         assert!(verify_artifact_bytes(&a, b"").is_ok());
-        let b = artifact("mach.zip", HELLO_SHA);
+        let b = artifact("ambulo.zip", HELLO_SHA);
         assert!(verify_artifact_bytes(&b, b"").is_err());
     }
 
@@ -818,21 +1157,21 @@ mod tests {
     fn a_manifest_missing_the_component_or_the_platform_says_which() {
         let key = platform_key();
         let m = manifest(&format!(
-            r#"{{"components":{{"mach":{{"version":"0.0.14","artifacts":{{"{key}":{{"file":"f","sha256":"{HELLO_SHA}"}}}}}}}}}}"#
+            r#"{{"components":{{"ambulo":{{"version":"0.0.14","artifacts":{{"{key}":{{"file":"f","sha256":"{HELLO_SHA}"}}}}}}}}}}"#
         ));
-        assert!(resolve_artifact(&m, "mach").is_ok());
+        assert!(resolve_artifact(&m, "ambulo").is_ok());
 
-        let err = resolve_artifact(&m, "cortex")
+        let err = resolve_artifact(&m, "plessor")
             .expect_err("a component that is not there")
             .to_string();
-        assert!(err.contains("cortex"), "got: {err}");
+        assert!(err.contains("plessor"), "got: {err}");
 
         // A component that exists with no artifact for this host is a different problem
         // from one that does not exist, and the two messages were worth separating.
         let other = manifest(
-            r#"{"components":{"mach":{"version":"0.0.14","artifacts":{"solaris-sparc":{"file":"f","sha256":"x"}}}}}"#,
+            r#"{"components":{"ambulo":{"version":"0.0.14","artifacts":{"solaris-sparc":{"file":"f","sha256":"x"}}}}}"#,
         );
-        let err = resolve_artifact(&other, "mach")
+        let err = resolve_artifact(&other, "ambulo")
             .expect_err("no artifact for this platform")
             .to_string();
         assert!(err.contains(&key), "the message names the platform: {err}");
@@ -845,16 +1184,106 @@ mod tests {
         // additive change becomes a fleet-wide update failure.
         let key = platform_key();
         let m = manifest(&format!(
-            r#"{{"generated":"2026-10-03","components":{{"mach":{{"version":"0.0.14","channel":"stable","artifacts":{{"{key}":{{"file":"f","sha256":"{HELLO_SHA}","size":1234}}}}}}}}}}"#
+            r#"{{"generated":"2026-10-03","components":{{"ambulo":{{"version":"0.0.14","channel":"stable","artifacts":{{"{key}":{{"file":"f","sha256":"{HELLO_SHA}","size":1234}}}}}}}}}}"#
         ));
-        let (c, a) = resolve_artifact(&m, "mach").expect("unknown fields are ignored");
+        let (c, a) = resolve_artifact(&m, "ambulo").expect("unknown fields are ignored");
         assert_eq!(c.version, "0.0.14");
         assert_eq!(a.sha256, HELLO_SHA);
-        assert_eq!(manifest_version(&m, "mach"), "0.0.14");
+        assert_eq!(manifest_version(&m, "ambulo"), "0.0.14");
         assert_eq!(
             manifest_version(&m, "nope"),
             "",
             "an absent component reports no version rather than panicking"
+        );
+    }
+
+    #[test]
+    fn an_engine_resolves_under_its_new_key_and_falls_back_to_its_old_one() {
+        let key = platform_key();
+        let entry = |v: &str| {
+            format!(
+                r#"{{"version":"{v}","artifacts":{{"{key}":{{"file":"f-{v}","sha256":"{HELLO_SHA}"}}}}}}"#
+            )
+        };
+        // The release manifest carries the new key and, for one release, the old one
+        // as an alias. The new key is the one taken.
+        let both = manifest(&format!(
+            r#"{{"components":{{"cortex":{},"plessor":{}}}}}"#,
+            entry("0.0.22"),
+            entry("0.0.23")
+        ));
+        assert_eq!(manifest_version(&both, "cortex"), "0.0.23");
+        assert_eq!(manifest_version(&both, "plessor"), "0.0.23");
+        // A manifest that has not gained the new key yet still installs the engine.
+        let old = manifest(&format!(
+            r#"{{"components":{{"cortex":{}}}}}"#,
+            entry("0.0.22")
+        ));
+        assert_eq!(manifest_version(&old, "cortex"), "0.0.22");
+        assert_eq!(manifest_version(&old, "plessor"), "0.0.22");
+    }
+
+    /// An engine that was renamed, as the table describes one.
+    const RENAMED: crate::toolchain::Engine = crate::toolchain::Engine {
+        id: "cortex",
+        name: "fresh",
+        legacy: Some("cortex"),
+        port: 4445,
+        about: "",
+    };
+
+    #[test]
+    fn a_renamed_engine_is_looked_up_under_its_public_name_then_its_legacy_one() {
+        assert_eq!(keys_for(Some(&RENAMED), "cortex"), ["fresh", "cortex"]);
+        assert_eq!(keys_for(None, "crossfyre"), ["crossfyre"]);
+        let key = platform_key();
+        let entry = |v: &str| {
+            format!(
+                r#"{{"version":"{v}","artifacts":{{"{key}":{{"file":"f-{v}","sha256":"{HELLO_SHA}"}}}}}}"#
+            )
+        };
+
+        // A manifest from before the rename has only the legacy key.
+        let old = manifest(&format!(
+            r#"{{"components":{{"cortex":{}}}}}"#,
+            entry("0.0.22")
+        ));
+        let (c, _) = resolve_keys(&old, &keys_for(Some(&RENAMED), "cortex")).expect("falls back");
+        assert_eq!(c.version, "0.0.22");
+
+        // One from after it carries both, and the public name is taken.
+        let both = manifest(&format!(
+            r#"{{"components":{{"cortex":{},"fresh":{}}}}}"#,
+            entry("0.0.22"),
+            entry("0.0.23")
+        ));
+        let (c, a) = resolve_keys(&both, &keys_for(Some(&RENAMED), "cortex")).expect("found");
+        assert_eq!(
+            (c.version.as_str(), a.file.as_str()),
+            ("0.0.23", "f-0.0.23")
+        );
+
+        let err = resolve_keys(&manifest(r#"{"components":{}}"#), &["fresh", "cortex"])
+            .expect_err("in neither")
+            .to_string();
+        assert!(
+            err.contains("'fresh'"),
+            "the public name is the one reported: {err}"
+        );
+    }
+
+    #[test]
+    fn the_binary_inside_an_artifact_may_carry_either_name() {
+        let s = Scratch::new("member");
+        let keys = keys_for(Some(&RENAMED), "cortex");
+        assert_eq!(find_member(&s.0, &keys), None);
+        fs::write(s.join(&file_name("cortex")), b"alias").expect("legacy member");
+        assert_eq!(find_member(&s.0, &keys), Some(s.join(&file_name("cortex"))));
+        fs::write(s.join(&file_name("fresh")), b"new").expect("public member");
+        assert_eq!(
+            find_member(&s.0, &keys),
+            Some(s.join(&file_name("fresh"))),
+            "the public name first"
         );
     }
 
@@ -916,7 +1345,7 @@ mod tests {
     #[test]
     fn a_placed_binary_is_executable_even_when_the_archive_was_not() {
         let s = Scratch::new("mode");
-        let src = s.join("mach-unpacked");
+        let src = s.join("ambulo-unpacked");
         fs::write(&src, b"#!/bin/sh\necho hi\n").expect("write src");
         #[cfg(unix)]
         {
@@ -925,7 +1354,7 @@ mod tests {
             fs::set_permissions(&src, fs::Permissions::from_mode(0o644)).expect("chmod src");
         }
 
-        let dest = s.join("bin").join("mach");
+        let dest = s.join("bin").join("ambulo");
         place_binary(&src, &dest).expect("place");
         assert!(dest.exists(), "the parent directory is created");
         #[cfg(unix)]
@@ -935,7 +1364,7 @@ mod tests {
             fs::read(&src).expect("read")
         );
         assert!(
-            !s.join("bin").join("mach.new").exists(),
+            !s.join("bin").join("ambulo.new").exists(),
             "nothing is left staged next to the destination"
         );
     }
@@ -943,9 +1372,9 @@ mod tests {
     #[test]
     fn placing_over_an_existing_binary_replaces_it() {
         let s = Scratch::new("replace");
-        let dest = s.join("mach");
+        let dest = s.join("ambulo");
         fs::write(&dest, b"the-old-one").expect("write old");
-        let src = s.join("new-mach");
+        let src = s.join("new-ambulo");
         fs::write(&src, b"the-new-one").expect("write new");
 
         place_binary(&src, &dest).expect("place");
@@ -957,7 +1386,7 @@ mod tests {
     #[test]
     fn staging_appends_to_the_name_instead_of_replacing_its_extension() {
         // `with_extension("new")` does not append, it REPLACES whatever follows the last
-        // dot, so placing `cortex-0.1.2` used to stage through `cortex-0.1.new`. That is
+        // dot, so placing `plessor-0.1.2` used to stage through `plessor-0.1.new`. That is
         // a path belonging to something else.
         //
         // The oracle is a bystander: a real file already sitting at the old staging name.
@@ -969,10 +1398,10 @@ mod tests {
         let src = s.join("payload");
         fs::write(&src, b"x").expect("write src");
 
-        let bystander = s.join("cortex-0.1.new");
+        let bystander = s.join("plessor-0.1.new");
         fs::write(&bystander, b"somebody-elses-file").expect("write bystander");
 
-        let dest = s.join("cortex-0.1.2");
+        let dest = s.join("plessor-0.1.2");
         place_binary(&src, &dest).expect("place");
 
         assert!(dest.exists(), "the binary was placed");
@@ -981,5 +1410,68 @@ mod tests {
             Some(&b"somebody-elses-file"[..]),
             "staging must not go through a path that belongs to another name"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Placing cfx-script
+    // ---------------------------------------------------------------------------
+
+    /// A stand-in cfx-script: a shell script that reads its stdin and exits as told.
+    #[cfg(unix)]
+    fn fake_helper(s: &Scratch, name: &str, body: &str) -> std::path::PathBuf {
+        let p = s.join(name);
+        fs::write(&p, format!("#!/bin/sh\ncat >/dev/null\n{body}\n")).expect("write helper");
+        p
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_helper_that_refuses_an_empty_job_is_placed() {
+        // Exit status 2 on an empty stdin is how cfx-script refuses a job that is not
+        // there, and getting that far means it loaded.
+        let s = Scratch::new("helper-ok");
+        let src = fake_helper(&s, "unpacked", "exit 2");
+        let dest = s.join("bin").join("cfx-script");
+        let failed = place_helper_if_it_starts(&src, &dest).expect("place");
+        assert_eq!(failed, None);
+        assert_eq!(
+            fs::read(&dest).expect("read"),
+            fs::read(&src).expect("read")
+        );
+        assert_eq!(mode_of(&dest), 0o755);
+        assert!(!s.join("bin").join("cfx-script.new").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_helper_that_cannot_start_is_not_placed_and_the_old_one_stays() {
+        let s = Scratch::new("helper-broken");
+        let src = fake_helper(
+            &s,
+            "unpacked",
+            "echo 'cfx-script: error while loading shared libraries: libpython3.11.so.1.0' >&2\nexit 127",
+        );
+        let dest = s.join("cfx-script");
+        fs::write(&dest, b"the-old-one").expect("write old");
+        let failed = place_helper_if_it_starts(&src, &dest).expect("place");
+        let output = failed.expect("a helper exiting 127 cannot start");
+        assert!(output.contains("libpython3.11.so.1.0"), "{output}");
+        assert_eq!(fs::read(&dest).expect("read"), b"the-old-one");
+        assert!(!s.join("cfx-script.new").exists(), "nothing is left staged");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_helper_that_ran_a_job_it_was_never_given_is_not_placed() {
+        // Exit 0 on an empty stdin is not cfx-script refusing a missing job, so it is
+        // not proof that it loaded. Whatever it printed is all there is to say.
+        let s = Scratch::new("helper-zero");
+        let src = fake_helper(&s, "unpacked", "exit 0");
+        let dest = s.join("cfx-script");
+        let output = place_helper_if_it_starts(&src, &dest)
+            .expect("place")
+            .expect("exit 0 is not the refusal");
+        assert!(output.contains("exit status: 0"), "{output}");
+        assert!(!dest.exists());
     }
 }

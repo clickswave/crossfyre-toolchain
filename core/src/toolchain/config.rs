@@ -33,74 +33,107 @@ pub struct ContainerSection {
     pub id: Option<String>,
 }
 
-/// Per-extension daemon ports. Defaults are the protocol constants
-/// ([`super::EXTENSION_PORTS`]); every field is `#[serde(default)]` so a config
-/// that predates this section (or omits a newer engine) still loads.
-#[derive(Debug, Serialize, Deserialize)]
+/// Per-extension daemon ports, keyed by engine id.
+///
+/// In `config.toml` the `[extensions]` table is keyed by each engine's public name.
+/// A key may also be an engine's id or its legacy name, so a file written before an
+/// engine took its current name still loads with its ports intact; the public name
+/// wins when a file carries both. A file that predates this section, or omits an
+/// engine, gets the protocol default ([`super::Engine::port`]) for it, and an
+/// unknown key is ignored. Written back, the table always uses public names.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionPorts {
-    #[serde(default = "def_mach")]
-    pub mach: u16,
-    #[serde(default = "def_voyage")]
-    pub voyage: u16,
-    #[serde(default = "def_pulse")]
-    pub pulse: u16,
-    #[serde(default = "def_scout")]
-    pub scout: u16,
-    #[serde(default = "def_cortex")]
-    pub cortex: u16,
-}
-
-fn def_mach() -> u16 {
-    4441
-}
-fn def_voyage() -> u16 {
-    4442
-}
-fn def_pulse() -> u16 {
-    4443
-}
-fn def_scout() -> u16 {
-    4444
-}
-fn def_cortex() -> u16 {
-    4445
+    ports: Vec<(&'static str, u16)>,
 }
 
 impl Default for ExtensionPorts {
     fn default() -> Self {
-        Self {
-            mach: def_mach(),
-            voyage: def_voyage(),
-            pulse: def_pulse(),
-            scout: def_scout(),
-            cortex: def_cortex(),
-        }
+        Self::defaults_in(super::ENGINES)
     }
 }
 
 impl ExtensionPorts {
-    /// Configured port for `ext`, or 0 if it isn't a known engine.
-    pub fn get(&self, ext: &str) -> u16 {
-        match ext {
-            "mach" => self.mach,
-            "voyage" => self.voyage,
-            "pulse" => self.pulse,
-            "scout" => self.scout,
-            "cortex" => self.cortex,
-            _ => 0,
+    fn defaults_in(table: &'static [super::Engine]) -> Self {
+        Self {
+            ports: table.iter().map(|e| (e.id, e.port)).collect(),
         }
+    }
+
+    /// Ports from `[extensions]` entries, read against `table`.
+    fn from_entries_in<'a>(
+        table: &'static [super::Engine],
+        entries: impl IntoIterator<Item = (&'a str, u16)> + Clone,
+    ) -> Self {
+        let mut out = Self::defaults_in(table);
+        // Two passes so a public-name key beats an id or legacy key for the same
+        // engine whatever order the file lists them in.
+        for public in [false, true] {
+            for (key, port) in entries.clone() {
+                if let Some(e) = super::find_engine(table, key)
+                    && (key == e.name) == public
+                {
+                    out.set(e.id, port);
+                }
+            }
+        }
+        out
+    }
+
+    /// Configured port for `ext` (an id, public name or legacy name), or 0 if it
+    /// isn't a known engine.
+    pub fn get(&self, ext: &str) -> u16 {
+        let id = super::engine(ext).map(|e| e.id).unwrap_or(ext);
+        self.ports
+            .iter()
+            .find(|(k, _)| *k == id)
+            .map(|(_, p)| *p)
+            .unwrap_or(0)
     }
 
     /// Set `ext`'s port; no-op for an unknown engine name.
     pub fn set(&mut self, ext: &str, port: u16) {
-        match ext {
-            "mach" => self.mach = port,
-            "voyage" => self.voyage = port,
-            "pulse" => self.pulse = port,
-            "scout" => self.scout = port,
-            "cortex" => self.cortex = port,
-            _ => {}
+        let id = super::engine(ext).map(|e| e.id).unwrap_or(ext);
+        if let Some(slot) = self.ports.iter_mut().find(|(k, _)| *k == id) {
+            slot.1 = port;
         }
+    }
+}
+
+impl Serialize for ExtensionPorts {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(
+            self.ports
+                .iter()
+                .map(|(id, port)| (super::public_name(id), *port)),
+        )
+    }
+}
+
+impl<'de> Deserialize<'de> for ExtensionPorts {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // A value that is not a port under a key that is not an engine is somebody
+        // else's business, as it was when this was a plain struct.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Entry {
+            Port(u16),
+            Other(serde::de::IgnoredAny),
+        }
+        let raw: std::collections::BTreeMap<String, Entry> =
+            std::collections::BTreeMap::deserialize(deserializer)?;
+        let mut entries: Vec<(&str, u16)> = Vec::new();
+        for (key, value) in &raw {
+            match value {
+                Entry::Port(p) => entries.push((key.as_str(), *p)),
+                Entry::Other(_) if super::engine(key).is_some() => {
+                    return Err(serde::de::Error::custom(format!(
+                        "[extensions] {key} must be a port number"
+                    )));
+                }
+                Entry::Other(_) => {}
+            }
+        }
+        Ok(Self::from_entries_in(super::ENGINES, entries))
     }
 }
 
@@ -165,12 +198,18 @@ pub fn get_bin_dir() -> PathBuf {
     }
 }
 
-/// On-disk file name of an extension binary (adds `.exe` on Windows).
+/// On-disk file name of an extension binary (adds `.exe` on Windows). `ext` may be an
+/// engine id or any other component name; an engine is named by its public name.
 pub fn ext_file_name(ext: &str) -> String {
+    file_name(super::public_name(ext))
+}
+
+/// `name` as a file name on this OS.
+pub(crate) fn file_name(name: &str) -> String {
     if cfg!(windows) {
-        format!("{ext}.exe")
+        format!("{name}.exe")
     } else {
-        ext.to_string()
+        name.to_string()
     }
 }
 
@@ -179,8 +218,26 @@ pub fn ext_bin_path(ext: &str) -> PathBuf {
     get_bin_dir().join(ext_file_name(ext))
 }
 
+/// Where the binary of an engine that has been renamed was installed under its legacy
+/// name. `None` for an engine that has never had another name.
+pub fn legacy_bin_path(ext: &str) -> Option<PathBuf> {
+    let legacy = super::engine(ext)?.legacy?;
+    Some(get_bin_dir().join(file_name(legacy)))
+}
+
+/// `path` exists and is a file in its own right, not a symlink to one.
+pub fn is_regular_file(path: &std::path::Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_file())
+        .unwrap_or(false)
+}
+
+/// An engine counts as installed under its public name, or as a binary still sitting
+/// under its legacy name on a machine the rename has not been carried to yet. A
+/// legacy symlink does not count: that is what the migration leaves behind, and it
+/// points at the binary under the public name.
 pub fn is_extension_installed(ext: &str) -> bool {
-    ext_bin_path(ext).exists()
+    ext_bin_path(ext).exists() || legacy_bin_path(ext).is_some_and(|p| is_regular_file(&p))
 }
 
 pub fn load_config() -> Result<ToolchainConfig, Box<dyn std::error::Error>> {
@@ -218,11 +275,7 @@ pub fn engine_port(ext: &str) -> u16 {
         return configured;
     }
     // Unknown to the config (old file, or a brand-new engine): protocol default.
-    super::EXTENSION_PORTS
-        .iter()
-        .find(|(name, _)| *name == ext)
-        .map(|(_, p)| *p)
-        .unwrap_or(0)
+    super::engine(ext).map(|e| e.port).unwrap_or(0)
 }
 
 /// `127.0.0.1:<port>` for an extension daemon, ready to hand to `TcpStream::connect`.
@@ -231,10 +284,11 @@ pub fn engine_addr(ext: &str) -> String {
 }
 
 /// Merge server-provided port overrides into the host `config.toml`. The JSON
-/// is a flat map of service name to port, e.g.
+/// is a flat map of service name to port, keyed by engine id (the ids are the
+/// engines' original names), e.g.
 /// `{ "postgres": 4440, "mach": 4441, "pulse": 4443 }` - "postgres" targets the
-/// database, every other key an engine daemon. Missing/unknown keys keep their
-/// current value. Ensures `config.toml` exists first, and only writes when
+/// database, every other key an engine daemon. A public name is accepted in place
+/// of an id. Missing/unknown keys keep their current value. Ensures `config.toml` exists first, and only writes when
 /// something actually changed. Returns the list of services whose port moved
 /// (so a live re-apply can restart exactly those), postgres included.
 pub fn apply_ports_from_json(
@@ -254,12 +308,13 @@ pub fn apply_ports_from_json(
             changed.push("postgres".to_string());
         }
     }
-    for ext in super::EXTENSIONS {
-        if let Some(p) = obj.get(*ext).and_then(|v| v.as_u64()) {
+    for e in super::ENGINES {
+        let given = obj.get(e.id).or_else(|| obj.get(e.name));
+        if let Some(p) = given.and_then(|v| v.as_u64()) {
             let p = p as u16;
-            if p != 0 && config.extensions.get(ext) != p {
-                config.extensions.set(ext, p);
-                changed.push((*ext).to_string());
+            if p != 0 && config.extensions.get(e.id) != p {
+                config.extensions.set(e.id, p);
+                changed.push(e.id.to_string());
             }
         }
     }
@@ -268,6 +323,31 @@ pub fn apply_ports_from_json(
         save_config(&config)?;
     }
     Ok(changed)
+}
+
+/// Rewrite the `config.toml` at `path` so `[extensions]` is keyed by public names, if
+/// it still names an engine by an id or legacy name that differs from its public name.
+/// The file loads either way; this keeps what a person reads in it current. Returns
+/// whether the file was written. A missing file is not an error.
+pub fn rewrite_legacy_keys(path: &std::path::Path) -> Result<bool, Box<dyn std::error::Error>> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return Ok(false);
+    };
+    let value: toml::Value = toml::from_str(&text)?;
+    let stale = value
+        .get("extensions")
+        .and_then(|v| v.as_table())
+        .is_some_and(|t| {
+            t.keys()
+                .any(|k| super::engine(k).is_some_and(|e| e.name != k))
+        });
+    if !stale {
+        return Ok(false);
+    }
+    let config: ToolchainConfig = toml::from_str(&text)?;
+    fs::write(path, toml::to_string(&config)?)?;
+    super::sudo_user::chown_to_invoking_user(path);
+    Ok(true)
 }
 
 /// Load the toolchain config, writing the defaults first if none exists.
@@ -283,4 +363,147 @@ pub fn load_or_create_config() -> Result<ToolchainConfig, Box<dyn std::error::Er
         );
     }
     load_config()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::toolchain::{ENGINES, Engine};
+
+    fn ports(text: &str) -> ExtensionPorts {
+        let cfg: ToolchainConfig = toml::from_str(&format!(
+            "[postgres]\nhost = \"localhost\"\nport = 4440\nuser = \"postgres\"\n\
+             db_name = \"crossfyre\"\n\n[container]\n\n{text}"
+        ))
+        .expect("config parses");
+        cfg.extensions
+    }
+
+    #[test]
+    fn a_config_without_the_section_gets_every_default() {
+        let p = ports("");
+        for e in ENGINES {
+            assert_eq!(p.get(e.id), e.port, "{}", e.id);
+        }
+    }
+
+    #[test]
+    fn a_port_is_read_under_an_engine_id() {
+        let p = ports("[extensions]\nmach = 5999\n");
+        assert_eq!(p.get("mach"), 5999);
+        assert_eq!(
+            p.get("voyage"),
+            4442,
+            "an engine left out keeps its default"
+        );
+    }
+
+    #[test]
+    fn unknown_keys_are_ignored_and_a_bad_engine_port_is_not() {
+        let p = ports("[extensions]\nsomething_else = \"x\"\nvoyage = 5000\n");
+        assert_eq!(p.get("voyage"), 5000);
+        let bad: Result<ToolchainConfig, _> = toml::from_str(
+            "[postgres]\nhost = \"h\"\nport = 1\nuser = \"u\"\ndb_name = \"d\"\n\
+             [container]\n[extensions]\nvoyage = \"x\"\n",
+        );
+        assert!(
+            bad.is_err(),
+            "a port that is not a number is an error, as it was"
+        );
+    }
+
+    #[test]
+    fn written_back_the_section_uses_public_names_in_table_order() {
+        let text = toml::to_string(&ToolchainConfig::default()).expect("serialises");
+        let section = text.split("[extensions]").nth(1).expect("section");
+        let keys: Vec<&str> = section
+            .lines()
+            .filter_map(|l| l.split_once(" = ").map(|(k, _)| k))
+            .collect();
+        let names: Vec<&str> = ENGINES.iter().map(|e| e.name).collect();
+        assert_eq!(keys, names);
+    }
+
+    #[test]
+    fn a_config_written_before_the_rename_keeps_its_ports() {
+        let p = ports("[extensions]\ncortex = 5001\nmach = 5002\npulse = 5003\nscout = 5004\n");
+        assert_eq!(
+            [
+                p.get("cortex"),
+                p.get("mach"),
+                p.get("pulse"),
+                p.get("scout")
+            ],
+            [5001, 5002, 5003, 5004]
+        );
+        // Reached by the new names as well, since a port is the engine's.
+        assert_eq!(p.get("plessor"), 5001);
+    }
+
+    #[test]
+    fn a_config_written_after_the_rename_uses_the_new_names() {
+        let p = ports("[extensions]\nplessor = 5001\nambulo = 5002\n");
+        assert_eq!((p.get("cortex"), p.get("mach")), (5001, 5002));
+        let cfg = ToolchainConfig {
+            extensions: p,
+            ..ToolchainConfig::default()
+        };
+        let text = toml::to_string(&cfg).expect("serialises");
+        assert!(
+            text.contains("plessor = 5001") && text.contains("ambulo = 5002"),
+            "{text}"
+        );
+        for old in ["cortex", "mach", "pulse", "scout"] {
+            assert!(!text.contains(old), "{old} written back: {text}");
+        }
+    }
+
+    #[test]
+    fn the_migration_rewrites_old_keys_and_leaves_a_current_file_alone() {
+        let dir = std::env::temp_dir().join(format!("cfx-config-rewrite-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("config.toml");
+        fs::write(
+            &path,
+            "[postgres]\nhost = \"localhost\"\nport = 4440\nuser = \"postgres\"\n\
+             db_name = \"crossfyre\"\n\n[container]\n\n[extensions]\ncortex = 5001\n",
+        )
+        .expect("old config");
+
+        assert!(rewrite_legacy_keys(&path).expect("rewrites"));
+        let text = fs::read_to_string(&path).expect("read");
+        assert!(
+            text.contains("plessor = 5001") && !text.contains("cortex"),
+            "{text}"
+        );
+        assert!(
+            !rewrite_legacy_keys(&path).expect("reads"),
+            "a current file is not written"
+        );
+        assert!(!rewrite_legacy_keys(&dir.join("absent.toml")).expect("absent is fine"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The alias reading against a table in which an engine was renamed.
+    const RENAMED: &[Engine] = &[Engine {
+        id: "cortex",
+        name: "fresh",
+        legacy: Some("cortex"),
+        port: 4445,
+        about: "",
+    }];
+
+    #[test]
+    fn a_legacy_key_is_read_and_the_public_name_wins_over_it() {
+        let p = ExtensionPorts::from_entries_in(RENAMED, vec![("cortex", 5001)]);
+        assert_eq!(p.get("cortex"), 5001);
+        for order in [
+            vec![("fresh", 5002), ("cortex", 5001)],
+            vec![("cortex", 5001), ("fresh", 5002)],
+        ] {
+            let p = ExtensionPorts::from_entries_in(RENAMED, order.clone());
+            assert_eq!(p.get("cortex"), 5002, "{order:?}");
+        }
+    }
 }

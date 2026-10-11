@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 type BoxErr = Box<dyn Error + Send + Sync>;
 
@@ -330,6 +330,19 @@ pub struct CaptureCfg {
     /// otherwise, and those are a large share of what this tool is for. A per-project
     /// decision an operator makes knowingly, never a build-time default.
     pub trust_any_upstream_cert: bool,
+    /// The certificate to present when a target asks for one.
+    ///
+    /// `None` presents none, which is what every caller did before this existed and is
+    /// right for everything that is not mutual TLS. Shared rather than cloned because it
+    /// holds two built TLS configurations.
+    pub client_identity: Option<Arc<ClientIdentity>>,
+    /// How a flow reaches the origin once it has been admitted.
+    ///
+    /// Here rather than passed beside the config at every call site, because a front end
+    /// hands it to `serve_plain_request` and `serve_mitm_flow` separately and the two
+    /// drifting is a tool that goes through the company proxy for https and straight out
+    /// for http, which on that network means half the traffic silently fails.
+    pub egress: Egress,
     /// What the operator said they may reach.
     ///
     /// `None` is unrestricted, which is what every front end did before this existed; the
@@ -376,26 +389,264 @@ impl std::fmt::Debug for CaptureCfg {
 // Egress: how an inspected flow reaches the origin
 // ---------------------------------------------------------------------------
 
+/// A certificate this proxy presents when a target asks for one.
+///
+/// An API that requires a client certificate refuses the handshake without one. The
+/// browser holds the operator's certificate, but with this proxy in the middle the browser
+/// is no longer the client the target sees, so the certificate has to live here.
+///
+/// Both connectors are built once, when the identity is set. Which one a flow uses depends
+/// on the project's trust-any-upstream-cert decision, and building either per flow would
+/// parse a private key on every request.
+pub struct ClientIdentity {
+    strict: TlsConnector,
+    any: TlsConnector,
+}
+
+/// Says that there is one and nothing about what it is. A `Debug` that printed the
+/// connectors would say nothing useful; one that printed the key would be the key in the
+/// logs.
+impl std::fmt::Debug for ClientIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ClientIdentity(set)")
+    }
+}
+
+impl ClientIdentity {
+    /// Build one from the PEM the operator pasted in.
+    ///
+    /// Every refusal names which half of it was wrong, because the two arrive in the same
+    /// paste and "invalid certificate" sends somebody to look at the wrong one.
+    pub fn from_pem(cert_pem: &str, key_pem: &str) -> Result<Self, String> {
+        let chain: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("the certificate could not be read: {e}"))?;
+        if chain.is_empty() {
+            return Err(
+                "no certificate was found. It should start with -----BEGIN CERTIFICATE-----"
+                    .to_string(),
+            );
+        }
+        let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+            .map_err(|e| format!("the private key could not be read: {e}"))?
+            .ok_or_else(|| {
+                "no private key was found. It should start with -----BEGIN PRIVATE KEY----- \
+                 or -----BEGIN RSA PRIVATE KEY-----"
+                    .to_string()
+            })?;
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let strict = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(chain.clone(), key.clone_key())
+            // The one failure that is about the pair rather than about either half.
+            .map_err(|e| format!("the key does not go with the certificate: {e}"))?;
+
+        let provider = rustls::crypto::aws_lc_rs::default_provider();
+        let any = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(flow::TrustAnyServerCert(Arc::new(
+                provider,
+            ))))
+            .with_client_auth_cert(chain, key)
+            .map_err(|e| format!("the key does not go with the certificate: {e}"))?;
+
+        Ok(Self {
+            strict: TlsConnector::from(Arc::new(strict)),
+            any: TlsConnector::from(Arc::new(any)),
+        })
+    }
+
+    /// Which connector this flow should use.
+    pub fn connector(&self, trust_any: bool) -> &TlsConnector {
+        if trust_any { &self.any } else { &self.strict }
+    }
+}
+
+/// Another proxy to go through, for a machine that cannot dial a target itself.
+///
+/// On a corporate network the only route out is the company proxy, and without this the
+/// tool cannot reach anything at all. The same applies to chaining through a second tool,
+/// which is how a tester puts this in front of or behind something else.
+#[derive(Clone)]
+pub struct UpstreamProxy {
+    pub host: String,
+    pub port: u16,
+    /// Basic credentials, when the proxy asks for them.
+    pub auth: Option<(String, String)>,
+}
+
+/// Hand-written so the password is not in the logs. A derived `Debug` on a struct holding
+/// one is a credential printed by every `{:?}` anybody adds later.
+impl std::fmt::Debug for UpstreamProxy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpstreamProxy")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field(
+                "auth",
+                &self.auth.as_ref().map(|(u, _)| format!("{u}:<redacted>")),
+            )
+            .finish()
+    }
+}
+
+/// How long the upstream proxy has to answer a CONNECT.
+///
+/// A proxy that accepts the TCP connection and then says nothing would otherwise hold the
+/// flow for as long as the window is open, and the operator would see a page that never
+/// loads with nothing anywhere saying why.
+const UPSTREAM_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The most a proxy may send before its blank line. Generous for a status line and a few
+/// headers, and bounded because the alternative is reading a hostile proxy's output until
+/// the process runs out of memory.
+const UPSTREAM_HEAD_MAX: usize = 8 * 1024;
+
 /// Where a captured flow egresses after inspection. `Direct` dials the origin from the local host
-/// (the phone, on mobile) so the target sees the local IP. A future `NodeTunnel { .. }` variant will
-/// dial a chosen crossfyre node and egress from THERE (the target sees the node IP) - the per-node
-/// isolated-egress model applied to a device. Keeping this an enum behind one `connect` keeps the
-/// data path identical; unlocking node routing is adding a variant, not re-plumbing.
-#[derive(Clone, Debug)]
+/// (the phone, on mobile) so the target sees the local IP. `Upstream` goes through another proxy by
+/// CONNECT, which is the only route out of a corporate network. A future `NodeTunnel { .. }` variant
+/// will dial a chosen crossfyre node and egress from THERE (the target sees the node IP) - the
+/// per-node isolated-egress model applied to a device. Keeping this an enum behind one `connect`
+/// keeps the data path identical; unlocking node routing is adding a variant, not re-plumbing.
+#[derive(Clone, Debug, Default)]
 pub enum Egress {
     /// Dial the origin directly from this host.
+    #[default]
     Direct,
+    /// Tunnel to the origin through another proxy.
+    Upstream(UpstreamProxy),
     // NodeTunnel { node: std::net::SocketAddr, token: String },  // locked; ships with mobile routing.
 }
 
 impl Egress {
     /// Open a byte stream to `(host, port)` per the routing mode. Async, so a future node-tunnel
     /// variant can perform its own handshake here without any caller change.
+    ///
+    /// The scope fence is not consulted here and must not be: this is called from inside a
+    /// flow that has already been admitted, and the upstream proxy itself is not a target.
+    /// It is infrastructure the operator typed in, which is the authorisation.
     pub async fn connect(&self, host: &str, port: u16) -> std::io::Result<tokio::net::TcpStream> {
         match self {
             Egress::Direct => tokio::net::TcpStream::connect((host, port)).await,
+            Egress::Upstream(up) => connect_through(up, host, port).await,
         }
     }
+}
+
+/// CONNECT through `up` to `(host, port)`, returning the tunnelled stream.
+async fn connect_through(
+    up: &UpstreamProxy,
+    host: &str,
+    port: u16,
+) -> std::io::Result<tokio::net::TcpStream> {
+    use base64::Engine as _;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut s = tokio::net::TcpStream::connect((up.host.as_str(), up.port))
+        .await
+        .map_err(|e| {
+            // Named, because "connection refused" with no subject reads as the target
+            // refusing and sends somebody to look at the wrong machine.
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "the upstream proxy at {}:{} could not be reached: {e}",
+                    up.host, up.port
+                ),
+            )
+        })?;
+
+    let mut head = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
+    if let Some((user, pass)) = &up.auth {
+        let token = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+        head.push_str(&format!("Proxy-Authorization: Basic {token}\r\n"));
+    }
+    head.push_str("\r\n");
+
+    let answer = tokio::time::timeout(UPSTREAM_DEADLINE, async {
+        s.write_all(head.as_bytes()).await?;
+        s.flush().await?;
+        // One byte at a time, stopping exactly at the blank line. A buffered read would
+        // swallow whatever the proxy sent after it, and after a 200 those bytes are the
+        // target's: dropping them corrupts the first response of every flow in a way that
+        // reads as a broken target.
+        let mut seen = Vec::with_capacity(128);
+        let mut byte = [0u8; 1];
+        loop {
+            if s.read_exact(&mut byte).await.is_err() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "the upstream proxy at {}:{} closed the connection without answering \
+                         the CONNECT",
+                        up.host, up.port
+                    ),
+                ));
+            }
+            seen.push(byte[0]);
+            if seen.ends_with(b"\r\n\r\n") {
+                break;
+            }
+            if seen.len() > UPSTREAM_HEAD_MAX {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "the upstream proxy at {}:{} sent {UPSTREAM_HEAD_MAX} bytes without \
+                         finishing its answer",
+                        up.host, up.port
+                    ),
+                ));
+            }
+        }
+        Ok(seen)
+    })
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "the upstream proxy at {}:{} did not answer the CONNECT within {}s",
+                up.host,
+                up.port,
+                UPSTREAM_DEADLINE.as_secs()
+            ),
+        )
+    })??;
+
+    let status_line = String::from_utf8_lossy(&answer);
+    let first = status_line.lines().next().unwrap_or_default();
+    let code = first.split_whitespace().nth(1).unwrap_or("");
+    if code.starts_with('2') {
+        return Ok(s);
+    }
+    // The two that happen, said in the words the operator can act on. Everything else is
+    // passed through as the proxy wrote it, because a proxy's own refusal is usually more
+    // specific than anything invented here.
+    let said = match code {
+        "407" => format!(
+            "the upstream proxy at {}:{} wants credentials{}",
+            up.host,
+            up.port,
+            if up.auth.is_some() {
+                " and refused the ones given"
+            } else {
+                ", and none were set"
+            }
+        ),
+        "403" => format!(
+            "the upstream proxy at {}:{} refused to carry {host}:{port}",
+            up.host, up.port
+        ),
+        _ => format!(
+            "the upstream proxy at {}:{} answered: {}",
+            up.host,
+            up.port,
+            first.trim()
+        ),
+    };
+    Err(std::io::Error::other(said))
 }
 
 #[cfg(test)]

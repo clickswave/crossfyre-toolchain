@@ -4,7 +4,7 @@
 //! `core::creds` `AuthContext`) and hands to an engine so its outbound requests
 //! run authenticated: a set of custom headers plus an optional `Cookie` value.
 //!
-//! This lived independently in `cortex`, `mach` and `scout` (three byte-identical
+//! This lived independently in `plessor`, `ambulo` and `toolmark` (three byte-identical
 //! copies), which meant only whoever owned the copy could authenticate. Hoisting
 //! it here makes authed crawl/fingerprint/scan uniformly available to any engine
 //! that pulls in `transport`.

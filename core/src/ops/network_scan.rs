@@ -36,13 +36,13 @@ pub async fn handle(env: OpEnv) {
 
         // Use the same `scan` engine path the batch modes use, just
         // with a single-port array, so it shares the
-        // exact same code in pulse that's been validated to
+        // exact same code in doorward that's been validated to
         // find every open port - the older `probe` mode had
         // a subtle reliability gap where some opens were
         // returned as the default-closed when run_connect_scan's
         // result event raced with the channel close.
         // Concurrency is already gated by `_ws_permit`.
-        let pulse_req = serde_json::json!({
+        let doorward_req = serde_json::json!({
             "operation": "scan",
             "response": "instant",
             "save": false,
@@ -56,7 +56,7 @@ pub async fn handle(env: OpEnv) {
         let short_op = op_id.get(..8).unwrap_or(&op_id).to_string();
         // Log every probe response while we're debugging the
         // discrepancy between scan modes. Noisy but definitive: we'll
-        // see exactly what pulse says about every port and
+        // see exactly what doorward says about every port and
         // can grep for known-open ones (53, 80, 5432, etc).
         let log_sample = true;
         let mut found_count = 0;
@@ -65,7 +65,7 @@ pub async fn handle(env: OpEnv) {
         match conn {
             Ok(stream) => {
                 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-                // RST-close so this per-op connection to pulse doesn't pile
+                // RST-close so this per-op connection to doorward doesn't pile
                 // up TIME_WAIT sockets and exhaust ephemeral ports on a big scan.
                 // SO_LINGER(0) is an RST close: it returns immediately and is what keeps a
                 // full-range scan from exhausting the ephemeral-port pool via TIME_WAIT.
@@ -75,7 +75,7 @@ pub async fn handle(env: OpEnv) {
                 #[allow(deprecated)]
                 let _ = stream.set_linger(Some(std::time::Duration::ZERO));
                 let (reader, mut writer) = stream.into_split();
-                let mut req_str = dguard::encode(&pulse_req);
+                let mut req_str = dguard::encode(&doorward_req);
                 req_str.push('\n');
                 if log_sample {
                     println!(
@@ -97,7 +97,7 @@ pub async fn handle(env: OpEnv) {
                         // sampled probes so we can see the actual shape.
                         if log_sample {
                             let snippet = &line[..line.len().min(250)];
-                            println!("[ds {short_op} {host}:{port}] <- pulse: {snippet}");
+                            println!("[ds {short_op} {host}:{port}] <- doorward: {snippet}");
                         }
                         if let Ok(resp) = serde_json::from_str::<serde_json::Value>(&line) {
                             let results_arr =
@@ -173,7 +173,7 @@ pub async fn handle(env: OpEnv) {
                     }
                     Ok(None) => {
                         eprintln!(
-                            "[ds {short_op} {host}:{port}] pulse closed connection without response"
+                            "[ds {short_op} {host}:{port}] doorward closed connection without response"
                         );
                     }
                     Err(e) => {
@@ -229,7 +229,7 @@ pub async fn handle(env: OpEnv) {
                 if now_secs.saturating_sub(LAST_LOG.load(Ordering::Relaxed)) >= 60 {
                     LAST_LOG.store(now_secs, Ordering::Relaxed);
                     eprintln!(
-                        "[op] FAIL pulse daemon unreachable on {} ({e}). Is `pulse --daemon` running? (suppressing further messages for 60s)",
+                        "[op] FAIL doorward daemon unreachable on {} ({e}). Is `doorward --daemon` running? (suppressing further messages for 60s)",
                         crate::toolchain::config::engine_addr("pulse")
                     );
                 }
@@ -259,17 +259,17 @@ pub async fn handle(env: OpEnv) {
     let timeout = data["timeout"].as_i64().unwrap_or(2000);
     let delay = data["delay"].as_i64().unwrap_or(0).max(0);
     let service_detection = data["service_detection"].as_bool().unwrap_or(true);
-    // Adaptive rate governor: default on. When on, pulse tunes
+    // Adaptive rate governor: default on. When on, doorward tunes
     // concurrency/timeout/retries live from loss+RTT (tasks is
     // just the seed); when off it uses the fixed tasks/timeout.
     let adaptive = data["adaptive"].as_bool().unwrap_or(true);
     let max_concurrency = data["max_concurrency"].as_i64();
     // Posture caps how aggressive the governor may get (stealth |
-    // balanced | throughput). Passed straight through to pulse.
+    // balanced | throughput). Passed straight through to doorward.
     let posture = data["posture"].as_str().unwrap_or("balanced").to_string();
 
     println!(
-        "[op] pulse scan: {} targets, ports={}, {} tasks, delay={}ms, adaptive={} posture={}",
+        "[op] doorward scan: {} targets, ports={}, {} tasks, delay={}ms, adaptive={} posture={}",
         targets.len(),
         ports_value,
         tasks,
@@ -278,7 +278,7 @@ pub async fn handle(env: OpEnv) {
         posture
     );
 
-    let mut pulse_req = serde_json::json!({
+    let mut doorward_req = serde_json::json!({
         "operation": "scan",
         "response": "stream",
         "save": false,
@@ -292,14 +292,14 @@ pub async fn handle(env: OpEnv) {
         "posture": posture,
     });
     if let Some(mc) = max_concurrency {
-        pulse_req["max_concurrency"] = serde_json::json!(mc);
+        doorward_req["max_concurrency"] = serde_json::json!(mc);
     }
 
     let conn = tokio::net::TcpStream::connect(crate::toolchain::config::engine_addr("pulse")).await;
     match conn {
         Ok(stream) => {
             use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-            // RST-close so this per-op connection to pulse doesn't pile
+            // RST-close so this per-op connection to doorward doesn't pile
             // up TIME_WAIT sockets and exhaust ephemeral ports on a big scan.
             // SO_LINGER(0) is an RST close: it returns immediately and is what keeps a
             // full-range scan from exhausting the ephemeral-port pool via TIME_WAIT.
@@ -309,7 +309,7 @@ pub async fn handle(env: OpEnv) {
             #[allow(deprecated)]
             let _ = stream.set_linger(Some(std::time::Duration::ZERO));
             let (reader, mut writer) = stream.into_split();
-            let mut req_str = dguard::encode(&pulse_req);
+            let mut req_str = dguard::encode(&doorward_req);
             req_str.push('\n');
             let _ = writer.write_all(req_str.as_bytes()).await;
 
@@ -348,7 +348,7 @@ pub async fn handle(env: OpEnv) {
                                 .await;
                         }
                         "progress" => {
-                            // Probe-level progress from pulse: forward as
+                            // Probe-level progress from doorward: forward as
                             // operation_progress so the workflow bar can show
                             // "N / total_ports" instead of a coarse per-op count.
                             let processed = event["processed"].as_i64().unwrap_or(0);
@@ -373,7 +373,7 @@ pub async fn handle(env: OpEnv) {
                         }
                         "error" => {
                             let msg = event["message"].as_str().unwrap_or("unknown");
-                            eprintln!("[op] FAIL pulse error: {msg}");
+                            eprintln!("[op] FAIL doorward error: {msg}");
                             break;
                         }
                         _ => {}
@@ -413,7 +413,7 @@ pub async fn handle(env: OpEnv) {
             if now_secs.saturating_sub(LAST_LOG.load(Ordering::Relaxed)) >= 60 {
                 LAST_LOG.store(now_secs, Ordering::Relaxed);
                 eprintln!(
-                    "[op] FAIL Cannot connect to pulse daemon: {e} (suppressing further messages for 60s)"
+                    "[op] FAIL Cannot connect to doorward daemon: {e} (suppressing further messages for 60s)"
                 );
             }
             let msg = serde_json::json!({

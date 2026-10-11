@@ -2,7 +2,7 @@
 //
 // Two kinds of services:
 //
-// 1. Extension daemons (mach, voyage, pulse) - long-lived *per-user* daemons:
+// 1. Extension daemons (ambulo, voyage, doorward) - long-lived *per-user* daemons:
 //      Linux   -> systemd user units      (~/.config/systemd/user, systemctl --user)
 //      macOS   -> launchd user agents     (~/Library/LaunchAgents, launchctl)
 //      Windows -> Task Scheduler tasks    (schtasks, ONLOGON trigger)
@@ -15,7 +15,7 @@
 // Each `imp` exposes the same set of primitives; only the one matching the
 // build target compiles.
 
-use super::EXTENSIONS;
+use super::ENGINES;
 use super::config::is_extension_installed;
 
 pub const NODE_TARGET: &str = "node";
@@ -64,28 +64,103 @@ fn resolve_targets(target: &str) -> Result<Vec<&'static str>, Box<dyn std::error
     }
 }
 
+/// The name an engine's service is registered under on this machine: its public name,
+/// unless only a unit under its legacy name exists, which is a machine the rename has
+/// not been carried to yet. Anything that is not an engine is its own key.
+fn unit_key(ext: &str) -> String {
+    match super::engine(ext) {
+        Some(e) => match e.legacy {
+            Some(old) if !imp::exists(e.name) && imp::exists(old) => old.to_string(),
+            _ => e.name.to_string(),
+        },
+        None => ext.to_string(),
+    }
+}
+
+/// Every name a unit for `ext` may be registered under, public name first.
+fn unit_keys(ext: &str) -> Vec<&str> {
+    match super::engine(ext) {
+        Some(e) => std::iter::once(e.name).chain(e.legacy).collect(),
+        None => vec![ext],
+    }
+}
+
 // ── Public API ────────────────────────────────────────────────────────
 
-/// Register the service for an extension (write unit/plist/task). Called
-/// after install. The service exists but is left disabled until `enable`.
+/// Register the service for an extension (write unit/plist/task) under its public
+/// name. Called after install. The service exists but is left disabled until `enable`.
 pub fn create_service_file(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
     imp::create(ext)
 }
 
-/// Remove the service registration for an extension. Called during `remove`.
+/// Remove the service registration for an extension, under every name it may have.
+/// Called during `remove`.
 pub fn remove_service_file(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
-    imp::delete(ext)
+    for key in unit_keys(ext) {
+        imp::delete(key)?;
+    }
+    Ok(())
 }
 
 /// Human-readable run state of an extension's daemon: running | stopped |
 /// failed | disabled | unknown.
 pub fn daemon_status(ext: &str) -> String {
-    imp::status(ext)
+    imp::status(&unit_key(ext))
 }
 
 /// Best-effort stop used before replacing a binary on reinstall. Never errors.
 pub fn try_stop(ext: &str) {
-    let _ = imp::action("stop", ext);
+    let _ = imp::action("stop", &unit_key(ext));
+}
+
+/// Stop and disable `ext`'s service under every name it may have. Never errors.
+pub fn try_stop_and_disable_all(ext: &str) {
+    for key in unit_keys(ext) {
+        if imp::exists(key) {
+            let _ = imp::action("stop", key);
+            let _ = imp::action("disable", key);
+        }
+    }
+}
+
+/// The systemd user unit directory, where the drop-in directories that
+/// configure an extension's unit live. `None` off Linux.
+pub fn user_unit_dir() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        Some(super::sudo_user::invoking_user_home().join(".config/systemd/user"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// This machine's service manager, as the engine migration drives it.
+pub struct HostUnits;
+
+impl super::migrate::Units for HostUnits {
+    fn exists(&self, key: &str) -> bool {
+        imp::exists(key)
+    }
+    fn stop(&self, key: &str) {
+        let _ = imp::action("stop", key);
+    }
+    fn disable(&self, key: &str) {
+        let _ = imp::action("disable", key);
+    }
+    fn enable(&self, key: &str) {
+        let _ = imp::action("enable", key);
+    }
+    fn start(&self, key: &str) {
+        let _ = imp::action("start", key);
+    }
+    fn remove(&self, key: &str) {
+        let _ = imp::delete(key);
+    }
+    fn create(&self, id: &str) {
+        let _ = imp::create(id);
+    }
 }
 
 pub fn start(target: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -93,7 +168,7 @@ pub fn start(target: &str) -> Result<(), Box<dyn std::error::Error>> {
         if t == NODE_TARGET {
             node::action("start")?;
         } else {
-            imp::action("start", t)?;
+            imp::action("start", &unit_key(t))?;
         }
     }
     Ok(())
@@ -104,7 +179,7 @@ pub fn stop(target: &str) -> Result<(), Box<dyn std::error::Error>> {
         if t == NODE_TARGET {
             node::action("stop")?;
         } else {
-            imp::action("stop", t)?;
+            imp::action("stop", &unit_key(t))?;
         }
     }
     Ok(())
@@ -115,7 +190,7 @@ pub fn restart(target: &str) -> Result<(), Box<dyn std::error::Error>> {
         if t == NODE_TARGET {
             node::action("restart")?;
         } else {
-            imp::action("restart", t)?;
+            imp::action("restart", &unit_key(t))?;
         }
     }
     Ok(())
@@ -126,7 +201,7 @@ pub fn enable(target: &str) -> Result<(), Box<dyn std::error::Error>> {
         if t == NODE_TARGET {
             node::action("enable")?;
         } else {
-            imp::action("enable", t)?;
+            imp::action("enable", &unit_key(t))?;
         }
     }
     Ok(())
@@ -137,7 +212,7 @@ pub fn disable(target: &str) -> Result<(), Box<dyn std::error::Error>> {
         if t == NODE_TARGET {
             node::action("disable")?;
         } else {
-            imp::action("disable", t)?;
+            imp::action("disable", &unit_key(t))?;
         }
     }
     Ok(())
@@ -177,21 +252,22 @@ pub fn list() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    for ext in EXTENSIONS {
-        let installed = is_extension_installed(ext);
-        let has_service = imp::exists(ext);
+    for e in ENGINES {
+        let installed = is_extension_installed(e.id);
+        let key = unit_key(e.id);
+        let has_service = imp::exists(&key);
 
         let status_str = if !installed {
             "-".to_string()
         } else if !has_service {
             "no service".to_string()
         } else {
-            imp::status(ext)
+            imp::status(&key)
         };
 
         let enabled_str = if !installed || !has_service {
             "-".to_string()
-        } else if imp::is_enabled(ext) {
+        } else if imp::is_enabled(&key) {
             "yes".to_string()
         } else {
             "no".to_string()
@@ -199,7 +275,7 @@ pub fn list() -> Result<(), Box<dyn std::error::Error>> {
 
         println!(
             "  {:<12} {:<12} {:<10} {:<10}",
-            ext,
+            e.name,
             if installed { "yes" } else { "no" },
             status_str,
             enabled_str,
@@ -389,8 +465,10 @@ mod imp {
     };
     use std::fs;
 
-    fn service_name(ext: &str) -> String {
-        format!("crossfyre-{ext}.service")
+    /// `key` is the name inside the unit name: an engine's public name, or its
+    /// legacy name for a unit registered before the engine took its current one.
+    fn service_name(key: &str) -> String {
+        format!("crossfyre-{key}.service")
     }
 
     fn unit_dir() -> std::path::PathBuf {
@@ -401,6 +479,7 @@ mod imp {
 
     fn unit_body(ext: &str) -> String {
         let bin = ext_bin_path(ext);
+        let name = super::super::public_name(ext);
         // Daemon port from the host config.toml (defaults to the protocol
         // constant). Baked into ExecStart so a reinstall picks up a changed
         // port; the op-clients and heartbeat read the same source.
@@ -411,7 +490,7 @@ mod imp {
         let egress_env = invoking_user_home().join(".config/crossfyre/egress.env");
         format!(
             "[Unit]\n\
-             Description=Crossfyre {ext} extension daemon\n\
+             Description=Crossfyre {name} extension daemon\n\
              After=network.target\n\
              \n\
              [Service]\n\
@@ -423,7 +502,7 @@ mod imp {
              \n\
              [Install]\n\
              WantedBy=default.target\n",
-            ext = ext,
+            name = name,
             bin = bin.display(),
             egress_env = egress_env.display(),
             port = port,
@@ -432,15 +511,16 @@ mod imp {
 
     pub fn create(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
         let dir = unit_dir();
+        let svc = service_name(super::super::public_name(ext));
         fs::create_dir_all(&dir)?;
-        fs::write(dir.join(service_name(ext)), unit_body(ext))?;
+        fs::write(dir.join(&svc), unit_body(ext))?;
         // Written into the user's home as root - chown it back.
         chown_to_invoking_user(&dir);
         let _ = cmd_as_invoking_user("systemctl")
             .args(["--user", "daemon-reload"])
             .status();
         if !super::quiet() {
-            super::svc_ok(&format!("{} created", service_name(ext)));
+            super::svc_ok(&format!("{svc} created"));
         }
         Ok(())
     }
@@ -528,6 +608,7 @@ mod imp {
     fn plist_body(ext: &str) -> String {
         let bin = ext_bin_path(ext);
         let port = super::super::config::engine_port(ext);
+        let key = super::super::public_name(ext);
         format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
              <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
@@ -548,7 +629,7 @@ mod imp {
              \x20 <true/>\n\
              </dict>\n\
              </plist>\n",
-            label = label(ext),
+            label = label(key),
             bin = bin.display(),
             port = port,
         )
@@ -556,10 +637,11 @@ mod imp {
 
     pub fn create(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
         let dir = agents_dir();
+        let key = super::super::public_name(ext);
         fs::create_dir_all(&dir)?;
-        fs::write(plist_path(ext), plist_body(ext))?;
+        fs::write(plist_path(key), plist_body(ext))?;
         chown_to_invoking_user(&dir);
-        super::svc_ok(&format!("{} created", label(ext)));
+        super::svc_ok(&format!("{} created", label(key)));
         Ok(())
     }
 
@@ -657,13 +739,14 @@ mod imp {
     pub fn create(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
         let bin = ext_bin_path(ext);
         let port = super::super::config::engine_port(ext);
+        let key = super::super::public_name(ext);
         // Quote the path; ONLOGON mirrors systemd --user (starts at user login).
         let tr = format!("\"{}\" --daemon --port {}", bin.display(), port);
         let status = Command::new("schtasks")
             .args([
                 "/Create",
                 "/TN",
-                &task_name(ext),
+                &task_name(key),
                 "/TR",
                 &tr,
                 "/SC",
@@ -675,13 +758,13 @@ mod imp {
             .status()
             .map_err(|e| format!("schtasks failed: {}", e))?;
         if !status.success() {
-            return Err(format!("Failed to create task {}", task_name(ext)).into());
+            return Err(format!("Failed to create task {}", task_name(key)).into());
         }
         // Created enabled by default; disable to mirror "installed, not enabled".
         let _ = Command::new("schtasks")
-            .args(["/Change", "/TN", &task_name(ext), "/DISABLE"])
+            .args(["/Change", "/TN", &task_name(key), "/DISABLE"])
             .status();
-        super::svc_ok(&format!("{} created", task_name(ext)));
+        super::svc_ok(&format!("{} created", task_name(key)));
         Ok(())
     }
 

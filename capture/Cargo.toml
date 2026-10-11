@@ -2,6 +2,8 @@
 name = "cfx_capture"
 version = "0.0.1"
 edition = "2024"
+license.workspace = true
+publish.workspace = true
 description = "Shared traffic-capture core (session CA, per-SNI MITM leaves, egress, per-flow inspect+forward, privacy-safe reduction) for the Web Tracer family: desktop proxy and mobile VpnService netstack."
 
 [dependencies]
@@ -9,7 +11,10 @@ cfx_scope = { path = "../scope" }
 rustls = { version = "0.23", features = ["aws_lc_rs"] }
 tokio-rustls = "0.26"
 rcgen = "0.13"
-tokio = { version = "1.49.0", features = ["net", "io-util", "rt", "macros", "sync"] }
+# `time` for the upstream proxy's handshake deadline: a proxy that accepts the connection
+# and never answers the CONNECT would otherwise hold the flow open for as long as the
+# window is.
+tokio = { version = "1.49.0", features = ["net", "io-util", "rt", "macros", "sync", "time"] }
 hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
@@ -24,6 +29,12 @@ log = "0.4"
 flate2 = "1.1"
 brotli = { version = "8", default-features = false, features = ["std"] }
 zstd = "0.13"
+# One header, Proxy-Authorization, and a hand-rolled encoder for it is the kind of thing
+# that is wrong in one corner and silently refuses every credential.
+base64 = "0.22"
+# Reading the operator's client certificate and key. Already a dev-dependency for the test
+# origin; a client identity makes it a real one.
+rustls-pemfile = "2"
 
 [dev-dependencies]
 flate2 = "1.1"

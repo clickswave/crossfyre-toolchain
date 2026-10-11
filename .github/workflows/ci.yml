@@ -57,7 +57,10 @@ jobs:
         run: |
           set -eu
           leaked=0
-          for p in adaptive-private .cargo/config.toml core/src/egress/private.rs cortex/src/authz/private.rs; do
+          # The authz drop-in sat under cortex/ before 0.1.31; both paths are checked
+          # for one more release.
+          for p in adaptive-private .cargo/config.toml core/src/egress/private.rs \
+                   plessor/src/authz/private.rs cortex/src/authz/private.rs; do
             if git ls-files --error-unmatch "$p" >/dev/null 2>&1; then
               echo "::error file=$p::$p is tracked in git. This is a private \
           drop-in and must never ship in the open repo."
@@ -82,7 +85,8 @@ jobs:
           test -f adaptive/src/lib.rs        || { echo "::error::open adaptive crate missing"; exit 1; }
           test -f core/src/egress/baseline.rs || { echo "::error::open egress baseline missing"; exit 1; }
           test ! -e core/src/egress/private.rs
-          test -f cortex/src/authz/baseline.rs || { echo "::error::open authz baseline missing"; exit 1; }
+          test -f plessor/src/authz/baseline.rs || { echo "::error::open authz baseline missing"; exit 1; }
+          test ! -e plessor/src/authz/private.rs
           test ! -e cortex/src/authz/private.rs
           echo "clean checkout resolves to the open baseline"
 
@@ -129,8 +133,8 @@ jobs:
       - name: Check feature-gated code (tuning)
         run: |
           cargo check --locked --all-targets \
-            -p mach -p voyage -p pulse \
-            --features mach/tuning,voyage/tuning,pulse/tuning
+            -p ambulo -p voyage -p doorward \
+            --features ambulo/tuning,voyage/tuning,doorward/tuning
 
       - name: Test
         run: cargo test --workspace --locked --no-fail-fast
@@ -138,7 +142,7 @@ jobs:
   oracles:
     name: detection regression
     runs-on: ubuntu-latest
-    # mach's daemon mode talks to postgres, so the mach cases need one. Without
+    # ambulo's daemon mode talks to postgres, so the ambulo cases need one. Without
     # it they failed on every run with "Cannot read toolchain config", and
     # because CI only triggers on main they had never run at all: they were
     # written on dev, sat there for two weeks, and first executed on the release
@@ -188,10 +192,10 @@ jobs:
           restore-keys: oracles-${{ runner.os }}-
 
       - name: Build the engines under test
-        run: cargo build --locked -p cortex -p mach
+        run: cargo build --locked -p plessor -p ambulo
 
       - name: Write the toolchain config
-        # mach, pulse and voyage refuse to start in daemon mode without this and
+        # ambulo, doorward and voyage refuse to start in daemon mode without this and
         # tell you to run `crossfyre init`. The CLI that would write it is not
         # in this repo, and standalone terminal use never reads it, so the file
         # is the whole dependency. Matches the postgres service above.
@@ -213,14 +217,14 @@ jobs:
         #
         # NO_SANDBOX because Chrome's setuid sandbox does not work on the hosted
         # runners. Without it the browser is found and then refuses to launch,
-        # mach falls back to static extraction, and the case fails as two
+        # ambulo falls back to static extraction, and the case fails as two
         # missing URLs rather than as the browser problem it is.
         env:
-          MACH_BROWSER_NO_SANDBOX: '1'
+          AMBULO_BROWSER_NO_SANDBOX: '1'
           # The default 20s is marginal here. The same commit launched inside it
           # on one run and missed it on another running at the same time, which
           # reported as a detection regression rather than as a slow machine.
-          MACH_BROWSER_LAUNCH_TIMEOUT_SECS: '90'
+          AMBULO_BROWSER_LAUNCH_TIMEOUT_SECS: '90'
         run: python3 tests/oracles/run.py
 
   fmt:
@@ -272,16 +276,16 @@ jobs:
       - name: clippy (tuning feature)
         run: |
           cargo clippy --locked --all-targets \
-            -p mach -p voyage -p pulse \
-            --features mach/tuning,voyage/tuning,pulse/tuning -- -D warnings
+            -p ambulo -p voyage -p doorward \
+            --features ambulo/tuning,voyage/tuning,doorward/tuning -- -D warnings
 
       # The impersonate feature swaps the engines' HTTP client from reqwest to
       # wreq, so `transport::Error` becomes a different type and anything naming
       # reqwest directly stops compiling. Nothing else here builds that
       # combination, and the only other thing that does is the release script, so
-      # for three weeks from 2026-09-11 `mach` could not be released at all:
+      # for three weeks from 2026-09-11 `ambulo` could not be released at all:
       # `fetch_reason` took a `&reqwest::Error` and the default build resolved it
-      # against mach's own direct reqwest dependency. Found by a release failing,
+      # against ambulo's own direct reqwest dependency. Found by a release failing,
       # which is the wrong way to find it.
       #
       # This builds BoringSSL and is therefore slow. Worth it: the artifacts we
@@ -289,8 +293,8 @@ jobs:
       - name: build (impersonate feature, which is what ships)
         run: |
           cargo build --locked \
-            -p mach -p voyage -p scout -p cortex \
-            --features mach/impersonate,voyage/impersonate,scout/impersonate,cortex/impersonate
+            -p ambulo -p voyage -p toolmark -p plessor \
+            --features ambulo/impersonate,voyage/impersonate,toolmark/impersonate,plessor/impersonate
 
   audit:
     name: dependency advisories
@@ -317,14 +321,14 @@ jobs:
       #     Open since 2023; the fix needs modular exponentiation reworked
       #     upstream and there is no patched release to move to.
       #
-      #     We DO perform the affected operation: cortex/src/oast.rs decrypts the
+      #     We DO perform the affected operation: plessor/src/oast.rs decrypts the
       #     sealed OAST envelope with its own private key (RSA-OAEP), which is
       #     exactly what Marvin times. An earlier version of this comment claimed
       #     we only verify certificates; that was wrong.
       #
       #     It is still ignored, on narrower grounds: recovering the key needs
       #     many chosen ciphertexts AND a precise timing signal from the
-      #     decryption. cortex decrypts locally after polling and returns nothing
+      #     decryption. plessor decrypts locally after polling and returns nothing
       #     timing-bearing to the target, and the keypair is generated per scan
       #     (RsaPrivateKey::new at oast.rs:86), so even a successful recovery
       #     yields a key that is already discarded. Revisit if that key ever

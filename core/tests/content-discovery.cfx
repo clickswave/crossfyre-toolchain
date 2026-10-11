@@ -28,7 +28,7 @@ def find_wordlist():
 
 def run():
     server = cfxs.connect()
-    mach = extensions.get("mach")
+    ambulo = extensions.get("ambulo")
     wordlist = find_wordlist()
     print(f"using wordlist {wordlist}")
 
@@ -47,7 +47,7 @@ def run():
         # scan() raises if the daemon reports an error or stops without
         # finishing, so a scan that did not run cannot look like one that found
         # nothing.
-        events = mach.scan({
+        events = ambulo.scan({
             "endpoint": endpoint,
             "wordlist": wordlist,
             "method": "GET",

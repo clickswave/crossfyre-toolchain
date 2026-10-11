@@ -4,7 +4,7 @@
 //! no handshake and no per-connection state, so **the bind address is the
 //! security boundary**. They used to bind `0.0.0.0`, which put an unauthenticated
 //! command channel on every interface: anyone who could reach the port could
-//! drive a scan, and `mach`'s wordlist parameter is a filesystem path, so they
+//! drive a scan, and `ambulo`'s wordlist parameter is a filesystem path, so they
 //! could also read files off the host one line at a time.
 //!
 //! Loopback is now the default. That costs nothing in the normal deployment,
@@ -224,11 +224,11 @@ pub fn is_error(line: &str) -> bool {
         return false;
     };
     // Two spellings are in the wild. Stream events use `type`, and so do
-    // scout and cortex throughout; `status` is what every pulse reply uses and
-    // what mach and voyage use for their invalid-JSON reply. Both carry the
+    // toolmark and plessor throughout; `status` is what every doorward reply uses and
+    // what ambulo and voyage use for their invalid-JSON reply. Both carry the
     // detail in `message`, so only the discriminator differs. Accept either: a
     // client that understands one of them exits 0 on half the failures, which
-    // is how `pulse exec` reported success on an unknown operation.
+    // is how `doorward exec` reported success on an unknown operation.
     ["type", "status"]
         .iter()
         .filter_map(|k| v.get(*k))
@@ -250,7 +250,7 @@ mod is_error_tests {
 
     #[test]
     fn the_status_spelling_is_recognised_too() {
-        // pulse uses this for every reply, and mach and voyage for invalid JSON.
+        // doorward uses this for every reply, and ambulo and voyage for invalid JSON.
         assert!(is_error(
             r#"{"status":"error","message":"Unknown operation: x"}"#
         ));
@@ -443,7 +443,7 @@ mod wordlist_tests {
 
 /// Wait for a dependency the daemon cannot start without, instead of dying.
 ///
-/// mach, pulse and voyage open Postgres at startup. When the database went away
+/// ambulo, doorward and voyage open Postgres at startup. When the database went away
 /// they exited, systemd restarted them, and they exited again: one host racked
 /// up 2,663 restarts over a day and the only symptom anyone saw was three
 /// engines being "down" with no reason attached. The database being briefly
@@ -529,5 +529,97 @@ mod wait_for_tests {
         })
         .await;
         assert_eq!(got.unwrap_err(), "still down");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Settings whose environment variable was renamed.
+//
+// An engine's user-facing variables carry the engine's name, so renaming an engine
+// renames them. Machines set them in places nobody revisits (systemd drop-ins, shell
+// profiles, CI), and a scanner that silently stops reading one keeps scanning and
+// reports less, which reads as a clean target. So the old name is still read, after
+// the new one, and saying so is the only side effect.
+// ---------------------------------------------------------------------------
+
+/// The value of `new`, or else of `old`, the name the same setting had before. Reading
+/// `old` prints one line to stderr naming `new`, once per variable per process.
+pub fn env_renamed(new: &str, old: &str) -> Option<String> {
+    static NOTICED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let (value, notice) = pick_renamed(new, old, |k| std::env::var(k).ok());
+    if let Some(line) = notice {
+        let mut seen = NOTICED.lock().unwrap_or_else(|p| p.into_inner());
+        if !seen.iter().any(|s| s == old) {
+            seen.push(old.to_string());
+            eprintln!("{line}");
+        }
+    }
+    value
+}
+
+/// The decision behind [`env_renamed`], over any lookup: the value, and the notice to
+/// print when it came from the old name.
+fn pick_renamed(
+    new: &str,
+    old: &str,
+    get: impl Fn(&str) -> Option<String>,
+) -> (Option<String>, Option<String>) {
+    if let Some(v) = get(new) {
+        return (Some(v), None);
+    }
+    match get(old) {
+        Some(v) => (
+            Some(v),
+            Some(format!(
+                "note: {old} is now {new}. The old name is still read for this release; \
+                 set {new} instead."
+            )),
+        ),
+        None => (None, None),
+    }
+}
+
+#[cfg(test)]
+mod env_renamed_tests {
+    use super::pick_renamed;
+
+    fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| {
+            vars.iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn the_new_name_is_read_first_and_says_nothing() {
+        let (v, notice) = pick_renamed("NEW_X", "OLD_X", env(&[("NEW_X", "a"), ("OLD_X", "b")]));
+        assert_eq!(v.as_deref(), Some("a"));
+        assert_eq!(notice, None);
+    }
+
+    #[test]
+    fn the_old_name_still_works_and_names_the_new_one() {
+        let (v, notice) = pick_renamed("NEW_X", "OLD_X", env(&[("OLD_X", "b")]));
+        assert_eq!(v.as_deref(), Some("b"));
+        let notice = notice.expect("reading the old name says so");
+        assert!(
+            notice.contains("OLD_X") && notice.contains("NEW_X"),
+            "{notice}"
+        );
+    }
+
+    #[test]
+    fn neither_set_is_unset() {
+        assert_eq!(pick_renamed("NEW_X", "OLD_X", env(&[])), (None, None));
+    }
+
+    #[test]
+    fn an_empty_new_value_still_wins() {
+        // Set-but-empty is how a person turns a setting off; falling through to the
+        // old name would turn it back on behind their back.
+        let (v, notice) = pick_renamed("NEW_X", "OLD_X", env(&[("NEW_X", ""), ("OLD_X", "b")]));
+        assert_eq!(v.as_deref(), Some(""));
+        assert_eq!(notice, None);
     }
 }

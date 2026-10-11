@@ -17,8 +17,10 @@ object Native {
     external fun setStorageDir(dir: String)
 
     /**
-     * Generate a fresh session CA on-device and return its certificate PEM to install. The private
-     * key stays in native memory and is reused by [startCapture].
+     * Return the device CA's certificate PEM to install, generating the CA on first use. The
+     * certificate and its private key are kept in the directory given to [setStorageDir], the
+     * app's private storage, and reused by [startCapture] and across restarts until the user
+     * resets the certificate.
      */
     external fun generateCaPem(): String
 

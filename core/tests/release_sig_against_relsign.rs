@@ -67,7 +67,7 @@ fn a_manifest_signed_by_relsign_verifies_and_tampering_does_not() {
 
     // Bytes that look like a real manifest, including the nested shape and a sha256, so
     // the thing being signed is representative rather than a toy string.
-    let body = br#"{"components":{"mach":{"version":"0.0.14","artifacts":{"linux-x86_64":{"file":"mach-linux-x86_64-0.0.14-abc123def456.zip","sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}}}}}"#;
+    let body = br#"{"components":{"ambulo":{"version":"0.0.14","artifacts":{"linux-x86_64":{"file":"ambulo-linux-x86_64-0.0.14-abc123def456.zip","sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}}}}}"#;
     std::fs::write(&manifest, body).expect("write manifest");
 
     run(

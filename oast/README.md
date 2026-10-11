@@ -1,8 +1,8 @@
 # oast
 
 An out-of-band interaction server. It answers DNS and HTTP(S) for a domain you
-control and records who called back, so [`cortex`](../cortex/) can confirm blind
-vulnerabilities: cortex plants a unique hostname in a payload, the vulnerable target
+control and records who called back, so [`plessor`](../plessor/) can confirm blind
+vulnerabilities: plessor plants a unique hostname in a payload, the vulnerable target
 resolves or fetches it, and that callback lands here.
 
 Part of the [Crossfyre toolchain](../). This is the same server that backs the hosted
@@ -10,7 +10,7 @@ pool; run your own when you want callbacks on your own domain.
 
 ## Why run your own
 
-cortex talks to the server with Crossfyre's own encrypted register/poll protocol, so
+plessor talks to the server with Crossfyre's own encrypted register/poll protocol, so
 a generic interactsh instance will not work here. The interaction contents are sealed
 to a per-scan key before they are stored, so even you, running the server, only ever
 have ciphertext at rest. The point of self-hosting is control of the domain, not

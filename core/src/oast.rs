@@ -2,7 +2,7 @@
 //! `oast_endpoint_id` (the workspace's selected out-of-band server: "managed" or
 //! "" for the managed pool, a self-hosted endpoint UUID, or "off" to disable OOB).
 //! The node resolves it via the control plane into { domains, api_url } and hands
-//! that to cortex, which registers/polls/decrypts directly (zero-knowledge).
+//! that to plessor, which registers/polls/decrypts directly (zero-knowledge).
 
 use serde_json::{Value, json};
 

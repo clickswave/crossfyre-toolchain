@@ -2,6 +2,8 @@
 name = "dguard"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
+publish.workspace = true
 authors = ["Crossfyre"]
 description = "Inbound listener policy for the Crossfyre engine daemons"
 homepage = "https://crossfyre.io"

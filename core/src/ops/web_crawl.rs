@@ -1,4 +1,4 @@
-//! Web-crawl op: wordlist-free crawl via the mach daemon, streaming
+//! Web-crawl op: wordlist-free crawl via the ambulo daemon, streaming
 //! discovered URLs into the shared asset graph.
 //!
 //! Extracted verbatim from the run_operation() dispatcher in lib.rs.
@@ -19,7 +19,7 @@ pub async fn handle(env: OpEnv) {
         api_key,
     } = env;
 
-    // Wordlist-free crawl via the mach daemon (port 4441),
+    // Wordlist-free crawl via the ambulo daemon (port 4441),
     // streaming discovered URLs into the shared asset graph.
     let seed = data["seed"]
         .as_str()
@@ -60,7 +60,7 @@ pub async fn handle(env: OpEnv) {
     }
 
     // Authenticated crawl: resolve an attached credential into
-    // request auth (headers/cookies) and hand it to mach.
+    // request auth (headers/cookies) and hand it to ambulo.
     if let Some(cid) = data["credential_id"].as_str().filter(|s| !s.is_empty()) {
         let host = target_host(&seed);
         match creds::resolve_auth(&http, &api_url, &api_key, cid, &host).await {
@@ -100,7 +100,7 @@ pub async fn handle(env: OpEnv) {
             while let Ok(Some(line)) = lines.next_line().await {
                 if !workflow_id.is_empty() && is_workflow_cancelled(&workflow_id) {
                     println!(
-                        "[op] web-crawl cancelled (workflow paused/deleted) - stopping mach stream"
+                        "[op] web-crawl cancelled (workflow paused/deleted) - stopping ambulo stream"
                     );
                     drop(lines);
                     drop(writer);
@@ -172,7 +172,7 @@ pub async fn handle(env: OpEnv) {
                     "done" => break,
                     "error" => {
                         eprintln!(
-                            "[op] FAIL mach crawl error: {}",
+                            "[op] FAIL ambulo crawl error: {}",
                             event["message"].as_str().unwrap_or("unknown")
                         );
                         break;
@@ -198,7 +198,7 @@ pub async fn handle(env: OpEnv) {
         }
         Err(e) => {
             eprintln!(
-                "[op] FAIL mach daemon unreachable on {} for crawl ({e}). Is `mach --daemon` running?",
+                "[op] FAIL ambulo daemon unreachable on {} for crawl ({e}). Is `ambulo --daemon` running?",
                 crate::toolchain::config::engine_addr("mach")
             );
             relay.publish_failed().await;

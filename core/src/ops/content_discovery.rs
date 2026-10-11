@@ -1,4 +1,4 @@
-//! Content-discovery op: wordlist-driven path fuzzing via the mach daemon
+//! Content-discovery op: wordlist-driven path fuzzing via the ambulo daemon
 //! (probe + recursive batch modes), streaming found endpoints as results.
 //!
 //! Extracted verbatim from the run_operation() dispatcher in lib.rs.
@@ -41,7 +41,7 @@ pub async fn handle(env: OpEnv) {
             tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
         }
 
-        let mach_req = serde_json::json!({
+        let ambulo_req = serde_json::json!({
             "operation": "probe",
             "response": "instant",
             "url": probe_url,
@@ -59,13 +59,13 @@ pub async fn handle(env: OpEnv) {
             Ok(stream) => {
                 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
                 let (reader, mut writer) = stream.into_split();
-                let mut req_str = dguard::encode(&mach_req);
+                let mut req_str = dguard::encode(&ambulo_req);
                 req_str.push('\n');
                 let _ = writer.write_all(req_str.as_bytes()).await;
 
                 let mut lines = BufReader::new(reader).lines();
-                // Bound the wait. If mach connects but never
-                // answers (target stopped responding, or mach
+                // Bound the wait. If ambulo connects but never
+                // answers (target stopped responding, or ambulo
                 // wedged on this URL), don't deadlock the op
                 // forever - time out and fall through to the
                 // completion ack below so the scan advances.
@@ -104,7 +104,7 @@ pub async fn handle(env: OpEnv) {
                 }
             }
             Err(e) => {
-                eprintln!("[op] FAIL Cannot connect to mach daemon: {e}");
+                eprintln!("[op] FAIL Cannot connect to ambulo daemon: {e}");
             }
         }
 
@@ -133,12 +133,12 @@ pub async fn handle(env: OpEnv) {
         return;
     }
 
-    // Batch/stream mode: full scan via mach
+    // Batch/stream mode: full scan via ambulo
     let url = data["url"].as_str().unwrap_or("");
     let method = data["method"].as_str().unwrap_or("GET");
     let threads = data["threads"].as_i64().unwrap_or(10);
     // Wizard "Follow Redirects" toggle. api_switch puts it on the op, but the
-    // streaming scan request below never forwarded it, so mach fell back to
+    // streaming scan request below never forwarded it, so ambulo fell back to
     // its default (off) and a path that 301s was recorded as a 301 with an
     // empty body instead of following through to the real page.
     let follow_redirects = data["follow_redirects"].as_bool().unwrap_or(false);
@@ -202,7 +202,7 @@ pub async fn handle(env: OpEnv) {
         }
     }
 
-    // Build mach endpoint
+    // Build ambulo endpoint
     // Parse success codes + pacing (shared across recursion levels).
     let codes: Vec<u16> = success_codes_str
         .split(',')
@@ -210,7 +210,7 @@ pub async fn handle(env: OpEnv) {
         .collect();
     let delay = data["delay"].as_i64().unwrap_or(0).max(0);
     // Resume vs fresh: a re-dispatched paused op sets data.resume=true,
-    // so mach RESUMES the chunk (fresh_start=false) instead of re-probing.
+    // so ambulo RESUMES the chunk (fresh_start=false) instead of re-probing.
     let resume = data["resume"].as_bool().unwrap_or(false);
 
     // Recursive discovery (wizard toggle): when a directory is found,
@@ -219,7 +219,7 @@ pub async fn handle(env: OpEnv) {
     // single-pass scan as before (frontier holds one item, none added).
     let recurse = data["recurse"].as_bool().unwrap_or(false);
     let recurse_depth = data["recurse_depth"].as_i64().unwrap_or(0).max(0) as usize;
-    // Adaptive engine flags (default off = current fixed pacing). mach
+    // Adaptive engine flags (default off = current fixed pacing). ambulo
     // reads these and, when set, runs the controller-driven path.
     let adaptive_rate = data["adaptive_rate"].as_bool().unwrap_or(false);
     let adaptive_resilience = data["adaptive_resilience"].as_bool().unwrap_or(false);
@@ -229,7 +229,7 @@ pub async fn handle(env: OpEnv) {
     // (rate self-adaptation off) while each chunk still adapts resilience.
     let cd_host = target_host(url);
     // Coverage-first, feedback-driven concurrency. A CD workflow runs many
-    // chunks concurrently, each a mach scan, so an unbounded per-chunk
+    // chunks concurrently, each an ambulo scan, so an unbounded per-chunk
     // `tasks` would multiply the combined volume against one target well
     // past a healthy range and start dropping findings. The shared pace
     // starts from the posture seed and adapts toward safety as the engine
@@ -295,7 +295,7 @@ pub async fn handle(env: OpEnv) {
     // sitting at a fixed 99%.
     let mut probes_done: i64 = 0;
     let mut probes_total: i64 = chunk_total.max(0);
-    let mut probes_tested: i64 = 0; // requests sent incl. retries (reported by mach)
+    let mut probes_tested: i64 = 0; // requests sent incl. retries (reported by ambulo)
     let mut last_prog = std::time::Instant::now();
 
     // Frontier of (base_url, depth). Level 0 = the assigned target.
@@ -307,7 +307,7 @@ pub async fn handle(env: OpEnv) {
     visited.insert(base0);
 
     // Authenticated content discovery: resolve the attached credential ONCE
-    // (host is fixed for this op) into request auth mach applies to every
+    // (host is fixed for this op) into request auth ambulo applies to every
     // probe. Resolved here rather than per recursion level so the credential
     // is fetched a single time and every level of the crawl is authenticated
     // the same way. A resolve failure logs and falls through to an
@@ -331,7 +331,7 @@ pub async fn handle(env: OpEnv) {
     let mut cancelled = false;
 
     while let Some((base, depth)) = frontier.pop_front() {
-        // Build the mach endpoint for this level.
+        // Build the ambulo endpoint for this level.
         let endpoint = if base.contains("::FUZZ::") {
             base.clone()
         } else {
@@ -346,10 +346,10 @@ pub async fn handle(env: OpEnv) {
         };
 
         println!(
-            "[op] mach scan (depth {depth}): {endpoint} method={method} threads={threads} delay={delay}ms wordlist={level_wordlist} mode={mode}"
+            "[op] ambulo scan (depth {depth}): {endpoint} method={method} threads={threads} delay={delay}ms wordlist={level_wordlist} mode={mode}"
         );
 
-        let mut mach_req = serde_json::json!({
+        let mut ambulo_req = serde_json::json!({
             "operation": "scan",
             "response": "stream",
             "endpoint": endpoint,
@@ -364,7 +364,7 @@ pub async fn handle(env: OpEnv) {
             "success_status_codes": codes.clone(),
             "fresh_start": !resume,
             "follow_redirects": follow_redirects,
-            // The pace owns the rate now, so mach doesn't self-adapt it; it
+            // The pace owns the rate now, so ambulo doesn't self-adapt it; it
             // still runs the adaptive path for resilience when enabled.
             "adaptive_rate": false,
             "adaptive_resilience": adaptive_resilience,
@@ -372,8 +372,8 @@ pub async fn handle(env: OpEnv) {
         });
 
         // Attach the resolved credential (headers + cookies) when present, so
-        // mach probes every path as the authenticated user.
-        if let (Some(auth), Some(obj)) = (cd_auth.as_ref(), mach_req.as_object_mut()) {
+        // ambulo probes every path as the authenticated user.
+        if let (Some(auth), Some(obj)) = (cd_auth.as_ref(), ambulo_req.as_object_mut()) {
             obj.insert("auth".into(), auth.clone());
         }
 
@@ -383,7 +383,7 @@ pub async fn handle(env: OpEnv) {
             Ok(stream) => {
                 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
                 let (reader, mut writer) = stream.into_split();
-                let mut req_str = dguard::encode(&mach_req);
+                let mut req_str = dguard::encode(&ambulo_req);
                 req_str.push('\n');
                 let _ = writer.write_all(req_str.as_bytes()).await;
 
@@ -393,7 +393,7 @@ pub async fn handle(env: OpEnv) {
                     // Honor pause / halt / delete promptly (checked per probe event).
                     if !workflow_id.is_empty() && is_workflow_cancelled(&workflow_id) {
                         println!(
-                            "[op] content-discovery cancelled (workflow paused/deleted) - stopping mach stream"
+                            "[op] content-discovery cancelled (workflow paused/deleted) - stopping ambulo stream"
                         );
                         cancelled = true;
                         break;
@@ -409,7 +409,7 @@ pub async fn handle(env: OpEnv) {
                         if let Some(t) = event["tested"].as_i64() {
                             probes_tested = t.max(probes_tested);
                         }
-                        // mach's "ack" carries the real entry count it will probe.
+                        // ambulo's "ack" carries the real entry count it will probe.
                         // Seed the total from it when the op didn't pre-set
                         // wordlist_lines, so the progress
                         // bar shows real probes instead of a 0/1 op fallback.
@@ -443,7 +443,7 @@ pub async fn handle(env: OpEnv) {
                                 found_count += 1;
                                 let found_url = event["url"].as_str().unwrap_or(url).to_string();
                                 let code = event["code"].as_i64().unwrap_or(0);
-                                // Present only when mach followed a redirect
+                                // Present only when ambulo followed a redirect
                                 // to a different URL; carried through so the UI
                                 // can show "requested -> final".
                                 let final_url = event["final_url"].as_str();
@@ -494,7 +494,7 @@ pub async fn handle(env: OpEnv) {
                             }
                             "error" => {
                                 let msg = event["message"].as_str().unwrap_or("unknown error");
-                                eprintln!("[op] FAIL mach error: {msg}");
+                                eprintln!("[op] FAIL ambulo error: {msg}");
                                 break;
                             }
                             _ => {} // ack, progress, not_found - skip
@@ -545,7 +545,7 @@ pub async fn handle(env: OpEnv) {
                     .await;
             }
             Err(e) => {
-                eprintln!("[op] FAIL Cannot connect to mach daemon: {e}");
+                eprintln!("[op] FAIL Cannot connect to ambulo daemon: {e}");
                 let msg = serde_json::json!({
                     "type": "completed",
                     "job_id": format!("{}-{}", workflow_id, op_id),

@@ -10,7 +10,7 @@
 //! policy. Keep the public type/function signatures stable so the private
 //! implementation stays a clean drop-in.
 //!
-//! Pure logic, no I/O, a workflow engine (mach content-discovery, the DS
+//! Pure logic, no I/O, a workflow engine (ambulo content-discovery, the DS
 //! fan-out in `cfx_core`, future scanners) feeds it probe outcomes and asks it,
 //! on a tick, how many probes to run concurrently, how long to wait between
 //! them, and whether a failed probe is worth retrying.

@@ -7,7 +7,7 @@
 
 use super::config::get_toolchain_dir;
 use super::sudo_user::cmd_as_invoking_user;
-use super::{EXTENSIONS, install, service};
+use super::{ENGINES, EXTENSIONS, install, service};
 use std::path::Path;
 
 pub fn run(purge: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -40,6 +40,19 @@ pub fn run(purge: bool) -> Result<(), Box<dyn std::error::Error>> {
     section("Services");
     for ext in EXTENSIONS {
         let _ = install::remove(ext);
+    }
+    // Drop-in directories beside the units, under the public name and the legacy
+    // one. `remove` leaves them, since a person wrote them and a reinstall wants
+    // them back; uninstalling everything is the moment they go too.
+    if let Some(dir) = service::user_unit_dir() {
+        for e in ENGINES {
+            for key in std::iter::once(e.name).chain(e.legacy) {
+                let d = dir.join(format!("crossfyre-{key}.service.d"));
+                if d.is_dir() && std::fs::remove_dir_all(&d).is_ok() {
+                    ok(&format!("Removed {}", d.display()));
+                }
+            }
+        }
     }
     let _ = service::remove_node_service();
 
