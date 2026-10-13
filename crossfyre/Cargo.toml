@@ -1,6 +1,6 @@
 [package]
 name = "crossfyre"
-version = "0.1.31"
+version = "0.1.32"
 edition = "2024"
 license.workspace = true
 publish.workspace = true
