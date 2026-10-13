@@ -95,7 +95,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "ambulo"
-version = "0.0.15"
+version = "0.0.16"
 dependencies = [
  "adaptive",
  "base64 0.22.1",
@@ -1420,7 +1420,7 @@ dependencies = [
 
 [[package]]
 name = "doorward"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "adaptive",
  "cfx_tui",
@@ -3370,7 +3370,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "plessor"
-version = "0.0.23"
+version = "0.0.24"
 dependencies = [
  "adaptive",
  "aes-gcm",
@@ -5282,7 +5282,7 @@ checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
 name = "toolmark"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "adaptive",
  "base64 0.22.1",
