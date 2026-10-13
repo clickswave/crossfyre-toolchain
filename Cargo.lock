@@ -629,7 +629,7 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
 name = "cfx-script"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cfx_core",
  "dguard",
@@ -1110,7 +1110,7 @@ checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 
 [[package]]
 name = "crossfyre"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "cfx_core",
  "clap",
@@ -2892,7 +2892,7 @@ dependencies = [
 
 [[package]]
 name = "node"
-version = "0.1.41"
+version = "0.1.42"
 dependencies = [
  "cfx_core",
  "clap",
@@ -5621,7 +5621,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voyage"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "adaptive",
  "cfx_tui",
