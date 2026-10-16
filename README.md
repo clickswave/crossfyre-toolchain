@@ -10,7 +10,7 @@
 
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-1f6feb.svg)](LICENSE)
 [![Made with Rust](https://img.shields.io/badge/made%20with-Rust-b7410e.svg)](https://www.rust-lang.org)
-![Platforms](https://img.shields.io/badge/platforms-Linux%20%C2%B7%20macOS%20%C2%B7%20Windows-444.svg)
+![Platform](https://img.shields.io/badge/platform-Linux-444.svg)
 [![Discord](https://img.shields.io/badge/discord-join-5865F2.svg)](https://discord.gg/cPccst2Vr6)
 
 </div>
@@ -78,19 +78,15 @@ The old names stay where a value is stored or sent between a node and the platfo
 
 ### Install
 
-Linux and macOS:
+On Linux, x86_64:
 
 ```sh
 curl -fsSL https://get.crossfyre.io/install.sh | sudo bash
 ```
 
-Windows (PowerShell):
+No macOS or Windows build is published. On Windows, run `wsl --install` and then the line above inside WSL 2. On a Mac, install on a Linux host or a Linux virtual machine instead.
 
-```powershell
-irm https://get.crossfyre.io/install.ps1 | iex
-```
-
-Prebuilt binaries for each release are on the [Releases](../../releases) page, or [build from source](#building-from-source).
+The installer and `bins.crossfyre.io` ship the first-party build. The [Releases](../../releases) page of this repository carries the open build for Linux x86_64 and aarch64, compiled by GitHub Actions from each tag. The open build has no authorization oracle, no per-node egress isolation, untuned pacing, and no `impersonate` feature (see [`transport`](transport/)). You can also [build from source](#building-from-source), which gives you the open build too.
 
 ### Run something
 
