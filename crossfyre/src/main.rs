@@ -539,16 +539,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 email,
                 no_tls,
             } => {
-                let exe = std::env::current_exe()?;
-                cfx_core::toolchain::oast::setup(
-                    &exe,
-                    cfx_core::toolchain::oast::SetupOpts {
-                        domain,
-                        public_ip,
-                        email,
-                        no_tls,
-                    },
-                )
+                cfx_core::toolchain::oast::setup(cfx_core::toolchain::oast::SetupOpts {
+                    domain,
+                    public_ip,
+                    email,
+                    no_tls,
+                })
                 .await?;
             }
             OastAction::Serve {

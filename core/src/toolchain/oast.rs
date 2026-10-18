@@ -155,8 +155,12 @@ fn print_delegation(domain: &str, ip: &str) {
     hint("Delegation can take a few minutes to propagate.");
 }
 
-pub async fn setup(exe: &Path, opts: SetupOpts) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn setup(opts: SetupOpts) -> Result<(), Box<dyn std::error::Error>> {
     require_root()?;
+    // cf-oast.service runs the CLI as root, so it names the installed copy (or the
+    // packaged CLI where its package put it) and only one that root alone can replace.
+    let exe = super::install::ensure_self_installed()?;
+    super::service::root_may_run(&exe)?;
     let domain = opts.domain.trim().trim_matches('.').to_ascii_lowercase();
     if domain.split('.').count() < 2 {
         return Err("--domain must be a delegated zone like oob.example.com".into());
@@ -174,7 +178,7 @@ pub async fn setup(exe: &Path, opts: SetupOpts) -> Result<(), Box<dyn std::error
     std::fs::create_dir_all(format!("{LEGO_PATH}/certificates"))?;
     let _ = std::fs::write(ACME_TXT, "");
     write_env(&domain, &ip)?;
-    write_unit(exe)?;
+    write_unit(&exe)?;
     systemctl(&["daemon-reload"]);
     systemctl(&["enable", "cf-oast"]);
     systemctl(&["restart", "cf-oast"]);

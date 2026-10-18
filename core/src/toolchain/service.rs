@@ -93,6 +93,11 @@ pub fn create_service_file(ext: &str) -> Result<(), Box<dyn std::error::Error>> 
     imp::create(ext)
 }
 
+/// Is a service registered for an extension, under any name it may have?
+pub fn has_service_file(ext: &str) -> bool {
+    unit_keys(ext).into_iter().any(imp::exists)
+}
+
 /// Remove the service registration for an extension, under every name it may have.
 /// Called during `remove`.
 pub fn remove_service_file(ext: &str) -> Result<(), Box<dyn std::error::Error>> {

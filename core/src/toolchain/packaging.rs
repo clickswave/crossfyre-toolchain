@@ -355,10 +355,27 @@ pub fn named_cli() -> Option<&'static Path> {
     CLI.get().map(PathBuf::as_path)
 }
 
+// What a test on this thread has the process find instead. Per thread, because tests run
+// side by side and most of them want none.
+#[cfg(test)]
+thread_local! {
+    static PRETEND: std::cell::Cell<Option<&'static Found>> = const { std::cell::Cell::new(None) };
+}
+
+/// Have this thread find `found`, for a test of what a packaged install does.
+#[cfg(test)]
+pub(crate) fn pretend(found: Found) {
+    PRETEND.with(|p| p.set(Some(Box::leak(Box::new(found)))));
+}
+
 /// What this process found: from the CLI named by `set_cli` if there is one, and
 /// otherwise from the running executable. A file that is there but cannot be used is
 /// reported once, on stderr.
 pub fn found() -> &'static Found {
+    #[cfg(test)]
+    if let Some(f) = PRETEND.with(|p| p.get()) {
+        return f;
+    }
     CURRENT.get_or_init(|| {
         let anchor = match CLI.get() {
             Some(p) => p.clone(),

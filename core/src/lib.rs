@@ -2420,11 +2420,15 @@ pub async fn run_daemon(force: bool, paths: &NodePaths) -> Result<(), Box<dyn st
                         std::time::Duration::from_millis(200),
                     ).is_ok();
 
-                    serde_json::json!({
+                    let mut status = serde_json::json!({
                         "installed": true,
                         "version": format!("crossfyre {}", env!("CARGO_PKG_VERSION")),
                         "postgres": { "port": pg_port, "running": pg_running }
-                    })
+                    });
+                    if let Some(m) = crate::toolchain::packaging::owner("crossfyre") {
+                        status["managed_by"] = serde_json::json!(m.name());
+                    }
+                    status
                 };
 
                 let host_status = if first_tick {
@@ -2784,21 +2788,28 @@ pub async fn run_daemon(force: bool, paths: &NodePaths) -> Result<(), Box<dyn st
                                 println!("\n[update] Updating crossfyre from the release manifest...");
                                 let updated = toolchain::install::update_for_dashboard().await;
 
-                                let (success, restarting) = match &updated {
-                                    Ok(true) => (true, true),
-                                    Ok(false) => (true, false), // already current
+                                let (success, restarting, managed_by) = match &updated {
+                                    Ok(u) => (true, u.restart, u.cli_managed_by),
                                     Err(e) => {
                                         eprintln!("[update] FAIL {e}");
-                                        (false, false)
+                                        (false, false, None)
                                     }
                                 };
 
-                                let msg = serde_json::json!({
+                                let mut msg = serde_json::json!({
                                     "type": "node_updated",
                                     "success": success,
                                     "restarting": restarting,
                                     "node_id": &node_id
                                 });
+                                // A package manager keeps the CLI here, so "already up to
+                                // date" would not be the whole story: say which one.
+                                if let Some(m) = managed_by {
+                                    msg["managed_by"] = serde_json::json!(m.name());
+                                    msg["message"] = serde_json::json!(
+                                        toolchain::packaging::update_note(m)
+                                    );
+                                }
                                 let _ = publisher.publish(status_subject.clone(), msg.to_string().into()).await;
 
                                 if restarting {
