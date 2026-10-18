@@ -95,7 +95,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "ambulo"
-version = "0.0.16"
+version = "0.0.17"
 dependencies = [
  "adaptive",
  "base64 0.22.1",
@@ -629,7 +629,7 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
 name = "cfx-script"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "cfx_core",
  "dguard",
@@ -1111,7 +1111,7 @@ checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 
 [[package]]
 name = "crossfyre"
-version = "0.1.32"
+version = "0.1.33"
 dependencies = [
  "cfx_core",
  "clap",
@@ -2893,7 +2893,7 @@ dependencies = [
 
 [[package]]
 name = "node"
-version = "0.1.42"
+version = "0.1.43"
 dependencies = [
  "cfx_core",
  "clap",
@@ -3371,7 +3371,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "plessor"
-version = "0.0.24"
+version = "0.0.25"
 dependencies = [
  "adaptive",
  "aes-gcm",
@@ -5283,7 +5283,7 @@ checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
 name = "toolmark"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "adaptive",
  "base64 0.22.1",
@@ -5625,7 +5625,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voyage"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "adaptive",
  "cfx_tui",
