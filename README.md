@@ -70,7 +70,7 @@ Four engines took new names in 0.1.31:
 | `toolmark` | `scout` |
 | `plessor` | `cortex` |
 
-The first `crossfyre update` or `crossfyre node init` after upgrading moves an existing install over: it stops the old service, moves the binary and any systemd drop-in directory, and starts the service under the new name. The old commands keep working through links until the next release, and so do the old environment variables (`CORTEX_OAST_DOMAIN`, `MACH_BROWSER` and the rest), with a notice naming the new one. `crossfyre extension install cortex` keeps working for good.
+The first `crossfyre update` or `crossfyre node init` after upgrading moves an existing install over: it stops the old service, moves the binary and any systemd drop-in directory, and starts the service under the new name. 0.1.31 and 0.1.32 also left a link under each old name, so the old commands kept running the engines. 0.1.33 makes no link and removes the ones those releases left, so `mach`, `pulse`, `scout` and `cortex` are no longer commands. The old environment variables (`CORTEX_OAST_DOMAIN`, `MACH_BROWSER` and the rest) still work, with a notice naming the new one, and `crossfyre extension install cortex` keeps working for good.
 
 The old names stay where a value is stored or sent between a node and the platform, because they are identifiers rather than names: the engine ids, a finding's `source` (`mach`, `scout`, `scout-cve`, `scout-services`), finding tool ids such as `cortex-inject`, template ids such as `cortex:waf-challenge`, and the local scan databases `mach` and `pulse`.
 
@@ -146,6 +146,8 @@ Install a single engine straight from the repo:
 ```sh
 cargo install --git https://github.com/clickswave/crossfyre-toolchain.git ambulo
 ```
+
+Both give you the open build, the one the [Releases](../../releases) page carries. The authorization oracle, the egress isolation and the tuned pacing are not in this repository, and the `impersonate` feature is off unless you build with it.
 
 ## Responsible use
 

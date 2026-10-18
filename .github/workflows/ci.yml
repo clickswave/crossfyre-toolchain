@@ -296,6 +296,46 @@ jobs:
             -p ambulo -p voyage -p toolmark -p plessor \
             --features ambulo/impersonate,voyage/impersonate,toolmark/impersonate,plessor/impersonate
 
+  impersonate-aarch64:
+    name: build (impersonate feature, aarch64)
+    runs-on: ubuntu-24.04-arm
+    # The same build as the last step of the clippy job, on arm64. BoringSSL is compiled
+    # for each target, so a break in this feature that only arm64 shows would otherwise
+    # first appear in an arm64 release build.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust and the BoringSSL build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup toolchain install 1.88.0 --profile minimal --no-self-update
+          rustup default 1.88.0
+          rustc --version && cargo --version
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: impersonate-arm-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: impersonate-arm-${{ runner.os }}-
+
+      - name: build (impersonate feature, aarch64)
+        run: |
+          cargo build --locked \
+            -p ambulo -p voyage -p toolmark -p plessor \
+            --features ambulo/impersonate,voyage/impersonate,toolmark/impersonate,plessor/impersonate
+
   audit:
     name: dependency advisories
     runs-on: ubuntu-latest

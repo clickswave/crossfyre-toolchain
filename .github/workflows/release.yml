@@ -54,11 +54,8 @@ jobs:
         run: |
           set -euo pipefail
           fail=0
-          # The authz drop-in sat under cortex/ before 0.1.31; both paths are checked
-          # for one more release.
           for p in adaptive-private .cargo/config.toml \
-                   core/src/egress/private.rs plessor/src/authz/private.rs \
-                   cortex/src/authz/private.rs; do
+                   core/src/egress/private.rs plessor/src/authz/private.rs; do
             if [ -e "$p" ]; then
               echo "::error::$p is present in a clean checkout of this tag"
               fail=1
@@ -189,18 +186,24 @@ jobs:
             ## What this is not
 
             This is **not** the binary `get.crossfyre.io` installs. The repo is
-            open-core, and three things are absent from any public checkout:
+            open-core: three things are absent from any public checkout, and
+            one feature that is in it is not turned on here.
 
-            | absent | effect on this build |
+            | not in this build | effect on this build |
             |---|---|
             | `plessor/src/authz/private.rs` | no BOLA/BFLA/BOPLA authorization oracle |
             | `core/src/egress/private.rs` | no per-node egress isolation |
             | `adaptive-private/` | untuned pacing, not the shipped governor |
+            | the `impersonate` feature | the engines use rustls, not a browser's TLS and HTTP/2 fingerprint |
 
             `build.rs` selects the `baseline.rs` stubs instead. The distributed
             binary includes the real implementations and cannot be reproduced
             from this source. That difference is the point of publishing this
             separately rather than pretending the two are the same artifact.
+
+            This release also carries a standalone `oast` binary, the
+            out-of-band interaction server. The first-party CLI runs the same
+            server as `crossfyre oast serve`.
 
             ## Verifying it
 
