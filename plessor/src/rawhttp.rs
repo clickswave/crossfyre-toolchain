@@ -489,8 +489,14 @@ async fn send_tls(
         b.set_verify(SslVerifyMode::NONE);
     }
     b.set_grease_enabled(true);
+    // The TLS 1.3 suites have to be named here. The BoringSSL that boring2 builds
+    // takes them from this list like any other suite, where stock BoringSSL adds
+    // them on its own, so a list without them offers TLS 1.3 in
+    // supported_versions with no suite to use it, and a TLS 1.3 server ends the
+    // handshake at the ClientHello.
     let _ = b.set_cipher_list(
-        "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:\
+        "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:\
+         ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:\
          ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:\
          ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:\
          ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA:AES128-GCM-SHA256:\
