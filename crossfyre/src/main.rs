@@ -436,6 +436,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     api_url,
                     agree_tos,
                     no_prompt,
+                    cli_version: env!("CARGO_PKG_VERSION").to_string(),
                 },
             )
             .await?;
