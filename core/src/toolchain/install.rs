@@ -921,13 +921,15 @@ pub async fn self_update(
     }
 
     let exe = std::env::current_exe()?;
-    place_binary(&extracted, &exe)?;
-
+    let stable = get_bin_dir().join(ext_file_name("crossfyre"));
+    let mut targets = cli_targets(&exe, &stable).into_iter();
+    if let Some(first) = targets.next() {
+        place_binary(&extracted, &first)?;
+    }
     // Keep the stable /opt path in sync too, in case the process was started
     // from somewhere else (e.g. a dev checkout).
-    let stable = get_bin_dir().join(ext_file_name("crossfyre"));
-    if stable != exe {
-        let _ = place_binary(&extracted, &stable);
+    for also in targets {
+        let _ = place_binary(&extracted, &also);
     }
 
     // Record the installed CLI version (mirrors node.version). The next update -
@@ -942,6 +944,23 @@ pub async fn self_update(
         );
     }
     Ok(true)
+}
+
+/// Where an update of the CLI is written, in order: over the running binary when that
+/// is the CLI, then at the stable path in the bin directory. The node daemon runs this
+/// for the dashboard's update too, and there the running binary is the node worker.
+/// Writing the CLI over it left a unit that ran `crossfyre supervise`, which exits with
+/// a usage error, so the node restarted into the same failure every few seconds and
+/// stayed offline, while node.version still said it was current.
+fn cli_targets(exe: &Path, stable: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if exe.file_name() == stable.file_name() {
+        out.push(exe.to_path_buf());
+    }
+    if !out.iter().any(|p| p == stable) {
+        out.push(stable.to_path_buf());
+    }
+    out
 }
 
 /// The crossfyre CLI version recorded on disk by `self_update`. Empty when never
@@ -1376,6 +1395,23 @@ mod tests {
             !s.join("bin").join("ambulo.new").exists(),
             "nothing is left staged next to the destination"
         );
+    }
+
+    #[test]
+    fn the_dashboard_update_writes_the_cli_beside_the_node_and_never_over_it() {
+        let stable = Path::new("/opt/crossfyre/bin/crossfyre");
+        // The node daemon runs the dashboard's update, and its own binary is the worker.
+        assert_eq!(
+            cli_targets(Path::new("/opt/crossfyre/bin/node"), stable),
+            [stable.to_path_buf()]
+        );
+        // The CLI run from a checkout updates itself and the installed copy.
+        let dev = Path::new("/home/op/src/target/release/crossfyre");
+        assert_eq!(
+            cli_targets(dev, stable),
+            [dev.to_path_buf(), stable.to_path_buf()]
+        );
+        assert_eq!(cli_targets(stable, stable), [stable.to_path_buf()]);
     }
 
     #[test]
