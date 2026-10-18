@@ -1547,6 +1547,9 @@ pub async fn run_init(
     // orion services and binaries don't fight the new ones.
     toolchain::uninstall::cleanup_legacy_orionchain();
     toolchain::migrate::renamed_engines();
+    // An older installer put the bin directory at the front of PATH, where its `node`
+    // hides Node.js.
+    toolchain::rcfile::fix_for_invoking_user();
 
     // Put the crossfyre binary at its stable path so OS services have a
     // fixed ExecStart (no-op when already running from /opt/crossfyre/bin, or

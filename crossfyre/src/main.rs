@@ -619,12 +619,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
         }
         Commands::Update { target, force } => {
-            let self_updated = cfx_core::toolchain::install::update(
+            let updated = cfx_core::toolchain::install::update(
                 target.as_deref(),
                 env!("CARGO_PKG_VERSION"),
                 force,
             )
-            .await?;
+            .await;
+            // Here and in `node init` only, both run by a person: the node's own update
+            // runs as a root service and leaves a home directory alone.
+            cfx_core::toolchain::rcfile::fix_for_invoking_user();
+            let self_updated = updated?;
             if self_updated && cfx_core::toolchain::service::node_service_exists() {
                 step("Restarting the node service to pick up the new binary...");
                 let _ = cfx_core::toolchain::service::restart(
