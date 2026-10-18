@@ -9,6 +9,7 @@ mod wire;
 
 use std::time::Duration;
 
+use transport::HeaderValue;
 use wire::{ClientHello, Encoding, H2Preface, Origin};
 
 // The identity User-Agents the engines pass. They only pick the family: the
@@ -380,6 +381,70 @@ async fn http1_requests_keep_the_profile_order() {
         ]
     );
     assert_eq!(seen.body, wire::BODY);
+}
+
+#[tokio::test]
+async fn cookies_go_where_each_browser_writes_them() {
+    // plessor sends a challenge clearance and a credential's cookies as app
+    // headers. Captures with cookies set put Cookie after accept-language in
+    // Chrome, after accept-encoding in Firefox, and last in Safari (see
+    // src/emulation.rs), and the header blocks here have to agree.
+    let chrome: &[&str] = &[
+        "sec-ch-ua",
+        "sec-ch-ua-mobile",
+        "sec-ch-ua-platform",
+        "upgrade-insecure-requests",
+        "user-agent",
+        "accept",
+        "sec-fetch-site",
+        "sec-fetch-mode",
+        "sec-fetch-user",
+        "sec-fetch-dest",
+        "accept-encoding",
+        "accept-language",
+        "cookie",
+        "priority",
+    ];
+    let firefox: &[&str] = &[
+        "user-agent",
+        "accept",
+        "accept-language",
+        "accept-encoding",
+        "cookie",
+        "upgrade-insecure-requests",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "sec-fetch-user",
+        "priority",
+        "te",
+    ];
+    let safari: &[&str] = &[
+        "sec-fetch-dest",
+        "user-agent",
+        "accept",
+        "sec-fetch-site",
+        "sec-fetch-mode",
+        "accept-language",
+        "priority",
+        "accept-encoding",
+        "cookie",
+    ];
+    for (identity, want) in [
+        (CHROME_IDENTITY, chrome),
+        (FIREFOX_IDENTITY, firefox),
+        (SAFARI_IDENTITY, safari),
+    ] {
+        let mut config = emulating(identity);
+        config.extra_headers.insert(
+            transport::header::COOKIE,
+            HeaderValue::from_static("cf_clearance=c; session=s"),
+        );
+        let seen = fetch_with(config, H2_AND_H1, Encoding::Identity).await;
+        let h2 = seen.h2();
+        assert_eq!(h2.header_names(), want, "{identity}");
+        assert_eq!(h2.header("cookie"), Some("cf_clearance=c; session=s"));
+    }
 }
 
 #[tokio::test]

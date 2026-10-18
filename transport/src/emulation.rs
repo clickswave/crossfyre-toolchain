@@ -16,10 +16,14 @@
 //!
 //! The newest Chrome cannot be matched. Chrome 149 and later put ML-DSA-44, -65
 //! and -87 first in signature_algorithms, and Chrome 152 and later also GREASE
-//! that list; the BoringSSL that boring2 4.15 builds can do neither. So the
-//! Chrome and Edge profiles are Chrome 148, the newest release whose ClientHello
-//! this library reproduces, and they send Chrome 148's User-Agent so the two
-//! agree. Firefox 158 and Safari 26 are reproduced as they ship.
+//! that list and send Trust Anchor IDs (0xca34); the BoringSSL that boring2 4.15
+//! builds can do none of that. So the Chrome and Edge profiles are Chrome 148,
+//! the newest release whose ClientHello this library reproduces, and they send
+//! Chrome 148's User-Agent so the two agree. Chrome 148 reached Stable on
+//! 2026-04-23 and Stable was at 156 by 2026-10-15, so following it again needs
+//! a newer wreq and BoringSSL that can send those extensions; until then these
+//! two profiles stay at 148. Firefox 158 and Safari 26 on macOS 26 are
+//! reproduced as they ship.
 
 use wreq::header::{HeaderMap, HeaderName, HeaderValue};
 use wreq::{
@@ -89,7 +93,12 @@ impl Browser {
     }
 
     /// The order the browser writes its request headers in. A header not named
-    /// here goes after these, in the order it was added.
+    /// here goes after these; wreq's sort takes the named ones out with
+    /// swap_remove, so the rest do not keep the order they were added in.
+    ///
+    /// Cookie, which the engines send as an app header, has the place each
+    /// browser gives it. Over HTTP/2 the browsers send each cookie as a field of
+    /// its own, and this client sends one Cookie field.
     pub(crate) fn header_order(self) -> &'static [HeaderName] {
         match self {
             Browser::Chrome | Browser::Edge => &CHROMIUM_HEADER_ORDER,
@@ -110,6 +119,16 @@ impl Browser {
     /// case, where this client would otherwise write them in lower case.
     /// Chromium's `sec-ch-ua*` names, which it keeps in lower case, come out as
     /// `Sec-Ch-Ua*` over HTTP/1.1; HTTP/2 sends every name in lower case.
+    ///
+    /// The profiles are made for HTTP/2, and over HTTP/1.1 they part from the
+    /// browsers in ways wreq 5 gives no setting for:
+    ///   * Host goes last, because wreq adds it after the order is applied.
+    ///     Browsers write it first.
+    ///   * No profile sends `Connection: keep-alive`, which all three browsers
+    ///     send over HTTP/1.1.
+    ///   * Firefox's `TE: trailers` goes out over HTTP/1.1 too, since the
+    ///     default headers are the same for both protocols. Firefox sends it
+    ///     only over HTTP/2.
     pub(crate) fn http1(self) -> Http1Config {
         Http1Config::builder().title_case_headers(true).build()
     }
@@ -208,10 +227,19 @@ const fn extension_order<const N: usize>(order: [ExtensionType; N]) -> [u8; N] {
 // GetUnifiedPlatform), and sec-ch-ua is GenerateBrandVersionList in the same
 // file, seeded with 148: "Not/A)Brand" at version 99, in the third place. Cookie
 // is added after Accept-Language (net/url_request/url_request_http_job.cc,
-// Start calls AddExtraHeaders before AddCookieHeaderAndStart). Edge sends the
-// same handshake and headers with "Microsoft Edge" as the brand and an Edg/
-// token after Safari/ (learn.microsoft.com, "Detecting Microsoft Edge from your
-// website").
+// Start calls AddExtraHeaders before AddCookieHeaderAndStart), where a capture of
+// Chrome 154 on Windows 11 with cookies set has it too (plabayo/rama,
+// rama-ua/src/profile/embed_profiles.json, MIT OR Apache-2.0, retrieved
+// 2026-10-17).
+//
+// Edge: the same headers with "Microsoft Edge" as the brand and an Edg/ token
+// after Safari/ (learn.microsoft.com, "Detecting Microsoft Edge from your
+// website"). That its handshake and HTTP/2 settings are Chrome's rests on the
+// captures in that rama file: Edge 151 sends Chrome 151's ClientHello (JA4
+// t13d1516h2_8daaf6152771_c8687cd82e98), SETTINGS and window, and Edge 154
+// Chrome 154's header order. No capture of Edge 148 was found, so for 148 the
+// match is inferred from 151. The two part at 152, where Chrome starts sending
+// Trust Anchor IDs and Edge does not.
 // ---------------------------------------------------------------------------
 
 const CHROME_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
@@ -401,7 +429,11 @@ static CHROMIUM_HEADER_ORDER: [HeaderName; 14] = [
 // tests/signatures/firefox_144.0.0_linux.yaml). Accept comes from
 // nsHttpHandler.cpp, Accept-Encoding from network.http.accept-encoding.secure in
 // modules/libpref/init/all.js, and the User-Agent from nsHttpHandler.cpp
-// (OSCPU_WIN64 and "rv:" with the frozen Gecko/20100101).
+// (OSCPU_WIN64 and "rv:" with the frozen Gecko/20100101). Cookie goes after
+// Accept-Encoding and before Upgrade-Insecure-Requests: a second capture of
+// Firefox 158.0, following a redirect that set two cookies, put them there over
+// HTTP/2 and over HTTP/1.1, and so do the captures of Firefox 154 to 157 in the
+// rama file named above.
 // ---------------------------------------------------------------------------
 
 const FIREFOX_UA: &str =
@@ -539,11 +571,12 @@ const FIREFOX_HEADERS: [(&str, &str); 10] = [
     ("te", "trailers"),
 ];
 
-static FIREFOX_HEADER_ORDER: [HeaderName; 11] = [
+static FIREFOX_HEADER_ORDER: [HeaderName; 12] = [
     HeaderName::from_static("user-agent"),
     HeaderName::from_static("accept"),
     HeaderName::from_static("accept-language"),
     HeaderName::from_static("accept-encoding"),
+    HeaderName::from_static("cookie"),
     HeaderName::from_static("upgrade-insecure-requests"),
     HeaderName::from_static("sec-fetch-dest"),
     HeaderName::from_static("sec-fetch-mode"),
@@ -557,7 +590,13 @@ static FIREFOX_HEADER_ORDER: [HeaderName; 11] = [
 // Safari 26 on macOS 26
 //
 // Safari's TLS and HTTP/2 stack is closed, so every value here is from
-// published captures of the real browser:
+// published captures of the real browser. Safari has sent two ClientHellos:
+// Safari 18.4 on macOS 15 (the rama file named above) and a Safari 26.3 on a Mac
+// (lexiforest/curl-impersonate issue 220) send AES-128 first, with padding and
+// no X25519MLKEM768 (JA4 t13d2014h2_a09f3c656075_e42f34c56612), while Safari
+// 26.0.1 on macOS and Safari 26.4 on macOS 26 send the one below. Safari 26
+// also runs on macOS 15, which would explain the 26.3 capture. This profile is
+// the macOS 26 one.
 //   * The ClientHello and the HTTP/2 frames of Safari 26.0.1 on macOS
 //     (lexiforest/curl-impersonate, tests/signatures/safari_26.0.1_macOS.yaml,
 //     MIT): GREASE on; cipher suites in the order below, AES-256 first among
@@ -566,7 +605,10 @@ static FIREFOX_HEADER_ORDER: [HeaderName; 11] = [
 //     the 1216-byte X25519MLKEM768 key share makes unnecessary; groups
 //     X25519MLKEM768, X25519, P-256, P-384, P-521 with key shares for the first
 //     two; signature algorithms with rsa_pss_rsae_sha384 twice, as Safari sends
-//     them; zlib certificate compression; TLS 1.2 to 1.3.
+//     them; zlib certificate compression; TLS 1.2 to 1.3. The 26.0 capture also
+//     sends session_ticket. Safari 26.4 on macOS 26, captured with cookies set
+//     (rama, as above, 2026-10-04), sends this ClientHello exactly, without
+//     session_ticket, and the same HTTP/2 SETTINGS, window and pseudo-headers.
 //   * JA4 t13d2013h2_a09f3c656075_7f0f34a4126d, which the scrapfly.io JA4
 //     database attributes to Safari 26 and 27 on macOS and iOS and the
 //     usefoil.com JA4 database lists as Safari (both retrieved 2026-10-17).
@@ -575,12 +617,18 @@ static FIREFOX_HEADER_ORDER: [HeaderName; 11] = [
 //     issue 220), the same SETTINGS, window and pseudo-header order as the
 //     26.0.1 capture.
 //
-// SETTINGS_NO_RFC7540_PRIORITIES (9) = 1 tells the server the client does not
-// use RFC 7540 priority signals (RFC 9218 section 2.1), so HEADERS carries no
-// priority. The headers, their values and their order are the 26.0.1 capture's.
-// The User-Agent names Safari 26.6, which shipped with macOS 26.6 on 2026-07-27
-// (support.apple.com/en-us/100100), and keeps the capture's 10_15_7 as the macOS
-// version.
+// HEADERS carries no priority: curl-impersonate's safari2601 and safari260
+// targets set http2_no_priority (lib/impersonate.c in its patches/curl.patch),
+// which fits SETTINGS_NO_RFC7540_PRIORITIES (9) = 1, the client saying it does
+// not use RFC 7540 priority signals (RFC 9218 section 2.1). The headers and
+// their order are those of the 26.0.1 and 26.4 captures. Their values agree
+// apart from Sec-Fetch-Site, which follows how a navigation starts, and
+// Accept-Encoding: 26.0.1 leaves zstd out, 26.0 and 26.4 offer it, and the
+// value here is 26.4's. Cookie goes last, after Accept-Encoding, where the
+// captures of Safari 18 and 26.4 in the rama file have it. The User-Agent names
+// Safari 26.6, which shipped with macOS 26.6 on 2026-07-27
+// (support.apple.com/en-us/100100), and keeps the captures' 10_15_7 as the
+// macOS version.
 // ---------------------------------------------------------------------------
 
 const SAFARI_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 \
@@ -700,10 +748,10 @@ const SAFARI_HEADERS: [(&str, &str); 7] = [
     ("sec-fetch-mode", "navigate"),
     ("accept-language", "en-US,en;q=0.9"),
     ("priority", "u=0, i"),
-    ("accept-encoding", "gzip, deflate, br"),
+    ("accept-encoding", "gzip, deflate, br, zstd"),
 ];
 
-static SAFARI_HEADER_ORDER: [HeaderName; 8] = [
+static SAFARI_HEADER_ORDER: [HeaderName; 9] = [
     HeaderName::from_static("sec-fetch-dest"),
     HeaderName::from_static("user-agent"),
     HeaderName::from_static("accept"),
@@ -712,6 +760,7 @@ static SAFARI_HEADER_ORDER: [HeaderName; 8] = [
     HeaderName::from_static("accept-language"),
     HeaderName::from_static("priority"),
     HeaderName::from_static("accept-encoding"),
+    HeaderName::from_static("cookie"),
 ];
 
 #[cfg(test)]
@@ -804,15 +853,39 @@ mod tests {
                 );
             }
         }
-        // Safari does not advertise zstd; the others do.
+        // All four advertise zstd. Safari 26.0.1 did not, but 26.0 and 26.4 on
+        // macOS 26 do, and the profile names 26.6.
+        for b in ALL {
+            assert_eq!(
+                b.default_headers()["accept-encoding"],
+                "gzip, deflate, br, zstd",
+                "{b:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cookie_has_the_place_each_browser_gives_it() {
+        // From captures with cookies set: Chromium after accept-language,
+        // Firefox after accept-encoding, Safari last, after accept-encoding.
+        let after = |b: Browser| {
+            let order = b.header_order();
+            let at = order.iter().position(|n| n == "cookie");
+            at.map(|i| (order[i - 1].as_str(), order.get(i + 1).map(|n| n.as_str())))
+        };
         assert_eq!(
-            Browser::Safari.default_headers()["accept-encoding"],
-            "gzip, deflate, br"
+            after(Browser::Chrome),
+            Some(("accept-language", Some("priority")))
         );
         assert_eq!(
-            Browser::Firefox.default_headers()["accept-encoding"],
-            "gzip, deflate, br, zstd"
+            after(Browser::Edge),
+            Some(("accept-language", Some("priority")))
         );
+        assert_eq!(
+            after(Browser::Firefox),
+            Some(("accept-encoding", Some("upgrade-insecure-requests")))
+        );
+        assert_eq!(after(Browser::Safari), Some(("accept-encoding", None)));
     }
 
     #[test]
