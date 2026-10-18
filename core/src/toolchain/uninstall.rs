@@ -1,6 +1,8 @@
 // `crossfyre uninstall` - remove everything the toolchain put on this host:
 // extension daemons + binaries, the node service, the Postgres container,
 // and (with --purge) the config root including registered node configs.
+// --keep-data leaves the container, and --yes skips the question, which is how a
+// package's removal script runs it.
 //
 // Also home of the legacy OrionChain cleanup used by `init` to migrate hosts
 // that were set up before the orion -> crossfyre merge.
@@ -15,30 +17,57 @@ use std::path::{Path, PathBuf};
 /// has files in it.
 const INSTALL_ROOT: &str = "/opt/crossfyre";
 
-pub fn run(purge: bool) -> Result<(), Box<dyn std::error::Error>> {
+/// What `crossfyre uninstall` removes besides the services and binaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Scope {
+    /// The config root too, node registrations included.
+    pub purge: bool,
+    /// Leave the database container, and the scan state in it, in place.
+    pub keep_data: bool,
+}
+
+impl Scope {
+    fn question(self) -> &'static str {
+        match (self.purge, self.keep_data) {
+            (true, _) => {
+                "Remove all Crossfyre services, binaries, the database container AND all config/node registrations?"
+            }
+            (false, true) => {
+                "Remove all Crossfyre services and binaries? (the database container and config root are kept)"
+            }
+            (false, false) => {
+                "Remove all Crossfyre services, binaries and the database container? (config root is kept)"
+            }
+        }
+    }
+
+    fn what(self) -> &'static str {
+        match (self.purge, self.keep_data) {
+            (true, _) => "services, binaries, database, config",
+            (false, true) => "services, binaries",
+            (false, false) => "services, binaries, database",
+        }
+    }
+}
+
+/// Uninstall, asking first unless `yes`.
+pub fn run(scope: Scope, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
     use super::ui::*;
 
-    let confirmed = dialoguer::Confirm::new()
-        .with_prompt(if purge {
-            "Remove all Crossfyre services, binaries, the database container AND all config/node registrations?"
-        } else {
-            "Remove all Crossfyre services, binaries and the database container? (config root is kept)"
-        })
-        .default(false)
-        .interact()?;
+    if scope.purge && scope.keep_data {
+        return Err("--purge removes the config root and --keep-data keeps it: pick one".into());
+    }
+    let confirmed = yes
+        || dialoguer::Confirm::new()
+            .with_prompt(scope.question())
+            .default(false)
+            .interact()?;
     if !confirmed {
         warn("Aborted, nothing was removed.");
         return Ok(());
     }
 
-    title(
-        "Crossfyre uninstall",
-        if purge {
-            "services, binaries, database, config"
-        } else {
-            "services, binaries, database"
-        },
-    );
+    title("Crossfyre uninstall", scope.what());
 
     // Extensions: stop, disable, deregister, delete binaries. Then the node
     // service (system scope). Each sub-call prints its own per-item lines.
@@ -63,10 +92,14 @@ pub fn run(purge: bool) -> Result<(), Box<dyn std::error::Error>> {
 
     // Database container.
     section("Database");
-    let _ = std::process::Command::new("docker")
-        .args(["rm", "-f", "crossfyre-postgres"])
-        .output();
-    ok("Removed database container (if it existed).");
+    if scope.keep_data {
+        warn("Database container kept (--keep-data).");
+    } else {
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", "crossfyre-postgres"])
+            .output();
+        ok("Removed database container (if it existed).");
+    }
 
     // The install dir (binaries are already gone; this removes the tree,
     // including the crossfyre binary itself - fine, we're already loaded).
@@ -105,7 +138,7 @@ pub fn run(purge: bool) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     section("Config");
-    if purge {
+    if scope.purge {
         let dir = get_toolchain_dir();
         let _ = std::fs::remove_dir_all(&dir);
         ok(&format!(
@@ -244,6 +277,25 @@ pub fn cleanup_legacy_orionchain() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keeping_the_data_and_purging_it_are_not_both_asked_for() {
+        let both = Scope {
+            purge: true,
+            keep_data: true,
+        };
+        let err = run(both, true).expect_err("refused before anything is removed");
+        assert!(err.to_string().contains("pick one"), "{err}");
+        let keep = Scope {
+            purge: false,
+            keep_data: true,
+        };
+        assert!(!keep.what().contains("database"), "{}", keep.what());
+        assert!(
+            keep.question()
+                .contains("database container and config root are kept")
+        );
+    }
 
     fn packaging(json: &str, file: &str) -> Packaging {
         Packaging::parse(json, PathBuf::from(file), true).expect("parses")

@@ -182,8 +182,14 @@ enum Commands {
     /// container from this host.
     Uninstall {
         /// Also remove the config root (node registrations included)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "keep_data")]
         purge: bool,
+        /// Keep the database container, and the scan state in it
+        #[arg(long)]
+        keep_data: bool,
+        /// Do not ask first (for scripts, such as a package's removal script)
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 
@@ -641,8 +647,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Doctor => {
             cfx_core::toolchain::doctor::run(&base).await?;
         }
-        Commands::Uninstall { purge } => {
-            cfx_core::toolchain::uninstall::run(purge)?;
+        Commands::Uninstall {
+            purge,
+            keep_data,
+            yes,
+        } => {
+            cfx_core::toolchain::uninstall::run(
+                cfx_core::toolchain::uninstall::Scope { purge, keep_data },
+                yes,
+            )?;
         }
     }
 
