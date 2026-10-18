@@ -352,17 +352,29 @@ async fn compressed_bodies_come_back_decoded() {
 }
 
 #[tokio::test]
-async fn http1_requests_keep_the_profile_order() {
-    // Over HTTP/1.1 the same headers go out in the same order, with the names
-    // in title case as browsers write them.
-    let seen = fetch(FIREFOX_IDENTITY, &[b"http/1.1"], Encoding::Identity).await;
+async fn http1_requests_keep_the_profile_order_with_three_known_gaps() {
+    // Over HTTP/1.1 the profile's headers go out in its order, with the names in
+    // title case. Firefox 158.0 itself, captured over HTTP/1.1 and TLS with two
+    // cookies set, sent
+    //   Host, User-Agent, Accept, Accept-Language, Accept-Encoding,
+    //   Connection: keep-alive, Cookie, Upgrade-Insecure-Requests,
+    //   Sec-Fetch-Dest, Sec-Fetch-Mode, Sec-Fetch-Site, Sec-Fetch-User, Priority
+    // and this client parts from it where wreq 5 has no setting, as
+    // Browser::http1 says: Host goes last, Connection: keep-alive is missing,
+    // and Te: trailers, which Firefox sends only over HTTP/2, goes out here too.
+    // Whoever closes one of those gaps changes this list.
+    let mut config = emulating(FIREFOX_IDENTITY);
+    config.extra_headers.insert(
+        transport::header::COOKIE,
+        HeaderValue::from_static("a=1; b=2"),
+    );
+    let seen = fetch_with(config, &[b"http/1.1"], Encoding::Identity).await;
     assert_eq!(seen.alpn.as_deref(), Some(&b"http/1.1"[..]));
-    let head = String::from_utf8(seen.request).unwrap();
+    let head = String::from_utf8(seen.request.clone()).unwrap();
     let names: Vec<&str> = head
         .lines()
         .skip(1)
         .filter_map(|l| l.split_once(':').map(|(n, _)| n))
-        .filter(|n| !n.eq_ignore_ascii_case("host"))
         .collect();
     assert_eq!(
         names,
@@ -371,6 +383,7 @@ async fn http1_requests_keep_the_profile_order() {
             "Accept",
             "Accept-Language",
             "Accept-Encoding",
+            "Cookie",
             "Upgrade-Insecure-Requests",
             "Sec-Fetch-Dest",
             "Sec-Fetch-Mode",
@@ -378,8 +391,19 @@ async fn http1_requests_keep_the_profile_order() {
             "Sec-Fetch-User",
             "Priority",
             "Te",
+            "Host",
         ]
     );
+    let fields = seen.fields();
+    let value = |name: &str| {
+        fields
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    };
+    assert_eq!(value("te"), Some("trailers"));
+    assert_eq!(value("cookie"), Some("a=1; b=2"));
+    assert_eq!(value("connection"), None);
     assert_eq!(seen.body, wire::BODY);
 }
 
