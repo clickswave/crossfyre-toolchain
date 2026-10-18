@@ -1421,7 +1421,7 @@ dependencies = [
 
 [[package]]
 name = "doorward"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "adaptive",
  "cfx_tui",
