@@ -186,7 +186,11 @@ pub fn get_config_path() -> PathBuf {
 pub fn get_bin_dir() -> PathBuf {
     // Where extension binaries (and the crossfyre binary itself) are
     // installed. Linux/macOS keep the conventional /opt prefix; Windows has
-    // no /opt so we use %ProgramData%\Crossfyre\bin.
+    // no /opt so we use %ProgramData%\Crossfyre\bin. A package that keeps them
+    // somewhere else says where in its packaging.json.
+    if let Some(dir) = super::packaging::bin_dir() {
+        return dir.to_path_buf();
+    }
     #[cfg(windows)]
     {
         let base = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".to_string());
@@ -234,8 +238,8 @@ pub fn is_regular_file(path: &std::path::Path) -> bool {
 
 /// An engine counts as installed under its public name, or as a binary still sitting
 /// under its legacy name on a machine the rename has not been carried to yet. A
-/// legacy symlink does not count: that is what the migration leaves behind, and it
-/// points at the binary under the public name.
+/// legacy symlink does not count: that is what the migration in 0.1.31 and 0.1.32 left
+/// behind, pointing at the binary under the public name, until the migration removes it.
 pub fn is_extension_installed(ext: &str) -> bool {
     ext_bin_path(ext).exists() || legacy_bin_path(ext).is_some_and(|p| is_regular_file(&p))
 }

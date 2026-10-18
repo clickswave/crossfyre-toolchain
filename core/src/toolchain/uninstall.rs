@@ -1,39 +1,73 @@
 // `crossfyre uninstall` - remove everything the toolchain put on this host:
 // extension daemons + binaries, the node service, the Postgres container,
 // and (with --purge) the config root including registered node configs.
+// --keep-data leaves the container, and --yes skips the question, which is how a
+// package's removal script runs it.
 //
 // Also home of the legacy OrionChain cleanup used by `init` to migrate hosts
 // that were set up before the orion -> crossfyre merge.
 
-use super::config::get_toolchain_dir;
+use super::config::{file_name, get_bin_dir, get_toolchain_dir};
+use super::packaging::{Packaging, remove_note};
 use super::sudo_user::cmd_as_invoking_user;
 use super::{ENGINES, EXTENSIONS, install, service};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-pub fn run(purge: bool) -> Result<(), Box<dyn std::error::Error>> {
+/// Where the installer puts everything, and what uninstall removes whole when no package
+/// has files in it.
+const INSTALL_ROOT: &str = "/opt/crossfyre";
+
+/// What `crossfyre uninstall` removes besides the services and binaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Scope {
+    /// The config root too, node registrations included.
+    pub purge: bool,
+    /// Leave the database container, and the scan state in it, in place.
+    pub keep_data: bool,
+}
+
+impl Scope {
+    fn question(self) -> &'static str {
+        match (self.purge, self.keep_data) {
+            (true, _) => {
+                "Remove all Crossfyre services, binaries, the database container AND all config/node registrations?"
+            }
+            (false, true) => {
+                "Remove all Crossfyre services and binaries? (the database container and config root are kept)"
+            }
+            (false, false) => {
+                "Remove all Crossfyre services, binaries and the database container? (config root is kept)"
+            }
+        }
+    }
+
+    fn what(self) -> &'static str {
+        match (self.purge, self.keep_data) {
+            (true, _) => "services, binaries, database, config",
+            (false, true) => "services, binaries",
+            (false, false) => "services, binaries, database",
+        }
+    }
+}
+
+/// Uninstall, asking first unless `yes`.
+pub fn run(scope: Scope, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
     use super::ui::*;
 
-    let confirmed = dialoguer::Confirm::new()
-        .with_prompt(if purge {
-            "Remove all Crossfyre services, binaries, the database container AND all config/node registrations?"
-        } else {
-            "Remove all Crossfyre services, binaries and the database container? (config root is kept)"
-        })
-        .default(false)
-        .interact()?;
+    if scope.purge && scope.keep_data {
+        return Err("--purge removes the config root and --keep-data keeps it: pick one".into());
+    }
+    let confirmed = yes
+        || dialoguer::Confirm::new()
+            .with_prompt(scope.question())
+            .default(false)
+            .interact()?;
     if !confirmed {
         warn("Aborted, nothing was removed.");
         return Ok(());
     }
 
-    title(
-        "Crossfyre uninstall",
-        if purge {
-            "services, binaries, database, config"
-        } else {
-            "services, binaries, database"
-        },
-    );
+    title("Crossfyre uninstall", scope.what());
 
     // Extensions: stop, disable, deregister, delete binaries. Then the node
     // service (system scope). Each sub-call prints its own per-item lines.
@@ -58,22 +92,53 @@ pub fn run(purge: bool) -> Result<(), Box<dyn std::error::Error>> {
 
     // Database container.
     section("Database");
-    let _ = std::process::Command::new("docker")
-        .args(["rm", "-f", "crossfyre-postgres"])
-        .output();
-    ok("Removed database container (if it existed).");
+    if scope.keep_data {
+        warn("Database container kept (--keep-data).");
+    } else {
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", "crossfyre-postgres"])
+            .output();
+        ok("Removed database container (if it existed).");
+    }
 
     // The install dir (binaries are already gone; this removes the tree,
     // including the crossfyre binary itself - fine, we're already loaded).
+    // A package's own files stay where it put them, for it to remove.
     #[cfg(not(windows))]
     {
         section("Binaries");
-        let _ = std::fs::remove_dir_all("/opt/crossfyre");
-        ok("Removed /opt/crossfyre.");
+        let root = Path::new(INSTALL_ROOT);
+        match super::packaging::current() {
+            None => {
+                let _ = std::fs::remove_dir_all(root);
+                ok(&format!("Removed {INSTALL_ROOT}."));
+            }
+            Some(p) => {
+                let bin = get_bin_dir();
+                for f in unowned_files(&bin, p) {
+                    let _ = std::fs::remove_file(f);
+                }
+                let cli = std::env::current_exe().ok();
+                if bin.starts_with(root) && !has_files_under(p, &bin, root, cli.as_deref()) {
+                    let _ = std::fs::remove_dir_all(root);
+                    ok(&format!("Removed {INSTALL_ROOT}."));
+                } else {
+                    ok(&format!(
+                        "Removed what Crossfyre fetched into {}.",
+                        bin.display()
+                    ));
+                }
+                warn(&format!(
+                    "Kept {}: {}",
+                    p.owned().join(", "),
+                    remove_note(p.manager)
+                ));
+            }
+        }
     }
 
     section("Config");
-    if purge {
+    if scope.purge {
         let dir = get_toolchain_dir();
         let _ = std::fs::remove_dir_all(&dir);
         ok(&format!(
@@ -90,6 +155,49 @@ pub fn run(purge: bool) -> Result<(), Box<dyn std::error::Error>> {
     done("Uninstalled");
     end();
     Ok(())
+}
+
+/// Every file name a component may have in the bin directory, with the name of its version
+/// sidecar: the CLI, the node, cfx-script, and each engine under its public name and the
+/// name it had before.
+fn component_files(component: &str) -> Vec<String> {
+    let mut names = vec![component.to_string()];
+    if let Some(old) = super::engine(component).and_then(|e| e.legacy) {
+        names.push(old.to_string());
+    }
+    names
+        .into_iter()
+        .flat_map(|n| [file_name(&n), format!("{n}.version")])
+        .collect()
+}
+
+/// The components uninstall may find in the bin directory, by public name.
+fn components() -> Vec<&'static str> {
+    let mut out = vec!["crossfyre", "node", "cfx-script"];
+    out.extend(ENGINES.iter().map(|e| e.name));
+    out
+}
+
+/// What uninstall removes from `bin_dir` for a packaged install: the files of every
+/// component the package does not own, which the CLI fetched there.
+fn unowned_files(bin_dir: &Path, p: &Packaging) -> Vec<PathBuf> {
+    components()
+        .into_iter()
+        .filter(|c| !p.owns(c))
+        .flat_map(component_files)
+        .map(|f| bin_dir.join(f))
+        .collect()
+}
+
+/// Does the package have a file under `root`: its packaging.json, the CLI at `cli` when
+/// it owns that, or another component it owns in `bin_dir`?
+fn has_files_under(p: &Packaging, bin_dir: &Path, root: &Path, cli: Option<&Path>) -> bool {
+    let owned_in_bin = components()
+        .into_iter()
+        .any(|c| c != "crossfyre" && p.owns(c));
+    p.file.starts_with(root)
+        || (p.owns("crossfyre") && cli.is_some_and(|c| c.starts_with(root)))
+        || (bin_dir.starts_with(root) && owned_in_bin)
 }
 
 /// Best-effort migration cleanup for hosts initialized before the
@@ -164,4 +272,86 @@ pub fn cleanup_legacy_orionchain() {
         }
     }
     println!("[migrate] Legacy cleanup complete.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keeping_the_data_and_purging_it_are_not_both_asked_for() {
+        let both = Scope {
+            purge: true,
+            keep_data: true,
+        };
+        let err = run(both, true).expect_err("refused before anything is removed");
+        assert!(err.to_string().contains("pick one"), "{err}");
+        let keep = Scope {
+            purge: false,
+            keep_data: true,
+        };
+        assert!(!keep.what().contains("database"), "{}", keep.what());
+        assert!(
+            keep.question()
+                .contains("database container and config root are kept")
+        );
+    }
+
+    fn packaging(json: &str, file: &str) -> Packaging {
+        Packaging::parse(json, PathBuf::from(file), true).expect("parses")
+    }
+
+    #[test]
+    fn an_apt_install_loses_what_the_cli_fetched_and_keeps_the_cli() {
+        let apt = packaging(
+            r#"{"manager":"apt","owns":["crossfyre"]}"#,
+            "/usr/lib/crossfyre/packaging.json",
+        );
+        let bin = Path::new("/opt/crossfyre/bin");
+        let gone = unowned_files(bin, &apt);
+        for f in [
+            "node",
+            "node.version",
+            "cfx-script",
+            "plessor",
+            "plessor.version",
+            "cortex",
+        ] {
+            assert!(gone.contains(&bin.join(f)), "{f} in {gone:?}");
+        }
+        assert!(!gone.iter().any(|f| f.ends_with("crossfyre")), "{gone:?}");
+        // apt's files are in /usr, so the whole of /opt/crossfyre is the CLI's to remove.
+        let root = Path::new(INSTALL_ROOT);
+        let cli = Path::new("/usr/bin/crossfyre");
+        assert!(!has_files_under(&apt, bin, root, Some(cli)));
+    }
+
+    #[test]
+    fn a_package_that_keeps_its_files_in_opt_crossfyre_keeps_them() {
+        let image = packaging(
+            r#"{"manager":"container","owns":["crossfyre","node","cfx-script","ambulo",
+                "voyage","doorward","toolmark","plessor"]}"#,
+            "/opt/crossfyre/bin/packaging.json",
+        );
+        let bin = Path::new("/opt/crossfyre/bin");
+        assert!(unowned_files(bin, &image).is_empty());
+        let root = Path::new(INSTALL_ROOT);
+        assert!(has_files_under(
+            &image,
+            bin,
+            root,
+            Some(&bin.join("crossfyre"))
+        ));
+        // Even with its packaging.json somewhere else, the CLI it owns keeps the tree.
+        let elsewhere = packaging(
+            r#"{"manager":"pacman","owns":["crossfyre"]}"#,
+            "/usr/lib/crossfyre/packaging.json",
+        );
+        assert!(has_files_under(
+            &elsewhere,
+            bin,
+            root,
+            Some(&bin.join("crossfyre"))
+        ));
+    }
 }

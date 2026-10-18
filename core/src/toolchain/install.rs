@@ -14,6 +14,7 @@
 use super::config::{
     ext_bin_path, ext_file_name, file_name, get_bin_dir, is_regular_file, legacy_bin_path,
 };
+use super::packaging::{self, Manager, remove_note, update_note};
 use super::service;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -397,6 +398,8 @@ pub enum HelperOutcome {
     /// The release's cfx-script cannot start on this host, so it was not installed and
     /// whatever was there before is left as it was. `output` is what it wrote.
     CannotStart { version: String, output: String },
+    /// A package manager installed cfx-script, so it is that manager's to update.
+    Owned(Manager),
 }
 
 /// Install or refresh the cfx-script helper from the release manifest: download it,
@@ -408,6 +411,9 @@ pub async fn install_cfx_script(
     manifest: &Manifest,
     force: bool,
 ) -> Result<HelperOutcome, Box<dyn std::error::Error>> {
+    if let Some(m) = packaging::owner(CFX_SCRIPT) {
+        return Ok(HelperOutcome::Owned(m));
+    }
     let Ok((comp, artifact)) = resolve_artifact(manifest, CFX_SCRIPT) else {
         return Ok(HelperOutcome::NotInRelease);
     };
@@ -456,7 +462,9 @@ fn report_cfx_script(result: Result<HelperOutcome, Box<dyn std::error::Error>>) 
              {output}",
             without_new_helper()
         ),
-        Ok(HelperOutcome::Current { .. } | HelperOutcome::NotInRelease) => {}
+        Ok(
+            HelperOutcome::Current { .. } | HelperOutcome::NotInRelease | HelperOutcome::Owned(_),
+        ) => {}
         Err(e) => eprintln!(
             "[!] could not install cfx-script: {e}. Until it installs, {}.",
             without_new_helper()
@@ -471,9 +479,44 @@ pub async fn install(extension: &str, force: bool) -> Result<(), Box<dyn std::er
     // Before anything is placed: an engine still installed under its legacy name
     // would otherwise end up with a second unit on its port.
     super::migrate::renamed_engines();
-    let manifest = fetch_manifest().await?;
+    // Fetched only for an engine that is ours to download: one a package installed needs
+    // nothing from the release.
+    let mut manifest = None;
     for ext in super::resolve_extensions(extension)? {
-        install_one(&manifest, ext, force, false).await?;
+        if let Some(m) = packaging::owner(ext) {
+            adopt_packaged(ext, m, false)?;
+            continue;
+        }
+        if manifest.is_none() {
+            manifest = Some(fetch_manifest().await?);
+        }
+        if let Some(manifest) = &manifest {
+            install_one(manifest, ext, force, false).await?;
+        }
+    }
+    Ok(())
+}
+
+/// An engine a package manager put in place: its binary is the package's, and the unit
+/// that runs it, which no package writes, is still ours to register.
+fn adopt_packaged(ext: &str, m: Manager, quiet: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use super::ui::*;
+    let bin_path = ext_bin_path(ext);
+    let name = super::public_name(ext);
+    if !bin_path.exists() {
+        return Err(format!(
+            "{name} is installed by {m}, but {} is missing; reinstall it with {m}",
+            bin_path.display()
+        )
+        .into());
+    }
+    if !service::has_service_file(ext) {
+        service::create_service_file(ext)?;
+    }
+    if !quiet {
+        title("Crossfyre extension install", name);
+        ok(&format!("{name} is {}", update_note(m)));
+        end();
     }
     Ok(())
 }
@@ -487,6 +530,10 @@ async fn install_one(
     use super::ui::*;
     let bin_path = ext_bin_path(ext);
     let name = super::public_name(ext);
+
+    if let Some(m) = packaging::owner(ext) {
+        return adopt_packaged(ext, m, quiet);
+    }
 
     if !quiet {
         title("Crossfyre extension install", name);
@@ -577,7 +624,7 @@ fn remove_one(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
     let bin_path = ext_bin_path(ext);
     let name = super::public_name(ext);
     // The legacy path, whether it is the binary itself (not migrated yet) or the
-    // link the migration left there.
+    // link an earlier migration left there.
     let legacy = legacy_bin_path(ext).filter(|p| fs::symlink_metadata(p).is_ok());
 
     title("Crossfyre extension remove", name);
@@ -591,6 +638,15 @@ fn remove_one(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
     step(&format!("Stopping and disabling {name} service"));
     service::try_stop_and_disable_all(ext);
     service::remove_service_file(ext)?;
+
+    if let Some(m) = packaging::owner(ext) {
+        warn(&format!(
+            "{name}'s service is removed and its binary stays: {}",
+            remove_note(m)
+        ));
+        end();
+        return Ok(());
+    }
 
     if bin_path.exists() {
         fs::remove_file(&bin_path)?;
@@ -643,6 +699,11 @@ pub async fn update(
         println!("  {}", dim("Extensions"));
         for ext in &exts {
             let name = super::public_name(ext);
+            if let Some(m) = packaging::owner(ext) {
+                println!("{}", row(&check(), name, "", &dim(&update_note(m))));
+                current += 1;
+                continue;
+            }
             let want = manifest_version(&manifest, ext);
             let have = installed_ext_version(ext);
             let up_to_date = ext_bin_path(ext).exists()
@@ -691,7 +752,18 @@ pub async fn update(
         println!("  {}", dim("Core"));
 
         let want = manifest_version(&manifest, "crossfyre");
-        if !want.is_empty() && want == current_version && !force {
+        if let Some(m) = packaging::owner("crossfyre") {
+            println!(
+                "{}",
+                row(
+                    &check(),
+                    "crossfyre",
+                    &ver(current_version),
+                    &dim(&update_note(m))
+                )
+            );
+            current += 1;
+        } else if !want.is_empty() && want == current_version && !force {
             println!(
                 "{}",
                 row(&check(), "crossfyre", &ver(&want), &dim("up to date"))
@@ -744,7 +816,10 @@ pub async fn update(
         let node_ok = get_bin_dir().join(ext_file_name("node")).exists()
             && !nwant.is_empty()
             && nhave.as_deref() == Some(nwant.as_str());
-        if node_ok && !force {
+        if let Some(m) = packaging::owner("node") {
+            println!("{}", row(&check(), "node", "", &dim(&update_note(m))));
+            current += 1;
+        } else if node_ok && !force {
             println!(
                 "{}",
                 row(&check(), "node", &ver(&nwant), &dim("up to date"))
@@ -795,7 +870,10 @@ pub async fn update(
         let hwant = manifest_version(&manifest, CFX_SCRIPT);
         let helper_ok = ext_bin_path(CFX_SCRIPT).exists()
             && installed_ext_version(CFX_SCRIPT).as_deref() == Some(hwant.as_str());
-        if !hwant.is_empty() {
+        if let Some(m) = packaging::owner(CFX_SCRIPT) {
+            println!("{}", row(&check(), CFX_SCRIPT, "", &dim(&update_note(m))));
+            current += 1;
+        } else if !hwant.is_empty() {
             if helper_ok && !force {
                 println!(
                     "{}",
@@ -824,6 +902,10 @@ pub async fn update(
                     Ok(HelperOutcome::Current { .. } | HelperOutcome::NotInRelease) => {
                         current += 1;
                         row(&check(), CFX_SCRIPT, &ver(&hwant), &dim("up to date"))
+                    }
+                    Ok(HelperOutcome::Owned(m)) => {
+                        current += 1;
+                        row(&check(), CFX_SCRIPT, "", &dim(&update_note(m)))
                     }
                     Ok(HelperOutcome::CannotStart { output, .. }) => row(
                         &bang(),
@@ -889,6 +971,9 @@ pub async fn self_update(
     quiet: bool,
     force: bool,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    if let Some(m) = packaging::owner("crossfyre") {
+        return Err(format!("crossfyre is {}", update_note(m)).into());
+    }
     let (comp, artifact) = resolve_artifact(manifest, "crossfyre")?;
 
     // `current_version` is supplied by the caller: the crossfyre CLI passes its
@@ -921,13 +1006,15 @@ pub async fn self_update(
     }
 
     let exe = std::env::current_exe()?;
-    place_binary(&extracted, &exe)?;
-
+    let stable = get_bin_dir().join(ext_file_name("crossfyre"));
+    let mut targets = cli_targets(&exe, &stable).into_iter();
+    if let Some(first) = targets.next() {
+        place_binary(&extracted, &first)?;
+    }
     // Keep the stable /opt path in sync too, in case the process was started
     // from somewhere else (e.g. a dev checkout).
-    let stable = get_bin_dir().join(ext_file_name("crossfyre"));
-    if stable != exe {
-        let _ = place_binary(&extracted, &stable);
+    for also in targets {
+        let _ = place_binary(&extracted, &also);
     }
 
     // Record the installed CLI version (mirrors node.version). The next update -
@@ -944,6 +1031,23 @@ pub async fn self_update(
     Ok(true)
 }
 
+/// Where an update of the CLI is written, in order: over the running binary when that
+/// is the CLI, then at the stable path in the bin directory. The node daemon runs this
+/// for the dashboard's update too, and there the running binary is the node worker.
+/// Writing the CLI over it left a unit that ran `crossfyre supervise`, which exits with
+/// a usage error, so the node restarted into the same failure every few seconds and
+/// stayed offline, while node.version still said it was current.
+fn cli_targets(exe: &Path, stable: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if exe.file_name() == stable.file_name() {
+        out.push(exe.to_path_buf());
+    }
+    if !out.iter().any(|p| p == stable) {
+        out.push(stable.to_path_buf());
+    }
+    out
+}
+
 /// The crossfyre CLI version recorded on disk by `self_update`. Empty when never
 /// recorded. Used by callers that cannot read the running CLI's env! version
 /// (e.g. the node worker's dashboard-triggered self-update).
@@ -956,9 +1060,14 @@ pub fn installed_cli_version() -> String {
 
 /// Copy the running binary to the stable install path
 /// (`/opt/crossfyre/bin/crossfyre`) so OS services have a fixed ExecStart.
-/// No-op when already running from there.
+/// No-op when already running from there, and when a package manager installed this
+/// CLI: a copy beside the engines would be one that no package upgrade replaces. The
+/// path returned is the one to name the CLI by.
 pub fn ensure_self_installed() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
     let exe = std::env::current_exe()?;
+    if super::packaging::owner("crossfyre").is_some() {
+        return Ok(super::packaging::cli_path_for(&exe));
+    }
     let stable = get_bin_dir().join(ext_file_name("crossfyre"));
     if exe == stable {
         return Ok(stable);
@@ -979,6 +1088,9 @@ pub async fn download_node(
     quiet: bool,
     force: bool,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    if let Some(m) = packaging::owner("node") {
+        return Err(format!("node is {}", update_note(m)).into());
+    }
     let (comp, artifact) = resolve_artifact(manifest, "node")?;
     let stable = get_bin_dir().join(ext_file_name("node"));
     let ver_file = get_bin_dir().join("node.version");
@@ -1020,7 +1132,15 @@ pub async fn download_node(
 pub async fn ensure_node_installed() -> Result<(), Box<dyn std::error::Error>> {
     let stable = get_bin_dir().join(ext_file_name("node"));
     let mut manifest = None;
-    if !stable.exists() {
+    if let Some(m) = packaging::owner("node") {
+        if !stable.exists() {
+            return Err(format!(
+                "node is installed by {m}, but {} is missing; reinstall it with {m}",
+                stable.display()
+            )
+            .into());
+        }
+    } else if !stable.exists() {
         if let Some(sib) = sibling_of_this_binary("node") {
             place_binary(&sib, &stable)?;
             println!("[+] Installed node binary to {}", stable.display());
@@ -1031,6 +1151,9 @@ pub async fn ensure_node_installed() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    if packaging::owner(CFX_SCRIPT).is_some() {
+        return Ok(());
+    }
     let helper = ext_bin_path(CFX_SCRIPT);
     if !helper.exists()
         && let Some(sib) = sibling_of_this_binary(CFX_SCRIPT)
@@ -1067,21 +1190,46 @@ pub async fn ensure_node_installed() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// `name` in the directory of the running binary, when it is there and is not the
-/// installed copy itself.
+/// installed copy itself. Never for a packaged CLI: its directory belongs to the package,
+/// and in /usr/bin a file called `node` is Node.js.
 fn sibling_of_this_binary(name: &str) -> Option<PathBuf> {
+    if super::packaging::current().is_some() {
+        return None;
+    }
     let installed = get_bin_dir().join(ext_file_name(name));
     let exe = std::env::current_exe().ok()?;
     let sib = exe.parent()?.join(ext_file_name(name));
     (sib.exists() && sib != installed).then_some(sib)
 }
 
+/// What the dashboard's update did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DashboardUpdate {
+    /// The CLI was replaced, and the node should restart to run it.
+    pub restart: bool,
+    /// The package manager the CLI belongs to, when one does. The update left the CLI
+    /// alone, and the dashboard can say which manager updates it.
+    pub cli_managed_by: Option<Manager>,
+}
+
 /// The update the dashboard asks a node for: the crossfyre CLI and the cfx-script helper,
-/// from the release manifest. True when the CLI was replaced and the node should restart
-/// to run it. A new helper needs no restart, since every job starts it afresh.
-pub async fn update_for_dashboard() -> Result<bool, Box<dyn std::error::Error>> {
+/// from the release manifest. A component a package manager installed is left to it. A
+/// new helper needs no restart, since every job starts it afresh.
+pub async fn update_for_dashboard() -> Result<DashboardUpdate, Box<dyn std::error::Error>> {
     let manifest = fetch_manifest().await?;
     report_cfx_script(install_cfx_script(&manifest, false).await);
-    self_update(&manifest, &installed_cli_version(), false, false).await
+    if let Some(m) = packaging::owner("crossfyre") {
+        println!("[update] crossfyre is {}", update_note(m));
+        return Ok(DashboardUpdate {
+            restart: false,
+            cli_managed_by: Some(m),
+        });
+    }
+    let restart = self_update(&manifest, &installed_cli_version(), false, false).await?;
+    Ok(DashboardUpdate {
+        restart,
+        cli_managed_by: None,
+    })
 }
 
 #[cfg(test)]
@@ -1303,6 +1451,104 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
+    // A packaged install
+    // ---------------------------------------------------------------------------
+
+    /// Have this test's thread run as if a package with this packaging.json installed it.
+    fn packaged(json: &str) {
+        let p = packaging::Packaging::parse(
+            json,
+            PathBuf::from("/usr/lib/crossfyre/packaging.json"),
+            true,
+        )
+        .expect("parses");
+        packaging::pretend(packaging::Found::Packaged(p));
+    }
+
+    /// A manifest with every component at `v` for this platform.
+    fn full_manifest(v: &str) -> Manifest {
+        let key = platform_key();
+        let entry = format!(
+            r#"{{"version":"{v}","artifacts":{{"{key}":{{"file":"f","sha256":"{HELLO_SHA}"}}}}}}"#
+        );
+        let body: Vec<String> = [
+            "crossfyre",
+            "node",
+            "cfx-script",
+            "ambulo",
+            "voyage",
+            "doorward",
+            "toolmark",
+            "plessor",
+        ]
+        .iter()
+        .map(|n| format!(r#""{n}":{entry}"#))
+        .collect();
+        manifest(&format!(r#"{{"components":{{{}}}}}"#, body.join(",")))
+    }
+
+    #[tokio::test]
+    async fn a_cli_that_apt_installed_is_left_to_apt_and_apt_is_named() {
+        packaged(r#"{"manager":"apt","owns":["crossfyre"]}"#);
+        let err = self_update(&full_manifest("0.1.33"), "0.1.33", true, false)
+            .await
+            .expect_err("refused even when current");
+        assert_eq!(
+            err.to_string(),
+            "crossfyre is installed by apt; update it with apt"
+        );
+        // A newer release, or --force, does not make apt's file the CLI's to replace.
+        assert!(
+            self_update(&full_manifest("9.9.9"), "0.1.33", true, true)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_node_and_a_helper_a_package_owns_are_left_to_it() {
+        packaged(r#"{"manager":"container","owns":["crossfyre","node","cfx-script"]}"#);
+        let err = download_node(&full_manifest("9.9.9"), true, true)
+            .await
+            .expect_err("refused");
+        assert!(err.to_string().contains("installed by container"), "{err}");
+        let out = install_cfx_script(&full_manifest("9.9.9"), true)
+            .await
+            .expect("not an error");
+        assert!(
+            matches!(out, HelperOutcome::Owned(Manager::Container)),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn a_packaged_cli_is_not_copied_into_the_bin_dir_and_takes_nothing_from_beside_it() {
+        packaged(
+            r#"{"manager":"brew","owns":["crossfyre"],
+                "cli_path":"/home/linuxbrew/.linuxbrew/bin/crossfyre"}"#,
+        );
+        assert_eq!(
+            ensure_self_installed().expect("nothing to copy"),
+            PathBuf::from("/home/linuxbrew/.linuxbrew/bin/crossfyre"),
+            "named by the path brew keeps across upgrades"
+        );
+        assert_eq!(sibling_of_this_binary("node"), None);
+        assert_eq!(sibling_of_this_binary(CFX_SCRIPT), None);
+    }
+
+    #[test]
+    fn the_bin_dir_a_package_names_is_where_everything_else_is() {
+        packaged(
+            r#"{"manager":"nix","owns":["crossfyre","node","cfx-script","ambulo","voyage",
+                "doorward","toolmark","plessor"],"bin_dir":"/nix/store/x-crossfyre/libexec"}"#,
+        );
+        let dir = PathBuf::from("/nix/store/x-crossfyre/libexec");
+        assert_eq!(get_bin_dir(), dir);
+        assert_eq!(ext_bin_path("cortex"), dir.join("plessor"));
+        assert_eq!(service::node_binary(), dir.join("node"));
+    }
+
+    // ---------------------------------------------------------------------------
     // Placing a binary
     // ---------------------------------------------------------------------------
 
@@ -1367,6 +1613,23 @@ mod tests {
             !s.join("bin").join("ambulo.new").exists(),
             "nothing is left staged next to the destination"
         );
+    }
+
+    #[test]
+    fn the_dashboard_update_writes_the_cli_beside_the_node_and_never_over_it() {
+        let stable = Path::new("/opt/crossfyre/bin/crossfyre");
+        // The node daemon runs the dashboard's update, and its own binary is the worker.
+        assert_eq!(
+            cli_targets(Path::new("/opt/crossfyre/bin/node"), stable),
+            [stable.to_path_buf()]
+        );
+        // The CLI run from a checkout updates itself and the installed copy.
+        let dev = Path::new("/home/op/src/target/release/crossfyre");
+        assert_eq!(
+            cli_targets(dev, stable),
+            [dev.to_path_buf(), stable.to_path_buf()]
+        );
+        assert_eq!(cli_targets(stable, stable), [stable.to_path_buf()]);
     }
 
     #[test]

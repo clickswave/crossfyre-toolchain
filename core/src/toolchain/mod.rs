@@ -16,6 +16,8 @@ pub mod doctor;
 pub mod install;
 pub mod migrate;
 pub mod oast;
+pub mod packaging;
+pub mod rcfile;
 pub mod release_sig;
 pub mod service;
 pub mod status;

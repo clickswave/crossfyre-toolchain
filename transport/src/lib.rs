@@ -19,8 +19,9 @@
 //!
 //! The *choice* of which browser to present (the per-target UA) is a trade secret
 //! and lives in the private `adaptive` drop-in (the profile catalogue). This crate
-//! only maps a browser *family* (read from the UA) to a `wreq_util::Emulation`;
-//! that mapping is not secret, the selection is.
+//! only maps a browser *family* (read from the UA) to one of the emulation
+//! profiles in `emulation`; those profiles and that mapping are not secret, the
+//! selection is.
 
 use std::time::Duration;
 
@@ -37,6 +38,9 @@ pub use reqwest::{Method, StatusCode, Url};
 
 mod auth;
 pub use auth::AuthSpec;
+
+#[cfg(feature = "impersonate")]
+mod emulation;
 
 pub mod guard;
 
@@ -79,7 +83,8 @@ pub struct ClientConfig {
     pub cookie_store: bool,
     /// The identity's User-Agent. Sent when NOT emulating; when emulating, the
     /// emulation profile provides a coherent UA and this is used only to choose
-    /// the browser family.
+    /// the browser family. A User-Agent that names no family a profile covers,
+    /// such as a scanner's own string, is not emulated: it is sent as it is.
     pub user_agent: Option<String>,
     /// Browser fingerprint headers (sec-ch-ua, sec-fetch, accept-language, ...).
     /// Sent only when NOT emulating; when emulating, the profile owns these, so
@@ -89,7 +94,9 @@ pub struct ClientConfig {
     /// sent, in both the emulating and non-emulating paths.
     pub extra_headers: HeaderMap,
     /// Attempt browser emulation (Evasive / Identify posture). Honoured only when
-    /// the `impersonate` backend is compiled in; a no-op for the reqwest backend.
+    /// the `impersonate` backend is compiled in and the User-Agent names a browser
+    /// family it has a profile for; otherwise the client is built as if this were
+    /// off.
     pub emulate: bool,
     /// Static DNS overrides: `(host, addr)` pairs. A request to `host` connects to
     /// `addr` while keeping `host` as the SNI + Host header. Origin discovery uses
@@ -126,16 +133,37 @@ impl Default for ClientConfig {
     }
 }
 
+/// The profile this build presents for `cfg`: emulation was requested and the
+/// User-Agent names a browser family the `impersonate` backend has a profile for.
+#[cfg(feature = "impersonate")]
+fn profile(cfg: &ClientConfig) -> Option<emulation::Browser> {
+    if !cfg.emulate {
+        return None;
+    }
+    cfg.user_agent
+        .as_deref()
+        .and_then(emulation::Browser::from_user_agent)
+}
+
 /// True when this build will actually emulate a browser fingerprint: the
-/// `impersonate` backend is compiled in *and* emulation was requested.
+/// `impersonate` backend is compiled in, emulation was requested, and there is
+/// a profile for the User-Agent's family.
+#[cfg(feature = "impersonate")]
 fn will_emulate(cfg: &ClientConfig) -> bool {
-    cfg!(feature = "impersonate") && cfg.emulate
+    profile(cfg).is_some()
+}
+
+#[cfg(not(feature = "impersonate"))]
+fn will_emulate(_: &ClientConfig) -> bool {
+    false
 }
 
 /// Build a client from `cfg`. All backend differences are confined here.
 pub fn build_client(cfg: ClientConfig) -> Result<Client, Error> {
     // App headers are always sent. Browser headers + UA are sent only when we are
-    // NOT emulating (the emulation profile provides its own coherent set).
+    // NOT emulating (the emulation profile provides its own coherent set). That
+    // includes a requested emulation with no profile for the User-Agent, so the
+    // caller's own User-Agent still goes out.
     let mut headers = cfg.extra_headers.clone();
     if !will_emulate(&cfg) {
         for (k, v) in cfg.browser_headers.iter() {
@@ -203,32 +231,18 @@ pub fn build_client(cfg: ClientConfig) -> Result<Client, Error> {
         if cfg.accept_invalid_certs {
             b = b.cert_verification(false).verify_hostname(false);
         }
-        if cfg.emulate {
-            let ua = cfg.user_agent.as_deref();
-            if let Some(em) = emulation_for_ua(ua) {
-                // wreq's `emulation()` REPLACES the default header map wholesale
-                // (`std::mem::swap`), which would wipe the app/auth headers we set
-                // above (Authorization, Cookie, attribution token) -- silently
-                // de-authenticating every scan run under the default evasive
-                // posture. Merge them back: take the emulation profile's own
-                // default headers (read off a throwaway client, since the profile's
-                // header map is not otherwise accessible), overlay our extra
-                // headers so auth wins, and apply that AFTER emulation. The TLS /
-                // HTTP2 / header-order fingerprint from `emulation()` is carried in
-                // separate config fields and is unaffected by this final
-                // default_headers() call.
-                let mut merged = Client::builder()
-                    .emulation(em)
-                    .build()
-                    .map(|c| c.headers())
-                    .unwrap_or_default();
-                for (k, v) in cfg.extra_headers.iter() {
-                    merged.insert(k.clone(), v.clone());
-                }
-                if let Some(em2) = emulation_for_ua(ua) {
-                    b = b.emulation(em2).default_headers(merged);
-                }
+        if let Some(browser) = profile(&cfg) {
+            // The profile's own headers (its User-Agent and navigation set)
+            // with the app headers laid over them, so Authorization, Cookie
+            // and the attribution token win over anything the profile sends.
+            // default_headers() replaces the map the builder holds, so the
+            // merged map has to be the last one set. The TLS, HTTP/2 and
+            // header-order settings travel separately in emulation().
+            let mut headers = browser.default_headers();
+            for (k, v) in cfg.extra_headers.iter() {
+                headers.insert(k.clone(), v.clone());
             }
+            b = b.emulation(browser.emulation()).default_headers(headers);
         }
     }
 
@@ -312,26 +326,6 @@ pub fn build_scan_client(spec: ScanClient) -> Result<Client, Error> {
     })
 }
 
-/// Map the identity's User-Agent to a `wreq_util` emulation profile by browser
-/// family. The family variety across targets comes from the private catalogue's
-/// per-target UA choice; only the family -> profile mapping is here (public).
-#[cfg(feature = "impersonate")]
-fn emulation_for_ua(ua: Option<&str>) -> Option<wreq_util::Emulation> {
-    use wreq_util::Emulation::*;
-    let ua = ua?;
-    Some(if ua.contains("Firefox/") {
-        Firefox139
-    } else if ua.contains("Edg/") {
-        Edge134
-    } else if ua.contains("Version/") && ua.contains("Safari/") && !ua.contains("Chrome/") {
-        Safari18_5
-    } else if ua.contains("Chrome/") {
-        Chrome137
-    } else {
-        return None;
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,20 +355,62 @@ mod tests {
     }
 
     #[test]
-    fn will_emulate_tracks_feature_and_flag() {
-        assert_eq!(will_emulate(&ua("x")), cfg!(feature = "impersonate"));
+    fn will_emulate_tracks_feature_flag_and_family() {
+        let firefox = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
+        assert_eq!(will_emulate(&ua(firefox)), cfg!(feature = "impersonate"));
+        // No profile covers a User-Agent that names no browser.
+        assert!(!will_emulate(&ua("Crossfyre-Scanner/1.0")));
         assert!(!will_emulate(&ClientConfig {
             emulate: false,
-            ..Default::default()
+            ..ua(firefox)
         }));
     }
 
     #[cfg(feature = "impersonate")]
     #[test]
-    fn ua_maps_to_browser_family() {
-        assert!(emulation_for_ua(Some("... Chrome/138.0.0.0 Safari/537.36")).is_some());
-        assert!(emulation_for_ua(Some("... rv:139.0) Gecko/20100101 Firefox/139.0")).is_some());
-        assert!(emulation_for_ua(Some("... Version/18.5 Safari/605.1.15")).is_some());
-        assert!(emulation_for_ua(None).is_none());
+    fn a_user_agent_no_profile_covers_is_sent_as_it_is() {
+        // voyage's --active-user-agent takes any string, and with emulation on a
+        // string that names no browser used to leave the client with no
+        // User-Agent at all. It has to go out, with the browser headers, as it
+        // does when emulation is off.
+        let mut extra_headers = HeaderMap::new();
+        extra_headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer t"));
+        let client = build_client(ClientConfig {
+            extra_headers,
+            browser_headers: headers_from_pairs(&[("accept-language", "en-GB".into())]),
+            ..ua("Crossfyre-Scanner/1.0")
+        })
+        .unwrap();
+        let sent = client.headers();
+        assert_eq!(sent[header::USER_AGENT], "Crossfyre-Scanner/1.0");
+        assert_eq!(sent[header::ACCEPT_LANGUAGE], "en-GB");
+        assert_eq!(sent[header::AUTHORIZATION], "Bearer t");
+        assert!(sent.get("te").is_none(), "no profile header goes out");
+    }
+
+    #[cfg(feature = "impersonate")]
+    #[test]
+    fn emulating_client_sends_the_profile_headers_under_the_app_headers() {
+        let mut extra_headers = HeaderMap::new();
+        extra_headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer t"));
+        // An app header the profile also sets: the app's value has to win.
+        extra_headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
+        let client = build_client(ClientConfig {
+            extra_headers,
+            browser_headers: headers_from_pairs(&[("sec-ch-ua", "from-identity".into())]),
+            ..ua("Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0")
+        })
+        .unwrap();
+        let sent = client.headers();
+        assert_eq!(sent[header::AUTHORIZATION], "Bearer t");
+        assert_eq!(sent[header::ACCEPT], "application/json");
+        // The profile owns the User-Agent and the browser headers; the
+        // identity's are not sent alongside them.
+        assert_eq!(
+            sent[header::USER_AGENT],
+            emulation::Browser::Firefox.user_agent()
+        );
+        assert_eq!(sent["te"], "trailers");
+        assert!(sent.get("sec-ch-ua").is_none());
     }
 }

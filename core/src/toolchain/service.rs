@@ -93,6 +93,11 @@ pub fn create_service_file(ext: &str) -> Result<(), Box<dyn std::error::Error>> 
     imp::create(ext)
 }
 
+/// Is a service registered for an extension, under any name it may have?
+pub fn has_service_file(ext: &str) -> bool {
+    unit_keys(ext).into_iter().any(imp::exists)
+}
+
 /// Remove the service registration for an extension, under every name it may have.
 /// Called during `remove`.
 pub fn remove_service_file(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -288,15 +293,145 @@ pub fn list() -> Result<(), Box<dyn std::error::Error>> {
 // ── Node supervisor service (system scope) ───────────────────────────
 
 /// Install + enable + start the node supervisor as an OS service so registered
-/// nodes survive reboots and closed terminals. `exe` is the stable binary path
-/// the unit should exec (normally `/opt/crossfyre/bin/crossfyre`).
+/// nodes survive reboots and closed terminals. The unit runs the node worker in
+/// the bin directory, and names `cli` (normally `/opt/crossfyre/bin/crossfyre`,
+/// or wherever a package put it) to the node in `CROSSFYRE_CLI`.
 pub fn install_node_service(
-    exe: &std::path::Path,
+    cli: &std::path::Path,
     data_dir: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    node::create(exe, data_dir)?;
+    node::create(cli, data_dir)?;
     node::action("enable")?;
     node::action("start")?;
+    Ok(())
+}
+
+/// The node worker the node unit runs: the one in the bin directory.
+pub fn node_binary() -> std::path::PathBuf {
+    super::config::get_bin_dir().join(super::config::ext_file_name("node"))
+}
+
+/// The node unit for a CLI at `cli` whose node worker lives in `bin_dir`.
+///
+/// The worker is taken from `bin_dir` and never from beside the CLI. The installer puts
+/// the two side by side, but a package puts the CLI in /usr/bin, and /usr/bin/node is
+/// Node.js where it is installed and nothing at all where it is not, while the worker is
+/// fetched into the bin directory.
+pub fn node_unit(
+    cli: &std::path::Path,
+    bin_dir: &std::path::Path,
+    data_dir: &std::path::Path,
+    sudo_user: Option<&str>,
+) -> Result<String, String> {
+    let node_exe = bin_dir.join(super::config::ext_file_name("node"));
+    let node_exe = unit_line_value(&node_exe.display().to_string())?.to_string();
+    let data_dir = unit_line_value(&data_dir.display().to_string())?.to_string();
+    let cli_env = quoted_assignment(super::packaging::CLI_ENV, &cli.display().to_string())?;
+    // Bake SUDO_USER into the unit so the daemon's user-scoped state (config root,
+    // systemctl --user for extensions) keeps resolving to the operator's home
+    // instead of /root.
+    let sudo_env = match sudo_user {
+        Some(name) => format!("Environment=SUDO_USER={}\n", unit_line_value(name)?),
+        None => String::new(),
+    };
+    Ok(format!(
+        "[Unit]\n\
+         Description=Crossfyre node supervisor\n\
+         After=network-online.target docker.service\n\
+         Wants=network-online.target\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStart={node_exe} supervise --data-dir {data_dir}\n\
+         Environment={cli_env}\n\
+         {sudo_env}\
+         Restart=on-failure\n\
+         RestartSec=5\n\
+         \n\
+         [Install]\n\
+         WantedBy=multi-user.target\n"
+    ))
+}
+
+/// `value` as it may appear on one line of a unit file. A line break would end the
+/// directive and start another one, so it is refused rather than written.
+fn unit_line_value(value: &str) -> Result<&str, String> {
+    if value.contains(['\n', '\r']) {
+        return Err(format!("{value:?} cannot go in a unit file"));
+    }
+    Ok(value)
+}
+
+/// `name=value` in double quotes, as `Environment=` reads it: one assignment even when
+/// the value has a space in it, with no `%` specifier expanded.
+fn quoted_assignment(name: &str, value: &str) -> Result<String, String> {
+    let value = unit_line_value(value)?
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%");
+    Ok(format!("\"{name}={value}\""))
+}
+
+/// One path on the way to a file a root service runs: its owner, group and mode.
+pub(crate) struct PathOwner {
+    pub path: std::path::PathBuf,
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u32,
+}
+
+/// Could anyone other than root replace the file whose path is described by `chain`, the
+/// file first and then each directory above it? The file must belong to root and be
+/// writable by nobody else, and so must every directory, except that a directory with its
+/// sticky bit set (the Nix store) does not let anyone replace an entry they do not own.
+/// Write access for the root group counts as root's.
+pub(crate) fn judge_root_run(chain: &[PathOwner]) -> Result<(), String> {
+    for (i, p) in chain.iter().enumerate() {
+        let others_write = p.mode & 0o002 != 0 || (p.mode & 0o020 != 0 && p.gid != 0);
+        let sticky_dir = i > 0 && p.mode & 0o1000 != 0;
+        let why = if p.uid != 0 {
+            format!("{} belongs to uid {}", p.path.display(), p.uid)
+        } else if others_write && !sticky_dir {
+            format!("{} may be written by others", p.path.display())
+        } else {
+            continue;
+        };
+        return Err(format!(
+            "{} could be replaced by a user other than root ({why}), and a service running \
+             as root would run it",
+            chain[0].path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse to point a root service at `path` when anyone but root could replace it. The
+/// path is checked as given and where its symlinks lead, since either could be swapped.
+#[cfg(unix)]
+pub fn root_may_run(path: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let real = std::fs::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    for start in [real.as_path(), path] {
+        let mut chain = Vec::new();
+        for p in start.ancestors() {
+            if p.as_os_str().is_empty() {
+                continue;
+            }
+            let m = std::fs::metadata(p).map_err(|e| format!("{}: {e}", p.display()))?;
+            chain.push(PathOwner {
+                path: p.to_path_buf(),
+                uid: m.uid(),
+                gid: m.gid(),
+                mode: m.mode(),
+            });
+        }
+        judge_root_run(&chain)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn root_may_run(_path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
@@ -323,40 +458,16 @@ mod node {
     }
 
     pub fn create(
-        exe: &std::path::Path,
+        cli: &std::path::Path,
         data_dir: &std::path::Path,
     ) -> Result<(), Box<dyn std::error::Error>> {
         require_root()?;
-        // Bake SUDO_USER into the unit so the daemon's user-scoped state
-        // (config root, systemctl --user for extensions) keeps resolving to
-        // the operator's home instead of /root.
-        let sudo_env = match super::super::sudo_user::sudo_user_info() {
-            Some((_, _, _, name)) => format!("Environment=SUDO_USER={name}\n"),
-            None => String::new(),
-        };
-        // The supervisor is the separate `node` worker binary, installed
-        // alongside `crossfyre` (e.g. /opt/crossfyre/bin/node). Derive its path
-        // from the crossfyre binary path we were given.
-        let node_exe = exe.with_file_name("node");
-        let body = format!(
-            "[Unit]\n\
-             Description=Crossfyre node supervisor\n\
-             After=network-online.target docker.service\n\
-             Wants=network-online.target\n\
-             \n\
-             [Service]\n\
-             Type=simple\n\
-             ExecStart={node_exe} supervise --data-dir {data_dir}\n\
-             {sudo_env}\
-             Restart=on-failure\n\
-             RestartSec=5\n\
-             \n\
-             [Install]\n\
-             WantedBy=multi-user.target\n",
-            node_exe = node_exe.display(),
-            data_dir = data_dir.display(),
-            sudo_env = sudo_env,
-        );
+        let sudo_user = super::super::sudo_user::sudo_user_info().map(|(_, _, _, name)| name);
+        // The supervisor is the separate `node` worker binary in the bin directory,
+        // and it runs as root, so it has to be a file only root can replace.
+        super::root_may_run(&super::node_binary())?;
+        let bin_dir = super::super::config::get_bin_dir();
+        let body = super::node_unit(cli, &bin_dir, data_dir, sudo_user.as_deref())?;
         fs::write(UNIT_PATH, body)?;
         let _ = std::process::Command::new("systemctl")
             .arg("daemon-reload")
@@ -434,7 +545,7 @@ mod node {
     // Windows the operator runs `crossfyre node up` in a terminal (or wires up
     // their own LaunchDaemon / scheduled task).
     pub fn create(
-        _exe: &std::path::Path,
+        _cli: &std::path::Path,
         _data_dir: &std::path::Path,
     ) -> Result<(), Box<dyn std::error::Error>> {
         Err("the node service is only supported on Linux for now - run `crossfyre node up` directly".into())
@@ -852,5 +963,168 @@ mod imp {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn exec_start(unit: &str) -> &str {
+        unit.lines()
+            .find(|l| l.starts_with("ExecStart="))
+            .expect("an ExecStart line")
+    }
+
+    #[test]
+    fn a_packaged_cli_in_usr_bin_has_the_unit_run_the_node_in_the_bin_dir() {
+        // apt and pacman put the CLI in /usr/bin and leave the CLI to fetch the node
+        // worker into /opt/crossfyre/bin. Taking the worker from beside the CLI made the
+        // unit run /usr/bin/node, which is Node.js.
+        let unit = node_unit(
+            Path::new("/usr/bin/crossfyre"),
+            Path::new("/opt/crossfyre/bin"),
+            Path::new("/home/op/.config/crossfyre"),
+            Some("op"),
+        )
+        .expect("unit");
+        assert_eq!(
+            exec_start(&unit),
+            "ExecStart=/opt/crossfyre/bin/node supervise --data-dir /home/op/.config/crossfyre"
+        );
+        assert!(
+            unit.contains("\nEnvironment=\"CROSSFYRE_CLI=/usr/bin/crossfyre\"\n"),
+            "the node is told which CLI set it up: {unit}"
+        );
+        assert!(unit.contains("\nEnvironment=SUDO_USER=op\n"), "{unit}");
+    }
+
+    #[test]
+    fn the_installer_layout_runs_the_node_beside_the_cli() {
+        let unit = node_unit(
+            Path::new("/opt/crossfyre/bin/crossfyre"),
+            Path::new("/opt/crossfyre/bin"),
+            Path::new("/root/.config/crossfyre"),
+            None,
+        )
+        .expect("unit");
+        assert_eq!(
+            exec_start(&unit),
+            "ExecStart=/opt/crossfyre/bin/node supervise --data-dir /root/.config/crossfyre"
+        );
+        assert!(!unit.contains("SUDO_USER"), "{unit}");
+    }
+
+    #[test]
+    fn a_line_break_in_a_path_is_refused_rather_than_written() {
+        // It would end the directive and start one of the caller's choosing in a unit
+        // that runs as root.
+        for (cli, data) in [
+            ("/usr/bin/crossfyre", "/home/op\nExecStartPre=/bin/sh -c id"),
+            ("/usr/bin/crossfyre\nUser=nobody", "/home/op"),
+        ] {
+            assert!(
+                node_unit(
+                    Path::new(cli),
+                    Path::new("/opt/crossfyre/bin"),
+                    Path::new(data),
+                    None
+                )
+                .is_err(),
+                "{cli:?} {data:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cli_stays_one_assignment_whatever_its_path_holds() {
+        let unit = node_unit(
+            Path::new("/opt/my tools/cross%fyre\"x"),
+            Path::new("/opt/crossfyre/bin"),
+            Path::new("/d"),
+            None,
+        )
+        .expect("unit");
+        assert!(
+            unit.contains("\nEnvironment=\"CROSSFYRE_CLI=/opt/my tools/cross%%fyre\\\"x\"\n"),
+            "{unit}"
+        );
+    }
+
+    fn owned(path: &str, uid: u32, gid: u32, mode: u32) -> PathOwner {
+        PathOwner {
+            path: PathBuf::from(path),
+            uid,
+            gid,
+            mode,
+        }
+    }
+
+    #[test]
+    fn root_runs_only_what_root_alone_can_replace() {
+        let root_dirs = || {
+            vec![
+                owned("/opt/crossfyre/bin", 0, 0, 0o40755),
+                owned("/opt/crossfyre", 0, 0, 0o40755),
+                owned("/opt", 0, 0, 0o40755),
+                owned("/", 0, 0, 0o40755),
+            ]
+        };
+        let with_file = |file: PathOwner, dirs: Vec<PathOwner>| {
+            let mut chain = vec![file];
+            chain.extend(dirs);
+            judge_root_run(&chain)
+        };
+        assert!(
+            with_file(
+                owned("/opt/crossfyre/bin/node", 0, 0, 0o100755),
+                root_dirs()
+            )
+            .is_ok()
+        );
+
+        // A worker a user owns, or one anyone may write, could be swapped for anything.
+        for file in [
+            owned("/opt/crossfyre/bin/node", 1000, 1000, 0o100755),
+            owned("/opt/crossfyre/bin/node", 0, 0, 0o100777),
+            owned("/opt/crossfyre/bin/node", 0, 1000, 0o100775),
+        ] {
+            assert!(with_file(file, root_dirs()).is_err());
+        }
+
+        // So could one in a directory a user owns or may write.
+        let mut user_dir = root_dirs();
+        user_dir[0] = owned("/opt/crossfyre/bin", 1000, 1000, 0o40755);
+        assert!(with_file(owned("/opt/crossfyre/bin/node", 0, 0, 0o100755), user_dir).is_err());
+        let mut open_dir = root_dirs();
+        open_dir[1] = owned("/opt/crossfyre", 0, 0, 0o40777);
+        let err = with_file(owned("/opt/crossfyre/bin/node", 0, 0, 0o100755), open_dir)
+            .expect_err("a directory others may write");
+        assert!(err.contains("/opt/crossfyre/bin/node"), "{err}");
+
+        // Write access for the root group is root's, and a sticky directory such as the
+        // Nix store does not let others replace what they do not own.
+        assert!(
+            with_file(
+                owned("/opt/crossfyre/bin/node", 0, 0, 0o100775),
+                root_dirs()
+            )
+            .is_ok()
+        );
+        let store = vec![
+            owned("/nix/store/x-crossfyre/bin", 0, 0, 0o40555),
+            owned("/nix/store/x-crossfyre", 0, 0, 0o40555),
+            owned("/nix/store", 0, 30000, 0o41775),
+            owned("/nix", 0, 0, 0o40755),
+            owned("/", 0, 0, 0o40755),
+        ];
+        assert!(
+            with_file(
+                owned("/nix/store/x-crossfyre/bin/node", 0, 0, 0o100555),
+                store
+            )
+            .is_ok()
+        );
     }
 }

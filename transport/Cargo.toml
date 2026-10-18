@@ -17,14 +17,24 @@ tokio = { version = "1", features = ["net"] }
 serde = { version = "1", features = ["derive"] }
 
 # Impersonation backend (BoringSSL). Optional so the open build never requires a
-# C toolchain and never ships the emulation policy.
-wreq = { version = "5", optional = true, features = ["cookies", "gzip", "json"] }
-wreq-util = { version = "2", optional = true }
+# C toolchain and never ships the emulation policy. The browser profiles it
+# presents are in src/emulation.rs. Every profile advertises brotli and deflate
+# and most advertise zstd, so the client has to decode all of them: wreq only
+# decodes the encodings whose features are on, and hands back the raw bytes for
+# the rest.
+wreq = { version = "5", optional = true, features = ["cookies", "gzip", "brotli", "deflate", "zstd", "json"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["net", "rt", "macros"] }
+# tests/emulation_wire.rs: a local TLS origin that records the ClientHello and
+# the HTTP/2 preface, and the hashes JA4 is made of. All four are already in the
+# lock through other crates.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = "0.13"
+sha2 = "0.10"
+brotli = "8"
 
 [features]
 # Off by default: the open toolchain builds a plain reqwest client. First-party
 # distribution enables this to get real browser TLS/HTTP2 fingerprints.
-impersonate = ["dep:wreq", "dep:wreq-util"]
+impersonate = ["dep:wreq"]

@@ -182,8 +182,14 @@ enum Commands {
     /// container from this host.
     Uninstall {
         /// Also remove the config root (node registrations included)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "keep_data")]
         purge: bool,
+        /// Keep the database container, and the scan state in it
+        #[arg(long)]
+        keep_data: bool,
+        /// Do not ask first (for scripts, such as a package's removal script)
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 
@@ -346,17 +352,33 @@ enum ExtensionAction {
     Disable { name: String },
 }
 
+/// The `node` worker to run in the foreground: the one built beside this binary, for a
+/// build run from a checkout, and otherwise the installed one. Never one from beside a
+/// packaged CLI or from PATH, where `node` is Node.js on most machines that have either.
+fn node_worker() -> Option<std::path::PathBuf> {
+    let beside = if cfx_core::toolchain::packaging::current().is_some() {
+        None
+    } else {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("node")))
+            .filter(|p| p.exists())
+    };
+    beside.or_else(|| Some(cfx_core::toolchain::service::node_binary()).filter(|p| p.exists()))
+}
+
 /// Run the `node` worker's supervisor in the foreground (fallback for hosts
-/// with no OS service). Finds the `node` binary next to this one, else on PATH.
+/// with no OS service).
 fn exec_node_supervise(
     base: &std::path::Path,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let node = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("node")))
-        .filter(|p| p.exists())
-        .unwrap_or_else(|| std::path::PathBuf::from("node"));
+    let node = node_worker().ok_or_else(|| {
+        format!(
+            "the node worker is not installed at {}; run `sudo crossfyre node init`",
+            cfx_core::toolchain::service::node_binary().display()
+        )
+    })?;
     let mut cmd = std::process::Command::new(node);
     cmd.arg("supervise").arg("--data-dir").arg(base);
     if force {
@@ -414,6 +436,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     api_url,
                     agree_tos,
                     no_prompt,
+                    cli_version: env!("CARGO_PKG_VERSION").to_string(),
                 },
             )
             .await?;
@@ -523,16 +546,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 email,
                 no_tls,
             } => {
-                let exe = std::env::current_exe()?;
-                cfx_core::toolchain::oast::setup(
-                    &exe,
-                    cfx_core::toolchain::oast::SetupOpts {
-                        domain,
-                        public_ip,
-                        email,
-                        no_tls,
-                    },
-                )
+                cfx_core::toolchain::oast::setup(cfx_core::toolchain::oast::SetupOpts {
+                    domain,
+                    public_ip,
+                    email,
+                    no_tls,
+                })
                 .await?;
             }
             OastAction::Serve {
@@ -603,12 +622,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
         }
         Commands::Update { target, force } => {
-            let self_updated = cfx_core::toolchain::install::update(
+            let updated = cfx_core::toolchain::install::update(
                 target.as_deref(),
                 env!("CARGO_PKG_VERSION"),
                 force,
             )
-            .await?;
+            .await;
+            // Here and in `node init` only, both run by a person: the node's own update
+            // runs as a root service and leaves a home directory alone.
+            cfx_core::toolchain::rcfile::fix_for_invoking_user();
+            let self_updated = updated?;
             if self_updated && cfx_core::toolchain::service::node_service_exists() {
                 step("Restarting the node service to pick up the new binary...");
                 let _ = cfx_core::toolchain::service::restart(
@@ -625,8 +648,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Doctor => {
             cfx_core::toolchain::doctor::run(&base).await?;
         }
-        Commands::Uninstall { purge } => {
-            cfx_core::toolchain::uninstall::run(purge)?;
+        Commands::Uninstall {
+            purge,
+            keep_data,
+            yes,
+        } => {
+            cfx_core::toolchain::uninstall::run(
+                cfx_core::toolchain::uninstall::Scope { purge, keep_data },
+                yes,
+            )?;
         }
     }
 

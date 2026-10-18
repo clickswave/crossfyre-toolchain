@@ -116,8 +116,12 @@ fn os_label() -> String {
     format!("{} ({})", std::env::consts::OS, std::env::consts::ARCH)
 }
 
-fn cli_version() -> String {
-    env!("CARGO_PKG_VERSION").to_string()
+/// What the device flow tells the approval page about the machine asking to sign in.
+/// The version is the one the CLI passes in: env!("CARGO_PKG_VERSION") in this crate is
+/// cfx_core's own, 0.1.0 in every binary that links it, and the page showed that for
+/// every login.
+fn client_info(cli_version: &str) -> serde_json::Value {
+    serde_json::json!({ "hostname": hostname(), "os": os_label(), "version": cli_version })
 }
 
 fn spawn_quiet(cmd: &str, args: &[&str]) -> bool {
@@ -182,6 +186,8 @@ pub struct LoginFlags {
     pub api_url: String,
     pub agree_tos: bool,
     pub no_prompt: bool,
+    /// The CLI's own version, which a browser login shows on the approval page.
+    pub cli_version: String,
 }
 
 /// Resolve which method to use from the flags, erroring on mismatched or
@@ -343,7 +349,7 @@ pub async fn perform_login(
             let password = flags.password.clone().unwrap();
             password_login(&client, &api_url, &username, &password).await?
         }
-        Method::Browser => browser_login(&client, &api_url).await?,
+        Method::Browser => browser_login(&client, &api_url, &flags.cli_version).await?,
     };
 
     let account = Account {
@@ -439,12 +445,13 @@ async fn password_login(
 async fn browser_login(
     client: &reqwest::Client,
     api_url: &str,
+    cli_version: &str,
 ) -> Result<(String, UserTriple), Box<dyn std::error::Error>> {
     // 1. Start the device flow.
     let res = client
         .post(format!("{api_url}/api/v1/cli/device/start"))
         .json(&serde_json::json!({
-            "client_info": { "hostname": hostname(), "os": os_label(), "version": cli_version() }
+            "client_info": client_info(cli_version)
         }))
         .send()
         .await?;
@@ -804,5 +811,14 @@ mod tests {
         );
         assert_eq!(load_account(&dir).as_ref(), Some(&short));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The approval page shows this version beside the host asking to sign in. Read with
+    /// env! in this crate it was cfx_core's 0.1.0 for every CLI.
+    #[test]
+    fn the_approval_page_is_told_the_version_the_cli_passes_in() {
+        let info = client_info("7.8.9");
+        assert_eq!(info["version"], "7.8.9");
+        assert_eq!(info["os"], os_label());
     }
 }

@@ -1547,9 +1547,13 @@ pub async fn run_init(
     // orion services and binaries don't fight the new ones.
     toolchain::uninstall::cleanup_legacy_orionchain();
     toolchain::migrate::renamed_engines();
+    // An older installer put the bin directory at the front of PATH, where its `node`
+    // hides Node.js.
+    toolchain::rcfile::fix_for_invoking_user();
 
     // Put the crossfyre binary at its stable path so OS services have a
-    // fixed ExecStart (no-op when already running from /opt/crossfyre/bin).
+    // fixed ExecStart (no-op when already running from /opt/crossfyre/bin, or
+    // when a package manager installed it).
     let stable_exe = match toolchain::install::ensure_self_installed() {
         Ok(p) => p,
         Err(e) => {
@@ -1562,7 +1566,7 @@ pub async fn run_init(
         }
     };
 
-    // Ensure the `node` worker binary is installed next to crossfyre, so the
+    // Ensure the `node` worker binary is installed in the bin directory, so the
     // node service's ExecStart (/opt/crossfyre/bin/node) resolves.
     if let Err(e) = toolchain::install::ensure_node_installed().await {
         warn(&format!("could not install the node worker binary: {e}"));
@@ -1844,7 +1848,36 @@ fn host_seed() -> String {
     }
 }
 
-pub async fn run_daemon(force: bool, paths: &NodePaths) -> Result<(), Box<dyn std::error::Error>> {
+/// The toolchain part of the heartbeat. "installed" is always true, since the node
+/// sending it is what it describes. The version is the one `node --version` prints,
+/// built from the version the node binary hands to run_daemon: env!("CARGO_PKG_VERSION")
+/// in this crate is cfx_core's own, 0.1.0 in every binary that links it, and that is
+/// what every node reported. `cli_manager` is the package manager that installed the
+/// CLI, when one did.
+fn toolchain_health(
+    node_version: &str,
+    pg_port: u16,
+    pg_running: bool,
+    cli_manager: Option<toolchain::packaging::Manager>,
+) -> serde_json::Value {
+    let mut status = serde_json::json!({
+        "installed": true,
+        "version": format!("node {node_version}"),
+        "postgres": { "port": pg_port, "running": pg_running }
+    });
+    if let Some(m) = cli_manager {
+        status["managed_by"] = serde_json::json!(m.name());
+    }
+    status
+}
+
+/// Run the registered node at `paths` until it is stopped. `node_version` is the node
+/// binary's own version, which the heartbeat reports.
+pub async fn run_daemon(
+    force: bool,
+    paths: &NodePaths,
+    node_version: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting Crossfyre Node Client Daemon...");
     println!("Node id       : {}", paths.node_id);
     println!("Config root   : {}", paths.base.display());
@@ -2404,9 +2437,8 @@ pub async fn run_daemon(force: bool, paths: &NodePaths) -> Result<(), Box<dyn st
                     serde_json::Value::Object(map)
                 };
 
-                // Toolchain health. The package manager is built into this
-                // binary, so "installed" is always true and the version is
-                // our own; Postgres is probed on its configured TCP port.
+                // Toolchain health: the node's own version, and Postgres
+                // probed on its configured TCP port.
                 let toolchain_status: serde_json::Value = {
                     let pg_port = crate::toolchain::config::load_config()
                         .map(|c| c.postgres.port)
@@ -2415,12 +2447,12 @@ pub async fn run_daemon(force: bool, paths: &NodePaths) -> Result<(), Box<dyn st
                         &std::net::SocketAddr::from(([127, 0, 0, 1], pg_port)),
                         std::time::Duration::from_millis(200),
                     ).is_ok();
-
-                    serde_json::json!({
-                        "installed": true,
-                        "version": format!("crossfyre {}", env!("CARGO_PKG_VERSION")),
-                        "postgres": { "port": pg_port, "running": pg_running }
-                    })
+                    toolchain_health(
+                        node_version,
+                        pg_port,
+                        pg_running,
+                        crate::toolchain::packaging::owner("crossfyre"),
+                    )
                 };
 
                 let host_status = if first_tick {
@@ -2780,21 +2812,28 @@ pub async fn run_daemon(force: bool, paths: &NodePaths) -> Result<(), Box<dyn st
                                 println!("\n[update] Updating crossfyre from the release manifest...");
                                 let updated = toolchain::install::update_for_dashboard().await;
 
-                                let (success, restarting) = match &updated {
-                                    Ok(true) => (true, true),
-                                    Ok(false) => (true, false), // already current
+                                let (success, restarting, managed_by) = match &updated {
+                                    Ok(u) => (true, u.restart, u.cli_managed_by),
                                     Err(e) => {
                                         eprintln!("[update] FAIL {e}");
-                                        (false, false)
+                                        (false, false, None)
                                     }
                                 };
 
-                                let msg = serde_json::json!({
+                                let mut msg = serde_json::json!({
                                     "type": "node_updated",
                                     "success": success,
                                     "restarting": restarting,
                                     "node_id": &node_id
                                 });
+                                // A package manager keeps the CLI here, so "already up to
+                                // date" would not be the whole story: say which one.
+                                if let Some(m) = managed_by {
+                                    msg["managed_by"] = serde_json::json!(m.name());
+                                    msg["message"] = serde_json::json!(
+                                        toolchain::packaging::update_note(m)
+                                    );
+                                }
                                 let _ = publisher.publish(status_subject.clone(), msg.to_string().into()).await;
 
                                 if restarting {
@@ -3070,5 +3109,34 @@ mod security_tests {
         )
         .expect("parse");
         assert!(cfg.remote_exec, "an explicit opt-in was ignored");
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+    use super::*;
+
+    /// The dashboard's node card shows this version. Read with env! in this crate it was
+    /// cfx_core's 0.1.0 on every node, whatever had been installed.
+    #[test]
+    fn the_heartbeat_reports_the_version_the_node_binary_passes_in() {
+        let status = toolchain_health("7.8.9", 4440, true, None);
+        assert_eq!(status["version"], "node 7.8.9");
+        assert_eq!(status["installed"], true);
+        assert_eq!(status["postgres"]["port"], 4440);
+        assert_eq!(status["postgres"]["running"], true);
+        assert!(status.get("managed_by").is_none(), "{status}");
+    }
+
+    #[test]
+    fn the_heartbeat_names_the_package_manager_that_installed_the_cli() {
+        let status = toolchain_health(
+            "7.8.9",
+            4441,
+            false,
+            Some(toolchain::packaging::Manager::Apt),
+        );
+        assert_eq!(status["managed_by"], "apt");
+        assert_eq!(status["postgres"]["running"], false);
     }
 }

@@ -2,6 +2,7 @@
 // in the field: missing docker/unzip, dead daemons, unreachable control
 // plane, leftover OrionChain installs.
 
+use super::packaging::Found;
 use super::ui::{dim, done, error, fail, ok, section, step, title, warn};
 use super::{ENGINES, config};
 use std::path::Path;
@@ -64,6 +65,37 @@ pub async fn run(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
         "install iproute2 (needed for VPN network namespaces)",
     ) {
         failed += 1;
+    }
+
+    // -- How this crossfyre was installed ---------------------------------------
+    section("Install");
+    let bin_dir = config::get_bin_dir();
+    match super::packaging::found() {
+        Found::None => step(&format!(
+            "installer layout {}",
+            dim(&format!("(binaries in {})", bin_dir.display()))
+        )),
+        Found::Packaged(p) => ok(&format!(
+            "installed by {} {}",
+            p.manager,
+            dim(&format!(
+                "(owns {}; binaries in {}; {})",
+                p.owned().join(", "),
+                bin_dir.display(),
+                p.file.display()
+            ))
+        )),
+        Found::Ignored { file, why } => {
+            if !check(
+                &format!("{} is not used", file.display()),
+                false,
+                &format!(
+                    "{why}; give it to root, or to the owner of crossfyre, with mode 644, or remove it"
+                ),
+            ) {
+                failed += 1;
+            }
+        }
     }
 
     // -- Toolchain config ---------------------------------------------------
