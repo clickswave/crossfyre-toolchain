@@ -186,7 +186,11 @@ pub fn get_config_path() -> PathBuf {
 pub fn get_bin_dir() -> PathBuf {
     // Where extension binaries (and the crossfyre binary itself) are
     // installed. Linux/macOS keep the conventional /opt prefix; Windows has
-    // no /opt so we use %ProgramData%\Crossfyre\bin.
+    // no /opt so we use %ProgramData%\Crossfyre\bin. A package that keeps them
+    // somewhere else says where in its packaging.json.
+    if let Some(dir) = super::packaging::bin_dir() {
+        return dir.to_path_buf();
+    }
     #[cfg(windows)]
     {
         let base = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".to_string());

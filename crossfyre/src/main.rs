@@ -346,17 +346,33 @@ enum ExtensionAction {
     Disable { name: String },
 }
 
+/// The `node` worker to run in the foreground: the one built beside this binary, for a
+/// build run from a checkout, and otherwise the installed one. Never one from beside a
+/// packaged CLI or from PATH, where `node` is Node.js on most machines that have either.
+fn node_worker() -> Option<std::path::PathBuf> {
+    let beside = if cfx_core::toolchain::packaging::current().is_some() {
+        None
+    } else {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("node")))
+            .filter(|p| p.exists())
+    };
+    beside.or_else(|| Some(cfx_core::toolchain::service::node_binary()).filter(|p| p.exists()))
+}
+
 /// Run the `node` worker's supervisor in the foreground (fallback for hosts
-/// with no OS service). Finds the `node` binary next to this one, else on PATH.
+/// with no OS service).
 fn exec_node_supervise(
     base: &std::path::Path,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let node = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("node")))
-        .filter(|p| p.exists())
-        .unwrap_or_else(|| std::path::PathBuf::from("node"));
+    let node = node_worker().ok_or_else(|| {
+        format!(
+            "the node worker is not installed at {}; run `sudo crossfyre node init`",
+            cfx_core::toolchain::service::node_binary().display()
+        )
+    })?;
     let mut cmd = std::process::Command::new(node);
     cmd.arg("supervise").arg("--data-dir").arg(base);
     if force {

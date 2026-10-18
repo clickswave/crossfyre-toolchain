@@ -52,7 +52,8 @@ const STDERR_TAIL: usize = 20;
 const STDERR_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Where the helper is: `CROSSFYRE_CFX_SCRIPT` when set, else beside this binary
-/// (the installer puts it next to `node` and the CLI), else on PATH.
+/// (the installer puts it next to `node` and the CLI), else in the bin directory
+/// (where a packaged CLI, which lives elsewhere, has it fetched), else on PATH.
 pub fn helper_path() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("CROSSFYRE_CFX_SCRIPT") {
         return Some(PathBuf::from(p));
@@ -63,6 +64,10 @@ pub fn helper_path() -> Option<PathBuf> {
         .filter(|p| p.is_file());
     if beside.is_some() {
         return beside;
+    }
+    let installed = crate::toolchain::config::get_bin_dir().join(HELPER);
+    if installed.is_file() {
+        return Some(installed);
     }
     std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths)

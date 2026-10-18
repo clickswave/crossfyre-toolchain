@@ -1549,7 +1549,8 @@ pub async fn run_init(
     toolchain::migrate::renamed_engines();
 
     // Put the crossfyre binary at its stable path so OS services have a
-    // fixed ExecStart (no-op when already running from /opt/crossfyre/bin).
+    // fixed ExecStart (no-op when already running from /opt/crossfyre/bin, or
+    // when a package manager installed it).
     let stable_exe = match toolchain::install::ensure_self_installed() {
         Ok(p) => p,
         Err(e) => {
@@ -1562,7 +1563,7 @@ pub async fn run_init(
         }
     };
 
-    // Ensure the `node` worker binary is installed next to crossfyre, so the
+    // Ensure the `node` worker binary is installed in the bin directory, so the
     // node service's ExecStart (/opt/crossfyre/bin/node) resolves.
     if let Err(e) = toolchain::install::ensure_node_installed().await {
         warn(&format!("could not install the node worker binary: {e}"));

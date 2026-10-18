@@ -956,9 +956,14 @@ pub fn installed_cli_version() -> String {
 
 /// Copy the running binary to the stable install path
 /// (`/opt/crossfyre/bin/crossfyre`) so OS services have a fixed ExecStart.
-/// No-op when already running from there.
+/// No-op when already running from there, and when a package manager installed this
+/// CLI: a copy beside the engines would be one that no package upgrade replaces. The
+/// path returned is the one to name the CLI by.
 pub fn ensure_self_installed() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
     let exe = std::env::current_exe()?;
+    if super::packaging::owner("crossfyre").is_some() {
+        return Ok(super::packaging::cli_path_for(&exe));
+    }
     let stable = get_bin_dir().join(ext_file_name("crossfyre"));
     if exe == stable {
         return Ok(stable);
@@ -1067,8 +1072,12 @@ pub async fn ensure_node_installed() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// `name` in the directory of the running binary, when it is there and is not the
-/// installed copy itself.
+/// installed copy itself. Never for a packaged CLI: its directory belongs to the package,
+/// and in /usr/bin a file called `node` is Node.js.
 fn sibling_of_this_binary(name: &str) -> Option<PathBuf> {
+    if super::packaging::current().is_some() {
+        return None;
+    }
     let installed = get_bin_dir().join(ext_file_name(name));
     let exe = std::env::current_exe().ok()?;
     let sib = exe.parent()?.join(ext_file_name(name));

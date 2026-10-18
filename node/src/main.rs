@@ -45,6 +45,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // The node unit names the CLI that set it up. The node takes that CLI's packaging,
+    // because a packaged CLI and the node it fetched live in different directories.
+    if let Some(path) =
+        std::env::var_os(cfx_core::toolchain::packaging::CLI_ENV).filter(|p| !p.is_empty())
+    {
+        cfx_core::toolchain::packaging::set_cli(PathBuf::from(path));
+    }
     let cli = Cli::parse();
     let base = cfx_core::resolve_data_dir(cli.data_dir.as_deref())?;
     match cli.command {
