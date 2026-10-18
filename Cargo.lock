@@ -5419,7 +5419,6 @@ dependencies = [
  "serde",
  "tokio",
  "wreq",
- "wreq-util",
 ]
 
 [[package]]
@@ -6401,16 +6400,6 @@ dependencies = [
  "url",
  "webpki-root-certs 0.26.11",
  "windows-registry 0.5.3",
-]
-
-[[package]]
-name = "wreq-util"
-version = "2.2.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b28b3585973a8923c32c2f916e60b7b0d1cb4dd53e8cb2d7422c0ac001ef2487"
-dependencies = [
- "typed-builder",
- "wreq",
 ]
 
 [[package]]
