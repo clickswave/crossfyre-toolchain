@@ -58,7 +58,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Supervise { force } => cfx_core::run_boot(force, &base).await?,
         Cmd::Daemon { node_id, force } => {
             let paths = cfx_core::NodePaths::new(&base, &node_id);
-            cfx_core::run_daemon(force, &paths).await?;
+            cfx_core::run_daemon(force, &paths, env!("CARGO_PKG_VERSION")).await?;
         }
     }
     Ok(())

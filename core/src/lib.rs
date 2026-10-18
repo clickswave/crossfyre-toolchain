@@ -1848,7 +1848,36 @@ fn host_seed() -> String {
     }
 }
 
-pub async fn run_daemon(force: bool, paths: &NodePaths) -> Result<(), Box<dyn std::error::Error>> {
+/// The toolchain part of the heartbeat. "installed" is always true, since the node
+/// sending it is what it describes. The version is the one `node --version` prints,
+/// built from the version the node binary hands to run_daemon: env!("CARGO_PKG_VERSION")
+/// in this crate is cfx_core's own, 0.1.0 in every binary that links it, and that is
+/// what every node reported. `cli_manager` is the package manager that installed the
+/// CLI, when one did.
+fn toolchain_health(
+    node_version: &str,
+    pg_port: u16,
+    pg_running: bool,
+    cli_manager: Option<toolchain::packaging::Manager>,
+) -> serde_json::Value {
+    let mut status = serde_json::json!({
+        "installed": true,
+        "version": format!("node {node_version}"),
+        "postgres": { "port": pg_port, "running": pg_running }
+    });
+    if let Some(m) = cli_manager {
+        status["managed_by"] = serde_json::json!(m.name());
+    }
+    status
+}
+
+/// Run the registered node at `paths` until it is stopped. `node_version` is the node
+/// binary's own version, which the heartbeat reports.
+pub async fn run_daemon(
+    force: bool,
+    paths: &NodePaths,
+    node_version: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting Crossfyre Node Client Daemon...");
     println!("Node id       : {}", paths.node_id);
     println!("Config root   : {}", paths.base.display());
@@ -2408,9 +2437,8 @@ pub async fn run_daemon(force: bool, paths: &NodePaths) -> Result<(), Box<dyn st
                     serde_json::Value::Object(map)
                 };
 
-                // Toolchain health. The package manager is built into this
-                // binary, so "installed" is always true and the version is
-                // our own; Postgres is probed on its configured TCP port.
+                // Toolchain health: the node's own version, and Postgres
+                // probed on its configured TCP port.
                 let toolchain_status: serde_json::Value = {
                     let pg_port = crate::toolchain::config::load_config()
                         .map(|c| c.postgres.port)
@@ -2419,16 +2447,12 @@ pub async fn run_daemon(force: bool, paths: &NodePaths) -> Result<(), Box<dyn st
                         &std::net::SocketAddr::from(([127, 0, 0, 1], pg_port)),
                         std::time::Duration::from_millis(200),
                     ).is_ok();
-
-                    let mut status = serde_json::json!({
-                        "installed": true,
-                        "version": format!("crossfyre {}", env!("CARGO_PKG_VERSION")),
-                        "postgres": { "port": pg_port, "running": pg_running }
-                    });
-                    if let Some(m) = crate::toolchain::packaging::owner("crossfyre") {
-                        status["managed_by"] = serde_json::json!(m.name());
-                    }
-                    status
+                    toolchain_health(
+                        node_version,
+                        pg_port,
+                        pg_running,
+                        crate::toolchain::packaging::owner("crossfyre"),
+                    )
                 };
 
                 let host_status = if first_tick {
@@ -3085,5 +3109,34 @@ mod security_tests {
         )
         .expect("parse");
         assert!(cfg.remote_exec, "an explicit opt-in was ignored");
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+    use super::*;
+
+    /// The dashboard's node card shows this version. Read with env! in this crate it was
+    /// cfx_core's 0.1.0 on every node, whatever had been installed.
+    #[test]
+    fn the_heartbeat_reports_the_version_the_node_binary_passes_in() {
+        let status = toolchain_health("7.8.9", 4440, true, None);
+        assert_eq!(status["version"], "node 7.8.9");
+        assert_eq!(status["installed"], true);
+        assert_eq!(status["postgres"]["port"], 4440);
+        assert_eq!(status["postgres"]["running"], true);
+        assert!(status.get("managed_by").is_none(), "{status}");
+    }
+
+    #[test]
+    fn the_heartbeat_names_the_package_manager_that_installed_the_cli() {
+        let status = toolchain_health(
+            "7.8.9",
+            4441,
+            false,
+            Some(toolchain::packaging::Manager::Apt),
+        );
+        assert_eq!(status["managed_by"], "apt");
+        assert_eq!(status["postgres"]["running"], false);
     }
 }
