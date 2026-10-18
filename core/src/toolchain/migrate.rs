@@ -11,14 +11,19 @@
 //
 //   1. stops and disables the legacy service, before anything else can start on the
 //      same port;
-//   2. moves the binary to its public name and the version sidecar with it, and leaves
-//      a symlink at the legacy path so the old command keeps working;
+//   2. moves the binary to its public name and the version sidecar with it;
 //   3. moves the drop-in directory to the new unit's name, so its settings follow;
 //   4. removes the legacy service and registers the new one, enabled and started if
 //      the legacy one existed;
 //
 // and once for the host, rewrites `config.toml` so `[extensions]` uses public names.
 // `nodes.d` is left alone: it holds engine ids, which never change.
+//
+// 0.1.31 and 0.1.32 also left a symlink at the legacy path so the old command kept
+// working for one release. None is made now, and one of those links, still pointing at
+// the binary under the public name, is removed. The old names stay valid arguments to
+// `crossfyre extension install` and the rest, and the old environment variables keep
+// working, so only the command under the old name goes.
 //
 // Modelled on `uninstall::cleanup_legacy_orionchain`, and called from the same places
 // plus the start of `crossfyre update` and `crossfyre extension install`.
@@ -75,8 +80,8 @@ pub struct Outcome {
     /// The binary was moved to its public name (or a newer one was already there and
     /// the legacy copy was removed).
     pub binary: bool,
-    /// A symlink was left at the legacy path.
-    pub linked: bool,
+    /// The symlink an earlier release left at the legacy path was removed.
+    pub unlinked: bool,
     /// The drop-in directory was moved to the new unit's name.
     pub dropin: bool,
     /// The legacy service was replaced by the new one.
@@ -95,6 +100,14 @@ pub fn renamed_engines() {
             eprintln!("[migrate] {} is now {}, not moved yet: {why}", o.from, o.to);
             continue;
         }
+        if o.unlinked && !o.binary && !o.unit && !o.dropin {
+            println!(
+                "[migrate] removed {}, the link to {} that an earlier release left",
+                layout.bin_dir.join(file_name(o.from)).display(),
+                o.to
+            );
+            continue;
+        }
         let mut done = Vec::new();
         if o.binary {
             done.push("binary".to_string());
@@ -111,10 +124,11 @@ pub fn renamed_engines() {
             o.to,
             done.join(", ")
         );
-        if o.linked {
+        if o.unlinked {
             println!(
-                "[migrate] {} still runs it, through a link that the next release removes",
-                layout.bin_dir.join(file_name(o.from)).display()
+                "[migrate] removed {}, the link to {} that an earlier release left",
+                layout.bin_dir.join(file_name(o.from)).display(),
+                o.to
             );
         }
     }
@@ -153,13 +167,15 @@ fn migrate_one(
     let old_bin = layout.bin_dir.join(file_name(old));
     let new_bin = layout.bin_dir.join(file_name(e.name));
     let old_is_file = is_regular_file(&old_bin);
+    let old_link = links_to(&old_bin, &new_bin);
     let had_old_unit = units.exists(old);
 
     // Something to carry over: the binary under the legacy name, or a legacy unit
     // left beside a binary already under the public one. A legacy unit with no binary
-    // behind it under either name has nothing to be moved to.
+    // behind it under either name has nothing to be moved to. A link an earlier
+    // release left at the legacy path is something to remove.
     let legacy_unit_beside_new = had_old_unit && new_bin.exists();
-    if !(old_is_file || legacy_unit_beside_new) {
+    if !(old_is_file || legacy_unit_beside_new || old_link) {
         return None;
     }
 
@@ -172,12 +188,19 @@ fn migrate_one(
 
     // Checked before anything is stopped, so a run without the rights to finish (a
     // `crossfyre update` without sudo) leaves the engine running as it was.
-    if old_is_file && !writable(&layout.bin_dir) {
+    if (old_is_file || old_link) && !writable(&layout.bin_dir) {
         o.skipped = Some(format!(
             "{} is not writable here (run it with sudo)",
             layout.bin_dir.display()
         ));
         return Some(o);
+    }
+
+    if old_link {
+        o.unlinked = fs::remove_file(&old_bin).is_ok();
+        if !legacy_unit_beside_new {
+            return Some(o);
+        }
     }
 
     // The legacy daemon goes down first. The new unit listens on the same port, and
@@ -205,7 +228,6 @@ fn migrate_one(
         }
         o.binary = true;
         move_sidecar(&layout.bin_dir, old, e.name);
-        o.linked = link(&old_bin, &new_bin);
     }
 
     if let Some(dir) = &layout.unit_dir {
@@ -243,22 +265,16 @@ fn move_sidecar(bin_dir: &Path, old: &str, new: &str) {
     }
 }
 
-/// Leave `old` as a relative symlink to `new`, so the old command keeps running the
-/// engine. Windows is skipped: a symlink there needs a privilege the CLI may not have,
-/// and the old name is only a convenience.
-fn link(old: &Path, new: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        let Some(target) = new.file_name() else {
-            return false;
-        };
-        std::os::unix::fs::symlink(target, old).is_ok()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (old, new);
-        false
-    }
+/// Is `path` a symlink that leads to `target`? 0.1.31 and 0.1.32 made the link relative,
+/// but one made by hand may not be, so where it leads is compared rather than what it
+/// says.
+fn links_to(path: &Path, target: &Path) -> bool {
+    let is_link = fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+    is_link
+        && matches!(
+            (fs::canonicalize(path), fs::canonicalize(target)),
+            (Ok(a), Ok(b)) if a == b
+        )
 }
 
 /// Can files be created and renamed in `dir`?
@@ -419,9 +435,9 @@ mod tests {
         assert_eq!((out[0].from, out[0].to), ("cortex", "plessor"));
         assert!(units.position("stop cortex") < units.position("start plessor"));
         assert!(is_regular_file(&s.bin("plessor")));
-        assert_eq!(
-            fs::read_link(s.bin("cortex")).expect("link"),
-            PathBuf::from("plessor")
+        assert!(
+            fs::symlink_metadata(s.bin("cortex")).is_err(),
+            "nothing is left under the old name"
         );
         assert!(s.unit("crossfyre-plessor.service.d/oast.conf").exists());
         assert!(is_regular_file(&s.bin("voyage")), "voyage is left as it is");
@@ -445,28 +461,22 @@ mod tests {
         assert!(units.position("remove cortex") < start_new);
         assert!(units.position("create cortex") < start_new);
         assert!(!units.calls().contains(&"start cortex".to_string()));
-        assert!(out[0].unit && out[0].binary && out[0].linked && out[0].dropin);
+        assert!(out[0].unit && out[0].binary && out[0].dropin);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn the_binary_moves_and_a_link_is_left_at_the_old_path() {
+    fn the_binary_moves_and_nothing_is_left_at_the_old_path() {
         let s = Scratch::new("binary");
         legacy_machine(&s);
-        migrate_in(TABLE, &s.layout(), &Recorder::with(&["cortex"]));
+        let out = migrate_in(TABLE, &s.layout(), &Recorder::with(&["cortex"]));
 
         assert_eq!(fs::read(s.bin("fresh")).expect("moved"), b"engine-0.0.23");
         assert!(is_regular_file(&s.bin("fresh")));
-        let link = fs::read_link(s.bin("cortex")).expect("the old path is a symlink");
-        assert_eq!(
-            link,
-            PathBuf::from("fresh"),
-            "relative, so the directory can move"
+        assert!(
+            fs::symlink_metadata(s.bin("cortex")).is_err(),
+            "no link is made at the old path"
         );
-        assert_eq!(
-            fs::read(s.bin("cortex")).expect("through the link"),
-            b"engine-0.0.23"
-        );
+        assert!(!out[0].unlinked);
 
         assert_eq!(
             fs::read_to_string(s.0.join("bin/fresh.version")).expect("sidecar moved"),
@@ -595,5 +605,56 @@ mod tests {
             units.calls()
         );
         assert!(is_regular_file(&s.bin("cortex")));
+    }
+
+    /// The bin directory as 0.1.31 or 0.1.32 left it after moving the binary: the binary
+    /// under the public name, and a relative link to it under the old one.
+    #[cfg(unix)]
+    fn linked_machine(s: &Scratch) {
+        fs::write(s.bin("fresh"), b"engine-0.0.24").expect("binary");
+        std::os::unix::fs::symlink("fresh", s.bin("cortex")).expect("link");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_link_an_earlier_release_left_is_removed_and_nothing_else_is_touched() {
+        let s = Scratch::new("unlink");
+        linked_machine(&s);
+        let units = Recorder::with(&["fresh"]);
+
+        let out = migrate_in(TABLE, &s.layout(), &units);
+
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].unlinked && !out[0].binary && !out[0].unit, "{out:?}");
+        assert!(
+            fs::symlink_metadata(s.bin("cortex")).is_err(),
+            "the link is gone"
+        );
+        assert_eq!(fs::read(s.bin("fresh")).expect("kept"), b"engine-0.0.24");
+        assert!(
+            units.calls().is_empty(),
+            "no service was touched: {:?}",
+            units.calls()
+        );
+        assert!(
+            migrate_in(TABLE, &s.layout(), &units).is_empty(),
+            "and once is enough"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_absolute_link_to_the_binary_counts_and_a_link_elsewhere_does_not() {
+        let s = Scratch::new("links");
+        fs::write(s.bin("fresh"), b"engine").expect("binary");
+        std::os::unix::fs::symlink(s.bin("fresh"), s.bin("cortex")).expect("absolute link");
+        assert!(migrate_in(TABLE, &s.layout(), &Recorder::default())[0].unlinked);
+
+        // A link the person made to something else under that name is theirs.
+        let other = s.0.join("their-cortex");
+        fs::write(&other, b"theirs").expect("theirs");
+        std::os::unix::fs::symlink(&other, s.bin("cortex")).expect("their link");
+        assert!(migrate_in(TABLE, &s.layout(), &Recorder::default()).is_empty());
+        assert_eq!(fs::read(s.bin("cortex")).expect("kept"), b"theirs");
     }
 }

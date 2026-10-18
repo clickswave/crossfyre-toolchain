@@ -624,7 +624,7 @@ fn remove_one(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
     let bin_path = ext_bin_path(ext);
     let name = super::public_name(ext);
     // The legacy path, whether it is the binary itself (not migrated yet) or the
-    // link the migration left there.
+    // link an earlier migration left there.
     let legacy = legacy_bin_path(ext).filter(|p| fs::symlink_metadata(p).is_ok());
 
     title("Crossfyre extension remove", name);
