@@ -5415,8 +5415,12 @@ dependencies = [
 name = "transport"
 version = "0.1.0"
 dependencies = [
+ "brotli",
+ "rcgen",
  "reqwest 0.12.28",
+ "rustls",
  "serde",
+ "sha2",
  "tokio",
  "wreq",
 ]

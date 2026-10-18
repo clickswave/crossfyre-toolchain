@@ -26,6 +26,13 @@ wreq = { version = "5", optional = true, features = ["cookies", "gzip", "brotli"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["net", "rt", "macros"] }
+# tests/emulation_wire.rs: a local TLS origin that records the ClientHello and
+# the HTTP/2 preface, and the hashes JA4 is made of. All four are already in the
+# lock through other crates.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = "0.13"
+sha2 = "0.10"
+brotli = "8"
 
 [features]
 # Off by default: the open toolchain builds a plain reqwest client. First-party
