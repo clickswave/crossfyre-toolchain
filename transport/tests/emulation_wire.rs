@@ -36,18 +36,50 @@ impl Seen {
         assert_eq!(self.alpn.as_deref(), Some(&b"h2"[..]));
         H2Preface::parse(&self.request)
     }
+
+    /// The request's header fields in order, names in lower case, whichever
+    /// protocol ALPN settled on. Pseudo-headers are left out.
+    fn fields(&self) -> Vec<(String, String)> {
+        if self.alpn.as_deref() == Some(&b"h2"[..]) {
+            return self
+                .h2()
+                .headers
+                .into_iter()
+                .filter(|(n, _)| !n.starts_with(':'))
+                .collect();
+        }
+        String::from_utf8_lossy(&self.request)
+            .lines()
+            .skip(1)
+            .filter_map(|l| l.split_once(": "))
+            .map(|(n, v)| (n.to_ascii_lowercase(), v.to_string()))
+            .collect()
+    }
+}
+
+/// An emulating client's settings for an engine identity's User-Agent.
+fn emulating(identity: &str) -> transport::ClientConfig {
+    transport::ClientConfig {
+        user_agent: Some(identity.to_string()),
+        emulate: true,
+        ..Default::default()
+    }
 }
 
 /// One request from an emulating client to a fresh origin.
 async fn fetch(identity: &str, alpn: &[&[u8]], encoding: Encoding) -> Seen {
+    fetch_with(emulating(identity), alpn, encoding).await
+}
+
+/// One request from a client built from `config` to a fresh origin. The
+/// origin's address, its self-signed certificate and a timeout are filled in.
+async fn fetch_with(config: transport::ClientConfig, alpn: &[&[u8]], encoding: Encoding) -> Seen {
     let origin = Origin::start(alpn, encoding);
     let client = transport::build_client(transport::ClientConfig {
-        user_agent: Some(identity.to_string()),
-        emulate: true,
         accept_invalid_certs: true,
         resolve: vec![(wire::HOST.to_string(), origin.addr)],
         timeout: Some(Duration::from_secs(20)),
-        ..Default::default()
+        ..config
     })
     .unwrap();
     let resp = client.get(origin.url()).send().await.expect("request");
@@ -346,6 +378,26 @@ async fn http1_requests_keep_the_profile_order() {
             "Priority",
             "Te",
         ]
+    );
+    assert_eq!(seen.body, wire::BODY);
+}
+
+#[tokio::test]
+async fn a_user_agent_no_profile_covers_goes_out_as_it_is() {
+    // An identity whose User-Agent names no browser gets no profile, so the
+    // request has to carry that User-Agent rather than none at all.
+    let seen = fetch("Crossfyre-Scanner/1.0", H2_AND_H1, Encoding::Identity).await;
+    let fields = seen.fields();
+    let agents: Vec<&str> = fields
+        .iter()
+        .filter(|(n, _)| n == "user-agent")
+        .map(|(_, v)| v.as_str())
+        .collect();
+    assert_eq!(agents, ["Crossfyre-Scanner/1.0"]);
+    assert!(
+        fields
+            .iter()
+            .all(|(n, _)| n != "sec-fetch-mode" && n != "te")
     );
     assert_eq!(seen.body, wire::BODY);
 }
