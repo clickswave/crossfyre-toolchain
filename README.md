@@ -78,13 +78,30 @@ The old names stay where a value is stored or sent between a node and the platfo
 
 ### Install
 
-On Linux, x86_64:
+On Linux, x86_64 or aarch64:
 
 ```sh
 curl -fsSL https://get.crossfyre.io/install.sh | sudo bash
 ```
 
-No macOS or Windows build is published. On Windows, run `wsl --install` and then the line above inside WSL 2. On a Mac, install on a Linux host or a Linux virtual machine instead.
+On Debian, Ubuntu or Kali, you can install from the apt repository instead:
+
+```sh
+curl -fsSL https://bins.crossfyre.io/apt/crossfyre-archive-keyring.gpg | sudo tee /usr/share/keyrings/crossfyre-archive-keyring.gpg > /dev/null
+sudo tee /etc/apt/sources.list.d/crossfyre.sources > /dev/null <<'EOF'
+Types: deb
+URIs: https://bins.crossfyre.io/apt
+Suites: stable
+Components: main
+Signed-By: /usr/share/keyrings/crossfyre-archive-keyring.gpg
+EOF
+sudo apt update
+sudo apt install crossfyre crossfyre-archive-keyring
+```
+
+The archive key's fingerprint is `992F 106C 6CF0 32E4 3A3C A8BE D5D9 2DAC 3BA8 CDBF`. From then on, `sudo apt update && sudo apt upgrade` updates the CLI, and `crossfyre update all` updates the node and the engines. [crossfyre.io/docs/install](https://crossfyre.io/docs/install) also covers the standalone .deb, checking signatures, and removal.
+
+No macOS or Windows build is published. On Windows, run `wsl --install` and then the installer inside WSL 2. On a Mac, install on a Linux host or a Linux virtual machine instead.
 
 The installer and `bins.crossfyre.io` ship the first-party build. The [Releases](../../releases) page of this repository carries the open build for Linux x86_64 and aarch64, compiled by GitHub Actions from each tag. The open build has no authorization oracle, no per-node egress isolation, untuned pacing, and no `impersonate` feature (see [`transport`](transport/)). You can also [build from source](#building-from-source), which gives you the open build too.
 
