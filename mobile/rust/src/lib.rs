@@ -1,4 +1,4 @@
-//! Crossfyre mobile tracer - native core (JNI bridge).
+//! Crossfyre Mobile - native core (JNI bridge).
 //!
 //! The heavy lifting (session CA, per-SNI MITM leaves, egress, per-flow inspect+forward, privacy-safe
 //! reduction) is the SHARED `cfx_capture` crate - the same code the desktop Web Tracer proxy uses.
@@ -6,8 +6,8 @@
 //! netstack (`netstack`) that turns captured packets into flows for `cfx_capture`, and the ingest
 //! shipper (`ingest`).
 //!
-//! JNI naming: symbols are `Java_io_crossfyre_tracer_Native_<method>` for a Kotlin
-//! `object io.crossfyre.tracer.Native`.
+//! JNI naming: symbols are `Java_io_crossfyre_mobile_Native_<method>` for a Kotlin
+//! `object io.crossfyre.mobile.Native`. The test at the bottom keeps the two in step.
 
 mod ingest;
 mod intercept;
@@ -58,7 +58,7 @@ fn capture() -> &'static Mutex<Option<tokio::runtime::Runtime>> {
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_crossfyre_tracer_Native_initLogging(_env: JNIEnv, _class: JClass) {
+pub extern "system" fn Java_io_crossfyre_mobile_Native_initLogging(_env: JNIEnv, _class: JClass) {
     // Debug level logs full request URLs, query strings included, for every
     // flow under capture. That is fine on a developer's device and not fine in
     // a release build: access tokens, session ids and password-reset nonces end
@@ -84,7 +84,7 @@ pub extern "system" fn Java_io_crossfyre_tracer_Native_initLogging(_env: JNIEnv,
 /// storing one when there is none. The private key stays in the app-private storage dir and is
 /// never passed out.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_crossfyre_tracer_Native_generateCaPem<'local>(
+pub extern "system" fn Java_io_crossfyre_mobile_Native_generateCaPem<'local>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jstring {
@@ -130,7 +130,7 @@ pub extern "system" fn Java_io_crossfyre_tracer_Native_generateCaPem<'local>(
 /// Normal (Direct egress) in v1. Returns false if no CA was generated first or capture is already
 /// running.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_crossfyre_tracer_Native_startCapture<'local>(
+pub extern "system" fn Java_io_crossfyre_mobile_Native_startCapture<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     tun_fd: jint,
@@ -278,7 +278,7 @@ pub extern "system" fn Java_io_crossfyre_tracer_Native_startCapture<'local>(
 
 /// Stop capturing: drop the runtime (aborts netstack + ingest, closes the TUN dup). Idempotent.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_crossfyre_tracer_Native_stopCapture(_env: JNIEnv, _class: JClass) {
+pub extern "system" fn Java_io_crossfyre_mobile_Native_stopCapture(_env: JNIEnv, _class: JClass) {
     if let Some(rt) = capture().lock().unwrap().take() {
         rt.shutdown_background();
         log::info!("stopCapture: capture stopped");
@@ -297,7 +297,7 @@ fn install_crypto_provider() {
 /// Tell native where it may persist the CA (the app's private files dir). Call once at startup before
 /// `generateCaPem` / `startCapture` so the CA is stable across app restarts.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_crossfyre_tracer_Native_setStorageDir<'local>(
+pub extern "system" fn Java_io_crossfyre_mobile_Native_setStorageDir<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     dir: JString<'local>,
@@ -309,7 +309,7 @@ pub extern "system" fn Java_io_crossfyre_tracer_Native_setStorageDir<'local>(
 /// Return a JSON snapshot of the live capture counters (flows, TLS flows, CA rejections, events,
 /// ingest results, last event/error) for the UI to poll and render. See [`stats`].
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_crossfyre_tracer_Native_captureStats<'local>(
+pub extern "system" fn Java_io_crossfyre_mobile_Native_captureStats<'local>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jstring {
@@ -318,6 +318,94 @@ pub extern "system" fn Java_io_crossfyre_tracer_Native_captureStats<'local>(
         .unwrap_or(std::ptr::null_mut())
 }
 
+/// The requests kept from the current or last capture, newest first, as a JSON array of reduced
+/// shapes. See [`stats::recent_json`].
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_crossfyre_mobile_Native_recentRequests<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jstring {
+    env.new_string(stats::recent_json())
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
 fn jstr(env: &mut JNIEnv, s: JString) -> String {
     env.get_string(&s).map(|s| s.into()).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    /// The Kotlin file that declares `object Native`, wherever its package puts it.
+    fn kotlin_native() -> (PathBuf, String) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../app/src/main/kotlin");
+        let mut dirs = vec![root.clone()];
+        while let Some(dir) = dirs.pop() {
+            let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+            for entry in entries {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "kt") {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    if text.lines().any(|l| l.trim_start().starts_with("object Native")) {
+                        return (path, text);
+                    }
+                }
+            }
+        }
+        panic!("no `object Native` under {}", root.display());
+    }
+
+    /// The `extern "system" fn` names this file defines.
+    fn exports() -> Vec<&'static str> {
+        let lib = include_str!("lib.rs");
+        let marker = "extern \"system\" fn ";
+        lib.match_indices(marker)
+            .map(|(at, _)| {
+                let rest = &lib[at + marker.len()..];
+                rest[..rest.find(['(', '<']).unwrap()].trim()
+            })
+            .filter(|name| name.starts_with("Java_"))
+            .collect()
+    }
+
+    /// JNI finds a native method by a symbol spelled from the package and name of
+    /// the class that declares it. Move the Kotlin class without renaming these and
+    /// the build still succeeds and the app still installs; it fails on the first
+    /// call, with UnsatisfiedLinkError, when capture starts.
+    #[test]
+    fn every_kotlin_external_has_an_export_under_its_package() {
+        let (path, kotlin) = kotlin_native();
+        let package = kotlin
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("package "))
+            .unwrap_or_else(|| panic!("no package line in {}", path.display()))
+            .trim();
+        let prefix = format!("Java_{}_Native_", package.replace('.', "_"));
+        let externals: Vec<&str> = kotlin
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("external fun "))
+            .map(|rest| rest.split('(').next().unwrap().trim())
+            .collect();
+        assert!(!externals.is_empty(), "no `external fun` in {}", path.display());
+
+        let exports = exports();
+        for name in &externals {
+            let want = format!("{prefix}{name}");
+            assert!(
+                exports.contains(&want.as_str()),
+                "{} declares `external fun {name}`, and nothing here exports {want}. Exported: {exports:?}",
+                path.display()
+            );
+        }
+        for export in &exports {
+            assert!(
+                export.starts_with(&prefix),
+                "{export} names a class other than {package}.Native, so nothing can call it"
+            );
+        }
+    }
 }

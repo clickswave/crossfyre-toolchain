@@ -10,7 +10,7 @@
   Permitted for every host rather than a listed one: the dev box's LAN address
   changes with the network it is on, and a domain-config takes hostnames, not
   ranges. This is scoped by build flavour instead - it reaches only
-  io.crossfyre.tracer.dev, never the app that captures anyone's real traffic.
+  io.crossfyre.mobile.dev, never the app that captures anyone's real traffic.
 -->
 <network-security-config>
     <base-config cleartextTrafficPermitted="true" />

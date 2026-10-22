@@ -1,12 +1,12 @@
 # Capturing certificate-pinned apps
 
-The Tracer intercepts TLS using a CA it generates on the device. That works for
-any app that *trusts* that CA. Two Android realities get in the way of "just
-capture app X":
+Crossfyre Mobile intercepts TLS using a CA it generates on the device. That
+works for any app that *trusts* that CA. Two Android realities get in the way
+of "just capture app X":
 
 1. **User CAs are ignored.** Since Android 7, apps do not trust user-installed
    CAs unless they opt in via a network security configuration. See
-   [OWASP MASTG](https://mas.owasp.org/MASTG/tests/android/MASTG-TEST-0021/).
+   [OWASP MASTG](https://mas.owasp.org/MASTG/tests/android/MASVS-NETWORK/MASTG-TEST-0286/).
 2. **Certificate pinning.** A pinned app demands a specific certificate and
    rejects even a trusted CA's leaf. Under interception it simply fails to
    connect, usually with a generic "something went wrong".
@@ -30,21 +30,25 @@ manual repackage per app. That is the state of the art described by
 [OWASP MASTG](https://mas.owasp.org/MASTG/tools/android/MASTG-TOOL-0029/) and by
 [NetSPI](https://www.netspi.com/blog/technical-blog/mobile-application-pentesting/four-ways-bypass-android-ssl-verification-certificate-pinning/).
 
-## How the Tracer does it
+## How Crossfyre Mobile does it
 
-Tap **Patch** on a pinned app. The app is rewritten and re-signed so that it
-trusts your session certificate, and you are handed installable packages back.
-No workstation, no root.
+In the direct-download build, open the **Patch** tab, pick the app, and tap
+**Patch this app**. The Google Play build does not include this feature. The
+app is rewritten and re-signed so that it trusts this phone's certificate, and
+you are handed installable packages back.
+Android asks you to confirm removing the original and installing the patched
+build. No workstation, no root.
 
 The rewriting happens as a hosted service, which is why this part needs an
 account and is not in this repository. Everything on the device side is here.
 
-After patching, scope the Tracer to the target (**Scope → Only these**) and start
+After patching, scope capture to the target (**Scope > Only these**) and start
 capturing.
 
-The Tracer persists its CA across restarts, so a patched app keeps working. Do
-**not** regenerate the CA afterwards: that invalidates the patch and the app has
-to be patched again.
+The app keeps its CA across restarts, so a patched app keeps working. **Reset
+certificate** makes a new one, which invalidates every patch made with the old
+one, so the app says how many patched apps a reset will break before doing it,
+and marks each of them "Patch again" afterwards.
 
 ## What still will not work
 
@@ -54,20 +58,21 @@ Being straight about the limits, because you will hit them:
   their own signature or call the Play Integrity API. Any re-signed build has a
   different signature, so the app may refuse to log in or fetch data even once
   pinning is out of the way. Symptoms: it opens but reports it cannot verify
-  itself, forces a logout, or its API calls fail while the Tracer shows the
+  itself, forces a logout, or its API calls fail while the app shows the
   flows. Nothing that works without root beats this, ours included.
 - **You have to re-login.** Replacing an installed app means removing the
   original first, so its data goes with it.
 - **Not every app patches cleanly.** Some fail to rebuild. When that happens the
-  Tracer tells you rather than installing something broken.
+  app tells you rather than installing something broken. Each app's details
+  screen says beforehand when it looks shielded.
 
 For pinned apps that do not tamper-check, which is a large share of them, this
 path works.
 
 ## Keeping your other apps working
 
-While testing one target, put your everyday apps in **Scope → All except these**
-so they bypass the Tracer entirely and keep working normally.
+While testing one target, put your everyday apps in **Scope > All except**
+so they bypass capture entirely and keep working normally.
 
 ## Authorisation
 
