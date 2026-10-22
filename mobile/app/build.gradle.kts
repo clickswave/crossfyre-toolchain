@@ -59,8 +59,8 @@ android {
         applicationId = "io.crossfyre.mobile"
         minSdk = 26
         targetSdk = 36
-        versionCode = 24
-        versionName = "0.2.0"
+        versionCode = 25
+        versionName = "0.2.1"
         // arm64 for real devices, x86_64 for the emulator.
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -205,9 +205,9 @@ dependencies {
     // code. Only the core library: the embedded CaptureActivity had a black-preview bug
     // when locked to portrait. ZXing decodes on the phone with no service behind it,
     // which ML Kit did not: it brought Google's data transport services with it.
-    implementation("androidx.camera:camera-camera2:1.3.4")
-    implementation("androidx.camera:camera-lifecycle:1.3.4")
-    implementation("androidx.camera:camera-view:1.3.4")
+    implementation("androidx.camera:camera-camera2:1.4.2")
+    implementation("androidx.camera:camera-lifecycle:1.4.2")
+    implementation("androidx.camera:camera-view:1.4.2")
     implementation("com.google.zxing:core:3.5.3")
 
     testImplementation("junit:junit:4.13.2")
