@@ -366,14 +366,18 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../app/src/main/kotlin");
         let mut dirs = vec![root.clone()];
         while let Some(dir) = dirs.pop() {
-            let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+            let entries =
+                std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
             for entry in entries {
                 let path = entry.unwrap().path();
                 if path.is_dir() {
                     dirs.push(path);
                 } else if path.extension().is_some_and(|e| e == "kt") {
                     let text = std::fs::read_to_string(&path).unwrap();
-                    if text.lines().any(|l| l.trim_start().starts_with("object Native")) {
+                    if text
+                        .lines()
+                        .any(|l| l.trim_start().starts_with("object Native"))
+                    {
                         return (path, text);
                     }
                 }
@@ -413,7 +417,11 @@ mod tests {
             .filter_map(|l| l.trim().strip_prefix("external fun "))
             .map(|rest| rest.split('(').next().unwrap().trim())
             .collect();
-        assert!(!externals.is_empty(), "no `external fun` in {}", path.display());
+        assert!(
+            !externals.is_empty(),
+            "no `external fun` in {}",
+            path.display()
+        );
 
         let exports = exports();
         for name in &externals {
