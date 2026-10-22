@@ -96,7 +96,7 @@ fun Disclosure(m: AppModel) {
         ),
         Triple(
             R.drawable.ic_shield_check, "Apps outside the scope are not touched",
-            "Scope starts as the whole phone; change it first if you would rather it did not.",
+            m.scope.disclosure { m.labelOf(it) },
         ),
     )
     Solo(

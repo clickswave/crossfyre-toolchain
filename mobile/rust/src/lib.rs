@@ -13,6 +13,7 @@ mod ingest;
 mod intercept;
 mod netstack;
 mod stats;
+mod tunfd;
 
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -177,9 +178,13 @@ pub extern "system" fn Java_io_crossfyre_mobile_Native_startCapture<'local>(
     let token = jstr(&mut env, token);
 
     let mut slot = capture().lock().unwrap();
-    if slot.is_some() {
-        log::warn!("startCapture: already running");
-        return 0;
+    if let Some(stale) = slot.take() {
+        // A capture the service never stopped (it was killed, or Android took the
+        // VPN away). Its tunnel is gone; refusing to start would leave the new one
+        // with nothing reading it. Shut it down the same way Stop does.
+        log::warn!("startCapture: replacing a capture that was never stopped");
+        tunfd::release();
+        shut_down_in_background(stale);
     }
 
     let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -276,12 +281,30 @@ pub extern "system" fn Java_io_crossfyre_mobile_Native_startCapture<'local>(
     1
 }
 
-/// Stop capturing: drop the runtime (aborts netstack + ingest, closes the TUN dup). Idempotent.
+/// Stop capturing. Idempotent, and returns at once.
+///
+/// The tunnel is let go of first and directly (see [`tunfd`]), so Android tears the
+/// VPN down now rather than whenever the runtime manages to drop the task that owns
+/// it. The runtime is then shut down on a thread of its own: this is called on the
+/// app's main thread, and a task that blocks while it is dropped must not hold up
+/// the rest of the service's teardown, which is what keeps the VPN key icon and the
+/// notification honest.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_crossfyre_mobile_Native_stopCapture(_env: JNIEnv, _class: JClass) {
-    if let Some(rt) = capture().lock().unwrap().take() {
-        rt.shutdown_background();
-        log::info!("stopCapture: capture stopped");
+    let released = tunfd::release();
+    let rt = capture().lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(rt) = rt {
+        shut_down_in_background(rt);
+    }
+    log::info!("stopCapture: capture stopped (tunnel released: {released})");
+}
+
+fn shut_down_in_background(rt: tokio::runtime::Runtime) {
+    let spawned = std::thread::Builder::new()
+        .name("cfx-shutdown".into())
+        .spawn(move || rt.shutdown_background());
+    if let Err(e) = spawned {
+        log::warn!("could not start the shutdown thread: {e}");
     }
 }
 

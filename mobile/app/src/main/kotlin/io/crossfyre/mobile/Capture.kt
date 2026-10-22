@@ -83,6 +83,25 @@ data class Scope(val mode: String, val apps: List<String>) {
         }
     }
 
+    /**
+     * The disclosure's line about scope, as it stands right now: telling someone
+     * whose scope is one app that it "starts as the whole phone" sends them off to
+     * change something that is already the way they want it.
+     */
+    fun disclosure(labelOf: (String) -> String): String {
+        val names = apps.map(labelOf)
+        val list = when (names.size) {
+            0 -> ""
+            1 -> names[0]
+            else -> names.dropLast(1).joinToString(", ") + " and " + names.last()
+        }
+        return when (effectiveMode) {
+            ONLY -> "Only $list ${if (names.size == 1) "is" else "are"} in scope. Every other app works as normal, untouched."
+            EXCEPT -> "Every app is in scope except $list, which ${if (names.size == 1) "is" else "are"} left alone."
+            else -> "Scope is the whole phone; change it first if you would rather it did not see every app."
+        }
+    }
+
     /** The scope inside a sentence: "the whole phone", "only 2 apps". */
     fun inline(): String = if (effectiveMode == ALL) "the whole phone" else title().lowercase()
 

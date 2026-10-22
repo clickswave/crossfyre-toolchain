@@ -166,3 +166,27 @@ class CaptureTest {
         assertEquals("10.0.2.2:12004", displayHost("http://10.0.2.2:12004"))
     }
 }
+
+class DisclosureScopeTest {
+    private val labels = mapOf("com.android.chrome" to "Chrome", "org.mozilla.firefox" to "Firefox", "a.b" to "Bank")
+
+    @Test
+    fun the_disclosure_states_the_scope_that_is_set_now() {
+        assertEquals(
+            "Only Chrome is in scope. Every other app works as normal, untouched.",
+            Scope(Scope.ONLY, listOf("com.android.chrome")).disclosure { labels.getValue(it) },
+        )
+        assertEquals(
+            "Only Chrome and Firefox are in scope. Every other app works as normal, untouched.",
+            Scope(Scope.ONLY, listOf("com.android.chrome", "org.mozilla.firefox")).disclosure { labels.getValue(it) },
+        )
+        assertEquals(
+            "Every app is in scope except Bank, which is left alone.",
+            Scope(Scope.EXCEPT, listOf("a.b")).disclosure { labels.getValue(it) },
+        )
+        val whole = Scope(Scope.ALL, emptyList()).disclosure { it }
+        assertTrue(whole, whole.startsWith("Scope is the whole phone"))
+        // Only these, with nothing ticked, is the whole phone as the service runs it.
+        assertEquals(whole, Scope(Scope.ONLY, emptyList()).disclosure { it })
+    }
+}

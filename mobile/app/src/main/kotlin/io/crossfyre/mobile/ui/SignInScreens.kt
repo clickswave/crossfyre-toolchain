@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -68,7 +69,16 @@ fun Solo(
     centered: Boolean = false,
     content: @Composable ColumnScope.() -> Unit,
 ) {
-    Column(Modifier.fillMaxSize().background(cfx.ground).imePadding()) {
+    // The ground is painted under the system bars, but nothing is drawn there:
+    // with three-button navigation the buttons are opaque to the eye, and a last
+    // line sitting under them reads as cut off however far it scrolls. So a page
+    // with no dock stops above the navigation bar, and one with a dock lets the
+    // dock do it. The keyboard is taken off first, and the navigation bar inset
+    // only adds what the keyboard did not already cover.
+    Column(
+        Modifier.fillMaxSize().background(cfx.ground).imePadding()
+            .then(if (dock == null) Modifier.navigationBarsPadding() else Modifier)
+    ) {
         bar?.invoke()
         BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
             val min = maxHeight
@@ -76,8 +86,7 @@ fun Solo(
                 Modifier.fillMaxWidth().verticalScroll(rememberScrollState())
                     .then(if (bar == null) Modifier.windowInsetsPadding(WindowInsets.statusBars) else Modifier)
                     .heightIn(min = if (centered) min else 0.dp)
-                    .padding(start = 16.dp, end = 16.dp, top = if (bar == null) 16.dp else 8.dp, bottom = if (dock == null) 36.dp else 16.dp)
-                    .then(if (dock == null) Modifier.windowInsetsPadding(WindowInsets.navigationBars) else Modifier),
+                    .padding(start = 16.dp, end = 16.dp, top = if (bar == null) 16.dp else 8.dp, bottom = if (dock == null) 24.dp else 16.dp),
                 verticalArrangement = if (centered) Arrangement.spacedBy(14.dp, Alignment.CenterVertically) else Arrangement.spacedBy(14.dp),
                 content = content,
             )

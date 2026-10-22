@@ -58,14 +58,16 @@ class TracerVpnService : VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_STOP -> { stop(); return START_NOT_STICKY }
-            else -> start(
+        when (commandFor(intent?.action)) {
+            Command.STOP -> stop()
+            Command.START -> start(
                 intent?.getStringExtra(EXTRA_MODE) ?: MODE_ALL,
                 intent?.getStringArrayExtra(EXTRA_APPS)?.toList() ?: emptyList()
             )
         }
-        return START_STICKY
+        // Not sticky: Android restarts a sticky service with no intent, and so with
+        // no scope. A capture that died ends; the person starts it again.
+        return START_NOT_STICKY
     }
 
     private val pairing get() = Pairing.load(this)
@@ -128,18 +130,33 @@ class TracerVpnService : VpnService() {
         Log.i(TAG, "capture started: mode=$effectiveMode apps=${apps.joinToString().ifEmpty { "-" }} native=$ok")
     }
 
+    /**
+     * Tear the capture down completely, however the stop was asked for: from the
+     * app, from the notification, or by Android revoking the VPN.
+     *
+     * Android keeps the VPN up, its key icon showing and this service bound, for as
+     * long as any copy of the tunnel fd is open, so the native copy goes first and
+     * the app's own after it. Native stopping returns at once; it no longer waits
+     * for the capture's tasks, which is what once left the main thread stuck there
+     * with the tunnel up and nothing below this line run.
+     */
     private fun stop() {
         // Stopping sends the final batch that ends the session, and the ingest
-        // refuses its token from then on, however the stop was asked for: from
-        // the app, from the notification, or by Android revoking the VPN.
+        // refuses its token from then on.
         if (active) Pairing.markEnded(this)
         active = false
         startedAt = 0L
-        runCatching { Native.stopCapture() }
-        runCatching { tun?.close() }
+        val pfd = tun
         tun = null
-        stopForegroundCompat()
-        stopSelf()
+        val failed = Teardown(
+            listOf(
+                "native" to { Native.stopCapture() },
+                "tunnel" to { pfd?.close() },
+                "notification" to { stopForegroundCompat() },
+                "service" to { stopSelf() },
+            )
+        ).run()
+        if (failed.isNotEmpty()) Log.w(TAG, "teardown steps failed: ${failed.joinToString()}")
     }
 
     override fun onDestroy() {

@@ -21,7 +21,9 @@ use tokio::sync::mpsc::UnboundedSender;
 /// An async wrapper over the VpnService TUN fd. Each read yields exactly one raw IP packet; each write
 /// sends one. No packet-information header (Android VpnService TUN is bare IP).
 struct TunDevice {
-    inner: AsyncFd<OwnedFd>,
+    /// Some until the device is dropped; see the `Drop` impl.
+    inner: Option<AsyncFd<OwnedFd>>,
+    fd: i32,
 }
 
 impl TunDevice {
@@ -36,9 +38,29 @@ impl TunDevice {
         let flags = unsafe { libc_fcntl_getfl(dup_fd) };
         unsafe { libc_fcntl_setfl(dup_fd, flags | O_NONBLOCK) };
         let owned = unsafe { OwnedFd::from_raw_fd(dup_fd) };
-        Ok(Self {
-            inner: AsyncFd::new(owned)?,
-        })
+        let device = Self {
+            inner: Some(AsyncFd::new(owned)?),
+            fd: dup_fd,
+        };
+        // Recorded so Stop can let go of the tunnel without waiting for this
+        // device to be dropped. See `tunfd`.
+        crate::tunfd::hold(dup_fd);
+        Ok(device)
+    }
+
+    fn fd(&self) -> &AsyncFd<OwnedFd> {
+        self.inner
+            .as_ref()
+            .expect("the tunnel is read only while the device is alive")
+    }
+}
+
+impl Drop for TunDevice {
+    fn drop(&mut self) {
+        // Close under the hold's lock, so a Stop arriving now cannot act on this
+        // fd number after it has been closed and possibly reused.
+        let inner = self.inner.take();
+        crate::tunfd::forget(self.fd, move || drop(inner));
     }
 }
 
@@ -49,7 +71,7 @@ impl AsyncRead for TunDevice {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         loop {
-            let mut guard = match self.inner.poll_read_ready(cx) {
+            let mut guard = match self.fd().poll_read_ready(cx) {
                 Poll::Ready(Ok(g)) => g,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
@@ -87,7 +109,7 @@ impl AsyncWrite for TunDevice {
         data: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         loop {
-            let mut guard = match self.inner.poll_write_ready(cx) {
+            let mut guard = match self.fd().poll_write_ready(cx) {
                 Poll::Ready(Ok(g)) => g,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
