@@ -26,6 +26,9 @@ pub async fn run(
         .unwrap_or_default();
     let url = format!("{}/api/v1/web-trace/ingest", api_url.trim_end_matches('/'));
     let mut batch: Vec<TraceEvent> = Vec::new();
+    // The sequence number of the newest event in `batch`, so a delivered batch can be marked sent
+    // on the requests the Tracer screen lists.
+    let mut last_seq = 0u64;
     let mut ticker = tokio::time::interval(FLUSH_EVERY);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -36,20 +39,21 @@ pub async fn run(
                     log::info!("event: {} {} ({:?})", e.method, e.url, e.status);
                     crate::stats::inc(&crate::stats::EVENTS);
                     crate::stats::set_last_event(format!("{} {}", e.method, e.url));
+                    last_seq = crate::stats::record_event(&e);
                     batch.push(e);
                     if batch.len() >= MAX_BATCH {
-                        flush(&client, &url, &workflow_id, &token, &mut batch, false).await;
+                        flush(&client, &url, &workflow_id, &token, &mut batch, last_seq, false).await;
                     }
                 }
                 None => {
                     // Channel closed: capture stopped. Final flush closes the session.
-                    flush(&client, &url, &workflow_id, &token, &mut batch, true).await;
+                    flush(&client, &url, &workflow_id, &token, &mut batch, last_seq, true).await;
                     return;
                 }
             },
             _ = ticker.tick() => {
                 if !batch.is_empty() {
-                    flush(&client, &url, &workflow_id, &token, &mut batch, false).await;
+                    flush(&client, &url, &workflow_id, &token, &mut batch, last_seq, false).await;
                 }
             }
         }
@@ -62,6 +66,7 @@ async fn flush(
     workflow_id: &str,
     token: &str,
     batch: &mut Vec<TraceEvent>,
+    last_seq: u64,
     ended: bool,
 ) {
     if batch.is_empty() && !ended {
@@ -78,6 +83,7 @@ async fn flush(
         Ok(res) if res.status().is_success() => {
             log::info!("ingested {} events (ended={ended})", batch.len());
             crate::stats::INGEST_SENT.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            crate::stats::mark_sent(last_seq);
             batch.clear();
         }
         Ok(res) => {

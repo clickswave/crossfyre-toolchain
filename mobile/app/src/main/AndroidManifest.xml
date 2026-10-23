@@ -3,18 +3,27 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- The type Android documents for VPN apps, and the one Play exempts from
+         its foreground service review. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SYSTEM_EXEMPTED" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- QR pairing scans a workspace QR from the web app. -->
     <uses-permission android:name="android.permission.CAMERA" />
-    <!-- Server-assisted patch: uninstall the original then install the patched (pinning-stripped) build. -->
-    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
-    <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES" />
-    <!-- QUERY_ALL_PACKAGES: the per-app capture picker lists installed apps. Sensitive permission;
-         justified because scoping capture to specific apps is the core feature. -->
-    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
-        tools:ignore="QueryAllPackagesPermission"
-        xmlns:tools="http://schemas.android.com/tools" />
+    <!-- Asking for the camera, and locking the scanner to portrait, would each
+         otherwise make that hardware a requirement, and Play would hide the app
+         from devices without it. Scanning is one of two ways to pair; signing in
+         needs neither. -->
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.screen.portrait" android:required="false" />
+    <!-- The scope and patch lists offer the apps that have a launcher icon. Asking
+         for exactly those, rather than holding QUERY_ALL_PACKAGES, is enough: an
+         app with no launcher has no screen to test. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
 
     <application
         android:allowBackup="false"
@@ -23,7 +32,7 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:label="@string/app_name"
         android:supportsRtl="true"
-        android:theme="@style/Theme.CrossfyreTracer">
+        android:theme="@style/Theme.CrossfyreMobile">
 
         <activity
             android:name=".MainActivity"
@@ -37,6 +46,7 @@
         <!-- Portrait QR scanner (CameraX + ML Kit). -->
         <activity
             android:name=".ScannerActivity"
+            android:theme="@style/Theme.CrossfyreMobile.Scanner"
             android:screenOrientation="portrait"
             android:exported="false"
             tools:ignore="LockedOrientationActivity"
@@ -47,10 +57,7 @@
             android:name=".TracerVpnService"
             android:exported="false"
             android:permission="android.permission.BIND_VPN_SERVICE"
-            android:foregroundServiceType="specialUse">
-            <property
-                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="Authorized on-device traffic capture for security testing (Crossfyre Web Tracer)." />
+            android:foregroundServiceType="systemExempted">
             <intent-filter>
                 <action android:name="android.net.VpnService" />
             </intent-filter>

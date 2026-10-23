@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Phosphor Icons, bold weight, MIT licence. See the open source licences screen. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="256"
+    android:viewportHeight="256">
+    <path android:fillColor="@android:color/white" android:pathData="M100 36H56a20 20 0 0 0-20 20v44a20 20 0 0 0 20 20h44a20 20 0 0 0 20-20V56a20 20 0 0 0-20-20m-4 60H60V60h36Zm4 40H56a20 20 0 0 0-20 20v44a20 20 0 0 0 20 20h44a20 20 0 0 0 20-20v-44a20 20 0 0 0-20-20m-4 60H60v-36h36ZM200 36h-44a20 20 0 0 0-20 20v44a20 20 0 0 0 20 20h44a20 20 0 0 0 20-20V56a20 20 0 0 0-20-20m-4 60h-36V60h36Zm-60 76v-24a12 12 0 0 1 24 0v24a12 12 0 0 1-24 0m84-8a12 12 0 0 1-12 12h-12v32a12 12 0 0 1-12 12h-36a12 12 0 0 1 0-24h24v-48a12 12 0 0 1 24 0v4h12a12 12 0 0 1 12 12" />
+</vector>

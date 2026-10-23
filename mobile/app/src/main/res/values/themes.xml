@@ -1,17 +1,22 @@
 <resources>
-    <!-- Dark, and edge to edge.
+    <!-- Follows the phone's light or dark setting, and draws edge to edge.
 
-         This was Theme.Material.Light.NoActionBar, which is why the navigation
-         bar rendered white with dark icons underneath a black app: the Compose
-         theme is dark but the WINDOW followed the platform theme, and the system
-         bars follow the window. Nothing in Compose could have fixed that.
+         The window background is the app's own ground colour in each half, so a
+         cold start shows the right colour before Compose draws anything, rather
+         than a black or white flash in the wrong theme. The bars are transparent
+         and contrast enforcement is off, so the app paints behind them instead of
+         the system laying a scrim over the bottom of the screen;
+         enableEdgeToEdge() picks the icon colour for each half at runtime. -->
+    <style name="Theme.CrossfyreMobile" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/cfx_ground</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:enforceStatusBarContrast">false</item>
+        <item name="android:enforceNavigationBarContrast">false</item>
+    </style>
 
-         The bars are transparent and contrast enforcement is off, so the app
-         paints behind them instead of the system laying a pale scrim over the
-         bottom of the screen. Contrast enforcement is API 29+ and the light-bar
-         flags are API 23/27+; older devices ignore what they do not know, and
-         enableEdgeToEdge() sets the same things at runtime anyway. -->
-    <style name="Theme.CrossfyreTracer" parent="@android:style/Theme.Material.NoActionBar">
+    <!-- The camera is the camera: dark whatever the theme. -->
+    <style name="Theme.CrossfyreMobile.Scanner" parent="@android:style/Theme.Material.NoActionBar">
         <item name="android:windowBackground">@android:color/black</item>
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>

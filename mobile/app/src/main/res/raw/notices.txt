@@ -1,0 +1,1058 @@
+Crossfyre Mobile is licensed under the Apache License 2.0.
+It includes the components below. Each is listed with its licence and the
+copyright lines its own licence files carry. The licence texts are under
+Open source licences.
+
+ANDROID, FONTS AND ICONS
+
+AndroidX (activity, core, lifecycle, browser)
+  Apache-2.0
+  Copyright The Android Open Source Project
+
+Jetpack Compose
+  Apache-2.0
+  Copyright The Android Open Source Project
+
+CameraX
+  Apache-2.0
+  Copyright The Android Open Source Project
+
+Kotlin standard library and kotlinx.coroutines
+  Apache-2.0
+  Copyright JetBrains s.r.o. and Kotlin Programming Language contributors
+
+ZXing core
+  Apache-2.0
+  Copyright ZXing authors
+
+Inter
+  OFL-1.1
+  Copyright 2020 The Inter Project Authors
+
+Outfit
+  OFL-1.1
+  Copyright 2021 The Outfit Project Authors
+
+JetBrains Mono
+  OFL-1.1
+  Copyright 2020 The JetBrains Mono Project Authors
+
+Orbitron
+  OFL-1.1
+  Copyright 2018 The Orbitron Project Authors
+
+Phosphor Icons
+  MIT
+  Copyright (c) 2023 Phosphor Icons
+
+CAPTURE CORE (the native library)
+
+adler2 2.0.1
+  0BSD OR MIT OR Apache-2.0
+  Copyright (C) Jonas Schievink <jonasschievink@gmail.com>
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+
+ahash 0.8.12
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2018 Tom Kaitchuck
+
+aho-corasick 1.1.4
+  Unlicense OR MIT
+  Copyright (c) 2015 Andrew Gallant
+
+alloc-no-stdlib 2.0.4
+  BSD-3-Clause
+  Copyright (c) 2016 Dropbox, Inc.
+
+alloc-stdlib 0.2.4
+  BSD-3-Clause
+
+allocator-api2 0.2.21
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+
+android_log-sys 0.3.2
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright 2016 The android_log_sys Developers
+  Copyright (c) 2016 The android_log_sys Developers
+
+android_logger 0.14.1
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright 2016 The android_logger Developers
+  Copyright (c) 2016 The android_logger Developers
+
+arrayvec 0.7.8
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) Ulrik Sverdrup "bluss" 2015-2023
+
+async-compression 0.4.42
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2018 the rustasync developers
+
+atomic-waker 1.1.2
+  Apache-2.0 OR MIT
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2016 Alex Crichton
+  Copyright (c) 2017 The Tokio Authors
+
+aws-lc-rs 1.18.1
+  ISC AND (Apache-2.0 OR ISC)
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright Amazon.com, Inc. or its affiliates.
+  copyright notice and this permission notice appear in all copies.
+
+aws-lc-sys 0.45.0
+  ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0)
+  Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+  Copyright (c) 2014-2024 Google Inc.
+  Copyright (c) 2025-2026 Google Inc.
+  Copyright (c) 1998-2011 The OpenSSL Project. All rights reserved.
+  Copyright (c) 1995-1998 Eric Young (eay@cryptsoft.com). All rights reserved.
+  Copyright (c) The mlkem-native project authors.
+  Copyright (c) The mldsa-native project authors.
+  Copyright (c) 2015-2020 the fiat-crypto authors.
+  Copyright (C) 2017 - 2025, Stephan Mueller <smueller@chronox.de>.
+  Copyright 2008 Google Inc.
+  Copyright (c) The Go Authors. All rights reserved.
+
+base64 0.22.1
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2015 Alice Maz
+
+bitflags 2.13.1
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2014 The Rust Project Developers
+
+brotli 8.0.4
+  BSD-3-Clause AND MIT
+  Copyright (c) 2016 Dropbox, Inc.
+  Copyright (c) 2009, 2010, 2013-2016 by the Brotli Authors.
+
+brotli-decompressor 5.0.3
+  BSD-3-Clause/MIT
+  Copyright (c) 2016 Dropbox, Inc.
+
+bytes 1.12.1
+  MIT
+  Copyright (c) 2018 Carl Lerche
+
+cesu8 1.1.0
+  Apache-2.0/MIT
+  Copyright (C) 2000-2010 Julian Seward. All rights
+  copyright notice, this list of conditions and the
+  Copyright (c) 2003-2013 University of Illinois at
+  Copyright (c) 2009-2014 by the contributors listed in
+  Copyright (C) 2008-2010 Tachyon Technologies.
+  Copyright (c) 2008, Natacha Porté
+  Copyright (c) 2011, Vicent Martí
+  Copyright (c) 2013, Devin Torres and the Hoedown authors
+  Copyright (C) 2012-2014 Free Software Foundation, Inc.
+  Copyright (C) 2002-2014 Jason Evans
+  Copyright (C) 2007-2012 Mozilla Foundation.
+  Copyright (C) 2009-2014 Facebook, Inc.
+  copyright itself, held by the contributor.
+
+cfg-if 1.0.4
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2014 Alex Crichton
+
+chacha20 0.10.1
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2019-2026 The RustCrypto Project Developers
+
+combine 4.6.7
+  MIT
+  Copyright (c) 2015 Markus Westerlind
+
+compression-codecs 0.4.38
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2018 the rustasync developers
+
+compression-core 0.4.32
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2018 the rustasync developers
+
+cookie 0.18.1
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright 2017 Sergio Benitez
+  Copyright 2014 Alex Chricton
+  Copyright (c) 2017 Sergio Benitez
+  Copyright (c) 2014 Alex Crichton
+
+cookie_store 0.22.1
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2017
+
+crc32fast 1.5.0
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2018 Sam Rijs, Alex Crichton and contributors
+
+critical-section 1.2.0
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2022 The critical-section authors
+
+deranged 0.5.8
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright 2024 Jacob Pratt et al.
+  Copyright (c) 2024 Jacob Pratt et al.
+
+displaydoc 0.2.6
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+
+document-features 0.2.12
+  MIT OR Apache-2.0
+  Copyright (c) 2020 Olivier Goffart <ogoffart@sixtyfps.io>
+
+encoding_rs 0.8.35
+  (Apache-2.0 OR MIT) AND BSD-3-Clause
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright Mozilla Foundation
+  Copyright © WHATWG (Apple, Google, Mozilla, Microsoft).
+
+env_filter 0.1.4
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) Individual contributors
+
+equivalent 1.0.2
+  Apache-2.0 OR MIT
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2016--2023
+
+errno 0.3.14
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2014 Chris Wong
+
+etherparse 0.20.3
+  MIT OR Apache-2.0
+
+flate2 1.1.9
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2014-2026 Alex Crichton
+
+fnv 1.0.7
+  Apache-2.0 / MIT
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2017 Contributors
+
+foldhash 0.2.0
+  Zlib
+  Copyright (c) 2024 Orson Peters
+
+form_urlencoded 1.2.2
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2013-2016 The rust-url developers
+
+futures 0.3.34
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2016 Alex Crichton
+  Copyright (c) 2017 The Tokio Authors
+
+futures-channel 0.3.34
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2016 Alex Crichton
+  Copyright (c) 2017 The Tokio Authors
+
+futures-core 0.3.34
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2016 Alex Crichton
+  Copyright (c) 2017 The Tokio Authors
+
+futures-executor 0.3.34
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2016 Alex Crichton
+  Copyright (c) 2017 The Tokio Authors
+
+futures-io 0.3.34
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2016 Alex Crichton
+  Copyright (c) 2017 The Tokio Authors
+
+futures-macro 0.3.34
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2016 Alex Crichton
+  Copyright (c) 2017 The Tokio Authors
+
+futures-sink 0.3.34
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2016 Alex Crichton
+  Copyright (c) 2017 The Tokio Authors
+
+futures-task 0.3.34
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2016 Alex Crichton
+  Copyright (c) 2017 The Tokio Authors
+
+futures-util 0.3.34
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2016 Alex Crichton
+  Copyright (c) 2017 The Tokio Authors
+
+getrandom 0.2.17
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2018-2024 The rust-random Project Developers
+  Copyright (c) 2014 The Rust Project Developers
+
+getrandom 0.4.3
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2018-2026 The rust-random Project Developers
+  Copyright (c) 2014 The Rust Project Developers
+
+h2 0.4.17
+  MIT
+  Copyright (c) 2017 h2 authors
+
+hashbrown 0.17.1
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2016 Amanieu d'Antras
+
+http 1.4.2
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright 2017 http-rs authors
+  Copyright (c) 2017 http-rs authors
+
+http-body 1.1.0
+  MIT
+  Copyright (c) 2019-2026 Sean McArthur & Hyper Contributors
+
+http-body-util 0.1.4
+  MIT
+  Copyright (c) 2019-2026 Sean McArthur & Hyper Contributors
+
+httparse 1.10.1
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2015-2025 Sean McArthur
+
+httpdate 1.0.3
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2016 Pyfisch
+
+hyper 1.11.0
+  MIT
+  Copyright (c) 2014-2026 Sean McArthur
+
+hyper-rustls 0.27.9
+  Apache-2.0 OR ISC OR MIT
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2016, Joseph Birr-Pixton <jpixton@gmail.com>
+  Copyright (c) 2016 Joseph Birr-Pixton <jpixton@gmail.com>
+
+hyper-util 0.1.20
+  MIT
+  Copyright (c) 2023-2025 Sean McArthur
+
+icu_collections 2.2.0
+  Unicode-3.0
+  COPYRIGHT AND PERMISSION NOTICE
+  Copyright © 2020-2024 Unicode, Inc.
+
+icu_locale_core 2.2.0
+  Unicode-3.0
+  COPYRIGHT AND PERMISSION NOTICE
+  Copyright © 2020-2024 Unicode, Inc.
+
+icu_normalizer 2.2.0
+  Unicode-3.0
+  COPYRIGHT AND PERMISSION NOTICE
+  Copyright © 2020-2024 Unicode, Inc.
+
+icu_normalizer_data 2.2.0
+  Unicode-3.0
+  COPYRIGHT AND PERMISSION NOTICE
+  Copyright © 2020-2024 Unicode, Inc.
+
+icu_properties 2.2.0
+  Unicode-3.0
+  COPYRIGHT AND PERMISSION NOTICE
+  Copyright © 2020-2024 Unicode, Inc.
+
+icu_properties_data 2.2.0
+  Unicode-3.0
+  COPYRIGHT AND PERMISSION NOTICE
+  Copyright © 2020-2024 Unicode, Inc.
+
+icu_provider 2.2.0
+  Unicode-3.0
+  COPYRIGHT AND PERMISSION NOTICE
+  Copyright © 2020-2024 Unicode, Inc.
+
+idna 1.1.0
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2013-2025 The rust-url developers
+
+idna_adapter 1.2.2
+  Apache-2.0 OR MIT
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) The rust-url developers
+
+indexmap 2.14.0
+  Apache-2.0 OR MIT
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2016--2017
+
+ipnet 2.12.0
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright 2017 Juniper Networks, Inc.
+
+ipstack 1.0.1
+  Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+
+itoa 1.0.18
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+
+jni 0.21.1
+  MIT/Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2016 Prevoty, Inc. and jni-rs contributors
+
+jni-sys 0.3.1
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2015 The rust-jni-sys Developers
+
+jni-sys 0.4.1
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2015 The rust-jni-sys Developers
+
+jni-sys-macros 0.4.1
+  MIT OR Apache-2.0
+
+libc 0.2.189
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) The Rust Project Developers
+
+litemap 0.8.2
+  Unicode-3.0
+  COPYRIGHT AND PERMISSION NOTICE
+  Copyright © 2020-2024 Unicode, Inc.
+
+litrs 1.0.0
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2020 Project Developers
+
+log 0.4.33
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2014 The Rust Project Developers
+
+lru-slab 0.1.2
+  MIT OR Apache-2.0 OR Zlib
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2024 The lru-slab Developers
+
+memchr 2.8.3
+  Unlicense OR MIT
+  Copyright (c) 2015 Andrew Gallant
+
+mime 0.3.17
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2014 Sean McArthur
+
+miniz_oxide 0.8.9
+  MIT OR Zlib OR Apache-2.0
+  Copyright 2013-2014 RAD Game Tools and Valve Software
+  Copyright 2010-2014 Rich Geldreich and Tenacious Software LLC
+  Copyright (c) 2017 Frommi
+  Copyright (c) 2017-2024 oyvindln
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2020 Frommi
+
+mio 1.2.2
+  MIT
+  Copyright (c) 2014 Carl Lerche and other MIO contributors
+
+num-conv 0.2.2
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) Jacob Pratt
+
+num_threads 0.1.7
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright 2021 Jacob Pratt
+  Copyright (c) 2021 Jacob Pratt
+
+once_cell 1.21.4
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+
+pem 3.0.6
+  MIT
+  Copyright (c) 2016 Jonathan Creekmore
+
+percent-encoding 2.3.2
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2013-2025 The rust-url developers
+
+pin-project-lite 0.2.17
+  Apache-2.0 OR MIT
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+
+portable-atomic 1.14.0
+  Apache-2.0 OR MIT
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+
+potential_utf 0.1.5
+  Unicode-3.0
+  COPYRIGHT AND PERMISSION NOTICE
+  Copyright © 2020-2024 Unicode, Inc.
+
+powerfmt 0.2.0
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright 2023 Jacob Pratt et al.
+  Copyright (c) 2023 Jacob Pratt et al.
+
+proc-macro2 1.0.107
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+
+psl-types 2.0.11
+  MIT/Apache-2.0
+  Copyright (c) 2021 Rushmore Mushambi
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+
+publicsuffix 2.3.0
+  MIT/Apache-2.0
+  Copyright (c) 2016 Rushmore Mushambi
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+
+quinn 0.11.11
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2018 The quinn Developers
+
+quinn-proto 0.11.19
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2018 The quinn Developers
+
+quinn-udp 0.5.15
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2018 The quinn Developers
+
+quote 1.0.47
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+
+rand 0.10.2
+  MIT OR Apache-2.0
+  Copyrights in the Rand project are retained by their contributors. No
+  copyright assignment is required to contribute to the Rand project.
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright 2018 Developers of the Rand project
+  Copyright (c) 2014 The Rust Project Developers
+
+rand_core 0.10.1
+  MIT OR Apache-2.0
+  Copyrights in the Rand project are retained by their contributors. No
+  copyright assignment is required to contribute to the Rand project.
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2018-2026 The Rand Project Developers
+
+rand_pcg 0.10.2
+  MIT OR Apache-2.0
+  Copyrights in the Rand project are retained by their contributors. No
+  copyright assignment is required to contribute to the Rand project.
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2014-2017 Melissa O'Neill and PCG Project contributors
+  Copyright 2018 Developers of the Rand project
+
+rcgen 0.13.2
+  MIT OR Apache-2.0
+  Copyright (c) 2019-2022 est31 <MTest31@outlook.com> and contributors
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+
+regex 1.13.1
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2014 The Rust Project Developers
+
+regex-automata 0.4.16
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2014 The Rust Project Developers
+
+regex-syntax 0.8.11
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2014 The Rust Project Developers
+
+reqwest 0.12.28
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright 2016 Sean McArthur
+  Copyright (c) 2016-2025 Sean McArthur
+
+ring 0.17.14
+  Apache-2.0 AND ISC
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2009 The Go Authors. All rights reserved.
+  copyright notice, this list of conditions and the following disclaimer
+  Copyright 2015 The Chromium Authors. All rights reserved.
+  Copyright 2015-2025 Brian Smith.
+  copyright notice and this permission notice appear in all copies.
+
+rustc-hash 2.1.3
+  Apache-2.0 OR MIT
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+
+rustls 0.23.46
+  Apache-2.0 OR ISC OR MIT
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2016, Joseph Birr-Pixton <jpixton@gmail.com>
+  Copyright (c) 2016 Joseph Birr-Pixton <jpixton@gmail.com>
+
+rustls-pemfile 2.2.0
+  Apache-2.0 OR ISC OR MIT
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2016, Joseph Birr-Pixton <jpixton@gmail.com>
+  Copyright (c) 2016 Joseph Birr-Pixton <jpixton@gmail.com>
+
+rustls-pki-types 1.15.1
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright 2023 Dirkjan Ochtman
+  Copyright (c) 2023 Dirkjan Ochtman <dirkjan@ochtman.nl>
+
+rustls-webpki 0.103.15
+  ISC
+  Copyright 2015 Brian Smith.
+  copyright notice and this permission notice appear in all copies.
+
+ryu 1.0.23
+  Apache-2.0 OR BSL-1.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+
+serde 1.0.229
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+
+serde_core 1.0.229
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+
+serde_derive 1.0.229
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+
+serde_json 1.0.151
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+
+serde_urlencoded 0.7.1
+  MIT/Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2016 Anthony Ramine
+
+signal-hook-registry 1.4.8
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2017 tokio-jsonrpc developers
+
+simd-adler32 0.3.10
+  MIT
+  Copyright (c) [2021] [Marvin Countryman]
+
+slab 0.4.12
+  MIT
+  Copyright (c) 2019 Carl Lerche
+
+smallvec 1.15.2
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2018 The Servo Project Developers
+
+socket2 0.6.5
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2014 Alex Crichton
+
+stable_deref_trait 1.2.1
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2017 Robert Grosse
+
+subtle 2.6.1
+  BSD-3-Clause
+  Copyright (c) 2016-2017 Isis Agora Lovecruft, Henry de Valence. All rights reserved.
+  Copyright (c) 2016-2024 Isis Agora Lovecruft. All rights reserved.
+
+syn 2.0.119
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+
+syn 3.0.3
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+
+sync_wrapper 1.0.2
+  Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+
+synstructure 0.13.2
+  MIT
+  Copyright 2016 Nika Layzell
+
+thiserror 1.0.69
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+
+thiserror 2.0.19
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+
+thiserror-impl 1.0.69
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+
+thiserror-impl 2.0.19
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+
+time 0.3.54
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) Jacob Pratt et al.
+
+time-core 0.1.9
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) Jacob Pratt et al.
+
+time-macros 0.2.32
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) Jacob Pratt et al.
+
+tinystr 0.8.3
+  Unicode-3.0
+  COPYRIGHT AND PERMISSION NOTICE
+  Copyright © 2020-2024 Unicode, Inc.
+
+tinyvec 1.12.0
+  Zlib OR Apache-2.0 OR MIT
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2019 Daniel "Lokathor" Gee.
+
+tinyvec_macros 0.1.1
+  MIT OR Apache-2.0 OR Zlib
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright 2020 Tomasz "Soveu" Marx
+  Copyright (c) 2020 Soveu
+
+tokio 1.53.1
+  MIT
+  Copyright (c) Tokio Contributors
+
+tokio-macros 2.7.1
+  MIT
+  Copyright (c) 2019 Yoshua Wuyts
+  Copyright (c) Tokio Contributors
+
+tokio-rustls 0.26.4
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright 2017 quininer kel
+  Copyright (c) 2017 quininer kel
+
+tokio-util 0.7.19
+  MIT
+  Copyright (c) Tokio Contributors
+
+tower 0.5.3
+  MIT
+  Copyright (c) 2019 Tower Contributors
+
+tower-http 0.6.11
+  MIT
+  Copyright (c) 2019-2021 Tower Contributors
+
+tower-layer 0.3.3
+  MIT
+  Copyright (c) 2019 Tower Contributors
+
+tower-service 0.3.3
+  MIT
+  Copyright (c) 2019 Tower Contributors
+
+tracing 0.1.44
+  MIT
+  Copyright (c) 2019 Tokio Contributors
+
+tracing-attributes 0.1.31
+  MIT
+  Copyright (c) 2019 Tokio Contributors
+
+tracing-core 0.1.36
+  MIT
+  Copyright (c) 2019 Tokio Contributors
+
+try-lock 0.2.5
+  MIT
+  Copyright (c) 2018-2023 Sean McArthur
+  Copyright (c) 2016 Alex Crichton
+
+unicode-ident 1.0.24
+  (MIT OR Apache-2.0) AND Unicode-3.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  COPYRIGHT AND PERMISSION NOTICE
+  Copyright © 1991-2023 Unicode, Inc.
+
+untrusted 0.9.0
+  ISC
+
+url 2.5.8
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2013-2025 The rust-url developers
+
+utf8_iter 1.0.4
+  Apache-2.0 OR MIT
+  Copyright Mozilla Foundation
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+
+want 0.3.1
+  MIT
+  Copyright (c) 2018-2019 Sean McArthur
+
+webpki-roots 0.26.11
+  CDLA-Permissive-2.0
+
+webpki-roots 1.0.9
+  CDLA-Permissive-2.0
+
+writeable 0.6.3
+  Unicode-3.0
+  COPYRIGHT AND PERMISSION NOTICE
+  Copyright © 2020-2024 Unicode, Inc.
+
+yasna 0.5.2
+  MIT OR Apache-2.0
+
+yoke 0.8.3
+  Unicode-3.0
+  COPYRIGHT AND PERMISSION NOTICE
+  Copyright © 2020-2024 Unicode, Inc.
+
+yoke-derive 0.8.2
+  Unicode-3.0
+  COPYRIGHT AND PERMISSION NOTICE
+  Copyright © 2020-2024 Unicode, Inc.
+
+zerocopy 0.8.55
+  BSD-2-Clause OR Apache-2.0 OR MIT
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright 2023 The Fuchsia Authors
+  Copyright 2019 The Fuchsia Authors.
+  copyright notice, this list of conditions and the following disclaimer
+
+zerofrom 0.1.8
+  Unicode-3.0
+  COPYRIGHT AND PERMISSION NOTICE
+  Copyright © 2020-2024 Unicode, Inc.
+
+zerofrom-derive 0.1.7
+  Unicode-3.0
+  COPYRIGHT AND PERMISSION NOTICE
+  Copyright © 2020-2024 Unicode, Inc.
+
+zeroize 1.9.0
+  Apache-2.0 OR MIT
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2018-2026 The RustCrypto Project Developers
+
+zerotrie 0.2.4
+  Unicode-3.0
+  COPYRIGHT AND PERMISSION NOTICE
+  Copyright © 2020-2024 Unicode, Inc.
+
+zerovec 0.11.6
+  Unicode-3.0
+  COPYRIGHT AND PERMISSION NOTICE
+  Copyright © 2020-2024 Unicode, Inc.
+
+zerovec-derive 0.11.3
+  Unicode-3.0
+  COPYRIGHT AND PERMISSION NOTICE
+  Copyright © 2020-2024 Unicode, Inc.
+
+zmij 1.0.23
+  MIT
+
+zstd 0.13.3
+  MIT
+  Copyright (c) 2016 Alexandre Bury
+
+zstd-safe 7.2.4
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2016 Alexandre Bury
+
+zstd-sys 2.0.16+zstd.1.5.7
+  MIT/Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2016-present, Facebook, Inc. All rights reserved.
+  Copyright (c) 2016 Alexandre Bury
+
