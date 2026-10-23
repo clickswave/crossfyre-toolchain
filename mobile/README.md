@@ -156,8 +156,6 @@ They do **not** produce identical file hashes, and that is expected: `apksigner`
 signs RSA with a random PSS salt, so the signature differs every run. The
 reproducibility identity is therefore a digest over the zip entries with the
 signing block excluded, published as `contentSha256` alongside each release.
-This is the same comparison F-Droid makes when verifying that a developer-signed
-APK really came from the published source (see `fdroid/`).
 
 ## Layout
 
@@ -168,7 +166,6 @@ APK really came from the published source (see `fdroid/`).
 | `app/src/direct` | the patch feature, in the direct build only |
 | `app/src/play` | the Play build's stand-in for it, which says it is not available |
 | `app/src/test*` | unit tests, shared and per build |
-| `fdroid/` | the F-Droid recipe for the direct build |
 | `tools/` | notes on capturing pinned apps, and `notices.py`, which writes the in-app licence notices |
 
 ## What is not in this repository
