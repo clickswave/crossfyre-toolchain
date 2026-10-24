@@ -87,7 +87,8 @@ curl -fsSL https://get.crossfyre.io/install.sh | sudo bash
 On Debian, Ubuntu or Kali, you can install from the apt repository instead:
 
 ```sh
-curl -fsSL https://bins.crossfyre.io/apt/crossfyre-archive-keyring.gpg | sudo tee /usr/share/keyrings/crossfyre-archive-keyring.gpg > /dev/null
+curl -fsSLO https://bins.crossfyre.io/apt/crossfyre-archive-keyring.gpg
+echo "5dd16a4067070a7763afe58deb829c5129618af9ac3bc096637345b6f43cc020  crossfyre-archive-keyring.gpg" | sha256sum -c - && sudo tee /usr/share/keyrings/crossfyre-archive-keyring.gpg < crossfyre-archive-keyring.gpg > /dev/null
 sudo tee /etc/apt/sources.list.d/crossfyre.sources > /dev/null <<'EOF'
 Types: deb
 URIs: https://bins.crossfyre.io/apt
@@ -98,6 +99,9 @@ EOF
 sudo apt update
 sudo apt install crossfyre crossfyre-archive-keyring
 ```
+
+The keyring is installed only if its SHA-256 matches. It holds one key, fingerprint
+`992F106C6CF032E43A3CA8BED5D92DAC3BA8CDBF`, which `gpg --show-keys` prints.
 
 The archive key's fingerprint is `992F 106C 6CF0 32E4 3A3C A8BE D5D9 2DAC 3BA8 CDBF`. From then on, `sudo apt update && sudo apt upgrade` updates the CLI, and `crossfyre update all` updates the node and the engines. [crossfyre.io/docs/install](https://crossfyre.io/docs/install) also covers the standalone .deb, checking signatures, and removal.
 
