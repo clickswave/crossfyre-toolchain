@@ -4,7 +4,7 @@
 
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-1f6feb.svg)](LICENSE)
 [![Made with Rust](https://img.shields.io/badge/made%20with-Rust-b7410e.svg)](https://www.rust-lang.org)
-![Platform](https://img.shields.io/badge/platform-Linux-444.svg)
+![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-444.svg)
 [![Discord](https://img.shields.io/badge/discord-join-5865F2.svg)](https://discord.gg/cPccst2Vr6)
 
 </div>
@@ -23,10 +23,16 @@ Alongside them: [`crossfyre`](crossfyre/), the CLI that installs and updates eve
 
 ## Install
 
-On Linux, x86_64 or aarch64:
+On Linux (x86_64 or aarch64) or macOS (Intel or Apple silicon):
 
 ```sh
 curl -fsSL https://get.crossfyre.io/install.sh | sudo bash
+```
+
+On Windows, in PowerShell run as administrator:
+
+```powershell
+irm https://get.crossfyre.io/install.ps1 | iex
 ```
 
 <details>
@@ -50,7 +56,7 @@ The keyring is installed only if its SHA-256 matches. Its key's fingerprint is `
 
 </details>
 
-`crossfyre update all` updates the engines. There is no macOS or Windows build: on Windows, run the installer inside WSL 2, and on a Mac, use a Linux machine or VM. [crossfyre.io/docs/install](https://crossfyre.io/docs/install) covers the .deb, signature checks and removal.
+`crossfyre update all` updates the engines. [crossfyre.io/docs/install](https://crossfyre.io/docs/install) covers the .deb, signature checks and removal.
 
 ## Use
 
