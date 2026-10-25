@@ -222,7 +222,30 @@ fn inherited_from_outside() -> Vec<i64> {
         }
         fds
     }
-    #[cfg(not(target_os = "linux"))]
+    // macOS has no /proc. /dev/fd lists the open descriptors, and F_GETFD says whether
+    // each closes on exec, which is what the helper's own check reads. A CI runner can
+    // hand the test descriptors of its own, as GitHub's macOS runners do.
+    #[cfg(target_os = "macos")]
+    {
+        let mut fds = Vec::new();
+        for entry in std::fs::read_dir("/dev/fd").into_iter().flatten().flatten() {
+            let Some(fd) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            // SAFETY: F_GETFD only reads the descriptor's flags; a descriptor that has
+            // closed since the listing (the listing's own) answers -1 and is skipped.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if fd > 2 && flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                fds.push(i64::from(fd));
+            }
+        }
+        fds
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Vec::new()
     }

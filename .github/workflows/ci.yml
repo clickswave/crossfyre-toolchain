@@ -156,8 +156,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # mobile/rust is the Android app's core and is built for Android, Linux and
+          # macOS; it speaks to a tun device through Unix file descriptors.
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
+            skip: --exclude cfx_mobile
           - target: x86_64-apple-darwin
             runner: macos-15-intel
           - target: aarch64-apple-darwin
@@ -204,12 +207,12 @@ jobs:
       - name: Check (all targets, including tests and benches)
         env:
           PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
-        run: cargo check --workspace --all-targets --locked --target ${{ matrix.target }}
+        run: cargo check --workspace ${{ matrix.skip }} --all-targets --locked --target ${{ matrix.target }}
 
       - name: clippy
         env:
           PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
-        run: cargo clippy --workspace --all-targets --locked --target ${{ matrix.target }} -- -D warnings
+        run: cargo clippy --workspace ${{ matrix.skip }} --all-targets --locked --target ${{ matrix.target }} -- -D warnings
 
       # The impersonate feature compiles BoringSSL, which builds with MSVC on Windows
       # and not with MinGW, so this is also what shows the MSVC target is the one the
@@ -224,7 +227,7 @@ jobs:
       - name: Test
         env:
           PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
-        run: cargo test --workspace --locked --no-fail-fast --target ${{ matrix.target }}
+        run: cargo test --workspace ${{ matrix.skip }} --locked --no-fail-fast --target ${{ matrix.target }}
 
   oracles:
     name: detection regression

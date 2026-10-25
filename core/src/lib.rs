@@ -1619,7 +1619,9 @@ pub async fn run_init(
             {
                 Ok(()) => ok(&format!("{name} already installed, started")),
                 Err(e) => {
-                    fail(&format!("{name} is installed but its service did not start: {e}"));
+                    fail(&format!(
+                        "{name} is installed but its service did not start: {e}"
+                    ));
                     hint(&format!("Run manually: crossfyre extension install {name}"));
                 }
             }

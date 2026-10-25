@@ -1538,7 +1538,12 @@ mod tests {
         // With nobody logged in at the screen (a Mac reached over SSH, or one that
         // has just booted), only the user's background domain exists, and launchd
         // loads an agent there only if the agent says it may run in that session.
-        let plist = agent_plist("io.crossfyre.voyage", Path::new("/c"), "voyage", Path::new("/l"));
+        let plist = agent_plist(
+            "io.crossfyre.voyage",
+            Path::new("/c"),
+            "voyage",
+            Path::new("/l"),
+        );
         assert!(
             plist.contains(
                 "<key>LimitLoadToSessionType</key>\n  <array>\n    <string>Aqua</string>\n    \

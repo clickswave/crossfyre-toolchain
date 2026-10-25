@@ -213,7 +213,9 @@ mod create_dir_tests {
     #[test]
     fn the_first_missing_level_is_the_outermost_one_created() {
         let base = tempfile::tempdir().expect("tempdir");
-        let deep = base.path().join("Library/Application Support/crossfyre/logs");
+        let deep = base
+            .path()
+            .join("Library/Application Support/crossfyre/logs");
         assert_eq!(first_missing(&deep), Some(base.path().join("Library")));
         std::fs::create_dir_all(base.path().join("Library/Application Support")).expect("dirs");
         assert_eq!(
