@@ -1,6 +1,6 @@
 [package]
 name = "cfx-script"
-version = "0.1.2"
+version = "0.1.5"
 edition = "2024"
 license.workspace = true
 publish.workspace = true
@@ -18,3 +18,23 @@ pyo3 = { version = "0.29", features = ["auto-initialize"] }
 pythonize = "0.29"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+
+[features]
+# Build for Python's stable ABI, as Windows and macOS builds always are (below). Here so
+# that a Linux build can run the tests against the same code: `--features abi3`.
+abi3 = ["pyo3/abi3-py310"]
+
+# Windows and macOS have no system Python a release could be built against, so the
+# helper is built for the stable ABI and loads whichever CPython 3.10 or later the
+# machine has. On Windows that is python3.dll, the same name in every CPython there,
+# linked with raw-dylib, so no import library and no Windows Python is needed to build
+# it (`executor::python_env` says where it is looked for). Linux keeps linking the
+# versioned libpython of the build machine. The minimum here is
+# `executor::PYTHON_MIN`. On macOS the build reads it from the Python that
+# PYO3_PYTHON names, which has to be set: the Xcode tools' python3 is 3.9.
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+pyo3 = { version = "0.29", features = ["auto-initialize", "abi3-py310"] }
+
+# SetStdHandle, for moving the messages off stdout before Python starts.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }

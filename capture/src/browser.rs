@@ -56,7 +56,7 @@ const CANDIDATES: &[(&str, Family)] = &[
 pub fn installed() -> Vec<Browser> {
     let mut out = Vec::new();
     for (name, family) in CANDIDATES {
-        if let Some(binary) = which(name) {
+        if let Some(binary) = locate(name) {
             // Several names often resolve to the same binary (chromium and
             // chromium-browser, chrome and google-chrome-stable). Offering one browser
             // three times under different names is not a choice, it is noise.
@@ -103,8 +103,80 @@ impl Browser {
 /// Resolve a command name on PATH. No shell, so a name cannot become an invocation.
 fn which(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
+    let name = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    };
     std::env::split_paths(&path)
-        .map(|dir| dir.join(name))
+        .map(|dir| dir.join(&name))
+        .find(|p| p.is_file())
+}
+
+/// Find the browser a candidate name stands for: on PATH, which is where Linux puts
+/// them, or where its installer puts it on macOS and Windows, which do not.
+pub fn locate(name: &str) -> Option<PathBuf> {
+    which(name).or_else(|| well_known(name).into_iter().find(|p| p.is_file()))
+}
+
+/// Where a browser's own installer puts it, for a candidate name. Empty on Linux.
+fn well_known(name: &str) -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let app = match name {
+            "firefox" | "firefox-esr" => "Firefox.app/Contents/MacOS/firefox",
+            "chromium" | "chromium-browser" => "Chromium.app/Contents/MacOS/Chromium",
+            "google-chrome" | "google-chrome-stable" => {
+                "Google Chrome.app/Contents/MacOS/Google Chrome"
+            }
+            "brave" | "brave-browser" => "Brave Browser.app/Contents/MacOS/Brave Browser",
+            "microsoft-edge" => "Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            _ => return Vec::new(),
+        };
+        let mut roots = vec![PathBuf::from("/Applications")];
+        if let Some(home) = std::env::var_os("HOME") {
+            roots.push(PathBuf::from(home).join("Applications"));
+        }
+        roots.into_iter().map(|r| r.join(app)).collect()
+    }
+    #[cfg(windows)]
+    {
+        // Per-machine installs go under Program Files (either of them), per-user ones
+        // under %LOCALAPPDATA%.
+        let rel = match name {
+            "firefox" | "firefox-esr" => r"Mozilla Firefox\firefox.exe",
+            "chromium" | "chromium-browser" => r"Chromium\Application\chrome.exe",
+            "google-chrome" | "google-chrome-stable" => r"Google\Chrome\Application\chrome.exe",
+            "brave" | "brave-browser" => r"BraveSoftware\Brave-Browser\Application\brave.exe",
+            "microsoft-edge" => r"Microsoft\Edge\Application\msedge.exe",
+            _ => return Vec::new(),
+        };
+        ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"]
+            .iter()
+            .filter_map(std::env::var_os)
+            .map(|root| PathBuf::from(root).join(rel))
+            .collect()
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        let _ = name;
+        Vec::new()
+    }
+}
+
+/// The NSS `certutil`, which can add a certificate to a Firefox profile's store. On
+/// Windows a `certutil` on PATH is usually the system's own tool of that name, which
+/// manages the Windows certificate stores and must not be handed these arguments, so
+/// only one outside the Windows directory is taken there.
+fn nss_certutil() -> Option<PathBuf> {
+    if !cfg!(windows) {
+        return Some(PathBuf::from("certutil"));
+    }
+    let system = std::env::var_os("SystemRoot").map(PathBuf::from)?;
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .filter(|dir| !dir.starts_with(&system))
+        .map(|dir| dir.join("certutil.exe"))
         .find(|p| p.is_file())
 }
 
@@ -216,12 +288,15 @@ pub fn launch(l: &Launch<'_>) -> std::io::Result<(std::process::Child, Trust)> {
 /// Best-effort, returning false when `certutil` (from nss) is not installed.
 pub fn trust_ca_in_profile(profile: &Path, ca_pem: &Path) -> bool {
     use std::process::Command;
+    let Some(certutil) = nss_certutil() else {
+        return false;
+    };
     let db = format!("sql:{}", profile.display());
     // A fresh profile has no NSS database yet. A no-op where one exists.
-    let _ = Command::new("certutil")
+    let _ = Command::new(&certutil)
         .args(["-N", "-d", &db, "--empty-password"])
         .output();
-    Command::new("certutil")
+    Command::new(&certutil)
         .args(["-A", "-n", "Crossfyre Workbench CA", "-t", "C,,", "-i"])
         .arg(ca_pem)
         .args(["-d", &db])

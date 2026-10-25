@@ -139,6 +139,96 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked --no-fail-fast
 
+  # The build and clippy jobs below, for each target the release workflow publishes
+  # beside Linux, each on a runner of its own system and arch. Code behind cfg(unix) or
+  # cfg(target_os = "linux") with no arm for the others has to fail here, on the pull
+  # request that adds it, and not at a tag. The engines' tests that need Postgres or a
+  # browser run in the oracles job, on Linux; anything here that needs a service the
+  # runner lacks has to skip loudly, as on Linux.
+  #
+  # cfx-script is built for Python's stable ABI on these systems (its Cargo.toml turns
+  # that on for them), so any CPython from 3.10 serves; PYO3_PYTHON names the one
+  # setup-python installs, so pyo3 does not pick up another the image has first.
+  build-native:
+    name: build, clippy and test (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # mobile/rust is the Android app's core and is built for Android, Linux and
+          # macOS; it speaks to a tun device through Unix file descriptors.
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            skip: --exclude cfx_mobile
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-15
+    defaults:
+      run:
+        shell: bash
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        id: python
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust with clippy
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --component clippy --no-self-update
+          rustup default 1.88.0
+          rustup target add ${{ matrix.target }}
+          rustc --version && cargo --version
+
+      # aws-lc-sys and BoringSSL assemble their x86_64 code with NASM on Windows, and
+      # the runner image does not carry it.
+      - name: Install NASM
+        if: runner.os == 'Windows'
+        run: |
+          choco install nasm -y --no-progress
+          echo "C:\\Program Files\\NASM" >> "$GITHUB_PATH"
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: native-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: native-${{ matrix.target }}-
+
+      - name: Check (all targets, including tests and benches)
+        env:
+          PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
+        run: cargo check --workspace ${{ matrix.skip }} --all-targets --locked --target ${{ matrix.target }}
+
+      - name: clippy
+        env:
+          PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
+        run: cargo clippy --workspace ${{ matrix.skip }} --all-targets --locked --target ${{ matrix.target }} -- -D warnings
+
+      # The impersonate feature compiles BoringSSL, which builds with MSVC on Windows
+      # and not with MinGW, so this is also what shows the MSVC target is the one the
+      # release can ship it on.
+      - name: clippy (impersonate feature)
+        run: |
+          cargo clippy --locked --all-targets --target ${{ matrix.target }} \
+            -p transport -p ambulo -p voyage -p toolmark -p plessor \
+            --features transport/impersonate,ambulo/impersonate,voyage/impersonate,toolmark/impersonate,plessor/impersonate \
+            -- -D warnings
+
+      - name: Test
+        env:
+          PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
+        run: cargo test --workspace ${{ matrix.skip }} --locked --no-fail-fast --target ${{ matrix.target }}
+
   oracles:
     name: detection regression
     runs-on: ubuntu-latest

@@ -8,17 +8,75 @@
 //!   * dim **hints** and a bold-green **done** summary
 //!
 //! Prefer these helpers over raw `println!` + ANSI in command output, so the look
-//! stays consistent. ANSI is emitted unconditionally; the toolchain targets
-//! interactive terminals (matching the existing status table in lib.rs).
+//! stays consistent. Everything here writes to stdout, and the escape codes are
+//! written only when stdout is a terminal and NO_COLOR is not set (see [`colour`]),
+//! so output sent to a file or a pipe is plain text.
 #![allow(dead_code)]
 
-pub const RESET: &str = "\x1b[0m";
-pub const BOLD: &str = "\x1b[1m";
-pub const DIM: &str = "\x1b[2m";
-pub const GREEN: &str = "\x1b[32m";
-pub const CYAN: &str = "\x1b[36m";
-pub const YELLOW: &str = "\x1b[33m";
-pub const RED: &str = "\x1b[31m";
+/// One ANSI escape code. It writes itself only while [`colour`] is on, so a format
+/// string such as `"{GREEN}ok{RESET}"` is plain `ok` in a file.
+#[derive(Debug, Clone, Copy)]
+pub struct Ansi(&'static str);
+
+impl std::fmt::Display for Ansi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if colour() {
+            f.write_str(self.0)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+pub const RESET: Ansi = Ansi("\x1b[0m");
+pub const BOLD: Ansi = Ansi("\x1b[1m");
+pub const DIM: Ansi = Ansi("\x1b[2m");
+pub const GREEN: Ansi = Ansi("\x1b[32m");
+pub const CYAN: Ansi = Ansi("\x1b[36m");
+pub const YELLOW: Ansi = Ansi("\x1b[33m");
+pub const RED: Ansi = Ansi("\x1b[31m");
+
+/// Is colour on for this process? Decided once, from stdout and NO_COLOR.
+pub fn colour() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        use std::io::IsTerminal;
+        wants_colour(
+            std::env::var_os("NO_COLOR").as_deref(),
+            std::io::stdout().is_terminal(),
+        ) && console_reads_escapes()
+    })
+}
+
+/// Colour only for a terminal, and only when NO_COLOR is unset or empty, which is what
+/// https://no-color.org asks of every program.
+fn wants_colour(no_color: Option<&std::ffi::OsStr>, terminal: bool) -> bool {
+    terminal && no_color.is_none_or(|v| v.is_empty())
+}
+
+/// A Windows console shows escape codes as text until it is told to read them, which
+/// every console since Windows 10 can be. Where that fails there is no colour.
+#[cfg(windows)]
+fn console_reads_escapes() -> bool {
+    use windows_sys::Win32::System::Console::{
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetStdHandle, STD_OUTPUT_HANDLE,
+        SetConsoleMode,
+    };
+    // SAFETY: the handle is this process's stdout, and the mode is read before it is
+    // written back with one more flag.
+    unsafe {
+        let out = GetStdHandle(STD_OUTPUT_HANDLE);
+        let mut mode = 0u32;
+        GetConsoleMode(out, &mut mode) != 0
+            && (mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0
+                || SetConsoleMode(out, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0)
+    }
+}
+
+#[cfg(not(windows))]
+fn console_reads_escapes() -> bool {
+    true
+}
 
 // ── inline colorizers (for a fragment inside a larger line) ─────────────
 pub fn dim(s: &str) -> String {
@@ -128,4 +186,18 @@ pub fn error(msg: &str) {
 /// A trailing blank line to close a block.
 pub fn end() {
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn colour_is_for_a_terminal_when_no_color_is_unset_or_empty() {
+        use std::ffi::OsStr;
+        assert!(wants_colour(None, true));
+        assert!(wants_colour(Some(OsStr::new("")), true));
+        assert!(!wants_colour(Some(OsStr::new("1")), true));
+        assert!(!wants_colour(None, false));
+    }
 }

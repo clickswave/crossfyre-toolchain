@@ -12,7 +12,7 @@ mod governor;
 mod libs;
 mod scanner;
 
-/// Mirrors the toolchain config at ~/.config/crossfyre/config.toml
+/// Mirrors the toolchain config at ~/.config/crossfyre/config.toml (see `toolchain_dir`)
 #[derive(Debug, Deserialize)]
 struct ToolchainConfig {
     postgres: PostgresConfig,
@@ -28,12 +28,27 @@ struct PostgresConfig {
     db_name: String,
 }
 
+/// The toolchain directory: `CROSSFYRE_TOOLCHAIN_DIR` when the service that started this
+/// daemon names one, as the engine host does on macOS and Windows, else
+/// `~/.config/crossfyre` on Linux and the per-user config directory elsewhere
+/// (`~/Library/Application Support` on macOS, `%APPDATA%` on Windows), which is where
+/// the CLI writes it.
+fn toolchain_dir() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    if let Some(dir) = std::env::var_os("CROSSFYRE_TOOLCHAIN_DIR").filter(|d| !d.is_empty()) {
+        return Ok(dir.into());
+    }
+    let root = if cfg!(target_os = "linux") {
+        dirs::home_dir()
+            .ok_or("Could not find home directory")?
+            .join(".config")
+    } else {
+        dirs::config_dir().ok_or("Could not find the config directory")?
+    };
+    Ok(root.join("crossfyre"))
+}
+
 fn load_toolchain_config() -> Result<ToolchainConfig, Box<dyn std::error::Error>> {
-    let config_path = dirs::home_dir()
-        .ok_or("Could not find home directory")?
-        .join(".config")
-        .join("crossfyre")
-        .join("config.toml");
+    let config_path = toolchain_dir()?.join("config.toml");
 
     let contents = std::fs::read_to_string(&config_path).map_err(|e| {
         format!(
@@ -132,6 +147,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ports = libs::cli_args::resolve_ports(&scan_args.ports);
 
+    // On stderr, so a piped scan's JSON on stdout stays clean.
+    if let Some(notice) = scan_args.technique.notice() {
+        eprintln!("{notice}");
+    }
+
     // Build and send the stream scan request
     let request = serde_json::json!({
         "operation": "scan",
@@ -139,7 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "save": true,
         "targets": scan_args.targets,
         "ports": ports,
-        "technique": scan_args.technique.to_string(),
+        "technique": scan_args.technique.runs(),
         "tasks": scan_args.tasks,
         "timeout": scan_args.timeout,
         "delay": scan_args.delay,

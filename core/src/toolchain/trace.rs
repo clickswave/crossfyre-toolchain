@@ -494,14 +494,23 @@ pub async fn run(cfg: TraceConfig) -> Result<(), BoxErr> {
     Ok(())
 }
 
+/// The program to launch for `--browser <name>`. On Linux the browsers are on PATH under
+/// these names; macOS and Windows keep them where their installers put them, so there the
+/// name is looked up and the path found is what is launched.
 pub fn browser_binary(name: &str) -> String {
-    match name.to_lowercase().as_str() {
+    let bin: String = match name.to_lowercase().as_str() {
         "chrome" | "google-chrome" => "google-chrome".into(),
         "chromium" => "chromium".into(),
         "firefox" => "firefox".into(),
         "edge" | "msedge" => "microsoft-edge".into(),
         other => other.into(),
+    };
+    if cfg!(target_os = "linux") {
+        return bin;
     }
+    super::capture::browser::locate(&bin)
+        .map(|p| p.display().to_string())
+        .unwrap_or(bin)
 }
 
 #[cfg(test)]

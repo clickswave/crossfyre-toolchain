@@ -92,16 +92,24 @@ pub fn rewrite(path: &Path, owner: Option<u32>) -> std::io::Result<bool> {
         for (at, new) in &found {
             file.write_all_at(new.as_bytes(), *at as u64)?;
         }
-        file.sync_all()?;
-        Ok(true)
     }
-    #[cfg(not(unix))]
-    {
-        Ok(false)
+    #[cfg(windows)]
+    for (at, new) in &found {
+        use std::os::windows::fs::FileExt;
+        let mut done = 0;
+        while done < new.len() {
+            done += file.seek_write(&new.as_bytes()[done..], (*at + done) as u64)?;
+        }
     }
+    file.sync_all()?;
+    Ok(true)
 }
 
-/// The shell startup files the installer writes its PATH line into, under `home`.
+/// The shell startup files the installer writes its PATH line into, under `home`. The
+/// old line only ever went into these three, from the Linux installer. On macOS and
+/// Windows there is nothing to rewrite: an installer there appends the bin directory to
+/// PATH from the start (on Windows, to the user's PATH in the registry), for the same
+/// reason.
 fn rc_files(home: &Path) -> [PathBuf; 3] {
     [
         home.join(".bashrc"),

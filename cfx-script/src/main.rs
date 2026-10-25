@@ -131,6 +131,7 @@ fn read_job() -> Result<Job, String> {
 ///
 /// `None` when the helper was started with fd 1 closed; the messages then go nowhere,
 /// as they did before.
+#[cfg(unix)]
 fn take_stdout() -> Option<std::fs::File> {
     use std::os::fd::{AsFd, AsRawFd};
     // Duplicated with F_DUPFD_CLOEXEC, so no process the script starts inherits it.
@@ -150,6 +151,31 @@ fn take_stdout() -> Option<std::fs::File> {
         // No stderr and no /dev/null. A closed fd 1 is still better than the caller's
         // pipe left where any child can write to it.
         unsafe { libc::close(libc::STDOUT_FILENO) };
+    }
+    pipe
+}
+
+/// The Windows form of the same move. The pipe is duplicated as a handle no child can
+/// inherit, and the process's standard output handle becomes its standard error, which
+/// is what every process the script starts is given. Python's own fd 1 belongs to the C
+/// runtime Python was built with, which is not necessarily this binary's, so that one is
+/// pointed at stderr from inside Python once it starts (see `redirect_python_stdout`).
+#[cfg(windows)]
+fn take_stdout() -> Option<std::fs::File> {
+    use std::os::windows::io::AsHandle;
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
+    };
+    // `try_clone_to_owned` duplicates without inheritance.
+    let pipe = std::io::stdout()
+        .as_handle()
+        .try_clone_to_owned()
+        .ok()
+        .map(std::fs::File::from);
+    // SAFETY: both calls act on this process's standard handle table, and Python, which
+    // is the only other thing that would read it, has not started.
+    unsafe {
+        SetStdHandle(STD_OUTPUT_HANDLE, GetStdHandle(STD_ERROR_HANDLE));
     }
     pipe
 }
@@ -280,16 +306,19 @@ impl Messages {
 
     /// The pipe, or `None` once the script has closed it.
     fn live(&mut self) -> Option<&std::fs::File> {
-        use std::os::fd::AsRawFd;
         let pipe = self.pipe.take()?;
         if self.id.is_none() || identity(&pipe) == self.id {
             return Some(&*self.pipe.insert(pipe));
         }
-        eprintln!(
-            "cfx-script: the script closed fd {}, the pipe its messages go out on, so \
-             nothing it sends from now on can be reported",
-            pipe.as_raw_fd()
-        );
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            eprintln!(
+                "cfx-script: the script closed fd {}, the pipe its messages go out on, so \
+                 nothing it sends from now on can be reported",
+                pipe.as_raw_fd()
+            );
+        }
         std::mem::forget(pipe);
         None
     }
@@ -327,9 +356,31 @@ impl Drop for Messages {
 }
 
 /// The device and inode a descriptor refers to, or `None` when it is closed.
+#[cfg(unix)]
 fn identity(file: &std::fs::File) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     file.metadata().ok().map(|m| (m.dev(), m.ino()))
+}
+
+/// Always `None` on Windows. The pipe is a handle of the helper's own, not one of the C
+/// runtime's descriptors, so a script closing descriptors it did not open, which is what
+/// the check guards against, cannot reach it.
+#[cfg(windows)]
+fn identity(_file: &std::fs::File) -> Option<(u64, u64)> {
+    None
+}
+
+/// On Windows, point the C runtime descriptor 1 that Python uses at its descriptor 2,
+/// as `take_stdout` does for the process on Unix before Python starts. Python's C
+/// runtime set up descriptor 1 from the standard output handle while it was loading,
+/// before `main`, so the helper cannot reach it from outside. Elsewhere there is nothing
+/// left to do.
+fn redirect_python_stdout(py: Python<'_>) {
+    if cfg!(windows)
+        && let Ok(os) = py.import("os")
+    {
+        let _ = os.call_method1("dup2", (2, 1));
+    }
 }
 
 /// Point the script's `sys.stdout` at `sys.stderr`, line-buffered.
@@ -406,6 +457,7 @@ fn wait_for_threads(stage: &Mutex<Stage>) {
 fn run_python(script: &str) -> Result<(), String> {
     Python::attach(|py| {
         let result = (|| -> PyResult<()> {
+            redirect_python_stdout(py);
             runtime::register_modules(py)?;
             prepare_streams(py);
 

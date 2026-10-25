@@ -18,7 +18,7 @@ mod scanner;
 mod spa;
 mod tui;
 
-/// Mirrors the toolchain config at ~/.config/crossfyre/config.toml
+/// Mirrors the toolchain config at ~/.config/crossfyre/config.toml (see `toolchain_dir`)
 #[derive(Debug, Deserialize)]
 struct ToolchainConfig {
     postgres: PostgresConfig,
@@ -34,12 +34,27 @@ struct PostgresConfig {
     db_name: String,
 }
 
+/// The toolchain directory: `CROSSFYRE_TOOLCHAIN_DIR` when the service that started this
+/// daemon names one, as the engine host does on macOS and Windows, else
+/// `~/.config/crossfyre` on Linux and the per-user config directory elsewhere
+/// (`~/Library/Application Support` on macOS, `%APPDATA%` on Windows), which is where
+/// the CLI writes it.
+fn toolchain_dir() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    if let Some(dir) = std::env::var_os("CROSSFYRE_TOOLCHAIN_DIR").filter(|d| !d.is_empty()) {
+        return Ok(dir.into());
+    }
+    let root = if cfg!(target_os = "linux") {
+        dirs::home_dir()
+            .ok_or("Could not find home directory")?
+            .join(".config")
+    } else {
+        dirs::config_dir().ok_or("Could not find the config directory")?
+    };
+    Ok(root.join("crossfyre"))
+}
+
 fn load_toolchain_config() -> Result<ToolchainConfig, Box<dyn std::error::Error>> {
-    let config_path = dirs::home_dir()
-        .ok_or("Could not find home directory")?
-        .join(".config")
-        .join("crossfyre")
-        .join("config.toml");
+    let config_path = toolchain_dir()?.join("config.toml");
 
     let contents = std::fs::read_to_string(&config_path).map_err(|e| {
         format!(
@@ -351,10 +366,13 @@ async fn handle_db(args: DbArgs, port: u16) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-async fn handle_fuzz_exec(args: ExecArgs, port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    // Parse the caller's JSON and fill in the operation if they did not name one.
+/// The request `exec` sends for the caller's JSON, with the operation, the response
+/// mode and, for a probe, an operation id filled in where the caller left them out. The
+/// daemon files a probe's result under its operation id and refuses a probe without
+/// one, so the README's own example was refused.
+fn exec_request(json: &str) -> Result<serde_json::Value, String> {
     let mut payload: serde_json::Value =
-        serde_json::from_str(&args.json).map_err(|e| format!("Invalid JSON: {e}"))?;
+        serde_json::from_str(json).map_err(|e| format!("Invalid JSON: {e}"))?;
 
     // Must be an object. Indexing a non-object panicked inside serde_json, so
     // `exec '[1,2]'` aborted with a library backtrace instead of an error.
@@ -367,6 +385,16 @@ async fn handle_fuzz_exec(args: ExecArgs, port: u16) -> Result<(), Box<dyn std::
         .or_insert_with(|| serde_json::json!("probe"));
     obj.entry("response")
         .or_insert_with(|| serde_json::json!("instant"));
+    if obj.get("operation").and_then(|o| o.as_str()) == Some("probe") {
+        obj.entry("operation_id")
+            .or_insert_with(|| serde_json::json!(uuid::Uuid::new_v4().to_string()));
+    }
+    Ok(payload)
+}
+
+async fn handle_fuzz_exec(args: ExecArgs, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    // Parse the caller's JSON and fill in the operation if they did not name one.
+    let payload = exec_request(&args.json)?;
 
     let daemon_addr = format!("127.0.0.1:{port}");
     let stream = TcpStream::connect(&daemon_addr).await.map_err(|_| {
@@ -393,4 +421,30 @@ async fn handle_fuzz_exec(args: ExecArgs, port: u16) -> Result<(), Box<dyn std::
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod exec_tests {
+    use super::exec_request;
+
+    #[test]
+    fn the_readme_example_is_a_probe_the_daemon_accepts() {
+        let req = exec_request(
+            r#"{"url":"https://example.com/robots.txt","success_codes":[200],"method":"get"}"#,
+        )
+        .expect("an object");
+        assert_eq!(req["operation"], "probe");
+        let parsed: Result<crate::daemon::ProbeParams, _> = serde_json::from_value(req);
+        assert!(parsed.is_ok(), "the daemon refuses it: {:?}", parsed.err());
+    }
+
+    #[test]
+    fn what_the_caller_named_is_kept() {
+        let req =
+            exec_request(r#"{"operation":"probe","operation_id":"mine","response":"stream"}"#)
+                .expect("an object");
+        assert_eq!(req["operation_id"], "mine");
+        assert_eq!(req["response"], "stream");
+        assert!(exec_request("[1,2]").is_err());
+    }
 }

@@ -135,13 +135,183 @@ jobs:
           path: crossfyre-toolchain-${{ matrix.target }}.tar.gz*
           if-no-files-found: error
 
+  # macOS and Windows, on their own runners. A job container is Linux only, so these
+  # cannot share the job above, and the glibc reason for that container does not
+  # apply: a Mach-O or PE binary links the system libraries of the OS it runs on.
+  #
+  # Each target builds where it runs, so the start check at the end runs the binary
+  # it is about to publish. x86_64-apple-darwin is built on the Intel image rather
+  # than cross-compiled on Apple silicon for the same reason.
+  build-native:
+    name: build ${{ matrix.target }}
+    needs: boundary
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            archive: zip
+    env:
+      # The oldest macOS the binaries start on. 11 is the first release for Apple
+      # silicon, and holding the Intel build to the same floor keeps one answer to
+      # "which macOS does this need".
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      # The C runtime linked in, so the Windows binaries need no Visual C++
+      # Redistributable on the machine that runs them.
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
+      # Room in each macOS binary's header for the load commands cfx-script's are
+      # rewritten with below; the same for every binary, so nothing is built twice.
+      CARGO_TARGET_X86_64_APPLE_DARWIN_RUSTFLAGS: "-C link-arg=-Wl,-headerpad_max_install_names"
+      CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS: "-C link-arg=-Wl,-headerpad_max_install_names"
+      # The Python cfx-script goes out with on Windows, which has none of its own:
+      # python.org's embeddable package, as published.
+      WINDOWS_PYTHON: "3.13.12"
+      WINDOWS_PYTHON_SHA256: "76f238f606250c87c6beac75dccd35ee99070a13490555936abb6cb64ecce3d0"
+    steps:
+      - uses: actions/checkout@v4
+
+      # cfx-script is built for Python's stable ABI on these systems and loads any
+      # CPython from 3.10. PYO3_PYTHON names the interpreter it is built with, so pyo3
+      # does not pick up whichever python3 the image puts first on PATH.
+      - uses: actions/setup-python@v5
+        id: python
+        with:
+          python-version: "3.12"
+
+      # rust-toolchain.toml pins the compiler, and rustup installs it on first use.
+      # The target is named so that rustup installs its standard library with it.
+      - name: Install the Rust target
+        run: |
+          set -euo pipefail
+          rustup target add ${{ matrix.target }}
+          rustc --version && cargo --version
+
+      # aws-lc-sys assembles its x86_64 code with NASM on Windows, and the runner
+      # image does not carry it.
+      - name: Install NASM
+        if: runner.os == 'Windows'
+        run: |
+          set -euo pipefail
+          choco install nasm -y --no-progress
+          echo "C:\\Program Files\\NASM" >> "$GITHUB_PATH"
+
+      - name: Build the workspace binaries
+        env:
+          PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target ${{ matrix.target }} \
+            -p crossfyre -p plessor -p ambulo -p voyage -p doorward -p toolmark -p node -p oast \
+            -p cfx-script --features cfx-script/abi3
+
+      - name: Stage the artifacts
+        run: |
+          set -euo pipefail
+          exe=""
+          [ "${{ runner.os }}" != "Windows" ] || exe=".exe"
+          out="dist/${{ matrix.target }}"
+          mkdir -p "$out"
+          for b in crossfyre plessor ambulo voyage doorward toolmark node oast cfx-script; do
+            cp "target/${{ matrix.target }}/release/$b$exe" "$out/$b$exe"
+          done
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            # cfx-script is linked against the Python this runner has. It is made to
+            # load @rpath/Python instead, found in the framework python.org installs
+            # or the one Homebrew does, so it runs on any Mac with either.
+            lib="$(otool -L "$out/cfx-script" | awk 'NR > 1 && /Python\.framework|libpython3/ { print $1; exit }')"
+            test -n "$lib"
+            install_name_tool -change "$lib" @rpath/Python \
+              -add_rpath /Library/Frameworks/Python.framework/Versions/Current \
+              -add_rpath /opt/homebrew/opt/python3/Frameworks/Python.framework/Versions/Current \
+              -add_rpath /usr/local/opt/python3/Frameworks/Python.framework/Versions/Current \
+              "$out/cfx-script"
+            # strip and install_name_tool rewrite the binary, which leaves the
+            # signature the linker made over other bytes, and Apple silicon refuses
+            # to start an arm64 binary whose signature does not match. Signed again,
+            # ad hoc, after both.
+            for f in "$out"/*; do
+              strip "$f"
+              codesign --force --sign - "$f"
+              codesign --verify --strict "$f"
+            done
+          fi
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            # cfx-script looks for a python folder beside itself first.
+            curl -fsSL -o python.zip \
+              "https://www.python.org/ftp/python/$WINDOWS_PYTHON/python-$WINDOWS_PYTHON-embed-amd64.zip"
+            echo "$WINDOWS_PYTHON_SHA256  python.zip" | sha256sum -c -
+            mkdir -p "$out/python"
+            (cd "$out/python" && 7z x -bso0 ../../../python.zip)
+            rm python.zip
+            test -f "$out/python/python3.dll"
+          fi
+          name="crossfyre-toolchain-${{ matrix.target }}.${{ matrix.archive }}"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            (cd "$out" && 7z a -tzip -bso0 "../../$name" .)
+          else
+            tar -C "$out" -czf "$name" .
+          fi
+          # Git Bash's sha256sum marks the file binary with "*", and macOS has shasum
+          # instead, so the line is written here in the one form the Linux jobs give.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sum="$(sha256sum "$name" | cut -d' ' -f1)"
+          else
+            sum="$(shasum -a 256 "$name" | cut -d' ' -f1)"
+          fi
+          printf '%s  %s\n' "$sum" "$name" > "$name.sha256"
+          cat "$name.sha256"
+
+      # What runs here is what goes out: each binary has to start and print its
+      # version. One whose signature broke in staging, or that was built for the
+      # other arch, fails here rather than on the first machine that installs it.
+      #
+      # cfx-script is started on Windows alone, with the Python it goes out with. On
+      # macOS it loads a Python framework the runner need not have, and otool -L shows
+      # it names @rpath/Python.
+      - name: The binaries start
+        run: |
+          set -euo pipefail
+          exe=""
+          [ "${{ runner.os }}" != "Windows" ] || exe=".exe"
+          for b in crossfyre plessor ambulo voyage doorward toolmark node oast; do
+            "dist/${{ matrix.target }}/$b$exe" --version
+          done
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            otool -L "dist/${{ matrix.target }}/cfx-script"
+          fi
+          # Given no job, cfx-script refuses the empty stdin with exit status 2, which
+          # shows it loaded with the Python beside it.
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            rc=0
+            PATH="$PWD/dist/${{ matrix.target }}/python:$PATH" \
+              "dist/${{ matrix.target }}/cfx-script.exe" </dev/null || rc=$?
+            test "$rc" -eq 2
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: crossfyre-toolchain-${{ matrix.target }}.${{ matrix.archive }}*
+          if-no-files-found: error
+
   publish:
     name: attest and publish
-    needs: build
+    needs: [build, build-native]
     runs-on: ubuntu-latest
     # `id-token` and `attestations` are what let the provenance be signed. They
-    # are granted here and nowhere else in the file, so the build job that
-    # compiles third-party code cannot mint an attestation.
+    # are granted here and nowhere else in the file, so the build jobs that
+    # compile third-party code cannot mint an attestation.
     permissions:
       contents: write
       id-token: write
@@ -155,11 +325,22 @@ jobs:
           pattern: dist-*
           merge-multiple: true
 
+      # Linux and macOS archives are .tar.gz, the Windows one .zip. Every one of them
+      # has to be here: a target whose build failed stops the release at this step
+      # rather than publishing it with a platform missing.
       - name: One checksum file for the whole release
         run: |
           set -euo pipefail
-          cat ./*.tar.gz.sha256 > SHA256SUMS
-          rm -f ./*.tar.gz.sha256
+          for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
+                   x86_64-apple-darwin aarch64-apple-darwin; do
+            test -f "crossfyre-toolchain-$t.tar.gz.sha256"
+          done
+          test -f crossfyre-toolchain-x86_64-pc-windows-msvc.zip.sha256
+          cat ./*.tar.gz.sha256 ./*.zip.sha256 > SHA256SUMS
+          rm -f ./*.tar.gz.sha256 ./*.zip.sha256
+          # Five runners on three systems wrote these lines; checking them against
+          # the files here is what says they agree.
+          sha256sum -c SHA256SUMS
           cat SHA256SUMS
 
       # The piece that removes "trust us". Verify with:
@@ -167,7 +348,9 @@ jobs:
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v1
         with:
-          subject-path: "*.tar.gz"
+          subject-path: |
+            *.tar.gz
+            *.zip
 
       - name: Publish the release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -175,6 +358,7 @@ jobs:
         with:
           files: |
             *.tar.gz
+            *.zip
             SHA256SUMS
           fail_on_unmatched_files: true
           body: |
@@ -205,6 +389,26 @@ jobs:
             out-of-band interaction server. The first-party CLI runs the same
             server as `crossfyre oast serve`.
 
+            ## Platforms
+
+            | archive | runs on |
+            |---|---|
+            | `crossfyre-toolchain-x86_64-unknown-linux-gnu.tar.gz` | Linux on x86-64, glibc 2.36 or later |
+            | `crossfyre-toolchain-aarch64-unknown-linux-gnu.tar.gz` | Linux on 64-bit ARM, glibc 2.36 or later |
+            | `crossfyre-toolchain-x86_64-apple-darwin.tar.gz` | macOS 11 or later on Intel |
+            | `crossfyre-toolchain-aarch64-apple-darwin.tar.gz` | macOS 11 or later on Apple silicon |
+            | `crossfyre-toolchain-x86_64-pc-windows-msvc.zip` | Windows 10 or later on x86-64 |
+
+            The macOS binaries are signed ad hoc, not with a Developer ID, so a
+            copy downloaded with a browser is quarantined and Gatekeeper refuses
+            to open it. Clear that once the checks below pass:
+            `xattr -d com.apple.quarantine <file>`. One fetched with curl is not
+            quarantined. `cfx-script` needs a Python; everything else starts without
+            one. On Linux it loads the libpython3.11 it was built against. On macOS it
+            loads CPython 3.10 or later from python.org's framework or Homebrew's. On
+            Windows the zip carries python.org's embeddable Python in a `python`
+            folder beside it, which it loads first.
+
             ## Verifying it
 
             Provenance is attested, so you do not have to take our word for where
@@ -215,5 +419,9 @@ jobs:
               --repo clickswave/crossfyre-toolchain
             sha256sum -c SHA256SUMS
             ```
+
+            On macOS, `shasum -a 256 -c SHA256SUMS`. In PowerShell,
+            `(Get-FileHash crossfyre-toolchain-x86_64-pc-windows-msvc.zip).Hash`
+            prints the sum to compare with the line in SHA256SUMS.
 
             Or skip us entirely: clone the tag and `cargo build --release`.

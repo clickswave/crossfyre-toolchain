@@ -73,7 +73,12 @@ pub fn run(scope: Scope, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
     // service (system scope). Each sub-call prints its own per-item lines.
     section("Services");
     for ext in EXTENSIONS {
-        let _ = install::remove(ext);
+        if let Err(e) = install::remove(ext) {
+            warn(&format!(
+                "could not remove {}: {e}",
+                super::public_name(ext)
+            ));
+        }
     }
     // Drop-in directories beside the units, under the public name and the legacy
     // one. `remove` leaves them, since a person wrote them and a reinstall wants
@@ -136,6 +141,32 @@ pub fn run(scope: Scope, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    // Windows keeps everything in %ProgramFiles%\Crossfyre. A program that is running,
+    // this crossfyre.exe for one, cannot be removed while it runs, so whatever is still
+    // held open is removed at the next restart instead, and everything else now.
+    #[cfg(windows)]
+    {
+        section("Binaries");
+        let bin = get_bin_dir();
+        let root = bin.parent().unwrap_or(&bin).to_path_buf();
+        let mut held = Vec::new();
+        clear_tree(&root, &mut |p| {
+            remove_at_restart(p);
+            held.push(p.to_path_buf());
+        });
+        ok(&format!("Removed {}.", root.display()));
+        let files: Vec<String> = held
+            .iter()
+            .filter(|p| !p.is_dir())
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+        if !files.is_empty() {
+            warn(&format!(
+                "{} still in use, so removed at the next restart along with the folder.",
+                files.join(", ")
+            ));
+        }
+    }
 
     section("Config");
     if scope.purge {
@@ -155,6 +186,50 @@ pub fn run(scope: Scope, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
     done("Uninstalled");
     end();
     Ok(())
+}
+
+/// Have Windows remove the file or the empty directory at `path` when the machine next
+/// starts. Queued deepest first, so each directory is empty by its turn.
+#[cfg(windows)]
+fn remove_at_restart(path: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_DELAY_UNTIL_REBOOT, MoveFileExW};
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: a NUL-terminated path, and NULL as the new name, which is how MoveFileExW
+    // is asked to delete.
+    unsafe {
+        MoveFileExW(wide.as_ptr(), std::ptr::null(), MOVEFILE_DELAY_UNTIL_REBOOT);
+    }
+}
+
+/// Remove `dir` and everything in it that can be removed now, and hand to `later`
+/// whatever cannot, deepest first so a directory comes after what is in it. Returns
+/// whether anything was handed over. A file that cannot be removed does not stop the
+/// rest being removed, as it does in `remove_dir_all`, which gives up at the first.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn clear_tree(dir: &Path, later: &mut dyn FnMut(&Path)) -> bool {
+    let mut handed = false;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // A link to a directory is removed as a link, not followed.
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                handed |= clear_tree(&path, later);
+            } else if std::fs::remove_file(&path).is_err() && path.exists() {
+                later(&path);
+                handed = true;
+            }
+        }
+    }
+    if std::fs::remove_dir(dir).is_err() && dir.exists() {
+        later(dir);
+        handed = true;
+    }
+    handed
 }
 
 /// Every file name a component may have in the bin directory, with the name of its version
@@ -241,13 +316,13 @@ pub fn cleanup_legacy_orionchain() {
     for tool in EXTENSIONS {
         let plist = super::sudo_user::invoking_user_home()
             .join("Library/LaunchAgents")
-            .join(format!("com.orionchain.{}.plist", tool));
+            .join(format!("com.orionchain.{tool}.plist"));
         if plist.exists() {
             let _ = cmd_as_invoking_user("launchctl")
                 .args(["unload", "-w", &plist.to_string_lossy()])
                 .output();
             let _ = std::fs::remove_file(&plist);
-            println!("[migrate] Removed old launchd agent for {}", tool);
+            println!("[migrate] Removed old launchd agent for {tool}");
         }
     }
 
@@ -278,6 +353,57 @@ pub fn cleanup_legacy_orionchain() {
 mod tests {
     use super::*;
 
+    // A directory others cannot write stands in for a program Windows will not let go
+    // of: what is in it cannot be removed, and nothing else should wait for a restart.
+    #[cfg(unix)]
+    #[test]
+    fn only_what_cannot_be_removed_now_is_left_for_the_restart() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root removes it regardless
+        }
+        let scratch = tempfile::tempdir().expect("scratch");
+        let root = scratch.path().join("Crossfyre");
+        let bin = root.join("bin");
+        let held = bin.join("held");
+        std::fs::create_dir_all(&bin).expect("dirs");
+        for name in [
+            "oast.exe",
+            "ambulo.exe",
+            "voyage.exe",
+            "node.version",
+            "plessor.exe",
+        ] {
+            std::fs::write(bin.join(name), "x").expect("file");
+        }
+        // Made after the files, which puts it first in a tmpfs listing: a removal that
+        // gives up at the first failure then leaves every other file behind.
+        std::fs::create_dir(&held).expect("dir");
+        std::fs::write(held.join("crossfyre.exe"), "x").expect("file");
+        std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o555)).expect("lock");
+
+        let mut later = Vec::new();
+        let deferred = clear_tree(&root, &mut |p| later.push(p.to_path_buf()));
+        std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o755)).expect("unlock");
+
+        assert!(deferred);
+        assert_eq!(
+            later,
+            vec![
+                held.join("crossfyre.exe"),
+                held.clone(),
+                bin.clone(),
+                root.clone()
+            ],
+            "only the held file and the directories above it wait"
+        );
+        assert!(
+            !bin.join("oast.exe").exists(),
+            "a file nothing holds goes now"
+        );
+        assert!(!clear_tree(&root, &mut |_| panic!("nothing is left")));
+    }
+
     #[test]
     fn keeping_the_data_and_purging_it_are_not_both_asked_for() {
         let both = Scope {
@@ -301,6 +427,8 @@ mod tests {
         Packaging::parse(json, PathBuf::from(file), true).expect("parses")
     }
 
+    // Unix only: packaged installs and their systemd units are a Linux and macOS layout.
+    #[cfg(unix)]
     #[test]
     fn an_apt_install_loses_what_the_cli_fetched_and_keeps_the_cli() {
         let apt = packaging(

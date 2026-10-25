@@ -13,6 +13,7 @@ mod egress;
 pub mod executor;
 pub mod oast;
 mod ops;
+pub mod os;
 pub mod toolchain;
 
 use toolchain::sudo_user::chown_to_invoking_user;
@@ -615,7 +616,8 @@ pub fn default_nats_url() -> String {
 
 /// Resolve the data directory for this invocation. Order of preference:
 ///   1. `--data-dir <PATH>` (if provided)
-///   2. `$SUDO_USER`'s home + `.config/crossfyre`  - keeps the user's data
+///   2. `$SUDO_USER`'s config root + `crossfyre` (`~/.config` on Linux,
+///      `~/Library/Application Support` on macOS) - keeps the user's data
 ///      visible when they `sudo crossfyre node up`
 ///   3. `dirs::config_dir()/crossfyre`
 pub fn resolve_data_dir(
@@ -631,8 +633,7 @@ pub fn resolve_data_dir(
         // Best effort - fall back to dirs::config_dir() if the home directory
         // can't be resolved (e.g. unusual NSS setup).
         if let Some(home) = home_for_user(&sudo_user) {
-            let mut p = home;
-            p.push(".config");
+            let mut p = toolchain::sudo_user::config_root_in(&home);
             p.push("crossfyre");
             return Ok(p);
         }
@@ -687,18 +688,26 @@ pub fn chown_tree_to_sudo_user(dir: &std::path::Path) {
 /// dropping back to $SUDO_USER for anything user-state (configs, the
 /// toolchain database, extensions). Plain-root invocations get a soft
 /// warning - things still work, but on-disk artifacts end up owned by root.
+///
+/// Windows has no sudo: an elevated prompt runs as the person themselves, so there is
+/// no plain-root case to warn about, only a missing elevation.
 pub fn print_privilege_banner(needs_root: bool) {
-    let euid = unsafe { libc::geteuid() };
+    let elevated = os::is_elevated();
     let sudo_user = std::env::var("SUDO_USER")
         .ok()
         .filter(|s| !s.is_empty() && s != "root");
-    if euid == 0 && sudo_user.is_none() {
+    if elevated && sudo_user.is_none() && cfg!(unix) {
         eprintln!(
             "[security] WARNING: launched as plain root. Re-run with `sudo crossfyre ...` from your user shell."
         );
-    } else if euid != 0 && needs_root {
-        eprintln!("Please re-run with sudo:");
-        eprintln!("  sudo crossfyre node up");
+    } else if !elevated && needs_root {
+        if cfg!(windows) {
+            eprintln!("Please re-run from an elevated prompt (Run as administrator):");
+            eprintln!("  crossfyre node up");
+        } else {
+            eprintln!("Please re-run with sudo:");
+            eprintln!("  sudo crossfyre node up");
+        }
         std::process::exit(1);
     }
 }
@@ -893,6 +902,7 @@ pub fn spawn_node_daemon(
     // Pin children to the same config root so a custom --data-dir propagates
     // (resolve_data_dir would otherwise re-derive it).
     cmd.arg("--data-dir").arg(base);
+    os::make_stoppable(&mut cmd);
     match cmd.spawn() {
         Ok(child) => {
             println!("[boot] Started node {} (pid {})", id, child.id());
@@ -955,8 +965,7 @@ pub async fn run_boot(
         return Err("no node daemons could be started".into());
     }
 
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("failed to install SIGTERM handler");
+    let mut sigterm = os::StopSignal::new().expect("failed to install SIGTERM handler");
     let mut rescan = tokio::time::interval(BOOT_RESCAN_INTERVAL);
     rescan.tick().await; // consume the immediate first tick
 
@@ -971,7 +980,7 @@ pub async fn run_boot(
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => { println!("\n[boot] Ctrl+C received - stopping all nodes..."); break; }
-            _ = sigterm.recv() => { println!("\n[boot] SIGTERM received - stopping all nodes..."); break; }
+            _ = sigterm.recv() => { println!("\n[boot] {} received - stopping all nodes...", os::STOP_SIGNAL_NAME); break; }
             _ = rescan.tick() => {
                 // 1. Reap children that exited on their own; park them in
                 //    `dead` so we don't respawn a flapping node every tick.
@@ -1016,8 +1025,7 @@ pub async fn run_boot(
                 for id in removed {
                     if let Some(mut child) = children.remove(&id) {
                         println!("[boot] Node {} de-registered (config removed) - stopping (pid {}).", id, child.id());
-                        #[cfg(unix)]
-                        unsafe { libc::kill(child.id() as i32, libc::SIGTERM); }
+                        os::ask_to_stop(&mut child);
                         // Reap without blocking the loop; the kernel will
                         // deliver SIGTERM and the daemon tears its tunnel down.
                         let _ = child.try_wait();
@@ -1029,13 +1037,16 @@ pub async fn run_boot(
     }
 
     // Shutdown: forward SIGTERM to every child so their egress teardown
-    // (Drop guards) runs, give the fleet a moment, then hard-reap.
-    for (id, child) in &children {
-        #[cfg(unix)]
-        unsafe {
-            libc::kill(child.id() as i32, libc::SIGTERM);
-        }
-        println!("[boot] Sent SIGTERM to node {} (pid {})", id, child.id());
+    // (Drop guards) runs, give the fleet a moment, then hard-reap. On Windows the
+    // request is the end of the child's stdin (see `os::ask_to_stop`).
+    for (id, child) in children.iter_mut() {
+        os::ask_to_stop(child);
+        println!(
+            "[boot] Sent {} to node {} (pid {})",
+            os::STOP_SIGNAL_NAME,
+            id,
+            child.id()
+        );
     }
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
     for (id, mut child) in children {
@@ -1593,9 +1604,27 @@ pub async fn run_init(
     for ext in &selected_extensions {
         let name = toolchain::public_name(ext);
         if toolchain::config::is_extension_installed(ext) {
-            ok(&format!("{name} already installed"));
-            let _ = toolchain::service::enable(ext);
-            let _ = toolchain::service::start(ext);
+            // Installed before this node was set up (by an earlier init, by
+            // `extension install`, or by a package), which is no promise that its
+            // service exists: register it if it does not, then enable and start it,
+            // and say so if any of that fails rather than reporting it ready.
+            let ready = if toolchain::service::has_service_file(ext) {
+                Ok(())
+            } else {
+                toolchain::service::create_service_file(ext)
+            };
+            match ready
+                .and_then(|()| toolchain::service::enable(ext))
+                .and_then(|()| toolchain::service::start(ext))
+            {
+                Ok(()) => ok(&format!("{name} already installed, started")),
+                Err(e) => {
+                    fail(&format!(
+                        "{name} is installed but its service did not start: {e}"
+                    ));
+                    hint(&format!("Run manually: crossfyre extension install {name}"));
+                }
+            }
             continue;
         }
         working(&format!("Installing {name}"));
@@ -1632,7 +1661,10 @@ pub async fn run_init(
             Ok(()) => ok("Node service installed and started (crossfyre-node)"),
             Err(e) => {
                 warn(&format!("could not install the node service: {e}"));
-                hint("Run the node manually with: sudo crossfyre node up");
+                hint(&format!(
+                    "Run the node manually with: {}",
+                    os::elevated("crossfyre node up")
+                ));
             }
         }
     }
@@ -1674,6 +1706,26 @@ pub async fn run_init(
     Ok(())
 }
 
+/// The command that runs `command` in the system shell: `sh -c` on Unix, and on Windows
+/// `cmd /d /s /c`, which is given the line as typed, because cmd parses its own command
+/// line and would not see the quoting the standard argument encoding adds.
+fn shell_command(command: &str) -> std::process::Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut cmd = std::process::Command::new("cmd.exe");
+        cmd.args(["/d", "/s", "/c"])
+            .raw_arg(format!("\"{command}\""));
+        cmd
+    }
+    #[cfg(not(windows))]
+    {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg(command);
+        cmd
+    }
+}
+
 /// Cap shell output at a char boundary so a huge dump can't blow past NATS's
 /// max message size. Appends a marker when truncated.
 fn shell_cap(s: String) -> String {
@@ -1686,19 +1738,16 @@ fn shell_cap(s: String) -> String {
     t
 }
 
-#[cfg(unix)]
+/// Root on Unix, an elevated token on Windows.
 pub fn is_root() -> bool {
-    unsafe { libc::geteuid() == 0 }
-}
-#[cfg(not(unix))]
-pub fn is_root() -> bool {
-    false
+    os::is_elevated()
 }
 
 pub fn which_binary(name: &str) -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
+    let name = toolchain::config::file_name(name);
     for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(name);
+        let candidate = dir.join(&name);
         if candidate.is_file() {
             return Some(candidate);
         }
@@ -1829,17 +1878,10 @@ fn reconcile_ports(ports_json: &serde_json::Value) -> Vec<String> {
 /// nodes on the same box group into one host. /etc/machine-id is the canonical
 /// Linux host id (stable across reboots, unique per install); the SMBIOS
 /// product_uuid corroborates it against cloned machine-ids in some VM images.
-/// api_switch stores only the sha256 of this, never the raw value.
+/// macOS offers its hardware UUID and Windows its MachineGuid (see
+/// `os::host_ids`). api_switch stores only the sha256 of this, never the raw value.
 fn host_seed() -> String {
-    let machine_id = fs::read_to_string("/etc/machine-id")
-        .or_else(|_| fs::read_to_string("/var/lib/dbus/machine-id"))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let product_uuid = fs::read_to_string("/sys/class/dmi/id/product_uuid")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let (machine_id, product_uuid) = os::host_ids();
     match (machine_id, product_uuid) {
         (Some(m), Some(p)) => format!("mid:{m}|puuid:{p}"),
         (Some(m), None) => format!("mid:{m}"),
@@ -1891,27 +1933,22 @@ pub async fn run_daemon(
     if pid_path.exists() {
         let existing_pid_str = fs::read_to_string(&pid_path).unwrap_or_default();
         let existing_pid: u32 = existing_pid_str.trim().parse().unwrap_or(0);
-        if existing_pid > 0 {
-            let proc_path = format!("/proc/{existing_pid}");
-            if std::path::Path::new(&proc_path).exists() {
-                if force {
-                    println!("  --force: Terminating existing daemon (PID {existing_pid})...");
-                    // SIGTERM the old process
-                    unsafe {
-                        libc::kill(existing_pid as i32, libc::SIGTERM);
-                    }
-                    // Give it a moment to exit
-                    tokio::time::sleep(tokio::time::Duration::from_millis(800)).await;
-                } else {
-                    eprintln!(
-                        "\n  A daemon is already running for node {}.",
-                        paths.node_id
-                    );
-                    eprintln!("  PID            : {existing_pid}");
-                    eprintln!("\n  Take it over with:");
-                    eprintln!("  crossfyre node daemon {} --force\n", paths.node_id);
-                    std::process::exit(1);
-                }
+        if existing_pid > 0 && os::process_alive(existing_pid) {
+            if force {
+                println!("  --force: Terminating existing daemon (PID {existing_pid})...");
+                // SIGTERM the old process
+                os::terminate(existing_pid);
+                // Give it a moment to exit
+                tokio::time::sleep(tokio::time::Duration::from_millis(800)).await;
+            } else {
+                eprintln!(
+                    "\n  A daemon is already running for node {}.",
+                    paths.node_id
+                );
+                eprintln!("  PID            : {existing_pid}");
+                eprintln!("\n  Take it over with:");
+                eprintln!("  crossfyre node daemon {} --force\n", paths.node_id);
+                std::process::exit(1);
             }
         }
     }
@@ -2377,8 +2414,8 @@ pub async fn run_daemon(
 
     // Catch SIGTERM (the default `kill` signal) so the egress teardown
     // path runs - without this, `kill <pid>` would bypass the Drop guard.
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("failed to install SIGTERM handler");
+    // On Windows the same request arrives as described in `os::StopSignal`.
+    let mut sigterm = os::StopSignal::new().expect("failed to install SIGTERM handler");
 
     // A revoked key gives a persistent 401; a control-plane restart/deploy gives a TRANSIENT one.
     // Evicting on the first 401 meant a brief blip could permanently kill the node (and, in prod, the
@@ -2538,7 +2575,7 @@ pub async fn run_daemon(
             // SIGTERM (e.g. `kill <pid>`, systemd stop) - same shutdown path
             _ = sigterm.recv() => {
                 let reason = "sigterm_received";
-                println!("\nSIGTERM received. Shutting down...");
+                println!("\n{} received. Shutting down...", os::STOP_SIGNAL_NAME);
                 let msg = serde_json::json!({
                     "type": "terminated",
                     "reason": reason,
@@ -2607,7 +2644,7 @@ pub async fn run_daemon(
                                 }
                                 println!("[shell] exec: {command}");
                                 let run = tokio::task::spawn_blocking(move || {
-                                    std::process::Command::new("sh").arg("-c").arg(&command).output()
+                                    shell_command(&command).output()
                                 })
                                 .await;
                                 let mut resp = match run {

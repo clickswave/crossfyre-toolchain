@@ -183,17 +183,63 @@ pub fn get_config_path() -> PathBuf {
     get_toolchain_dir().join("config.toml")
 }
 
+/// The variable that tells an engine daemon where the toolchain directory, and so its
+/// `config.toml`, is. The engine host sets it on macOS and Windows; an engine without
+/// it looks in the per-user default, as it always has on Linux.
+pub const TOOLCHAIN_DIR_ENV: &str = "CROSSFYRE_TOOLCHAIN_DIR";
+
+/// The file holding the egress-proxy variables the engine daemons start with. Linux
+/// keeps the path its systemd units have always named; elsewhere it is in the
+/// toolchain directory, which is where that path leads on Linux too unless
+/// `--data-dir` moved the directory.
+pub fn egress_env_path() -> PathBuf {
+    if cfg!(target_os = "linux") {
+        super::sudo_user::invoking_user_home().join(".config/crossfyre/egress.env")
+    } else {
+        get_toolchain_dir().join("egress.env")
+    }
+}
+
+/// Where a file the node hands to an engine is written, such as a downloaded wordlist
+/// the engine then reads by its path: `/tmp/<name>` on Unix, as it always has been. On
+/// Windows the node runs as LocalSystem, whose temporary directory the operator, whom
+/// the engines run as, cannot read, so it is the toolchain directory's `tmp`, in the
+/// operator's profile, which both can.
+pub fn handoff_path(name: &str) -> String {
+    #[cfg(windows)]
+    {
+        let dir = get_toolchain_dir().join("tmp");
+        let _ = fs::create_dir_all(&dir);
+        dir.join(name).display().to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        format!("/tmp/{name}")
+    }
+}
+
+/// Where the services write their logs on macOS and Windows, which have no journal: the
+/// toolchain directory's `logs`, beside the configs they describe and readable by the
+/// same person. Linux services log to the journal instead.
+pub fn logs_dir() -> PathBuf {
+    get_toolchain_dir().join("logs")
+}
+
 pub fn get_bin_dir() -> PathBuf {
     // Where extension binaries (and the crossfyre binary itself) are
-    // installed. Linux/macOS keep the conventional /opt prefix; Windows has
-    // no /opt so we use %ProgramData%\Crossfyre\bin. A package that keeps them
-    // somewhere else says where in its packaging.json.
+    // installed. Linux/macOS keep the conventional /opt prefix. Windows has
+    // no /opt, so %ProgramFiles%\Crossfyre\bin: the node service runs from here
+    // as LocalSystem, and Program Files is writable by administrators only.
+    // %ProgramData% is not: every user may create files in its subdirectories,
+    // which would let anyone plant a binary or a DLL the service then loads.
+    // A package that keeps them somewhere else says where in its packaging.json.
     if let Some(dir) = super::packaging::bin_dir() {
         return dir.to_path_buf();
     }
     #[cfg(windows)]
     {
-        let base = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".to_string());
+        let base =
+            std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".to_string());
         PathBuf::from(base).join("Crossfyre").join("bin")
     }
     #[cfg(not(windows))]
@@ -253,9 +299,7 @@ pub fn load_config() -> Result<ToolchainConfig, Box<dyn std::error::Error>> {
 
 pub fn save_config(config: &ToolchainConfig) -> Result<(), Box<dyn std::error::Error>> {
     let dir = get_toolchain_dir();
-    if !dir.exists() {
-        fs::create_dir_all(&dir)?;
-    }
+    super::sudo_user::create_dir_all_for_invoking_user(&dir)?;
 
     let path = get_config_path();
     let toml_string = toml::to_string(config)?;

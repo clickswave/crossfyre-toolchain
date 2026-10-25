@@ -30,7 +30,7 @@ pub async fn handle(env: OpEnv) {
             .unwrap_or("200,201,301,302,403");
         let codes: Vec<u16> = success_codes_str
             .split(',')
-            .filter_map(|s| s.trim().parse().ok())
+            .filter_map(|s| s.trim().parse::<u16>().ok())
             .collect();
 
         // Per-slot pacing: sleep WHILE holding the semaphore
@@ -154,7 +154,7 @@ pub async fn handle(env: OpEnv) {
     if let Some(wl_url) = data["wordlist_url"].as_str() {
         // single chunk URL
         if !wl_url.is_empty() {
-            let tmp = format!("/tmp/cfx-wl-chunk-{op_id}.txt");
+            let tmp = crate::toolchain::config::handoff_path(&format!("cfx-wl-chunk-{op_id}.txt"));
             println!("[op] Downloading wordlist chunk...");
             if let Ok(resp) = reqwest::get(wl_url).await
                 && let Ok(body) = resp.text().await
@@ -175,7 +175,7 @@ pub async fn handle(env: OpEnv) {
             let dl_url = first["url"].as_str().unwrap_or("");
             if !dl_url.is_empty() {
                 let wl_id = first["id"].as_str().unwrap_or("wordlist");
-                let tmp = format!("/tmp/cfx-wl-{wl_id}.txt");
+                let tmp = crate::toolchain::config::handoff_path(&format!("cfx-wl-{wl_id}.txt"));
                 println!("[op] Downloading wordlist: {wl_id}");
                 if let Ok(resp) = reqwest::get(dl_url).await
                     && let Ok(body) = resp.text().await
@@ -206,7 +206,7 @@ pub async fn handle(env: OpEnv) {
     // Parse success codes + pacing (shared across recursion levels).
     let codes: Vec<u16> = success_codes_str
         .split(',')
-        .filter_map(|s| s.trim().parse().ok())
+        .filter_map(|s| s.trim().parse::<u16>().ok())
         .collect();
     let delay = data["delay"].as_i64().unwrap_or(0).max(0);
     // Resume vs fresh: a re-dispatched paused op sets data.resume=true,
@@ -277,7 +277,7 @@ pub async fn handle(env: OpEnv) {
         && let Some(rw_url) = data["recurse_wordlist_url"].as_str()
         && !rw_url.is_empty()
     {
-        let tmp = format!("/tmp/cfx-wl-recurse-{op_id}.txt");
+        let tmp = crate::toolchain::config::handoff_path(&format!("cfx-wl-recurse-{op_id}.txt"));
         if let Ok(resp) = reqwest::get(rw_url).await
             && let Ok(body) = resp.text().await
         {

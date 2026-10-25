@@ -1,90 +1,42 @@
 <div align="center">
 
-<a href="https://crossfyre.io"><img src="https://crossfyre.io/og/default.png" alt="Crossfyre" width="100%"></a>
-
-# Crossfyre Toolchain
-
-### Five standalone recon and vulnerability scanning engines, written in Rust, for systems you are authorized to test.
-
-`voyage` enumerates subdomains, `doorward` scans hosts and ports, `ambulo` does content discovery, `toolmark` fingerprints services and `plessor` tests for vulnerabilities. Run them on their own from the terminal, or connect them to the [Crossfyre platform](https://crossfyre.io) when one machine isn't enough.
+<a href="https://crossfyre.io"><img src=".github/assets/banner.png" alt="Crossfyre Toolchain: recon and vulnerability scanning engines, written in Rust" width="100%"></a>
 
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-1f6feb.svg)](LICENSE)
 [![Made with Rust](https://img.shields.io/badge/made%20with-Rust-b7410e.svg)](https://www.rust-lang.org)
-![Platform](https://img.shields.io/badge/platform-Linux-444.svg)
+![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-444.svg)
 [![Discord](https://img.shields.io/badge/discord-join-5865F2.svg)](https://discord.gg/cPccst2Vr6)
 
 </div>
 
----
+Five scanning engines you run from the terminal, on systems you are authorized to test. Each one works on its own, with no account, and nothing leaves your machine unless you connect it to the [Crossfyre platform](https://crossfyre.io) yourself.
 
-The Crossfyre toolchain is a set of standalone reconnaissance and scanning engines plus a lightweight node agent. **Every tool here works on its own.** There is no account to sign up for, and nothing leaves your machine unless you connect it to the platform yourself. When you outgrow a single box, the same engines plug into the hosted platform for fleet-wide, scheduled, resumable scans.
-
-## Highlights
-
-- **Standalone first.** Use `ambulo`, `voyage`, and `doorward` like any other CLI. Nothing phones home unless you ask it to.
-- **Stateful and resumable.** Findings are written as they're discovered, so a scan you stop picks up exactly where it left off.
-- **Live in the terminal.** Every engine shares one terminal dashboard: progress, hits and throughput as they happen, the same keys and layout across all of them. The scan tools show it by default; the daemon tools take `--tui`.
-- **One coherent CLI.** `crossfyre` installs the engines, runs scans, and manages nodes from a single command.
-- **Scales when you do.** Enrol a host as a node and the same engines run distributed under the optional [platform](https://crossfyre.io).
-
-## What's inside
-
-| Tool | What it does |
+| Engine | What it does |
 | --- | --- |
-| [**`ambulo`**](ambulo/) | HTTP fuzzing and content-discovery engine. Stateful and resumable. |
-| [**`voyage`**](voyage/) | Subdomain enumeration engine: passive sources plus active wordlist brute-forcing. |
-| [**`doorward`**](doorward/) | Host and port-scanning engine (connect and SYN techniques, service detection). |
-| [**`toolmark`**](toolmark/) | Service enumeration and web fingerprinting engine: identifies technologies and versions, and flags version-based CVE leads. |
-| [**`plessor`**](plessor/) | Vulnerability-scanning engine: a nuclei-compatible template and matcher pipeline with active fuzzing and out-of-band confirmation, so every finding is verified before it is reported. |
-| [**`oast`**](oast/) | Out-of-band interaction server. Run your own so `plessor` can confirm blind bugs (SSRF, blind RCE) against your own domain instead of the hosted pool. |
-| [**`node`**](node/) | The Crossfyre node agent. Runs the engines on your machine and, optionally, connects to the platform. |
-| [**`crossfyre`**](crossfyre/) | The CLI that ties it together: installs the engines, manages nodes, runs `.cfx` scripts, and runs the Web Tracer's local capture proxy (`crossfyre trace`). |
-| [**`cfx-script`**](cfx-script/) | Runs one `.cfx` script in an embedded Python interpreter, for `node` and `crossfyre`. It is a binary of its own so that neither of them links libpython. |
-| [**`mobile`**](mobile/) | An Android app that inspects the device's own HTTPS traffic through a `VpnService`, without root, and its native core in `mobile/rust`. |
-| [**`relsign`**](relsign/) | Signs the release manifest. A tool for the machine that builds releases: it is not shipped and not listed in the manifest. |
+| [`voyage`](voyage/) | Finds subdomains, from passive sources and wordlist brute-forcing. |
+| [`doorward`](doorward/) | Scans hosts and ports, with service detection. |
+| [`ambulo`](ambulo/) | Fuzzes paths and parameters to discover content. |
+| [`toolmark`](toolmark/) | Fingerprints services and technologies, and flags CVE leads by version. |
+| [`plessor`](plessor/) | Tests for vulnerabilities with nuclei-compatible templates, and confirms each finding before it reports it. |
 
-The libraries they share:
+Alongside them: [`crossfyre`](crossfyre/), the CLI that installs and updates everything, [`node`](node/), the agent that runs the engines for the platform, [`oast`](oast/), an out-of-band server you can host so `plessor` confirms blind bugs on your own domain, and [`mobile`](mobile/), Crossfyre Mobile for Android.
 
-| Crate | What it does |
-| --- | --- |
-| [**`core`**](core/) | Code `crossfyre` and `node` share: signing in, installing and updating the engines, checking the release manifest's signature, the node service, and the Web Tracer. |
-| [**`capture`**](capture/) | The Web Tracer's capture core, used by the desktop proxy and the Android app: a session CA that issues a certificate per host, forwarding, and a redacted shape of each request. |
-| [**`tui`**](tui/) | The terminal dashboard every engine draws. |
-| [**`finding`**](finding/) | The one shape every engine reports a finding in. |
-| [**`transport`**](transport/) | The outbound HTTP client the engines use, reqwest with rustls. The optional `impersonate` feature swaps in a client that presents a browser's TLS and HTTP/2 fingerprint. |
-| [**`dguard`**](dguard/) | Listener policy for the engine daemons: loopback unless told otherwise, and an optional token (see [The daemon boundary](#the-daemon-boundary)). |
-| [**`scope`**](scope/) | The destinations an operator has said they may test, and the guard that refuses everything else. |
-| [**`spec`**](spec/) | Reads OpenAPI, Swagger, Postman, HAR and Insomnia files into a flat list of operations and their request shapes. |
-| [**`surface`**](surface/) | Turns what a scan saw into a stable description of the attack surface: hosts, endpoint templates, content hashes and typed diffs. |
+## Install
 
-Also in the workspace: **`adaptive`**, an open reference library the engines use to pace themselves and decide retries. It ships an untuned baseline; the tuned pacing is a platform feature (see [`adaptive/README.md`](adaptive/README.md)).
-
-## Renamed in 0.1.31
-
-Four engines took new names in 0.1.31:
-
-| Now | Before |
-|---|---|
-| `ambulo` | `mach` |
-| `doorward` | `pulse` |
-| `toolmark` | `scout` |
-| `plessor` | `cortex` |
-
-The first `crossfyre update` or `crossfyre node init` after upgrading moves an existing install over: it stops the old service, moves the binary and any systemd drop-in directory, and starts the service under the new name. 0.1.31 and 0.1.32 also left a link under each old name, so the old commands kept running the engines. 0.1.33 makes no link and removes the ones those releases left, so `mach`, `pulse`, `scout` and `cortex` are no longer commands. The old environment variables (`CORTEX_OAST_DOMAIN`, `MACH_BROWSER` and the rest) still work, with a notice naming the new one, and `crossfyre extension install cortex` keeps working for good.
-
-The old names stay where a value is stored or sent between a node and the platform, because they are identifiers rather than names: the engine ids, a finding's `source` (`mach`, `scout`, `scout-cve`, `scout-services`), finding tool ids such as `cortex-inject`, template ids such as `cortex:waf-challenge`, and the local scan databases `mach` and `pulse`.
-
-## Quick start
-
-### Install
-
-On Linux, x86_64 or aarch64:
+On Linux (x86_64 or aarch64) or macOS (Intel or Apple silicon):
 
 ```sh
 curl -fsSL https://get.crossfyre.io/install.sh | sudo bash
 ```
 
-On Debian, Ubuntu or Kali, you can install from the apt repository instead:
+On Windows, in PowerShell run as administrator:
+
+```powershell
+irm https://get.crossfyre.io/install.ps1 | iex
+```
+
+<details>
+<summary>Or from the apt repository, on Debian, Ubuntu or Kali</summary>
 
 ```sh
 curl -fsSLO https://bins.crossfyre.io/apt/crossfyre-archive-keyring.gpg
@@ -100,92 +52,93 @@ sudo apt update
 sudo apt install crossfyre crossfyre-archive-keyring
 ```
 
-The keyring is installed only if its SHA-256 matches. It holds one key, fingerprint
-`992F106C6CF032E43A3CA8BED5D92DAC3BA8CDBF`, which `gpg --show-keys` prints.
+The keyring is installed only if its SHA-256 matches. Its key's fingerprint is `992F106C6CF032E43A3CA8BED5D92DAC3BA8CDBF`. After that, `sudo apt upgrade` keeps the CLI current.
 
-The archive key's fingerprint is `992F 106C 6CF0 32E4 3A3C A8BE D5D9 2DAC 3BA8 CDBF`. From then on, `sudo apt update && sudo apt upgrade` updates the CLI, and `crossfyre update all` updates the node and the engines. [crossfyre.io/docs/install](https://crossfyre.io/docs/install) also covers the standalone .deb, checking signatures, and removal.
+</details>
 
-No macOS or Windows build is published. On Windows, run `wsl --install` and then the installer inside WSL 2. On a Mac, install on a Linux host or a Linux virtual machine instead.
+`crossfyre update all` updates the engines. [crossfyre.io/docs/install](https://crossfyre.io/docs/install) covers the .deb, signature checks and removal.
 
-The installer and `bins.crossfyre.io` ship the first-party build. The [Releases](../../releases) page of this repository carries the open build for Linux x86_64 and aarch64, compiled by GitHub Actions from each tag. The open build has no authorization oracle, no per-node egress isolation, untuned pacing, and no `impersonate` feature (see [`transport`](transport/)). You can also [build from source](#building-from-source), which gives you the open build too.
-
-### Run something
+## Use
 
 ```sh
-# Content discovery: fuzz a path with a wordlist
-ambulo scan --url https://example.com/::FUZZ:: --wordlist-path ./wordlist.txt
-
-# Subdomain enumeration: passive sources + active brute-force
+# Subdomains of a domain
 voyage scan --domain example.com --wordlist-path ./subdomains.txt
 
-# Port scan a network range, with service detection
+# Ports and services across a range
 doorward scan --targets 10.0.0.0/24 --ports top-1000 --service-detection
+
+# Content discovery, fuzzing the path at ::FUZZ::
+ambulo scan --url https://example.com/::FUZZ:: --wordlist-path ./wordlist.txt
 ```
 
-Every engine is a daemon plus a client: start it with `--daemon` and the client subcommands talk to it over loopback. All five take `scan` for a run you drive and `exec` for a raw JSON op, and `ambulo`, `voyage` and `doorward` keep findings in a local store, so a run you interrupt can be resumed.
+In a terminal you get a live dashboard. Piped or redirected, every engine writes newline-delimited JSON instead, one event per line, and exits non-zero if the run ends in an error. `voyage`, `doorward` and `ambulo` save findings as they go, so a stopped scan resumes where it left off. Add `--help` to any command for the rest.
 
-Output is newline-delimited JSON, one event per line, each carrying a `type`. A dashboard is drawn instead when stdout is a terminal: on by default for `ambulo`, `voyage` and `doorward`, where a run is long enough to want progress, and on `--tui` for `toolmark` and `plessor`. Either way, redirecting or piping gives you the JSON, and `--no-tui` forces it in a terminal. A run that ends in a `type: "error"` event exits non-zero, so a script can read `$?` without parsing the stream.
+## When one machine is not enough
 
-### The daemon boundary
-
-The daemons speak unauthenticated newline-delimited JSON with no session or handshake, so **the bind address is the security boundary**. They listen on loopback only, which is all the node needs, and two environment variables move that:
-
-| Variable | Effect |
-|---|---|
-| `CFX_DAEMON_BIND` | Binds the listener to this IP instead of loopback. A value that is not an IP falls back to loopback rather than widening the listener. |
-| `CFX_DAEMON_TOKEN` | Requires a matching token on every request. Set it on the daemon and on anything that talks to it; the clients and the node read the same variable and stamp it automatically. |
-
-Binding off loopback without a token is allowed, for operators who have put the port behind a firewall, but it is announced on every start. `ambulo`'s wordlist parameter is a filesystem path, so an exposed daemon is also a file-read primitive: if you move the listener, set the token.
-
-## Standalone, or part of the platform
-
-Run them on systems you are authorized to test, from any terminal.
-
-When you need more than one machine can give you (a fleet of nodes, scheduled recurring scans, adaptive rate limiting that paces each scan to what the target can take, a shared findings dashboard), enrol the host as a node and the same engines run under the [Crossfyre platform](https://crossfyre.io):
+Enrol the host as a node and the same engines run under the [Crossfyre platform](https://crossfyre.io), with a fleet of nodes, scheduled scans, pacing tuned to each target, and one dashboard for your team:
 
 ```sh
 crossfyre login
 crossfyre node init
-crossfyre node list
 ```
 
-The platform is optional. The tools never require it, and nothing here reports back unless you connect it yourself.
+The platform is optional. Nothing here needs it.
 
-## Building from source
+## Build from source
 
-You need a recent stable [Rust toolchain](https://rustup.rs).
+With a stable [Rust toolchain](https://rustup.rs):
 
 ```sh
 git clone https://github.com/clickswave/crossfyre-toolchain.git
 cd crossfyre-toolchain
 cargo build --release
-# binaries land in ./target/release/{crossfyre,node,ambulo,voyage,doorward,toolmark,plessor}
 ```
 
-Install a single engine straight from the repo:
+Or install one engine with `cargo install --git https://github.com/clickswave/crossfyre-toolchain.git ambulo`.
 
-```sh
-cargo install --git https://github.com/clickswave/crossfyre-toolchain.git ambulo
-```
+`cfx-script` embeds Python, so building it needs one. On Linux that is your distribution's Python and its development files. On macOS it has to be Python 3.10 or later, and the `python3` that comes with the Xcode command line tools is 3.9, so name another one: `PYO3_PYTHON=/opt/homebrew/bin/python3 cargo build --release`. Windows needs no Python to build it, and Python 3.10 or later to run scripts.
 
-Both give you the open build, the one the [Releases](../../releases) page carries. The authorization oracle, the egress isolation and the tuned pacing are not in this repository, and the `impersonate` feature is off unless you build with it.
+A source build, like the binaries on the [Releases](../../releases) page, is the open build. The installer ships the first-party build, which adds the authorization checks, per-node egress isolation, tuned pacing and the browser-fingerprint transport.
+
+<details>
+<summary>Running an engine as a daemon on another address</summary>
+
+Every engine can run as a daemon (`--daemon`) that its client talks to over loopback. The protocol is unauthenticated, so the bind address is the security boundary. `CFX_DAEMON_BIND` moves the listener to another IP, and `CFX_DAEMON_TOKEN` makes it require a token, which the clients and the node read from the same variable. If you move the listener, set the token: `ambulo` takes a wordlist path, so an open daemon can be made to read files.
+
+</details>
+
+<details>
+<summary>What else is in this repository</summary>
+
+| Crate | What it does |
+| --- | --- |
+| [`core`](core/) | What `crossfyre` and `node` share: sign-in, installs and updates, the release manifest check, the node service and the Web Tracer. |
+| [`capture`](capture/) | The Web Tracer's capture core, used by the desktop proxy and the Android app. |
+| [`cfx-script`](cfx-script/) | Runs `.cfx` scripts in an embedded Python interpreter. |
+| [`tui`](tui/) | The terminal dashboard every engine draws. |
+| [`finding`](finding/) | The one shape every engine reports a finding in. |
+| [`transport`](transport/) | The engines' HTTP client. |
+| [`dguard`](dguard/) | The daemon listener policy. |
+| [`scope`](scope/) | The destinations an operator may test, and the guard that refuses the rest. |
+| [`spec`](spec/) | Reads OpenAPI, Swagger, Postman, HAR and Insomnia files. |
+| [`surface`](surface/) | Describes a scanned attack surface and diffs it between runs. |
+| [`adaptive`](adaptive/) | The engines' pacing and retry decisions, with an untuned baseline. |
+| [`relsign`](relsign/) | Signs the release manifest. Used to build releases, not shipped. |
+
+</details>
 
 ## Responsible use
 
-These are security testing tools. **Only scan systems you own or have explicit, written permission to test.** Unauthorized scanning is illegal in most jurisdictions and can disrupt the systems you point it at. How you use them is on you.
+Only scan systems you own or have written permission to test. Unauthorized scanning is illegal in most places and can disrupt the systems you point it at.
 
 ## Contributing
 
-Issues and pull requests are welcome. Open pull requests against the `dev` branch: that is where development happens, and `main` tracks the latest release. For a bug, include the tool, the exact command, and what you expected. For larger changes, open an issue first so we can agree on the approach before you invest the work. See [CONTRIBUTING.md](CONTRIBUTING.md).
-
-Found a security issue? Please don't open a public issue. See [SECURITY.md](SECURITY.md) or email **team@clickswave.org**.
+Issues and pull requests are welcome. Open pull requests against `dev`; `main` tracks the latest release. See [CONTRIBUTING.md](CONTRIBUTING.md). To report a security issue, see [SECURITY.md](SECURITY.md) or email team@clickswave.org rather than opening a public issue.
 
 ## License
 
-Licensed under the [Apache License, Version 2.0](LICENSE). Use, modify, and distribute freely, including commercially, subject to the license terms.
-
----
+[Apache License 2.0](LICENSE).
 
 <div align="center">
-Built by <a href="https://clickswave.org">Clickswave</a> · The platform lives at <a href="https://crossfyre.io">crossfyre.io</a>
+<sub>Built by <a href="https://clickswave.org">Clickswave</a>. The platform is at <a href="https://crossfyre.io">crossfyre.io</a>.</sub>
 </div>

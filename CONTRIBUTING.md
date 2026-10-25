@@ -42,6 +42,8 @@ cargo fmt              # format before you commit
 cargo clippy           # lint; please keep it warning-clean
 ```
 
+On macOS, set `PYO3_PYTHON` to a Python 3.10 or later first, for example `export PYO3_PYTHON=/opt/homebrew/bin/python3`. `cfx-script` cannot be built against the Xcode command line tools' `python3`, which is 3.9.
+
 Run `scripts/install-hooks.sh` once per clone to enable the local git hooks (`core.hooksPath -> .githooks`). They run fast, dependency-free checks on push; on a public checkout they no-op cleanly.
 
 Keep pull requests focused: one logical change per PR, with a clear description of what and why. Match the style of the surrounding code.

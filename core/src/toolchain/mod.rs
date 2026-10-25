@@ -26,6 +26,8 @@ pub mod trace;
 pub mod trace_proxy;
 pub mod ui;
 pub mod uninstall;
+#[cfg(windows)]
+pub mod win;
 
 /// One scan engine installable as a node extension.
 ///
