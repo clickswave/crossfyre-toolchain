@@ -142,8 +142,9 @@ fn open_browser(url: &str) -> bool {
     if cfg!(target_os = "macos") {
         return spawn_quiet("open", &[url]);
     }
-    if cfg!(target_os = "windows") {
-        return spawn_quiet("cmd", &["/C", "start", "", url]);
+    #[cfg(windows)]
+    {
+        open_url_windows(url)
     }
     #[cfg(unix)]
     {
@@ -165,8 +166,36 @@ fn open_browser(url: &str) -> bool {
         {
             return true;
         }
+        spawn_quiet("xdg-open", &[url])
     }
-    spawn_quiet("xdg-open", &[url])
+}
+
+/// Hand `url` to the default browser through the shell, as a click on a link does. Going
+/// through `cmd /c start` instead would split the URL at every `&`, and the device flow's
+/// links have query strings.
+#[cfg(windows)]
+fn open_url_windows(url: &str) -> bool {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let wide = |s: &str| {
+        s.encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>()
+    };
+    let (verb, target) = (wide("open"), wide(url));
+    // SAFETY: both strings are NUL-terminated and outlive the call. ShellExecuteW returns
+    // a value above 32 when it succeeded.
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    result as usize > 32
 }
 
 // ---- login orchestration -----------------------------------------------

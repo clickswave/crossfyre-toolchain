@@ -82,7 +82,7 @@ pub fn nodes(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok())
         {
-            Some(pid) if Path::new(&format!("/proc/{pid}")).exists() => {
+            Some(pid) if crate::os::process_alive(pid) => {
                 (check(), format!("{GREEN}running{RESET}"), pid.to_string())
             }
             // A pid file naming a process that no longer exists is leftover

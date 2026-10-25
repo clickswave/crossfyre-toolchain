@@ -350,6 +350,11 @@ enum ExtensionAction {
     Enable { name: String },
     /// Disable an extension daemon (don't start on boot).
     Disable { name: String },
+    /// Run an extension's daemon as its service (the launchd agent or scheduled task
+    /// runs this).
+    #[cfg(not(target_os = "linux"))]
+    #[command(hide = true)]
+    Host { name: String },
 }
 
 /// The `node` worker to run in the foreground: the one built beside this binary, for a
@@ -361,7 +366,10 @@ fn node_worker() -> Option<std::path::PathBuf> {
     } else {
         std::env::current_exe()
             .ok()
-            .and_then(|p| p.parent().map(|d| d.join("node")))
+            .and_then(|p| {
+                p.parent()
+                    .map(|d| d.join(cfx_core::toolchain::config::ext_file_name("node")))
+            })
             .filter(|p| p.exists())
     };
     beside.or_else(|| Some(cfx_core::toolchain::service::node_binary()).filter(|p| p.exists()))
@@ -375,8 +383,9 @@ fn exec_node_supervise(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let node = node_worker().ok_or_else(|| {
         format!(
-            "the node worker is not installed at {}; run `sudo crossfyre node init`",
-            cfx_core::toolchain::service::node_binary().display()
+            "the node worker is not installed at {}; run `{}`",
+            cfx_core::toolchain::service::node_binary().display(),
+            cfx_core::os::elevated("crossfyre node init")
         )
     })?;
     let mut cmd = std::process::Command::new(node);
@@ -538,6 +547,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             ExtensionAction::Restart { name } => cfx_core::toolchain::service::restart(&name)?,
             ExtensionAction::Enable { name } => cfx_core::toolchain::service::enable(&name)?,
             ExtensionAction::Disable { name } => cfx_core::toolchain::service::disable(&name)?,
+            #[cfg(not(target_os = "linux"))]
+            ExtensionAction::Host { name } => cfx_core::toolchain::service::host(&name)?,
         },
         Commands::Oast { action } => match action {
             OastAction::Setup {

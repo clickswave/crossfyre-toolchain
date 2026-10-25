@@ -147,7 +147,7 @@ fn default_success_codes() -> Vec<u16> {
 
 /// Params for the lightweight single-URL probe operation.
 #[derive(Debug, Deserialize)]
-struct ProbeParams {
+pub(crate) struct ProbeParams {
     operation_id: String,
     url: String,
     #[serde(default = "default_method")]

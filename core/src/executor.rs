@@ -58,22 +58,98 @@ pub fn helper_path() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("CROSSFYRE_CFX_SCRIPT") {
         return Some(PathBuf::from(p));
     }
+    let file = crate::toolchain::config::file_name(HELPER);
     let beside = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join(HELPER)))
+        .and_then(|exe| exe.parent().map(|dir| dir.join(&file)))
         .filter(|p| p.is_file());
     if beside.is_some() {
         return beside;
     }
-    let installed = crate::toolchain::config::get_bin_dir().join(HELPER);
+    let installed = crate::toolchain::config::get_bin_dir().join(&file);
     if installed.is_file() {
         return Some(installed);
     }
     std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths)
-            .map(|dir| dir.join(HELPER))
+            .map(|dir| dir.join(&file))
             .find(|p| p.is_file())
     })
+}
+
+/// The oldest Python the helper can load on Windows and macOS, where it is built for
+/// Python's stable ABI (see cfx-script's Cargo.toml).
+pub const PYTHON_MIN: (u32, u32) = (3, 10);
+
+/// What the helper at `helper` has to be started with to find a Python. Nothing outside
+/// Windows: there the dynamic loader finds libpython by itself.
+///
+/// On Windows the helper loads python3.dll, the stable-ABI library every CPython
+/// install has, and Windows looks for it beside the helper and then on PATH. A Python
+/// is looked for, in order, as the embeddable package in a `python` folder beside the
+/// helper, which a release can ship so that nothing has to be installed, then among the
+/// installs registered under PEP 514 (python.org's installer, among others), newest
+/// first. The one found goes at the front of PATH, and becomes PYTHONHOME for a
+/// registered install, so its own standard library is the one loaded.
+pub fn python_env(helper: &Path) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    #[cfg(windows)]
+    {
+        let Some((dir, registered)) = find_python(helper) else {
+            return Vec::new();
+        };
+        let mut path = std::ffi::OsString::from(dir.as_os_str());
+        if let Some(rest) = std::env::var_os("PATH").filter(|p| !p.is_empty()) {
+            path.push(";");
+            path.push(rest);
+        }
+        let mut env = vec![("PATH".into(), path)];
+        if registered && std::env::var_os("PYTHONHOME").is_none() {
+            env.push(("PYTHONHOME".into(), dir.into_os_string()));
+        }
+        env
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = helper;
+        Vec::new()
+    }
+}
+
+/// A directory holding a python3.dll the helper can load, and whether it is a registered
+/// install rather than the package beside the helper.
+#[cfg(windows)]
+fn find_python(helper: &Path) -> Option<(PathBuf, bool)> {
+    use crate::os::win::{Hive, reg_string, reg_subkeys};
+    let bundled = helper.parent()?.join("python");
+    if bundled.join("python3.dll").is_file() {
+        return Some((bundled, false));
+    }
+    // `3.12`, and `3.12-32` or `3.12-arm64` for other architectures, which this
+    // 64-bit x86 helper cannot load.
+    const CORE: &str = r"SOFTWARE\Python\PythonCore";
+    let mut found: Vec<((u32, u32), PathBuf)> = Vec::new();
+    for hive in [Hive::CurrentUser, Hive::LocalMachine] {
+        for tag in reg_subkeys(hive, CORE) {
+            let Some((major, minor)) = tag.split_once('.') else {
+                continue;
+            };
+            let (Ok(major), Ok(minor)) = (major.parse::<u32>(), minor.parse::<u32>()) else {
+                continue;
+            };
+            if (major, minor) < PYTHON_MIN {
+                continue;
+            }
+            let Some(dir) = reg_string(hive, &format!(r"{CORE}\{tag}\InstallPath"), "") else {
+                continue;
+            };
+            let dir = PathBuf::from(dir);
+            if dir.join("python3.dll").is_file() {
+                found.push(((major, minor), dir));
+            }
+        }
+    }
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.into_iter().next().map(|(_, dir)| (dir, true))
 }
 
 /// A line from the helper's stdout as a message, or `None` when it is not one.
@@ -109,9 +185,22 @@ async fn read_line(
     }
 }
 
+/// The exit status Windows gives a program a DLL it needs was not found for:
+/// STATUS_DLL_NOT_FOUND, before `main` and with nothing on stderr.
+const DLL_NOT_FOUND: i32 = 0xC000_0135_u32 as i32;
+
 /// Why a helper that never said `completed` stopped, from its exit status and the
 /// tail of what it wrote to stderr.
 fn explain_exit(status: Option<std::process::ExitStatus>, tail: &[String]) -> String {
+    if cfg!(windows) && status.and_then(|s| s.code()) == Some(DLL_NOT_FOUND) {
+        let (major, minor) = PYTHON_MIN;
+        return format!(
+            "cfx-script could not start: no Python {major}.{minor} or later was found \
+             (python3.dll). Install one from python.org, or put Python's embeddable package \
+             in a folder called python beside cfx-script. Nothing else in Crossfyre needs \
+             Python."
+        );
+    }
     let python = tail
         .iter()
         .find(|l| l.contains("libpython") || l.contains("error while loading shared libraries"));
@@ -145,6 +234,7 @@ pub async fn run_helper(
     mut on_message: impl FnMut(serde_json::Value),
 ) -> (ExecutionResult, bool) {
     let mut command = tokio::process::Command::new(helper);
+    command.envs(python_env(helper));
     match toolchain_dir {
         Some(dir) => command.env(TOOLCHAIN_DIR_ENV, dir),
         None => command.env_remove(TOOLCHAIN_DIR_ENV),
@@ -387,7 +477,8 @@ pub async fn execute_local(script_path: &str, targets: Vec<(String, String)>) ->
     result
 }
 
-#[cfg(test)]
+// The stand-in helpers are shell scripts.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

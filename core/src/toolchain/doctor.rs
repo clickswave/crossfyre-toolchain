@@ -26,7 +26,19 @@ fn has_binary(name: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
     };
-    std::env::split_paths(&path).any(|dir| dir.join(name).is_file())
+    let name = config::file_name(name);
+    std::env::split_paths(&path).any(|dir| dir.join(&name).is_file())
+}
+
+/// Can extension downloads be unpacked here: by unzip, or on Windows by the bsdtar in
+/// System32 (see `install::extract_zip`).
+fn can_unzip() -> bool {
+    if cfg!(windows) {
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+        Path::new(&root).join("System32").join("tar.exe").is_file()
+    } else {
+        has_binary("unzip")
+    }
 }
 
 fn port_open(port: u16) -> bool {
@@ -51,11 +63,18 @@ pub async fn run(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
     ) {
         failed += 1;
     }
-    if !check(
-        "unzip available",
-        has_binary("unzip"),
-        "install unzip (used to unpack extension downloads)",
-    ) {
+    let (unzip_label, unzip_fix) = if cfg!(windows) {
+        (
+            "tar.exe available",
+            "Windows 10 1803 or later ships tar.exe in System32 (used to unpack extension downloads)",
+        )
+    } else {
+        (
+            "unzip available",
+            "install unzip (used to unpack extension downloads)",
+        )
+    };
+    if !check(unzip_label, can_unzip(), unzip_fix) {
         failed += 1;
     }
     #[cfg(target_os = "linux")]

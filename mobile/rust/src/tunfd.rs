@@ -64,7 +64,11 @@ pub fn release() -> bool {
     swapped
 }
 
-#[cfg(test)]
+// Linux and Android only, the systems this crate is the tunnel core for. The test
+// speaks to libc through its own declarations, with Linux's value for O_NONBLOCK
+// (0x800). On macOS that bit is another flag, so the pipe stays blocking and the
+// first read waits forever instead of failing.
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 mod tests {
     use super::*;
 

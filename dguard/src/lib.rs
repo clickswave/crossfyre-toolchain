@@ -309,35 +309,88 @@ mod encode_tests {
 // ---------------------------------------------------------------------------
 // Wordlist path containment
 
-/// Extra directories a wordlist may be read from, colon-separated.
+/// Extra directories a wordlist may be read from, separated as PATH is on this OS:
+/// by `:` on Unix and by `;` on Windows, where `:` is part of every absolute path.
 pub const WORDLIST_ROOTS_ENV: &str = "CFX_WORDLIST_ROOTS";
+
+/// How [`WORDLIST_ROOTS_ENV`]'s separator is named in an error.
+const ROOTS_SEPARATED: &str = if cfg!(windows) {
+    "semicolon-separated"
+} else {
+    "colon-separated"
+};
 
 /// Directories a wordlist may be read from without configuration.
 ///
-/// These are the two places wordlists actually come from in normal operation:
-/// the node downloads remote lists to the temp dir as `cfx-wl-<id>.txt`, and the
-/// bundled default ships in `/opt/crossfyre/wordlists`. The distro paths are
-/// included because they are where operators keep lists on a scanning host.
+/// These are the places wordlists actually come from in normal operation: where the
+/// node hands remote lists over as `cfx-wl-<id>.txt`, and where the bundled default
+/// ships. On Linux the hand-over is the temp dir and the default is in
+/// `/opt/crossfyre/wordlists`, and the distro paths are included because they are
+/// where operators keep lists on a scanning host. macOS hands over in /tmp too, which
+/// is not a process's own temp dir there (that is a per-user directory under
+/// /var/folders), and Homebrew's seclists are where operators keep lists. Windows
+/// hands over in the toolchain directory's `tmp` (the node runs as LocalSystem, whose
+/// temp dir the engines cannot read) and ships the default under Program Files.
 fn default_roots() -> Vec<std::path::PathBuf> {
-    vec![
-        std::env::temp_dir(),
-        std::path::PathBuf::from("/opt/crossfyre/wordlists"),
-        std::path::PathBuf::from("/usr/share/wordlists"),
-        std::path::PathBuf::from("/usr/share/seclists"),
-    ]
+    use std::path::PathBuf;
+    #[cfg(windows)]
+    {
+        let mut roots = vec![std::env::temp_dir()];
+        // The engine host names the toolchain directory; without it, the default one.
+        let toolchain = std::env::var_os("CROSSFYRE_TOOLCHAIN_DIR")
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("crossfyre")));
+        if let Some(dir) = toolchain {
+            roots.push(dir.join("tmp"));
+        }
+        let program_files =
+            std::env::var_os("ProgramFiles").unwrap_or_else(|| r"C:\Program Files".into());
+        roots.push(
+            PathBuf::from(program_files)
+                .join("Crossfyre")
+                .join("wordlists"),
+        );
+        roots
+    }
+    #[cfg(target_os = "macos")]
+    {
+        vec![
+            std::env::temp_dir(),
+            PathBuf::from("/tmp"),
+            PathBuf::from("/opt/crossfyre/wordlists"),
+            PathBuf::from("/opt/homebrew/share/seclists"),
+            PathBuf::from("/usr/local/share/seclists"),
+        ]
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        vec![
+            std::env::temp_dir(),
+            PathBuf::from("/opt/crossfyre/wordlists"),
+            PathBuf::from("/usr/share/wordlists"),
+            PathBuf::from("/usr/share/seclists"),
+        ]
+    }
+}
+
+/// The directories in a [`WORDLIST_ROOTS_ENV`] value, split as PATH is split here, each
+/// trimmed of spaces, with empty entries left out.
+fn roots_from(value: &str) -> Vec<std::path::PathBuf> {
+    std::env::split_paths(value)
+        .filter_map(|p| {
+            let s = p.to_string_lossy();
+            let s = s.trim();
+            (!s.is_empty()).then(|| std::path::PathBuf::from(s))
+        })
+        .collect()
 }
 
 /// Every directory a wordlist may be read from, defaults plus [`WORDLIST_ROOTS_ENV`].
 pub fn wordlist_roots() -> Vec<std::path::PathBuf> {
     let mut roots = default_roots();
     if let Ok(extra) = std::env::var(WORDLIST_ROOTS_ENV) {
-        roots.extend(
-            extra
-                .split(':')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(std::path::PathBuf::from),
-        );
+        roots.extend(roots_from(&extra));
     }
     roots
 }
@@ -379,9 +432,10 @@ pub fn resolve_wordlist_in(
     }
     Err(format!(
         "wordlist {} is outside the permitted directories. Move it under one of \
-         them, or add its directory to {} (colon-separated).",
+         them, or add its directory to {} ({}).",
         real.display(),
-        WORDLIST_ROOTS_ENV
+        WORDLIST_ROOTS_ENV,
+        ROOTS_SEPARATED
     ))
 }
 
@@ -434,6 +488,58 @@ mod wordlist_tests {
     #[test]
     fn an_empty_path_is_refused() {
         assert!(resolve_wordlist_in("   ", &[std::env::temp_dir()]).is_err());
+    }
+
+    #[test]
+    fn the_extra_roots_are_split_as_path_is() {
+        let a = std::env::temp_dir().join("lists a");
+        let b = std::env::temp_dir().join("lists-b");
+        let joined = std::env::join_paths([&a, &b]).expect("joinable");
+        assert_eq!(roots_from(joined.to_str().expect("utf-8")), vec![a, b]);
+        assert!(roots_from("").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn on_unix_a_colon_separates_and_spaces_around_an_entry_go() {
+        assert_eq!(
+            roots_from(" /srv/lists : :/opt/more"),
+            vec![
+                std::path::PathBuf::from("/srv/lists"),
+                std::path::PathBuf::from("/opt/more")
+            ]
+        );
+    }
+
+    // The bug this replaced split on ':', which cut every Windows path in two at its
+    // drive letter.
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_a_drive_letter_is_part_of_the_path() {
+        assert_eq!(
+            roots_from(r"C:\lists;D:\more lists"),
+            vec![
+                std::path::PathBuf::from(r"C:\lists"),
+                std::path::PathBuf::from(r"D:\more lists")
+            ]
+        );
+    }
+
+    // The node hands wordlists over in /tmp on macOS, which is not the engine's own
+    // temp dir there.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn on_macos_the_node_s_hand_over_directory_is_a_root() {
+        assert!(default_roots().contains(&std::path::PathBuf::from("/tmp")));
+    }
+
+    #[test]
+    fn the_refusal_names_the_separator_this_os_uses() {
+        let p = tmp_with("dguard-separator.txt", "x\n");
+        let err = resolve_wordlist_in(p.to_str().unwrap(), &[]).unwrap_err();
+        let _ = std::fs::remove_file(p);
+        let want = if cfg!(windows) { "semicolon" } else { "colon" };
+        assert!(err.contains(&format!("({want}-separated)")), "{err}");
     }
 }
 

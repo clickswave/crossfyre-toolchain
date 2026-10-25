@@ -30,7 +30,8 @@ pub async fn handle(env: OpEnv) {
     if !disable_active {
         if let Some(wl_url) = data["wordlist_url"].as_str() {
             if !wl_url.is_empty() {
-                let tmp = format!("/tmp/cfx-wl-sub-{op_id}.txt");
+                let tmp =
+                    crate::toolchain::config::handoff_path(&format!("cfx-wl-sub-{op_id}.txt"));
                 if let Ok(resp) = reqwest::get(wl_url).await
                     && let Ok(body) = resp.text().await
                 {
@@ -43,10 +44,10 @@ pub async fn handle(env: OpEnv) {
         {
             let dl_url = first["url"].as_str().unwrap_or("");
             if !dl_url.is_empty() {
-                let tmp = format!(
-                    "/tmp/cfx-wl-sub-{}.txt",
+                let tmp = crate::toolchain::config::handoff_path(&format!(
+                    "cfx-wl-sub-{}.txt",
                     first["id"].as_str().unwrap_or("wl")
-                );
+                ));
                 if let Ok(resp) = reqwest::get(dl_url).await
                     && let Ok(body) = resp.text().await
                 {

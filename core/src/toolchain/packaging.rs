@@ -621,7 +621,13 @@ mod tests {
         match discover_from(&exe) {
             Found::Packaged(pkg) => {
                 assert_eq!(pkg.manager, Manager::Apt);
-                assert_eq!(pkg.file, file);
+                // The file is found from the executable's real path, and the scratch
+                // directory may be reached through a symlink: /var is /private/var
+                // on macOS.
+                assert_eq!(
+                    fs::canonicalize(&pkg.file).expect("found file"),
+                    fs::canonicalize(&file).expect("written file")
+                );
                 assert!(pkg.owns("crossfyre"));
             }
             other => panic!("{other:?}"),

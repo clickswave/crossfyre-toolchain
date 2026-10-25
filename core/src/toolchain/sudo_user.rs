@@ -58,13 +58,58 @@ pub fn invoking_user_home() -> PathBuf {
 }
 
 /// Config root of the invoking user. Under sudo this is `$SUDO_USER`'s
-/// `~/.config`; otherwise the platform config dir.
+/// config root (see [`config_root_in`]); otherwise the platform config dir.
 pub fn invoking_user_config_dir() -> PathBuf {
     if let Some((_, _, home, _)) = sudo_user_info() {
-        home.join(".config")
+        config_root_in(&home)
     } else {
         dirs::config_dir().expect("Could not resolve config directory")
     }
+}
+
+/// The per-user config root under the home directory `home`, where `dirs::config_dir()`
+/// puts it for that user: `~/.config` on Linux (and any other Unix), and
+/// `~/Library/Application Support` on macOS. Used where the user is not the one running
+/// the process, as under sudo, so the root is the same one that user's own runs find.
+pub fn config_root_in(home: &std::path::Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        home.join("Library").join("Application Support")
+    } else {
+        home.join(".config")
+    }
+}
+
+/// The variable through which the Windows node service hands its children the account
+/// that registered it, which the engines' scheduled tasks run as. The service itself
+/// runs as LocalSystem, so its own account is not the operator's.
+#[cfg(windows)]
+pub const OPERATOR_ENV: &str = "CROSSFYRE_OPERATOR";
+
+/// The Windows account per-user things are done for, as `DOMAIN\user`: the one the
+/// node service was registered by when this process runs under it, otherwise the
+/// account running this process. An elevated prompt is still its user's own account,
+/// which is what sudo is not.
+#[cfg(windows)]
+pub fn operator_account() -> Result<String, String> {
+    if let Some(name) = std::env::var(OPERATOR_ENV).ok().filter(|n| !n.is_empty()) {
+        return Ok(name);
+    }
+    let user = std::env::var("USERNAME").unwrap_or_default();
+    let domain = std::env::var("USERDOMAIN").unwrap_or_default();
+    // LocalSystem's environment names the machine account, which owns no profile and
+    // must not be given the operator's tasks.
+    if user.is_empty() || user.ends_with('$') {
+        return Err(
+            "this process does not know which account to act for; run the command from \
+             the operator's own elevated prompt"
+                .to_string(),
+        );
+    }
+    Ok(if domain.is_empty() {
+        user
+    } else {
+        format!("{domain}\\{user}")
+    })
 }
 
 /// Build a Command that, if running under sudo, drops uid/gid back to the

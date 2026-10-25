@@ -6,8 +6,11 @@
 //! authoritative for the delegated zone, so cf_oast answers its own challenge), and
 //! prints the DNS-delegation records the operator must add at their DNS provider.
 //!
-//! The server itself is the `oast` crate, run in-process by `crossfyre oast serve`.
-//! Self-hosting is Linux/systemd only (like the node service).
+//! The server itself is the `oast` crate, run in-process by `crossfyre oast serve`,
+//! which works on every platform. Setting one up to run for good is Linux/systemd only:
+//! the box has to be the authoritative DNS server for a delegated zone on a public
+//! address, answering on 53, 80 and 443, which is a server's job rather than a
+//! workstation's, and the renewal hook and lego install are written for that box.
 
 use crate::toolchain::ui::{hint, ok, step, warn};
 use std::path::Path;
@@ -33,8 +36,16 @@ pub struct SetupOpts {
     pub no_tls: bool,
 }
 
+/// What `setup` and `status` say off Linux.
+const LINUX_ONLY: &str = "setting up an OAST server is supported on Linux with systemd: run \
+                          `crossfyre oast setup` on the Linux box that will answer for the zone. \
+                          `crossfyre oast serve` runs the server here, in the foreground";
+
 fn require_root() -> Result<(), Box<dyn std::error::Error>> {
-    if unsafe { libc::geteuid() } != 0 {
+    if !cfg!(target_os = "linux") {
+        return Err(LINUX_ONLY.into());
+    }
+    if !crate::os::is_elevated() {
         return Err("setting up an OAST server needs root - re-run with sudo".into());
     }
     Ok(())
@@ -497,6 +508,11 @@ fn print_endpoint(domain: &str, tls: bool) {
 
 /// Show local OAST server status.
 pub fn status() -> Result<(), Box<dyn std::error::Error>> {
+    if !cfg!(target_os = "linux") {
+        warn("No OAST server is set up on this host.");
+        hint(LINUX_ONLY);
+        return Ok(());
+    }
     if !Path::new(UNIT_PATH).exists() {
         warn("No OAST server configured on this host.");
         hint("Run `crossfyre oast setup --domain oob.example.com` to stand one up.");

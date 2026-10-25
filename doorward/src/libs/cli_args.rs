@@ -53,8 +53,9 @@ pub struct ScanArgs {
     #[arg(short = 'p', long, default_value = "top-1000")]
     pub ports: String,
 
-    /// Scan technique
-    #[arg(long, default_value = "syn")]
+    /// Scan technique. Only connect scanning is implemented; `syn` is accepted
+    /// so existing commands keep working, and runs a connect scan.
+    #[arg(long, default_value = "connect")]
     pub technique: ScanTechnique,
 
     /// Number of concurrent tasks
@@ -104,8 +105,26 @@ pub struct DbArgs {
 pub enum ScanTechnique {
     /// TCP connect scan (full handshake)
     Connect,
-    /// SYN scan (half-open, requires privileges)
+    /// Accepted for compatibility. No SYN scan is implemented yet, so it runs
+    /// a connect scan and says so.
     Syn,
+}
+
+impl ScanTechnique {
+    /// The technique the scan actually runs with.
+    pub fn runs(&self) -> &'static str {
+        "connect"
+    }
+
+    /// What to tell the user before the scan starts, if anything.
+    pub fn notice(&self) -> Option<&'static str> {
+        match self {
+            ScanTechnique::Connect => None,
+            ScanTechnique::Syn => Some(
+                "doorward: SYN scanning is not implemented yet, so this is a TCP connect scan.",
+            ),
+        }
+    }
 }
 
 impl std::fmt::Display for ScanTechnique {
@@ -244,5 +263,31 @@ mod resolve_ports_tests {
     fn garbage_does_not_panic() {
         let _ = resolve_ports("not-a-port-spec");
         let _ = resolve_ports("");
+    }
+}
+
+#[cfg(test)]
+mod technique_tests {
+    use super::*;
+
+    fn scan(argv: &[&str]) -> ScanArgs {
+        match Cli::try_parse_from(argv).expect("arguments parse").command {
+            Some(Commands::Scan(args)) => args,
+            _ => panic!("not a scan"),
+        }
+    }
+
+    #[test]
+    fn the_default_is_the_scan_that_runs() {
+        let args = scan(&["doorward", "scan", "-t", "10.0.0.5"]);
+        assert_eq!(args.technique.to_string(), "connect");
+    }
+
+    #[test]
+    fn asking_for_syn_still_parses_and_says_it_is_a_connect_scan() {
+        let args = scan(&["doorward", "scan", "-t", "10.0.0.5", "--technique", "syn"]);
+        assert_eq!(args.technique.runs(), "connect");
+        assert!(args.technique.notice().is_some());
+        assert!(ScanTechnique::Connect.notice().is_none());
     }
 }

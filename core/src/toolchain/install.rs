@@ -265,9 +265,24 @@ fn verify_artifact_bytes(artifact: &Artifact, bytes: &[u8]) -> Result<(), String
 }
 
 /// Unzip `zip_path` into `extract_dir` (shells out to `unzip`, which the
-/// installer checks for).
+/// installer checks for). Windows has no unzip, and has had bsdtar, which reads zip
+/// archives, in System32 since Windows 10 1803; it is named by its full path so that
+/// another `tar` on PATH, which may not read zip at all, is not the one run.
 fn extract_zip(zip_path: &Path, extract_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(extract_dir)?;
+    #[cfg(windows)]
+    let status = {
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+        Command::new(Path::new(&root).join("System32").join("tar.exe"))
+            .arg("-x")
+            .arg("-f")
+            .arg(zip_path)
+            .arg("-C")
+            .arg(extract_dir)
+            .status()
+            .map_err(|e| format!("tar.exe not found or failed to execute: {e}"))?
+    };
+    #[cfg(not(windows))]
     let status = Command::new("unzip")
         .args([
             "-q",
@@ -324,9 +339,78 @@ fn stage_binary(src: &Path, dest: &Path) -> Result<PathBuf, Box<dyn std::error::
 
 /// Move a binary that `stage_binary` staged into place at `dest`.
 fn commit_staged(staged: &Path, dest: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(windows)]
+    move_aside_if_running(dest);
     if let Err(e) = fs::rename(staged, dest) {
         let _ = fs::remove_file(staged);
         return Err(e.into());
+    }
+    Ok(())
+}
+
+/// Windows will not let a running program's file be replaced or removed, which is what
+/// updating the CLI from itself, or the node from the node service, does. It does let
+/// the file be renamed, so a program that is running is moved to `<name>.old` and the
+/// new one takes its name; the old one finishes from where it was moved to. A `.old`
+/// that a previous update left is removed first, once nothing runs it any more.
+#[cfg(windows)]
+fn move_aside_if_running(dest: &Path) {
+    let Some(name) = dest.file_name() else {
+        return;
+    };
+    let mut old_name = name.to_os_string();
+    old_name.push(".old");
+    let old = dest.with_file_name(old_name);
+    let _ = fs::remove_file(&old);
+    if !dest.exists() {
+        return;
+    }
+    // Opening for writing is refused while the file is being run.
+    if fs::OpenOptions::new().write(true).open(dest).is_err() {
+        let _ = fs::rename(dest, &old);
+    }
+}
+
+/// The folder holding the embeddable Python package a Windows cfx-script can be shipped
+/// with (see `executor::python_env`), copied from beside `src` to beside `dest` when
+/// there is one there. Nothing on other platforms, where the helper finds the Python it
+/// was built against by itself.
+fn place_bundled_python(src: &Path, dest: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if !cfg!(windows) {
+        return Ok(());
+    }
+    let (Some(from_dir), Some(to_dir)) = (src.parent(), dest.parent()) else {
+        return Ok(());
+    };
+    let from = from_dir.join("python");
+    if !from.join("python3.dll").is_file() {
+        return Ok(());
+    }
+    let to = to_dir.join("python");
+    let staged = to_dir.join("python.new");
+    let _ = fs::remove_dir_all(&staged);
+    copy_dir(&from, &staged)?;
+    // A script running now holds the old DLLs open, which stops them being removed but
+    // not their folder being renamed.
+    let old = to_dir.join(format!("python.old-{}", std::process::id()));
+    if to.exists() {
+        fs::rename(&to, &old)?;
+    }
+    fs::rename(&staged, &to)?;
+    let _ = fs::remove_dir_all(&old);
+    Ok(())
+}
+
+fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), &target)?;
+        }
     }
     Ok(())
 }
@@ -339,6 +423,7 @@ fn helper_starts(path: &Path) -> Result<(), String> {
     let mut busy = 0;
     let out = loop {
         let run = Command::new(path)
+            .envs(crate::executor::python_env(path))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -433,6 +518,7 @@ pub async fn install_cfx_script(
     if !extracted.exists() {
         return Err("cfx-script binary not found inside its zip".into());
     }
+    place_bundled_python(&extracted, &dest)?;
     if let Some(output) = place_helper_if_it_starts(&extracted, &dest)? {
         return Ok(HelperOutcome::CannotStart { version, output });
     }
@@ -1161,6 +1247,12 @@ pub async fn ensure_node_installed() -> Result<(), Box<dyn std::error::Error>> {
         // From the same build as a node beside it. Its version is unknown, so none is
         // recorded, and the next update replaces it with the manifest's.
         let _ = fs::remove_file(ext_version_file(CFX_SCRIPT));
+        if let Err(e) = place_bundled_python(&sib, &helper) {
+            eprintln!(
+                "[!] could not copy the Python beside {}: {e}",
+                sib.display()
+            );
+        }
         match place_helper_if_it_starts(&sib, &helper) {
             Ok(None) => println!(
                 "[+] Installed cfx-script to {} (runs .cfx scripts)",

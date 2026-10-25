@@ -9,12 +9,13 @@
 //! here - the URL is operator-supplied, the mechanism is a plain env var).
 
 use crate::NetworkConfig;
-use crate::toolchain::sudo_user::{chown_to_invoking_user, invoking_user_home};
+use crate::toolchain::sudo_user::chown_to_invoking_user;
 
 /// Path of the env file the engine service units source
-/// (`EnvironmentFile=-<home>/.config/crossfyre/egress.env`).
+/// (`EnvironmentFile=-<home>/.config/crossfyre/egress.env` on Linux; on macOS and
+/// Windows the engine host reads it, see `toolchain::service::host`).
 fn env_file() -> std::path::PathBuf {
-    invoking_user_home().join(".config/crossfyre/egress.env")
+    crate::toolchain::config::egress_env_path()
 }
 
 /// Write or clear the egress-proxy env file from the node's network config.

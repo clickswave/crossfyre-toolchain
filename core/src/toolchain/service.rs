@@ -5,12 +5,18 @@
 // 1. Extension daemons (ambulo, voyage, doorward) - long-lived *per-user* daemons:
 //      Linux   -> systemd user units      (~/.config/systemd/user, systemctl --user)
 //      macOS   -> launchd user agents     (~/Library/LaunchAgents, launchctl)
-//      Windows -> Task Scheduler tasks    (schtasks, ONLOGON trigger)
+//      Windows -> scheduled tasks run as the operator (see `win::tasks`)
 //
 // 2. The node supervisor itself (`crossfyre node up`) - a *system* service, because
-//    tunnel bring-up (network namespaces, openvpn) needs root. Linux only for
-//    now: /etc/systemd/system/crossfyre-node.service with SUDO_USER baked in
-//    so user-scoped state keeps resolving to the operator's home.
+//    tunnel bring-up (network namespaces, openvpn) needs root:
+//      Linux   -> /etc/systemd/system/crossfyre-node.service with SUDO_USER baked in
+//                 so user-scoped state keeps resolving to the operator's home
+//      macOS   -> /Library/LaunchDaemons/io.crossfyre.node.plist, the same way
+//      Windows -> the crossfyre-node service, as LocalSystem (see `win::scm`)
+//
+// On macOS and Windows an engine's job runs the CLI's hidden `extension host <engine>`
+// rather than the engine itself, to give the engine what a systemd unit would: its
+// toolchain directory and the egress-proxy environment file (see `host`).
 //
 // Each `imp` exposes the same set of primitives; only the one matching the
 // build target compiles.
@@ -430,9 +436,291 @@ pub fn root_may_run(path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+/// The owner of a file or directory on Windows and who its access list lets do what, as
+/// SID strings and access masks. `allows` is `None` for an object with no access list
+/// at all, which lets everyone do everything.
+pub struct Secured {
+    pub path: std::path::PathBuf,
+    pub owner: String,
+    pub allows: Option<Vec<(String, u32)>>,
+}
+
+/// The accounts that own and may write what a LocalSystem service runs: LocalSystem,
+/// the Administrators group and TrustedInstaller, which owns what Windows installs.
+const ADMIN_SIDS: [&str; 3] = [
+    "S-1-5-18",
+    "S-1-5-32-544",
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
+];
+
+/// Could anyone but an administrator replace the file whose path `chain` describes, the
+/// file first and then each directory above it? The Windows counterpart of
+/// [`judge_root_run`]. Everything on the way must be owned by an administrator. Nobody
+/// else may write or replace the file. Nobody else may add a file to the directory it is
+/// in, since a DLL dropped beside a program is loaded before the system's own, nor
+/// remove or rename one. Higher up, adding is harmless and removing or renaming is not.
+pub fn judge_admin_only(chain: &[Secured]) -> Result<(), String> {
+    // Access mask bits, from winnt.h.
+    const WRITE_DATA_OR_ADD_FILE: u32 = 0x0002;
+    const APPEND_DATA_OR_ADD_SUBDIR: u32 = 0x0004;
+    const DELETE_CHILD: u32 = 0x0040;
+    const DELETE: u32 = 0x0001_0000;
+    const WRITE_DAC: u32 = 0x0004_0000;
+    const WRITE_OWNER: u32 = 0x0008_0000;
+    const GENERIC_ALL: u32 = 0x1000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    let take_over = DELETE | WRITE_DAC | WRITE_OWNER | GENERIC_ALL;
+    for (i, p) in chain.iter().enumerate() {
+        let dangerous = match i {
+            0 => take_over | GENERIC_WRITE | WRITE_DATA_OR_ADD_FILE | APPEND_DATA_OR_ADD_SUBDIR,
+            1 => take_over | GENERIC_WRITE | WRITE_DATA_OR_ADD_FILE | DELETE_CHILD,
+            _ => take_over | DELETE_CHILD,
+        };
+        let why = if !ADMIN_SIDS.contains(&p.owner.as_str()) {
+            Some(format!("{} belongs to {}", p.path.display(), p.owner))
+        } else {
+            match &p.allows {
+                None => Some(format!(
+                    "{} has no access list, so anyone may write it",
+                    p.path.display()
+                )),
+                Some(allows) => allows
+                    .iter()
+                    .find(|(sid, mask)| {
+                        !ADMIN_SIDS.contains(&sid.as_str()) && mask & dangerous != 0
+                    })
+                    .map(|(sid, _)| format!("{} may be changed by {sid}", p.path.display())),
+            }
+        };
+        if let Some(why) = why {
+            return Err(format!(
+                "{} could be replaced by an account other than an administrator ({why}), and \
+                 a service running as LocalSystem would run it",
+                chain[0].path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse to point a LocalSystem service at `path` when anyone but an administrator could
+/// replace it, or plant a DLL beside it.
+#[cfg(windows)]
+pub fn root_may_run(path: &std::path::Path) -> Result<(), String> {
+    let real = std::fs::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut chain = Vec::new();
+    for p in real.ancestors() {
+        if p.as_os_str().is_empty() {
+            continue;
+        }
+        let mut s = super::win::security_of(p)?;
+        // Shown as given rather than with the \\?\ prefix canonicalize adds.
+        if p == real {
+            s.path = path.to_path_buf();
+        }
+        chain.push(s);
+    }
+    judge_admin_only(&chain)
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn root_may_run(_path: &std::path::Path) -> Result<(), String> {
     Ok(())
+}
+
+/// `s` as plist text: the three characters XML reserves in text, replaced.
+fn plist_string(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// A launchd property list from its top-level entries, each a key and the XML of its
+/// value.
+fn plist(entries: &[(&str, String)]) -> String {
+    let mut body = String::new();
+    for (key, value) in entries {
+        body.push_str(&format!("  <key>{key}</key>\n  {value}\n"));
+    }
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
+         \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\">\n<dict>\n{body}</dict>\n</plist>\n"
+    )
+}
+
+fn plist_array(items: &[String]) -> String {
+    let inner: String = items
+        .iter()
+        .map(|i| format!("    <string>{}</string>\n", plist_string(i)))
+        .collect();
+    format!("<array>\n{inner}  </array>")
+}
+
+/// The entries every Crossfyre job shares: started when loaded, started again when it
+/// exits with a failure and not when it exits cleanly (`Restart=on-failure`), 5 seconds
+/// apart (`RestartSec=5`), and logging to `log`.
+fn job_entries(label: &str, args: &[String], log: &std::path::Path) -> Vec<(&'static str, String)> {
+    let log = format!(
+        "<string>{}</string>",
+        plist_string(&log.display().to_string())
+    );
+    vec![
+        ("Label", format!("<string>{}</string>", plist_string(label))),
+        ("ProgramArguments", plist_array(args)),
+        ("RunAtLoad", "<true/>".to_string()),
+        (
+            "KeepAlive",
+            "<dict>\n    <key>SuccessfulExit</key>\n    <false/>\n  </dict>".to_string(),
+        ),
+        ("ThrottleInterval", "<integer>5</integer>".to_string()),
+        ("StandardOutPath", log.clone()),
+        ("StandardErrorPath", log),
+    ]
+}
+
+/// The launchd daemon for the node supervisor on macOS, the counterpart of
+/// [`node_unit`]: the node worker in the bin directory supervising the nodes under
+/// `data_dir`, told which CLI set it up, and, under sudo, which user it acts for.
+pub fn node_plist(
+    node_exe: &std::path::Path,
+    cli: &std::path::Path,
+    data_dir: &std::path::Path,
+    sudo_user: Option<&str>,
+    log: &std::path::Path,
+) -> String {
+    let args = [
+        node_exe.display().to_string(),
+        "supervise".to_string(),
+        "--data-dir".to_string(),
+        data_dir.display().to_string(),
+    ];
+    let mut env = format!(
+        "<dict>\n    <key>{}</key>\n    <string>{}</string>\n",
+        super::packaging::CLI_ENV,
+        plist_string(&cli.display().to_string())
+    );
+    if let Some(name) = sudo_user {
+        env.push_str(&format!(
+            "    <key>SUDO_USER</key>\n    <string>{}</string>\n",
+            plist_string(name)
+        ));
+    }
+    env.push_str("  </dict>");
+    let mut entries = job_entries(NODE_LABEL, &args, log);
+    entries.push(("EnvironmentVariables", env));
+    plist(&entries)
+}
+
+/// The launchd label of the node supervisor on macOS.
+pub const NODE_LABEL: &str = "io.crossfyre.node";
+
+/// The launchd agent for an engine on macOS: the CLI's `extension host <engine>`, which
+/// starts the engine's daemon (see [`host`]).
+pub fn agent_plist(
+    label: &str,
+    cli: &std::path::Path,
+    engine: &str,
+    log: &std::path::Path,
+) -> String {
+    let args = [
+        cli.display().to_string(),
+        "extension".to_string(),
+        "host".to_string(),
+        engine.to_string(),
+    ];
+    plist(&job_entries(label, &args, log))
+}
+
+/// The `KEY=VALUE` assignments in an environment file as systemd's `EnvironmentFile=`
+/// reads them, for the engine host where systemd does not read it: one per line, blank
+/// lines and `#` or `;` comments skipped, and a value in matching double or single
+/// quotes taken without them.
+pub fn env_assignments(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let valid = key
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !valid {
+            continue;
+        }
+        let value = value.trim();
+        let value = ['"', '\'']
+            .iter()
+            .find_map(|q| value.strip_prefix(*q).and_then(|v| v.strip_suffix(*q)))
+            .unwrap_or(value);
+        out.push((key.to_string(), value.to_string()));
+    }
+    out
+}
+
+/// The CLI an engine's service names on macOS and Windows to host the engine: the one in
+/// the bin directory, else the path a package names its CLI by, else this CLI, else the
+/// one that set up the node this process is.
+#[cfg(not(target_os = "linux"))]
+fn host_cli() -> std::path::PathBuf {
+    let cli = super::config::file_name("crossfyre");
+    let stable = super::config::get_bin_dir().join(&cli);
+    if stable.is_file() {
+        return stable;
+    }
+    let exe = std::env::current_exe().ok();
+    if let Some(exe) = exe.as_deref()
+        && exe.file_name().is_some_and(|n| n == cli.as_str())
+    {
+        return super::packaging::cli_path_for(exe);
+    }
+    super::packaging::named_cli()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or(stable)
+}
+
+/// Start engine `ext`'s daemon the way its service on macOS or Windows wants it: on its
+/// configured port, told where the toolchain directory is, and with the egress-proxy
+/// variables of the file a systemd unit would have read. Run by the CLI's hidden
+/// `extension host <engine>`, which the launchd agent and the scheduled task name.
+///
+/// On macOS this becomes the engine (exec), so launchd supervises the daemon itself. On
+/// Windows it stays to restart the engine when it fails (see `win::host`).
+#[cfg(not(target_os = "linux"))]
+pub fn host(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let e = super::engine(ext).ok_or_else(|| format!("{ext} is not an engine"))?;
+    let bin = super::config::ext_bin_path(e.id);
+    let port = super::config::engine_port(e.id);
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.args(["--daemon", "--port", &port.to_string()]);
+    cmd.env(
+        super::config::TOOLCHAIN_DIR_ENV,
+        super::config::get_toolchain_dir(),
+    );
+    if let Ok(text) = std::fs::read_to_string(super::config::egress_env_path()) {
+        for (key, value) in env_assignments(&text) {
+            cmd.env(key, value);
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = cmd.exec();
+        Err(format!("could not start {}: {err}", bin.display()).into())
+    }
+    #[cfg(windows)]
+    {
+        let log = super::config::logs_dir().join(format!("{}.log", e.name));
+        super::win::host(e.name, cmd, &log)
+    }
 }
 
 pub fn remove_node_service() -> Result<(), Box<dyn std::error::Error>> {
@@ -539,31 +827,286 @@ mod node {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-mod node {
-    // Auto-start of the node supervisor is Linux-only for now. On macOS and
-    // Windows the operator runs `crossfyre node up` in a terminal (or wires up
-    // their own LaunchDaemon / scheduled task).
-    pub fn create(
-        _cli: &std::path::Path,
-        _data_dir: &std::path::Path,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        Err("the node service is only supported on Linux for now - run `crossfyre node up` directly".into())
+// ── launchd (macOS) ───────────────────────────────────────────────────
+//
+// Jobs are addressed by domain and label, through the subcommands launchd has had
+// since macOS 10.10: `bootstrap` loads a job from its plist, `bootout` unloads it (which
+// stops it, and KeepAlive does not bring it back), `kickstart` starts a loaded one, and
+// `enable` / `disable` keep a persistent setting that decides whether it may be loaded,
+// which is what `systemctl enable` decides. The node daemon is in the `system` domain.
+// An engine agent is in its user's `gui/<uid>` domain, or `user/<uid>` when that user
+// has no graphical session, as on a Mac used over ssh.
+#[cfg(target_os = "macos")]
+mod launchd {
+    use std::process::Command;
+
+    fn launchctl(args: &[&str]) -> std::io::Result<std::process::Output> {
+        Command::new("/bin/launchctl").args(args).output()
     }
-    pub fn delete() -> Result<(), Box<dyn std::error::Error>> {
+
+    fn run(args: &[&str]) -> Result<(), String> {
+        let out = launchctl(args).map_err(|e| format!("launchctl failed: {e}"))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let said = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        Err(format!("launchctl {} failed: {said}", args.join(" ")))
+    }
+
+    fn target(domain: &str, label: &str) -> String {
+        format!("{domain}/{label}")
+    }
+
+    /// Load the job from `plist`. A job that was booted out a moment ago may still be
+    /// on its way out, and launchd refuses to load it again until it is gone, so a
+    /// refusal is tried again for a few seconds.
+    fn bootstrap(domain: &str, label: &str, plist: &str) -> Result<(), String> {
+        let mut last = String::new();
+        for _ in 0..20 {
+            match run(&["bootstrap", domain, plist]) {
+                Ok(()) => return Ok(()),
+                Err(e) => last = e,
+            }
+            if loaded(domain, label) {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        Err(last)
+    }
+
+    /// Is the job loaded in `domain`?
+    pub fn loaded(domain: &str, label: &str) -> bool {
+        launchctl(&["print", &target(domain, label)]).is_ok_and(|o| o.status.success())
+    }
+
+    /// The domain a user's agents belong in.
+    pub fn user_domain(uid: u32) -> String {
+        let gui = format!("gui/{uid}");
+        if launchctl(&["print", &gui]).is_ok_and(|o| o.status.success()) {
+            gui
+        } else {
+            format!("user/{uid}")
+        }
+    }
+
+    /// start | stop | restart | enable | disable, as `systemctl` takes them.
+    pub fn act(domain: &str, label: &str, plist: &str, action: &str) -> Result<(), String> {
+        let t = target(domain, label);
+        match action {
+            "start" if loaded(domain, label) => run(&["kickstart", &t]),
+            "start" => bootstrap(domain, label, plist),
+            "stop" if loaded(domain, label) => run(&["bootout", &t]),
+            "stop" => Ok(()),
+            // Booted out and in again, so a plist rewritten since it was loaded (a new
+            // port, say) is the one that runs, as a restart after daemon-reload does.
+            "restart" => {
+                if loaded(domain, label) {
+                    run(&["bootout", &t])?;
+                }
+                bootstrap(domain, label, plist)
+            }
+            "enable" => run(&["enable", &t]),
+            "disable" => run(&["disable", &t]),
+            other => Err(format!("Unsupported action: {other}")),
+        }
+    }
+
+    /// running | stopped | failed.
+    pub fn status(domain: &str, label: &str) -> String {
+        let Ok(out) = launchctl(&["print", &target(domain, label)]) else {
+            return "unknown".to_string();
+        };
+        if !out.status.success() {
+            return "stopped".to_string();
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        if text.lines().any(|l| l.trim() == "state = running") {
+            return "running".to_string();
+        }
+        // `last exit code = 1: Operation not permitted`, or `(never exited)`.
+        let failed = text
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("last exit code = "))
+            .any(|code| {
+                code.chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_digit() && c != '0')
+            });
+        if failed { "failed" } else { "stopped" }.to_string()
+    }
+
+    /// Has `disable` been set for the job? `print-disabled` lists a job switched off as
+    /// `"label" => disabled`, or `=> true` on releases before macOS 13.
+    pub fn disabled(domain: &str, label: &str) -> bool {
+        let quoted = format!("\"{label}\"");
+        launchctl(&["print-disabled", domain]).is_ok_and(|o| {
+            String::from_utf8_lossy(&o.stdout).lines().any(|l| {
+                l.contains(&quoted) && (l.contains("=> disabled") || l.contains("=> true"))
+            })
+        })
+    }
+
+    pub fn bootout(domain: &str, label: &str) {
+        let _ = launchctl(&["bootout", &target(domain, label)]);
+    }
+
+    pub fn disable(domain: &str, label: &str) {
+        let _ = launchctl(&["disable", &target(domain, label)]);
+    }
+}
+
+// ── macOS: the node supervisor as a launchd daemon ───────────────────
+#[cfg(target_os = "macos")]
+mod node {
+    use super::launchd;
+    use std::fs;
+
+    const PLIST: &str = "/Library/LaunchDaemons/io.crossfyre.node.plist";
+    const DOMAIN: &str = "system";
+
+    fn require_root() -> Result<(), Box<dyn std::error::Error>> {
+        if !crate::os::is_elevated() {
+            return Err("managing the node service needs root - re-run with sudo".into());
+        }
         Ok(())
     }
-    pub fn action(_action: &str) -> Result<(), Box<dyn std::error::Error>> {
-        Err("the node service is only supported on Linux for now - run `crossfyre node up` directly".into())
+
+    pub fn create(
+        cli: &std::path::Path,
+        data_dir: &std::path::Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        require_root()?;
+        let sudo_user = super::super::sudo_user::sudo_user_info().map(|(_, _, _, name)| name);
+        // The daemon runs the node worker as root, so it has to be a file only root can
+        // replace.
+        super::root_may_run(&super::node_binary())?;
+        let logs = data_dir.join("logs");
+        fs::create_dir_all(&logs)?;
+        super::super::sudo_user::chown_to_invoking_user(&logs);
+        let body = super::node_plist(
+            &super::node_binary(),
+            cli,
+            data_dir,
+            sudo_user.as_deref(),
+            &logs.join("node.log"),
+        );
+        let fresh = !exists();
+        fs::write(PLIST, body)?;
+        // launchd refuses a daemon whose plist anyone but root could write.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(PLIST, fs::Permissions::from_mode(0o644))?;
+        }
+        // Off until `enable`, as a new unit is. A plist in LaunchDaemons is otherwise
+        // loaded at the next boot.
+        if fresh {
+            launchd::disable(DOMAIN, super::NODE_LABEL);
+        }
+        if !super::quiet() {
+            super::svc_ok(&format!("{} created", super::NODE_LABEL));
+        }
+        Ok(())
     }
+
+    pub fn delete() -> Result<(), Box<dyn std::error::Error>> {
+        if exists() {
+            require_root()?;
+            launchd::bootout(DOMAIN, super::NODE_LABEL);
+            fs::remove_file(PLIST)?;
+            super::svc_ok(&format!("{} removed", super::NODE_LABEL));
+        }
+        Ok(())
+    }
+
+    pub fn action(action: &str) -> Result<(), Box<dyn std::error::Error>> {
+        require_root()?;
+        launchd::act(DOMAIN, super::NODE_LABEL, PLIST, action)?;
+        if !super::quiet() {
+            super::svc_ok(&format!(
+                "{} {}",
+                super::NODE_LABEL,
+                super::action_past(action)
+            ));
+        }
+        Ok(())
+    }
+
     pub fn status() -> String {
-        "unsupported".to_string()
+        launchd::status(DOMAIN, super::NODE_LABEL)
     }
+
     pub fn is_enabled() -> bool {
-        false
+        exists() && !launchd::disabled(DOMAIN, super::NODE_LABEL)
     }
+
     pub fn exists() -> bool {
-        false
+        std::path::Path::new(PLIST).exists()
+    }
+}
+
+// ── Windows: the node supervisor as a service ─────────────────────────
+#[cfg(windows)]
+mod node {
+    use super::super::win::scm;
+
+    fn require_elevated() -> Result<(), Box<dyn std::error::Error>> {
+        if !crate::os::is_elevated() {
+            return Err(
+                "managing the node service needs an elevated prompt - re-run it as administrator"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn create(
+        cli: &std::path::Path,
+        data_dir: &std::path::Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        require_elevated()?;
+        // The service runs the node worker as LocalSystem, so it has to be a file only
+        // an administrator can replace.
+        super::root_may_run(&super::node_binary())?;
+        scm::create_node(&super::node_binary(), cli, data_dir)?;
+        if !super::quiet() {
+            super::svc_ok(&format!("{} created", scm::NODE_SERVICE));
+        }
+        Ok(())
+    }
+
+    pub fn delete() -> Result<(), Box<dyn std::error::Error>> {
+        if exists() {
+            require_elevated()?;
+            scm::delete_node()?;
+            super::svc_ok(&format!("{} removed", scm::NODE_SERVICE));
+        }
+        Ok(())
+    }
+
+    pub fn action(action: &str) -> Result<(), Box<dyn std::error::Error>> {
+        require_elevated()?;
+        scm::node_action(action)?;
+        if !super::quiet() {
+            super::svc_ok(&format!(
+                "{} {}",
+                scm::NODE_SERVICE,
+                super::action_past(action)
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn status() -> String {
+        scm::node_status()
+    }
+
+    pub fn is_enabled() -> bool {
+        scm::node_enabled()
+    }
+
+    pub fn exists() -> bool {
+        scm::node_exists()
     }
 }
 
@@ -696,15 +1239,13 @@ mod imp {
 // ── macOS: launchd user agents (extensions) ───────────────────────────
 #[cfg(target_os = "macos")]
 mod imp {
-    use super::super::config::ext_bin_path;
-    use super::super::sudo_user::{
-        chown_to_invoking_user, cmd_as_invoking_user, invoking_user_home,
-    };
+    use super::super::sudo_user::{chown_to_invoking_user, invoking_user_home, sudo_user_info};
+    use super::launchd;
     use std::fs;
     use std::path::PathBuf;
 
-    fn label(ext: &str) -> String {
-        format!("io.crossfyre.{}", ext)
+    fn label(key: &str) -> String {
+        format!("io.crossfyre.{key}")
     }
 
     fn agents_dir() -> PathBuf {
@@ -712,257 +1253,129 @@ mod imp {
         invoking_user_home().join("Library").join("LaunchAgents")
     }
 
-    fn plist_path(ext: &str) -> PathBuf {
-        agents_dir().join(format!("{}.plist", label(ext)))
+    fn plist_path(key: &str) -> PathBuf {
+        agents_dir().join(format!("{}.plist", label(key)))
     }
 
-    fn plist_body(ext: &str) -> String {
-        let bin = ext_bin_path(ext);
-        let port = super::super::config::engine_port(ext);
-        let key = super::super::public_name(ext);
-        format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-             <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
-             <plist version=\"1.0\">\n\
-             <dict>\n\
-             \x20 <key>Label</key>\n\
-             \x20 <string>{label}</string>\n\
-             \x20 <key>ProgramArguments</key>\n\
-             \x20 <array>\n\
-             \x20   <string>{bin}</string>\n\
-             \x20   <string>--daemon</string>\n\
-             \x20   <string>--port</string>\n\
-             \x20   <string>{port}</string>\n\
-             \x20 </array>\n\
-             \x20 <key>RunAtLoad</key>\n\
-             \x20 <true/>\n\
-             \x20 <key>KeepAlive</key>\n\
-             \x20 <true/>\n\
-             </dict>\n\
-             </plist>\n",
-            label = label(key),
-            bin = bin.display(),
-            port = port,
-        )
+    /// The user whose agents these are: the invoking one under sudo.
+    fn domain() -> String {
+        let uid = sudo_user_info()
+            .map(|(uid, _, _, _)| uid)
+            .unwrap_or_else(|| unsafe { libc::getuid() });
+        launchd::user_domain(uid)
     }
 
     pub fn create(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let dir = agents_dir();
         let key = super::super::public_name(ext);
+        let dir = agents_dir();
         fs::create_dir_all(&dir)?;
-        fs::write(plist_path(key), plist_body(ext))?;
+        let logs = super::super::config::logs_dir();
+        fs::create_dir_all(&logs)?;
+        chown_to_invoking_user(&logs);
+        let fresh = !exists(key);
+        let body = super::agent_plist(
+            &label(key),
+            &super::host_cli(),
+            key,
+            &logs.join(format!("{key}.log")),
+        );
+        fs::write(plist_path(key), body)?;
+        // Written into the user's home as root - chown it back.
         chown_to_invoking_user(&dir);
-        super::svc_ok(&format!("{} created", label(key)));
+        // Off until `enable`, as a new unit is. A plist in LaunchAgents is otherwise
+        // loaded at the user's next login.
+        if fresh {
+            launchd::disable(&domain(), &label(key));
+        }
+        if !super::quiet() {
+            super::svc_ok(&format!("{} created", label(key)));
+        }
         Ok(())
     }
 
-    pub fn delete(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let path = plist_path(ext);
+    pub fn delete(key: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let path = plist_path(key);
         if path.exists() {
-            // Unload (best-effort) before deleting the plist.
-            let _ = cmd_as_invoking_user("launchctl")
-                .args(["unload", "-w", &path.to_string_lossy()])
-                .status();
+            launchd::bootout(&domain(), &label(key));
             fs::remove_file(&path)?;
-            super::svc_ok(&format!("{} removed", label(ext)));
+            super::svc_ok(&format!("{} removed", label(key)));
         }
         Ok(())
     }
 
-    pub fn action(action: &str, ext: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let lbl = label(ext);
-        let plist = plist_path(ext).to_string_lossy().into_owned();
-        let result = match action {
-            "start" => cmd_as_invoking_user("launchctl")
-                .args(["start", &lbl])
-                .status(),
-            "stop" => cmd_as_invoking_user("launchctl")
-                .args(["stop", &lbl])
-                .status(),
-            // load -w / unload -w toggle the Disabled key, i.e. start-on-login.
-            "enable" => cmd_as_invoking_user("launchctl")
-                .args(["load", "-w", &plist])
-                .status(),
-            "disable" => cmd_as_invoking_user("launchctl")
-                .args(["unload", "-w", &plist])
-                .status(),
-            "restart" => {
-                let _ = cmd_as_invoking_user("launchctl")
-                    .args(["stop", &lbl])
-                    .status();
-                cmd_as_invoking_user("launchctl")
-                    .args(["start", &lbl])
-                    .status()
-            }
-            other => return Err(format!("Unsupported action: {}", other).into()),
+    pub fn action(action: &str, key: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let plist = plist_path(key).to_string_lossy().into_owned();
+        launchd::act(&domain(), &label(key), &plist, action)?;
+        if !super::quiet() {
+            super::svc_ok(&format!("{} {}", label(key), super::action_past(action)));
         }
-        .map_err(|e| format!("launchctl failed: {}", e))?;
-
-        if !result.success() {
-            return Err(format!("Failed to {} {}", action, lbl).into());
-        }
-        super::svc_ok(&format!("{} {}", lbl, super::action_past(action)));
         Ok(())
     }
 
-    pub fn status(ext: &str) -> String {
-        // `launchctl list <label>` exits 0 and prints a dict (with "PID" when
-        // the job is actually running) only if the agent is loaded.
-        match cmd_as_invoking_user("launchctl")
-            .args(["list", &label(ext)])
-            .output()
-        {
-            Ok(o) if o.status.success() => {
-                if String::from_utf8_lossy(&o.stdout).contains("\"PID\"") {
-                    "running".to_string()
-                } else {
-                    "stopped".to_string()
-                }
-            }
-            _ => "stopped".to_string(),
-        }
+    pub fn status(key: &str) -> String {
+        launchd::status(&domain(), &label(key))
     }
 
-    pub fn is_enabled(ext: &str) -> bool {
-        // Loaded == enabled (will RunAtLoad on next login).
-        cmd_as_invoking_user("launchctl")
-            .args(["list", &label(ext)])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+    pub fn is_enabled(key: &str) -> bool {
+        exists(key) && !launchd::disabled(&domain(), &label(key))
     }
 
-    pub fn exists(ext: &str) -> bool {
-        plist_path(ext).exists()
+    pub fn exists(key: &str) -> bool {
+        plist_path(key).exists()
     }
 }
 
-// ── Windows: Task Scheduler (extensions) ──────────────────────────────
-#[cfg(target_os = "windows")]
+// ── Windows: scheduled tasks (extensions) ─────────────────────────────
+#[cfg(windows)]
 mod imp {
-    use super::super::config::ext_bin_path;
-    use std::process::Command;
+    use super::super::win::tasks;
 
-    fn task_name(ext: &str) -> String {
-        format!("Crossfyre-{}", ext)
-    }
-
+    /// Registered from an elevated prompt (or by the node service) the task runs at boot;
+    /// from an ordinary one it runs at the operator's logon, and `tasks::create` says so.
     pub fn create(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let bin = ext_bin_path(ext);
-        let port = super::super::config::engine_port(ext);
         let key = super::super::public_name(ext);
-        // Quote the path; ONLOGON mirrors systemd --user (starts at user login).
-        let tr = format!("\"{}\" --daemon --port {}", bin.display(), port);
-        let status = Command::new("schtasks")
-            .args([
-                "/Create",
-                "/TN",
-                &task_name(key),
-                "/TR",
-                &tr,
-                "/SC",
-                "ONLOGON",
-                "/RL",
-                "LIMITED",
-                "/F",
-            ])
-            .status()
-            .map_err(|e| format!("schtasks failed: {}", e))?;
-        if !status.success() {
-            return Err(format!("Failed to create task {}", task_name(key)).into());
-        }
-        // Created enabled by default; disable to mirror "installed, not enabled".
-        let _ = Command::new("schtasks")
-            .args(["/Change", "/TN", &task_name(key), "/DISABLE"])
-            .status();
-        super::svc_ok(&format!("{} created", task_name(key)));
-        Ok(())
-    }
-
-    pub fn delete(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
-        if exists(ext) {
-            let status = Command::new("schtasks")
-                .args(["/Delete", "/TN", &task_name(ext), "/F"])
-                .status()
-                .map_err(|e| format!("schtasks failed: {}", e))?;
-            if !status.success() {
-                return Err(format!("Failed to delete task {}", task_name(ext)).into());
-            }
-            super::svc_ok(&format!("{} removed", task_name(ext)));
+        tasks::create(
+            key,
+            &format!("Crossfyre {key} extension daemon"),
+            &super::host_cli(),
+            &format!("extension host {key}"),
+        )?;
+        if !super::quiet() {
+            super::svc_ok(&format!("{} created", tasks::task_name(key)));
         }
         Ok(())
     }
 
-    pub fn action(action: &str, ext: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let tn = task_name(ext);
-        let result = match action {
-            "start" => Command::new("schtasks").args(["/Run", "/TN", &tn]).status(),
-            "stop" => Command::new("schtasks").args(["/End", "/TN", &tn]).status(),
-            "enable" => Command::new("schtasks")
-                .args(["/Change", "/TN", &tn, "/ENABLE"])
-                .status(),
-            "disable" => Command::new("schtasks")
-                .args(["/Change", "/TN", &tn, "/DISABLE"])
-                .status(),
-            "restart" => {
-                let _ = Command::new("schtasks").args(["/End", "/TN", &tn]).status();
-                Command::new("schtasks").args(["/Run", "/TN", &tn]).status()
-            }
-            other => return Err(format!("Unsupported action: {}", other).into()),
+    pub fn delete(key: &str) -> Result<(), Box<dyn std::error::Error>> {
+        if exists(key) {
+            tasks::delete(key)?;
+            super::svc_ok(&format!("{} removed", tasks::task_name(key)));
         }
-        .map_err(|e| format!("schtasks failed: {}", e))?;
-
-        if !result.success() {
-            return Err(format!("Failed to {} {}", action, tn).into());
-        }
-        super::svc_ok(&format!("{} {}", tn, super::action_past(action)));
         Ok(())
     }
 
-    fn query(ext: &str) -> Option<String> {
-        match Command::new("schtasks")
-            .args(["/Query", "/TN", &task_name(ext), "/FO", "LIST"])
-            .output()
-        {
-            Ok(o) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).into_owned()),
-            _ => None,
+    pub fn action(action: &str, key: &str) -> Result<(), Box<dyn std::error::Error>> {
+        tasks::action(action, key)?;
+        if !super::quiet() {
+            super::svc_ok(&format!(
+                "{} {}",
+                tasks::task_name(key),
+                super::action_past(action)
+            ));
         }
+        Ok(())
     }
 
-    pub fn status(ext: &str) -> String {
-        match query(ext) {
-            Some(out) => {
-                let line = out
-                    .lines()
-                    .find(|l| l.trim_start().to_lowercase().starts_with("status:"));
-                match line
-                    .and_then(|l| l.split(':').nth(1))
-                    .map(|s| s.trim().to_lowercase())
-                {
-                    Some(s) if s == "running" => "running".to_string(),
-                    Some(s) if s == "ready" => "stopped".to_string(),
-                    Some(s) if s == "disabled" => "disabled".to_string(),
-                    Some(s) if !s.is_empty() => s,
-                    _ => "unknown".to_string(),
-                }
-            }
-            None => "unknown".to_string(),
-        }
+    pub fn status(key: &str) -> String {
+        tasks::status(key)
     }
 
-    pub fn is_enabled(ext: &str) -> bool {
-        match query(ext) {
-            Some(out) => !out.to_lowercase().contains("disabled"),
-            None => false,
-        }
+    pub fn is_enabled(key: &str) -> bool {
+        tasks::is_enabled(key)
     }
 
-    pub fn exists(ext: &str) -> bool {
-        Command::new("schtasks")
-            .args(["/Query", "/TN", &task_name(ext)])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+    pub fn exists(key: &str) -> bool {
+        tasks::exists(key)
     }
 }
 
@@ -1050,6 +1463,157 @@ mod tests {
             unit.contains("\nEnvironment=\"CROSSFYRE_CLI=/opt/my tools/cross%%fyre\\\"x\"\n"),
             "{unit}"
         );
+    }
+
+    #[test]
+    fn the_macos_node_daemon_runs_the_worker_and_restarts_only_on_failure() {
+        let plist = node_plist(
+            Path::new("/opt/crossfyre/bin/node"),
+            Path::new("/opt/crossfyre/bin/crossfyre"),
+            Path::new("/Users/op/Library/Application Support/crossfyre"),
+            Some("op"),
+            Path::new("/Users/op/Library/Application Support/crossfyre/logs/node.log"),
+        );
+        assert!(
+            plist.contains("<string>io.crossfyre.node</string>"),
+            "{plist}"
+        );
+        assert!(
+            plist.contains(
+                "    <string>/opt/crossfyre/bin/node</string>\n    <string>supervise</string>\n    \
+                 <string>--data-dir</string>\n    \
+                 <string>/Users/op/Library/Application Support/crossfyre</string>\n"
+            ),
+            "one argument per string, the space kept: {plist}"
+        );
+        assert!(
+            plist.contains("<key>SuccessfulExit</key>\n    <false/>"),
+            "Restart=on-failure, not always: {plist}"
+        );
+        assert!(plist.contains("<key>ThrottleInterval</key>\n  <integer>5</integer>"));
+        assert!(plist.contains(
+            "<key>CROSSFYRE_CLI</key>\n    <string>/opt/crossfyre/bin/crossfyre</string>"
+        ));
+        assert!(plist.contains("<key>SUDO_USER</key>\n    <string>op</string>"));
+        let without = node_plist(
+            Path::new("/n"),
+            Path::new("/c"),
+            Path::new("/d"),
+            None,
+            Path::new("/l"),
+        );
+        assert!(!without.contains("SUDO_USER"), "{without}");
+    }
+
+    #[test]
+    fn a_plist_value_cannot_open_an_element_of_its_own() {
+        let plist = agent_plist(
+            "io.crossfyre.ambulo",
+            Path::new("/opt/a&b/<crossfyre>"),
+            "ambulo",
+            Path::new("/l"),
+        );
+        assert!(
+            plist.contains("<string>/opt/a&amp;b/&lt;crossfyre&gt;</string>"),
+            "{plist}"
+        );
+        assert!(plist.contains(
+            "<string>extension</string>\n    <string>host</string>\n    <string>ambulo</string>"
+        ));
+    }
+
+    #[test]
+    fn the_environment_file_is_read_as_systemd_reads_it() {
+        let text = "# written by the node\n\nCROSSFYRE_EGRESS_PROXY=socks5://u:p@h:1080/?a=1&b=2\n\
+                    ; a comment\nQUOTED=\"x y\"\nSINGLE='z'\n not a line\n1BAD=x\nBAD KEY=x\n";
+        assert_eq!(
+            env_assignments(text),
+            vec![
+                (
+                    "CROSSFYRE_EGRESS_PROXY".to_string(),
+                    "socks5://u:p@h:1080/?a=1&b=2".to_string()
+                ),
+                ("QUOTED".to_string(), "x y".to_string()),
+                ("SINGLE".to_string(), "z".to_string()),
+            ]
+        );
+    }
+
+    fn secured(path: &str, owner: &str, allows: &[(&str, u32)]) -> Secured {
+        Secured {
+            path: PathBuf::from(path),
+            owner: owner.to_string(),
+            allows: Some(allows.iter().map(|(s, m)| (s.to_string(), *m)).collect()),
+        }
+    }
+
+    #[test]
+    fn a_localsystem_service_runs_only_what_administrators_alone_can_replace() {
+        const SYSTEM: &str = "S-1-5-18";
+        const ADMINS: &str = "S-1-5-32-544";
+        const TRUSTED_INSTALLER: &str =
+            "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+        const USERS: &str = "S-1-5-32-545";
+        const AUTHENTICATED: &str = "S-1-5-11";
+        const READ_EXECUTE: u32 = 0x0012_00A9;
+        const FULL: u32 = 0x001F_01FF;
+        const ADD_SUBDIR: u32 = 0x0004;
+        const ADD_FILE: u32 = 0x0002;
+        // What a default install of Windows gives Program Files and C:\.
+        let chain = |file: Secured, bin: Secured| {
+            vec![
+                file,
+                bin,
+                secured(
+                    r"C:\Program Files\Crossfyre",
+                    ADMINS,
+                    &[(SYSTEM, FULL), (ADMINS, FULL), (USERS, READ_EXECUTE)],
+                ),
+                secured(
+                    r"C:\Program Files",
+                    TRUSTED_INSTALLER,
+                    &[
+                        (TRUSTED_INSTALLER, FULL),
+                        (SYSTEM, FULL),
+                        (USERS, READ_EXECUTE),
+                    ],
+                ),
+                secured(
+                    r"C:\",
+                    TRUSTED_INSTALLER,
+                    &[
+                        (ADMINS, FULL),
+                        (AUTHENTICATED, ADD_SUBDIR),
+                        (USERS, READ_EXECUTE),
+                    ],
+                ),
+            ]
+        };
+        let file = |allows: &[(&str, u32)]| {
+            secured(r"C:\Program Files\Crossfyre\bin\node.exe", ADMINS, allows)
+        };
+        let bin =
+            |allows: &[(&str, u32)]| secured(r"C:\Program Files\Crossfyre\bin", ADMINS, allows);
+        let safe = &[(SYSTEM, FULL), (ADMINS, FULL), (USERS, READ_EXECUTE)];
+        assert!(judge_admin_only(&chain(file(safe), bin(safe))).is_ok());
+
+        // A worker a user may write could be swapped for anything.
+        let err = judge_admin_only(&chain(file(&[(USERS, FULL)]), bin(safe)))
+            .expect_err("a file users may write");
+        assert!(err.contains("node.exe") && err.contains(USERS), "{err}");
+        // A bin directory a user may add to takes a DLL the worker loads first.
+        assert!(judge_admin_only(&chain(file(safe), bin(&[(USERS, ADD_FILE)]))).is_err());
+        // A file another account owns, or one with no access list at all.
+        let mut theirs = file(safe);
+        theirs.owner = "S-1-5-21-1-2-3-1001".to_string();
+        assert!(judge_admin_only(&chain(theirs, bin(safe))).is_err());
+        let mut open = file(safe);
+        open.allows = None;
+        assert!(judge_admin_only(&chain(open, bin(safe))).is_err());
+        // Higher up, creating a folder is harmless, and renaming one is not.
+        let mut renamable = chain(file(safe), bin(safe));
+        renamable[3] = secured(r"C:\Program Files", TRUSTED_INSTALLER, &[(USERS, 0x0040)]);
+        assert!(judge_admin_only(&renamable).is_err());
     }
 
     fn owned(path: &str, uid: u32, gid: u32, mode: u32) -> PathOwner {

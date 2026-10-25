@@ -3,8 +3,8 @@
 Formerly `pulse`, renamed in 0.1.31.
 
 Host and port scanning. Give it targets (IPs, ranges, CIDRs) and a set of ports, and
-it tells you what is open. It can do a plain connect scan or a SYN scan, and it can go
-a step further and try to detect the service and OS behind an open port.
+it tells you what is open, with a TCP connect scan, and it can go a step further and
+try to detect the service and OS behind an open port.
 
 Part of the [Crossfyre toolchain](../). Runs standalone.
 
@@ -16,13 +16,10 @@ doorward scan --targets 10.0.0.0/24 --ports top-1000 --service-detection
 
 # specific hosts and ports
 doorward scan -t 10.0.0.5 10.0.0.6 -p 22,80,443,8080
-
-# pick the technique explicitly
-doorward scan -t 192.168.1.0/24 -p top-100 --technique syn
 ```
 
-SYN scanning needs raw-socket privileges, so run it with sudo (or the right
-capability) when you use `--technique syn`.
+`--technique syn` is accepted so older commands keep working, but no SYN scan is
+implemented yet: it runs a connect scan and says so.
 
 For scripted single probes, `exec` takes a JSON payload and runs it through the
 daemon.
@@ -36,7 +33,6 @@ terminal, and `--tui` is accepted for symmetry with the other engines.
 
 - `-t, --targets` one or more hosts, ranges or CIDRs
 - `-p, --ports` a list (`22,80,443`), a range, or a preset like `top-1000`
-- `--technique` connect or syn
 - `--service-detection` fingerprint the service on open ports
 - `--os-detection` guess the host OS
 - `--tasks` concurrency, `--timeout` and `--delay` to pace it

@@ -270,9 +270,19 @@ def run():
 fn the_toolchain_dir_comes_from_the_environment_even_when_it_is_not_utf8() {
     // JSON cannot carry a path that is not UTF-8, so the directory arrives in the
     // environment. The config.toml there moves ambulo to 5999, and a script sees it.
-    use std::os::unix::ffi::OsStrExt;
+    //
+    // macOS filesystems store names as UTF-8 and refuse any other bytes, so no such
+    // directory can exist there. The name is then "jos\u{e9}" in UTF-8, which still
+    // checks that the directory comes from the environment and survives the trip.
+    #[cfg(not(target_os = "macos"))]
+    let name = {
+        use std::os::unix::ffi::OsStrExt;
+        std::ffi::OsStr::from_bytes(b"jos\xe9").to_os_string()
+    };
+    #[cfg(target_os = "macos")]
+    let name = std::ffi::OsString::from("jos\u{e9}");
     let base = std::env::temp_dir().join(format!("cfx-script-dir-{}", std::process::id()));
-    let dir = base.join(std::ffi::OsStr::from_bytes(b"jos\xe9"));
+    let dir = base.join(name);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("config.toml"),

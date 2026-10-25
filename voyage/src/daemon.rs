@@ -133,7 +133,7 @@ fn default_origin_timeout() -> u64 {
 }
 
 #[derive(Debug, Deserialize)]
-struct ProbeParams {
+pub(crate) struct ProbeParams {
     operation_id: String,
     domain: String,
     /// 0 = don't store; 1-8766 = store and delete after this many hours
@@ -536,10 +536,22 @@ async fn dispatch(req: DaemonRequest, db: Arc<VoyageDb>) -> DaemonResponse {
 // Shared enum setup → returns (Scanner, total_entries)
 // ---------------------------------------------------------------------------
 
+/// The wordlist an enum reads, if it reads one, contained as ambulo contains its own.
+/// `wordlist` is a path from the request, and the enum sends one DNS query per line for
+/// a domain the same request names, so without the check any file the daemon can read
+/// went out a line at a time to whoever answers for that domain.
+fn active_wordlist(params: &EnumParams) -> Result<Option<std::path::PathBuf>, String> {
+    if params.disable_active || params.wordlist.is_empty() {
+        return Ok(None);
+    }
+    dguard::resolve_wordlist(&params.wordlist).map(Some)
+}
+
 async fn prepare_enum(
     params: &EnumParams,
     db: &Arc<VoyageDb>,
 ) -> Result<(Scanner, usize), Box<dyn std::error::Error + Send + Sync>> {
+    let wordlist = active_wordlist(params)?;
     // Compute config hash from domain + wordlist path
     let config_str = serde_json::json!({
         "domain": &params.domain,
@@ -589,8 +601,8 @@ async fn prepare_enum(
     }
 
     // Active wordlist - insert entries with status="queued"
-    if !params.disable_active && !params.wordlist.is_empty() {
-        let words = crate::libs::wordlist::read_lines(&params.wordlist)
+    if let Some(wordlist) = &wordlist {
+        let words = crate::libs::wordlist::read_lines(&wordlist.to_string_lossy())
             .await
             .map_err(|e| format!("Wordlist error: {e}"))?;
 
@@ -1160,4 +1172,41 @@ async fn handle_stream_takeover(
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod wordlist_tests {
+    use super::*;
+
+    fn enum_params(wordlist: &str, disable_active: bool) -> EnumParams {
+        serde_json::from_value(serde_json::json!({
+            "domain": "example.com",
+            "wordlist": wordlist,
+            "disable_active": disable_active,
+        }))
+        .expect("enum params")
+    }
+
+    #[test]
+    fn a_wordlist_outside_the_permitted_directories_is_refused() {
+        // This crate's own manifest: a readable file that is in none of the roots.
+        let outside = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+        let err = active_wordlist(&enum_params(outside, false)).expect_err("refused");
+        assert!(err.contains(dguard::WORDLIST_ROOTS_ENV), "{err}");
+    }
+
+    #[test]
+    fn a_wordlist_in_the_temp_dir_is_read_and_none_is_needed_without_active_enum() {
+        let inside = std::env::temp_dir().join(format!("voyage-wl-{}.txt", std::process::id()));
+        std::fs::write(&inside, "www\n").expect("write");
+        let got = active_wordlist(&enum_params(&inside.to_string_lossy(), false));
+        let _ = std::fs::remove_file(&inside);
+        assert!(matches!(got, Ok(Some(_))), "{got:?}");
+        let outside = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+        assert!(matches!(
+            active_wordlist(&enum_params(outside, true)),
+            Ok(None)
+        ));
+        assert!(matches!(active_wordlist(&enum_params("", false)), Ok(None)));
+    }
 }
