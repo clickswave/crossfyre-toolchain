@@ -1401,6 +1401,8 @@ mod tests {
             .expect("an ExecStart line")
     }
 
+    // Unix only: packaged installs and their systemd units are a Linux and macOS layout.
+    #[cfg(unix)]
     #[test]
     fn a_packaged_cli_in_usr_bin_has_the_unit_run_the_node_in_the_bin_dir() {
         // apt and pacman put the CLI in /usr/bin and leave the CLI to fetch the node
@@ -1424,6 +1426,8 @@ mod tests {
         assert!(unit.contains("\nEnvironment=SUDO_USER=op\n"), "{unit}");
     }
 
+    // Unix only: packaged installs and their systemd units are a Linux and macOS layout.
+    #[cfg(unix)]
     #[test]
     fn the_installer_layout_runs_the_node_beside_the_cli() {
         let unit = node_unit(

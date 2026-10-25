@@ -192,6 +192,7 @@ def run():
 /// Descriptors above 2 that this test process holds open without close-on-exec. The
 /// helper inherits these from whatever started the tests, a CI runner for one, so they
 /// say nothing about the helper.
+#[cfg(unix)]
 fn inherited_from_outside() -> Vec<i64> {
     #[cfg(target_os = "linux")]
     {
@@ -251,6 +252,8 @@ fn inherited_from_outside() -> Vec<i64> {
     }
 }
 
+// Unix only: it reads close-on-exec through fcntl, which Python has no module for on Windows.
+#[cfg(unix)]
 #[test]
 fn a_child_process_inherits_no_descriptor_but_0_1_and_2() {
     // The messages travel on a descriptor of their own, and it must close on exec. A child
@@ -388,7 +391,8 @@ fn threads_still_running_when_run_returns_finish_before_the_job_ends() {
     let r = run(&job(r#"
 import cfxs, threading, time
 def work(s, i):
-    time.sleep(0.1 * (i + 1))
+    # Far enough apart that a busy CI runner cannot reorder them.
+    time.sleep(0.4 * (i + 1))
     s.send_result({"i": i})
     if i == 2:
         s.signal.completed(4)
@@ -500,6 +504,8 @@ def run():
     assert_eq!(r.status, 1, "a script that reported failure exits 1");
 }
 
+// Unix only: on Windows the pipe is a handle of the helper's own, which closing descriptors cannot reach (see the Windows test below).
+#[cfg(unix)]
 #[test]
 fn a_script_that_closes_the_message_descriptor_is_told_so_and_the_helper_does_not_crash() {
     // A script can close descriptors it did not open, and the helper's message pipe is
@@ -527,6 +533,8 @@ def run():
     );
 }
 
+// Unix only: on Windows the pipe is not a descriptor, so no file the script opens can take its number.
+#[cfg(unix)]
 #[test]
 fn a_file_the_script_opens_on_the_message_descriptor_gets_no_messages() {
     // After closerange, the next file the script opens takes the number the message pipe
@@ -590,4 +598,34 @@ fn a_job_that_is_not_json_is_refused_with_code_two() {
     assert_eq!(r.status, 2);
     assert_eq!(types(&r), ["log", "completed"]);
     assert_eq!(r.messages[1]["code"], 2);
+}
+
+#[cfg(windows)]
+#[test]
+fn on_windows_closing_descriptors_leaves_the_message_pipe_alone() {
+    // The pipe is a handle of the helper's own, not one of the C runtime's descriptors,
+    // so a script that closes descriptors it did not open and opens a file of its own
+    // still reports everything, and its file holds only what it wrote.
+    let path = std::env::temp_dir().join(format!("cfx-script-notes-{}", std::process::id()));
+    let r = run_within(
+        &job(&format!(
+            r#"
+import cfxs, os
+def run():
+    s = cfxs.connect()
+    s.send_result({{"n": 1}})
+    os.closerange(3, 64)
+    with open({path:?}, "w") as f:
+        s.send_result({{"n": 2}})
+        f.write("notes\n")
+"#,
+            path = path.to_str().unwrap()
+        )),
+        HANG,
+    );
+    let notes = std::fs::read_to_string(&path).unwrap_or_default();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(r.status, 0, "stderr: {}", r.stderr);
+    assert_eq!(types(&r), ["result", "result", "completed"]);
+    assert_eq!(notes.replace("\r\n", "\n"), "notes\n");
 }

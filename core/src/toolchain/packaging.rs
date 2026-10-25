@@ -446,6 +446,8 @@ mod tests {
         assert_eq!(p.bin_dir(), None);
     }
 
+    // Unix only: packaged installs and their systemd units are a Linux and macOS layout.
+    #[cfg(unix)]
     #[test]
     fn a_package_that_owns_everything_names_its_bin_dir() {
         let p = parse(
@@ -502,6 +504,8 @@ mod tests {
         }
     }
 
+    // Unix only: packaged installs and their systemd units are a Linux and macOS layout.
+    #[cfg(unix)]
     #[test]
     fn root_follows_paths_only_from_a_file_root_owns() {
         let json = r#"{"manager":"brew","owns":["crossfyre"],"bin_dir":"/home/linuxbrew/b"}"#;

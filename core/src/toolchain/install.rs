@@ -1637,6 +1637,8 @@ mod tests {
         );
     }
 
+    // Unix only: packaged installs and their systemd units are a Linux and macOS layout.
+    #[cfg(unix)]
     #[test]
     fn a_packaged_cli_is_not_copied_into_the_bin_dir_and_takes_nothing_from_beside_it() {
         packaged(
@@ -1652,6 +1654,8 @@ mod tests {
         assert_eq!(sibling_of_this_binary(CFX_SCRIPT), None);
     }
 
+    // Unix only: packaged installs and their systemd units are a Linux and macOS layout.
+    #[cfg(unix)]
     #[test]
     fn the_bin_dir_a_package_names_is_where_everything_else_is() {
         packaged(

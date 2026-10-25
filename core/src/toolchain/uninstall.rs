@@ -427,6 +427,8 @@ mod tests {
         Packaging::parse(json, PathBuf::from(file), true).expect("parses")
     }
 
+    // Unix only: packaged installs and their systemd units are a Linux and macOS layout.
+    #[cfg(unix)]
     #[test]
     fn an_apt_install_loses_what_the_cli_fetched_and_keeps_the_cli() {
         let apt = packaging(
