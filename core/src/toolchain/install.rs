@@ -735,10 +735,10 @@ fn remove_one(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if bin_path.exists() {
-        fs::remove_file(&bin_path)?;
+        remove_stopped_binary(&bin_path)?;
     }
     if let Some(p) = &legacy {
-        fs::remove_file(p)?;
+        remove_stopped_binary(p)?;
     }
     for v in std::iter::once(ext_version_file(ext)).chain(legacy_version_file(ext)) {
         let _ = fs::remove_file(v);
@@ -746,6 +746,30 @@ fn remove_one(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
     ok(&format!("{name} removed"));
     end();
     Ok(())
+}
+
+/// Remove the binary of a service that has just been stopped. On Windows stopping the
+/// task ends the engine through its job object, and Windows lets go of a program's file
+/// only once the process has fully exited, which can take a moment after the stop
+/// returns, so the delete is tried again for up to 10 seconds before it gives up.
+fn remove_stopped_binary(path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        let mut tries = 0;
+        loop {
+            match fs::remove_file(path) {
+                Err(_) if tries < 40 && path.exists() => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                other => return other,
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        fs::remove_file(path)
+    }
 }
 
 /// `crossfyre update [self|<ext>|all]`. With no target: update self plus

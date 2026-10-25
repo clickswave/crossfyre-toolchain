@@ -630,7 +630,15 @@ pub fn agent_plist(
         "host".to_string(),
         engine.to_string(),
     ];
-    plist(&job_entries(label, &args, log))
+    let mut entries = job_entries(label, &args, log);
+    // An agent loads into the gui/<uid> domain when someone is logged in at the screen
+    // and into user/<uid> otherwise, and launchd refuses it there (bootstrap fails with
+    // "Input/output error") unless it may run in a background session too.
+    entries.push((
+        "LimitLoadToSessionType",
+        plist_array(&["Aqua".to_string(), "Background".to_string()]),
+    ));
+    plist(&entries)
 }
 
 /// The `KEY=VALUE` assignments in an environment file as systemd's `EnvironmentFile=`
@@ -1115,7 +1123,8 @@ mod node {
 mod imp {
     use super::super::config::ext_bin_path;
     use super::super::sudo_user::{
-        chown_to_invoking_user, cmd_as_invoking_user, invoking_user_home,
+        chown_to_invoking_user, cmd_as_invoking_user, create_dir_all_for_invoking_user,
+        invoking_user_home,
     };
     use std::fs;
 
@@ -1166,7 +1175,7 @@ mod imp {
     pub fn create(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
         let dir = unit_dir();
         let svc = service_name(super::super::public_name(ext));
-        fs::create_dir_all(&dir)?;
+        create_dir_all_for_invoking_user(&dir)?;
         fs::write(dir.join(&svc), unit_body(ext))?;
         // Written into the user's home as root - chown it back.
         chown_to_invoking_user(&dir);
@@ -1239,7 +1248,10 @@ mod imp {
 // ── macOS: launchd user agents (extensions) ───────────────────────────
 #[cfg(target_os = "macos")]
 mod imp {
-    use super::super::sudo_user::{chown_to_invoking_user, invoking_user_home, sudo_user_info};
+    use super::super::sudo_user::{
+        chown_to_invoking_user, create_dir_all_for_invoking_user, invoking_user_home,
+        sudo_user_info,
+    };
     use super::launchd;
     use std::fs;
     use std::path::PathBuf;
@@ -1268,10 +1280,9 @@ mod imp {
     pub fn create(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
         let key = super::super::public_name(ext);
         let dir = agents_dir();
-        fs::create_dir_all(&dir)?;
+        create_dir_all_for_invoking_user(&dir)?;
         let logs = super::super::config::logs_dir();
-        fs::create_dir_all(&logs)?;
-        chown_to_invoking_user(&logs);
+        create_dir_all_for_invoking_user(&logs)?;
         let fresh = !exists(key);
         let body = super::agent_plist(
             &label(key),
@@ -1520,6 +1531,21 @@ mod tests {
         assert!(plist.contains(
             "<string>extension</string>\n    <string>host</string>\n    <string>ambulo</string>"
         ));
+    }
+
+    #[test]
+    fn an_engine_agent_loads_without_a_desktop_login() {
+        // With nobody logged in at the screen (a Mac reached over SSH, or one that
+        // has just booted), only the user's background domain exists, and launchd
+        // loads an agent there only if the agent says it may run in that session.
+        let plist = agent_plist("io.crossfyre.voyage", Path::new("/c"), "voyage", Path::new("/l"));
+        assert!(
+            plist.contains(
+                "<key>LimitLoadToSessionType</key>\n  <array>\n    <string>Aqua</string>\n    \
+                 <string>Background</string>\n  </array>"
+            ),
+            "{plist}"
+        );
     }
 
     #[test]

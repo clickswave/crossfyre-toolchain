@@ -94,22 +94,21 @@ pub fn operator_account() -> Result<String, String> {
     if let Some(name) = std::env::var(OPERATOR_ENV).ok().filter(|n| !n.is_empty()) {
         return Ok(name);
     }
-    let user = std::env::var("USERNAME").unwrap_or_default();
-    let domain = std::env::var("USERDOMAIN").unwrap_or_default();
-    // LocalSystem's environment names the machine account, which owns no profile and
-    // must not be given the operator's tasks.
-    if user.is_empty() || user.ends_with('$') {
-        return Err(
+    // From the process token, not USERNAME and USERDOMAIN: over SSH USERDOMAIN is the
+    // workgroup, and a task registered for `WORKGROUP\user` is refused. LocalSystem
+    // has no profile and must not be given the operator's tasks.
+    match crate::os::process_account() {
+        Some((domain, user)) if !user.is_empty() => Ok(if domain.is_empty() {
+            user
+        } else {
+            format!("{domain}\\{user}")
+        }),
+        _ => Err(
             "this process does not know which account to act for; run the command from \
              the operator's own elevated prompt"
                 .to_string(),
-        );
+        ),
     }
-    Ok(if domain.is_empty() {
-        user
-    } else {
-        format!("{domain}\\{user}")
-    })
 }
 
 /// Build a Command that, if running under sudo, drops uid/gid back to the
@@ -138,6 +137,34 @@ pub fn cmd_as_invoking_user<S: AsRef<std::ffi::OsStr>>(program: S) -> Command {
         );
     }
     cmd
+}
+
+/// The outermost of `dir` and its ancestors that does not exist yet, which is the first
+/// directory `create_dir_all(dir)` creates. None when `dir` is already there.
+pub fn first_missing(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut missing = None;
+    let mut level = Some(dir);
+    while let Some(p) = level {
+        if p.exists() {
+            break;
+        }
+        missing = Some(p.to_path_buf());
+        level = p.parent();
+    }
+    missing
+}
+
+/// `create_dir_all`, then every directory it created handed back to the invoking user.
+/// Under sudo, creating `~/Library/LaunchAgents/` or `~/.config/crossfyre/toolchain/`
+/// made each missing level root's, and handing back only the last one left the rest
+/// root-owned in the person's home. Directories that were already there keep their owner.
+pub fn create_dir_all_for_invoking_user(dir: &std::path::Path) -> std::io::Result<()> {
+    let top = first_missing(dir);
+    std::fs::create_dir_all(dir)?;
+    if let Some(top) = top {
+        chown_to_invoking_user(&top);
+    }
+    Ok(())
 }
 
 /// Recursively chown a path tree back to the invoking user. Best-effort -
@@ -176,5 +203,24 @@ fn chown_recursive(path: &std::path::Path, uid: u32, gid: u32) {
         for entry in rd.flatten() {
             chown_recursive(&entry.path(), uid, gid);
         }
+    }
+}
+
+#[cfg(test)]
+mod create_dir_tests {
+    use super::first_missing;
+
+    #[test]
+    fn the_first_missing_level_is_the_outermost_one_created() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let deep = base.path().join("Library/Application Support/crossfyre/logs");
+        assert_eq!(first_missing(&deep), Some(base.path().join("Library")));
+        std::fs::create_dir_all(base.path().join("Library/Application Support")).expect("dirs");
+        assert_eq!(
+            first_missing(&deep),
+            Some(base.path().join("Library/Application Support/crossfyre"))
+        );
+        std::fs::create_dir_all(&deep).expect("dirs");
+        assert_eq!(first_missing(&deep), None);
     }
 }

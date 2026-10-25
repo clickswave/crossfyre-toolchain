@@ -73,7 +73,12 @@ pub fn run(scope: Scope, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
     // service (system scope). Each sub-call prints its own per-item lines.
     section("Services");
     for ext in EXTENSIONS {
-        let _ = install::remove(ext);
+        if let Err(e) = install::remove(ext) {
+            warn(&format!(
+                "could not remove {}: {e}",
+                super::public_name(ext)
+            ));
+        }
     }
     // Drop-in directories beside the units, under the public name and the legacy
     // one. `remove` leaves them, since a person wrote them and a reinstall wants

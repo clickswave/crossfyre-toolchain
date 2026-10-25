@@ -299,9 +299,7 @@ pub fn load_config() -> Result<ToolchainConfig, Box<dyn std::error::Error>> {
 
 pub fn save_config(config: &ToolchainConfig) -> Result<(), Box<dyn std::error::Error>> {
     let dir = get_toolchain_dir();
-    if !dir.exists() {
-        fs::create_dir_all(&dir)?;
-    }
+    super::sudo_user::create_dir_all_for_invoking_user(&dir)?;
 
     let path = get_config_path();
     let toml_string = toml::to_string(config)?;

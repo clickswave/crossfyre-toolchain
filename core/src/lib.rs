@@ -1604,9 +1604,25 @@ pub async fn run_init(
     for ext in &selected_extensions {
         let name = toolchain::public_name(ext);
         if toolchain::config::is_extension_installed(ext) {
-            ok(&format!("{name} already installed"));
-            let _ = toolchain::service::enable(ext);
-            let _ = toolchain::service::start(ext);
+            // Installed before this node was set up (by an earlier init, by
+            // `extension install`, or by a package), which is no promise that its
+            // service exists: register it if it does not, then enable and start it,
+            // and say so if any of that fails rather than reporting it ready.
+            let ready = if toolchain::service::has_service_file(ext) {
+                Ok(())
+            } else {
+                toolchain::service::create_service_file(ext)
+            };
+            match ready
+                .and_then(|()| toolchain::service::enable(ext))
+                .and_then(|()| toolchain::service::start(ext))
+            {
+                Ok(()) => ok(&format!("{name} already installed, started")),
+                Err(e) => {
+                    fail(&format!("{name} is installed but its service did not start: {e}"));
+                    hint(&format!("Run manually: crossfyre extension install {name}"));
+                }
+            }
             continue;
         }
         working(&format!("Installing {name}"));

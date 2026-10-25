@@ -40,6 +40,66 @@ pub fn is_elevated() -> bool {
     }
 }
 
+/// The account this process runs as, from its token: `(domain, name)` as Windows
+/// resolves them, so a local account's domain is its machine name and a domain
+/// account's is its domain. Not the USERDOMAIN variable, which a Windows OpenSSH
+/// session sets to the workgroup, and `WORKGROUP\user` names no account. None for
+/// LocalSystem, which owns no profile and must not be anyone's operator.
+#[cfg(windows)]
+pub fn process_account() -> Option<(String, String)> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, IsWellKnownSid, LookupAccountSidW, SID_NAME_USE, TOKEN_QUERY,
+        TOKEN_USER, TokenUser, WinLocalSystemSid,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: the token handle is closed before returning, GetTokenInformation writes
+    // at most `buf.len()` bytes into `buf`, which is u64-aligned for TOKEN_USER, and
+    // LookupAccountSidW writes at most the lengths it is given.
+    unsafe {
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return None;
+        }
+        let mut buf = vec![0u64; 64];
+        let mut len = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenUser,
+            buf.as_mut_ptr().cast(),
+            (buf.len() * 8) as u32,
+            &mut len,
+        );
+        CloseHandle(token);
+        if ok == 0 {
+            return None;
+        }
+        let sid = (*(buf.as_ptr() as *const TOKEN_USER)).User.Sid;
+        if IsWellKnownSid(sid, WinLocalSystemSid) != 0 {
+            return None;
+        }
+        let mut name = vec![0u16; 256];
+        let mut domain = vec![0u16; 256];
+        let (mut name_len, mut domain_len) = (name.len() as u32, domain.len() as u32);
+        let mut kind: SID_NAME_USE = 0;
+        if LookupAccountSidW(
+            std::ptr::null(),
+            sid,
+            name.as_mut_ptr(),
+            &mut name_len,
+            domain.as_mut_ptr(),
+            &mut domain_len,
+            &mut kind,
+        ) == 0
+        {
+            return None;
+        }
+        let name = String::from_utf16_lossy(&name[..name_len as usize]);
+        let domain = String::from_utf16_lossy(&domain[..domain_len as usize]);
+        Some((domain, name))
+    }
+}
+
 /// `command` as a person runs it with administrative rights: under sudo on Unix, from an
 /// elevated prompt on Windows.
 pub fn elevated(command: &str) -> String {
