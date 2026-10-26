@@ -33,6 +33,13 @@
 // root follows `bin_dir` and `cli_path` only from a file that root owns, because they say
 // where the binaries root runs are put and found.
 //
+// On Windows there is no such file. Scoop and winget run no script of the package's
+// that could write one, and the owner and mode checks above have no Windows
+// counterpart here. What they install sits at a path of their own making, so the CLI
+// knows those layouts instead (`windows_layout`): a crossfyre.exe Scoop or winget
+// unpacked is theirs to update, and the rest is fetched as for the installer. Nothing
+// in a path decides where binaries go, so there is nothing for a planted path to steer.
+//
 // The node worker is fetched by the CLI rather than installed beside it, so it cannot
 // find the file from its own location. The node unit names the CLI that set it up in
 // `CROSSFYRE_CLI`, and the node reads the file from there (`set_cli`).
@@ -54,9 +61,14 @@ pub enum Manager {
     Brew,
     Nix,
     Container,
+    /// Known from where Scoop unpacks an app on Windows, never from a file.
+    Scoop,
+    /// Known from where winget unpacks a portable package on Windows, never from a file.
+    Winget,
 }
 
 impl Manager {
+    /// The managers a `packaging.json` may name.
     const ALL: [Manager; 5] = [
         Manager::Apt,
         Manager::Pacman,
@@ -73,6 +85,8 @@ impl Manager {
             Manager::Brew => "brew",
             Manager::Nix => "nix",
             Manager::Container => "container",
+            Manager::Scoop => "scoop",
+            Manager::Winget => "winget",
         }
     }
 
@@ -232,9 +246,66 @@ fn candidates(exe: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Look for the `packaging.json` that describes the executable at `exe`.
+/// The Scoop or winget install that the executable at `exe` sits in, if it sits in one,
+/// from the path alone. Scoop unpacks an app into `<root>\apps\crossfyre\<version>\`
+/// and points `current` beside it at the newest; winget unpacks a portable package into
+/// `<WinGet>\Packages\Clickswave.Crossfyre_<source>\` and links it from
+/// `<WinGet>\Links`. Either way the CLI is named by the path that survives an upgrade.
+fn windows_layout(exe: &Path) -> Option<Packaging> {
+    let named = |p: Option<&Path>, want: &str| {
+        p.and_then(Path::file_name)
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case(want))
+    };
+    let exe_name = exe.file_name()?.to_str()?;
+    if !exe_name.eq_ignore_ascii_case("crossfyre.exe") {
+        return None;
+    }
+    let dir = exe.parent()?;
+    let packaged = |manager, cli: PathBuf| Packaging {
+        manager,
+        owns: vec!["crossfyre"],
+        bin_dir: None,
+        cli_path: Some(cli),
+        file: exe.to_path_buf(),
+        root_owned: false,
+    };
+    let app = dir.parent();
+    if named(app, "crossfyre") && named(app.and_then(Path::parent), "apps") {
+        let app = app?;
+        return Some(packaged(Manager::Scoop, app.join("current").join(exe_name)));
+    }
+    // The zip's own top directory sits inside the package's.
+    for package in [dir, dir.parent()?] {
+        let is_ours = package
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("Clickswave.Crossfyre_"));
+        let packages = package.parent();
+        if is_ours
+            && named(packages, "Packages")
+            && named(packages.and_then(Path::parent), "WinGet")
+        {
+            let winget = packages?.parent()?;
+            return Some(packaged(
+                Manager::Winget,
+                winget.join("Links").join(exe_name),
+            ));
+        }
+    }
+    None
+}
+
+/// Look for the `packaging.json` that describes the executable at `exe`, or on Windows
+/// the Scoop or winget install it sits in.
 pub fn discover_from(exe: &Path) -> Found {
     let exe = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+    if cfg!(windows) {
+        return match windows_layout(&exe) {
+            Some(p) => Found::Packaged(p),
+            None => Found::None,
+        };
+    }
     let Some(file) = candidates(&exe)
         .into_iter()
         .find(|p| std::fs::symlink_metadata(p).is_ok())
@@ -735,5 +806,111 @@ mod tests {
             remove_note(Manager::Pacman),
             "installed by pacman; remove it with pacman"
         );
+    }
+
+    // The layouts are read from the path alone, so these run everywhere; `/` separates
+    // components on Windows as well.
+    #[test]
+    fn scoop_owns_the_cli_it_unpacked_and_names_it_by_current() {
+        for exe in [
+            "C:/Users/u/scoop/apps/crossfyre/0.1.37/crossfyre.exe",
+            "C:/Users/u/scoop/apps/crossfyre/current/crossfyre.exe",
+            "C:/ProgramData/scoop/Apps/Crossfyre/0.1.37/CROSSFYRE.EXE",
+        ] {
+            let p = windows_layout(Path::new(exe)).unwrap_or_else(|| panic!("{exe}"));
+            assert_eq!(p.manager, Manager::Scoop, "{exe}");
+            assert_eq!(p.owned(), ["crossfyre"], "{exe}");
+            assert_eq!(p.bin_dir, None, "{exe}");
+        }
+        let p = windows_layout(Path::new(
+            "C:/Users/u/scoop/apps/crossfyre/0.1.37/crossfyre.exe",
+        ))
+        .expect("scoop");
+        assert_eq!(
+            p.cli_path,
+            Some(PathBuf::from(
+                "C:/Users/u/scoop/apps/crossfyre/current/crossfyre.exe"
+            ))
+        );
+        assert_eq!(
+            update_note(p.manager),
+            "installed by scoop; update it with scoop"
+        );
+    }
+
+    #[test]
+    fn winget_owns_the_cli_it_unpacked_and_names_it_by_its_link() {
+        let base = "C:/Users/u/AppData/Local/Microsoft/WinGet";
+        for exe in [
+            format!(
+                "{base}/Packages/Clickswave.Crossfyre_Microsoft.Winget.Source_8wekyb3d8bbwe/crossfyre-v0.1.37-windows-x86_64/crossfyre.exe"
+            ),
+            format!("{base}/Packages/Clickswave.Crossfyre__DefaultSource/crossfyre.exe"),
+        ] {
+            let p = windows_layout(Path::new(&exe)).unwrap_or_else(|| panic!("{exe}"));
+            assert_eq!(p.manager, Manager::Winget, "{exe}");
+            assert_eq!(p.owned(), ["crossfyre"], "{exe}");
+            assert_eq!(p.bin_dir, None, "{exe}");
+            assert_eq!(
+                p.cli_path,
+                Some(PathBuf::from(format!("{base}/Links/crossfyre.exe")))
+            );
+        }
+    }
+
+    #[test]
+    fn other_windows_paths_are_the_installer_s() {
+        for exe in [
+            "C:/Program Files/Crossfyre/bin/crossfyre.exe",
+            "C:/Users/u/Downloads/crossfyre-v0.1.37-windows-x86_64/crossfyre.exe",
+            // Another app of Scoop's, or another package of winget's.
+            "C:/Users/u/scoop/apps/other/1.0/crossfyre.exe",
+            "C:/Users/u/AppData/Local/Microsoft/WinGet/Packages/Someone.Else_x/crossfyre.exe",
+            // The node worker beside a Scoop CLI is not the CLI.
+            "C:/Users/u/scoop/apps/crossfyre/0.1.37/node.exe",
+        ] {
+            assert!(windows_layout(Path::new(exe)).is_none(), "{exe}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_finds_a_scoop_install_on_disk_and_reads_no_json() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root
+            .path()
+            .join("scoop")
+            .join("apps")
+            .join("crossfyre")
+            .join("0.1.37");
+        fs::create_dir_all(&dir).expect("dirs");
+        let exe = dir.join("crossfyre.exe");
+        fs::write(&exe, "binary").expect("exe");
+        fs::write(
+            dir.join(FILE_NAME),
+            r#"{"manager":"apt","owns":["crossfyre"]}"#,
+        )
+        .expect("json");
+        match discover_from(&exe) {
+            Found::Packaged(p) => assert_eq!(p.manager, Manager::Scoop),
+            other => panic!("{other:?}"),
+        }
+        let elsewhere = root.path().join("crossfyre.exe");
+        fs::write(&elsewhere, "binary").expect("exe");
+        fs::write(
+            root.path().join(FILE_NAME),
+            r#"{"manager":"apt","owns":["crossfyre"]}"#,
+        )
+        .expect("json");
+        assert_eq!(discover_from(&elsewhere), Found::None);
+    }
+
+    #[test]
+    fn json_cannot_claim_scoop_or_winget() {
+        for m in ["scoop", "winget"] {
+            let err = parse(&format!(r#"{{"manager":"{m}","owns":["crossfyre"]}}"#))
+                .expect_err("refused");
+            assert!(err.contains("is not one of"), "{err}");
+        }
     }
 }
