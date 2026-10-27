@@ -473,8 +473,8 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       # Ignored by ID, with the reasoning recorded so it can be re-checked
-      # rather than inherited on faith. Re-examine both whenever rsa or
-      # rustls-pemfile move.
+      # rather than inherited on faith. Re-examine each whenever rsa,
+      # rustls-pemfile or boring2 move.
       #
       #   RUSTSEC-2023-0071  rsa: Marvin timing sidechannel in RSA decryption.
       #     Open since 2023; the fix needs modular exponentiation reworked
@@ -498,6 +498,20 @@ jobs:
       #     not a vulnerability, on a crate reached via axum-server and
       #     rustls-native-certs.
       #
+      #   RUSTSEC-2026-0391, RUSTSEC-2026-0398, RUSTSEC-2026-0403  zstd 0.13 and
+      #     zstd-safe 7. Everything of ours is on the patched zstd 0.14.3 and
+      #     zstd-safe 8.2.0; the old pair is left only by boring2 4.15.15 (the
+      #     impersonate build), whose last stable release still asks for 0.13.
+      #     boring2 calls nothing but zstd::encode_all and zstd::decode_all, for
+      #     TLS certificate compression. 0391 is in the with_context
+      #     constructors, which those never use; 0398 is in the seekable
+      #     feature, which nothing enables; 0403 is in DCtx::decompress_stream,
+      #     and the advisory names decode_all as unaffected. Drop all three once
+      #     boring2 moves to zstd 0.14.
+      #
       # Everything else must stay visible and get fixed.
       - name: Audit
-        run: cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2025-0134
+        run: >-
+          cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2025-0134
+          --ignore RUSTSEC-2026-0391 --ignore RUSTSEC-2026-0398
+          --ignore RUSTSEC-2026-0403

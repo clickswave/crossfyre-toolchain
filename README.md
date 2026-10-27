@@ -11,6 +11,8 @@
 
 Five scanning engines you run from the terminal, on systems you are authorized to test. Each one works on its own, with no account, and nothing leaves your machine unless you connect it to the [Crossfyre platform](https://crossfyre.io) yourself.
 
+![doorward, toolmark, ambulo and plessor run against a lab network: open ports with services and banners, the web stack, discovered paths, and findings piped through jq](.github/assets/demo.gif)
+
 | Engine | What it does |
 | --- | --- |
 | [`voyage`](voyage/) | Finds subdomains, from passive sources and wordlist brute-forcing. |
@@ -62,16 +64,18 @@ The keyring is installed only if its SHA-256 matches. Its key's fingerprint is `
 
 ```sh
 # Subdomains of a domain
-voyage scan --domain example.com --wordlist-path ./subdomains.txt
+voyage scan --domain example.com --wordlist-path /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt
 
 # Ports and services across a range
 doorward scan --targets 10.0.0.0/24 --ports top-1000 --service-detection
 
 # Content discovery, fuzzing the path at ::FUZZ::
-ambulo scan --url https://example.com/::FUZZ:: --wordlist-path ./wordlist.txt
+ambulo scan --url https://example.com/::FUZZ:: --wordlist-path /usr/share/seclists/Discovery/Web-Content/common.txt
 ```
 
-In a terminal you get a live dashboard. Piped or redirected, every engine writes newline-delimited JSON instead, one event per line, and exits non-zero if the run ends in an error. `voyage`, `doorward` and `ambulo` save findings as they go, so a stopped scan resumes where it left off. Add `--help` to any command for the rest.
+Wordlists are read only from a few directories, since the daemon would otherwise read any file a request names: `/usr/share/wordlists`, `/usr/share/seclists` and the temp directory on Linux, and Homebrew's seclists on macOS. Add your own with `CFX_WORDLIST_ROOTS`, separated like `PATH`.
+
+In a terminal `voyage`, `doorward` and `ambulo` draw a live dashboard. `toolmark` and `plessor` finish a single target in seconds, so they print JSON unless you put `--tui` before `scan`, as in `toolmark --tui scan https://example.com`. Piped or redirected, every engine writes newline-delimited JSON, one event per line, and exits non-zero if the run ends in an error. `voyage`, `doorward` and `ambulo` save findings as they go, so a stopped scan resumes where it left off. Add `--help` to any command for the rest.
 
 ## When one machine is not enough
 
@@ -95,6 +99,13 @@ cargo build --release
 ```
 
 Or install one engine with `cargo install --git https://github.com/clickswave/crossfyre-toolchain.git ambulo`.
+
+A source build sets up no services, so before the first scan start the Postgres container the engines keep their state in (this needs Docker), then the daemon of each engine you use:
+
+```sh
+crossfyre db up
+ambulo --daemon &
+```
 
 `cfx-script` embeds Python, so building it needs one. On Linux that is your distribution's Python and its development files. On macOS it has to be Python 3.10 or later, and the `python3` that comes with the Xcode command line tools is 3.9, so name another one: `PYO3_PYTHON=/opt/homebrew/bin/python3 cargo build --release`. Windows needs no Python to build it, and Python 3.10 or later to run scripts.
 

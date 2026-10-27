@@ -28,7 +28,7 @@ log = "0.4"
 # them. Decoder-only use, on bytes we already hold in memory.
 flate2 = "1.1"
 brotli = { version = "8", default-features = false, features = ["std"] }
-zstd = "0.13"
+zstd = "0.14"
 # One header, Proxy-Authorization, and a hand-rolled encoder for it is the kind of thing
 # that is wrong in one corner and silently refuses every credential.
 base64 = "0.22"

@@ -169,7 +169,6 @@ impl Prober {
     pub async fn calibrate(&mut self) {
         let bases = self.config.url.clone();
         let Some(base) = bases.first() else { return };
-        let b = base.trim_end_matches('/');
         let synthetic = [
             "cfx404probe-zqx1w9",
             "this-path-should-not-exist-8f3a2b",
@@ -178,7 +177,7 @@ impl Prober {
         let mut hits: Vec<(u16, i64)> = Vec::new();
         for p in synthetic {
             let work = Work {
-                url: format!("{b}/{p}"),
+                url: calibration_url(base, &self.config.fuzz_marker, p),
                 entry_id: -1,
                 method: "get".to_string(),
             };
@@ -337,5 +336,44 @@ impl Prober {
                 final_url,
             },
         })
+    }
+}
+
+/// The URL a calibration probe requests: the synthetic word where a wordlist entry
+/// would go, so the baseline describes the page a real miss gets. A URL with no
+/// marker is probed beneath it.
+fn calibration_url(base: &str, marker: &str, word: &str) -> String {
+    if base.contains(marker) {
+        base.replace(marker, word)
+    } else {
+        format!("{}/{word}", base.trim_end_matches('/'))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_calibration_probe_takes_the_place_of_the_marker() {
+        // Appended after the marker, the probe asked for `/::FUZZ::/probe`, a
+        // path no wordlist entry ever produces, so the baseline described the
+        // wrong page.
+        assert_eq!(
+            calibration_url("http://h/::FUZZ::", "::FUZZ::", "probe"),
+            "http://h/probe"
+        );
+        assert_eq!(
+            calibration_url("http://h/api/::FUZZ::.json", "::FUZZ::", "probe"),
+            "http://h/api/probe.json"
+        );
+    }
+
+    #[test]
+    fn a_url_without_a_marker_is_probed_beneath_it() {
+        assert_eq!(
+            calibration_url("http://h/app/", "::FUZZ::", "probe"),
+            "http://h/app/probe"
+        );
     }
 }

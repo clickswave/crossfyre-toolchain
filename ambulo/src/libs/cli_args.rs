@@ -207,7 +207,7 @@ pub struct ScanArgs {
     pub random_user_agent_request: bool,
 
     /// Append trailing slash to URLs
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = false)]
     pub append_slash: bool,
 
     /// Save response body for each request
@@ -414,5 +414,40 @@ impl ScanArgs {
             .map_err(|e| e.to_string())?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scan_args(argv: &[&str]) -> ScanArgs {
+        match Cli::try_parse_from(argv).unwrap().command {
+            Some(Commands::Scan(args)) => args,
+            other => panic!("not a scan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_word_is_requested_as_written() {
+        // `index.php/` is a different resource from `index.php`, and on most
+        // servers a missing one. The slash was on by default with no way to
+        // turn it off, so every file in a wordlist was requested as a directory.
+        let mut args = scan_args(&["ambulo", "scan", "--url", "http://h/::FUZZ::"]);
+        args.validate_urls().unwrap();
+        assert_eq!(args.url, ["http://h/::FUZZ::"]);
+    }
+
+    #[test]
+    fn append_slash_asks_for_directories() {
+        let mut args = scan_args(&[
+            "ambulo",
+            "scan",
+            "--url",
+            "http://h/::FUZZ::",
+            "--append-slash",
+        ]);
+        args.validate_urls().unwrap();
+        assert_eq!(args.url, ["http://h/::FUZZ::/"]);
     }
 }

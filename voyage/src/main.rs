@@ -54,7 +54,7 @@ fn load_toolchain_config() -> Result<ToolchainConfig, Box<dyn std::error::Error>
 
     let contents = std::fs::read_to_string(&config_path).map_err(|e| {
         format!(
-            "Cannot read toolchain config at {}: {}. Run 'crossfyre init' first.",
+            "Cannot read toolchain config at {}: {}. Run 'crossfyre db up' first.",
             config_path.display(),
             e
         )

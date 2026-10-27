@@ -229,11 +229,14 @@ pub fn is_error(line: &str) -> bool {
     // detail in `message`, so only the discriminator differs. Accept either: a
     // client that understands one of them exits 0 on half the failures, which
     // is how `doorward exec` reported success on an unknown operation.
-    ["type", "status"]
-        .iter()
-        .filter_map(|k| v.get(*k))
-        .filter_map(|x| x.as_str())
-        .any(|x| x == "error")
+    //
+    // A line with a `type` is decided by it alone. Its `status` belongs to what
+    // the event describes: an ambulo result for one URL that could not be fetched
+    // says `"status":"error"`, and the scan carries on past it.
+    match v.get("type") {
+        Some(kind) => kind.as_str() == Some("error"),
+        None => v.get("status").and_then(|s| s.as_str()) == Some("error"),
+    }
 }
 
 #[cfg(test)]
@@ -264,6 +267,16 @@ mod is_error_tests {
         // `status` also carries port state, which must not read as a failure.
         assert!(!is_error(r#"{"status":"open","port":443}"#));
         assert!(!is_error(r#"{"status":"closed","port":22}"#));
+    }
+
+    #[test]
+    fn one_failed_request_in_a_stream_is_not_a_failed_run() {
+        // ambulo reports a URL it could not fetch as a result whose status is
+        // `error`, and the scan goes on. Read as terminal, it ended a piped scan
+        // halfway through a wordlist with exit 1.
+        assert!(!is_error(
+            r#"{"type":"result","url":"http://h/x","status":"error","code":"0"}"#
+        ));
     }
 
     #[test]
