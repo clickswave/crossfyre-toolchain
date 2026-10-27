@@ -37,13 +37,34 @@ of checks it could actually reproduce, not a pile of maybes.
 
 ## Templates
 
-Point plessor at a directory of templates with `PLESSOR_TEMPLATES_DIR`. The built-in
-checks always run; anything in that directory runs on top. plessor reads the nuclei
-format (a supported subset: matchers, status/word/regex/dsl conditions, and payload
-fuzzing), so a lot of existing packs work as-is.
+`plessor scan` runs the built-in checks and the starter pack in
+[`templates/`](templates/), which is compiled into the binary, so an installed copy
+needs no folder beside it. Add your own with `--templates`:
 
-This repo ships a starter pack, grouped by category, in [`templates/`](templates/).
-Its [README](templates/README.md) covers the layout and how to write your own.
+```sh
+plessor scan https://example.com --templates ./my-templates
+```
+
+plessor reads the nuclei format (a supported subset: matchers, status/word/regex/dsl
+conditions, and payload fuzzing), so a lot of existing packs work as-is. A template in
+your folder replaces a pack template with the same `id`. The pack's
+[README](templates/README.md) covers the layout and how to write your own.
+
+## Injection
+
+`plessor inject` tests the parameters of URLs you give it: SQL, command and template
+injection, XSS, file inclusion and the rest of the injection engine. Every query
+parameter is tried, and `-d` sends a form as a POST and tests its fields too. A
+cookie or headers carry a login:
+
+```sh
+plessor inject 'https://example.com/item?id=1' --cookie 'session=...'
+plessor inject https://example.com/search -d 'q=shoes&page=1' -H 'Authorization: Bearer ...'
+```
+
+With no URLs it reads them from stdin, one per line, so another engine's output can
+be piped in. It only sends GET and POST: a DELETE, PUT or PATCH could change or
+remove what it tests, and the engine needs a separate opt-in for those.
 
 ## Out-of-band confirmation
 

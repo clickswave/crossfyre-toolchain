@@ -992,6 +992,20 @@ pub static BUILTIN: LazyLock<Vec<Template>> = LazyLock::new(|| {
         .collect()
 });
 
+// `PACK_YAML`: every file under templates/, as (path, text), written by build.rs.
+include!(concat!(env!("OUT_DIR"), "/pack.rs"));
+
+/// The starter pack in templates/, compiled in. Parsed with the same rules as
+/// `load_dir`, so a file that does not parse, or carries no request, is skipped
+/// here exactly as it would be from disk.
+pub static PACK: LazyLock<Vec<Template>> = LazyLock::new(|| {
+    PACK_YAML
+        .iter()
+        .filter_map(|(_, y)| serde_yaml::from_str::<Template>(y).ok())
+        .filter(|t| !t.http.is_empty())
+        .collect()
+});
+
 /// Load external nuclei templates (*.yaml / *.yml) from a directory, recursing
 /// into subdirectories so a categorized pack (technologies/, exposures/, cves/,
 /// ...) loads as one set. Templates that fail to parse against the supported
@@ -1169,6 +1183,27 @@ mod tests {
                 .iter()
                 .any(|t| t.id == "debug-stacktrace-disclosure")
         );
+    }
+
+    /// The pack compiled into the binary is the pack on disk, all of it, and none
+    /// of it shadows a built-in check. A stale or partial build would scan with
+    /// fewer templates than the repository shows, and nothing else would say so.
+    #[test]
+    fn the_compiled_pack_is_the_templates_folder() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/templates");
+        let mut on_disk: Vec<String> = super::load_dir(dir).into_iter().map(|t| t.id).collect();
+        let mut compiled: Vec<String> = super::PACK.iter().map(|t| t.id.clone()).collect();
+        on_disk.sort();
+        compiled.sort();
+        assert_eq!(compiled, on_disk);
+        assert_eq!(super::PACK_YAML.len(), walk_yaml(std::path::Path::new(dir)));
+        for t in super::PACK.iter() {
+            assert!(
+                !super::BUILTIN.iter().any(|b| b.id == t.id),
+                "pack template {} has a built-in check's id",
+                t.id
+            );
+        }
     }
 
     fn walk_yaml(dir: &std::path::Path) -> usize {

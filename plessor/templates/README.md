@@ -1,11 +1,10 @@
 # Plessor templates
 
-Detection templates the plessor engine loads at run time, on top of the checks built
-into the binary. The format is a practical subset of the nuclei schema, so many
-existing nuclei templates work here unchanged.
+The starter pack `plessor scan` runs on top of its built-in checks. The folder is
+compiled into the binary, so every installed copy has it. The format is a practical
+subset of the nuclei schema, so many existing nuclei templates work here unchanged.
 
-Point plessor at this folder with `PLESSOR_TEMPLATES_DIR`. It reads the folder
-recursively, so the subdirectories below are just categories.
+The folder is read recursively, so the subdirectories below are just categories.
 
 ## Categories
 
@@ -21,9 +20,11 @@ recursively, so the subdirectories below are just categories.
 
 ## Adding a template
 
-Drop a `.yaml` file into the category folder it fits, and give it a unique `id`.
-plessor picks it up the next time it starts. A file that fails to parse, or uses a
-feature plessor does not support, is skipped without breaking the rest.
+Drop a `.yaml` file into the category folder it fits, and give it a unique `id`. A
+template here ships in the next build; to run one before that, keep it in a folder
+of your own and pass `plessor scan <target> --templates <folder>`. A file that fails
+to parse, or uses a feature plessor does not support, is skipped without breaking
+the rest, and the test suite fails if one in this folder does.
 
 ## Writing good templates
 
