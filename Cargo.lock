@@ -3411,7 +3411,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "plessor"
-version = "0.0.27"
+version = "0.0.28"
 dependencies = [
  "adaptive",
  "aes-gcm",
