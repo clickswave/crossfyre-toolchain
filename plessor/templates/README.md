@@ -20,7 +20,8 @@ The folder is read recursively, so the subdirectories below are just categories.
 
 ## Adding a template
 
-Drop a `.yaml` file into the category folder it fits, and give it a unique `id`. A
+Drop a `.yaml` file into the category folder it fits, give it a unique `id`, and add
+a line for it to `src/template/pack.rs` (the tests name any file missing there). A
 template here ships in the next build; to run one before that, keep it in a folder
 of your own and pass `plessor scan <target> --templates <folder>`. A file that fails
 to parse, or uses a feature plessor does not support, is skipped without breaking

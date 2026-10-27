@@ -992,8 +992,8 @@ pub static BUILTIN: LazyLock<Vec<Template>> = LazyLock::new(|| {
         .collect()
 });
 
-// `PACK_YAML`: every file under templates/, as (path, text), written by build.rs.
-include!(concat!(env!("OUT_DIR"), "/pack.rs"));
+mod pack;
+use pack::PACK_YAML;
 
 /// The starter pack in templates/, compiled in. Parsed with the same rules as
 /// `load_dir`, so a file that does not parse, or carries no request, is skipped
@@ -1186,17 +1186,27 @@ mod tests {
     }
 
     /// The pack compiled into the binary is the pack on disk, all of it, and none
-    /// of it shadows a built-in check. A stale or partial build would scan with
-    /// fewer templates than the repository shows, and nothing else would say so.
+    /// of it shadows a built-in check. src/template/pack.rs lists the files by
+    /// hand, so a template added to the folder and not to the list would ship
+    /// in the repository and never run.
     #[test]
     fn the_compiled_pack_is_the_templates_folder() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/templates");
+        let listed: Vec<&str> = super::PACK_YAML.iter().map(|(p, _)| *p).collect();
+        let missing: Vec<String> = yaml_paths(std::path::Path::new(dir), "")
+            .into_iter()
+            .filter(|p| !listed.contains(&p.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "in templates/ but not in src/template/pack.rs: {missing:?}"
+        );
+        assert_eq!(super::PACK_YAML.len(), walk_yaml(std::path::Path::new(dir)));
         let mut on_disk: Vec<String> = super::load_dir(dir).into_iter().map(|t| t.id).collect();
         let mut compiled: Vec<String> = super::PACK.iter().map(|t| t.id.clone()).collect();
         on_disk.sort();
         compiled.sort();
         assert_eq!(compiled, on_disk);
-        assert_eq!(super::PACK_YAML.len(), walk_yaml(std::path::Path::new(dir)));
         for t in super::PACK.iter() {
             assert!(
                 !super::BUILTIN.iter().any(|b| b.id == t.id),
@@ -1204,6 +1214,27 @@ mod tests {
                 t.id
             );
         }
+    }
+
+    /// Every .yaml and .yml under `dir`, as a path relative to it with forward
+    /// slashes, the way pack.rs names them.
+    fn yaml_paths(dir: &std::path::Path, prefix: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return out;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().into_owned();
+            if p.is_dir() {
+                if !name.starts_with('.') {
+                    out.extend(yaml_paths(&p, &format!("{prefix}{name}/")));
+                }
+            } else if name.ends_with(".yaml") || name.ends_with(".yml") {
+                out.push(format!("{prefix}{name}"));
+            }
+        }
+        out
     }
 
     fn walk_yaml(dir: &std::path::Path) -> usize {
