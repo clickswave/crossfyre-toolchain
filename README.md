@@ -19,7 +19,7 @@ Five scanning engines you run from the terminal, on systems you are authorized t
 | [`doorward`](doorward/) | Scans hosts and ports, with service detection. |
 | [`ambulo`](ambulo/) | Fuzzes paths and parameters to discover content. |
 | [`toolmark`](toolmark/) | Fingerprints services and technologies, and flags CVE leads by version. |
-| [`plessor`](plessor/) | Tests for vulnerabilities with nuclei-compatible templates, and confirms each finding before it reports it. |
+| [`plessor`](plessor/) | Tests for vulnerabilities with nuclei-compatible templates and an injection engine, and confirms each finding before it reports it. |
 
 Alongside them: [`crossfyre`](crossfyre/), the CLI that installs and updates everything, [`node`](node/), the agent that runs the engines for the platform, [`oast`](oast/), an out-of-band server you can host so `plessor` confirms blind bugs on your own domain, and [`mobile`](mobile/), Crossfyre Mobile for Android.
 

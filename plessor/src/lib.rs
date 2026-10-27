@@ -74,11 +74,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Some(Commands::Scan(args)) => {
-            let req = serde_json::json!({
-                "operation": "scan",
-                "response": "stream",
-                "target": args.target,
-            });
+            let req = scan_request(&args.target, args.templates.as_deref())?;
             send_stream(
                 cli.port,
                 req,
@@ -86,6 +82,38 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 args.target.clone(),
             )
             .await
+        }
+        Some(Commands::Inject(args)) => {
+            let mut urls = args.urls.clone();
+            if urls.is_empty() {
+                use std::io::{BufRead, IsTerminal};
+                let stdin = std::io::stdin();
+                if stdin.is_terminal() {
+                    return Err("give URLs to test, or pipe them in one per line".into());
+                }
+                for line in stdin.lock().lines() {
+                    let line = line?;
+                    if !line.trim().is_empty() {
+                        urls.push(line.trim().to_string());
+                    }
+                }
+            }
+            let batches = inject_requests(
+                &urls,
+                args.cookie.as_deref(),
+                &args.headers,
+                args.data.as_deref(),
+            )?;
+            for (origin, req) in batches {
+                send_stream(
+                    cli.port,
+                    req,
+                    cfx_tui::wanted(cli.tui, cli.no_tui, false),
+                    origin,
+                )
+                .await?;
+            }
+            Ok(())
         }
         Some(Commands::Exec(args)) => {
             let mut payload: serde_json::Value =
@@ -104,11 +132,107 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         None => {
             eprintln!(
-                "No command given. Use `plessor scan <target>`, `plessor exec <json>`, or `plessor --daemon`."
+                "No command given. Use `plessor scan <target>`, `plessor inject <url>...`, `plessor exec <json>`, or `plessor --daemon`."
             );
             std::process::exit(1);
         }
     }
+}
+
+/// The daemon request for `plessor scan`.
+///
+/// It asks for the starter pack, which the daemon leaves off for anyone who does
+/// not ask (the node sends its own scans). A templates directory goes as an
+/// absolute path, because the daemon resolves it from its own working directory,
+/// which is wherever its service started it.
+fn scan_request(target: &str, templates: Option<&str>) -> Result<serde_json::Value, String> {
+    let mut req = serde_json::json!({
+        "operation": "scan",
+        "response": "stream",
+        "target": target,
+        "pack": true,
+    });
+    if let Some(dir) = templates {
+        let abs = std::fs::canonicalize(dir)
+            .ok()
+            .filter(|p| p.is_dir())
+            .ok_or_else(|| format!("--templates {dir}: not a directory"))?;
+        req["templates_dir"] = serde_json::json!(abs.to_string_lossy());
+    }
+    Ok(req)
+}
+
+/// The daemon requests for `plessor inject`, one per origin, each paired with the
+/// origin it targets.
+///
+/// One per origin because the injection pass drops any endpoint on a host other
+/// than its target, so URLs from two hosts in one request would test only the
+/// first host's and say nothing about the rest. Origins keep the order their first
+/// URL arrived in.
+fn inject_requests(
+    urls: &[String],
+    cookie: Option<&str>,
+    headers: &[String],
+    data: Option<&str>,
+) -> Result<Vec<(String, serde_json::Value)>, String> {
+    let mut header_map = serde_json::Map::new();
+    for h in headers {
+        let (name, value) = h
+            .split_once(':')
+            .ok_or_else(|| format!("-H {h:?}: expected \"Name: value\""))?;
+        header_map.insert(name.trim().to_string(), serde_json::json!(value.trim()));
+    }
+    // Decoded as a form is, so `a=b+c` tests the value "b c".
+    let body: Vec<serde_json::Value> = match data {
+        Some(d) => reqwest::Url::parse(&format!("http://form.invalid/?{d}"))
+            .map_err(|e| format!("-d {d:?}: {e}"))?
+            .query_pairs()
+            .map(|(k, v)| serde_json::json!({ "name": k, "value": v }))
+            .collect(),
+        None => Vec::new(),
+    };
+    let method = if data.is_some() { "POST" } else { "GET" };
+
+    let mut batches: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
+    for raw in urls {
+        let url = reqwest::Url::parse(raw).map_err(|e| format!("{raw}: {e}"))?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return Err(format!("{raw}: not an http or https URL"));
+        }
+        let origin = url.origin().ascii_serialization();
+        let endpoint = serde_json::json!({
+            "method": method,
+            "url": url.as_str(),
+            "body": body,
+            "body_type": "form",
+        });
+        match batches.iter_mut().find(|(o, _)| *o == origin) {
+            Some((_, endpoints)) => endpoints.push(endpoint),
+            None => batches.push((origin, vec![endpoint])),
+        }
+    }
+    if batches.is_empty() {
+        return Err("no URLs to test".into());
+    }
+
+    Ok(batches
+        .into_iter()
+        .map(|(origin, endpoints)| {
+            let mut req = serde_json::json!({
+                "operation": "inject",
+                "response": "stream",
+                "target": origin,
+                "endpoints": endpoints,
+            });
+            if cookie.is_some() || !header_map.is_empty() {
+                req["auth"] = serde_json::json!({
+                    "cookies": cookie.unwrap_or(""),
+                    "headers": header_map,
+                });
+            }
+            (origin, req)
+        })
+        .collect())
 }
 
 async fn send_stream(
@@ -177,4 +301,102 @@ async fn send_stream(
         std::process::exit(1);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{inject_requests, scan_request};
+
+    fn urls(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Without `pack`, an installed `plessor scan` ran twelve checks and never the
+    /// hundred templates beside them.
+    #[test]
+    fn scan_asks_for_the_pack() {
+        let req = scan_request("http://h", None).unwrap();
+        assert_eq!(req["pack"], true);
+        assert!(req.get("templates_dir").is_none());
+    }
+
+    #[test]
+    fn a_templates_folder_goes_to_the_daemon_as_an_absolute_path() {
+        let here = env!("CARGO_MANIFEST_DIR");
+        let req = scan_request("http://h", Some(&format!("{here}/templates"))).unwrap();
+        let sent = req["templates_dir"].as_str().unwrap();
+        assert!(std::path::Path::new(sent).is_absolute());
+        assert!(sent.ends_with("templates"));
+        assert!(scan_request("http://h", Some(&format!("{here}/no-such-folder"))).is_err());
+    }
+
+    /// The injection pass drops endpoints on any host but its target, so two
+    /// hosts in one request would leave the second untested without a word.
+    #[test]
+    fn urls_on_two_hosts_become_two_requests() {
+        let batches = inject_requests(
+            &urls(&[
+                "http://a.test/x?id=1",
+                "http://b.test:8080/y?q=2",
+                "http://a.test/z?p=3",
+            ]),
+            None,
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].0, "http://a.test");
+        assert_eq!(batches[0].1["target"], "http://a.test");
+        assert_eq!(batches[0].1["endpoints"].as_array().unwrap().len(), 2);
+        assert_eq!(batches[1].0, "http://b.test:8080");
+        assert_eq!(
+            batches[1].1["endpoints"][0]["url"],
+            "http://b.test:8080/y?q=2"
+        );
+        assert_eq!(batches[0].1["endpoints"][0]["method"], "GET");
+        assert!(batches[0].1.get("auth").is_none());
+    }
+
+    #[test]
+    fn a_login_cookie_and_headers_go_with_every_request() {
+        let batches = inject_requests(
+            &urls(&["http://a.test/x?id=1"]),
+            Some("PHPSESSID=abc; security=low"),
+            &["X-Api-Key: k1".to_string()],
+            None,
+        )
+        .unwrap();
+        let auth = &batches[0].1["auth"];
+        assert_eq!(auth["cookies"], "PHPSESSID=abc; security=low");
+        assert_eq!(auth["headers"]["X-Api-Key"], "k1");
+        assert!(
+            inject_requests(&urls(&["http://a.test/"]), None, &["nocolon".into()], None).is_err()
+        );
+    }
+
+    /// A form is decoded as a browser would encode it, and tested as a POST.
+    #[test]
+    fn a_form_body_is_sent_as_a_post_with_its_fields() {
+        let batches = inject_requests(
+            &urls(&["http://a.test/login"]),
+            None,
+            &[],
+            Some("user=gordon+b&pass=a%26b"),
+        )
+        .unwrap();
+        let ep = &batches[0].1["endpoints"][0];
+        assert_eq!(ep["method"], "POST");
+        assert_eq!(ep["body_type"], "form");
+        assert_eq!(ep["body"][0]["name"], "user");
+        assert_eq!(ep["body"][0]["value"], "gordon b");
+        assert_eq!(ep["body"][1]["value"], "a&b");
+    }
+
+    #[test]
+    fn only_web_urls_are_accepted() {
+        assert!(inject_requests(&urls(&["ftp://a.test/x"]), None, &[], None).is_err());
+        assert!(inject_requests(&urls(&["not a url"]), None, &[], None).is_err());
+        assert!(inject_requests(&[], None, &[], None).is_err());
+    }
 }

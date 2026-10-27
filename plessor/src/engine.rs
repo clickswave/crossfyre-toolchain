@@ -33,6 +33,14 @@ pub struct ScanParams {
     /// Optional external nuclei-template directory (supported subset).
     #[serde(default)]
     pub templates_dir: Option<String>,
+    /// Run the starter pack compiled from templates/ beside the built-in checks.
+    ///
+    /// Off unless a request asks: the node sends its own scans, and turning this
+    /// on for it would change every platform scan at once. `plessor scan` asks,
+    /// because without it an installed copy ran twelve checks and never the
+    /// hundred templates it ships with.
+    #[serde(default)]
+    pub pack: bool,
     /// nuclei-style severity filter (lowercased); empty = all severities.
     #[serde(default)]
     pub severity: Vec<String>,
@@ -438,10 +446,21 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
             .as_deref()
             .map(template::load_dir)
             .unwrap_or_default();
+        // A directory template with a pack template's id replaces it, so a copy
+        // of the pack pointed at with --templates runs each check once.
+        let pack: Vec<&template::Template> = if params.pack {
+            template::PACK
+                .iter()
+                .filter(|p| !external.iter().any(|e| e.id == p.id))
+                .collect()
+        } else {
+            Vec::new()
+        };
         // Count only what will actually run, or a filtered scan reports progress
         // against a denominator it can never reach and the UI sticks at 20%.
         let total = template::BUILTIN
             .iter()
+            .chain(pack.iter().copied())
             .chain(external.iter())
             .filter(|t| allow_id(&t.id))
             .count();
@@ -480,7 +499,11 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
         // rather than dropped, so a shorter run is not mistaken for a clean one.
         let mut write_templates: Vec<String> = Vec::new();
 
-        for tmpl in template::BUILTIN.iter().chain(external.iter()) {
+        for tmpl in template::BUILTIN
+            .iter()
+            .chain(pack.iter().copied())
+            .chain(external.iter())
+        {
             // Skipped before the progress counter, because `total` above counts
             // only id-allowed templates. The severity filter stays inside the
             // loop, where it has always been counted as work done.
@@ -677,6 +700,19 @@ fn normalize_base(t: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The node's scans do not name `pack`, and must keep running exactly the
+    /// templates they ran before the pack was compiled in.
+    #[test]
+    fn a_scan_that_does_not_ask_for_the_pack_does_not_get_it() {
+        let quiet: super::ScanParams =
+            serde_json::from_value(serde_json::json!({ "target": "http://h" })).unwrap();
+        assert!(!quiet.pack);
+        let asked: super::ScanParams =
+            serde_json::from_value(serde_json::json!({ "target": "http://h", "pack": true }))
+                .unwrap();
+        assert!(asked.pack);
+    }
 
     /// The one template in our own pack that changes the target instead of
     /// testing it, and the shapes that must keep running.
