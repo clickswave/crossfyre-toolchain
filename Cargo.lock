@@ -116,6 +116,7 @@ dependencies = [
  "base64 0.22.1",
  "cfx_tui",
  "clap",
+ "clap_complete",
  "crossterm",
  "csv",
  "dguard",

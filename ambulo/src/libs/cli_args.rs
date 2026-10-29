@@ -121,6 +121,12 @@ pub enum Commands {
     Exec(ExecArgs),
     /// Database management
     Db(DbArgs),
+    /// Print a shell completion script to stdout, for example:
+    ///   ambulo completions bash > ~/.local/share/bash-completion/completions/ambulo
+    Completions {
+        /// The shell to generate completions for
+        shell: clap_complete::Shell,
+    },
 }
 
 #[derive(ClapArgs, Clone, Debug)]
