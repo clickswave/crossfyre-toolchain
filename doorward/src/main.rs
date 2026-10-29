@@ -1,6 +1,6 @@
 use crate::libs::cli_args::{Cli, Commands, DbArgs, ExecArgs};
 use crate::scanner::StreamEvent;
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -116,6 +116,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // -----------------------------------------------------------------------
     if let Some(Commands::Exec(exec_args)) = &cli.command {
         return handle_scan_exec(exec_args.clone(), cli.port).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Completions subcommand - print a shell completion script (no daemon needed)
+    // -----------------------------------------------------------------------
+    if let Some(Commands::Completions { shell }) = &cli.command {
+        clap_complete::generate(
+            *shell,
+            &mut Cli::command(),
+            "doorward",
+            &mut std::io::stdout(),
+        );
+        return Ok(());
     }
 
     // -----------------------------------------------------------------------

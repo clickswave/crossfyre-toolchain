@@ -41,6 +41,12 @@ pub enum Commands {
     Exec(ExecArgs),
     /// Database management
     Db(DbArgs),
+    /// Print a shell completion script to stdout, for example:
+    ///   doorward completions bash > ~/.local/share/bash-completion/completions/doorward
+    Completions {
+        /// The shell to generate completions for
+        shell: clap_complete::Shell,
+    },
 }
 
 #[derive(Parser, Clone)]
