@@ -2,7 +2,7 @@
 //! Node lifecycle is delegated to the separate `node` worker binary (the OS
 //! service execs `node supervise`; `crossfyre node up/down` manage that service).
 use cfx_core::toolchain::ui::*;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -190,6 +190,12 @@ enum Commands {
         /// Do not ask first (for scripts, such as a package's removal script)
         #[arg(long, short = 'y')]
         yes: bool,
+    },
+    /// Print a shell completion script to stdout, for example:
+    ///   crossfyre completions bash > ~/.local/share/bash-completion/completions/crossfyre
+    Completions {
+        /// The shell to generate completions for
+        shell: clap_complete::Shell,
     },
 }
 
@@ -668,6 +674,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 cfx_core::toolchain::uninstall::Scope { purge, keep_data },
                 yes,
             )?;
+        }
+        Commands::Completions { shell } => {
+            clap_complete::generate(
+                shell,
+                &mut Cli::command(),
+                "crossfyre",
+                &mut std::io::stdout(),
+            );
         }
     }
 
