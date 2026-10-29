@@ -1,6 +1,6 @@
 use crate::libs::cli_args::{Cli, Commands, DbArgs, ExecArgs};
 use crate::scanner::StreamEvent;
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -210,11 +210,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // -----------------------------------------------------------------------
+    // Completions subcommand - print a shell completion script (no daemon needed)
+    // -----------------------------------------------------------------------
+    if let Some(Commands::Completions { shell }) = &cli.command {
+        clap_complete::generate(
+            *shell,
+            &mut Cli::command(),
+            "ambulo",
+            &mut std::io::stdout(),
+        );
+        return Ok(());
+    }
+
+    // -----------------------------------------------------------------------
     // Fuzz subcommand - client that talks to the running daemon
     // -----------------------------------------------------------------------
     let mut fuzz_args = match cli.command {
         Some(Commands::Scan(args)) => args,
-        Some(Commands::Exec(_)) | Some(Commands::Db(_)) | None => {
+        Some(Commands::Exec(_))
+        | Some(Commands::Db(_))
+        | Some(Commands::Completions { .. })
+        | None => {
             eprintln!(
                 "No command given. Use `ambulo scan`, `ambulo exec`, `ambulo db`, or `ambulo --daemon`. Try --help."
             );
