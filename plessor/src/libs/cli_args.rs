@@ -41,6 +41,12 @@ pub enum Commands {
     /// Send a JSON op to the daemon and print the streamed events. `operation` is
     /// required: this is the raw interface the node uses.
     Exec(ExecArgs),
+    /// Print a shell completion script to stdout, for example:
+    ///   plessor completions bash > ~/.local/share/bash-completion/completions/plessor
+    Completions {
+        /// The shell to generate completions for
+        shell: clap_complete::Shell,
+    },
 }
 
 #[derive(Parser, Clone)]

@@ -3431,6 +3431,7 @@ dependencies = [
  "cfx_scope",
  "cfx_tui",
  "clap",
+ "clap_complete",
  "dguard",
  "rand 0.8.7",
  "ratatui",
