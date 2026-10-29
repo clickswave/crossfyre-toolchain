@@ -59,6 +59,7 @@ mod writes_rail;
 mod xml;
 
 use crate::libs::cli_args::{Cli, Commands};
+use clap::CommandFactory;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
@@ -129,6 +130,15 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 target,
             )
             .await
+        }
+        Some(Commands::Completions { shell }) => {
+            clap_complete::generate(
+                shell,
+                &mut Cli::command(),
+                "plessor",
+                &mut std::io::stdout(),
+            );
+            Ok(())
         }
         None => {
             eprintln!(
