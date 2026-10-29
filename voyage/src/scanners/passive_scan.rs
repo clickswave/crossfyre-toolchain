@@ -26,7 +26,7 @@ pub async fn execute(
     // Each arm resolves to the source's names, or an empty vec if it was
     // excluded or errored. `join!` polls them on one task, so this needs no
     // spawning and no 'static bounds on the borrowed client.
-    let (crtsh, certspotter, hackertarget, alienvault) = tokio::join!(
+    let (crtsh, certspotter, hackertarget, alienvault, urlscan) = tokio::join!(
         async {
             if skipped("crt.sh") {
                 return vec![];
@@ -75,6 +75,18 @@ pub async fn execute(
                 }
             }
         },
+        async {
+            if skipped("urlscan") {
+                return vec![];
+            }
+            match crate::scanners::providers::urlscan::fetch(&client, domain).await {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("[WARN] urlscan error: {e}");
+                    vec![]
+                }
+            }
+        },
     );
 
     // Merged in a fixed order so the recorded `source` for a name found by more
@@ -86,8 +98,9 @@ pub async fn execute(
         .map(|p| (p, "crt.sh"))
         .chain(certspotter.into_iter().map(|p| (p, "certspotter")))
         .chain(hackertarget.into_iter().map(|p| (p, "hackertarget")))
+        .chain(urlscan.into_iter().map(|p| (p, "urlscan")))
     {
-        // These three return the label prefix; reconstruct the full name.
+        // These return the label prefix; reconstruct the full name.
         results.insert(format!("{prefix}.{domain}"), source.to_string());
     }
     // alienvault returns fully-qualified names already.
