@@ -60,6 +60,22 @@ The keyring is installed only if its SHA-256 matches. Its key's fingerprint is `
 
 </details>
 
+<details>
+<summary>Or the CLI on its own, from Homebrew or Scoop</summary>
+
+```sh
+brew install clickswave/tap/crossfyre
+```
+
+```powershell
+scoop bucket add clickswave https://github.com/clickswave/scoop-bucket
+scoop install clickswave/crossfyre
+```
+
+These install the `crossfyre` CLI for your own user, and the package manager keeps it current. The engines and the node service go into a system directory, so for those use the installer above.
+
+</details>
+
 `crossfyre update all` updates the engines. [crossfyre.io/docs/install](https://crossfyre.io/docs/install) covers the .deb, signature checks and removal.
 
 ## Use
