@@ -1,5 +1,5 @@
 use crate::libs::cli_args::{Cli, Commands};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
@@ -66,6 +66,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 target,
             )
             .await
+        }
+        Some(Commands::Completions { shell }) => {
+            clap_complete::generate(
+                shell,
+                &mut Cli::command(),
+                "toolmark",
+                &mut std::io::stdout(),
+            );
+            Ok(())
         }
         None => {
             eprintln!(

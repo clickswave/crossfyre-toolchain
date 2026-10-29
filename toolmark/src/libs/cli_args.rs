@@ -43,6 +43,12 @@ pub enum Commands {
     /// Identify non-HTTP services on host:port targets, and whether they let
     /// anyone in
     Services(SvcArgs),
+    /// Print a shell completion script to stdout, for example:
+    ///   toolmark completions bash > ~/.local/share/bash-completion/completions/toolmark
+    Completions {
+        /// The shell to generate completions for
+        shell: clap_complete::Shell,
+    },
 }
 
 #[derive(Parser, Clone)]
