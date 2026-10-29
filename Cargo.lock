@@ -5682,6 +5682,7 @@ dependencies = [
  "adaptive",
  "cfx_tui",
  "clap",
+ "clap_complete",
  "crossterm",
  "dguard",
  "dialoguer 0.11.0",
