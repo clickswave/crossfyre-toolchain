@@ -1,6 +1,6 @@
 use crate::libs::cli_args::{Cli, Commands, DbArgs, ExecArgs, OriginArgs};
 use crate::scanner::StreamEvent;
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -129,6 +129,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // -----------------------------------------------------------------------
+    // Completions subcommand - print a shell completion script (no daemon needed)
+    // -----------------------------------------------------------------------
+    if let Some(Commands::Completions { shell }) = &cli.command {
+        clap_complete::generate(
+            *shell,
+            &mut Cli::command(),
+            "voyage",
+            &mut std::io::stdout(),
+        );
+        return Ok(());
+    }
+
+    // -----------------------------------------------------------------------
     // Scan subcommand - client that talks to the running daemon
     // -----------------------------------------------------------------------
     let mut enum_args = match cli.command {
@@ -137,6 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         | Some(Commands::Db(_))
         | Some(Commands::Origin(_))
         | Some(Commands::Axfr(_))
+        | Some(Commands::Completions { .. })
         | None => {
             eprintln!(
                 "No command given. Use `voyage scan`, `voyage exec`, `voyage db`, or `voyage --daemon`. Try --help."

@@ -74,6 +74,12 @@ pub enum Commands {
     Origin(OriginArgs),
     /// Try a DNS zone transfer (AXFR) and print every name the zone gives up
     Axfr(AxfrArgs),
+    /// Print a shell completion script to stdout, for example:
+    ///   voyage completions bash > ~/.local/share/bash-completion/completions/voyage
+    Completions {
+        /// The shell to generate completions for
+        shell: clap_complete::Shell,
+    },
 }
 
 #[derive(ClapArgs, Clone, Debug)]

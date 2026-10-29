@@ -27,6 +27,7 @@ adaptive = { path = "../adaptive" }
 transport = { path = "../transport" }
 tokio = { version = "1.47.1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "process", "time"] }
 clap = { version = "4.5.42", features = ["derive"] }
+clap_complete = "4.6.9"
 whoami = { version = "2.0.0-pre.2", features = [] }
 serde = { version = "1.0.219", features = ["derive"] }
 sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "chrono"] }
