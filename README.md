@@ -95,7 +95,7 @@ Wordlists are read only from a few directories, since the daemon would otherwise
 
 In a terminal `voyage`, `doorward` and `ambulo` draw a live dashboard. `toolmark` and `plessor` finish a single target in seconds, so they print JSON unless you put `--tui` before `scan`, as in `toolmark --tui scan https://example.com`. Piped or redirected, every engine writes newline-delimited JSON, one event per line, and exits non-zero if the run ends in an error. `voyage`, `doorward` and `ambulo` save findings as they go, so a stopped scan resumes where it left off. Add `--help` to any command for the rest.
 
-From 0.1.38, `crossfyre completions <shell>` prints a completion script for bash, zsh, fish, powershell or elvish: `crossfyre completions bash > ~/.local/share/bash-completion/completions/crossfyre`.
+From 0.1.38, `crossfyre completions <shell>` prints a completion script for bash, zsh, fish, powershell or elvish: `crossfyre completions bash > ~/.local/share/bash-completion/completions/crossfyre`. Each engine takes the same command, as in `voyage completions zsh`.
 
 ## When one machine is not enough
 
