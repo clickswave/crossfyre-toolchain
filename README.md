@@ -21,7 +21,7 @@ Five scanning engines you run from the terminal, on systems you are authorized t
 | [`toolmark`](toolmark/) | Fingerprints services and technologies, and flags CVE leads by version. |
 | [`plessor`](plessor/) | Tests for vulnerabilities with nuclei-compatible templates and an injection engine, and confirms each finding before it reports it. |
 
-Alongside them: [`crossfyre`](crossfyre/), the CLI that installs and updates everything, [`node`](node/), the agent that runs the engines for the platform, [`oast`](oast/), an out-of-band server you can host so `plessor` confirms blind bugs on your own domain, and [`mobile`](mobile/), Crossfyre Mobile for Android.
+Alongside them: [`crossfyre`](crossfyre/), the CLI that installs and updates everything, [`node`](node/), the agent that runs the engines for the platform, [`oast`](oast/), an out-of-band server you can host so `plessor` confirms blind bugs on your own domain, and [`mobile`](mobile/), Crossfyre Mobile for Android, which is [on Google Play](https://play.google.com/store/apps/details?id=io.crossfyre.mobile).
 
 This repository began as [voyage](https://github.com/clickswave/crossfyre-toolchain/tree/voyage), the standalone subdomain finder, and its history is kept on that branch. ambulo began as [mach](https://github.com/clickswave/mach).
 
@@ -94,6 +94,8 @@ ambulo scan --url https://example.com/::FUZZ:: --wordlist-path /usr/share/seclis
 Wordlists are read only from a few directories, since the daemon would otherwise read any file a request names: `/usr/share/wordlists`, `/usr/share/seclists` and the temp directory on Linux, and Homebrew's seclists on macOS. Add your own with `CFX_WORDLIST_ROOTS`, separated like `PATH`.
 
 In a terminal `voyage`, `doorward` and `ambulo` draw a live dashboard. `toolmark` and `plessor` finish a single target in seconds, so they print JSON unless you put `--tui` before `scan`, as in `toolmark --tui scan https://example.com`. Piped or redirected, every engine writes newline-delimited JSON, one event per line, and exits non-zero if the run ends in an error. `voyage`, `doorward` and `ambulo` save findings as they go, so a stopped scan resumes where it left off. Add `--help` to any command for the rest.
+
+From 0.1.38, `crossfyre completions <shell>` prints a completion script for bash, zsh, fish, powershell or elvish: `crossfyre completions bash > ~/.local/share/bash-completion/completions/crossfyre`.
 
 ## When one machine is not enough
 
