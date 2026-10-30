@@ -135,6 +135,28 @@ class ApprovalApiTest {
     }
 
     @Test
+    fun the_enrolment_wait_rides_out_a_server_error_and_slows_down_for_a_rate_limit() = runBlocking {
+        val e = Enrolment("ap-1", "cfe_1", "u", "fp", intervalSeconds = 3, expiresInSeconds = 60)
+        var clock = 0L
+        val answers = ArrayDeque(listOf<Outcome<EnrolState>>(
+            Outcome.Failed(Problem.Broken(502, "Bad gateway")),
+            Outcome.Failed(Problem.Refused(429, "Slow down")),
+            Outcome.Failed(Problem.Broken(503, "Unavailable")),
+            Outcome.Ok(EnrolState.ACTIVE),
+        ))
+        val r = awaitEnrolment(e, { answers.removeFirst() }, { clock += it }, { clock })
+        assertEquals(Outcome.Ok(EnrolState.ACTIVE), r)
+        assertEquals("three seconds, three, then six after the 429", 18_000L, clock)
+
+        // A refusal that asking again will not change ends the wait, and so does
+        // an answer this app cannot read.
+        val forbidden = Outcome.Failed(Problem.Refused(403, "No"))
+        assertEquals(forbidden, awaitEnrolment(e, { forbidden }, { }, { 0L }))
+        val unreadable = Outcome.Failed(Problem.Broken(200, "The server answered with something this app cannot read (HTTP 200)."))
+        assertEquals(unreadable, awaitEnrolment(e, { unreadable }, { }, { 0L }))
+    }
+
+    @Test
     fun revoking_is_idempotent_and_sends_the_approver() {
         val fake = Fake(envelope(200, "ok"), envelope(404, "No such approver"))
         assertEquals(Unit, ok(api(fake).revoke(key, "ap-1")))

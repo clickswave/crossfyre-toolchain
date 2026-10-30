@@ -7,6 +7,9 @@ import io.crossfyre.mobile.account.Refusal
 import io.crossfyre.mobile.account.Transport
 import io.crossfyre.mobile.account.cliCall
 import io.crossfyre.mobile.account.str
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
 import org.json.JSONObject
 import java.net.URI
 import java.net.URLEncoder
@@ -339,9 +342,10 @@ class ApprovalApi(origin: String, private val transport: Transport) {
  * Wait for the browser to confirm this phone, deny it, or let it lapse.
  *
  * The same shape as the sign-in wait: the interval the server asked for, never
- * faster than once a second, and a poll that gets no answer at all is tried again
- * rather than ending the wait, because the person is in the browser on this same
- * phone while it runs.
+ * faster than once a second. A poll that gets no answer, a server error or a 429
+ * is tried again rather than ending the wait, because the person is in the
+ * browser on this same phone while it runs and can still confirm it there; a 429
+ * doubles the interval, up to thirty seconds.
  */
 suspend fun awaitEnrolment(
     enrolment: Enrolment,
@@ -349,14 +353,64 @@ suspend fun awaitEnrolment(
     sleep: suspend (Long) -> Unit,
     now: () -> Long,
 ): Outcome<EnrolState> {
-    val interval = enrolment.intervalSeconds.coerceIn(1, 30) * 1000L
+    var interval = enrolment.intervalSeconds.coerceIn(1, 30) * 1000L
     val deadline = now() + enrolment.expiresInSeconds.coerceAtLeast(1) * 1000L
     while (now() < deadline) {
         sleep(interval)
         when (val answer = poll(enrolment.code)) {
             is Outcome.Ok -> if (answer.value != EnrolState.PENDING) return answer
-            is Outcome.Failed -> if (answer.problem !is Problem.Unreachable) return answer
+            is Outcome.Failed -> when (val p = answer.problem) {
+                is Problem.Unreachable -> Unit
+                is Problem.Broken -> if (p.status !in 500..599) return answer
+                is Problem.Refused -> if (p.status == 429) interval = (interval * 2).coerceAtMost(30_000L) else return answer
+                else -> return answer
+            }
         }
     }
     return Outcome.Ok(EnrolState.EXPIRED)
+}
+
+/**
+ * Enrol this phone with the public half of a key it has just made: send it, let
+ * [opened] show the fingerprint and open the confirmation page, and wait.
+ *
+ * What comes of it is written to [ledger] before this returns. An approver the
+ * server created and the browser did not confirm here is let go of and revoked,
+ * however the wait ended, cancelling included, because the browser page stays
+ * open: a Confirm pressed after the phone stopped waiting would otherwise make
+ * an approver whose key the phone has already deleted.
+ */
+suspend fun enrol(
+    api: ApprovalApi,
+    key: String,
+    deviceId: String,
+    deviceName: String,
+    publicKey: ByteArray,
+    ledger: ApproverLedger,
+    opened: suspend (Enrolment) -> Unit,
+    sleep: suspend (Long) -> Unit,
+    now: () -> Long,
+): Outcome<EnrolState> {
+    val e = when (val started = api.enrolStart(key, deviceId, deviceName, publicKey)) {
+        is Outcome.Ok -> started.value
+        is Outcome.Failed -> return started
+    }
+    // Cancelled while the start was on its way: the server made an approver
+    // all the same, and nothing will wait for it.
+    if (!currentCoroutineContext().isActive) {
+        ledger.letGo(e.approverId)
+        throw CancellationException("The enrolment was cancelled while it started.")
+    }
+    ledger.started(e.approverId)
+    val result = try {
+        opened(e)
+        awaitEnrolment(e, { code -> api.enrolPoll(key, code) }, sleep, now)
+    } catch (c: CancellationException) {
+        ledger.stopped(e.approverId)
+        throw c
+    }
+    if (result is Outcome.Ok && result.value == EnrolState.ACTIVE && ledger.confirmed(e.approverId, e.fingerprint)) return result
+    ledger.stopped(e.approverId)
+    ledger.settle { id -> api.revoke(key, id) }
+    return result
 }

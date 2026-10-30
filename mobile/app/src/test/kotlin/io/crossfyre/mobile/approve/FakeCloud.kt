@@ -33,6 +33,15 @@ class FakeCloud(private val key: String) : AutoCloseable {
     val routes = mutableListOf<String>()
     var now: Instant = Instant.parse("2026-10-30T09:14:02Z")
 
+    /** A status every `approver/poll` answers with instead of the row's state, while set. */
+    @Volatile var pollFails: Int? = null
+
+    /** The same for `approver/revoke`. */
+    @Volatile var revokeFails: Int? = null
+
+    /** How long an enrolment code lasts, in seconds, as `approver/start` says. */
+    @Volatile var enrolSeconds = 600
+
     init {
         thread(isDaemon = true) {
             while (!server.isClosed) {
@@ -61,9 +70,11 @@ class FakeCloud(private val key: String) : AutoCloseable {
         }
     }
 
-    /** The browser page's Confirm, for the signed-in owner of the account. */
-    @Synchronized fun confirm(code: String) {
-        approvers.first { it.code == code && it.status == "pending" }.status = "active"
+    /** The browser page's Confirm, for the signed-in owner of the account. False when there is nothing pending to confirm. */
+    @Synchronized fun confirm(code: String): Boolean {
+        val a = approvers.firstOrNull { it.code == code && it.status == "pending" } ?: return false
+        a.status = "active"
+        return true
     }
 
     /** An agent asks for something that needs a person. */
@@ -84,11 +95,12 @@ class FakeCloud(private val key: String) : AutoCloseable {
                 val a = Approver(UUID.randomUUID().toString(), "cfe_" + UUID.randomUUID().toString().replace("-", ""), spki, b.getString("device_name"), "pending")
                 approvers += a
                 200 to JSONObject().put("approver_id", a.id).put("enrol_code", a.code).put("fingerprint", Spki.fingerprint(spki))
-                    .put("confirm_url", "https://wrong.example/m/enrol").put("interval", 1).put("expires_in", 600)
+                    .put("confirm_url", "https://wrong.example/m/enrol").put("interval", 1).put("expires_in", enrolSeconds)
             }
-            "approver/poll" -> approvers.firstOrNull { it.code == b.getString("enrol_code") }
-                ?.let { 200 to JSONObject().put("status", it.status) } ?: (404 to JSONObject().put("message", "Unknown code"))
-            "approver/revoke" -> {
+            "approver/poll" -> pollFails?.let { it to JSONObject().put("message", "Poll refused") }
+                ?: approvers.firstOrNull { it.code == b.getString("enrol_code") }
+                    ?.let { 200 to JSONObject().put("status", it.status) } ?: (404 to JSONObject().put("message", "Unknown code"))
+            "approver/revoke" -> revokeFails?.let { it to JSONObject().put("message", "Revoke failed") } ?: run {
                 approvers.firstOrNull { it.id == b.getString("approver_id") }?.status = "revoked"
                 200 to JSONObject()
             }

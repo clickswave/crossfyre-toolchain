@@ -42,11 +42,12 @@ import io.crossfyre.mobile.approve.PollPolicy
 import io.crossfyre.mobile.approve.ServerClock
 import io.crossfyre.mobile.approve.approvalView
 import io.crossfyre.mobile.approve.ApproverKeys
+import io.crossfyre.mobile.approve.ApproverLedger
 import io.crossfyre.mobile.approve.EnrolState
 import io.crossfyre.mobile.approve.KeyGone
 import io.crossfyre.mobile.approve.KeystoreApproverKeys
 import io.crossfyre.mobile.approve.NoScreenLock
-import io.crossfyre.mobile.approve.awaitEnrolment
+import io.crossfyre.mobile.approve.enrol
 import io.crossfyre.mobile.apps.AppFacts
 import io.crossfyre.mobile.apps.Apps
 import io.crossfyre.mobile.apps.InstalledApp
@@ -422,6 +423,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
         // Back from Android's settings with the screen lock removed: the keystore
         // has dropped the key, so say so now rather than at the next Approve.
         if (approverState == ApproverState.ACTIVE && !approverKeys.exists()) approverBroke(LOCK_CHANGED)
+        settleRevokes()
         if (route == Route.MAIN && tab == "activity" && push == null) refreshActivity()
     }
 
@@ -650,6 +652,14 @@ class AppModel(app: Application) : AndroidViewModel(app) {
         if (store.approverId != null && !approverKeys.exists()) {
             approverBroke("The approval key is gone from this phone, so it no longer approves. Turn Approvals on again to make a new one.")
         }
+        // The app closed while the browser page was open. The page may still
+        // be confirmed, so the approver it was for is revoked with the rest.
+        if (approverLedger.abandoned()) {
+            approverKeys.delete()
+            approverTrouble = "The app closed before the browser confirmed this phone, so approvals were not turned on. Turn them on again."
+            approverState = ApproverState.BROKEN
+        }
+        settleRevokes()
     }
 
     /**
@@ -1130,7 +1140,6 @@ class AppModel(app: Application) : AndroidViewModel(app) {
         private set
     private var enrolUrl = ""
     private var enrolJob: Job? = null
-    private var enrolApproverId: String? = null
 
     /** The Settings row: explain first, show the wait, or offer to turn it off. */
     fun openApprovals() {
@@ -1155,43 +1164,39 @@ class AppModel(app: Application) : AndroidViewModel(app) {
             return
         }
         enrolJob?.cancel()
+        store.enrollingApproverId?.let { approverLedger.letGo(it) }
         approverState = ApproverState.ENROLLING
         approverTrouble = null
         enrolStatus = EnrolStatus.STARTING
         enrolError = null
         enrolFingerprint = ""
         overlay = Overlay.Enrol
+        settleRevokes()
         enrolJob = viewModelScope.launch {
             val api = approvals()
             val made = withContext(Dispatchers.IO) { runCatching { approverKeys.create() } }
             val spki = made.getOrElse { e ->
                 return@launch enrolFailed(Notice(Level.DANGER, "Couldn't make the approval key.", keyTrouble(e)))
             }
-            val started = withContext(Dispatchers.IO) { api.enrolStart(key, store.deviceId(), deviceName(), spki) }
-            val e = when (started) {
-                is Outcome.Ok -> started.value
-                is Outcome.Failed -> {
-                    if (started.problem == Problem.SignedOut) {
-                        enrolFailed(null)
-                        return@launch signedOut()
-                    }
-                    return@launch enrolFailed(enrolNotice(started.problem, host))
-                }
-            }
-            enrolApproverId = e.approverId
-            enrolFingerprint = e.fingerprint
-            enrolUrl = e.confirmUrl
-            enrolStatus = EnrolStatus.WAITING
-            emit(Effect.OpenUrl(e.confirmUrl))
+            // The ledger hears how it ended, whatever happens here, and revokes an
+            // approver that was started and not confirmed.
             val result = withContext(Dispatchers.IO) {
-                awaitEnrolment(e, poll = { code -> api.enrolPoll(key, code) }, sleep = { ms -> delay(ms) }, now = { SystemClock.elapsedRealtime() })
+                enrol(
+                    api, key, store.deviceId(), deviceName(), spki, approverLedger,
+                    opened = { e ->
+                        withContext(Dispatchers.Main) {
+                            enrolFingerprint = e.fingerprint
+                            enrolUrl = e.confirmUrl
+                            enrolStatus = EnrolStatus.WAITING
+                            emit(Effect.OpenUrl(e.confirmUrl))
+                        }
+                    },
+                    sleep = { ms -> delay(ms) }, now = { SystemClock.elapsedRealtime() },
+                )
             }
             when {
                 result is Outcome.Ok && result.value == EnrolState.ACTIVE -> {
-                    store.approverId = e.approverId
-                    store.approverFingerprint = e.fingerprint
-                    approverFingerprint = e.fingerprint
-                    enrolApproverId = null
+                    approverFingerprint = store.approverFingerprint
                     approverState = ApproverState.ACTIVE
                     if (overlay == Overlay.Enrol) overlay = null
                     say("This phone now approves agent actions.")
@@ -1212,14 +1217,12 @@ class AppModel(app: Application) : AndroidViewModel(app) {
 
     private fun enrolEnded(status: EnrolStatus) {
         approverKeys.delete()
-        enrolApproverId = null
         approverState = ApproverState.OFF
         enrolStatus = status
     }
 
     private fun enrolFailed(n: Notice?) {
         approverKeys.delete()
-        enrolApproverId = null
         approverState = ApproverState.OFF
         enrolError = n
         enrolStatus = EnrolStatus.ERROR
@@ -1231,24 +1234,28 @@ class AppModel(app: Application) : AndroidViewModel(app) {
 
     /** Stop waiting. The half-made approver is revoked so a later confirm does nothing. */
     fun cancelEnrol() {
-        enrolJob?.cancel()
+        val job = enrolJob
+        job?.cancel()
         enrolJob = null
-        val pendingId = enrolApproverId
-        val key = store.key()
-        if (pendingId != null && key != null) viewModelScope.launch(Dispatchers.IO) { approvals().revoke(key, pendingId) }
-        enrolApproverId = null
+        // Whichever of this and the cancelled wait gets there first lets the
+        // approver go; the revoke is sent once the wait has stopped.
+        store.enrollingApproverId?.let { approverLedger.letGo(it) }
         approverKeys.delete()
         if (approverState == ApproverState.ENROLLING) approverState = ApproverState.OFF
         overlay = null
+        viewModelScope.launch {
+            job?.join()
+            settleRevokes()
+        }
     }
 
     fun turnOffApprovals() {
         overlay = null
-        val id = store.approverId
-        val key = store.key()
-        // Best effort, as sign-out is: the key is deleted here whatever the
-        // server says, and a phone with no key cannot sign anything.
-        if (key != null && id != null) viewModelScope.launch(Dispatchers.IO) { approvals().revoke(key, id) }
+        // The key is deleted here whatever the server says, and a phone with no
+        // key cannot sign anything. The revoke is owed until the server confirms
+        // it, so that no request waits on an approver that can no longer sign.
+        store.approverId?.let { approverLedger.letGo(it) }
+        settleRevokes()
         forgetApprover()
         say("This phone no longer approves agent actions.", R.drawable.ic_info)
     }
@@ -1258,7 +1265,6 @@ class AppModel(app: Application) : AndroidViewModel(app) {
         clearActivity()
         enrolJob?.cancel()
         enrolJob = null
-        enrolApproverId = null
         approverKeys.delete()
         store.approverId = null
         store.approverFingerprint = null
@@ -1273,15 +1279,44 @@ class AppModel(app: Application) : AndroidViewModel(app) {
      * why; turning approvals on again makes a new key.
      */
     private fun approverBroke(why: String) {
-        val id = store.approverId
-        val key = store.key()
-        if (key != null && id != null) viewModelScope.launch(Dispatchers.IO) { approvals().revoke(key, id) }
+        store.approverId?.let { approverLedger.letGo(it) }
+        settleRevokes()
         approverKeys.delete()
-        store.approverId = null
-        store.approverFingerprint = null
         approverFingerprint = null
         approverTrouble = why
         approverState = ApproverState.BROKEN
+    }
+
+    val approverLedger = ApproverLedger(store)
+    private var settling = false
+    private var settleAgain = false
+
+    /**
+     * Send the revokes still owed, while there is a key to send them with. One
+     * round runs at a time; an approver let go of during a round gets another.
+     */
+    private fun settleRevokes() {
+        val key = store.key() ?: return
+        if (approverLedger.owed.isEmpty()) return
+        if (settling) {
+            settleAgain = true
+            return
+        }
+        settling = true
+        viewModelScope.launch {
+            try {
+                do {
+                    settleAgain = false
+                    val r = withContext(Dispatchers.IO) { approverLedger.settle { id -> approvals().revoke(key, id) } }
+                    if (r is Outcome.Failed && r.problem == Problem.SignedOut) {
+                        revoked = true
+                        break
+                    }
+                } while (settleAgain)
+            } finally {
+                settling = false
+            }
+        }
     }
 
     private val LOCK_CHANGED = "Android retired the approval key, which happens when the screen lock is removed. Turn Approvals on again to make a new one."
