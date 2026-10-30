@@ -711,6 +711,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cfx_cloud_wire"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cfx_core"
 version = "0.1.0"
 dependencies = [
