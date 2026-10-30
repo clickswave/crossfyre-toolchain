@@ -353,6 +353,10 @@ pub(crate) struct FakePeer {
     pub progress_messages: Mutex<Vec<String>>,
     /// How many times the server said its tool list changed.
     pub list_changed: AtomicUsize,
+    /// How the client answers a request to open a URL; `None` cannot be asked.
+    pub url: Elicit,
+    /// Every URL a person was sent to.
+    pub urls: Mutex<Vec<String>>,
 }
 
 impl FakePeer {
@@ -364,6 +368,8 @@ impl FakePeer {
             progress: Mutex::new(Vec::new()),
             progress_messages: Mutex::new(Vec::new()),
             list_changed: AtomicUsize::new(0),
+            url: Elicit::None,
+            urls: Mutex::new(Vec::new()),
         }
     }
     pub(crate) fn asked(&self) -> usize {
@@ -406,6 +412,19 @@ impl ClientPeer for FakePeer {
     fn tool_list_changed<'a>(&'a self) -> BoxFut<'a, ()> {
         Box::pin(async move {
             self.list_changed.fetch_add(1, Ordering::SeqCst);
+        })
+    }
+    fn can_elicit_url(&self) -> bool {
+        self.url != Elicit::None
+    }
+    fn open_url<'a>(&'a self, _: String, url: String, _: String) -> BoxFut<'a, Answer> {
+        Box::pin(async move {
+            self.urls.lock().unwrap().push(url);
+            match self.url {
+                Elicit::Accept => Answer::Yes,
+                Elicit::Decline => Answer::No,
+                _ => Answer::Dismissed,
+            }
         })
     }
 }

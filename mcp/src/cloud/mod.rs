@@ -158,6 +158,8 @@ pub(crate) struct Cloud {
     pub retry_after: Duration,
     /// Between two reads of a running scan while a call waits on it.
     pub poll_every: Duration,
+    /// The longest a launch call waits for a person to approve it.
+    pub approval_wait: Duration,
 }
 
 impl Cloud {
@@ -176,6 +178,7 @@ impl Cloud {
             asked: tokio::sync::Mutex::new(Asked::Unasked),
             retry_after: Duration::from_millis(500),
             poll_every: Duration::from_secs(5),
+            approval_wait: Duration::from_secs(100),
         })
     }
 

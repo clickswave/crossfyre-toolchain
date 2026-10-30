@@ -250,4 +250,30 @@ impl ClientPeer for RmcpPeer {
             let _ = self.peer.notify_tool_list_changed().await;
         })
     }
+
+    fn can_elicit_url(&self) -> bool {
+        self.peer
+            .supported_elicitation_modes()
+            .contains(&ElicitationMode::Url)
+    }
+
+    fn open_url<'a>(&'a self, message: String, url: String, id: String) -> BoxFut<'a, Answer> {
+        Box::pin(async move {
+            let params = ElicitRequestParams::UrlElicitationParams {
+                meta: None,
+                message: untrusted::clean(&message, 4000),
+                url,
+                elicitation_id: untrusted::clean(&id, 64),
+            };
+            match self
+                .peer
+                .create_elicitation_with_timeout(params, Some(confirm::ASK_TIMEOUT))
+                .await
+            {
+                Ok(r) if r.action == ElicitationAction::Accept => Answer::Yes,
+                Ok(r) if r.action == ElicitationAction::Decline => Answer::No,
+                _ => Answer::Dismissed,
+            }
+        })
+    }
 }

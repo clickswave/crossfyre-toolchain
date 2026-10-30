@@ -290,6 +290,13 @@ pub(crate) struct World {
     pub fallback: bool,
     /// The fake's own origin, for the approval page.
     pub origin: String,
+    /// `whoami`'s approval policy: `risky` or `always`.
+    pub policy: &'static str,
+    /// On the n-th `approvals/wait`, decide every pending approval: a status and who.
+    pub decide_on_wait: Option<(u32, &'static str, &'static str)>,
+    waits: u32,
+    /// An approved launch fails with this reason instead of starting.
+    pub fail_launch: Option<&'static str>,
 }
 
 impl World {
@@ -325,6 +332,10 @@ impl World {
             phones: Vec::new(),
             fallback: true,
             origin: String::new(),
+            policy: "risky",
+            decide_on_wait: None,
+            waits: 0,
+            fail_launch: None,
         }
     }
 
@@ -345,7 +356,47 @@ impl World {
         w["scope"]["current"] = json!(self.scope.len());
         w["scope"]["attested"] = json!(self.attested().len());
         w["scope"]["effective"] = json!(self.attested().len());
+        w["approval"] = json!({"policy": self.policy, "fallback": self.fallback,
+                               "phone_registered": !self.phones.is_empty()});
         w
+    }
+
+    /// Settle an approval as the platform does once someone decides it: a denial ends
+    /// it, an approval launches the stored request.
+    fn settle(&mut self, id: &str, status: &str, via: &str) {
+        let Some(a) = self.approvals.get(id).cloned() else {
+            return;
+        };
+        let mut a = a;
+        a["status"] = json!(status);
+        a["decided_via"] = json!(via);
+        a["decided_at"] = json!("2026-11-02T10:15:12Z");
+        if status == "approved" {
+            match self.fail_launch {
+                Some(r) => {
+                    a["launch_state"] = json!("failed");
+                    a["launch_error"] = json!({"reason": r, "message": "no node"});
+                }
+                None => {
+                    self.next += 1;
+                    let sid = uuid(500 + self.next);
+                    let act = a["action"].clone();
+                    self.scans.insert(
+                        0,
+                        json!({
+                        "id": sid, "approval_id": id,
+                        "name": format!("MCP: {} on {}", act["type"].as_str().unwrap_or(""),
+                                        act["targets"][0].as_str().unwrap_or("")),
+                        "type": act["type"], "status": "running", "targets": act["targets"],
+                        "findings_count": 0, "created_at": "2026-11-02T10:15:13Z",
+                        "created_via": "mcp"}),
+                    );
+                    a["launch_state"] = json!("launched");
+                    a["workflow_id"] = json!(sid);
+                }
+            }
+        }
+        self.approvals.insert(id.to_string(), a);
     }
 
     /// A scan row, newest first in the list, `n` naming its id.
@@ -566,6 +617,42 @@ fn route(w: &mut World, r: &Req) -> Resp {
                 Resp::ok(json!({"result": "not_running", "status": s["status"]}))
             }
         }
+        wire::route::APPROVALS_WAIT => {
+            let id = b["id"].as_str().unwrap_or("").to_string();
+            if !w.approvals.contains_key(&id) {
+                return not_found();
+            }
+            w.waits += 1;
+            if let Some((n, status, via)) = w.decide_on_wait
+                && w.waits >= n
+                && w.approvals[&id]["status"] == "pending"
+            {
+                w.settle(&id, status, via);
+            }
+            Resp::ok(json!({"approval": w.approvals[&id]}))
+        }
+        wire::route::APPROVALS_DECIDE => {
+            let id = b["id"].as_str().unwrap_or("").to_string();
+            let Some(a) = w.approvals.get(&id) else {
+                return not_found();
+            };
+            if b["via"] != "agent_client" {
+                return Resp::refusal(400, wire::Reason::InvalidArguments);
+            }
+            if a["status"] != "pending" {
+                return Resp::refusal(409, wire::Reason::AlreadyDecided);
+            }
+            let approve = b["decision"] == "approve";
+            if approve && (!w.phones.is_empty() || !w.fallback) {
+                return Resp::refusal(403, wire::Reason::ElicitationNotAllowed);
+            }
+            w.settle(
+                &id,
+                if approve { "approved" } else { "denied" },
+                "agent_client",
+            );
+            Resp::ok(json!({"approval": w.approvals[&id]}))
+        }
         wire::route::APPROVALS_GET => match w.approvals.get(b["id"].as_str().unwrap_or("")) {
             Some(a) => Resp::ok(json!({"approval": a})),
             None => not_found(),
@@ -657,6 +744,7 @@ pub(crate) async fn connect(t: &mut TestMcp, url: &str, cached_permission: Optio
     let mut cloud = crate::cloud::Cloud::new(config, "0.0.0-test").unwrap();
     cloud.retry_after = Duration::from_millis(10);
     cloud.poll_every = Duration::from_millis(20);
+    cloud.approval_wait = Duration::from_millis(400);
     let cloud = Arc::new(cloud);
     Arc::get_mut(&mut t.mcp).expect("not shared yet").cloud =
         crate::cloud::Slot::On(Arc::clone(&cloud));
