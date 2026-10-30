@@ -101,6 +101,8 @@ pub struct ClientConfig {
     /// Static DNS overrides: `(host, addr)` pairs. A request to `host` connects to
     /// `addr` while keeping `host` as the SNI + Host header. Origin discovery uses
     /// this to hit a candidate origin IP as if it were the fronted target host.
+    /// A client with any pin uses no proxy, since a proxy would look the name up
+    /// again.
     pub resolve: Vec<(String, std::net::SocketAddr)>,
     /// Refuse to connect to private / reserved addresses.
     ///
@@ -114,7 +116,9 @@ pub struct ClientConfig {
     /// rebinding, neither of which a check at the call site can see, and in the
     /// redirect policy for a hop to an address written as one, which never reaches
     /// the resolver. See [`guard`]. A request the caller itself sends to an
-    /// address is not filtered: that destination is the caller's to check.
+    /// address is not filtered: that destination is the caller's to check. The
+    /// client uses no proxy, which would resolve names where this filter cannot
+    /// see them.
     pub block_internal: bool,
 }
 
@@ -223,6 +227,14 @@ pub fn build_client(cfg: ClientConfig) -> Result<Client, Error> {
         b = b.resolve(host.as_str(), *addr);
     }
 
+    // A proxy resolves the destination itself, so neither the internal filter
+    // nor a pin would ever be consulted. A client that asks for either uses no
+    // proxy, not one from HTTP_PROXY and the like and not the egress one below.
+    let guarded = cfg.block_internal || !cfg.resolve.is_empty();
+    if guarded {
+        b = b.no_proxy();
+    }
+
     // BYO residential / mobile egress. When the node exports
     // `CROSSFYRE_EGRESS_PROXY` (an `http(s)://` or `socks5://` gateway URL, with
     // optional `user:pass@`), every engine client routes through it. One env var
@@ -230,7 +242,9 @@ pub fn build_client(cfg: ClientConfig) -> Result<Client, Error> {
     // provider is exactly one such gateway URL. Ignored (direct egress) when
     // unset or unparseable, so a bad value never silently drops to a worse path
     // than "no proxy".
-    if let Ok(proxy_url) = std::env::var("CROSSFYRE_EGRESS_PROXY") {
+    if let Ok(proxy_url) = std::env::var("CROSSFYRE_EGRESS_PROXY")
+        && !guarded
+    {
         let proxy_url = proxy_url.trim();
         if !proxy_url.is_empty() {
             match Proxy::all(proxy_url) {

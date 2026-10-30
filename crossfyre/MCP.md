@@ -122,7 +122,7 @@ The server also writes a `start` and a `stop` line, the `stop` line on Ctrl-C, S
 
 - `fingerprint` and `test_injection` run the engines with redirects off and each name pinned to the address the server checked. An endpoint that answers with a redirect is tested on the redirect response itself.
 - If the plessor daemon has an OAST endpoint configured (`PLESSOR_OAST_DOMAIN` and `PLESSOR_OAST_API_URL` in its environment), `test_injection` registers with and polls that endpoint, and blind payloads ask the target to call it. Neither host has to be in the scope file.
-- With `CROSSFYRE_EGRESS_PROXY` or `HTTP(S)_PROXY` set, the proxy resolves names, so the address check is best effort. `status` reports `egress_proxy: true`.
+- A request to a name never goes through a proxy, since the proxy would look the name up again: `HTTP(S)_PROXY` and `CROSSFYRE_EGRESS_PROXY` are not used for it. A destination the scope file lists as an address can still be reached through one of them, from wherever that proxy runs. `status` reports `egress_proxy: true` when one is set.
 - The scan caps are counted across every `crossfyre mcp` process that shares the scope file's directory, but each process checks them under its own lock, so two processes can both start a scan in the last free slot.
 - A client can be set to answer confirmations on its own. The scope file is the real gate.
 - Redaction matches names and known formats, not meaning. A secret with an ordinary name in an ordinary format is not masked.
