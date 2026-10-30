@@ -298,3 +298,48 @@ async fn the_form_shows_every_option_the_launch_carries() {
     }
     assert_eq!(yes.asked(), 7);
 }
+
+#[tokio::test]
+async fn a_launch_sent_with_nobody_asked_is_never_started_at_once() {
+    // whoami said every launch waits for a person, so nobody is asked here; since then
+    // the workspace went back to a policy that would start this launch at once.
+    let (t, cloud, world) = fake_cloud::server(&[], held("always", vec!["Pixel 8"], true)).await;
+    {
+        let mut w = world.lock().unwrap();
+        w.policy = "risky";
+        w.approval_required = false;
+    }
+    let peer = FakePeer::new(Elicit::Accept);
+    let v = ok(&t.call(&peer, SCAN, args()).await).clone();
+    assert_eq!(v["status"], "awaiting_approval", "{v}");
+    assert!(v["scan_id"].as_str().unwrap().starts_with("ap_"), "{v}");
+    assert_eq!(peer.asked(), 0);
+    assert!(
+        world.lock().unwrap().scans.is_empty(),
+        "a launch started with nobody asked"
+    );
+    let starts: Vec<Value> = cloud
+        .requests()
+        .into_iter()
+        .filter(|r| r.route == "scans/start")
+        .map(|r| r.body)
+        .collect();
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0]["hold_for_approval"], true);
+
+    // Where the question is asked, nothing is held on its account.
+    let (t, cloud, _) = fake_cloud::server(&[], World::new("launch")).await;
+    let v = ok(&t.call(&peer, SCAN, args()).await).clone();
+    assert!(v["scan_id"].as_str().unwrap().starts_with("cs_"), "{v}");
+    assert_eq!(peer.asked(), 1);
+    let sent = cloud
+        .requests()
+        .into_iter()
+        .find(|r| r.route == "scans/start")
+        .unwrap();
+    assert!(
+        sent.body.get("hold_for_approval").is_none(),
+        "{}",
+        sent.body
+    );
+}

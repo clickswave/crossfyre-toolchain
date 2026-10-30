@@ -1192,6 +1192,13 @@ pub struct StartRequest {
     /// `request_id` within 10 minutes answers with what the first one produced, so a
     /// retry after a lost answer does not start a second scan.
     pub request_id: String,
+    /// Set when the client asked nobody before sending, because `whoami` said the
+    /// workspace holds every launch for a person. The platform then holds this launch
+    /// for a person whatever its policy is by now: it answers 202, or refuses with
+    /// `approval_required` when nobody can approve it, and never 201. Omitted when
+    /// false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hold_for_approval: bool,
 }
 
 /// `scans/start`, 201: the scan was created and started.
@@ -1617,6 +1624,18 @@ mod tests {
         .unwrap();
         assert_eq!(ok.kind, LaunchType::Crawl);
         assert!(ok.node_ids.is_empty());
+        assert!(!ok.hold_for_approval);
+        // Sent only when set, so a platform that predates it reads every other launch.
+        let back = serde_json::to_value(&ok).unwrap();
+        assert!(back.get("hold_for_approval").is_none(), "{back}");
+        let held = StartRequest {
+            hold_for_approval: true,
+            ..ok
+        };
+        assert_eq!(
+            serde_json::to_value(&held).unwrap()["hold_for_approval"],
+            true
+        );
         let bad: Result<StartRequest, _> = serde_json::from_value(json!({
             "type": "crawl", "targets": [], "request_id": "r_1", "workspace_id": "x"}));
         assert!(bad.is_err());

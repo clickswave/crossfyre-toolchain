@@ -697,7 +697,8 @@ fn start(w: &mut World, b: &Value) -> Resp {
     }
     w.started.push(b.clone());
     w.next += 1;
-    let (status, data) = if w.approval_required {
+    // A launch sent with nobody asked is held whatever the policy is now.
+    let (status, data) = if w.approval_required || req.hold_for_approval {
         let id = uuid(600 + w.next);
         let devices: Vec<Value> = w
             .phones

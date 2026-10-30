@@ -325,7 +325,8 @@ pub(super) async fn run(
         ));
     }
     // The approval replaces this question in a workspace that asks a person about every
-    // launch.
+    // launch. That was true when whoami last answered, so the launch also asks the
+    // platform to hold it for a person even if the policy has changed since.
     let always = cloud
         .whoami()
         .is_some_and(|w| w.approval.policy == wire::ApprovalMode::Always);
@@ -344,6 +345,7 @@ pub(super) async fn run(
         node_ids: a.node_ids.clone(),
         options: a.options.clone(),
         request_id: crate::jobs::new_id("r"),
+        hold_for_approval: always,
     };
     let (status, data): (u16, Value) = cloud
         .request(
