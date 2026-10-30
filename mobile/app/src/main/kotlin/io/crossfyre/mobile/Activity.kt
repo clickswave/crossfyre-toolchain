@@ -1,6 +1,7 @@
 package io.crossfyre.mobile
 
 import io.crossfyre.mobile.approve.ActivityEvent
+import io.crossfyre.mobile.approve.PendingApproval
 import io.crossfyre.mobile.approve.Summary
 import java.time.LocalDate
 import java.time.format.DateTimeFormatter
@@ -24,6 +25,14 @@ fun activityHeader(signedIn: Boolean, approver: ApproverState): ActivityHeader =
     approver == ApproverState.ENROLLING -> ActivityHeader.ENROLLING
     else -> ActivityHeader.TURN_ON
 }
+
+/**
+ * What Home's banner and the Activity tab's badge count as waiting. The list is
+ * asked for only while the phone approves, so in any other state it is stale,
+ * and a phone that cannot approve is not waited for.
+ */
+fun waitingForYou(approver: ApproverState, pending: List<PendingApproval>): List<PendingApproval> =
+    if (approver == ApproverState.ACTIVE) pending else emptyList()
 
 /**
  * Whether the tab reads and shows the activity log. It is off until the platform

@@ -1,6 +1,7 @@
 package io.crossfyre.mobile
 
 import io.crossfyre.mobile.approve.ActivityEvent
+import io.crossfyre.mobile.approve.PendingApproval
 import io.crossfyre.mobile.approve.Summary
 import org.json.JSONArray
 import org.json.JSONObject
@@ -34,6 +35,19 @@ class ActivityStateTest {
         assertEquals(ActivityHeader.TURN_ON, activityHeader(true, ApproverState.BROKEN))
         assertEquals(ActivityHeader.ENROLLING, activityHeader(true, ApproverState.ENROLLING))
         assertEquals(ActivityHeader.LIVE, activityHeader(true, ApproverState.ACTIVE))
+    }
+
+    /**
+     * The list is kept fresh only while the phone approves, so once it stops,
+     * Home's banner and the tab's badge must not keep saying an agent waits.
+     */
+    @Test
+    fun only_a_phone_that_approves_says_an_agent_is_waiting() {
+        val waiting = listOf(PendingApproval("3f9c1e0b-6a2d-4b8e-9c71-0d5e2f4a8b13", "pending", null, null, "{}", ""))
+        assertEquals(waiting, waitingForYou(ApproverState.ACTIVE, waiting))
+        for (state in listOf(ApproverState.BROKEN, ApproverState.OFF, ApproverState.ENROLLING)) {
+            assertEquals(state.name, emptyList<PendingApproval>(), waitingForYou(state, waiting))
+        }
     }
 
     private fun event(action: String, actor: String = "asha", kind: String = "user") = ActivityEvent(

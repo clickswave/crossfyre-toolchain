@@ -94,7 +94,7 @@ private fun MainScreen(m: AppModel) {
                 TabSpec("tracer", R.drawable.ic_broadcast, "Tracer", live = m.phase == Phase.CAPTURING),
                 if (m.patch.available) TabSpec("patch", R.drawable.ic_package, "Patch") else null,
                 // Activity took the place of the locked Node tab. Node is a row on Home.
-                TabSpec("activity", R.drawable.ic_clock, "Activity", badge = m.pending.size),
+                TabSpec("activity", R.drawable.ic_clock, "Activity", badge = m.waiting.size),
                 TabSpec("settings", R.drawable.ic_gear_six, "Settings"),
             ),
             current = tab,

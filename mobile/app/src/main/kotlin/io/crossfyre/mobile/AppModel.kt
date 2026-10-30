@@ -1316,6 +1316,15 @@ class AppModel(app: Application) : AndroidViewModel(app) {
         approverFingerprint = null
         approverTrouble = why
         approverState = ApproverState.BROKEN
+        // Nothing asks for the list again until approvals are back on, so what
+        // it held would stand on Home as waiting for a phone that cannot sign.
+        pending = emptyList()
+        settled.clear()
+        signing = null
+        if (overlay is Overlay.Approval) {
+            overlay = null
+            say("This phone stopped approving. The Activity tab says why.", R.drawable.ic_info)
+        }
     }
 
     val approverLedger = ApproverLedger(store)
@@ -1364,6 +1373,9 @@ class AppModel(app: Application) : AndroidViewModel(app) {
 
     var pending by mutableStateOf<List<PendingApproval>>(emptyList())
         private set
+
+    /** What Home and the tab badge say is waiting: [pending], while this phone approves. */
+    val waiting: List<PendingApproval> get() = waitingForYou(approverState, pending)
 
     /** Approvals that stopped waiting while this app watched, with what became of them. */
     private val settled = mutableStateMapOf<String, PendingApproval>()
@@ -1434,11 +1446,13 @@ class AppModel(app: Application) : AndroidViewModel(app) {
         val r = withContext(Dispatchers.IO) { approvals().pending(key) }
         when (r) {
             is Outcome.Ok -> {
+                // The phone stopped approving, or became another approver, while
+                // this was on its way: the list is for an approver that is gone.
+                if (approverState != ApproverState.ACTIVE || store.approverId != mine) return
                 pendingTrouble = null
                 r.value.serverTime?.let { serverClock = ServerClock(it, SystemClock.elapsedRealtime()) }
                 val approver = r.value.approver
-                if (approverState == ApproverState.ACTIVE && (approver == null || approver.id != mine || approver.status != "active")) {
-                    pending = emptyList()
+                if (approver == null || approver.id != mine || approver.status != "active") {
                     approverBroke("This phone's approval was revoked, in the dashboard or by signing this phone's key out. Turn Approvals on again to approve here.")
                     return
                 }

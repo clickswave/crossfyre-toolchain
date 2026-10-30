@@ -238,7 +238,7 @@ private fun ticking(): Long {
 /** On Home, above everything: an agent is waiting for this phone. */
 @Composable
 fun PendingBanner(m: AppModel) {
-    val first = m.pending.firstOrNull() ?: return
+    val first = m.waiting.firstOrNull() ?: return
     val c = cfx
     val s = remember(first.summaryJson) { Summary.parse(first.summaryJson) }
     Column(
@@ -246,7 +246,7 @@ fun PendingBanner(m: AppModel) {
         verticalArrangement = Arrangement.spacedBy(3.dp),
     ) {
         Text(
-            if (m.pending.size == 1) "An agent is waiting for your approval" else "${m.pending.size} agent requests are waiting for you",
+            if (m.waiting.size == 1) "An agent is waiting for your approval" else "${m.waiting.size} agent requests are waiting for you",
             style = TextStyle(fontFamily = CfxFonts.ui, fontWeight = FontWeight.SemiBold, fontSize = 14.5.sp, lineHeight = 20.sp, color = c.warningLight),
         )
         Text(listOfNotNull(s?.action?.label?.ifEmpty { null }, s?.workspace?.name?.ifEmpty { null }).joinToString(" · ").ifEmpty { "Open it to see what was asked." },
