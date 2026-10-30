@@ -536,6 +536,16 @@ async fn pump(
     let mut last_write = Instant::now();
     let mut seq = 0u64;
     let mut capped = false;
+    // A scan of a request captured somewhere else tests the URL and session that were
+    // captured, and plessor reports its findings on them. The model never saw those
+    // values unmasked, so the file keeps them masked too, the way the job keeps its
+    // endpoints, whatever `--no-redact` says about results.
+    let captured = job
+        .meta
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .source
+        .is_some();
 
     let update = |f: &mut dyn FnMut(&mut JobMeta)| -> JobMeta {
         let mut m = job.meta.lock().unwrap_or_else(|p| p.into_inner());
@@ -573,7 +583,7 @@ async fn pump(
                             continue;
                         }
                         seq += 1;
-                        let f = findings::from_plessor(
+                        let mut f = findings::from_plessor(
                             v.get("data").unwrap_or(&Value::Null),
                             Stamp {
                                 id: jobs::new_id("f"),
@@ -582,6 +592,9 @@ async fn pump(
                                 recorded_ms: jobs::now_ms(),
                             },
                         );
+                        if captured {
+                            findings::redact_finding(&mut f);
+                        }
                         let sev = f["severity"].as_str().unwrap_or("unknown").to_string();
                         if store.append_findings(&job.id, std::slice::from_ref(&f)).is_ok() {
                             let m = update(&mut |m| m.count(&sev));

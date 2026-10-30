@@ -154,7 +154,7 @@ claude mcp add crossfyre -- crossfyre mcp --workbench always
 
 A handle names its project. After the person switches projects, a handle from the old one is refused as `project_changed` rather than reaching whatever exchange has that number in the new one. With projects open in more than one Workbench, the list tools take `project` to say which.
 
-What comes back is shaped like any other result: everything from captured traffic (URLs, paths, headers, bodies, the Repeater draft, refused hosts) is under `target_data`, stripped and capped, and masked as described above unless `--no-redact`. The captured session's cookies and headers that `workbench_test_injection` hands to plessor go over loopback only, and are never written to a result, a scan file or the audit log.
+What comes back is shaped like any other result: everything from captured traffic (URLs, paths, headers, bodies, the Repeater draft, refused hosts) is under `target_data`, stripped and capped, and masked as described above unless `--no-redact`. The captured session's cookies and headers that `workbench_test_injection` hands to plessor go over loopback only, and are never written to a result, a scan file or the audit log. Its findings are kept masked in the scan file, since plessor reports them on the captured URL, so `--no-redact` shows them masked too.
 
 Not reachable from an agent: starting or stopping the proxy, intercept decisions, opening, closing or deleting projects, pinning or deleting exchanges, editing the scope, identities, the client certificate, network and upstream proxy settings, the account, findings and reports, and the CA. The Workbench has no message for any of them.
 

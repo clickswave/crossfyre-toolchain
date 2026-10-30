@@ -1692,6 +1692,69 @@ mod injection {
         assert_eq!(plessor.ops().len(), 1);
     }
 
+    /// plessor reports a finding on the URL it was given, which is the captured one with
+    /// its query values, and its evidence can carry the request it sent. Neither may put
+    /// the captured secrets in the scan's findings file, and `--no-redact` does not bring
+    /// them back, since the file is what would have to be unmasked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_finding_on_a_captured_request_is_stored_masked() {
+        let plessor = stub_engine(StubOpts {
+            events: vec![json!({"type": "finding", "data": {
+                "type": "vulnerability", "vuln_class": "sqli", "name": "SQL injection",
+                "severity": "HIGH", "confidence": "confirmed", "source": "cortex-inject",
+                "url": "http://app.example.test/api/items?id=2&token=S6-tok",
+                "method": "GET", "param": "id", "location": "query",
+                "evidence": "GET /api/items?id=2'&token=S6-tok HTTP/1.1\r\nCookie: sid=S1-ck\r\n\
+                             Authorization: Bearer S3-bearer\r\n\r\n",
+            }})],
+            ..Default::default()
+        })
+        .await;
+        let b = bench_with(
+            scope(&["app.example.test".into()], "")
+                .resolver(names())
+                .plessor(plessor.port)
+                .no_redact(),
+            get_items(),
+        )
+        .await;
+        let peer = FakePeer::new(Elicit::None);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_test_injection",
+                json!({"exchange": handle(4), "wait_seconds": 5}),
+            )
+            .await;
+        let scan_id = ok(&r)["scan_id"].as_str().unwrap().to_string();
+        let m = b.t.mcp.jobs.read_meta(&scan_id).unwrap();
+        assert_eq!(m.counts.findings, 1, "{}", r.text);
+
+        let found = std::fs::read_to_string(
+            b.t.dir
+                .path()
+                .join("jobs")
+                .join(format!("{scan_id}.findings.ndjson")),
+        )
+        .unwrap();
+        for s in ["S1-ck", "S3-bearer", "S6-tok"] {
+            assert!(!found.contains(s), "{s} in the findings file: {found}");
+        }
+        assert!(found.contains("token=%5Bredacted%5D"), "{found}");
+
+        let list =
+            b.t.call(&peer, "list_findings", json!({"scan_id": scan_id}))
+                .await;
+        let id = ok(&list)["findings"][0]["id"].clone();
+        let r =
+            b.t.call(&peer, "get_finding", json!({"finding_id": id}))
+                .await;
+        ok(&r);
+        for s in ["S1-ck", "S3-bearer", "S6-tok"] {
+            assert!(!r.text.contains(s), "{s} in get_finding: {}", r.text);
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_json_body_is_tested_member_by_member_and_kept_out_of_the_files() {
         let plessor = stub_engine(StubOpts::default()).await;
