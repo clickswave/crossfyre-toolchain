@@ -18,6 +18,12 @@ import java.security.spec.X509EncodedKeySpec
 class NoScreenLock : Exception("Set a screen lock on this phone first.")
 
 /**
+ * The key is not in the keystore any more. Android deletes a key that needs an
+ * unlock when the screen lock is removed, rather than only marking it invalid.
+ */
+class KeyGone : Exception("No approval key on this phone.")
+
+/**
  * The key this phone approves with.
  *
  * It is made in the platform keystore, its private half never enters this
@@ -117,7 +123,7 @@ class KeystoreApproverKeys(
     override fun publicKey(): ByteArray? = runCatching { store().getCertificate(alias)?.publicKey?.encoded }.getOrNull()
 
     override fun signature(): Signature {
-        val key = store().getKey(alias, null) as? PrivateKey ?: throw IllegalStateException("No approval key on this phone.")
+        val key = store().getKey(alias, null) as? PrivateKey ?: throw KeyGone()
         return Signature.getInstance("SHA256withECDSA").apply { initSign(key) }
     }
 

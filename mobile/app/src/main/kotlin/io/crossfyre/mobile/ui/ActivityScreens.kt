@@ -12,17 +12,45 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import io.crossfyre.mobile.ActivityHeader
 import io.crossfyre.mobile.AppModel
 import io.crossfyre.mobile.ApproverState
 import io.crossfyre.mobile.EnrolStatus
 import io.crossfyre.mobile.Level
+import io.crossfyre.mobile.ListStatus
+import io.crossfyre.mobile.Overlay
 import io.crossfyre.mobile.R
+import io.crossfyre.mobile.activityHeader
+import io.crossfyre.mobile.activityLine
+import io.crossfyre.mobile.ago
+import io.crossfyre.mobile.approve.ActivityEvent
+import io.crossfyre.mobile.approve.ActivityScope
+import io.crossfyre.mobile.approve.HistoryRow
+import io.crossfyre.mobile.approve.PendingApproval
+import io.crossfyre.mobile.approve.Summary
+import io.crossfyre.mobile.approve.TargetRef
+import io.crossfyre.mobile.approve.approvalView
+import io.crossfyre.mobile.approve.countdown
+import io.crossfyre.mobile.channelLabel
+import io.crossfyre.mobile.riskChips
+import io.crossfyre.mobile.shortDate
+import java.time.Instant
 
 // ── Turning approvals on ─────────────────────────────────────────────────────
 
@@ -186,3 +214,325 @@ fun ApprovalsSettings(m: AppModel) {
         )
     }
 }
+
+// ── The Activity tab ─────────────────────────────────────────────────────────
+//
+// Everything here that came from an agent or a scanned system is drawn with a
+// plain Text: never through marked(), which reads backticks and asterisks, and
+// never as a link. The strings were cleaned when they were read.
+
+/** A clock that ticks once a second while it is on screen, for countdowns. */
+@Composable
+private fun ticking(): Long {
+    var now by remember { mutableLongStateOf(android.os.SystemClock.elapsedRealtime()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            now = android.os.SystemClock.elapsedRealtime()
+            kotlinx.coroutines.delay(1000)
+        }
+    }
+    return now
+}
+
+/** On Home, above everything: an agent is waiting for this phone. */
+@Composable
+fun PendingBanner(m: AppModel) {
+    val first = m.pending.firstOrNull() ?: return
+    val c = cfx
+    val s = remember(first.summaryJson) { Summary.parse(first.summaryJson) }
+    Column(
+        Modifier.fillMaxWidth().background(c.warningTint).border(1.dp, c.mix(c.warning, 0.35f)).padding(horizontal = 14.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(3.dp),
+    ) {
+        Text(
+            if (m.pending.size == 1) "An agent is waiting for your approval" else "${m.pending.size} agent requests are waiting for you",
+            style = TextStyle(fontFamily = CfxFonts.ui, fontWeight = FontWeight.SemiBold, fontSize = 14.5.sp, lineHeight = 20.sp, color = c.warningLight),
+        )
+        Text(listOfNotNull(s?.action?.label?.ifEmpty { null }, s?.workspace?.name?.ifEmpty { null }).joinToString(" · ").ifEmpty { "Open it to see what was asked." },
+            style = T.hint().copy(color = c.text2))
+        Row(Modifier.padding(top = 4.dp)) {
+            CfxButton("Review", Kind.TEXT, small = true) { m.openApproval(first.id) }
+            CfxButton("All activity", Kind.TEXT_DIM, small = true) { m.goTab("activity") }
+        }
+    }
+}
+
+@Composable
+fun ActivityContent(m: AppModel) {
+    val tick = ticking()
+    val now = m.serverNow(tick)
+    when (activityHeader(m.signedIn, m.approverState)) {
+        ActivityHeader.SIGN_IN -> {
+            Empty(
+                R.drawable.ic_clock, "Sign in to see activity",
+                "Approvals and your workspace's activity come with an account. A QR pairing has neither.",
+            ) { CfxButton("Sign in", Kind.SECONDARY, small = true) { m.toSignIn() } }
+            return
+        }
+        ActivityHeader.TURN_ON -> CfxCard {
+            Eyebrow("Approvals")
+            m.approverTrouble?.let { Text(it, style = T.body().copy(color = cfx.warningLight)) }
+            Text("Turn on approvals to approve what an agent asks to do, with an unlock on this phone.", style = T.body())
+            Row { CfxButton("Turn on approvals", Kind.PRIMARY, small = true) { m.overlay = Overlay.ApprovalsExplain } }
+        }
+        ActivityHeader.ENROLLING -> CfxCard {
+            Eyebrow("Approvals")
+            Text("Waiting for you to confirm this phone in the browser.", style = T.body())
+            Row { CfxButton("Show", Kind.SECONDARY, small = true) { m.overlay = Overlay.Enrol } }
+        }
+        ActivityHeader.LIVE -> {
+            GroupLabel("Waiting for you")
+            if (m.pending.isEmpty()) {
+                CfxCard(tight = true) {
+                    Text("Nothing is waiting.", style = T.rowTitle())
+                    Text("When an agent asks for something that needs you, it shows up here while the app is open.", style = T.hint())
+                }
+            } else {
+                CfxList { m.pending.forEachIndexed { i, a -> PendingRow(m, a, i == 0, now) } }
+            }
+            m.pendingTrouble?.let { Text(it, style = T.hint().copy(color = cfx.warning)) }
+        }
+    }
+
+    GroupLabel("Recent decisions")
+    when {
+        m.history.isNotEmpty() -> CfxList { m.history.take(20).forEachIndexed { i, h -> HistoryItem(h, i == 0, now) } }
+        m.historyStatus == ListStatus.LOADING -> CfxList { repeat(2) { SkelRow(first = it == 0) } }
+        m.historyStatus == ListStatus.ERROR -> Text("Couldn't load recent decisions.", style = T.hint())
+        else -> Text("No decisions yet.", style = T.hint())
+    }
+
+    GroupLabel("Activity")
+    val scopes = m.activityScopes
+    if (scopes.size > 1) {
+        Seg(
+            scopes.map { sc -> key(sc) to if (sc is ActivityScope.Workspace) sc.name.ifEmpty { "Workspace" } else "Your account" },
+            key(m.activityScope),
+        ) { k -> scopes.firstOrNull { key(it) == k }?.let { m.chooseActivityScope(it) } }
+    }
+    m.activityNotice?.let { Banner(it, listOf("Try again" to { m.loadActivity() })) }
+    when {
+        m.activity.isNotEmpty() -> {
+            CfxList { m.activity.forEachIndexed { i, e -> EventRow(m, e, i == 0, now) } }
+            if (m.activityNext != null) {
+                CfxButton("Show older", Kind.SECONDARY, block = true, busy = m.activityMoreBusy) { m.loadActivity(more = true) }
+            }
+        }
+        m.activityStatus == ListStatus.LOADING -> CfxList { repeat(3) { SkelRow(first = it == 0) } }
+        m.activityStatus == ListStatus.EMPTY -> Text("Nothing has happened here yet, or this account cannot read this view.", style = T.hint())
+    }
+    Text("Read from ${m.host} while the app is open and kept in memory. Nothing on this tab is written to the phone's storage.", style = T.hint())
+}
+
+private fun key(s: ActivityScope): String = when (s) {
+    is ActivityScope.Workspace -> "ws:" + s.id
+    ActivityScope.Account -> "account"
+}
+
+private fun secondsBetween(a: Instant?, b: Instant): Long = if (a == null) 0 else (b.epochSecond - a.epochSecond).coerceAtLeast(0)
+
+@Composable
+private fun PendingRow(m: AppModel, a: PendingApproval, first: Boolean, now: Instant) {
+    val v = approvalView(a, now, m.approverState == ApproverState.ACTIVE)
+    val s = v.summary
+    CfxRow(
+        s?.action?.label?.ifEmpty { null } ?: "Agent request", first = first, icon = R.drawable.ic_shield_check,
+        sub = listOfNotNull(s?.workspace?.name?.ifEmpty { null }, s?.requester?.username?.ifEmpty { null }?.let { "asked by $it" }).joinToString(" · ").ifEmpty { null },
+        note = if (!v.checked) "Could not be checked: deny it or open it in the dashboard" else null, noteTone = Tone.WARN,
+        value = countdown(v.secondsLeft), valueTone = if (v.secondsLeft < 60) Tone.WARN else Tone.NONE,
+        chevron = R.drawable.ic_caret_right,
+        onClick = { m.openApproval(a.id) },
+    )
+}
+
+@Composable
+private fun HistoryItem(h: HistoryRow, first: Boolean, now: Instant) {
+    val (word, tone) = when (h.status) {
+        "approved" -> "Approved" to Tone.OK
+        "denied" -> "Denied" to Tone.DANGER
+        "expired" -> "Expired" to Tone.NONE
+        "cancelled" -> "Cancelled" to Tone.NONE
+        else -> h.status.replaceFirstChar { it.uppercase() } to Tone.NONE
+    }
+    val via = when (h.decidedVia) {
+        "phone" -> h.deviceName.ifEmpty { "a phone" }.let { "on $it" }
+        "dashboard" -> "in the dashboard"
+        "agent_client" -> "in the agent's client"
+        "agent_cancel" -> "by the agent"
+        "expiry" -> "by expiry"
+        else -> ""
+    }
+    val launched = when (h.launchState) {
+        "launched" -> "started"
+        "launching" -> "starting"
+        "failed" -> "did not start"
+        else -> ""
+    }
+    CfxRow(
+        h.actionLabel.ifEmpty { "Agent request" }, first = first,
+        sub = listOf(h.workspaceName, via, ago(secondsBetween(h.decidedAt ?: h.createdAt, now))).filter { it.isNotEmpty() }.joinToString(" · "),
+        note = launched.ifEmpty { null }?.let { "The request $it" }, noteTone = if (h.launchState == "failed") Tone.WARN else Tone.NONE,
+        trailing = { Chip(word, tone) },
+    )
+}
+
+@Composable
+private fun EventRow(m: AppModel, e: ActivityEvent, first: Boolean, now: Instant) {
+    CfxRow(
+        activityLine(e), first = first,
+        sub = listOf(e.subjectName, channelLabel(e.channel), ago(secondsBetween(e.at, now))).filter { it.isNotEmpty() }.joinToString(" · "),
+        note = when (e.outcome) {
+            "refused" -> "Refused"
+            "error" -> "Failed"
+            else -> null
+        },
+        noteTone = Tone.WARN,
+        chevron = R.drawable.ic_caret_right,
+        onClick = { m.overlay = Overlay.Event(e.id) },
+    )
+}
+
+@Composable
+fun BoxScope.EventSheet(m: AppModel, id: Long) {
+    val e = m.activity.firstOrNull { it.id == id } ?: run { m.overlay = null; return }
+    Sheet(title = { SheetTitle(activityLine(e)) }, onDismiss = { m.overlay = null }) {
+        val rows = buildList {
+            e.at?.let { add("When" to java.time.format.DateTimeFormatter.ofPattern("d MMM yyyy, HH:mm").withZone(java.time.ZoneId.systemDefault()).format(it)) }
+            add("Who" to e.actorName.ifEmpty { e.actorKind })
+            channelLabel(e.channel).takeIf { it.isNotEmpty() }?.let { add("Through" to it) }
+            e.credentialLabel.takeIf { it.isNotEmpty() }?.let { add("Key" to it) }
+            add("Action" to e.action)
+            add("Outcome" to e.outcome)
+            if (e.subjectName.isNotEmpty() || e.subjectType.isNotEmpty()) add("Subject" to listOf(e.subjectName, e.subjectType).filter { it.isNotEmpty() }.joinToString(", "))
+            e.workspace?.let { add("Workspace" to it.name) }
+            e.team?.let { add("Team" to it.name) }
+            e.org?.let { add("Organization" to it.name) }
+            addAll(e.detail)
+        }
+        Facts(rows, mono = setOf("Action", "Key"))
+    }
+}
+
+/**
+ * One approval, top to bottom: what is asked, who asked, where, each target with
+ * the scope entry that admits it, the nodes, the options, the agent's own words
+ * marked as such, and the time left by the server's clock.
+ */
+@Composable
+fun BoxScope.ApprovalSheet(m: AppModel, id: String) {
+    val c = cfx
+    val a = m.approvalFor(id) ?: run { m.overlay = null; return }
+    val now = m.serverNow(ticking())
+    val v = approvalView(a, now, m.approverState == ApproverState.ACTIVE)
+    val s = v.summary
+    val busy = m.deciding == id
+    Sheet(
+        title = { SheetTitle(s?.action?.label?.ifEmpty { null } ?: "Agent request") },
+        onDismiss = { m.overlay = null }, tall = true,
+        foot = {
+            when {
+                a.status != "pending" -> Text(settledLine(a.status), style = T.body())
+                v.secondsLeft <= 0 -> Text("This request expired. Nothing was started.", style = T.body())
+                else -> Text("Expires in " + countdown(v.secondsLeft), style = T.mono(13.5.sp).copy(color = if (v.secondsLeft < 60) c.warning else c.text2))
+            }
+            m.decisionNotice?.let { Banner(it) }
+            v.blocked?.takeIf { a.status == "pending" && v.secondsLeft > 0 }?.let { Text(it, style = T.hint().copy(color = c.warning)) }
+            if (v.canDeny || v.canApprove) {
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    CfxButton("Deny", Kind.DANGER_TEXT, Modifier.weight(1f), enabled = v.canDeny && !busy) { m.deny(id) }
+                    if (v.canApprove) {
+                        CfxButton("Approve", Kind.PRIMARY, Modifier.weight(1f), icon = R.drawable.ic_lock_key_open, busy = busy) { m.approve(id) }
+                    }
+                }
+            } else {
+                CfxButton("Close", Kind.SECONDARY, block = true) { m.overlay = null }
+            }
+        },
+    ) {
+        if (s == null) {
+            Text("This request could not be read on this phone.", style = T.body())
+            return@Sheet
+        }
+        val chips = riskChips(s)
+        if (chips.isNotEmpty()) Wrap { for (chip in chips) Chip(chip, if (chip.startsWith("Can change")) Tone.DANGER else Tone.WARN) }
+
+        Eyebrow("Who asked")
+        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text("${s.requester.username.ifEmpty { "Someone" }}, through an agent", style = T.rowTitle())
+            if (s.requester.keyName.isNotEmpty()) Text("Key: ${s.requester.keyName}", style = T.rowSub())
+            val from = listOf(s.requester.ip, s.requester.location).filter { it.isNotEmpty() }.joinToString(", ")
+            if (from.isNotEmpty()) Text("From $from", style = T.rowSub())
+            if (s.requester.client.isNotEmpty()) Text("Client says: ${s.requester.client} (not verified)", style = T.rowSub())
+            Text(ago(secondsBetween(s.requestedAt ?: a.createdAt, now)), style = T.rowSub())
+        }
+
+        Eyebrow("Workspace")
+        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(s.workspace.name.ifEmpty { "Unnamed workspace" }, style = T.rowTitle())
+            if (s.workspace.org.isNotEmpty()) Text(s.workspace.org, style = T.rowSub())
+        }
+
+        Eyebrow(if (s.targets.size == 1) "Target" else "${s.targets.size} targets")
+        Targets(s.targets)
+
+        if (s.nodes.isNotEmpty()) {
+            Eyebrow(if (s.nodes.size == 1) "Node" else "${s.nodes.size} nodes")
+            Text(s.nodes.joinToString(", ") { it.name.ifEmpty { it.id } }, style = T.body())
+        }
+
+        if (s.options.isNotEmpty()) {
+            Eyebrow("Options")
+            Facts(s.options, compact = true, mono = s.options.map { it.first }.toSet())
+        }
+
+        if (s.reason.isNotEmpty()) {
+            Column(
+                Modifier.fillMaxWidth().background(c.surface2).border(1.dp, c.line).padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Eyebrow("In the agent's words, not checked")
+                Text(s.reason, style = T.body().copy(color = c.text2))
+            }
+        }
+    }
+}
+
+private fun settledLine(status: String): String = when (status) {
+    "approved" -> "Approved."
+    "denied" -> "Denied. Nothing was started."
+    "expired" -> "This request expired. Nothing was started."
+    else -> "This request is no longer waiting. It was decided elsewhere, cancelled, or it expired."
+}
+
+@Composable
+private fun Targets(targets: List<TargetRef>) {
+    val c = cfx
+    var all by remember { mutableStateOf(false) }
+    val shown = if (all) targets else targets.take(20)
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        for (t in shown) {
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(t.target.ifEmpty { t.host }, style = T.mono(13.sp), maxLines = 3, overflow = TextOverflow.Ellipsis)
+                val adm = t.admittedBy
+                if (adm == null || adm.entry.isEmpty()) {
+                    Text("No scope entry was named for this target.", style = T.rowSub().copy(color = c.warning))
+                } else {
+                    Text(
+                        buildAnnotatedString {
+                            append("Allowed by ")
+                            withStyle(SpanStyle(fontFamily = CfxFonts.mono, fontSize = 12.5.sp, color = c.text1)) { append(adm.entry) }
+                            if (adm.addedBy.isNotEmpty()) append(", added by ${adm.addedBy}")
+                            if (adm.addedOn.isNotEmpty()) append(" on ${shortDate(adm.addedOn)}")
+                            if (adm.note.isNotEmpty()) append(" (${adm.note})")
+                        },
+                        style = T.rowSub(),
+                    )
+                }
+            }
+        }
+        if (targets.size > 20 && !all) {
+            Row { CfxButton("+${targets.size - 20} more", Kind.TEXT, small = true) { all = true } }
+        }
+    }
+}
+

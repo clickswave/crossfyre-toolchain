@@ -98,3 +98,23 @@ fun enrolNotice(p: Problem, host: String): Notice = when {
     listTrouble(p) == ListTrouble.UNVERIFIED || listTrouble(p) == ListTrouble.SUSPENDED -> listNotice(p, host)
     else -> Notice(Level.DANGER, "Couldn't turn on approvals.", p.text)
 }
+
+/** What the approval screen says when a decision did not go through. */
+fun decisionNotice(p: Problem, host: String): Notice = when {
+    p is Problem.Unreachable -> Notice(Level.DANGER, "Couldn't send your answer.", "$host didn't answer, so nothing was decided. Try again.")
+    reasonOf(p) == Refusal.NOT_PENDING -> Notice(Level.INFO, "This request is no longer waiting.", "It was decided somewhere else, or cancelled.")
+    reasonOf(p) == Refusal.APPROVAL_EXPIRED -> Notice(Level.WARN, "This request expired.", "Nothing was started. The agent has to ask again.")
+    reasonOf(p) == Refusal.UNKNOWN -> Notice(Level.INFO, "This request is gone.", "The server no longer has it, so there is nothing to decide.")
+    reasonOf(p) == Refusal.BAD_SIGNATURE -> Notice(
+        Level.DANGER, "The server did not accept this phone's signature.",
+        "Nothing was approved. Turn Approvals off and on again in Settings, then ask the agent to try again.",
+    )
+    reasonOf(p) == Refusal.APPROVER_INACTIVE -> Notice(Level.WARN, "This phone no longer approves.", "Turn Approvals on again in Settings.")
+    else -> Notice(Level.DANGER, "Couldn't send your answer.", p.text)
+}
+
+/** Why the activity log did not load. */
+fun activityNotice(p: Problem, host: String): Notice = when (p) {
+    is Problem.Unreachable -> Notice(Level.DANGER, "Couldn't load activity.", "$host didn't answer. Check the phone's connection.")
+    else -> Notice(Level.DANGER, "Couldn't load activity.", p.text)
+}

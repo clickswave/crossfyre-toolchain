@@ -10,15 +10,17 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
+import org.junit.Assume.assumeFalse
 import org.junit.Test
 import org.junit.runner.RunWith
 
 /**
  * The approval key in the real keystore, on a device or emulator.
  *
- * The tests set and clear a PIN themselves through `locksettings`, so they need
- * a device whose lock screen they are allowed to change: an emulator, not a phone
- * in use. The unlock prompt itself is checked by hand.
+ * The tests set a PIN through `locksettings` when the device has none, and clear
+ * only a PIN they set, so a phone's own screen lock is never touched; the test
+ * that needs no lock at all is skipped on such a phone. Run them on an emulator.
+ * The unlock prompt itself is checked by hand.
  */
 @RunWith(AndroidJUnit4::class)
 class ApproverKeyTest {
@@ -32,25 +34,25 @@ class ApproverKeyTest {
             android.os.ParcelFileDescriptor.AutoCloseInputStream(fd).bufferedReader().use { it.readText() }
         }
 
-    private fun lock() {
-        if (!keyguard.isDeviceSecure) shell("locksettings set-pin $PIN")
-        assertTrue("could not set a PIN on this device", keyguard.isDeviceSecure)
-    }
+    private var pinSetHere = false
 
-    private fun unlock() {
-        if (keyguard.isDeviceSecure) shell("locksettings clear --old $PIN")
-        assertFalse("could not clear the PIN on this device", keyguard.isDeviceSecure)
+    private fun lock() {
+        if (!keyguard.isDeviceSecure) {
+            shell("locksettings set-pin $PIN")
+            pinSetHere = true
+        }
+        assertTrue("could not set a PIN on this device", keyguard.isDeviceSecure)
     }
 
     @After
     fun down() {
         keys.delete()
-        unlock()
+        if (pinSetHere) shell("locksettings clear --old $PIN")
     }
 
     @Test
     fun no_key_is_made_on_a_phone_without_a_screen_lock() {
-        unlock()
+        assumeFalse("this device has a screen lock the test did not set, and it is left alone", keyguard.isDeviceSecure)
         try {
             keys.create()
             fail("a key that needs an unlock was made on a phone with no lock")
