@@ -94,7 +94,10 @@ the app asks for a new code.
 
 The account key is kept encrypted under a key held by the Android keystore.
 Signing out revokes it on the server as well as forgetting it on the phone. The
-certificate and any patched apps are device things and stay.
+phone waits for the server to confirm first; when it cannot, the phone still
+signs out, and the sign-in screen says to revoke the key in the dashboard under
+Settings > CLI Access. The certificate and any patched apps are device things
+and stay.
 
 ## Approving agent actions
 
