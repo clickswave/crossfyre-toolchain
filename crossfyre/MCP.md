@@ -98,7 +98,7 @@ Scans are kept in `jobs/` next to the scope file. When the server starts, it rem
 - Run commands or take file paths.
 - Return text from a target anywhere but under `target_data`, which is marked `"untrusted": true`. That text is stripped of terminal escapes, control characters and invisible or reordering characters, and capped.
 
-Secrets in responses and evidence (authorization and cookie headers, bearer tokens, common key formats) are masked in results. `--no-redact` turns that off for results; the audit log is masked either way.
+Secrets in responses and evidence (authorization headers, bearer tokens, common key formats, and JSON members and multipart form parts whose names say they hold a password, token, key, secret or session) are masked in results. Cookie headers keep each cookie's name and lose its value, so `sid=[redacted]; theme=[redacted]` still shows that a session was there. `--no-redact` turns that off for results; the audit log is masked either way.
 
 ## Confirmations
 

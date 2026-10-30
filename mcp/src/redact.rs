@@ -55,6 +55,20 @@ static PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
         p(r"xox[baprs]-[\w-]+", MASK),
         p(r"AIza[\w-]{35}", MASK),
         p(r"sk_live_\w+", MASK),
+        // A JSON member whose name carries one of those words, with a string value:
+        // `"password":"hunter2"`, `"access_token": "..."`. Escapes inside the value are
+        // stepped over, so `\"` does not end it early.
+        p(
+            r#"(?i)"([^"\\]*(?:passw|secret|token|api[_-]?key|session|auth)[^"\\]*)"\s*:\s*"(?:[^"\\]|\\.)*""#,
+            r#""$1":"[redacted]""#,
+        ),
+        // A multipart/form-data part whose name carries one: its headers are kept and
+        // its body, up to the next boundary or the end of what was captured, is masked.
+        // `\bname` so a `filename=` is not read as the part's name.
+        p(
+            r#"(?i)(content-disposition:[^\r\n]*\bname="?[^"\r\n;]*(?:passw|secret|token|api[_-]?key|session|auth)[^"\r\n;]*"?[^\r\n]*\r?\n(?:[^\r\n]+\r?\n)*?\r?\n)(?s:.*?)(\r?\n--|\z)"#,
+            "${1}[redacted]${2}",
+        ),
         // `name=value` where the name carries one of the words `sensitive_name` looks
         // for, prefixed or not: `access_token=`, `client_secret=`, `session_id=`. No
         // word boundary in front, because `_` is a word character and `\b` would
@@ -116,10 +130,58 @@ pub(crate) fn redact_url(s: &str) -> String {
     url.to_string()
 }
 
+/// Cookie attributes a server sets beside the cookie, which are kept as they are.
+const COOKIE_ATTRIBUTES: [&str; 9] = [
+    "path",
+    "domain",
+    "expires",
+    "max-age",
+    "samesite",
+    "secure",
+    "httponly",
+    "partitioned",
+    "priority",
+];
+
+/// `a=1; b=2` as `a=[redacted]; b=[redacted]`, so a reader can see which cookies a
+/// request carried without seeing them. In a `Set-Cookie`, the attributes after the
+/// first pair are kept unless they are not attributes at all.
+fn mask_cookies(value: &str, set: bool) -> String {
+    let mut out = Vec::new();
+    for (i, part) in value.split(';').enumerate() {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (k, has_value) = match part.split_once('=') {
+            Some((k, _)) => (k.trim(), true),
+            None => (part, false),
+        };
+        let attribute =
+            set && i > 0 && COOKIE_ATTRIBUTES.contains(&k.to_ascii_lowercase().as_str());
+        out.push(if attribute {
+            part.to_string()
+        } else if has_value && !k.is_empty() {
+            format!("{k}={MASK}")
+        } else {
+            MASK.to_string()
+        });
+    }
+    if out.iter().all(|p| p == MASK) {
+        return MASK.to_string();
+    }
+    out.join("; ")
+}
+
 /// One header value, masked by its name and then by format. A URL in a header is
-/// masked as a URL, by parameter name.
+/// masked as a URL, by parameter name. Cookies keep their names.
 pub(crate) fn redact_header(name: &str, value: &str) -> String {
-    if sensitive_name(name) {
+    let n = name.trim();
+    if n.eq_ignore_ascii_case("cookie") {
+        mask_cookies(value, false)
+    } else if n.eq_ignore_ascii_case("set-cookie") {
+        mask_cookies(value, true)
+    } else if sensitive_name(name) {
         MASK.to_string()
     } else if name.eq_ignore_ascii_case("location") || name.eq_ignore_ascii_case("content-location")
     {
@@ -283,6 +345,55 @@ mod unit {
     fn a_location_header_is_masked_as_a_url() {
         let r = redact_header("Location", "https://h.test/cb?code=DDD1&token=DDD2");
         assert!(!r.contains("DDD1") && !r.contains("DDD2"), "{r}");
+    }
+
+    #[test]
+    fn json_members_with_secret_names_are_masked() {
+        let r = redact_text(
+            r#"{"password":"hunter2","access_token":"AAA1","user":{"Session-Id" : "AAA2"},"q":"keep","note":"a \"quoted\" token"}"#,
+        );
+        for secret in ["hunter2", "AAA1", "AAA2"] {
+            assert!(!r.contains(secret), "{secret} survived: {r}");
+        }
+        assert!(r.contains(r#""password":"[redacted]""#), "{r}");
+        assert!(r.contains(r#""q":"keep""#), "{r}");
+        assert!(r.contains(r#""note":"a \"quoted\" token""#), "{r}");
+        let r = redact_text(r#"{"api_key":"k\"EEE1\\"}"#);
+        assert!(!r.contains("EEE1"), "{r}");
+    }
+
+    #[test]
+    fn multipart_parts_with_secret_names_are_masked() {
+        let body = "--XyZ\r\nContent-Disposition: form-data; name=\"user\"\r\n\r\nalice\r\n\
+                    --XyZ\r\nContent-Disposition: form-data; name=\"password\"\r\n\
+                    Content-Type: text/plain\r\n\r\nhunter2\r\n\
+                    --XyZ\r\ncontent-disposition: form-data; name=csrf_token\r\n\r\nBBB1\r\n--XyZ--\r\n";
+        let r = redact_text(body);
+        for secret in ["hunter2", "BBB1"] {
+            assert!(!r.contains(secret), "{secret} survived: {r}");
+        }
+        assert!(r.contains("alice"), "{r}");
+        assert!(r.contains("name=\"password\""), "{r}");
+        // A body cut off inside the part still loses the value.
+        let r = redact_text("--b\nContent-Disposition: form-data; name=\"secret\"\n\nCCC1 and mo");
+        assert!(!r.contains("CCC1"), "{r}");
+    }
+
+    #[test]
+    fn cookie_headers_keep_their_names_and_lose_their_values() {
+        assert_eq!(
+            redact_header("Cookie", "sid=S1; theme=dark"),
+            "sid=[redacted]; theme=[redacted]"
+        );
+        let r = redact_header("Set-Cookie", "sid=S2; Path=/; HttpOnly");
+        assert_eq!(r, "sid=[redacted]; Path=/; HttpOnly");
+        let r = redact_header("set-cookie", "__Host-a=S3=more; Secure");
+        assert!(
+            !r.contains("S3") && r.starts_with("__Host-a=[redacted]"),
+            "{r}"
+        );
+        // Nothing that looks like a pair keeps nothing at all.
+        assert_eq!(redact_header("Cookie", "S4"), MASK);
     }
 
     #[test]
