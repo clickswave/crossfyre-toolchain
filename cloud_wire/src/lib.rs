@@ -119,6 +119,70 @@ fn is_lower_hex(b: u8) -> bool {
     b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
 }
 
+/// The words a client keeps at the top of a result. A value outside these reaches a
+/// model as `other`, with the text moved under `target_data`, because a status or a
+/// kind is where a field written by a scanned system would otherwise pass for the
+/// platform's own.
+pub mod vocab {
+    pub const SCAN_STATUSES: [&str; 10] = [
+        "pending",
+        "populating",
+        "queued",
+        "running",
+        "completed",
+        "failed",
+        "halted",
+        "stopped",
+        "cancelled",
+        "awaiting_approval",
+    ];
+    /// The scan statuses after which nothing more happens.
+    pub const SCAN_ENDED: [&str; 5] = ["completed", "failed", "halted", "stopped", "cancelled"];
+    pub const VERDICT_STATUSES: [&str; 9] = [
+        "open",
+        "triaged",
+        "confirmed",
+        "false_positive",
+        "accepted",
+        "fixed",
+        "resolved",
+        "reopened",
+        "ignored",
+    ];
+    pub const ASSET_STATUSES: [&str; 5] = ["active", "inactive", "new", "gone", "archived"];
+    pub const NODE_STATUSES: [&str; 6] = [
+        "online",
+        "offline",
+        "busy",
+        "provisioning",
+        "error",
+        "maintenance",
+    ];
+    pub const CONFIDENCES: [&str; 7] = [
+        "tentative",
+        "firm",
+        "certain",
+        "low",
+        "medium",
+        "high",
+        "confirmed",
+    ];
+    /// How a scan was started: `created_via`.
+    pub const CHANNELS: [&str; 6] = ["dashboard", "cli", "mcp", "valkyrie", "mobile", "system"];
+
+    /// A type, kind, source, engine or phase: a lowercase word of letters, digits and
+    /// `_`, `.` or `-`, at most 64 characters, starting with a letter or digit.
+    pub fn is_word(s: &str) -> bool {
+        let b = s.as_bytes();
+        !b.is_empty()
+            && b.len() <= 64
+            && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+            && b.iter().all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'_' | b'.' | b'-')
+            })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The envelope and refusals
 
@@ -1511,6 +1575,38 @@ mod tests {
         assert!(count_ports("90-80").is_err());
         assert!(count_ports("http").is_err());
         assert!(count_ports("1-65535,1-65535").is_err());
+    }
+
+    #[test]
+    fn the_vocabulary_is_made_of_words() {
+        let lists: [&[&str]; 7] = [
+            &vocab::SCAN_STATUSES,
+            &vocab::SCAN_ENDED,
+            &vocab::VERDICT_STATUSES,
+            &vocab::ASSET_STATUSES,
+            &vocab::NODE_STATUSES,
+            &vocab::CONFIDENCES,
+            &vocab::CHANNELS,
+        ];
+        for w in lists.into_iter().flatten() {
+            assert!(vocab::is_word(w), "{w}");
+        }
+        for e in vocab::SCAN_ENDED {
+            assert!(vocab::SCAN_STATUSES.contains(&e), "{e}");
+        }
+        for t in LaunchType::ALL {
+            assert!(vocab::is_word(t.as_str()));
+        }
+        for bad in [
+            "",
+            "Running",
+            "ignore previous instructions",
+            "-x",
+            "a\u{200B}b",
+            &"a".repeat(65),
+        ] {
+            assert!(!vocab::is_word(bad), "{bad:?}");
+        }
     }
 
     #[test]
