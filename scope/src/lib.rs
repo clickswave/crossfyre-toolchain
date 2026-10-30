@@ -361,6 +361,10 @@ pub enum Point {
     /// request they typed and watched. Named apart because several go out from one click,
     /// so a refusal here is one of a set and reads differently from a single send.
     Replay,
+    /// A send an agent asked for through `crossfyre mcp`, rather than one the operator
+    /// typed. Named apart so the record can answer which sends no person made, which is
+    /// the first question anyone asks of a refusal on that path.
+    Agent,
 }
 
 impl Point {
@@ -370,6 +374,7 @@ impl Point {
             Point::Request => "request",
             Point::Repeater => "repeater",
             Point::Replay => "replay",
+            Point::Agent => "agent",
         }
     }
 
@@ -381,6 +386,7 @@ impl Point {
             "request" => Some(Point::Request),
             "repeater" => Some(Point::Repeater),
             "replay" => Some(Point::Replay),
+            "agent" => Some(Point::Agent),
             _ => None,
         }
     }
@@ -803,9 +809,11 @@ mod tests {
             Point::Request,
             Point::Repeater,
             Point::Replay,
+            Point::Agent,
         ] {
             assert_eq!(Point::parse(p.as_str()), Some(p), "{p:?} round trips");
         }
+        assert_eq!(Point::parse("agent"), Some(Point::Agent));
         assert_eq!(Point::parse("something-else"), None);
     }
 
