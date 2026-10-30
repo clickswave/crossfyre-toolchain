@@ -236,3 +236,65 @@ async fn a_cancelled_wait_leaves_the_launch_pending() {
     let w = world.lock().unwrap();
     assert!(w.approvals.values().all(|a| a["status"] == "pending"));
 }
+
+#[tokio::test]
+async fn the_form_shows_every_option_the_launch_carries() {
+    let mut w = held("always", vec![], true);
+    w.scope.push(("10.9.0.0/24".into(), true));
+    let (t, _, _) = fake_cloud::server(&[], w).await;
+    let yes = FakePeer::new(Elicit::Accept);
+    let cases = [
+        (
+            "start_recon",
+            json!({"domain": "example.org", "mode": "active"}),
+            vec!["mode=active", "probes names under"],
+        ),
+        (
+            "start_recon",
+            json!({"domain": "example.org"}),
+            vec!["mode=passive"],
+        ),
+        (
+            "start_port_scan",
+            json!({"targets": ["10.9.0.7"], "ports": "22,80,8000-8100"}),
+            vec!["ports=22,80,8000-8100", "103 ports"],
+        ),
+        (
+            "start_crawl",
+            json!({"url": "https://app.example.com/", "max_depth": 2, "max_pages": 50}),
+            vec!["max_depth=2", "max_pages=50"],
+        ),
+        (
+            "start_content_discovery",
+            json!({"url": "https://app.example.com/", "wordlist": "common",
+                   "extensions": ["php", "bak"], "recurse": true}),
+            vec!["wordlist=common", "extensions=php,bak", "recurse=true"],
+        ),
+        (
+            "start_vuln_scan",
+            json!({"urls": ["https://app.example.com/"], "severity_min": "high",
+                   "tags": ["cve"]}),
+            vec!["severity_min=high", "tags=cve"],
+        ),
+        (
+            "start_authz_scan",
+            json!({"url": "https://app.example.com/", "identities": ["admin", "viewer"]}),
+            vec!["identities=admin,viewer"],
+        ),
+    ];
+    for (i, (tool, args, want)) in cases.into_iter().enumerate() {
+        let v = ok(&t.call(&yes, tool, args.clone()).await).clone();
+        let q = yes.questions.lock().unwrap()[i].clone();
+        for w in want {
+            assert!(q.contains(w), "{tool} {args}: {w} not in {q}");
+        }
+        assert!(!q.contains("exactly as shown"), "{q}");
+        // The agent's view of the approval carries the same options.
+        let opts = &v["approval"]["action"]["options"];
+        assert!(opts.is_object(), "{tool}: {v}");
+        if tool == "start_recon" {
+            assert!(opts["mode"] == "active" || opts["mode"] == "passive", "{v}");
+        }
+    }
+    assert_eq!(yes.asked(), 7);
+}

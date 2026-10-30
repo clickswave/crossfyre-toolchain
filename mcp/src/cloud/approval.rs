@@ -54,8 +54,8 @@ fn confirmation(a: &wire::Approval) -> Option<&'static str> {
     }
 }
 
-/// What the form shows: what the platform stored, so the person approves what would
-/// actually launch.
+/// What the form shows: what the platform stored, options included, so the person
+/// approves what would actually launch.
 fn summary(cloud: &Cloud, a: &wire::Approval) -> Option<String> {
     let act = a.action.as_ref()?;
     let targets: Vec<String> = act
@@ -68,9 +68,16 @@ fn summary(cloud: &Cloud, a: &wire::Approval) -> Option<String> {
         .whoami()
         .map(|w| untrusted::clean(&w.workspace.name, 200))
         .unwrap_or_else(|| "the key's workspace".into());
+    let options = shape::launch_options_text(act.kind, &act.options);
+    let options = if options.is_empty() {
+        "the platform's defaults for every option".to_string()
+    } else {
+        options
+    };
     Some(format!(
-        "An agent asks to start a {} scan on {} node(s) of {workspace}, against: {}. It runs \
-         exactly as shown once approved. Approve it?",
+        "An agent asks to start a {} scan on {} node(s) of {workspace}, against: {}, with \
+         {options}. The platform runs the request as it stored it, so nothing the agent sends \
+         later changes it. Approve it?",
         act.kind.as_str(),
         act.nodes,
         targets.join(", ")

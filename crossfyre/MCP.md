@@ -181,7 +181,7 @@ The first launch in a server process asks you to confirm that you are authorised
 A workspace can hold launches for a person. Then the launch call waits, up to 100 seconds or the approval's 10 minute expiry, whichever is sooner:
 
 - If you have a phone registered in the Crossfyre app, only the phone can approve. The call waits and reports which phone it is waiting on.
-- If you have none and the workspace allows it, you are asked in the agent's client: sent to the approval page when the client can open a URL, or shown what would start in a form, whose answer is sent as your decision. The platform records that the decision came from the agent's client, since a client can be set to answer on its own.
+- If you have none and the workspace allows it, you are asked in the agent's client: sent to the approval page when the client can open a URL, or shown what would start in a form (type, targets, node count and every option, with the recon mode always named), whose answer is sent as your decision. The platform records that the decision came from the agent's client, since a client can be set to answer on its own.
 - Otherwise the call returns an `ap_` handle and the approval page. `get_scan` on the handle says whether it is still waiting, was denied or expired, failed to start, or became a `cs_` scan.
 
 The platform launches the request it stored, so nothing the agent sends after asking can change what is approved. When the workspace holds every launch, the approval replaces the confirmation question.
