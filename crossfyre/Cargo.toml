@@ -18,3 +18,4 @@ oast = { path = "../oast" }
 clap = { version = "4.5.60", features = ["derive"] }
 clap_complete = "4.6.9"
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "time", "signal"] }
+clap_mangen = "0.3.3"

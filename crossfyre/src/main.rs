@@ -197,6 +197,10 @@ enum Commands {
         /// The shell to generate completions for
         shell: clap_complete::Shell,
     },
+    /// Print the crossfyre man page (roff) to stdout, for example:
+    ///   crossfyre man > crossfyre.1
+    #[command(hide = true)]
+    Man,
 }
 
 #[derive(Subcommand, Debug)]
@@ -682,6 +686,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "crossfyre",
                 &mut std::io::stdout(),
             );
+        }
+        Commands::Man => {
+            clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
         }
     }
 
