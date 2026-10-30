@@ -6,9 +6,13 @@
 //! when another user could read or replace it: a key in a file anyone on the machine
 //! can read is a key anyone on the machine holds.
 //!
-//! The environment is read only when there is no file. The key and the API origin
-//! always come from the same place, so a project's client config that sets a URL
-//! cannot send a key from the file somewhere else.
+//! The environment is read only when there is no file, and a key from it goes only to
+//! this build's origin. A client starts the server with the user's environment and the
+//! server entry's own env block together, so an origin read from the environment may
+//! come from a project's config rather than from the user, and could send a key they
+//! exported in their shell anywhere. A key for another origin is saved in the file
+//! with `crossfyre mcp cloud login --api-url`, and the file's origin is the only one
+//! used with the file's key.
 
 use cfx_cloud_wire as wire;
 use serde::{Deserialize, Serialize};
@@ -16,7 +20,9 @@ use std::path::{Path, PathBuf};
 
 /// The key, when it is not in a file.
 pub(crate) const KEY_ENV: &str = "CROSSFYRE_MCP_CLOUD_KEY";
-/// The API origin to use with [`KEY_ENV`]. Ignored when the key is in a file.
+/// Never used as an origin. Set to anything but this build's origin beside
+/// [`KEY_ENV`], it leaves Cloud off, so a key meant for another origin is not sent to
+/// this one either. Ignored when the key is in a file.
 pub(crate) const URL_ENV: &str = "CROSSFYRE_MCP_CLOUD_URL";
 /// The file's name in the MCP directory.
 pub(crate) const FILE_NAME: &str = "cloud.toml";
@@ -254,18 +260,26 @@ fn from_env(env: impl Fn(&str) -> Option<String>) -> Loaded {
             "{KEY_ENV} is not an MCP key (cfm_ and 32 hex characters)"
         ));
     }
-    let url = env(URL_ENV)
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_API_URL.to_string());
-    match check_api_url(&url) {
-        Ok(api_url) => Loaded::Ready(Config {
-            api_url,
-            key: Key(key.to_string()),
-            source: Source::Env,
-            cached: Cached::default(),
-        }),
-        Err(e) => Loaded::Refused(format!("{URL_ENV}: {e}")),
+    let api_url = match check_api_url(DEFAULT_API_URL) {
+        Ok(u) => u,
+        Err(e) => return Loaded::Refused(format!("this build's API origin: {e}")),
+    };
+    if let Some(asked) = env(URL_ENV).filter(|v| !v.trim().is_empty())
+        && check_api_url(&asked).ok().as_deref() != Some(api_url.as_str())
+    {
+        return Loaded::Refused(format!(
+            "{URL_ENV} names another origin, and a key from {KEY_ENV} goes only to \
+             {api_url}: an origin in the environment can come from a project's client \
+             config. Save the key for that origin with `crossfyre mcp cloud login --api-url \
+             <origin>` instead"
+        ));
     }
+    Loaded::Ready(Config {
+        api_url,
+        key: Key(key.to_string()),
+        source: Source::Env,
+        cached: Cached::default(),
+    })
 }
 
 /// Where a key from the environment goes when nothing says otherwise: the origin this
@@ -434,19 +448,38 @@ mod unit {
         let d = TempDir::new();
         let p = d.path().join(FILE_NAME);
         let other = "cfm_ffffffffffffffffffffffffffffffff";
+        let key_only = |k: &str| (k == KEY_ENV).then(|| other.to_string());
+        match load_with(&p, None, key_only) {
+            Loaded::Ready(c) => {
+                assert_eq!(c.key.expose(), other);
+                assert_eq!(c.source, Source::Env);
+                assert_eq!(c.api_url, check_api_url(DEFAULT_API_URL).unwrap());
+            }
+            other => panic!("{other:?}"),
+        }
+        // A client starts the server with the user's environment and the server entry's
+        // own env block together, so an origin there may not be the user's choice: a key
+        // from the environment goes only to this build's origin, and any other leaves
+        // Cloud off.
         let env = |k: &str| match k {
             KEY_ENV => Some(other.to_string()),
             URL_ENV => Some("https://attacker.example".to_string()),
             _ => None,
         };
         match load_with(&p, None, env) {
-            Loaded::Ready(c) => {
-                assert_eq!(c.key.expose(), other);
-                assert_eq!(c.source, Source::Env);
-                assert_eq!(c.api_url, "https://attacker.example");
+            Loaded::Refused(why) => {
+                assert!(why.contains(URL_ENV), "{why}");
+                assert!(why.contains("cloud login --api-url"), "{why}");
+                assert!(!why.contains("ffffffff"), "{why}");
             }
             other => panic!("{other:?}"),
         }
+        let same = |k: &str| match k {
+            KEY_ENV => Some(other.to_string()),
+            URL_ENV => Some(format!("{DEFAULT_API_URL}/")),
+            _ => None,
+        };
+        assert!(matches!(load_with(&p, None, same), Loaded::Ready(_)));
         // With a file, neither the key nor the URL from the environment is used.
         write_private(
             &p,
