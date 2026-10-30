@@ -1203,11 +1203,13 @@ checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 name = "crossfyre"
 version = "0.1.37"
 dependencies = [
+ "cfx_bridge",
  "cfx_core",
  "cfx_mcp",
  "clap",
  "clap_complete",
  "clap_mangen",
+ "dirs 6.0.0",
  "oast",
  "serde_json",
  "sha2",
