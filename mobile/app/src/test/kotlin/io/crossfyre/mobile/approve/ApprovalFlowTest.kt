@@ -28,7 +28,7 @@ class ApprovalFlowTest {
     /** [ApproverKeys] without a keystore, so the flow runs on the JVM. */
     private class SoftwareKeys : ApproverKeys {
         var pair: KeyPair? = null
-        override fun exists() = pair != null
+        override fun presence() = if (pair != null) KeyPresence.PRESENT else KeyPresence.ABSENT
         override fun create(): ByteArray {
             pair = KeyPairGenerator.getInstance("EC").apply { initialize(ECGenParameterSpec("secp256r1")) }.generateKeyPair()
             return pair!!.public.encoded

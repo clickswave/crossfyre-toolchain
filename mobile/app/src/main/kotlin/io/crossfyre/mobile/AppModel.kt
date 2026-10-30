@@ -45,6 +45,7 @@ import io.crossfyre.mobile.approve.ApproverKeys
 import io.crossfyre.mobile.approve.ApproverLedger
 import io.crossfyre.mobile.approve.EnrolState
 import io.crossfyre.mobile.approve.KeyGone
+import io.crossfyre.mobile.approve.KeyPresence
 import io.crossfyre.mobile.approve.KeystoreApproverKeys
 import io.crossfyre.mobile.approve.NoScreenLock
 import io.crossfyre.mobile.approve.enrol
@@ -422,7 +423,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
         if (route == Route.MAIN) refreshPatchStates()
         // Back from Android's settings with the screen lock removed: the keystore
         // has dropped the key, so say so now rather than at the next Approve.
-        if (approverState == ApproverState.ACTIVE && !approverKeys.exists()) approverBroke(LOCK_CHANGED)
+        if (approverState == ApproverState.ACTIVE && approverKeys.presence() == KeyPresence.ABSENT) approverBroke(LOCK_CHANGED)
         settleRevokes()
         if (route == Route.MAIN && tab == "activity" && push == null) refreshActivity()
     }
@@ -649,7 +650,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
         checkKey()
         // The id survived but the key did not: the keystore was wiped, or the
         // data was restored onto another phone.
-        if (store.approverId != null && !approverKeys.exists()) {
+        if (store.approverId != null && approverKeys.presence() == KeyPresence.ABSENT) {
             approverBroke("The approval key is gone from this phone, so it no longer approves. Turn Approvals on again to make a new one.")
         }
         // The app closed while the browser page was open. The page may still
@@ -1122,7 +1123,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
     private fun approvals() = ApprovalApi(origin, HttpTransport())
 
     var approverState by mutableStateOf(
-        if (store.approverId != null && approverKeys.exists()) ApproverState.ACTIVE else ApproverState.OFF
+        if (store.approverId != null && approverKeys.presence() != KeyPresence.ABSENT) ApproverState.ACTIVE else ApproverState.OFF
     )
         private set
     var approverFingerprint by mutableStateOf(store.approverFingerprint)

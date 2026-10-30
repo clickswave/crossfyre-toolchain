@@ -7,7 +7,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import org.junit.After
 import org.junit.Assert.assertArrayEquals
-import org.junit.Assert.assertFalse
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Assume.assumeFalse
@@ -57,7 +57,7 @@ class ApproverKeyTest {
             keys.create()
             fail("a key that needs an unlock was made on a phone with no lock")
         } catch (e: NoScreenLock) {
-            assertFalse(keys.exists())
+            assertEquals(KeyPresence.ABSENT, keys.presence())
         }
     }
 
@@ -66,10 +66,10 @@ class ApproverKeyTest {
         lock()
         val spki = keys.create()
         assertTrue(Spki.isP256(spki))
-        assertTrue(keys.exists())
+        assertEquals(KeyPresence.PRESENT, keys.presence())
         assertArrayEquals(spki, keys.publicKey())
         keys.delete()
-        assertFalse(keys.exists())
+        assertEquals(KeyPresence.ABSENT, keys.presence())
     }
 
     /**

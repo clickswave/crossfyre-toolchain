@@ -24,6 +24,13 @@ class NoScreenLock : Exception("Set a screen lock on this phone first.")
 class KeyGone : Exception("No approval key on this phone.")
 
 /**
+ * Whether the approval key is in the keystore. [UNKNOWN] is a keystore that
+ * could not be asked, which happens while its service restarts: nothing about
+ * the key follows from it, so nothing is deleted or revoked on it.
+ */
+enum class KeyPresence { PRESENT, ABSENT, UNKNOWN }
+
+/**
  * The key this phone approves with.
  *
  * It is made in the platform keystore, its private half never enters this
@@ -32,7 +39,7 @@ class KeyGone : Exception("No approval key on this phone.")
  * Android 8 to 10 within fifteen seconds of the unlock.
  */
 interface ApproverKeys {
-    fun exists(): Boolean
+    fun presence(): KeyPresence
 
     /** Make a fresh key, replacing any old one, and return its public half as SPKI DER. */
     fun create(): ByteArray
@@ -79,7 +86,11 @@ class KeystoreApproverKeys(
     private val deviceSecure: () -> Boolean,
 ) : ApproverKeys {
 
-    override fun exists(): Boolean = runCatching { store().containsAlias(alias) }.getOrDefault(false)
+    override fun presence(): KeyPresence = try {
+        if (store().containsAlias(alias)) KeyPresence.PRESENT else KeyPresence.ABSENT
+    } catch (e: Exception) {
+        KeyPresence.UNKNOWN
+    }
 
     override fun create(): ByteArray {
         // A key that needs an unlock cannot be made on a phone with nothing to
