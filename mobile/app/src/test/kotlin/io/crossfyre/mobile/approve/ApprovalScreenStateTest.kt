@@ -1,5 +1,6 @@
 package io.crossfyre.mobile.approve
 
+import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -109,6 +110,59 @@ class ApprovalScreenStateTest {
             assertTrue(name, v.canDeny)
             assertNotNull(name, v.blocked)
         }
+    }
+
+    /**
+     * The signature covers the whole text, so a part the parser drops is a part
+     * the person approves without seeing: a target that is not an object, a
+     * section missing or of another shape, or a key the phone has no line for.
+     */
+    @Test
+    fun a_request_with_a_part_the_phone_does_not_draw_offers_only_deny() {
+        val target = { o: JSONObject -> o.getJSONArray("targets").getJSONObject(0) }
+        val cases = listOf<Pair<String, (JSONObject) -> Unit>>(
+            "targets as plain strings" to { o -> o.put("targets", JSONArray().put("https://prod.example.com/admin/delete-all")) },
+            "an object target and a string target" to { o -> o.getJSONArray("targets").put("https://prod.example.com/admin/delete-all") },
+            "a target that is a list" to { o -> o.getJSONArray("targets").put(JSONArray().put("https://prod.example.com")) },
+            "targets as one string" to { o -> o.put("targets", "https://prod.example.com") },
+            "no targets at all" to { o -> o.remove("targets") },
+            "targets as null" to { o -> o.put("targets", JSONObject.NULL) },
+            "nodes as plain strings" to { o -> o.put("nodes", JSONArray().put("fra-1").put("blr-2").put("nyc-3")) },
+            "nodes as one object" to { o -> o.put("nodes", JSONObject().put("id", "n-9").put("name", "nyc-3")) },
+            "no workspace" to { o -> o.remove("workspace") },
+            "no requester" to { o -> o.remove("requester") },
+            "a workspace that is a string" to { o -> o.put("workspace", "Acme production") },
+            "options that are a string" to { o -> o.put("options", "severity_min=info") },
+            "risk that is a string" to { o -> o.getJSONObject("action").put("risk", "writes") },
+            "writes that is not true or false" to { o -> o.getJSONObject("action").put("writes", "yes") },
+            "a scope entry that is a string" to { o -> target(o).put("admitted_by", "app.example.com") },
+            "a key the summary does not have" to { o -> o.put("extra_targets", JSONArray().put("https://prod.example.com")) },
+            "a key the requester does not have" to { o -> o.getJSONObject("requester").put("on_behalf_of", "mallory") },
+            "a key the workspace does not have" to { o -> o.getJSONObject("workspace").put("environment", "production") },
+            "a key the action does not have" to { o -> o.getJSONObject("action").put("method", "DELETE") },
+            "a key a target does not have" to { o -> target(o).put("method", "DELETE") },
+            "a key a scope entry does not have" to { o -> target(o).getJSONObject("admitted_by").put("expires", "yesterday") },
+            "a key a node does not have" to { o -> o.getJSONArray("nodes").getJSONObject(0).put("egress", "residential") },
+        )
+        val approvable = cases.filter { (_, edit) ->
+            val v = approvalView(edited(edit), now, approverActive = true)
+            !v.checked || v.canApprove || !v.canDeny || v.blocked == null
+        }.map { it.first }
+        assertEquals(emptyList<String>(), approvable)
+    }
+
+    @Test
+    fun the_parts_a_request_may_leave_out_still_let_it_be_approved() {
+        val cases = listOf<Pair<String, (JSONObject) -> Unit>>(
+            "no nodes" to { o -> o.remove("nodes") },
+            "no options" to { o -> o.remove("options") },
+            "no reason" to { o -> o.remove("reason") },
+            "a target with no scope entry" to { o -> o.getJSONArray("targets").getJSONObject(0).remove("admitted_by") },
+            "a workspace with no organization" to { o -> o.getJSONObject("workspace").remove("org") },
+            "an option no other request has" to { o -> o.getJSONObject("options").put("rate_limit", 5) },
+        )
+        val refused = cases.filter { (_, edit) -> !approvalView(edited(edit), now, approverActive = true).canApprove }.map { it.first }
+        assertEquals(emptyList<String>(), refused)
     }
 
     @Test

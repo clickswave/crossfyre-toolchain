@@ -192,8 +192,10 @@ data class Summary(
     val requestDigest: String,
     /**
      * Every field is on screen as the server sent it: none was cut to its cap,
-     * left out, or changed by cleaning. The signature covers the server's text,
-     * so a phone that showed less than that must not offer to sign it.
+     * left out, or changed by cleaning, no section is missing or of another
+     * shape, and there is no key this version has no line for. The signature
+     * covers the server's text, so a phone that showed less than that must not
+     * offer to sign it.
      */
     val whole: Boolean = true,
 ) {
@@ -206,9 +208,11 @@ data class Summary(
             val r = Reader()
             val id = r.text(o, "id", 64).takeIf { it.isNotEmpty() } ?: return null
             val action = o.optJSONObject("action") ?: return null
-            val req = o.optJSONObject("requester") ?: JSONObject()
-            val ws = o.optJSONObject("workspace") ?: JSONObject()
-            val opts = o.optJSONObject("options")
+            r.only(o, TOP)
+            r.only(action, ACTION)
+            val req = r.section(o, "requester", REQUESTER)
+            val ws = r.section(o, "workspace", WORKSPACE)
+            val opts = r.optional(o, "options")
             if (opts != null && opts.length() > Untrusted.OPTION_KEYS) r.whole = false
             return Summary(
                 version = version,
@@ -226,14 +230,15 @@ data class Summary(
                 action = ActionRef(
                     tool = r.text(action, "tool", Untrusted.NAME),
                     label = r.text(action, "label", Untrusted.NAME),
-                    risk = r.strings(action.optJSONArray("risk"), Untrusted.NAME),
-                    writes = action.optBoolean("writes", false),
+                    risk = r.strings(r.array(action, "risk"), Untrusted.NAME),
+                    writes = r.flag(action, "writes"),
                 ),
-                targets = o.optJSONArray("targets").objects().map { t ->
+                targets = r.objects(o, "targets", required = true, TARGET).map { t ->
                     TargetRef(
                         target = r.text(t, "target", Untrusted.TARGET),
                         host = r.text(t, "host", Untrusted.HOST),
-                        admittedBy = t.optJSONObject("admitted_by")?.let { a ->
+                        admittedBy = r.optional(t, "admitted_by")?.let { a ->
+                            r.only(a, ADMISSION)
                             Admission(
                                 entry = r.text(a, "entry", Untrusted.ENTRY),
                                 addedBy = r.text(a, "added_by", Untrusted.NAME),
@@ -243,7 +248,7 @@ data class Summary(
                         },
                     )
                 },
-                nodes = o.optJSONArray("nodes").objects().map { NodeRef(r.text(it, "id", 64), r.text(it, "name", Untrusted.NAME)) },
+                nodes = r.objects(o, "nodes", required = false, NODE).map { NodeRef(r.text(it, "id", 64), r.text(it, "name", Untrusted.NAME)) },
                 options = opts?.let {
                     it.keys().asSequence().sorted().take(Untrusted.OPTION_KEYS).map { k ->
                         r.clean(k, 64) to r.clean(scalar(it.opt(k)), Untrusted.OPTION)
@@ -260,9 +265,26 @@ data class Summary(
             is JSONArray -> (0 until v.length()).joinToString(", ") { scalar(v.opt(it)) }
             else -> v.toString()
         }
+
+        // The keys of a version-1 summary. Option names are the agent's and are
+        // shown as sent, so `options` is the one object not held to a list.
+        private val TOP = setOf(
+            "v", "id", "requested_at", "expires_at", "requester", "workspace", "action",
+            "targets", "nodes", "options", "reason", "request_digest",
+        )
+        private val REQUESTER = setOf("username", "key_name", "client", "ip", "location")
+        private val WORKSPACE = setOf("id", "name", "org")
+        private val ACTION = setOf("tool", "label", "risk", "writes")
+        private val TARGET = setOf("target", "host", "admitted_by")
+        private val ADMISSION = setOf("entry", "added_by", "added_on", "note")
+        private val NODE = setOf("id", "name")
     }
 
-    /** Cleans what it reads, and remembers whether cleaning had to change anything. */
+    /**
+     * Cleans what it reads, and remembers whether anything was changed or left
+     * out on the way: a value cleaned or cut, a section missing or of another
+     * shape, or a key the screen has no line for.
+     */
     private class Reader {
         var whole = true
 
@@ -274,6 +296,67 @@ data class Summary(
         fun strings(a: JSONArray?, cap: Int): List<String> =
             if (a == null) emptyList()
             else (0 until a.length()).mapNotNull { i -> if (a.isNull(i)) null else clean(a.opt(i).toString(), cap) }.filter { it.isNotEmpty() }
+
+        /** Any key of [o] outside [keys] is one the screen would not draw. */
+        fun only(o: JSONObject, keys: Set<String>) {
+            if (o.keys().asSequence().any { it !in keys }) whole = false
+        }
+
+        /** A section every summary has. Missing, or not an object, it reads as empty and the summary is not whole. */
+        fun section(o: JSONObject, name: String, keys: Set<String>): JSONObject {
+            val s = o.optJSONObject(name)
+            if (s == null) {
+                whole = false
+                return JSONObject()
+            }
+            only(s, keys)
+            return s
+        }
+
+        /** An object a summary may leave out. Present as anything else, it is not shown and the summary is not whole. */
+        fun optional(o: JSONObject, name: String): JSONObject? {
+            if (o.isNull(name)) return null
+            val v = o.optJSONObject(name)
+            if (v == null) whole = false
+            return v
+        }
+
+        /** A list a summary may leave out, the same way. */
+        fun array(o: JSONObject, name: String): JSONArray? {
+            if (o.isNull(name)) return null
+            val v = o.optJSONArray(name)
+            if (v == null) whole = false
+            return v
+        }
+
+        /** True or false, and nothing else: a writes flag read as false from any other value would hide that a request writes. */
+        fun flag(o: JSONObject, name: String): Boolean {
+            if (o.isNull(name)) return false
+            val v = o.opt(name)
+            if (v !is Boolean) {
+                whole = false
+                return false
+            }
+            return v
+        }
+
+        /** A list of objects, each held to [keys]. An element of any other kind is not shown, so it makes the summary not whole. */
+        fun objects(o: JSONObject, name: String, required: Boolean, keys: Set<String>): List<JSONObject> {
+            if (o.isNull(name)) {
+                if (required) whole = false
+                return emptyList()
+            }
+            val a = o.optJSONArray(name)
+            if (a == null) {
+                whole = false
+                return emptyList()
+            }
+            return (0 until a.length()).mapNotNull { i ->
+                val e = a.optJSONObject(i)
+                if (e == null) whole = false else only(e, keys)
+                e
+            }
+        }
     }
 }
 
