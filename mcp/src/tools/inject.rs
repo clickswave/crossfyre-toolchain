@@ -7,8 +7,8 @@
 use super::{in_range, parse_args};
 use crate::confirm::WriteAsk;
 use crate::core::{
-    CallNote, Done, Intent, Mcp, Reason, Refusal, RunningJob, RunningMap, SCAN_TIME_LIMIT, Snap,
-    TrafficRequest,
+    CallNote, Done, Intent, Mcp, Pending, Reason, Refusal, RunningJob, RunningMap, SCAN_TIME_LIMIT,
+    Snap, TrafficRequest,
 };
 use crate::engine::{self, Line, LineReader, event_type};
 use crate::findings::{self, Stamp};
@@ -209,17 +209,10 @@ pub(crate) fn scan_view(m: &JobMeta, redact: bool) -> Value {
     })
 }
 
-pub(crate) async fn run(
-    mcp: &Mcp,
-    args: &Value,
-    peer: &dyn ClientPeer,
-    ct: &CancellationToken,
-    note: &mut CallNote,
-) -> Result<Done, Refusal> {
-    let a: Args = parse_args(args)?;
-    let wait = in_range("wait_seconds", a.wait_seconds.unwrap_or(0), 0, 50)?;
+/// The classes named, checked and without repeats. Empty means all of them.
+pub(crate) fn parse_classes(named: Option<Vec<String>>) -> Result<Vec<String>, Refusal> {
     let mut classes: Vec<String> = Vec::new();
-    for c in a.classes.clone().unwrap_or_default() {
+    for c in named.unwrap_or_default() {
         let c = c.trim().to_ascii_lowercase();
         if !CLASSES.contains(&c.as_str()) {
             return Err(Refusal::invalid(format!(
@@ -232,6 +225,19 @@ pub(crate) async fn run(
             classes.push(c);
         }
     }
+    Ok(classes)
+}
+
+pub(crate) async fn run(
+    mcp: &Mcp,
+    args: &Value,
+    peer: &dyn ClientPeer,
+    ct: &CancellationToken,
+    note: &mut CallNote,
+) -> Result<Done, Refusal> {
+    let a: Args = parse_args(args)?;
+    let wait = in_range("wait_seconds", a.wait_seconds.unwrap_or(0), 0, 50)?;
+    let classes = parse_classes(a.classes.clone())?;
     let eps = endpoints(&a)?;
 
     let pending = mcp
@@ -265,7 +271,66 @@ pub(crate) async fn run(
                 .join(", ")
         )));
     }
+    let write = a.test_writes.then(|| WriteAsk {
+        remember: None,
+        message: format!(
+            "test_injection with test_writes will send DELETE, PUT and PATCH requests to {} \
+             ({} endpoints). These can change or destroy data.",
+            untrusted::clean(&origin, 200),
+            eps.len()
+        ),
+    });
+    let plan = Plan {
+        tool: "test_injection",
+        origin,
+        endpoints: eps.iter().map(|e| e.op.clone()).collect(),
+        shown_endpoints: eps.iter().map(|e| e.dest.url.clone()).collect(),
+        classes,
+        test_writes: a.test_writes,
+        auth: None,
+        source: None,
+        scope: mcp.scope.entries.clone(),
+        wait,
+        write,
+        on_start: None,
+    };
+    start_scan(mcp, pending, plan, peer, ct, note).await
+}
 
+/// A scan whose destinations passed the checks, ready to be confirmed and started.
+pub(crate) struct Plan {
+    /// The tool the job is recorded under.
+    pub tool: &'static str,
+    pub origin: String,
+    /// plessor's endpoints, as its operation reads them.
+    pub endpoints: Vec<Value>,
+    /// What the job file keeps of each endpoint.
+    pub shown_endpoints: Vec<String>,
+    pub classes: Vec<String>,
+    pub test_writes: bool,
+    /// Headers and cookies plessor sends with every probe. Handed over on loopback and
+    /// never written to a job file, the audit log or a result.
+    pub auth: Option<Value>,
+    /// Where the request came from, kept in the job.
+    pub source: Option<Value>,
+    /// The entries plessor may follow up to.
+    pub scope: Vec<String>,
+    pub wait: u64,
+    /// The question for a scan that writes.
+    pub write: Option<WriteAsk>,
+    /// Called once the scan is running, before the call waits on it.
+    pub on_start: Option<Box<dyn FnOnce(Arc<RunningJob>) + Send>>,
+}
+
+/// Confirm and start a planned scan, then wait for it as long as it was asked to.
+pub(crate) async fn start_scan(
+    mcp: &Mcp,
+    pending: Pending,
+    plan: Plan,
+    peer: &dyn ClientPeer,
+    ct: &CancellationToken,
+    note: &mut CallNote,
+) -> Result<Done, Refusal> {
     let port = mcp.engine("plessor")?.port;
     let mut conn = engine::connect(port)
         .await
@@ -278,16 +343,7 @@ pub(crate) async fn run(
         &["follow_redirects", "resolve"],
     )
     .await?;
-    let write = a.test_writes.then(|| WriteAsk {
-        remember: None,
-        message: format!(
-            "test_injection with test_writes will send DELETE, PUT and PATCH requests to {} \
-             ({} endpoints). These can change or destroy data.",
-            untrusted::clean(&origin, 200),
-            eps.len()
-        ),
-    });
-    let clearance = mcp.confirm(pending, peer, write, note, ct).await?;
+    let clearance = mcp.confirm(pending, peer, plan.write, note, ct).await?;
     if ct.is_cancelled() {
         return Err(Refusal::new(
             Reason::Cancelled,
@@ -298,19 +354,22 @@ pub(crate) async fn run(
     // plessor follows no redirects, since a hop it follows is one this server never
     // sees, and dials a name only at the address the guard cleared for it. Its
     // internal-address filter is on as well, for anything else it connects to.
-    let op = json!({
+    let mut op = json!({
         "operation": "inject",
         "response": "stream",
-        "target": origin,
-        "endpoints": eps.iter().map(|e| e.op.clone()).collect::<Vec<_>>(),
-        "classes": classes,
-        "test_writes": a.test_writes,
-        "scope": mcp.scope.entries,
+        "target": plan.origin,
+        "endpoints": plan.endpoints,
+        "classes": plan.classes,
+        "test_writes": plan.test_writes,
+        "scope": plan.scope,
         "block_internal": clearance.block_internal(mcp.scope.allow_private),
         "follow_redirects": false,
         "resolve": clearance.pins(),
         "timeout_ms": 12_000,
     });
+    if let Some(auth) = plan.auth {
+        op["auth"] = auth;
+    }
 
     let start_lock = mcp.scan_start.lock().await;
     mcp.check_scan_caps()?;
@@ -320,6 +379,7 @@ pub(crate) async fn run(
             format!("could not send to plessor: {e}"),
         )
     })?;
+    drop(op);
     let ack = tokio::time::timeout(ACK_WAIT, async {
         loop {
             match reader.next().await {
@@ -341,19 +401,21 @@ pub(crate) async fn run(
     .map_err(|m| Refusal::new(Reason::EngineError, format!("plessor reported: {m}")))?;
     let cancellable = ack.get("cancellable").and_then(|c| c.as_bool()) == Some(true);
 
+    let origin = plan.origin;
     let mut meta = JobMeta::new(
         &mcp.session,
         NewJob {
-            tool: "test_injection",
+            tool: plan.tool,
             engine: "plessor",
             target: &origin,
-            endpoints: eps.iter().map(|e| e.dest.url.clone()).collect(),
+            endpoints: plan.shown_endpoints,
             scope_sha256: mcp.scope.sha256.clone(),
             cancellable,
-            test_writes: a.test_writes,
+            test_writes: plan.test_writes,
         },
     );
-    meta.progress.total = eps.len() as u64;
+    meta.source = plan.source;
+    meta.progress.total = meta.endpoints.len() as u64;
     meta.progress.phase = "testing endpoints".into();
     if let Err(e) = mcp.jobs.write_meta(&meta) {
         let mut w = writer;
@@ -389,9 +451,12 @@ pub(crate) async fn run(
     if let Ok(mut p) = job.pump.lock() {
         *p = Some(handle);
     }
+    if let Some(f) = plan.on_start {
+        f(Arc::clone(&job));
+    }
 
-    if wait > 0 {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(wait);
+    if plan.wait > 0 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(plan.wait);
         let mut rx = job.snap.clone();
         let mut last_progress = Instant::now() - Duration::from_secs(1);
         // A progress value has to go up with every notification, and the snapshot

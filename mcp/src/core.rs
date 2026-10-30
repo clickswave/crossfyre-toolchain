@@ -893,7 +893,9 @@ impl Mcp {
                 ),
             ));
         }
-        let starts = self.jobs.starts_since("test_injection", now - 3_600_000);
+        let starts = self
+            .jobs
+            .starts_since(&jobs::INJECTION_TOOLS, now - 3_600_000);
         let max = self.scope.max_scan_starts_per_hour as usize;
         if starts >= max {
             return Err(Refusal::new(
@@ -914,57 +916,7 @@ impl Mcp {
     /// Stop a scan this process owns. `stopped` when the engine confirmed it,
     /// `requested` when it could not say so.
     pub(crate) async fn cancel_running(&self, job: &Arc<RunningJob>) -> &'static str {
-        job.cancel_requested.store(true, Ordering::SeqCst);
-        let sent = match job.writer.lock().await.as_mut() {
-            Some(w) => w.send_cancel().await.is_ok(),
-            None => false,
-        };
-        if job.cancellable && sent {
-            let mut rx = job.snap.clone();
-            let stopped = tokio::time::timeout(Duration::from_secs(3), async {
-                loop {
-                    if jobs::is_terminal(&rx.borrow_and_update().status) {
-                        return true;
-                    }
-                    if rx.changed().await.is_err() {
-                        return jobs::is_terminal(&rx.borrow().status);
-                    }
-                }
-            })
-            .await
-            .unwrap_or(false);
-            if stopped {
-                return "stopped";
-            }
-        }
-        // The engine cannot stop the operation, or did not confirm it had. Closing the
-        // connection stops a current plessor at its next write; an older one keeps
-        // going, which is why this is reported as `requested` and not `stopped`.
-        job.writer.lock().await.take();
-        let pump = job.pump.lock().ok().and_then(|mut p| p.take());
-        if let Some(h) = pump {
-            h.abort();
-            let _ = h.await;
-        }
-        let meta = job.meta.lock().ok().map(|mut m| {
-            if !jobs::is_terminal(&m.status) {
-                m.finish(jobs::CANCELLED);
-                m.cancel = Some("requested".into());
-                m.note(
-                    "cancellation was requested; this engine version keeps running until it \
-                     finishes, so update it to stop scans on request"
-                        .into(),
-                );
-            }
-            m.clone()
-        });
-        if let Some(m) = meta {
-            let _ = self.jobs.write_meta(&m);
-        }
-        if let Ok(mut r) = self.running.lock() {
-            r.remove(&job.id);
-        }
-        "requested"
+        cancel_job(&self.jobs, &self.running, job).await
     }
 
     /// On the way out: write the line for every call still open, ask every running
@@ -1027,6 +979,66 @@ impl Mcp {
             r.clear();
         }
     }
+}
+
+/// Stop a running scan: ask the engine, wait briefly for it to confirm, and otherwise
+/// close the connection and record it as cancelled on request.
+pub(crate) async fn cancel_job(
+    store: &JobStore,
+    running: &RunningMap,
+    job: &Arc<RunningJob>,
+) -> &'static str {
+    job.cancel_requested.store(true, Ordering::SeqCst);
+    let sent = match job.writer.lock().await.as_mut() {
+        Some(w) => w.send_cancel().await.is_ok(),
+        None => false,
+    };
+    if job.cancellable && sent {
+        let mut rx = job.snap.clone();
+        let stopped = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if jobs::is_terminal(&rx.borrow_and_update().status) {
+                    return true;
+                }
+                if rx.changed().await.is_err() {
+                    return jobs::is_terminal(&rx.borrow().status);
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if stopped {
+            return "stopped";
+        }
+    }
+    // The engine cannot stop the operation, or did not confirm it had. Closing the
+    // connection stops a current plessor at its next write; an older one keeps
+    // going, which is why this is reported as `requested` and not `stopped`.
+    job.writer.lock().await.take();
+    let pump = job.pump.lock().ok().and_then(|mut p| p.take());
+    if let Some(h) = pump {
+        h.abort();
+        let _ = h.await;
+    }
+    let meta = job.meta.lock().ok().map(|mut m| {
+        if !jobs::is_terminal(&m.status) {
+            m.finish(jobs::CANCELLED);
+            m.cancel = Some("requested".into());
+            m.note(
+                "cancellation was requested; this engine version keeps running until it \
+                 finishes, so update it to stop scans on request"
+                    .into(),
+            );
+        }
+        m.clone()
+    });
+    if let Some(m) = meta {
+        let _ = store.write_meta(&m);
+    }
+    if let Ok(mut r) = running.lock() {
+        r.remove(&job.id);
+    }
+    "requested"
 }
 
 fn rate_limited_host(d: &Dest, retry: u64) -> Refusal {

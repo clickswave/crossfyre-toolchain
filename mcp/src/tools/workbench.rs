@@ -7,6 +7,7 @@
 //! details) is returned under `target_data`: stripped, capped, and masked by name and
 //! format unless the server runs with `--no-redact`.
 
+mod inject;
 mod replay;
 
 use super::{parse_args, result_size};
@@ -54,6 +55,7 @@ pub(crate) async fn run(
         "workbench_get_site_map" => get_site_map(mcp, args, ct, note).await,
         "workbench_get_scope" => get_scope(mcp, args, ct, note).await,
         "workbench_replay" => replay::run(mcp, args, peer, ct, note).await,
+        "workbench_test_injection" => inject::run(mcp, args, peer, ct, note).await,
         _ => Err(unavailable(mcp)),
     }
 }

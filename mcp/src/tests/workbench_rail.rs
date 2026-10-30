@@ -1532,3 +1532,486 @@ mod replay {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Injection tests through the captured session
+
+#[cfg(unix)]
+mod injection {
+    use super::*;
+    use crate::tests::fake_wb::*;
+    use cfx_bridge::{
+        Call, CheckResult, CheckRow, ExchangeHandle, Method, ScanSourceResult, ScopeResult,
+    };
+    use serde_json::Value;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn names() -> FakeResolver {
+        FakeResolver::default()
+            .with("app.example.test", &["93.184.216.34"])
+            .with("evil.example.test", &["93.184.216.66"])
+    }
+
+    fn handle(id: i64) -> String {
+        ExchangeHandle::new(UID_A, id).unwrap().to_string()
+    }
+
+    fn source(
+        method: &'static str,
+        url: &'static str,
+        content_type: Option<&'static str>,
+        body: Option<&'static str>,
+    ) -> impl Fn(&Call, &Option<cfx_bridge::ProjectInfo>) -> Result<Value, cfx_bridge::ErrorBody>
+    + Send
+    + Sync
+    + 'static {
+        move |_, _| {
+            let mut headers = vec![
+                ("Host".to_string(), "app.example.test".to_string()),
+                ("Cookie".to_string(), "sid=S1-ck".to_string()),
+                ("Authorization".to_string(), "Bearer S3-bearer".to_string()),
+                ("Accept-Encoding".to_string(), "gzip".to_string()),
+                ("If-None-Match".to_string(), "\"v1\"".to_string()),
+                ("X-Csrf-Token".to_string(), "S8-csrf".to_string()),
+            ];
+            if let Some(ct) = content_type {
+                headers.push(("Content-Type".into(), ct.into()));
+            }
+            Ok(serde_json::to_value(ScanSourceResult {
+                method: method.into(),
+                url: url.into(),
+                req_headers: headers,
+                body: body.map(String::from),
+                content_type: content_type.map(String::from),
+            })
+            .unwrap())
+        }
+    }
+
+    fn get_items() -> WbOpts {
+        WbOpts::default().answer(
+            Method::ScanSource,
+            source(
+                "GET",
+                "http://app.example.test/api/items?id=2&token=S6-tok",
+                None,
+                None,
+            ),
+        )
+    }
+
+    const SECRETS: [&str; 4] = ["S1-ck", "S3-bearer", "S6-tok", "S8-csrf"];
+
+    fn files_under(dir: &std::path::Path, out: &mut Vec<String>) {
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                files_under(&p, out);
+            } else {
+                out.push(std::fs::read_to_string(&p).unwrap_or_default());
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_captured_session_goes_to_plessor_and_nowhere_else() {
+        let plessor = stub_engine(StubOpts::default()).await;
+        let b = bench_with(
+            scope(&["app.example.test".into()], "max_scan_starts_per_hour = 1")
+                .resolver(names())
+                .plessor(plessor.port),
+            get_items(),
+        )
+        .await;
+        let peer = FakePeer::new(Elicit::None);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_test_injection",
+                json!({"exchange": handle(4), "wait_seconds": 5}),
+            )
+            .await;
+        let v = ok(&r).clone();
+        let scan_id = v["scan_id"].as_str().unwrap().to_string();
+        assert_eq!(v["workbench"]["project_uid"], UID_A);
+
+        let ops = plessor.ops();
+        assert_eq!(ops.len(), 1);
+        let op = &ops[0];
+        assert_eq!(op["auth"]["cookies"], "sid=S1-ck");
+        let h = op["auth"]["headers"].as_object().unwrap();
+        assert_eq!(h["authorization"], "Bearer S3-bearer");
+        assert_eq!(h["x-csrf-token"], "S8-csrf");
+        for gone in ["host", "accept-encoding", "if-none-match", "cookie"] {
+            assert!(!h.contains_key(gone), "{gone} was handed on");
+        }
+        assert_eq!(op["endpoints"][0]["method"], "GET");
+        assert_eq!(op["endpoints"][0]["params"], json!(["id", "token"]));
+        assert_eq!(op["scope"], json!(["app.example.test"]));
+        assert_eq!(
+            op["resolve"],
+            json!([["app.example.test", "93.184.216.34:80"]])
+        );
+        let check = &b.fake.params(Method::Check)[0];
+        assert_eq!(check["record"], true);
+        assert_eq!(check["detail"], "agent injection test");
+
+        for s in SECRETS {
+            assert!(!r.text.contains(s), "{s} in the result");
+        }
+        let mut files = Vec::new();
+        files_under(&b.t.dir.path().join("jobs"), &mut files);
+        assert!(!files.is_empty());
+        for f in &files {
+            for s in SECRETS {
+                assert!(!f.contains(s), "{s} in a job file: {f}");
+            }
+        }
+        let audit = b.t.audit_text();
+        for s in SECRETS {
+            assert!(!audit.contains(s), "{s} in the audit");
+        }
+        let m = b.t.mcp.jobs.read_meta(&scan_id).unwrap();
+        assert_eq!(m.tool, "workbench_test_injection");
+        assert_eq!(
+            m.source.as_ref().unwrap()["workbench"]["exchange"],
+            handle(4)
+        );
+        assert_eq!(m.source.as_ref().unwrap()["workbench"]["pid"], b.fake.pid);
+
+        // It counts toward the scope file's hourly cap.
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_test_injection",
+                json!({"exchange": handle(4)}),
+            )
+            .await;
+        assert_eq!(reason(&r), "scan_limit", "{}", r.text);
+        assert_eq!(plessor.ops().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_json_body_is_tested_member_by_member_and_kept_out_of_the_files() {
+        let plessor = stub_engine(StubOpts::default()).await;
+        let b = bench_with(
+            scope(&["app.example.test".into()], "")
+                .resolver(names())
+                .plessor(plessor.port),
+            WbOpts::default().answer(
+                Method::ScanSource,
+                source(
+                    "POST",
+                    "http://app.example.test/api/login",
+                    Some("application/json; charset=utf-8"),
+                    Some("{\"user\":\"ann\",\"n\":2,\"admin\":false,\"password\":\"S4-pw\"}"),
+                ),
+            ),
+        )
+        .await;
+        let r =
+            b.t.call(
+                &FakePeer::new(Elicit::None),
+                "workbench_test_injection",
+                json!({"exchange": handle(4), "params": ["user", "n"], "wait_seconds": 5}),
+            )
+            .await;
+        ok(&r);
+        let op = &plessor.ops()[0];
+        let ep = &op["endpoints"][0];
+        assert_eq!(ep["body_type"], "json");
+        assert_eq!(ep["method"], "POST");
+        // Members come in name order: the body is read as a JSON value.
+        assert_eq!(
+            ep["body"],
+            json!([{"name": "n", "value": "2", "type": "integer"},
+                   {"name": "user", "value": "ann", "type": "string"}])
+        );
+        let mut files = Vec::new();
+        files_under(&b.t.dir.path().join("jobs"), &mut files);
+        for f in &files {
+            assert!(!f.contains("S4-pw") && !f.contains("S1-ck"), "{f}");
+        }
+    }
+
+    #[tokio::test]
+    async fn requests_plessor_cannot_test_as_asked_are_refused_before_anything_is_sent() {
+        let plessor = stub_engine(StubOpts::default()).await;
+        let cases: Vec<(WbOpts, Value, &str)> = vec![
+            (
+                WbOpts::default().answer(
+                    Method::ScanSource,
+                    source("PUT", "http://app.example.test/api/items/2", None, None),
+                ),
+                json!({"exchange": handle(1)}),
+                "test_writes",
+            ),
+            (
+                WbOpts::default().answer(
+                    Method::ScanSource,
+                    source(
+                        "POST",
+                        "http://app.example.test/upload",
+                        Some("application/octet-stream"),
+                        Some("\u{1}\u{2}"),
+                    ),
+                ),
+                json!({"exchange": handle(1)}),
+                "plessor tests",
+            ),
+            (
+                get_items(),
+                json!({"exchange": handle(1), "params": ["password"]}),
+                "none of params",
+            ),
+            (
+                WbOpts::default().answer(
+                    Method::ScanSource,
+                    source(
+                        "POST",
+                        "http://app.example.test/login?next=/home",
+                        Some("application/x-www-form-urlencoded"),
+                        Some("user=ann&password=S5-form"),
+                    ),
+                ),
+                json!({"exchange": handle(1), "params": ["user"]}),
+                "every query parameter",
+            ),
+        ];
+        for (opts, args, says) in cases {
+            let b = bench_with(
+                scope(&["app.example.test".into()], "")
+                    .resolver(names())
+                    .plessor(plessor.port),
+                opts,
+            )
+            .await;
+            let r =
+                b.t.call(
+                    &FakePeer::new(Elicit::None),
+                    "workbench_test_injection",
+                    args,
+                )
+                .await;
+            assert_eq!(reason(&r), "invalid_arguments", "{}", r.text);
+            assert!(r.text.contains(says), "{says}: {}", r.text);
+            assert_eq!(b.fake.count(Method::Check), 0);
+        }
+        assert!(plessor.ops().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_scope_file_and_then_the_project_must_admit_the_test() {
+        let plessor = stub_engine(StubOpts::default()).await;
+        let b = bench_with(
+            scope(&["app.example.test".into()], "")
+                .resolver(names())
+                .plessor(plessor.port),
+            WbOpts::default().answer(
+                Method::ScanSource,
+                source("GET", "http://evil.example.test/?q=1", None, None),
+            ),
+        )
+        .await;
+        let r =
+            b.t.call(
+                &FakePeer::new(Elicit::None),
+                "workbench_test_injection",
+                json!({"exchange": handle(1)}),
+            )
+            .await;
+        assert_eq!(reason(&r), "out_of_scope", "{}", r.text);
+        assert_eq!(b.fake.count(Method::Check), 0);
+
+        let b = bench_with(
+            scope(&["app.example.test".into()], "")
+                .resolver(names())
+                .plessor(plessor.port),
+            get_items().answer(Method::Check, |c, _| {
+                let Call::Check(p) = c else { unreachable!() };
+                Ok(serde_json::to_value(CheckResult {
+                    results: p
+                        .dests
+                        .iter()
+                        .map(|d| CheckRow {
+                            host: d.host.clone(),
+                            port: d.port,
+                            admitted: false,
+                        })
+                        .collect(),
+                })
+                .unwrap())
+            }),
+        )
+        .await;
+        let r =
+            b.t.call(
+                &FakePeer::new(Elicit::None),
+                "workbench_test_injection",
+                json!({"exchange": handle(1)}),
+            )
+            .await;
+        assert_eq!(reason(&r), "workbench_out_of_scope", "{}", r.text);
+        assert_eq!(refused_list(&r)[0]["at"], "workbench_scope");
+        assert!(plessor.ops().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plessors_follow_ups_are_held_to_what_both_lists_admit() {
+        let plessor = stub_engine(StubOpts::default()).await;
+        let b = bench_with(
+            scope(
+                &[
+                    "app.example.test".into(),
+                    "other.example.test".into(),
+                    "api.corp.test".into(),
+                ],
+                "",
+            )
+            .resolver(names())
+            .plessor(plessor.port),
+            get_items().answer(Method::Scope, |_, _| {
+                Ok(serde_json::to_value(ScopeResult {
+                    restricted: true,
+                    entries: vec!["app.example.test".into(), "*.corp.test".into()],
+                    rejected: vec![],
+                    refused_total: 0,
+                    refusals_dropped: 0,
+                    recent: vec![],
+                })
+                .unwrap())
+            }),
+        )
+        .await;
+        let r =
+            b.t.call(
+                &FakePeer::new(Elicit::None),
+                "workbench_test_injection",
+                json!({"exchange": handle(1), "wait_seconds": 5}),
+            )
+            .await;
+        ok(&r);
+        assert_eq!(
+            plessor.ops()[0]["scope"],
+            json!(["app.example.test", "api.corp.test"])
+        );
+    }
+
+    /// A project whose scope admits the first check and refuses every one after it.
+    fn admits_once(calls: Arc<AtomicUsize>) -> WbOpts {
+        get_items().answer(Method::Check, move |c, _| {
+            let Call::Check(p) = c else { unreachable!() };
+            let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+            Ok(serde_json::to_value(CheckResult {
+                results: p
+                    .dests
+                    .iter()
+                    .map(|d| CheckRow {
+                        host: d.host.clone(),
+                        port: d.port,
+                        admitted: first,
+                    })
+                    .collect(),
+            })
+            .unwrap())
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scope_change_that_drops_the_origin_cancels_the_scan() {
+        let plessor = stub_engine(StubOpts {
+            hold: true,
+            cancellable: true,
+            ..Default::default()
+        })
+        .await;
+        let checks = Arc::new(AtomicUsize::new(0));
+        let b = bench_with(
+            scope(&["app.example.test".into()], "")
+                .resolver(names())
+                .plessor(plessor.port),
+            admits_once(Arc::clone(&checks)),
+        )
+        .await;
+        let r =
+            b.t.call(
+                &FakePeer::new(Elicit::None),
+                "workbench_test_injection",
+                json!({"exchange": handle(1)}),
+            )
+            .await;
+        let scan_id = ok(&r)["scan_id"].as_str().unwrap().to_string();
+        assert_eq!(ok(&r)["status"], "running");
+
+        b.fake.push(&cfx_bridge::Event::Scope {
+            restricted: true,
+            rules: 1,
+        });
+        let mcp = Arc::clone(&b.t.mcp);
+        let id = scan_id.clone();
+        eventually("the scan to be cancelled", 10, || {
+            mcp.jobs
+                .read_meta(&id)
+                .is_some_and(|m| m.status == crate::jobs::CANCELLED)
+        })
+        .await;
+        assert_eq!(plessor.cancels(), 1);
+        assert_eq!(checks.load(Ordering::SeqCst), 2);
+        let m = b.t.mcp.jobs.read_meta(&scan_id).unwrap();
+        assert!(
+            m.notes.iter().any(|n| n.contains("no longer admits")),
+            "{:?}",
+            m.notes
+        );
+        let r =
+            b.t.call(
+                &FakePeer::new(Elicit::None),
+                "get_scan",
+                json!({"scan_id": scan_id}),
+            )
+            .await;
+        assert_eq!(ok(&r)["status"], "cancelled");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closing_the_project_cancels_the_scan() {
+        let plessor = stub_engine(StubOpts {
+            hold: true,
+            cancellable: true,
+            ..Default::default()
+        })
+        .await;
+        let b = bench_with(
+            scope(&["app.example.test".into()], "")
+                .resolver(names())
+                .plessor(plessor.port),
+            get_items(),
+        )
+        .await;
+        let r =
+            b.t.call(
+                &FakePeer::new(Elicit::None),
+                "workbench_test_injection",
+                json!({"exchange": handle(1)}),
+            )
+            .await;
+        let scan_id = ok(&r)["scan_id"].as_str().unwrap().to_string();
+        b.fake.switch(None);
+        let mcp = Arc::clone(&b.t.mcp);
+        let id = scan_id.clone();
+        eventually("the scan to be cancelled", 10, || {
+            mcp.jobs
+                .read_meta(&id)
+                .is_some_and(|m| m.status == crate::jobs::CANCELLED)
+        })
+        .await;
+        let m = b.t.mcp.jobs.read_meta(&scan_id).unwrap();
+        assert!(
+            m.notes.iter().any(|n| n.contains("closed")),
+            "{:?}",
+            m.notes
+        );
+        assert_eq!(plessor.cancels(), 1);
+    }
+}

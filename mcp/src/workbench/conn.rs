@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::oneshot;
+use tokio::sync::{broadcast, oneshot};
 
 /// How long the socket has to accept and the Workbench to answer `hello`.
 const HANDSHAKE_WAIT: Duration = Duration::from_secs(2);
@@ -59,6 +59,9 @@ pub(crate) struct Instance {
     /// When the operator last selected something, as the Workbench said. Zero until it
     /// says.
     selection_ms: AtomicI64,
+    /// Every event, for whoever is watching. Taken on close, so a watcher sees the
+    /// channel end.
+    events: Mutex<Option<broadcast::Sender<Event>>>,
     writer: tokio::sync::Mutex<Writer>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Response>>>,
     next_id: AtomicU64,
@@ -73,6 +76,14 @@ impl Instance {
 
     pub(crate) fn selection_ms(&self) -> i64 {
         self.selection_ms.load(Ordering::SeqCst)
+    }
+
+    /// The events from now on. `None` once the connection has closed.
+    pub(crate) fn subscribe(&self) -> Option<broadcast::Receiver<Event>> {
+        self.events
+            .lock()
+            .ok()
+            .and_then(|e| e.as_ref().map(broadcast::Sender::subscribe))
     }
 
     pub(crate) fn is_closed(&self) -> bool {
@@ -143,10 +154,18 @@ impl Instance {
             }
             Event::Scope { .. } | Event::AgentAccess { .. } => {}
         }
+        if let Ok(e) = self.events.lock()
+            && let Some(tx) = e.as_ref()
+        {
+            let _ = tx.send(ev.clone());
+        }
     }
 
     fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
+        if let Ok(mut e) = self.events.lock() {
+            e.take();
+        }
         // Dropping the senders wakes every waiting request with `Closed`.
         if let Ok(mut p) = self.pending.lock() {
             p.clear();
@@ -340,6 +359,7 @@ where
         pid,
         project: Mutex::new(welcome.project.clone()),
         selection_ms: AtomicI64::new(0),
+        events: Mutex::new(Some(broadcast::channel(16).0)),
         welcome,
         writer: tokio::sync::Mutex::new(w),
         pending: Mutex::new(HashMap::new()),
