@@ -79,6 +79,11 @@ impl Resp {
         }
     }
 
+    /// Close the connection without answering, as a dropped request looks.
+    pub(crate) fn hangup() -> Self {
+        Resp::raw(0, "")
+    }
+
     pub(crate) fn header(mut self, k: &str, v: &str) -> Self {
         self.headers.push((k.into(), v.into()));
         self
@@ -132,6 +137,9 @@ impl FakeCloud {
                     let resp = h(&req);
                     if !resp.delay.is_zero() {
                         tokio::time::sleep(resp.delay).await;
+                    }
+                    if resp.status == 0 {
+                        return;
                     }
                     let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
                     let mut head = format!(
@@ -268,6 +276,20 @@ pub(crate) struct World {
     pub approvals: std::collections::HashMap<String, Value>,
     /// Answers given before anything else, a route at a time.
     pub queued: std::collections::HashMap<String, std::collections::VecDeque<Resp>>,
+    /// Every `scans/start` body that passed the platform's checks.
+    pub started: Vec<Value>,
+    /// What each `request_id` produced, so a retry gets the same answer.
+    answered: std::collections::HashMap<String, (u16, Value)>,
+    next: u32,
+    /// Ops a running scan gains on each `scans/get`; 0 leaves it where it is.
+    pub advance: u64,
+    /// Every launch waits for a person.
+    pub approval_required: bool,
+    /// The names of the key owner's registered phones.
+    pub phones: Vec<&'static str>,
+    pub fallback: bool,
+    /// The fake's own origin, for the approval page.
+    pub origin: String,
 }
 
 impl World {
@@ -295,6 +317,14 @@ impl World {
             assets: Vec::new(),
             approvals: Default::default(),
             queued: Default::default(),
+            started: Vec::new(),
+            answered: Default::default(),
+            next: 0,
+            advance: 0,
+            approval_required: false,
+            phones: Vec::new(),
+            fallback: true,
+            origin: String::new(),
         }
     }
 
@@ -441,17 +471,29 @@ fn route(w: &mut World, r: &Req) -> Resp {
             let (scans, next) = page(&rows, at, limit, 'p');
             Resp::ok(json!({"scans": scans, "next_cursor": next}))
         }
-        wire::route::SCANS_GET => match find(&w.scans, &b["id"]) {
-            Some(s) => {
-                let p = w
-                    .progress
-                    .get(b["id"].as_str().unwrap_or(""))
-                    .cloned()
-                    .unwrap_or(json!({"ops_expected": 10, "ops_done": 4, "phase": "probing"}));
-                Resp::ok(json!({"scan": s, "progress": p, "warnings": []}))
+        wire::route::SCANS_GET => {
+            let id = b["id"].as_str().unwrap_or("").to_string();
+            let Some(i) = w.scans.iter().position(|s| s["id"] == id.as_str()) else {
+                return not_found();
+            };
+            let mut p = w
+                .progress
+                .get(&id)
+                .cloned()
+                .unwrap_or(json!({"ops_expected": 10, "ops_done": 4, "phase": "probing"}));
+            if w.advance > 0 && w.scans[i]["status"] == "running" {
+                let total = p["ops_expected"].as_u64().unwrap_or(10);
+                let done = (p["ops_done"].as_u64().unwrap_or(0) + w.advance).min(total);
+                p["ops_done"] = json!(done);
+                if done == total {
+                    w.scans[i]["status"] = json!("completed");
+                    p["phase"] = json!("done");
+                }
+                w.progress.insert(id, p.clone());
             }
-            None => not_found(),
-        },
+            Resp::ok(json!({"scan": w.scans[i], "progress": p, "warnings": []}))
+        }
+        wire::route::SCANS_START => start(w, b),
         wire::route::SCANS_RESULTS => {
             let Some(s) = find(&w.scans, &b["id"]).cloned() else {
                 return not_found();
@@ -532,6 +574,75 @@ fn route(w: &mut World, r: &Req) -> Resp {
     }
 }
 
+/// `scans/start` as the platform answers it: the permission, the scope the key's owner
+/// confirmed, then a scan (201) or an approval (202). A repeated `request_id` gets the
+/// first answer again.
+fn start(w: &mut World, b: &Value) -> Resp {
+    if w.permission != "launch" {
+        return Resp::refusal(403, wire::Reason::PermissionDenied);
+    }
+    let Ok(req) = serde_json::from_value::<wire::StartRequest>(b.clone()) else {
+        return Resp::refusal(400, wire::Reason::InvalidArguments);
+    };
+    if let Some((status, data)) = w.answered.get(&req.request_id) {
+        return Resp::with(*status, data.clone());
+    }
+    if w.scope.is_empty() {
+        return Resp::refusal(403, wire::Reason::ScopeEmpty);
+    }
+    let attested = w.attested();
+    if attested.is_empty() {
+        return Resp::refusal(403, wire::Reason::ScopeNotAttested);
+    }
+    let (s, _) = cfx_scope::parse(&attested);
+    let active = req.options.mode == Some(wire::ReconMode::Active);
+    let refused: Vec<Value> = req
+        .targets
+        .iter()
+        .filter_map(|t| {
+            let k = crate::cloud::narrow::launch_kind(req.kind, t);
+            let v = crate::cloud::narrow::judge(&s, k, t, active);
+            (!v.admitted()).then(|| json!({"target": t, "host": v.host, "port": v.port}))
+        })
+        .collect();
+    if !refused.is_empty() {
+        return Resp::with(403, json!({"reason": "out_of_scope", "refused": refused}));
+    }
+    w.started.push(b.clone());
+    w.next += 1;
+    let (status, data) = if w.approval_required {
+        let id = uuid(600 + w.next);
+        let devices: Vec<Value> = w
+            .phones
+            .iter()
+            .map(|p| json!({"name": p, "last_seen_at": "2026-11-02T10:13:51Z"}))
+            .collect();
+        let a = json!({
+            "id": id, "status": "pending", "expires_at": "2099-01-01T00:00:00Z",
+            "devices": devices, "fallback": w.fallback && w.phones.is_empty(),
+            "approve_url": format!("{}/m/approve/{id}", w.origin),
+            "action": {"type": req.kind.as_str(), "targets": req.targets, "nodes": 2,
+                       "options": req.options},
+        });
+        w.approvals.insert(id, a.clone());
+        (202, json!({"approval": a}))
+    } else {
+        let id = uuid(500 + w.next);
+        let scan = json!({
+            "id": id, "name": format!("MCP: {} on {}", req.kind.as_str(), req.targets[0]),
+            "type": req.kind.as_str(), "status": "running", "targets": req.targets,
+            "findings_count": 0, "created_at": "2026-11-02T10:14:00Z", "created_via": "mcp"});
+        w.scans.insert(0, scan.clone());
+        w.progress.insert(
+            id,
+            json!({"ops_expected": 10, "ops_done": 0, "phase": "probing"}),
+        );
+        (201, json!({"scan": scan}))
+    };
+    w.answered.insert(req.request_id, (status, data.clone()));
+    Resp::with(status, data)
+}
+
 /// Give a test server a Cloud backend on `url`, and connect it as `serve` does.
 pub(crate) async fn connect(t: &mut TestMcp, url: &str, cached_permission: Option<&str>) {
     let config = crate::cloud::file::Config {
@@ -545,6 +656,7 @@ pub(crate) async fn connect(t: &mut TestMcp, url: &str, cached_permission: Optio
     };
     let mut cloud = crate::cloud::Cloud::new(config, "0.0.0-test").unwrap();
     cloud.retry_after = Duration::from_millis(10);
+    cloud.poll_every = Duration::from_millis(20);
     let cloud = Arc::new(cloud);
     Arc::get_mut(&mut t.mcp).expect("not shared yet").cloud =
         crate::cloud::Slot::On(Arc::clone(&cloud));
@@ -559,6 +671,7 @@ pub(crate) async fn server(
 ) -> (TestMcp, FakeCloud, Arc<Mutex<World>>) {
     let world = Arc::new(Mutex::new(world));
     let cloud = FakeCloud::start(platform(Arc::clone(&world))).await;
+    world.lock().unwrap().origin = cloud.url();
     let list: Vec<String> = entries.iter().map(|e| e.to_string()).collect();
     let mut t = super::support::scope(&list, "").build();
     connect(&mut t, &cloud.url(), None).await;

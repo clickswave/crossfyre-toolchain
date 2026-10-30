@@ -9,7 +9,7 @@
 //! looked up here: the workspace's nodes resolve the names, not this machine.
 
 use crate::guard;
-use cfx_cloud_wire::TargetKind;
+use cfx_cloud_wire::{LaunchType, TargetKind};
 use cfx_scope::Scope;
 use std::net::IpAddr;
 
@@ -60,6 +60,14 @@ pub(crate) fn kind_of(raw: &str) -> TargetKind {
         TargetKind::Range
     } else {
         TargetKind::Host
+    }
+}
+
+/// How a launch of this type reads one of its targets.
+pub(crate) fn launch_kind(t: LaunchType, raw: &str) -> TargetKind {
+    match t {
+        LaunchType::PortScan if raw.contains('/') => TargetKind::Range,
+        other => other.target_kind(),
     }
 }
 
@@ -189,7 +197,23 @@ mod unit {
     }
 
     #[test]
-    fn a_target_is_read_by_its_form() {
+    fn a_launch_reads_its_targets_by_type() {
+        assert_eq!(
+            launch_kind(LaunchType::PortScan, "10.0.0.0/24"),
+            TargetKind::Range
+        );
+        assert_eq!(
+            launch_kind(LaunchType::PortScan, "app.example.com"),
+            TargetKind::Host
+        );
+        assert_eq!(
+            launch_kind(LaunchType::Recon, "example.com"),
+            TargetKind::Zone
+        );
+        assert_eq!(
+            launch_kind(LaunchType::VulnScan, "https://a.example/"),
+            TargetKind::Url
+        );
         assert_eq!(kind_of("https://a.example/"), TargetKind::Url);
         assert_eq!(kind_of("10.0.0.0/8"), TargetKind::Range);
         assert_eq!(kind_of("a.example:443"), TargetKind::Host);
