@@ -106,7 +106,8 @@
           "poll_after_seconds": {"type": "integer"},
           "approval": {"type": "object"},
           "target_data": {"type": "object"},
-          "workspace_text": {"type": "object"}
+          "workspace_text": {"type": "object"},
+          "cloud_error": {"type": "string"}
         },
         "required": ["scan_id", "backend", "status"]
       },
@@ -303,7 +304,8 @@
           "progress": {"type": "object"},
           "approval": {"type": "object"},
           "target_data": {"type": "object"},
-          "workspace_text": {"type": "object"}
+          "workspace_text": {"type": "object"},
+          "cloud_error": {"type": "string"}
         },
         "required": ["scan_id", "backend", "status", "poll_after_seconds"]
       },
@@ -334,7 +336,8 @@
           "progress": {"type": "object"},
           "approval": {"type": "object"},
           "target_data": {"type": "object"},
-          "workspace_text": {"type": "object"}
+          "workspace_text": {"type": "object"},
+          "cloud_error": {"type": "string"}
         },
         "required": ["scan_id", "backend", "status", "poll_after_seconds"]
       },
@@ -366,7 +369,8 @@
           "progress": {"type": "object"},
           "approval": {"type": "object"},
           "target_data": {"type": "object"},
-          "workspace_text": {"type": "object"}
+          "workspace_text": {"type": "object"},
+          "cloud_error": {"type": "string"}
         },
         "required": ["scan_id", "backend", "status", "poll_after_seconds"]
       },
@@ -399,7 +403,8 @@
           "progress": {"type": "object"},
           "approval": {"type": "object"},
           "target_data": {"type": "object"},
-          "workspace_text": {"type": "object"}
+          "workspace_text": {"type": "object"},
+          "cloud_error": {"type": "string"}
         },
         "required": ["scan_id", "backend", "status", "poll_after_seconds"]
       },
@@ -431,7 +436,8 @@
           "progress": {"type": "object"},
           "approval": {"type": "object"},
           "target_data": {"type": "object"},
-          "workspace_text": {"type": "object"}
+          "workspace_text": {"type": "object"},
+          "cloud_error": {"type": "string"}
         },
         "required": ["scan_id", "backend", "status", "poll_after_seconds"]
       },
@@ -462,7 +468,8 @@
           "progress": {"type": "object"},
           "approval": {"type": "object"},
           "target_data": {"type": "object"},
-          "workspace_text": {"type": "object"}
+          "workspace_text": {"type": "object"},
+          "cloud_error": {"type": "string"}
         },
         "required": ["scan_id", "backend", "status", "poll_after_seconds"]
       },

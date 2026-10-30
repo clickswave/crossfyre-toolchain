@@ -357,7 +357,7 @@ impl Cloud {
                 Err(f) => {
                     self.set_state(State::Unreachable(f.describe()));
                     self.announce(peer).await;
-                    return Err(unreachable(&f.describe()));
+                    return Err(unreachable_on(route, &f.describe()));
                 }
             }
         };
@@ -391,7 +391,7 @@ impl Cloud {
         if answer.status >= 500 && refusal.reason == wire::Reason::Internal {
             let why = format!("HTTP {} on {route}", answer.status);
             self.set_state(State::Unreachable(why.clone()));
-            return Err(unreachable(&why));
+            return Err(unreachable_on(route, &why));
         }
         Err(worded(&refusal, &answer, route))
     }
@@ -551,6 +551,44 @@ pub(crate) fn unreachable(why: &str) -> Refusal {
             untrusted::clean(why, 200)
         ),
     )
+}
+
+/// [`unreachable`], except after `scans/start`, which the platform may have acted on
+/// before its answer was lost.
+fn unreachable_on(route: &str, why: &str) -> Refusal {
+    if route != wire::route::SCANS_START {
+        return unreachable(why);
+    }
+    Refusal::new(
+        Reason::CloudUnavailable,
+        format!(
+            "The Cloud did not answer scans/start ({}), so the launch may have been made. \
+             list_scans shows it if it was; look there before launching again.",
+            untrusted::clean(why, 200)
+        ),
+    )
+}
+
+/// A launch the platform made, after a later request in the same call failed: the
+/// handle as it was last seen and what failed, so the agent follows it with `get_scan`
+/// rather than starting a second one.
+pub(crate) fn made_but(mut d: Done, step: &str, r: &Refusal) -> Done {
+    let id = d.value["scan_id"].as_str().unwrap_or("").to_string();
+    d.value["cloud_error"] = json!(format!("{step} failed: {}", r.reason.as_str()));
+    let wait = r
+        .detail
+        .as_ref()
+        .and_then(|x| x["retry_after_seconds"].as_u64())
+        .unwrap_or(0);
+    let poll = d.value["poll_after_seconds"].as_u64().unwrap_or(0);
+    d.value["poll_after_seconds"] = json!(poll.max(wait).max(5));
+    d.summary = format!(
+        "{} Then {step} failed ({}), so this is how it was last seen. get_scan {id} follows \
+         it; launching again would start a second one.",
+        d.summary,
+        r.reason.as_str()
+    );
+    d
 }
 
 pub(crate) fn key_rejected(r: wire::Reason) -> Refusal {

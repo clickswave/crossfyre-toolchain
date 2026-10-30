@@ -188,7 +188,7 @@ The platform launches the request it stored, so nothing the agent sends after as
 
 ### Long scans
 
-A `start_*` call returns at once with a `cs_` handle, or after `wait_seconds` (up to 50), reporting progress while it waits. `get_scan` says how long to wait before asking again, 10, 20, 40 and then 60 seconds. `list_findings` with a `cs_` scan and the last `next_cursor` returns only what the scan recorded since. Cancelling the call stops the waiting, not the scan; `cancel_scan` stops the scan.
+A `start_*` call returns at once with a `cs_` handle, or after `wait_seconds` (up to 50), reporting progress while it waits. `get_scan` says how long to wait before asking again, 10, 20, 40 and then 60 seconds. `list_findings` with a `cs_` scan and the last `next_cursor` returns only what the scan recorded since. Cancelling the call stops the waiting, not the scan; `cancel_scan` stops the scan. Once the platform has made a launch, a request in the same call that then fails does not hide it: the call returns the `cs_` or `ap_` handle as last seen, with `cloud_error` saying what failed. When `scans/start` itself gets no answer, the refusal says the launch may have been made and `list_scans` shows it.
 
 ### What comes back
 

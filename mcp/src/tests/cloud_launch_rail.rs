@@ -416,3 +416,115 @@ async fn the_platforms_refusals_of_a_launch_say_what_to_do() {
     assert_eq!(reason(&r), "approval_required");
     assert!(r.text.contains("Register a phone"), "{}", r.text);
 }
+
+#[tokio::test]
+async fn a_launch_the_platform_made_keeps_its_handle_when_a_later_request_fails() {
+    // Started, then one read of it fails while the call follows it.
+    let mut w = World::new("launch");
+    w.queue("scans/get", Resp::refusal(500, wire::Reason::Internal));
+    let (t, _, world) = fake_cloud::server(&[], w).await;
+    let peer = FakePeer::new(Elicit::None);
+    let follow = json!({"url": "https://app.example.com/", "wait_seconds": 5});
+    let r = t.call(&peer, "start_crawl", follow.clone()).await;
+    let v = ok(&r).clone();
+    assert!(v["scan_id"].as_str().unwrap().starts_with("cs_"), "{v}");
+    assert_eq!(v["status"], "running");
+    assert!(v["poll_after_seconds"].as_u64().unwrap() > 0, "{v}");
+    assert!(
+        v["cloud_error"]
+            .as_str()
+            .unwrap()
+            .contains("cloud_unavailable")
+    );
+    assert!(
+        !r.text.contains("nothing was read or started"),
+        "{}",
+        r.text
+    );
+    assert!(r.text.contains("get_scan"), "{}", r.text);
+    assert_eq!(world.lock().unwrap().started.len(), 1);
+    let line = t.audit_lines().pop().unwrap();
+    assert_eq!(line["decision"], "ok", "{line}");
+    assert_eq!(line["scan_id"], v["scan_id"]);
+    assert_eq!(line["result"]["cloud_error"], v["cloud_error"]);
+
+    // Rate limited while following: the handle, and not asked again before the limit.
+    let mut w = World::new("launch");
+    w.rate_limit_after = Some(2);
+    let (t, _, _) = fake_cloud::server(&[], w).await;
+    let v = ok(&t.call(&peer, "start_crawl", follow).await).clone();
+    assert!(v["scan_id"].as_str().unwrap().starts_with("cs_"), "{v}");
+    assert!(v["cloud_error"].as_str().unwrap().contains("rate_limited"));
+    assert_eq!(v["poll_after_seconds"], 30);
+
+    // Held for a person, and the wait for the decision fails: the ap_ handle.
+    let mut w = World::new("launch");
+    w.approval_required = true;
+    w.policy = "always";
+    w.phones = vec!["Pixel 8"];
+    w.queue("approvals/wait", Resp::refusal(500, wire::Reason::Internal));
+    let (t, _, world) = fake_cloud::server(&[], w).await;
+    let urls = json!({"urls": ["https://app.example.com/"]});
+    let r = t.call(&peer, "start_vuln_scan", urls.clone()).await;
+    let v = ok(&r).clone();
+    assert!(v["scan_id"].as_str().unwrap().starts_with("ap_"), "{v}");
+    assert_eq!(v["status"], "awaiting_approval");
+    assert!(v["cloud_error"].is_string(), "{v}");
+    assert!(
+        !r.text.contains("nothing was read or started"),
+        "{}",
+        r.text
+    );
+    let pending = |w: &World| w.approvals.values().all(|a| a["status"] == "pending");
+    assert!(pending(&world.lock().unwrap()));
+
+    // The person answers in the form and the decision cannot be sent.
+    let mut w = World::new("launch");
+    w.approval_required = true;
+    w.policy = "always";
+    w.queue(
+        "approvals/decide",
+        Resp::refusal(500, wire::Reason::Internal),
+    );
+    let (t, _, _) = fake_cloud::server(&[], w).await;
+    let yes = FakePeer::new(Elicit::Accept);
+    let v = ok(&t.call(&yes, "start_vuln_scan", urls.clone()).await).clone();
+    assert!(v["scan_id"].as_str().unwrap().starts_with("ap_"), "{v}");
+    assert_eq!(v["status"], "awaiting_approval");
+    assert!(v["cloud_error"].is_string(), "{v}");
+
+    // Approved and launched, and the scan it became cannot be read just now.
+    let mut w = World::new("launch");
+    w.approval_required = true;
+    w.policy = "always";
+    w.phones = vec!["Pixel 8"];
+    w.decide_on_wait = Some((1, "approved", "phone"));
+    w.queue("scans/get", Resp::refusal(500, wire::Reason::Internal));
+    let (t, _, _) = fake_cloud::server(&[], w).await;
+    let v = ok(&t.call(&peer, "start_vuln_scan", urls.clone()).await).clone();
+    assert!(v["scan_id"].as_str().unwrap().starts_with("ap_"), "{v}");
+    assert_eq!(v["status"], "launching");
+    assert!(
+        v["approval"]["scan_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("cs_"),
+        "{v}"
+    );
+    assert!(v["cloud_error"].is_string(), "{v}");
+
+    // No answer to either try of scans/start: it may have been made.
+    let mut w = World::new("launch");
+    w.queue("scans/start", Resp::hangup());
+    w.queue("scans/start", Resp::hangup());
+    let (t, _, _) = fake_cloud::server(&[], w).await;
+    let r = t.call(&peer, "start_vuln_scan", urls).await;
+    assert_eq!(reason(&r), "cloud_unavailable", "{}", r.text);
+    assert!(r.text.contains("may have been made"), "{}", r.text);
+    assert!(r.text.contains("list_scans"), "{}", r.text);
+    assert!(
+        !r.text.contains("nothing was read or started"),
+        "{}",
+        r.text
+    );
+}

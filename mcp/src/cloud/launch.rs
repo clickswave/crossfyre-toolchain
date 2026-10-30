@@ -359,6 +359,7 @@ pub(super) async fn run(
     if status == 202 {
         let w: wire::AwaitingApproval = serde_json::from_value(data).map_err(|_| shape_error())?;
         let d = super::approval::wait(mcp, cloud, tool, &w.approval, peer, ct, note).await?;
+        record(note, &d);
         return Ok(with_poll(d));
     }
     let started: wire::Started = serde_json::from_value(data).map_err(|_| shape_error())?;
@@ -369,8 +370,20 @@ pub(super) async fn run(
     if a.wait > 0 {
         let uuid = started.scan.id.clone().unwrap_or_default();
         d = follow(mcp, cloud, peer, tool, &uuid, a.wait, ct, note, d).await?;
+        if d.value.get("cloud_error").is_some() {
+            record(note, &d);
+        }
     }
     Ok(with_poll(d))
+}
+
+/// What the audit line says the launch came to.
+fn record(note: &mut CallNote, d: &Done) {
+    let mut r = json!({"status": d.value["status"], "scan_id": d.value["scan_id"]});
+    if let Some(e) = d.value.get("cloud_error") {
+        r["cloud_error"] = e.clone();
+    }
+    note.result = Some(r);
 }
 
 /// A launch always says when to look again: 0 once there is nothing left to wait for.
@@ -410,6 +423,7 @@ fn started_now(cloud: &Cloud, scan: &wire::ScanRow, redact: bool) -> Done {
 
 /// Read the scan every few seconds for up to `wait` seconds, reporting its progress,
 /// and return it as it was last seen. A cancelled call stops waiting; the scan goes on.
+/// A read that fails stops the waiting too, and the answer says so.
 #[allow(clippy::too_many_arguments)]
 async fn follow(
     mcp: &Mcp,
@@ -439,7 +453,12 @@ async fn follow(
                 ));
             }
         }
-        let d = scan_now(mcp, cloud, peer, tool, uuid, note).await?;
+        // The scan exists whatever this read says, so a failed read ends the waiting
+        // and never the handle.
+        let d = match scan_now(mcp, cloud, peer, tool, uuid, note).await {
+            Ok(d) => d,
+            Err(r) => return Ok(super::made_but(last, "reading the scan", &r)),
+        };
         let p = &d.value["progress"];
         let phase = p["phase"].as_str().unwrap_or("running");
         peer.progress(

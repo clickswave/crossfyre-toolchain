@@ -141,7 +141,9 @@ pub(super) async fn wait(
     let Some(ap) = wire::encode(IdKind::Approval, &first.id) else {
         return Err(Refusal::new(
             Reason::CloudUnavailable,
-            "The Cloud answered with an approval id this crossfyre does not read.",
+            "The Cloud held the launch for a person to approve, and answered with an approval \
+             id this crossfyre does not read. list_scans shows the launch; look there before \
+             launching again.",
         ));
     };
     note.cloud
@@ -186,11 +188,17 @@ pub(super) async fn wait(
             r = peer.confirm(message, "approve", "Approve this launch") => r,
             _ = ct.cancelled() => return Err(still_pending(&ap)),
         };
-        match asked {
-            Answer::Yes => a = decide(mcp, cloud, peer, tool, &uuid, true, note).await?,
-            Answer::No => a = decide(mcp, cloud, peer, tool, &uuid, false, note).await?,
+        let yes = match asked {
+            Answer::Yes => true,
+            Answer::No => false,
             // Left for the person to decide on the approval page.
             Answer::Dismissed => return approval_result(mcp, cloud, peer, tool, &a, note).await,
+        };
+        match decide(mcp, cloud, peer, tool, &uuid, yes, note).await {
+            Ok(decided) => a = decided,
+            Err(r) => {
+                return lost(mcp, cloud, peer, tool, &a, "sending the decision", &r, note).await;
+            }
         }
         "Waiting for the approved scan to start".to_string()
     } else {
@@ -222,8 +230,24 @@ pub(super) async fn wait(
             note,
         );
         let got = tokio::select! {
-            r = asked => r?,
+            r = asked => r,
             _ = ct.cancelled() => return Err(still_pending(&ap)),
+        };
+        let got = match got {
+            Ok(got) => got,
+            Err(r) => {
+                return lost(
+                    mcp,
+                    cloud,
+                    peer,
+                    tool,
+                    &a,
+                    "waiting for the decision",
+                    &r,
+                    note,
+                )
+                .await;
+            }
         };
         a = got.1.approval;
         // A platform that answers at once is not asked again straight away.
@@ -241,6 +265,23 @@ pub(super) async fn wait(
         note.confirmation = Some(c);
     }
     approval_result(mcp, cloud, peer, tool, &a, note).await
+}
+
+/// The launch is held on the platform and a request about it failed: the handle as it
+/// was last seen, never a refusal that reads as if nothing was asked for.
+#[allow(clippy::too_many_arguments)]
+async fn lost(
+    mcp: &Mcp,
+    cloud: &Cloud,
+    peer: &dyn ClientPeer,
+    tool: &str,
+    a: &wire::Approval,
+    step: &str,
+    r: &Refusal,
+    note: &mut CallNote,
+) -> Result<Done, Refusal> {
+    let d = approval_result(mcp, cloud, peer, tool, a, note).await?;
+    Ok(super::made_but(d, step, r))
 }
 
 fn still_pending(ap: &str) -> Refusal {

@@ -572,7 +572,19 @@ pub(super) async fn approval_result(
                     format!("Launch {id} was approved and is starting."),
                 ));
             };
-            let mut d = scan_now(mcp, cloud, peer, tool, w, note).await?;
+            let mut d = match scan_now(mcp, cloud, peer, tool, w, note).await {
+                Ok(d) => d,
+                // It became a scan whatever this read says: the approval names it.
+                Err(r) => {
+                    let scan = shown["scan_id"].as_str().unwrap_or("").to_string();
+                    let d = waiting(
+                        "launching",
+                        5,
+                        format!("Launch {id} was approved and became Cloud scan {scan}."),
+                    );
+                    return Ok(super::made_but(d, "reading the scan it became", &r));
+                }
+            };
             d.value["approval"] = shown;
             d.summary = format!("Launch {id} was approved. {}", d.summary);
             Ok(d)
