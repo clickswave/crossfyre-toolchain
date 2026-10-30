@@ -112,6 +112,10 @@ or requests that can change data on a target. The phone is where you say yes.
   of the unlock on Android 8 to 10. What is signed is the SHA-256 of the exact
   request text the phone showed you, so the CLI or agent key on a computer cannot
   approve for you. Denying needs no unlock.
+- **Only the phone approves.** A request goes to the person whose agent made it,
+  not to anyone else in the workspace. While a phone approves for your account,
+  a yes from the dashboard or from the agent's own client does not count. Either
+  can still deny.
 - **What the phone shows.** The workspace, the action, every target with the
   scope entry that allows it, the nodes, the options, the key that asked and
   where the request came from. Anything the agent wrote is marked as its own

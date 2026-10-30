@@ -62,7 +62,7 @@ fun ApprovalFacts(m: AppModel) {
     val items = listOf(
         Triple(
             R.drawable.ic_shield_check, "Nothing starts until you approve it here",
-            "When an agent working with your account asks for something that needs a person, such as a scan on more than one node or requests that can change data on a target, Crossfyre waits. This phone shows the workspace, the action, each target with the scope entry that allows it, and where the request came from.",
+            "When an agent working with your account asks for something that needs a person, such as a scan on more than one node or requests that can change data on a target, Crossfyre waits. This phone shows the workspace, the action, each target with the scope entry that allows it, and where the request came from. Only requests made with your own account come here.",
         ),
         Triple(
             R.drawable.ic_key, "A key made on this phone",
@@ -70,7 +70,7 @@ fun ApprovalFacts(m: AppModel) {
         ),
         Triple(
             R.drawable.ic_lock_key_open, "An unlock for every approval",
-            "Your answer is signed with that key after you unlock the phone, so a CLI or agent key on a computer cannot approve for you. Denying needs no unlock.",
+            "Your answer is signed with that key after you unlock the phone, so a CLI or agent key on a computer cannot approve for you. While this phone approves, a yes from the dashboard or from the agent's own client does not count. Either can still deny, and denying needs no unlock.",
         ),
         Triple(
             R.drawable.ic_clock, "Checked while the app is open",
