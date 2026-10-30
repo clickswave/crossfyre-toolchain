@@ -1,6 +1,7 @@
 package io.crossfyre.mobile
 
 import android.app.Application
+import android.app.KeyguardManager
 import android.content.Intent
 import android.net.VpnService
 import android.os.Build
@@ -28,6 +29,12 @@ import io.crossfyre.mobile.account.SignedIn
 import io.crossfyre.mobile.account.StoredUser
 import io.crossfyre.mobile.account.Workspace
 import io.crossfyre.mobile.account.awaitApproval
+import io.crossfyre.mobile.approve.ApprovalApi
+import io.crossfyre.mobile.approve.ApproverKeys
+import io.crossfyre.mobile.approve.EnrolState
+import io.crossfyre.mobile.approve.KeystoreApproverKeys
+import io.crossfyre.mobile.approve.NoScreenLock
+import io.crossfyre.mobile.approve.awaitEnrolment
 import io.crossfyre.mobile.apps.AppFacts
 import io.crossfyre.mobile.apps.Apps
 import io.crossfyre.mobile.apps.InstalledApp
@@ -69,6 +76,11 @@ sealed interface Overlay {
     data object SignOut : Overlay
     data object Unpair : Overlay
     data class Licence(val name: String, val licence: String) : Overlay
+    /** What turning on approvals does, before it does it. */
+    data object ApprovalsExplain : Overlay
+    /** Waiting for the browser to confirm this phone as an approver. */
+    data object Enrol : Overlay
+    data object ApprovalsOff : Overlay
 }
 
 /** Things only the activity can do: Android's own prompts, pickers and other apps. */
@@ -84,6 +96,10 @@ sealed interface Effect {
 }
 
 enum class DeviceStatus { OPENING, WAITING, DENIED, EXPIRED, ERROR }
+
+/** Whether this phone approves agent actions for the account. */
+enum class ApproverState { OFF, ENROLLING, ACTIVE, BROKEN }
+enum class EnrolStatus { STARTING, WAITING, DENIED, EXPIRED, ERROR }
 enum class ListStatus { LOADING, READY, ERROR, EMPTY }
 
 data class Toast(val text: String, val icon: Int)
@@ -424,6 +440,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
     /** The key no longer works. Everything the account gave the phone goes; the device things stay. */
     private fun signedOut() {
         if (running) stopCapture()
+        forgetApprover()
         store.signOut()
         Pairing.clear(ctx)
         pairing = null
@@ -441,6 +458,9 @@ class AppModel(app: Application) : AndroidViewModel(app) {
         // Revoke on the server as well, so signing a lost phone out is not only
         // local. Best effort: a phone with no signal still signs out here.
         if (key != null) viewModelScope.launch(Dispatchers.IO) { api().logout(key) }
+        // Revoking the account key ends the approver on the server too, because
+        // every check joins the key; the phone's half is the keystore key.
+        forgetApprover()
         store.signOut()
         Pairing.clear(ctx)
         pairing = null
@@ -458,6 +478,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
     fun toSignIn() {
         if (revoked || signedIn) {
             if (running) stopCapture()
+            forgetApprover()
             store.signOut()
             Pairing.clear(ctx)
             pairing = null
@@ -598,6 +619,11 @@ class AppModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(Dispatchers.IO) { patch.tidy() }
         refreshCert()
         checkKey()
+        // The id survived but the key did not: the keystore was wiped, or the
+        // data was restored onto another phone.
+        if (store.approverId != null && !approverKeys.exists()) {
+            approverBroke("The approval key is gone from this phone, so it no longer approves. Turn Approvals on again to make a new one.")
+        }
     }
 
     /**
@@ -1049,6 +1075,192 @@ class AppModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun notificationSettings() = emit(Effect.NotificationSettings)
+
+    // ── Approvals ────────────────────────────────────────────────────────────
+
+    /** Whether the phone has a screen lock, without which no key can need an unlock. */
+    val deviceSecure: Boolean
+        get() = ctx.getSystemService(KeyguardManager::class.java)?.isDeviceSecure == true
+
+    val approverKeys: ApproverKeys = KeystoreApproverKeys(deviceSecure = { deviceSecure })
+    private fun approvals() = ApprovalApi(origin, HttpTransport())
+
+    var approverState by mutableStateOf(
+        if (store.approverId != null && approverKeys.exists()) ApproverState.ACTIVE else ApproverState.OFF
+    )
+        private set
+    var approverFingerprint by mutableStateOf(store.approverFingerprint)
+        private set
+
+    /** Why a phone that approved no longer can, in a sentence. */
+    var approverTrouble by mutableStateOf<String?>(null)
+        private set
+
+    var enrolStatus by mutableStateOf(EnrolStatus.STARTING)
+        private set
+    var enrolFingerprint by mutableStateOf("")
+        private set
+    var enrolError by mutableStateOf<Notice?>(null)
+        private set
+    private var enrolUrl = ""
+    private var enrolJob: Job? = null
+    private var enrolApproverId: String? = null
+
+    /** The Settings row: explain first, show the wait, or offer to turn it off. */
+    fun openApprovals() {
+        overlay = when (approverState) {
+            ApproverState.OFF, ApproverState.BROKEN -> Overlay.ApprovalsExplain
+            ApproverState.ENROLLING -> Overlay.Enrol
+            ApproverState.ACTIVE -> Overlay.ApprovalsOff
+        }
+    }
+
+    /**
+     * Make the key, send its public half, and wait for the browser.
+     *
+     * The wait runs in the model's scope rather than the screen's, because the
+     * person leaves the app for the browser to confirm, and the confirmation is
+     * what the wait is for.
+     */
+    fun turnOnApprovals() {
+        val key = store.key() ?: return signedOut()
+        if (!deviceSecure) {
+            overlay = Overlay.ApprovalsExplain
+            return
+        }
+        enrolJob?.cancel()
+        approverState = ApproverState.ENROLLING
+        approverTrouble = null
+        enrolStatus = EnrolStatus.STARTING
+        enrolError = null
+        enrolFingerprint = ""
+        overlay = Overlay.Enrol
+        enrolJob = viewModelScope.launch {
+            val api = approvals()
+            val made = withContext(Dispatchers.IO) { runCatching { approverKeys.create() } }
+            val spki = made.getOrElse { e ->
+                return@launch enrolFailed(Notice(Level.DANGER, "Couldn't make the approval key.", keyTrouble(e)))
+            }
+            val started = withContext(Dispatchers.IO) { api.enrolStart(key, store.deviceId(), deviceName(), spki) }
+            val e = when (started) {
+                is Outcome.Ok -> started.value
+                is Outcome.Failed -> {
+                    if (started.problem == Problem.SignedOut) {
+                        enrolFailed(null)
+                        return@launch signedOut()
+                    }
+                    return@launch enrolFailed(enrolNotice(started.problem, host))
+                }
+            }
+            enrolApproverId = e.approverId
+            enrolFingerprint = e.fingerprint
+            enrolUrl = e.confirmUrl
+            enrolStatus = EnrolStatus.WAITING
+            emit(Effect.OpenUrl(e.confirmUrl))
+            val result = withContext(Dispatchers.IO) {
+                awaitEnrolment(e, poll = { code -> api.enrolPoll(key, code) }, sleep = { ms -> delay(ms) }, now = { SystemClock.elapsedRealtime() })
+            }
+            when {
+                result is Outcome.Ok && result.value == EnrolState.ACTIVE -> {
+                    store.approverId = e.approverId
+                    store.approverFingerprint = e.fingerprint
+                    approverFingerprint = e.fingerprint
+                    enrolApproverId = null
+                    approverState = ApproverState.ACTIVE
+                    if (overlay == Overlay.Enrol) overlay = null
+                    say("This phone now approves agent actions.")
+                }
+                result is Outcome.Ok && result.value == EnrolState.DENIED -> enrolEnded(EnrolStatus.DENIED)
+                result is Outcome.Ok -> enrolEnded(EnrolStatus.EXPIRED)
+                result is Outcome.Failed && result.problem == Problem.SignedOut -> {
+                    enrolFailed(null)
+                    signedOut()
+                }
+                result is Outcome.Failed && reasonOf(result.problem) == io.crossfyre.mobile.account.Refusal.UNKNOWN -> enrolEnded(EnrolStatus.EXPIRED)
+                result is Outcome.Failed -> enrolFailed(enrolNotice(result.problem, host))
+            }
+        }
+    }
+
+    private fun deviceName(): String = Build.MODEL.trim().take(48).ifEmpty { "Android phone" }
+
+    private fun enrolEnded(status: EnrolStatus) {
+        approverKeys.delete()
+        enrolApproverId = null
+        approverState = ApproverState.OFF
+        enrolStatus = status
+    }
+
+    private fun enrolFailed(n: Notice?) {
+        approverKeys.delete()
+        enrolApproverId = null
+        approverState = ApproverState.OFF
+        enrolError = n
+        enrolStatus = EnrolStatus.ERROR
+    }
+
+    fun reopenEnrol() {
+        if (enrolUrl.isNotEmpty()) emit(Effect.OpenUrl(enrolUrl))
+    }
+
+    /** Stop waiting. The half-made approver is revoked so a later confirm does nothing. */
+    fun cancelEnrol() {
+        enrolJob?.cancel()
+        enrolJob = null
+        val pendingId = enrolApproverId
+        val key = store.key()
+        if (pendingId != null && key != null) viewModelScope.launch(Dispatchers.IO) { approvals().revoke(key, pendingId) }
+        enrolApproverId = null
+        approverKeys.delete()
+        if (approverState == ApproverState.ENROLLING) approverState = ApproverState.OFF
+        overlay = null
+    }
+
+    fun turnOffApprovals() {
+        overlay = null
+        val id = store.approverId
+        val key = store.key()
+        // Best effort, as sign-out is: the key is deleted here whatever the
+        // server says, and a phone with no key cannot sign anything.
+        if (key != null && id != null) viewModelScope.launch(Dispatchers.IO) { approvals().revoke(key, id) }
+        forgetApprover()
+        say("This phone no longer approves agent actions.", R.drawable.ic_info)
+    }
+
+    /** Delete the key and forget the approver. Every sign-out comes through here. */
+    private fun forgetApprover() {
+        enrolJob?.cancel()
+        enrolJob = null
+        enrolApproverId = null
+        approverKeys.delete()
+        store.approverId = null
+        store.approverFingerprint = null
+        approverFingerprint = null
+        approverTrouble = null
+        approverState = ApproverState.OFF
+    }
+
+    /**
+     * The key is gone or no longer works: Android invalidates a key that needs an
+     * unlock when the lock screen is removed. The phone stops approving and says
+     * why; turning approvals on again makes a new key.
+     */
+    private fun approverBroke(why: String) {
+        val id = store.approverId
+        val key = store.key()
+        if (key != null && id != null) viewModelScope.launch(Dispatchers.IO) { approvals().revoke(key, id) }
+        approverKeys.delete()
+        store.approverId = null
+        store.approverFingerprint = null
+        approverFingerprint = null
+        approverTrouble = why
+        approverState = ApproverState.BROKEN
+    }
+
+    private fun keyTrouble(e: Throwable): String = when (e) {
+        is NoScreenLock -> "Set a screen lock on this phone first. The approval key needs it to ask for an unlock."
+        else -> "Android refused to make it: ${e.message ?: e.javaClass.simpleName}. Nothing was sent."
+    }
 
     // ── Appearance ───────────────────────────────────────────────────────────
 

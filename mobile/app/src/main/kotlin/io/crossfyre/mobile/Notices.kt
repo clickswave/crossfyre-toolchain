@@ -87,3 +87,14 @@ fun pairNotice(p: Problem, host: String): Notice = when {
     p is Problem.Unreachable -> Notice(Level.DANGER, "Couldn't pair this phone.", "$host didn't answer. Check the phone's connection and try again.")
     else -> Notice(Level.DANGER, "Couldn't pair this phone.", p.text)
 }
+
+/** What turning on approvals says when the server will not take this phone. */
+fun enrolNotice(p: Problem, host: String): Notice = when {
+    p is Problem.Unreachable -> Notice(Level.DANGER, "Couldn't turn on approvals.", "$host didn't answer. Check the phone's connection and try again.")
+    reasonOf(p) == Refusal.TOO_MANY_APPROVERS -> Notice(
+        Level.WARN, "This account has as many approval phones as it may.",
+        "Turn Approvals off on a phone you no longer use, or sign that phone out, then try again.",
+    )
+    listTrouble(p) == ListTrouble.UNVERIFIED || listTrouble(p) == ListTrouble.SUSPENDED -> listNotice(p, host)
+    else -> Notice(Level.DANGER, "Couldn't turn on approvals.", p.text)
+}

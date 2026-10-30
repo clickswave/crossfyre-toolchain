@@ -512,6 +512,8 @@ fun SettingsContent(m: AppModel) {
         }
     }
 
+    ApprovalsSettings(m)
+
     GroupLabel("Workspace")
     CfxList {
         val ws = m.workspace

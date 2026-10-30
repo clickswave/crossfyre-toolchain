@@ -366,6 +366,10 @@ fun BoxScope.Overlays(m: AppModel) {
             )
         }
 
+        Overlay.ApprovalsExplain -> ApprovalsExplainSheet(m)
+        Overlay.Enrol -> EnrolSheet(m)
+        Overlay.ApprovalsOff -> ApprovalsOffDialog(m)
+
         is Overlay.Licence -> Sheet(title = { SheetTitle(o.name) }, onDismiss = { m.overlay = null }, tall = true) {
             Text(o.licence, style = T.rowSub())
             val texts = remember(o) { licenceTexts(o.name, o.licence).map { (title, res) -> title to readRaw(ctx, res) } }
