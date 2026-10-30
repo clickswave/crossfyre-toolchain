@@ -445,6 +445,7 @@ pub(crate) struct Build {
     per_minute: u32,
     audit: Option<AuditOpener>,
     workbench: WorkbenchMode,
+    workbench_dir: Option<PathBuf>,
 }
 
 /// A scope file with these entries and any extra lines.
@@ -465,6 +466,7 @@ impl Build {
             per_minute: 6_000_000,
             audit: None,
             workbench: WorkbenchMode::Auto,
+            workbench_dir: None,
         }
     }
     pub(crate) fn toolmark(mut self, port: u16) -> Self {
@@ -486,6 +488,11 @@ impl Build {
     }
     pub(crate) fn workbench_mode(mut self, mode: WorkbenchMode) -> Self {
         self.workbench = mode;
+        self
+    }
+    /// The Workbench data directory the server looks in, as the CLI would pass it.
+    pub(crate) fn workbench_dir(mut self, dir: &Path) -> Self {
+        self.workbench_dir = Some(dir.to_path_buf());
         self
     }
     pub(crate) fn audit(mut self, f: impl FnOnce(&Path) -> Audit + 'static) -> Self {
@@ -522,6 +529,7 @@ impl Build {
             ],
             postgres_port: None,
             workbench: self.workbench,
+            workbench_dir: self.workbench_dir,
             call_burst: self.burst,
             calls_per_minute: self.per_minute,
         };

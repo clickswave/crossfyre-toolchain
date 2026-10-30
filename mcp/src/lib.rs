@@ -27,6 +27,7 @@ mod scope_file;
 mod server;
 mod tools;
 mod untrusted;
+mod workbench;
 
 #[cfg(test)]
 mod tests;
@@ -168,6 +169,7 @@ fn build(opts: Options, resolver: Arc<dyn guard::Resolver>) -> Result<core::Mcp,
         engines: opts.engines,
         postgres_port: opts.postgres_port,
         workbench: opts.workbench,
+        workbench_dir: opts.workbench_dir,
         call_burst: 10,
         calls_per_minute: 60,
     };
@@ -233,10 +235,29 @@ pub async fn serve(opts: Options) -> Result<(), StartError> {
         .await
     {
         Ok(running) => {
+            let watcher = (mcp.settings.workbench != WorkbenchMode::Off).then(|| {
+                let peer = running.peer().clone();
+                if let Some(info) = peer.peer_info() {
+                    mcp.workbench.set_label(&format!(
+                        "{} {}",
+                        info.client_info.name, info.client_info.version
+                    ));
+                }
+                let notify = move || -> guard::BoxFut<'static, ()> {
+                    let peer = peer.clone();
+                    Box::pin(async move {
+                        let _ = peer.notify_tool_list_changed().await;
+                    })
+                };
+                tokio::spawn(workbench::watch(Arc::clone(&mcp), notify))
+            });
             tokio::select! {
                 _ = running.waiting() => {}
                 _ = tokio::signal::ctrl_c() => ct.cancel(),
                 _ = terminated() => ct.cancel(),
+            }
+            if let Some(w) = watcher {
+                w.abort();
             }
         }
         Err(e) => eprintln!("crossfyre mcp: the client did not start a session: {e}"),

@@ -4,7 +4,7 @@
 use crate::WorkbenchMode;
 use crate::core::{CallNote, Done, Mcp, Reason, Refusal};
 use crate::peer::ClientPeer;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) async fn run(
@@ -33,12 +33,35 @@ pub(crate) fn unavailable(mcp: &Mcp) -> Refusal {
     Refusal::new(Reason::WorkbenchUnavailable, message)
 }
 
-/// The `workbench` object in `status`.
-pub(crate) fn status(mcp: &Mcp) -> Value {
-    serde_json::json!({
+/// The `workbench` object in `status`, and its hints.
+pub(crate) async fn status(mcp: &Mcp, hints: &mut Vec<String>) -> Value {
+    let mut v = json!({
         "mode": mcp.settings.workbench.as_str(),
         "supported": cfg!(unix),
+        "dir": null,
         "instances": [],
         "ignored": [],
-    })
+    });
+    if mcp.settings.workbench == WorkbenchMode::Off {
+        return v;
+    }
+    if !cfg!(unix) {
+        hints.push("the Workbench bridge is not available on this platform".into());
+        return v;
+    }
+    let found = mcp.workbench.status(hints).await;
+    if let (Some(o), Some(f)) = (v.as_object_mut(), found.as_object()) {
+        for (k, x) in f {
+            o.insert(k.clone(), x.clone());
+        }
+    }
+    let none = v["instances"].as_array().is_none_or(|a| a.is_empty());
+    if none && mcp.settings.workbench == WorkbenchMode::Always {
+        hints.push(
+            "no Crossfyre Workbench with Agent access on was found, so the workbench_* tools \
+             refuse; open one (0.1.2 or later) and turn Agent access on"
+                .into(),
+        );
+    }
+    v
 }

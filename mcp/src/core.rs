@@ -310,6 +310,8 @@ pub(crate) struct Settings {
     pub engines: Vec<EngineInfo>,
     pub postgres_port: Option<u16>,
     pub workbench: WorkbenchMode,
+    /// Where a running Workbench writes its endpoint file. Never from a tool argument.
+    pub workbench_dir: Option<PathBuf>,
     pub call_burst: u32,
     pub calls_per_minute: u32,
 }
@@ -353,6 +355,8 @@ pub(crate) struct Mcp {
     /// both take the last slot.
     pub scan_start: tokio::sync::Mutex<()>,
     pub polls: Mutex<HashMap<String, u32>>,
+    /// The running Workbenches this server is connected to.
+    pub workbench: Arc<crate::workbench::Registry>,
     /// Calls that have not written their audit line, by `seq`. Whichever of the call
     /// and the shutdown takes an entry out writes the line, so it is written once.
     open_calls: Mutex<HashMap<u64, OpenCall>>,
@@ -370,7 +374,16 @@ impl Mcp {
         let guard = scope.guard();
         let pacer = HostPacer::new(scope.requests_per_second_per_host);
         let calls = CallBucket::new(settings.call_burst, settings.calls_per_minute);
+        // With the backend off no Workbench is looked for at all.
+        let workbench = crate::workbench::Registry::new(
+            match settings.workbench {
+                WorkbenchMode::Off => None,
+                _ => settings.workbench_dir.clone(),
+            },
+            settings.version.clone(),
+        );
         Mcp {
+            workbench,
             settings,
             dir,
             guard,
@@ -397,7 +410,7 @@ impl Mcp {
             workbench: match self.settings.workbench {
                 WorkbenchMode::Off => None,
                 WorkbenchMode::Always => Some(WORKBENCH_NAMES.to_vec()),
-                WorkbenchMode::Auto => Some(Vec::new()),
+                WorkbenchMode::Auto => Some(self.workbench.listed()),
             },
         }
     }

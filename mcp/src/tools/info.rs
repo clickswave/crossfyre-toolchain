@@ -138,6 +138,7 @@ pub(crate) async fn status(mcp: &Mcp, args: &Value) -> Result<Done, Refusal> {
             })
         })
         .collect();
+    let workbench = super::workbench::status(mcp, &mut hints).await;
     let value = json!({
         "version": mcp.settings.version,
         "mcp_dir": mcp.dir.display().to_string(),
@@ -158,7 +159,7 @@ pub(crate) async fn status(mcp: &Mcp, args: &Value) -> Result<Done, Refusal> {
         "refusals": {"total": mcp.guard.refused_total(), "recent": recent},
         "audit": {"path": mcp.audit.path().display().to_string(), "healthy": mcp.audit.healthy()},
         "hints": hints,
-        "workbench": super::workbench::status(mcp),
+        "workbench": workbench,
     });
     let summary = format!(
         "crossfyre mcp {}: scope {} ({} entries), {} hint(s).",

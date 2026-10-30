@@ -80,6 +80,7 @@ impl ServerHandler for Server {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
+        self.mcp.workbench.first_look().await;
         Ok(ListToolsResult {
             tools: tool_list(&self.mcp.backends()),
             ..Default::default()

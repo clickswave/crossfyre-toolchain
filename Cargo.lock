@@ -758,6 +758,7 @@ dependencies = [
 name = "cfx_mcp"
 version = "0.0.1"
 dependencies = [
+ "cfx_bridge",
  "cfx_scope",
  "chrono",
  "dguard",
