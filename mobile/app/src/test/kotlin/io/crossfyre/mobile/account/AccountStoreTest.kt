@@ -134,4 +134,19 @@ class AccountStoreTest {
         assertNull(store.workspace())
         assertTrue(values.map.keys.none { it.startsWith("workspace") })
     }
+
+    @Test
+    fun signing_out_forgets_the_approver_so_the_phone_no_longer_counts_as_one() {
+        val values = MapValues()
+        val store = AccountStore(values, FlipSealer())
+        store.saveSignIn(signedIn)
+        store.approverId = "5b0f6d0e-7a34-4c1b-9b43-0a8f6a5e2f11"
+        store.approverFingerprint = "ab12 cd34 ef56 7890"
+
+        store.signOut()
+
+        assertNull(store.approverId)
+        assertNull(store.approverFingerprint)
+        assertTrue(values.map.keys.none { it.startsWith("approver") })
+    }
 }
