@@ -20,6 +20,8 @@ clap = { version = "4.5.60", features = ["derive"] }
 clap_complete = "4.6.9"
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "time", "signal"] }
 clap_mangen = "0.3.3"
+# The hidden prompt for `crossfyre mcp cloud login`; already used by cfx_core's login.
+dialoguer = { version = "0.12.0", features = ["password"] }
 
 [dev-dependencies]
 # tests/mcp_stdio.rs speaks JSON-RPC to the binary and checks the audit log's hash.

@@ -5,8 +5,10 @@
 mod address_rail;
 mod audit_rail;
 mod cancel_rail;
+mod cloud_key_rail;
 mod confirm_rail;
 mod engine_rail;
+mod fake_cloud;
 mod http_rail;
 mod injection_rail;
 mod jobs_paging;

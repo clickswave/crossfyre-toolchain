@@ -194,7 +194,11 @@ enum Commands {
     /// Serve the installed engines to an MCP client over stdio. Tools refuse
     /// destinations that a scope file you write does not list; the server reads it at
     /// start and never changes it.
+    #[command(args_conflicts_with_subcommands = true)]
     Mcp {
+        #[command(subcommand)]
+        command: Option<McpCommand>,
+
         /// The scope file. Defaults to `<data-dir>/mcp/scope.toml`.
         #[arg(long, value_name = "PATH")]
         scope_file: Option<std::path::PathBuf>,
@@ -215,6 +219,42 @@ enum Commands {
     ///   crossfyre man > crossfyre.1
     #[command(hide = true)]
     Man,
+}
+
+#[derive(Subcommand, Debug)]
+enum McpCommand {
+    /// Connect `crossfyre mcp` to a Crossfyre Cloud workspace with an MCP key
+    #[command(subcommand)]
+    Cloud(CloudCommand),
+}
+
+#[derive(Subcommand, Debug)]
+enum CloudCommand {
+    /// Check an MCP key with the platform and save it for `crossfyre mcp`. The key is
+    /// read from a hidden prompt, or from stdin when that is not a terminal; never
+    /// from the command line.
+    Login {
+        /// Control-plane origin. Defaults to the one `crossfyre login` saved, else
+        /// this build's.
+        #[arg(long)]
+        api_url: Option<String>,
+        /// Where to save the key. Defaults to `<data-dir>/mcp/cloud.toml`.
+        #[arg(long, value_name = "PATH")]
+        cloud_file: Option<std::path::PathBuf>,
+    },
+    /// Show what the platform says about the saved key
+    Status {
+        #[arg(long, value_name = "PATH")]
+        cloud_file: Option<std::path::PathBuf>,
+    },
+    /// Remove the saved key
+    Logout {
+        /// Revoke the key on the platform first
+        #[arg(long)]
+        revoke: bool,
+        #[arg(long, value_name = "PATH")]
+        cloud_file: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -694,6 +734,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             )?;
         }
         Commands::Mcp {
+            command: Some(McpCommand::Cloud(cloud)),
+            ..
+        } => {
+            mcp_cloud(&base, cloud).await;
+        }
+        Commands::Mcp {
+            command: None,
             scope_file,
             no_redact,
         } => {
@@ -743,4 +790,58 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// The key, from a hidden prompt at a terminal or one line of stdin otherwise.
+fn read_mcp_key() -> std::io::Result<String> {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        dialoguer::Password::new()
+            .with_prompt("MCP key (cfm_...)")
+            .interact()
+            .map_err(std::io::Error::other)
+    } else {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        Ok(line.trim().to_string())
+    }
+}
+
+/// `crossfyre mcp cloud ...`. These print to the terminal; they never run while the
+/// server is serving, where stdout is the protocol.
+async fn mcp_cloud(base: &std::path::Path, cmd: CloudCommand) {
+    let at = |cloud_file| cfx_mcp::CloudCommand {
+        default_dir: base.join("mcp"),
+        cloud_file,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    let done = match cmd {
+        CloudCommand::Login {
+            api_url,
+            cloud_file,
+        } => {
+            let api_url = api_url
+                .or_else(|| cfx_core::auth::load_account(base).map(|a| a.api_url))
+                .unwrap_or_else(|| cfx_core::auth::DEFAULT_API_URL.to_string());
+            match read_mcp_key() {
+                Ok(key) => cfx_mcp::cloud_login(&at(cloud_file), &api_url, &key).await,
+                Err(e) => Err(format!("could not read the key: {e}")),
+            }
+        }
+        CloudCommand::Status { cloud_file } => cfx_mcp::cloud_status(&at(cloud_file)).await,
+        CloudCommand::Logout { revoke, cloud_file } => {
+            cfx_mcp::cloud_logout(&at(cloud_file), revoke).await
+        }
+    };
+    match done {
+        Ok(lines) => {
+            for l in lines {
+                println!("{l}");
+            }
+        }
+        Err(e) => {
+            eprintln!("crossfyre mcp cloud: {e}");
+            std::process::exit(1);
+        }
+    }
 }

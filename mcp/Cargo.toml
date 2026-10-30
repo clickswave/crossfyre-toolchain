@@ -16,6 +16,11 @@ dguard = { path = "../dguard" }
 # Target inference, the internal-address classification and the HTTP client, so a
 # destination means here exactly what it means to the engines.
 transport = { path = "../transport" }
+# The Cloud API's shapes, shared with the platform.
+cfx_cloud_wire = { path = "../cloud_wire" }
+# HTTPS to the Cloud API: the reqwest and rustls that transport already brings, so
+# there is no second TLS stack, with no redirect ever followed.
+reqwest = { version = "0.12.22", default-features = false, features = ["rustls-tls"] }
 # Pinned: the protocol layer is upgraded on purpose, with the tools/list snapshot
 # test updated in the same change.
 rmcp = { version = "=3.5.1", default-features = false, features = ["server", "transport-io", "elicitation"] }

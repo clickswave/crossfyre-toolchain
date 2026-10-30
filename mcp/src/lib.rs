@@ -14,6 +14,7 @@
 //! protocol on loopback. Nothing here links an engine.
 
 mod audit;
+mod cloud;
 mod confirm;
 mod core;
 mod engine;
@@ -31,6 +32,9 @@ mod untrusted;
 #[cfg(test)]
 mod tests;
 
+pub use cloud::login::{
+    CloudCommand, login as cloud_login, logout as cloud_logout, status as cloud_status,
+};
 use rmcp::ServiceExt;
 use serde_json::json;
 use std::path::{Path, PathBuf};

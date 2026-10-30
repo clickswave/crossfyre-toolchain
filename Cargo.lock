@@ -766,11 +766,13 @@ dependencies = [
 name = "cfx_mcp"
 version = "0.0.1"
 dependencies = [
+ "cfx_cloud_wire",
  "cfx_scope",
  "chrono",
  "dguard",
  "libc",
  "regex",
+ "reqwest 0.12.28",
  "rmcp",
  "serde",
  "serde_json",
@@ -1215,6 +1217,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "clap_mangen",
+ "dialoguer 0.12.0",
  "oast",
  "serde_json",
  "sha2",
