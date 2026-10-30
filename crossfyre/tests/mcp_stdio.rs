@@ -320,6 +320,8 @@ fn a_client_session_over_stdio() {
     assert_eq!(init["protocolVersion"], "2025-11-25", "{init}");
     assert_eq!(init["serverInfo"]["name"], "crossfyre", "{init}");
     assert!(init["capabilities"]["tools"].is_object(), "{init}");
+    // Declared whether or not a Workbench is running, since one can start later.
+    assert_eq!(init["capabilities"]["tools"]["listChanged"], true, "{init}");
 
     c.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
     let tools = c.reply(2)["result"]["tools"].clone();

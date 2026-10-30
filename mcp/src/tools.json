@@ -2,7 +2,7 @@
   {
     "name": "status",
     "title": "Server status",
-    "description": "Show the server's version, the scope it loaded (path, sha256, entries, and whether the file changed since), which engine daemons are listening, the limits in force, recent scope refusals, the audit log, and hints for anything that needs fixing. Sends no traffic.",
+    "description": "Show the server's version, the scope it loaded (path, sha256, entries, and whether the file changed since), which engine daemons are listening, the limits in force, recent scope refusals, the audit log, and hints for anything that needs fixing. The workbench object says which Crossfyre Workbench instances answer and which endpoint files were ignored; a cloud object appears when a Cloud backend is set up. Sends no traffic.",
     "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
     "outputSchema": {
       "type": "object",
@@ -18,7 +18,9 @@
         "limits": {"type": "object"},
         "refusals": {"type": "object"},
         "audit": {"type": "object"},
-        "hints": {"type": "array", "items": {"type": "string"}}
+        "hints": {"type": "array", "items": {"type": "string"}},
+        "workbench": {"type": "object"},
+        "cloud": {"type": "object"}
       },
       "required": ["version", "mcp_dir", "scope", "engines", "postgres", "daemon_token_set", "egress_proxy", "redaction", "limits", "refusals", "audit", "hints"]
     },

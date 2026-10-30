@@ -716,6 +716,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 postgres_port: config::load_config().ok().map(|c| c.postgres.port),
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 redact: !no_redact,
+                workbench_dir: None,
+                workbench: cfx_mcp::WorkbenchMode::Auto,
             };
             match cfx_mcp::serve(opts).await {
                 // Exit here rather than returning: a read of stdin still parked on the

@@ -7,7 +7,6 @@
 //! by [`Mcp::confirm`] (or [`Mcp::clear_hop`] for a redirect). The functions that
 //! send take a `&Clearance`, so a tool that skipped the guard would not compile.
 
-use crate::EngineInfo;
 use crate::audit::{Audit, now_rfc3339};
 use crate::confirm::{Confirmations, WriteAsk};
 use crate::engine::{EngineConn, EngineWriter, Support};
@@ -16,6 +15,7 @@ use crate::jobs::{self, JobMeta, JobStore};
 use crate::limits::{CallBucket, HostPacer};
 use crate::peer::ClientPeer;
 use crate::scope_file::LoadedScope;
+use crate::{EngineInfo, WorkbenchMode};
 use crate::{redact, untrusted};
 use cfx_scope::{Guard, Point};
 use serde_json::{Value, json};
@@ -34,6 +34,10 @@ pub(crate) const SCAN_TIME_LIMIT: Duration = Duration::from_secs(120 * 60);
 
 /// Why a call did not do what it was asked. The string forms are the `reason` codes
 /// a client and the audit log see.
+///
+/// One list for every backend, so a code means one thing whichever backend refused.
+/// The Cloud backend's codes are here before that backend is, which is why nothing
+/// builds them yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Reason {
     NoScope,
@@ -56,6 +60,34 @@ pub(crate) enum Reason {
     NotFound,
     OtherProcess,
     Cancelled,
+    /// No Workbench with Agent access on answers, or the backend is off.
+    WorkbenchUnavailable,
+    /// The open project's scope refused the destination.
+    #[allow(dead_code)]
+    WorkbenchOutOfScope,
+    /// A handle or cursor names a project that is no longer the open one.
+    #[allow(dead_code)]
+    ProjectChanged,
+    /// The Workbench answered with an error of its own.
+    #[allow(dead_code)]
+    WorkbenchError,
+    #[allow(dead_code)]
+    CloudUnavailable,
+    #[allow(dead_code)]
+    CloudKeyRejected,
+    #[allow(dead_code)]
+    PermissionDenied,
+    #[allow(dead_code)]
+    OutOfLocalScope,
+    #[allow(dead_code)]
+    ApprovalDenied,
+    #[allow(dead_code)]
+    ApprovalExpired,
+    #[allow(dead_code)]
+    ApprovalRequired,
+    /// The platform's own reason code, passed on as it was sent.
+    #[allow(dead_code)]
+    CloudRefused(&'static str),
 }
 
 impl Reason {
@@ -81,6 +113,18 @@ impl Reason {
             Reason::NotFound => "not_found",
             Reason::OtherProcess => "other_process",
             Reason::Cancelled => "cancelled",
+            Reason::WorkbenchUnavailable => "workbench_unavailable",
+            Reason::WorkbenchOutOfScope => "workbench_out_of_scope",
+            Reason::ProjectChanged => "project_changed",
+            Reason::WorkbenchError => "workbench_error",
+            Reason::CloudUnavailable => "cloud_unavailable",
+            Reason::CloudKeyRejected => "cloud_key_rejected",
+            Reason::PermissionDenied => "permission_denied",
+            Reason::OutOfLocalScope => "out_of_local_scope",
+            Reason::ApprovalDenied => "approval_denied",
+            Reason::ApprovalExpired => "approval_expired",
+            Reason::ApprovalRequired => "approval_required",
+            Reason::CloudRefused(code) => code,
         }
     }
 
@@ -93,7 +137,11 @@ impl Reason {
             | Reason::EngineUnavailable
             | Reason::EngineError
             | Reason::RequestFailed
-            | Reason::NotFound => "error",
+            | Reason::NotFound
+            | Reason::WorkbenchUnavailable
+            | Reason::ProjectChanged
+            | Reason::WorkbenchError
+            | Reason::CloudUnavailable => "error",
             _ => "refused",
         }
     }
@@ -261,6 +309,7 @@ pub(crate) struct Settings {
     pub redact: bool,
     pub engines: Vec<EngineInfo>,
     pub postgres_port: Option<u16>,
+    pub workbench: WorkbenchMode,
     pub call_burst: u32,
     pub calls_per_minute: u32,
 }
@@ -338,6 +387,18 @@ impl Mcp {
             polls: Mutex::new(HashMap::new()),
             open_calls: Mutex::new(HashMap::new()),
             scope,
+        }
+    }
+
+    /// What the tool list holds besides the local engines' tools, now.
+    pub(crate) fn backends(&self) -> crate::tools::Backends {
+        use crate::tools::WORKBENCH_NAMES;
+        crate::tools::Backends {
+            workbench: match self.settings.workbench {
+                WorkbenchMode::Off => None,
+                WorkbenchMode::Always => Some(WORKBENCH_NAMES.to_vec()),
+                WorkbenchMode::Auto => Some(Vec::new()),
+            },
         }
     }
 
@@ -432,7 +493,7 @@ impl Mcp {
             ..Default::default()
         };
         // A name that is not a tool is the same answer however busy the server is.
-        let outcome = if !crate::tools::NAMES.contains(&tool) {
+        let outcome = if !crate::tools::known(tool, &self.backends()) {
             crate::tools::Dispatched::Unknown
         } else {
             match self.calls.take() {

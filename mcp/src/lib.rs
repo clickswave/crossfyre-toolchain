@@ -46,6 +46,30 @@ pub struct EngineInfo {
     pub installed: bool,
 }
 
+/// Whether the Workbench tools are offered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorkbenchMode {
+    /// Listed while at least one Workbench with Agent access on answers. The client is
+    /// told when that changes.
+    #[default]
+    Auto,
+    /// Always listed, for a client that ignores a changed tool list. With no Workbench
+    /// answering, a call is refused with `workbench_unavailable`.
+    Always,
+    /// Never listed, and no Workbench is looked for.
+    Off,
+}
+
+impl WorkbenchMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkbenchMode::Auto => "auto",
+            WorkbenchMode::Always => "always",
+            WorkbenchMode::Off => "off",
+        }
+    }
+}
+
 /// Everything `serve` needs from the CLI.
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -59,6 +83,10 @@ pub struct Options {
     pub version: String,
     /// False with `--no-redact`.
     pub redact: bool,
+    /// A running Workbench's data directory, where it says how to reach it. Never taken
+    /// from a tool argument.
+    pub workbench_dir: Option<PathBuf>,
+    pub workbench: WorkbenchMode,
 }
 
 /// A reason the server did not start. Its text is printed and the process exits 2.
@@ -139,6 +167,7 @@ fn build(opts: Options, resolver: Arc<dyn guard::Resolver>) -> Result<core::Mcp,
         redact: opts.redact,
         engines: opts.engines,
         postgres_port: opts.postgres_port,
+        workbench: opts.workbench,
         call_burst: 10,
         calls_per_minute: 60,
     };
@@ -197,7 +226,6 @@ pub async fn serve(opts: Options) -> Result<(), StartError> {
 
     let handler = server::Server {
         mcp: Arc::clone(&mcp),
-        tools: Arc::new(server::tool_list()),
     };
     let ct = tokio_util::sync::CancellationToken::new();
     match handler

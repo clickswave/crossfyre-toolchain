@@ -15,3 +15,4 @@ mod redirect_rail;
 mod scope_rail;
 pub(crate) mod support;
 mod tools_snapshot;
+mod workbench_rail;

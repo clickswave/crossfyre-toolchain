@@ -2,13 +2,13 @@
 //! that records what it was asked, a client that answers on cue, and a resolver that
 //! says what a name points at without DNS.
 
-use crate::EngineInfo;
 use crate::audit::Audit;
 use crate::core::{CallOutput, Mcp, Settings, ToolResult};
 use crate::guard::{BoxFut, Resolver};
 use crate::jobs::JobStore;
 use crate::peer::{Answer, ClientPeer};
 use crate::scope_file;
+use crate::{EngineInfo, WorkbenchMode};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -444,6 +444,7 @@ pub(crate) struct Build {
     burst: u32,
     per_minute: u32,
     audit: Option<AuditOpener>,
+    workbench: WorkbenchMode,
 }
 
 /// A scope file with these entries and any extra lines.
@@ -463,6 +464,7 @@ impl Build {
             burst: 100_000,
             per_minute: 6_000_000,
             audit: None,
+            workbench: WorkbenchMode::Auto,
         }
     }
     pub(crate) fn toolmark(mut self, port: u16) -> Self {
@@ -480,6 +482,10 @@ impl Build {
     pub(crate) fn calls(mut self, burst: u32, per_minute: u32) -> Self {
         self.burst = burst;
         self.per_minute = per_minute;
+        self
+    }
+    pub(crate) fn workbench_mode(mut self, mode: WorkbenchMode) -> Self {
+        self.workbench = mode;
         self
     }
     pub(crate) fn audit(mut self, f: impl FnOnce(&Path) -> Audit + 'static) -> Self {
@@ -515,6 +521,7 @@ impl Build {
                 },
             ],
             postgres_port: None,
+            workbench: self.workbench,
             call_burst: self.burst,
             calls_per_minute: self.per_minute,
         };
@@ -623,7 +630,9 @@ pub(crate) async fn eventually(what: &str, secs: u64, f: impl Fn() -> bool) {
 /// The structured result has every field its outputSchema requires, with the type it
 /// says. A client checks this, so a mismatch is a broken tool.
 pub(crate) fn assert_schema(tool: &str, v: &Value) {
-    let tools: Vec<Value> = serde_json::from_str(crate::tools::TOOLS_JSON).unwrap();
+    let mut tools: Vec<Value> = serde_json::from_str(crate::tools::TOOLS_JSON).unwrap();
+    let more: Vec<Value> = serde_json::from_str(crate::tools::TOOLS_WORKBENCH_JSON).unwrap();
+    tools.extend(more);
     let def = tools
         .iter()
         .find(|t| t["name"] == tool)

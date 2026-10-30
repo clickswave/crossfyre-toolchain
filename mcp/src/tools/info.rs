@@ -158,6 +158,7 @@ pub(crate) async fn status(mcp: &Mcp, args: &Value) -> Result<Done, Refusal> {
         "refusals": {"total": mcp.guard.refused_total(), "recent": recent},
         "audit": {"path": mcp.audit.path().display().to_string(), "healthy": mcp.audit.healthy()},
         "hints": hints,
+        "workbench": super::workbench::status(mcp),
     });
     let summary = format!(
         "crossfyre mcp {}: scope {} ({} entries), {} hint(s).",
