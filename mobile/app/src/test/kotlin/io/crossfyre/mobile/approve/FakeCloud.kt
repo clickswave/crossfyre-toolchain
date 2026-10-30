@@ -45,6 +45,9 @@ class FakeCloud(private val key: String) : AutoCloseable {
     /** How long an enrolment code lasts, in seconds, as `approver/start` says. */
     @Volatile var enrolSeconds = 600
 
+    /** The fingerprint `approver/start` reports, while set, in place of the key's own: a key changed on the way. */
+    @Volatile var startFingerprint: String? = null
+
     init {
         thread(isDaemon = true) {
             while (!server.isClosed) {
@@ -97,7 +100,7 @@ class FakeCloud(private val key: String) : AutoCloseable {
                 if (!Spki.isP256(spki)) return 400 to JSONObject().put("message", "public_key is not a P-256 key")
                 val a = Approver(UUID.randomUUID().toString(), "cfe_" + UUID.randomUUID().toString().replace("-", ""), spki, b.getString("device_name"), "pending")
                 approvers += a
-                200 to JSONObject().put("approver_id", a.id).put("enrol_code", a.code).put("fingerprint", Spki.fingerprint(spki))
+                200 to JSONObject().put("approver_id", a.id).put("enrol_code", a.code).put("fingerprint", startFingerprint ?: Spki.fingerprint(spki))
                     .put("confirm_url", "https://wrong.example/m/enrol").put("interval", 1).put("expires_in", enrolSeconds)
             }
             "approver/poll" -> pollFails?.let { it to JSONObject().put("message", "Poll refused") }

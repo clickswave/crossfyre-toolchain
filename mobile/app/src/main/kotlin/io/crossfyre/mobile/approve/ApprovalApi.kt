@@ -98,8 +98,18 @@ class ApprovalApi(origin: String, private val transport: Transport) {
      * The confirmation page is built from the origin this app talks to, not taken
      * from the answer, for the same reason as the sign-in page: a server whose
      * public address is set wrong would send a staging phone to production.
+     *
+     * [made] hears the approver id as soon as the answer names one, before the
+     * rest of the answer is checked. The server has made that approver either
+     * way, so a caller that refuses the answer still knows what to revoke.
      */
-    fun enrolStart(key: String, deviceId: String, deviceName: String, publicKey: ByteArray): Outcome<Enrolment> {
+    fun enrolStart(
+        key: String,
+        deviceId: String,
+        deviceName: String,
+        publicKey: ByteArray,
+        made: (String) -> Unit = {},
+    ): Outcome<Enrolment> {
         val body = JSONObject()
             .put("api_key", key)
             .put("device_id", deviceId)
@@ -111,6 +121,7 @@ class ApprovalApi(origin: String, private val transport: Transport) {
                 a.ok -> {
                     val d = a.data ?: return@call a.unreadable()
                     val id = d.str("approver_id")
+                    if (!id.isNullOrEmpty()) made(id)
                     val code = d.str("enrol_code")
                     if (id.isNullOrEmpty() || code.isNullOrEmpty()) return@call a.unreadable()
                     // The server says which key it received. If that is not the key
@@ -378,7 +389,8 @@ suspend fun awaitEnrolment(
  * server created and the browser did not confirm here is let go of and revoked,
  * however the wait ended, cancelling included, because the browser page stays
  * open: a Confirm pressed after the phone stopped waiting would otherwise make
- * an approver whose key the phone has already deleted.
+ * an approver whose key the phone has already deleted. So is one whose start
+ * the phone refused.
  */
 suspend fun enrol(
     api: ApprovalApi,
@@ -391,9 +403,19 @@ suspend fun enrol(
     sleep: suspend (Long) -> Unit,
     now: () -> Long,
 ): Outcome<EnrolState> {
-    val e = when (val started = api.enrolStart(key, deviceId, deviceName, publicKey)) {
+    // An approver the server made and this phone refused, for a key that is not
+    // this phone's or with no code to confirm it by, is revoked like any other
+    // the phone lets go of. Whoever changed the key also holds the code.
+    var made: String? = null
+    val e = when (val started = api.enrolStart(key, deviceId, deviceName, publicKey) { made = it }) {
         is Outcome.Ok -> started.value
-        is Outcome.Failed -> return started
+        is Outcome.Failed -> {
+            made?.let { id ->
+                ledger.letGo(id)
+                ledger.settle { api.revoke(key, it) }
+            }
+            return started
+        }
     }
     // Cancelled while the start was on its way: the server made an approver
     // all the same, and nothing will wait for it.

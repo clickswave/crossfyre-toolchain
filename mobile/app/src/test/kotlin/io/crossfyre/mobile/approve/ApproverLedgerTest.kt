@@ -16,6 +16,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 import java.security.KeyPairGenerator
 import java.security.spec.ECGenParameterSpec
@@ -80,6 +81,29 @@ class ApproverLedgerTest {
         assertEquals(Outcome.Ok(EnrolState.EXPIRED), enrolNow())
         assertEquals("revoked", cloud.approvers.single().status)
         assertFalse(cloud.confirm(code()))
+    }
+
+    @Test
+    fun an_approver_made_for_a_key_the_phone_did_not_send_is_revoked() {
+        // Whoever changed the key on the way holds the enrol code too, and could
+        // send the person the confirm link.
+        cloud.startFingerprint = "0000 0000 0000 0000"
+        val r = enrolNow(opened = { fail("the confirmation page opened for a key that is not this phone's") })
+        assertTrue(((r as Outcome.Failed).problem as Problem.Broken).text.contains("different key"))
+        assertEquals("revoked", cloud.approvers.single().status)
+        assertFalse(cloud.confirm(code()))
+        assertTrue(ledger.owed.isEmpty())
+        assertNull(store.enrollingApproverId)
+        assertNull(store.approverId)
+    }
+
+    @Test
+    fun an_approver_for_another_key_whose_revoke_fails_stays_owed() {
+        cloud.startFingerprint = "0000 0000 0000 0000"
+        cloud.revokeFails = 503
+        enrolNow()
+        assertEquals(setOf(cloud.approvers.single().id), ledger.owed)
+        assertEquals("pending", cloud.approvers.single().status)
     }
 
     @Test
