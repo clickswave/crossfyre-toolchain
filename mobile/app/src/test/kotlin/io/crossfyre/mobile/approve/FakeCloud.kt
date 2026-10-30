@@ -20,6 +20,9 @@ import kotlin.concurrent.thread
  * approval is decided once, and an approve counts only with a signature that
  * verifies over the server's own copy of the digest. The real routes are built on
  * the platform; this is what the phone is tested against until they exist.
+ *
+ * The rules here are this file's own copies. A test that passes against them
+ * shows that the phone speaks the protocol, not that the platform enforces it.
  */
 class FakeCloud(private val key: String) : AutoCloseable {
     private val server = ServerSocket(0, 16, InetAddress.getLoopbackAddress())

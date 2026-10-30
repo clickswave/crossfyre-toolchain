@@ -19,9 +19,15 @@ import java.security.spec.ECGenParameterSpec
 
 /**
  * The phone's side of the protocol end to end, over HTTP, against [FakeCloud]:
- * enrol, wait for the browser, read what is pending, sign it, and have the server
- * verify the signature over its own digest. The keystore is replaced by a key in
- * this JVM; the keystore itself is tested on a device.
+ * enrol, wait for the browser, read what is pending, sign it, and send it. The
+ * keystore is replaced by a key in this JVM; the keystore itself is tested on a
+ * device.
+ *
+ * Where a request is refused here, FakeCloud is what refuses it: an approver the
+ * browser never confirmed, a revoked one, a signature over anything but the
+ * digest it holds. The tests named for the fake check its copy of those rules
+ * and how the phone reads each refusal. They say nothing about the platform,
+ * whose routes need their own tests of the same rules, run against them.
  */
 class ApprovalFlowTest {
 
@@ -84,7 +90,7 @@ class ApprovalFlowTest {
     }
 
     @Test
-    fun a_signature_over_anything_but_the_servers_digest_is_refused_and_changes_nothing() {
+    fun the_fake_refuses_a_signature_over_another_digest_and_the_phone_reads_a_bad_signature() {
         val e = enrolled()
         val asked = cloud.request(summary())
         val p = ok(api.pending(key)).approvals.single()
@@ -98,7 +104,7 @@ class ApprovalFlowTest {
     }
 
     @Test
-    fun a_phone_the_browser_never_confirmed_cannot_approve() = runBlocking {
+    fun the_fake_refuses_an_unconfirmed_phone_and_the_phone_reads_an_inactive_approver() = runBlocking {
         val e = ok(api.enrolStart(key, "install-0001", "Pixel 8", keys.create()))
         cloud.request(summary())
         val p = cloud.approvals.single()
@@ -117,7 +123,7 @@ class ApprovalFlowTest {
     }
 
     @Test
-    fun a_revoked_phone_is_no_longer_an_approver() {
+    fun the_fake_refuses_a_revoked_phone_and_the_phone_reads_an_inactive_approver() {
         val e = enrolled()
         ok(api.revoke(key, e.approverId))
         assertEquals(null, ok(api.pending(key)).approver)
