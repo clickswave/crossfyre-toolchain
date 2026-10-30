@@ -25,6 +25,16 @@ fun activityHeader(signedIn: Boolean, approver: ApproverState): ActivityHeader =
     else -> ActivityHeader.TURN_ON
 }
 
+/**
+ * Whether the tab reads and shows the activity log. It is off until the platform
+ * serves `/cli/activity/list` to a phone key and to nothing else: a key route
+ * can be called with any account key, the CLI's on the host an agent runs on
+ * included, and the log names the people, keys and targets of every workspace
+ * the account belongs to. The route has to answer only a key that has an active
+ * approver, with export off, before this is turned on.
+ */
+const val ACTIVITY_LOG = false
+
 /** How a channel is named on screen. */
 fun channelLabel(channel: String): String = when (channel) {
     "dashboard" -> "Dashboard"

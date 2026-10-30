@@ -1466,6 +1466,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
 
     /** The newest page of the log, or with [more] the page after the last one shown. */
     fun loadActivity(more: Boolean = false) {
+        if (!ACTIVITY_LOG) return
         val key = store.key() ?: return
         if (activityScope !in activityScopes) activityScope = activityScopes.first()
         val scope = activityScope

@@ -123,9 +123,9 @@ or requests that can change data on a target. The phone is where you say yes.
   approvals every five seconds for two minutes, then every fifteen. With the app
   closed, requests reach you through the alerts you set up in the dashboard, and
   a link to `https://crossfyre.io/m/approve/<id>` opens the request in the app.
-- **The Activity tab** shows what is waiting, your recent decisions, and the
-  activity log of your workspace or your account. All of it is kept in memory
-  while the app is open, and none of it is written to the phone's storage.
+- **The Activity tab** shows what is waiting and your recent decisions. Both
+  are kept in memory while the app is open, and neither is written to the
+  phone's storage.
 
 Signing out, turning Approvals off, or revoking the phone's key in the dashboard
 stops the key from working. Removing the screen lock makes Android delete the

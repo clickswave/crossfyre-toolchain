@@ -5,6 +5,7 @@ import io.crossfyre.mobile.approve.Summary
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Test
 
 /** What the Activity tab leads with, and how its rows read. */
@@ -15,6 +16,16 @@ class ActivityStateTest {
         for (state in ApproverState.values()) {
             assertEquals(ActivityHeader.SIGN_IN, activityHeader(signedIn = false, approver = state))
         }
+    }
+
+    /**
+     * Turning the log on needs `/cli/activity/list` on the platform first, bound
+     * to a key with an active approver, and a testkit case showing a CLI key is
+     * refused. Change this test with that work, not before it.
+     */
+    @Test
+    fun the_activity_log_stays_off_until_its_route_answers_only_a_phone() {
+        assertFalse(ACTIVITY_LOG)
     }
 
     @Test

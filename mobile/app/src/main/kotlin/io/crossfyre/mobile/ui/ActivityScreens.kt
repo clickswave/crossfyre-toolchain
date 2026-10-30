@@ -28,6 +28,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import io.crossfyre.mobile.ACTIVITY_LOG
 import io.crossfyre.mobile.ActivityHeader
 import io.crossfyre.mobile.AppModel
 import io.crossfyre.mobile.ApproverState
@@ -73,7 +74,7 @@ fun ApprovalFacts(m: AppModel) {
         ),
         Triple(
             R.drawable.ic_clock, "Checked while the app is open",
-            "While the app is on screen it asks ${m.host} every few seconds for approvals waiting for you. There is no push notification: with the app closed, requests reach you through the alerts you set up in the dashboard. Pending approvals, recent decisions and activity are kept in memory while the app is open and are not written to the phone's storage.",
+            "While the app is on screen it asks ${m.host} every few seconds for approvals waiting for you. There is no push notification: with the app closed, requests reach you through the alerts you set up in the dashboard. Pending approvals and recent decisions are kept in memory while the app is open and are not written to the phone's storage.",
         ),
     )
     Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
@@ -265,7 +266,7 @@ fun ActivityContent(m: AppModel) {
         ActivityHeader.SIGN_IN -> {
             Empty(
                 R.drawable.ic_clock, "Sign in to see activity",
-                "Approvals and your workspace's activity come with an account. A QR pairing has neither.",
+                "Approvals and your decisions on them come with an account. A QR pairing has neither.",
             ) { CfxButton("Sign in", Kind.SECONDARY, small = true) { m.toSignIn() } }
             return
         }
@@ -302,6 +303,12 @@ fun ActivityContent(m: AppModel) {
         else -> Text("No decisions yet.", style = T.hint())
     }
 
+    if (ACTIVITY_LOG) ActivityLog(m, now)
+    Text("Read from ${m.host} while the app is open and kept in memory. Nothing on this tab is written to the phone's storage.", style = T.hint())
+}
+
+@Composable
+private fun ActivityLog(m: AppModel, now: Instant) {
     GroupLabel("Activity")
     val scopes = m.activityScopes
     if (scopes.size > 1) {
@@ -321,7 +328,6 @@ fun ActivityContent(m: AppModel) {
         m.activityStatus == ListStatus.LOADING -> CfxList { repeat(3) { SkelRow(first = it == 0) } }
         m.activityStatus == ListStatus.EMPTY -> Text("Nothing has happened here yet, or this account cannot read this view.", style = T.hint())
     }
-    Text("Read from ${m.host} while the app is open and kept in memory. Nothing on this tab is written to the phone's storage.", style = T.hint())
 }
 
 private fun key(s: ActivityScope): String = when (s) {

@@ -260,10 +260,10 @@ class ApprovalApi(origin: String, private val transport: Transport) {
     }
 
     /**
-     * A page of the activity log, newest first. The answer is `/activity/list`'s,
-     * read through the key route the phone can call; the server applies the same
-     * rule about who may read what, and a scope the account cannot read comes back
-     * empty rather than refused.
+     * A page of the activity log, newest first, in the shape `/activity/list`
+     * gives it. Not called while [io.crossfyre.mobile.ACTIVITY_LOG] is off: the
+     * key route it needs does not exist yet, and must answer only a key that has
+     * an active approver, never a CLI or Workbench key.
      */
     fun activity(key: String, scope: ActivityScope, beforeId: Long? = null, limit: Int = 30): Outcome<ActivityPage> {
         val body = JSONObject().put("api_key", key).put("limit", limit.coerceIn(1, 200))
