@@ -51,11 +51,19 @@ pub async fn fetch(
         return Ok(vec![]);
     }
 
-    let body: Vec<Issuance> = response.json().await?;
+    let body = response.text().await?;
+
+    Ok(parse(&body, domain)?)
+}
+
+/// Extract the label prefixes of `domain`'s subdomains from an issuances
+/// response.
+fn parse(body: &str, domain: &str) -> Result<Vec<String>, serde_json::Error> {
+    let issuances: Vec<Issuance> = serde_json::from_str(body)?;
     let dot_suffix = format!(".{domain}");
     let mut unique: HashSet<String> = HashSet::new();
 
-    for issuance in body {
+    for issuance in issuances {
         for raw in issuance.dns_names {
             let host = raw.trim().trim_start_matches("*.").to_lowercase();
             if host.is_empty() {
@@ -74,4 +82,45 @@ pub async fn fetch(
     }
 
     Ok(unique.into_iter().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse;
+
+    // A real response for `clickswave.org`, cut down to a few of its issuances
+    // and to the one field the parser reads.
+    const SAMPLE: &str = r#"[
+        {"id": "16242158881", "dns_names": ["orionchain.clickswave.org"]},
+        {"id": "16243173089", "dns_names": ["clickswave.org"]},
+        {"id": "16245649270", "dns_names": ["orionchain.clickswave.org"]},
+        {"id": "17209257301", "dns_names": ["*.clickswave.org", "clickswave.org"]},
+        {"id": "18061223182", "dns_names": ["pinlock.clickswave.org"]},
+        {"id": "16848624202", "dns_names": ["status.clickswave.org"]}
+    ]"#;
+
+    #[test]
+    fn parse_keeps_unique_subdomain_prefixes_of_a_saved_response() {
+        let mut prefixes = parse(SAMPLE, "clickswave.org").unwrap();
+        prefixes.sort();
+        assert_eq!(prefixes, ["orionchain", "pinlock", "status"]);
+    }
+
+    #[test]
+    fn parse_lowercases_and_skips_the_apex_look_alikes_and_wildcards() {
+        let body = r#"[
+            {"dns_names": ["API.Example.com", "*.mail.example.com"]},
+            {"dns_names": ["example.com", "*.example.com"]},
+            {"dns_names": ["notexample.com", " "]},
+            {"id": "no dns_names field"}
+        ]"#;
+        let mut prefixes = parse(body, "example.com").unwrap();
+        prefixes.sort();
+        assert_eq!(prefixes, ["api", "mail"]);
+    }
+
+    #[test]
+    fn parse_rejects_a_non_issuances_body() {
+        assert!(parse(r#"{"code": "rate_limited"}"#, "example.com").is_err());
+    }
 }
