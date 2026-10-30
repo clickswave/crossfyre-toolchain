@@ -77,6 +77,40 @@ class ApprovalScreenStateTest {
         assertFalse(v.canDeny)
     }
 
+    /** The fixture's summary with [edit] applied, under the digest of the new text. */
+    private fun edited(edit: (JSONObject) -> Unit): PendingApproval {
+        val o = JSONObject(text).also(edit).toString()
+        return pending(summary = o, d = ApprovalProtocol.sha256Hex(o.toByteArray()))
+    }
+
+    @Test
+    fun a_long_target_is_read_whole_and_can_be_approved() {
+        // A path is what matters on a request that writes, and its tail is where it says what it does.
+        val long = "https://app.example.com/api/v2/" + "a".repeat(240) + "/users/delete-all"
+        val v = approvalView(edited { it.getJSONArray("targets").getJSONObject(0).put("target", long) }, now, approverActive = true)
+        assertEquals(long, v.summary!!.targets[0].target)
+        assertTrue(v.canApprove)
+    }
+
+    @Test
+    fun a_request_the_phone_had_to_cut_to_show_offers_only_deny() {
+        val cases = listOf<Pair<String, (JSONObject) -> Unit>>(
+            "a target longer than any the server sends" to { o -> o.getJSONArray("targets").getJSONObject(0).put("target", "https://a.example/" + "x".repeat(5000)) },
+            "a workspace name past its cap" to { o -> o.getJSONObject("workspace").put("name", "n".repeat(81)) },
+            "a scope entry past its cap" to { o -> o.getJSONArray("targets").getJSONObject(0).getJSONObject("admitted_by").put("entry", "e".repeat(256)) },
+            "the agent's reason past its cap" to { o -> o.put("reason", "r".repeat(201)) },
+            "an option value past its cap" to { o -> o.getJSONObject("options").put("severity_min", "v".repeat(201)) },
+            "more options than the screen shows" to { o -> val opts = o.getJSONObject("options"); repeat(20) { opts.put("k%02d".format(it), "v") } },
+            "a target with a character the phone does not draw" to { o -> o.getJSONArray("targets").getJSONObject(0).put("target", "https://app.exa\u200Bmple.com") },
+        )
+        for ((name, edit) in cases) {
+            val v = approvalView(edited(edit), now, approverActive = true)
+            assertFalse(name, v.canApprove)
+            assertTrue(name, v.canDeny)
+            assertNotNull(name, v.blocked)
+        }
+    }
+
     @Test
     fun a_phone_that_is_not_an_active_approver_can_deny_but_not_approve() {
         val v = approvalView(pending(), now, approverActive = false)

@@ -338,7 +338,12 @@ private fun PendingRow(m: AppModel, a: PendingApproval, first: Boolean, now: Ins
     CfxRow(
         s?.action?.label?.ifEmpty { null } ?: "Agent request", first = first, icon = R.drawable.ic_shield_check,
         sub = listOfNotNull(s?.workspace?.name?.ifEmpty { null }, s?.requester?.username?.ifEmpty { null }?.let { "asked by $it" }).joinToString(" · ").ifEmpty { null },
-        note = if (!v.checked) "Could not be checked: deny it or open it in the dashboard" else null, noteTone = Tone.WARN,
+        note = when {
+            !v.checked -> "Could not be checked: deny it or open it in the dashboard"
+            s?.whole == false -> "Not shown in full: deny it or open it in the dashboard"
+            else -> null
+        },
+        noteTone = Tone.WARN,
         value = countdown(v.secondsLeft), valueTone = if (v.secondsLeft < 60) Tone.WARN else Tone.NONE,
         chevron = R.drawable.ic_caret_right,
         onClick = { m.openApproval(a.id) },
@@ -520,8 +525,17 @@ private fun Targets(targets: List<TargetRef>) {
     val shown = if (all) targets else targets.take(20)
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         for (t in shown) {
+            // Three lines until asked for the rest: on a request that writes, the
+            // end of a path is often where it says what it does.
+            var open by remember(t) { mutableStateOf(false) }
+            var cut by remember(t) { mutableStateOf(false) }
             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text(t.target.ifEmpty { t.host }, style = T.mono(13.sp), maxLines = 3, overflow = TextOverflow.Ellipsis)
+                Text(
+                    t.target.ifEmpty { t.host }, style = T.mono(13.sp),
+                    maxLines = if (open) Int.MAX_VALUE else 3, overflow = TextOverflow.Ellipsis,
+                    onTextLayout = { if (!open) cut = it.hasVisualOverflow },
+                )
+                if (cut && !open) Row { CfxButton("Show the whole target", Kind.TEXT, small = true) { open = true } }
                 val adm = t.admittedBy
                 if (adm == null || adm.entry.isEmpty()) {
                     Text("No scope entry was named for this target.", style = T.rowSub().copy(color = c.warning))

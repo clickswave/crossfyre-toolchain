@@ -134,6 +134,13 @@ object Untrusted {
     const val REASON = 200
     const val OPTION = 200
     const val OPTION_KEYS = 20
+
+    /**
+     * Targets have no cap in the protocol. These are the longest URL and hostname
+     * the platform keeps anywhere, so a target the server sends is never shown cut.
+     */
+    const val TARGET = 2048
+    const val HOST = 253
 }
 
 /** One approval waiting for this account, as `/cli/approvals/pending` lists it. */
@@ -183,6 +190,12 @@ data class Summary(
     val options: List<Pair<String, String>>,
     val reason: String,
     val requestDigest: String,
+    /**
+     * Every field is on screen as the server sent it: none was cut to its cap,
+     * left out, or changed by cleaning. The signature covers the server's text,
+     * so a phone that showed less than that must not offer to sign it.
+     */
+    val whole: Boolean = true,
 ) {
     companion object {
         /** The summary, or null when the text is not a version-1 summary this app can show. */
@@ -190,51 +203,55 @@ data class Summary(
             val o = runCatching { JSONObject(summaryJson) }.getOrNull() ?: return null
             val version = o.optInt("v", 0)
             if (version != 1) return null
-            val id = o.text("id", 64).takeIf { it.isNotEmpty() } ?: return null
+            val r = Reader()
+            val id = r.text(o, "id", 64).takeIf { it.isNotEmpty() } ?: return null
             val action = o.optJSONObject("action") ?: return null
             val req = o.optJSONObject("requester") ?: JSONObject()
             val ws = o.optJSONObject("workspace") ?: JSONObject()
+            val opts = o.optJSONObject("options")
+            if (opts != null && opts.length() > Untrusted.OPTION_KEYS) r.whole = false
             return Summary(
                 version = version,
                 id = id,
-                requestedAt = instant(o.text("requested_at", 64)),
-                expiresAt = instant(o.text("expires_at", 64)),
+                requestedAt = instant(r.text(o, "requested_at", 64)),
+                expiresAt = instant(r.text(o, "expires_at", 64)),
                 requester = Requester(
-                    username = req.text("username", Untrusted.NAME),
-                    keyName = req.text("key_name", Untrusted.NAME),
-                    client = req.text("client", Untrusted.NAME),
-                    ip = req.text("ip", Untrusted.NAME),
-                    location = req.text("location", Untrusted.NAME),
+                    username = r.text(req, "username", Untrusted.NAME),
+                    keyName = r.text(req, "key_name", Untrusted.NAME),
+                    client = r.text(req, "client", Untrusted.NAME),
+                    ip = r.text(req, "ip", Untrusted.NAME),
+                    location = r.text(req, "location", Untrusted.NAME),
                 ),
-                workspace = WorkspaceRef(ws.text("id", 64), ws.text("name", Untrusted.NAME), ws.text("org", Untrusted.NAME)),
+                workspace = WorkspaceRef(r.text(ws, "id", 64), r.text(ws, "name", Untrusted.NAME), r.text(ws, "org", Untrusted.NAME)),
                 action = ActionRef(
-                    tool = action.text("tool", Untrusted.NAME),
-                    label = action.text("label", Untrusted.NAME),
-                    risk = action.optJSONArray("risk").strings(Untrusted.NAME),
+                    tool = r.text(action, "tool", Untrusted.NAME),
+                    label = r.text(action, "label", Untrusted.NAME),
+                    risk = r.strings(action.optJSONArray("risk"), Untrusted.NAME),
                     writes = action.optBoolean("writes", false),
                 ),
                 targets = o.optJSONArray("targets").objects().map { t ->
                     TargetRef(
-                        target = t.text("target", Untrusted.ENTRY),
-                        host = t.text("host", Untrusted.ENTRY),
+                        target = r.text(t, "target", Untrusted.TARGET),
+                        host = r.text(t, "host", Untrusted.HOST),
                         admittedBy = t.optJSONObject("admitted_by")?.let { a ->
                             Admission(
-                                entry = a.text("entry", Untrusted.ENTRY),
-                                addedBy = a.text("added_by", Untrusted.NAME),
-                                addedOn = a.text("added_on", 32),
-                                note = a.text("note", Untrusted.NAME),
+                                entry = r.text(a, "entry", Untrusted.ENTRY),
+                                addedBy = r.text(a, "added_by", Untrusted.NAME),
+                                addedOn = r.text(a, "added_on", 32),
+                                note = r.text(a, "note", Untrusted.NAME),
                             )
                         },
                     )
                 },
-                nodes = o.optJSONArray("nodes").objects().map { NodeRef(it.text("id", 64), it.text("name", Untrusted.NAME)) },
-                options = o.optJSONObject("options")?.let { opts ->
-                    opts.keys().asSequence().sorted().take(Untrusted.OPTION_KEYS).map { k ->
-                        Untrusted.clean(k, 64) to Untrusted.clean(scalar(opts.opt(k)), Untrusted.OPTION)
+                nodes = o.optJSONArray("nodes").objects().map { NodeRef(r.text(it, "id", 64), r.text(it, "name", Untrusted.NAME)) },
+                options = opts?.let {
+                    it.keys().asSequence().sorted().take(Untrusted.OPTION_KEYS).map { k ->
+                        r.clean(k, 64) to r.clean(scalar(it.opt(k)), Untrusted.OPTION)
                     }.toList()
                 }.orEmpty(),
-                reason = o.text("reason", Untrusted.REASON),
-                requestDigest = o.text("request_digest", 64),
+                reason = r.text(o, "reason", Untrusted.REASON),
+                requestDigest = r.text(o, "request_digest", 64),
+                whole = r.whole,
             )
         }
 
@@ -243,6 +260,20 @@ data class Summary(
             is JSONArray -> (0 until v.length()).joinToString(", ") { scalar(v.opt(it)) }
             else -> v.toString()
         }
+    }
+
+    /** Cleans what it reads, and remembers whether cleaning had to change anything. */
+    private class Reader {
+        var whole = true
+
+        fun clean(raw: String, cap: Int): String = Untrusted.clean(raw, cap).also { if (it != raw) whole = false }
+
+        fun text(o: JSONObject, name: String, cap: Int): String =
+            if (!o.has(name) || o.isNull(name)) "" else clean(o.opt(name).toString(), cap)
+
+        fun strings(a: JSONArray?, cap: Int): List<String> =
+            if (a == null) emptyList()
+            else (0 until a.length()).mapNotNull { i -> if (a.isNull(i)) null else clean(a.opt(i).toString(), cap) }.filter { it.isNotEmpty() }
     }
 }
 
@@ -262,10 +293,10 @@ data class ApprovalView(
 /**
  * Decide what the approval screen offers.
  *
- * Approve needs all of: a digest that matches the text, a summary that parses and
- * names this approval, an approval still pending and not past its expiry by the
- * server's clock, and this phone's approver active. Deny needs only a pending
- * approval: refusing is always safe.
+ * Approve needs all of: a digest that matches the text, a summary that parses,
+ * names this approval and is shown whole, an approval still pending and not past
+ * its expiry by the server's clock, and this phone's approver active. Deny needs
+ * only a pending approval: refusing is always safe.
  */
 fun approvalView(a: PendingApproval, serverNow: Instant, approverActive: Boolean): ApprovalView {
     val summary = Summary.parse(a.summaryJson)
@@ -275,6 +306,7 @@ fun approvalView(a: PendingApproval, serverNow: Instant, approverActive: Boolean
     val pending = a.status == "pending" && left > 0
     val blocked = when {
         !checked -> "This request could not be checked. Deny it, or open it in the dashboard."
+        summary?.whole == false -> "This phone could not show all of this request as it was sent. Deny it, or open it in the dashboard."
         !pending -> "This request is no longer waiting."
         !approverActive -> "This phone does not approve agent actions. Turn on Approvals in Settings."
         else -> null
@@ -319,7 +351,3 @@ internal fun JSONObject.text(name: String, cap: Int): String =
 
 internal fun JSONArray?.objects(): List<JSONObject> =
     if (this == null) emptyList() else (0 until length()).mapNotNull { optJSONObject(it) }
-
-internal fun JSONArray?.strings(cap: Int): List<String> =
-    if (this == null) emptyList()
-    else (0 until length()).mapNotNull { i -> if (isNull(i)) null else Untrusted.clean(opt(i).toString(), cap) }.filter { it.isNotEmpty() }
