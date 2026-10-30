@@ -119,7 +119,7 @@ impl State {
 }
 
 /// What a call did on the Cloud, for its audit line.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct CloudNote {
     /// `x-crossfyre-call-id` of every request the call made, in order.
     pub call_ids: Vec<String>,
@@ -345,7 +345,8 @@ impl Cloud {
             session: &mcp.session,
             local_scope: mcp.scope.sha256.as_deref().unwrap_or("none"),
         };
-        let n = note.cloud.get_or_insert_with(CloudNote::default);
+        note.cloud.get_or_insert_with(CloudNote::default);
+        note.share_cloud();
         let mut tries = 0;
         let answer = loop {
             tries += 1;
@@ -362,10 +363,11 @@ impl Cloud {
             }
         };
         self.remember_call_id(answer.call_id.as_deref());
-        if let Some(id) = &answer.call_id
+        if let (Some(id), Some(n)) = (&answer.call_id, note.cloud.as_mut())
             && n.call_ids.len() < 20
         {
             n.call_ids.push(id.clone());
+            note.share_cloud();
         }
         if (200..300).contains(&answer.status) {
             self.set_state(State::Ready);

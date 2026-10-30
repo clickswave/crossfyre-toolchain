@@ -156,6 +156,7 @@ pub(super) async fn wait(
     note.cloud
         .get_or_insert_with(CloudNote::default)
         .approval_id = Some(ap.clone());
+    note.share_cloud();
     note.set_scan(ap.clone());
     let uuid = first.id.clone();
     let until = deadline(cloud, first);

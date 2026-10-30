@@ -297,6 +297,8 @@ pub(crate) struct World {
     waits: u32,
     /// An approved launch fails with this reason instead of starting.
     pub fail_launch: Option<&'static str>,
+    /// How long each `approvals/wait` is held before it answers.
+    pub wait_delay: Duration,
 }
 
 impl World {
@@ -336,6 +338,7 @@ impl World {
             decide_on_wait: None,
             waits: 0,
             fail_launch: None,
+            wait_delay: Duration::ZERO,
         }
     }
 
@@ -629,7 +632,9 @@ fn route(w: &mut World, r: &Req) -> Resp {
             {
                 w.settle(&id, status, via);
             }
-            Resp::ok(json!({"approval": w.approvals[&id]}))
+            let mut r = Resp::ok(json!({"approval": w.approvals[&id]}));
+            r.delay = w.wait_delay;
+            r
         }
         wire::route::APPROVALS_DECIDE => {
             let id = b["id"].as_str().unwrap_or("").to_string();

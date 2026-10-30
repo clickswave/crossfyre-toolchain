@@ -196,7 +196,7 @@ The platform is ours, but most of what it holds was written by someone else. Ids
 
 ### Audit
 
-With a key set up, each line also carries `backend` (`local`, `cloud` or `both`), `key_prefix`, `workspace_id`, `cloud_call_id` (the platform's record of the request, for matching the two logs) and `approval_id`. `confirmation` can also be `key_attestation`, `approval:phone`, `approval:dashboard` or `approval:agent_client`.
+With a key set up, each line, the one written for a call still open when the server stops included, also carries `backend` (`local`, `cloud` or `both`), `key_prefix`, `workspace_id`, `cloud_call_id` (the platform's record of the request, for matching the two logs) and `approval_id`. `confirmation` can also be `key_attestation`, `approval:phone`, `approval:dashboard` or `approval:agent_client`.
 
 ## Known limits
 

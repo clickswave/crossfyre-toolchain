@@ -343,3 +343,45 @@ async fn a_launch_sent_with_nobody_asked_is_never_started_at_once() {
         sent.body
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_launch_open_when_the_server_stops_keeps_its_cloud_fields() {
+    let mut w = held("always", vec!["Pixel 8"], true);
+    w.wait_delay = std::time::Duration::from_millis(800);
+    let (t, cloud, _) = fake_cloud::server(&[], w).await;
+    let t = std::sync::Arc::new(t);
+    let t2 = std::sync::Arc::clone(&t);
+    let call =
+        tokio::spawn(async move { t2.call(&FakePeer::new(Elicit::None), SCAN, args()).await });
+    eventually("the wait for a decision", 5, || {
+        cloud.routes().iter().any(|r| r == "approvals/wait")
+    })
+    .await;
+    t.mcp.shutdown().await;
+
+    let calls = |t: &TestMcp| -> Vec<Value> {
+        t.audit_lines()
+            .into_iter()
+            .filter(|l| l["event"] == "call")
+            .collect()
+    };
+    let lines = calls(&t);
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    let l = &lines[0];
+    assert_eq!(l["decision"], "interrupted", "{l}");
+    assert_eq!(l["backend"], "cloud", "{l}");
+    assert_eq!(l["key_prefix"], "cfm_01234567", "{l}");
+    assert_eq!(l["workspace_id"], fake_cloud::WORKSPACE, "{l}");
+    assert!(l["approval_id"].as_str().unwrap().starts_with("ap_"), "{l}");
+    assert_eq!(l["scan_id"], l["approval_id"]);
+    // scans/start was answered, so the platform's record of it can be matched.
+    assert!(
+        l["cloud_call_id"].as_str().unwrap().starts_with("call-"),
+        "{l}"
+    );
+    assert!(!t.audit_text().contains(&fake_cloud::KEY[4..]));
+
+    // The call ends later and writes no second line.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), call).await;
+    assert_eq!(calls(&t).len(), 1, "{:#?}", calls(&t));
+}

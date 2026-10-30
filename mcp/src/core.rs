@@ -208,7 +208,11 @@ pub(crate) struct CallNote {
     scan_slot: Option<Arc<Mutex<Option<String>>>>,
     /// What the call did on the Cloud, when it went there.
     pub cloud: Option<crate::cloud::CloudNote>,
+    /// Where [`CallNote::cloud`] is also kept for a line written at shutdown.
+    cloud_slot: Option<CloudSlot>,
 }
+
+type CloudSlot = Arc<Mutex<Option<crate::cloud::CloudNote>>>;
 
 impl CallNote {
     pub(crate) fn set_scan(&mut self, id: String) {
@@ -216,6 +220,14 @@ impl CallNote {
             *slot = Some(id.clone());
         }
         self.scan_id = Some(id);
+    }
+
+    /// Copy [`CallNote::cloud`] where a line written at shutdown finds it. Called
+    /// whenever it changes before the call waits on something.
+    pub(crate) fn share_cloud(&self) {
+        if let Some(Ok(mut slot)) = self.cloud_slot.as_ref().map(|s| s.lock()) {
+            slot.clone_from(&self.cloud);
+        }
     }
 }
 
@@ -226,6 +238,7 @@ struct OpenCall {
     args: Value,
     started: Instant,
     scan_id: Arc<Mutex<Option<String>>>,
+    cloud: CloudSlot,
 }
 
 /// What the protocol layer sends back.
@@ -482,6 +495,7 @@ impl Mcp {
         let client = untrusted::clean(&peer.label(), 64);
         let audit_args = redact::audit_args(tool, &args);
         let scan_slot = Arc::new(Mutex::new(None));
+        let cloud_slot: CloudSlot = Arc::new(Mutex::new(None));
         if let Ok(mut open) = self.open_calls.lock() {
             open.insert(
                 seq,
@@ -491,11 +505,13 @@ impl Mcp {
                     args: audit_args.clone(),
                     started,
                     scan_id: Arc::clone(&scan_slot),
+                    cloud: Arc::clone(&cloud_slot),
                 },
             );
         }
         let mut note = CallNote {
             scan_slot: Some(scan_slot),
+            cloud_slot: Some(cloud_slot),
             ..Default::default()
         };
         // A name that is not a tool is the same answer however busy the server is.
@@ -966,7 +982,7 @@ impl Mcp {
             .unwrap_or_default();
         for (seq, c) in open {
             let scan_id = c.scan_id.lock().ok().and_then(|s| s.clone());
-            self.audit.write(json!({
+            let mut line = json!({
                 "ts": now_rfc3339(),
                 "event": "call",
                 "session": self.session,
@@ -984,7 +1000,13 @@ impl Mcp {
                 "scan_id": scan_id,
                 "result": null,
                 "duration_ms": c.started.elapsed().as_millis() as u64,
-            }));
+            });
+            let note = CallNote {
+                cloud: c.cloud.lock().ok().and_then(|n| n.clone()),
+                ..Default::default()
+            };
+            crate::cloud::audit_fields(self, &note, &mut line);
+            self.audit.write(line);
         }
         let jobs: Vec<Arc<RunningJob>> = self
             .running
