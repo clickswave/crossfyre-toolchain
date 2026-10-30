@@ -1,0 +1,20 @@
+[package]
+name = "cfx_bridge"
+version = "0.0.1"
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+homepage = "https://clickswave.org"
+repository = "https://github.com/clickswave/crossfyre-toolchain"
+keywords = ["mcp", "protocol", "workbench"]
+description = "The messages `crossfyre mcp` and a running Workbench exchange over the Workbench's local socket."
+authors = ["Clickswave <team@clickswave.org>"]
+
+# Shapes and parsing only, so both ends can depend on it without taking anything else
+# with it: no I/O, no async runtime and no project data.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# raw_value: a request's params are typed straight from the line. Going through a JSON
+# value first would sort the names in an edit and keep only the last of a name written
+# twice, so a refusal of duplicates could never fire.
+serde_json = { version = "1", features = ["raw_value"] }

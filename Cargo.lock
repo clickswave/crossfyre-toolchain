@@ -679,6 +679,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cfx_bridge"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cfx_capture"
 version = "0.0.1"
 dependencies = [
