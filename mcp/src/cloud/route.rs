@@ -274,6 +274,26 @@ struct Row {
     cloud: bool,
 }
 
+/// Two newest-first lists as one, each kept in its own backend's order, so the rows a
+/// page takes from either side are the start of that side's list and its cursor
+/// continues exactly after them. Sorting the two together could take a later Cloud row
+/// before an earlier one that shares its millisecond, and the earlier one would never
+/// be shown.
+fn merge(local: Vec<Row>, cloud: Vec<Row>) -> Vec<Row> {
+    let mut out = Vec::with_capacity(local.len() + cloud.len());
+    let mut l = local.into_iter().peekable();
+    let mut c = cloud.into_iter().peekable();
+    loop {
+        let take_local = match (l.peek(), c.peek()) {
+            (Some(a), Some(b)) => (a.ms, &a.id) >= (b.ms, &b.id),
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => return out,
+        };
+        out.extend(if take_local { l.next() } else { c.next() });
+    }
+}
+
 async fn list_scans(
     mcp: &Mcp,
     cloud: &Cloud,
@@ -312,7 +332,8 @@ async fn list_scans(
     }
 
     // Each side fetches a page after its own position.
-    let mut rows: Vec<Row> = Vec::new();
+    let mut local_rows: Vec<Row> = Vec::new();
+    let mut cloud_list: Vec<Row> = Vec::new();
     let mut local_more = false;
     if l_side != Side::Done {
         let after = match &l_side {
@@ -336,7 +357,7 @@ async fn list_scans(
         for m in &all {
             let mut v = scans::scan_row(m, mcp.settings.redact);
             v["backend"] = json!("local");
-            rows.push(Row {
+            local_rows.push(Row {
                 ms: m.created_ms,
                 id: m.id.clone(),
                 value: v,
@@ -373,7 +394,7 @@ async fn list_scans(
             Ok((_, page)) => {
                 for r in page.scans.iter().take(limit) {
                     let v = shape::scan_row(r, mcp.settings.redact);
-                    rows.push(Row {
+                    cloud_list.push(Row {
                         ms: shape::millis(&r.created_at),
                         id: v["scan_id"].as_str().unwrap_or("").to_string(),
                         value: v,
@@ -393,7 +414,7 @@ async fn list_scans(
         note.cloud.get_or_insert_with(CloudNote::default).local = true;
     }
 
-    rows.sort_by(|x, y| (y.ms, &y.id).cmp(&(x.ms, &x.id)));
+    let rows = merge(local_rows, cloud_list);
     let n = rows.len().min(limit);
     let page =
         |k: usize| -> Value { Value::Array(rows[..k].iter().map(|r| r.value.clone()).collect()) };
