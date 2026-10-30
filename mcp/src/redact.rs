@@ -236,6 +236,42 @@ pub(crate) fn audit_args(tool: &str, args: &serde_json::Value) -> serde_json::Va
                 });
             }
         }
+        "workbench_replay" => {
+            if let Some(e) = v.get_mut("edits").and_then(|e| e.as_object_mut()) {
+                if let Some(h) = e.get_mut("headers").and_then(|h| h.as_object_mut()) {
+                    for (k, x) in h.iter_mut() {
+                        if let Some(s) = x.as_str() {
+                            *x = json!(redact_header(k, s));
+                        }
+                    }
+                }
+                for field in ["query", "form", "json"] {
+                    if let Some(m) = e.get_mut(field).and_then(|m| m.as_object_mut()) {
+                        for (k, x) in m.iter_mut() {
+                            if sensitive_name(k) && !x.is_null() {
+                                *x = json!(MASK);
+                            }
+                        }
+                    }
+                }
+                if let Some(path) = e.get("path").and_then(|p| p.as_str()) {
+                    let shown = redact_url(&format!("http://h{path}"));
+                    let shown = shown.strip_prefix("http://h").unwrap_or(&shown).to_string();
+                    e.insert("path".into(), json!(shown));
+                }
+                if let Some(b) = e.get("body").filter(|b| !b.is_null()) {
+                    let text = b
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| b.to_string());
+                    let reduced = json!({
+                        "body_bytes": text.len(),
+                        "body_sha256": crate::scope_file::sha256_hex(text.as_bytes()),
+                    });
+                    e.insert("body".into(), reduced);
+                }
+            }
+        }
         "test_injection" | "fingerprint" => {
             url_in(&mut v, "url");
             if let Some(eps) = v.get_mut("endpoints").and_then(|e| e.as_array_mut()) {

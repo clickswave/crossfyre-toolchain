@@ -206,6 +206,8 @@ pub(crate) struct CallNote {
     pub refused: Vec<RefusedDest>,
     /// The Workbench a call went to: `{pid, project_uid}`.
     pub workbench: Option<Value>,
+    /// This call's number in the session, as its audit line has it.
+    pub seq: u64,
     /// Where the scan id is also kept for a line written at shutdown.
     scan_slot: Option<Arc<Mutex<Option<String>>>>,
 }
@@ -505,6 +507,7 @@ impl Mcp {
         }
         let mut note = CallNote {
             scan_slot: Some(scan_slot),
+            seq,
             ..Default::default()
         };
         // A name that is not a tool is the same answer however busy the server is.

@@ -1112,3 +1112,423 @@ mod reads {
         assert_eq!(reason(&r), "invalid_arguments");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Replay: the scope file first, the project's scope second
+
+#[cfg(unix)]
+mod replay {
+    use super::*;
+    use crate::tests::fake_wb::*;
+    use cfx_bridge::{Body, Call, ErrorBody, ErrorCode, ExchangeHandle, Method, ReplayResult};
+
+    fn names() -> FakeResolver {
+        FakeResolver::default()
+            .with("app.example.test", &["93.184.216.34", "93.184.216.35"])
+            .with("other.example.test", &["93.184.216.36"])
+            .with("evil.example.test", &["93.184.216.66"])
+            .with("local.example.test", &["127.0.0.1"])
+    }
+
+    fn base(extra: &str) -> Build {
+        scope(
+            &[
+                "app.example.test".into(),
+                "other.example.test".into(),
+                "local.example.test".into(),
+            ],
+            extra,
+        )
+        .resolver(names())
+    }
+
+    fn handle(uid: &str, id: i64) -> String {
+        ExchangeHandle::new(uid, id).unwrap().to_string()
+    }
+
+    /// The fake's stored request: this method and URL, with this Host header.
+    fn stored(method: &'static str, url: &'static str, host: &'static str) -> WbOpts {
+        WbOpts::default().answer(Method::Exchange, move |c, _| {
+            let Call::Exchange(p) = c else { unreachable!() };
+            let mut x = default_exchange(p.id);
+            x.method = method.into();
+            x.url = url.into();
+            x.req_headers = Some(vec![
+                ("Host".into(), host.into()),
+                ("Cookie".into(), "sid=S1-ck".into()),
+            ]);
+            Ok(serde_json::to_value(x).unwrap())
+        })
+    }
+
+    fn get_app() -> WbOpts {
+        stored(
+            "GET",
+            "http://app.example.test/api/items?id=2",
+            "app.example.test",
+        )
+    }
+
+    #[tokio::test]
+    async fn a_replay_is_pinned_to_the_cleared_addresses_and_comes_back_masked() {
+        let b = bench_with(
+            base(""),
+            get_app().answer(Method::Replay, |c, _| {
+                let Call::Replay(p) = c else { unreachable!() };
+                Ok(serde_json::to_value(ReplayResult {
+                    new_id: p.id + 1000,
+                    status: Some(200),
+                    duration_ms: 9,
+                    bytes: 30,
+                    request_line: "GET /api/items?id=2&token=S6-tok HTTP/1.1".into(),
+                    applied: vec!["query id set to 3".into()],
+                    resp_headers: vec![("Set-Cookie".into(), "sid=S2-set; Path=/".into())],
+                    resp_body: Some(Body::text(
+                        "{\"password\":\"S4-pw\",\"ok\":1}".into(),
+                        27,
+                        false,
+                    )),
+                })
+                .unwrap())
+            }),
+        )
+        .await;
+        let r =
+            b.t.call(
+                &FakePeer::new(Elicit::None),
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 4), "edits": {"query": {"id": "3"}}}),
+            )
+            .await;
+        let v = ok(&r).clone();
+        assert_eq!(v["status"], 200);
+        assert_eq!(v["new_exchange"], handle(UID_A, 1004));
+        let applied = v["applied_edits"].to_string();
+        assert!(applied.contains("id set to 3"), "{applied}");
+        assert!(applied.contains("accept-encoding"), "{applied}");
+        for s in ["S1-ck", "S2-set", "S4-pw", "S6-tok"] {
+            assert!(!r.text.contains(s), "{s} in {}", r.text);
+        }
+        assert_eq!(v["target_data"]["untrusted"], true);
+
+        // The stored request was read without its body, then replayed once.
+        let read = &b.fake.params(Method::Exchange)[0];
+        assert_eq!(read["parts"], json!(["request"]));
+        assert_eq!(read["max_body_bytes"], 0);
+        let sent = b.fake.params(Method::Replay);
+        assert_eq!(sent.len(), 1);
+        let p = &sent[0];
+        assert_eq!(p["pins"], json!(["93.184.216.34:80", "93.184.216.35:80"]));
+        assert_eq!(p["label"], "fake-client 1.0");
+        assert_eq!(p["edits"]["headers"]["accept-encoding"], "identity");
+        assert_eq!(p["edits"]["query"]["id"], "3");
+        let line = b.t.audit_lines().pop().unwrap();
+        assert_eq!(p["mcp"]["session"], line["session"]);
+        assert_eq!(p["mcp"]["seq"], line["seq"]);
+        assert_eq!(line["workbench"]["project_uid"], UID_A);
+        assert_eq!(line["result"]["new_exchange"], handle(UID_A, 1004));
+    }
+
+    #[tokio::test]
+    async fn the_scope_file_is_checked_before_the_workbench_is_asked_to_send() {
+        let b = bench_with(
+            base(""),
+            stored("GET", "http://evil.example.test/x", "evil.example.test"),
+        )
+        .await;
+        let r =
+            b.t.call(
+                &FakePeer::new(Elicit::None),
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1)}),
+            )
+            .await;
+        assert_eq!(reason(&r), "out_of_scope", "{}", r.text);
+        assert_eq!(refused_list(&r)[0]["at"], "tool_boundary");
+        assert_eq!(b.fake.count(Method::Replay), 0);
+    }
+
+    #[tokio::test]
+    async fn the_projects_scope_is_checked_second() {
+        let b = bench_with(
+            base(""),
+            get_app().answer(Method::Replay, |_, _| {
+                Err(ErrorBody::new(
+                    ErrorCode::OutOfScope,
+                    "app.example.test:80 is not in this project's scope",
+                ))
+            }),
+        )
+        .await;
+        let r =
+            b.t.call(
+                &FakePeer::new(Elicit::None),
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1)}),
+            )
+            .await;
+        assert_eq!(reason(&r), "workbench_out_of_scope", "{}", r.text);
+        let refused = refused_list(&r);
+        assert_eq!(refused[0]["at"], "workbench_scope");
+        assert_eq!(refused[0]["host"], "app.example.test");
+        assert_eq!(b.t.audit_lines().pop().unwrap()["decision"], "refused");
+    }
+
+    #[tokio::test]
+    async fn a_host_header_the_file_does_not_list_is_refused_edited_or_stored() {
+        let b = bench_with(base(""), get_app()).await;
+        let r =
+            b.t.call(
+                &FakePeer::new(Elicit::None),
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1),
+                       "edits": {"headers": {"Host": "evil.example.test"}}}),
+            )
+            .await;
+        assert_eq!(reason(&r), "out_of_scope", "{}", r.text);
+        assert_eq!(refused_list(&r)[0]["at"], "host_header");
+        assert_eq!(b.fake.count(Method::Replay), 0);
+
+        let b = bench_with(
+            base(""),
+            stored("GET", "http://app.example.test/", "evil.example.test"),
+        )
+        .await;
+        let r =
+            b.t.call(
+                &FakePeer::new(Elicit::None),
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1)}),
+            )
+            .await;
+        assert_eq!(reason(&r), "out_of_scope", "{}", r.text);
+        assert_eq!(refused_list(&r)[0]["at"], "host_header");
+        assert_eq!(b.fake.count(Method::Replay), 0);
+
+        // Removing the stored Host header leaves nothing to check, and the send goes.
+        let r =
+            b.t.call(
+                &FakePeer::new(Elicit::None),
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1), "edits": {"headers": {"host": null}}}),
+            )
+            .await;
+        ok(&r);
+        assert_eq!(b.fake.count(Method::Replay), 1);
+    }
+
+    #[tokio::test]
+    async fn a_name_only_on_loopback_is_refused_before_the_bridge_sends() {
+        let b = bench_with(
+            base(""),
+            stored("GET", "http://local.example.test/", "local.example.test"),
+        )
+        .await;
+        let r =
+            b.t.call(
+                &FakePeer::new(Elicit::None),
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1)}),
+            )
+            .await;
+        assert_eq!(reason(&r), "private_address", "{}", r.text);
+        assert_eq!(b.fake.count(Method::Replay), 0);
+    }
+
+    #[tokio::test]
+    async fn writes_need_the_file_and_a_yes_once_per_host() {
+        let post = || {
+            stored(
+                "POST",
+                "http://app.example.test/api/items",
+                "app.example.test",
+            )
+        };
+        let b = bench_with(base(""), post()).await;
+        let r =
+            b.t.call(
+                &FakePeer::new(Elicit::Accept),
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1)}),
+            )
+            .await;
+        assert_eq!(reason(&r), "writes_not_allowed", "{}", r.text);
+        assert_eq!(b.fake.count(Method::Replay), 0);
+
+        let b = bench_with(base("allow_writes = true"), post()).await;
+        let peer = FakePeer::new(Elicit::Accept);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1)}),
+            )
+            .await;
+        ok(&r);
+        assert_eq!(b.fake.count(Method::Replay), 1);
+        assert_eq!(peer.asked(), 2, "the scope, then the write");
+        let q = peer.questions.lock().unwrap().last().unwrap().clone();
+        assert!(q.contains("cookies and headers that were captured"), "{q}");
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 2)}),
+            )
+            .await;
+        ok(&r);
+        assert_eq!(b.fake.count(Method::Replay), 2);
+        assert_eq!(peer.asked(), 2, "the same host is not asked about again");
+
+        let b = bench_with(base("allow_writes = true"), post()).await;
+        let r =
+            b.t.call(
+                &FakePeer::new(Elicit::Decline),
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1)}),
+            )
+            .await;
+        assert_eq!(reason(&r), "declined", "{}", r.text);
+        assert_eq!(b.fake.count(Method::Replay), 0);
+    }
+
+    #[tokio::test]
+    async fn a_handle_from_another_project_sends_nothing() {
+        let b = bench_with(base(""), get_app()).await;
+        b.fake.switch(Some(project(UID_B, "beta")));
+        let mcp = std::sync::Arc::clone(&b.t.mcp);
+        eventually("the switch", 5, || {
+            mcp.workbench.instances()[0]
+                .project()
+                .is_some_and(|p| p.uid == UID_B)
+        })
+        .await;
+        let r =
+            b.t.call(
+                &FakePeer::new(Elicit::None),
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1)}),
+            )
+            .await;
+        assert_eq!(reason(&r), "project_changed", "{}", r.text);
+        assert_eq!(b.fake.count(Method::Replay), 0);
+        assert_eq!(b.fake.count(Method::Exchange), 0);
+
+        // The same when the server has not heard yet: the Workbench says so itself.
+        let b = bench_with(base(""), get_app()).await;
+        b.fake.switch_quietly(Some(project(UID_B, "beta")));
+        let r =
+            b.t.call(
+                &FakePeer::new(Elicit::None),
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1)}),
+            )
+            .await;
+        assert_eq!(reason(&r), "project_changed", "{}", r.text);
+        assert_eq!(b.fake.count(Method::Replay), 0);
+    }
+
+    #[tokio::test]
+    async fn edits_the_protocol_refuses_are_refused_here_first() {
+        let b = bench_with(base(""), get_app()).await;
+        let peer = FakePeer::new(Elicit::None);
+        for edits in [
+            json!({"headers": {"Content-Length": "0"}}),
+            json!({"headers": {"x-a": "1\r\nX-Injected: 1"}}),
+            json!({"path": "no-slash"}),
+            json!({"form": {"a": "1"}, "json": {"a": 1}}),
+            json!({"method": "DELETE"}),
+            json!("not an object"),
+        ] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1), "edits": edits.clone()}),
+                )
+                .await;
+            assert_eq!(reason(&r), "invalid_arguments", "{edits}: {}", r.text);
+        }
+        assert_eq!(b.fake.count(Method::Exchange), 0);
+        assert_eq!(b.fake.count(Method::Replay), 0);
+    }
+
+    #[tokio::test]
+    async fn an_accept_encoding_the_edits_name_is_left_as_named() {
+        let b = bench_with(base(""), get_app()).await;
+        let r =
+            b.t.call(
+                &FakePeer::new(Elicit::None),
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1),
+                       "edits": {"headers": {"Accept-Encoding": "gzip"}}}),
+            )
+            .await;
+        ok(&r);
+        let p = &b.fake.params(Method::Replay)[0];
+        assert_eq!(p["edits"]["headers"], json!({"Accept-Encoding": "gzip"}));
+    }
+
+    #[tokio::test]
+    async fn addresses_that_moved_are_unresolvable_with_a_retry_hint() {
+        let b = bench_with(
+            base(""),
+            get_app().answer(Method::Replay, |_, _| {
+                Err(ErrorBody::new(
+                    ErrorCode::PinMismatch,
+                    "no pin in the lookup",
+                ))
+            }),
+        )
+        .await;
+        let r =
+            b.t.call(
+                &FakePeer::new(Elicit::None),
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1)}),
+            )
+            .await;
+        assert_eq!(reason(&r), "unresolvable", "{}", r.text);
+        assert!(r.text.contains("calling again"), "{}", r.text);
+    }
+
+    #[tokio::test]
+    async fn the_audit_line_masks_what_the_edits_carry() {
+        let b = bench_with(base(""), get_app()).await;
+        let peer = FakePeer::new(Elicit::None);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1), "edits": {
+                    "path": "/login?token=S6-tok",
+                    "headers": {"Authorization": "Bearer S3-bearer", "Cookie": "sid=S1-ck"},
+                    "query": {"api_key": "S7-key"},
+                    "json": {"password": "S4-pw"}}}),
+            )
+            .await;
+        ok(&r);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1), "edits": {"body": "user=a&password=S5-form"}}),
+            )
+            .await;
+        ok(&r);
+        let audit = b.t.audit_text();
+        for s in ["S1-ck", "S3-bearer", "S4-pw", "S5-form", "S6-tok", "S7-key"] {
+            assert!(!audit.contains(s), "{s} in the audit");
+        }
+        let line = b.t.audit_lines().pop().unwrap();
+        assert!(
+            line["args"]["edits"]["body"]["body_sha256"].is_string(),
+            "{line}"
+        );
+        // What the Workbench was sent is the edits as given.
+        assert_eq!(
+            b.fake.params(Method::Replay)[0]["edits"]["json"]["password"],
+            "S4-pw"
+        );
+    }
+}
