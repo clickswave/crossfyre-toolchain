@@ -56,6 +56,13 @@ class ApproverLedger(private val store: AccountStore) {
         }
     }
 
+    /** Sign-out: the approver this phone is and the one it is enrolling are both given up. */
+    @Synchronized
+    fun letGoAll() {
+        store.approverId?.let(::letGo)
+        store.enrollingApproverId?.let(::letGo)
+    }
+
     /**
      * At start, before any wait can be running: an enrolment the last process
      * began and never finished is let go of. True when there was one, so the
@@ -108,4 +115,32 @@ class ApproverLedger(private val store: AccountStore) {
         }
         return last
     }
+
+    /**
+     * Sign-out's part, run while the account key is still on the phone: every
+     * approver it holds, is enrolling or still owes a revoke for is revoked
+     * first, while the key that sends those revokes still works, and then the
+     * key itself. The caller forgets all of it locally afterwards, whatever the
+     * answer, and tells the person what the server may still count.
+     */
+    fun signOut(revoke: (String) -> Outcome<Unit>, logout: () -> Outcome<Unit>): SignOutLeft {
+        letGoAll()
+        settle(revoke)
+        return when {
+            // Every approver check joins the key, so a revoked key ends them all.
+            logout() is Outcome.Ok -> SignOutLeft.NOTHING
+            owed.isEmpty() -> SignOutLeft.KEY
+            else -> SignOutLeft.APPROVER
+        }
+    }
+}
+
+/** What the server may still count after a sign-out, by what it confirmed. */
+enum class SignOutLeft {
+    /** The key is revoked, and every approver it had with it. */
+    NOTHING,
+    /** Every approver is revoked, but not the key, which still works on the server until it is revoked in the dashboard. */
+    KEY,
+    /** Neither: the server may still wait for this phone to approve what an agent asks for. */
+    APPROVER,
 }

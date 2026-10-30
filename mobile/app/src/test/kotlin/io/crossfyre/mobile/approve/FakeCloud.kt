@@ -45,6 +45,12 @@ class FakeCloud(private val key: String) : AutoCloseable {
     /** How long an enrolment code lasts, in seconds, as `approver/start` says. */
     @Volatile var enrolSeconds = 600
 
+    /** The status `logout` answers with, while set, in place of revoking the key. */
+    @Volatile var logoutFails: Int? = null
+
+    /** `logout` revoked the account key: every call with it is refused from then on. */
+    @Volatile var keyRevoked = false
+
     /** The fingerprint `approver/start` reports, while set, in place of the key's own: a key changed on the way. */
     @Volatile var startFingerprint: String? = null
 
@@ -93,7 +99,7 @@ class FakeCloud(private val key: String) : AutoCloseable {
 
     private fun handle(route: String, b: JSONObject): Pair<Int, JSONObject> {
         routes += route
-        if (b.optString("api_key") != key) return 401 to JSONObject().put("message", "Invalid key")
+        if (b.optString("api_key") != key || keyRevoked) return 401 to JSONObject().put("message", "Invalid key")
         return when (route) {
             "approver/start" -> {
                 val spki = Base64.getDecoder().decode(b.getString("public_key"))
@@ -120,6 +126,10 @@ class FakeCloud(private val key: String) : AutoCloseable {
                     }))
             }
             "approvals/decide" -> decide(b)
+            "logout" -> logoutFails?.let { it to JSONObject().put("message", "Logout failed") } ?: run {
+                keyRevoked = true
+                200 to JSONObject()
+            }
             else -> 404 to JSONObject().put("message", "Not found")
         }
     }

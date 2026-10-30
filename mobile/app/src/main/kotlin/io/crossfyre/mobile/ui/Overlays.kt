@@ -344,7 +344,7 @@ fun BoxScope.Overlays(m: AppModel) {
             "Sign out?", onDismiss = { m.overlay = null },
             actions = {
                 CfxButton("Cancel", Kind.TEXT_DIM) { m.overlay = null }
-                CfxButton("Sign out", Kind.TEXT, color = c.danger) { m.signOut() }
+                CfxButton("Sign out", Kind.TEXT, color = c.danger, busy = m.signingOut) { m.signOut() }
             },
         ) {
             Text("Capture stops and this phone's key is revoked. The certificate and any patched apps stay on the phone.")

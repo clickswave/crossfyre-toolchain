@@ -1,5 +1,6 @@
 package io.crossfyre.mobile.approve
 
+import io.crossfyre.mobile.account.AccountApi
 import io.crossfyre.mobile.account.AccountStore
 import io.crossfyre.mobile.account.HttpTransport
 import io.crossfyre.mobile.account.KeyValues
@@ -165,6 +166,62 @@ class ApproverLedgerTest {
         assertNull(store.enrollingApproverId)
         ledger.settle { api.revoke(key, it) }
         assertFalse(cloud.confirm(code()))
+    }
+
+    // ── sign-out ──────────────────────────────────────────────────────────
+
+    private val account = AccountApi(cloud.origin, HttpTransport(2_000, 2_000))
+
+    private fun signOut() = ledger.signOut({ id -> api.revoke(key, id) }, { account.logout(key) })
+
+    /** A phone that approves as one approver, is enrolling a second, and owes a revoke for a third. */
+    private fun busyPhone(): List<String> {
+        enrolNow(opened = { e -> assertTrue(cloud.confirm(e.code)) })
+        val enrolling = (api.enrolStart(key, "install-0001", "Pixel 8", spki) as Outcome.Ok).value.approverId
+        ledger.started(enrolling)
+        val owed = (api.enrolStart(key, "install-0001", "Pixel 8", spki) as Outcome.Ok).value.approverId
+        ledger.letGo(owed)
+        return cloud.approvers.map { it.id }
+    }
+
+    @Test
+    fun signing_out_revokes_every_approver_and_then_the_key() {
+        busyPhone()
+        cloud.routes.clear()
+        assertEquals(SignOutLeft.NOTHING, signOut())
+        assertEquals(listOf("revoked", "revoked", "revoked"), cloud.approvers.map { it.status })
+        assertTrue(cloud.keyRevoked)
+        // A revoke sent after the logout would be refused for the key it carries.
+        assertEquals("logout", cloud.routes.last())
+        assertEquals(3, cloud.routes.count { it == "approver/revoke" })
+        assertTrue(ledger.owed.isEmpty())
+        assertNull(store.approverId)
+        assertNull(store.enrollingApproverId)
+    }
+
+    @Test
+    fun a_sign_out_the_server_did_not_take_says_what_it_may_still_count() {
+        val ids = busyPhone()
+        cloud.revokeFails = 503
+        cloud.logoutFails = 503
+        assertEquals(SignOutLeft.APPROVER, signOut())
+        assertEquals("active", cloud.approvers.first().status)
+        assertFalse(cloud.keyRevoked)
+        assertEquals(ids.toSet(), ledger.owed)
+
+        // The approvers go through on a second try, the key still does not.
+        cloud.revokeFails = null
+        assertEquals(SignOutLeft.KEY, signOut())
+        assertEquals(listOf("revoked", "revoked", "revoked"), cloud.approvers.map { it.status })
+        assertFalse(cloud.keyRevoked)
+    }
+
+    @Test
+    fun a_sign_out_with_a_key_already_revoked_leaves_nothing() {
+        busyPhone()
+        cloud.keyRevoked = true
+        assertEquals(SignOutLeft.NOTHING, signOut())
+        assertTrue(ledger.owed.isEmpty())
     }
 
     @Test

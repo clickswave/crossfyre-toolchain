@@ -2,6 +2,7 @@ package io.crossfyre.mobile
 
 import io.crossfyre.mobile.account.Problem
 import io.crossfyre.mobile.account.Refusal
+import io.crossfyre.mobile.approve.SignOutLeft
 
 /** How loud a message is: the banner colour, and whether it is read out as an alert. */
 enum class Level { OK, WARN, DANGER, INFO }
@@ -111,6 +112,23 @@ fun decisionNotice(p: Problem, host: String): Notice = when {
     )
     reasonOf(p) == Refusal.APPROVER_INACTIVE -> Notice(Level.WARN, "This phone no longer approves.", "Turn Approvals on again in Settings.")
     else -> Notice(Level.DANGER, "Couldn't send your answer.", p.text)
+}
+
+/**
+ * What the sign-in screen says after a sign-out the server did not confirm, or
+ * null when it did. The phone has forgotten the key either way, so the only
+ * way left to revoke it is the dashboard.
+ */
+fun signOutNotice(left: SignOutLeft, host: String): Notice? = when (left) {
+    SignOutLeft.NOTHING -> null
+    SignOutLeft.KEY -> Notice(
+        Level.WARN, "Signed out on this phone only.",
+        "$host did not confirm that this phone's key is revoked, so it may still work. Revoke it in the dashboard, under Settings > CLI Access.",
+    )
+    SignOutLeft.APPROVER -> Notice(
+        Level.WARN, "Signed out on this phone only.",
+        "$host did not confirm the sign-out, so it may still count this phone as an approver and hold agent requests for it. Revoke this phone's key in the dashboard, under Settings > CLI Access.",
+    )
 }
 
 /** Why the activity log did not load. */

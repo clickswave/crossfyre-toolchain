@@ -273,6 +273,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
     private fun keyName() = "Crossfyre Mobile: ${Build.MODEL}"
 
     private fun signedInAs(s: SignedIn, via: String) {
+        siError = null
         store.saveSignIn(s)
         store.signedInWith = via
         signedInWith = via
@@ -480,27 +481,55 @@ class AppModel(app: Application) : AndroidViewModel(app) {
         say("You have been signed out. Sign in again.", R.drawable.ic_info)
     }
 
+    /** A sign-out waiting for the server to answer. */
+    var signingOut by mutableStateOf(false)
+        private set
+
+    /**
+     * Sign out on the server, then here. The approvers this phone holds, is
+     * enrolling or still owes a revoke for are revoked while the key that sends
+     * the revokes still works, then the key itself, and only after that does the
+     * phone forget any of it. A sign-out the server did not confirm still signs
+     * the phone out, and the sign-in screen says what the server may still count.
+     */
     fun signOut() {
-        overlay = null
+        if (signingOut) return
         val key = store.key()
         if (running) stopCapture()
-        // Revoke on the server as well, so signing a lost phone out is not only
-        // local. Best effort: a phone with no signal still signs out here.
-        if (key != null) viewModelScope.launch(Dispatchers.IO) { api().logout(key) }
-        // Revoking the account key ends the approver on the server too, because
-        // every check joins the key; the phone's half is the keystore key.
-        forgetApprover()
-        store.signOut()
-        Pairing.clear(ctx)
-        pairing = null
-        workspace = null
-        user = null
-        signedInWith = null
-        revoked = false
-        route = Route.SIGN_IN
-        tab = "home"
-        push = null
-        say("Signed out. This phone's key was revoked.")
+        // An enrolment waiting for the browser stops here, so its approver is
+        // among the ones revoked.
+        enrolJob?.cancel()
+        enrolJob = null
+        signingOut = true
+        viewModelScope.launch {
+            val noKey = Outcome.Failed(Problem.Broken(0, "The account key could not be read on this phone."))
+            // Shorter waits than other calls: the person is looking at a busy
+            // button, and a phone the server never hears from signs out anyway.
+            val quick = HttpTransport(5_000, 10_000)
+            val left = withContext(Dispatchers.IO) {
+                approverLedger.signOut(
+                    revoke = { id -> if (key == null) noKey else ApprovalApi(origin, quick).revoke(key, id) },
+                    logout = { if (key == null) noKey else AccountApi(origin, quick).logout(key) },
+                )
+            }
+            signingOut = false
+            forgetApprover()
+            store.signOut()
+            Pairing.clear(ctx)
+            pairing = null
+            workspace = null
+            user = null
+            signedInWith = null
+            revoked = false
+            route = Route.SIGN_IN
+            tab = "home"
+            push = null
+            overlay = null
+            when (val n = signOutNotice(left, host)) {
+                null -> say("Signed out. This phone's key was revoked.")
+                else -> siError = n
+            }
+        }
     }
 
     /** "Sign in again" after a revoked key, or "Sign in" from a QR pairing: back to the front door. */
@@ -1159,6 +1188,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
      * what the wait is for.
      */
     fun turnOnApprovals() {
+        if (signingOut) return
         val key = store.key() ?: return signedOut()
         if (!deviceSecure) {
             overlay = Overlay.ApprovalsExplain
