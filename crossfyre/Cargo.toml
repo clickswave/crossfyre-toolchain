@@ -14,8 +14,14 @@ path = "src/main.rs"
 
 [dependencies]
 cfx_core = { path = "../core" }
+cfx_mcp = { path = "../mcp" }
 oast = { path = "../oast" }
 clap = { version = "4.5.60", features = ["derive"] }
 clap_complete = "4.6.9"
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "time", "signal"] }
 clap_mangen = "0.3.3"
+
+[dev-dependencies]
+# tests/mcp_stdio.rs speaks JSON-RPC to the binary and checks the audit log's hash.
+serde_json = "1"
+sha2 = "0.10"

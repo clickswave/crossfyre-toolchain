@@ -62,8 +62,7 @@ pub struct ClientOpts<'a> {
     pub target: &'a str,
     pub timeout_ms: u64,
     /// The floor this operation needs, e.g. an injection SLEEP probe needs the
-    /// timeout above the sleep. Zero when there is no such floor. Ignored by
-    /// [`build_client_no_redirect`], which has no probe with a floor.
+    /// timeout above the sleep. Zero when there is no such floor.
     pub min_timeout_ms: u64,
     /// Refuse private and reserved destinations at connect time, at the
     /// resolver, so redirect hops and DNS rebinding are covered too. Off for an
@@ -75,6 +74,18 @@ pub struct ClientOpts<'a> {
 
 /// Build an evasion-aware scan client.
 pub fn build_client(o: ClientOpts) -> Option<Client> {
+    build_client_with(o, transport::Redirect::Limited(3), Vec::new())
+}
+
+/// [`build_client`] with the redirect policy and the name pins chosen by the caller.
+/// With [`transport::Redirect::None`] the caller sees the raw 3xx and `Location`
+/// instead of the followed destination, which the open-redirect and header-injection
+/// oracles need.
+pub fn build_client_with(
+    o: ClientOpts,
+    redirect: transport::Redirect,
+    resolve: Vec<(String, std::net::SocketAddr)>,
+) -> Option<Client> {
     let ClientOpts {
         evasive,
         identify,
@@ -96,41 +107,10 @@ pub fn build_client(o: ClientOpts) -> Option<Client> {
         timeout: Some(Duration::from_millis(
             timeout_ms.clamp(1000, 120_000).max(min_timeout_ms),
         )),
-        redirect: transport::Redirect::Limited(3),
+        redirect,
         accept_invalid_certs: true,
         cookie_store: true,
-        resolve: Vec::new(),
-        block_internal,
-    })
-    .ok()
-}
-
-/// Same as [`build_client`] but with redirects DISABLED, so the caller sees the raw 3xx + `Location`
-/// instead of the followed destination. The open-redirect / header-injection oracles need that.
-pub fn build_client_no_redirect(o: ClientOpts) -> Option<Client> {
-    let ClientOpts {
-        evasive,
-        identify,
-        auth,
-        target,
-        timeout_ms,
-        block_internal,
-        ..
-    } = o;
-    let mode = adaptive::identity::Mode::from_flags(evasive, identify);
-    let seed = (!target.is_empty()).then_some(target);
-    let browser = adaptive::identity::resolve(&mode, seed);
-    transport::build_scan_client(transport::ScanClient {
-        identity_headers: &browser.headers,
-        user_agent: &browser.user_agent,
-        auth,
-        attribution_token: None,
-        emulate: !matches!(mode, adaptive::identity::Mode::Fast),
-        timeout: Some(Duration::from_millis(timeout_ms.clamp(1000, 120_000))),
-        redirect: transport::Redirect::None,
-        accept_invalid_certs: true,
-        cookie_store: true,
-        resolve: Vec::new(),
+        resolve,
         block_internal,
     })
     .ok()

@@ -97,6 +97,18 @@ pub struct InjectParams {
     /// ours.
     #[serde(default)]
     pub block_internal: bool,
+    /// Follow redirects, up to three. Absent = true, which is how every pass has run.
+    /// A caller that checks each destination itself sets it false, because a hop this
+    /// engine follows is one that caller never sees.
+    #[serde(default = "d_true")]
+    pub follow_redirects: bool,
+    /// Names pinned to addresses, `[["app.example.com", "203.0.113.7:443"], ...]`,
+    /// used on every connection the pass makes. A caller that has already decided
+    /// which addresses of a name may be dialled sends them, so the name is not looked
+    /// up again here and answered with somewhere else. The opt-in smuggling probe
+    /// opens raw sockets and looks names up itself.
+    #[serde(default)]
+    pub resolve: Vec<(String, std::net::SocketAddr)>,
 }
 fn d_timeout() -> u64 {
     12_000
@@ -421,20 +433,31 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
         let _ = tx.send(json!({"type":"done","found":0}));
         return;
     }
+    // The caller's redirect policy and name pins hold for every client this pass
+    // builds, the open-redirect client and a race burst's included.
+    let redirect = if params.follow_redirects {
+        transport::Redirect::Limited(3)
+    } else {
+        transport::Redirect::None
+    };
     // Injection probes send a benign SLEEP, so the timeout floor must clear it.
-    let client = match probe::build_client(probe::ClientOpts {
-        evasive: params.evasive,
-        identify: params.identify.clone(),
-        auth: params.auth.as_ref(),
-        target: &params.target,
-        timeout_ms: params.timeout_ms,
-        block_internal: params.block_internal,
-        // Room for the DOUBLED sleep the time-based oracle uses to prove the
-        // delay tracks the number we asked for. Sized for one sleep, the
-        // confirming request times out and every real time-based finding is
-        // lost with the false ones.
-        min_timeout_ms: SLEEP_SECS * 2 * 1000 + 3000,
-    }) {
+    let client = match probe::build_client_with(
+        probe::ClientOpts {
+            evasive: params.evasive,
+            identify: params.identify.clone(),
+            auth: params.auth.as_ref(),
+            target: &params.target,
+            timeout_ms: params.timeout_ms,
+            block_internal: params.block_internal,
+            // Room for the DOUBLED sleep the time-based oracle uses to prove the
+            // delay tracks the number we asked for. Sized for one sleep, the
+            // confirming request times out and every real time-based finding is
+            // lost with the false ones.
+            min_timeout_ms: SLEEP_SECS * 2 * 1000 + 3000,
+        },
+        redirect,
+        params.resolve.clone(),
+    ) {
         Some(c) => c,
         None => {
             let _ = tx.send(json!({"type":"error","message":"client build failed"}));
@@ -448,15 +471,19 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
         .iter()
         .skip(1)
         .filter_map(|a| {
-            probe::build_client(probe::ClientOpts {
-                evasive: params.evasive,
-                identify: params.identify.clone(),
-                auth: Some(a),
-                target: &params.target,
-                timeout_ms: params.timeout_ms,
-                min_timeout_ms: SLEEP_SECS * 2 * 1000 + 3000,
-                block_internal: params.block_internal,
-            })
+            probe::build_client_with(
+                probe::ClientOpts {
+                    evasive: params.evasive,
+                    identify: params.identify.clone(),
+                    auth: Some(a),
+                    target: &params.target,
+                    timeout_ms: params.timeout_ms,
+                    min_timeout_ms: SLEEP_SECS * 2 * 1000 + 3000,
+                    block_internal: params.block_internal,
+                },
+                redirect,
+                params.resolve.clone(),
+            )
         })
         .collect();
     if !session_clients.is_empty() {
@@ -472,15 +499,19 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
 
     // A redirect-following client hides the 3xx + Location the open-redirect oracle needs, so build a
     // second client with redirects disabled just for that probe.
-    let client_nr = probe::build_client_no_redirect(probe::ClientOpts {
-        evasive: params.evasive,
-        identify: params.identify.clone(),
-        auth: params.auth.as_ref(),
-        target: &params.target,
-        timeout_ms: params.timeout_ms,
-        min_timeout_ms: 0,
-        block_internal: params.block_internal,
-    });
+    let client_nr = probe::build_client_with(
+        probe::ClientOpts {
+            evasive: params.evasive,
+            identify: params.identify.clone(),
+            auth: params.auth.as_ref(),
+            target: &params.target,
+            timeout_ms: params.timeout_ms,
+            min_timeout_ms: 0,
+            block_internal: params.block_internal,
+        },
+        transport::Redirect::None,
+        params.resolve.clone(),
+    );
     let oast = match &params.oast {
         Some(s) if !s.domains.is_empty() && !s.api_url.is_empty() => {
             crate::oast::OastClient::from_spec(s.domains.clone(), &s.api_url)
@@ -605,6 +636,8 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
             target: params.target.clone(),
             timeout_ms: params.timeout_ms,
             block_internal: params.block_internal,
+            redirect,
+            resolve: params.resolve.clone(),
         })
     });
     // The operator's authorisation list, parsed once. Anything unparseable is

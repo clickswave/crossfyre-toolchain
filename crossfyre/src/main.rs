@@ -191,6 +191,20 @@ enum Commands {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+    /// Serve the installed engines to an MCP client over stdio. Tools refuse
+    /// destinations that a scope file you write does not list; the server reads it at
+    /// start and never changes it.
+    Mcp {
+        /// The scope file. Defaults to `<data-dir>/mcp/scope.toml`.
+        #[arg(long, value_name = "PATH")]
+        scope_file: Option<std::path::PathBuf>,
+
+        /// Return secrets found in responses and evidence unmasked. The audit log is
+        /// masked either way.
+        #[arg(long)]
+        no_redact: bool,
+    },
+
     /// Print a shell completion script to stdout, for example:
     ///   crossfyre completions bash > ~/.local/share/bash-completion/completions/crossfyre
     Completions {
@@ -678,6 +692,40 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 cfx_core::toolchain::uninstall::Scope { purge, keep_data },
                 yes,
             )?;
+        }
+        Commands::Mcp {
+            scope_file,
+            no_redact,
+        } => {
+            // Stdout is the protocol from here on, so nothing on this path may print
+            // to it: no ui helpers, no status output. Diagnostics go to stderr.
+            use cfx_core::toolchain::config;
+            let engines = cfx_core::toolchain::ENGINES
+                .iter()
+                .map(|e| cfx_mcp::EngineInfo {
+                    name: e.name.to_string(),
+                    port: config::engine_port(e.id),
+                    installed: config::is_extension_installed(e.id),
+                })
+                .collect();
+            let opts = cfx_mcp::Options {
+                scope_file,
+                default_dir: base.join("mcp"),
+                engines,
+                // The port only, to say whether the database is up; never the password.
+                postgres_port: config::load_config().ok().map(|c| c.postgres.port),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                redact: !no_redact,
+            };
+            match cfx_mcp::serve(opts).await {
+                // Exit here rather than returning: a read of stdin still parked on the
+                // runtime's blocking pool would hold up its shutdown after a Ctrl-C.
+                Ok(()) => std::process::exit(0),
+                Err(e) => {
+                    eprintln!("crossfyre mcp: {e}");
+                    std::process::exit(2);
+                }
+            }
         }
         Commands::Completions { shell } => {
             clap_complete::generate(

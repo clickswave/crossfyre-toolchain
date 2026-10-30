@@ -118,8 +118,10 @@ fn parse_one(raw: &str) -> Option<Rule> {
     }
 
     if let Some(rest) = e.strip_prefix("*.") {
-        // `*.com` is not an authorisation, it is an accident.
-        if !rest.contains('.') || rest.starts_with('.') {
+        // `*.com` is not an authorisation, it is an accident. Nor is `*.0.0.1`: a
+        // host ending in a number is an address to a URL parser, so that base could
+        // only ever match addresses, whichever network they are on.
+        if !rest.contains('.') || rest.starts_with('.') || ends_in_number(rest) {
             return None;
         }
         return Some(Rule::Suffix(rest.to_string()));
@@ -174,6 +176,17 @@ fn parse_one(raw: &str) -> Option<Rule> {
     Some(Rule::Host(e))
 }
 
+/// Does this name end in a label a URL parser reads as a number, decimal or hex
+/// after `0x`? Such a host is parsed as an IPv4 address, not looked up as a name.
+fn ends_in_number(name: &str) -> bool {
+    let last = name.trim_end_matches('.').rsplit('.').next().unwrap_or("");
+    !last.is_empty()
+        && (last.bytes().all(|b| b.is_ascii_digit())
+            || last
+                .strip_prefix("0x")
+                .is_some_and(|h| h.bytes().all(|b| b.is_ascii_hexdigit())))
+}
+
 impl Scope {
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
@@ -206,8 +219,13 @@ impl Scope {
             Rule::HostPort(name, p) => *name == h && port == Some(*p),
             // The leading dot is what stops `*.example.com` admitting
             // `evil-example.com`, which is the whole reason suffix rules are
-            // dangerous when written as a plain `ends_with`.
-            Rule::Suffix(base) => h.len() > base.len() + 1 && h.ends_with(&format!(".{base}")),
+            // dangerous when written as a plain `ends_with`. An address is never a
+            // subdomain of anything, whatever its digits happen to end with.
+            Rule::Suffix(base) => {
+                h.parse::<IpAddr>().is_err()
+                    && h.len() > base.len() + 1
+                    && h.ends_with(&format!(".{base}"))
+            }
             Rule::Net(net, bits) => h
                 .parse::<IpAddr>()
                 .map(|ip| in_net(&ip, net, *bits))
@@ -587,6 +605,28 @@ mod tests {
             let (_, rejected) = Policy::from_entries(&[bad.to_string()]);
             assert_eq!(rejected, vec![bad.to_string()], "{bad} should be refused");
         }
+    }
+
+    #[test]
+    fn a_wildcard_never_admits_an_address() {
+        // A URL parser reads any host whose last label is a number as an IPv4
+        // address, so `*.0.0.1` could only ever match addresses: 127.0.0.1, 10.0.0.1
+        // and every other one ending in .0.0.1, private or not.
+        for bad in ["*.0.0.1", "*.168.1.1", "*.example.123", "*.a.0x7f"] {
+            let (_, rejected) = Policy::from_entries(&[bad.to_string()]);
+            assert_eq!(rejected, vec![bad.to_string()], "{bad} should be refused");
+        }
+        // And a suffix rule does not match an address however it was made.
+        let s = Scope {
+            rules: vec![Rule::Suffix("0.1".into())],
+        };
+        assert!(!s.admits("127.0.0.1", Some(80)));
+        assert!(!s.admits("10.0.0.1", Some(80)));
+        assert!(!s.admits("::ffff:10.0.0.1", Some(80)));
+        // Names with numbers in them are still names.
+        let s = scope(&["*.10.example.com", "*.example.com"]);
+        assert!(s.admits("a.10.example.com", Some(443)));
+        assert!(s.admits("1.example.com", Some(443)));
     }
 
     #[test]

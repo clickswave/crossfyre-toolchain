@@ -111,8 +111,10 @@ pub struct ClientConfig {
     /// hop is ours, so the node must not be usable as a pivot.
     ///
     /// Enforced at the RESOLVER, so it also covers redirect hops and DNS
-    /// rebinding, neither of which a check at the call site can see. See
-    /// [`guard`].
+    /// rebinding, neither of which a check at the call site can see, and in the
+    /// redirect policy for a hop to an address written as one, which never reaches
+    /// the resolver. See [`guard`]. A request the caller itself sends to an
+    /// address is not filtered: that destination is the caller's to check.
     pub block_internal: bool,
 }
 
@@ -195,6 +197,23 @@ pub fn build_client(cfg: ClientConfig) -> Result<Client, Error> {
     }
     b = match cfg.redirect {
         Redirect::None => b.redirect(redirect::Policy::none()),
+        // The resolver above is never asked about an address written into a URL, so
+        // a hop to `http://127.0.0.1/` would get past it. Such a hop is refused here,
+        // before it is dialled.
+        Redirect::Limited(n) if cfg.block_internal => {
+            let limit = redirect::Policy::limited(n);
+            b.redirect(redirect::Policy::custom(move |attempt| {
+                if attempt
+                    .url()
+                    .host_str()
+                    .is_some_and(guard::is_internal_literal)
+                {
+                    attempt.error("destination is not a permitted address")
+                } else {
+                    limit.redirect(attempt)
+                }
+            }))
+        }
         Redirect::Limited(n) => b.redirect(redirect::Policy::limited(n)),
     };
     if cfg.cookie_store {
@@ -352,6 +371,60 @@ mod tests {
             ..Default::default()
         });
         assert!(c.is_ok(), "build failed: {:?}", c.err());
+    }
+
+    /// A listener on loopback that answers every request with `reply` and counts them.
+    fn counting_listener(reply: String) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { return };
+                let mut buf = [0u8; 4096];
+                if s.read(&mut buf).unwrap_or(0) > 0 {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = s.write_all(reply.as_bytes());
+                }
+            }
+        });
+        (port, seen)
+    }
+
+    #[tokio::test]
+    async fn block_internal_stops_a_redirect_to_an_internal_address_literal() {
+        // The resolver filter never sees an address written into a URL, so a hop to
+        // one has to be stopped before it is dialled.
+        let (inner, inner_seen) = counting_listener(
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".into(),
+        );
+        let (outer, _) = counting_listener(format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{inner}/admin\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+        ));
+        let client = |block_internal| {
+            build_client(ClientConfig {
+                timeout: Some(Duration::from_secs(5)),
+                redirect: Redirect::Limited(3),
+                block_internal,
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let url = format!("http://127.0.0.1:{outer}/");
+        let r = client(true).get(&url).send().await;
+        assert!(
+            r.is_err(),
+            "the hop was followed: {:?}",
+            r.map(|r| r.status())
+        );
+        assert_eq!(inner_seen.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // The same client without the flag follows it, so the fixture is sound.
+        let r = client(false).get(&url).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        assert_eq!(inner_seen.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

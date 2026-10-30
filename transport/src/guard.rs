@@ -18,6 +18,10 @@
 //! for an address, on every connection, including every redirect hop. Whatever
 //! it does not return cannot be dialled.
 //!
+//! The connector does not ask it about a host that is already an address, so a
+//! redirect to `http://10.0.0.5/` is refused by the client's redirect policy
+//! instead, with [`is_internal_literal`].
+//!
 //! ## Why filtering rather than rejecting
 //!
 //! A name that resolves to both a public and a private address is not
@@ -76,6 +80,16 @@ pub fn is_internal(ip: &IpAddr) -> bool {
                     .unwrap_or(false)
         }
     }
+}
+
+/// Is `host`, as a URL spells it, an internal address? A name is not: names are
+/// filtered when they are resolved. IPv6 may come with or without its brackets.
+pub fn is_internal_literal(host: &str) -> bool {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.parse::<IpAddr>().is_ok_and(|ip| is_internal(&ip))
 }
 
 /// Resolve `host` and keep only the addresses that are safe to dial.
