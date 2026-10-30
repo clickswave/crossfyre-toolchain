@@ -22,7 +22,7 @@ pub async fn fetch(
     domain: &str,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let url = format!("https://urlscan.io/api/v1/search/?q=domain:{domain}");
-    // Unlike the other providers, a non-2xx is an error here so the caller
+    // Unlike most providers, a non-2xx is an error here so the caller
     // logs it: the keyless API rate-limits hard, and a 429 should show up as a
     // warning rather than as a silent empty result.
     let response = reqwest_client.get(&url).send().await?.error_for_status()?;
