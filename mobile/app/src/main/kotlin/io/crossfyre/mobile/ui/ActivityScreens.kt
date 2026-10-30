@@ -462,7 +462,16 @@ fun BoxScope.ApprovalSheet(m: AppModel, id: String) {
             if (s.requester.keyName.isNotEmpty()) Text("Key: ${s.requester.keyName}", style = T.rowSub())
             val from = listOf(s.requester.ip, s.requester.location).filter { it.isNotEmpty() }.joinToString(", ")
             if (from.isNotEmpty()) Text("From $from", style = T.rowSub())
-            if (s.requester.client.isNotEmpty()) Text("Client says: ${s.requester.client} (not verified)", style = T.rowSub())
+            if (s.requester.client.isNotEmpty()) {
+                // One line, whatever the agent put in it, with the warning always in view.
+                Row {
+                    Text(
+                        "Client says: ${s.requester.client}", style = T.rowSub(), maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false),
+                    )
+                    Text(" (not verified)", style = T.rowSub(), maxLines = 1)
+                }
+            }
             Text(ago(secondsBetween(s.requestedAt ?: a.createdAt, now)), style = T.rowSub())
         }
 

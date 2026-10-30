@@ -1,5 +1,5 @@
 {
-  "about": "Display cleaning cases shared by Crossfyre Mobile and the platform. Each input, cleaned and capped at cap characters, must give output.",
+  "about": "Display cleaning cases shared by Crossfyre Mobile and the platform. Each input, cleaned and capped at cap characters, must give output. Every field of an approval summary is one line, so every control character goes, newline and tab included.",
   "cases": [
     {
       "name": "plain text is unchanged",
@@ -56,16 +56,28 @@
       "output": "ok"
     },
     {
-      "name": "CR and NUL go, newline stays",
+      "name": "CR, newline and NUL all go",
       "input": "a\r\nb\u0000c",
       "cap": 80,
-      "output": "a\nbc"
+      "output": "abc"
     },
     {
-      "name": "a tab stays",
+      "name": "a tab goes",
       "input": "a\tb",
       "cap": 80,
-      "output": "a\tb"
+      "output": "ab"
+    },
+    {
+      "name": "a run of newlines cannot push the next field down",
+      "input": "agent-cli\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nx",
+      "cap": 80,
+      "output": "agent-clix"
+    },
+    {
+      "name": "vertical tab, form feed and DEL go",
+      "input": "a\u000bb\fc\u007fd",
+      "cap": 80,
+      "output": "abcd"
     },
     {
       "name": "C1 controls are removed",

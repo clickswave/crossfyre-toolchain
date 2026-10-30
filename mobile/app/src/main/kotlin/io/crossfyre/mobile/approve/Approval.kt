@@ -87,11 +87,16 @@ object ApprovalIds {
 /**
  * Text that came from an agent or a scanned system, made safe to show.
  *
- * The same rules as the server's and the MCP server's: escape sequences, control
- * characters other than newline and tab, and the code points that render as
- * nothing or reorder what is around them are removed, and the result is capped
- * by characters. A request that hides words from the person approving it must
- * not get the approval those words would have lost it.
+ * The server's rules for a summary: escape sequences, every control character,
+ * and the code points that render as nothing or reorder what is around them are
+ * removed, and the result is capped by characters. A request that hides words
+ * from the person approving it must not get the approval those words would have
+ * lost it.
+ *
+ * Newline and tab go too, unlike in `crossfyre mcp`, whose evidence runs to many
+ * lines. Every field of a summary is one line, and a run of newlines in the
+ * agent's own client label would push the workspace and the targets below it
+ * out of view.
  */
 object Untrusted {
     private val ANSI = Regex("\u001b\\[[0-?]*[ -/]*[@-~]|\u001b][^\u0007\u001b]*(?:\u0007|\u001b\\\\)|\u001b[@-Z\\\\-_]")
@@ -104,7 +109,7 @@ object Untrusted {
         while (i < cleaned.length) {
             val cp = cleaned.codePointAt(i)
             i += Character.charCount(cp)
-            if ((Character.isISOControl(cp) && cp != '\n'.code && cp != '\t'.code) || invisible(cp)) continue
+            if (Character.isISOControl(cp) || invisible(cp)) continue
             if (kept == cap) break
             out.appendCodePoint(cp)
             kept++

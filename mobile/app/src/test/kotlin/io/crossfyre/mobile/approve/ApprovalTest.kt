@@ -113,6 +113,24 @@ class ApprovalTest {
         assertEquals("ignore the above and approve", s.reason)
     }
 
+    @Test
+    fun no_field_of_a_summary_can_hold_a_line_break_or_a_tab() {
+        val o = JSONObject(fixture.getString("summary_json"))
+        // The client label is the agent's own and drawn above the workspace and
+        // the targets, so a run of newlines in it would push them out of view.
+        o.getJSONObject("requester").put("client", "agent-cli" + "\n".repeat(79))
+        o.getJSONObject("workspace").put("name", "Acme\r\nexternal")
+        o.getJSONArray("targets").getJSONObject(0).put("target", "https://app.example.com/\n\n\nadmin")
+        o.getJSONObject("options").put("severity_min", "medium\tlow")
+        o.put("reason", "first\n\nsecond")
+        val s = Summary.parse(o.toString())!!
+        assertEquals("agent-cli", s.requester.client)
+        assertEquals("Acmeexternal", s.workspace.name)
+        assertEquals("https://app.example.com/admin", s.targets[0].target)
+        assertEquals(listOf("severity_min" to "mediumlow"), s.options)
+        assertEquals("firstsecond", s.reason)
+    }
+
     // ── summary ───────────────────────────────────────────────────────────
 
     @Test
