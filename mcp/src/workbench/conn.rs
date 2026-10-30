@@ -8,7 +8,7 @@ use cfx_bridge::{
 };
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -56,6 +56,9 @@ pub(crate) struct Instance {
     pub pid: u32,
     pub welcome: Welcome,
     project: Mutex<Option<ProjectInfo>>,
+    /// When the operator last selected something, as the Workbench said. Zero until it
+    /// says.
+    selection_ms: AtomicI64,
     writer: tokio::sync::Mutex<Writer>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Response>>>,
     next_id: AtomicU64,
@@ -66,6 +69,10 @@ impl Instance {
     /// The open project, as the Workbench last said.
     pub(crate) fn project(&self) -> Option<ProjectInfo> {
         self.project.lock().ok().and_then(|p| p.clone())
+    }
+
+    pub(crate) fn selection_ms(&self) -> i64 {
+        self.selection_ms.load(Ordering::SeqCst)
     }
 
     pub(crate) fn is_closed(&self) -> bool {
@@ -125,10 +132,16 @@ impl Instance {
     }
 
     fn apply(&self, ev: &Event) {
-        if let Event::Project { project } = ev
-            && let Ok(mut p) = self.project.lock()
-        {
-            *p = project.clone();
+        match ev {
+            Event::Project { project } => {
+                if let Ok(mut p) = self.project.lock() {
+                    *p = project.clone();
+                }
+            }
+            Event::Selection { changed_ms } => {
+                self.selection_ms.store(*changed_ms, Ordering::SeqCst);
+            }
+            Event::Scope { .. } | Event::AgentAccess { .. } => {}
         }
     }
 
@@ -326,6 +339,7 @@ where
     let inst = Arc::new(Instance {
         pid,
         project: Mutex::new(welcome.project.clone()),
+        selection_ms: AtomicI64::new(0),
         welcome,
         writer: tokio::sync::Mutex::new(w),
         pending: Mutex::new(HashMap::new()),

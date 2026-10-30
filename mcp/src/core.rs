@@ -204,6 +204,8 @@ pub(crate) struct CallNote {
     pub result: Option<Value>,
     /// Refusals inside a call that otherwise succeeded, such as a redirect hop.
     pub refused: Vec<RefusedDest>,
+    /// The Workbench a call went to: `{pid, project_uid}`.
+    pub workbench: Option<Value>,
     /// Where the scan id is also kept for a line written at shutdown.
     scan_slot: Option<Arc<Mutex<Option<String>>>>,
 }
@@ -566,6 +568,7 @@ impl Mcp {
                 "confirmation": note.confirmation,
                 "scan_id": note.scan_id,
                 "result": note.result,
+                "workbench": note.workbench,
                 "duration_ms": started.elapsed().as_millis() as u64,
             }));
         }

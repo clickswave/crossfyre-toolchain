@@ -490,6 +490,11 @@ impl Build {
         self.workbench = mode;
         self
     }
+    /// As `--no-redact`.
+    pub(crate) fn no_redact(mut self) -> Self {
+        self.redact = false;
+        self
+    }
     /// The Workbench data directory the server looks in, as the CLI would pass it.
     pub(crate) fn workbench_dir(mut self, dir: &Path) -> Self {
         self.workbench_dir = Some(dir.to_path_buf());

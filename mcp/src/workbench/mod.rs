@@ -10,7 +10,7 @@
 
 mod conn;
 
-pub(crate) use conn::Instance;
+pub(crate) use conn::{BridgeErr, Instance};
 
 use crate::core::Mcp;
 use crate::guard::BoxFut;

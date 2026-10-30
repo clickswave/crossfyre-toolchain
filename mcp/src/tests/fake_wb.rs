@@ -239,6 +239,21 @@ impl FakeWb {
         self.push(&cfx_bridge::Event::Project { project: p });
     }
 
+    /// Open another project without telling anyone, as when the event has not arrived
+    /// yet.
+    pub(crate) fn switch_quietly(&self, p: Option<ProjectInfo>) {
+        *self.project.lock().unwrap() = p;
+    }
+
+    /// The params of every request of this method, in order.
+    pub(crate) fn params(&self, m: Method) -> Vec<Value> {
+        self.requests()
+            .into_iter()
+            .filter(|l| l.method == m.as_str())
+            .map(|l| l.params)
+            .collect()
+    }
+
     /// Stop as a Workbench does on exit: close every connection and remove its files.
     pub(crate) fn exit(&mut self) {
         if let Some(a) = self.accept.take() {
