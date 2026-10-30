@@ -24,6 +24,10 @@ pub(crate) const TOOLS_JSON: &str = include_str!("../tools.json");
 /// The Workbench tools' definitions, listed only while a Workbench can answer them.
 pub(crate) const TOOLS_WORKBENCH_JSON: &str = include_str!("../tools_workbench.json");
 
+/// The Cloud's definitions: the shared tools as they read with a Cloud key, and the
+/// Cloud's own tools, listed only with one.
+pub(crate) const TOOLS_CLOUD_JSON: &str = include_str!("../tools_cloud.json");
+
 /// Every tool, in the order they are listed.
 pub(crate) const NAMES: [&str; 11] = [
     "status",
@@ -58,13 +62,18 @@ pub(crate) struct Backends {
     /// `None` when the Workbench backend is off, so its tool names are not this
     /// server's. Otherwise the Workbench tools to list now, which can be none.
     pub workbench: Option<Vec<&'static str>>,
+    /// `None` with no Cloud key, so the Cloud tool names are not this server's.
+    /// Otherwise which Cloud tools are listed now.
+    pub cloud: Option<crate::cloud::Listing>,
 }
 
 /// Is `name` a tool of this server, listed now or not. A Workbench tool that is not
 /// listed is still known, and a call to it is refused as `workbench_unavailable`
 /// rather than answered as a name the server has never heard of.
 pub(crate) fn known(name: &str, b: &Backends) -> bool {
-    NAMES.contains(&name) || (b.workbench.is_some() && WORKBENCH_NAMES.contains(&name))
+    NAMES.contains(&name)
+        || (b.workbench.is_some() && WORKBENCH_NAMES.contains(&name))
+        || (b.cloud.is_some() && crate::cloud::is_cloud_tool(name))
 }
 
 /// The tools whose results carry text from a scanned system.
@@ -96,6 +105,12 @@ pub(crate) async fn dispatch(
     ct: &CancellationToken,
     note: &mut CallNote,
 ) -> Dispatched {
+    if crate::cloud::handles(mcp, tool) {
+        return match crate::cloud::run(mcp, tool, args, peer, ct, note).await {
+            Ok(d) => Dispatched::Done(d),
+            Err(r) => Dispatched::Refused(r),
+        };
+    }
     let r = match tool {
         "status" => info::status(mcp, args).await,
         "get_scope" => info::get_scope(mcp, args),

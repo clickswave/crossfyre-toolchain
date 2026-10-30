@@ -44,7 +44,7 @@ struct ListScansArgs {
     limit: Option<u64>,
 }
 
-fn scan_row(m: &JobMeta, redact: bool) -> Value {
+pub(crate) fn scan_row(m: &JobMeta, redact: bool) -> Value {
     let target = untrusted::clean(&m.target, 200);
     json!({
         "scan_id": m.id,

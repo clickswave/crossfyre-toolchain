@@ -91,6 +91,11 @@ pub struct Options {
     /// from a tool argument.
     pub workbench_dir: Option<PathBuf>,
     pub workbench: WorkbenchMode,
+    /// `--cloud-file`: the Cloud key file. `None` means `<default_dir>/cloud.toml`, or
+    /// the environment when that does not exist.
+    pub cloud_file: Option<PathBuf>,
+    /// `--no-cloud`: no Cloud backend, whatever key is set up.
+    pub no_cloud: bool,
 }
 
 /// A reason the server did not start. Its text is printed and the process exits 2.
@@ -210,16 +215,41 @@ async fn terminated() {
 /// Serve MCP on stdin and stdout until the client goes away or the process is
 /// interrupted. Diagnostics go to stderr; stdout carries the protocol and nothing else.
 pub async fn serve(opts: Options) -> Result<(), StartError> {
-    let mcp = Arc::new(build(opts, Arc::new(guard::SystemResolver))?);
-    mcp.audit_event(
-        "start",
-        json!({
-            "entries": mcp.scope.entries.len(),
-            "allow_writes": mcp.scope.allow_writes,
-            "allow_private": mcp.scope.allow_private,
-            "redaction": mcp.settings.redact,
-        }),
-    );
+    let cloud_opts = cloud::StartOptions {
+        cloud_file: opts.cloud_file.clone(),
+        no_cloud: opts.no_cloud,
+        version: opts.version.clone(),
+    };
+    let default_dir = opts.default_dir.clone();
+    let mut mcp = build(opts, Arc::new(guard::SystemResolver))?;
+    // Before the client is answered, so the first tool list already says what the key
+    // may do.
+    cloud::start(&mut mcp, &default_dir, &cloud_opts).await;
+    let mcp = Arc::new(mcp);
+    let mut start = json!({
+        "entries": mcp.scope.entries.len(),
+        "allow_writes": mcp.scope.allow_writes,
+        "allow_private": mcp.scope.allow_private,
+        "redaction": mcp.settings.redact,
+    });
+    if let Some((c, _)) = cloud::status(&mcp) {
+        start["cloud"] = json!({
+            "state": c["state"],
+            "key_prefix": c["key_prefix"],
+            "workspace_id": c["workspace_id"],
+            "permission": c["permission"],
+        });
+        eprintln!(
+            "crossfyre mcp: Cloud {} ({})",
+            c["state"].as_str().unwrap_or("off"),
+            match (c["key_prefix"].as_str(), c["reason"].as_str()) {
+                (Some(k), None) => format!("key {k}"),
+                (Some(k), Some(r)) => format!("key {k}: {r}"),
+                (None, r) => r.unwrap_or("no key").to_string(),
+            }
+        );
+    }
+    mcp.audit_event("start", start);
     eprintln!(
         "crossfyre mcp: scope {} ({} entries, sha256 {}), audit {}",
         mcp.scope.path.display(),

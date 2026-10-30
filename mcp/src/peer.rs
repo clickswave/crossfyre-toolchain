@@ -1,8 +1,9 @@
 //! What the server needs from the client on the other end of a call.
 //!
-//! Kept to four things so the tests can stand in for a client without speaking the
-//! protocol: a label for the audit, whether it can show a form, asking a yes or no
-//! question, and reporting progress.
+//! Kept small so the tests can stand in for a client without speaking the protocol: a
+//! label for the audit, whether it can show a form, asking a yes or no question, and
+//! reporting progress. The Cloud backend adds telling the client its tool list changed,
+//! with a default that does nothing.
 
 use crate::guard::BoxFut;
 
@@ -31,4 +32,9 @@ pub(crate) trait ClientPeer: Send + Sync {
     ) -> BoxFut<'a, Answer>;
     /// Report progress on the current call, if the client asked for it.
     fn progress<'a>(&'a self, done: f64, total: Option<f64>, message: &'a str) -> BoxFut<'a, ()>;
+
+    /// Tell the client the tool list changed, as a backend comes or goes.
+    fn tool_list_changed<'a>(&'a self) -> BoxFut<'a, ()> {
+        Box::pin(async {})
+    }
 }

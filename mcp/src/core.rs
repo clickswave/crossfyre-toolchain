@@ -206,6 +206,8 @@ pub(crate) struct CallNote {
     pub refused: Vec<RefusedDest>,
     /// Where the scan id is also kept for a line written at shutdown.
     scan_slot: Option<Arc<Mutex<Option<String>>>>,
+    /// What the call did on the Cloud, when it went there.
+    pub cloud: Option<crate::cloud::CloudNote>,
 }
 
 impl CallNote {
@@ -356,6 +358,8 @@ pub(crate) struct Mcp {
     /// Calls that have not written their audit line, by `seq`. Whichever of the call
     /// and the shutdown takes an entry out writes the line, so it is written once.
     open_calls: Mutex<HashMap<u64, OpenCall>>,
+    /// A Cloud workspace, when a key is set up.
+    pub cloud: crate::cloud::Slot,
 }
 
 impl Mcp {
@@ -386,6 +390,7 @@ impl Mcp {
             scan_start: tokio::sync::Mutex::new(()),
             polls: Mutex::new(HashMap::new()),
             open_calls: Mutex::new(HashMap::new()),
+            cloud: crate::cloud::Slot::None,
             scope,
         }
     }
@@ -399,6 +404,7 @@ impl Mcp {
                 WorkbenchMode::Always => Some(WORKBENCH_NAMES.to_vec()),
                 WorkbenchMode::Auto => Some(Vec::new()),
             },
+            cloud: crate::cloud::listing(&self.cloud),
         }
     }
 
@@ -536,7 +542,7 @@ impl Mcp {
             .map(|mut open| open.remove(&seq).is_some())
             .unwrap_or(true);
         if still_open {
-            self.audit.write(json!({
+            let mut line = json!({
                 "ts": now_rfc3339(),
                 "event": "call",
                 "session": self.session,
@@ -554,7 +560,9 @@ impl Mcp {
                 "scan_id": note.scan_id,
                 "result": note.result,
                 "duration_ms": started.elapsed().as_millis() as u64,
-            }));
+            });
+            crate::cloud::audit_fields(self, &note, &mut line);
+            self.audit.write(line);
         }
 
         match outcome {

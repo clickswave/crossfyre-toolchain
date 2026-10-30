@@ -207,6 +207,15 @@ enum Commands {
         /// masked either way.
         #[arg(long)]
         no_redact: bool,
+
+        /// The Cloud key file. Defaults to `<data-dir>/mcp/cloud.toml`, written by
+        /// `crossfyre mcp cloud login`.
+        #[arg(long, value_name = "PATH", conflicts_with = "no_cloud")]
+        cloud_file: Option<std::path::PathBuf>,
+
+        /// Serve without the Cloud tools, whatever key is set up.
+        #[arg(long)]
+        no_cloud: bool,
     },
 
     /// Print a shell completion script to stdout, for example:
@@ -743,6 +752,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             command: None,
             scope_file,
             no_redact,
+            cloud_file,
+            no_cloud,
         } => {
             // Stdout is the protocol from here on, so nothing on this path may print
             // to it: no ui helpers, no status output. Diagnostics go to stderr.
@@ -765,6 +776,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 redact: !no_redact,
                 workbench_dir: None,
                 workbench: cfx_mcp::WorkbenchMode::Auto,
+                cloud_file,
+                no_cloud,
             };
             match cfx_mcp::serve(opts).await {
                 // Exit here rather than returning: a read of stdin still parked on the

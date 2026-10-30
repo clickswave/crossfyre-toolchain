@@ -177,15 +177,22 @@ fn plessor() -> (u16, Arc<AtomicUsize>) {
 }
 
 fn spawn(data: &std::path::Path) -> Child {
+    spawn_with(data, &[])
+}
+
+fn spawn_with(data: &std::path::Path, args: &[&str]) -> Child {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_crossfyre"));
     cmd.arg("--data-dir")
         .arg(data)
         .arg("mcp")
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for v in [
         "CFX_DAEMON_TOKEN",
+        "CROSSFYRE_MCP_CLOUD_KEY",
+        "CROSSFYRE_MCP_CLOUD_URL",
         "CROSSFYRE_EGRESS_PROXY",
         "HTTP_PROXY",
         "HTTPS_PROXY",
@@ -537,6 +544,155 @@ fn an_entry_that_does_not_parse_stops_the_start() {
     assert!(
         !data.join("mcp/audit.jsonl").exists(),
         "nothing ran, so nothing is logged"
+    );
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+const CLOUD_KEY: &str = "cfm_0123456789abcdef0123456789abcdef";
+
+/// A Cloud API that answers `whoami` for [`CLOUD_KEY`] with a read key, and counts the
+/// requests it reads.
+fn fake_cloud() -> (u16, Arc<AtomicUsize>) {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let n = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&n);
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(mut s) = s else { return };
+            seen.fetch_add(1, Ordering::SeqCst);
+            let mut r = BufReader::new(s.try_clone().unwrap());
+            let mut head = Vec::new();
+            let mut len = 0usize;
+            loop {
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                }
+                head.push(line);
+            }
+            let mut body = vec![0u8; len];
+            let _ = r.read_exact(&mut body);
+            let authorised = head.iter().any(|h| {
+                h.trim() == format!("authorization: Bearer {CLOUD_KEY}").as_str()
+                    || h.trim() == format!("Authorization: Bearer {CLOUD_KEY}").as_str()
+            });
+            let (status, data) = if authorised {
+                (
+                    200,
+                    json!({
+                    "key": {"id": "k", "prefix": "cfm_01234567", "name": "laptop",
+                            "permission": "read", "expires_at": "2027-01-28T09:00:00Z"},
+                    "user": {"id": "u", "username": "dev"},
+                    "workspace": {"id": "11111111-2222-4333-8444-555555555555", "name": "Acme"},
+                    "plan": "Pro",
+                    "limits": {"running_workflows": 0, "max_concurrent_workflows": 5,
+                               "monthly_used": 0, "monthly_cap": 100,
+                               "launches_left_this_hour": 10, "key_concurrent_cap": 5},
+                    "approval": {"policy": "risky", "fallback": true, "phone_registered": false},
+                    "scope": {"current": 1, "attested": 1, "effective": 1,
+                              "effective_sha256": "00"}}),
+                )
+            } else {
+                (401, json!({"reason": "key_invalid"}))
+            };
+            let body =
+                json!({"status": status, "message": "", "errors": [], "data": data}).to_string();
+            let _ = write!(
+                s,
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\nx-crossfyre-call-id: call-1\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    (port, n)
+}
+
+#[test]
+fn a_cloud_key_adds_the_cloud_tools_and_appears_in_no_output() {
+    let (port, asked) = fake_cloud();
+    let data = temp_dir("cloud");
+    write_config(&data, closed_port(), closed_port());
+    write_scope(&data, "entries = [\"app.example.test\"]\n");
+    let key_file = data.join("mcp/cloud.toml");
+    std::fs::write(
+        &key_file,
+        format!("api_url = \"http://127.0.0.1:{port}\"\nkey = \"{CLOUD_KEY}\"\n"),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let secret = &CLOUD_KEY[4..];
+
+    let mut child = spawn(&data);
+    let mut stderr = child.stderr.take().unwrap();
+    let (mut c, all_lines) = Client::attach(&mut child);
+    let init = c.initialize(false);
+    assert!(
+        init["instructions"].as_str().unwrap().contains("cs_"),
+        "{init}"
+    );
+    c.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+    let tools = c.reply(2)["result"]["tools"].clone();
+    let names: Vec<&str> = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names.len(), 15, "{names:?}");
+    assert!(names.contains(&"whoami") && !names.contains(&"start_vuln_scan"));
+    let who = c.call(3, "whoami", json!({}));
+    assert_eq!(
+        who["structuredContent"]["key"]["permission"], "read",
+        "{who}"
+    );
+    let status = c.call(4, "status", json!({}));
+    assert_eq!(
+        status["structuredContent"]["cloud"]["state"], "ready",
+        "{status}"
+    );
+    drop(c.stdin);
+    assert!(wait_exit(&mut child, Duration::from_secs(10)).success());
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        2,
+        "whoami at start, then the tool"
+    );
+
+    let mut err = String::new();
+    stderr.read_to_string(&mut err).unwrap();
+    assert!(err.contains("Cloud ready (key cfm_01234567)"), "{err}");
+    let out = all_lines.lock().unwrap().join("\n");
+    let (audit, _) = audit_calls(&data);
+    for (what, text) in [
+        ("stderr", &err),
+        ("stdout", &out),
+        ("the audit log", &audit),
+    ] {
+        assert!(!text.contains(secret), "{what} holds the key");
+    }
+
+    // --no-cloud: the local server, exactly.
+    let mut child = spawn_with(&data, &["--no-cloud"]);
+    let (mut c, _) = Client::attach(&mut child);
+    c.initialize(false);
+    c.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+    let tools = c.reply(2)["result"]["tools"].clone();
+    assert_eq!(tools.as_array().unwrap().len(), 11);
+    drop(c.stdin);
+    assert!(wait_exit(&mut child, Duration::from_secs(10)).success());
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        2,
+        "--no-cloud asked the Cloud"
     );
     let _ = std::fs::remove_dir_all(&data);
 }

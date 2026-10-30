@@ -138,7 +138,11 @@ pub(crate) async fn status(mcp: &Mcp, args: &Value) -> Result<Done, Refusal> {
             })
         })
         .collect();
-    let value = json!({
+    let cloud = crate::cloud::status(mcp).map(|(c, h)| {
+        hints.extend(h);
+        c
+    });
+    let mut value = json!({
         "version": mcp.settings.version,
         "mcp_dir": mcp.dir.display().to_string(),
         "scope": scope,
@@ -160,6 +164,9 @@ pub(crate) async fn status(mcp: &Mcp, args: &Value) -> Result<Done, Refusal> {
         "hints": hints,
         "workbench": super::workbench::status(mcp),
     });
+    if let Some(c) = cloud {
+        value["cloud"] = c;
+    }
     let summary = format!(
         "crossfyre mcp {}: scope {} ({} entries), {} hint(s).",
         mcp.settings.version,

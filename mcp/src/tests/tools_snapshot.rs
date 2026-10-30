@@ -123,7 +123,10 @@ fn every_workbench_tool_is_described_completely() {
 #[test]
 fn the_protocol_layer_reads_them() {
     let all = |b: &Backends| crate::server::tool_list(b);
-    let off = all(&Backends { workbench: None });
+    let off = all(&Backends {
+        workbench: None,
+        ..Default::default()
+    });
     assert_eq!(off.len(), 11);
     assert!(
         off.iter()
@@ -131,13 +134,15 @@ fn the_protocol_layer_reads_them() {
     );
     assert_eq!(
         all(&Backends {
-            workbench: Some(Vec::new())
+            workbench: Some(Vec::new()),
+            ..Default::default()
         })
         .len(),
         11
     );
     let every = all(&Backends {
         workbench: Some(WORKBENCH_NAMES.to_vec()),
+        ..Default::default()
     });
     assert_eq!(every.len(), 18);
     assert!(
@@ -147,6 +152,7 @@ fn the_protocol_layer_reads_them() {
     );
     let some = all(&Backends {
         workbench: Some(vec!["workbench_get_scope"]),
+        ..Default::default()
     });
     assert_eq!(some.last().unwrap().name, "workbench_get_scope");
     assert_eq!(some.len(), 12);

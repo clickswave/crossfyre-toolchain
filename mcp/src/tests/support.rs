@@ -349,6 +349,10 @@ pub(crate) struct FakePeer {
     asked: AtomicUsize,
     pub questions: Mutex<Vec<String>>,
     pub progress: Mutex<Vec<(f64, Option<f64>)>>,
+    /// The message of each progress notification.
+    pub progress_messages: Mutex<Vec<String>>,
+    /// How many times the server said its tool list changed.
+    pub list_changed: AtomicUsize,
 }
 
 impl FakePeer {
@@ -358,6 +362,8 @@ impl FakePeer {
             asked: AtomicUsize::new(0),
             questions: Mutex::new(Vec::new()),
             progress: Mutex::new(Vec::new()),
+            progress_messages: Mutex::new(Vec::new()),
+            list_changed: AtomicUsize::new(0),
         }
     }
     pub(crate) fn asked(&self) -> usize {
@@ -391,9 +397,15 @@ impl ClientPeer for FakePeer {
             }
         })
     }
-    fn progress<'a>(&'a self, done: f64, total: Option<f64>, _: &'a str) -> BoxFut<'a, ()> {
+    fn progress<'a>(&'a self, done: f64, total: Option<f64>, m: &'a str) -> BoxFut<'a, ()> {
         Box::pin(async move {
             self.progress.lock().unwrap().push((done, total));
+            self.progress_messages.lock().unwrap().push(m.to_string());
+        })
+    }
+    fn tool_list_changed<'a>(&'a self) -> BoxFut<'a, ()> {
+        Box::pin(async move {
+            self.list_changed.fetch_add(1, Ordering::SeqCst);
         })
     }
 }
@@ -562,7 +574,11 @@ impl TestMcp {
         match self.mcp.call(tool, args, peer, ct).await {
             CallOutput::Result(r) => {
                 if let (false, Some(v)) = (r.is_error, &r.structured) {
-                    assert_schema(tool, v);
+                    if self.mcp.cloud.on().is_some() {
+                        assert_listed_schema(&self.mcp, tool, v);
+                    } else {
+                        assert_schema(tool, v);
+                    }
                 }
                 r
             }
@@ -627,6 +643,17 @@ pub(crate) async fn eventually(what: &str, secs: u64, f: impl Fn() -> bool) {
     panic!("timed out waiting for {what}");
 }
 
+/// [`assert_schema`] against the definition the server lists now, which for a shared
+/// tool with a Cloud key is the Cloud one.
+pub(crate) fn assert_listed_schema(mcp: &Mcp, tool: &str, v: &Value) {
+    let def = crate::server::tool_list(&mcp.backends())
+        .into_iter()
+        .find(|t| t.name == tool)
+        .map(|t| serde_json::to_value(t).unwrap())
+        .unwrap_or_else(|| panic!("{tool} answered without being listed"));
+    check_schema(tool, &def, v);
+}
+
 /// The structured result has every field its outputSchema requires, with the type it
 /// says. A client checks this, so a mismatch is a broken tool.
 pub(crate) fn assert_schema(tool: &str, v: &Value) {
@@ -637,6 +664,10 @@ pub(crate) fn assert_schema(tool: &str, v: &Value) {
         .iter()
         .find(|t| t["name"] == tool)
         .unwrap_or_else(|| panic!("no definition for {tool}"));
+    check_schema(tool, def, v);
+}
+
+fn check_schema(tool: &str, def: &Value, v: &Value) {
     let schema = &def["outputSchema"];
     for req in schema["required"].as_array().cloned().unwrap_or_default() {
         let k = req.as_str().unwrap();

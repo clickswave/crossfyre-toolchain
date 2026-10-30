@@ -33,10 +33,32 @@ static WORKBENCH: LazyLock<Vec<Tool>> = LazyLock::new(|| {
     serde_json::from_str(crate::tools::TOOLS_WORKBENCH_JSON).expect("tools_workbench.json is valid")
 });
 
+/// `tools_cloud.json`: the Cloud versions of the shared tools, then the Cloud's own.
+#[derive(serde::Deserialize)]
+struct CloudTools {
+    replace: Vec<Tool>,
+    read: Vec<Tool>,
+    #[serde(default)]
+    launch: Vec<Tool>,
+}
+
+static CLOUD: LazyLock<CloudTools> = LazyLock::new(|| {
+    serde_json::from_str(crate::tools::TOOLS_CLOUD_JSON).expect("tools_cloud.json is valid")
+});
+
 /// The tools to list now: the local engines' tools, then whatever the other backends
 /// can answer.
 pub(crate) fn tool_list(b: &Backends) -> Vec<Tool> {
+    use crate::cloud::Listing;
     let mut out = BASE.clone();
+    let cloud = b.cloud.filter(|l| *l != Listing::Hidden);
+    if cloud.is_some() {
+        for t in out.iter_mut() {
+            if let Some(r) = CLOUD.replace.iter().find(|r| r.name == t.name) {
+                *t = r.clone();
+            }
+        }
+    }
     if let Some(listed) = &b.workbench {
         out.extend(
             WORKBENCH
@@ -44,6 +66,12 @@ pub(crate) fn tool_list(b: &Backends) -> Vec<Tool> {
                 .filter(|t| listed.contains(&t.name.as_ref()))
                 .cloned(),
         );
+    }
+    if let Some(l) = cloud {
+        out.extend(CLOUD.read.iter().cloned());
+        if l == Listing::Launch {
+            out.extend(CLOUD.launch.iter().cloned());
+        }
     }
     out
 }
@@ -67,7 +95,10 @@ impl ServerHandler for Server {
             Implementation::new("crossfyre", self.mcp.settings.version.clone())
                 .with_title("Crossfyre"),
         )
-        .with_instructions(INSTRUCTIONS)
+        .with_instructions(match self.mcp.cloud.on() {
+            Some(_) => format!("{INSTRUCTIONS}{}", crate::cloud::INSTRUCTIONS),
+            None => INSTRUCTIONS.to_string(),
+        })
     }
 
     // Up to 2025-11-25, where a confirmation is an ordinary request to the client.
@@ -211,6 +242,12 @@ impl ClientPeer for RmcpPeer {
                 p = p.with_total(t);
             }
             let _ = self.peer.notify_progress(p).await;
+        })
+    }
+
+    fn tool_list_changed<'a>(&'a self) -> BoxFut<'a, ()> {
+        Box::pin(async move {
+            let _ = self.peer.notify_tool_list_changed().await;
         })
     }
 }
