@@ -9,6 +9,7 @@
 //! unchanged. TLS uses the same accept-any-cert posture as the reqwest client
 //! (plessor scans hosts with self-signed / mismatched certs).
 
+use std::net::SocketAddr;
 #[cfg(not(feature = "impersonate"))]
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,13 +48,14 @@ pub async fn send(req: RawReq<'_>) -> Option<RawResp> {
             send_tls(
                 &host,
                 port,
+                None,
                 request.as_bytes(),
                 ReadUntil::Closed,
                 Verify::Any,
             )
             .await
         } else {
-            send_plain(&host, port, request.as_bytes(), ReadUntil::Closed).await
+            send_plain(&host, port, None, request.as_bytes(), ReadUntil::Closed).await
         }
     })
     .await
@@ -376,12 +378,35 @@ pub async fn send_until(
     until: ReadUntil,
     verify: Verify,
 ) -> (Result<Vec<u8>, SendFail>, Duration) {
+    send_until_via(host, port, None, https, data, timeout, until, verify).await
+}
+
+/// [`send_until`], connecting to `connect` when it is given instead of resolving `host`.
+///
+/// For a caller that has already looked the name up and decided which address it may
+/// go to. Letting the connect resolve it again would allow a second answer that differs
+/// from the one that was checked. `host` is still the name the request is for: it is
+/// the TLS server name, and the bytes are sent as given.
+///
+/// `connect` has to be on `port`. One on another port is refused without dialling,
+/// because it would reach a service nobody looked at.
+#[allow(clippy::too_many_arguments)]
+pub async fn send_until_via(
+    host: &str,
+    port: u16,
+    connect: Option<SocketAddr>,
+    https: bool,
+    data: &[u8],
+    timeout: Duration,
+    until: ReadUntil,
+    verify: Verify,
+) -> (Result<Vec<u8>, SendFail>, Duration) {
     let start = std::time::Instant::now();
     let out = match tokio::time::timeout(timeout, async {
         if https {
-            send_tls(host, port, data, until, verify).await
+            send_tls(host, port, connect, data, until, verify).await
         } else {
-            send_plain(host, port, data, until).await
+            send_plain(host, port, connect, data, until).await
         }
     })
     .await
@@ -397,15 +422,29 @@ pub fn split_url(url: &str) -> Option<(bool, String, u16, String)> {
     split(url)
 }
 
+/// The one place a raw send opens its connection: the pinned address when there is
+/// one, the host's own lookup otherwise.
+async fn dial(host: &str, port: u16, pin: Option<SocketAddr>) -> Result<TcpStream, SendFail> {
+    let out = match pin {
+        Some(addr) if addr.port() != port => {
+            return Err(SendFail::Connect(format!(
+                "the address {addr} given for {host} is not on port {port}"
+            )));
+        }
+        Some(addr) => TcpStream::connect(addr).await,
+        None => TcpStream::connect((host, port)).await,
+    };
+    out.map_err(|e| SendFail::Connect(e.to_string()))
+}
+
 async fn send_plain(
     host: &str,
     port: u16,
+    pin: Option<SocketAddr>,
     data: &[u8],
     until: ReadUntil,
 ) -> Result<Vec<u8>, SendFail> {
-    let mut stream = TcpStream::connect((host, port))
-        .await
-        .map_err(|e| SendFail::Connect(e.to_string()))?;
+    let mut stream = dial(host, port, pin).await?;
     stream
         .write_all(data)
         .await
@@ -434,6 +473,7 @@ async fn send_plain(
 async fn send_tls(
     host: &str,
     port: u16,
+    pin: Option<SocketAddr>,
     data: &[u8],
     until: ReadUntil,
     verify: Verify,
@@ -441,9 +481,7 @@ async fn send_tls(
     let connector = tokio_rustls::TlsConnector::from(tls_config(verify));
     let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
         .map_err(|e| SendFail::Tls(format!("{host} is not a usable server name: {e}")))?;
-    let stream = TcpStream::connect((host, port))
-        .await
-        .map_err(|e| SendFail::Connect(e.to_string()))?;
+    let stream = dial(host, port, pin).await?;
     let mut tls = connector
         .connect(server_name, stream)
         .await
@@ -475,6 +513,7 @@ async fn send_tls(
 async fn send_tls(
     host: &str,
     port: u16,
+    pin: Option<SocketAddr>,
     data: &[u8],
     until: ReadUntil,
     verify: Verify,
@@ -511,9 +550,7 @@ async fn send_tls(
     if verify == Verify::Any {
         cfg.set_verify_hostname(false);
     }
-    let stream = TcpStream::connect((host, port))
-        .await
-        .map_err(|e| SendFail::Connect(e.to_string()))?;
+    let stream = dial(host, port, pin).await?;
     let mut tls = tokio_boring2::connect(cfg, host, stream)
         .await
         .map_err(|e| SendFail::Tls(e.to_string()))?;
