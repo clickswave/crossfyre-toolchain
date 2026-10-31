@@ -33,6 +33,29 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
     d
 }
 
+/// Removes a test's data directory when it goes out of scope, unwinding from a failed
+/// assertion included.
+struct RemoveOnDrop(std::path::PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn a_failed_test_leaves_no_data_dir_behind() {
+    let data = temp_dir("unwind");
+    let probe = data.clone();
+    let failed = std::panic::catch_unwind(move || {
+        let _gone = RemoveOnDrop(data.clone());
+        std::fs::write(data.join("mcp/cloud.toml"), "key = \"cfm_x\"\n").unwrap();
+        panic!("an assertion failed part way through");
+    });
+    assert!(failed.is_err());
+    assert!(!probe.exists(), "{} was left behind", probe.display());
+}
+
 fn write_scope(data: &std::path::Path, text: &str) {
     let p = data.join("mcp/scope.toml");
     std::fs::write(&p, text).unwrap();
@@ -913,8 +936,14 @@ fn a_workbench_that_starts_later_changes_the_tool_list() {
 /// - `CROSSFYRE_DEV_CLOUD_TARGET`: a host in the scope the key's owner confirmed;
 /// - an online node in that workspace with the crawl engine.
 ///
-/// The held launch is withdrawn before the test ends, so a rerun starts clean and the
-/// workspace is left as it was found.
+/// The held launch is withdrawn before the test ends, so the workspace is left as it was
+/// found. The key's hourly launch limit is not: each run asks for two launches, and the
+/// platform counts both against the key's ten an hour, the refused one included and the
+/// withdrawn one not given back. So one key does about five runs an hour, and a run with
+/// fewer than two launches left stops at `whoami` and says so.
+///
+/// The data directory is removed however the test ends, since the login saves the key
+/// there in full.
 #[test]
 fn a_dev_cloud_holds_a_launch_in_scope_and_refuses_one_outside() {
     if std::env::var("CROSSFYRE_DEV_CLOUD").as_deref() != Ok("1") {
@@ -938,6 +967,7 @@ fn a_dev_cloud_holds_a_launch_in_scope_and_refuses_one_outside() {
     let secret = key.strip_prefix("cfm_").expect("an MCP key").to_string();
 
     let data = temp_dir("dev-cloud");
+    let _gone = RemoveOnDrop(data.clone());
     write_config(&data, closed_port(), closed_port());
     // No entries: the scope file narrows nothing, and the platform decides alone.
     write_scope(&data, "entries = []\n");
@@ -991,6 +1021,12 @@ fn a_dev_cloud_holds_a_launch_in_scope_and_refuses_one_outside() {
     assert_eq!(w["key"]["prefix"], &key[..12], "{who}");
     assert_eq!(w["approval"]["policy"], "always", "{who}");
     assert_eq!(w["approval"]["phone_registered"], false, "{who}");
+    let left = w["limits"]["launches_left_this_hour"].as_u64().unwrap_or(0);
+    assert!(
+        left >= 2,
+        "this key has {left} launches left this hour and a run asks for two: wait for \
+         the hour to pass, or use another key"
+    );
 
     let checked = c.call(
         4,
@@ -1054,5 +1090,4 @@ fn a_dev_cloud_holds_a_launch_in_scope_and_refuses_one_outside() {
         cloud_calls.iter().all(|l| l["cloud_call_id"].is_string()),
         "{audit}"
     );
-    let _ = std::fs::remove_dir_all(&data);
 }
