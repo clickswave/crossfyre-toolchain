@@ -1,7 +1,7 @@
 use super::*;
 use crate::egress::testkit::{recorder_upstream, refusing_port, resolver};
 use cfx_tunnel::recorder::{Fixture, Recorder, to_loopback};
-use cfx_tunnel::{TunnelError, socks5_server::CONNECTION_REFUSED};
+use cfx_tunnel::socks5_server::CONNECTION_REFUSED;
 
 /// An address no test resolves into and nothing dials: the recorder joins every
 /// destination to the same port on loopback, whatever address it is asked for.
@@ -333,25 +333,28 @@ fn pass_of(lease: &Lease) -> String {
 }
 
 #[test]
-fn a_socks4_upstream_gets_an_ipv4_address() {
+fn a_socks4_upstream_gets_only_ipv4_addresses() {
     let v6: IpAddr = "2606:4700::1111".parse().unwrap();
     let v4: IpAddr = PUBLIC.parse().unwrap();
+    let v4b: IpAddr = "104.16.132.229".parse().unwrap();
     let private: IpAddr = "10.0.0.1".parse().unwrap();
-    assert_eq!(pick_public(&[v6, v4], true).ok(), Some(v4));
-    assert_eq!(pick_public(&[v6, v4], false).ok(), Some(v6));
-    assert_eq!(pick_public(&[private, v4], false).ok(), Some(v4));
+    assert_eq!(vetted(&[v6, v4], true).ok(), Some(vec![v4]));
+    assert_eq!(vetted(&[v6, v4], false).ok(), Some(vec![v4, v6]));
+    assert_eq!(vetted(&[v4b, v6, v4], false).ok(), Some(vec![v4b, v4, v6]));
+    assert_eq!(vetted(&[private, v4], false).ok(), Some(vec![v4]));
+    assert_eq!(
+        vetted(&[v4; 9], false).map(|v| v.len()).ok(),
+        Some(MAX_ADDRESSES)
+    );
     assert!(matches!(
-        pick_public(&[v6], true),
+        vetted(&[v6], true),
         Err(Verdict::Failed(ADDRESS_TYPE_NOT_SUPPORTED, _))
     ));
     assert!(matches!(
-        pick_public(&[private], false),
+        vetted(&[private], false),
         Err(Verdict::Refused(PRIVATE))
     ));
-    assert!(matches!(
-        pick_public(&[], false),
-        Err(Verdict::Refused(PRIVATE))
-    ));
+    assert!(matches!(vetted(&[], false), Err(Verdict::Refused(PRIVATE))));
 }
 
 /// Over the gateway's connection cap, a connection is closed before anything is read
@@ -571,4 +574,108 @@ async fn the_summary_counts_the_bytes_of_open_connections() {
         "15000 body bytes came back through the open connection: {s}"
     );
     drop(client);
+}
+
+/// A team proxy that reaches only one kind of address: the other kind is answered
+/// "host unreachable". Returns its port and every destination it was asked for.
+async fn one_kind_proxy(v6: bool) -> (u16, Arc<Mutex<Vec<Target>>>) {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let keep = Arc::clone(&seen);
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            let seen = Arc::clone(&keep);
+            tokio::spawn(async move {
+                let Ok(((), t)) =
+                    socks5_server::accept(&mut s, Duration::from_secs(5), |_, _| Some(())).await
+                else {
+                    return;
+                };
+                seen.lock().unwrap().push(t.clone());
+                let reaches = matches!(t.host, Host::Ip(ip) if ip.is_ipv6() == v6);
+                let code = if reaches { SUCCEEDED } else { HOST_UNREACHABLE };
+                let _ = socks5_server::reply(&mut s, code).await;
+                if reaches {
+                    let mut b = [0u8; 1];
+                    let _ = s.read(&mut b).await;
+                }
+            });
+        }
+    });
+    (port, seen)
+}
+
+/// With `block_internal` the node hands the proxy an address it vetted. A name with
+/// both kinds opens through a proxy that reaches only one of them, whichever order the
+/// node's resolver gives them in, as it would for a client sending directly.
+#[tokio::test]
+async fn a_dual_stack_name_opens_through_a_proxy_that_reaches_one_kind() {
+    const V6: &str = "2606:4700::6810:84e5";
+    const V4: &str = "104.16.132.229";
+    for v6_proxy in [false, true] {
+        for order in [[V6, V4], [V4, V6]] {
+            let (port, seen) = one_kind_proxy(v6_proxy).await;
+            let gw = gateway(&[("dual.example.test", &order)]).await;
+            let up = Upstream {
+                kind: Kind::Socks5,
+                host: "127.0.0.1".into(),
+                port,
+                auth: Some(("u".into(), "p".into())),
+            };
+            let lease = gw.lease("op", "proxy-1", Arc::new(up), true).unwrap();
+            let got = through(&lease, "dual.example.test", 443).await;
+            let asked = seen.lock().unwrap().clone();
+            let case = format!("v6 proxy {v6_proxy}, {order:?}");
+            assert!(
+                got.is_ok(),
+                "{case}: {}; the proxy was asked for {asked:?}",
+                shown(&got)
+            );
+            let opened = if v6_proxy { V6 } else { V4 };
+            assert_eq!(asked.last(), Some(&Target::new(opened, 443)), "{case}");
+            let s = lease.summary();
+            assert_eq!(s["connections"], 1, "{case}: {s}");
+            assert_eq!(s["hosts"][0]["host"], "dual.example.test", "{case}: {s}");
+            assert_eq!(s["hosts"][0]["ok"], 1, "{case}: {s}");
+        }
+    }
+}
+
+/// A proxy that fails the connection as a whole is not asked again for the name's
+/// other addresses: it would fail them the same way. This one refuses the
+/// credentials.
+#[tokio::test]
+async fn a_proxy_that_refuses_the_credentials_is_asked_once() {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    let asked = Arc::new(AtomicU64::new(0));
+    let count = Arc::clone(&asked);
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            count.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let _ =
+                    socks5_server::accept(&mut s, Duration::from_secs(5), |_, _| None::<()>).await;
+            });
+        }
+    });
+    let gw = gateway(&[("dual.example.test", &["2606:4700::6810:84e5", PUBLIC])]).await;
+    let up = Upstream {
+        kind: Kind::Socks5,
+        host: "127.0.0.1".into(),
+        port,
+        auth: Some(("u".into(), "wrong".into())),
+    };
+    let lease = gw.lease("op", "proxy-1", Arc::new(up), true).unwrap();
+    let got = through(&lease, "dual.example.test", 443).await;
+    assert!(
+        matches!(got, Err(TunnelError::Refused(GENERAL_FAILURE))),
+        "{}",
+        shown(&got)
+    );
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+    let s = lease.summary();
+    assert_eq!(s["connections"], 1, "{s}");
+    assert_eq!(s["failed"], 1, "{s}");
 }

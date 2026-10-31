@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use cfx_tunnel::socks5_server::{
     self, ADDRESS_TYPE_NOT_SUPPORTED, GENERAL_FAILURE, HOST_UNREACHABLE, NOT_ALLOWED, SUCCEEDED,
 };
-use cfx_tunnel::{Host, Kind, Target, Timeouts, Tunnel, Upstream};
+use cfx_tunnel::{Host, Kind, Target, Timeouts, Tunnel, TunnelError, Upstream};
 use futures_util::future::BoxFuture;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -200,18 +200,34 @@ impl Gateway {
                 return;
             }
         };
-        let opened = tokio::select! {
-            r = cfx_tunnel::connect(&lease.upstream, &onward, self.timeouts) => r,
-            _ = until_ended(&mut ended) => {
-                let _ = socks5_server::reply(&mut s, GENERAL_FAILURE).await;
-                return;
+        // Each vetted address in turn, while the proxy says it is that address it
+        // cannot reach: a name with IPv4 and IPv6 addresses still opens through a proxy
+        // that reaches only one kind, as it would for a client sending directly.
+        let mut opened = None;
+        for (i, t) in onward.iter().enumerate() {
+            let r = tokio::select! {
+                r = cfx_tunnel::connect(&lease.upstream, t, self.timeouts) => r,
+                _ = until_ended(&mut ended) => {
+                    let _ = socks5_server::reply(&mut s, GENERAL_FAILURE).await;
+                    return;
+                }
+            };
+            let next = i + 1 < onward.len() && r.as_ref().is_err_and(address_failed);
+            opened = Some(r);
+            if !next {
+                break;
             }
-        };
+        }
         let tunnel = match opened {
-            Ok(t) => t,
-            Err(e) => {
+            Some(Ok(t)) => t,
+            Some(Err(e)) => {
                 lease.record(&target, Outcome::Failed, Some(&e.to_string()));
                 let _ = socks5_server::reply(&mut s, e.reply_code()).await;
+                return;
+            }
+            None => {
+                lease.record(&target, Outcome::Failed, Some("no address to send it to"));
+                let _ = socks5_server::reply(&mut s, HOST_UNREACHABLE).await;
                 return;
             }
         };
@@ -247,8 +263,8 @@ impl Gateway {
         );
     }
 
-    /// Where a connection goes on to, or why it does not.
-    async fn route(&self, lease: &LeaseState, t: &Target) -> Result<Target, Verdict> {
+    /// Where a connection goes on to, in the order to try, or why it does not.
+    async fn route(&self, lease: &LeaseState, t: &Target) -> Result<Vec<Target>, Verdict> {
         if let Some(scope) = &lease.scope
             && !scope.admit(&host_text(&t.host), t.port, cfx_scope::Point::Connect, None)
         {
@@ -258,7 +274,7 @@ impl Gateway {
         }
         if !lease.block_internal {
             // Sent on as the engine named it: a name goes to the proxy unresolved.
-            return Ok(t.clone());
+            return Ok(vec![t.clone()]);
         }
         let found = match &t.host {
             Host::Ip(ip) => vec![*ip],
@@ -280,11 +296,14 @@ impl Gateway {
                 }
             }
         };
-        let ip = pick_public(&found, lease.upstream.kind == Kind::Socks4)?;
-        Ok(Target {
-            host: Host::Ip(ip),
-            port: t.port,
-        })
+        let ips = vetted(&found, lease.upstream.kind == Kind::Socks4)?;
+        Ok(ips
+            .into_iter()
+            .map(|ip| Target {
+                host: Host::Ip(ip),
+                port: t.port,
+            })
+            .collect())
     }
 }
 
@@ -321,9 +340,14 @@ enum Verdict {
     Failed(u8, &'static str),
 }
 
-/// The address a `block_internal` connection goes to: the first public one the name
-/// had, and for a SOCKS4 upstream, which carries no IPv6, the first public IPv4.
-fn pick_public(found: &[IpAddr], v4_only: bool) -> Result<IpAddr, Verdict> {
+/// Addresses of one name a `block_internal` connection tries, at most this many.
+const MAX_ADDRESSES: usize = 4;
+
+/// The addresses a `block_internal` connection may go to, in the order to try them: the
+/// public ones the name had, IPv4 first, since what counts is which kind the proxy can
+/// reach and IPv4 is the kind nearly every proxy reaches. A SOCKS4 upstream, which
+/// carries no IPv6, gets only the IPv4 ones.
+fn vetted(found: &[IpAddr], v4_only: bool) -> Result<Vec<IpAddr>, Verdict> {
     let public: Vec<IpAddr> = found
         .iter()
         .copied()
@@ -332,13 +356,31 @@ fn pick_public(found: &[IpAddr], v4_only: bool) -> Result<IpAddr, Verdict> {
     if public.is_empty() {
         return Err(Verdict::Refused(PRIVATE));
     }
-    public
-        .into_iter()
-        .find(|ip| !v4_only || ip.is_ipv4())
-        .ok_or(Verdict::Failed(
+    let v4 = public.iter().copied().filter(IpAddr::is_ipv4);
+    let v6 = public.iter().copied().filter(IpAddr::is_ipv6);
+    let order: Vec<IpAddr> = if v4_only {
+        v4.collect()
+    } else {
+        v4.chain(v6).collect()
+    };
+    if order.is_empty() {
+        return Err(Verdict::Failed(
             ADDRESS_TYPE_NOT_SUPPORTED,
             "the name has only IPv6 addresses, which a SOCKS4 proxy cannot carry",
-        ))
+        ));
+    }
+    Ok(order.into_iter().take(MAX_ADDRESSES).collect())
+}
+
+/// Whether the proxy failed this one address rather than the connection as a whole, so
+/// another address of the same name may still open: it could not reach it, was
+/// refused by it, or cannot carry its kind of address. A proxy that is down, refuses
+/// the credentials or does not answer would fail every address the same way.
+fn address_failed(e: &TunnelError) -> bool {
+    matches!(
+        e,
+        TunnelError::Refused(0x03 | 0x04 | 0x05 | 0x08 | 0x5B) | TunnelError::Http(502..=504)
+    )
 }
 
 fn host_text(h: &Host) -> String {
