@@ -142,15 +142,34 @@ fn body_fields(src: &ScanSourceResult) -> Result<(Vec<Field>, &'static str), Ref
             .collect();
         return Ok((fields, "json"));
     }
-    Err(Refusal::invalid(format!(
-        "the body of this request is {}; plessor tests query parameters, form fields and the \
-         members of a JSON object",
-        if ct.is_empty() {
-            "of no stated type".to_string()
-        } else {
-            untrusted::clean(&ct, 100)
-        }
-    )))
+    // The captured type is the target's text, so it goes under target_data rather than
+    // into the sentence a model reads as this server's.
+    if ct.is_empty() {
+        return Err(Refusal::invalid(
+            "the body of this request has no stated type; plessor tests query parameters, form \
+             fields and the members of a JSON object",
+        ));
+    }
+    Err(Refusal::invalid(
+        "the body of this request is of a type plessor does not test (its Content-Type is \
+         under target_data); plessor tests query parameters, form fields and the members of a \
+         JSON object",
+    )
+    .with_detail(json!({"target_data": {
+        "untrusted": true,
+        "content_type": untrusted::clean(&ct, 100),
+    }})))
+}
+
+/// Names from the captured request, for a refusal's `target_data`.
+fn names_shown(names: &[String]) -> Value {
+    Value::Array(
+        names
+            .iter()
+            .take(SITES_MAX)
+            .map(|n| json!(untrusted::clean(n, 200)))
+            .collect(),
+    )
 }
 
 /// The captured cookies and headers, as plessor's `auth`. `None` when there are none.
@@ -292,10 +311,14 @@ pub(crate) async fn run(
 
     let method = src.method.trim().to_ascii_uppercase();
     if !METHODS.contains(&method.as_str()) {
-        return Err(Refusal::invalid(format!(
-            "this is a {} request; plessor tests GET, POST, PUT, PATCH and DELETE requests",
-            untrusted::clean(&method, 32)
-        )));
+        return Err(Refusal::invalid(
+            "this request's method (under target_data) is not one plessor tests; it tests GET, \
+             POST, PUT, PATCH and DELETE requests",
+        )
+        .with_detail(json!({"target_data": {
+            "untrusted": true,
+            "method": untrusted::clean(&method, 32),
+        }})));
     }
     if WRITE_METHODS.contains(&method.as_str()) && !a.test_writes {
         return Err(Refusal::invalid(format!(
@@ -324,21 +347,32 @@ pub(crate) async fn run(
             .filter(|q| named.contains(q))
             .cloned()
             .collect();
+        let field_names: Vec<String> = fields.iter().map(|f| f.name.clone()).collect();
         fields.retain(|f| named.contains(&f.name));
+        // The names are the target's text: they are listed under target_data, never in
+        // the sentence.
         if in_query.is_empty() && fields.is_empty() {
-            return Err(Refusal::invalid(format!(
+            return Err(Refusal::invalid(
                 "none of params is a query parameter, form field or JSON member of this \
-                 request; it has: {}",
-                untrusted::clean(&query.join(", "), 500)
-            )));
+                 request; the names it has are under target_data",
+            )
+            .with_detail(json!({"target_data": {
+                "untrusted": true,
+                "query_parameters": names_shown(&query),
+                "body_fields": names_shown(&field_names),
+            }})));
         }
         // plessor reads an empty list as every query parameter of the URL.
         if in_query.is_empty() && !query.is_empty() {
-            return Err(Refusal::invalid(format!(
+            return Err(Refusal::invalid(
                 "plessor tests every query parameter of the URL unless at least one is named; \
-                 name one of {} as well, or leave params out",
-                untrusted::clean(&query.join(", "), 500)
-            )));
+                 name one of the query parameters under target_data as well, or leave params \
+                 out",
+            )
+            .with_detail(json!({"target_data": {
+                "untrusted": true,
+                "query_parameters": names_shown(&query),
+            }})));
         }
         query = in_query;
     }
