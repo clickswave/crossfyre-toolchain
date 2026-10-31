@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{broadcast, oneshot};
 
 /// How long the socket has to accept and the Workbench to answer `hello`.
@@ -280,7 +280,7 @@ pub(crate) async fn connect(
         e.pid,
         token,
         client,
-        BufReader::new(r),
+        tokio::io::BufReader::new(r),
         Box::new(w),
         registry,
     )
