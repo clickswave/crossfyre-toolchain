@@ -1508,6 +1508,89 @@ mod replay {
         assert_eq!(b.fake.count(Method::Replay), 0);
     }
 
+    /// The method cannot be edited, but many frameworks take it from a header or a
+    /// `_method` field instead. A GET that asks for DELETE that way is a write.
+    #[tokio::test]
+    async fn a_method_override_makes_a_captured_get_a_write() {
+        let b = bench_with(base(""), get_app()).await;
+        let peer = FakePeer::new(Elicit::None);
+        for edits in [
+            json!({"headers": {"X-HTTP-Method-Override": "DELETE"}}),
+            json!({"headers": {"x-http-method": "put"}}),
+            json!({"headers": {"X-Method-Override": "PATCH"}}),
+            json!({"query": {"_method": "DELETE"}}),
+            json!({"path": "/api/items?_method=DELETE"}),
+            json!({"form": {"_method": "DELETE"}}),
+            json!({"json": {"_method": "DELETE"}}),
+            json!({"body": "_method=DELETE&id=2"}),
+        ] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1), "edits": edits.clone()}),
+                )
+                .await;
+            assert_eq!(reason(&r), "writes_not_allowed", "{edits}: {}", r.text);
+        }
+        assert_eq!(b.fake.count(Method::Replay), 0);
+
+        // Asking for a read that way is still a read.
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1),
+                       "edits": {"headers": {"X-HTTP-Method-Override": "GET"}}}),
+            )
+            .await;
+        ok(&r);
+        assert_eq!(b.fake.count(Method::Replay), 1);
+
+        // A captured GET that already carried one is a write as captured, and stops
+        // being one when the edit takes the header away.
+        let b = bench_with(
+            base("allow_writes = true"),
+            WbOpts::default().answer(Method::Exchange, |c, _| {
+                let Call::Exchange(p) = c else { unreachable!() };
+                let mut x = default_exchange(p.id);
+                x.url = "http://app.example.test/api/items/2".into();
+                x.req_headers = Some(vec![
+                    ("Host".into(), "app.example.test".into()),
+                    ("X-HTTP-Method-Override".into(), "DELETE".into()),
+                ]);
+                Ok(serde_json::to_value(x).unwrap())
+            }),
+        )
+        .await;
+        let peer = FakePeer::new(Elicit::Accept);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1),
+                       "edits": {"headers": {"X-HTTP-Method-Override": null}}}),
+            )
+            .await;
+        ok(&r);
+        assert_eq!(peer.asked(), 1, "only the scope was asked about");
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1)}),
+            )
+            .await;
+        ok(&r);
+        assert_eq!(peer.asked(), 2, "then the write");
+        let q = peer.questions.lock().unwrap().last().unwrap().clone();
+        assert!(
+            q.contains("GET request that asks for DELETE by method override"),
+            "{q}"
+        );
+        assert_eq!(b.fake.count(Method::Replay), 2);
+    }
+
     #[tokio::test]
     async fn a_handle_from_another_project_sends_nothing() {
         let b = bench_with(base(""), get_app()).await;

@@ -16,7 +16,8 @@ use crate::peer::ClientPeer;
 use crate::tools::parse_args;
 use crate::{guard, untrusted};
 use cfx_bridge::{
-    Call, EDIT_ENTRIES_MAX, Edits, ErrorCode, McpRef, PINS_MAX, Part, ReplayParams, ReplayResult,
+    Call, EDIT_ENTRIES_MAX, Edits, ErrorCode, ExchangeResult, McpRef, PINS_MAX, Part, ReplayParams,
+    ReplayResult,
 };
 use cfx_scope::Point;
 use serde::Deserialize;
@@ -43,6 +44,89 @@ struct Args {
 /// GET, HEAD and OPTIONS read. Anything else can change or destroy data.
 fn safe(method: &str) -> bool {
     matches!(method, "GET" | "HEAD" | "OPTIONS")
+}
+
+/// Headers that many frameworks read as the method in place of the request line's.
+const OVERRIDE_HEADERS: [&str; 3] = [
+    "x-http-method-override",
+    "x-http-method",
+    "x-method-override",
+];
+/// The query or body field that does the same in Rails, Laravel, Symfony and others.
+const OVERRIDE_FIELD: &str = "_method";
+
+/// What one name holds after the edits: an edit's value in place of the first, the
+/// rest as captured, and nothing after a `null`.
+fn after_edit(captured: Vec<String>, edited: Option<Option<&str>>) -> Vec<String> {
+    match edited {
+        None => captured,
+        Some(None) => Vec::new(),
+        Some(Some(v)) => std::iter::once(v.to_string())
+            .chain(captured.into_iter().skip(1))
+            .collect(),
+    }
+}
+
+fn query_values(url: &str, name: &str) -> Vec<String> {
+    transport::Url::parse(url)
+        .map(|u| {
+            u.query_pairs()
+                .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A method the request as it will be sent asks for by override, when that method is
+/// not a read: `DELETE` for a GET carrying `X-HTTP-Method-Override: DELETE` or
+/// `_method=DELETE`. A replaced body that names the field at all counts, since what
+/// it asks for cannot be read reliably from raw text.
+fn overriding_write(stored: &ExchangeResult, edits: &Edits) -> Option<String> {
+    fn edited<'a>(pairs: &'a cfx_bridge::Pairs, name: &str) -> Option<Option<&'a str>> {
+        pairs
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v)
+    }
+    let mut asked: Vec<String> = Vec::new();
+    for h in OVERRIDE_HEADERS {
+        let captured: Vec<String> = stored
+            .req_headers
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .filter(|(k, _)| k.trim().eq_ignore_ascii_case(h))
+            .map(|(_, v)| v.clone())
+            .collect();
+        asked.extend(after_edit(captured, edited(&edits.headers, h)));
+    }
+    let query = match &edits.path {
+        Some(p) => query_values(&format!("http://h{p}"), OVERRIDE_FIELD),
+        None => query_values(&stored.url, OVERRIDE_FIELD),
+    };
+    asked.extend(after_edit(query, edited(&edits.query, OVERRIDE_FIELD)));
+    if let Some(Some(v)) = edited(&edits.form, OVERRIDE_FIELD) {
+        asked.push(v.to_string());
+    }
+    if let Some(j) = &edits.json {
+        for (k, v) in j {
+            if k.eq_ignore_ascii_case(OVERRIDE_FIELD) && !v.is_null() {
+                asked.push(v.as_str().map_or_else(|| v.to_string(), str::to_string));
+            }
+        }
+    }
+    if edits
+        .body
+        .as_deref()
+        .is_some_and(|b| b.to_ascii_lowercase().contains(OVERRIDE_FIELD))
+    {
+        asked.push("an overridden method".into());
+    }
+    asked
+        .into_iter()
+        .map(|m| m.trim().to_ascii_uppercase())
+        .find(|m| !m.is_empty() && !safe(m))
 }
 
 fn parse_edits(v: Option<Value>) -> Result<Edits, Refusal> {
@@ -110,7 +194,14 @@ pub(crate) async fn run(
         .map(|(_, v)| v.map(str::to_string));
     let host_headers = sent_hosts(&stored_hosts, edited_host);
 
-    let intent = if safe(&method) {
+    // The method cannot be edited, but a framework can be asked to act as if it were.
+    // A GET that asks for DELETE that way is a write here too.
+    let overridden = if safe(&method) {
+        overriding_write(&stored, &edits)
+    } else {
+        None
+    };
+    let intent = if safe(&method) && overridden.is_none() {
         Intent::Read
     } else {
         Intent::Write
@@ -158,14 +249,21 @@ pub(crate) async fn run(
             }]));
         }
     }
+    let asked = match &overridden {
+        Some(m) => format!(
+            "{} request that asks for {} by method override",
+            untrusted::clean(&method, 32),
+            untrusted::clean(m, 32)
+        ),
+        None => format!("{} request", untrusted::clean(&method, 32)),
+    };
     let write = (intent == Intent::Write).then(|| WriteAsk {
         remember: Some(dest.key()),
         message: format!(
-            "workbench_replay will send a {} request to {} from the Workbench project {}, with \
+            "workbench_replay will send a {asked} to {} from the Workbench project {}, with \
              the cookies and headers that were captured, so it acts as the captured user. \
              Methods other than GET, HEAD and OPTIONS can change or destroy data. Allow them \
              to {} for the rest of this session?",
-            untrusted::clean(&method, 32),
             untrusted::clean(&dest.origin(), 200),
             o.name(),
             untrusted::clean(&dest.key(), 200)

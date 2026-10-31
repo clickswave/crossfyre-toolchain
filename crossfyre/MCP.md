@@ -161,7 +161,7 @@ Not reachable from an agent: starting or stopping the proxy, intercept decisions
 Limits that come with it:
 
 - A replay goes out with the cookies and headers that were captured, so it acts as the captured user, with exactly that user's rights.
-- GET, HEAD and OPTIONS are reads to every check here. A GET with side effects, such as `/logout` or `/delete?id=3`, is sent without a confirmation.
+- GET, HEAD and OPTIONS are reads to every check here. A GET with side effects, such as `/logout` or `/delete?id=3`, is sent without a confirmation. A replay that asks for another method through `X-HTTP-Method-Override`, `X-HTTP-Method`, `X-Method-Override` or a `_method` query, form or JSON field, as captured or edited, is a write, and so is one whose replaced body names `_method` at all.
 - The name an agent shows in the Workbench is what its client said it was. Nothing checks it.
 - Any program running as you can read the same captured traffic, from the socket or from the project files themselves. Agent access being off, the file modes, the owner check and the token keep other users out.
 
