@@ -356,6 +356,20 @@ pub(crate) struct RunningJob {
 
 pub(crate) type RunningMap = Arc<Mutex<HashMap<String, Arc<RunningJob>>>>;
 
+/// What the client was last given as its tool list. One record for every backend, so a
+/// change is announced once whichever backend made it and whichever noticed it first.
+#[derive(Default)]
+struct Told {
+    /// The listing the client holds, as far as the server knows. `None` until a backend
+    /// has settled or the client has read the list.
+    given: Option<crate::tools::Backends>,
+    /// The client has read `tools/list` itself, so `given` is what it read or was told
+    /// of since.
+    listed: bool,
+    /// When the client was last told the list changed.
+    at: Option<Instant>,
+}
+
 pub(crate) struct Mcp {
     pub settings: Settings,
     pub dir: PathBuf,
@@ -381,6 +395,7 @@ pub(crate) struct Mcp {
     open_calls: Mutex<HashMap<u64, OpenCall>>,
     /// A Cloud workspace, when a key is set up.
     pub cloud: crate::cloud::Slot,
+    told: Mutex<Told>,
 }
 
 impl Mcp {
@@ -421,7 +436,60 @@ impl Mcp {
             polls: Mutex::new(HashMap::new()),
             open_calls: Mutex::new(HashMap::new()),
             cloud: crate::cloud::Slot::None,
+            told: Mutex::new(Told::default()),
             scope,
+        }
+    }
+
+    /// The listing for an answer to `tools/list`, recorded as what the client now holds.
+    pub(crate) fn list_for_client(&self) -> crate::tools::Backends {
+        let Ok(mut t) = self.told.lock() else {
+            return self.backends();
+        };
+        let now = self.backends();
+        t.given = Some(now.clone());
+        t.listed = true;
+        now
+    }
+
+    /// Take the listing as it stands as the one the client starts from, unless the client
+    /// has read a list already. A backend calls this once it has settled at start, so
+    /// what it found then is not announced as a change.
+    pub(crate) fn listing_settled(&self) {
+        if let Ok(mut t) = self.told.lock()
+            && !t.listed
+        {
+            t.given = Some(self.backends());
+        }
+    }
+
+    /// The listing is no longer what the client was last given or told of.
+    pub(crate) fn listing_moved(&self) -> bool {
+        self.told
+            .lock()
+            .map(|t| t.given.as_ref().is_some_and(|g| *g != self.backends()))
+            .unwrap_or(false)
+    }
+
+    /// When the client was last told its list changed.
+    pub(crate) fn last_told(&self) -> Option<Instant> {
+        self.told.lock().ok().and_then(|t| t.at)
+    }
+
+    /// Record the listing as announced when it is not what the client holds. True means
+    /// the caller sends `notifications/tools/list_changed`: only one caller is given true
+    /// for a change, so the client hears of it once.
+    pub(crate) fn listing_to_announce(&self) -> bool {
+        let Ok(mut t) = self.told.lock() else {
+            return false;
+        };
+        let now = self.backends();
+        match t.given.replace(now.clone()) {
+            Some(was) if was != now => {
+                t.at = Some(Instant::now());
+                true
+            }
+            _ => false,
         }
     }
 

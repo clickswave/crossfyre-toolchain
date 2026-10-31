@@ -144,8 +144,6 @@ struct Inner {
     state: State,
     whoami: Option<wire::Whoami>,
     last_call_id: Option<String>,
-    /// What the client was last given, so a change is announced once.
-    told: Option<Listing>,
 }
 
 pub(crate) struct Cloud {
@@ -172,7 +170,6 @@ impl Cloud {
                 state: State::Starting,
                 whoami: None,
                 last_call_id: None,
-                told: None,
             }),
             polls: Mutex::new(HashMap::new()),
             asked: tokio::sync::Mutex::new(Asked::Unasked),
@@ -260,11 +257,11 @@ impl Cloud {
             Ok(Ok(a)) => a,
             Ok(Err(f)) => {
                 self.set_state(State::Unreachable(f.describe()));
-                return self.remember_told();
+                return mcp.listing_settled();
             }
             Err(_) => {
                 self.set_state(State::Unreachable("no answer within 5 s".into()));
-                return self.remember_told();
+                return mcp.listing_settled();
             }
         };
         self.remember_call_id(answer.call_id.as_deref());
@@ -289,14 +286,7 @@ impl Cloud {
                 )));
             }
         }
-        self.remember_told();
-    }
-
-    fn remember_told(&self) {
-        let now = self.listing();
-        if let Ok(mut i) = self.inner.lock() {
-            i.told = Some(now);
-        }
+        mcp.listing_settled();
     }
 
     fn remember_call_id(&self, id: Option<&str>) {
@@ -305,18 +295,10 @@ impl Cloud {
         }
     }
 
-    /// Tell the client when the tools it was given are no longer the ones listed.
-    async fn announce(&self, peer: &dyn ClientPeer) {
-        let now = self.listing();
-        let changed = self
-            .inner
-            .lock()
-            .map(|mut i| {
-                let was = i.told.replace(now);
-                was.is_some_and(|w| w != now)
-            })
-            .unwrap_or(false);
-        if changed {
+    /// Tell the client when the tools it was given are no longer the ones listed, unless
+    /// another backend has told it already.
+    async fn announce(&self, mcp: &Mcp, peer: &dyn ClientPeer) {
+        if mcp.listing_to_announce() {
             peer.tool_list_changed().await;
         }
     }
@@ -357,7 +339,7 @@ impl Cloud {
                 }
                 Err(f) => {
                     self.set_state(State::Unreachable(f.describe()));
-                    self.announce(peer).await;
+                    self.announce(mcp, peer).await;
                     return Err(unreachable_on(route, &f.describe()));
                 }
             }
@@ -371,7 +353,7 @@ impl Cloud {
         }
         if (200..300).contains(&answer.status) {
             self.set_state(State::Ready);
-            self.announce(peer).await;
+            self.announce(mcp, peer).await;
             return serde_json::from_value::<T>(answer.envelope.data)
                 .map(|t| (answer.status, t))
                 .map_err(|_| {
@@ -387,7 +369,7 @@ impl Cloud {
         let refusal = refusal_of(&answer.envelope.data, answer.status);
         if disables(refusal.reason) || answer.status == 401 {
             self.set_state(State::Rejected(refusal.reason));
-            self.announce(peer).await;
+            self.announce(mcp, peer).await;
             return Err(key_rejected(refusal.reason));
         }
         if answer.status >= 500 && refusal.reason == wire::Reason::Internal {

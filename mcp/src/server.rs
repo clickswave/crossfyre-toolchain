@@ -113,7 +113,7 @@ impl ServerHandler for Server {
     ) -> Result<ListToolsResult, ErrorData> {
         self.mcp.workbench.first_look().await;
         Ok(ListToolsResult {
-            tools: tool_list(&self.mcp.backends()),
+            tools: tool_list(&self.mcp.list_for_client()),
             ..Default::default()
         })
     }

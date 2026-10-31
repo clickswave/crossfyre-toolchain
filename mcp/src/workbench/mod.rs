@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::watch;
 
 /// Connections kept at once.
@@ -299,7 +299,8 @@ impl Registry {
 
 /// Keep the tool list in step with the Workbenches that answer, for as long as the
 /// session runs: look for new ones, and tell the client when the set of listed tools
-/// changes, at most once every two seconds.
+/// changes, at most once every two seconds. A change another backend has announced
+/// already is not announced again.
 pub(crate) async fn watch<F>(mcp: Arc<Mcp>, notify: F)
 where
     F: Fn() -> BoxFut<'static, ()> + Send + Sync,
@@ -307,8 +308,7 @@ where
     let reg = Arc::clone(&mcp.workbench);
     let mut changed = reg.subscribe();
     reg.first_look().await;
-    let mut told = mcp.backends();
-    let mut last_told: Option<Instant> = None;
+    mcp.listing_settled();
     loop {
         let wait = if reg.instances().is_empty() {
             LOOK_IDLE
@@ -323,18 +323,19 @@ where
                 }
             }
         }
-        if mcp.backends() == told {
+        if !mcp.listing_moved() {
             continue;
         }
-        if let Some(gap) = last_told.map(|t| NOTIFY_GAP.saturating_sub(t.elapsed())) {
+        if let Some(gap) = mcp
+            .last_told()
+            .map(|t| NOTIFY_GAP.saturating_sub(t.elapsed()))
+        {
             tokio::time::sleep(gap).await;
         }
-        // What is listed after the wait, which can be back where it was.
-        let now = mcp.backends();
-        if now != told {
+        // What is listed after the wait, which can be back where it was, or announced
+        // by another backend meanwhile.
+        if mcp.listing_to_announce() {
             notify().await;
-            told = now;
-            last_told = Some(Instant::now());
         }
     }
 }

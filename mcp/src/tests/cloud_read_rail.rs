@@ -240,6 +240,42 @@ async fn a_key_refused_mid_session_takes_the_tools_away_once() {
     ok(&t.call(&peer, "get_scope", json!({})).await);
 }
 
+/// With the Workbench backend on, its watcher reads the whole listing, the Cloud's part
+/// included. The Cloud's change is still announced once, and only once.
+#[tokio::test]
+async fn a_key_refused_while_the_workbench_is_watched_is_announced_once() {
+    let wb = TempDir::new();
+    let world = std::sync::Arc::new(std::sync::Mutex::new(World::new("launch")));
+    let cloud = FakeCloud::start(fake_cloud::platform(std::sync::Arc::clone(&world))).await;
+    let mut t = scope(&[], "").workbench_dir(wb.path()).build();
+    fake_cloud::connect(&mut t, &cloud.url(), None).await;
+    let peer = std::sync::Arc::new(FakePeer::new(Elicit::None));
+    let p = std::sync::Arc::clone(&peer);
+    let watcher = tokio::spawn(crate::workbench::watch(
+        std::sync::Arc::clone(&t.mcp),
+        move || -> crate::guard::BoxFut<'static, ()> {
+            p.list_changed.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        },
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    ok(&t.call(&peer, "list_nodes", json!({})).await);
+    assert_eq!(peer.list_changed.load(Ordering::SeqCst), 0);
+
+    world.lock().unwrap().key_refused = Some(wire::Reason::KeyRevoked);
+    let r = t.call(&peer, "list_nodes", json!({})).await;
+    assert_eq!(reason(&r), "cloud_key_rejected", "{}", r.text);
+    assert_eq!(peer.list_changed.load(Ordering::SeqCst), 1);
+    // Past the watcher's next look, and the gap it keeps between two announcements.
+    tokio::time::sleep(std::time::Duration::from_millis(4500)).await;
+    assert_eq!(
+        peer.list_changed.load(Ordering::SeqCst),
+        1,
+        "announced twice"
+    );
+    watcher.abort();
+}
+
 #[tokio::test]
 async fn an_id_says_which_backend_answers_it() {
     let mut w = World::new("read");

@@ -73,7 +73,7 @@ async fn whoami(
         )
         .await?;
     cloud.set_whoami(w.clone());
-    cloud.announce(peer).await;
+    cloud.announce(mcp, peer).await;
     let value = json!({
         "backend": "cloud",
         "key": {

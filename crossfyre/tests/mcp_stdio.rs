@@ -556,6 +556,12 @@ const CLOUD_KEY: &str = "cfm_0123456789abcdef0123456789abcdef";
 /// A Cloud API that answers `whoami` for [`CLOUD_KEY`] with a read key, and counts the
 /// requests it reads.
 fn fake_cloud() -> (u16, Arc<AtomicUsize>) {
+    fake_cloud_revoking_after(usize::MAX)
+}
+
+/// [`fake_cloud`], answering only its first `n` requests: every later one is refused
+/// as a revoked key would be.
+fn fake_cloud_revoking_after(n_ok: usize) -> (u16, Arc<AtomicUsize>) {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
     let n = Arc::new(AtomicUsize::new(0));
@@ -563,7 +569,7 @@ fn fake_cloud() -> (u16, Arc<AtomicUsize>) {
     std::thread::spawn(move || {
         for s in l.incoming() {
             let Ok(mut s) = s else { return };
-            seen.fetch_add(1, Ordering::SeqCst);
+            let nth = seen.fetch_add(1, Ordering::SeqCst) + 1;
             let mut r = BufReader::new(s.try_clone().unwrap());
             let mut head = Vec::new();
             let mut len = 0usize;
@@ -583,7 +589,9 @@ fn fake_cloud() -> (u16, Arc<AtomicUsize>) {
                 h.trim() == format!("authorization: Bearer {CLOUD_KEY}").as_str()
                     || h.trim() == format!("Authorization: Bearer {CLOUD_KEY}").as_str()
             });
-            let (status, data) = if authorised {
+            let (status, data) = if authorised && nth > n_ok {
+                (401, json!({"reason": "key_revoked"}))
+            } else if authorised {
                 (
                     200,
                     json!({
@@ -615,16 +623,12 @@ fn fake_cloud() -> (u16, Arc<AtomicUsize>) {
     (port, n)
 }
 
-#[test]
-fn a_cloud_key_adds_the_cloud_tools_and_appears_in_no_output() {
-    let (port, asked) = fake_cloud();
-    let data = temp_dir("cloud");
-    write_config(&data, closed_port(), closed_port());
-    write_scope(&data, "entries = [\"app.example.test\"]\n");
+/// The Cloud key file `crossfyre mcp cloud login` writes, for `key` at `api_url`.
+fn write_cloud_key(data: &std::path::Path, api_url: &str, key: &str) {
     let key_file = data.join("mcp/cloud.toml");
     std::fs::write(
         &key_file,
-        format!("api_url = \"http://127.0.0.1:{port}\"\nkey = \"{CLOUD_KEY}\"\n"),
+        format!("api_url = \"{api_url}\"\nkey = \"{key}\"\n"),
     )
     .unwrap();
     #[cfg(unix)]
@@ -632,6 +636,24 @@ fn a_cloud_key_adds_the_cloud_tools_and_appears_in_no_output() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
+}
+
+fn tool_names(tools: &Value) -> Vec<String> {
+    tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn a_cloud_key_adds_the_cloud_tools_and_appears_in_no_output() {
+    let (port, asked) = fake_cloud();
+    let data = temp_dir("cloud");
+    write_config(&data, closed_port(), closed_port());
+    write_scope(&data, "entries = [\"app.example.test\"]\n");
+    write_cloud_key(&data, &format!("http://127.0.0.1:{port}"), CLOUD_KEY);
     let secret = &CLOUD_KEY[4..];
 
     let mut child = spawn(&data);
@@ -698,6 +720,59 @@ fn a_cloud_key_adds_the_cloud_tools_and_appears_in_no_output() {
         "--no-cloud asked the Cloud"
     );
     let _ = std::fs::remove_dir_all(&data);
+}
+
+/// A key the platform refuses partway through a session takes the Cloud tools away,
+/// and the client hears of it once, whether or not a Workbench is being watched too.
+#[test]
+fn a_key_refused_mid_session_changes_the_list_once() {
+    for mode in ["auto", "off"] {
+        // whoami at start is answered; everything after is refused as revoked.
+        let (port, _) = fake_cloud_revoking_after(1);
+        let data = temp_dir(&format!("revoked-{mode}"));
+        write_config(&data, closed_port(), closed_port());
+        write_scope(&data, "entries = [\"app.example.test\"]\n");
+        write_cloud_key(&data, &format!("http://127.0.0.1:{port}"), CLOUD_KEY);
+        let mut child = spawn_with(&data, &["--workbench", mode]);
+        let _stderr = child.stderr.take();
+        let (mut c, all_lines) = Client::attach(&mut child);
+        c.initialize(false);
+        c.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+        let before = tool_names(&c.reply(2)["result"]["tools"]);
+        assert_eq!(before.len(), 15, "{mode}: {before:?}");
+
+        let r = c.call(3, "whoami", json!({}));
+        assert_eq!(r["isError"], true, "{mode}: {r}");
+        assert!(
+            r["content"][0]["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("\"reason\":\"cloud_key_rejected\"")),
+            "{mode}: {r}"
+        );
+        // Past the Workbench watcher's next look and the gap it keeps between two
+        // announcements.
+        std::thread::sleep(Duration::from_millis(4500));
+        let told = all_lines
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| {
+                serde_json::from_str::<Value>(l)
+                    .is_ok_and(|v| v["method"] == "notifications/tools/list_changed")
+            })
+            .count();
+        assert_eq!(
+            told, 1,
+            "--workbench {mode}: tools/list_changed sent {told} times"
+        );
+        c.send(json!({"jsonrpc": "2.0", "id": 4, "method": "tools/list"}));
+        let after = tool_names(&c.reply(4)["result"]["tools"]);
+        assert_eq!(after.len(), 11, "{mode}: {after:?}");
+
+        drop(c);
+        wait_exit(&mut child, Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(&data);
+    }
 }
 
 /// A Workbench stand-in on a Unix socket: writes its endpoint file under `dir`, answers
