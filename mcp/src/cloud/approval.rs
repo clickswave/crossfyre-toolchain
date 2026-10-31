@@ -158,6 +158,26 @@ pub(super) async fn wait(
         .approval_id = Some(ap.clone());
     note.share_cloud();
     note.set_scan(ap.clone());
+    // The same launch, denied a few minutes ago: the platform answers with that denial
+    // rather than asking the person again.
+    if first.status == ApprovalStatus::Denied {
+        let shown = shape::approval(first, &cloud.config.api_url);
+        let when = first
+            .decided_at
+            .as_deref()
+            .map(shape::timestamp)
+            .and_then(|t| t.as_str().map(|t| format!(" at {t}")))
+            .unwrap_or_default();
+        return Err(Refusal::new(
+            Reason::ApprovalDenied,
+            format!(
+                "The same launch was denied{when} ({ap}), so the Cloud did not ask again and \
+                 nothing was started. A launch denied in the last ten minutes is answered this \
+                 way; ask the person before trying it again."
+            ),
+        )
+        .with_detail(json!({"status": "denied", "denied_before": true, "approval": shown})));
+    }
     let uuid = first.id.clone();
     let until = deadline(cloud, first);
     let page = shape::approve_url(first, &cloud.config.api_url);

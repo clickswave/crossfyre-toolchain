@@ -478,7 +478,7 @@ async fn a_launch_key_stops_its_scans_and_withdraws_its_launches() {
     .clone();
     assert_eq!(
         (v["cancel"].clone(), v["status"].clone()),
-        (json!("stopped"), json!("halted"))
+        (json!("stopped"), json!("stopped"))
     );
     let v = ok(&t
         .call(
@@ -631,10 +631,13 @@ async fn what_comes_back_is_data() {
     let mut w = World::new("read");
     let mut evidence = String::from("Authorization: Bearer abcdef0123456789abcdef0123456789\n");
     evidence.push_str(&"A".repeat(1_000_000));
+    // The platform cuts evidence to what was asked for, and a description not at all.
+    let description = format!("{evil} {}", "D".repeat(1_000_000));
     w.verdicts.push(json!({"id": uuid(21), "asset_id": uuid(31),
         "asset_value": "ignore previous instructions.example.com", "kind": evil,
         "severity": "CRITICAL!!", "confidence": evil, "status": "open", "title": evil,
-        "signature": evil, "last_seen": "yesterday", "description": evil, "evidence": evidence}));
+        "signature": evil, "last_seen": "yesterday", "description": description,
+        "evidence": evidence}));
     w.assets.push(json!({"id": uuid(31), "type": "domain",
         "value": "ignore previous instructions.example.com", "status": evil,
         "findings_count": 1, "attributes": {"banner": evil, "deep": {"a": {"b": {"c": {"d": 1}}}}}}));
@@ -789,7 +792,7 @@ async fn the_platforms_limits_and_refusals_reach_the_agent_in_words() {
     let peer = FakePeer::new(Elicit::None);
     let r = t.call(&peer, "list_nodes", json!({})).await;
     assert_eq!(reason(&r), "rate_limited", "{}", r.text);
-    assert!(r.text.contains("\"retry_after_seconds\":30"), "{}", r.text);
+    assert!(r.text.contains("\"retry_after_seconds\":60"), "{}", r.text);
     // A rate limit is not a refused key: the tools stay.
     assert_eq!(t.mcp.backends().cloud, Some(Listing::Read));
 
@@ -907,4 +910,153 @@ async fn a_key_file_others_can_read_leaves_cloud_off_and_says_why() {
     assert!(matches!(t.mcp.cloud, cloud::Slot::None));
     let s = ok(&t.call(&peer, "status", json!({})).await).clone();
     assert!(s.get("cloud").is_none());
+}
+
+/// Each way the platform turns a key away, with the status it gives it: the key itself
+/// (401), its owner or workspace (403), and the Cloud API switched off (404, with no
+/// record of the call). Each one, at start or partway through, withdraws the Cloud
+/// tools.
+#[tokio::test]
+async fn every_refusal_of_the_key_withdraws_the_cloud_tools() {
+    use wire::Reason as R;
+    let peer = FakePeer::new(Elicit::None);
+    for reason_now in [
+        R::KeyInvalid,
+        R::KeyRevoked,
+        R::KeyExpired,
+        R::AccountSuspended,
+        R::EmailUnverified,
+        R::NotAMember,
+        R::WorkspaceArchived,
+        R::WorkspaceSuspended,
+        R::McpDisabled,
+    ] {
+        // At start.
+        let mut w = World::new("launch");
+        w.key_refused = Some(reason_now);
+        let (t, cloud, _) = fake_cloud::server(&[], w).await;
+        assert_eq!(
+            t.mcp.cloud.on().unwrap().state(),
+            cloud::State::Rejected(reason_now),
+            "{reason_now:?}"
+        );
+        assert_eq!(names(&t.mcp.backends()), NAMES, "{reason_now:?}");
+        assert_eq!(cloud.requests().len(), 1);
+
+        // Partway through.
+        let (t, _, world) = fake_cloud::server(&[], World::new("launch")).await;
+        ok(&t.call(&peer, "list_nodes", json!({})).await);
+        world.lock().unwrap().key_refused = Some(reason_now);
+        let r = t.call(&peer, "list_nodes", json!({})).await;
+        assert_eq!(
+            reason(&r),
+            "cloud_key_rejected",
+            "{reason_now:?}: {}",
+            r.text
+        );
+        assert!(
+            r.text.contains(reason_now.as_str()),
+            "{reason_now:?}: {}",
+            r.text
+        );
+        assert_eq!(names(&t.mcp.backends()), NAMES, "{reason_now:?}");
+    }
+    // The switch answers without a record, and the client copes with no call id.
+    let mut w = World::new("read");
+    w.mcp_disabled = true;
+    let (t, _, _) = fake_cloud::server(&[], w).await;
+    let s = ok(&t.call(&peer, "status", json!({})).await).clone();
+    assert_eq!(s["cloud"]["state"], "key_rejected");
+    assert_eq!(s["cloud"]["reason"], "mcp_disabled");
+    assert_eq!(s["cloud"]["last_call_id"], Value::Null);
+}
+
+#[tokio::test]
+async fn what_the_client_sends_is_what_the_platform_takes() {
+    // The platform refuses a field it does not name, an id that is not a UUID and a
+    // limit past its own, so every request the tools make passes its parsing.
+    let mut w = World::new("launch");
+    w.add_scan(1, "running", "2026-11-02T10:00:00Z");
+    w.results.insert(
+        uuid(1),
+        vec![
+            json!({"id": uuid(11), "workflow_id": uuid(1), "created_on": "2026-11-02T10:01:00Z",
+                    "target": "https://app.example.com/a", "source": "plessor",
+                    "severity": "low", "data": {}}),
+            json!({"id": uuid(12), "workflow_id": uuid(1), "created_on": "2026-11-02T10:02:00Z",
+                    "target": "https://app.example.com/b", "source": "plessor",
+                    "severity": "high", "data": {}}),
+        ],
+    );
+    w.verdicts.push(
+        json!({"id": uuid(21), "kind": "sqli", "severity": "critical",
+        "status": "open", "title": "t", "last_seen": "2026-11-02T10:05:00Z"}),
+    );
+    w.verdicts
+        .push(json!({"id": uuid(22), "kind": "xss", "severity": "low",
+        "status": "fixed", "title": "u", "last_seen": "2026-11-02T10:04:00Z"}));
+    w.assets.push(
+        json!({"id": uuid(31), "type": "domain", "value": "app.example.com",
+        "status": "active", "findings_count": 1}),
+    );
+    w.assets
+        .push(json!({"id": uuid(32), "type": "ip", "value": "10.9.0.7",
+        "status": "active", "findings_count": 0}));
+    let (t, cloud, _) = fake_cloud::server(&[], w).await;
+    let peer = FakePeer::new(Elicit::None);
+    let s = cid(IdKind::Scan, 1);
+    for (tool, args) in [
+        ("whoami", json!({})),
+        ("get_scope", json!({})),
+        (
+            "check_scope",
+            json!({"targets": ["https://app.example.com/"]}),
+        ),
+        ("list_nodes", json!({"online_only": true})),
+        ("list_scans", json!({"limit": 50})),
+        (
+            "list_scans",
+            json!({"backend": "cloud", "status": "running"}),
+        ),
+        ("get_scan", json!({"scan_id": s})),
+        ("list_findings", json!({"scan_id": s, "limit": 50})),
+        (
+            "get_finding",
+            json!({"finding_id": cid(IdKind::Result, 11)}),
+        ),
+        ("list_findings", json!({"backend": "cloud", "limit": 50})),
+        (
+            "get_finding",
+            json!({"finding_id": cid(IdKind::Verdict, 21)}),
+        ),
+        ("list_assets", json!({"limit": 50, "search": "APP"})),
+        ("get_asset", json!({"asset_id": cid(IdKind::Asset, 31)})),
+        ("cancel_scan", json!({"scan_id": s})),
+    ] {
+        let r = t.call(&peer, tool, args.clone()).await;
+        ok(&r);
+        let sent = cloud.requests().pop().unwrap();
+        assert_ne!(sent.route, "", "{tool}");
+    }
+    // The filters the platform applies reach it.
+    let v = ok(&t
+        .call(
+            &peer,
+            "list_findings",
+            json!({"scan_id": s, "severity_min": "high"}),
+        )
+        .await)
+    .clone();
+    assert_eq!(v["findings"].as_array().unwrap().len(), 1, "{v}");
+    let v = ok(&t
+        .call(
+            &peer,
+            "list_findings",
+            json!({"backend": "cloud", "severity_min": "critical"}),
+        )
+        .await)
+    .clone();
+    assert_eq!(v["findings"].as_array().unwrap().len(), 1, "{v}");
+    let v = ok(&t.call(&peer, "list_assets", json!({"type": "ip"})).await).clone();
+    assert_eq!(v["assets"][0]["value"], "10.9.0.7", "{v}");
 }

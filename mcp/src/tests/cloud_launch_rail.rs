@@ -137,7 +137,7 @@ async fn an_empty_scope_file_narrows_nothing_and_the_platform_decides() {
 async fn each_launch_carries_its_targets_and_only_its_own_options() {
     let mut w = World::new("launch");
     w.scope.push(("10.9.0.0/24".into(), true));
-    let (t, cloud, _) = fake_cloud::server(&[], w).await;
+    let (t, cloud, world) = fake_cloud::server(&[], w).await;
     let peer = FakePeer::new(Elicit::None);
     let node = cid(IdKind::Node, 901);
     let cases = [
@@ -186,6 +186,8 @@ async fn each_launch_carries_its_targets_and_only_its_own_options() {
     for (tool, args, want) in cases {
         let r = t.call(&peer, tool, args).await;
         ok(&r);
+        // Each ends before the next, as a key may have only five running.
+        fake_cloud::end_scans(&world);
         let sent = starts(&cloud).pop().unwrap();
         let mut body = sent.body.clone();
         let rid = body.as_object_mut().unwrap().remove("request_id").unwrap();
@@ -455,11 +457,10 @@ async fn a_launch_the_platform_made_keeps_its_handle_when_a_later_request_fails(
     let v = ok(&t.call(&peer, "start_crawl", follow).await).clone();
     assert!(v["scan_id"].as_str().unwrap().starts_with("cs_"), "{v}");
     assert!(v["cloud_error"].as_str().unwrap().contains("rate_limited"));
-    assert_eq!(v["poll_after_seconds"], 30);
+    assert_eq!(v["poll_after_seconds"], 60);
 
     // Held for a person, and the wait for the decision fails: the ap_ handle.
     let mut w = World::new("launch");
-    w.approval_required = true;
     w.policy = "always";
     w.phones = vec!["Pixel 8"];
     w.queue("approvals/wait", Resp::refusal(500, wire::Reason::Internal));
@@ -480,7 +481,6 @@ async fn a_launch_the_platform_made_keeps_its_handle_when_a_later_request_fails(
 
     // The person answers in the form and the decision cannot be sent.
     let mut w = World::new("launch");
-    w.approval_required = true;
     w.policy = "always";
     w.queue(
         "approvals/decide",
@@ -495,7 +495,6 @@ async fn a_launch_the_platform_made_keeps_its_handle_when_a_later_request_fails(
 
     // Approved and launched, and the scan it became cannot be read just now.
     let mut w = World::new("launch");
-    w.approval_required = true;
     w.policy = "always";
     w.phones = vec!["Pixel 8"];
     w.decide_on_wait = Some((1, "approved", "phone"));
@@ -527,4 +526,114 @@ async fn a_launch_the_platform_made_keeps_its_handle_when_a_later_request_fails(
         "{}",
         r.text
     );
+}
+
+#[tokio::test]
+async fn a_launch_key_whose_owner_may_no_longer_launch_loses_its_launch_tools() {
+    let (t, cloud, world) = fake_cloud::server(&[], World::new("launch")).await;
+    assert_eq!(t.mcp.backends().cloud, Some(Listing::Launch));
+    let peer = FakePeer::new(Elicit::None);
+    // Demoted in the workspace since the server started.
+    world.lock().unwrap().role_may_launch = false;
+    let r = t
+        .call(
+            &peer,
+            "start_crawl",
+            json!({"url": "https://app.example.com/"}),
+        )
+        .await;
+    assert_eq!(reason(&r), "permission_denied", "{}", r.text);
+    assert!(r.text.contains("role"), "{}", r.text);
+    assert!(r.text.contains("Viewer"), "{}", r.text);
+    // What the platform says the key may do now decides the list, and the client is told.
+    assert_eq!(t.mcp.backends().cloud, Some(Listing::Read));
+    assert_eq!(
+        peer.list_changed.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        cloud.routes().iter().filter(|r| *r == "whoami").count(),
+        2,
+        "{:?}",
+        cloud.routes()
+    );
+    let line = t.audit_lines().pop().unwrap();
+    assert_eq!(line["cloud_call_ids"].as_array().map(Vec::len), Some(2));
+    assert!(world.lock().unwrap().scans.is_empty());
+}
+
+#[tokio::test]
+async fn the_platform_checks_the_launch_before_it_makes_anything() {
+    let (t, cloud, world) = fake_cloud::server(&[], World::new("launch")).await;
+    let peer = FakePeer::new(Elicit::None);
+    let crawl = |node: Option<u32>| {
+        let mut a = json!({"url": "https://app.example.com/"});
+        if let Some(n) = node {
+            a["node_ids"] = json!([cid(IdKind::Node, n)]);
+        }
+        a
+    };
+    // A node that is offline, and one the workspace does not have.
+    for n in [902, 999] {
+        let r = t.call(&peer, "start_crawl", crawl(Some(n))).await;
+        assert_eq!(reason(&r), "node_unavailable", "{}", r.text);
+        assert!(r.text.contains(&cid(IdKind::Node, n)), "{}", r.text);
+    }
+    // Out of scope is refused before the nodes are looked at.
+    world.lock().unwrap().nodes[0]["status"] = json!("offline");
+    let r = t
+        .call(
+            &peer,
+            "start_crawl",
+            json!({"url": "https://elsewhere.example/"}),
+        )
+        .await;
+    assert_eq!(reason(&r), "out_of_scope", "{}", r.text);
+    assert_eq!(refused_list(&r)[0]["host"], "elsewhere.example");
+    let r = t.call(&peer, "start_crawl", crawl(None)).await;
+    assert_eq!(reason(&r), "no_online_node", "{}", r.text);
+    world.lock().unwrap().nodes[0]["status"] = json!("online");
+    // A wordlist or a role the workspace does not have.
+    let r = t
+        .call(
+            &peer,
+            "start_content_discovery",
+            json!({"url": "https://app.example.com/", "wordlist": "nosuch"}),
+        )
+        .await;
+    assert_eq!(reason(&r), "invalid_arguments", "{}", r.text);
+    assert!(r.text.contains("nosuch"), "{}", r.text);
+    let r = t
+        .call(
+            &peer,
+            "start_authz_scan",
+            json!({"url": "https://app.example.com/", "identities": ["auditor"]}),
+        )
+        .await;
+    assert_eq!(reason(&r), "invalid_arguments", "{}", r.text);
+    assert!(world.lock().unwrap().scans.is_empty());
+    assert_eq!(starts(&cloud).len(), 6);
+
+    // Five running is the most one key may have.
+    let (t, cloud, world) = fake_cloud::server(&[], World::new("launch")).await;
+    for _ in 0..5 {
+        ok(&t.call(&peer, "start_crawl", crawl(None)).await);
+    }
+    for _ in 0..5 {
+        let r = t.call(&peer, "start_crawl", crawl(None)).await;
+        assert_eq!(reason(&r), "scan_limit", "{}", r.text);
+    }
+    // Ten launches an hour, refused ones included, and the wait is the hour's rest.
+    let r = t.call(&peer, "start_crawl", crawl(None)).await;
+    assert_eq!(reason(&r), "rate_limited", "{}", r.text);
+    let wait = r
+        .text
+        .split("\"retry_after_seconds\":")
+        .nth(1)
+        .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap();
+    assert!(wait > 3500 && wait <= 3600, "{wait}");
+    assert_eq!(world.lock().unwrap().scans.len(), 5);
+    assert_eq!(starts(&cloud).len(), 11);
 }

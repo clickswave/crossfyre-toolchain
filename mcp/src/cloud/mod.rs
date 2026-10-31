@@ -372,12 +372,52 @@ impl Cloud {
             self.announce(mcp, peer).await;
             return Err(key_rejected(refusal.reason));
         }
+        // A key made to launch, refused as one that may not: its owner's role in the
+        // workspace no longer allows it. What whoami says now decides the tools listed.
+        if refusal.reason == wire::Reason::PermissionDenied
+            && route != wire::route::WHOAMI
+            && self.permission() == Some(Permission::Launch)
+        {
+            self.reread_whoami(mcp, peer, &meta, note).await;
+        }
         if answer.status >= 500 && refusal.reason == wire::Reason::Internal {
             let why = format!("HTTP {} on {route}", answer.status);
             self.set_state(State::Unreachable(why.clone()));
             return Err(unreachable_on(route, &why));
         }
         Err(worded(&refusal, &answer, route))
+    }
+
+    /// Ask `whoami` again within a call, keeping its call id with the call's own, and
+    /// tell the client if the tools it lists have changed. A failure leaves things as
+    /// they were.
+    async fn reread_whoami(
+        &self,
+        mcp: &Mcp,
+        peer: &dyn ClientPeer,
+        meta: &client::Meta<'_>,
+        note: &mut CallNote,
+    ) {
+        let Ok(answer) = self
+            .client
+            .post(wire::route::WHOAMI, meta, &json!({}), Duration::ZERO)
+            .await
+        else {
+            return;
+        };
+        self.remember_call_id(answer.call_id.as_deref());
+        if let (Some(id), Some(n)) = (&answer.call_id, note.cloud.as_mut())
+            && n.call_ids.len() < 20
+        {
+            n.call_ids.push(id.clone());
+            note.share_cloud();
+        }
+        if (200..300).contains(&answer.status)
+            && let Ok(w) = serde_json::from_value::<wire::Whoami>(answer.envelope.data)
+        {
+            self.set_whoami(w);
+            self.announce(mcp, peer).await;
+        }
     }
 
     /// The launch confirmation: once per process, after every other local check. A
@@ -630,9 +670,20 @@ fn worded(r: &wire::Refusal, answer: &client::Answer, route: &str) -> Refusal {
     let (reason, message) = match r.reason {
         W::PermissionDenied => (
             Reason::PermissionDenied,
-            "This MCP key can read but not launch or stop scans. A launch key is made in \
-             Settings, Agent access."
+            "This MCP key may not launch or stop scans: it is a read key, or its owner's role \
+             in the workspace no longer allows it (cloud_errors says which). Nothing was \
+             started or stopped. A launch key is made in Settings, Agent access, by a member \
+             whose role may start scans."
                 .to_string(),
+        ),
+        W::RateLimited if route == wire::route::SCANS_START => (
+            Reason::RateLimited,
+            format!(
+                "The Cloud is not taking more launches from this key just now: too many in the \
+                 last hour, too many waiting for a person, or too many calls in a minute \
+                 (cloud_message says which). Nothing was started. Try again in {} s.",
+                answer.retry_after.unwrap_or(60)
+            ),
         ),
         W::RateLimited => (
             Reason::RateLimited,

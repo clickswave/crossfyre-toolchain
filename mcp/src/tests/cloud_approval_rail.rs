@@ -8,7 +8,6 @@ use serde_json::{Value, json};
 
 fn held(policy: &'static str, phones: Vec<&'static str>, fallback: bool) -> World {
     let mut w = World::new("launch");
-    w.approval_required = true;
     w.policy = policy;
     w.phones = phones;
     w.fallback = fallback;
@@ -117,7 +116,7 @@ async fn with_no_phone_a_form_decides_and_both_answers_reach_the_platform() {
         q.contains("vuln_scan") && q.contains("https://app.example.com/"),
         "{q}"
     );
-    assert!(q.contains("2 node(s) of Acme staging"), "{q}");
+    assert!(q.contains("1 node(s) of Acme staging"), "{q}");
     let d = decides(&cloud);
     assert_eq!(d.len(), 1);
     assert_eq!(d[0]["decision"], "approve");
@@ -159,12 +158,19 @@ async fn the_form_is_not_offered_where_the_workspace_does_not_allow_it() {
     assert!(peer.urls.lock().unwrap().is_empty());
     assert!(decides(&cloud).is_empty());
 
-    // No phone and the fallback off.
-    let (t, cloud, _) = fake_cloud::server(&[], held("always", vec![], false)).await;
-    let v = ok(&t.call(&peer, SCAN, args()).await).clone();
-    assert_eq!(v["status"], "awaiting_approval");
+    // No phone and the fallback off: nobody can approve it, so the platform refuses it
+    // and stores nothing.
+    let (t, cloud, world) = fake_cloud::server(&[], held("always", vec![], false)).await;
+    let r = t.call(&peer, SCAN, args()).await;
+    assert_eq!(reason(&r), "approval_required", "{}", r.text);
+    assert!(r.text.contains("Register a phone"), "{}", r.text);
     assert_eq!(peer.asked(), 0);
+    assert!(peer.urls.lock().unwrap().is_empty());
     assert!(decides(&cloud).is_empty());
+    {
+        let w = world.lock().unwrap();
+        assert!(w.approvals.is_empty() && w.scans.is_empty());
+    }
 
     // A client that can ask nothing: the page, in words.
     let (t, cloud, _) = fake_cloud::server(&[], held("always", vec![], true)).await;
@@ -204,19 +210,35 @@ async fn a_decision_against_the_launch_is_an_error_with_its_reason() {
 
 #[tokio::test]
 async fn a_risky_policy_still_asks_the_launch_question_first() {
-    // Approval needed, policy risky: the once-per-process question comes first, then
-    // the approval.
+    // Policy risky with a phone registered, and a launch across two nodes: the
+    // once-per-process question comes first, then the approval.
     let mut w = held("risky", vec!["Pixel 8"], true);
     w.decide_on_wait = Some((1, "approved", "phone"));
-    let (t, _, _) = fake_cloud::server(&[], w).await;
+    w.nodes[1]["status"] = json!("online");
+    let (t, cloud, _) = fake_cloud::server(&[], w).await;
     let peer = FakePeer::new(Elicit::Accept);
-    ok(&t.call(&peer, SCAN, args()).await);
+    let v = ok(&t.call(&peer, SCAN, args()).await).clone();
+    assert_eq!(v["approval"]["action"]["nodes"], 2, "{v}");
     assert_eq!(peer.asked(), 1);
     assert!(peer.questions.lock().unwrap()[0].contains("authorised"));
     assert_eq!(
         t.audit_lines().pop().unwrap()["confirmation"],
         "approval:phone"
     );
+    assert!(cloud.routes().iter().any(|r| r == "approvals/wait"));
+
+    // On one node a risky policy starts it at once, phone or not.
+    let (t, cloud, _) = fake_cloud::server(&[], held("risky", vec!["Pixel 8"], true)).await;
+    let v = ok(&t.call(&peer, SCAN, args()).await).clone();
+    assert!(v["scan_id"].as_str().unwrap().starts_with("cs_"), "{v}");
+    assert!(!cloud.routes().iter().any(|r| r.starts_with("approvals/")));
+    // And across nodes with no phone too: nothing is held for a phone nobody has.
+    let mut w = held("risky", vec![], true);
+    w.nodes[1]["status"] = json!("online");
+    let (t, cloud, _) = fake_cloud::server(&[], w).await;
+    let v = ok(&t.call(&peer, SCAN, args()).await).clone();
+    assert!(v["scan_id"].as_str().unwrap().starts_with("cs_"), "{v}");
+    assert!(!cloud.routes().iter().any(|r| r.starts_with("approvals/")));
 }
 
 #[tokio::test]
@@ -241,7 +263,7 @@ async fn a_cancelled_wait_leaves_the_launch_pending() {
 async fn the_form_shows_every_option_the_launch_carries() {
     let mut w = held("always", vec![], true);
     w.scope.push(("10.9.0.0/24".into(), true));
-    let (t, _, _) = fake_cloud::server(&[], w).await;
+    let (t, _, world) = fake_cloud::server(&[], w).await;
     let yes = FakePeer::new(Elicit::Accept);
     let cases = [
         (
@@ -284,6 +306,8 @@ async fn the_form_shows_every_option_the_launch_carries() {
     ];
     for (i, (tool, args, want)) in cases.into_iter().enumerate() {
         let v = ok(&t.call(&yes, tool, args.clone()).await).clone();
+        // Each ends before the next, as a key may have only five running.
+        fake_cloud::end_scans(&world);
         let q = yes.questions.lock().unwrap()[i].clone();
         for w in want {
             assert!(q.contains(w), "{tool} {args}: {w} not in {q}");
@@ -307,7 +331,6 @@ async fn a_launch_sent_with_nobody_asked_is_never_started_at_once() {
     {
         let mut w = world.lock().unwrap();
         w.policy = "risky";
-        w.approval_required = false;
     }
     let peer = FakePeer::new(Elicit::Accept);
     let v = ok(&t.call(&peer, SCAN, args()).await).clone();
@@ -384,4 +407,74 @@ async fn a_launch_open_when_the_server_stops_keeps_its_cloud_fields() {
     // The call ends later and writes no second line.
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), call).await;
     assert_eq!(calls(&t).len(), 1, "{:#?}", calls(&t));
+}
+
+#[tokio::test]
+async fn the_same_launch_is_one_approval_and_a_denial_stands() {
+    // Waiting on the phone: asked for again, it is the same approval, not a second one.
+    let (t, _, world) = fake_cloud::server(&[], held("always", vec!["Pixel 8"], true)).await;
+    let peer = FakePeer::new(Elicit::None);
+    let first = ok(&t.call(&peer, SCAN, args()).await).clone();
+    let again = ok(&t.call(&peer, SCAN, args()).await).clone();
+    assert_eq!(first["scan_id"], again["scan_id"]);
+    assert_eq!(world.lock().unwrap().approvals.len(), 1);
+
+    // Denied in the client's form, then asked for again: the platform answers with the
+    // denial, and nobody is asked a second time.
+    let (t, cloud, world) = fake_cloud::server(&[], held("always", vec![], true)).await;
+    let no = FakePeer::new(Elicit::Decline);
+    let r = t.call(&no, SCAN, args()).await;
+    assert_eq!(reason(&r), "approval_denied", "{}", r.text);
+    let r = t.call(&no, SCAN, args()).await;
+    assert_eq!(reason(&r), "approval_denied", "{}", r.text);
+    assert!(r.text.contains("did not ask again"), "{}", r.text);
+    assert!(r.text.contains("\"denied_before\":true"), "{}", r.text);
+    assert_eq!(no.asked(), 1, "the person was asked again");
+    assert_eq!(decides(&cloud).len(), 1);
+    let w = world.lock().unwrap();
+    assert_eq!(w.approvals.len(), 1);
+    assert!(w.scans.is_empty());
+}
+
+#[tokio::test]
+async fn too_many_launches_waiting_is_a_limit_on_launches() {
+    let (t, cloud, _) = fake_cloud::server(&[], held("always", vec!["Pixel 8"], true)).await;
+    let peer = FakePeer::new(Elicit::None);
+    for path in ["a", "b", "c"] {
+        let urls = json!({"urls": [format!("https://app.example.com/{path}")]});
+        let v = ok(&t.call(&peer, SCAN, urls).await).clone();
+        assert_eq!(v["status"], "awaiting_approval");
+    }
+    let r = t
+        .call(&peer, SCAN, json!({"urls": ["https://app.example.com/d"]}))
+        .await;
+    assert_eq!(reason(&r), "rate_limited", "{}", r.text);
+    let said = r.text.lines().next().unwrap();
+    assert!(said.contains("launches"), "{said}");
+    assert!(r.text.contains("\"retry_after_seconds\":60"), "{}", r.text);
+    assert!(
+        r.text
+            .contains("Too many launches are waiting for approval"),
+        "{}",
+        r.text
+    );
+    // Each waiting launch is a row of list_scans, with the handle that follows it.
+    let v = ok(&t
+        .call(&peer, "list_scans", json!({"backend": "cloud"}))
+        .await)
+    .clone();
+    let rows = v["scans"].as_array().unwrap();
+    assert_eq!(rows.len(), 3, "{v}");
+    assert!(
+        rows.iter().all(|s| s["status"] == "awaiting_approval"
+            && s["scan_id"].as_str().unwrap().starts_with("ap_"))
+    );
+    assert_eq!(
+        cloud
+            .routes()
+            .iter()
+            .filter(|r| *r == "scans/start")
+            .count(),
+        4
+    );
 }
