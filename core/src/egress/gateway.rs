@@ -148,6 +148,8 @@ impl Gateway {
             // third-party hosts on purpose, and the engines fence their own scope.
             scope: None,
             log: Mutex::new(EgressLog::default()),
+            bytes_up: AtomicU64::new(0),
+            bytes_down: AtomicU64::new(0),
             ended,
         });
         leases.insert(handle.clone(), Arc::clone(&state));
@@ -218,8 +220,14 @@ impl Gateway {
         if socks5_server::reply(&mut s, SUCCEEDED).await.is_err() {
             return;
         }
-        let (up, down) = pump(s, tunnel, self.idle, ended).await;
-        lease.add_bytes(up, down);
+        pump(
+            s,
+            tunnel,
+            self.idle,
+            ended,
+            (&lease.bytes_up, &lease.bytes_down),
+        )
+        .await;
     }
 
     /// A line in the node's log when the gateway turns connections away, at most once a
@@ -347,23 +355,23 @@ fn random_hex(bytes: usize) -> Result<String, String> {
 }
 
 /// Copies both ways until both sides are done, the tunnel is idle for `idle`, or the
-/// lease ends. Returns the bytes sent toward the destination and back.
+/// lease ends. The bytes sent toward the destination and back are added to `up` and
+/// `down` as they pass, so a summary taken while the tunnel is still open has them.
 async fn pump(
     mut client: TcpStream,
     tunnel: Tunnel,
     idle: Duration,
     mut ended: watch::Receiver<bool>,
-) -> (u64, u64) {
+    (up, down): (&AtomicU64, &AtomicU64),
+) {
     let start = Instant::now();
     let last = AtomicU64::new(0);
-    let up = AtomicU64::new(0);
-    let down = AtomicU64::new(0);
     let (cr, cw) = client.split();
     let (tr, tw) = tokio::io::split(tunnel);
     let both = async {
         tokio::join!(
-            copy_counting(cr, tw, &up, &last, start),
-            copy_counting(tr, cw, &down, &last, start)
+            copy_counting(cr, tw, up, &last, start),
+            copy_counting(tr, cw, down, &last, start)
         )
     };
     let quiet = async {
@@ -382,7 +390,6 @@ async fn pump(
         _ = quiet => {}
         _ = until_ended(&mut ended) => {}
     }
-    (up.load(Ordering::Relaxed), down.load(Ordering::Relaxed))
 }
 
 async fn copy_counting<R, W>(
@@ -426,6 +433,9 @@ pub(crate) struct LeaseState {
     /// Always `None` for now.
     scope: Option<Arc<cfx_scope::Guard>>,
     log: Mutex<EgressLog>,
+    /// Bytes toward the destinations and back, across every tunnel, open ones included.
+    bytes_up: AtomicU64,
+    bytes_down: AtomicU64,
     /// `true` once the lease is dropped. Open tunnels watch it and close.
     ended: watch::Sender<bool>,
 }
@@ -447,13 +457,6 @@ impl LeaseState {
                     self.upstream.label()
                 );
             }
-        }
-    }
-
-    fn add_bytes(&self, up: u64, down: u64) {
-        if let Ok(mut log) = self.log.lock() {
-            log.bytes_up += up;
-            log.bytes_down += down;
         }
     }
 }
@@ -483,8 +486,6 @@ struct EgressLog {
     connections: u64,
     refused: u64,
     failed: u64,
-    bytes_up: u64,
-    bytes_down: u64,
     /// Why the latest refused or failed connection did not open. Never holds
     /// credentials: a tunnel error does not quote the proxy URL.
     last_error: Option<String>,
@@ -586,8 +587,8 @@ impl Lease {
             "connections": log.connections,
             "refused": log.refused,
             "failed": log.failed,
-            "bytes_up": log.bytes_up,
-            "bytes_down": log.bytes_down,
+            "bytes_up": self.state.bytes_up.load(Ordering::Relaxed),
+            "bytes_down": self.state.bytes_down.load(Ordering::Relaxed),
             "hosts_truncated": log.unlisted > 0,
             "hosts": hosts,
         })

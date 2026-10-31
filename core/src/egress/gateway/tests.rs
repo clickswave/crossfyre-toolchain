@@ -261,7 +261,7 @@ async fn the_summary_counts_each_destination() {
         );
     }
     assert!(through(&lease, "10.0.0.1", fx.port).await.is_err());
-    // The byte counts land when each tunnel closes.
+    // The byte counts land as the bytes pass.
     for _ in 0..50 {
         if lease.summary()["bytes_down"].as_u64().unwrap_or(0) >= 2000 {
             break;
@@ -506,7 +506,10 @@ async fn the_end_of_an_upload_reaches_an_https_proxy() {
     let mut engine = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
     let (gw_side, _) = l.accept().await.unwrap();
     let (_alive, ended) = watch::channel(false);
-    let pumping = tokio::spawn(pump(gw_side, tunnel, IDLE, ended));
+    let pumping = tokio::spawn(async move {
+        let (up, down) = (AtomicU64::new(0), AtomicU64::new(0));
+        pump(gw_side, tunnel, IDLE, ended, (&up, &down)).await
+    });
 
     // A request body, then the answer read with the connection still open, as an HTTP
     // client waits for one.
@@ -520,4 +523,52 @@ async fn the_end_of_an_upload_reaches_an_https_proxy() {
         matches!(got, Ok(Ok(_))) && &answer == b"OK",
         "no answer within 20 s; the proxy side read {reached} of {TOTAL} bytes"
     );
+}
+
+/// The bytes of a connection that is still open are in the summary. An engine's client
+/// keeps its connections in a pool after the op's last request, and the op's summary is
+/// taken as soon as the engine says it is done, before the pool closes them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_summary_counts_the_bytes_of_open_connections() {
+    let rec = Recorder::start(to_loopback).await;
+    let fx = Fixture::http("text/plain", "x".repeat(5000)).await;
+    let gw = gateway(&[]).await;
+    let lease = gw
+        .lease("op", "proxy-1", Arc::new(recorder_upstream(&rec)), false)
+        .unwrap();
+    // An engine's client: a keep-alive pool, sending through the lease's URL.
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .proxy(reqwest::Proxy::all(lease.proxy_url()).unwrap())
+        .build()
+        .unwrap();
+    for _ in 0..3 {
+        let body = client
+            .get(format!("http://app.example.test:{}/", fx.port))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(body.len(), 5000);
+    }
+    let mut s = lease.summary();
+    for _ in 0..50 {
+        if s["bytes_down"].as_u64().unwrap_or(0) >= 15000 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        s = lease.summary();
+    }
+    assert_eq!(
+        s["connections"], 1,
+        "the pool did not keep its connection: {s}"
+    );
+    assert!(s["bytes_up"].as_u64().unwrap() > 0, "{s}");
+    assert!(
+        s["bytes_down"].as_u64().unwrap() >= 15000,
+        "15000 body bytes came back through the open connection: {s}"
+    );
+    drop(client);
 }
