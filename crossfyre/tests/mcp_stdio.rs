@@ -899,3 +899,160 @@ fn a_workbench_that_starts_later_changes_the_tool_list() {
     wait_exit(&mut child, Duration::from_secs(10));
     let _ = std::fs::remove_dir_all(&data);
 }
+
+/// Against a running platform rather than a stand-in, as an agent would use it: log in
+/// with an MCP key, `whoami`, check the scope, a launch in scope held for a person, and
+/// one out of scope refused before anything is made.
+///
+/// Skipped unless `CROSSFYRE_DEV_CLOUD=1`. It needs:
+///
+/// - `CROSSFYRE_DEV_CLOUD_URL`: the dashboard origin that serves `/api/v1/mcp`
+///   (default `http://localhost:12004`, a dev stack's web server);
+/// - `CROSSFYRE_DEV_CLOUD_KEY`: a launch key (`cfm_...`) for a workspace set to ask about
+///   every launch, whose owner has no phone registered and allows the fallback;
+/// - `CROSSFYRE_DEV_CLOUD_TARGET`: a host in the scope the key's owner confirmed;
+/// - an online node in that workspace with the crawl engine.
+///
+/// The held launch is withdrawn before the test ends, so a rerun starts clean and the
+/// workspace is left as it was found.
+#[test]
+fn a_dev_cloud_holds_a_launch_in_scope_and_refuses_one_outside() {
+    if std::env::var("CROSSFYRE_DEV_CLOUD").as_deref() != Ok("1") {
+        eprintln!("skipped: set CROSSFYRE_DEV_CLOUD=1 to run against a dev platform");
+        return;
+    }
+    let need = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| panic!("CROSSFYRE_DEV_CLOUD=1 needs {name}"))
+    };
+    let api_url = std::env::var("CROSSFYRE_DEV_CLOUD_URL")
+        .unwrap_or_else(|_| "http://localhost:12004".into())
+        .trim_end_matches('/')
+        .to_string();
+    let key = need("CROSSFYRE_DEV_CLOUD_KEY");
+    let target = need("CROSSFYRE_DEV_CLOUD_TARGET");
+    let inside = format!("https://{target}/");
+    let outside = format!("https://outside-{}.example.net/", std::process::id());
+    let secret = key.strip_prefix("cfm_").expect("an MCP key").to_string();
+
+    let data = temp_dir("dev-cloud");
+    write_config(&data, closed_port(), closed_port());
+    // No entries: the scope file narrows nothing, and the platform decides alone.
+    write_scope(&data, "entries = []\n");
+
+    // Log in: the key is checked with the platform, then saved for the server.
+    let mut login = Command::new(env!("CARGO_BIN_EXE_crossfyre"))
+        .arg("--data-dir")
+        .arg(&data)
+        .args(["mcp", "cloud", "login", "--api-url", &api_url])
+        .env_remove("CROSSFYRE_MCP_CLOUD_KEY")
+        .env_remove("CROSSFYRE_MCP_CLOUD_URL")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(login.stdin.take().unwrap(), "{key}").unwrap();
+    let out = login.wait_with_output().unwrap();
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "login: {said}");
+    assert!(
+        said.contains(&key[..12]) && said.contains("launch"),
+        "{said}"
+    );
+    assert!(!said.contains(&secret), "login printed the key");
+
+    let mut child = spawn(&data);
+    let mut stderr = child.stderr.take().unwrap();
+    let (mut c, all_lines) = Client::attach(&mut child);
+    // A client that shows no forms, so the held launch comes back as its handle.
+    c.initialize(false);
+    c.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+    let names = tool_names(&c.reply(2)["result"]["tools"]);
+    for t in [
+        "whoami",
+        "check_scope",
+        "start_crawl",
+        "get_scan",
+        "cancel_scan",
+    ] {
+        assert!(names.iter().any(|n| n == t), "{t} not listed: {names:?}");
+    }
+
+    let who = c.call(3, "whoami", json!({}));
+    let w = &who["structuredContent"];
+    assert_eq!(w["key"]["permission"], "launch", "{who}");
+    assert_eq!(w["key"]["prefix"], &key[..12], "{who}");
+    assert_eq!(w["approval"]["policy"], "always", "{who}");
+    assert_eq!(w["approval"]["phone_registered"], false, "{who}");
+
+    let checked = c.call(
+        4,
+        "check_scope",
+        json!({"targets": [inside, outside], "kind": "url"}),
+    );
+    let allowed: Vec<Value> = checked["structuredContent"]["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{checked}"))
+        .iter()
+        .map(|r| r["cloud_launch_allowed"].clone())
+        .collect();
+    assert_eq!(allowed, vec![json!(true), json!(false)], "{checked}");
+
+    // In scope: held for a person, and the answer is the handle and where to decide it.
+    let held = c.call(5, "start_crawl", json!({"url": inside, "max_depth": 1}));
+    let h = &held["structuredContent"];
+    assert_ne!(held["isError"], true, "{held}");
+    assert_eq!(h["status"], "awaiting_approval", "{held}");
+    let ap = h["scan_id"].as_str().unwrap_or("").to_string();
+    assert!(ap.starts_with("ap_"), "{held}");
+    assert_eq!(h["approval"]["fallback"], true, "{held}");
+    let page = h["approval"]["approve_url"].as_str().unwrap_or("");
+    assert!(page.starts_with(&format!("{api_url}/m/approve/")), "{held}");
+    let seen = c.call(6, "get_scan", json!({"scan_id": ap}));
+    assert_eq!(
+        seen["structuredContent"]["status"], "awaiting_approval",
+        "{seen}"
+    );
+
+    // Out of scope: refused by the platform, and nothing held or started.
+    let refused = c.call(7, "start_crawl", json!({"url": outside}));
+    assert_eq!(refused["isError"], true, "{refused}");
+    let text = refused["content"][0]["text"].as_str().unwrap_or("");
+    assert!(text.contains("\"reason\":\"out_of_scope\""), "{text}");
+    assert!(text.contains("\"at\":\"cloud_scope\""), "{text}");
+    assert!(!text.contains("ap_") && !text.contains("cs_"), "{text}");
+
+    // Withdraw the held launch.
+    let gone = c.call(8, "cancel_scan", json!({"scan_id": ap}));
+    assert_ne!(gone["isError"], true, "{gone}");
+    assert_eq!(gone["structuredContent"]["cancel"], "withdrawn", "{gone}");
+
+    drop(c.stdin);
+    assert!(wait_exit(&mut child, Duration::from_secs(20)).success());
+    let mut err = String::new();
+    stderr.read_to_string(&mut err).unwrap();
+    let stdout = all_lines.lock().unwrap().join("\n");
+    let (audit, calls) = audit_calls(&data);
+    for (what, text) in [
+        ("stderr", &err),
+        ("stdout", &stdout),
+        ("the audit log", &audit),
+    ] {
+        assert!(!text.contains(&secret), "{what} holds the key");
+    }
+    // Every Cloud call carries the platform's record of it.
+    let cloud_calls: Vec<&Value> = calls.iter().filter(|l| l["backend"] == "cloud").collect();
+    assert!(cloud_calls.len() >= 5, "{audit}");
+    assert!(
+        cloud_calls.iter().all(|l| l["cloud_call_id"].is_string()),
+        "{audit}"
+    );
+    let _ = std::fs::remove_dir_all(&data);
+}
