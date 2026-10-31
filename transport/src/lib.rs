@@ -84,6 +84,14 @@ pub struct ClientConfig {
     pub timeout: Option<Duration>,
     pub redirect: Redirect,
     /// Trust invalid/self-signed certs (scanners deliberately hit such hosts).
+    ///
+    /// Not honoured under [`Egress::Proxy`]: through a proxy the node was given, the
+    /// destination's certificate is always checked. The proxy carries the bytes of the
+    /// TLS connection, so one that answered with a certificate of its own would read
+    /// every header, cookie and token the client sends, and write the responses it
+    /// reads. A proxy the operator set in `CROSSFYRE_EGRESS_PROXY` (under
+    /// [`Egress::Inherit`]) is their own, often one that intercepts on purpose, and
+    /// keeps this setting.
     pub accept_invalid_certs: bool,
     pub cookie_store: bool,
     /// The identity's User-Agent. Sent when NOT emulating; when emulating, the
@@ -185,7 +193,8 @@ fn will_emulate(_: &ClientConfig) -> bool {
 ///
 /// A proxy is never quietly dropped: anything that keeps one from being used is a
 /// [`BuildError::Egress`], never a direct client. Names always go to the proxy
-/// unresolved (see [`egress`]).
+/// unresolved (see [`egress`]). Under `Proxy(url)` certificates are checked whatever
+/// [`ClientConfig::accept_invalid_certs`] says.
 pub fn build_client(cfg: ClientConfig, egress: &Egress) -> Result<Client, BuildError> {
     let route = egress::route(
         egress,
@@ -282,14 +291,17 @@ pub fn build_client(cfg: ClientConfig, egress: &Egress) -> Result<Client, BuildE
         }
     };
 
+    // Through a proxy the node was given, the destination proves who it is: see
+    // `ClientConfig::accept_invalid_certs`.
+    let accept_invalid_certs = cfg.accept_invalid_certs && !matches!(egress, Egress::Proxy(_));
     // Cert handling differs by backend.
     #[cfg(not(feature = "impersonate"))]
-    if cfg.accept_invalid_certs {
+    if accept_invalid_certs {
         b = b.danger_accept_invalid_certs(true);
     }
     #[cfg(feature = "impersonate")]
     {
-        if cfg.accept_invalid_certs {
+        if accept_invalid_certs {
             b = b.cert_verification(false).verify_hostname(false);
         }
         if let Some(browser) = profile(&cfg) {
@@ -333,6 +345,7 @@ pub struct ScanClient<'a> {
     pub emulate: bool,
     pub timeout: Option<Duration>,
     pub redirect: Redirect,
+    /// See [`ClientConfig::accept_invalid_certs`], which this becomes.
     pub accept_invalid_certs: bool,
     pub cookie_store: bool,
     pub resolve: Vec<(String, std::net::SocketAddr)>,

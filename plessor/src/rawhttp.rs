@@ -29,6 +29,21 @@ pub struct Route {
     pub block_internal: bool,
 }
 
+impl Route {
+    /// The certificate policy a send on this route runs under: the caller's, except
+    /// through a proxy the node was given, where the origin always has to prove who it
+    /// is. The proxy carries the TLS bytes, so one that answered with a certificate of
+    /// its own would read the request and write the response, as it would for the op's
+    /// HTTP client, which checks certificates there too.
+    pub fn verify(&self, asked: Verify) -> Verify {
+        if matches!(self.egress, transport::Egress::Proxy(_)) {
+            Verify::WebPki
+        } else {
+            asked
+        }
+    }
+}
+
 pub struct RawResp {
     pub status: u16,
     /// "name: value\n" per header, name lowercased (mirrors template::Resp).
@@ -56,7 +71,8 @@ pub async fn send(req: RawReq<'_>) -> Option<RawResp> {
     let request = build_request(&req, &host, port, https, &target);
     // A template probe, so Verify::Any: plessor scans hosts whose certificates are
     // expired, self-signed or for another name, and refusing to look at them would
-    // remove most internal applications from what it can test.
+    // remove most internal applications from what it can test. Not through a proxy the
+    // node was given: see `Route::verify`.
     let to = req.timeout;
     let raw = tokio::time::timeout(to, async {
         let stream = dial(req.route, &host, port, None, to).await?;
@@ -66,7 +82,7 @@ pub async fn send(req: RawReq<'_>) -> Option<RawResp> {
                 &host,
                 request.as_bytes(),
                 ReadUntil::Closed,
-                Verify::Any,
+                req.route.verify(Verify::Any),
             )
             .await
         } else {
@@ -354,7 +370,8 @@ where
     Some(buf)
 }
 
-/// The scanners' sender: read to close, and accept any certificate.
+/// The scanners' sender: read to close, and accept any certificate, except through a
+/// proxy the node was given (see [`Route::verify`]).
 ///
 /// Both of those are deliberate and neither is a default worth changing here. See
 /// [`ReadUntil::Closed`] and [`Verify::Any`].
@@ -426,7 +443,7 @@ pub async fn send_until_via(
     let out = match tokio::time::timeout(timeout, async {
         let stream = dial(route, host, port, connect, timeout).await?;
         if https {
-            send_tls(stream, host, data, until, verify).await
+            send_tls(stream, host, data, until, route.verify(verify)).await
         } else {
             send_plain(stream, data, until).await
         }
