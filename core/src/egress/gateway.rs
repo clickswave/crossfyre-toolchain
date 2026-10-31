@@ -37,6 +37,28 @@ use tokio::sync::{Semaphore, watch};
 /// each is accepted. One more is closed before anything is read from it.
 pub const MAX_CONNECTIONS: usize = 2048;
 
+/// Descriptors the node keeps for everything but the gateway's tunnels: its connections
+/// to the control plane, to NATS, and to the engine of each op it runs.
+const RESERVED_FDS: u64 = 512;
+
+/// The fewest connections the gateway is sized for, whatever the limit says.
+const MIN_CONNECTIONS: usize = 16;
+
+/// How many connections the gateway holds at once under a limit of `open_files`
+/// descriptors: [`MAX_CONNECTIONS`], or fewer when the process may not open two for
+/// each, the engine's side and the proxy's, and keep [`RESERVED_FDS`] besides. Over
+/// the cap a connection is turned away at once, where past the descriptor limit it
+/// would fail somewhere less clear, and so would whatever else the node was opening.
+pub fn connection_cap(open_files: Option<u64>) -> usize {
+    let Some(n) = open_files else {
+        return MAX_CONNECTIONS;
+    };
+    let fit = n.saturating_sub(RESERVED_FDS) / 2;
+    usize::try_from(fit)
+        .unwrap_or(usize::MAX)
+        .clamp(MIN_CONNECTIONS, MAX_CONNECTIONS)
+}
+
 /// Destinations listed one by one in a lease's summary. Connections to any further
 /// destination are still counted in the totals.
 pub const MAX_HOSTS: usize = 200;
@@ -84,10 +106,11 @@ impl fmt::Debug for Gateway {
 }
 
 impl Gateway {
-    /// Listen on an ephemeral port on 127.0.0.1. The gateway stops accepting once the
-    /// last handle to it is dropped.
+    /// Listen on an ephemeral port on 127.0.0.1, sized to the descriptor limit in force.
+    /// The gateway stops accepting once the last handle to it is dropped.
     pub async fn bind(resolver: Resolver) -> io::Result<Arc<Gateway>> {
-        Gateway::bind_with(resolver, Timeouts::default(), IDLE, MAX_CONNECTIONS).await
+        let cap = connection_cap(crate::os::open_file_limit());
+        Gateway::bind_with(resolver, Timeouts::default(), IDLE, cap).await
     }
 
     pub(crate) async fn bind_with(

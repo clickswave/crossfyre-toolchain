@@ -5,6 +5,70 @@
 //! On Linux every function does exactly what the code that called libc or /proc directly
 //! used to do.
 
+/// The most open descriptors the node asks for: room for the egress gateway's full
+/// complement of tunnels, two descriptors each, and everything else the node holds.
+pub const OPEN_FILES_WANTED: u64 = 65536;
+
+/// The process's soft limit on open descriptors, where the platform has one.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)] // rlim_t is u64 here, and not on every Unix
+pub fn open_file_limit() -> Option<u64> {
+    let mut rl = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit only writes the struct it is given.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 {
+        return None;
+    }
+    Some(rl.rlim_cur as u64)
+}
+
+#[cfg(not(unix))]
+pub fn open_file_limit() -> Option<u64> {
+    None
+}
+
+/// Raise the soft limit on open descriptors toward [`OPEN_FILES_WANTED`], as far as the
+/// hard limit allows. Returns the limit before and after, or `None` where the platform
+/// has no such limit.
+///
+/// A service usually starts with a soft limit of 1024, which the egress gateway reaches
+/// at about 500 tunnels, well short of its own cap. Past it, accepting a connection and
+/// dialling the proxy both fail, and so does everything else the node opens.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)] // rlim_t is u64 here, and not on every Unix
+pub fn raise_open_file_limit() -> Result<Option<(u64, u64)>, String> {
+    let mut rl = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit only writes the struct it is given.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let before = rl.rlim_cur as u64;
+    let mut want = (rl.rlim_max as u64).min(OPEN_FILES_WANTED);
+    // macOS refuses a soft limit above OPEN_MAX, whatever the hard limit says.
+    if cfg!(target_os = "macos") {
+        want = want.min(10240);
+    }
+    if before >= want {
+        return Ok(Some((before, before)));
+    }
+    rl.rlim_cur = want as libc::rlim_t;
+    // SAFETY: setrlimit only reads the struct it is given.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rl) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(Some((before, want)))
+}
+
+#[cfg(not(unix))]
+pub fn raise_open_file_limit() -> Result<Option<(u64, u64)>, String> {
+    Ok(None)
+}
+
 /// Does this process have full administrative rights: root on Unix, an elevated token on
 /// Windows?
 #[cfg(unix)]

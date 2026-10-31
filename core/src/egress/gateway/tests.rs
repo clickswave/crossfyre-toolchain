@@ -679,3 +679,14 @@ async fn a_proxy_that_refuses_the_credentials_is_asked_once() {
     assert_eq!(s["connections"], 1, "{s}");
     assert_eq!(s["failed"], 1, "{s}");
 }
+
+#[test]
+fn the_cap_leaves_room_under_the_descriptor_limit() {
+    assert_eq!(connection_cap(None), MAX_CONNECTIONS);
+    assert_eq!(connection_cap(Some(65536)), MAX_CONNECTIONS);
+    assert_eq!(connection_cap(Some(512 + 2 * 2048)), MAX_CONNECTIONS);
+    // A service's usual soft limit, where 2048 tunnels would need four times as many.
+    assert_eq!(connection_cap(Some(1024)), 256);
+    assert_eq!(connection_cap(Some(100)), MIN_CONNECTIONS);
+    assert_eq!(connection_cap(Some(u64::MAX)), MAX_CONNECTIONS);
+}

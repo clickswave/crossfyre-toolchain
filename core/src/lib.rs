@@ -2104,6 +2104,18 @@ pub async fn run_daemon(
     println!("Node id       : {}", paths.node_id);
     println!("Config root   : {}", paths.base.display());
     print_privilege_banner(std::env::var("CFX_ALLOW_UNPRIV_DAEMON").is_err());
+    // Before anything is opened: the egress gateway holds two descriptors per tunnel,
+    // and a service's usual soft limit runs out at a quarter of its cap.
+    match os::raise_open_file_limit() {
+        Ok(Some((before, after))) if after > before => {
+            println!("Open files    : limit raised from {before} to {after}")
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!(
+            "Open files    : the limit could not be raised ({e}); a proxied node's gateway \
+             holds fewer connections at once"
+        ),
+    }
 
     // --- PID lock: scoped to this node-id, so multiple nodes can coexist in
     // the same config root - each holds its own `nodes.d/<node-id>.pid`. ---
