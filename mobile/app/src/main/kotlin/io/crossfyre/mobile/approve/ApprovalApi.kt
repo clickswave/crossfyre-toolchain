@@ -91,8 +91,12 @@ data class InboxItem(
     val createdAt: Instant?,
 )
 
-/** One page of notifications, newest first. [unread] counts the account's unread ones, whatever the page holds. */
-data class InboxPage(val items: List<InboxItem>, val total: Int, val unread: Int, val page: Int)
+/**
+ * One page of notifications, newest first. [unread] counts the account's unread
+ * ones, whatever the page holds. [limit] is the page size the server used, so
+ * page [page] covered rows up to `page * limit` of [total].
+ */
+data class InboxPage(val items: List<InboxItem>, val total: Int, val unread: Int, val page: Int, val limit: Int)
 
 /** What marking notifications read came to: the rows that changed and the unread ones left. */
 data class InboxMarked(val marked: Int, val unread: Int)
@@ -357,7 +361,8 @@ class ApprovalApi(origin: String, private val transport: Transport) {
 
     /** A page of the account's notifications, newest first. Answered only for a phone that approves. */
     fun inbox(key: String, page: Int = 1, limit: Int = 20, unreadOnly: Boolean = false): Outcome<InboxPage> {
-        val body = JSONObject().put("api_key", key).put("page", page.coerceAtLeast(1)).put("limit", limit.coerceIn(1, 50))
+        val asked = limit.coerceIn(1, 50)
+        val body = JSONObject().put("api_key", key).put("page", page.coerceAtLeast(1)).put("limit", asked)
         if (unreadOnly) body.put("filter", "unread")
         return call("inbox/list", body) { a ->
             phoneRefusal(a) ?: when {
@@ -366,7 +371,12 @@ class ApprovalApi(origin: String, private val transport: Transport) {
                     val items = d.optJSONArray("items") ?: return@call a.unreadable()
                     if (!d.has("unread")) return@call a.unreadable()
                     val read = items.objects().mapNotNull(::notification)
-                    Outcome.Ok(InboxPage(read, d.optInt("total", read.size), d.optInt("unread", 0), d.optInt("page", page)))
+                    Outcome.Ok(
+                        InboxPage(
+                            read, d.optInt("total", read.size), d.optInt("unread", 0), d.optInt("page", page),
+                            d.optInt("limit", asked).coerceAtLeast(1),
+                        )
+                    )
                 }
                 else -> a.refusal()
             }

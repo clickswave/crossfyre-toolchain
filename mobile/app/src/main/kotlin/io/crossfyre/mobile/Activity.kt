@@ -93,9 +93,16 @@ data class InboxList(
     val unread: Int = 0,
     /** The last page read; 0 before the first. */
     val page: Int = 0,
+    /** The page size the server used for it. */
+    val limit: Int = 1,
 ) {
-    /** Whether there are older rows than the ones shown. */
-    val more: Boolean get() = page > 0 && items.size < total
+    /**
+     * Whether the server has rows past the last page read. Not whether fewer
+     * rows are shown than [total]: a row that arrived after page 1 is counted
+     * but sits above it, where no later page reaches, so that count never
+     * closed and Show older went on asking for empty pages.
+     */
+    val more: Boolean get() = page > 0 && total.toLong() > page.toLong() * limit
 
     /**
      * With [p] read: page 1 replaces what was shown, a later page adds the rows
@@ -103,8 +110,8 @@ data class InboxList(
      * between moves the rest down and a later page can repeat a row.
      */
     fun with(p: InboxPage): InboxList =
-        if (p.page <= 1) InboxList(p.items, p.total, p.unread, 1)
-        else InboxList(items + p.items.filter { n -> items.none { it.id == n.id } }, p.total, p.unread, p.page)
+        if (p.page <= 1) InboxList(p.items, p.total, p.unread, 1, p.limit)
+        else InboxList(items + p.items.filter { n -> items.none { it.id == n.id } }, p.total, p.unread, p.page, p.limit)
 
     /** [ids] marked read on the server, with [unread] the count it gave back. */
     fun read(ids: Collection<String>, unread: Int): InboxList =

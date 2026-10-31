@@ -369,6 +369,7 @@ class ApprovalApiTest {
         assertEquals(8, page.total)
         assertEquals(5, page.unread)
         assertEquals(2, page.page)
+        assertEquals(20, page.limit)
         assertEquals(2, page.items.size)
         val n = page.items[0]
         assertEquals(id, n.id)

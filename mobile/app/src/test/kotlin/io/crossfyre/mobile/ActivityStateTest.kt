@@ -93,21 +93,37 @@ class ActivityStateTest {
     fun the_inbox_pages_add_up_and_a_read_clears_only_its_rows() {
         var list = InboxList()
         assertFalse(list.more)
-        list = list.with(InboxPage(listOf(item("a"), item("b")), total = 3, unread = 3, page = 1))
+        list = list.with(InboxPage(listOf(item("a"), item("b")), total = 3, unread = 3, page = 1, limit = 2))
         assertTrue(list.more)
         // A row that arrived in between pushes one already shown onto the next page.
-        list = list.with(InboxPage(listOf(item("b"), item("c")), total = 4, unread = 4, page = 2))
+        list = list.with(InboxPage(listOf(item("b"), item("c")), total = 4, unread = 4, page = 2, limit = 2))
         assertEquals(listOf("a", "b", "c"), list.items.map { it.id })
         assertEquals(2, list.page)
-        assertTrue(list.more)
         list = list.read(listOf("b"), unread = 3)
         assertEquals(listOf(false, true, false), list.items.map { it.read })
         assertEquals(3, list.unread)
         list = list.allRead(unread = 0)
         assertTrue(list.items.all { it.read })
         // Page 1 again starts over, with what the server has now.
-        list = list.with(InboxPage(listOf(item("d")), total = 1, unread = 1, page = 1))
+        list = list.with(InboxPage(listOf(item("d")), total = 1, unread = 1, page = 1, limit = 2))
         assertEquals(listOf("d"), list.items.map { it.id })
+        assertFalse(list.more)
+    }
+
+    @Test
+    fun show_older_ends_where_the_servers_rows_end_when_one_arrived_between_pages() {
+        // Pages of two over a, b, c; then d arrives on top, so page 2 is b and c again.
+        var list = InboxList().with(InboxPage(listOf(item("a"), item("b")), total = 3, unread = 3, page = 1, limit = 2))
+        assertTrue(list.more)
+        list = list.with(InboxPage(listOf(item("b"), item("c")), total = 4, unread = 4, page = 2, limit = 2))
+        assertEquals(listOf("a", "b", "c"), list.items.map { it.id })
+        // Three shown of four, but the fourth is d, above page 1: there is no page 3 to ask for.
+        assertFalse("Show older is still offered with nothing past page 2", list.more)
+        // Refreshing page 1 is what brings d in.
+        list = list.with(InboxPage(listOf(item("d"), item("a")), total = 4, unread = 4, page = 1, limit = 2))
+        assertTrue(list.more)
+        // A page that comes back empty ends it too: the rows went while it was asked for.
+        list = list.with(InboxPage(emptyList(), total = 2, unread = 2, page = 2, limit = 2))
         assertFalse(list.more)
     }
 
