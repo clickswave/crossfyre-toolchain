@@ -346,6 +346,8 @@ pub(crate) enum Elicit {
 
 pub(crate) struct FakePeer {
     pub elicit: Elicit,
+    /// The name the client gave in `initialize`.
+    pub label: String,
     asked: AtomicUsize,
     pub questions: Mutex<Vec<String>>,
     pub progress: Mutex<Vec<(f64, Option<f64>)>>,
@@ -355,6 +357,7 @@ impl FakePeer {
     pub(crate) fn new(elicit: Elicit) -> Self {
         FakePeer {
             elicit,
+            label: "fake-client 1.0".into(),
             asked: AtomicUsize::new(0),
             questions: Mutex::new(Vec::new()),
             progress: Mutex::new(Vec::new()),
@@ -367,7 +370,7 @@ impl FakePeer {
 
 impl ClientPeer for FakePeer {
     fn label(&self) -> String {
-        "fake-client 1.0".into()
+        self.label.clone()
     }
     fn can_elicit_form(&self) -> bool {
         self.elicit != Elicit::None

@@ -296,7 +296,7 @@ pub(crate) async fn run(
         id: h.id,
         edits,
         pins,
-        label: untrusted::clean(&peer.label(), cfx_bridge::LABEL_MAX),
+        label: bridge_label(&peer.label()),
         mcp: McpRef {
             session: mcp.session.clone(),
             seq: note.seq,
@@ -369,6 +369,21 @@ pub(crate) async fn run(
     fit(&summary, &mut value, &EXCHANGE_TEXTS[1..], "/target_data");
     note.result = Some(json!({"status": sent.status, "new_exchange": new_exchange}));
     Ok(Done { value, summary })
+}
+
+/// The client's name as the Workbench records and shows it: the bridge refuses a label
+/// with a control character in it or one over `LABEL_MAX` bytes, and the agent can do
+/// nothing about the name its client gave. A tab or newline becomes a space.
+fn bridge_label(raw: &str) -> String {
+    let one_line: String = untrusted::clean(raw, cfx_bridge::LABEL_MAX)
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let (capped, _) = untrusted::cap_bytes(one_line.trim(), cfx_bridge::LABEL_MAX);
+    match capped.trim() {
+        "" => "unknown".into(),
+        t => t.to_string(),
+    }
 }
 
 /// The Host headers the sent request will carry. An edit that names Host sets the first

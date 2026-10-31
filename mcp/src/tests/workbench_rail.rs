@@ -1691,6 +1691,32 @@ mod replay {
         assert!(r.text.contains("calling again"), "{}", r.text);
     }
 
+    /// The label is the client's own name from `initialize`, which the agent cannot
+    /// change, so it is made to fit the bridge's rule rather than refused by it.
+    #[tokio::test]
+    async fn a_client_name_the_bridge_would_refuse_is_made_to_fit() {
+        let b = bench_with(base(""), get_app()).await;
+        let cases = [
+            ("probe\tclient\n1.0", "probe client 1.0".to_string()),
+            ("\u{200B}\u{200B}", "unknown".to_string()),
+            (&*"é".repeat(150), "é".repeat(100)),
+        ];
+        for (i, (given, sent)) in cases.iter().enumerate() {
+            let mut peer = FakePeer::new(Elicit::None);
+            peer.label = given.to_string();
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1)}),
+                )
+                .await;
+            ok(&r);
+            let p = &b.fake.params(Method::Replay)[i];
+            assert_eq!(p["label"], json!(sent), "{given:?}");
+        }
+    }
+
     /// The Workbench answers send_failed for a timeout or a connection dropped after the
     /// request was written as well as for one never made, and records no exchange.
     #[tokio::test]
