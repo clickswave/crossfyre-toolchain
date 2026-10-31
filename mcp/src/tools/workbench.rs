@@ -1174,6 +1174,17 @@ async fn get_scope(
             }),
         })
         .collect();
+    // A refusal's detail can be the request it stopped, `GET /path?query`, with
+    // whatever the query carried.
+    let redact = mcp.settings.redact;
+    let detail = |d: &str| {
+        let d = untrusted::clean(d, 200);
+        if redact {
+            redact::redact_request_line(&d)
+        } else {
+            d
+        }
+    };
     let recent: Vec<Value> = s
         .recent
         .iter()
@@ -1184,7 +1195,7 @@ async fn get_scope(
                 "host": untrusted::clean(&r.host, 200),
                 "port": r.port,
                 "point": untrusted::clean(&r.point, 40),
-                "detail": r.detail.as_deref().map(|d| untrusted::clean(d, 200)),
+                "detail": r.detail.as_deref().map(detail),
             })
         })
         .collect();

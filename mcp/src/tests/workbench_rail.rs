@@ -928,13 +928,28 @@ mod reads {
                         rejected: vec![],
                         refused_total: 3,
                         refusals_dropped: 0,
-                        recent: vec![cfx_bridge::RefusalRow {
-                            at_ms: 1_798_619_564_512,
-                            host: format!("evil.test{HOSTILE}"),
-                            port: 443,
-                            point: "agent".into(),
-                            detail: Some("claude-code".into()),
-                        }],
+                        recent: vec![
+                            cfx_bridge::RefusalRow {
+                                at_ms: 1_798_619_564_512,
+                                host: format!("evil.test{HOSTILE}"),
+                                port: 443,
+                                point: "agent".into(),
+                                detail: Some("claude-code".into()),
+                            },
+                            // The capture core records a plain-HTTP refusal as the
+                            // method and the whole path and query.
+                            cfx_bridge::RefusalRow {
+                                at_ms: 1_798_619_564_511,
+                                host: "out.example.test".into(),
+                                port: 80,
+                                point: "request".into(),
+                                detail: Some(
+                                    "GET /cb?access_token=S20-tok&code=S21-code&password=S22-pw\
+                                     &q=1"
+                                        .into(),
+                                ),
+                            },
+                        ],
                     })
                     .unwrap())
                 })
@@ -983,6 +998,16 @@ mod reads {
         let recent = &v["target_data"]["recent_refusals"][0];
         assert_clean(recent["host"].as_str().unwrap());
         assert_eq!(recent["point"], "agent");
+        let detail = v["target_data"]["recent_refusals"][1]["detail"]
+            .as_str()
+            .unwrap();
+        assert!(
+            detail.starts_with("GET /cb?") && detail.ends_with("&q=1"),
+            "{detail}"
+        );
+        for s in ["S20-tok", "S21-code", "S22-pw"] {
+            assert!(!r.text.contains(s), "{s} in {}", r.text);
+        }
     }
 
     #[tokio::test]
