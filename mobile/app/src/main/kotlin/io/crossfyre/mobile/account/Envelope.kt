@@ -1,5 +1,6 @@
 package io.crossfyre.mobile.account
 
+import io.crossfyre.mobile.approve.Untrusted
 import org.json.JSONObject
 import java.io.IOException
 
@@ -44,17 +45,35 @@ internal class Answer(val status: Int, val envelope: JSONObject?, private val re
     }
 
     /**
-     * A member whose role lacks a permission, in the server's own sentence, which
-     * names the role and what it may not do. The permission key that follows it in
-     * `errors` is for the dashboard and is left out.
+     * A member whose role lacks a permission: which role, and what it may not do.
+     *
+     * The sentence is the phone's own, made from `data.role.name` and
+     * `data.permission`, and not the server's message, which carries the role's
+     * name as an org admin typed it. That name is cleaned and cut like every other
+     * name the phone shows, and loses the marks a banner reads as formatting. The
+     * permission key that follows in `errors` is for the dashboard and is left out.
      */
-    fun <T> roleRefusal(): Outcome<T> = Outcome.Failed(
-        Problem.Refused(
-            status,
-            message ?: "Your role in this workspace does not allow this.",
-            Refusal.MISSING_PERMISSION,
-        )
-    )
+    fun <T> roleRefusal(): Outcome<T> {
+        val role = data?.optJSONObject("role")?.str("name")
+            ?.let { Untrusted.plain(it, Untrusted.NAME).trim() }
+            ?.takeIf { it.isNotEmpty() }
+        val what = doing(data?.str("permission"))
+        val text = if (role == null) {
+            "Your role in this workspace does not allow $what."
+        } else {
+            "Your role in this workspace ($role) does not allow $what."
+        }
+        return Outcome.Failed(Problem.Refused(status, text, Refusal.MISSING_PERMISSION))
+    }
+
+    /** What a permission lets a member do, in the server's words for it. */
+    private fun doing(permission: String?): String = when (permission) {
+        "workflow.create" -> "creating scans"
+        "workflow.run" -> "starting scans"
+        "workflow.halt" -> "stopping scans"
+        "workflow.delete" -> "deleting scans"
+        else -> "this"
+    }
 
     /** `data.reason`, the machine-readable half of a refusal, when the server gave one. */
     fun reason(): String? = data?.str("reason")

@@ -123,6 +123,13 @@ object Untrusted {
         return out.toString()
     }
 
+    /**
+     * [clean], for a name the app sets inside a sentence of its own that a banner
+     * renders: the two marks a banner reads as formatting, `*` and the backtick, go
+     * too, so the name shows as typed text and never as the app's own emphasis.
+     */
+    fun plain(s: String, cap: Int): String = clean(s.replace("*", "").replace("`", ""), cap)
+
     private fun invisible(c: Int): Boolean =
         c in 0x200B..0x200F || c in 0x2060..0x2064 || c == 0xFEFF ||
             c in 0x202A..0x202E || c in 0x2066..0x2069 || c == 0x061C || c == 0x180E ||

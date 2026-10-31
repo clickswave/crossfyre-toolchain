@@ -315,7 +315,9 @@ class ApprovalApiTest {
         assertEquals(Refusal.NOT_RUNNING, reasonOf(refusalOf(envelope(409, "That scan is not running",
             JSONObject().put("reason", "not_running").put("workflow_status", "stopped")))))
         val role = refusalOf(envelope(403, "Your role in this workspace (Viewer) does not allow stopping scans.",
-            JSONObject().put("reason", "missing_permission").put("permission", "workflow.halt"), errors = listOf("workflow.halt is required")))
+            JSONObject().put("reason", "missing_permission").put("permission", "workflow.halt")
+                .put("role", JSONObject().put("id", "viewer").put("name", "Viewer")),
+            errors = listOf("workflow.halt is required")))
         assertEquals(Refusal.MISSING_PERMISSION, reasonOf(role))
         assertEquals("Your role in this workspace (Viewer) does not allow stopping scans.", role.text)
         assertEquals(Refusal.NOT_MEMBER, reasonOf(refusalOf(envelope(403, "Not a member of this workspace"))))

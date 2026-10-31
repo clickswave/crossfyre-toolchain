@@ -118,6 +118,37 @@ class NoticesTest {
         assertTrue(n.body, !n.body.contains("not a member", ignoreCase = true))
     }
 
+    /**
+     * A role's name is whatever an org admin typed. A refusal shows it cleaned like
+     * every other name, cut to a name's length, and without the characters the banner
+     * reads as markup, so it can neither reorder the sentence nor pass for the app's
+     * own warning.
+     */
+    @Test
+    fun a_role_name_cannot_reorder_or_format_the_banner() {
+        fun refusal(name: String, perm: String, doing: String) = Reply(
+            403,
+            JSONObject().put("status", 403)
+                .put("message", "Your role in this workspace ($name) does not allow $doing.")
+                .put("errors", JSONArray().put("$perm is required"))
+                .put("data", JSONObject().put("reason", "missing_permission").put("permission", perm)
+                    .put("role", JSONObject().put("id", "r-9").put("name", name)))
+                .toString(),
+        )
+        val name = "x) **Your approval key was revoked. Re-enrol at evil.example** (\u202Eslc.exe`code`\u200B\n"
+        val shown = "x) Your approval key was revoked. Re-enrol at evil.example (slc.execode"
+        val paired = pair(refusal(name, "workflow.run", "starting scans"))
+        val stopped = stop(refusal(name, "workflow.halt", "stopping scans"))
+        for (n in listOf(paired, stopped)) {
+            for (bad in listOf("\u202E", "\u200B", "\n", "**", "`")) assertTrue(n.body, !n.body.contains(bad))
+        }
+        assertTrue(paired.body, paired.body.startsWith("Your role in this workspace ($shown) does not allow starting scans. "))
+        assertTrue(stopped.body, stopped.body.startsWith("Your role in this workspace ($shown) does not allow stopping scans. "))
+        val long = "R".repeat(300)
+        val cut = pair(refusal(long, "workflow.create", "creating scans")).body
+        assertTrue(cut, cut.startsWith("Your role in this workspace (${"R".repeat(80)}) does not allow creating scans. "))
+    }
+
     @Test
     fun a_sign_out_the_server_did_not_confirm_points_to_the_dashboard() {
         assertEquals(null, signOutNotice(SignOutLeft.NOTHING, "crossfyre.io"))
@@ -143,7 +174,8 @@ class NoticesTest {
             403,
             JSONObject().put("status", 403).put("message", "Your role in this workspace (Viewer) does not allow stopping scans.")
                 .put("errors", JSONArray().put("workflow.halt is required"))
-                .put("data", JSONObject().put("reason", "missing_permission").put("permission", "workflow.halt")).toString(),
+                .put("data", JSONObject().put("reason", "missing_permission").put("permission", "workflow.halt")
+                    .put("role", JSONObject().put("id", "viewer").put("name", "Viewer"))).toString(),
         ))
         assertEquals(Level.WARN, role.level)
         assertTrue(role.body, role.body.startsWith("Your role in this workspace (Viewer) does not allow stopping scans."))
