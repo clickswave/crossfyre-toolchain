@@ -413,6 +413,19 @@ fn replay_refusal(e: crate::workbench::BridgeErr, o: &Open, dest: &guard::Dest) 
             ),
         )
         .with_detail(json!({"workbench_error": "pin_mismatch"})),
+        // The Workbench says so for a refused connection, and as much for a timeout or a
+        // connection dropped after the request was written. Which it was is in its words,
+        // not its code, and no exchange is recorded either way.
+        BridgeErr::Remote(b) if b.code == ErrorCode::SendFailed => Refusal::new(
+            Reason::RequestFailed,
+            format!(
+                "The Workbench's send failed: {}. It may have reached the target before it \
+                 failed, and the project has no record of it, so a request that writes may \
+                 already have taken effect.",
+                untrusted::clean(&b.message, 300)
+            ),
+        )
+        .with_detail(json!({"workbench_error": "send_failed"})),
         e @ (BridgeErr::Closed | BridgeErr::Timeout) => bridge_refusal(
             e,
             o,

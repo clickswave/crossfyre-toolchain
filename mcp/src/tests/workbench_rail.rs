@@ -1691,6 +1691,34 @@ mod replay {
         assert!(r.text.contains("calling again"), "{}", r.text);
     }
 
+    /// The Workbench answers send_failed for a timeout or a connection dropped after the
+    /// request was written as well as for one never made, and records no exchange.
+    #[tokio::test]
+    async fn a_send_that_failed_is_not_said_to_have_sent_nothing() {
+        let b = bench_with(
+            base(""),
+            get_app().answer(Method::Replay, |_, _| {
+                Err(ErrorBody::new(
+                    ErrorCode::SendFailed,
+                    "No response from 93.184.216.34:80 within 30 seconds. It connected, so \
+                     something is there; it did not answer.",
+                ))
+            }),
+        )
+        .await;
+        let r =
+            b.t.call(
+                &FakePeer::new(Elicit::None),
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1)}),
+            )
+            .await;
+        assert_eq!(reason(&r), "request_failed", "{}", r.text);
+        assert!(!r.text.contains("Nothing was sent"), "{}", r.text);
+        assert!(r.text.contains("may have reached the target"), "{}", r.text);
+        assert!(r.text.contains("no record of it"), "{}", r.text);
+    }
+
     #[tokio::test]
     async fn the_audit_line_masks_what_the_edits_carry() {
         let b = bench_with(base(""), get_app()).await;
