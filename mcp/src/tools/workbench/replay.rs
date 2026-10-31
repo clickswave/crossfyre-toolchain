@@ -95,21 +95,20 @@ pub(crate) async fn run(
         ))
     })?;
     let method = stored.method.to_ascii_uppercase();
+    let stored_hosts: Vec<String> = stored
+        .req_headers
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .filter(|(k, _)| k.trim().eq_ignore_ascii_case("host"))
+        .map(|(_, v)| v.clone())
+        .collect();
     let edited_host = edits
         .headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("host"))
         .map(|(_, v)| v.map(str::to_string));
-    let host_header = match edited_host {
-        Some(v) => v,
-        None => stored
-            .req_headers
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("host"))
-            .map(|(_, v)| v.clone()),
-    };
+    let host_headers = sent_hosts(&stored_hosts, edited_host);
 
     let intent = if safe(&method) {
         Intent::Read
@@ -127,10 +126,12 @@ pub(crate) async fn run(
         })
         .await?;
     // A Host header names a destination too. A virtual host the file does not list is
-    // somebody else's site on a shared address.
-    if let Some(h) = host_header
-        .as_deref()
-        .map(str::trim)
+    // somebody else's site on a shared address. Every one the request will carry is
+    // checked: a project with no scope admits whatever the Workbench is asked about, so
+    // a second Host header nobody looked at here would go out unchecked.
+    for h in host_headers
+        .iter()
+        .map(|h| h.trim())
         .filter(|h| !h.is_empty())
     {
         let hd = guard::parse_target(&format!("{}://{}", dest.scheme, h))
@@ -270,6 +271,18 @@ pub(crate) async fn run(
     fit(&summary, &mut value, &EXCHANGE_TEXTS[1..], "/target_data");
     note.result = Some(json!({"status": sent.status, "new_exchange": new_exchange}));
     Ok(Done { value, summary })
+}
+
+/// The Host headers the sent request will carry. An edit that names Host sets the first
+/// one, or adds one, and leaves any others as they were captured; `null` removes them all.
+fn sent_hosts(stored: &[String], edited: Option<Option<String>>) -> Vec<String> {
+    match edited {
+        None => stored.to_vec(),
+        Some(None) => Vec::new(),
+        Some(Some(v)) => std::iter::once(v)
+            .chain(stored.iter().skip(1).cloned())
+            .collect(),
+    }
 }
 
 /// A replay the Workbench refused or could not finish.

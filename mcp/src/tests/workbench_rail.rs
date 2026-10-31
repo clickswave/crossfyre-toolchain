@@ -1383,6 +1383,56 @@ mod replay {
         assert_eq!(b.fake.count(Method::Replay), 1);
     }
 
+    /// A request typed with two Host headers, to test how a server reads them. The
+    /// Workbench sends both and, for a project with no scope, admits both, so the scope
+    /// file has to see the second one too.
+    #[tokio::test]
+    async fn a_second_host_header_the_file_does_not_list_is_refused() {
+        let two_hosts = || {
+            WbOpts::default().answer(Method::Exchange, |c, _| {
+                let Call::Exchange(p) = c else { unreachable!() };
+                let mut x = default_exchange(p.id);
+                x.url = "http://app.example.test/".into();
+                x.req_headers = Some(vec![
+                    ("Host".into(), "app.example.test".into()),
+                    ("Host".into(), "evil.example.test".into()),
+                ]);
+                Ok(serde_json::to_value(x).unwrap())
+            })
+        };
+        let b = bench_with(base(""), two_hosts()).await;
+        let peer = FakePeer::new(Elicit::None);
+        for edits in [
+            json!({}),
+            // An edit sets the first Host header and leaves the second as it was.
+            json!({"headers": {"Host": "app.example.test"}}),
+        ] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1), "edits": edits.clone()}),
+                )
+                .await;
+            assert_eq!(reason(&r), "out_of_scope", "{edits}: {}", r.text);
+            let refused = refused_list(&r);
+            assert_eq!(refused[0]["at"], "host_header");
+            assert_eq!(refused[0]["host"], "evil.example.test");
+        }
+        assert_eq!(b.fake.count(Method::Replay), 0);
+
+        // Removing them all leaves only the URL's host, which the file lists.
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1), "edits": {"headers": {"host": null}}}),
+            )
+            .await;
+        ok(&r);
+        assert_eq!(b.fake.count(Method::Replay), 1);
+    }
+
     #[tokio::test]
     async fn a_name_only_on_loopback_is_refused_before_the_bridge_sends() {
         let b = bench_with(
