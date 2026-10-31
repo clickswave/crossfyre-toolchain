@@ -49,6 +49,7 @@ data class Pairing(val apiUrl: String, val workflowId: String, val token: String
                 .putString("workflow_id", p.workflowId)
                 .putString("token", p.token)
                 .putBoolean("ended", false)
+                .putBoolean("refused", false)
                 .commit()
         }
 
@@ -66,6 +67,18 @@ data class Pairing(val apiUrl: String, val workflowId: String, val token: String
 
         fun markEnded(ctx: Context) {
             ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean("ended", true).apply()
+        }
+
+        /**
+         * The server turned this pairing's token away and the last capture
+         * stopped for it, whether the app was open or not. Cleared by the next
+         * pairing and by the next capture to start.
+         */
+        fun refused(ctx: Context): Boolean =
+            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean("refused", false)
+
+        fun markRefused(ctx: Context, refused: Boolean = true) {
+            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean("refused", refused).apply()
         }
 
         /**

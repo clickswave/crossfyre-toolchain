@@ -30,3 +30,50 @@ internal class Teardown(private val steps: List<Pair<String, () -> Unit>>) {
         return steps.mapNotNull { (name, step) -> if (runCatching(step).isFailure) name else null }
     }
 }
+
+/**
+ * The capture service's own look at whether the server still takes the
+ * session's token.
+ *
+ * Once the ingest is refused it sends nothing more, but the tunnel went on
+ * intercepting the in-scope apps' traffic until the app came to the front and
+ * stopped it, and during a capture the app is usually in the background. The
+ * service asks the native side every [EVERY_MS] instead and stops the capture
+ * itself, once, while it runs.
+ *
+ * @param stats the native side's counters as JSON, or null when it has none.
+ * @param refused stops the capture.
+ * @param after runs the next look after a delay.
+ */
+internal class TokenWatch(
+    private val stats: () -> String?,
+    private val refused: () -> Unit,
+    private val after: (Long, () -> Unit) -> Unit,
+) {
+    private var on = false
+
+    fun start() {
+        on = true
+        after(EVERY_MS, ::look)
+    }
+
+    /** The capture stopped for another reason: a look already scheduled does nothing. */
+    fun cancel() {
+        on = false
+    }
+
+    private fun look() {
+        if (!on) return
+        val json = runCatching { stats() }.getOrNull()
+        if (json != null && runCatching { Stats.parse(json).tokenRefused }.getOrDefault(false)) {
+            on = false
+            refused()
+            return
+        }
+        after(EVERY_MS, ::look)
+    }
+
+    companion object {
+        const val EVERY_MS = 1_000L
+    }
+}

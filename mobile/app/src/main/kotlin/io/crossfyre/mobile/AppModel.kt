@@ -677,6 +677,9 @@ class AppModel(app: Application) : AndroidViewModel(app) {
             else -> Route.SIGN_IN
         }
         qrEnded = pairing != null && !store.pairedFromAccount && Pairing.ended(ctx) && !TracerVpnService.active
+        // The last capture stopped because the server refused its token, perhaps by the
+        // service while the app was closed.
+        sessionRefused = pairing != null && Pairing.refused(ctx) && !TracerVpnService.active
         if (route == Route.WORKSPACES) loadWorkspaces()
         if (TracerVpnService.active) {
             // The foreground service kept the process alive while the app was
@@ -772,9 +775,14 @@ class AppModel(app: Application) : AndroidViewModel(app) {
             }
             if (live) since = TracerVpnService.startedAt
             if (wasActive && !live) {
-                // Stopped from the notification, or by Android: the session ended.
+                // Stopped from the notification, by Android, or by the service once the
+                // server refused the token: the session ended.
                 session.ended()
                 if (!fromAccount && pairing != null) qrEnded = true
+                if (Pairing.refused(ctx) && !sessionRefused) {
+                    sessionRefused = true
+                    say("The server stopped accepting this phone's requests, so capture stopped.", R.drawable.ic_warning)
+                }
             }
             wasActive = live
             if (live) {
@@ -782,7 +790,9 @@ class AppModel(app: Application) : AndroidViewModel(app) {
                 // Once: the service takes a moment to go, and polls meanwhile still see it.
                 if (stats?.tokenRefused == true && !sessionRefused) {
                     // Nothing captured from here on could be delivered, so the tunnel
-                    // stops rather than keep reading traffic for nobody.
+                    // stops rather than keep reading traffic for nobody. The service
+                    // watches for this too, and stops it while the app is closed.
+                    Pairing.markRefused(ctx)
                     stopCapture()
                     sessionRefused = true
                     say("The server stopped accepting this phone's requests, so capture stopped.", R.drawable.ic_warning)

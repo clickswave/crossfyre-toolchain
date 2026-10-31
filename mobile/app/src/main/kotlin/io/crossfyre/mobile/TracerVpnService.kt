@@ -8,6 +8,8 @@ import android.content.pm.ServiceInfo
 import android.content.Intent
 import android.net.VpnService
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.util.Log
 
@@ -22,6 +24,8 @@ import android.util.Log
 class TracerVpnService : VpnService() {
 
     private var tun: ParcelFileDescriptor? = null
+    private val main = Handler(Looper.getMainLooper())
+    private var tokenWatch: TokenWatch? = null
 
     companion object {
         const val ACTION_START = "io.crossfyre.mobile.START"
@@ -124,9 +128,14 @@ class TracerVpnService : VpnService() {
         tun = pfd
         // Device-side consent for full capture. The server can ask; only this grants.
         val allowFull = FullCapturePrefs.allowed(this)
+        Pairing.markRefused(this, false)
         val ok = Native.startCapture(pfd.fd, pair.apiUrl, pair.workflowId, pair.token, allowFull)
         startedAt = System.currentTimeMillis()
         active = true
+        // Watched here rather than by the app, which looks only while it is on screen.
+        tokenWatch = TokenWatch({ Native.captureStats() }, ::stopForRefusedToken) { ms, look ->
+            main.postDelayed({ look() }, ms)
+        }.also { it.start() }
         Log.i(TAG, "capture started: mode=$effectiveMode apps=${apps.joinToString().ifEmpty { "-" }} native=$ok")
     }
 
@@ -141,6 +150,9 @@ class TracerVpnService : VpnService() {
      * with the tunnel up and nothing below this line run.
      */
     private fun stop() {
+        tokenWatch?.cancel()
+        tokenWatch = null
+        main.removeCallbacksAndMessages(null)
         // Stopping sends the final batch that ends the session, and the ingest
         // refuses its token from then on.
         if (active) Pairing.markEnded(this)
@@ -157,6 +169,18 @@ class TracerVpnService : VpnService() {
             )
         ).run()
         if (failed.isNotEmpty()) Log.w(TAG, "teardown steps failed: ${failed.joinToString()}")
+    }
+
+    /**
+     * The server no longer takes the session's token, so nothing captured from
+     * here on can be delivered: the tunnel stops rather than keep intercepting
+     * traffic for nobody. The pairing remembers why, for the app to say so and
+     * offer a new pairing when it is next opened.
+     */
+    private fun stopForRefusedToken() {
+        Log.w(TAG, "the server refused the session's token; stopping capture")
+        Pairing.markRefused(this)
+        stop()
     }
 
     override fun onDestroy() {
