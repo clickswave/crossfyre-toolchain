@@ -632,11 +632,15 @@ impl TestMcp {
         args: Value,
         ct: CancellationToken,
     ) -> ToolResult {
+        // The list the client called from. A call can change it, as one refused for a
+        // key whose owner may no longer launch does, and its result still answers to
+        // the definition the client had.
+        let listed = self.mcp.backends();
         match self.mcp.call(tool, args, peer, ct).await {
             CallOutput::Result(r) => {
                 if let (false, Some(v)) = (r.is_error, &r.structured) {
                     if self.mcp.cloud.on().is_some() {
-                        assert_listed_schema(&self.mcp, tool, v);
+                        assert_listed_schema(&listed, tool, v);
                     } else {
                         assert_schema(tool, v);
                     }
@@ -704,10 +708,10 @@ pub(crate) async fn eventually(what: &str, secs: u64, f: impl Fn() -> bool) {
     panic!("timed out waiting for {what}");
 }
 
-/// [`assert_schema`] against the definition the server lists now, which for a shared
-/// tool with a Cloud key is the Cloud one.
-pub(crate) fn assert_listed_schema(mcp: &Mcp, tool: &str, v: &Value) {
-    let def = crate::server::tool_list(&mcp.backends())
+/// [`assert_schema`] against the definition the server listed, which for a shared tool
+/// with a Cloud key is the Cloud one.
+pub(crate) fn assert_listed_schema(listed: &crate::tools::Backends, tool: &str, v: &Value) {
+    let def = crate::server::tool_list(listed)
         .into_iter()
         .find(|t| t.name == tool)
         .map(|t| serde_json::to_value(t).unwrap())

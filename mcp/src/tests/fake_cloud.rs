@@ -309,6 +309,9 @@ pub(crate) struct World {
     /// The key owner's role in the workspace still lets them start and stop scans. When
     /// it does not, a launch key reads as `read` and is refused `permission_denied`.
     pub role_may_launch: bool,
+    /// The owner's role loses launching as soon as a launch is held, so whoever decides
+    /// it decides for a member who may no longer start scans.
+    pub demote_when_held: bool,
     /// Set to refuse the key as the platform would: `key_revoked`, `key_expired`,
     /// `not_a_member`, ... Each comes with the status the platform gives it.
     pub key_refused: Option<wire::Reason>,
@@ -401,6 +404,7 @@ impl World {
         World {
             permission,
             role_may_launch: true,
+            demote_when_held: false,
             key_refused: None,
             mcp_disabled: false,
             rate_limit_after: None,
@@ -1078,6 +1082,11 @@ fn answer(w: &mut World, r: &Req) -> Result<Resp, Resp> {
                         ],
                     ));
                 }
+                // The owner's role is asked again, as `scans/start` asks it: one that
+                // may no longer launch is refused and the approval stays pending.
+                if !w.role_may_launch {
+                    return Err(permission_refusal(w, "starting scans"));
+                }
             }
             w.settle(
                 &id,
@@ -1390,7 +1399,11 @@ fn start_checked(w: &mut World, b: &Value) -> Result<Resp, Resp> {
     w.started.push(b.clone());
     if hold {
         let held_for = if phone { "phone" } else { "fallback" };
-        return hold_launch(w, &req, &targets, &nodes, held_for);
+        let r = hold_launch(w, &req, &targets, &nodes, held_for);
+        if w.demote_when_held {
+            w.role_may_launch = false;
+        }
+        return r;
     }
     w.next += 1;
     let id = uuid(500 + w.next);

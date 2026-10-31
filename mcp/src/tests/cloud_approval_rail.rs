@@ -4,6 +4,7 @@
 
 use super::fake_cloud::{self, World};
 use super::support::*;
+use crate::cloud::Listing;
 use serde_json::{Value, json};
 
 fn held(policy: &'static str, phones: Vec<&'static str>, fallback: bool) -> World {
@@ -144,6 +145,51 @@ async fn with_no_phone_a_form_decides_and_both_answers_reach_the_platform() {
     let v = ok(&t.call(&later, SCAN, args()).await).clone();
     assert_eq!(v["status"], "awaiting_approval");
     assert!(decides(&cloud).is_empty());
+}
+
+#[tokio::test]
+async fn a_yes_for_a_member_who_may_no_longer_launch_launches_nothing() {
+    // The owner's role loses launching once the launch is held, before the person says
+    // yes in the form. The platform refuses the approve, starts nothing, and leaves the
+    // approval for a deny or its expiry.
+    let mut w = held("always", vec![], true);
+    w.demote_when_held = true;
+    let (t, cloud, world) = fake_cloud::server(&[], w).await;
+    assert_eq!(t.mcp.backends().cloud, Some(Listing::Launch));
+    let peer = FakePeer::new(Elicit::Accept);
+    let r = t.call(&peer, SCAN, args()).await;
+    let v = ok(&r).clone();
+    assert_eq!(peer.asked(), 1);
+    let d = decides(&cloud);
+    assert_eq!(d.len(), 1);
+    assert_eq!(d[0]["decision"], "approve");
+    // The handle as it stands and the step that failed, not a refusal that reads as if
+    // nothing was asked for.
+    assert_eq!(v["status"], "awaiting_approval", "{v}");
+    assert!(v["scan_id"].as_str().unwrap().starts_with("ap_"), "{v}");
+    assert_eq!(
+        v["cloud_error"], "sending the decision failed: permission_denied",
+        "{v}"
+    );
+    // What whoami says now decides the tools listed, and the client is told once.
+    assert_eq!(
+        cloud.routes().iter().filter(|r| *r == "whoami").count(),
+        2,
+        "{:?}",
+        cloud.routes()
+    );
+    assert_eq!(
+        peer.list_changed.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(t.mcp.backends().cloud, Some(Listing::Read));
+    let w = world.lock().unwrap();
+    assert!(
+        w.scans.is_empty(),
+        "a scan started for a member who may not launch"
+    );
+    assert_eq!(w.approvals.len(), 1);
+    assert!(w.approvals.values().all(|a| a["status"] == "pending"));
 }
 
 #[tokio::test]
