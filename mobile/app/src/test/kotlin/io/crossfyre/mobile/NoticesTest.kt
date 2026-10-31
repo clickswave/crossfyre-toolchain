@@ -98,6 +98,25 @@ class NoticesTest {
     }
 
     @Test
+    fun a_role_that_may_not_capture_is_told_so_and_who_can_change_it() {
+        val reply = Reply(
+            403,
+            JSONObject().put("status", 403)
+                .put("message", "Your role in this workspace (Member) does not allow starting scans.")
+                .put("errors", JSONArray().put("workflow.run is required"))
+                .put("data", JSONObject().put("reason", "missing_permission").put("permission", "workflow.run")
+                    .put("role", JSONObject().put("id", "member").put("name", "Member")))
+                .toString(),
+        )
+        val n = pair(reply)
+        assertEquals(Level.WARN, n.level)
+        assertEquals("Your role doesn't allow capture in this workspace.", n.title)
+        assertTrue(n.body, n.body.startsWith("Your role in this workspace (Member) does not allow starting scans."))
+        assertTrue(n.body, n.body.contains("workspace admin"))
+        assertTrue(n.body, !n.body.contains("not a member", ignoreCase = true))
+    }
+
+    @Test
     fun a_sign_out_the_server_did_not_confirm_points_to_the_dashboard() {
         assertEquals(null, signOutNotice(SignOutLeft.NOTHING, "crossfyre.io"))
         for (left in listOf(SignOutLeft.KEY, SignOutLeft.APPROVER)) {

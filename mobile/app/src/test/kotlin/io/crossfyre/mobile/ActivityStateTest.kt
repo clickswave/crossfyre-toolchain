@@ -68,6 +68,21 @@ class ActivityStateTest {
     }
 
     @Test
+    fun each_way_a_request_was_decided_reads_as_who_or_what_did_it() {
+        assertEquals("on Pixel 8", decidedBy("phone", "Pixel 8"))
+        assertEquals("on a phone", decidedBy("phone", ""))
+        assertEquals("in the dashboard", decidedBy("dashboard", ""))
+        assertEquals("in the agent's client", decidedBy("agent_client", ""))
+        // A deny sent with an account key, from a phone or a computer signed in to
+        // the account: the platform names it as neither a phone nor the dashboard.
+        assertEquals("from a signed-in device", decidedBy("other", ""))
+        assertEquals("from a signed-in device", decidedBy("account_key", ""))
+        assertEquals("by the agent", decidedBy("agent_cancel", ""))
+        assertEquals("by expiry", decidedBy("expiry", ""))
+        assertEquals("", decidedBy("", ""))
+    }
+
+    @Test
     fun the_badges_name_fleet_writes_and_active_testing() {
         val s = Summary.parse(JSONObject()
             .put("v", 1).put("id", "x")

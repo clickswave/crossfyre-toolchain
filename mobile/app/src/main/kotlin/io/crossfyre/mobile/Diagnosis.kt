@@ -15,7 +15,8 @@ internal data class Stats(
     val flows: Long, val tlsFlows: Long, val caRejected: Long, val flowErrors: Long,
     val events: Long, val ingestSent: Long, val ingestRejected: Long, val ingestFailed: Long,
     val quicDropped: Long,
-    val lastEvent: String, val lastError: String
+    val lastEvent: String, val lastError: String,
+    val tokenRefused: Boolean = false,
 ) {
     /** Requests were captured and none of them could be delivered. */
     val notSent: Boolean get() = events > 0 && ingestSent == 0L && (ingestRejected > 0 || ingestFailed > 0)
@@ -27,10 +28,38 @@ internal data class Stats(
                 o.optLong("flows"), o.optLong("tls_flows"), o.optLong("ca_rejected"), o.optLong("flow_errors"),
                 o.optLong("events"), o.optLong("ingest_sent"), o.optLong("ingest_rejected"), o.optLong("ingest_failed"),
                 o.optLong("quic_dropped"),
-                o.optString("last_event"), o.optString("last_error")
+                o.optString("last_event"), o.optString("last_error"),
+                o.optBoolean("token_refused", false),
             )
         }
     }
+}
+
+/**
+ * The server turned the session's token away, so the phone stopped sending.
+ *
+ * Every reason the ingest has for it reads the same from the phone: the session
+ * ended or was paired again elsewhere, or whoever armed it was removed from the
+ * workspace or no longer has a role that may capture there. Sending again under
+ * the same token would only be turned away again. A signed-in phone pairs again,
+ * which either gets it a new token or says why not; a QR pairing needs a new code.
+ */
+internal fun tokenRefused(renewable: Boolean): Diag = if (renewable) {
+    Diag(
+        Level.DANGER, "The server stopped accepting this phone's requests.",
+        "It turned this session's token away, so nothing more is sent. That happens when your role in the workspace " +
+            "no longer allows capture, you were removed from it, or the session was paired again elsewhere. " +
+            "Pairing again gets a new token, or says why it can't.",
+        DiagAction.PAIR_AGAIN,
+    )
+} else {
+    Diag(
+        Level.DANGER, "The server stopped accepting this phone's requests.",
+        "It turned this session's token away, so nothing more is sent. That happens when a new code was made for " +
+            "the session, or whoever made the code no longer has a role in the workspace that allows capture. " +
+            "Scan a new code.",
+        DiagAction.SCAN_NEW_CODE,
+    )
 }
 
 /**
@@ -53,6 +82,9 @@ internal fun diagnose(
     host: String = "The server",
 ): Diag? {
     if (!running || s == null) return null
+    // Before anything else: batches may have gone through before the token was
+    // turned away, and none will now.
+    if (s.tokenRefused) return tokenRefused(renewable)
     if (s.events > 0 && s.ingestSent > 0)
         return Diag(Level.OK, "Capturing and sending requests.", "Open the session in the dashboard to see them land.", DiagAction.OPEN_DASHBOARD)
     if (s.events > 0 && s.ingestRejected > 0)

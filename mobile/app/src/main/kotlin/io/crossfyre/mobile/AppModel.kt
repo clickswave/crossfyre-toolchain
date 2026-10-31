@@ -454,6 +454,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
                     session.paired()
                     qrEnded = false
                     revoked = false
+                    sessionRefused = false
                     route = Route.MAIN
                     tab = "home"
                     push = null
@@ -609,6 +610,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
         store.saveWorkspace(null)
         workspace = null
         qrEnded = false
+        sessionRefused = false
         route = Route.MAIN
         tab = "home"
         push = null
@@ -644,6 +646,12 @@ class AppModel(app: Application) : AndroidViewModel(app) {
     var notificationsBlocked by mutableStateOf(false)
         private set
     var renewing by mutableStateOf(false)
+        private set
+    /**
+     * The server turned the session's token away and capture was stopped for it.
+     * Cleared by the next start or pairing.
+     */
+    var sessionRefused by mutableStateOf(false)
         private set
     private val watch = StartWatch()
     private var wasActive = false
@@ -768,6 +776,14 @@ class AppModel(app: Application) : AndroidViewModel(app) {
             wasActive = live
             if (live) {
                 stats = withContext(Dispatchers.Default) { runCatching { Stats.parse(Native.captureStats()) }.getOrNull() }
+                // Once: the service takes a moment to go, and polls meanwhile still see it.
+                if (stats?.tokenRefused == true && !sessionRefused) {
+                    // Nothing captured from here on could be delivered, so the tunnel
+                    // stops rather than keep reading traffic for nobody.
+                    stopCapture()
+                    sessionRefused = true
+                    say("The server stopped accepting this phone's requests, so capture stopped.", R.drawable.ic_warning)
+                }
             } else if (phase == Phase.IDLE) {
                 stats = null
             }
@@ -854,6 +870,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun launchCapture() {
+        sessionRefused = false
         viewModelScope.launch {
             // Make the certificate on disk the one capture presents. The native
             // side keeps the last one it loaded in memory, and after a reset that
@@ -930,6 +947,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun diagnosis(): Diag? {
+        if (phase == Phase.IDLE && sessionRefused) return tokenRefused(renewable = fromAccount)
         if (phase != Phase.CAPTURING) return null
         val inScope = if (scope.effectiveMode == Scope.ONLY) scopeApps.toList() else emptyList()
         return diagnose(

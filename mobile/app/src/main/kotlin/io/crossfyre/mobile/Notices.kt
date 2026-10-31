@@ -84,6 +84,11 @@ fun pairNotice(p: Problem, host: String): Notice = when {
         "The organization that owns it is suspended. Pick another workspace, or ask its admin.",
     )
     reasonOf(p) == Refusal.NOT_MEMBER -> Notice(Level.DANGER, "You're not a member of this workspace any more.", "Someone removed you, or it was deleted. Pick another one.")
+    // Pairing starts a capture into the workspace, which a role has to allow.
+    reasonOf(p) == Refusal.MISSING_PERMISSION -> Notice(
+        Level.WARN, "Your role doesn't allow capture in this workspace.",
+        "${p.text} Ask a workspace admin for a role that can start scans, or pick another workspace.",
+    )
     listTrouble(p) == ListTrouble.UNVERIFIED || listTrouble(p) == ListTrouble.SUSPENDED || p == Problem.SignedOut -> listNotice(p, host)
     p is Problem.Unreachable -> Notice(Level.DANGER, "Couldn't pair this phone.", "$host didn't answer. Check the phone's connection and try again.")
     else -> Notice(Level.DANGER, "Couldn't pair this phone.", p.text)

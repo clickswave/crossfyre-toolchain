@@ -42,7 +42,7 @@ data class HistoryRow(
     val workspaceName: String,
     val createdAt: Instant?,
     val decidedAt: Instant?,
-    /** phone, dashboard, agent_client, expiry or agent_cancel. */
+    /** phone, dashboard, agent_client, account_key, expiry or agent_cancel. */
     val decidedVia: String,
     val deviceName: String,
     /** launching, launched or failed, once the platform has acted on an approval. */

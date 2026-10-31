@@ -31,6 +31,7 @@ counters!(
     INGEST_REJECTED, // server returned a non-2xx (e.g. 401 bad token)
     INGEST_FAILED,   // ingest POST could not be delivered (network/TLS)
     QUIC_DROPPED,    // HTTP/3 flows blackholed to force TCP fallback (invisible traffic)
+    TOKEN_REFUSED,   // 1 once the server turned the session's token away: nothing more is sent
 );
 
 fn last_event() -> &'static Mutex<String> {
@@ -120,6 +121,7 @@ pub fn snapshot_json() -> String {
         "ingest_rejected": g(&INGEST_REJECTED),
         "ingest_failed": g(&INGEST_FAILED),
         "quic_dropped": g(&QUIC_DROPPED),
+        "token_refused": g(&TOKEN_REFUSED) > 0,
         "last_event": le,
         "last_error": lerr,
     })
@@ -209,6 +211,11 @@ pub fn recent_json() -> String {
     serde_json::Value::Array(list).to_string()
 }
 
+/// Held by every test that resets or reads these globals, since the harness runs tests on several
+/// threads at once.
+#[cfg(test)]
+pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +235,7 @@ mod tests {
     // test harness runs tests on several threads.
     #[test]
     fn the_ring_keeps_the_newest_shapes_and_knows_what_was_sent() {
+        let _held = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         reset();
         let mut last = 0;
         for i in 0..(RECENT_MAX + 5) {

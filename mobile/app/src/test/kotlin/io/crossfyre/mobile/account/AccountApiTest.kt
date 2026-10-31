@@ -248,6 +248,29 @@ class AccountApiTest {
             problem(api(Fake(envelope(401, "Not logged in"))).pair("cfk_k", "w1", "dev-12345678", "Pixel")))
     }
 
+    /**
+     * A member whose role cannot start scans is refused by the role, not by
+     * membership, even when the role is called Member.
+     */
+    @Test
+    fun a_role_without_the_permission_is_its_own_refusal() {
+        for ((role, perm, doing) in listOf(
+            Triple("Member", "workflow.run", "starting scans"),
+            Triple("Viewer", "workflow.create", "creating scans"),
+        )) {
+            val said = "Your role in this workspace ($role) does not allow $doing."
+            val reply = envelope(
+                403, said,
+                JSONObject().put("reason", "missing_permission").put("permission", perm)
+                    .put("role", JSONObject().put("id", "r-1").put("name", role)),
+                errors = listOf("$perm is required"),
+            )
+            val p = problem(api(Fake(reply)).pair("cfk_k", "w1", "dev-12345678", "Pixel")) as Problem.Refused
+            assertEquals(role, Refusal.MISSING_PERMISSION, p.reason)
+            assertEquals(said, p.text)
+        }
+    }
+
     @Test
     fun a_pairing_without_a_token_is_not_kept() {
         val reply = envelope(201, "Paired", JSONObject().put("workflow_id", "wf-9"))

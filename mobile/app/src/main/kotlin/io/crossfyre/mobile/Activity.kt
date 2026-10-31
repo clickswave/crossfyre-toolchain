@@ -111,6 +111,22 @@ fun riskChips(s: Summary): List<String> = buildList {
 
 private val KNOWN_RISK = setOf("fleet", "writes", "active", "traffic")
 
+/**
+ * Who or what decided a request, as the Recent decisions list says it. A deny sent
+ * with an account key is neither a phone's signature nor the dashboard: the history
+ * names it `account_key` and the Cloud API `other`, and either is a device signed in
+ * to the account.
+ */
+fun decidedBy(via: String, deviceName: String): String = when (via) {
+    "phone" -> deviceName.ifEmpty { "a phone" }.let { "on $it" }
+    "dashboard" -> "in the dashboard"
+    "agent_client" -> "in the agent's client"
+    "account_key", "other" -> "from a signed-in device"
+    "agent_cancel" -> "by the agent"
+    "expiry" -> "by expiry"
+    else -> ""
+}
+
 /** "12 Oct" for a scope entry's date, or the text as it came when it is not a date. */
 fun shortDate(s: String): String =
     runCatching { LocalDate.parse(s.take(10)).format(DateTimeFormatter.ofPattern("d MMM", Locale.UK)) }.getOrDefault(s)

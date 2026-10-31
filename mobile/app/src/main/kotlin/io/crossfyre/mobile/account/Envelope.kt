@@ -43,6 +43,19 @@ internal class Answer(val status: Int, val envelope: JSONObject?) {
         else -> null
     }
 
+    /**
+     * A member whose role lacks a permission, in the server's own sentence, which
+     * names the role and what it may not do. The permission key that follows it in
+     * `errors` is for the dashboard and is left out.
+     */
+    fun <T> roleRefusal(): Outcome<T> = Outcome.Failed(
+        Problem.Refused(
+            status,
+            message ?: "Your role in this workspace does not allow this.",
+            Refusal.MISSING_PERMISSION,
+        )
+    )
+
     /** Whether the server's own words mention [word], for refusals with no flag to read. */
     fun says(word: String): Boolean =
         (message.orEmpty() + " " + firstError.orEmpty()).contains(word, ignoreCase = true)

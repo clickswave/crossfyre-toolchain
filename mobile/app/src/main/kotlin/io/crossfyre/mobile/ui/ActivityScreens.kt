@@ -49,6 +49,7 @@ import io.crossfyre.mobile.approve.TargetRef
 import io.crossfyre.mobile.approve.approvalView
 import io.crossfyre.mobile.approve.countdown
 import io.crossfyre.mobile.channelLabel
+import io.crossfyre.mobile.decidedBy
 import io.crossfyre.mobile.riskChips
 import io.crossfyre.mobile.shortDate
 import java.time.Instant
@@ -365,14 +366,7 @@ private fun HistoryItem(h: HistoryRow, first: Boolean, now: Instant) {
         "cancelled" -> "Cancelled" to Tone.NONE
         else -> h.status.replaceFirstChar { it.uppercase() } to Tone.NONE
     }
-    val via = when (h.decidedVia) {
-        "phone" -> h.deviceName.ifEmpty { "a phone" }.let { "on $it" }
-        "dashboard" -> "in the dashboard"
-        "agent_client" -> "in the agent's client"
-        "agent_cancel" -> "by the agent"
-        "expiry" -> "by expiry"
-        else -> ""
-    }
+    val via = decidedBy(h.decidedVia, h.deviceName)
     val launched = when (h.launchState) {
         "launched" -> "started"
         "launching" -> "starting"

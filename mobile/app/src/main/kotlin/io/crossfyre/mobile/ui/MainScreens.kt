@@ -109,7 +109,11 @@ fun CaptureCard(m: AppModel, tracer: Boolean) {
     if (phase == Phase.IDLE && m.qrEnded && !m.fromAccount) {
         CfxCard {
             Row { StateChip(phase) }
-            Text("The session ended when capture stopped.", style = lineStyle)
+            Text(
+                if (m.sessionRefused) "The server stopped accepting this phone's requests, so capture stopped."
+                else "The session ended when capture stopped.",
+                style = lineStyle,
+            )
             // Signed in already, the way out is one of the account's own workspaces,
             // which renew themselves; "Sign in" would mean signing out first.
             if (m.signedIn) {

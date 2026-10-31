@@ -151,6 +151,8 @@ enum class Refusal {
     BAD_SIGNATURE,
     /** The account already has as many approval phones as it may. */
     TOO_MANY_APPROVERS,
+    /** The member's role in the workspace does not allow what was asked. */
+    MISSING_PERMISSION,
 }
 
 sealed interface Outcome<out T> {
@@ -288,6 +290,8 @@ class AccountApi(origin: String, private val transport: Transport) {
                     )
                 }
                 a.status == 401 -> Outcome.Failed(Problem.SignedOut)
+                // Before the words are read for "member": a role can be called Member.
+                a.status == 403 && a.data?.str("reason") == "missing_permission" -> a.roleRefusal()
                 a.status == 403 && a.data?.optBoolean("archived") == true -> a.refusal(Refusal.WORKSPACE_ARCHIVED)
                 a.status == 403 && a.data?.has("workspace_suspended") == true -> a.refusal(Refusal.WORKSPACE_SUSPENDED)
                 a.status == 403 -> a.accountRefusal() ?: a.refusal(if (a.says("member")) Refusal.NOT_MEMBER else Refusal.OTHER)
