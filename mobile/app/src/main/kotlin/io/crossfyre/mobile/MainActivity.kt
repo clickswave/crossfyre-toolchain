@@ -1,12 +1,16 @@
 package io.crossfyre.mobile
 
 import android.Manifest
+import android.app.KeyguardManager
 import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.graphics.Color
+import android.hardware.biometrics.BiometricManager
+import android.hardware.biometrics.BiometricPrompt
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.CancellationSignal
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
@@ -14,6 +18,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.annotation.RequiresApi
 import androidx.browser.customtabs.CustomTabsIntent
 import androidx.compose.runtime.LaunchedEffect
 import androidx.lifecycle.Lifecycle
@@ -27,9 +32,10 @@ import kotlinx.coroutines.launch
 
 /**
  * The one screen of the app. It hosts the interface and does what only an
- * activity can: Android's permission and VPN prompts, the QR scanner, the
- * system's file picker, and opening other apps. Everything else lives in
- * [AppModel], so a prompt that recreates this activity loses nothing.
+ * activity can: Android's permission, VPN and unlock prompts, the QR scanner,
+ * the system's file picker, links into the app, and opening other apps.
+ * Everything else lives in [AppModel], so a prompt that recreates this activity
+ * loses nothing.
  */
 class MainActivity : ComponentActivity() {
 
@@ -67,6 +73,13 @@ class MainActivity : ComponentActivity() {
             model.certSaved(ok)
         }
 
+    // Android 8 to 10: the lock screen's own confirmation. The key then signs for
+    // fifteen seconds, which the model uses straight away.
+    private val confirmCredential =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
+            model.lockConfirmed(res.resultCode == RESULT_OK)
+        }
+
     private val apkSave =
         registerForActivityResult(ActivityResultContracts.CreateDocument("application/vnd.android.package-archive")) { uri ->
             if (uri == null) return@registerForActivityResult model.say("Export cancelled.", R.drawable.ic_info)
@@ -83,9 +96,12 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 launch { model.poll() }
+                // Pending approvals, asked for only while the app is in sight.
+                launch { model.watchApprovals() }
                 model.effects.collect { handle(it) }
             }
         }
+        if (savedInstanceState == null) model.openLink(intent?.dataString)
 
         setContent {
             val appearance = Appearance.of(model.appearance)
@@ -99,6 +115,12 @@ class MainActivity : ComponentActivity() {
             }
             CrossfyreTheme(appearance) { AppRoot(model) }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        model.openLink(intent.dataString)
     }
 
     override fun onResume() {
@@ -122,7 +144,45 @@ class MainActivity : ComponentActivity() {
                 Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", packageName, null)),
             )
             Effect.SecuritySettings -> open(Intent(Settings.ACTION_SECURITY_SETTINGS), Intent(Settings.ACTION_SETTINGS))
+            is Effect.Authenticate -> if (Build.VERSION.SDK_INT >= 30) unlockPrompt(e) else confirmLock(e)
         }
+    }
+
+    /**
+     * Android 11 and later: the system prompt, holding the signature the approval
+     * key will make. The keystore lets that one signature through only once the
+     * person has unlocked, with a strong biometric or the screen lock.
+     */
+    @RequiresApi(30)
+    private fun unlockPrompt(e: Effect.Authenticate) {
+        val sig = model.signatureForUnlock(e.id) ?: return
+        val prompt = BiometricPrompt.Builder(this)
+            .setTitle(e.title)
+            .setDescription(e.description)
+            .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG or BiometricManager.Authenticators.DEVICE_CREDENTIAL)
+            .build()
+        prompt.authenticate(
+            BiometricPrompt.CryptoObject(sig), CancellationSignal(), mainExecutor,
+            object : BiometricPrompt.AuthenticationCallback() {
+                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                    model.unlocked(e.id, result.cryptoObject?.signature ?: sig)
+                }
+
+                override fun onAuthenticationError(errorCode: Int, errString: CharSequence?) {
+                    val cancelled = errorCode == BiometricPrompt.BIOMETRIC_ERROR_USER_CANCELED || errorCode == BiometricPrompt.BIOMETRIC_ERROR_CANCELED
+                    model.unlockCancelled(e.id, if (cancelled) null else errString?.toString())
+                }
+            },
+        )
+    }
+
+    /** Android 8 to 10: confirm the screen lock, then sign within the key's fifteen seconds. */
+    private fun confirmLock(e: Effect.Authenticate) {
+        val keyguard = getSystemService(KeyguardManager::class.java)
+        @Suppress("DEPRECATION")
+        val intent = keyguard?.createConfirmDeviceCredentialIntent(e.title, e.description)
+            ?: return model.unlockCancelled(e.id, "This phone has no screen lock, so it cannot approve.")
+        confirmCredential.launch(intent)
     }
 
     /**

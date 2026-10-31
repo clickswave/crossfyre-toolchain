@@ -2,6 +2,7 @@ package io.crossfyre.mobile
 
 import io.crossfyre.mobile.account.Problem
 import io.crossfyre.mobile.account.Refusal
+import io.crossfyre.mobile.approve.SignOutLeft
 
 /** How loud a message is: the banner colour, and whether it is read out as an alert. */
 enum class Level { OK, WARN, DANGER, INFO }
@@ -86,4 +87,52 @@ fun pairNotice(p: Problem, host: String): Notice = when {
     listTrouble(p) == ListTrouble.UNVERIFIED || listTrouble(p) == ListTrouble.SUSPENDED || p == Problem.SignedOut -> listNotice(p, host)
     p is Problem.Unreachable -> Notice(Level.DANGER, "Couldn't pair this phone.", "$host didn't answer. Check the phone's connection and try again.")
     else -> Notice(Level.DANGER, "Couldn't pair this phone.", p.text)
+}
+
+/** What turning on approvals says when the server will not take this phone. */
+fun enrolNotice(p: Problem, host: String): Notice = when {
+    p is Problem.Unreachable -> Notice(Level.DANGER, "Couldn't turn on approvals.", "$host didn't answer. Check the phone's connection and try again.")
+    reasonOf(p) == Refusal.TOO_MANY_APPROVERS -> Notice(
+        Level.WARN, "This account has as many approval phones as it may.",
+        "Turn Approvals off on a phone you no longer use, or sign that phone out, then try again.",
+    )
+    listTrouble(p) == ListTrouble.UNVERIFIED || listTrouble(p) == ListTrouble.SUSPENDED -> listNotice(p, host)
+    else -> Notice(Level.DANGER, "Couldn't turn on approvals.", p.text)
+}
+
+/** What the approval screen says when a decision did not go through. */
+fun decisionNotice(p: Problem, host: String): Notice = when {
+    p is Problem.Unreachable -> Notice(Level.DANGER, "Couldn't send your answer.", "$host didn't answer, so nothing was decided. Try again.")
+    reasonOf(p) == Refusal.NOT_PENDING -> Notice(Level.INFO, "This request is no longer waiting.", "It was decided somewhere else, or cancelled.")
+    reasonOf(p) == Refusal.APPROVAL_EXPIRED -> Notice(Level.WARN, "This request expired.", "Nothing was started. The agent has to ask again.")
+    reasonOf(p) == Refusal.UNKNOWN -> Notice(Level.INFO, "This request is gone.", "The server no longer has it, so there is nothing to decide.")
+    reasonOf(p) == Refusal.BAD_SIGNATURE -> Notice(
+        Level.DANGER, "The server did not accept this phone's signature.",
+        "Nothing was approved. Turn Approvals off and on again in Settings, then ask the agent to try again.",
+    )
+    reasonOf(p) == Refusal.APPROVER_INACTIVE -> Notice(Level.WARN, "This phone no longer approves.", "Turn Approvals on again in Settings.")
+    else -> Notice(Level.DANGER, "Couldn't send your answer.", p.text)
+}
+
+/**
+ * What the sign-in screen says after a sign-out the server did not confirm, or
+ * null when it did. The phone has forgotten the key either way, so the only
+ * way left to revoke it is the dashboard.
+ */
+fun signOutNotice(left: SignOutLeft, host: String): Notice? = when (left) {
+    SignOutLeft.NOTHING -> null
+    SignOutLeft.KEY -> Notice(
+        Level.WARN, "Signed out on this phone only.",
+        "$host did not confirm that this phone's key is revoked, so it may still work. Revoke it in the dashboard, under Settings > CLI Access.",
+    )
+    SignOutLeft.APPROVER -> Notice(
+        Level.WARN, "Signed out on this phone only.",
+        "$host did not confirm the sign-out, so it may still count this phone as an approver and hold agent requests for it. Revoke this phone's key in the dashboard, under Settings > CLI Access.",
+    )
+}
+
+/** Why the activity log did not load. */
+fun activityNotice(p: Problem, host: String): Notice = when (p) {
+    is Problem.Unreachable -> Notice(Level.DANGER, "Couldn't load activity.", "$host didn't answer. Check the phone's connection.")
+    else -> Notice(Level.DANGER, "Couldn't load activity.", p.text)
 }

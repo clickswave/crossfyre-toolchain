@@ -3,6 +3,7 @@ package io.crossfyre.mobile.account
 import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
+import org.json.JSONArray
 import java.security.GeneralSecurityException
 import java.security.KeyStore
 import java.util.Base64
@@ -96,6 +97,32 @@ class AccountStore(private val values: KeyValues, private val sealer: Sealer) {
         get() = values.get(FROM_ACCOUNT) == "1"
         set(value) = values.put(FROM_ACCOUNT, if (value) "1" else null)
 
+    /**
+     * The server's id for this phone as an approver, once a browser confirmed it.
+     * Not a secret: what approves is the keystore key, and the server checks it
+     * against this phone's own account key on every decision.
+     */
+    var approverId: String?
+        get() = values.get(APPROVER_ID)
+        set(value) = values.put(APPROVER_ID, value)
+
+    /** The approval key's fingerprint, as the confirmation page showed it. */
+    var approverFingerprint: String?
+        get() = values.get(APPROVER_FP)
+        set(value) = values.put(APPROVER_FP, value)
+
+    /** The approver an enrolment started, from the server's answer until the wait ends either way. */
+    var enrollingApproverId: String?
+        get() = values.get(ENROLLING_ID)
+        set(value) = values.put(ENROLLING_ID, value)
+
+    /** Approvers this phone let go of whose revoke the server has not confirmed yet. */
+    var revokesOwed: Set<String>
+        get() = values.get(REVOKES_OWED)?.let { stored ->
+            runCatching { JSONArray(stored).let { a -> (0 until a.length()).map { a.getString(it) }.toSet() } }.getOrNull()
+        }.orEmpty()
+        set(value) = values.put(REVOKES_OWED, if (value.isEmpty()) null else JSONArray(value.sorted()).toString())
+
     /** The server a dev build was pointed at, or null for the build's own. */
     fun origin(): String? = values.get(ORIGIN)
 
@@ -106,9 +133,14 @@ class AccountStore(private val values: KeyValues, private val sealer: Sealer) {
         values.get(DEVICE_ID)?.takeIf { DeviceIds.isValid(it) }
             ?: DeviceIds.fresh().also { values.put(DEVICE_ID, it) }
 
-    /** Forget the account. The install id and the server stay. */
+    /**
+     * Forget the account, and with it this phone's approver. The install id and the server stay.
+     *
+     * Revokes still owed go too: they are sent with the account key, and a key
+     * that is revoked or gone takes every approver it had with it on the server.
+     */
     fun signOut() {
-        for (name in listOf(KEY, USERNAME, EMAIL, WORKSPACE_ID, WORKSPACE_NAME, WORKSPACE_KIND, WORKSPACE_ORG, FROM_ACCOUNT, VIA)) {
+        for (name in listOf(KEY, USERNAME, EMAIL, WORKSPACE_ID, WORKSPACE_NAME, WORKSPACE_KIND, WORKSPACE_ORG, FROM_ACCOUNT, VIA, APPROVER_ID, APPROVER_FP, ENROLLING_ID, REVOKES_OWED)) {
             values.put(name, null)
         }
     }
@@ -125,6 +157,10 @@ class AccountStore(private val values: KeyValues, private val sealer: Sealer) {
         const val ORIGIN = "origin"
         const val DEVICE_ID = "device_id"
         const val VIA = "signed_in_with"
+        const val APPROVER_ID = "approver_id"
+        const val APPROVER_FP = "approver_fingerprint"
+        const val ENROLLING_ID = "approver_enrolling_id"
+        const val REVOKES_OWED = "approver_revokes_owed"
     }
 }
 

@@ -1,0 +1,143 @@
+{
+  "about": "Display cleaning cases shared by Crossfyre Mobile and the platform. Each input, cleaned and capped at cap characters, must give output. Every field of an approval summary is one line, so every control character goes, newline and tab included.",
+  "cases": [
+    {
+      "name": "plain text is unchanged",
+      "input": "Acme external",
+      "cap": 80,
+      "output": "Acme external"
+    },
+    {
+      "name": "colour escapes are removed",
+      "input": "\u001b[31mred\u001b[0m",
+      "cap": 80,
+      "output": "red"
+    },
+    {
+      "name": "a terminal hyperlink keeps only its visible text",
+      "input": "\u001b]8;;https://evil.example\u0007click\u001b]8;;\u0007",
+      "cap": 80,
+      "output": "click"
+    },
+    {
+      "name": "an unterminated OSC loses only its ESC",
+      "input": "\u001b]0;title",
+      "cap": 80,
+      "output": "0;title"
+    },
+    {
+      "name": "a two-byte escape is removed",
+      "input": "\u001bMtext",
+      "cap": 80,
+      "output": "text"
+    },
+    {
+      "name": "a right-to-left override is removed",
+      "input": "abc\u202edcb",
+      "cap": 80,
+      "output": "abcdcb"
+    },
+    {
+      "name": "bidi isolates are removed",
+      "input": "\u2066evil\u2069.example.com",
+      "cap": 80,
+      "output": "evil.example.com"
+    },
+    {
+      "name": "a zero-width space inside a host is removed",
+      "input": "app\u200b.example.com",
+      "cap": 80,
+      "output": "app.example.com"
+    },
+    {
+      "name": "tag characters spell nothing",
+      "input": "ok\udb40\udc41\udb40\udc42",
+      "cap": 80,
+      "output": "ok"
+    },
+    {
+      "name": "CR, newline and NUL all go",
+      "input": "a\r\nb\u0000c",
+      "cap": 80,
+      "output": "abc"
+    },
+    {
+      "name": "a tab goes",
+      "input": "a\tb",
+      "cap": 80,
+      "output": "ab"
+    },
+    {
+      "name": "a run of newlines cannot push the next field down",
+      "input": "agent-cli\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nx",
+      "cap": 80,
+      "output": "agent-clix"
+    },
+    {
+      "name": "vertical tab, form feed and DEL go",
+      "input": "a\u000bb\fc\u007fd",
+      "cap": 80,
+      "output": "abcd"
+    },
+    {
+      "name": "C1 controls are removed",
+      "input": "x\u0085y\u009bz",
+      "cap": 80,
+      "output": "xyz"
+    },
+    {
+      "name": "the cap counts characters, not UTF-16 units",
+      "input": "\ud83d\ude00\ud83d\ude00\ud83d\ude00",
+      "cap": 2,
+      "output": "\ud83d\ude00\ud83d\ude00"
+    },
+    {
+      "name": "the cap applies after cleaning",
+      "input": "\u200babc",
+      "cap": 2,
+      "output": "ab"
+    },
+    {
+      "name": "soft hyphen and variation selector are removed",
+      "input": "pay\u00adpal\ufe0f",
+      "cap": 80,
+      "output": "paypal"
+    },
+    {
+      "name": "line and paragraph separators are removed",
+      "input": "a\u2028b\u2029c",
+      "cap": 80,
+      "output": "abc"
+    },
+    {
+      "name": "the Arabic letter mark is removed",
+      "input": "\u061cx",
+      "cap": 80,
+      "output": "x"
+    },
+    {
+      "name": "a byte order mark is removed",
+      "input": "\ufeffstart",
+      "cap": 80,
+      "output": "start"
+    },
+    {
+      "name": "Hangul filler is removed",
+      "input": "a\u3164b",
+      "cap": 80,
+      "output": "ab"
+    },
+    {
+      "name": "non-Latin text is kept",
+      "input": "\u092a\u094d\u0930\u093f\u092f\u093e \u0906\u0930\u094d\u092f",
+      "cap": 80,
+      "output": "\u092a\u094d\u0930\u093f\u092f\u093e \u0906\u0930\u094d\u092f"
+    },
+    {
+      "name": "an empty string stays empty",
+      "input": "",
+      "cap": 80,
+      "output": ""
+    }
+  ]
+}

@@ -745,7 +745,7 @@ fun AppBar(
     }
 }
 
-data class TabSpec(val key: String, val icon: Int, val label: String, val locked: Boolean = false, val live: Boolean = false)
+data class TabSpec(val key: String, val icon: Int, val label: String, val locked: Boolean = false, val live: Boolean = false, val badge: Int = 0)
 
 @Composable
 fun Tabs(tabs: List<TabSpec>, current: String, onSelect: (String) -> Unit) {
@@ -758,7 +758,13 @@ fun Tabs(tabs: List<TabSpec>, current: String, onSelect: (String) -> Unit) {
             Column(
                 Modifier.weight(1f).height(64.dp)
                     .clickable(role = Role.Tab) { onSelect(t.key) }
-                    .semantics { contentDescription = if (t.locked) "${t.label}, not available yet" else t.label }
+                    .semantics {
+                        contentDescription = when {
+                            t.locked -> "${t.label}, not available yet"
+                            t.badge > 0 -> "${t.label}, ${t.badge} waiting"
+                            else -> t.label
+                        }
+                    }
                     .drawBehind {
                         if (on) {
                             val w = 28.dp.toPx()
@@ -781,6 +787,16 @@ fun Tabs(tabs: List<TabSpec>, current: String, onSelect: (String) -> Unit) {
                     if (t.locked) {
                         Box(Modifier.align(Alignment.BottomEnd).offset(x = 9.dp, y = 4.dp).size(14.dp).clip(CircleShape).background(c.shell), contentAlignment = Alignment.Center) {
                             Ic(R.drawable.ic_lock_simple, 10.dp, c.text4)
+                        }
+                    }
+                    if (t.badge > 0) {
+                        Box(
+                            Modifier.align(Alignment.TopEnd).offset(x = 10.dp, y = (-4).dp).heightIn(min = 17.dp).widthIn(min = 17.dp)
+                                .clip(CircleShape).background(c.shell).padding(2.dp).clip(CircleShape).background(c.ember),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(if (t.badge > 9) "9+" else t.badge.toString(), modifier = Modifier.padding(horizontal = 3.dp),
+                                style = TextStyle(fontFamily = CfxFonts.ui, fontWeight = FontWeight.Bold, fontSize = 10.sp, lineHeight = 13.sp, color = c.emberFg))
                         }
                     }
                     if (t.live) {

@@ -5,6 +5,7 @@ import io.crossfyre.mobile.account.Outcome
 import io.crossfyre.mobile.account.Problem
 import io.crossfyre.mobile.account.Reply
 import io.crossfyre.mobile.account.Transport
+import io.crossfyre.mobile.approve.SignOutLeft
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -94,5 +95,18 @@ class NoticesTest {
         assertEquals("Verify your email address first.", pair(envelope(403, "Verify", JSONObject().put("email_unverified", true))).title)
         // Anything else keeps the server's own words.
         assertEquals("Choose a workspace", pair(envelope(400, "Choose a workspace")).body)
+    }
+
+    @Test
+    fun a_sign_out_the_server_did_not_confirm_points_to_the_dashboard() {
+        assertEquals(null, signOutNotice(SignOutLeft.NOTHING, "crossfyre.io"))
+        for (left in listOf(SignOutLeft.KEY, SignOutLeft.APPROVER)) {
+            val n = signOutNotice(left, "crossfyre.io")!!
+            assertEquals(Level.WARN, n.level)
+            assertEquals("Signed out on this phone only.", n.title)
+            assertTrue(n.body, n.body.startsWith("crossfyre.io did not confirm"))
+            assertTrue(n.body, n.body.endsWith("in the dashboard, under Settings > CLI Access."))
+        }
+        assertTrue(signOutNotice(SignOutLeft.APPROVER, "crossfyre.io")!!.body.contains("approver"))
     }
 }

@@ -201,6 +201,7 @@ private fun Counters(m: AppModel) {
 @Composable
 fun HomeContent(m: AppModel) {
     val c = cfx
+    PendingBanner(m)
     CaptureCard(m, tracer = false)
 
     val ws = m.workspace
@@ -255,7 +256,7 @@ fun HomeContent(m: AppModel) {
             val sub = (if (current > 0) "$current patched" else "Nothing patched yet") + if (stale > 0) " · $stale to patch again" else ""
             CfxRow("Patch a pinned app", first = true, icon = R.drawable.ic_package, sub = sub, chevron = R.drawable.ic_caret_right, onClick = { m.goTab("patch") })
         }
-        CfxRow("Node", first = !m.patch.available, icon = R.drawable.ic_hard_drives, sub = "Not available yet", chevron = R.drawable.ic_lock_simple, onClick = { m.goTab("node") })
+        CfxRow("Node", first = !m.patch.available, icon = R.drawable.ic_hard_drives, sub = "Not available yet", chevron = R.drawable.ic_lock_simple, onClick = { m.push = Push.Node })
     }
 }
 
@@ -511,6 +512,8 @@ fun SettingsContent(m: AppModel) {
             DeleteAccountRow(m)
         }
     }
+
+    ApprovalsSettings(m)
 
     GroupLabel("Workspace")
     CfxList {

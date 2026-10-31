@@ -344,10 +344,13 @@ fun BoxScope.Overlays(m: AppModel) {
             "Sign out?", onDismiss = { m.overlay = null },
             actions = {
                 CfxButton("Cancel", Kind.TEXT_DIM) { m.overlay = null }
-                CfxButton("Sign out", Kind.TEXT, color = c.danger) { m.signOut() }
+                CfxButton("Sign out", Kind.TEXT, color = c.danger, busy = m.signingOut) { m.signOut() }
             },
         ) {
             Text("Capture stops and this phone's key is revoked. The certificate and any patched apps stay on the phone.")
+            if (m.approverState == io.crossfyre.mobile.ApproverState.ACTIVE) {
+                Text("This phone also stops approving agent actions, and its approval key is deleted.")
+            }
         }
 
         Overlay.Unpair -> CfxDialog(
@@ -365,6 +368,12 @@ fun BoxScope.Overlays(m: AppModel) {
                 )
             )
         }
+
+        Overlay.ApprovalsExplain -> ApprovalsExplainSheet(m)
+        Overlay.Enrol -> EnrolSheet(m)
+        Overlay.ApprovalsOff -> ApprovalsOffDialog(m)
+        is Overlay.Approval -> ApprovalSheet(m, o.id)
+        is Overlay.Event -> EventSheet(m, o.id)
 
         is Overlay.Licence -> Sheet(title = { SheetTitle(o.name) }, onDismiss = { m.overlay = null }, tall = true) {
             Text(o.licence, style = T.rowSub())

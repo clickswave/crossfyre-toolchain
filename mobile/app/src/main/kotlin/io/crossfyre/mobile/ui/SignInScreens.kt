@@ -307,7 +307,7 @@ fun WorkspacesScreen(m: AppModel) {
                 withStyle(SpanStyle(color = c.text, fontWeight = FontWeight.SemiBold)) { append(u?.username?.ifEmpty { u.email } ?: "") }
             }
             Text(who, style = TextStyle(fontFamily = CfxFonts.ui, fontSize = 14.sp, color = c.text2), modifier = Modifier.weight(1f))
-            CfxButton("Not you?", Kind.TEXT_DIM, small = true) { m.signOut() }
+            CfxButton("Not you?", Kind.TEXT_DIM, small = true, busy = m.signingOut) { m.signOut() }
         }
         Text("Traffic captured on this phone goes to the workspace you pick. You can change it later.", style = T.lede())
         m.wsError?.let { Banner(it) }

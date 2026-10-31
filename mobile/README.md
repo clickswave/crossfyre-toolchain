@@ -94,7 +94,53 @@ the app asks for a new code.
 
 The account key is kept encrypted under a key held by the Android keystore.
 Signing out revokes it on the server as well as forgetting it on the phone. The
-certificate and any patched apps are device things and stay.
+phone waits for the server to confirm first; when it cannot, the phone still
+signs out, and the sign-in screen says to revoke the key in the dashboard under
+Settings > CLI Access. The certificate and any patched apps are device things
+and stay.
+
+## Approving agent actions
+
+An agent working with your Crossfyre account can be made to wait for you before
+it does something that needs a person, such as a scan across more than one node
+or requests that can change data on a target. The phone is where you say yes.
+
+- **A key made on the phone.** Turning on Approvals in Settings makes a P-256
+  signing key in the Android keystore. Its private half never leaves the phone.
+  The app sends the public half to crossfyre.io with the phone's model name and
+  install ID, and you confirm the phone once in a signed-in browser, which shows
+  the same fingerprint as the phone. A phone with no screen lock cannot turn it on.
+- **An unlock for every approval.** The keystore signs only after you unlock the
+  phone: for each signature on Android 11 and later, and within fifteen seconds
+  of the unlock on Android 8 to 10. What is signed is the SHA-256 of the exact
+  request text the phone showed you, so the CLI or agent key on a computer cannot
+  approve for you. Denying needs no unlock.
+- **Only the phone approves.** A request goes to the person whose agent made it,
+  not to anyone else in the workspace. While a phone approves for your account,
+  a yes from the dashboard or from the agent's own client does not count. Either
+  can still deny.
+- **What the phone shows.** The workspace, the action, every target with the
+  scope entry that allows it, the nodes, the options, the key that asked and
+  where the request came from. Anything the agent wrote is marked as its own
+  words, and every string is stripped of control and invisible characters before
+  it is drawn. If the text does not match the digest the server sent with it, the
+  phone offers only Deny.
+- **Checked while the app is open.** There is no push notification and no Google
+  service in the app. While it is on screen it asks crossfyre.io for waiting
+  approvals every five seconds for two minutes, then every fifteen. With the app
+  closed, requests reach you through the alerts you set up in the dashboard, and
+  a link to `https://crossfyre.io/m/approve/<id>` opens the request in the app.
+- **The Activity tab** shows what is waiting and your recent decisions. Both
+  are kept in memory while the app is open, and neither is written to the
+  phone's storage.
+
+Signing out, turning Approvals off, or revoking the phone's key in the dashboard
+stops the key from working. Removing the screen lock makes Android delete the
+key, and the app says so.
+
+The limit: an agent that drives your signed-in browser can do anything you can
+do there, including confirming a phone it enrolled itself. Approvals protect
+against agents that hold your keys outside the browser.
 
 ## Certificate-pinned apps
 
@@ -117,8 +163,8 @@ works, what it costs, and what still does not work.
   up to a minute before they do.
 - The phone keeps the last 30 requests it captured, for its own list, until the
   next capture starts. The dashboard holds the rest.
-- Using the phone as a node for scans is planned and not built. The Node tab
-  says so and does nothing.
+- Using the phone as a node for scans is planned and not built. The Node row
+  on Home says so and does nothing.
 
 ## Build
 
@@ -140,6 +186,9 @@ cargo install cargo-ndk
 
 # unit tests, every variant
 ./gradlew :app:test
+
+# the approval key on an emulator, which the tests give a PIN and take it from
+./gradlew :app:connectedDevDirectDebugAndroidTest
 ```
 
 `build.sh` does the native step and a `devDirect` debug build in one go. The
@@ -162,10 +211,12 @@ signing block excluded, published as `contentSha256` alongside each release.
 | | |
 |---|---|
 | `rust/` | `cfx_mobile`, the JNI native core. A member of this repository's cargo workspace, depending on `capture/` |
-| `app/src/main` | the app both builds share: the `VpnService`, the Compose screens, sign-in and pairing |
+| `app/src/main` | the app both builds share: the `VpnService`, the Compose screens, sign-in, pairing and approvals |
+| `app/src/prod`, `app/src/staging` | the link filters that open an approval from crossfyre.io or staging in the app |
 | `app/src/direct` | the patch feature, in the direct build only |
 | `app/src/play` | the Play build's stand-in for it, which says it is not available |
-| `app/src/test*` | unit tests, shared and per build |
+| `app/src/test*` | unit tests, shared and per build, with the approval fixtures the platform reads too |
+| `app/src/androidTest` | tests of the approval key in the real keystore; they set and clear a PIN, so run them on an emulator |
 | `tools/` | notes on capturing pinned apps, and `notices.py`, which writes the in-app licence notices |
 
 ## What is not in this repository
