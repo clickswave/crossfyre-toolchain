@@ -193,6 +193,25 @@ class NoticesTest {
         assertEquals("Couldn't send the stop.", stopNotice(Problem.Unreachable("crossfyre.io"), "crossfyre.io").title)
     }
 
+    /** An approve refused for the member's role says nothing started, and who can change the role. */
+    @Test
+    fun an_approve_refused_for_the_role_says_so_and_names_who_can_change_it() {
+        val reply = Reply(
+            403,
+            JSONObject().put("status", 403).put("message", "Your role in this workspace (**Owner**`x`) does not allow creating scans.")
+                .put("errors", JSONArray().put("workflow.create is required"))
+                .put("data", JSONObject().put("reason", "missing_permission").put("permission", "workflow.create")
+                    .put("role", JSONObject().put("id", "r-1").put("name", "**Owner**`x`"))).toString(),
+        )
+        val p = problem(ApprovalApi("https://crossfyre.io", Transport { _, _ -> reply })
+            .approve("cfk_k", "3f9c1e0b-6a2d-4b8e-9c71-0d5e2f4a8b13", "ap-1", 1, byteArrayOf(1)))
+        val n = decisionNotice(p, "crossfyre.io")
+        assertEquals(Level.WARN, n.level)
+        assertEquals("Not approved.", n.title)
+        assertTrue(n.body, n.body.startsWith("Your role in this workspace (Ownerx) does not allow creating scans."))
+        assertTrue(n.body, n.body.endsWith("Ask a workspace admin for a role that can start scans."))
+    }
+
     @Test
     fun a_list_only_an_approver_reads_says_so_when_this_phone_is_not_one() {
         val inactive = envelope(403, "approver_inactive", JSONObject().put("approver_inactive", true))

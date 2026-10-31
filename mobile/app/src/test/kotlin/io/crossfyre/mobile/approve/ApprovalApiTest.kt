@@ -240,6 +240,28 @@ class ApprovalApiTest {
         assertFalse(refusalOf(envelope(403, "Suspended", JSONObject().put("suspended", true))).let { reasonOf(it) == Refusal.APPROVER_INACTIVE })
     }
 
+    /** The platform's 403 for a member whose role may no longer start scans, as it sends it. */
+    private fun roleRefused(name: String) = envelope(
+        403, "Your role in this workspace ($name) does not allow creating scans.",
+        JSONObject().put("reason", "missing_permission").put("permission", "workflow.create")
+            .put("role", JSONObject().put("id", "r-1").put("name", name)),
+        errors = listOf("workflow.create is required"),
+    )
+
+    @Test
+    fun an_approve_refused_for_the_role_is_about_the_role_whatever_the_role_is_called() {
+        fun refusalOf(reply: Reply) = problem(api(Fake(reply)).approve(key, id, "ap-1", 1, byteArrayOf(1)))
+        // A role named for approving is still a role refusal, not this phone losing its approver.
+        val approvers = refusalOf(roleRefused("Scan Approvers"))
+        assertEquals(Refusal.MISSING_PERMISSION, reasonOf(approvers))
+        assertEquals("Your role in this workspace (Scan Approvers) does not allow creating scans.", approvers.text)
+        // The name an org admin typed comes out cleaned, never as the server's sentence.
+        val marked = refusalOf(roleRefused("**Owner**\u202E evil`x`"))
+        assertEquals(Refusal.MISSING_PERMISSION, reasonOf(marked))
+        assertFalse(marked.text, marked.text.contains("**") || marked.text.contains("`") || marked.text.contains("\u202E"))
+        assertFalse(marked.text, marked.text.contains("workflow.create"))
+    }
+
     // ── history and activity ──────────────────────────────────────────────
 
     @Test

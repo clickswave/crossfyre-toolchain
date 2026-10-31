@@ -271,11 +271,18 @@ class ApprovalApi(origin: String, private val transport: Transport) {
         return call("approvals/decide", body, ::decided)
     }
 
-    /** What a decision came to: the approval's status after it, or the refusal. */
+    /**
+     * What a decision came to: the approval's status after it, or the refusal.
+     *
+     * A role refusal is read by its reason before anything reads the server's
+     * words, which carry the role's name as an org admin typed it: a role called
+     * "Scan Approvers" said "approver" and cost the phone its approver.
+     */
     private fun decided(a: Answer): Outcome<String> = when {
         a.ok -> Outcome.Ok(a.data?.str("status") ?: a.data?.optJSONObject("approval")?.str("status") ?: "")
         a.status == 401 -> Outcome.Failed(Problem.SignedOut)
         a.status == 404 -> a.refusal(Refusal.UNKNOWN)
+        a.status == 403 && a.reason() == "missing_permission" -> a.roleRefusal()
         a.status == 403 && a.data?.optBoolean("approver_inactive") == true -> a.refusal(Refusal.APPROVER_INACTIVE)
         a.status == 403 && a.says("approver") -> a.refusal(Refusal.APPROVER_INACTIVE)
         a.status == 403 -> a.accountRefusal() ?: a.refusal()

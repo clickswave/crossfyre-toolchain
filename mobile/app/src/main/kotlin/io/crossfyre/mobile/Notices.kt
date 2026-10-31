@@ -116,6 +116,8 @@ fun decisionNotice(p: Problem, host: String): Notice = when {
         "Nothing was approved. Turn Approvals off and on again in Settings, then ask the agent to try again.",
     )
     reasonOf(p) == Refusal.APPROVER_INACTIVE -> Notice(Level.WARN, "This phone no longer approves.", "Turn Approvals on again in Settings.")
+    // Only an approve asks the role: the launch would start a scan as this member.
+    reasonOf(p) == Refusal.MISSING_PERMISSION -> Notice(Level.WARN, "Not approved.", "${p.text} Ask a workspace admin for a role that can start scans.")
     reasonOf(p) == Refusal.RATE_LIMITED -> Notice(Level.WARN, "Too many requests from this phone.", "Nothing was decided. Wait a minute, then try again.")
     else -> Notice(Level.DANGER, "Couldn't send your answer.", p.text)
 }
