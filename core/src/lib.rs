@@ -533,6 +533,17 @@ async fn run_operation(cmd: serde_json::Value, ctx: OpCtx) {
             node_id.clone(),
         )
     });
+    // An op that starts direct has to stop if the node is set to send through a proxy
+    // while it runs; a proxied op keeps its lease, which still sends through a proxy.
+    let direct = lease.is_none().then(|| {
+        (
+            pub_clone.clone(),
+            status_subj.clone(),
+            op_id.clone(),
+            workflow_id.clone(),
+            node_id.clone(),
+        )
+    });
     let env = ops::OpEnv {
         op_id,
         workflow_id,
@@ -546,9 +557,48 @@ async fn run_operation(cmd: serde_json::Value, ctx: OpCtx) {
         api_key,
         egress: lease,
     };
-    run_op_type(&op_type, env).await;
+    match direct {
+        None => run_op_type(&op_type, env).await,
+        Some((pubc, subj, op_id, workflow_id, node_id)) => {
+            if while_direct(&egress_state, run_op_type(&op_type, env))
+                .await
+                .is_none()
+            {
+                eprintln!("[op] {op_id} {STOPPED_DIRECT}");
+                ops::publish_refused(
+                    &pubc,
+                    &subj,
+                    &op_id,
+                    &workflow_id,
+                    &node_id,
+                    None,
+                    STOPPED_DIRECT,
+                )
+                .await;
+            }
+        }
+    }
     if let Some((l, pubc, subj, op_id, workflow_id, node_id)) = summary {
         ops::publish_egress(&pubc, &subj, &op_id, &workflow_id, &node_id, Some(&l)).await;
+    }
+}
+
+/// Why an op or a .cfx job that was sending from this node's own address was stopped.
+pub(crate) const STOPPED_DIRECT: &str = "stopped: this node was set to send through a proxy \
+     while this was sending from the node's own address. Run it again to send it through \
+     the proxy";
+
+/// Run `work`, which started while this node sent directly, until it ends or the node is
+/// set to send through a proxy, whichever comes first. `None` when it was stopped.
+/// Dropping `work` closes its engine connections, which ends the engine's side of it,
+/// and a .cfx job's helper, which is killed when dropped.
+async fn while_direct<F: std::future::Future>(
+    egress: &egress::state::EgressState,
+    work: F,
+) -> Option<F::Output> {
+    tokio::select! {
+        out = work => Some(out),
+        _ = egress.until_not_direct() => None,
     }
 }
 
@@ -3072,8 +3122,24 @@ pub async fn run_daemon(
                                 };
                                 let pub_clone = publisher.clone();
                                 let subj = format!("cfx.results.{node_id}");
+                                let state = Arc::clone(&egress_state);
                                 tokio::spawn(async move {
-                                    let result = executor::execute_job(ctx, pub_clone, subj).await;
+                                    // Its helper asks the engines for ops with no egress
+                                    // wrapper, so it stops if the node is set to send
+                                    // through a proxy while it runs.
+                                    let job =
+                                        executor::execute_job(ctx, pub_clone.clone(), subj.clone());
+                                    let Some(result) = while_direct(&state, job).await else {
+                                        println!("[execute] job={job_id} {STOPPED_DIRECT}");
+                                        executor::publish_failure(
+                                            &pub_clone,
+                                            &subj,
+                                            &job_id,
+                                            STOPPED_DIRECT,
+                                        )
+                                        .await;
+                                        return;
+                                    };
                                     match result {
                                         executor::ExecutionResult::Completed { code } =>
                                             println!("[execute] job={job_id} completed code={code}"),
@@ -3555,6 +3621,7 @@ mod egress_tests {
         FakeEngine, FakeNats, FakePlatform, direct_settings, http, ok, proxy_settings, resolver,
     };
     use serde_json::{Value, json};
+    use std::time::Duration;
 
     const NODE: &str = "node-1";
     const PUBLIC: &str = "93.184.216.34";
@@ -3876,5 +3943,179 @@ mod egress_tests {
         );
         assert_eq!(login.connections(), rec.joined());
         assert_eq!(platform.count("/api/v1/creds/resolve"), 1);
+    }
+
+    /// An engine that acknowledges the op it is sent and goes on scanning until its
+    /// connection is closed, which it reports.
+    async fn scanning_engine() -> (
+        u16,
+        Arc<std::sync::atomic::AtomicBool>,
+        Arc<tokio::sync::Notify>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let (c, st) = (Arc::clone(&closed), Arc::clone(&started));
+        tokio::spawn(async move {
+            let Ok((s, _)) = l.accept().await else { return };
+            let (r, mut w) = s.into_split();
+            let mut lines = tokio::io::BufReader::new(r).lines();
+            let _ = lines.next_line().await;
+            let _ = w.write_all(b"{\"type\":\"ack\"}\n").await;
+            st.notify_one();
+            while let Ok(Some(_)) = lines.next_line().await {}
+            c.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        (port, closed, started)
+    }
+
+    /// The platform switches a node to its proxy while an op runs from the node's own
+    /// address, as a crawl or a vuln scan does for hours. The op does not go on sending
+    /// directly: its engine connection is closed, and it ends with a note saying why,
+    /// left for a later dispatch.
+    #[tokio::test]
+    async fn an_op_sending_direct_stops_when_the_node_switches_to_a_proxy() {
+        let rec = Recorder::start(to_loopback).await;
+        let nats = FakeNats::start().await;
+        let settings = proxy_settings(6, "p1", &rec);
+        let platform = FakePlatform::start(move |_, _| ok(settings.clone())).await;
+        let st = EgressState::new(resolver(&[]));
+        st.apply_authorize(&direct_settings(5));
+        let (port, closed, started) = scanning_engine().await;
+        let c = ctx(&nats, &platform, &st).await;
+        let client = c.pub_clone.clone();
+        let data = json!({
+            "target": "http://app.example.test/",
+            "egress_expect": {NODE: {"mode": "direct", "proxy_id": null, "rev": 5}},
+        });
+        let engines = [("cortex", port)];
+        let run =
+            ops::test_engines::with(&engines, run_operation(op("op-sw", "vuln-scan-1", data), c));
+        let switch = async {
+            started.notified().await;
+            // What the egress_changed arm does with the announcement.
+            st.announce(Some(6));
+            let h = http();
+            let f = egress::state::Fetch {
+                http: &h,
+                api_url: &platform.url,
+                api_key: "cfk_node",
+            };
+            st.refresh(&f).await.unwrap();
+        };
+        let (ran, ()) = tokio::join!(tokio::time::timeout(Duration::from_secs(5), run), switch);
+        assert!(
+            ran.is_ok(),
+            "the op went on sending from the node's own address"
+        );
+        client.flush().await.unwrap();
+        let done = nats.wait_for("operation_completed").await.unwrap();
+        assert_eq!(done["error"], STOPPED_DIRECT, "{done}");
+        assert_eq!(
+            nats.first("operation_note").unwrap()["message"],
+            STOPPED_DIRECT
+        );
+        for _ in 0..100 {
+            if closed.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            closed.load(std::sync::atomic::Ordering::SeqCst),
+            "the engine's connection stayed open"
+        );
+        assert!(
+            !op_is_done("op-sw"),
+            "a stopped op is left for a later dispatch"
+        );
+    }
+
+    /// The same for a .cfx job: its helper, which asks the engines for ops with no
+    /// wrapper, is ended.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_cfx_job_running_direct_stops_when_the_node_switches_to_a_proxy() {
+        use std::os::unix::fs::PermissionsExt;
+        let rec = Recorder::start(to_loopback).await;
+        let settings = proxy_settings(6, "p1", &rec);
+        let platform = FakePlatform::start(move |_, _| ok(settings.clone())).await;
+        let st = EgressState::new(resolver(&[]));
+        st.apply_authorize(&direct_settings(5));
+
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let helper = dir.path().join("cfx-script");
+        std::fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\necho $$ > {}\nexec sleep 30\n",
+                pidfile.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let job = executor::JobContext {
+            node_id: NODE.into(),
+            job_id: "job-1".into(),
+            script: "print('hi')".into(),
+            targets: Vec::new(),
+        };
+        // A process that is gone, or a zombie waiting to be reaped, is not running.
+        let running = |pid: &str| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|s| s.rsplit_once(") ").map(|(_, rest)| !rest.starts_with('Z')))
+                .unwrap_or(false)
+        };
+
+        let run = async {
+            // Another test forking while the helper was being written can leave it
+            // briefly busy to execute; that is retried.
+            let busy = std::io::Error::from_raw_os_error(libc::ETXTBSY).to_string();
+            for _ in 0..100 {
+                let out =
+                    while_direct(&st, executor::run_helper(&helper, &job, None, |_| {})).await;
+                match &out {
+                    Some((executor::ExecutionResult::Error { message }, _))
+                        if message.ends_with(&busy) =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    _ => return out.map(|_| ()),
+                }
+            }
+            panic!("the helper stayed busy");
+        };
+        let switch = async {
+            for _ in 0..250 {
+                if pidfile.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let h = http();
+            let f = egress::state::Fetch {
+                http: &h,
+                api_url: &platform.url,
+                api_key: "cfk_node",
+            };
+            st.refresh(&f).await.unwrap();
+        };
+        let (out, ()) = tokio::join!(tokio::time::timeout(Duration::from_secs(10), run), switch);
+        assert_eq!(out.ok(), Some(None), "the job went on running");
+        let pid = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .to_string();
+        for _ in 0..100 {
+            if !running(&pid) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!running(&pid), "the job's helper is still running");
     }
 }

@@ -13,7 +13,7 @@
 //! node that no longer has one.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use cfx_tunnel::{Kind, Upstream};
@@ -248,7 +248,9 @@ enum Stale {
 /// This node's egress settings and its gateway. The daemon holds one ([`global`]);
 /// tests make their own.
 pub struct EgressState {
-    current: RwLock<NodeEgress>,
+    /// A channel rather than a lock, so work that started direct can wait for the node
+    /// to stop being direct.
+    current: tokio::sync::watch::Sender<NodeEgress>,
     stale: Mutex<Option<Stale>>,
     last_failure: Mutex<Option<(Instant, String)>>,
     refreshing: tokio::sync::Mutex<()>,
@@ -270,7 +272,7 @@ pub fn global() -> &'static Arc<EgressState> {
 impl EgressState {
     pub fn new(resolver: Resolver) -> Arc<EgressState> {
         Arc::new(EgressState {
-            current: RwLock::new(NodeEgress::direct()),
+            current: tokio::sync::watch::Sender::new(NodeEgress::direct()),
             stale: Mutex::new(None),
             last_failure: Mutex::new(None),
             refreshing: tokio::sync::Mutex::new(()),
@@ -281,17 +283,11 @@ impl EgressState {
     }
 
     pub fn current(&self) -> NodeEgress {
-        self.current
-            .read()
-            .map(|c| c.clone())
-            .unwrap_or_else(|p| p.into_inner().clone())
+        self.current.borrow().clone()
     }
 
     fn set(&self, n: NodeEgress) {
-        match self.current.write() {
-            Ok(mut c) => *c = n,
-            Err(p) => *p.into_inner() = n,
-        }
+        self.current.send_replace(n);
     }
 
     fn stale(&self) -> Option<Stale> {
@@ -546,6 +542,17 @@ impl EgressState {
             .await
             .map_err(|e| format!("this node's egress gateway could not start: {e}"))?;
         gw.lease(op, proxy_id, upstream, block_internal)
+    }
+
+    /// Resolves once this node's settings no longer say direct: they name a proxy,
+    /// usable or not. Work that started while the node sent directly waits on this, so
+    /// that it stops rather than go on sending from the node's own address after the
+    /// node was set to send through a proxy. Settings that are only stale do not end it.
+    pub async fn until_not_direct(&self) {
+        let mut rx = self.current.subscribe();
+        // Checks the settings as they are now before it waits, so a switch made between
+        // the work's start and this call is seen too.
+        let _ = rx.wait_for(|n| !matches!(n.setting, Setting::Direct)).await;
     }
 
     /// This node's NATS connection dropped. A change the platform announces until it is
