@@ -21,6 +21,48 @@ fn default_response() -> String {
     "queue".to_string()
 }
 
+/// Why a port scan is not run through a proxy.
+pub(crate) const NOT_THROUGH_A_PROXY: &str = "Port scans cannot run on a node that sends \
+     through a proxy: a connect scan measures this machine's own path to each port, and \
+     through a proxy every port would read as whatever the proxy answers";
+
+/// One request line, unwrapped. A node wraps an op with the egress it chose; this
+/// engine only ever connects directly, so it runs a wrapped op whose egress is
+/// direct and refuses one that names a proxy, with the reason, rather than scan
+/// from this machine's own address instead. An error is the message the client is
+/// answered with, and nothing is sent anywhere.
+fn parse_request(line: &str) -> Result<DaemonRequest, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(line).map_err(|e| format!("Invalid JSON: {e}"))?;
+    let (inner, wire) = dguard::split_egress(v)?;
+    if let Some(wire) = wire {
+        let fields = wire
+            .as_object()
+            .ok_or("the egress instruction cannot be read")?;
+        if let Some(k) = fields
+            .keys()
+            .find(|k| !["v", "proxy"].contains(&k.as_str()))
+        {
+            return Err(format!(
+                "the egress instruction cannot be read: unknown field {k}"
+            ));
+        }
+        match fields.get("v").and_then(|v| v.as_u64()) {
+            Some(1) => {}
+            Some(v) => {
+                return Err(format!(
+                    "egress version {v} is not one this engine reads (it reads 1)"
+                ));
+            }
+            None => return Err("the egress instruction cannot be read: no version".into()),
+        }
+        if fields.get("proxy").is_some_and(|p| !p.is_null()) {
+            return Err(NOT_THROUGH_A_PROXY.to_string());
+        }
+    }
+    serde_json::from_value(inner).map_err(|e| format!("Invalid request: {e}"))
+}
+
 pub async fn run(port: u16, db: DoorwardDb) -> Result<(), Box<dyn std::error::Error>> {
     // Loopback unless an operator opts out: this channel has no per-request
     // credential of its own, so the bind address is the boundary.
@@ -93,13 +135,14 @@ async fn handle_connection(
             break;
         }
 
-        let req: DaemonRequest = match serde_json::from_str(&line) {
+        let req = match parse_request(&line) {
             Ok(r) => r,
-            Err(e) => {
+            Err(message) => {
                 let err = serde_json::json!({
+                    "type": "error",
                     "operation_id": "",
                     "status": "error",
-                    "message": format!("Invalid JSON: {}", e),
+                    "message": message,
                 });
                 write_json(&mut writer, &err).await?;
                 continue;
@@ -318,4 +361,56 @@ async fn write_json<W: AsyncWriteExt + Unpin>(
     writer.write_all(json.as_bytes()).await?;
     writer.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod egress_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn line(v: serde_json::Value) -> String {
+        v.to_string()
+    }
+
+    #[test]
+    fn a_scan_wrapped_with_a_proxy_is_refused_with_the_reason() {
+        let scan = json!({"operation": "scan", "response": "stream",
+                          "targets": ["127.0.0.1"], "ports": [22]});
+        let wrapped = dguard::wrap_egress(
+            &scan,
+            &json!({"v": 1, "proxy": "socks5h://u:p@127.0.0.1:1080"}),
+        );
+        let e = parse_request(&line(wrapped)).unwrap_err();
+        assert_eq!(e, NOT_THROUGH_A_PROXY);
+        assert!(!e.contains("u:p"), "{e}");
+    }
+
+    #[test]
+    fn a_scan_wrapped_as_direct_runs_as_it_always_has() {
+        let scan = json!({"operation": "scan", "response": "stream"});
+        let wrapped = dguard::wrap_egress(&scan, &json!({"v": 1, "proxy": null}));
+        let req = parse_request(&line(wrapped)).unwrap();
+        assert_eq!(req.operation, "scan");
+        assert_eq!(req.response, "stream");
+        let unwrapped = parse_request(&line(scan)).unwrap();
+        assert_eq!(unwrapped.operation, "scan");
+    }
+
+    #[test]
+    fn an_egress_this_engine_cannot_read_is_refused() {
+        let scan = json!({"operation": "scan"});
+        for egress in [
+            json!({"v": 2, "proxy": null}),
+            json!({"v": 1, "proxy": null, "pace": 1}),
+            json!({"proxy": null}),
+            json!("direct"),
+        ] {
+            assert!(
+                parse_request(&line(dguard::wrap_egress(&scan, &egress))).is_err(),
+                "{egress}"
+            );
+        }
+        // And an egress outside the wrapper is not quietly dropped.
+        assert!(parse_request(&line(json!({"operation": "scan", "egress": {}}))).is_err());
+    }
 }

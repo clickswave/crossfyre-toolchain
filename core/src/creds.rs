@@ -15,7 +15,8 @@
 //!
 //! - static types (bearer/header/cookie/basic): built directly, no network.
 //! - login_flow: the node replays the login (reqwest) and captures the resulting
-//!   session token/cookie.
+//!   session token/cookie. On a node that sends through a proxy, the login goes
+//!   through the op's lease on the egress gateway like the rest of the op.
 //! - oauth2 / sso: delegated to the control-plane broker (not yet wired here).
 //!
 //! Built contexts are cached per credential id (with a short TTL) so we do not
@@ -23,6 +24,8 @@
 
 use base64::Engine as _;
 use serde_json::{Value, json};
+
+use crate::egress::gateway::Lease;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -158,11 +161,28 @@ fn auth_context_from_json(v: &Value) -> AuthContext {
     AuthContext { headers, cookies }
 }
 
+/// The client a login or token exchange reaches the target with, through `egress`
+/// when the op has one. Never the control-plane client in that case: a login is
+/// target traffic, and a proxied node sends none of that from its own address.
+fn target_client(
+    builder: reqwest::ClientBuilder,
+    egress: &Lease,
+) -> Result<reqwest::Client, String> {
+    let proxy = reqwest::Proxy::all(egress.proxy_url())
+        .map_err(|_| "the egress gateway's address could not be used".to_string())?;
+    builder
+        .proxy(proxy)
+        .build()
+        .map_err(|e| format!("the login client could not be built: {e}"))
+}
+
 /// Build a concrete AuthContext from a resolved credential. Executes a login for
-/// login_flow types; static types are built directly.
+/// login_flow types; static types are built directly. `egress` is the op's lease when
+/// this node sends through a proxy; a login then goes through it.
 pub async fn build_context(
     http: &reqwest::Client,
     cred: &ResolvedCredential,
+    egress: Option<&Lease>,
 ) -> Result<AuthContext, String> {
     match cred.auth_type.as_str() {
         "bearer" => {
@@ -205,12 +225,12 @@ pub async fn build_context(
                 cookies: None,
             })
         }
-        "login_flow" => login_flow(http, cred).await,
+        "login_flow" => login_flow(http, cred, egress).await,
         // Non-interactive OAuth2 grants (client_credentials / password) are a
         // direct token exchange, done node-side like login_flow. The redirect-based
         // authorization_code grant and interactive SSO need a browser, so they are
         // delegated to the control-plane broker (not yet wired here).
-        "oauth2" => oauth2_token(http, cred).await,
+        "oauth2" => oauth2_token(http, cred, egress).await,
         "sso" => Err(
             "sso session was not resolved by the auth broker (check AUTHBROKER_URL and the cf_authbroker logs)"
                 .to_string(),
@@ -273,6 +293,7 @@ fn attr_after(fragment: &str, attr: &str, quote: char) -> Option<String> {
 async fn login_flow(
     http: &reqwest::Client,
     cred: &ResolvedCredential,
+    egress: Option<&Lease>,
 ) -> Result<AuthContext, String> {
     let cfg = &cred.config;
     let login_url = cfg["login_url"].as_str().unwrap_or("").trim();
@@ -291,12 +312,14 @@ async fn login_flow(
     // A cookie store lets us capture Set-Cookie session cookies from the login,
     // and lets an anti-CSRF prefetch share the session the token was minted for.
     let jar = std::sync::Arc::new(reqwest::cookie::Jar::default());
-    let client = reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .cookie_provider(jar.clone())
         .timeout(Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .build()
-        .unwrap_or_else(|_| http.clone());
+        .redirect(reqwest::redirect::Policy::limited(5));
+    let client = match egress {
+        Some(lease) => target_client(builder, lease)?,
+        None => builder.build().unwrap_or_else(|_| http.clone()),
+    };
 
     // Assemble the credential body plus any extra static fields.
     let mut form = serde_json::Map::new();
@@ -459,6 +482,7 @@ async fn login_flow(
 async fn oauth2_token(
     http: &reqwest::Client,
     cred: &ResolvedCredential,
+    egress: Option<&Lease>,
 ) -> Result<AuthContext, String> {
     let cfg = &cred.config;
     let grant = cfg["grant_type"].as_str().unwrap_or("client_credentials");
@@ -508,7 +532,14 @@ async fn oauth2_token(
         .map(|(k, v)| format!("{}={}", form_urlencode(k), form_urlencode(v)))
         .collect::<Vec<_>>()
         .join("&");
-    let resp = http
+    let client = match egress {
+        Some(lease) => target_client(
+            reqwest::Client::builder().timeout(Duration::from_secs(20)),
+            lease,
+        )?,
+        None => http.clone(),
+    };
+    let resp = client
         .post(token_url)
         .header(
             reqwest::header::CONTENT_TYPE,
@@ -553,6 +584,7 @@ pub async fn resolve_identities(
     node_api_key: &str,
     identities: &[Value],
     host: &str,
+    egress: Option<&Lease>,
 ) -> Vec<Value> {
     let mut out = Vec::new();
     for ident in identities {
@@ -562,7 +594,7 @@ pub async fn resolve_identities(
         }
         let cid = ident["credential_id"].as_str().filter(|s| !s.is_empty());
         let auth = match cid {
-            Some(id) => match resolve_auth(http, api_url, node_api_key, id, host).await {
+            Some(id) => match resolve_auth(http, api_url, node_api_key, id, host, egress).await {
                 Ok(a) => a,
                 Err(e) => {
                     eprintln!("[op] authz identity '{role}' resolve failed ({id}): {e}");
@@ -606,8 +638,9 @@ pub async fn resolve_auth_pool(
     credential_id: &str,
     host: &str,
     want: usize,
+    egress: Option<&Lease>,
 ) -> Result<Vec<Value>, String> {
-    let first = resolve_auth(http, api_url, node_api_key, credential_id, host).await?;
+    let first = resolve_auth(http, api_url, node_api_key, credential_id, host, egress).await?;
     let want = want.clamp(1, 4);
     if want == 1 {
         return Ok(vec![first]);
@@ -619,7 +652,7 @@ pub async fn resolve_auth_pool(
     }
     let mut out = vec![first];
     for _ in 1..want {
-        match build_context(http, &cred).await {
+        match build_context(http, &cred, egress).await {
             Ok(ctx) => out.push(ctx.to_json()),
             // A login that fails the second time is not fatal: the pass runs on
             // the sessions it has. Silence would be, so it is reported.
@@ -638,6 +671,7 @@ pub async fn resolve_auth(
     node_api_key: &str,
     credential_id: &str,
     host: &str,
+    egress: Option<&Lease>,
 ) -> Result<Value, String> {
     if let Some(ctx) = cache_get(credential_id) {
         return Ok(ctx.to_json());
@@ -647,7 +681,7 @@ pub async fn resolve_auth(
     let ctx = if let Some(ra) = &cred.resolved_auth {
         auth_context_from_json(ra)
     } else {
-        build_context(http, &cred).await?
+        build_context(http, &cred, egress).await?
     };
     cache_put(credential_id, &ctx);
     Ok(ctx.to_json())

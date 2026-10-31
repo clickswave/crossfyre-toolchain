@@ -63,6 +63,20 @@ impl VoyageDb {
         Ok(Self { pool })
     }
 
+    /// A handle that has never connected and connects only if it is used, for tests
+    /// of daemon paths that do not touch the database.
+    #[cfg(test)]
+    pub fn unconnected() -> Self {
+        let opts = PgConnectOptions::new()
+            .host("127.0.0.1")
+            .port(1)
+            .username("none")
+            .database("voyage");
+        Self {
+            pool: sqlx::PgPool::connect_lazy_with(opts),
+        }
+    }
+
     pub async fn create_tables(&self) -> Result<(), sqlx::Error> {
         // scans table
         sqlx::query(

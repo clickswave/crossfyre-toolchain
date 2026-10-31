@@ -11,15 +11,26 @@ use std::collections::HashMap;
 ///
 /// Every source is best-effort. One failing or timing out costs its results and
 /// nothing else, so the merge below runs over whatever came back.
+///
+/// The sources are third parties, not the target, but they are asked about the
+/// target, so the questions go out the way the rest of the op's traffic does.
 pub async fn execute(
     domain: &str,
     user_agent: &str,
     exclude_sources: &[String],
+    egress: &transport::Egress,
 ) -> Result<HashMap<String, String>, Box<dyn std::error::Error + Send + Sync>> {
-    let client = reqwest::Client::builder()
-        .user_agent(user_agent)
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?;
+    // A plain client that says who it is: no browser emulation for a provider's API.
+    let client = transport::build_client(
+        transport::ClientConfig {
+            timeout: Some(std::time::Duration::from_secs(15)),
+            redirect: transport::Redirect::Limited(10),
+            user_agent: Some(user_agent.to_string()),
+            emulate: false,
+            ..Default::default()
+        },
+        egress,
+    )?;
 
     let skipped = |name: &str| exclude_sources.iter().any(|s| s == name);
 

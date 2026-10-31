@@ -13,9 +13,9 @@
 //! Setting `CERTSPOTTER_TOKEN` sends an API key, which lifts the limit. Absent,
 //! we query anonymously and accept the throttling.
 
-use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashSet;
+use transport::Client;
 
 #[derive(Deserialize)]
 struct Issuance {
@@ -44,7 +44,7 @@ pub async fn fetch(
     // endpoint. Returning an empty set rather than an error keeps it a
     // best-effort source: the caller unions what every provider managed to
     // return and should not lose crt.sh's results because this one was busy.
-    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+    if response.status() == transport::StatusCode::TOO_MANY_REQUESTS {
         return Ok(vec![]);
     }
     if !response.status().is_success() {

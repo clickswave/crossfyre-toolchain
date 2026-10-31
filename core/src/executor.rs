@@ -419,7 +419,7 @@ pub async fn execute_job(
 }
 
 /// A log line with the reason, then `completed` with code 1.
-async fn publish_failure(
+pub(crate) async fn publish_failure(
     publisher: &async_nats::Client,
     subject: &str,
     job_id: &str,

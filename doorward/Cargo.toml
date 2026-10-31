@@ -37,3 +37,7 @@ toml = "0.8"
 dirs = "5"
 dialoguer = "0.11"
 csv = "1.3.1"
+
+[dev-dependencies]
+# A recording SOCKS5 proxy and counting listeners for the egress tests.
+cfx_tunnel = { path = "../tunnel", features = ["recorder"] }

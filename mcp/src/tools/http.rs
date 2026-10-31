@@ -107,16 +107,24 @@ async fn send_once(cleared: &Clearance, r: Request<'_>) -> Result<Sent, String> 
         Some(_) => Vec::new(),
         None => vec![(c.dest.host.clone(), c.addrs[0])],
     };
-    let client = transport::build_client(transport::ClientConfig {
-        timeout: Some(r.timeout),
-        redirect: transport::Redirect::None,
-        accept_invalid_certs: true,
-        cookie_store: false,
-        user_agent: Some(r.user_agent.to_string()),
-        resolve,
-        ..Default::default()
-    })
-    .map_err(|_| "was not sent: no client could be built".to_string())?;
+    let client = transport::build_client(
+        transport::ClientConfig {
+            timeout: Some(r.timeout),
+            redirect: transport::Redirect::None,
+            accept_invalid_certs: true,
+            cookie_store: false,
+            user_agent: Some(r.user_agent.to_string()),
+            resolve,
+            ..Default::default()
+        },
+        &transport::Egress::Inherit,
+    )
+    .map_err(|e| match e {
+        // Which setting stops it, such as CROSSFYRE_EGRESS_PROXY with a pinned name.
+        // The text never quotes a proxy URL.
+        transport::BuildError::Egress(why) => format!("was not sent: {why}"),
+        transport::BuildError::Backend(_) => "was not sent: no client could be built".to_string(),
+    })?;
     let method = transport::Method::from_bytes(r.method.as_bytes())
         .map_err(|_| "was not sent: the method is not valid".to_string())?;
     let mut rb = client.request(method, r.url);

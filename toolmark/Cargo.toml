@@ -27,6 +27,10 @@ base64 = "0.22.1"
 md5 = "0.7"
 uuid = { version = "1.18.0", features = ["v4"] }
 
+[dev-dependencies]
+# A recording SOCKS5 proxy and counting listeners for the egress tests.
+cfx_tunnel = { path = "../tunnel", features = ["recorder"] }
+
 [features]
 # First-party builds enable this to swap the scan client to wreq (BoringSSL) for
 # real browser TLS/HTTP2 fingerprints. Off by default so the open build stays on

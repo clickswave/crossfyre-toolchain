@@ -1,6 +1,6 @@
-use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashSet;
+use transport::Client;
 
 #[derive(Deserialize)]
 struct Response {

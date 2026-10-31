@@ -17,8 +17,10 @@ pub async fn handle(env: OpEnv) {
         pub_clone,
         status_subj,
         result_subj,
+        egress,
         ..
     } = env;
+    let lease = egress.as_deref();
 
     // Either an explicit host list (the usual case when a subdomain enum ran
     // first and we are checking what it found) or a bare domain, which voyage
@@ -56,6 +58,7 @@ pub async fn handle(env: OpEnv) {
         op_id: &op_id,
         workflow_id: &workflow_id,
         node_id: &node_id,
+        egress: lease,
     };
 
     let mut found_count: i64 = 0;
@@ -63,24 +66,21 @@ pub async fn handle(env: OpEnv) {
     let mut total: i64 = 0;
     let mut last_prog = std::time::Instant::now();
 
-    let conn =
-        tokio::net::TcpStream::connect(crate::toolchain::config::engine_addr("voyage")).await;
-    let Ok(stream) = conn else {
-        eprintln!(
-            "[op] FAIL voyage daemon unreachable on {}. Is `voyage --daemon` running?",
-            crate::toolchain::config::engine_addr("voyage")
-        );
-        relay.publish_failed().await;
-        return;
+    let (mut lines, writer) = match super::open_engine("voyage", &req, lease).await {
+        Ok(c) => c,
+        Err(super::EngineOpen::Refused(why)) => {
+            relay.refuse(&why).await;
+            return;
+        }
+        Err(super::EngineOpen::Unreachable(_)) => {
+            eprintln!(
+                "[op] FAIL voyage daemon unreachable on {}. Is `voyage --daemon` running?",
+                super::engine_addr("voyage")
+            );
+            relay.publish_failed().await;
+            return;
+        }
     };
-
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    let (reader, mut writer) = stream.into_split();
-    let mut req_str = dguard::encode(&req);
-    req_str.push('\n');
-    let _ = writer.write_all(req_str.as_bytes()).await;
-
-    let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         if !workflow_id.is_empty() && is_workflow_cancelled(&workflow_id) {
             drop(lines);

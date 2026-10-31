@@ -204,6 +204,12 @@ fn spawn(data: &std::path::Path) -> Child {
 }
 
 fn spawn_with(data: &std::path::Path, args: &[&str]) -> Child {
+    spawn_env(data, args, &[])
+}
+
+/// `crossfyre mcp` with no proxy, Cloud key or daemon token from the environment the
+/// tests run in, and with `vars` set.
+fn spawn_env(data: &std::path::Path, args: &[&str], vars: &[(&str, &str)]) -> Child {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_crossfyre"));
     cmd.arg("--data-dir")
         .arg(data)
@@ -229,6 +235,7 @@ fn spawn_with(data: &std::path::Path, args: &[&str]) -> Child {
     ] {
         cmd.env_remove(v);
     }
+    cmd.envs(vars.iter().copied());
     cmd.spawn().expect("crossfyre runs")
 }
 
@@ -438,6 +445,52 @@ fn a_client_session_over_stdio() {
     assert_eq!(calls[1]["reason"], "out_of_scope");
     assert_eq!(calls[2]["confirmation"], "elicited");
     assert!(audit.contains("\"event\":\"start\"") && audit.contains("\"event\":\"stop\""));
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+/// A proxy would look a name up again, past the address the server checked, so with
+/// `CROSSFYRE_EGRESS_PROXY` set a request to a name is refused: neither sent through
+/// the proxy nor around it.
+#[test]
+fn with_an_egress_proxy_set_a_request_to_a_name_is_refused() {
+    let (port, hits) = target();
+    let (proxy_port, via_proxy) = target();
+    let data = temp_dir("egress-proxy");
+    write_config(&data, closed_port(), closed_port());
+    write_scope(
+        &data,
+        &format!("entries = [\"localhost:{port}\"]\nallow_private = true\n"),
+    );
+    let proxy = format!("http://127.0.0.1:{proxy_port}");
+    let mut child = spawn_env(&data, &[], &[("CROSSFYRE_EGRESS_PROXY", &proxy)]);
+    let (mut c, _) = Client::attach(&mut child);
+    c.initialize(true);
+
+    let s = c.call(2, "status", json!({}));
+    assert_eq!(s["structuredContent"]["egress_proxy"], true, "{s}");
+    let hints = s["structuredContent"]["hints"].to_string();
+    assert!(
+        hints.contains("CROSSFYRE_EGRESS_PROXY is set, so requests to names are refused"),
+        "{hints}"
+    );
+
+    let r = c.call(
+        3,
+        "send_http_request",
+        json!({"method": "GET", "url": format!("http://localhost:{port}/")}),
+    );
+    assert_eq!(r["isError"], true, "{r}");
+    assert!(r.to_string().contains("CROSSFYRE_EGRESS_PROXY"), "{r}");
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "sent around the proxy");
+    assert_eq!(
+        via_proxy.load(Ordering::SeqCst),
+        0,
+        "sent through the proxy"
+    );
+
+    drop(c.stdin);
+    let status = wait_exit(&mut child, Duration::from_secs(5));
+    assert!(status.success(), "{status:?}");
     let _ = std::fs::remove_dir_all(&data);
 }
 

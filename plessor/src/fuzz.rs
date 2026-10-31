@@ -50,6 +50,11 @@ pub struct FuzzParams {
     /// ours.
     #[serde(default)]
     pub block_internal: bool,
+    /// Where this op's connections go. Never read from the op's own fields: the
+    /// daemon sets it from the egress wrapper the request came in, and a request
+    /// without one gets `Inherit`.
+    #[serde(skip)]
+    pub egress: transport::Egress,
 }
 fn d_timeout() -> u64 {
     12_000
@@ -78,18 +83,23 @@ pub async fn run(mut params: FuzzParams, tx: mpsc::UnboundedSender<Value>) {
         return;
     }
     let want = |c: &str| params.classes.is_empty() || params.classes.iter().any(|x| x == c);
-    let client = match probe::build_client(probe::ClientOpts {
-        evasive: params.evasive,
-        identify: params.identify.clone(),
-        auth: params.auth.as_ref(),
-        target: &params.target,
-        timeout_ms: params.timeout_ms,
-        min_timeout_ms: 3000,
-        block_internal: params.block_internal,
-    }) {
-        Some(c) => c,
-        None => {
-            let _ = tx.send(json!({"type":"error","message":"client build failed"}));
+    let client = match probe::try_build_client(
+        probe::ClientOpts {
+            evasive: params.evasive,
+            identify: params.identify.clone(),
+            auth: params.auth.as_ref(),
+            target: &params.target,
+            timeout_ms: params.timeout_ms,
+            min_timeout_ms: 3000,
+            block_internal: params.block_internal,
+            egress: &params.egress,
+        },
+        transport::Redirect::Limited(3),
+        Vec::new(),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.send(json!({"type":"error","message": e}));
             return;
         }
     };

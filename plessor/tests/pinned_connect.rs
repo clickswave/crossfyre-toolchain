@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use plessor::rawhttp::{ReadUntil, SendFail, Verify, send_until_via};
+use plessor::rawhttp::{ReadUntil, Route, SendFail, Verify, send_until_via};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -100,7 +100,28 @@ async fn send(
     pin: Option<SocketAddr>,
     https: bool,
 ) -> Result<Vec<u8>, SendFail> {
+    send_via(
+        &Route {
+            egress: transport::Egress::Inherit,
+            block_internal: false,
+        },
+        host,
+        port,
+        pin,
+        https,
+    )
+    .await
+}
+
+async fn send_via(
+    route: &Route,
+    host: &str,
+    port: u16,
+    pin: Option<SocketAddr>,
+    https: bool,
+) -> Result<Vec<u8>, SendFail> {
     send_until_via(
+        route,
         host,
         port,
         pin,
@@ -175,4 +196,36 @@ async fn without_a_pin_the_host_is_dialled_as_before() {
         "and a name that resolves nowhere still goes nowhere"
     );
     assert_eq!(seen.connections.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_pin_is_refused_through_a_proxy_and_nothing_is_dialled() {
+    // A proxy looks the name up itself, so the address the caller checked would not
+    // be the one used. Refused before the proxy or the pin is dialled.
+    let (addr, seen) = plain_listener().await;
+    let (proxy, proxied) = plain_listener().await;
+    let route = Route {
+        egress: transport::Egress::Proxy(format!("socks5h://127.0.0.1:{}", proxy.port())),
+        block_internal: false,
+    };
+    let out = send_via(&route, NAME, addr.port(), Some(addr), false).await;
+    match out {
+        Err(SendFail::Connect(why)) => assert!(why.contains("pinned"), "{why}"),
+        Err(e) => panic!("refused, but not as a connect failure: {e}"),
+        Ok(_) => panic!("a pin was sent through a proxy"),
+    }
+    assert_eq!(seen.connections.load(Ordering::SeqCst), 0);
+    assert_eq!(proxied.connections.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn block_internal_refuses_a_private_pin_before_dialling_it() {
+    let (addr, seen) = plain_listener().await;
+    let route = Route {
+        egress: transport::Egress::Direct,
+        block_internal: true,
+    };
+    let out = send_via(&route, NAME, addr.port(), Some(addr), false).await;
+    assert!(matches!(out, Err(SendFail::Connect(_))), "{out:?}");
+    assert_eq!(seen.connections.load(Ordering::SeqCst), 0);
 }

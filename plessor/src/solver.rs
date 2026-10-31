@@ -13,6 +13,11 @@
 //!      or the cookie is rejected. We pass the node's `CROSSFYRE_EGRESS_PROXY` to
 //!      the solver and return its UA for plessor to adopt.
 //!
+//! An op a node sends through its gateway is not handed to the solver at all. The
+//! gateway's address is loopback on this machine and its credential belongs to the
+//! op, so the solver could not use it, and a clearance minted from the node's own
+//! address would be refused at the proxy's exit anyway. [`not_used`] says so.
+//!
 //! Configured with `CROSSFYRE_CHALLENGE_SOLVER` = the solver's `/v1` endpoint;
 //! unset means no solver (plessor just reports the block). This is a niche,
 //! best-effort last resort: origin discovery, fingerprint parity, and
@@ -28,6 +33,12 @@ pub struct Solved {
     pub user_agent: Option<String>,
 }
 
+/// Why the solver is not used for an op with this egress, or `None` when it is.
+pub fn not_used(egress: &transport::Egress) -> Option<&'static str> {
+    matches!(egress, transport::Egress::Proxy(_))
+        .then_some("challenge solver not used: this op sends through a proxy")
+}
+
 /// Whether a solver is configured.
 pub fn configured() -> bool {
     std::env::var("CROSSFYRE_CHALLENGE_SOLVER")
@@ -36,13 +47,26 @@ pub fn configured() -> bool {
 }
 
 /// Ask the configured solver to clear `target_url`. Returns the clearance cookies
-/// + UA, or None if no solver is configured or it failed.
-pub async fn solve(target_url: &str, timeout_ms: u64) -> Option<Solved> {
+/// and UA, or None if no solver is configured, the op's egress rules it out (see
+/// [`not_used`]), or it failed.
+///
+/// The solver is told to use `CROSSFYRE_EGRESS_PROXY` only under
+/// [`transport::Egress::Inherit`], which is the egress that reads it. A direct op's
+/// clearance is minted direct.
+pub async fn solve(
+    target_url: &str,
+    timeout_ms: u64,
+    egress: &transport::Egress,
+) -> Option<Solved> {
+    if not_used(egress).is_some() {
+        return None;
+    }
     let endpoint = std::env::var("CROSSFYRE_CHALLENGE_SOLVER")
         .ok()
         .filter(|s| !s.trim().is_empty())?;
-    let egress_proxy = std::env::var("CROSSFYRE_EGRESS_PROXY")
-        .ok()
+    let egress_proxy = matches!(egress, transport::Egress::Inherit)
+        .then(|| std::env::var(transport::EGRESS_PROXY_VAR).ok())
+        .flatten()
         .filter(|s| !s.trim().is_empty());
     let max_timeout = timeout_ms.max(20_000);
 
