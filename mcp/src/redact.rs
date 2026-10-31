@@ -336,6 +336,22 @@ pub(crate) fn audit_args(tool: &str, args: &serde_json::Value) -> serde_json::Va
             _ => {}
         }
     }
+    /// Every member with a sensitive name, at any depth, loses its value.
+    fn by_name(v: &mut Value) {
+        match v {
+            Value::Array(a) => a.iter_mut().for_each(by_name),
+            Value::Object(o) => {
+                for (k, x) in o.iter_mut() {
+                    if sensitive_name(k) && !x.is_null() {
+                        *x = json!(MASK);
+                    } else {
+                        by_name(x);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 
     let mut v = args.clone();
     match tool {
@@ -370,13 +386,11 @@ pub(crate) fn audit_args(tool: &str, args: &serde_json::Value) -> serde_json::Va
                         }
                     }
                 }
+                // A JSON edit can set a member to an object, so its names are looked at
+                // all the way down: `{"data":{"password":"..."}}`.
                 for field in ["query", "form", "json"] {
-                    if let Some(m) = e.get_mut(field).and_then(|m| m.as_object_mut()) {
-                        for (k, x) in m.iter_mut() {
-                            if sensitive_name(k) && !x.is_null() {
-                                *x = json!(MASK);
-                            }
-                        }
+                    if let Some(m) = e.get_mut(field).filter(|m| m.is_object()) {
+                        by_name(m);
                     }
                 }
                 if let Some(path) = e.get("path").and_then(|p| p.as_str()) {
@@ -521,6 +535,23 @@ mod unit {
         assert!(r.contains(r#""note":"a \"quoted\" token""#), "{r}");
         let r = redact_text(r#"{"api_key":"k\"EEE1\\"}"#);
         assert!(!r.contains("EEE1"), "{r}");
+    }
+
+    #[test]
+    fn the_audit_masks_a_json_edit_by_name_at_every_depth() {
+        let args = serde_json::json!({"exchange": "wx_0123456789_1", "edits": {
+            "json": {"data": {"password": "AU1", "n": 2},
+                     "list": [{"api_key": "AU2"}, "plain"],
+                     "token": {"value": "AU3"},
+                     "keep": "AU4"},
+            "query": {"code": "AU5", "q": "AU6"}}});
+        let shown = audit_args("workbench_replay", &args).to_string();
+        for secret in ["AU1", "AU2", "AU3", "AU5"] {
+            assert!(!shown.contains(secret), "{secret} survived: {shown}");
+        }
+        for kept in ["AU4", "AU6", "\"n\":2", "plain"] {
+            assert!(shown.contains(kept), "{kept} was lost: {shown}");
+        }
     }
 
     /// A body is cut at a byte cap, which can fall inside a secret. What was kept of it

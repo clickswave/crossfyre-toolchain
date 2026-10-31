@@ -1557,11 +1557,28 @@ mod replay {
             )
             .await;
         ok(&r);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1),
+                       "edits": {"json": {"data": {"password": "S8-nested"}}}}),
+            )
+            .await;
+        ok(&r);
         let audit = b.t.audit_text();
-        for s in ["S1-ck", "S3-bearer", "S4-pw", "S5-form", "S6-tok", "S7-key"] {
+        for s in [
+            "S1-ck",
+            "S3-bearer",
+            "S4-pw",
+            "S5-form",
+            "S6-tok",
+            "S7-key",
+            "S8-nested",
+        ] {
             assert!(!audit.contains(s), "{s} in the audit");
         }
-        let line = b.t.audit_lines().pop().unwrap();
+        let line = &b.t.audit_lines()[1];
         assert!(
             line["args"]["edits"]["body"]["body_sha256"].is_string(),
             "{line}"
