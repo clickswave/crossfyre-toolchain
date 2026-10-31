@@ -1,5 +1,6 @@
 package io.crossfyre.mobile.approve
 
+import io.crossfyre.mobile.InboxList
 import io.crossfyre.mobile.account.HttpTransport
 import io.crossfyre.mobile.account.Outcome
 import io.crossfyre.mobile.account.Refusal
@@ -162,6 +163,13 @@ class LivePlatformTest {
         assertTrue(ok(api.inbox(key)).items.first { it.id == note.id }.read)
         assertEquals(0, ok(api.inboxReadAll(key)).unread)
         assertTrue(ok(api.inbox(key, unreadOnly = true)).items.isEmpty())
+        // Pages of one: the server says the size it used, and Show older ends with its rows.
+        val one = ok(api.inbox(key, limit = 1))
+        assertEquals(1, one.limit)
+        var shown = InboxList().with(one)
+        for (n in 2..one.total) shown = shown.with(ok(api.inbox(key, page = n, limit = 1)))
+        assertEquals(one.total, shown.items.size)
+        assertFalse(shown.more)
 
         // The log, read as the account: the stop is this phone's, through Mobile.
         val events = ok(api.activity(key, workspace)).events
