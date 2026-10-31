@@ -1805,8 +1805,12 @@ mod replay {
 
 // ---------------------------------------------------------------------------
 // Injection tests through the captured session
+//
+// Linux only: the captured session is handed only to a plessor the kernel says runs as
+// this user, and only Linux says. Elsewhere the call is refused, as the module after
+// this one shows.
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 mod injection {
     use super::*;
     use crate::tests::fake_wb::*;
@@ -1882,6 +1886,43 @@ mod injection {
                 out.push(std::fs::read_to_string(&p).unwrap_or_default());
             }
         }
+    }
+
+    /// A loopback port is open to every account, and while plessor is stopped anyone
+    /// can listen on its port. The captured session must not go to them.
+    #[tokio::test]
+    async fn a_plessor_port_another_user_holds_gets_no_session() {
+        let plessor = stub_engine(StubOpts::default()).await;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        crate::engine::OWNERS
+            .lock()
+            .unwrap()
+            .insert(plessor.port, me.wrapping_add(1));
+        let b = bench_with(
+            scope(&["app.example.test".into()], "")
+                .resolver(names())
+                .plessor(plessor.port),
+            get_items(),
+        )
+        .await;
+        let peer = FakePeer::new(Elicit::Accept);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_test_injection",
+                json!({"exchange": handle(4), "wait_seconds": 2}),
+            )
+            .await;
+        crate::engine::OWNERS.lock().unwrap().remove(&plessor.port);
+        assert_eq!(reason(&r), "engine_unavailable", "{}", r.text);
+        assert!(r.text.contains("not handed to it"), "{}", r.text);
+        assert!(plessor.ops().is_empty(), "{:?}", plessor.ops());
+        assert_eq!(
+            peer.asked(),
+            0,
+            "nobody was asked to confirm a send that cannot go"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2423,5 +2464,45 @@ mod injection {
             m.notes
         );
         assert_eq!(plessor.cancels(), 1);
+    }
+}
+
+/// Off Linux nothing can say which user a loopback port belongs to, so a captured
+/// session is never handed on, even to a plessor the test itself runs.
+#[cfg(all(unix, not(target_os = "linux")))]
+mod injection_elsewhere {
+    use super::*;
+    use crate::tests::fake_wb::*;
+    use cfx_bridge::{ExchangeHandle, Method, ScanSourceResult};
+
+    #[tokio::test]
+    async fn a_captured_session_is_not_handed_on() {
+        let plessor = stub_engine(StubOpts::default()).await;
+        let b = bench_with(
+            scope(&["app.example.test".into()], "")
+                .resolver(FakeResolver::default().with("app.example.test", &["93.184.216.34"]))
+                .plessor(plessor.port),
+            WbOpts::default().answer(Method::ScanSource, |_, _| {
+                Ok(serde_json::to_value(ScanSourceResult {
+                    method: "GET".into(),
+                    url: "http://app.example.test/api/items?id=2".into(),
+                    req_headers: vec![("Cookie".into(), "sid=S1-ck".into())],
+                    body: None,
+                    content_type: None,
+                })
+                .unwrap())
+            }),
+        )
+        .await;
+        let r =
+            b.t.call(
+                &FakePeer::new(Elicit::None),
+                "workbench_test_injection",
+                json!({"exchange": ExchangeHandle::new(UID_A, 4).unwrap().to_string()}),
+            )
+            .await;
+        assert_eq!(reason(&r), "engine_unavailable", "{}", r.text);
+        assert!(r.text.contains("only on Linux"), "{}", r.text);
+        assert!(plessor.ops().is_empty());
     }
 }

@@ -335,6 +335,22 @@ pub(crate) async fn start_scan(
     let mut conn = engine::connect(port)
         .await
         .map_err(|_| mcp.engine_down("plessor", port))?;
+    // A captured session goes only to a daemon this user runs. Anyone on the machine can
+    // listen on a loopback port while plessor is stopped.
+    if plan.auth.is_some()
+        && let Err(why) = conn.runs_as_this_user().await
+    {
+        return Err(Refusal::new(
+            Reason::EngineUnavailable,
+            format!(
+                "Whatever is listening on 127.0.0.1:{port} could not be shown to be your \
+                 plessor ({why}), so the captured session was not handed to it and nothing \
+                 was sent. Another user can listen on that port while plessor is stopped. \
+                 Check that `crossfyre extension start plessor` started it as you, and call \
+                 again."
+            ),
+        ));
+    }
     mcp.require(
         &mut conn,
         "plessor",
