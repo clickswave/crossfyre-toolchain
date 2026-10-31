@@ -82,9 +82,10 @@ static PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
         p(r"sk_live_\w+", MASK),
         // A JSON member with one of those names and a string value: `"password":"x"`,
         // `"access_token": "..."`. Escapes inside the value are stepped over, so `\"`
-        // does not end it early.
+        // does not end it early, and a value a body cap cut off before its closing
+        // quote is masked to the end of what was captured.
         p(
-            &format!(r#"(?i)"(?P<name>{member})"\s*:\s*"(?:[^"\\]|\\.)*""#),
+            &format!(r#"(?i)"(?P<name>{member})"\s*:\s*"(?:[^"\\]|\\.)*(?:"|\\?\z)"#),
             r#""$name":"[redacted]""#,
         ),
         // A multipart/form-data part with one of those names: its headers are kept and
@@ -520,6 +521,21 @@ mod unit {
         assert!(r.contains(r#""note":"a \"quoted\" token""#), "{r}");
         let r = redact_text(r#"{"api_key":"k\"EEE1\\"}"#);
         assert!(!r.contains("EEE1"), "{r}");
+    }
+
+    /// A body is cut at a byte cap, which can fall inside a secret. What was kept of it
+    /// is masked, as the multipart pattern already did.
+    #[test]
+    fn a_json_secret_cut_off_by_the_body_cap_is_masked() {
+        let r = redact_text(r#"{"user":"a","access_token":"TRUNC1abcdef"#);
+        assert_eq!(r, r#"{"user":"a","access_token":"[redacted]""#);
+        // Cut just after an escape character, and with nothing after the quote yet.
+        let r = redact_text(r#"{"password":"TRUNC2\"#);
+        assert!(!r.contains("TRUNC2"), "{r}");
+        assert_eq!(redact_text(r#"{"secret":""#), r#"{"secret":"[redacted]""#);
+        // A whole value is still masked only up to its own closing quote.
+        let r = redact_text(r#"{"token":"T1","q":"keep"}"#);
+        assert_eq!(r, r#"{"token":"[redacted]","q":"keep"}"#);
     }
 
     #[test]

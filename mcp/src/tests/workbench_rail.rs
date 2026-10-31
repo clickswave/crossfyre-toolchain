@@ -637,6 +637,33 @@ mod reads {
         }
     }
 
+    /// The Workbench cuts a body at max_body_bytes, which can fall inside a JSON secret
+    /// and leave its value with no closing quote.
+    #[tokio::test]
+    async fn a_secret_the_body_cap_cut_off_comes_back_masked() {
+        let b = bench_with(
+            base(),
+            WbOpts::default().answer(Method::Exchange, |c, _| {
+                let Call::Exchange(p) = c else { unreachable!() };
+                let mut x = default_exchange(p.id);
+                let cut = "{\"user\":\"a\",\"access_token\":\"S7-trunc-abcdef";
+                x.resp_body = Some(Body::text(cut.into(), 4096, true));
+                Ok(serde_json::to_value(x).unwrap())
+            }),
+        )
+        .await;
+        let r =
+            b.t.call(
+                &FakePeer::new(Elicit::None),
+                "workbench_get_exchange",
+                json!({"exchange": handle(UID_A, 4), "max_body_bytes": 41}),
+            )
+            .await;
+        let v = ok(&r).clone();
+        assert!(!r.text.contains("S7-trunc"), "{}", r.text);
+        assert_eq!(v["target_data"]["response"]["body"]["truncated"], true);
+    }
+
     #[tokio::test]
     async fn with_no_redact_the_results_show_secrets_and_the_audit_still_does_not() {
         let b = bench_with(
