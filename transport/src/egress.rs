@@ -103,6 +103,22 @@ impl Egress {
         }
     }
 
+    /// The egress for a request an engine received: [`Egress::Inherit`] when it
+    /// came without a wrapper, else what the wrapper's `egress` object asks for.
+    /// `wire` is what `dguard::split_egress` returned. An object that does not read
+    /// as an [`EgressWire`] is an error, as is a version or proxy [`Egress::from_wire`]
+    /// refuses.
+    pub fn from_request(wire: Option<serde_json::Value>) -> Result<Egress, String> {
+        let Some(v) = wire else {
+            return Ok(Egress::Inherit);
+        };
+        // serde's message names the field or type it stopped at, never a value it
+        // read, so a proxy URL with credentials is not echoed back.
+        let w: EgressWire = serde_json::from_value(v)
+            .map_err(|e| format!("the egress instruction cannot be read: {e}"))?;
+        Egress::from_wire(&w)
+    }
+
     /// Whether connections go through a proxy: [`Egress::Proxy`], or
     /// [`Egress::Inherit`] with `CROSSFYRE_EGRESS_PROXY` set.
     pub fn is_proxied(&self) -> bool {
@@ -519,6 +535,30 @@ mod tests {
         assert!(Egress::from_wire(&w).is_err());
         assert!(wire(r#"{"v":1,"proxy":null,"scope":"x"}"#).is_err());
         assert!(wire(r#"{"proxy":null}"#).is_err());
+    }
+
+    #[test]
+    fn a_request_reads_as_its_wrapper_says() {
+        use serde_json::json;
+        assert_eq!(Egress::from_request(None), Ok(Egress::Inherit));
+        assert_eq!(
+            Egress::from_request(Some(json!({"v": 1, "proxy": null}))),
+            Ok(Egress::Direct)
+        );
+        assert_eq!(
+            Egress::from_request(Some(json!({"v": 1, "proxy": "socks5h://a:b@127.0.0.1:9"}))),
+            Ok(Egress::Proxy("socks5h://a:b@127.0.0.1:9".into()))
+        );
+        for bad in [
+            json!({"v": 2, "proxy": null}),
+            json!({"v": 1, "proxy": null, "pace": 3}),
+            json!({"proxy": null}),
+            json!("socks5h://127.0.0.1:9"),
+            json!({"v": 1, "proxy": "bogus://u:hunter2@x"}),
+        ] {
+            let e = Egress::from_request(Some(bad.clone())).unwrap_err();
+            assert!(!e.contains("hunter2"), "{bad}: {e}");
+        }
     }
 
     #[test]

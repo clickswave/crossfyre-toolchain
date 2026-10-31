@@ -108,6 +108,8 @@ pub struct Recipe {
     /// The pass's redirect policy and name pins, carried for the same reason.
     pub redirect: transport::Redirect,
     pub resolve: Vec<(String, std::net::SocketAddr)>,
+    /// The pass's egress, so the burst goes out the way the rest of the pass does.
+    pub egress: transport::Egress,
 }
 
 /// A finding, or an explanation of why there is not one.
@@ -307,6 +309,7 @@ pub async fn probe(recipe: &Recipe, ep: &InjEndpoint) -> Outcome {
                     timeout_ms: recipe.timeout_ms,
                     min_timeout_ms: 0,
                     block_internal: recipe.block_internal,
+                    egress: &recipe.egress,
                 },
                 recipe.redirect,
                 recipe.resolve.clone(),

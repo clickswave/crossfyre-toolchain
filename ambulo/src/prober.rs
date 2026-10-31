@@ -153,7 +153,7 @@ impl Prober {
                 resolve: Vec::new(),
                 ..Default::default()
             },
-            &transport::Egress::Inherit,
+            &config.egress,
         )
         .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
 

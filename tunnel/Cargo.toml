@@ -21,6 +21,11 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "1"
 
+[features]
+# A recording SOCKS5 proxy and counting listeners for the engines' egress tests.
+# Only test builds turn it on, through a dev-dependency.
+recorder = ["tokio/rt"]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["net", "io-util", "time", "macros", "rt", "rt-multi-thread"] }
 # A local HTTPS proxy for the TLS tests, with a certificate made on the spot.

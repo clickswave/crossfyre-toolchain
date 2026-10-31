@@ -50,12 +50,27 @@ fn hash_body(bytes: &[u8]) -> u64 {
     h.finish()
 }
 
+/// Why origin discovery does not run with this egress, or `None` when it does.
+///
+/// Validating a candidate means connecting to that address and nowhere else, with
+/// the target's name pinned to it. Through a proxy the proxy would look the name up
+/// again and reach the CDN, so every candidate would be measured against the very
+/// thing it is meant to get around. Refused rather than run from this machine's
+/// own address instead.
+pub fn refused(egress: &transport::Egress) -> Option<&'static str> {
+    egress.is_proxied().then_some(
+        "Origin discovery connects to candidate addresses directly and cannot run through \
+         a proxy",
+    )
+}
+
 /// A transport client for one origin probe. `resolve` pins the target host to a
 /// candidate IP so the request keeps the real SNI + Host while hitting that IP.
 fn client(
     evasive: bool,
     timeout_ms: u64,
     resolve: Vec<(String, SocketAddr)>,
+    egress: &transport::Egress,
 ) -> Option<transport::Client> {
     transport::build_client(
         transport::ClientConfig {
@@ -68,7 +83,7 @@ fn client(
             resolve,
             ..Default::default()
         },
-        &transport::Egress::Inherit,
+        egress,
     )
     .ok()
 }
@@ -161,8 +176,13 @@ pub async fn discover(
     domain: &str,
     timeout_ms: u64,
     evasive: bool,
+    egress: &transport::Egress,
     log: &(dyn Fn(String) + Send + Sync),
 ) -> Vec<OriginFinding> {
+    if let Some(why) = refused(egress) {
+        log(why.to_string());
+        return vec![];
+    }
     let domain = domain
         .trim()
         .trim_start_matches("https://")
@@ -170,7 +190,7 @@ pub async fn discover(
         .trim_end_matches('/')
         .to_lowercase();
     let tmo = timeout_ms.max(8000);
-    let base = match client(evasive, tmo, vec![]) {
+    let base = match client(evasive, tmo, vec![], egress) {
         Some(c) => c,
         None => return vec![],
     };
@@ -269,6 +289,7 @@ pub async fn discover(
             evasive,
             tmo,
             vec![(domain.clone(), SocketAddr::new(ip, 443))],
+            egress,
         ) {
             Some(c) => c,
             None => continue,

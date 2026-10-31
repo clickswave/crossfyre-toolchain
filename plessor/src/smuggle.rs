@@ -149,7 +149,7 @@ fn request(host_hdr: &str, target: &str, body: &str, framing: Framing) -> Vec<u8
 }
 
 /// Probe one URL for a framing disagreement. `None` when there is no evidence.
-pub async fn probe(url: &str) -> Option<Value> {
+pub async fn probe(url: &str, route: &crate::rawhttp::Route) -> Option<Value> {
     let (https, host, port, target) = crate::rawhttp::split_url(url)?;
     let host_hdr = if (https && port == 443) || (!https && port == 80) {
         host.clone()
@@ -171,14 +171,14 @@ pub async fn probe(url: &str) -> Option<Value> {
             Framing::Ambiguous(ok_body.len()),
         );
         let (_, control_time) =
-            crate::rawhttp::send_exact(&host, port, https, &control, PROBE_TIMEOUT).await;
+            crate::rawhttp::send_exact(route, &host, port, https, &control, PROBE_TIMEOUT).await;
         if control_time >= CONTROL_CEILING {
             return None;
         }
 
         let hang = request(&host_hdr, &target, &hang_body, Framing::Ambiguous(cl));
         let (_, hang_time) =
-            crate::rawhttp::send_exact(&host, port, https, &hang, PROBE_TIMEOUT).await;
+            crate::rawhttp::send_exact(route, &host, port, https, &hang, PROBE_TIMEOUT).await;
         if hang_time < control_time + DESYNC_GAP {
             return None;
         }
@@ -191,13 +191,15 @@ pub async fn probe(url: &str) -> Option<Value> {
         // disagreement has been demonstrated.
         let unambiguous = request(&host_hdr, &target, &hang_body, Framing::LengthOnly(cl));
         let (_, unambiguous_time) =
-            crate::rawhttp::send_exact(&host, port, https, &unambiguous, PROBE_TIMEOUT).await;
+            crate::rawhttp::send_exact(route, &host, port, https, &unambiguous, PROBE_TIMEOUT)
+                .await;
         if unambiguous_time >= control_time + DESYNC_GAP {
             return None;
         }
 
         // Reproduce before reporting, as every other oracle here does.
-        let (_, again) = crate::rawhttp::send_exact(&host, port, https, &hang, PROBE_TIMEOUT).await;
+        let (_, again) =
+            crate::rawhttp::send_exact(route, &host, port, https, &hang, PROBE_TIMEOUT).await;
         if again < control_time + DESYNC_GAP {
             return None;
         }

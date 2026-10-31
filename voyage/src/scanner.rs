@@ -44,6 +44,9 @@ pub struct EnumConfig {
     /// who registers a domain with records pointing inward can otherwise aim
     /// those probes at our own network.
     pub block_internal: bool,
+    /// Where the enum's HTTP probing and passive lookups go. DNS queries are not
+    /// HTTP and go to the configured or public resolvers from this machine.
+    pub egress: transport::Egress,
 }
 
 /// Events streamed from the daemon to the enum client over TCP.
@@ -256,23 +259,7 @@ async fn task_handle(
         config.active_user_agent.clone()
     };
 
-    let mut extra_headers = transport::HeaderMap::new();
-    if let Some(token) = &config.identify {
-        if let Ok(val) = transport::HeaderValue::from_str(token) {
-            extra_headers.insert(transport::HeaderName::from_static("x-bug-bounty"), val);
-        }
-    }
-    let client = match transport::build_client(
-        transport::ClientConfig {
-            block_internal: config.block_internal,
-            timeout: Some(Duration::from_secs(10)),
-            user_agent: Some(user_agent.clone()),
-            emulate: config.evasive,
-            extra_headers,
-            ..Default::default()
-        },
-        &transport::Egress::Inherit,
-    ) {
+    let client = match probe_client(&config, &user_agent) {
         Ok(c) => c,
         Err(e) => {
             emit_log(
@@ -367,6 +354,30 @@ async fn task_handle(
             ..Default::default()
         });
     }
+}
+
+/// The client an enum worker probes found names over HTTP and HTTPS with.
+pub(crate) fn probe_client(
+    config: &EnumConfig,
+    user_agent: &str,
+) -> Result<transport::Client, transport::BuildError> {
+    let mut extra_headers = transport::HeaderMap::new();
+    if let Some(token) = &config.identify {
+        if let Ok(val) = transport::HeaderValue::from_str(token) {
+            extra_headers.insert(transport::HeaderName::from_static("x-bug-bounty"), val);
+        }
+    }
+    transport::build_client(
+        transport::ClientConfig {
+            block_internal: config.block_internal,
+            timeout: Some(Duration::from_secs(10)),
+            user_agent: Some(user_agent.to_string()),
+            emulate: config.evasive,
+            extra_headers,
+            ..Default::default()
+        },
+        &config.egress,
+    )
 }
 
 fn emit_log(event_tx: &Option<Arc<mpsc::UnboundedSender<StreamEvent>>>, level: &str, msg: &str) {
@@ -495,23 +506,7 @@ async fn adaptive_task_handle(
     } else {
         config.active_user_agent.clone()
     };
-    let mut extra_headers = transport::HeaderMap::new();
-    if let Some(token) = &config.identify {
-        if let Ok(val) = transport::HeaderValue::from_str(token) {
-            extra_headers.insert(transport::HeaderName::from_static("x-bug-bounty"), val);
-        }
-    }
-    let client = match transport::build_client(
-        transport::ClientConfig {
-            block_internal: config.block_internal,
-            timeout: Some(Duration::from_secs(10)),
-            user_agent: Some(user_agent.clone()),
-            emulate: config.evasive,
-            extra_headers,
-            ..Default::default()
-        },
-        &transport::Egress::Inherit,
-    ) {
+    let client = match probe_client(&config, &user_agent) {
         Ok(c) => c,
         Err(e) => {
             emit_log(

@@ -15,10 +15,51 @@ struct DaemonRequest {
     response: String,
     #[serde(flatten)]
     params: Value,
+    /// From the egress wrapper, never from the request's own fields.
+    #[serde(skip)]
+    egress: transport::Egress,
 }
 fn default_response() -> String {
     "stream".to_string()
 }
+
+/// One request line: the operation it asks for, unwrapped, with the egress its
+/// wrapper names. An error is the message the client is answered with, and nothing
+/// is sent anywhere.
+fn parse_request(line: &str) -> Result<DaemonRequest, String> {
+    let v: Value = serde_json::from_str(line).map_err(|e| format!("Invalid JSON: {e}"))?;
+    let (inner, wire) = dguard::split_egress(v)?;
+    let egress = transport::Egress::from_request(wire)?;
+    let mut req: DaemonRequest =
+        serde_json::from_value(inner).map_err(|e| format!("Invalid request: {e}"))?;
+    req.egress = egress;
+    Ok(req)
+}
+
+/// An op's parameters, which carry the egress the daemon read off the request.
+pub(crate) trait Routed {
+    fn route(&mut self, egress: transport::Egress);
+}
+
+macro_rules! routed {
+    ($($t:ty),* $(,)?) => {$(
+        impl Routed for $t {
+            fn route(&mut self, egress: transport::Egress) {
+                self.egress = egress;
+            }
+        }
+    )*};
+}
+
+routed!(
+    crate::engine::ScanParams,
+    crate::authz::AuthzParams,
+    crate::inject::InjectParams,
+    crate::discover::DiscoverParams,
+    crate::fuzz::FuzzParams,
+    crate::graphql::GraphqlParams,
+    crate::flow::FlowParams,
+);
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -77,15 +118,12 @@ async fn handle_connection(stream: TcpStream, gate: dguard::Gate) -> Result<(), 
             break;
         }
 
-        let req: DaemonRequest = match serde_json::from_str(&line) {
+        let req = match parse_request(&line) {
             Ok(r) => r,
-            Err(e) => {
+            Err(message) => {
                 write_line(
                     &mut writer,
-                    &serde_json::json!({
-                        "type": "error",
-                        "message": format!("Invalid JSON: {}", e),
-                    }),
+                    &serde_json::json!({"type": "error", "message": message}),
                 )
                 .await?;
                 continue;
@@ -93,15 +131,16 @@ async fn handle_connection(stream: TcpStream, gate: dguard::Gate) -> Result<(), 
         };
 
         let (w, l, g) = (&mut writer, &mut lines, &gate);
+        let (params, egress) = (req.params, req.egress);
         match req.operation.as_str() {
-            "scan" => run_op(req.params, "scan", crate::engine::run, w, l, g).await?,
-            "authz" => run_op(req.params, "authz", crate::authz::run, w, l, g).await?,
-            "inject" => run_op(req.params, "inject", crate::inject::run, w, l, g).await?,
-            "discover" => run_op(req.params, "discover", crate::discover::run, w, l, g).await?,
-            "fuzz" => run_op(req.params, "fuzz", crate::fuzz::run, w, l, g).await?,
-            "graphql" => run_op(req.params, "graphql", crate::graphql::run, w, l, g).await?,
+            "scan" => run_op(params, egress, "scan", crate::engine::run, w, l, g).await?,
+            "authz" => run_op(params, egress, "authz", crate::authz::run, w, l, g).await?,
+            "inject" => run_op(params, egress, "inject", crate::inject::run, w, l, g).await?,
+            "discover" => run_op(params, egress, "discover", crate::discover::run, w, l, g).await?,
+            "fuzz" => run_op(params, egress, "fuzz", crate::fuzz::run, w, l, g).await?,
+            "graphql" => run_op(params, egress, "graphql", crate::graphql::run, w, l, g).await?,
             // Replay a recorded multi-step flow and test its order. See `flow`.
-            "flow" => run_op(req.params, "flow", crate::flow::run, w, l, g).await?,
+            "flow" => run_op(params, egress, "flow", crate::flow::run, w, l, g).await?,
             // What this daemon honours beyond the original protocol. A caller that
             // must not run on a daemon that would ignore an option asks first, and an
             // older daemon answers `Unknown operation` before anything is sent. The
@@ -113,6 +152,8 @@ async fn handle_connection(stream: TcpStream, gate: dguard::Gate) -> Result<(), 
                         "type": "capabilities",
                         "cancel": true,
                         "inject": ["follow_redirects", "resolve"],
+                        // The version of the egress wrapper this daemon reads.
+                        "egress": transport::WIRE_VERSION,
                     }),
                 )
                 .await?;
@@ -164,8 +205,10 @@ fn is_cancel(line: &str, gate: &dguard::Gate) -> bool {
 ///
 /// The `ack` says `"cancellable": true`, so a client can tell this daemon from one
 /// that cannot be stopped and say so rather than claim it stopped.
+#[allow(clippy::too_many_arguments)]
 async fn run_op<P, F, Fut>(
     params: Value,
+    egress: transport::Egress,
     what: &str,
     run: F,
     writer: &mut OwnedWriteHalf,
@@ -173,12 +216,15 @@ async fn run_op<P, F, Fut>(
     gate: &dguard::Gate,
 ) -> Result<(), BoxError>
 where
-    P: DeserializeOwned + Send + 'static,
+    P: DeserializeOwned + Routed + Send + 'static,
     F: FnOnce(P, mpsc::UnboundedSender<Value>) -> Fut,
     Fut: Future<Output = ()> + Send + 'static,
 {
     let p: P = match serde_json::from_value(params) {
-        Ok(p) => p,
+        Ok(mut p) => {
+            P::route(&mut p, egress);
+            p
+        }
         Err(e) => {
             write_line(
                 writer,
@@ -539,5 +585,200 @@ mod tests {
             seen.load(Ordering::SeqCst) > 0,
             "the scan never reached the target"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The egress wrapper. A fixture that counts its connections sits behind a
+    // recording SOCKS5 proxy; every connection the fixture accepts has to be one
+    // the proxy opened, so a connection made around the proxy shows up as the
+    // difference.
+
+    use cfx_tunnel::recorder::{Fixture, Recorder, name_of, to_loopback};
+
+    /// A name only the proxy can be trusted with: a client that looked it up
+    /// itself would fail rather than reach anything.
+    const ONLY_THE_PROXY: &str = "only-the-proxy-knows.invalid";
+
+    fn wrapped(inner: Value, egress: Value) -> Value {
+        dguard::wrap_egress(&inner, &egress)
+    }
+
+    fn through(proxy: &Recorder) -> Value {
+        serde_json::json!({"v": 1, "proxy": proxy.url()})
+    }
+
+    /// Send one line and read the first event that comes back.
+    async fn first_answer(dport: u16, op: &Value) -> Value {
+        let stream = TcpStream::connect(("127.0.0.1", dport)).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut lines = BufReader::new(r).lines();
+        let mut line = op.to_string();
+        line.push('\n');
+        w.write_all(line.as_bytes()).await.unwrap();
+        next_event(&mut lines, Duration::from_secs(10))
+            .await
+            .expect("an answer")
+    }
+
+    /// Send one op and read its events until `done` or the connection closes.
+    async fn run_to_end(dport: u16, op: &Value) -> Vec<Value> {
+        let stream = TcpStream::connect(("127.0.0.1", dport)).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut lines = BufReader::new(r).lines();
+        let mut line = op.to_string();
+        line.push('\n');
+        w.write_all(line.as_bytes()).await.unwrap();
+        let mut events = Vec::new();
+        while let Some(ev) = next_event(&mut lines, Duration::from_secs(60)).await {
+            let done = ev["type"] == "done";
+            events.push(ev);
+            if done {
+                break;
+            }
+        }
+        events
+    }
+
+    fn assert_all_through(fx: &Fixture, proxy: &Recorder, events: &[Value]) {
+        assert!(
+            fx.connections() > 0,
+            "nothing reached the target: {events:?}"
+        );
+        assert_eq!(
+            fx.connections(),
+            proxy.joined(),
+            "the target accepted connections the proxy did not open"
+        );
+        assert!(proxy.seen().iter().all(|t| t.port == fx.port));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wrapped_inject_op_reaches_the_target_only_through_the_proxy() {
+        let fx = Fixture::http("text/html", "<html><body>ok</body></html>".into()).await;
+        let proxy = Recorder::start(to_loopback).await;
+        let dport = daemon().await;
+        let url = format!("{}/p?q=1", fx.base());
+        let events = run_to_done(dport, &wrapped(one_endpoint_op(&url), through(&proxy))).await;
+        assert_all_through(&fx, &proxy, &events);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wrapped_template_scan_sends_its_raw_requests_through_the_proxy_too() {
+        // An `unsafe` template goes out over a raw socket rather than the HTTP
+        // client. The target is a name that resolves nowhere, so a raw send that
+        // went around the proxy would never arrive.
+        let fx = Fixture::http("text/html", "<html><body>ok</body></html>".into()).await;
+        let proxy = Recorder::start(to_loopback).await;
+        let dport = daemon().await;
+        let dir = std::env::temp_dir().join(format!("plessor-egress-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("raw.yaml"),
+            "id: egress-raw-probe\n\
+             info:\n  name: raw probe\n  severity: info\n\
+             http:\n  - method: GET\n    unsafe: true\n    path:\n\
+             \x20     - \"{{BaseURL}}/raw/.%2e/probe\"\n    matchers:\n\
+             \x20     - type: status\n        status:\n          - 200\n",
+        )
+        .unwrap();
+        let op = serde_json::json!({
+            "operation": "scan",
+            "response": "stream",
+            "target": format!("http://{ONLY_THE_PROXY}:{}", fx.port),
+            "templates_dir": dir.to_string_lossy(),
+            "only": ["egress-raw-probe"],
+            "evasive": false,
+            "timeout_ms": 5000,
+        });
+        let events = run_to_done(dport, &wrapped(op, through(&proxy))).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            fx.requests().iter().any(|l| l.contains("/raw/.%2e/probe")),
+            "the raw request never arrived: {:?} {events:?}",
+            fx.requests()
+        );
+        assert_all_through(&fx, &proxy, &events);
+        assert!(
+            proxy
+                .seen()
+                .iter()
+                .all(|t| name_of(t) == Some(ONLY_THE_PROXY)),
+            "the name went to the proxy unresolved: {:?}",
+            proxy.seen()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wrapped_op_with_an_unknown_egress_version_is_refused_unsent() {
+        let fx = Fixture::http("text/html", "ok".into()).await;
+        let dport = daemon().await;
+        let url = format!("{}/p?q=1", fx.base());
+        let answer = first_answer(
+            dport,
+            &wrapped(
+                one_endpoint_op(&url),
+                serde_json::json!({"v": 2, "proxy": null}),
+            ),
+        )
+        .await;
+        assert_eq!(answer["type"], "error", "{answer}");
+        assert!(
+            answer["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("version 2"),
+            "{answer}"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(fx.connections(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_egress_outside_the_wrapper_is_refused_unsent() {
+        let fx = Fixture::http("text/html", "ok".into()).await;
+        let dport = daemon().await;
+        let mut op = one_endpoint_op(&format!("{}/p?q=1", fx.base()));
+        op["egress"] = serde_json::json!({"v": 1, "proxy": null});
+        let answer = first_answer(dport, &op).await;
+        assert_eq!(answer["type"], "error", "{answer}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(fx.connections(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn wrapped_capabilities_name_the_egress_version() {
+        let dport = daemon().await;
+        let answer = first_answer(
+            dport,
+            &wrapped(
+                serde_json::json!({"operation": "capabilities"}),
+                serde_json::json!({"v": 1, "proxy": null}),
+            ),
+        )
+        .await;
+        assert_eq!(answer["type"], "capabilities", "{answer}");
+        assert_eq!(answer["egress"], 1, "{answer}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_pinned_name_cannot_go_through_a_proxy_and_the_op_says_why() {
+        // Pins are honoured only when this process dials. Through a proxy the op is
+        // refused, with the reason, and nothing is sent.
+        let fx = Fixture::http("text/html", "ok".into()).await;
+        let proxy = Recorder::start(to_loopback).await;
+        let dport = daemon().await;
+        let url = format!("http://pinned.invalid:{}/p?q=1", fx.port);
+        let mut op = one_endpoint_op(&url);
+        op["resolve"] = serde_json::json!([["pinned.invalid", format!("127.0.0.1:{}", fx.port)]]);
+        let events = run_to_end(dport, &wrapped(op, through(&proxy))).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| e["type"] == "error"
+                    && e["message"].as_str().unwrap_or("").contains("pinned")),
+            "{events:?}"
+        );
+        assert_eq!(fx.connections(), 0);
+        assert_eq!(proxy.connections(), 0);
     }
 }

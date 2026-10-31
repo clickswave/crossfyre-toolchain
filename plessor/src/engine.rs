@@ -116,6 +116,11 @@ pub struct ScanParams {
     /// enabling per-scan choice of the managed pool or a BYO self-hosted OAST.
     #[serde(default)]
     pub oast: Option<OastSpec>,
+    /// Where this op's connections go. Never read from the op's own fields: the
+    /// daemon sets it from the egress wrapper the request came in, and a request
+    /// without one gets `Inherit`.
+    #[serde(skip)]
+    pub egress: transport::Egress,
 }
 fn d_timeout() -> u64 {
     10_000
@@ -253,7 +258,7 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
                 resolve: Vec::new(),
                 block_internal: params.block_internal,
             },
-            &transport::Egress::Inherit,
+            &params.egress,
         )
     };
 
@@ -329,7 +334,14 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
                         // node's own egress. On success, retry the base carrying
                         // that cookie; if there is no solver, or it can't clear, or
                         // the challenge persists even with clearance, report + stop.
-                        if clearance.is_none() && crate::solver::configured() {
+                        if let Some(note) = crate::solver::not_used(&params.egress)
+                            .filter(|_| clearance.is_none() && crate::solver::configured())
+                        {
+                            let _ = tx.send(json!({
+                                "type":"log",
+                                "message":format!("waf {} on base; {note}; ending scan", ch.label())
+                            }));
+                        } else if clearance.is_none() && crate::solver::configured() {
                             let _ = tx.send(json!({
                                 "type":"log",
                                 "message":format!("waf {} on base; handing off to challenge solver", ch.label())
@@ -337,6 +349,7 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
                             match crate::solver::solve(
                                 &base,
                                 params.timeout_ms.clamp(1000, 120_000),
+                                &params.egress,
                             )
                             .await
                             {
@@ -498,6 +511,11 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
             }
         }
         let oob_queue: crate::inject::OobQueue = Default::default();
+        // `unsafe` templates go out over raw sockets, the same way as everything else.
+        let raw = crate::rawhttp::Route {
+            egress: params.egress.clone(),
+            block_internal: params.block_internal,
+        };
         // Templates held back because their method changes the target. Named
         // rather than dropped, so a shorter run is not mistaken for a clean one.
         let mut write_templates: Vec<String> = Vec::new();
@@ -533,6 +551,7 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
                     oob_reg.as_ref(),
                     Some(&oob_queue),
                     params.evasive,
+                    &raw,
                 )
                 .await
                 {

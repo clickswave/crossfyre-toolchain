@@ -38,6 +38,9 @@ mod socks4;
 mod socks5;
 pub mod socks5_server;
 
+#[cfg(feature = "recorder")]
+pub mod recorder;
+
 /// The longest destination name sent to any proxy. SOCKS5 gives a name one length
 /// byte, and no DNS name is longer.
 pub const MAX_NAME: usize = 255;

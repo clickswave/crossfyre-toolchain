@@ -70,6 +70,9 @@ pub struct ClientOpts<'a> {
     /// their own node is the product. On for anything an anonymous caller can
     /// aim, where our egress is shared.
     pub block_internal: bool,
+    /// Where the client's connections go: the op's own egress, which the daemon
+    /// read off the request. Required, for the reason this struct exists.
+    pub egress: &'a transport::Egress,
 }
 
 /// Build an evasion-aware scan client.
@@ -86,6 +89,17 @@ pub fn build_client_with(
     redirect: transport::Redirect,
     resolve: Vec<(String, std::net::SocketAddr)>,
 ) -> Option<Client> {
+    try_build_client(o, redirect, resolve).ok()
+}
+
+/// [`build_client_with`], saying why when there is no client. An op reports this
+/// instead of a bare failure: through a proxy the reason is usually the egress
+/// (a pinned name cannot be honoured there), and the operator has to see it.
+pub fn try_build_client(
+    o: ClientOpts,
+    redirect: transport::Redirect,
+    resolve: Vec<(String, std::net::SocketAddr)>,
+) -> Result<Client, String> {
     let ClientOpts {
         evasive,
         identify,
@@ -94,6 +108,7 @@ pub fn build_client_with(
         timeout_ms,
         min_timeout_ms,
         block_internal,
+        egress,
     } = o;
     let mode = adaptive::identity::Mode::from_flags(evasive, identify);
     let seed = (!target.is_empty()).then_some(target);
@@ -114,9 +129,9 @@ pub fn build_client_with(
             resolve,
             block_internal,
         },
-        &transport::Egress::Inherit,
+        egress,
     )
-    .ok()
+    .map_err(|e| format!("client build failed: {e}"))
 }
 
 /// Send one request with an optional `(body, content-type)` and read the capped response.

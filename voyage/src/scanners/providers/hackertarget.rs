@@ -1,5 +1,5 @@
-use reqwest::Client;
 use std::collections::HashSet;
+use transport::Client;
 
 pub async fn fetch(
     reqwest_client: &Client,

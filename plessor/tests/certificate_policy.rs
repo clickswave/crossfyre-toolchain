@@ -14,7 +14,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use plessor::rawhttp::{ReadUntil, SendFail, Verify, send_until};
+use plessor::rawhttp::{ReadUntil, Route, SendFail, Verify, send_until};
+
+/// Straight to the origin, as these sends always went.
+const DIRECT: Route = Route {
+    egress: transport::Egress::Direct,
+    block_internal: false,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -73,6 +79,7 @@ async fn self_signed_server() -> u16 {
 async fn trusting_any_certificate_reaches_a_self_signed_origin() {
     let port = self_signed_server().await;
     let (out, _) = send_until(
+        &DIRECT,
         "localhost",
         port,
         true,
@@ -95,6 +102,7 @@ async fn trusting_any_certificate_reaches_a_self_signed_origin() {
 async fn checking_certificates_refuses_the_same_origin() {
     let port = self_signed_server().await;
     let (out, _) = send_until(
+        &DIRECT,
         "localhost",
         port,
         true,
@@ -132,6 +140,7 @@ async fn the_policy_is_what_decides() {
     let req = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
 
     let (lax, _) = send_until(
+        &DIRECT,
         "localhost",
         port,
         true,
@@ -142,6 +151,7 @@ async fn the_policy_is_what_decides() {
     )
     .await;
     let (strict, _) = send_until(
+        &DIRECT,
         "localhost",
         port,
         true,

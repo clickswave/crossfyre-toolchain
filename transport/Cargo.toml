@@ -21,6 +21,8 @@ cfx_tunnel = { path = "../tunnel" }
 
 # `AuthSpec` deserializes straight from engine op params.
 serde = { version = "1", features = ["derive"] }
+# An engine reads the egress a node wrapped its request with from the request's JSON.
+serde_json = "1"
 
 # Impersonation backend (BoringSSL). Optional so the open build never requires a
 # C toolchain and never ships the emulation policy. The browser profiles it

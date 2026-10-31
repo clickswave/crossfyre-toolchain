@@ -20,7 +20,6 @@ use hickory_resolver::TokioResolver;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 /// One server's answer to an AXFR request.
 pub struct Transfer {
@@ -59,7 +58,16 @@ pub async fn authoritative(
 }
 
 /// Attempt a transfer of `zone` from one server.
-pub async fn transfer(zone: &str, server: SocketAddr, timeout: Duration) -> Transfer {
+///
+/// The connection to the nameserver goes out the way `egress` says: a nameserver
+/// is the target's own infrastructure, so a transfer through a proxy comes from
+/// the proxy's address like the rest of the op.
+pub async fn transfer(
+    zone: &str,
+    server: SocketAddr,
+    timeout: Duration,
+    egress: &transport::Egress,
+) -> Transfer {
     let fail = |why: String| Transfer {
         names: Vec::new(),
         refused: Some(why),
@@ -74,10 +82,21 @@ pub async fn transfer(zone: &str, server: SocketAddr, timeout: Duration) -> Tran
         return fail("could not encode the AXFR query".into());
     };
 
-    let conn = match tokio::time::timeout(timeout, TcpStream::connect(server)).await {
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => return fail(format!("connect failed: {e}")),
-        Err(_) => return fail("connect timed out".into()),
+    let dialled = transport::dial(
+        egress,
+        &server.ip().to_string(),
+        server.port(),
+        false,
+        timeout,
+        None,
+    )
+    .await;
+    let conn = match dialled {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            return fail("connect timed out".into());
+        }
+        Err(e) => return fail(format!("connect failed: {e}")),
     };
     let mut conn = conn;
     // DNS over TCP frames each message with a two-byte length.
@@ -153,6 +172,7 @@ mod tests {
             "example.test",
             "127.0.0.1:1".parse().unwrap(),
             Duration::from_millis(500),
+            &transport::Egress::Direct,
         )
         .await;
         assert!(t.names.is_empty());
@@ -165,6 +185,7 @@ mod tests {
             "not a name",
             "127.0.0.1:1".parse().unwrap(),
             Duration::from_millis(500),
+            &transport::Egress::Direct,
         )
         .await;
         assert!(t.refused.unwrap().contains("invalid zone"));

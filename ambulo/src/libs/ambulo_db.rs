@@ -209,6 +209,21 @@ impl AmbuloDb {
         })
     }
 
+    /// A handle that has never connected and connects only if it is used, for tests
+    /// of daemon paths that do not touch the database.
+    #[cfg(test)]
+    pub fn unconnected(config: &crate::libs::cli_args::Args) -> Self {
+        let opts = PgConnectOptions::new()
+            .host("127.0.0.1")
+            .port(1)
+            .username("none")
+            .database("mach");
+        Self {
+            pool: sqlx::PgPool::connect_lazy_with(opts),
+            config: config.clone(),
+        }
+    }
+
     pub async fn spawn_logger(
         &self,
         scan_id: &i64,

@@ -214,6 +214,149 @@ pub fn encode_with(req: &serde_json::Value, token: Option<&str>) -> String {
     req.to_string()
 }
 
+// ---------------------------------------------------------------------------
+// The egress wrapper
+//
+// A node that sends an op through a proxy wraps the request it would have sent:
+//
+//   {"operation":"egress","egress":{"v":1,"proxy":"socks5h://..."},"inner":{...}}
+//
+// `inner` is the unchanged request. An engine too old to know the wrapper answers
+// "Unknown operation: egress" and sends nothing, which is the point of putting the
+// instruction in the operation name rather than in a field an old engine would
+// skip over. `encode` still adds `token` at the top level.
+// ---------------------------------------------------------------------------
+
+/// The operation name of a wrapped request.
+pub const EGRESS_OP: &str = "egress";
+
+/// The fields a wrapper may have. Anything else is an instruction this engine does
+/// not understand, and an op whose traffic it might change is refused rather than
+/// run without it.
+const WRAPPER_FIELDS: [&str; 4] = ["operation", "egress", "inner", "token"];
+
+/// `inner` wrapped with the egress a node chose for it.
+pub fn wrap_egress(inner: &serde_json::Value, egress: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"operation": EGRESS_OP, "egress": egress, "inner": inner})
+}
+
+/// The request a line asks for, and the egress it was wrapped with.
+///
+/// A request with no wrapper comes back as it is, with `None`. A wrapped one comes
+/// back as its `inner` request and the `egress` object, unread: what the object
+/// means is the HTTP layer's to decide.
+///
+/// An error is a request that names an egress in a way this function cannot honour
+/// to the letter, and the engine refuses it without sending anything:
+/// - a wrapper with no `egress`, with an `inner` that is not a request, or with a
+///   field it does not know;
+/// - a wrapper inside a wrapper;
+/// - an `egress` field anywhere but on the wrapper. Each op's parameters skip that
+///   name, so it would otherwise be dropped without a word and the op sent by
+///   whatever route it would have taken.
+pub fn split_egress(
+    v: serde_json::Value,
+) -> Result<(serde_json::Value, Option<serde_json::Value>), String> {
+    let Some(obj) = v.as_object() else {
+        return Ok((v, None));
+    };
+    if obj.get("operation").and_then(|o| o.as_str()) != Some(EGRESS_OP) {
+        if obj.contains_key(EGRESS_OP) {
+            return Err(stray_egress());
+        }
+        return Ok((v, None));
+    }
+    if let Some(k) = obj.keys().find(|k| !WRAPPER_FIELDS.contains(&k.as_str())) {
+        return Err(format!(
+            "the egress wrapper has a field this engine does not read: {k}"
+        ));
+    }
+    let Some(egress) = obj.get("egress").filter(|e| !e.is_null()) else {
+        return Err("the egress wrapper has no egress".to_string());
+    };
+    let Some(inner) = obj.get("inner").and_then(|i| i.as_object()) else {
+        return Err("the egress wrapper has no request inside it".to_string());
+    };
+    if inner.get("operation").and_then(|o| o.as_str()) == Some(EGRESS_OP) {
+        return Err("an egress wrapper inside another is refused".to_string());
+    }
+    if inner.contains_key(EGRESS_OP) {
+        return Err(stray_egress());
+    }
+    let egress = egress.clone();
+    let inner = serde_json::Value::Object(inner.clone());
+    Ok((inner, Some(egress)))
+}
+
+fn stray_egress() -> String {
+    "an egress is read only from the egress wrapper, not from a request's own fields".to_string()
+}
+
+#[cfg(test)]
+mod egress_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_request_without_a_wrapper_is_left_alone() {
+        let req = json!({"operation": "inject", "target": "http://a"});
+        assert_eq!(split_egress(req.clone()), Ok((req, None)));
+        // Not an object: the daemon's own parsing reports it.
+        assert_eq!(split_egress(json!([1])), Ok((json!([1]), None)));
+    }
+
+    #[test]
+    fn wrap_and_split_are_inverses() {
+        let inner = json!({"operation": "crawl", "seed": "http://a", "response": "stream"});
+        let egress = json!({"v": 1, "proxy": "socks5h://u:p@127.0.0.1:1"});
+        let wrapped = wrap_egress(&inner, &egress);
+        assert_eq!(wrapped["operation"], EGRESS_OP);
+        assert_eq!(split_egress(wrapped), Ok((inner, Some(egress))));
+    }
+
+    #[test]
+    fn the_token_rides_on_the_wrapper() {
+        let inner = json!({"operation": "scan"});
+        let line = encode_with(&wrap_egress(&inner, &json!({"v": 1})), Some("t"));
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["token"], "t");
+        let (got, _) = split_egress(v).unwrap();
+        assert_eq!(got, inner);
+    }
+
+    #[test]
+    fn a_malformed_wrapper_is_refused() {
+        for bad in [
+            json!({"operation": "egress", "inner": {"operation": "scan"}}),
+            json!({"operation": "egress", "egress": null, "inner": {"operation": "scan"}}),
+            json!({"operation": "egress", "egress": {"v": 1}}),
+            json!({"operation": "egress", "egress": {"v": 1}, "inner": "scan"}),
+            json!({"operation": "egress", "egress": {"v": 1}, "inner": {"operation": "scan"},
+                   "response": "stream"}),
+        ] {
+            assert!(split_egress(bad.clone()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_wrapper_inside_a_wrapper_is_refused() {
+        let inner = wrap_egress(&json!({"operation": "scan"}), &json!({"v": 1}));
+        let e = split_egress(wrap_egress(&inner, &json!({"v": 1}))).unwrap_err();
+        assert!(e.contains("inside another"), "{e}");
+    }
+
+    #[test]
+    fn an_egress_anywhere_but_the_wrapper_is_refused() {
+        let bare = json!({"operation": "inject", "egress": {"v": 1, "proxy": null}});
+        assert!(split_egress(bare).is_err());
+        let inside = wrap_egress(
+            &json!({"operation": "inject", "egress": {"v": 1}}),
+            &json!({"v": 1}),
+        );
+        assert!(split_egress(inside).is_err());
+    }
+}
+
 /// True when a daemon reply line is a terminal error.
 ///
 /// One definition, in one place. Each client used to spell this itself, and the

@@ -28,9 +28,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
+use transport::{Egress, Tunnel};
 
 #[derive(Debug, Deserialize)]
 pub struct SvcParams {
@@ -47,6 +47,11 @@ pub struct SvcParams {
     /// Targets probed concurrently.
     #[serde(default = "d_tasks")]
     pub tasks: usize,
+    /// Where the probes' connections go. Never read from the request's own fields:
+    /// the daemon sets it from the egress wrapper, and a request without one gets
+    /// `Inherit`.
+    #[serde(skip)]
+    pub egress: Egress,
 }
 fn d_timeout() -> u64 {
     5000
@@ -93,8 +98,9 @@ pub async fn run(params: SvcParams, tx: mpsc::UnboundedSender<Value>) {
         while inflight.len() < tasks {
             match queue.next() {
                 Some(t) => {
+                    let egress = params.egress.clone();
                     inflight.spawn(async move {
-                        let svc = identify(&t, to, auth_checks).await;
+                        let svc = identify(&egress, &t, to, auth_checks).await;
                         (t, svc)
                     });
                 }
@@ -173,21 +179,21 @@ fn order_for(port: u16) -> Vec<&'static str> {
     v
 }
 
-async fn identify(target: &str, to: Duration, auth_checks: bool) -> Option<Svc> {
+async fn identify(egress: &Egress, target: &str, to: Duration, auth_checks: bool) -> Option<Svc> {
     let (_, port) = split_host_port(target);
     for proto in order_for(port) {
         let got = match proto {
-            "redis" => redis(target, to).await,
-            "memcached" => memcached(target, to).await,
-            "mongodb" => mongodb(target, to).await,
-            "mysql" => mysql(target, to, auth_checks).await,
-            "postgres" => postgres(target, to, auth_checks).await,
-            "ftp" => ftp(target, to, auth_checks).await,
-            "ssh" => banner_service(target, to).await,
-            "smtp" => smtp(target, to).await,
-            "ldap" => ldap(target, to, auth_checks).await,
-            "banner" => banner_service(target, to).await,
-            "http" => http_service(target, to).await,
+            "redis" => redis(egress, target, to).await,
+            "memcached" => memcached(egress, target, to).await,
+            "mongodb" => mongodb(egress, target, to).await,
+            "mysql" => mysql(egress, target, to, auth_checks).await,
+            "postgres" => postgres(egress, target, to, auth_checks).await,
+            "ftp" => ftp(egress, target, to, auth_checks).await,
+            "ssh" => banner_service(egress, target, to).await,
+            "smtp" => smtp(egress, target, to).await,
+            "ldap" => ldap(egress, target, to, auth_checks).await,
+            "banner" => banner_service(egress, target, to).await,
+            "http" => http_service(egress, target, to).await,
             _ => None,
         };
         if let Some(mut svc) = got {
@@ -196,17 +202,17 @@ async fn identify(target: &str, to: Duration, auth_checks: bool) -> Option<Svc> 
             if proto == "banner" {
                 match svc.service.as_str() {
                     "ftp" => {
-                        if let Some(s) = ftp(target, to, auth_checks).await {
+                        if let Some(s) = ftp(egress, target, to, auth_checks).await {
                             svc = s;
                         }
                     }
                     "smtp" => {
-                        if let Some(s) = smtp(target, to).await {
+                        if let Some(s) = smtp(egress, target, to).await {
                             svc = s;
                         }
                     }
                     "mysql" => {
-                        if let Some(s) = mysql(target, to, auth_checks).await {
+                        if let Some(s) = mysql(egress, target, to, auth_checks).await {
                             svc = s;
                         }
                     }
@@ -223,15 +229,17 @@ async fn identify(target: &str, to: Duration, auth_checks: bool) -> Option<Svc> 
 // Transport helpers
 // ---------------------------------------------------------------------------
 
-async fn connect(target: &str, to: Duration) -> Option<TcpStream> {
-    let s = timeout(to, TcpStream::connect(target)).await.ok()?.ok()?;
-    let _ = s.set_nodelay(true);
-    Some(s)
+/// A connection to `target` (`host:port`) the way `egress` says, within `to`.
+async fn connect(egress: &Egress, target: &str, to: Duration) -> Option<Tunnel> {
+    let (host, port) = split_host_port(target);
+    transport::dial(egress, &host, port, false, to, None)
+        .await
+        .ok()
 }
 
 /// Read whatever arrives within the window, up to `cap` bytes. Absence of data
 /// is not an error: plenty of protocols wait for the client to speak first.
-async fn read_some(s: &mut TcpStream, to: Duration, cap: usize) -> Vec<u8> {
+async fn read_some(s: &mut Tunnel, to: Duration, cap: usize) -> Vec<u8> {
     let mut buf = vec![0u8; cap];
     match timeout(to, s.read(&mut buf)).await {
         Ok(Ok(n)) if n > 0 => {
@@ -242,7 +250,7 @@ async fn read_some(s: &mut TcpStream, to: Duration, cap: usize) -> Vec<u8> {
     }
 }
 
-async fn write_all(s: &mut TcpStream, data: &[u8], to: Duration) -> bool {
+async fn write_all(s: &mut Tunnel, data: &[u8], to: Duration) -> bool {
     matches!(timeout(to, s.write_all(data)).await, Ok(Ok(())))
 }
 
@@ -306,8 +314,8 @@ fn creds_finding(service: &str, target: &str, name: &str, detail: String) -> Val
 
 /// Services that greet on connect: SSH, FTP, SMTP, MySQL, and anything else
 /// whose first bytes name it.
-async fn banner_service(target: &str, to: Duration) -> Option<Svc> {
-    let mut s = connect(target, to).await?;
+async fn banner_service(egress: &Egress, target: &str, to: Duration) -> Option<Svc> {
+    let mut s = connect(egress, target, to).await?;
     let b = read_some(&mut s, to, 1024).await;
     if b.is_empty() {
         return None;
@@ -347,9 +355,9 @@ async fn banner_service(target: &str, to: Duration) -> Option<Svc> {
 /// Last resort: does it speak HTTP? No finding here - the web engines own that
 /// surface - but an identified port is better than an unknown one, and a
 /// service on a port nobody expects HTTP on is worth seeing.
-async fn http_service(target: &str, to: Duration) -> Option<Svc> {
+async fn http_service(egress: &Egress, target: &str, to: Duration) -> Option<Svc> {
     let (host, _) = split_host_port(target);
-    let mut s = connect(target, to).await?;
+    let mut s = connect(egress, target, to).await?;
     let req = format!("GET / HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     if !write_all(&mut s, req.as_bytes(), to).await {
         return None;
@@ -368,8 +376,8 @@ async fn http_service(target: &str, to: Duration) -> Option<Svc> {
 }
 
 /// Redis. PING is read-only and answers before AUTH on an open instance.
-async fn redis(target: &str, to: Duration) -> Option<Svc> {
-    let mut s = connect(target, to).await?;
+async fn redis(egress: &Egress, target: &str, to: Duration) -> Option<Svc> {
+    let mut s = connect(egress, target, to).await?;
     if !write_all(&mut s, b"*1\r\n$4\r\nPING\r\n", to).await {
         return None;
     }
@@ -430,8 +438,8 @@ async fn redis(target: &str, to: Duration) -> Option<Svc> {
 
 /// memcached. `version` is read-only; the protocol has no authentication at all
 /// in its default configuration, so reachability IS the finding.
-async fn memcached(target: &str, to: Duration) -> Option<Svc> {
-    let mut s = connect(target, to).await?;
+async fn memcached(egress: &Egress, target: &str, to: Duration) -> Option<Svc> {
+    let mut s = connect(egress, target, to).await?;
     if !write_all(&mut s, b"version\r\n", to).await {
         return None;
     }
@@ -463,8 +471,8 @@ async fn memcached(target: &str, to: Duration) -> Option<Svc> {
 /// MongoDB over OP_MSG (wire protocol 3.6+). `hello` identifies the server;
 /// `listDatabases` establishes whether authentication is enforced. Both are
 /// reads.
-async fn mongodb(target: &str, to: Duration) -> Option<Svc> {
-    let mut s = connect(target, to).await?;
+async fn mongodb(egress: &Egress, target: &str, to: Duration) -> Option<Svc> {
+    let mut s = connect(egress, target, to).await?;
     let hello = bson_doc(&[("hello", BsonVal::I32(1)), ("$db", BsonVal::Str("admin"))]);
     if !write_all(&mut s, &op_msg(&hello, 1), to).await {
         return None;
@@ -534,8 +542,8 @@ async fn mongodb(target: &str, to: Duration) -> Option<Svc> {
 
 /// PostgreSQL. The startup message is enough: the server's answer says which
 /// authentication method it will demand, and `trust` answers "none at all".
-async fn postgres(target: &str, to: Duration, auth_checks: bool) -> Option<Svc> {
-    let mut s = connect(target, to).await?;
+async fn postgres(egress: &Egress, target: &str, to: Duration, auth_checks: bool) -> Option<Svc> {
+    let mut s = connect(egress, target, to).await?;
     // StartupMessage: length, protocol 3.0, then null-terminated key/value pairs.
     let mut body: Vec<u8> = Vec::new();
     body.extend_from_slice(&[0x00, 0x03, 0x00, 0x00]);
@@ -627,8 +635,8 @@ async fn postgres(target: &str, to: Duration, auth_checks: bool) -> Option<Svc> 
 /// handshake as root with an empty password says whether the classic
 /// misconfiguration is present. An empty password needs no scramble, so this
 /// stays a single well-formed packet.
-async fn mysql(target: &str, to: Duration, auth_checks: bool) -> Option<Svc> {
-    let mut s = connect(target, to).await?;
+async fn mysql(egress: &Egress, target: &str, to: Duration, auth_checks: bool) -> Option<Svc> {
+    let mut s = connect(egress, target, to).await?;
     let greet = read_some(&mut s, to, 1024).await;
     if greet.len() < 6 || greet[4] != 10 {
         return None;
@@ -709,8 +717,8 @@ async fn mysql(target: &str, to: Duration, auth_checks: bool) -> Option<Svc> {
 }
 
 /// FTP. The banner identifies it; anonymous login is one exchange.
-async fn ftp(target: &str, to: Duration, auth_checks: bool) -> Option<Svc> {
-    let mut s = connect(target, to).await?;
+async fn ftp(egress: &Egress, target: &str, to: Duration, auth_checks: bool) -> Option<Svc> {
+    let mut s = connect(egress, target, to).await?;
     let hello = printable(&read_some(&mut s, to, 512).await);
     if !hello.starts_with("220") {
         return None;
@@ -754,8 +762,8 @@ async fn ftp(target: &str, to: Duration, auth_checks: bool) -> Option<Svc> {
 
 /// SMTP: identify and read the advertised capabilities. Deliberately stops
 /// before anything that would test relaying, which is not a read.
-async fn smtp(target: &str, to: Duration) -> Option<Svc> {
-    let mut s = connect(target, to).await?;
+async fn smtp(egress: &Egress, target: &str, to: Duration) -> Option<Svc> {
+    let mut s = connect(egress, target, to).await?;
     let hello = printable(&read_some(&mut s, to, 512).await);
     if !hello.starts_with("220") {
         return None;
@@ -784,11 +792,11 @@ async fn smtp(target: &str, to: Duration) -> Option<Svc> {
 
 /// LDAP. An anonymous simple bind is one BER-encoded request, and its result
 /// code is the whole answer.
-async fn ldap(target: &str, to: Duration, auth_checks: bool) -> Option<Svc> {
+async fn ldap(egress: &Egress, target: &str, to: Duration, auth_checks: bool) -> Option<Svc> {
     if !auth_checks {
         return None;
     }
-    let mut s = connect(target, to).await?;
+    let mut s = connect(egress, target, to).await?;
     // SEQUENCE { messageID 1, [APPLICATION 0] { version 3, name "", [0] "" } }
     let req: [u8; 14] = [
         0x30, 0x0c, 0x02, 0x01, 0x01, 0x60, 0x07, 0x02, 0x01, 0x03, 0x04, 0x00, 0x80, 0x00,

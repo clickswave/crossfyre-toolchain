@@ -44,6 +44,11 @@ pub struct FpParams {
     /// `transport::ClientConfig::block_internal`.
     #[serde(default)]
     pub block_internal: bool,
+    /// Where the op's connections go. Never read from the request's own fields: the
+    /// daemon sets it from the egress wrapper, and a request without one gets
+    /// `Inherit`.
+    #[serde(skip)]
+    pub egress: transport::Egress,
 }
 fn d_timeout() -> u64 {
     8000
@@ -102,7 +107,7 @@ pub async fn run(params: FpParams, tx: mpsc::UnboundedSender<Value>) {
             resolve: params.resolve.clone(),
             block_internal: params.block_internal,
         },
-        &transport::Egress::Inherit,
+        &params.egress,
     ) {
         Ok(c) => c,
         Err(e) => {

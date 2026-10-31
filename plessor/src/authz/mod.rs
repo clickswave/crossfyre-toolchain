@@ -71,6 +71,11 @@ pub struct AuthzParams {
     /// nothing and reads exactly like a clean result.
     #[serde(default = "d_settle")]
     pub escalation_settle_secs: u64,
+    /// Where this op's connections go. Never read from the op's own fields: the
+    /// daemon sets it from the egress wrapper the request came in, and a request
+    /// without one gets `Inherit`.
+    #[serde(skip)]
+    pub egress: transport::Egress,
 }
 fn d_settle() -> u64 {
     20
