@@ -420,3 +420,104 @@ async fn connections_that_never_authenticate_count_against_the_cap() {
         "the gateway holds {open} connections that never authenticated, under a cap of 1"
     );
 }
+
+/// A certificate for `name` and the TLS configs of a server presenting it and a client
+/// trusting only it.
+fn tls_pair(name: &str) -> (Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>) {
+    let cert = rcgen::generate_simple_self_signed(vec![name.into()]).unwrap();
+    let der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
+    let key = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
+    let prov = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let server = rustls::ServerConfig::builder_with_provider(Arc::clone(&prov))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![der.clone()], key)
+        .unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(der).unwrap();
+    let client = rustls::ClientConfig::builder_with_provider(prov)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    (Arc::new(server), Arc::new(client))
+}
+
+/// A tunnel to an HTTPS proxy is a TLS stream, which can keep the end of what it was
+/// given in its own buffer when the socket under it is full. The gateway has to flush
+/// it, or the tail of a large upload never reaches the proxy and the engine waits for
+/// an answer that cannot come. Small socket buffers make the last write meet a full
+/// socket, as a slow link to the proxy does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_end_of_an_upload_reaches_an_https_proxy() {
+    const TOTAL: usize = 4 * 1024 * 1024;
+    let (server_cfg, client_cfg) = tls_pair("proxy.test");
+
+    // The far side of the proxy: reads everything at a modest pace, then answers.
+    let seen = Arc::new(AtomicU64::new(0));
+    let far = {
+        let seen = Arc::clone(&seen);
+        let sock = tokio::net::TcpSocket::new_v4().unwrap();
+        sock.set_recv_buffer_size(4096).unwrap();
+        sock.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let l = sock.listen(8).unwrap();
+        let addr = l.local_addr().unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_cfg);
+        let task = tokio::spawn(async move {
+            let (tcp, _) = l.accept().await.unwrap();
+            let mut s = acceptor.accept(tcp).await.unwrap();
+            let mut buf = vec![0u8; 16 * 1024];
+            let mut got = 0usize;
+            while got < TOTAL {
+                match s.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        got += n;
+                        seen.store(got as u64, Ordering::Relaxed);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            if got == TOTAL {
+                let _ = s.write_all(b"OK").await;
+                let _ = s.flush().await;
+            }
+        });
+        (addr, task)
+    };
+
+    // The gateway's connection to the proxy, as an https upstream is opened: TLS over
+    // TCP.
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    sock.set_send_buffer_size(4096).unwrap();
+    let tcp = sock.connect(far.0).await.unwrap();
+    let tls = tokio_rustls::TlsConnector::from(client_cfg)
+        .connect(
+            rustls::pki_types::ServerName::try_from("proxy.test").unwrap(),
+            tcp,
+        )
+        .await
+        .unwrap();
+    let tunnel: Tunnel = Box::new(tls);
+
+    // The engine's connection to the gateway.
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut engine = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
+    let (gw_side, _) = l.accept().await.unwrap();
+    let (_alive, ended) = watch::channel(false);
+    let pumping = tokio::spawn(pump(gw_side, tunnel, IDLE, ended));
+
+    // A request body, then the answer read with the connection still open, as an HTTP
+    // client waits for one.
+    engine.write_all(&vec![b'x'; TOTAL]).await.unwrap();
+    let mut answer = [0u8; 2];
+    let got = tokio::time::timeout(Duration::from_secs(20), engine.read_exact(&mut answer)).await;
+    let reached = seen.load(Ordering::Relaxed);
+    far.1.abort();
+    pumping.abort();
+    assert!(
+        matches!(got, Ok(Ok(_))) && &answer == b"OK",
+        "no answer within 20 s; the proxy side read {reached} of {TOTAL} bytes"
+    );
+}

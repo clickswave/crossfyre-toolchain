@@ -404,7 +404,10 @@ async fn copy_counting<R, W>(
             }
             Ok(n) => n,
         };
-        if w.write_all(&buf[..n]).await.is_err() {
+        // Flushed every time: toward an HTTPS proxy the writer is a TLS stream, which
+        // can keep the end of what it was given in its own buffer when the socket is
+        // full, and nothing else would ever write that out.
+        if w.write_all(&buf[..n]).await.is_err() || w.flush().await.is_err() {
             return;
         }
         count.fetch_add(n as u64, Ordering::Relaxed);
