@@ -169,3 +169,65 @@ fn the_server_says_its_tool_list_can_change() {
     let tools = info.capabilities.tools.expect("tools are declared");
     assert_eq!(tools.list_changed, Some(true));
 }
+
+#[test]
+fn a_workbench_and_a_cloud_key_list_their_tools_side_by_side() {
+    use crate::cloud::Listing;
+    let both = crate::server::tool_list(&Backends {
+        workbench: Some(WORKBENCH_NAMES.to_vec()),
+        cloud: Some(Listing::Launch),
+    });
+    let names: Vec<&str> = both.iter().map(|t| t.name.as_ref()).collect();
+    assert_eq!(names.len(), 28, "{names:?}");
+    let mut unique = names.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), names.len(), "{names:?}");
+    let b = Backends {
+        workbench: Some(Vec::new()),
+        cloud: Some(Listing::Read),
+    };
+    for n in names {
+        assert!(crate::tools::known(n, &b), "{n}");
+    }
+}
+
+/// A refusal says which backend refused by its reason alone, and an id says which
+/// backend it belongs to by its prefix alone, so neither is read as the other's.
+#[test]
+fn the_backends_share_no_reason_and_no_id_prefix() {
+    use crate::core::Reason;
+    let workbench = [
+        Reason::WorkbenchUnavailable,
+        Reason::WorkbenchOutOfScope,
+        Reason::ProjectChanged,
+        Reason::WorkbenchError,
+    ]
+    .map(Reason::as_str);
+    let cloud: Vec<&str> = [
+        Reason::CloudUnavailable,
+        Reason::CloudKeyRejected,
+        Reason::PermissionDenied,
+        Reason::OutOfLocalScope,
+        Reason::ApprovalDenied,
+        Reason::ApprovalExpired,
+        Reason::ApprovalRequired,
+    ]
+    .map(Reason::as_str)
+    .into_iter()
+    .chain(cfx_cloud_wire::Reason::ALL.map(cfx_cloud_wire::Reason::as_str))
+    .collect();
+    for w in workbench {
+        assert!(!cloud.contains(&w), "{w} is a Cloud reason too");
+    }
+
+    let mut prefixes = vec![cfx_bridge::HANDLE_PREFIX, cfx_bridge::CURSOR_PREFIX];
+    prefixes.extend(cfx_cloud_wire::IdKind::ALL.map(cfx_cloud_wire::IdKind::prefix));
+    // Local scans and findings, as crate::jobs::new_id writes them.
+    prefixes.extend(["s_", "f_"]);
+    for (i, a) in prefixes.iter().enumerate() {
+        for b in &prefixes[i + 1..] {
+            assert!(!a.starts_with(b) && !b.starts_with(a), "{a} and {b}");
+        }
+    }
+}
