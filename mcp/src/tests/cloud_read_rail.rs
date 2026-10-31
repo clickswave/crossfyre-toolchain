@@ -194,7 +194,8 @@ async fn what_whoami_answers_at_start_decides_the_list() {
 
     // Nothing answers: listed from the cached permission, and refusing until it does.
     let mut t = scope(&[], "").build();
-    let url = format!("http://127.0.0.1:{}", closed_port());
+    let closed = closed_port();
+    let url = format!("http://127.0.0.1:{closed}");
     fake_cloud::connect(&mut t, &url, Some("read")).await;
     assert_eq!(t.mcp.backends().cloud, Some(Listing::Read));
     let r = t.call(&peer, "list_nodes", json!({})).await;

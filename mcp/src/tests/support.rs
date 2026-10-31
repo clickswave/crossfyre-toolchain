@@ -464,6 +464,8 @@ impl Resolver for FakeResolver {
 pub(crate) struct TestMcp {
     pub dir: TempDir,
     pub mcp: Arc<Mcp>,
+    /// The closed ports the engines default to, kept closed while the server runs.
+    _closed: Vec<ClosedPort>,
 }
 
 /// Opens the audit log a test server writes to.
@@ -480,6 +482,7 @@ pub(crate) struct Build {
     audit: Option<AuditOpener>,
     workbench: WorkbenchMode,
     workbench_dir: Option<PathBuf>,
+    closed: Vec<ClosedPort>,
 }
 
 /// A scope file with these entries and any extra lines.
@@ -490,10 +493,11 @@ pub(crate) fn scope(entries: &[String], extra: &str) -> Build {
 
 impl Build {
     pub(crate) fn with_file(text: Option<String>) -> Self {
+        let (toolmark, plessor) = (closed_port(), closed_port());
         Build {
             scope: text,
-            toolmark: closed_port(),
-            plessor: closed_port(),
+            toolmark: toolmark.port,
+            plessor: plessor.port,
             resolver: FakeResolver::default(),
             redact: true,
             burst: 100_000,
@@ -501,6 +505,7 @@ impl Build {
             audit: None,
             workbench: WorkbenchMode::Auto,
             workbench_dir: None,
+            closed: vec![toolmark, plessor],
         }
     }
     pub(crate) fn toolmark(mut self, port: u16) -> Self {
@@ -585,14 +590,33 @@ impl Build {
         TestMcp {
             dir,
             mcp: Arc::new(mcp),
+            _closed: self.closed,
         }
     }
 }
 
-/// A port with nothing listening on it.
-pub(crate) fn closed_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
+/// A port with nothing listening on it, for as long as this lives.
+///
+/// The port stays bound without listening, so a connection to it is refused and no
+/// listener is given it meanwhile, in this process or another. A port freed at once
+/// could go to the listener of a test running alongside, which then counted a
+/// connection meant for a closed port as one it was sent.
+pub(crate) struct ClosedPort {
+    pub port: u16,
+    _held: tokio::net::TcpSocket,
+}
+
+impl std::fmt::Display for ClosedPort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.port)
+    }
+}
+
+pub(crate) fn closed_port() -> ClosedPort {
+    let s = tokio::net::TcpSocket::new_v4().unwrap();
+    s.bind((std::net::Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+    let port = s.local_addr().unwrap().port();
+    ClosedPort { port, _held: s }
 }
 
 impl TestMcp {
