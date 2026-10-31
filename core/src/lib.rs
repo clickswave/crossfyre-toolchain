@@ -2286,13 +2286,31 @@ pub async fn run_daemon(
     // node comes up but never connects. Idempotent: ignore if already installed.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
+    // A change to this node's egress is announced on the job subject, which is plain
+    // NATS: one sent while the connection is down never arrives. From a drop until the
+    // settings are fetched again, ops ask for them first, and the fetch is made as soon
+    // as the connection is back.
+    let reconnected = Arc::new(tokio::sync::Notify::new());
+    let on_event = {
+        let egress_state = Arc::clone(&egress_state);
+        let reconnected = Arc::clone(&reconnected);
+        move |event: async_nats::Event| {
+            match event {
+                async_nats::Event::Disconnected => egress_state.connection_lost(),
+                async_nats::Event::Connected => reconnected.notify_one(),
+                _ => {}
+            }
+            std::future::ready(())
+        }
+    };
     let opts = async_nats::ConnectOptions::with_jwt(jwt_str, move |nonce: Vec<u8>| {
         let kp = key_pair.clone();
         async move { kp.sign(&nonce).map_err(async_nats::AuthError::new) }
     })
     // Increase the subscriber buffer so large bursts (e.g. a 65k-op scan)
     // don't overflow and drop messages as "slow consumer".
-    .subscription_capacity(1_000_000);
+    .subscription_capacity(1_000_000)
+    .event_callback(on_event);
 
     // TLS to the control plane.
     //
@@ -2447,6 +2465,16 @@ pub async fn run_daemon(
     let api_url = config.api_url.clone();
     let api_key = config.api_key.clone();
     let node_id = config.node_id.clone();
+
+    // The egress settings, asked for once a minute and after every reconnect, so a
+    // change whose announcement was lost still reaches this node.
+    tokio::spawn(Arc::clone(&egress_state).keep_current(
+        http_client.clone(),
+        api_url.clone(),
+        api_key.clone(),
+        Arc::clone(&reconnected),
+        egress::state::POLL_EVERY,
+    ));
 
     // Ask the controller to re-publish any operations that were assigned
     // to this node and never finished (because we crashed, were killed, or

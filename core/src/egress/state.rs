@@ -3,14 +3,16 @@
 //!
 //! The platform says which in an `egress` object: in the authorize-node answer at
 //! start, and from the node-facing settings route (`POST /api/v1/node-egress`)
-//! whenever it announces a change or an op expects settings newer than the node's.
-//! The object carries the proxy's credentials, so it never travels over NATS.
+//! whenever it announces a change, an op expects settings newer than the node's, the
+//! node's NATS connection comes back, and once a minute besides. The object carries the
+//! proxy's credentials, so it never travels over NATS.
 //!
 //! Every way of being unsure ends with the op refused rather than sent from the node's
 //! own address: settings the node could not fetch, settings it cannot read, a proxy
 //! other than the one the op was dispatched for, and an op that expects a proxy on a
 //! node that no longer has one.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -37,6 +39,11 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// asking again. A scan dispatched as thousands of ops would otherwise queue a fetch
 /// per op behind a control plane that is not answering.
 const RETRY_AFTER: Duration = Duration::from_secs(5);
+
+/// How often the node asks for its settings with no change announced. The platform
+/// announces a change over NATS, and an announcement sent while the node is
+/// reconnecting is lost; nothing else would tell the node.
+pub const POLL_EVERY: Duration = Duration::from_secs(60);
 
 /// How long a node-side proxy check may take, end to end.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
@@ -232,8 +239,10 @@ pub struct Fetch<'a> {
 enum Stale {
     /// The platform has this revision and the node has not fetched it.
     Rev(i64),
-    /// The last settings the node got could not be read.
-    Unreadable,
+    /// The node cannot tell which revision the platform has: the last settings it got
+    /// could not be read, a change was announced without one, or the node's NATS
+    /// connection dropped, and a change announced meanwhile was lost.
+    Unsure,
 }
 
 /// This node's egress settings and its gateway. The daemon holds one ([`global`]);
@@ -245,6 +254,10 @@ pub struct EgressState {
     refreshing: tokio::sync::Mutex<()>,
     gateway: tokio::sync::OnceCell<Arc<Gateway>>,
     resolver: Resolver,
+    /// Whether the platform has shown it keeps egress settings for this node. A
+    /// controller older than proxies has no route to fetch them from, so its nodes
+    /// never ask, and stay direct as they always were.
+    platform_has_settings: AtomicBool,
 }
 
 /// The daemon's state. Each node runs as its own process, so one per process is one
@@ -263,6 +276,7 @@ impl EgressState {
             refreshing: tokio::sync::Mutex::new(()),
             gateway: tokio::sync::OnceCell::new(),
             resolver,
+            platform_has_settings: AtomicBool::new(false),
         })
     }
 
@@ -281,16 +295,13 @@ impl EgressState {
     }
 
     fn stale(&self) -> Option<Stale> {
-        self.stale
-            .lock()
-            .map(|s| *s)
-            .unwrap_or(Some(Stale::Unreadable))
+        self.stale.lock().map(|s| *s).unwrap_or(Some(Stale::Unsure))
     }
 
     fn mark_stale(&self, s: Stale) {
         if let Ok(mut cur) = self.stale.lock() {
             *cur = match (*cur, s) {
-                (Some(Stale::Unreadable), _) | (_, Stale::Unreadable) => Some(Stale::Unreadable),
+                (Some(Stale::Unsure), _) | (_, Stale::Unsure) => Some(Stale::Unsure),
                 (Some(Stale::Rev(a)), Stale::Rev(b)) => Some(Stale::Rev(a.max(b))),
                 (None, s) => Some(s),
             };
@@ -308,6 +319,7 @@ impl EgressState {
             }
             return;
         }
+        self.platform_has_settings.store(true, Ordering::Relaxed);
         match NodeEgress::from_wire(v) {
             Ok(n) => {
                 self.say_applied(&n);
@@ -325,7 +337,7 @@ impl EgressState {
                         "this node's proxy settings cannot be read: {e}"
                     )),
                 });
-                self.mark_stale(Stale::Unreadable);
+                self.mark_stale(Stale::Unsure);
             }
         }
     }
@@ -348,10 +360,11 @@ impl EgressState {
     /// says which. Until they are fetched, ops are refused rather than run on the old
     /// ones.
     pub fn announce(&self, rev: Option<i64>) {
+        self.platform_has_settings.store(true, Ordering::Relaxed);
         match rev {
             Some(r) if r <= self.current().rev => {}
             Some(r) => self.mark_stale(Stale::Rev(r)),
-            None => self.mark_stale(Stale::Unreadable),
+            None => self.mark_stale(Stale::Unsure),
         }
     }
 
@@ -369,6 +382,7 @@ impl EgressState {
         };
         match got {
             Ok(n) => {
+                self.platform_has_settings.store(true, Ordering::Relaxed);
                 if let Ok(mut last) = self.last_failure.lock() {
                     *last = None;
                 }
@@ -401,7 +415,7 @@ impl EgressState {
         let behind = |cur: &NodeEgress, stale: Option<Stale>| {
             want_rev.is_some_and(|w| w > cur.rev)
                 || match stale {
-                    Some(Stale::Unreadable) => true,
+                    Some(Stale::Unsure) => true,
                     Some(Stale::Rev(r)) => r > cur.rev,
                     None => false,
                 }
@@ -532,6 +546,58 @@ impl EgressState {
             .await
             .map_err(|e| format!("this node's egress gateway could not start: {e}"))?;
         gw.lease(op, proxy_id, upstream, block_internal)
+    }
+
+    /// This node's NATS connection dropped. A change the platform announces until it is
+    /// back is lost, so from now until the settings are fetched again, ops ask for them
+    /// before they run and .cfx jobs are refused.
+    pub fn connection_lost(&self) {
+        if self.platform_has_settings.load(Ordering::Relaxed) {
+            self.mark_stale(Stale::Unsure);
+        }
+    }
+
+    /// Keep the settings current without an announcement: fetch them every `every`,
+    /// every [`RETRY_AFTER`] while the node knows it is behind, and at once each time
+    /// `reconnected` is notified. Runs for as long as the daemon does. Only once the
+    /// platform has shown it keeps settings for this node.
+    pub async fn keep_current(
+        self: Arc<Self>,
+        http: reqwest::Client,
+        api_url: String,
+        api_key: String,
+        reconnected: Arc<tokio::sync::Notify>,
+        every: Duration,
+    ) {
+        let f = Fetch {
+            http: &http,
+            api_url: &api_url,
+            api_key: &api_key,
+        };
+        let mut failing = false;
+        loop {
+            let wait = if self.stale().is_some() {
+                RETRY_AFTER.min(every)
+            } else {
+                every
+            };
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = reconnected.notified() => {}
+            }
+            if !self.platform_has_settings.load(Ordering::Relaxed) {
+                continue;
+            }
+            match self.refresh(&f).await {
+                Ok(_) => failing = false,
+                // Said once, not on every retry, until a fetch works again.
+                Err(e) if !failing => {
+                    failing = true;
+                    eprintln!("[egress] could not fetch this node's proxy settings: {e}");
+                }
+                Err(_) => {}
+            }
+        }
     }
 
     /// The heartbeat's `toolchain_status.egress`.

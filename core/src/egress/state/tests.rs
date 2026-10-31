@@ -487,3 +487,137 @@ async fn a_failed_check_says_why_the_proxy_failed() {
         "{e}"
     );
 }
+
+/// Polls with a short interval, as the daemon does every minute.
+fn keep(st: &Arc<EgressState>, p: &FakePlatform) -> Arc<tokio::sync::Notify> {
+    let reconnected = Arc::new(tokio::sync::Notify::new());
+    tokio::spawn(Arc::clone(st).keep_current(
+        http(),
+        p.url.clone(),
+        "cfk_node".into(),
+        Arc::clone(&reconnected),
+        Duration::from_millis(50),
+    ));
+    reconnected
+}
+
+/// The platform announces a change over NATS, and an announcement sent while the node
+/// is reconnecting is lost. An op dispatched before the change, still queued or sent
+/// again on resume, expects the old settings, so it would never make the node ask. The
+/// node asks on its own, and sends nothing directly once it has the answer.
+#[tokio::test]
+async fn a_change_whose_announcement_was_lost_is_found_by_asking() {
+    let rec = Recorder::start(to_loopback).await;
+    let now = proxy_settings(6, "p1", &rec);
+    let p = FakePlatform::start(move |_, _| ok(now.clone())).await;
+    let h = http();
+    let st = state();
+    st.apply_authorize(&direct_settings(5));
+    keep(&st, &p);
+    for _ in 0..100 {
+        if st.current().rev == 6 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(st.current().rev, 6, "the node never asked");
+    assert!(st.sends_through_proxy());
+    let lease = st
+        .for_op(
+            "op-queued",
+            NODE,
+            &expect("direct", None, 5),
+            &fetch(&h, &p),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        lease.map(|l| l.proxy_id().to_string()).as_deref(),
+        Some("p1")
+    );
+}
+
+/// While the node's NATS connection is down it cannot hear of a change, so from the
+/// moment it drops, an op asks for the settings before it runs, and a .cfx job, which
+/// cannot go through a proxy, is refused until they are confirmed.
+#[tokio::test]
+async fn after_the_connection_drops_the_settings_are_confirmed_before_an_op() {
+    let rec = Recorder::start(to_loopback).await;
+    let now = proxy_settings(6, "p1", &rec);
+    let p = FakePlatform::start(move |_, _| ok(now.clone())).await;
+    let h = http();
+    let st = state();
+    st.apply_authorize(&direct_settings(5));
+    st.connection_lost();
+    assert!(
+        st.sends_through_proxy(),
+        "unconfirmed settings let a .cfx job run"
+    );
+    let lease = st
+        .for_op("op-after", NODE, &expect("direct", None, 5), &fetch(&h, &p))
+        .await
+        .unwrap();
+    assert_eq!(p.count(ROUTE), 1);
+    assert_eq!(
+        lease.map(|l| l.proxy_id().to_string()).as_deref(),
+        Some("p1")
+    );
+}
+
+/// Settings confirmed after a reconnect clear the doubt: a direct node runs direct again
+/// without asking once per op.
+#[tokio::test]
+async fn a_reconnect_asks_at_once_and_clears_the_doubt() {
+    let p = FakePlatform::start(|_, _| ok(direct_settings(5))).await;
+    let h = http();
+    let st = state();
+    st.apply_authorize(&direct_settings(5));
+    let reconnected = Arc::new(tokio::sync::Notify::new());
+    tokio::spawn(Arc::clone(&st).keep_current(
+        http(),
+        p.url.clone(),
+        "cfk_node".into(),
+        Arc::clone(&reconnected),
+        Duration::from_secs(3600),
+    ));
+    st.connection_lost();
+    reconnected.notify_one();
+    for _ in 0..100 {
+        if !st.sends_through_proxy() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        !st.sends_through_proxy(),
+        "the reconnect did not confirm the settings"
+    );
+    assert_eq!(p.count(ROUTE), 1);
+    let lease = st
+        .for_op("op", NODE, &expect("direct", None, 5), &fetch(&h, &p))
+        .await
+        .unwrap();
+    assert!(lease.is_none());
+    assert_eq!(p.count(ROUTE), 1);
+}
+
+/// A controller older than proxies has no settings route. Its nodes never ask, so a
+/// dropped connection or the poll cannot leave them refusing every op.
+#[tokio::test]
+async fn a_controller_without_egress_settings_is_never_asked() {
+    let p = FakePlatform::start(|_, _| (404, json!({"status": 404, "message": "no route"}))).await;
+    let h = http();
+    let st = state();
+    st.apply_authorize(&Value::Null);
+    let reconnected = keep(&st, &p);
+    st.connection_lost();
+    reconnected.notify_one();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(p.count(ROUTE), 0);
+    assert!(!st.sends_through_proxy());
+    let lease = st
+        .for_op("op", NODE, &json!({}), &fetch(&h, &p))
+        .await
+        .unwrap();
+    assert!(lease.is_none());
+}
