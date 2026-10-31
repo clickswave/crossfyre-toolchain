@@ -985,13 +985,16 @@ impl Mcp {
             .map(|m| m.values().cloned().collect())
             .unwrap_or_default();
         for job in jobs {
-            if let Some(w) = job.writer.lock().await.as_mut() {
-                let _ = w.send_cancel().await;
-            }
+            // Stop the pump before asking the engine to stop. A pump still reading can
+            // take the engine's answer and record the scan as cancelled, as if a client
+            // had stopped it, when it was the server going away that interrupted it.
             let pump = job.pump.lock().ok().and_then(|mut p| p.take());
             if let Some(h) = pump {
                 h.abort();
                 let _ = h.await;
+            }
+            if let Some(w) = job.writer.lock().await.as_mut() {
+                let _ = w.send_cancel().await;
             }
             let meta = job.meta.lock().ok().map(|mut m| {
                 if !jobs::is_terminal(&m.status) {
