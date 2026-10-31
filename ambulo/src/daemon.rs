@@ -1108,6 +1108,94 @@ mod egress_tests {
         assert_all_through(&fx, &proxy, &events);
     }
 
+    /// A site whose every page links to ten pages nobody has asked for yet, so a crawl
+    /// of it never runs out. Returns its port and how many requests it has had.
+    async fn endless_site() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&count);
+        tokio::spawn(async move {
+            while let Ok((s, _)) = l.accept().await {
+                let seen = Arc::clone(&seen);
+                tokio::spawn(async move {
+                    let (r, mut w) = s.into_split();
+                    let mut lines = BufReader::new(r).lines();
+                    let Ok(Some(first)) = lines.next_line().await else {
+                        return;
+                    };
+                    while let Ok(Some(l)) = lines.next_line().await {
+                        if l.is_empty() {
+                            break;
+                        }
+                    }
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    let path = first.split_whitespace().nth(1).unwrap_or("/");
+                    let base = path.trim_end_matches('/');
+                    let links: String = (0..10)
+                        .map(|i| format!("<a href=\"{base}/p{i}\">p{i}</a> "))
+                        .collect();
+                    let body = format!("<html><body>{links}</body></html>");
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+                         Connection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = w.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        (port, count)
+    }
+
+    /// A crawl stops once the client that asked for it is gone: the node closes the
+    /// connection when it stops an op, and a crawl nobody reads is only traffic at
+    /// somebody's site, from wherever this engine sends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_crawl_stops_when_its_client_goes_away() {
+        use std::sync::atomic::Ordering;
+        let (port, count) = endless_site().await;
+        let dport = daemon().await;
+        let op = serde_json::json!({
+            "operation": "crawl",
+            "response": "stream",
+            "seed": format!("http://127.0.0.1:{port}/"),
+            "max_pages": 100000,
+            "max_depth": 20,
+            "tasks": 2,
+            "delay": 10,
+            "evasive": false,
+        });
+        let stream = TcpStream::connect(("127.0.0.1", dport)).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut lines = BufReader::new(r).lines();
+        w.write_all(format!("{op}\n").as_bytes()).await.unwrap();
+        let mut fetched = 0;
+        while fetched < 5 {
+            let line = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+                .await
+                .expect("the crawl went quiet")
+                .unwrap()
+                .expect("the crawl ended");
+            // A fetched page is reported with the status it answered.
+            if line.contains("\"status_code\"") {
+                fetched += 1;
+            }
+        }
+        drop(lines);
+        drop(w);
+        // Requests already in flight finish; after them, nothing more is asked for.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let settled = count.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        let later = count.load(Ordering::SeqCst);
+        assert!(
+            later <= settled + 2,
+            "the crawl went on without its client: {settled} requests, then {later} a second later"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_proxied_crawl_skips_the_headless_tier_and_says_so() {
         let fx = Fixture::http("text/html", PAGE.into()).await;

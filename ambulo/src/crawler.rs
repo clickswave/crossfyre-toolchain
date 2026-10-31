@@ -863,6 +863,11 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
     .await;
 
     while !frontier.is_empty() && pages_crawled < max_pages {
+        // Nobody reads the crawl any more: its client went away, or the node stopped
+        // the op. Going on would only be traffic at somebody's site.
+        if tx.is_closed() {
+            return;
+        }
         // Take a wave of up to `tasks` URLs without exceeding the page budget.
         let mut wave: Vec<Queued> = Vec::new();
         while wave.len() < tasks && pages_crawled + (wave.len() as u32) < max_pages {
@@ -1067,6 +1072,10 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
         for (u, d, parent) in held {
             let _ = tx.send(CrawlEvent::url_candidate(&u, parent, d));
         }
+    }
+
+    if tx.is_closed() {
+        return;
     }
 
     // Probe API-spec locations AFTER the link crawl so the burst of probe requests
