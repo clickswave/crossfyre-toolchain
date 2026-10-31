@@ -10,6 +10,7 @@ import io.crossfyre.mobile.account.str
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
+import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URI
 import java.net.URLEncoder
@@ -49,7 +50,52 @@ data class HistoryRow(
     val launchState: String,
     val workflowId: String,
     val workflowStatus: String,
+    /** SHA-256 hex of the approval's summary text: what a stop is signed over. Empty from a platform that does not send it. */
+    val digest: String,
 )
+
+/** The Recent decisions list, with the platform's time when it answered. */
+data class History(val serverTime: Instant?, val rows: List<HistoryRow>)
+
+/** What a signed stop came to. */
+sealed interface StopAnswer {
+    /** The scan stopped. */
+    data class Stopped(val workflowStatus: String, val operationsCancelled: Int) : StopAnswer
+
+    /**
+     * The signature's time was more than five minutes from the platform's clock,
+     * which was [serverTime] when it answered. Nothing was stopped; a stop signed
+     * at the platform's time goes through.
+     */
+    data class Stale(val serverTime: Instant) : StopAnswer
+}
+
+/** One of the account's notifications, as `/cli/inbox/list` gives it. */
+data class InboxItem(
+    val id: String,
+    /** node, workflow, billing, finding, account, system or approval. */
+    val category: String,
+    val eventType: String,
+    /** info, success, warning or error. */
+    val severity: String,
+    val title: String,
+    /** Its lines, each cleaned like any other text from the server. Empty when there is none. */
+    val body: String,
+    /**
+     * An in-app path such as `/m/approve/<id>`, exactly as sent, or empty. It is
+     * never opened as it stands: [io.crossfyre.mobile.notificationUrl] decides
+     * whether it is a page on this app's own server.
+     */
+    val link: String,
+    val read: Boolean,
+    val createdAt: Instant?,
+)
+
+/** One page of notifications, newest first. [unread] counts the account's unread ones, whatever the page holds. */
+data class InboxPage(val items: List<InboxItem>, val total: Int, val unread: Int, val page: Int)
+
+/** What marking notifications read came to: the rows that changed and the unread ones left. */
+data class InboxMarked(val marked: Int, val unread: Int)
 
 /** Which activity to read: the paired workspace, or the account's own. */
 sealed interface ActivityScope {
@@ -239,14 +285,14 @@ class ApprovalApi(origin: String, private val transport: Transport) {
         else -> a.refusal()
     }
 
-    fun history(key: String, before: Instant? = null): Outcome<List<HistoryRow>> {
+    fun history(key: String, before: Instant? = null): Outcome<History> {
         val body = JSONObject().put("api_key", key)
         if (before != null) body.put("before", before.toString())
         return call("approvals/history", body) { a ->
             when {
                 a.ok -> {
                     val list = a.data?.optJSONArray("approvals") ?: a.data?.optJSONArray("history") ?: return@call a.unreadable()
-                    Outcome.Ok(list.objects().mapNotNull { o ->
+                    Outcome.Ok(History(instant(a.data?.str("server_time")), list.objects().mapNotNull { o ->
                         val id = o.str("id")?.let(ApprovalIds::normal) ?: return@mapNotNull null
                         HistoryRow(
                             id = id,
@@ -260,8 +306,9 @@ class ApprovalApi(origin: String, private val transport: Transport) {
                             launchState = o.text("launch_state", 20),
                             workflowId = o.text("workflow_id", 64),
                             workflowStatus = o.text("workflow_status", 20),
+                            digest = o.text("digest", 64),
                         )
-                    })
+                    }))
                 }
                 a.status == 401 -> Outcome.Failed(Problem.SignedOut)
                 a.status == 403 -> a.accountRefusal() ?: a.refusal()
@@ -271,10 +318,78 @@ class ApprovalApi(origin: String, private val transport: Transport) {
     }
 
     /**
+     * Stop the scan an approval launched, with the signature the unlock produced
+     * over [ApprovalProtocol.signingBytes] with `stop` as the decision. It is
+     * signed at the platform's time: a stop has nothing of its own to use up, so
+     * the platform takes one only within five minutes of its clock.
+     */
+    fun stop(key: String, approvalId: String, approverId: String, signedAt: Long, signature: ByteArray): Outcome<StopAnswer> {
+        val body = JSONObject()
+            .put("api_key", key)
+            .put("approval_id", approvalId)
+            .put("approver_id", approverId)
+            .put("signed_at", signedAt)
+            .put("signature", Base64.getEncoder().encodeToString(signature))
+        return call("approvals/stop", body) { a ->
+            phoneRefusal(a) ?: when {
+                a.ok -> Outcome.Ok(
+                    StopAnswer.Stopped(a.data?.text("workflow_status", 20).orEmpty(), a.data?.optInt("operations_cancelled", 0) ?: 0)
+                )
+                a.status == 422 && a.reason() == "stale_signature" ->
+                    instant(a.data?.str("server_time"))?.let { Outcome.Ok(StopAnswer.Stale(it)) } ?: a.refusal(Refusal.STALE_SIGNATURE)
+                a.status == 422 -> a.refusal(Refusal.BAD_SIGNATURE)
+                a.status == 404 -> a.refusal(Refusal.UNKNOWN)
+                a.status == 409 && a.reason() == "not_running" -> a.refusal(Refusal.NOT_RUNNING)
+                a.status == 409 -> a.refusal(Refusal.NOT_LAUNCHED)
+                a.status == 403 && a.reason() == "missing_permission" -> a.roleRefusal()
+                a.status == 403 && a.says("member") -> a.refusal(Refusal.NOT_MEMBER)
+                else -> a.refusal()
+            }
+        }
+    }
+
+    /** A page of the account's notifications, newest first. Answered only for a phone that approves. */
+    fun inbox(key: String, page: Int = 1, limit: Int = 20, unreadOnly: Boolean = false): Outcome<InboxPage> {
+        val body = JSONObject().put("api_key", key).put("page", page.coerceAtLeast(1)).put("limit", limit.coerceIn(1, 50))
+        if (unreadOnly) body.put("filter", "unread")
+        return call("inbox/list", body) { a ->
+            phoneRefusal(a) ?: when {
+                a.ok -> {
+                    val d = a.data ?: return@call a.unreadable()
+                    val items = d.optJSONArray("items") ?: return@call a.unreadable()
+                    if (!d.has("unread")) return@call a.unreadable()
+                    val read = items.objects().mapNotNull(::notification)
+                    Outcome.Ok(InboxPage(read, d.optInt("total", read.size), d.optInt("unread", 0), d.optInt("page", page)))
+                }
+                else -> a.refusal()
+            }
+        }
+    }
+
+    /** Mark these notifications read. Ids that are not the account's, or already read, change nothing. */
+    fun inboxRead(key: String, ids: List<String>): Outcome<InboxMarked> =
+        markRead(JSONObject().put("api_key", key).put("ids", JSONArray(ids)))
+
+    /** Mark every notification of the account read. */
+    fun inboxReadAll(key: String): Outcome<InboxMarked> =
+        markRead(JSONObject().put("api_key", key).put("all", true))
+
+    private fun markRead(body: JSONObject): Outcome<InboxMarked> = call("inbox/read", body) { a ->
+        phoneRefusal(a) ?: when {
+            a.ok -> {
+                val d = a.data ?: return@call a.unreadable()
+                if (!d.has("unread")) return@call a.unreadable()
+                Outcome.Ok(InboxMarked(d.optInt("marked", 0), d.optInt("unread", 0)))
+            }
+            else -> a.refusal()
+        }
+    }
+
+    /**
      * A page of the activity log, newest first, in the shape `/activity/list`
-     * gives it. Not called while [io.crossfyre.mobile.ACTIVITY_LOG] is off: the
-     * key route it needs does not exist yet, and must answer only a key that has
-     * an active approver, never a CLI or Workbench key.
+     * gives it, read as the key's owner under their roles. The platform answers
+     * it only for a key whose own approver is active, never a CLI or Workbench
+     * key, and never exports from it.
      */
     fun activity(key: String, scope: ActivityScope, beforeId: Long? = null, limit: Int = 30): Outcome<ActivityPage> {
         val body = JSONObject().put("api_key", key).put("limit", limit.coerceIn(1, 200))
@@ -284,15 +399,13 @@ class ApprovalApi(origin: String, private val transport: Transport) {
         }
         if (beforeId != null) body.put("before_id", beforeId)
         return call("activity/list", body) { a ->
-            when {
+            phoneRefusal(a) ?: when {
                 a.ok -> {
                     val d = a.data ?: return@call a.unreadable()
                     val events = d.optJSONArray("events") ?: return@call a.unreadable()
                     val next = if (d.has("next_before_id") && !d.isNull("next_before_id")) d.optLong("next_before_id") else null
                     Outcome.Ok(ActivityPage(events.objects().mapNotNull(::event), next))
                 }
-                a.status == 401 -> Outcome.Failed(Problem.SignedOut)
-                a.status == 403 -> a.accountRefusal() ?: a.refusal()
                 else -> a.refusal()
             }
         }
@@ -345,8 +458,51 @@ class ApprovalApi(origin: String, private val transport: Transport) {
         }.take(8).toList()
     }
 
+    private fun notification(o: JSONObject): InboxItem? {
+        val id = o.text("id", 64).takeIf { it.isNotEmpty() } ?: return null
+        // Kept as sent, never cleaned into something else: a link with anything
+        // odd in it is not opened at all.
+        val link = o.str("link")?.takeIf { it.length <= LINK_MAX }.orEmpty()
+        return InboxItem(
+            id = id,
+            category = o.text("category", 20),
+            eventType = o.text("event_type", 64),
+            severity = o.text("severity", 20),
+            title = o.text("title", Untrusted.REASON),
+            body = lines(o.str("body").orEmpty()),
+            link = link,
+            read = o.optBoolean("read", false),
+            createdAt = instant(o.str("created_at")),
+        )
+    }
+
+    /**
+     * The phone's refusals that every key route of its own can give before its
+     * checks: a key the server no longer knows, approvals switched off on the
+     * platform, a phone that does not approve now, and the account's own
+     * refusals. Null for anything else, which the route reads.
+     */
+    private fun <T> phoneRefusal(a: Answer): Outcome<T>? = when {
+        a.ok -> null
+        a.status == 401 -> Outcome.Failed(Problem.SignedOut)
+        a.status == 404 && a.reason() == "mcp_disabled" -> a.refusal(Refusal.APPROVALS_OFF)
+        a.status == 403 && a.data?.optBoolean("approver_inactive") == true -> a.refusal(Refusal.APPROVER_INACTIVE)
+        a.status == 403 -> a.accountRefusal()
+        else -> null
+    }
+
+    /** Every call here shares one limit per key on the platform; a 429 says how long to leave it. */
     private fun <T> call(route: String, body: JSONObject, read: (Answer) -> Outcome<T>): Outcome<T> =
-        cliCall(transport, origin, host, route, body, read)
+        cliCall(transport, origin, host, route, body) { a -> if (a.status == 429) a.limited() else read(a) }
+
+    private companion object {
+        const val LINK_MAX = 2048
+        const val BODY_LINES = 8
+
+        /** A notification's text: each line cleaned and capped, blank ones dropped, at most [BODY_LINES]. */
+        fun lines(raw: String): String =
+            raw.split('\n').map { Untrusted.clean(it, Untrusted.OPTION) }.filter { it.isNotBlank() }.take(BODY_LINES).joinToString("\n")
+    }
 }
 
 /**

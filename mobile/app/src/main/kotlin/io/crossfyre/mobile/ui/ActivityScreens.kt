@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -20,6 +21,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -43,6 +48,7 @@ import io.crossfyre.mobile.ago
 import io.crossfyre.mobile.approve.ActivityEvent
 import io.crossfyre.mobile.approve.ActivityScope
 import io.crossfyre.mobile.approve.HistoryRow
+import io.crossfyre.mobile.approve.InboxItem
 import io.crossfyre.mobile.approve.PendingApproval
 import io.crossfyre.mobile.approve.Summary
 import io.crossfyre.mobile.approve.TargetRef
@@ -50,8 +56,10 @@ import io.crossfyre.mobile.approve.approvalView
 import io.crossfyre.mobile.approve.countdown
 import io.crossfyre.mobile.channelLabel
 import io.crossfyre.mobile.decidedBy
+import io.crossfyre.mobile.notificationUrl
 import io.crossfyre.mobile.riskChips
 import io.crossfyre.mobile.shortDate
+import io.crossfyre.mobile.stoppable
 import java.time.Instant
 
 // ── Turning approvals on ─────────────────────────────────────────────────────
@@ -63,7 +71,7 @@ fun ApprovalFacts(m: AppModel) {
     val items = listOf(
         Triple(
             R.drawable.ic_shield_check, "Nothing starts until you approve it here",
-            "When an agent working with your account asks for something that needs a person, such as a scan on more than one node or requests that can change data on a target, Crossfyre waits. This phone shows the workspace, the action, each target with the scope entry that allows it, and where the request came from. Only requests made with your own account come here.",
+            "When an agent working with your account asks for something that needs a person, such as a scan on more than one node or requests that can change data on a target, Crossfyre waits. This phone shows the workspace, the action, each target with the scope entry that allows it, and where the request came from. Only requests made with your own account come here. A scan you approved can be stopped from here while it runs.",
         ),
         Triple(
             R.drawable.ic_key, "A key made on this phone",
@@ -75,7 +83,7 @@ fun ApprovalFacts(m: AppModel) {
         ),
         Triple(
             R.drawable.ic_clock, "Checked while the app is open",
-            "While the app is on screen it asks ${m.host} every few seconds for approvals waiting for you. There is no push notification: with the app closed, requests reach you through the alerts you set up in the dashboard. Pending approvals and recent decisions are kept in memory while the app is open and are not written to the phone's storage.",
+            "While the app is on screen it asks ${m.host} every few seconds for approvals waiting for you. There is no push notification: with the app closed, requests reach you through the alerts you set up in the dashboard. Pending approvals, recent decisions, your notifications and the activity log are kept in memory while the app is open and are not written to the phone's storage.",
         ),
     )
     Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
@@ -263,7 +271,8 @@ fun PendingBanner(m: AppModel) {
 fun ActivityContent(m: AppModel) {
     val tick = ticking()
     val now = m.serverNow(tick)
-    when (activityHeader(m.signedIn, m.approverState)) {
+    val header = activityHeader(m.signedIn, m.approverState)
+    when (header) {
         ActivityHeader.SIGN_IN -> {
             Empty(
                 R.drawable.ic_clock, "Sign in to see activity",
@@ -297,15 +306,78 @@ fun ActivityContent(m: AppModel) {
     }
 
     GroupLabel("Recent decisions")
+    m.stopNotice?.let { Banner(it) }
     when {
-        m.history.isNotEmpty() -> CfxList { m.history.take(20).forEachIndexed { i, h -> HistoryItem(h, i == 0, now) } }
+        m.history.isNotEmpty() -> CfxList { m.history.take(20).forEachIndexed { i, h -> HistoryItem(m, h, i == 0, now) } }
         m.historyStatus == ListStatus.LOADING -> CfxList { repeat(2) { SkelRow(first = it == 0) } }
         m.historyStatus == ListStatus.ERROR -> Text("Couldn't load recent decisions.", style = T.hint())
         else -> Text("No decisions yet.", style = T.hint())
     }
 
-    if (ACTIVITY_LOG) ActivityLog(m, now)
+    // The platform answers notifications and the log only for a phone that
+    // approves, so a phone that does not is told how to get them.
+    if (header == ActivityHeader.LIVE) {
+        Notifications(m, now)
+        if (ACTIVITY_LOG) ActivityLog(m, now)
+    } else {
+        GroupLabel("Notifications")
+        Text(
+            if (ACTIVITY_LOG) "Your notifications and the activity log show here while this phone approves agent actions."
+            else "Your notifications show here while this phone approves agent actions.",
+            style = T.hint(),
+        )
+    }
     Text("Read from ${m.host} while the app is open and kept in memory. Nothing on this tab is written to the phone's storage.", style = T.hint())
+}
+
+@Composable
+private fun Notifications(m: AppModel, now: Instant) {
+    val list = m.inbox
+    GroupLabel(if (list.unread > 0) "Notifications, ${list.unread} unread" else "Notifications")
+    m.inboxNotice?.let { Banner(it, listOf("Try again" to { m.loadInbox() })) }
+    when {
+        list.items.isNotEmpty() -> {
+            CfxList { list.items.forEachIndexed { i, n -> NotificationRow(m, n, i == 0, now) } }
+            if (list.unread > 0) Row { CfxButton("Mark all read", Kind.TEXT, small = true) { m.markAllRead() } }
+            if (list.more) {
+                CfxButton("Show older", Kind.SECONDARY, block = true, busy = m.inboxMoreBusy) { m.loadInbox(more = true) }
+            }
+        }
+        m.inboxStatus == ListStatus.LOADING -> CfxList { repeat(2) { SkelRow(first = it == 0) } }
+        m.inboxStatus == ListStatus.EMPTY -> Text("No notifications.", style = T.hint())
+    }
+}
+
+/**
+ * One notification. Its words are drawn as plain text, never as links, even the
+ * address a body may end with; only the row's own link opens anything, and only
+ * when it is a page on this app's server.
+ */
+@Composable
+private fun NotificationRow(m: AppModel, n: InboxItem, first: Boolean, now: Instant) {
+    val c = cfx
+    val opens = notificationUrl(m.origin, n.link) != null
+    val dot = when (n.severity) {
+        "error" -> c.danger
+        "warning" -> c.warning
+        else -> c.ember
+    }
+    CfxRow(
+        n.title.ifEmpty { "Notification" }, first = first,
+        leading = {
+            Box(
+                Modifier.size(8.dp).clip(CircleShape).background(if (n.read) Color.Transparent else dot)
+                    .then(if (n.read) Modifier else Modifier.semantics { contentDescription = "Unread" }),
+            )
+        },
+        subContent = {
+            if (n.body.isNotEmpty()) Text(n.body, style = T.rowSub(), maxLines = 4, overflow = TextOverflow.Ellipsis)
+            Text(ago(secondsBetween(n.createdAt, now)), style = T.rowSub())
+        },
+        dimTitle = n.read,
+        chevron = if (opens) R.drawable.ic_arrow_square_out else null,
+        onClick = if (opens || !n.read) ({ m.openNotification(n) }) else null,
+    )
 }
 
 @Composable
@@ -358,7 +430,7 @@ private fun PendingRow(m: AppModel, a: PendingApproval, first: Boolean, now: Ins
 }
 
 @Composable
-private fun HistoryItem(h: HistoryRow, first: Boolean, now: Instant) {
+private fun HistoryItem(m: AppModel, h: HistoryRow, first: Boolean, now: Instant) {
     val (word, tone) = when (h.status) {
         "approved" -> "Approved" to Tone.OK
         "denied" -> "Denied" to Tone.DANGER
@@ -367,17 +439,31 @@ private fun HistoryItem(h: HistoryRow, first: Boolean, now: Instant) {
         else -> h.status.replaceFirstChar { it.uppercase() } to Tone.NONE
     }
     val via = decidedBy(h.decidedVia, h.deviceName)
-    val launched = when (h.launchState) {
-        "launched" -> "started"
-        "launching" -> "starting"
-        "failed" -> "did not start"
-        else -> ""
+    // A scan this phone may stop: the request was approved, it launched a scan,
+    // the scan still runs, and this phone approves now.
+    val canStop = stoppable(h) && m.approverState == ApproverState.ACTIVE
+    val note = when {
+        h.launchState == "launched" && h.workflowStatus in setOf("running", "populating") -> "The scan is running"
+        h.launchState == "launched" && h.workflowStatus == "stopped" -> "The scan was stopped"
+        h.launchState == "launched" -> "The request started"
+        h.launchState == "launching" -> "The request is starting"
+        h.launchState == "failed" -> "The request did not start"
+        else -> null
     }
     CfxRow(
         h.actionLabel.ifEmpty { "Agent request" }, first = first,
         sub = listOf(h.workspaceName, via, ago(secondsBetween(h.decidedAt ?: h.createdAt, now))).filter { it.isNotEmpty() }.joinToString(" · "),
-        note = launched.ifEmpty { null }?.let { "The request $it" }, noteTone = if (h.launchState == "failed") Tone.WARN else Tone.NONE,
-        trailing = { Chip(word, tone) },
+        note = note, noteTone = if (h.launchState == "failed") Tone.WARN else Tone.NONE,
+        trailing = {
+            if (canStop) {
+                CfxButton(
+                    "Stop", Kind.DANGER_TEXT, small = true, icon = R.drawable.ic_lock_key_open,
+                    busy = m.stopping == h.id, enabled = m.stopping == null,
+                ) { m.stopScan(h.id) }
+            } else {
+                Chip(word, tone)
+            }
+        },
     )
 }
 

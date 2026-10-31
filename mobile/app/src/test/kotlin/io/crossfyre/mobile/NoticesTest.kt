@@ -5,6 +5,8 @@ import io.crossfyre.mobile.account.Outcome
 import io.crossfyre.mobile.account.Problem
 import io.crossfyre.mobile.account.Reply
 import io.crossfyre.mobile.account.Transport
+import io.crossfyre.mobile.approve.ApprovalApi
+import io.crossfyre.mobile.approve.ActivityScope
 import io.crossfyre.mobile.approve.SignOutLeft
 import org.json.JSONArray
 import org.json.JSONObject
@@ -127,5 +129,46 @@ class NoticesTest {
             assertTrue(n.body, n.body.endsWith("in the dashboard, under Settings > CLI Access."))
         }
         assertTrue(signOutNotice(SignOutLeft.APPROVER, "crossfyre.io")!!.body.contains("approver"))
+    }
+
+    private fun stop(reply: Reply) = stopNotice(
+        problem(ApprovalApi("https://crossfyre.io", Transport { _, _ -> reply }).stop("cfk_k", "3f9c1e0b-6a2d-4b8e-9c71-0d5e2f4a8b13", "ap-1", 1, byteArrayOf(1))),
+        "crossfyre.io",
+    )
+
+    /** Each refusal of a stop says that nothing was stopped, or that there was nothing to stop, and what to do. */
+    @Test
+    fun each_refused_stop_says_what_happened_and_what_to_do() {
+        val role = stop(Reply(
+            403,
+            JSONObject().put("status", 403).put("message", "Your role in this workspace (Viewer) does not allow stopping scans.")
+                .put("errors", JSONArray().put("workflow.halt is required"))
+                .put("data", JSONObject().put("reason", "missing_permission").put("permission", "workflow.halt")).toString(),
+        ))
+        assertEquals(Level.WARN, role.level)
+        assertTrue(role.body, role.body.startsWith("Your role in this workspace (Viewer) does not allow stopping scans."))
+        assertTrue(role.body, !role.body.contains("workflow.halt"))
+        assertEquals("That scan is not running any more.", stop(envelope(409, "That scan is not running", JSONObject().put("reason", "not_running"))).title)
+        assertEquals("That request did not start a scan.", stop(envelope(409, "This approval did not launch a scan", JSONObject().put("reason", "not_launched"))).title)
+        assertEquals("The server no longer has that request.", stop(envelope(404, "No such approval")).title)
+        val sig = stop(envelope(422, "bad_signature"))
+        assertEquals(Level.DANGER, sig.level)
+        assertTrue(sig.body, sig.body.startsWith("Nothing was stopped."))
+        assertTrue(stop(envelope(403, "approver_inactive", JSONObject().put("approver_inactive", true))).body.contains("Turn Approvals on again"))
+        assertTrue(stop(envelope(429, "Too many requests", JSONObject().put("reason", "rate_limited"))).body.contains("Wait a minute"))
+        assertEquals("Approvals are switched off on crossfyre.io.", stop(envelope(404, "Approvals are switched off", JSONObject().put("reason", "mcp_disabled"))).title)
+        assertEquals("You're not a member of that workspace any more.", stop(envelope(403, "Not a member of this workspace")).title)
+        assertEquals("Couldn't send the stop.", stopNotice(Problem.Unreachable("crossfyre.io"), "crossfyre.io").title)
+    }
+
+    @Test
+    fun a_list_only_an_approver_reads_says_so_when_this_phone_is_not_one() {
+        val inactive = envelope(403, "approver_inactive", JSONObject().put("approver_inactive", true))
+        val api = ApprovalApi("https://crossfyre.io", Transport { _, _ -> inactive })
+        val n = inboxNotice(problem(api.inbox("cfk_k")), "crossfyre.io")
+        assertEquals("crossfyre.io does not count this phone as an approver.", n.title)
+        assertTrue(n.body, n.body.startsWith("Only a phone that approves can read your notifications here."))
+        val a = activityNotice(problem(api.activity("cfk_k", ActivityScope.Account)), "crossfyre.io")
+        assertTrue(a.body, a.body.startsWith("Only a phone that approves can read your activity here."))
     }
 }

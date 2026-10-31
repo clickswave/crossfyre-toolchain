@@ -33,7 +33,10 @@ class HttpTransport(
             val status = conn.responseCode
             val stream = if (status in 200..299) conn.inputStream else conn.errorStream
             val body = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
-            return Reply(status, body)
+            // Only the delay-seconds form. An HTTP date would need this phone's
+            // clock to agree with the server's, which nothing else here relies on.
+            val retryAfter = conn.getHeaderField("Retry-After")?.trim()?.toLongOrNull()?.takeIf { it >= 0 }
+            return Reply(status, body, retryAfter)
         } catch (e: IOException) {
             throw e
         } catch (e: RuntimeException) {

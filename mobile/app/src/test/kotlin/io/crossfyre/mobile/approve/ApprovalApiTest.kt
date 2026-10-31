@@ -40,9 +40,9 @@ class ApprovalApiTest {
         }
     }
 
-    private fun envelope(status: Int, message: String, data: Any? = null) =
+    private fun envelope(status: Int, message: String, data: Any? = null, errors: List<String> = emptyList(), retryAfter: Long? = null) =
         Reply(status, JSONObject().put("status", status).put("message", message)
-            .put("errors", JSONArray()).put("data", data ?: JSONObject.NULL).toString())
+            .put("errors", JSONArray(errors)).put("data", data ?: JSONObject.NULL).toString(), retryAfter)
 
     private fun api(fake: Fake) = ApprovalApi("https://crossfyre.io/", fake)
 
@@ -244,18 +244,176 @@ class ApprovalApiTest {
 
     @Test
     fun the_history_reads_each_row_and_skips_ones_without_an_id() {
-        val fake = Fake(envelope(200, "ok", JSONObject().put("approvals", JSONArray()
+        val fake = Fake(envelope(200, "ok", JSONObject().put("server_time", "2026-10-31T13:57:01Z").put("approvals", JSONArray()
             .put(JSONObject().put("id", id).put("status", "approved").put("action_label", "Launch a vulnerability scan")
                 .put("workspace_name", "Acme external").put("created_at", "2026-10-30T09:12:44Z").put("decided_at", "2026-10-30T09:13:10Z")
-                .put("decided_via", "phone").put("device_name", "Pixel 8").put("launch_state", "launched").put("workflow_id", "wf-1"))
+                .put("decided_via", "phone").put("device_name", "Pixel 8").put("launch_state", "launched").put("workflow_id", "wf-1")
+                .put("digest", "ab".repeat(32)))
             .put(JSONObject().put("status", "denied")))))
-        val rows = ok(api(fake).history(key, before = Instant.parse("2026-10-31T00:00:00Z")))
+        val history = ok(api(fake).history(key, before = Instant.parse("2026-10-31T00:00:00Z")))
+        val rows = history.rows
         assertEquals(1, rows.size)
         assertEquals("phone", rows[0].decidedVia)
         assertEquals("launched", rows[0].launchState)
         assertEquals("", rows[0].workflowStatus)
+        // What a stop is signed over, and the platform's time to sign it at.
+        assertEquals("ab".repeat(32), rows[0].digest)
+        assertEquals(Instant.parse("2026-10-31T13:57:01Z"), history.serverTime)
         assertEquals("2026-10-31T00:00:00Z", fake.calls.single().second.getString("before"))
         assertEquals("https://crossfyre.io/api/v1/cli/approvals/history", fake.calls.single().first)
+    }
+
+    @Test
+    fun a_history_from_a_platform_without_digests_has_none_to_sign() {
+        val history = ok(api(Fake(envelope(200, "ok", JSONObject().put("approvals", JSONArray()
+            .put(JSONObject().put("id", id).put("status", "approved")))))).history(key))
+        assertEquals("", history.rows.single().digest)
+        assertNull(history.serverTime)
+    }
+
+    // ── stop ──────────────────────────────────────────────────────────────
+
+    @Test
+    fun a_stop_is_signed_like_an_approval_and_says_what_it_stopped() {
+        val fake = Fake(envelope(200, "Stopped", JSONObject().put("id", id).put("workflow_id", "wf-1").put("result", "stopped")
+            .put("workflow_status", "stopped").put("operations_cancelled", 3)))
+        val sig = byteArrayOf(0x30, 0x45, 9, 8, 7)
+        val r = ok(api(fake).stop(key, id, "ap-1", 1793500000, sig))
+        assertEquals(StopAnswer.Stopped("stopped", 3), r)
+
+        val (url, body) = fake.calls.single()
+        assertEquals("https://crossfyre.io/api/v1/cli/approvals/stop", url)
+        // No decision field: the route is the decision, and the signature names it.
+        assertEquals(setOf("api_key", "approval_id", "approver_id", "signed_at", "signature"), body.keySet())
+        assertEquals(id, body.getString("approval_id"))
+        assertEquals("ap-1", body.getString("approver_id"))
+        // An integer, never a string: the platform refuses a string before the handler.
+        assertTrue(body.get("signed_at") is Number)
+        assertEquals(1793500000L, body.getLong("signed_at"))
+        assertEquals(Base64.getEncoder().encodeToString(sig), body.getString("signature"))
+    }
+
+    @Test
+    fun a_stop_signed_off_the_platform_clock_hands_back_its_time() {
+        val stale = envelope(422, "stale_signature", JSONObject().put("reason", "stale_signature").put("server_time", "2026-10-31T14:00:00.123456Z"))
+        assertEquals(StopAnswer.Stale(Instant.parse("2026-10-31T14:00:00.123456Z")), ok(api(Fake(stale)).stop(key, id, "ap-1", 1, byteArrayOf(1))))
+        // Without the time there is nothing to sign again at: it is a refusal.
+        val noTime = envelope(422, "stale_signature", JSONObject().put("reason", "stale_signature"))
+        assertEquals(Refusal.STALE_SIGNATURE, reasonOf(problem(api(Fake(noTime)).stop(key, id, "ap-1", 1, byteArrayOf(1)))))
+    }
+
+    @Test
+    fun each_stop_refusal_is_its_own_problem() {
+        fun refusalOf(reply: Reply) = problem(api(Fake(reply)).stop(key, id, "ap-1", 1, byteArrayOf(1)))
+        assertEquals(Problem.SignedOut, refusalOf(envelope(401, "Not logged in", JSONObject())))
+        assertEquals(Refusal.UNKNOWN, reasonOf(refusalOf(envelope(404, "No such approval", JSONObject()))))
+        assertEquals(Refusal.APPROVALS_OFF, reasonOf(refusalOf(envelope(404, "Approvals are switched off", JSONObject().put("reason", "mcp_disabled")))))
+        assertEquals(Refusal.APPROVER_INACTIVE, reasonOf(refusalOf(envelope(403, "approver_inactive", JSONObject().put("approver_inactive", true)))))
+        assertEquals(Refusal.BAD_SIGNATURE, reasonOf(refusalOf(envelope(422, "bad_signature", JSONObject()))))
+        assertEquals(Refusal.NOT_LAUNCHED, reasonOf(refusalOf(envelope(409, "This approval did not launch a scan",
+            JSONObject().put("reason", "not_launched").put("status", "pending")))))
+        assertEquals(Refusal.NOT_RUNNING, reasonOf(refusalOf(envelope(409, "That scan is not running",
+            JSONObject().put("reason", "not_running").put("workflow_status", "stopped")))))
+        val role = refusalOf(envelope(403, "Your role in this workspace (Viewer) does not allow stopping scans.",
+            JSONObject().put("reason", "missing_permission").put("permission", "workflow.halt"), errors = listOf("workflow.halt is required")))
+        assertEquals(Refusal.MISSING_PERMISSION, reasonOf(role))
+        assertEquals("Your role in this workspace (Viewer) does not allow stopping scans.", role.text)
+        assertEquals(Refusal.NOT_MEMBER, reasonOf(refusalOf(envelope(403, "Not a member of this workspace"))))
+        assertEquals(Refusal.ACCOUNT_SUSPENDED, reasonOf(refusalOf(envelope(403, "Suspended", JSONObject().put("suspended", true)))))
+        assertTrue(refusalOf(envelope(500, "boom")) is Problem.Broken)
+    }
+
+    // ── notifications ─────────────────────────────────────────────────────
+
+    private fun note(id: String, read: Boolean, link: Any? = "/m/approve/$id", body: Any? = "Launch a crawl\nWorkspace: Acme\n\nOpen https://crossfyre.io/m/approve/$id") =
+        JSONObject().put("id", id).put("category", "approval").put("event_type", "approval.requested").put("severity", "warning")
+            .put("title", "An agent is waiting for your approval").put("body", body ?: JSONObject.NULL)
+            .put("link", link ?: JSONObject.NULL).put("read", read).put("created_at", "2026-10-31T13:56:58.401796Z")
+
+    @Test
+    fun the_inbox_reads_a_page_and_keeps_each_line_of_a_body_apart() {
+        val fake = Fake(envelope(200, "Notifications", JSONObject()
+            .put("items", JSONArray().put(note(id, false)).put(note("n-2", true, link = null, body = "a\u202Eb\tc")).put(JSONObject().put("title", "no id")))
+            .put("total", 8).put("unread", 5).put("page", 2).put("limit", 20)))
+        val page = ok(api(fake).inbox(key, page = 2))
+
+        val (url, body) = fake.calls.single()
+        assertEquals("https://crossfyre.io/api/v1/cli/inbox/list", url)
+        assertEquals(setOf("api_key", "page", "limit"), body.keySet())
+        assertEquals(2, body.getInt("page"))
+        assertEquals(20, body.getInt("limit"))
+        assertEquals(8, page.total)
+        assertEquals(5, page.unread)
+        assertEquals(2, page.page)
+        assertEquals(2, page.items.size)
+        val n = page.items[0]
+        assertEquals(id, n.id)
+        assertEquals("approval", n.category)
+        assertEquals("warning", n.severity)
+        assertFalse(n.read)
+        assertEquals("/m/approve/$id", n.link)
+        // Each line cleaned on its own, the blank one dropped.
+        assertEquals("Launch a crawl\nWorkspace: Acme\nOpen https://crossfyre.io/m/approve/$id", n.body)
+        assertEquals(Instant.parse("2026-10-31T13:56:58.401796Z"), n.createdAt)
+        assertEquals("", page.items[1].link)
+        assertEquals("abc", page.items[1].body)
+        assertTrue(page.items[1].read)
+    }
+
+    @Test
+    fun the_unread_filter_is_asked_for_by_name() {
+        val fake = Fake(envelope(200, "Notifications", JSONObject().put("items", JSONArray()).put("total", 0).put("unread", 0).put("page", 1)))
+        ok(api(fake).inbox(key, limit = 500, unreadOnly = true))
+        val body = fake.calls.single().second
+        assertEquals("unread", body.getString("filter"))
+        assertEquals(50, body.getInt("limit"))
+    }
+
+    @Test
+    fun marking_read_sends_the_ids_or_all_and_reads_what_is_left() {
+        val fake = Fake(envelope(200, "Marked read", JSONObject().put("marked", 2).put("unread", 3)),
+            envelope(200, "Marked read", JSONObject().put("marked", 3).put("unread", 0)))
+        assertEquals(InboxMarked(2, 3), ok(api(fake).inboxRead(key, listOf(id, "n-2"))))
+        assertEquals(InboxMarked(3, 0), ok(api(fake).inboxReadAll(key)))
+        assertEquals("https://crossfyre.io/api/v1/cli/inbox/read", fake.calls[0].first)
+        assertEquals(setOf("api_key", "ids"), fake.calls[0].second.keySet())
+        assertEquals(listOf(id, "n-2"), fake.calls[0].second.getJSONArray("ids").toList())
+        assertEquals(setOf("api_key", "all"), fake.calls[1].second.keySet())
+        assertTrue(fake.calls[1].second.getBoolean("all"))
+        val bad = problem(api(Fake(envelope(400, "Name 1 to 100 notification ids", JSONObject()))).inboxRead(key, emptyList()))
+        assertEquals(Problem.Refused(400, "Name 1 to 100 notification ids"), bad)
+    }
+
+    /**
+     * Notifications, the log and stop answer only a key whose own approver is
+     * active. A phone that does not approve is told so, not shown an error.
+     */
+    @Test
+    fun a_phone_that_does_not_approve_is_told_so_by_every_route_only_an_approver_reads() {
+        val inactive = { envelope(403, "approver_inactive", JSONObject().put("approver_inactive", true)) }
+        assertEquals(Refusal.APPROVER_INACTIVE, reasonOf(problem(api(Fake(inactive())).inbox(key))))
+        assertEquals(Refusal.APPROVER_INACTIVE, reasonOf(problem(api(Fake(inactive())).inboxReadAll(key))))
+        assertEquals(Refusal.APPROVER_INACTIVE, reasonOf(problem(api(Fake(inactive())).activity(key, ActivityScope.Account))))
+        assertEquals(Refusal.APPROVER_INACTIVE, reasonOf(problem(api(Fake(inactive())).stop(key, id, "ap-1", 1, byteArrayOf(1)))))
+        val off = { envelope(404, "Approvals are switched off", JSONObject().put("reason", "mcp_disabled")) }
+        assertEquals(Refusal.APPROVALS_OFF, reasonOf(problem(api(Fake(off())).inbox(key))))
+        assertEquals(Refusal.APPROVALS_OFF, reasonOf(problem(api(Fake(off())).activity(key, ActivityScope.Account))))
+    }
+
+    @Test
+    fun a_rate_limit_on_any_approval_route_carries_the_wait_the_server_asked_for() {
+        val limited = { envelope(429, "Too many requests", JSONObject().put("reason", "rate_limited"), retryAfter = 60) }
+        for (call in listOf<(ApprovalApi) -> Outcome<*>>(
+            { it.pending(key) }, { it.history(key) }, { it.inbox(key) }, { it.activity(key, ActivityScope.Account) },
+            { it.stop(key, id, "ap-1", 1, byteArrayOf(1)) }, { it.deny(key, id) },
+        )) {
+            val p = problem(call(api(Fake(limited())))) as Problem.Refused
+            assertEquals(Refusal.RATE_LIMITED, p.reason)
+            assertEquals(429, p.status)
+            assertEquals(60L, p.retryAfterSeconds)
+        }
+        // No header: the wait is left to the caller.
+        assertNull((problem(api(Fake(envelope(429, "Too many requests"))).inbox(key)) as Problem.Refused).retryAfterSeconds)
     }
 
     @Test
@@ -299,5 +457,8 @@ class ApprovalApiTest {
         assertTrue(body.getBoolean("account"))
         assertNull(page.nextBeforeId)
         assertEquals(Problem.SignedOut, problem(api(Fake(envelope(401, "Invalid key"))).activity(key, ActivityScope.Account)))
+        val export = problem(api(Fake(envelope(400, "Export the activity log from the dashboard", JSONObject().put("reason", "export_not_here"))))
+            .activity(key, ActivityScope.Account))
+        assertEquals(Problem.Refused(400, "Export the activity log from the dashboard"), export)
     }
 }

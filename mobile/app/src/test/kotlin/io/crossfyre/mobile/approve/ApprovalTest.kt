@@ -45,6 +45,20 @@ class ApprovalTest {
         )
     }
 
+    /** The platform's stop: the approve message with `stop` as its third line, and nothing else changed. */
+    @Test
+    fun a_stop_is_signed_over_the_same_six_lines_with_stop_in_place_of_approve() {
+        val d = "ab".repeat(32)
+        assertEquals(
+            "crossfyre-approval-v1\nid-1\nstop\n$d\n1793500000\ndev-1",
+            String(ApprovalProtocol.signingBytes("id-1", ApprovalProtocol.STOP, d, 1793500000, "dev-1"), Charsets.UTF_8),
+        )
+        assertEquals(
+            "crossfyre-approval-v1\nid-1\napprove\n$d\n1793500000\ndev-1",
+            String(ApprovalProtocol.signingBytes("id-1", ApprovalProtocol.APPROVE, d, 1793500000, "dev-1"), Charsets.UTF_8),
+        )
+    }
+
     @Test
     fun the_signed_message_is_the_fixture_byte_for_byte() {
         val f = fixture

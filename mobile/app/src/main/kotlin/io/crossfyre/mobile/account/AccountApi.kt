@@ -115,8 +115,13 @@ sealed interface Problem {
         var reason: Refusal = Refusal.OTHER
             private set
 
-        constructor(status: Int, text: String, reason: Refusal) : this(status, text) {
+        /** On a 429, the seconds the server asked for before the next call, when it said. */
+        var retryAfterSeconds: Long? = null
+            private set
+
+        constructor(status: Int, text: String, reason: Refusal, retryAfterSeconds: Long? = null) : this(status, text) {
             this.reason = reason
+            this.retryAfterSeconds = retryAfterSeconds
         }
     }
 
@@ -129,7 +134,7 @@ enum class Refusal {
     OTHER,
     /** An enterprise account whose request has not been approved yet. */
     IN_REVIEW,
-    /** The login limiter said no for now. */
+    /** A limiter said no for now: the login one, or the one on the phone's approval routes. */
     RATE_LIMITED,
     /** Signing in works, but the account cannot use a workspace until its address is verified. */
     EMAIL_UNVERIFIED,
@@ -153,6 +158,14 @@ enum class Refusal {
     TOO_MANY_APPROVERS,
     /** The member's role in the workspace does not allow what was asked. */
     MISSING_PERMISSION,
+    /** The platform has its approval routes switched off. */
+    APPROVALS_OFF,
+    /** A stop for an approval that never launched a scan. */
+    NOT_LAUNCHED,
+    /** A stop for a scan that is no longer running. */
+    NOT_RUNNING,
+    /** A signature made more than five minutes from the platform's clock. */
+    STALE_SIGNATURE,
 }
 
 sealed interface Outcome<out T> {
@@ -160,8 +173,11 @@ sealed interface Outcome<out T> {
     data class Failed(val problem: Problem) : Outcome<Nothing>
 }
 
-/** An HTTP answer: the status, and the body as text. */
-data class Reply(val status: Int, val body: String)
+/**
+ * An HTTP answer: the status, the body as text, and the seconds a 429's
+ * Retry-After asked for, when it gave a number.
+ */
+data class Reply(val status: Int, val body: String, val retryAfterSeconds: Long? = null)
 
 /** POST a JSON body, return whatever came back. Throws only when nothing did. */
 fun interface Transport {

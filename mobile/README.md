@@ -130,9 +130,20 @@ or requests that can change data on a target. The phone is where you say yes.
   approvals every five seconds for two minutes, then every fifteen. With the app
   closed, requests reach you through the alerts you set up in the dashboard, and
   a link to `https://crossfyre.io/m/approve/<id>` opens the request in the app.
-- **The Activity tab** shows what is waiting and your recent decisions. Both
-  are kept in memory while the app is open, and neither is written to the
-  phone's storage.
+- **Stopping what you approved.** While a scan you approved is running, Recent
+  decisions offers Stop. The stop is signed like an approval, after the same
+  unlock and over the same request, with `stop` where an approval says
+  `approve`, and at crossfyre.io's time: it takes a stop only within five
+  minutes of its own clock. Your role in that workspace has to allow stopping
+  scans.
+- **The Activity tab** shows what is waiting, your recent decisions, your
+  notifications, and the activity log as the dashboard shows it to you, under
+  the same roles. crossfyre.io answers notifications and the log only for a
+  phone that approves, never for the CLI's key on a computer, and the log
+  cannot be exported from the phone. A notification's link opens only when it
+  is a page on crossfyre.io: a request waiting for you opens in the app, and
+  anything else in a browser tab. All of it is kept in memory while the app is
+  open, and none of it is written to the phone's storage.
 
 Signing out, turning Approvals off, or revoking the phone's key in the dashboard
 stops the key from working. Removing the screen lock makes Android delete the

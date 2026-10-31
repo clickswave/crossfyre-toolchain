@@ -116,7 +116,33 @@ fun decisionNotice(p: Problem, host: String): Notice = when {
         "Nothing was approved. Turn Approvals off and on again in Settings, then ask the agent to try again.",
     )
     reasonOf(p) == Refusal.APPROVER_INACTIVE -> Notice(Level.WARN, "This phone no longer approves.", "Turn Approvals on again in Settings.")
+    reasonOf(p) == Refusal.RATE_LIMITED -> Notice(Level.WARN, "Too many requests from this phone.", "Nothing was decided. Wait a minute, then try again.")
     else -> Notice(Level.DANGER, "Couldn't send your answer.", p.text)
+}
+
+/** What Recent decisions says when a stop did not go through. */
+fun stopNotice(p: Problem, host: String): Notice = when {
+    p is Problem.Unreachable -> Notice(Level.DANGER, "Couldn't send the stop.", "$host didn't answer, so nothing was stopped. Try again.")
+    reasonOf(p) == Refusal.NOT_RUNNING -> Notice(Level.INFO, "That scan is not running any more.", "It finished or was stopped before this reached it.")
+    reasonOf(p) == Refusal.NOT_LAUNCHED -> Notice(Level.INFO, "That request did not start a scan.", "There is nothing to stop.")
+    reasonOf(p) == Refusal.UNKNOWN -> Notice(Level.INFO, "The server no longer has that request.", "There is nothing to stop.")
+    reasonOf(p) == Refusal.MISSING_PERMISSION -> Notice(Level.WARN, "Not stopped.", "${p.text} Ask a workspace admin to stop it.")
+    reasonOf(p) == Refusal.NOT_MEMBER -> Notice(Level.WARN, "You're not a member of that workspace any more.", "Nothing was stopped. Ask someone in it to stop the scan.")
+    reasonOf(p) == Refusal.BAD_SIGNATURE -> Notice(
+        Level.DANGER, "The server did not accept this phone's signature.",
+        "Nothing was stopped. Turn Approvals off and on again in Settings.",
+    )
+    reasonOf(p) == Refusal.STALE_SIGNATURE -> Notice(
+        Level.WARN, "This phone's time and the server's were too far apart.",
+        "Nothing was stopped. Refresh this tab, then tap Stop again.",
+    )
+    reasonOf(p) == Refusal.APPROVER_INACTIVE -> Notice(
+        Level.WARN, "This phone no longer approves.",
+        "Only a phone that approves can stop a scan. Turn Approvals on again in Settings.",
+    )
+    reasonOf(p) == Refusal.RATE_LIMITED -> Notice(Level.WARN, "Too many requests from this phone.", "Nothing was stopped. Wait a minute, then try again.")
+    reasonOf(p) == Refusal.APPROVALS_OFF -> Notice(Level.WARN, "Approvals are switched off on $host.", "Nothing was stopped. Stop the scan in the dashboard.")
+    else -> Notice(Level.DANGER, "Couldn't stop the scan.", p.text)
 }
 
 /**
@@ -137,7 +163,26 @@ fun signOutNotice(left: SignOutLeft, host: String): Notice? = when (left) {
 }
 
 /** Why the activity log did not load. */
-fun activityNotice(p: Problem, host: String): Notice = when (p) {
-    is Problem.Unreachable -> Notice(Level.DANGER, "Couldn't load activity.", "$host didn't answer. Check the phone's connection.")
-    else -> Notice(Level.DANGER, "Couldn't load activity.", p.text)
+fun activityNotice(p: Problem, host: String): Notice = readNotice("activity", p, host)
+
+/** Why the notifications did not load, or were not marked read. */
+fun inboxNotice(p: Problem, host: String): Notice = readNotice("notifications", p, host)
+
+/** Why notifications could not be marked read. They stay unread on the server, and so here. */
+fun markReadNotice(p: Problem, host: String): Notice = when {
+    p is Problem.Unreachable -> Notice(Level.WARN, "Couldn't mark notifications read.", "$host didn't answer. They stay unread for now.")
+    else -> readNotice("notifications", p, host).copy(title = "Couldn't mark notifications read.")
+}
+
+private fun readNotice(what: String, p: Problem, host: String): Notice = when {
+    p is Problem.Unreachable -> Notice(Level.DANGER, "Couldn't load $what.", "$host didn't answer. Check the phone's connection.")
+    reasonOf(p) == Refusal.RATE_LIMITED -> Notice(Level.WARN, "Too many requests from this phone.", "The app waits a minute before it asks $host again.")
+    reasonOf(p) == Refusal.APPROVALS_OFF -> Notice(Level.INFO, "Approvals are switched off on $host.", "The dashboard still shows your $what.")
+    // Only a phone that approves is answered. The app asks the pending list
+    // whether this one still does, and says so there if not.
+    reasonOf(p) == Refusal.APPROVER_INACTIVE -> Notice(
+        Level.WARN, "$host does not count this phone as an approver.",
+        "Only a phone that approves can read your $what here. If this stays, turn Approvals off and on again in Settings.",
+    )
+    else -> Notice(Level.DANGER, "Couldn't load $what.", p.text)
 }

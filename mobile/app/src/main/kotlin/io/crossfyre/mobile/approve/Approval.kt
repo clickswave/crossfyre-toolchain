@@ -1,5 +1,7 @@
 package io.crossfyre.mobile.approve
 
+import io.crossfyre.mobile.account.Problem
+import io.crossfyre.mobile.account.Refusal
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URI
@@ -23,6 +25,10 @@ import java.time.format.DateTimeFormatter
 object ApprovalProtocol {
     /** The first line of every signed message, so a signature cannot be reused for anything else. */
     const val CONTEXT = "crossfyre-approval-v1"
+
+    /** The third line: what the signature says yes to. A signature for one does nothing as the other. */
+    const val APPROVE = "approve"
+    const val STOP = "stop"
 
     /**
      * What the phone signs: six lines of UTF-8, joined by `\n`, with no newline at
@@ -409,6 +415,35 @@ object PollPolicy {
 
     fun next(sinceResumeMs: Long, hasPending: Boolean): Long =
         if (hasPending || sinceResumeMs < FAST_WINDOW_MS) FAST_MS else SLOW_MS
+}
+
+/**
+ * The pause after a 429 from the phone's routes. They share one limit per key
+ * on the platform, so once it says to wait, nothing that polls or loads on its
+ * own asks again until the wait it named is over: sixty seconds when it named
+ * none, and never more than ten minutes, whatever it named.
+ */
+class Quiet {
+    private var until = Long.MIN_VALUE
+
+    /** Hear an answer; a rate limit starts the pause from [nowMs]. */
+    fun heard(p: Problem, nowMs: Long) {
+        val r = p as? Problem.Refused ?: return
+        if (r.reason != Refusal.RATE_LIMITED) return
+        val seconds = (r.retryAfterSeconds ?: DEFAULT_SECONDS).coerceIn(1, MAX_SECONDS)
+        until = maxOf(until, nowMs + seconds * 1000)
+    }
+
+    fun open(nowMs: Long): Boolean = nowMs >= until
+
+    fun clear() {
+        until = Long.MIN_VALUE
+    }
+
+    companion object {
+        const val DEFAULT_SECONDS = 60L
+        const val MAX_SECONDS = 600L
+    }
 }
 
 /** The server's clock, carried forward on this phone's monotonic one, so a wrong phone clock does not matter. */

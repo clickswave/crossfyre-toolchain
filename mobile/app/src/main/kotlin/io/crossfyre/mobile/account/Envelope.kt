@@ -8,7 +8,7 @@ import java.io.IOException
  * when it is one. Shared by the account client and the approvals client, which
  * read the same envelope from the same server.
  */
-internal class Answer(val status: Int, val envelope: JSONObject?) {
+internal class Answer(val status: Int, val envelope: JSONObject?, private val retryAfterSeconds: Long? = null) {
     val ok = status in 200..299 && envelope != null
     val data: JSONObject? = envelope?.optJSONObject("data")
     private val message = envelope?.str("message")?.takeIf { it.isNotBlank() }
@@ -56,6 +56,19 @@ internal class Answer(val status: Int, val envelope: JSONObject?) {
         )
     )
 
+    /** `data.reason`, the machine-readable half of a refusal, when the server gave one. */
+    fun reason(): String? = data?.str("reason")
+
+    /** A 429, with how long the server asked the phone to wait before it calls again. */
+    fun <T> limited(): Outcome<T> = Outcome.Failed(
+        Problem.Refused(
+            status,
+            message ?: "Too many requests. Wait a minute before trying again.",
+            Refusal.RATE_LIMITED,
+            retryAfterSeconds,
+        )
+    )
+
     /** Whether the server's own words mention [word], for refusals with no flag to read. */
     fun says(word: String): Boolean =
         (message.orEmpty() + " " + firstError.orEmpty()).contains(word, ignoreCase = true)
@@ -80,7 +93,7 @@ internal fun <T> cliCall(
         return Outcome.Failed(Problem.Unreachable(host))
     }
     val envelope = runCatching { JSONObject(reply.body) }.getOrNull()
-    return read(Answer(reply.status, envelope))
+    return read(Answer(reply.status, envelope, reply.retryAfterSeconds))
 }
 
 /**

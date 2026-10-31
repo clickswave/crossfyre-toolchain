@@ -29,10 +29,15 @@ class FakeCloud(private val key: String) : AutoCloseable {
     val origin = "http://127.0.0.1:${server.localPort}"
 
     class Approver(val id: String, val code: String, val spki: ByteArray, val deviceName: String, var status: String)
-    class Pending(val id: String, val summaryJson: String, val digest: String, var status: String, val expiresAt: Instant, var signature: String? = null)
+    class Pending(
+        val id: String, val summaryJson: String, val digest: String, var status: String, val expiresAt: Instant, var signature: String? = null,
+        var launchState: String? = null, var workflowId: String? = null, var workflowStatus: String? = null,
+    )
+    class Note(val id: String, val title: String, val link: String?, var read: Boolean = false)
 
     val approvers = mutableListOf<Approver>()
     val approvals = mutableListOf<Pending>()
+    val notes = mutableListOf<Note>()
     val routes = mutableListOf<String>()
     var now: Instant = Instant.parse("2026-10-30T09:14:02Z")
 
@@ -97,6 +102,21 @@ class FakeCloud(private val key: String) : AutoCloseable {
         return Pending(id, text, digest, "pending", now.plusSeconds(600)).also { approvals += it }
     }
 
+    /** The platform launched what an approval let through, and the scan runs. */
+    @Synchronized fun launch(a: Pending) {
+        a.launchState = "launched"
+        a.workflowId = UUID.randomUUID().toString()
+        a.workflowStatus = "running"
+    }
+
+    /** A notification for the account, newest last. */
+    @Synchronized fun notify(title: String, link: String?): Note =
+        Note(UUID.randomUUID().toString(), title, link).also { notes += it }
+
+    private fun active(): Approver? = approvers.lastOrNull { it.status == "active" }
+
+    private fun inactive() = 403 to JSONObject().put("approver_inactive", true).put("message", "approver_inactive")
+
     private fun handle(route: String, b: JSONObject): Pair<Int, JSONObject> {
         routes += route
         if (b.optString("api_key") != key || keyRevoked) return 401 to JSONObject().put("message", "Invalid key")
@@ -126,6 +146,25 @@ class FakeCloud(private val key: String) : AutoCloseable {
                     }))
             }
             "approvals/decide" -> decide(b)
+            "approvals/history" -> 200 to JSONObject().put("server_time", now.toString())
+                .put("approvals", JSONArray(approvals.filter { it.status != "pending" }.map {
+                    JSONObject().put("id", it.id).put("status", it.status).put("digest", it.digest)
+                        .put("launch_state", it.launchState ?: JSONObject.NULL).put("workflow_id", it.workflowId ?: JSONObject.NULL)
+                        .put("workflow_status", it.workflowStatus ?: JSONObject.NULL)
+                }))
+            "approvals/stop" -> stop(b)
+            "inbox/list" -> if (active() == null) inactive() else 200 to JSONObject()
+                .put("items", JSONArray(notes.reversed().map {
+                    JSONObject().put("id", it.id).put("title", it.title).put("link", it.link ?: JSONObject.NULL).put("read", it.read)
+                        .put("category", "approval").put("severity", "warning").put("created_at", now.toString())
+                }))
+                .put("total", notes.size).put("unread", notes.count { !it.read }).put("page", 1).put("limit", 20)
+            "inbox/read" -> if (active() == null) inactive() else {
+                val ids = b.optJSONArray("ids")?.let { a -> (0 until a.length()).map { a.getString(it) } }
+                val hit = notes.filter { !it.read && (b.optBoolean("all") || ids?.contains(it.id) == true) }
+                hit.forEach { it.read = true }
+                200 to JSONObject().put("marked", hit.size).put("unread", notes.count { !it.read })
+            }
             "logout" -> logoutFails?.let { it to JSONObject().put("message", "Logout failed") } ?: run {
                 keyRevoked = true
                 200 to JSONObject()
@@ -154,6 +193,30 @@ class FakeCloud(private val key: String) : AutoCloseable {
         a.status = "approved"
         a.signature = b.getString("signature")
         return 200 to JSONObject().put("status", "approved")
+    }
+
+    /** The platform's order: whose approval, which approver, the signature over "stop", its time, then the scan. */
+    private fun stop(b: JSONObject): Pair<Int, JSONObject> {
+        val a = approvals.firstOrNull { it.id == b.optString("approval_id") } ?: return 404 to JSONObject().put("message", "No such approval")
+        val dev = approvers.firstOrNull { it.id == b.optString("approver_id") && it.status == "active" } ?: return inactive()
+        if (!b.has("signed_at") || !b.has("signature")) return 422 to JSONObject().put("message", "bad_signature")
+        val at = b.getLong("signed_at")
+        val bytes = ApprovalProtocol.signingBytes(a.id, "stop", a.digest, at, dev.id)
+        val pub = KeyFactory.getInstance("EC").generatePublic(X509EncodedKeySpec(dev.spki))
+        val ok = runCatching {
+            Signature.getInstance("SHA256withECDSA").run { initVerify(pub); update(bytes); verify(Base64.getDecoder().decode(b.getString("signature"))) }
+        }.getOrDefault(false)
+        if (!ok) return 422 to JSONObject().put("message", "bad_signature")
+        if (kotlin.math.abs(at - now.epochSecond) > 300) {
+            return 422 to JSONObject().put("message", "stale_signature").put("reason", "stale_signature").put("server_time", now.toString())
+        }
+        if (a.launchState != "launched") return 409 to JSONObject().put("message", "This approval did not launch a scan").put("reason", "not_launched")
+        if (a.workflowStatus != "running" && a.workflowStatus != "populating") {
+            return 409 to JSONObject().put("message", "That scan is not running").put("reason", "not_running")
+        }
+        a.workflowStatus = "stopped"
+        return 200 to JSONObject().put("id", a.id).put("workflow_id", a.workflowId).put("result", "stopped")
+            .put("workflow_status", "stopped").put("operations_cancelled", 2)
     }
 
     private fun line(input: InputStream): String {

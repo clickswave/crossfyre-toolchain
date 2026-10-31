@@ -1,8 +1,12 @@
 package io.crossfyre.mobile
 
 import io.crossfyre.mobile.approve.ActivityEvent
+import io.crossfyre.mobile.approve.HistoryRow
+import io.crossfyre.mobile.approve.InboxItem
+import io.crossfyre.mobile.approve.InboxPage
 import io.crossfyre.mobile.approve.PendingApproval
 import io.crossfyre.mobile.approve.Summary
+import java.net.URI
 import java.time.LocalDate
 import java.time.format.DateTimeFormatter
 import java.util.Locale
@@ -35,14 +39,80 @@ fun waitingForYou(approver: ApproverState, pending: List<PendingApproval>): List
     if (approver == ApproverState.ACTIVE) pending else emptyList()
 
 /**
- * Whether the tab reads and shows the activity log. It is off until the platform
- * serves `/cli/activity/list` to a phone key and to nothing else: a key route
- * can be called with any account key, the CLI's on the host an agent runs on
- * included, and the log names the people, keys and targets of every workspace
- * the account belongs to. The route has to answer only a key that has an active
- * approver, with export off, before this is turned on.
+ * Whether the tab reads and shows the activity log. A key route can be called
+ * with any account key, the CLI's on the host an agent runs on included, and
+ * the log names the people, keys and targets of every workspace the account
+ * belongs to. `/cli/activity/list` answers only a key whose own approver is
+ * active, under the owner's roles, and never exports, so the tab reads it, and
+ * only while this phone approves.
  */
-const val ACTIVITY_LOG = false
+const val ACTIVITY_LOG = true
+
+/** The scan states in which a stop has something to stop. */
+private val RUNNING = setOf("running", "populating")
+private val HEX64 = Regex("^[0-9a-fA-F]{64}$")
+
+/**
+ * Whether a decided request's scan can be stopped from this phone: it was
+ * approved, it launched a scan, that scan still runs, and the row carries the
+ * digest a stop is signed over. Without the digest the platform could only
+ * refuse the signature, so the button is not offered.
+ */
+fun stoppable(h: HistoryRow): Boolean =
+    h.status == "approved" && h.launchState == "launched" && h.workflowId.isNotEmpty() &&
+        h.workflowStatus in RUNNING && HEX64.matches(h.digest)
+
+/**
+ * The page a notification's link opens: `{origin}{link}`, for a link that is a
+ * path on this app's own server and nothing else. It must start with one `/`
+ * (two would name another host), hold no space, backslash or control character,
+ * and come out on the same scheme, host and port as [origin]. Anything else
+ * opens nothing.
+ */
+fun notificationUrl(origin: String, link: String?): String? {
+    if (link.isNullOrEmpty() || !link.startsWith("/") || link.startsWith("//")) return null
+    if (link.any { it.isWhitespace() || it.isISOControl() || it == '\\' }) return null
+    val base = origin.trimEnd('/')
+    val url = base + link
+    val u = runCatching { URI(url) }.getOrNull() ?: return null
+    val o = runCatching { URI(base) }.getOrNull() ?: return null
+    if (u.scheme == null || !u.scheme.equals(o.scheme, ignoreCase = true)) return null
+    if (u.host == null || !u.host.equals(o.host, ignoreCase = true) || u.port != o.port) return null
+    if (u.rawUserInfo != null) return null
+    return url
+}
+
+/**
+ * The Notifications section's rows: pages as they arrive, newest first, and
+ * rows marked read once the server says so. Plain data, so it is tested on the
+ * JVM; nothing of it is written to storage.
+ */
+data class InboxList(
+    val items: List<InboxItem> = emptyList(),
+    val total: Int = 0,
+    val unread: Int = 0,
+    /** The last page read; 0 before the first. */
+    val page: Int = 0,
+) {
+    /** Whether there are older rows than the ones shown. */
+    val more: Boolean get() = page > 0 && items.size < total
+
+    /**
+     * With [p] read: page 1 replaces what was shown, a later page adds the rows
+     * not already shown. Pages count from the newest row, so one that arrived in
+     * between moves the rest down and a later page can repeat a row.
+     */
+    fun with(p: InboxPage): InboxList =
+        if (p.page <= 1) InboxList(p.items, p.total, p.unread, 1)
+        else InboxList(items + p.items.filter { n -> items.none { it.id == n.id } }, p.total, p.unread, p.page)
+
+    /** [ids] marked read on the server, with [unread] the count it gave back. */
+    fun read(ids: Collection<String>, unread: Int): InboxList =
+        copy(items = items.map { if (it.id in ids) it.copy(read = true) else it }, unread = unread)
+
+    /** Every row marked read on the server. */
+    fun allRead(unread: Int): InboxList = copy(items = items.map { it.copy(read = true) }, unread = unread)
+}
 
 /** How a channel is named on screen. */
 fun channelLabel(channel: String): String = when (channel) {

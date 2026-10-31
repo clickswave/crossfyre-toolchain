@@ -4,6 +4,7 @@ import io.crossfyre.mobile.account.HttpTransport
 import io.crossfyre.mobile.account.Outcome
 import io.crossfyre.mobile.account.Refusal
 import io.crossfyre.mobile.reasonOf
+import io.crossfyre.mobile.stoppable
 import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
 import org.junit.After
@@ -12,10 +13,6 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
-import java.security.KeyPair
-import java.security.KeyPairGenerator
-import java.security.Signature
-import java.security.spec.ECGenParameterSpec
 
 /**
  * The phone's side of the protocol end to end, over HTTP, against [FakeCloud]:
@@ -30,19 +27,6 @@ import java.security.spec.ECGenParameterSpec
  * whose routes need their own tests of the same rules, run against them.
  */
 class ApprovalFlowTest {
-
-    /** [ApproverKeys] without a keystore, so the flow runs on the JVM. */
-    private class SoftwareKeys : ApproverKeys {
-        var pair: KeyPair? = null
-        override fun presence() = if (pair != null) KeyPresence.PRESENT else KeyPresence.ABSENT
-        override fun create(): ByteArray {
-            pair = KeyPairGenerator.getInstance("EC").apply { initialize(ECGenParameterSpec("secp256r1")) }.generateKeyPair()
-            return pair!!.public.encoded
-        }
-        override fun publicKey() = pair?.public?.encoded
-        override fun signature(): Signature = Signature.getInstance("SHA256withECDSA").apply { initSign(pair!!.private) }
-        override fun delete() { pair = null }
-    }
 
     private val key = "cfk_" + "d".repeat(40)
     private val cloud = FakeCloud(key)
@@ -69,8 +53,64 @@ class ApprovalFlowTest {
         e
     }
 
-    private fun sign(id: String, digest: String, approverId: String, signedAt: Long = 1793345642): ByteArray =
-        keys.signature().run { update(ApprovalProtocol.signingBytes(id, "approve", digest, signedAt, approverId)); sign() }
+    private fun sign(id: String, digest: String, approverId: String, signedAt: Long = 1793345642, decision: String = "approve"): ByteArray =
+        keys.signature().run { update(ApprovalProtocol.signingBytes(id, decision, digest, signedAt, approverId)); sign() }
+
+    private fun reason(o: Outcome<*>): Refusal = reasonOf((o as Outcome.Failed).problem)
+
+    /** Enrol, have the agent ask, approve at the fake's time, and let the fake launch it. */
+    private fun approvedAndRunning(): Pair<Enrolment, FakeCloud.Pending> {
+        val e = enrolled()
+        val asked = cloud.request(summary())
+        val p = ok(api.pending(key)).approvals.single()
+        val at = cloud.now.epochSecond
+        assertEquals("approved", ok(api.approve(key, p.id, e.approverId, at, sign(p.id, p.digest, e.approverId, at))))
+        cloud.launch(asked)
+        return e to asked
+    }
+
+    @Test
+    fun the_phone_stops_the_scan_it_approved_from_its_history_row() {
+        val (e, asked) = approvedAndRunning()
+        val history = ok(api.history(key))
+        val row = history.rows.single()
+        assertTrue(stoppable(row))
+        // As the app signs it: the row's digest, at the time the history answered.
+        val at = history.serverTime!!.epochSecond
+        assertEquals(Refusal.BAD_SIGNATURE, reason(api.stop(key, row.id, e.approverId, at, sign(row.id, row.digest, e.approverId, at))))
+        assertEquals("running", asked.workflowStatus)
+        val stopped = ok(api.stop(key, row.id, e.approverId, at, sign(row.id, row.digest, e.approverId, at, ApprovalProtocol.STOP)))
+        assertEquals(StopAnswer.Stopped("stopped", 2), stopped)
+        assertEquals("stopped", asked.workflowStatus)
+        assertFalse(stoppable(ok(api.history(key)).rows.single()))
+        assertEquals(Refusal.NOT_RUNNING, reason(api.stop(key, row.id, e.approverId, at, sign(row.id, row.digest, e.approverId, at, ApprovalProtocol.STOP))))
+    }
+
+    @Test
+    fun a_stop_signed_by_the_phone_s_own_wrong_clock_is_handed_the_fake_s_time_and_goes_through_at_it() {
+        val (e, asked) = approvedAndRunning()
+        val row = ok(api.history(key)).rows.single()
+        val phoneClock = cloud.now.epochSecond - 400
+        val first = ok(api.stop(key, row.id, e.approverId, phoneClock, sign(row.id, row.digest, e.approverId, phoneClock, ApprovalProtocol.STOP)))
+        assertEquals(StopAnswer.Stale(cloud.now), first)
+        assertEquals("running", asked.workflowStatus)
+        val at = (first as StopAnswer.Stale).serverTime.epochSecond
+        assertTrue(ok(api.stop(key, row.id, e.approverId, at, sign(row.id, row.digest, e.approverId, at, ApprovalProtocol.STOP))) is StopAnswer.Stopped)
+    }
+
+    @Test
+    fun the_fake_reads_notifications_only_to_a_phone_that_approves_and_the_phone_marks_them_read() {
+        cloud.notify("An agent is waiting for your approval", "/m/approve/x")
+        cloud.notify("Scan finished", null)
+        assertEquals(Refusal.APPROVER_INACTIVE, reason(api.inbox(key)))
+        enrolled()
+        val page = ok(api.inbox(key))
+        assertEquals(listOf("Scan finished", "An agent is waiting for your approval"), page.items.map { it.title })
+        assertEquals(2, page.unread)
+        assertEquals(InboxMarked(1, 1), ok(api.inboxRead(key, listOf(page.items[1].id))))
+        assertEquals(listOf(false, true), ok(api.inbox(key)).items.map { it.read })
+        assertEquals(InboxMarked(1, 0), ok(api.inboxReadAll(key)))
+    }
 
     @Test
     fun an_enrolled_phone_approves_what_it_was_shown_and_the_server_verifies_it() {
