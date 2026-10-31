@@ -76,12 +76,15 @@ async fn fetch(identity: &str, alpn: &[&[u8]], encoding: Encoding) -> Seen {
 /// origin's address, its self-signed certificate and a timeout are filled in.
 async fn fetch_with(config: transport::ClientConfig, alpn: &[&[u8]], encoding: Encoding) -> Seen {
     let origin = Origin::start(alpn, encoding);
-    let client = transport::build_client(transport::ClientConfig {
-        accept_invalid_certs: true,
-        resolve: vec![(wire::HOST.to_string(), origin.addr)],
-        timeout: Some(Duration::from_secs(20)),
-        ..config
-    })
+    let client = transport::build_client(
+        transport::ClientConfig {
+            accept_invalid_certs: true,
+            resolve: vec![(wire::HOST.to_string(), origin.addr)],
+            timeout: Some(Duration::from_secs(20)),
+            ..config
+        },
+        &transport::Egress::Direct,
+    )
     .unwrap();
     let resp = client.get(origin.url()).send().await.expect("request");
     assert_eq!(resp.status(), 200);

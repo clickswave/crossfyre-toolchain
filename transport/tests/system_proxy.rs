@@ -1,6 +1,7 @@
 //! A proxy named in the environment resolves the destination itself, so the
 //! private-address filter and the pinned addresses would never be consulted.
-//! A client that asks for either must not use one.
+//! A client that asks for either must not use one, and a client built for
+//! `Egress::Direct` uses none at all.
 //!
 //! This is a test binary of its own because it sets HTTP_PROXY for the whole
 //! process, which would reach every other test running beside it.
@@ -11,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use transport::{ClientConfig, Redirect, build_client};
+use transport::{ClientConfig, Egress, Redirect, build_client};
 
 /// A listener that answers 200 to anything and counts what reached it.
 fn counting_listener() -> (u16, Arc<AtomicUsize>) {
@@ -35,11 +36,14 @@ fn counting_listener() -> (u16, Arc<AtomicUsize>) {
 }
 
 fn client(cfg: ClientConfig) -> transport::Client {
-    build_client(ClientConfig {
-        timeout: Some(Duration::from_secs(5)),
-        redirect: Redirect::None,
-        ..cfg
-    })
+    build_client(
+        ClientConfig {
+            timeout: Some(Duration::from_secs(5)),
+            redirect: Redirect::None,
+            ..cfg
+        },
+        &Egress::Inherit,
+    )
     .unwrap()
 }
 
@@ -112,4 +116,33 @@ async fn a_client_with_pins_or_the_internal_filter_ignores_a_proxy_in_the_enviro
         "the proxy carried a filtered request"
     );
     assert_eq!(direct.load(Ordering::SeqCst), 1);
+
+    // An address goes through the proxy too, for a client that names no egress...
+    let to_address = format!("http://127.0.0.1:{target_port}/");
+    let r = client(ClientConfig::default())
+        .get(&to_address)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(via_proxy.load(Ordering::SeqCst), 2);
+
+    // ...and not for one built to go direct.
+    let direct_client = build_client(
+        ClientConfig {
+            timeout: Some(Duration::from_secs(5)),
+            redirect: Redirect::None,
+            ..Default::default()
+        },
+        &Egress::Direct,
+    )
+    .unwrap();
+    let r = direct_client.get(&to_address).send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(
+        via_proxy.load(Ordering::SeqCst),
+        2,
+        "the proxy carried a request built to go direct"
+    );
+    assert_eq!(direct.load(Ordering::SeqCst), 2);
 }

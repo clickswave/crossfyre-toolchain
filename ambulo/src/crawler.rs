@@ -791,21 +791,24 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
     } else {
         None
     };
-    let client = match transport::build_scan_client(transport::ScanClient {
-        identity_headers: &ident.headers,
-        user_agent: &ident.user_agent,
-        auth: params.auth.as_ref(),
-        attribution_token: token,
-        emulate: !matches!(mode, adaptive::identity::Mode::Fast),
-        timeout: Some(std::time::Duration::from_millis(
-            params.timeout_ms.max(1000),
-        )),
-        redirect: transport::Redirect::Limited(5),
-        accept_invalid_certs: true,
-        cookie_store: true,
-        resolve: Vec::new(),
-        ..Default::default()
-    }) {
+    let client = match transport::build_scan_client(
+        transport::ScanClient {
+            identity_headers: &ident.headers,
+            user_agent: &ident.user_agent,
+            auth: params.auth.as_ref(),
+            attribution_token: token,
+            emulate: !matches!(mode, adaptive::identity::Mode::Fast),
+            timeout: Some(std::time::Duration::from_millis(
+                params.timeout_ms.max(1000),
+            )),
+            redirect: transport::Redirect::Limited(5),
+            accept_invalid_certs: true,
+            cookie_store: true,
+            resolve: Vec::new(),
+            ..Default::default()
+        },
+        &transport::Egress::Inherit,
+    ) {
         Ok(c) => c,
         Err(e) => {
             let _ = tx.send(CrawlEvent::error(format!("client build failed: {e}")));

@@ -262,14 +262,17 @@ async fn task_handle(
             extra_headers.insert(transport::HeaderName::from_static("x-bug-bounty"), val);
         }
     }
-    let client = match transport::build_client(transport::ClientConfig {
-        block_internal: config.block_internal,
-        timeout: Some(Duration::from_secs(10)),
-        user_agent: Some(user_agent.clone()),
-        emulate: config.evasive,
-        extra_headers,
-        ..Default::default()
-    }) {
+    let client = match transport::build_client(
+        transport::ClientConfig {
+            block_internal: config.block_internal,
+            timeout: Some(Duration::from_secs(10)),
+            user_agent: Some(user_agent.clone()),
+            emulate: config.evasive,
+            extra_headers,
+            ..Default::default()
+        },
+        &transport::Egress::Inherit,
+    ) {
         Ok(c) => c,
         Err(e) => {
             emit_log(
@@ -498,14 +501,17 @@ async fn adaptive_task_handle(
             extra_headers.insert(transport::HeaderName::from_static("x-bug-bounty"), val);
         }
     }
-    let client = match transport::build_client(transport::ClientConfig {
-        block_internal: config.block_internal,
-        timeout: Some(Duration::from_secs(10)),
-        user_agent: Some(user_agent.clone()),
-        emulate: config.evasive,
-        extra_headers,
-        ..Default::default()
-    }) {
+    let client = match transport::build_client(
+        transport::ClientConfig {
+            block_internal: config.block_internal,
+            timeout: Some(Duration::from_secs(10)),
+            user_agent: Some(user_agent.clone()),
+            emulate: config.evasive,
+            extra_headers,
+            ..Default::default()
+        },
+        &transport::Egress::Inherit,
+    ) {
         Ok(c) => c,
         Err(e) => {
             emit_log(

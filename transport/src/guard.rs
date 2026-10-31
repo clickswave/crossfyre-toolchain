@@ -37,9 +37,19 @@
 //! a customer scanning their own RFC1918 network from a node inside it is the
 //! product working. This is for the paths where the caller is anonymous and the
 //! egress is shared: the free public tools. `ClientConfig::block_internal` turns
-//! it on, and nothing else should.
+//! it on for a client and `dial`'s `block_internal` for a raw connection, and
+//! nothing else should.
+//!
+//! A client that sends through a proxy never asks this resolver about a
+//! destination, since the proxy looks names up. Such a client cannot have the
+//! filter; see [`crate::egress`] for which combinations are refused.
 
+use std::io;
 use std::net::{IpAddr, SocketAddr};
+
+/// The one refusal message. Generic on purpose: the precise reason is a useful
+/// oracle for mapping an internal network, which is the thing being prevented.
+pub(crate) const NOT_PERMITTED: &str = "destination is not a permitted address";
 
 /// Addresses an untrusted caller must never be able to reach through us.
 ///
@@ -94,12 +104,12 @@ pub fn is_internal_literal(host: &str) -> bool {
 
 /// Resolve `host` and keep only the addresses that are safe to dial.
 ///
-/// Shared by both backend impls below so the filtering logic exists once.
-async fn resolve_public(host: String) -> Result<Vec<SocketAddr>, String> {
-    // Port 0: the caller (hyper) overrides it with the real port afterwards.
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+/// Shared by both backend impls below and by [`crate::dial`], so the filtering
+/// logic exists once. The addresses come back on port 0, for the caller to set.
+pub(crate) async fn resolve_public(host: &str) -> io::Result<Vec<SocketAddr>> {
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, 0))
         .await
-        .map_err(|e| format!("could not resolve {host}: {e}"))?
+        .map_err(|e| io::Error::new(e.kind(), format!("could not resolve {host}: {e}")))?
         .collect();
 
     let public: Vec<SocketAddr> = addrs
@@ -109,9 +119,10 @@ async fn resolve_public(host: String) -> Result<Vec<SocketAddr>, String> {
         .collect();
 
     if public.is_empty() {
-        // Generic on purpose. The precise reason is a useful oracle for mapping
-        // an internal network, which is the thing being prevented.
-        return Err("destination is not a permitted address".to_string());
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            NOT_PERMITTED,
+        ));
     }
     Ok(public)
 }
@@ -127,7 +138,7 @@ impl reqwest::dns::Resolve for PublicOnlyResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let host = name.as_str().to_string();
         Box::pin(async move {
-            let addrs = resolve_public(host).await?;
+            let addrs = resolve_public(&host).await?;
             Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
         })
     }
@@ -138,7 +149,7 @@ impl wreq::dns::Resolve for PublicOnlyResolver {
     fn resolve(&self, name: wreq::dns::Name) -> wreq::dns::Resolving {
         let host = name.as_str().to_string();
         Box::pin(async move {
-            let addrs = resolve_public(host).await?;
+            let addrs = resolve_public(&host).await?;
             Ok(Box::new(addrs.into_iter()) as wreq::dns::Addrs)
         })
     }
@@ -200,13 +211,14 @@ mod tests {
     async fn a_name_resolving_only_inward_is_refused() {
         // localhost resolves to 127.0.0.1 and/or ::1, all of which are filtered,
         // leaving nothing to dial.
-        assert!(resolve_public("localhost".to_string()).await.is_err());
+        assert!(resolve_public("localhost").await.is_err());
     }
 
     #[tokio::test]
     async fn the_error_does_not_name_the_address() {
         // The message must not become an oracle for what is on the inside.
-        if let Err(e) = resolve_public("localhost".to_string()).await {
+        if let Err(e) = resolve_public("localhost").await {
+            let e = e.to_string();
             assert!(!e.contains("127.0.0.1"), "error leaked the address: {e}");
             assert!(!e.contains("::1"), "error leaked the address: {e}");
         }
@@ -215,7 +227,7 @@ mod tests {
 
 #[cfg(test)]
 mod client_tests {
-    use crate::{ClientConfig, Redirect, build_client};
+    use crate::{ClientConfig, Egress, Redirect, build_client};
 
     /// End-to-end through a real built client: the guard must stop the request
     /// at resolution, not merely exist as a filter function.
@@ -224,12 +236,15 @@ mod client_tests {
     /// so this asserts real behaviour without needing the network.
     #[tokio::test]
     async fn a_guarded_client_cannot_reach_loopback() {
-        let client = build_client(ClientConfig {
-            block_internal: true,
-            redirect: Redirect::None,
-            timeout: Some(std::time::Duration::from_secs(5)),
-            ..Default::default()
-        })
+        let client = build_client(
+            ClientConfig {
+                block_internal: true,
+                redirect: Redirect::None,
+                timeout: Some(std::time::Duration::from_secs(5)),
+                ..Default::default()
+            },
+            &Egress::Direct,
+        )
         .expect("client builds");
 
         let err = client
@@ -249,12 +264,15 @@ mod client_tests {
     /// what changes behaviour and nothing else does.
     #[tokio::test]
     async fn an_unguarded_client_still_resolves_loopback() {
-        let client = build_client(ClientConfig {
-            block_internal: false,
-            redirect: Redirect::None,
-            timeout: Some(std::time::Duration::from_millis(1500)),
-            ..Default::default()
-        })
+        let client = build_client(
+            ClientConfig {
+                block_internal: false,
+                redirect: Redirect::None,
+                timeout: Some(std::time::Duration::from_millis(1500)),
+                ..Default::default()
+            },
+            &Egress::Direct,
+        )
         .expect("client builds");
 
         // Nothing is listening, so this fails to CONNECT rather than failing to

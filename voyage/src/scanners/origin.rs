@@ -57,16 +57,19 @@ fn client(
     timeout_ms: u64,
     resolve: Vec<(String, SocketAddr)>,
 ) -> Option<transport::Client> {
-    transport::build_client(transport::ClientConfig {
-        timeout: Some(Duration::from_millis(timeout_ms)),
-        accept_invalid_certs: true,
-        user_agent: Some(
-            adaptive::identity::resolve(&adaptive::identity::Mode::Evasive, None).user_agent,
-        ),
-        emulate: evasive,
-        resolve,
-        ..Default::default()
-    })
+    transport::build_client(
+        transport::ClientConfig {
+            timeout: Some(Duration::from_millis(timeout_ms)),
+            accept_invalid_certs: true,
+            user_agent: Some(
+                adaptive::identity::resolve(&adaptive::identity::Mode::Evasive, None).user_agent,
+            ),
+            emulate: evasive,
+            resolve,
+            ..Default::default()
+        },
+        &transport::Egress::Inherit,
+    )
     .ok()
 }
 

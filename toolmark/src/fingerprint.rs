@@ -82,25 +82,28 @@ pub async fn run(params: FpParams, tx: mpsc::UnboundedSender<Value>) {
     } else {
         None
     };
-    let client = match transport::build_scan_client(transport::ScanClient {
-        identity_headers: &ident.headers,
-        user_agent: &ident.user_agent,
-        auth: params.auth.as_ref(),
-        attribution_token: token,
-        emulate: !matches!(mode, adaptive::identity::Mode::Fast),
-        timeout: Some(std::time::Duration::from_millis(
-            params.timeout_ms.clamp(1000, 120_000),
-        )),
-        redirect: if params.follow_redirects {
-            transport::Redirect::Limited(5)
-        } else {
-            transport::Redirect::None
+    let client = match transport::build_scan_client(
+        transport::ScanClient {
+            identity_headers: &ident.headers,
+            user_agent: &ident.user_agent,
+            auth: params.auth.as_ref(),
+            attribution_token: token,
+            emulate: !matches!(mode, adaptive::identity::Mode::Fast),
+            timeout: Some(std::time::Duration::from_millis(
+                params.timeout_ms.clamp(1000, 120_000),
+            )),
+            redirect: if params.follow_redirects {
+                transport::Redirect::Limited(5)
+            } else {
+                transport::Redirect::None
+            },
+            accept_invalid_certs: true,
+            cookie_store: true,
+            resolve: params.resolve.clone(),
+            block_internal: params.block_internal,
         },
-        accept_invalid_certs: true,
-        cookie_store: true,
-        resolve: params.resolve.clone(),
-        block_internal: params.block_internal,
-    }) {
+        &transport::Egress::Inherit,
+    ) {
         Ok(c) => c,
         Err(e) => {
             let _ = tx.send(json!({"type":"error","message":format!("client build failed: {e}")}));

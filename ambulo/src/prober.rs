@@ -140,18 +140,21 @@ impl Prober {
                 headers_map.insert(transport::HeaderName::from_static("x-bug-bounty"), val);
             }
         }
-        let reqwest_client = transport::build_client(transport::ClientConfig {
-            timeout: None,
-            redirect: policy,
-            accept_invalid_certs: false,
-            cookie_store: config.store_cookies,
-            user_agent: Some(user_agent),
-            browser_headers: transport::HeaderMap::new(),
-            extra_headers: headers_map,
-            emulate: config.evasive,
-            resolve: Vec::new(),
-            ..Default::default()
-        })
+        let reqwest_client = transport::build_client(
+            transport::ClientConfig {
+                timeout: None,
+                redirect: policy,
+                accept_invalid_certs: false,
+                cookie_store: config.store_cookies,
+                user_agent: Some(user_agent),
+                browser_headers: transport::HeaderMap::new(),
+                extra_headers: headers_map,
+                emulate: config.evasive,
+                resolve: Vec::new(),
+                ..Default::default()
+            },
+            &transport::Egress::Inherit,
+        )
         .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
 
         Ok(Self {

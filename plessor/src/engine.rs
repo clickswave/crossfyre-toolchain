@@ -234,24 +234,27 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
                 ua = sua.clone();
             }
         }
-        transport::build_client(transport::ClientConfig {
-            timeout: Some(Duration::from_millis(
-                params.timeout_ms.clamp(1000, 120_000),
-            )),
-            redirect: if params.follow_redirects {
-                transport::Redirect::Limited(5)
-            } else {
-                transport::Redirect::None
+        transport::build_client(
+            transport::ClientConfig {
+                timeout: Some(Duration::from_millis(
+                    params.timeout_ms.clamp(1000, 120_000),
+                )),
+                redirect: if params.follow_redirects {
+                    transport::Redirect::Limited(5)
+                } else {
+                    transport::Redirect::None
+                },
+                accept_invalid_certs: true,
+                cookie_store: true,
+                user_agent: Some(ua),
+                browser_headers,
+                extra_headers,
+                emulate: should_emulate(params.user_agent.as_deref(), &mode),
+                resolve: Vec::new(),
+                block_internal: params.block_internal,
             },
-            accept_invalid_certs: true,
-            cookie_store: true,
-            user_agent: Some(ua),
-            browser_headers,
-            extra_headers,
-            emulate: should_emulate(params.user_agent.as_deref(), &mode),
-            resolve: Vec::new(),
-            block_internal: params.block_internal,
-        })
+            &transport::Egress::Inherit,
+        )
     };
 
     let _ = tx.send(json!({"type":"ack","target": base}));

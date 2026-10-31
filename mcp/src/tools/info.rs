@@ -107,8 +107,8 @@ pub(crate) async fn status(mcp: &Mcp, args: &Value) -> Result<Done, Refusal> {
                 .into(),
         );
     }
-    let proxy = [
-        "CROSSFYRE_EGRESS_PROXY",
+    let egress_proxy = env_set(transport::EGRESS_PROXY_VAR);
+    let system_proxy = [
         "HTTP_PROXY",
         "HTTPS_PROXY",
         "ALL_PROXY",
@@ -118,10 +118,19 @@ pub(crate) async fn status(mcp: &Mcp, args: &Value) -> Result<Done, Refusal> {
     ]
     .iter()
     .any(|v| env_set(v));
-    if proxy {
+    let proxy = egress_proxy || system_proxy;
+    // A request to a name is pinned to the address the server checked, and a proxy
+    // would look the name up again, so such a request never goes through one.
+    if egress_proxy {
+        hints.push(format!(
+            "{} is set, so requests to names are refused rather than sent around it; \
+             requests to addresses go through it",
+            transport::EGRESS_PROXY_VAR
+        ));
+    } else if system_proxy {
         hints.push(
-            "an egress proxy is set, so names are resolved by the proxy and the address check \
-             is best effort"
+            "a system proxy is set; requests to names go directly to the address that was \
+             checked, and requests to addresses go through the proxy"
                 .into(),
         );
     }

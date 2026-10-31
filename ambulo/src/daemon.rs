@@ -186,36 +186,42 @@ pub async fn run_on(listener: TcpListener, db: AmbuloDb) -> Result<(), Box<dyn s
     gate.announce("Ambulo", addr);
 
     let db = Arc::new(db);
-    let probe_client = Arc::new(transport::build_client(transport::ClientConfig {
-        timeout: Some(std::time::Duration::from_secs(10)),
-        redirect: transport::Redirect::Limited(10),
-        accept_invalid_certs: false,
-        cookie_store: false,
-        user_agent: Some(
-            adaptive::identity::resolve(&adaptive::identity::Mode::Evasive, None).user_agent,
-        ),
-        browser_headers: transport::HeaderMap::new(),
-        extra_headers: transport::HeaderMap::new(),
-        emulate: true,
-        resolve: Vec::new(),
-        ..Default::default()
-    })?);
+    let probe_client = Arc::new(transport::build_client(
+        transport::ClientConfig {
+            timeout: Some(std::time::Duration::from_secs(10)),
+            redirect: transport::Redirect::Limited(10),
+            accept_invalid_certs: false,
+            cookie_store: false,
+            user_agent: Some(
+                adaptive::identity::resolve(&adaptive::identity::Mode::Evasive, None).user_agent,
+            ),
+            browser_headers: transport::HeaderMap::new(),
+            extra_headers: transport::HeaderMap::new(),
+            emulate: true,
+            resolve: Vec::new(),
+            ..Default::default()
+        },
+        &transport::Egress::Inherit,
+    )?);
     // Second client that does NOT follow redirects, for the wizard's
     // "Follow Redirects = off" probes (reqwest sets redirect policy per-client).
-    let probe_client_noredirect = Arc::new(transport::build_client(transport::ClientConfig {
-        timeout: Some(std::time::Duration::from_secs(10)),
-        redirect: transport::Redirect::None,
-        accept_invalid_certs: false,
-        cookie_store: false,
-        user_agent: Some(
-            adaptive::identity::resolve(&adaptive::identity::Mode::Evasive, None).user_agent,
-        ),
-        browser_headers: transport::HeaderMap::new(),
-        extra_headers: transport::HeaderMap::new(),
-        emulate: true,
-        resolve: Vec::new(),
-        ..Default::default()
-    })?);
+    let probe_client_noredirect = Arc::new(transport::build_client(
+        transport::ClientConfig {
+            timeout: Some(std::time::Duration::from_secs(10)),
+            redirect: transport::Redirect::None,
+            accept_invalid_certs: false,
+            cookie_store: false,
+            user_agent: Some(
+                adaptive::identity::resolve(&adaptive::identity::Mode::Evasive, None).user_agent,
+            ),
+            browser_headers: transport::HeaderMap::new(),
+            extra_headers: transport::HeaderMap::new(),
+            emulate: true,
+            resolve: Vec::new(),
+            ..Default::default()
+        },
+        &transport::Egress::Inherit,
+    )?);
 
     // Background task: delete expired probe_results + GC old scans every 5 min.
     {

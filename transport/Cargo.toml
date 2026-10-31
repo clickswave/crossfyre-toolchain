@@ -8,10 +8,16 @@ description = "Backend-agnostic outbound HTTP client for the Crossfyre engines. 
 
 [dependencies]
 # Default backend. Always compiled so the shared http/url types are available.
-reqwest = { version = "0.12.22", default-features = false, features = ["rustls-tls", "http2", "charset", "cookies", "gzip", "brotli", "deflate", "zstd", "json"] }
+# `socks` lets a client send through a SOCKS proxy; without it reqwest takes a
+# socks5:// URL for an HTTP proxy.
+reqwest = { version = "0.12.22", default-features = false, features = ["rustls-tls", "http2", "charset", "cookies", "gzip", "brotli", "deflate", "zstd", "json", "socks"] }
 
-# The connect-time destination guard resolves names on tokio's blocking pool.
-tokio = { version = "1", features = ["net"] }
+# The connect-time destination guard resolves names on tokio's blocking pool, and
+# `dial` bounds a connection with a timer.
+tokio = { version = "1", features = ["net", "time"] }
+
+# `dial` opens a raw connection through a proxy with this.
+cfx_tunnel = { path = "../tunnel" }
 
 # `AuthSpec` deserializes straight from engine op params.
 serde = { version = "1", features = ["derive"] }
@@ -22,10 +28,12 @@ serde = { version = "1", features = ["derive"] }
 # and most advertise zstd, so the client has to decode all of them: wreq only
 # decodes the encodings whose features are on, and hands back the raw bytes for
 # the rest.
-wreq = { version = "5", optional = true, features = ["cookies", "gzip", "brotli", "deflate", "zstd", "json"] }
+# `socks` as for reqwest: without it wreq refuses a socks5:// proxy URL.
+wreq = { version = "5", optional = true, features = ["cookies", "gzip", "brotli", "deflate", "zstd", "json", "socks"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["net", "rt", "macros"] }
+tokio = { version = "1", features = ["net", "rt", "macros", "io-util", "time"] }
+serde_json = "1"
 # tests/emulation_wire.rs: a local TLS origin that records the ClientHello and
 # the HTTP/2 preface, and the hashes JA4 is made of. All four are already in the
 # lock through other crates.

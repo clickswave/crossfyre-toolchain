@@ -46,6 +46,11 @@ pub mod guard;
 
 pub mod url;
 
+pub mod egress;
+pub use egress::{
+    BuildError, EGRESS_PROXY_VAR, Egress, EgressWire, Io, Tunnel, TunnelError, WIRE_VERSION, dial,
+};
+
 /// Build a [`HeaderMap`] from `(name, value)` string pairs, skipping any that
 /// fail to parse. Convenience for turning an identity's header list (from
 /// `adaptive::identity`) into `ClientConfig::browser_headers`.
@@ -101,8 +106,9 @@ pub struct ClientConfig {
     /// Static DNS overrides: `(host, addr)` pairs. A request to `host` connects to
     /// `addr` while keeping `host` as the SNI + Host header. Origin discovery uses
     /// this to hit a candidate origin IP as if it were the fronted target host.
-    /// A client with any pin uses no proxy, since a proxy would look the name up
-    /// again.
+    /// A proxy would look the name up again, so a client with any pin uses no proxy
+    /// from `HTTP_PROXY` and the like, and cannot be built to send through
+    /// `CROSSFYRE_EGRESS_PROXY` or [`Egress::Proxy`].
     pub resolve: Vec<(String, std::net::SocketAddr)>,
     /// Refuse to connect to private / reserved addresses.
     ///
@@ -116,9 +122,12 @@ pub struct ClientConfig {
     /// rebinding, neither of which a check at the call site can see, and in the
     /// redirect policy for a hop to an address written as one, which never reaches
     /// the resolver. See [`guard`]. A request the caller itself sends to an
-    /// address is not filtered: that destination is the caller's to check. The
-    /// client uses no proxy, which would resolve names where this filter cannot
-    /// see them.
+    /// address is not filtered: that destination is the caller's to check.
+    ///
+    /// A proxy resolves names where this filter cannot see them. Under
+    /// [`Egress::Inherit`] the client therefore uses no proxy from `HTTP_PROXY` and
+    /// the like, and cannot be built while `CROSSFYRE_EGRESS_PROXY` is set. Under
+    /// [`Egress::Proxy`] the filter is the proxy's job, which a node's gateway does.
     pub block_internal: bool,
 }
 
@@ -164,8 +173,29 @@ fn will_emulate(_: &ClientConfig) -> bool {
     false
 }
 
-/// Build a client from `cfg`. All backend differences are confined here.
-pub fn build_client(cfg: ClientConfig) -> Result<Client, Error> {
+/// Build a client from `cfg` that sends the way `egress` says. All backend
+/// differences are confined here.
+///
+/// | `egress` | the client |
+/// |---|---|
+/// | `Direct` | uses no proxy, whatever the environment says |
+/// | `Inherit`, `CROSSFYRE_EGRESS_PROXY` unset | as before: `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` apply, unless the client pins names or refuses private addresses, which then uses none |
+/// | `Inherit`, `CROSSFYRE_EGRESS_PROXY` set | sends through it; a value that is not a usable proxy URL, or a client that pins names or refuses private addresses, is an error |
+/// | `Proxy(url)` | sends through `url`; an unusable URL or a pinned name is an error |
+///
+/// A proxy is never quietly dropped: anything that keeps one from being used is a
+/// [`BuildError::Egress`], never a direct client. Names always go to the proxy
+/// unresolved (see [`egress`]).
+pub fn build_client(cfg: ClientConfig, egress: &Egress) -> Result<Client, BuildError> {
+    let route = egress::route(
+        egress,
+        egress::Checks {
+            block_internal: cfg.block_internal,
+            pinned: !cfg.resolve.is_empty(),
+        },
+    )
+    .map_err(BuildError::Egress)?;
+
     // App headers are always sent. Browser headers + UA are sent only when we are
     // NOT emulating (the emulation profile provides its own coherent set). That
     // includes a requested emulation with no profile for the User-Agent, so the
@@ -191,7 +221,10 @@ pub fn build_client(cfg: ClientConfig) -> Result<Client, Error> {
     }
 
     let mut b = Client::builder().default_headers(headers);
-    if cfg.block_internal {
+    // Through a proxy no destination is resolved here, so the filter would only
+    // ever be asked about the proxy itself.
+    let proxied = matches!(route, egress::Route::Proxy { .. });
+    if cfg.block_internal && !proxied {
         // Both backends expose the same `dns_resolver` hook and an identical
         // `Resolve` trait, so one value serves whichever is compiled.
         b = b.dns_resolver(std::sync::Arc::new(guard::PublicOnlyResolver));
@@ -212,7 +245,7 @@ pub fn build_client(cfg: ClientConfig) -> Result<Client, Error> {
                     .host_str()
                     .is_some_and(guard::is_internal_literal)
                 {
-                    attempt.error("destination is not a permitted address")
+                    attempt.error(guard::NOT_PERMITTED)
                 } else {
                     limit.redirect(attempt)
                 }
@@ -227,32 +260,27 @@ pub fn build_client(cfg: ClientConfig) -> Result<Client, Error> {
         b = b.resolve(host.as_str(), *addr);
     }
 
-    // A proxy resolves the destination itself, so neither the internal filter
-    // nor a pin would ever be consulted. A client that asks for either uses no
-    // proxy, not one from HTTP_PROXY and the like and not the egress one below.
-    let guarded = cfg.block_internal || !cfg.resolve.is_empty();
-    if guarded {
-        b = b.no_proxy();
-    }
-
-    // BYO residential / mobile egress. When the node exports
-    // `CROSSFYRE_EGRESS_PROXY` (an `http(s)://` or `socks5://` gateway URL, with
-    // optional `user:pass@`), every engine client routes through it. One env var
-    // covers all engines with no per-engine plumbing, and a rotating-residential
-    // provider is exactly one such gateway URL. Ignored (direct egress) when
-    // unset or unparseable, so a bad value never silently drops to a worse path
-    // than "no proxy".
-    if let Ok(proxy_url) = std::env::var("CROSSFYRE_EGRESS_PROXY")
-        && !guarded
-    {
-        let proxy_url = proxy_url.trim();
-        if !proxy_url.is_empty() {
-            match Proxy::all(proxy_url) {
-                Ok(p) => b = b.proxy(p),
-                Err(e) => eprintln!("[transport] ignoring invalid CROSSFYRE_EGRESS_PROXY: {e}"),
-            }
+    b = match route {
+        // The backend reads HTTP_PROXY, HTTPS_PROXY and ALL_PROXY by itself.
+        egress::Route::System => b,
+        egress::Route::Direct => b.no_proxy(),
+        egress::Route::Proxy { url, .. } => {
+            // The backend's own error is not passed on: it can quote the URL, and the
+            // URL can hold a password. The value has already parsed as a proxy URL,
+            // so what is left is the backend refusing it, or not finding the address
+            // of a SOCKS proxy's host, which one backend looks up here.
+            let p = Proxy::all(url.as_str()).map_err(|_| {
+                BuildError::Egress(
+                    "the HTTP client cannot use the proxy URL, or could not find the \
+                     proxy's address"
+                        .into(),
+                )
+            })?;
+            // An explicit proxy turns off the ones from the environment in both
+            // backends; clearing them first does not depend on that.
+            b.no_proxy().proxy(p)
         }
-    }
+    };
 
     // Cert handling differs by backend.
     #[cfg(not(feature = "impersonate"))]
@@ -279,7 +307,7 @@ pub fn build_client(cfg: ClientConfig) -> Result<Client, Error> {
         }
     }
 
-    b.build()
+    Ok(b.build()?)
 }
 
 /// A scan client described in terms an engine already has: a resolved browser
@@ -332,8 +360,8 @@ impl<'a> Default for ScanClient<'a> {
 
 /// Build a scan [`Client`] from a [`ScanClient`] description. Assembles the app
 /// (auth + attribution) headers and the browser (identity) headers, then defers
-/// to [`build_client`] for all backend-specific construction.
-pub fn build_scan_client(spec: ScanClient) -> Result<Client, Error> {
+/// to [`build_client`] for all backend-specific construction, egress included.
+pub fn build_scan_client(spec: ScanClient, egress: &Egress) -> Result<Client, BuildError> {
     let mut extra_headers = HeaderMap::new();
     if let Some(a) = spec.auth.filter(|a| a.is_meaningful()) {
         for (k, v) in a.to_header_map().iter() {
@@ -345,18 +373,21 @@ pub fn build_scan_client(spec: ScanClient) -> Result<Client, Error> {
             extra_headers.insert(HeaderName::from_static("x-bug-bounty"), val);
         }
     }
-    build_client(ClientConfig {
-        timeout: spec.timeout,
-        redirect: spec.redirect,
-        accept_invalid_certs: spec.accept_invalid_certs,
-        cookie_store: spec.cookie_store,
-        user_agent: Some(spec.user_agent.to_string()),
-        browser_headers: headers_from_pairs(spec.identity_headers),
-        extra_headers,
-        emulate: spec.emulate,
-        resolve: spec.resolve,
-        block_internal: spec.block_internal,
-    })
+    build_client(
+        ClientConfig {
+            timeout: spec.timeout,
+            redirect: spec.redirect,
+            accept_invalid_certs: spec.accept_invalid_certs,
+            cookie_store: spec.cookie_store,
+            user_agent: Some(spec.user_agent.to_string()),
+            browser_headers: headers_from_pairs(spec.identity_headers),
+            extra_headers,
+            emulate: spec.emulate,
+            resolve: spec.resolve,
+            block_internal: spec.block_internal,
+        },
+        egress,
+    )
 }
 
 #[cfg(test)]
@@ -373,17 +404,20 @@ mod tests {
 
     #[test]
     fn builds_in_both_backends() {
-        let c = build_client(ClientConfig {
-            accept_invalid_certs: true,
-            cookie_store: true,
-            user_agent: Some(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+        let c = build_client(
+            ClientConfig {
+                accept_invalid_certs: true,
+                cookie_store: true,
+                user_agent: Some(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                  (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
-                    .into(),
-            ),
-            emulate: true,
-            ..Default::default()
-        });
+                        .into(),
+                ),
+                emulate: true,
+                ..Default::default()
+            },
+            &Egress::Direct,
+        );
         assert!(c.is_ok(), "build failed: {:?}", c.err());
     }
 
@@ -419,12 +453,15 @@ mod tests {
              Content-Length: 0\r\nConnection: close\r\n\r\n"
         ));
         let client = |block_internal| {
-            build_client(ClientConfig {
-                timeout: Some(Duration::from_secs(5)),
-                redirect: Redirect::Limited(3),
-                block_internal,
-                ..Default::default()
-            })
+            build_client(
+                ClientConfig {
+                    timeout: Some(Duration::from_secs(5)),
+                    redirect: Redirect::Limited(3),
+                    block_internal,
+                    ..Default::default()
+                },
+                &Egress::Direct,
+            )
             .unwrap()
         };
         let url = format!("http://127.0.0.1:{outer}/");
@@ -462,11 +499,14 @@ mod tests {
         // does when emulation is off.
         let mut extra_headers = HeaderMap::new();
         extra_headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer t"));
-        let client = build_client(ClientConfig {
-            extra_headers,
-            browser_headers: headers_from_pairs(&[("accept-language", "en-GB".into())]),
-            ..ua("Crossfyre-Scanner/1.0")
-        })
+        let client = build_client(
+            ClientConfig {
+                extra_headers,
+                browser_headers: headers_from_pairs(&[("accept-language", "en-GB".into())]),
+                ..ua("Crossfyre-Scanner/1.0")
+            },
+            &Egress::Direct,
+        )
         .unwrap();
         let sent = client.headers();
         assert_eq!(sent[header::USER_AGENT], "Crossfyre-Scanner/1.0");
@@ -482,11 +522,14 @@ mod tests {
         extra_headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer t"));
         // An app header the profile also sets: the app's value has to win.
         extra_headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
-        let client = build_client(ClientConfig {
-            extra_headers,
-            browser_headers: headers_from_pairs(&[("sec-ch-ua", "from-identity".into())]),
-            ..ua("Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0")
-        })
+        let client = build_client(
+            ClientConfig {
+                extra_headers,
+                browser_headers: headers_from_pairs(&[("sec-ch-ua", "from-identity".into())]),
+                ..ua("Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0")
+            },
+            &Egress::Direct,
+        )
         .unwrap();
         let sent = client.headers();
         assert_eq!(sent[header::AUTHORIZATION], "Bearer t");

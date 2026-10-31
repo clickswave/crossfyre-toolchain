@@ -98,21 +98,24 @@ pub fn build_client_with(
     let mode = adaptive::identity::Mode::from_flags(evasive, identify);
     let seed = (!target.is_empty()).then_some(target);
     let browser = adaptive::identity::resolve(&mode, seed);
-    transport::build_scan_client(transport::ScanClient {
-        identity_headers: &browser.headers,
-        user_agent: &browser.user_agent,
-        auth,
-        attribution_token: None,
-        emulate: !matches!(mode, adaptive::identity::Mode::Fast),
-        timeout: Some(Duration::from_millis(
-            timeout_ms.clamp(1000, 120_000).max(min_timeout_ms),
-        )),
-        redirect,
-        accept_invalid_certs: true,
-        cookie_store: true,
-        resolve,
-        block_internal,
-    })
+    transport::build_scan_client(
+        transport::ScanClient {
+            identity_headers: &browser.headers,
+            user_agent: &browser.user_agent,
+            auth,
+            attribution_token: None,
+            emulate: !matches!(mode, adaptive::identity::Mode::Fast),
+            timeout: Some(Duration::from_millis(
+                timeout_ms.clamp(1000, 120_000).max(min_timeout_ms),
+            )),
+            redirect,
+            accept_invalid_certs: true,
+            cookie_store: true,
+            resolve,
+            block_internal,
+        },
+        &transport::Egress::Inherit,
+    )
     .ok()
 }
 
