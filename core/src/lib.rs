@@ -1706,6 +1706,82 @@ pub async fn run_init(
     Ok(())
 }
 
+/// The client the Bench repeater sends with. It does not follow redirects.
+///
+/// The platform checks a Bench request's URL against the workspace's scope before
+/// it reaches the node, and a redirect followed here would carry the request to a
+/// host nobody checked. The 3xx and its `Location` go back to the person instead,
+/// as a repeater's do, and the next hop is a send of its own.
+fn bench_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        // Only fails where `Client::new()` would panic too: no TLS backend.
+        .expect("the Bench client builds")
+}
+
+/// Send one Bench repeater request from this node and describe the response.
+///
+/// The platform has already authorised the request. A caller-supplied `Host`
+/// header is dropped, so the URL's host is the host the request goes to.
+async fn bench_send(client: &reqwest::Client, cmd: &serde_json::Value) -> serde_json::Value {
+    let method = cmd["method"].as_str().unwrap_or("GET");
+    let url = cmd["url"].as_str().unwrap_or("");
+    let body = cmd["body"].as_str().map(|s| s.to_string());
+    let headers: Vec<(String, String)> = cmd["headers"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|h| {
+                    let p = h.as_array()?;
+                    Some((
+                        p.first()?.as_str()?.to_string(),
+                        p.get(1)?.as_str()?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let started = std::time::Instant::now();
+    let m = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
+    let mut rb = client.request(m, url);
+    for (k, v) in &headers {
+        // Skip hop-by-hop / auto-managed headers reqwest sets itself.
+        let kl = k.to_ascii_lowercase();
+        if kl == "host" || kl == "content-length" || kl == "connection" {
+            continue;
+        }
+        rb = rb.header(k.as_str(), v.as_str());
+    }
+    if let Some(b) = body {
+        rb = rb.body(b);
+    }
+    match rb.send().await {
+        Ok(r) => {
+            let status = r.status().as_u16();
+            let resp_headers: Vec<[String; 2]> = r
+                .headers()
+                .iter()
+                .map(|(k, v)| [k.to_string(), v.to_str().unwrap_or("").to_string()])
+                .collect();
+            let text = r.text().await.unwrap_or_default();
+            serde_json::json!({
+                "ok": true,
+                "status": status,
+                "headers": resp_headers,
+                "body": text,
+                "duration_ms": started.elapsed().as_millis() as u64,
+                // Tells the platform this node returns redirects; an older node
+                // follows them and says nothing.
+                "redirects": "not_followed",
+            })
+        }
+        Err(e) => {
+            serde_json::json!({ "ok": false, "error": e.to_string(), "redirects": "not_followed" })
+        }
+    }
+}
+
 /// The command that runs `command` in the system shell: `sh -c` on Unix, and on Windows
 /// `cmd /d /s /c`, which is given the line as typed, because cmd parses its own command
 /// line and would not see the quoting the standard argument encoding adds.
@@ -2200,6 +2276,7 @@ pub async fn run_daemon(
     // -- Validate API key before going online -------------------------------
     // This blocks the node from ever appearing online with a revoked key.
     let http_client = reqwest::Client::new();
+    let bench_client = bench_client();
     let validate_res = http_client
         .post(format!("{}/api/v1/node-status", config.api_url))
         .json(&serde_json::json!({
@@ -2670,59 +2747,10 @@ pub async fn run_daemon(
                             // the node just sends it and replies with the full response by command_id.
                             Some("repeater") => {
                                 let command_id = cmd["command_id"].as_str().unwrap_or("").to_string();
-                                let method = cmd["method"].as_str().unwrap_or("GET").to_string();
-                                let url = cmd["url"].as_str().unwrap_or("").to_string();
-                                let body = cmd["body"].as_str().map(|s| s.to_string());
-                                let headers: Vec<(String, String)> = cmd["headers"]
-                                    .as_array()
-                                    .map(|a| {
-                                        a.iter()
-                                            .filter_map(|h| {
-                                                let p = h.as_array()?;
-                                                Some((p.first()?.as_str()?.to_string(), p.get(1)?.as_str()?.to_string()))
-                                            })
-                                            .collect()
-                                    })
-                                    .unwrap_or_default();
-                                let client = http_client.clone();
-                                let started = std::time::Instant::now();
-                                let m = reqwest::Method::from_bytes(method.as_bytes())
-                                    .unwrap_or(reqwest::Method::GET);
-                                let mut rb = client.request(m, &url);
-                                for (k, v) in &headers {
-                                    // Skip hop-by-hop / auto-managed headers reqwest sets itself.
-                                    let kl = k.to_ascii_lowercase();
-                                    if kl == "host" || kl == "content-length" || kl == "connection" {
-                                        continue;
-                                    }
-                                    rb = rb.header(k.as_str(), v.as_str());
-                                }
-                                if let Some(b) = body {
-                                    rb = rb.body(b);
-                                }
-                                let mut resp = serde_json::json!({
-                                    "type": "repeater_result", "command_id": command_id, "node_id": &node_id,
-                                });
-                                match rb.send().await {
-                                    Ok(r) => {
-                                        let status = r.status().as_u16();
-                                        let resp_headers: Vec<[String; 2]> = r
-                                            .headers()
-                                            .iter()
-                                            .map(|(k, v)| [k.to_string(), v.to_str().unwrap_or("").to_string()])
-                                            .collect();
-                                        let text = r.text().await.unwrap_or_default();
-                                        resp["ok"] = serde_json::json!(true);
-                                        resp["status"] = serde_json::json!(status);
-                                        resp["headers"] = serde_json::json!(resp_headers);
-                                        resp["body"] = serde_json::json!(text);
-                                        resp["duration_ms"] = serde_json::json!(started.elapsed().as_millis() as u64);
-                                    }
-                                    Err(e) => {
-                                        resp["ok"] = serde_json::json!(false);
-                                        resp["error"] = serde_json::json!(e.to_string());
-                                    }
-                                }
+                                let mut resp = bench_send(&bench_client, &cmd).await;
+                                resp["type"] = serde_json::json!("repeater_result");
+                                resp["command_id"] = serde_json::json!(command_id);
+                                resp["node_id"] = serde_json::json!(&node_id);
                                 let _ = publisher.publish(status_subject.clone(), resp.to_string().into()).await;
                             }
                             Some("operation") => {
@@ -3175,5 +3203,70 @@ mod heartbeat_tests {
         );
         assert_eq!(status["managed_by"], "apt");
         assert_eq!(status["postgres"]["running"], false);
+    }
+}
+
+#[cfg(test)]
+mod bench_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A loopback listener that answers every request with `reply` and counts the
+    /// connections it accepted.
+    async fn listener(reply: String) -> (u16, Arc<AtomicUsize>) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let count = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                let reply = reply.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf).await;
+                    let _ = s.write_all(reply.as_bytes()).await;
+                    let _ = s.shutdown().await;
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    /// The platform checks a Bench URL against the workspace's scope before it
+    /// reaches the node. A redirect the node followed by itself would take the
+    /// request to a host nobody checked, so the 3xx comes back instead.
+    #[tokio::test]
+    async fn the_repeater_returns_a_redirect_instead_of_following_it() {
+        let (second, second_seen) =
+            listener("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".into())
+                .await;
+        let (first, first_seen) = listener(format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{second}/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        ))
+        .await;
+        let cmd = serde_json::json!({ "method": "GET", "url": format!("http://127.0.0.1:{first}/start") });
+        let resp = bench_send(&bench_client(), &cmd).await;
+        assert_eq!(resp["ok"], true, "{resp}");
+        assert_eq!(resp["status"], 302, "{resp}");
+        assert_eq!(resp["redirects"], "not_followed", "{resp}");
+        let location = resp["headers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h[0] == "location")
+            .map(|h| h[1].clone());
+        assert_eq!(
+            location,
+            Some(serde_json::json!(format!("http://127.0.0.1:{second}/")))
+        );
+        assert_eq!(first_seen.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            second_seen.load(Ordering::SeqCst),
+            0,
+            "the redirect was followed"
+        );
     }
 }
