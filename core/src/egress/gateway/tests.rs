@@ -354,10 +354,10 @@ fn a_socks4_upstream_gets_an_ipv4_address() {
     ));
 }
 
-/// Over the gateway's connection cap, a connection is answered with a failure and
-/// counted, instead of waiting for a slot.
+/// Over the gateway's connection cap, a connection is closed before anything is read
+/// from it, and once an open one ends the next goes through.
 #[tokio::test]
-async fn connections_over_the_cap_fail() {
+async fn connections_over_the_cap_are_closed_unanswered() {
     let rec = Recorder::start(to_loopback).await;
     let fx = Fixture::banner(b"hi\r\n").await;
     let gw = Gateway::bind_with(resolver(&[]), Timeouts::default(), IDLE, 1)
@@ -366,12 +366,57 @@ async fn connections_over_the_cap_fail() {
     let lease = gw
         .lease("op", "proxy-1", Arc::new(recorder_upstream(&rec)), false)
         .unwrap();
-    let _held = through(&lease, "a.example.test", fx.port).await.unwrap();
+    let held = through(&lease, "a.example.test", fx.port).await.unwrap();
     let got = through(&lease, "b.example.test", fx.port).await;
+    // Closed with the greeting unread, which the client sees as an end or a reset
+    // depending on when its next read lands.
     assert!(
-        matches!(got, Err(TunnelError::Refused(GENERAL_FAILURE))),
+        matches!(got, Err(TunnelError::Protocol(_) | TunnelError::Connect(_))),
         "{}",
         shown(&got)
     );
-    assert_eq!(lease.summary()["failed"], 1);
+    assert_eq!(rec.seen().len(), 1, "the proxy was asked: {:?}", rec.seen());
+    drop(held);
+    let mut again = Err(TunnelError::Timeout);
+    for _ in 0..50 {
+        again = through(&lease, "c.example.test", fx.port).await;
+        if again.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(again.is_ok(), "{}", shown(&again));
+}
+
+/// Connections count against the cap from the moment they are accepted. One that
+/// never authenticates would otherwise keep a descriptor in the node's process for the
+/// whole handshake deadline, outside the cap, and enough of them leave the node unable
+/// to open anything else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connections_that_never_authenticate_count_against_the_cap() {
+    let gw = Gateway::bind_with(resolver(&[]), Timeouts::default(), IDLE, 1)
+        .await
+        .unwrap();
+    let mut held = Vec::new();
+    for _ in 0..300 {
+        // Connect and send nothing: no greeting, no credentials.
+        held.push(TcpStream::connect(gw.addr()).await.unwrap());
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // A connection the gateway has closed reads as ended at once; one it still holds
+    // has nothing to read.
+    let mut open = 0;
+    for s in held.iter_mut() {
+        let mut b = [0u8; 1];
+        if tokio::time::timeout(Duration::from_millis(5), s.read(&mut b))
+            .await
+            .is_err()
+        {
+            open += 1;
+        }
+    }
+    assert!(
+        open <= 1,
+        "the gateway holds {open} connections that never authenticated, under a cap of 1"
+    );
 }

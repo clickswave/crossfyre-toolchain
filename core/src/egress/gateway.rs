@@ -33,8 +33,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, watch};
 
-/// Connections open through the gateway at once, across every lease. One more is
-/// answered with a general failure.
+/// Connections the gateway holds at once, across every lease, counted from the moment
+/// each is accepted. One more is closed before anything is read from it.
 pub const MAX_CONNECTIONS: usize = 2048;
 
 /// Destinations listed one by one in a lease's summary. Connections to any further
@@ -69,6 +69,9 @@ pub struct Gateway {
     addr: SocketAddr,
     leases: Mutex<HashMap<String, Arc<LeaseState>>>,
     conns: Arc<Semaphore>,
+    cap: usize,
+    /// When the node last said the gateway was full, so a flood says it once a minute.
+    full_said: Mutex<Option<Instant>>,
     resolver: Resolver,
     timeouts: Timeouts,
     idle: Duration,
@@ -98,6 +101,8 @@ impl Gateway {
             addr: listener.local_addr()?,
             leases: Mutex::new(HashMap::new()),
             conns: Arc::new(Semaphore::new(max_connections)),
+            cap: max_connections,
+            full_said: Mutex::new(None),
             resolver,
             timeouts,
             idle,
@@ -160,6 +165,15 @@ impl Gateway {
     }
 
     async fn serve(self: Arc<Self>, mut s: TcpStream) {
+        // The cap counts a connection from the moment it is accepted, not once it has
+        // authenticated: one that never sends a greeting would otherwise hold a
+        // descriptor for the whole handshake deadline, outside the cap, and enough of
+        // them leave the node unable to open anything else. Nothing is owed before the
+        // greeting, so one over the cap is closed unanswered.
+        let Ok(_permit) = Arc::clone(&self.conns).try_acquire_owned() else {
+            self.say_full();
+            return;
+        };
         let _ = s.set_nodelay(true);
         let accepted = socks5_server::accept(&mut s, HANDSHAKE, |u, p| self.find(u, p)).await;
         // A missing lease or a wrong secret has been answered with an auth failure.
@@ -171,15 +185,6 @@ impl Gateway {
             let _ = socks5_server::reply(&mut s, GENERAL_FAILURE).await;
             return;
         }
-        let Ok(_permit) = Arc::clone(&self.conns).try_acquire_owned() else {
-            lease.record(
-                &target,
-                Outcome::Failed,
-                Some("too many connections open at once"),
-            );
-            let _ = socks5_server::reply(&mut s, GENERAL_FAILURE).await;
-            return;
-        };
         let onward = match self.route(&lease, &target).await {
             Ok(t) => t,
             Err(Verdict::Refused(why)) => {
@@ -215,6 +220,23 @@ impl Gateway {
         }
         let (up, down) = pump(s, tunnel, self.idle, ended).await;
         lease.add_bytes(up, down);
+    }
+
+    /// A line in the node's log when the gateway turns connections away, at most once a
+    /// minute.
+    fn say_full(&self) {
+        let Ok(mut said) = self.full_said.lock() else {
+            return;
+        };
+        if said.is_some_and(|at| at.elapsed() < Duration::from_secs(60)) {
+            return;
+        }
+        *said = Some(Instant::now());
+        eprintln!(
+            "[egress] the gateway holds its limit of {} connections; new ones are closed \
+             until some end",
+            self.cap
+        );
     }
 
     /// Where a connection goes on to, or why it does not.
