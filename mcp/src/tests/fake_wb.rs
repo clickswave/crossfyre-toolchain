@@ -308,16 +308,19 @@ async fn serve_conn(s: Arc<Shared>, sock: tokio::net::UnixStream) {
         capabilities: s.capabilities.clone(),
         project: s.project.lock().unwrap().clone(),
     });
+    // Counted and listening for events before the welcome goes. A client that has read
+    // it can be back in the test, counting welcomes or pushing an event, before this
+    // task runs again after the write, and an event pushed with nobody subscribed is lost.
+    s.welcomed.fetch_add(1, Ordering::SeqCst);
+    let mut events = s.lines.subscribe();
     if w.write_all(cfx_bridge::to_line(&welcome).as_bytes())
         .await
         .is_err()
     {
         return;
     }
-    s.welcomed.fetch_add(1, Ordering::SeqCst);
 
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    let mut events = s.lines.subscribe();
     let writer = tokio::spawn(async move {
         while let Some(l) = rx.recv().await {
             if w.write_all(l.as_bytes()).await.is_err() {
