@@ -823,5 +823,55 @@ pub async fn engine_reads_egress(addr: &str) -> Option<bool> {
     dguard::is_error(&line).then_some(false)
 }
 
+/// How long an engine's answer to [`engine_reads_egress`] stands. An engine replaced
+/// between two heartbeats (a package upgrade or downgrade, a restart by hand) is back on
+/// the same port before the next one, so the heartbeat never sees it stopped; asking
+/// again this often bounds how long it reports the previous engine's answer.
+pub const ENGINE_ASK_EVERY: Duration = Duration::from_secs(30);
+
+/// What each running engine answered when asked whether it reads the egress wrapper,
+/// and when, by engine id. The heartbeat reports it per engine.
+#[derive(Default)]
+pub struct EngineEgress {
+    answers: std::collections::HashMap<String, (bool, Instant)>,
+}
+
+impl EngineEgress {
+    /// Whether `ext` is to be asked at `now`: it has not answered yet, or answered
+    /// [`ENGINE_ASK_EVERY`] ago or longer.
+    pub fn due(&self, ext: &str, now: Instant) -> bool {
+        self.answers
+            .get(ext)
+            .is_none_or(|(_, at)| now.saturating_duration_since(*at) >= ENGINE_ASK_EVERY)
+    }
+
+    /// Keep an engine's answer, or forget the old one when it gave none.
+    pub fn answered(&mut self, ext: String, reads: Option<bool>, now: Instant) {
+        match reads {
+            Some(r) => {
+                self.answers.insert(ext, (r, now));
+            }
+            None => {
+                self.answers.remove(&ext);
+            }
+        }
+    }
+
+    /// Whether `ext` said it reads the wrapper. An engine that has not said so does not.
+    pub fn reads(&self, ext: &str) -> bool {
+        self.answers.get(ext).is_some_and(|(r, _)| *r)
+    }
+
+    /// Forget `ext`'s answer: it was stopped, installed or restarted.
+    pub fn remove(&mut self, ext: &str) {
+        self.answers.remove(ext);
+    }
+
+    /// Forget every answer: the engines may all have been replaced.
+    pub fn clear(&mut self) {
+        self.answers.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests;

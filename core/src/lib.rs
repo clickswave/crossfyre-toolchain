@@ -2702,11 +2702,10 @@ pub async fn run_daemon(
     const EVICT_AFTER_401: u32 = 4; // ~20s of sustained auth failure at the 5s interval
 
     // Whether each running engine sends a wrapped op through the proxy it names, by
-    // engine id. Asked once an engine is seen running, and again after it is
-    // installed, restarted or stopped, so the heartbeat can say which engines a
-    // proxied op can use.
-    let mut engine_egress: std::collections::HashMap<String, bool> =
-        std::collections::HashMap::new();
+    // engine id. Asked once an engine is seen running, again after it is installed,
+    // restarted or stopped, and every half minute besides, so the heartbeat can say
+    // which engines a proxied op can use.
+    let mut engine_egress = egress::state::EngineEgress::default();
 
     loop {
         tokio::select! {
@@ -2753,8 +2752,8 @@ pub async fn run_daemon(
                             std::time::Duration::from_millis(200),
                         ).is_ok();
                         if !running {
-                            engine_egress.remove(*ext);
-                        } else if !engine_egress.contains_key(*ext) {
+                            engine_egress.remove(ext);
+                        } else if engine_egress.due(ext, std::time::Instant::now()) {
                             ask.push((ext.to_string(), format!("127.0.0.1:{port}")));
                         }
                         map.insert(ext.to_string(), serde_json::json!({
@@ -2766,14 +2765,12 @@ pub async fn run_daemon(
                         egress::state::engine_reads_egress(addr)
                     }))
                     .await;
+                    let asked_at = std::time::Instant::now();
                     for ((ext, _), reads) in ask.into_iter().zip(answers) {
-                        if let Some(reads) = reads {
-                            engine_egress.insert(ext, reads);
-                        }
+                        engine_egress.answered(ext, reads, asked_at);
                     }
                     for (ext, status) in map.iter_mut() {
-                        status["egress"] =
-                            serde_json::json!(engine_egress.get(ext).copied().unwrap_or(false));
+                        status["egress"] = serde_json::json!(engine_egress.reads(ext));
                     }
                     serde_json::Value::Object(map)
                 };

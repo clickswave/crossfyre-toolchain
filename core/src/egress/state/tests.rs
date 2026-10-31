@@ -621,3 +621,25 @@ async fn a_controller_without_egress_settings_is_never_asked() {
         .unwrap();
     assert!(lease.is_none());
 }
+
+/// An engine swapped for an older one between two heartbeats keeps its port, so the
+/// heartbeat never sees it stopped. Its answer is asked for again after a while, so the
+/// heartbeat stops reporting the previous engine's.
+#[test]
+fn an_engine_is_asked_again_after_a_while() {
+    let t0 = Instant::now();
+    let mut e = EngineEgress::default();
+    assert!(e.due("mach", t0));
+    e.answered("mach".into(), Some(true), t0);
+    assert!(e.reads("mach"));
+    assert!(!e.due("mach", t0 + Duration::from_secs(1)));
+    assert!(e.due("mach", t0 + ENGINE_ASK_EVERY));
+    // The engine now in its place says it does not read the wrapper.
+    e.answered("mach".into(), Some(false), t0 + ENGINE_ASK_EVERY);
+    assert!(!e.reads("mach"));
+    // No answer is not a yes, whatever the engine said before.
+    e.answered("mach".into(), Some(true), t0);
+    e.answered("mach".into(), None, t0 + ENGINE_ASK_EVERY);
+    assert!(!e.reads("mach"));
+    assert!(e.due("mach", t0 + ENGINE_ASK_EVERY));
+}
