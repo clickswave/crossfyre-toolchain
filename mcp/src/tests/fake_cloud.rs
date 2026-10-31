@@ -373,6 +373,11 @@ pub(crate) struct World {
     pub credentials: Vec<&'static str>,
     /// The scans this key started.
     mine: HashSet<String>,
+    /// Scans another member started and launches another key asked for. Both are
+    /// listed and read like the rest, but the platform stops only a scan the key's
+    /// owner started and answers only this key's own approvals, so `scans/cancel` and
+    /// the approval routes find neither.
+    pub theirs: HashSet<String>,
     /// What the platform keeps beside each approval it made.
     held: HashMap<String, Held>,
 }
@@ -447,6 +452,7 @@ impl World {
             wordlists: vec!["common"],
             credentials: vec!["admin", "viewer"],
             mine: HashSet::new(),
+            theirs: HashSet::new(),
             held: HashMap::new(),
         }
     }
@@ -565,7 +571,8 @@ impl World {
         self.approvals.insert(id.to_string(), a);
     }
 
-    /// A scan row, newest first in the list, `n` naming its id.
+    /// A scan row, newest first in the list, `n` naming its id. The key's owner started
+    /// it, in the dashboard or with another key, unless its id is put in `theirs`.
     pub(crate) fn add_scan(&mut self, n: u32, status: &str, created_at: &str) {
         self.scans.push(json!({
             "id": uuid(n), "name": format!("MCP: vuln_scan on https://app.example.com/{n}"),
@@ -1003,6 +1010,9 @@ fn answer(w: &mut World, r: &Req) -> Result<Resp, Resp> {
             }
             let q: wire::CancelRequest = body(b)?;
             let id = id_arg(&q.id)?;
+            if w.theirs.contains(&id) {
+                return Err(not_found());
+            }
             if q.kind == wire::CancelKind::Approval {
                 let Some(a) = w.approvals.get_mut(&id) else {
                     return Err(not_found());
@@ -1035,7 +1045,7 @@ fn answer(w: &mut World, r: &Req) -> Result<Resp, Resp> {
                 )));
             }
             let id = id_arg(&q.id)?;
-            if !w.approvals.contains_key(&id) {
+            if !w.approvals.contains_key(&id) || w.theirs.contains(&id) {
                 return Err(not_found());
             }
             w.waits += 1;
@@ -1052,7 +1062,7 @@ fn answer(w: &mut World, r: &Req) -> Result<Resp, Resp> {
         wire::route::APPROVALS_DECIDE => {
             let q: wire::DecideRequest = body(b)?;
             let id = id_arg(&q.id)?;
-            let Some(a) = w.approvals.get(&id) else {
+            let Some(a) = w.approvals.get(&id).filter(|_| !w.theirs.contains(&id)) else {
                 return Err(not_found());
             };
             let already = || {
@@ -1098,7 +1108,7 @@ fn answer(w: &mut World, r: &Req) -> Result<Resp, Resp> {
         wire::route::APPROVALS_GET => {
             let q: wire::IdRequest = body(b)?;
             let id = id_arg(&q.id)?;
-            if !w.approvals.contains_key(&id) {
+            if !w.approvals.contains_key(&id) || w.theirs.contains(&id) {
                 return Err(not_found());
             }
             Resp::ok(json!({"approval": w.approval(&id)}))

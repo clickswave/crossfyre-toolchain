@@ -506,6 +506,75 @@ async fn a_launch_key_stops_its_scans_and_withdraws_its_launches() {
     assert_eq!(line["approval_id"], cid(IdKind::Approval, 41));
 }
 
+#[tokio::test]
+async fn a_launch_key_stops_only_what_its_owner_started() {
+    let mut w = World::new("launch");
+    // A teammate's crawl, running in the key's workspace, and a launch another key of the
+    // same workspace asked for.
+    w.add_scan(3, "running", "2026-11-02T10:00:00Z");
+    w.theirs.insert(uuid(3));
+    w.approvals.insert(
+        uuid(46),
+        json!({"id": uuid(46), "status": "pending", "expires_at": "2026-11-02T10:24:00Z",
+               "approve_url": "https://crossfyre.io/m/approve/x"}),
+    );
+    w.theirs.insert(uuid(46));
+    let (t, cloud, world) = fake_cloud::server(&[], w).await;
+    let peer = FakePeer::new(Elicit::None);
+    let id = cid(IdKind::Scan, 3);
+
+    // Listed and read like any other scan in the workspace.
+    let listed = ok(&t
+        .call(&peer, "list_scans", json!({"backend": "cloud"}))
+        .await)
+    .clone();
+    assert!(
+        listed["scans"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["scan_id"] == id.as_str() && s["status"] == "running"),
+        "{listed}"
+    );
+    let seen = ok(&t.call(&peer, "get_scan", json!({"scan_id": id})).await).clone();
+    assert_eq!(seen["status"], "running");
+
+    // Not the key's to stop, and the agent is told why rather than that the id it just
+    // read is not there.
+    let r = t.call(&peer, "cancel_scan", json!({"scan_id": id})).await;
+    assert_eq!(reason(&r), "not_found");
+    assert!(
+        r.text
+            .contains("Only a scan the key's owner started can be stopped"),
+        "{}",
+        r.text
+    );
+    assert!(!r.text.contains("no such id"), "{}", r.text);
+    let last = cloud.requests().pop().unwrap();
+    assert_eq!(last.body, json!({"id": uuid(3), "kind": "scan"}));
+    assert_eq!(world.lock().unwrap().scans[0]["status"], "running");
+
+    // Nor is another key's launch to withdraw.
+    let r = t
+        .call(
+            &peer,
+            "cancel_scan",
+            json!({"scan_id": cid(IdKind::Approval, 46)}),
+        )
+        .await;
+    assert_eq!(reason(&r), "not_found");
+    assert!(
+        r.text
+            .contains("Only a launch this key asked for can be withdrawn"),
+        "{}",
+        r.text
+    );
+    assert_eq!(
+        world.lock().unwrap().approvals[&uuid(46)]["status"],
+        "pending"
+    );
+}
+
 fn local_scan(t: &TestMcp, created_ms: i64) -> String {
     let mut m = JobMeta::new(
         &t.mcp.session,

@@ -963,6 +963,29 @@ async fn get_finding(
 // ---------------------------------------------------------------------------
 // Stopping
 
+/// `not_found` from `scans/cancel` in words that fit it. The platform stops only a scan
+/// the key's owner started and withdraws only a launch this key asked for, so an id
+/// `list_scans` and `get_scan` show can still be one it does not find here.
+fn cancel_not_found(r: Refusal, kind: wire::CancelKind) -> Refusal {
+    if r.reason != Reason::NotFound {
+        return r;
+    }
+    let message = match kind {
+        wire::CancelKind::Scan => {
+            "Only a scan the key's owner started can be stopped, and this id is not one of \
+             theirs or does not exist. Nothing was stopped."
+        }
+        wire::CancelKind::Approval => {
+            "Only a launch this key asked for can be withdrawn, and this id is not one of \
+             those or does not exist. Nothing was withdrawn."
+        }
+    };
+    Refusal {
+        message: message.to_string(),
+        ..r
+    }
+}
+
 async fn cancel_scan(
     mcp: &Mcp,
     cloud: &Cloud,
@@ -996,7 +1019,8 @@ async fn cancel_scan(
             Duration::ZERO,
             note,
         )
-        .await?;
+        .await
+        .map_err(|r| cancel_not_found(r, kind))?;
     let cancel = match c.result {
         wire::CancelResult::Stopped => Some("stopped"),
         wire::CancelResult::Cancelled => Some("withdrawn"),
