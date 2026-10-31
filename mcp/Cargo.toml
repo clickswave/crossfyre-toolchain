@@ -13,6 +13,8 @@ authors = ["Clickswave <team@clickswave.org>"]
 [dependencies]
 cfx_scope = { path = "../scope" }
 dguard = { path = "../dguard" }
+# The messages a running Workbench and this server exchange over its local socket.
+cfx_bridge = { path = "../bridge" }
 # Target inference, the internal-address classification and the HTTP client, so a
 # destination means here exactly what it means to the engines.
 transport = { path = "../transport" }

@@ -119,7 +119,15 @@ pub(crate) struct JobMeta {
     pub cancellable: bool,
     #[serde(default)]
     pub test_writes: bool,
+    /// Where the scan's request came from, when it was not typed by the client:
+    /// `{"workbench": {"pid", "project_uid", "exchange"}}`. Absent in files written
+    /// before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<Value>,
 }
+
+/// The tools whose scans count toward `max_scan_starts_per_hour`.
+pub(crate) const INJECTION_TOOLS: [&str; 2] = ["test_injection", "workbench_test_injection"];
 
 pub(crate) struct NewJob<'a> {
     pub tool: &'a str,
@@ -158,6 +166,7 @@ impl JobMeta {
             scope_sha256: n.scope_sha256,
             cancellable: n.cancellable,
             test_writes: n.test_writes,
+            source: None,
         }
     }
 
@@ -406,10 +415,10 @@ impl JobStore {
             .count()
     }
 
-    pub(crate) fn starts_since(&self, tool: &str, since: i64) -> usize {
+    pub(crate) fn starts_since(&self, tools: &[&str], since: i64) -> usize {
         self.list()
             .iter()
-            .filter(|m| m.tool == tool && m.created_ms >= since)
+            .filter(|m| tools.contains(&m.tool.as_str()) && m.created_ms >= since)
             .count()
     }
 }

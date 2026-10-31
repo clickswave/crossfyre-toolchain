@@ -16,33 +16,58 @@ use std::sync::LazyLock;
 
 pub(crate) const MASK: &str = "[redacted]";
 
+/// Names masked wherever they appear in them: `x-auth-token`, `client_secret`,
+/// `session_id`, `api_key`.
+const NAME_WORDS: [&str; 6] = ["token", "secret", "session", "auth", "key", "passw"];
+/// Names masked only when they are the whole name. `code` is the OAuth authorization
+/// code a login redirect carries.
+const NAMES: [&str; 6] = [
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+    "code",
+];
+
 /// A header, query parameter or form field whose value should not be shown.
 pub(crate) fn sensitive_name(name: &str) -> bool {
     let n = name.trim().to_ascii_lowercase();
-    // `code` is the OAuth authorization code a login redirect carries.
-    matches!(
-        n.as_str(),
-        "authorization" | "proxy-authorization" | "cookie" | "set-cookie" | "x-api-key" | "code"
-    ) || ["token", "secret", "session", "auth", "key", "passw"]
-        .iter()
-        .any(|k| n.contains(k))
+    NAMES.contains(&n.as_str()) || NAME_WORDS.iter().any(|k| n.contains(k))
+}
+
+/// A regex alternative matching the names [`sensitive_name`] passes, where a name is a
+/// run of `chars` (a character class body), ignoring case.
+fn sensitive_names(chars: &str) -> String {
+    let words = NAME_WORDS.join("|");
+    let exact: Vec<String> = NAMES.iter().map(|n| regex::escape(n)).collect();
+    format!("(?:[{chars}]*(?:{words})[{chars}]*|{})", exact.join("|"))
 }
 
 struct Pattern {
     re: Regex,
     with: &'static str,
+    /// Replace only when the `name` group passes [`sensitive_name`].
+    named: bool,
 }
 
 static PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
     let p = |re: &str, with: &'static str| Pattern {
         re: Regex::new(re).expect("redaction pattern"),
         with,
+        named: false,
     };
+    // Header field name characters (RFC 9110 `tchar`).
+    let header = sensitive_names(r"!#$%&'*+.^_`|~0-9A-Za-z-");
+    let member = sensitive_names(r#"^"\\"#);
+    let field = sensitive_names("A-Za-z0-9_.-");
     vec![
-        // A raw request or response pasted as evidence keeps its header names.
+        // A raw request or response pasted as evidence keeps its header names. Every
+        // header `sensitive_name` would mask is masked here too: `X-Auth-Token:` and
+        // `Api-Key:` as well as `Authorization:`.
         p(
-            r"(?im)^(\s*(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key)\s*:).*$",
-            "$1 [redacted]",
+            &format!(r"(?im)^(?P<head>[ \t]*{header}[ \t]*:)[^\r\n]*"),
+            "${head} [redacted]",
         ),
         p(
             r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\z)",
@@ -55,38 +80,57 @@ static PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
         p(r"xox[baprs]-[\w-]+", MASK),
         p(r"AIza[\w-]{35}", MASK),
         p(r"sk_live_\w+", MASK),
-        // A JSON member whose name carries one of those words, with a string value:
-        // `"password":"hunter2"`, `"access_token": "..."`. Escapes inside the value are
-        // stepped over, so `\"` does not end it early.
+        // A JSON member with one of those names and a string value: `"password":"x"`,
+        // `"access_token": "..."`. Escapes inside the value are stepped over, so `\"`
+        // does not end it early, and a value a body cap cut off before its closing
+        // quote is masked to the end of what was captured.
         p(
-            r#"(?i)"([^"\\]*(?:passw|secret|token|api[_-]?key|session|auth)[^"\\]*)"\s*:\s*"(?:[^"\\]|\\.)*""#,
-            r#""$1":"[redacted]""#,
+            &format!(r#"(?i)"(?P<name>{member})"\s*:\s*"(?:[^"\\]|\\.)*(?:"|\\?\z)"#),
+            r#""$name":"[redacted]""#,
         ),
-        // A multipart/form-data part whose name carries one: its headers are kept and
+        // A multipart/form-data part with one of those names: its headers are kept and
         // its body, up to the next boundary or the end of what was captured, is masked.
         // `\bname` so a `filename=` is not read as the part's name.
+        Pattern {
+            re: Regex::new(
+                r#"(?i)(?P<head>content-disposition:[^\r\n]*\bname="?(?P<name>[^"\r\n;]*)"?[^\r\n]*\r?\n(?:[^\r\n]+\r?\n)*?\r?\n)(?s:.*?)(?P<end>\r?\n--|\z)"#,
+            )
+            .expect("redaction pattern"),
+            with: "${head}[redacted]${end}",
+            named: true,
+        },
+        // `name=value` with one of those names, prefixed or not: `access_token=`,
+        // `client_secret=`, `api_key=`, `code=`. The character before the name is kept
+        // and is what makes `code` a whole name.
         p(
-            r#"(?i)(content-disposition:[^\r\n]*\bname="?[^"\r\n;]*(?:passw|secret|token|api[_-]?key|session|auth)[^"\r\n;]*"?[^\r\n]*\r?\n(?:[^\r\n]+\r?\n)*?\r?\n)(?s:.*?)(\r?\n--|\z)"#,
-            "${1}[redacted]${2}",
-        ),
-        // `name=value` where the name carries one of the words `sensitive_name` looks
-        // for, prefixed or not: `access_token=`, `client_secret=`, `session_id=`. No
-        // word boundary in front, because `_` is a word character and `\b` would
-        // miss every prefixed name.
-        p(
-            r#"(?i)([A-Za-z0-9_.-]*(?:passw|secret|token|api[_-]?key|session|auth)[A-Za-z0-9_.-]*)=[^&\s#"']+"#,
-            "$1=[redacted]",
+            &format!(r#"(?i)(?P<pre>^|[^A-Za-z0-9_.-])(?P<name>{field})=[^&\s#"']+"#),
+            "${pre}${name}=[redacted]",
         ),
     ]
 });
 
-/// Mask secrets recognised by format anywhere in free text.
+/// Mask secrets recognised by name or format anywhere in free text.
 pub(crate) fn redact_text(s: &str) -> String {
     let mut out = s.to_string();
     for p in PATTERNS.iter() {
-        if p.re.is_match(&out) {
-            out = p.re.replace_all(&out, p.with).into_owned();
+        if !p.re.is_match(&out) {
+            continue;
         }
+        out = if p.named {
+            p.re.replace_all(&out, |c: &regex::Captures| {
+                let name = c.name("name").map_or("", |m| m.as_str());
+                if sensitive_name(name) {
+                    let mut to = String::new();
+                    c.expand(p.with, &mut to);
+                    to
+                } else {
+                    c[0].to_string()
+                }
+            })
+            .into_owned()
+        } else {
+            p.re.replace_all(&out, p.with).into_owned()
+        };
     }
     out
 }
@@ -128,6 +172,87 @@ pub(crate) fn redact_url(s: &str) -> String {
         url.set_fragment(Some(&masked.join("&")));
     }
     url.to_string()
+}
+
+/// `%41` as `A` and `+` as a space, for reading a parameter's name. Bytes that do not
+/// decode are kept as they are.
+fn percent_decoded(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2]))
+        {
+            out.push((h * 16 + l) as u8);
+            i += 3;
+            continue;
+        }
+        out.push(if b[i] == b'+' { b' ' } else { b[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A request target as a request line carries it, `/path?query#fragment`. Query and
+/// fragment parameters whose names [`sensitive_name`] passes lose their values, and
+/// everything else keeps the bytes it was written with, so a path is shown as it was
+/// sent rather than as a URL parser would tidy it. An absolute URL is masked as a URL.
+pub(crate) fn redact_target(t: &str) -> String {
+    if !t.starts_with('/') {
+        return if t.contains("://") {
+            redact_url(t)
+        } else {
+            redact_text(t)
+        };
+    }
+    let (rest, fragment) = match t.split_once('#') {
+        Some((r, f)) => (r, Some(f)),
+        None => (t, None),
+    };
+    let (path, query) = match rest.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (rest, None),
+    };
+    let pairs = |q: &str| -> String {
+        q.split('&')
+            .map(|pair| match pair.split_once('=') {
+                Some((k, _)) if sensitive_name(&percent_decoded(k)) => format!("{k}={MASK}"),
+                _ => redact_text(pair),
+            })
+            .collect::<Vec<_>>()
+            .join("&")
+    };
+    let mut out = redact_text(path);
+    if let Some(q) = query {
+        out.push('?');
+        out.push_str(&pairs(q));
+    }
+    if let Some(f) = fragment {
+        out.push('#');
+        out.push_str(&pairs(f));
+    }
+    out
+}
+
+/// `METHOD target [version]`, as a request line or a refusal's detail says it, with
+/// the target masked by [`redact_target`]. Anything else is masked as free text.
+pub(crate) fn redact_request_line(line: &str) -> String {
+    let mut parts = line.splitn(3, ' ');
+    let (Some(method), Some(target)) = (parts.next(), parts.next()) else {
+        return redact_text(line);
+    };
+    if method.is_empty() || !(target.starts_with('/') || target.contains("://")) {
+        return redact_text(line);
+    }
+    let mut out = format!("{} {}", redact_text(method), redact_target(target));
+    if let Some(rest) = parts.next() {
+        out.push(' ');
+        out.push_str(&redact_text(rest));
+    }
+    out
 }
 
 /// Cookie attributes a server sets beside the cookie, which are kept as they are.
@@ -211,6 +336,22 @@ pub(crate) fn audit_args(tool: &str, args: &serde_json::Value) -> serde_json::Va
             _ => {}
         }
     }
+    /// Every member with a sensitive name, at any depth, loses its value.
+    fn by_name(v: &mut Value) {
+        match v {
+            Value::Array(a) => a.iter_mut().for_each(by_name),
+            Value::Object(o) => {
+                for (k, x) in o.iter_mut() {
+                    if sensitive_name(k) && !x.is_null() {
+                        *x = json!(MASK);
+                    } else {
+                        by_name(x);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 
     let mut v = args.clone();
     match tool {
@@ -234,6 +375,40 @@ pub(crate) fn audit_args(tool: &str, args: &serde_json::Value) -> serde_json::Va
                     "body_bytes": text.len(),
                     "body_sha256": crate::scope_file::sha256_hex(text.as_bytes()),
                 });
+            }
+        }
+        "workbench_replay" => {
+            if let Some(e) = v.get_mut("edits").and_then(|e| e.as_object_mut()) {
+                if let Some(h) = e.get_mut("headers").and_then(|h| h.as_object_mut()) {
+                    for (k, x) in h.iter_mut() {
+                        if let Some(s) = x.as_str() {
+                            *x = json!(redact_header(k, s));
+                        }
+                    }
+                }
+                // A JSON edit can set a member to an object, so its names are looked at
+                // all the way down: `{"data":{"password":"..."}}`.
+                for field in ["query", "form", "json"] {
+                    if let Some(m) = e.get_mut(field).filter(|m| m.is_object()) {
+                        by_name(m);
+                    }
+                }
+                if let Some(path) = e.get("path").and_then(|p| p.as_str()) {
+                    let shown = redact_url(&format!("http://h{path}"));
+                    let shown = shown.strip_prefix("http://h").unwrap_or(&shown).to_string();
+                    e.insert("path".into(), json!(shown));
+                }
+                if let Some(b) = e.get("body").filter(|b| !b.is_null()) {
+                    let text = b
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| b.to_string());
+                    let reduced = json!({
+                        "body_bytes": text.len(),
+                        "body_sha256": crate::scope_file::sha256_hex(text.as_bytes()),
+                    });
+                    e.insert("body".into(), reduced);
+                }
             }
         }
         "test_injection" | "fingerprint" => {
@@ -363,6 +538,38 @@ mod unit {
     }
 
     #[test]
+    fn the_audit_masks_a_json_edit_by_name_at_every_depth() {
+        let args = serde_json::json!({"exchange": "wx_0123456789_1", "edits": {
+            "json": {"data": {"password": "AU1", "n": 2},
+                     "list": [{"api_key": "AU2"}, "plain"],
+                     "token": {"value": "AU3"},
+                     "keep": "AU4"},
+            "query": {"code": "AU5", "q": "AU6"}}});
+        let shown = audit_args("workbench_replay", &args).to_string();
+        for secret in ["AU1", "AU2", "AU3", "AU5"] {
+            assert!(!shown.contains(secret), "{secret} survived: {shown}");
+        }
+        for kept in ["AU4", "AU6", "\"n\":2", "plain"] {
+            assert!(shown.contains(kept), "{kept} was lost: {shown}");
+        }
+    }
+
+    /// A body is cut at a byte cap, which can fall inside a secret. What was kept of it
+    /// is masked, as the multipart pattern already did.
+    #[test]
+    fn a_json_secret_cut_off_by_the_body_cap_is_masked() {
+        let r = redact_text(r#"{"user":"a","access_token":"TRUNC1abcdef"#);
+        assert_eq!(r, r#"{"user":"a","access_token":"[redacted]""#);
+        // Cut just after an escape character, and with nothing after the quote yet.
+        let r = redact_text(r#"{"password":"TRUNC2\"#);
+        assert!(!r.contains("TRUNC2"), "{r}");
+        assert_eq!(redact_text(r#"{"secret":""#), r#"{"secret":"[redacted]""#);
+        // A whole value is still masked only up to its own closing quote.
+        let r = redact_text(r#"{"token":"T1","q":"keep"}"#);
+        assert_eq!(r, r#"{"token":"[redacted]","q":"keep"}"#);
+    }
+
+    #[test]
     fn multipart_parts_with_secret_names_are_masked() {
         let body = "--XyZ\r\nContent-Disposition: form-data; name=\"user\"\r\n\r\nalice\r\n\
                     --XyZ\r\nContent-Disposition: form-data; name=\"password\"\r\n\
@@ -403,5 +610,53 @@ mod unit {
         );
         assert!(!r.contains("MIIE"), "{r}");
         assert!(r.starts_with("a\n") && r.ends_with("\nb"));
+    }
+
+    /// Free text is masked by the names a header list or a URL is masked by. A raw
+    /// request in a Repeater draft or a finding's evidence carries custom auth headers,
+    /// and `code` and `*_key` values, that the old word list let through.
+    #[test]
+    fn free_text_is_masked_by_the_same_names_as_headers_and_urls() {
+        let raw = "GET /cb?code=FT1&access_key=FT2&barcode=keep1 HTTP/1.1\r\n\
+                   Host: h.test\r\nX-Auth-Token: FT3\r\nX-CSRF-Token: FT4\r\n\
+                   Api-Key: FT5\r\nCode: FT6\r\nContent-Type: text/plain\r\n\r\n\
+                   codex=keep2 next=/cb?token=FT7";
+        let r = redact_text(raw);
+        for secret in ["FT1", "FT2", "FT3", "FT4", "FT5", "FT6", "FT7"] {
+            assert!(!r.contains(secret), "{secret} survived: {r}");
+        }
+        for kept in [
+            "barcode=keep1",
+            "codex=keep2",
+            "Host: h.test",
+            "Content-Type: text/plain",
+        ] {
+            assert!(r.contains(kept), "{kept} was lost: {r}");
+        }
+        // Each masked header line keeps its name and its line ending.
+        assert!(r.contains("X-Auth-Token: [redacted]\r\n"), "{r}");
+        let r = redact_text(r#"{"code":"FJ1","api_key":"FJ2","codec":"keep"}"#);
+        assert!(!r.contains("FJ1") && !r.contains("FJ2"), "{r}");
+        assert!(r.contains(r#""codec":"keep""#), "{r}");
+    }
+
+    #[test]
+    fn a_request_line_is_masked_by_its_parameters_and_keeps_its_path() {
+        let r = redact_request_line("GET /a/../cb?code=RL1&access_key=RL2&q=1%202 HTTP/1.1");
+        assert_eq!(
+            r,
+            "GET /a/../cb?code=[redacted]&access_key=[redacted]&q=1%202 HTTP/1.1"
+        );
+        let r = redact_request_line("POST /x?%74oken=RL3#id_token=RL4&s=1 HTTP/1.1");
+        assert!(!r.contains("RL3") && !r.contains("RL4"), "{r}");
+        assert!(r.ends_with("&s=1 HTTP/1.1"), "{r}");
+        let r = redact_request_line("GET http://h.test/cb?code=RL5 HTTP/1.1");
+        assert!(!r.contains("RL5"), "{r}");
+        // Not a request line: masked as text.
+        assert_eq!(
+            redact_request_line("agent injection test"),
+            "agent injection test"
+        );
+        assert_eq!(redact_request_line("token=RL6"), "token=[redacted]");
     }
 }

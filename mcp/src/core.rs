@@ -204,6 +204,10 @@ pub(crate) struct CallNote {
     pub result: Option<Value>,
     /// Refusals inside a call that otherwise succeeded, such as a redirect hop.
     pub refused: Vec<RefusedDest>,
+    /// The Workbench a call went to: `{pid, project_uid}`.
+    pub workbench: Option<Value>,
+    /// This call's number in the session, as its audit line has it.
+    pub seq: u64,
     /// Where the scan id is also kept for a line written at shutdown.
     scan_slot: Option<Arc<Mutex<Option<String>>>>,
     /// What the call did on the Cloud, when it went there.
@@ -325,6 +329,8 @@ pub(crate) struct Settings {
     pub engines: Vec<EngineInfo>,
     pub postgres_port: Option<u16>,
     pub workbench: WorkbenchMode,
+    /// Where a running Workbench writes its endpoint file. Never from a tool argument.
+    pub workbench_dir: Option<PathBuf>,
     pub call_burst: u32,
     pub calls_per_minute: u32,
 }
@@ -368,6 +374,8 @@ pub(crate) struct Mcp {
     /// both take the last slot.
     pub scan_start: tokio::sync::Mutex<()>,
     pub polls: Mutex<HashMap<String, u32>>,
+    /// The running Workbenches this server is connected to.
+    pub workbench: Arc<crate::workbench::Registry>,
     /// Calls that have not written their audit line, by `seq`. Whichever of the call
     /// and the shutdown takes an entry out writes the line, so it is written once.
     open_calls: Mutex<HashMap<u64, OpenCall>>,
@@ -387,7 +395,16 @@ impl Mcp {
         let guard = scope.guard();
         let pacer = HostPacer::new(scope.requests_per_second_per_host);
         let calls = CallBucket::new(settings.call_burst, settings.calls_per_minute);
+        // With the backend off no Workbench is looked for at all.
+        let workbench = crate::workbench::Registry::new(
+            match settings.workbench {
+                WorkbenchMode::Off => None,
+                _ => settings.workbench_dir.clone(),
+            },
+            settings.version.clone(),
+        );
         Mcp {
+            workbench,
             settings,
             dir,
             guard,
@@ -415,7 +432,7 @@ impl Mcp {
             workbench: match self.settings.workbench {
                 WorkbenchMode::Off => None,
                 WorkbenchMode::Always => Some(WORKBENCH_NAMES.to_vec()),
-                WorkbenchMode::Auto => Some(Vec::new()),
+                WorkbenchMode::Auto => Some(self.workbench.listed()),
             },
             cloud: crate::cloud::listing(&self.cloud),
         }
@@ -512,6 +529,7 @@ impl Mcp {
         let mut note = CallNote {
             scan_slot: Some(scan_slot),
             cloud_slot: Some(cloud_slot),
+            seq,
             ..Default::default()
         };
         // A name that is not a tool is the same answer however busy the server is.
@@ -575,6 +593,7 @@ impl Mcp {
                 "confirmation": note.confirmation,
                 "scan_id": note.scan_id,
                 "result": note.result,
+                "workbench": note.workbench,
                 "duration_ms": started.elapsed().as_millis() as u64,
             });
             crate::cloud::audit_fields(self, &note, &mut line);
@@ -898,7 +917,9 @@ impl Mcp {
                 ),
             ));
         }
-        let starts = self.jobs.starts_since("test_injection", now - 3_600_000);
+        let starts = self
+            .jobs
+            .starts_since(&jobs::INJECTION_TOOLS, now - 3_600_000);
         let max = self.scope.max_scan_starts_per_hour as usize;
         if starts >= max {
             return Err(Refusal::new(
@@ -919,57 +940,7 @@ impl Mcp {
     /// Stop a scan this process owns. `stopped` when the engine confirmed it,
     /// `requested` when it could not say so.
     pub(crate) async fn cancel_running(&self, job: &Arc<RunningJob>) -> &'static str {
-        job.cancel_requested.store(true, Ordering::SeqCst);
-        let sent = match job.writer.lock().await.as_mut() {
-            Some(w) => w.send_cancel().await.is_ok(),
-            None => false,
-        };
-        if job.cancellable && sent {
-            let mut rx = job.snap.clone();
-            let stopped = tokio::time::timeout(Duration::from_secs(3), async {
-                loop {
-                    if jobs::is_terminal(&rx.borrow_and_update().status) {
-                        return true;
-                    }
-                    if rx.changed().await.is_err() {
-                        return jobs::is_terminal(&rx.borrow().status);
-                    }
-                }
-            })
-            .await
-            .unwrap_or(false);
-            if stopped {
-                return "stopped";
-            }
-        }
-        // The engine cannot stop the operation, or did not confirm it had. Closing the
-        // connection stops a current plessor at its next write; an older one keeps
-        // going, which is why this is reported as `requested` and not `stopped`.
-        job.writer.lock().await.take();
-        let pump = job.pump.lock().ok().and_then(|mut p| p.take());
-        if let Some(h) = pump {
-            h.abort();
-            let _ = h.await;
-        }
-        let meta = job.meta.lock().ok().map(|mut m| {
-            if !jobs::is_terminal(&m.status) {
-                m.finish(jobs::CANCELLED);
-                m.cancel = Some("requested".into());
-                m.note(
-                    "cancellation was requested; this engine version keeps running until it \
-                     finishes, so update it to stop scans on request"
-                        .into(),
-                );
-            }
-            m.clone()
-        });
-        if let Some(m) = meta {
-            let _ = self.jobs.write_meta(&m);
-        }
-        if let Ok(mut r) = self.running.lock() {
-            r.remove(&job.id);
-        }
-        "requested"
+        cancel_job(&self.jobs, &self.running, job).await
     }
 
     /// On the way out: write the line for every call still open, ask every running
@@ -1038,6 +1009,66 @@ impl Mcp {
             r.clear();
         }
     }
+}
+
+/// Stop a running scan: ask the engine, wait briefly for it to confirm, and otherwise
+/// close the connection and record it as cancelled on request.
+pub(crate) async fn cancel_job(
+    store: &JobStore,
+    running: &RunningMap,
+    job: &Arc<RunningJob>,
+) -> &'static str {
+    job.cancel_requested.store(true, Ordering::SeqCst);
+    let sent = match job.writer.lock().await.as_mut() {
+        Some(w) => w.send_cancel().await.is_ok(),
+        None => false,
+    };
+    if job.cancellable && sent {
+        let mut rx = job.snap.clone();
+        let stopped = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if jobs::is_terminal(&rx.borrow_and_update().status) {
+                    return true;
+                }
+                if rx.changed().await.is_err() {
+                    return jobs::is_terminal(&rx.borrow().status);
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if stopped {
+            return "stopped";
+        }
+    }
+    // The engine cannot stop the operation, or did not confirm it had. Closing the
+    // connection stops a current plessor at its next write; an older one keeps
+    // going, which is why this is reported as `requested` and not `stopped`.
+    job.writer.lock().await.take();
+    let pump = job.pump.lock().ok().and_then(|mut p| p.take());
+    if let Some(h) = pump {
+        h.abort();
+        let _ = h.await;
+    }
+    let meta = job.meta.lock().ok().map(|mut m| {
+        if !jobs::is_terminal(&m.status) {
+            m.finish(jobs::CANCELLED);
+            m.cancel = Some("requested".into());
+            m.note(
+                "cancellation was requested; this engine version keeps running until it \
+                 finishes, so update it to stop scans on request"
+                    .into(),
+            );
+        }
+        m.clone()
+    });
+    if let Some(m) = meta {
+        let _ = store.write_meta(&m);
+    }
+    if let Ok(mut r) = running.lock() {
+        r.remove(&job.id);
+    }
+    "requested"
 }
 
 fn rate_limited_host(d: &Dest, retry: u64) -> Refusal {

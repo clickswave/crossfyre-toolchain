@@ -138,6 +138,7 @@ pub(crate) async fn status(mcp: &Mcp, args: &Value) -> Result<Done, Refusal> {
             })
         })
         .collect();
+    let workbench = super::workbench::status(mcp, &mut hints).await;
     let cloud = crate::cloud::status(mcp).map(|(c, h)| {
         hints.extend(h);
         c
@@ -162,7 +163,7 @@ pub(crate) async fn status(mcp: &Mcp, args: &Value) -> Result<Done, Refusal> {
         "refusals": {"total": mcp.guard.refused_total(), "recent": recent},
         "audit": {"path": mcp.audit.path().display().to_string(), "healthy": mcp.audit.healthy()},
         "hints": hints,
-        "workbench": super::workbench::status(mcp),
+        "workbench": workbench,
     });
     if let Some(c) = cloud {
         value["cloud"] = c;

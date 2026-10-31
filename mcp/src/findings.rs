@@ -207,7 +207,7 @@ fn redact_strings(v: &mut Value) {
     }
 }
 
-fn redact_finding(f: &mut Value) {
+pub(crate) fn redact_finding(f: &mut Value) {
     if let Some(u) = f.get("url").and_then(|u| u.as_str()) {
         let r = redact::redact_url(u);
         f["url"] = json!(r);

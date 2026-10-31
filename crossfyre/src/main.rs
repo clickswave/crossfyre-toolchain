@@ -208,6 +208,12 @@ enum Commands {
         #[arg(long)]
         no_redact: bool,
 
+        /// The workbench_* tools: `auto` lists them while a Crossfyre Workbench with
+        /// Agent access on answers, `always` lists them even when none does (for a
+        /// client that never rereads the tool list), `off` reaches no Workbench.
+        #[arg(long, value_enum, default_value_t = WorkbenchArg::Auto, value_name = "MODE")]
+        workbench: WorkbenchArg,
+
         /// The Cloud key file. Defaults to `<data-dir>/mcp/cloud.toml`, written by
         /// `crossfyre mcp cloud login`.
         #[arg(long, value_name = "PATH", conflicts_with = "no_cloud")]
@@ -228,6 +234,23 @@ enum Commands {
     ///   crossfyre man > crossfyre.1
     #[command(hide = true)]
     Man,
+}
+
+/// `crossfyre mcp --workbench`.
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum WorkbenchArg {
+    Auto,
+    Always,
+    Off,
+}
+
+/// Where a running Workbench says how to reach it: `$CROSSFYRE_WORKBENCH_DIR`, or the
+/// Workbench's own data directory.
+fn workbench_dir() -> Option<std::path::PathBuf> {
+    match std::env::var_os("CROSSFYRE_WORKBENCH_DIR") {
+        Some(d) if !d.is_empty() => Some(std::path::PathBuf::from(d)),
+        _ => dirs::data_dir().map(|d| d.join("io.crossfyre.workbench")),
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -752,6 +775,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             command: None,
             scope_file,
             no_redact,
+            workbench,
             cloud_file,
             no_cloud,
         } => {
@@ -774,8 +798,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 postgres_port: config::load_config().ok().map(|c| c.postgres.port),
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 redact: !no_redact,
-                workbench_dir: None,
-                workbench: cfx_mcp::WorkbenchMode::Auto,
+                workbench_dir: workbench_dir(),
+                workbench: match workbench {
+                    WorkbenchArg::Auto => cfx_mcp::WorkbenchMode::Auto,
+                    WorkbenchArg::Always => cfx_mcp::WorkbenchMode::Always,
+                    WorkbenchArg::Off => cfx_mcp::WorkbenchMode::Off,
+                },
                 cloud_file,
                 no_cloud,
             };

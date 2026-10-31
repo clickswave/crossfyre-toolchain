@@ -186,6 +186,9 @@ fn spawn_with(data: &std::path::Path, args: &[&str]) -> Child {
         .arg(data)
         .arg("mcp")
         .args(args)
+        // Its own Workbench directory, so a Workbench the person running the tests has
+        // open is never seen.
+        .env("CROSSFYRE_WORKBENCH_DIR", data.join("wb"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -694,5 +697,130 @@ fn a_cloud_key_adds_the_cloud_tools_and_appears_in_no_output() {
         2,
         "--no-cloud asked the Cloud"
     );
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+/// A Workbench stand-in on a Unix socket: writes its endpoint file under `dir`, answers
+/// the handshake with every method and a project open, and then reads requests without
+/// answering them. Returns how many clients it welcomed.
+#[cfg(unix)]
+fn workbench(dir: &std::path::Path) -> Arc<AtomicUsize> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+    let control = dir.join("control");
+    std::fs::create_dir_all(&control).unwrap();
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&control, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // This process stands in for the Workbench, so the file names its pid.
+    let pid = std::process::id();
+    let socket = control.join(format!("{pid}.sock"));
+    let listener = UnixListener::bind(&socket).unwrap();
+    let token = "5e".repeat(32);
+    let endpoint = cfx_bridge::Endpoint {
+        v: cfx_bridge::ENDPOINT_VERSION,
+        app: cfx_bridge::ENDPOINT_APP.into(),
+        app_version: "0.1.2".into(),
+        pid,
+        started_ms: 1_798_619_564_512,
+        protocol: cfx_bridge::PROTOCOL,
+        agent_access: true,
+        socket: Some(socket.display().to_string()),
+        token: Some(token.clone()),
+        why: None,
+    };
+    let path = control.join(format!("{pid}.json"));
+    std::fs::write(&path, serde_json::to_vec(&endpoint).unwrap()).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let welcomed = Arc::new(AtomicUsize::new(0));
+    let w = Arc::clone(&welcomed);
+    std::thread::spawn(move || {
+        for s in listener.incoming() {
+            let Ok(s) = s else { return };
+            let (token, w) = (token.clone(), Arc::clone(&w));
+            std::thread::spawn(move || {
+                let mut out = s.try_clone().unwrap();
+                let mut r = BufReader::new(s);
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                let Ok(cfx_bridge::Handshake::Hello(hello)) = serde_json::from_str(&line) else {
+                    return;
+                };
+                if hello.token != token {
+                    return;
+                }
+                let welcome = cfx_bridge::Handshake::Welcome(cfx_bridge::Welcome {
+                    protocol: cfx_bridge::PROTOCOL,
+                    app_version: "0.1.2".into(),
+                    pid,
+                    capabilities: cfx_bridge::Method::ALL
+                        .iter()
+                        .map(|m| m.as_str().to_string())
+                        .collect(),
+                    project: Some(cfx_bridge::ProjectInfo {
+                        uid: "3f9a0c21be7d44c1a0e5b6f1c2d3e4f5".into(),
+                        name: "acme-q4".into(),
+                        exchanges: 3,
+                    }),
+                });
+                if out
+                    .write_all(cfx_bridge::to_line(&welcome).as_bytes())
+                    .is_err()
+                {
+                    return;
+                }
+                w.fetch_add(1, Ordering::SeqCst);
+                line.clear();
+                while r.read_line(&mut line).unwrap_or(0) > 0 {
+                    line.clear();
+                }
+            });
+        }
+    });
+    welcomed
+}
+
+#[cfg(unix)]
+#[test]
+fn a_workbench_that_starts_later_changes_the_tool_list() {
+    let data = temp_dir("workbench");
+    write_config(&data, closed_port(), closed_port());
+    write_scope(&data, "entries = [\"app.example.test\"]\n");
+    let mut child = spawn(&data);
+    let _stderr = child.stderr.take();
+    let (mut c, _) = Client::attach(&mut child);
+    c.initialize(false);
+    c.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+    let tools = c.reply(2)["result"]["tools"].clone();
+    assert_eq!(tools.as_array().unwrap().len(), 11);
+
+    let welcomed = workbench(&data.join("wb"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let line = c
+            .lines
+            .recv_timeout(left)
+            .expect("notifications/tools/list_changed within 5 s");
+        let v: Value = serde_json::from_str(&line).unwrap();
+        if v["method"] == "notifications/tools/list_changed" {
+            break;
+        }
+    }
+    assert_eq!(welcomed.load(Ordering::SeqCst), 1);
+    c.send(json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}));
+    let tools = c.reply(3)["result"]["tools"].clone();
+    let names: Vec<&str> = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names.len(), 18, "{names:?}");
+    assert!(names.contains(&"workbench_replay"), "{names:?}");
+
+    drop(c);
+    wait_exit(&mut child, Duration::from_secs(10));
     let _ = std::fs::remove_dir_all(&data);
 }

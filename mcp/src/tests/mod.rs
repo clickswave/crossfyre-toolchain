@@ -12,6 +12,8 @@ mod cloud_read_rail;
 mod confirm_rail;
 mod engine_rail;
 mod fake_cloud;
+#[cfg(unix)]
+pub(crate) mod fake_wb;
 mod http_rail;
 mod injection_rail;
 mod jobs_paging;
