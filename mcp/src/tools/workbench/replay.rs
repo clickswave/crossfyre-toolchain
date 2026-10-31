@@ -236,7 +236,7 @@ pub(crate) async fn run(
     }
     let request_line = untrusted::clean(&sent.request_line, 2048);
     let request_line = if redact {
-        crate::redact::redact_text(&request_line)
+        crate::redact::redact_request_line(&request_line)
     } else {
         request_line
     };

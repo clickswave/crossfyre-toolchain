@@ -1009,7 +1009,11 @@ mod reads {
             wb.path(),
             WbOpts::default().answer(
                 Method::Selection,
-                draft(UID_A, "GET / HTTP/1.1\r\nCookie: sid=S1-ck\r\n\r\n"),
+                draft(
+                    UID_A,
+                    "GET /cb?code=S13-code HTTP/1.1\r\nCookie: sid=S1-ck\r\n\
+                     X-Auth-Token: S11-tok\r\nApi-Key: S12-key\r\n\r\n",
+                ),
             ),
         )
         .await;
@@ -1039,7 +1043,9 @@ mod reads {
         assert_eq!(v["tool"], "repeater");
         assert_eq!(v["selected"]["exchange"], handle(UID_A, 3));
         let text = v["repeater_draft"]["target_data"]["text"].as_str().unwrap();
-        assert!(!text.contains("S1-ck"), "{text}");
+        for s in ["S1-ck", "S11-tok", "S12-key", "S13-code"] {
+            assert!(!text.contains(s), "{s} in {text}");
+        }
         assert_eq!(v["repeater_draft"]["target"]["port"], 443);
         assert_eq!(
             (a.count(Method::Selection), b.count(Method::Selection)),
@@ -1180,7 +1186,10 @@ mod replay {
                     status: Some(200),
                     duration_ms: 9,
                     bytes: 30,
-                    request_line: "GET /api/items?id=2&token=S6-tok HTTP/1.1".into(),
+                    request_line:
+                        "GET /api/items?id=2&token=S6-tok&code=S9-code&access_key=S10-key \
+                                   HTTP/1.1"
+                            .into(),
                     applied: vec!["query id set to 3".into()],
                     resp_headers: vec![("Set-Cookie".into(), "sid=S2-set; Path=/".into())],
                     resp_body: Some(Body::text(
@@ -1206,10 +1215,15 @@ mod replay {
         let applied = v["applied_edits"].to_string();
         assert!(applied.contains("id set to 3"), "{applied}");
         assert!(applied.contains("accept-encoding"), "{applied}");
-        for s in ["S1-ck", "S2-set", "S4-pw", "S6-tok"] {
+        for s in ["S1-ck", "S2-set", "S4-pw", "S6-tok", "S9-code", "S10-key"] {
             assert!(!r.text.contains(s), "{s} in {}", r.text);
         }
         assert_eq!(v["target_data"]["untrusted"], true);
+        let line = v["target_data"]["request_line"].as_str().unwrap();
+        assert!(
+            line.starts_with("GET /api/items?id=2&") && line.ends_with(" HTTP/1.1"),
+            "{line}"
+        );
 
         // The stored request was read without its body, then replayed once.
         let read = &b.fake.params(Method::Exchange)[0];
@@ -1705,7 +1719,7 @@ mod injection {
                 "url": "http://app.example.test/api/items?id=2&token=S6-tok",
                 "method": "GET", "param": "id", "location": "query",
                 "evidence": "GET /api/items?id=2'&token=S6-tok HTTP/1.1\r\nCookie: sid=S1-ck\r\n\
-                             Authorization: Bearer S3-bearer\r\n\r\n",
+                             Authorization: Bearer S3-bearer\r\nX-Csrf-Token: S8-csrf\r\n\r\n",
             }})],
             ..Default::default()
         })
@@ -1737,7 +1751,7 @@ mod injection {
                 .join(format!("{scan_id}.findings.ndjson")),
         )
         .unwrap();
-        for s in ["S1-ck", "S3-bearer", "S6-tok"] {
+        for s in ["S1-ck", "S3-bearer", "S6-tok", "S8-csrf"] {
             assert!(!found.contains(s), "{s} in the findings file: {found}");
         }
         assert!(found.contains("token=%5Bredacted%5D"), "{found}");
@@ -1750,7 +1764,7 @@ mod injection {
             b.t.call(&peer, "get_finding", json!({"finding_id": id}))
                 .await;
         ok(&r);
-        for s in ["S1-ck", "S3-bearer", "S6-tok"] {
+        for s in ["S1-ck", "S3-bearer", "S6-tok", "S8-csrf"] {
             assert!(!r.text.contains(s), "{s} in get_finding: {}", r.text);
         }
     }
