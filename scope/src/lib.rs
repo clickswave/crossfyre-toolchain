@@ -62,6 +62,10 @@ impl std::fmt::Display for Rule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Rule::Host(h) => write!(f, "{h}"),
+            // `::1:8080` would read back as an address on every port.
+            Rule::HostPort(h, p) if h.parse::<std::net::Ipv6Addr>().is_ok() => {
+                write!(f, "[{h}]:{p}")
+            }
             Rule::HostPort(h, p) => write!(f, "{h}:{p}"),
             Rule::Suffix(b) => write!(f, "*.{b}"),
             Rule::Net(n, bits) => write!(f, "{n}/{bits}"),
@@ -790,6 +794,32 @@ mod tests {
         assert_eq!(p.entries(), written);
         let (again, _) = Policy::from_entries(&p.entries());
         assert_eq!(again.entries(), written);
+    }
+
+    #[test]
+    fn an_ipv6_entry_with_a_port_keeps_its_brackets() {
+        // Without them `::1:8080` is itself an IPv6 address, so the entry would come back
+        // as a different host on every port rather than ::1 on port 8080.
+        let written = [
+            "[::1]:8080".to_string(),
+            "[fd00::5]:443".into(),
+            "::2".into(),
+            "fd00::/8".into(),
+        ];
+        let (p, rejected) = Policy::from_entries(&written);
+        assert!(rejected.is_empty());
+        assert_eq!(p.entries(), written);
+        let (again, rejected) = Policy::from_entries(&p.entries());
+        assert!(rejected.is_empty());
+        assert_eq!(again.entries(), written);
+        assert!(again.admits("::1", 8080));
+        assert!(!again.admits("::1", 80));
+        assert!(!again.admits("::1:8080", 8080));
+        let s = scope(&["[::1]:8080"]);
+        assert_eq!(
+            s.matching("[::1]", Some(8080)).as_deref(),
+            Some("[::1]:8080")
+        );
     }
 
     // ----- Guard: refusing is also recording -----

@@ -651,6 +651,20 @@ mod unit {
     }
 
     #[test]
+    fn a_project_entry_for_an_ipv6_port_reads_as_that_port() {
+        // The Workbench sends its project's scope as the scope crate prints it.
+        let (project, _) = cfx_scope::Policy::from_entries(&v(&["[::1]:8080", "[::1]:9090"]));
+        assert_eq!(
+            both(&v(&["[::1]:8080"]), &project.entries()),
+            v(&["[::1]:8080"])
+        );
+        assert_eq!(
+            both(&v(&["::1"]), &project.entries()),
+            v(&["[::1]:8080", "[::1]:9090"])
+        );
+    }
+
+    #[test]
     fn a_host_on_every_port_is_not_covered_by_one_port() {
         assert!(
             both(&v(&["app.example.com"]), &v(&["app.example.com:443"]))
