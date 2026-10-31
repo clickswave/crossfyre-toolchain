@@ -17,7 +17,9 @@ pub async fn handle(env: OpEnv) {
         http,
         api_url,
         api_key,
+        egress,
     } = env;
+    let lease = egress.as_deref();
 
     let mode = data["mode"].as_str().unwrap_or("batch");
 
@@ -53,26 +55,21 @@ pub async fn handle(env: OpEnv) {
             "follow_redirects": data["follow_redirects"].as_bool().unwrap_or(false),
         });
 
-        let conn =
-            tokio::net::TcpStream::connect(crate::toolchain::config::engine_addr("mach")).await;
-        match conn {
-            Ok(stream) => {
-                use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-                let (reader, mut writer) = stream.into_split();
-                let mut req_str = dguard::encode(&ambulo_req);
-                req_str.push('\n');
-                let _ = writer.write_all(req_str.as_bytes()).await;
-
-                let mut lines = BufReader::new(reader).lines();
-                // Bound the wait. If ambulo connects but never
-                // answers (target stopped responding, or ambulo
-                // wedged on this URL), don't deadlock the op
-                // forever - time out and fall through to the
-                // completion ack below so the scan advances.
-                let read =
-                    tokio::time::timeout(std::time::Duration::from_secs(30), lines.next_line())
-                        .await;
-                if let Ok(Ok(Some(line))) = read
+        // Bound the wait. If ambulo connects but never answers (target stopped
+        // responding, or ambulo wedged on this URL), don't deadlock the op forever:
+        // time out and fall through to the completion ack below so the scan
+        // advances. A proxied op's answer is read while the request is opened, to
+        // see whether ambulo took the wrapper, so the bound covers that too.
+        let bound = std::time::Duration::from_secs(30);
+        let answer = tokio::time::timeout(bound, async {
+            let (mut lines, _writer) = super::open_engine("mach", &ambulo_req, lease).await?;
+            Ok::<_, super::EngineOpen>(lines.next_line().await)
+        })
+        .await;
+        match answer {
+            Err(_) => {}
+            Ok(Ok(read)) => {
+                if let Ok(Some(line)) = read
                     && let Ok(resp) = serde_json::from_str::<serde_json::Value>(&line)
                 {
                     let status = resp["status"].as_str().unwrap_or("");
@@ -103,7 +100,21 @@ pub async fn handle(env: OpEnv) {
                     }
                 }
             }
-            Err(e) => {
+            Ok(Err(super::EngineOpen::Refused(why))) => {
+                eprintln!("[op] {op_id} not run: {why}");
+                super::publish_refused(
+                    &pub_clone,
+                    &status_subj,
+                    &op_id,
+                    &workflow_id,
+                    &node_id,
+                    lease,
+                    &why,
+                )
+                .await;
+                return;
+            }
+            Ok(Err(super::EngineOpen::Unreachable(e))) => {
                 eprintln!("[op] FAIL Cannot connect to ambulo daemon: {e}");
             }
         }
@@ -119,6 +130,15 @@ pub async fn handle(env: OpEnv) {
             .publish(result_subj, done_msg.to_string().into())
             .await;
 
+        super::publish_egress(
+            &pub_clone,
+            &status_subj,
+            &op_id,
+            &workflow_id,
+            &node_id,
+            lease,
+        )
+        .await;
         mark_op_done(&op_id);
         let status_msg = serde_json::json!({
             "type": "operation_completed",
@@ -316,7 +336,7 @@ pub async fn handle(env: OpEnv) {
         match data["credential_id"].as_str().filter(|s| !s.is_empty()) {
             Some(cid) => {
                 let host = target_host(url);
-                match creds::resolve_auth(&http, &api_url, &api_key, cid, &host).await {
+                match creds::resolve_auth(&http, &api_url, &api_key, cid, &host, lease).await {
                     Ok(auth) => Some(auth),
                     Err(e) => {
                         eprintln!("[op] content-discovery credential resolve failed ({cid}): {e}");
@@ -377,18 +397,8 @@ pub async fn handle(env: OpEnv) {
             obj.insert("auth".into(), auth.clone());
         }
 
-        let conn =
-            tokio::net::TcpStream::connect(crate::toolchain::config::engine_addr("mach")).await;
-        match conn {
-            Ok(stream) => {
-                use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-                let (reader, mut writer) = stream.into_split();
-                let mut req_str = dguard::encode(&ambulo_req);
-                req_str.push('\n');
-                let _ = writer.write_all(req_str.as_bytes()).await;
-
-                let mut lines = BufReader::new(reader).lines();
-
+        match super::open_engine("mach", &ambulo_req, lease).await {
+            Ok((mut lines, writer)) => {
                 while let Ok(Some(line)) = lines.next_line().await {
                     // Honor pause / halt / delete promptly (checked per probe event).
                     if !workflow_id.is_empty() && is_workflow_cancelled(&workflow_id) {
@@ -544,7 +554,21 @@ pub async fn handle(env: OpEnv) {
                     .publish(status_subj.clone(), prog.to_string().into())
                     .await;
             }
-            Err(e) => {
+            Err(super::EngineOpen::Refused(why)) => {
+                eprintln!("[op] {op_id} not run: {why}");
+                super::publish_refused(
+                    &pub_clone,
+                    &status_subj,
+                    &op_id,
+                    &workflow_id,
+                    &node_id,
+                    lease,
+                    &why,
+                )
+                .await;
+                return;
+            }
+            Err(super::EngineOpen::Unreachable(e)) => {
                 eprintln!("[op] FAIL Cannot connect to ambulo daemon: {e}");
                 let msg = serde_json::json!({
                     "type": "completed",
@@ -559,7 +583,7 @@ pub async fn handle(env: OpEnv) {
         }
     }
 
-    // All recursion levels drained: completion + final progress + status.
+    // All recursion levels drained: completion + final progress + egress + status.
     let done_msg = serde_json::json!({
         "type": "completed",
         "job_id": format!("{}-{}", workflow_id, op_id),
@@ -584,6 +608,15 @@ pub async fn handle(env: OpEnv) {
         .publish(status_subj.clone(), final_prog.to_string().into())
         .await;
 
+    super::publish_egress(
+        &pub_clone,
+        &status_subj,
+        &op_id,
+        &workflow_id,
+        &node_id,
+        lease,
+    )
+    .await;
     mark_op_done(&op_id);
     let status_msg = serde_json::json!({
         "type": "operation_completed",

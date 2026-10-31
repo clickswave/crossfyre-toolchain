@@ -1,0 +1,377 @@
+use super::*;
+use crate::egress::testkit::{recorder_upstream, refusing_port, resolver};
+use cfx_tunnel::recorder::{Fixture, Recorder, to_loopback};
+use cfx_tunnel::{TunnelError, socks5_server::CONNECTION_REFUSED};
+
+/// An address no test resolves into and nothing dials: the recorder joins every
+/// destination to the same port on loopback, whatever address it is asked for.
+const PUBLIC: &str = "93.184.216.34";
+
+async fn gateway(names: &[(&str, &[&str])]) -> Arc<Gateway> {
+    Gateway::bind(resolver(names)).await.unwrap()
+}
+
+/// What an engine does with the URL it is handed: open a tunnel through it.
+async fn through(lease: &Lease, host: &str, port: u16) -> Result<Tunnel, TunnelError> {
+    let up = Upstream::parse(&lease.proxy_url()).unwrap();
+    cfx_tunnel::connect(&up, &Target::new(host, port), Timeouts::default()).await
+}
+
+fn shown(r: &Result<Tunnel, TunnelError>) -> String {
+    match r {
+        Ok(_) => "an open tunnel".into(),
+        Err(e) => format!("{e:?}"),
+    }
+}
+
+async fn http_get(mut t: Tunnel, host: &str) -> String {
+    t.write_all(format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), t.read_to_end(&mut out)).await;
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// With `block_internal`, a destination that is or resolves to a
+/// private address is refused at the gateway, before the team proxy is asked for
+/// anything. Forwarding the name, which is what turning a client's proxy on would
+/// do, lets the proxy resolve it on the far side and reach whatever it names there.
+#[tokio::test]
+async fn block_internal_refuses_before_any_upstream_dial() {
+    let rec = Recorder::start(to_loopback).await;
+    let gw = gateway(&[
+        ("localhost", &["127.0.0.1", "::1"]),
+        ("intranet.example.test", &["10.0.0.5"]),
+        ("mapped.example.test", &["::ffff:192.168.1.1"]),
+    ])
+    .await;
+    let lease = gw
+        .lease("op-7", "proxy-1", Arc::new(recorder_upstream(&rec)), true)
+        .unwrap();
+    for (host, port) in [
+        ("localhost", 80),
+        ("127.0.0.1", 80),
+        ("169.254.169.254", 80),
+        ("intranet.example.test", 443),
+        ("mapped.example.test", 443),
+        ("::1", 22),
+    ] {
+        match through(&lease, host, port).await {
+            Err(TunnelError::Refused(0x02)) => {}
+            Err(e) => panic!("{host}:{port} gave {e}, not the gateway's refusal"),
+            Ok(_) => panic!("{host}:{port} was let through"),
+        }
+    }
+    assert_eq!(
+        rec.connections(),
+        0,
+        "the team proxy was asked: {:?}",
+        rec.seen()
+    );
+    assert_eq!(lease.last_error().as_deref(), Some(PRIVATE));
+    let s = lease.summary();
+    assert_eq!(s["connections"], 6, "{s}");
+    assert_eq!(s["refused"], 6, "{s}");
+    assert_eq!(s["failed"], 0, "{s}");
+    assert_eq!(s["hosts"][0]["host"], "localhost", "{s}");
+    assert_eq!(s["hosts"][0]["refused"], 1, "{s}");
+}
+
+/// A name with a public address goes on as that address, so the proxy cannot answer
+/// it differently from what the node vetted; the private address it also has is
+/// never used.
+#[tokio::test]
+async fn block_internal_sends_the_vetted_address_on() {
+    let rec = Recorder::start(to_loopback).await;
+    let fx = Fixture::http("text/plain", "hello".into()).await;
+    let gw = gateway(&[("app.example.test", &["10.1.2.3", PUBLIC])]).await;
+    let lease = gw
+        .lease("op", "proxy-1", Arc::new(recorder_upstream(&rec)), true)
+        .unwrap();
+    let t = through(&lease, "app.example.test", fx.port).await.unwrap();
+    assert!(http_get(t, "app.example.test").await.contains("hello"));
+    assert_eq!(
+        rec.seen(),
+        vec![Target {
+            host: Host::Ip(PUBLIC.parse().unwrap()),
+            port: fx.port
+        }]
+    );
+    assert_eq!(fx.connections(), 1);
+    assert_eq!(rec.joined(), 1);
+}
+
+/// Without `block_internal`, the node does not look the name up. The
+/// proxy does, so geo answers and split-horizon names come out as they would from
+/// the proxy's side.
+#[tokio::test]
+async fn without_block_internal_the_name_goes_to_the_proxy_unresolved() {
+    let rec = Recorder::start(to_loopback).await;
+    let fx = Fixture::http("text/plain", "hello".into()).await;
+    // A resolver that knows nothing: asking it would fail the connection.
+    let gw = gateway(&[]).await;
+    let lease = gw
+        .lease("op", "proxy-1", Arc::new(recorder_upstream(&rec)), false)
+        .unwrap();
+    let t = through(&lease, "only-the-proxy-knows.invalid", fx.port)
+        .await
+        .unwrap();
+    assert!(
+        http_get(t, "only-the-proxy-knows.invalid")
+            .await
+            .contains("hello")
+    );
+    assert_eq!(
+        rec.seen(),
+        vec![Target {
+            host: Host::Name("only-the-proxy-knows.invalid".into()),
+            port: fx.port
+        }]
+    );
+    assert_eq!(fx.connections(), rec.joined());
+    assert_eq!(fx.connections(), 1);
+}
+
+/// A lease ends with its op. Its engine's later connections are
+/// refused at authentication, and a tunnel it still has open is closed.
+#[tokio::test]
+async fn an_ended_lease_is_refused_and_its_tunnels_close() {
+    let rec = Recorder::start(to_loopback).await;
+    let fx = Fixture::banner(b"220 ready\r\n").await;
+    let gw = gateway(&[]).await;
+    let lease = gw
+        .lease("op", "proxy-1", Arc::new(recorder_upstream(&rec)), false)
+        .unwrap();
+    let url = Upstream::parse(&lease.proxy_url()).unwrap();
+    let mut open = through(&lease, "svc.example.test", fx.port).await.unwrap();
+    let mut banner = [0u8; 11];
+    open.read_exact(&mut banner).await.unwrap();
+    assert_eq!(&banner, b"220 ready\r\n");
+
+    drop(lease);
+    let again = cfx_tunnel::connect(
+        &url,
+        &Target::new("svc.example.test", fx.port),
+        Timeouts::default(),
+    )
+    .await;
+    assert!(matches!(again, Err(TunnelError::Auth)), "{}", shown(&again));
+    // The banner fixture waits half a second for input; the gateway closes first.
+    let mut rest = Vec::new();
+    let closed =
+        tokio::time::timeout(Duration::from_millis(300), open.read_to_end(&mut rest)).await;
+    assert!(
+        closed.is_ok(),
+        "the tunnel stayed open after its lease ended"
+    );
+    assert_eq!(fx.connections(), 1);
+}
+
+/// When the team proxy cannot be reached, the engine gets a SOCKS
+/// failure, and nothing reaches the destination by any other way.
+#[tokio::test]
+async fn a_dead_upstream_fails_and_nothing_reaches_the_target() {
+    let fx = Fixture::http("text/plain", "hello".into()).await;
+    let (_held, dead) = refusing_port();
+    let gw = gateway(&[("app.example.test", &[PUBLIC])]).await;
+    for block_internal in [false, true] {
+        let up = Upstream {
+            kind: Kind::Socks5,
+            host: "127.0.0.1".into(),
+            port: dead,
+            auth: None,
+        };
+        let lease = gw
+            .lease("op", "proxy-1", Arc::new(up), block_internal)
+            .unwrap();
+        for host in ["127.0.0.1", "app.example.test"] {
+            let got = through(&lease, host, fx.port).await;
+            // 127.0.0.1 under block_internal is refused by policy instead.
+            let want = if block_internal && host == "127.0.0.1" {
+                0x02
+            } else {
+                GENERAL_FAILURE
+            };
+            match got {
+                Err(TunnelError::Refused(c)) if c == want => {}
+                other => panic!(
+                    "{host} (block_internal={block_internal}) gave {}",
+                    shown(&other)
+                ),
+            }
+        }
+        let s = lease.summary();
+        assert_eq!(s["connections"], 2, "{s}");
+        assert!(
+            lease
+                .last_error()
+                .unwrap()
+                .contains("could not connect to the proxy")
+        );
+    }
+    assert_eq!(fx.connections(), 0);
+}
+
+/// An onward refusal keeps its meaning: a proxy that refuses the destination is
+/// passed on as the same SOCKS reply, and counted as a failure.
+#[tokio::test]
+async fn an_upstream_refusal_is_passed_on() {
+    let rec = Recorder::start(|_: &Target| None).await;
+    let gw = gateway(&[]).await;
+    let lease = gw
+        .lease("op", "proxy-1", Arc::new(recorder_upstream(&rec)), false)
+        .unwrap();
+    let got = through(&lease, "app.example.test", 443).await;
+    assert!(
+        matches!(got, Err(TunnelError::Refused(0x02))),
+        "{}",
+        shown(&got)
+    );
+    assert_eq!(lease.summary()["failed"], 1);
+
+    let rec = Recorder::start(|_: &Target| Some("127.0.0.1:1".parse().unwrap())).await;
+    let lease = gw
+        .lease("op", "proxy-1", Arc::new(recorder_upstream(&rec)), false)
+        .unwrap();
+    let got = through(&lease, "app.example.test", 443).await;
+    assert!(
+        matches!(got, Err(TunnelError::Refused(CONNECTION_REFUSED))),
+        "{}",
+        shown(&got)
+    );
+}
+
+/// The summary counts every connection once, by destination, with
+/// the bytes each way.
+#[tokio::test]
+async fn the_summary_counts_each_destination() {
+    let rec = Recorder::start(to_loopback).await;
+    let fx = Fixture::http("text/plain", "x".repeat(1000)).await;
+    let gw = gateway(&[("app.example.test", &[PUBLIC])]).await;
+    let lease = gw
+        .lease("op", "proxy-9", Arc::new(recorder_upstream(&rec)), true)
+        .unwrap();
+    for _ in 0..2 {
+        let t = through(&lease, "app.example.test", fx.port).await.unwrap();
+        assert!(
+            http_get(t, "app.example.test")
+                .await
+                .ends_with(&"x".repeat(1000))
+        );
+    }
+    assert!(through(&lease, "10.0.0.1", fx.port).await.is_err());
+    // The byte counts land when each tunnel closes.
+    for _ in 0..50 {
+        if lease.summary()["bytes_down"].as_u64().unwrap_or(0) >= 2000 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let s = lease.summary();
+    assert_eq!(s["mode"], "proxy");
+    assert_eq!(s["proxy_id"], "proxy-9");
+    assert_eq!(s["connections"], 3, "{s}");
+    assert_eq!(s["refused"], 1, "{s}");
+    assert_eq!(s["failed"], 0, "{s}");
+    assert_eq!(s["hosts_truncated"], false, "{s}");
+    assert_eq!(
+        s["hosts"],
+        serde_json::json!([
+            {"host": "app.example.test", "port": fx.port, "ok": 2, "refused": 0, "failed": 0},
+            {"host": "10.0.0.1", "port": fx.port, "ok": 0, "refused": 1, "failed": 0},
+        ])
+    );
+    assert!(s["bytes_up"].as_u64().unwrap() > 0, "{s}");
+    assert!(s["bytes_down"].as_u64().unwrap() >= 2000, "{s}");
+    assert_eq!(rec.joined(), 2);
+    assert_eq!(fx.connections(), 2);
+
+    // Published once, whichever path ends the op.
+    assert!(lease.take_summary().is_some());
+    assert!(lease.take_summary().is_none());
+}
+
+#[test]
+fn destinations_past_the_cap_are_counted_but_not_listed() {
+    let mut log = EgressLog::default();
+    for i in 0..=MAX_HOSTS {
+        log.record(format!("h{i}.example.test"), 443, Outcome::Ok);
+    }
+    log.record("h0.example.test".into(), 443, Outcome::Failed);
+    assert_eq!(log.hosts.len(), MAX_HOSTS);
+    assert_eq!(log.unlisted, 1);
+    assert_eq!(log.connections, MAX_HOSTS as u64 + 2);
+    assert_eq!(log.failed, 1);
+    assert_eq!(log.hosts[0].1.failed, 1);
+}
+
+#[tokio::test]
+async fn a_wrong_secret_is_refused() {
+    let rec = Recorder::start(to_loopback).await;
+    let gw = gateway(&[]).await;
+    let lease = gw
+        .lease("op", "proxy-1", Arc::new(recorder_upstream(&rec)), false)
+        .unwrap();
+    let mut up = Upstream::parse(&lease.proxy_url()).unwrap();
+    let (user, pass) = up.auth.clone().unwrap();
+    assert_eq!(user.len(), 16);
+    assert_eq!(pass.len(), 64);
+    up.auth = Some((user, "0".repeat(64)));
+    let got =
+        cfx_tunnel::connect(&up, &Target::new("a.example.test", 80), Timeouts::default()).await;
+    assert!(matches!(got, Err(TunnelError::Auth)), "{}", shown(&got));
+    assert_eq!(rec.connections(), 0);
+    // A lease's URL and wire object name only the gateway.
+    assert!(lease.proxy_url().ends_with(&format!("@{}", gw.addr())));
+    assert_eq!(lease.wire()["v"], 1);
+    assert!(!format!("{lease:?}").contains(&pass_of(&lease)));
+}
+
+fn pass_of(lease: &Lease) -> String {
+    Upstream::parse(&lease.proxy_url()).unwrap().auth.unwrap().1
+}
+
+#[test]
+fn a_socks4_upstream_gets_an_ipv4_address() {
+    let v6: IpAddr = "2606:4700::1111".parse().unwrap();
+    let v4: IpAddr = PUBLIC.parse().unwrap();
+    let private: IpAddr = "10.0.0.1".parse().unwrap();
+    assert_eq!(pick_public(&[v6, v4], true).ok(), Some(v4));
+    assert_eq!(pick_public(&[v6, v4], false).ok(), Some(v6));
+    assert_eq!(pick_public(&[private, v4], false).ok(), Some(v4));
+    assert!(matches!(
+        pick_public(&[v6], true),
+        Err(Verdict::Failed(ADDRESS_TYPE_NOT_SUPPORTED, _))
+    ));
+    assert!(matches!(
+        pick_public(&[private], false),
+        Err(Verdict::Refused(PRIVATE))
+    ));
+    assert!(matches!(
+        pick_public(&[], false),
+        Err(Verdict::Refused(PRIVATE))
+    ));
+}
+
+/// Over the gateway's connection cap, a connection is answered with a failure and
+/// counted, instead of waiting for a slot.
+#[tokio::test]
+async fn connections_over_the_cap_fail() {
+    let rec = Recorder::start(to_loopback).await;
+    let fx = Fixture::banner(b"hi\r\n").await;
+    let gw = Gateway::bind_with(resolver(&[]), Timeouts::default(), IDLE, 1)
+        .await
+        .unwrap();
+    let lease = gw
+        .lease("op", "proxy-1", Arc::new(recorder_upstream(&rec)), false)
+        .unwrap();
+    let _held = through(&lease, "a.example.test", fx.port).await.unwrap();
+    let got = through(&lease, "b.example.test", fx.port).await;
+    assert!(
+        matches!(got, Err(TunnelError::Refused(GENERAL_FAILURE))),
+        "{}",
+        shown(&got)
+    );
+    assert_eq!(lease.summary()["failed"], 1);
+}

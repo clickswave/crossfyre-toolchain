@@ -33,10 +33,13 @@ use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
+mod addr;
 mod http;
 mod socks4;
 mod socks5;
 pub mod socks5_server;
+
+pub use addr::is_internal;
 
 #[cfg(feature = "recorder")]
 pub mod recorder;

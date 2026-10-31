@@ -16,7 +16,9 @@ pub async fn handle(env: OpEnv) {
         http,
         api_url,
         api_key,
+        egress,
     } = env;
+    let lease = egress.as_deref();
 
     // Vulnerability detection via the plessor daemon (port 4445).
     // Plessor streams already-confirmed `finding` events; the node
@@ -35,7 +37,8 @@ pub async fn handle(env: OpEnv) {
         // Authorization testing (BOLA/BFLA): resolve the identity
         // matrix and hand plessor the endpoints + identities.
         let idents = data["identities"].as_array().cloned().unwrap_or_default();
-        let resolved = creds::resolve_identities(&http, &api_url, &api_key, &idents, &host).await;
+        let resolved =
+            creds::resolve_identities(&http, &api_url, &api_key, &idents, &host, lease).await;
         serde_json::json!({
             "operation": "authz",
             "response": "stream",
@@ -174,7 +177,8 @@ pub async fn handle(env: OpEnv) {
             // Only the injection mode benefits: template scanning is stateless
             // per request, so it takes one session like before.
             let want = if mode == "inject" { 4 } else { 1 };
-            match creds::resolve_auth_pool(&http, &api_url, &api_key, cid, &host, want).await {
+            match creds::resolve_auth_pool(&http, &api_url, &api_key, cid, &host, want, lease).await
+            {
                 Ok(pool) if !pool.is_empty() => {
                     if let Some(cr) = plessor_req.as_object_mut() {
                         cr.insert("auth".into(), pool[0].clone());
@@ -222,23 +226,15 @@ pub async fn handle(env: OpEnv) {
         op_id: &op_id,
         workflow_id: &workflow_id,
         node_id: &node_id,
+        egress: lease,
     };
 
     let mut found_count: i64 = 0;
     let mut processed: i64 = 0;
     let mut total: i64 = 0;
     let mut last_prog = std::time::Instant::now();
-    let conn =
-        tokio::net::TcpStream::connect(crate::toolchain::config::engine_addr("cortex")).await;
-    match conn {
-        Ok(stream) => {
-            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-            let (reader, mut writer) = stream.into_split();
-            let mut req_str = dguard::encode(&plessor_req);
-            req_str.push('\n');
-            let _ = writer.write_all(req_str.as_bytes()).await;
-
-            let mut lines = BufReader::new(reader).lines();
+    match super::open_engine("cortex", &plessor_req, lease).await {
+        Ok((mut lines, writer)) => {
             while let Ok(Some(line)) = lines.next_line().await {
                 if !workflow_id.is_empty() && is_workflow_cancelled(&workflow_id) {
                     drop(lines);
@@ -312,10 +308,14 @@ pub async fn handle(env: OpEnv) {
                 }
             }
         }
-        Err(e) => {
+        Err(super::EngineOpen::Refused(why)) => {
+            relay.refuse(&why).await;
+            return;
+        }
+        Err(super::EngineOpen::Unreachable(e)) => {
             eprintln!(
                 "[op] FAIL plessor daemon unreachable on {} ({e}). Is `plessor --daemon` running?",
-                crate::toolchain::config::engine_addr("cortex")
+                super::engine_addr("cortex")
             );
             relay.publish_failed().await;
             return;

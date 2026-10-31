@@ -305,6 +305,8 @@ struct OpCtx {
     // This node's own api_key, used to authorize credential resolution against
     // the control plane (POST /api/v1/creds/resolve).
     api_key: String,
+    // Where this node's ops leave from, and the gateway a proxied op is leased.
+    egress: Arc<egress::state::EgressState>,
 }
 
 /// Execute one dispatched operation to completion: gate on the per-workflow
@@ -330,6 +332,7 @@ async fn run_operation(cmd: serde_json::Value, ctx: OpCtx) {
         http,
         api_url,
         api_key,
+        egress: egress_state,
     } = ctx;
 
     // For distributed port-scan ops, gate on the workflow's
@@ -492,6 +495,44 @@ async fn run_operation(cmd: serde_json::Value, ctx: OpCtx) {
         use std::sync::atomic::Ordering;
         CLAIM_OK.fetch_add(1, Ordering::Relaxed);
     }
+
+    // Where this op's traffic leaves from. On a proxied node it gets a lease on the
+    // egress gateway, and every engine request is wrapped with it. When the node cannot
+    // say for certain that it sends through the proxy the op expects, the op is not
+    // run at all: nothing is ever sent from this node's own address instead.
+    let fetch = egress::state::Fetch {
+        http: &http,
+        api_url: &api_url,
+        api_key: &api_key,
+    };
+    let lease = match egress_state.for_op(&op_id, &node_id, &data, &fetch).await {
+        Ok(l) => l,
+        Err(why) => {
+            eprintln!("[op] {op_id} not run: {why}");
+            ops::publish_refused(
+                &pub_clone,
+                &status_subj,
+                &op_id,
+                &workflow_id,
+                &node_id,
+                None,
+                &why,
+            )
+            .await;
+            return;
+        }
+    };
+    // Kept here as well as in the op, so its summary goes out however the op ended.
+    let summary = lease.clone().map(|l| {
+        (
+            l,
+            pub_clone.clone(),
+            status_subj.clone(),
+            op_id.clone(),
+            workflow_id.clone(),
+            node_id.clone(),
+        )
+    });
     let env = ops::OpEnv {
         op_id,
         workflow_id,
@@ -503,7 +544,16 @@ async fn run_operation(cmd: serde_json::Value, ctx: OpCtx) {
         http,
         api_url,
         api_key,
+        egress: lease,
     };
+    run_op_type(&op_type, env).await;
+    if let Some((l, pubc, subj, op_id, workflow_id, node_id)) = summary {
+        ops::publish_egress(&pubc, &subj, &op_id, &workflow_id, &node_id, Some(&l)).await;
+    }
+}
+
+/// Hand an op to the handler for its type.
+async fn run_op_type(op_type: &str, env: ops::OpEnv) {
     if op_type.starts_with("content-discovery-") {
         ops::content_discovery::handle(env).await;
     } else if op_type.starts_with("web-crawl-") {
@@ -602,10 +652,10 @@ pub struct NetworkConfig {
     wg_endpoint: Option<String>,
     #[serde(default)]
     wg_public_key: Option<String>,
-    /// BYO residential / mobile egress proxy URL (`http(s)://` or `socks5://`,
-    /// with optional `user:pass@`). When set, engine clients route through it via
-    /// `CROSSFYRE_EGRESS_PROXY`. Orthogonal to the tunnel `kind`: a rotating
-    /// residential provider is one gateway URL, no netns tunnel needed.
+    /// A residential proxy URL, as older controllers sent it. Read so their answers
+    /// still parse, and otherwise ignored: a node's proxy now comes in the `egress`
+    /// object (see `egress::state`) and carries an op's traffic only through the
+    /// node's gateway.
     #[serde(default)]
     proxy: Option<String>,
 }
@@ -1724,7 +1774,42 @@ fn bench_client() -> reqwest::Client {
 ///
 /// The platform has already authorised the request. A caller-supplied `Host`
 /// header is dropped, so the URL's host is the host the request goes to.
-async fn bench_send(client: &reqwest::Client, cmd: &serde_json::Value) -> serde_json::Value {
+///
+/// `lease` is the send's lease on the egress gateway when this node sends through a
+/// proxy. The request then goes through it on a client of its own, which does not
+/// follow redirects either, and never on `client`.
+async fn bench_send(
+    client: &reqwest::Client,
+    cmd: &serde_json::Value,
+    lease: Option<&egress::gateway::Lease>,
+) -> serde_json::Value {
+    let sent_as = egress::state::EgressState::describe(lease);
+    let leased;
+    let client = match lease {
+        None => client,
+        Some(l) => {
+            let built = reqwest::Proxy::all(l.proxy_url())
+                .map_err(|_| "the egress gateway's address could not be used".to_string())
+                .and_then(|p| {
+                    reqwest::Client::builder()
+                        .proxy(p)
+                        .redirect(reqwest::redirect::Policy::none())
+                        .build()
+                        .map_err(|e| format!("the Bench client could not be built: {e}"))
+                });
+            match built {
+                Ok(c) => {
+                    leased = c;
+                    &leased
+                }
+                Err(e) => {
+                    return serde_json::json!({
+                        "ok": false, "error": e, "redirects": "not_followed", "egress": sent_as,
+                    });
+                }
+            }
+        }
+    };
     let method = cmd["method"].as_str().unwrap_or("GET");
     let url = cmd["url"].as_str().unwrap_or("");
     let body = cmd["body"].as_str().map(|s| s.to_string());
@@ -1774,10 +1859,19 @@ async fn bench_send(client: &reqwest::Client, cmd: &serde_json::Value) -> serde_
                 // Tells the platform this node returns redirects; an older node
                 // follows them and says nothing.
                 "redirects": "not_followed",
+                "egress": sent_as,
             })
         }
         Err(e) => {
-            serde_json::json!({ "ok": false, "error": e.to_string(), "redirects": "not_followed" })
+            // Through the gateway, its reason is the useful one: the destination was
+            // refused, or the proxy failed.
+            let error = match lease.and_then(|l| l.last_error()) {
+                Some(why) => format!("not sent through this node's proxy: {why}"),
+                None => e.to_string(),
+            };
+            serde_json::json!({
+                "ok": false, "error": error, "redirects": "not_followed", "egress": sent_as,
+            })
         }
     }
 }
@@ -1835,9 +1929,10 @@ pub fn which_binary(name: &str) -> Option<std::path::PathBuf> {
 /// to config.toml so the next NATS connect uses valid credentials.
 /// Re-authorize the node on every daemon start. The server response is the
 /// authoritative source for everything operator-configurable: NATS creds,
-/// installed extensions, network identity (VPN), and the proxy chain. Every
+/// installed extensions, network identity (VPN), and the egress proxy. Every
 /// piece is refreshed in-place so dashboard edits take effect on the next
-/// daemon restart without needing the operator to re-run --init.
+/// daemon restart without needing the operator to re-run --init. The egress
+/// proxy also changes while the daemon runs, when the platform announces it.
 pub async fn refresh_node_state(
     config: &mut Config,
     config_path: &std::path::Path,
@@ -1898,6 +1993,10 @@ pub async fn refresh_node_state(
         }
         config.network = new_network;
     }
+
+    // Where scans leave from: directly, or through a proxy. A controller older than
+    // proxies sends no `egress`, which means direct.
+    egress::state::global().apply_authorize(&json_resp["egress"]);
 
     // Persist so next restart also has fresh creds if refresh fails.
     let config_toml = toml::to_string(&config)?;
@@ -1972,16 +2071,21 @@ fn host_seed() -> String {
 /// in this crate is cfx_core's own, 0.1.0 in every binary that links it, and that is
 /// what every node reported. `cli_manager` is the package manager that installed the
 /// CLI, when one did.
+///
+/// `egress` says where this node's scans leave from and that it runs the egress
+/// gateway; the platform sends no proxied op to a node whose heartbeat lacks it.
 fn toolchain_health(
     node_version: &str,
     pg_port: u16,
     pg_running: bool,
     cli_manager: Option<toolchain::packaging::Manager>,
+    egress: serde_json::Value,
 ) -> serde_json::Value {
     let mut status = serde_json::json!({
         "installed": true,
         "version": format!("node {node_version}"),
-        "postgres": { "port": pg_port, "running": pg_running }
+        "postgres": { "port": pg_port, "running": pg_running },
+        "egress": egress,
     });
     if let Some(m) = cli_manager {
         status["managed_by"] = serde_json::json!(m.name());
@@ -2123,6 +2227,11 @@ pub async fn run_daemon(
         );
         std::process::exit(1);
     }
+
+    // An older node may have left a proxy in the engines' environment file, where it
+    // would carry a direct node's traffic. The node's proxy is a per-op lease now.
+    egress::cleanup_legacy_env_file();
+    let egress_state = Arc::clone(egress::state::global());
 
     // -- Apply isolated egress (if configured) before scanning starts ----
     // We do this after credential refresh (which needs regular internet to
@@ -2374,6 +2483,7 @@ pub async fn run_daemon(
         let http_pc = http_client.clone();
         let api_url_pc = api_url.clone();
         let api_key_pc = api_key.clone();
+        let egress_pc = Arc::clone(&egress_state);
         // Set >= the largest per-workflow concurrency (threads/tasks, capped at
         // 200) so a full-concurrency scan isn't throttled, while still bounding
         // node RAM to a few hundred small op payloads. Tunable per node.
@@ -2466,6 +2576,7 @@ pub async fn run_daemon(
                     http: http_pc.clone(),
                     api_url: api_url_pc.clone(),
                     api_key: api_key_pc.clone(),
+                    egress: Arc::clone(&egress_pc),
                 };
                 tokio::spawn(async move {
                     run_operation(cmd, ctx).await;
@@ -2499,6 +2610,13 @@ pub async fn run_daemon(
     // whole fleet during a deploy). So only evict after several CONSECUTIVE 401s; any success resets.
     let mut consecutive_401 = 0u32;
     const EVICT_AFTER_401: u32 = 4; // ~20s of sustained auth failure at the 5s interval
+
+    // Whether each running engine sends a wrapped op through the proxy it names, by
+    // engine id. Asked once an engine is seen running, and again after it is
+    // installed, restarted or stopped, so the heartbeat can say which engines a
+    // proxied op can use.
+    let mut engine_egress: std::collections::HashMap<String, bool> =
+        std::collections::HashMap::new();
 
     loop {
         tokio::select! {
@@ -2536,6 +2654,7 @@ pub async fn run_daemon(
                 // both probed and reported to the dashboard correctly.
                 let ext_status: serde_json::Value = {
                     let mut map = serde_json::Map::new();
+                    let mut ask = Vec::new();
                     for ext in crate::toolchain::EXTENSIONS {
                         if !config.extensions.iter().any(|e| e == ext) { continue; }
                         let port = crate::toolchain::config::engine_port(ext);
@@ -2543,10 +2662,28 @@ pub async fn run_daemon(
                             &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
                             std::time::Duration::from_millis(200),
                         ).is_ok();
+                        if !running {
+                            engine_egress.remove(*ext);
+                        } else if !engine_egress.contains_key(*ext) {
+                            ask.push((ext.to_string(), format!("127.0.0.1:{port}")));
+                        }
                         map.insert(ext.to_string(), serde_json::json!({
                             "port": port,
                             "running": running
                         }));
+                    }
+                    let answers = futures_util::future::join_all(ask.iter().map(|(_, addr)| {
+                        egress::state::engine_reads_egress(addr)
+                    }))
+                    .await;
+                    for ((ext, _), reads) in ask.into_iter().zip(answers) {
+                        if let Some(reads) = reads {
+                            engine_egress.insert(ext, reads);
+                        }
+                    }
+                    for (ext, status) in map.iter_mut() {
+                        status["egress"] =
+                            serde_json::json!(engine_egress.get(ext).copied().unwrap_or(false));
                     }
                     serde_json::Value::Object(map)
                 };
@@ -2566,6 +2703,7 @@ pub async fn run_daemon(
                         pg_port,
                         pg_running,
                         crate::toolchain::packaging::owner("crossfyre"),
+                        egress_state.heartbeat(),
                     )
                 };
 
@@ -2747,11 +2885,72 @@ pub async fn run_daemon(
                             // the node just sends it and replies with the full response by command_id.
                             Some("repeater") => {
                                 let command_id = cmd["command_id"].as_str().unwrap_or("").to_string();
-                                let mut resp = bench_send(&bench_client, &cmd).await;
+                                let fetch = egress::state::Fetch {
+                                    http: &http_client,
+                                    api_url: &api_url,
+                                    api_key: &api_key,
+                                };
+                                // Through the proxy the node is set to use, or not at all.
+                                let mut resp = match egress_state.for_bench(&cmd, &fetch).await {
+                                    Ok(lease) => bench_send(&bench_client, &cmd, lease.as_ref()).await,
+                                    Err(why) => {
+                                        eprintln!("[bench] {command_id} not sent: {why}");
+                                        let now = egress_state.current();
+                                        serde_json::json!({
+                                            "ok": false,
+                                            "error": why,
+                                            "redirects": "not_followed",
+                                            "egress": {"mode": now.mode(), "proxy_id": now.proxy_id()},
+                                        })
+                                    }
+                                };
                                 resp["type"] = serde_json::json!("repeater_result");
                                 resp["command_id"] = serde_json::json!(command_id);
                                 resp["node_id"] = serde_json::json!(&node_id);
                                 let _ = publisher.publish(status_subject.clone(), resp.to_string().into()).await;
+                            }
+                            // The platform changed where this node's scans leave from. The
+                            // settings themselves carry a proxy's credentials and never
+                            // travel over NATS; they are fetched. Awaited here, so an op
+                            // that arrives after this message runs on the new ones.
+                            Some("egress_changed") => {
+                                egress_state.announce(cmd["rev"].as_i64());
+                                let fetch = egress::state::Fetch {
+                                    http: &http_client,
+                                    api_url: &api_url,
+                                    api_key: &api_key,
+                                };
+                                if let Err(e) = egress_state.refresh(&fetch).await {
+                                    eprintln!(
+                                        "[egress] could not fetch this node's proxy settings: {e}. \
+                                         Scans and Bench sends are refused until they can be."
+                                    );
+                                }
+                            }
+                            // Check a proxy from this node: the exit address and how long a
+                            // fetch through it takes.
+                            Some("egress_test") => {
+                                let state = Arc::clone(&egress_state);
+                                let http = http_client.clone();
+                                let api_url = api_url.clone();
+                                let api_key = api_key.clone();
+                                let publisher = publisher.clone();
+                                let subject = status_subject.clone();
+                                let node_id = node_id.clone();
+                                let cmd = cmd.clone();
+                                tokio::spawn(async move {
+                                    let fetch = egress::state::Fetch {
+                                        http: &http,
+                                        api_url: &api_url,
+                                        api_key: &api_key,
+                                    };
+                                    let mut resp =
+                                        state.check(&cmd, egress::state::CHECK_URL, &fetch).await;
+                                    resp["type"] = serde_json::json!("egress_test_result");
+                                    resp["command_id"] = cmd["command_id"].clone();
+                                    resp["node_id"] = serde_json::json!(node_id);
+                                    let _ = publisher.publish(subject, resp.to_string().into()).await;
+                                });
                             }
                             Some("operation") => {
                                 // Hand off to run_operation so the pull path reuses the exact
@@ -2764,6 +2963,7 @@ pub async fn run_daemon(
                                     http: http_client.clone(),
                                     api_url: api_url.clone(),
                                     api_key: api_key.clone(),
+                                    egress: Arc::clone(&egress_state),
                                 };
                                 let __cmd = cmd.clone();
                                 tokio::spawn(async move { run_operation(__cmd, __ctx).await; });
@@ -2773,6 +2973,24 @@ pub async fn run_daemon(
                                 let script = cmd["script"].as_str().unwrap_or("").to_string();
                                 let raw_targets = cmd["targets"].as_array();
 
+                                // A .cfx script asks the engines for ops with no egress
+                                // wrapper, so on a node that sends through a proxy they
+                                // would go out from this node's own address.
+                                if egress_state.sends_through_proxy() {
+                                    println!("[execute] refused, this node sends through a proxy: job_id={job_id}");
+                                    let resp = serde_json::json!({
+                                        "type": "job_failed",
+                                        "job_id": job_id,
+                                        "node_id": &node_id,
+                                        "error": "this node sends its scans through a proxy, and a .cfx \
+                                                  script's requests cannot be sent that way, so it does not \
+                                                  run here",
+                                    });
+                                    let _ = publisher
+                                        .publish(status_subject.clone(), resp.to_string().into())
+                                        .await;
+                                    continue;
+                                }
                                 // Same consent gate as shell_exec: a .cfx job is
                                 // arbitrary Python from the control plane, run in
                                 // this process's privileges. See Config::remote_exec.
@@ -2826,6 +3044,7 @@ pub async fn run_daemon(
                             }
                             Some("install_extension") => {
                                 let ext = cmd["extension"].as_str().unwrap_or("").to_string();
+                                engine_egress.remove(&ext);
                                 // Printed by public name; `ext` stays the id the API sent, for the reply.
                                 let name = toolchain::public_name(&ext).to_string();
                                 println!("\n[install] Installing extension: {name}");
@@ -2876,6 +3095,9 @@ pub async fn run_daemon(
                                 // version (a clean exit would stay down).
                                 println!("\n[update] Updating crossfyre from the release manifest...");
                                 let updated = toolchain::install::update_for_dashboard().await;
+                                // An update can replace the engines without this node
+                                // restarting, so ask each again what it reads.
+                                engine_egress.clear();
 
                                 let (success, restarting, managed_by) = match &updated {
                                     Ok(u) => (true, u.restart, u.cli_managed_by),
@@ -2910,6 +3132,7 @@ pub async fn run_daemon(
                             }
                             Some("remove_extension") => {
                                 let ext = cmd["extension"].as_str().unwrap_or("").to_string();
+                                engine_egress.remove(&ext);
                                 // Printed by public name; `ext` stays the id the API sent, for the reply.
                                 let name = toolchain::public_name(&ext).to_string();
                                 println!("\n[remove] Removing extension: {name}");
@@ -2929,6 +3152,7 @@ pub async fn run_daemon(
                             }
                             Some("restart_extension") => {
                                 let ext = cmd["extension"].as_str().unwrap_or("").to_string();
+                                engine_egress.remove(&ext);
                                 // Printed by public name; `ext` stays the id the API sent, for the reply.
                                 let name = toolchain::public_name(&ext).to_string();
                                 println!("\n[restart] Restarting extension: {name}");
@@ -2957,6 +3181,7 @@ pub async fn run_daemon(
                             }
                             Some("reinstall_extension") => {
                                 let ext = cmd["extension"].as_str().unwrap_or("").to_string();
+                                engine_egress.remove(&ext);
                                 // Printed by public name; `ext` stays the id the API sent, for the reply.
                                 let name = toolchain::public_name(&ext).to_string();
                                 println!("\n[reinstall] Reinstalling extension: {name}");
@@ -2983,6 +3208,7 @@ pub async fn run_daemon(
                             }
                             Some("stop_extension") => {
                                 let ext = cmd["extension"].as_str().unwrap_or("").to_string();
+                                engine_egress.remove(&ext);
                                 // Printed by public name; `ext` stays the id the API sent, for the reply.
                                 let name = toolchain::public_name(&ext).to_string();
                                 println!("\n[stop] Stopping extension: {name}");
@@ -3185,8 +3411,9 @@ mod heartbeat_tests {
     /// cfx_core's 0.1.0 on every node, whatever had been installed.
     #[test]
     fn the_heartbeat_reports_the_version_the_node_binary_passes_in() {
-        let status = toolchain_health("7.8.9", 4440, true, None);
+        let status = toolchain_health("7.8.9", 4440, true, None, serde_json::json!({"gateway": 1}));
         assert_eq!(status["version"], "node 7.8.9");
+        assert_eq!(status["egress"]["gateway"], 1);
         assert_eq!(status["installed"], true);
         assert_eq!(status["postgres"]["port"], 4440);
         assert_eq!(status["postgres"]["running"], true);
@@ -3200,6 +3427,7 @@ mod heartbeat_tests {
             4441,
             false,
             Some(toolchain::packaging::Manager::Apt),
+            serde_json::Value::Null,
         );
         assert_eq!(status["managed_by"], "apt");
         assert_eq!(status["postgres"]["running"], false);
@@ -3248,10 +3476,14 @@ mod bench_tests {
         ))
         .await;
         let cmd = serde_json::json!({ "method": "GET", "url": format!("http://127.0.0.1:{first}/start") });
-        let resp = bench_send(&bench_client(), &cmd).await;
+        let resp = bench_send(&bench_client(), &cmd, None).await;
         assert_eq!(resp["ok"], true, "{resp}");
         assert_eq!(resp["status"], 302, "{resp}");
         assert_eq!(resp["redirects"], "not_followed", "{resp}");
+        assert_eq!(
+            resp["egress"],
+            serde_json::json!({"mode": "direct", "proxy_id": null})
+        );
         let location = resp["headers"]
             .as_array()
             .unwrap()
@@ -3268,5 +3500,341 @@ mod bench_tests {
             0,
             "the redirect was followed"
         );
+    }
+}
+
+/// A proxied node's ops and Bench sends, end to end inside the node: the op's egress
+/// decision, the wrapper an engine gets, what the node publishes, and what reaches the
+/// target. The engines, the platform, NATS and the team proxy are stand-ins on loopback.
+#[cfg(test)]
+mod egress_tests {
+    use super::*;
+    use cfx_tunnel::recorder::{Fixture, Recorder, to_loopback};
+    use egress::state::EgressState;
+    use egress::testkit::{
+        FakeEngine, FakeNats, FakePlatform, direct_settings, http, ok, proxy_settings, resolver,
+    };
+    use serde_json::{Value, json};
+
+    const NODE: &str = "node-1";
+    const PUBLIC: &str = "93.184.216.34";
+
+    async fn ctx(nats: &FakeNats, platform: &FakePlatform, st: &Arc<EgressState>) -> OpCtx {
+        OpCtx {
+            pub_clone: nats.client().await,
+            status_subj: format!("cfx.node.{NODE}.status"),
+            result_subj: format!("cfx.results.{NODE}"),
+            node_id: NODE.into(),
+            http: http(),
+            api_url: platform.url.clone(),
+            api_key: "cfk_node".into(),
+            egress: Arc::clone(st),
+        }
+    }
+
+    fn op(op_id: &str, op_type: &str, data: Value) -> Value {
+        json!({
+            "type": "operation", "operation_id": op_id, "workflow_id": format!("wf-{op_id}"),
+            "op_type": op_type, "pre_claimed": true, "data": data,
+        })
+    }
+
+    /// Runs `cmd` with these engines, and waits for what the node publishes to land.
+    async fn run(cmd: Value, ctx: OpCtx, engines: &[(&str, u16)], nats: &FakeNats) {
+        let client = ctx.pub_clone.clone();
+        ops::test_engines::with(engines, run_operation(cmd, ctx)).await;
+        client.flush().await.unwrap();
+        nats.wait_for("operation_completed").await;
+    }
+
+    fn proxied_state(rec: &Recorder) -> Arc<EgressState> {
+        let st = EgressState::new(resolver(&[("app.example.test", &[PUBLIC])]));
+        st.apply_authorize(&proxy_settings(5, "p1", rec));
+        st
+    }
+
+    /// An engine from before the wrapper refuses it and sends nothing,
+    /// and the op ends with a note saying to update. Sent unwrapped, which is what a
+    /// node without the wrapper does, the same engine would scan the target from the
+    /// node's own address.
+    #[tokio::test]
+    async fn proxied_node_never_sends_direct_when_engine_is_old() {
+        let target = Fixture::http("text/plain", "hello".into()).await;
+        let rec = Recorder::start(to_loopback).await;
+        let plessor = FakeEngine::old().await;
+        let nats = FakeNats::start().await;
+        let platform = FakePlatform::start(|_, _| (500, json!({}))).await;
+        let st = proxied_state(&rec);
+        let data = json!({"target": format!("http://127.0.0.1:{}/", target.port)});
+        let c = ctx(&nats, &platform, &st).await;
+        run(
+            op("op9", "vuln-scan-1", data),
+            c,
+            &[("cortex", plessor.port)],
+            &nats,
+        )
+        .await;
+
+        assert_eq!(target.connections(), 0, "the target was reached");
+        assert_eq!(rec.connections(), 0);
+        assert_eq!(plessor.seen()[0]["operation"], "egress");
+        let note = "plessor on this node cannot send through a proxy. Run `crossfyre update`, \
+                    then retry";
+        assert_eq!(nats.first("operation_note").unwrap()["message"], note);
+        let done = nats.first("operation_completed").unwrap();
+        assert_eq!(done["error"], note, "{done}");
+        assert_eq!(done["found_count"], 0);
+        assert_eq!(done["operation_id"], "op9");
+        assert!(
+            !op_is_done("op9"),
+            "a refused op is left for a later dispatch"
+        );
+    }
+
+    /// The op was dispatched for proxy settings at revision 8; the node
+    /// has 7, direct, and cannot fetch 8. The op is refused, and nothing reaches the
+    /// engine or the target. A node that ignored the expectation would run it
+    /// directly.
+    #[tokio::test]
+    async fn stale_settings_are_refreshed_or_refused() {
+        let target = Fixture::http("text/plain", "hello".into()).await;
+        let plessor = FakeEngine::old().await;
+        let nats = FakeNats::start().await;
+        let platform =
+            FakePlatform::start(|_, _| (500, json!({"status": 500, "message": "down"}))).await;
+        let st = EgressState::new(resolver(&[]));
+        st.apply_authorize(&direct_settings(7));
+        let data = json!({
+            "target": format!("http://127.0.0.1:{}/", target.port),
+            "egress_expect": {NODE: {"mode": "proxy", "proxy_id": "p1", "rev": 8}},
+        });
+        let c = ctx(&nats, &platform, &st).await;
+        run(
+            op("op10", "vuln-scan-1", data),
+            c,
+            &[("cortex", plessor.port)],
+            &nats,
+        )
+        .await;
+
+        assert_eq!(plessor.connections(), 0);
+        assert_eq!(target.connections(), 0);
+        assert_eq!(platform.count("/api/v1/node-egress"), 1);
+        let done = nats.first("operation_completed").unwrap();
+        let why = done["error"].as_str().unwrap();
+        assert!(
+            why.starts_with("could not fetch this node's proxy settings"),
+            "{done}"
+        );
+        assert_eq!(nats.first("operation_note").unwrap()["message"], why);
+        assert_eq!(nats.types(), ["operation_note", "operation_completed"]);
+    }
+
+    /// The same op once the platform answers: the node fetches revision 8, leases the
+    /// gateway, and the engine reaches the target only through the team proxy. The
+    /// op's egress summary goes out before its completion.
+    #[tokio::test]
+    async fn an_op_reaches_its_target_only_through_the_team_proxy() {
+        let target = Fixture::http("text/plain", "hello".into()).await;
+        let rec = Recorder::start(to_loopback).await;
+        let plessor = FakeEngine::current().await;
+        let nats = FakeNats::start().await;
+        let settings = proxy_settings(8, "p1", &rec);
+        let platform = FakePlatform::start(move |_, _| ok(settings.clone())).await;
+        let st = EgressState::new(resolver(&[]));
+        st.apply_authorize(&direct_settings(7));
+        let host = "app.example.test";
+        let data = json!({
+            "target": format!("http://{host}:{}/", target.port),
+            "egress_expect": {NODE: {"mode": "proxy", "proxy_id": "p1", "rev": 8}},
+        });
+        let c = ctx(&nats, &platform, &st).await;
+        run(
+            op("op10b", "vuln-scan-1", data),
+            c,
+            &[("cortex", plessor.port)],
+            &nats,
+        )
+        .await;
+
+        assert_eq!(target.connections(), 1);
+        assert_eq!(rec.joined(), 1, "the target was reached around the proxy");
+        assert_eq!(cfx_tunnel::recorder::name_of(&rec.seen()[0]), Some(host));
+        let types = nats.types();
+        let egress_at = types.iter().position(|t| t == "operation_egress").unwrap();
+        let done_at = types
+            .iter()
+            .position(|t| t == "operation_completed")
+            .unwrap();
+        assert!(egress_at < done_at, "{types:?}");
+        assert_eq!(types.iter().filter(|t| *t == "operation_egress").count(), 1);
+        let e = nats.first("operation_egress").unwrap();
+        assert_eq!(e["operation_id"], "op10b");
+        assert_eq!(e["node_id"], NODE);
+        assert_eq!(e["egress"]["proxy_id"], "p1");
+        assert_eq!(e["egress"]["connections"], 1, "{e}");
+        assert_eq!(e["egress"]["hosts"][0]["host"], host, "{e}");
+        assert!(
+            nats.first("operation_completed")
+                .unwrap()
+                .get("error")
+                .is_none()
+        );
+    }
+
+    /// Port scans connect to each port themselves, so a proxied node does not run
+    /// them, and says so.
+    #[tokio::test]
+    async fn a_proxied_node_does_not_run_a_port_scan() {
+        let rec = Recorder::start(to_loopback).await;
+        let doorward = FakeEngine::old().await;
+        let nats = FakeNats::start().await;
+        let platform = FakePlatform::start(|_, _| (500, json!({}))).await;
+        let st = proxied_state(&rec);
+        let c = ctx(&nats, &platform, &st).await;
+        let data = json!({"host": "127.0.0.1", "port": 22});
+        run(
+            op("op-ps", "network-scan-ds", data),
+            c,
+            &[("pulse", doorward.port)],
+            &nats,
+        )
+        .await;
+        assert_eq!(doorward.connections(), 0);
+        let done = nats.first("operation_completed").unwrap();
+        assert_eq!(done["error"], ops::network_scan::PROXIED, "{done}");
+    }
+
+    async fn bench_lease(rec: &Recorder) -> egress::gateway::Lease {
+        let st = proxied_state(rec);
+        let platform = FakePlatform::start(|_, _| (500, json!({}))).await;
+        let h = http();
+        let f = egress::state::Fetch {
+            http: &h,
+            api_url: &platform.url,
+            api_key: "k",
+        };
+        st.for_bench(&json!({"command_id": "c1"}), &f)
+            .await
+            .unwrap()
+            .expect("a lease")
+    }
+
+    /// A Bench send from a proxied node goes through the send's lease:
+    /// the team proxy sees the destination, and the target sees no connection of its
+    /// own. Bench sends refuse private addresses, so the gateway looks the name up on
+    /// the node and hands the proxy the public address it found.
+    #[tokio::test]
+    async fn bench_send_goes_through_the_lease() {
+        let target = Fixture::http("text/plain", "hello".into()).await;
+        let rec = Recorder::start(to_loopback).await;
+        let lease = bench_lease(&rec).await;
+        let cmd =
+            json!({"method": "GET", "url": format!("http://app.example.test:{}/x", target.port)});
+        let resp = bench_send(&bench_client(), &cmd, Some(&lease)).await;
+        assert_eq!(resp["ok"], true, "{resp}");
+        assert_eq!(resp["status"], 200, "{resp}");
+        assert_eq!(resp["body"], "hello");
+        assert_eq!(resp["egress"], json!({"mode": "proxy", "proxy_id": "p1"}));
+        assert_eq!(
+            rec.seen(),
+            vec![cfx_tunnel::Target::new(PUBLIC, target.port)]
+        );
+        assert_eq!(target.connections(), rec.joined());
+
+        // A private destination is refused on the node and never reaches the proxy, and
+        // the reply says so without naming the gateway or its credentials.
+        let cmd = json!({"method": "GET", "url": format!("http://127.0.0.1:{}/", target.port)});
+        let resp = bench_send(&bench_client(), &cmd, Some(&lease)).await;
+        assert_eq!(resp["ok"], false, "{resp}");
+        assert_eq!(
+            resp["error"],
+            "not sent through this node's proxy: the destination is a private address, \
+             which this operation may not reach",
+        );
+        let gateway = cfx_tunnel::Upstream::parse(&lease.proxy_url()).unwrap();
+        let secret = gateway.auth.unwrap().1;
+        assert!(!resp.to_string().contains(&secret), "{resp}");
+        assert_eq!(rec.seen().len(), 1);
+        assert_eq!(target.connections(), 1);
+    }
+
+    /// The leased client returns a redirect as the direct one does, instead of
+    /// following it to a host nobody checked.
+    #[tokio::test]
+    async fn a_leased_bench_send_returns_redirects() {
+        let second = Fixture::http("text/plain", "second".into()).await;
+        let first = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = l.local_addr().unwrap().port();
+            let to = second.port;
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                while let Ok((mut s, _)) = l.accept().await {
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf).await;
+                    let reply = format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://app.example.test:{to}/\r\n\
+                         Content-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = s.write_all(reply.as_bytes()).await;
+                }
+            });
+            port
+        };
+        let rec = Recorder::start(to_loopback).await;
+        let lease = bench_lease(&rec).await;
+        let cmd = json!({"method": "GET", "url": format!("http://app.example.test:{first}/")});
+        let resp = bench_send(&bench_client(), &cmd, Some(&lease)).await;
+        assert_eq!(resp["status"], 302, "{resp}");
+        assert_eq!(second.connections(), 0, "the redirect was followed");
+        assert_eq!(rec.seen().len(), 1);
+    }
+
+    /// A login-flow credential logs in through the op's lease, like the rest of the op.
+    #[tokio::test]
+    async fn a_login_goes_through_the_op_lease() {
+        let login = Fixture::http("application/json", r#"{"token":"abc"}"#.into()).await;
+        let rec = Recorder::start(to_loopback).await;
+        let login_url = format!("http://login.example.test:{}/login", login.port);
+        let platform = FakePlatform::start(move |_, _| {
+            ok(json!({
+                "name": "app", "auth_type": "login_flow",
+                "config": {"login_url": login_url, "as_json": true,
+                           "token_extract": {"from": "json", "ref": "token"}},
+                "secret": {"username": "u", "password": "p"},
+            }))
+        })
+        .await;
+        let st = EgressState::new(resolver(&[]));
+        st.apply_authorize(&proxy_settings(5, "p1", &rec));
+        let h = http();
+        let f = egress::state::Fetch {
+            http: &h,
+            api_url: &platform.url,
+            api_key: "k",
+        };
+        let lease = st
+            .for_op("op-login", NODE, &json!({}), &f)
+            .await
+            .unwrap()
+            .unwrap();
+        let auth = creds::resolve_auth(
+            &h,
+            &platform.url,
+            "k",
+            "cred-login-through-lease",
+            "login.example.test",
+            Some(&lease),
+        )
+        .await
+        .unwrap();
+        assert_eq!(auth["headers"]["Authorization"], "Bearer abc");
+        assert_eq!(
+            cfx_tunnel::recorder::name_of(&rec.seen()[0]),
+            Some("login.example.test")
+        );
+        assert_eq!(login.connections(), rec.joined());
+        assert_eq!(platform.count("/api/v1/creds/resolve"), 1);
     }
 }
