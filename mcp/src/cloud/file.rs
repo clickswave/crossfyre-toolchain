@@ -176,6 +176,7 @@ fn unsafe_reason(_: &Path) -> Option<String> {
 }
 
 /// The mode and owner rule on its own, so it can be tested without another user.
+#[cfg(any(unix, test))]
 pub(crate) fn mode_problem(mode: u32, uid: u32, me: u32) -> Option<&'static str> {
     if uid != me && uid != 0 {
         return Some("belongs to another user");

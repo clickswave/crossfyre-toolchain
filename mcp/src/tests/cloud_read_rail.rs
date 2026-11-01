@@ -937,7 +937,6 @@ async fn the_scope_tools_show_both_scopes() {
 async fn a_key_file_others_can_read_leaves_cloud_off_and_says_why() {
     let d = TempDir::new();
     let path = d.path().join("cloud.toml");
-    let mut t = scope(&[], "").build();
     let opts = |p: &std::path::Path| StartOptions {
         cloud_file: Some(p.to_path_buf()),
         no_cloud: false,
@@ -952,6 +951,7 @@ async fn a_key_file_others_can_read_leaves_cloud_off_and_says_why() {
             &format!("api_url = \"https://crossfyre.io\"\nkey = \"{KEY}\"\n"),
         );
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut t = scope(&[], "").build();
         let m = std::sync::Arc::get_mut(&mut t.mcp).unwrap();
         cloud::start(m, d.path(), &opts(&path)).await;
         assert!(matches!(t.mcp.cloud, cloud::Slot::Off(_)));

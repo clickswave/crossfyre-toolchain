@@ -162,6 +162,7 @@ fn toolmark() -> (u16, Arc<Mutex<Vec<Value>>>) {
 
 /// A plessor daemon stand-in that acknowledges a scan, sends nothing more, and
 /// counts the cancel lines it is sent.
+#[cfg(unix)]
 fn plessor() -> (u16, Arc<AtomicUsize>) {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
