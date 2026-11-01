@@ -4116,3 +4116,152 @@ mod egress_tests {
         assert!(!running(&pid), "the job's helper is still running");
     }
 }
+
+/// An op this node cannot run ends with `completed` code 1 on its result subject, as it
+/// always has, now naming the op, the node and the reason, so the scan can say why it
+/// failed. Nothing goes on the status subject: an `operation_completed` there reads as
+/// an op that ran and found nothing.
+#[cfg(test)]
+mod op_failure_tests {
+    use super::*;
+    use egress::state::EgressState;
+    use egress::testkit::{FakeNats, FakePlatform, direct_settings, http, refusing_port, resolver};
+    use serde_json::{Value, json};
+
+    const NODE: &str = "node-f";
+    const WF: &str = "wf-fail";
+
+    /// Runs `op_type` on a direct node with engine `ext` refusing every connection, and
+    /// returns the `completed` it published, the subject it went on, the message types
+    /// in order, and the port the engine was at.
+    async fn run_unreachable(
+        op_id: &str,
+        op_type: &str,
+        ext: &str,
+        data: Value,
+    ) -> (Value, String, Vec<String>, u16) {
+        let (_held, port) = refusing_port();
+        let nats = FakeNats::start().await;
+        let platform = FakePlatform::start(|_, _| (200, json!("word"))).await;
+        let st = EgressState::new(resolver(&[]));
+        st.apply_authorize(&direct_settings(1));
+        let ctx = OpCtx {
+            pub_clone: nats.client().await,
+            status_subj: format!("cfx.node.{NODE}.status"),
+            result_subj: format!("cfx.results.{NODE}"),
+            node_id: NODE.into(),
+            http: http(),
+            api_url: platform.url.clone(),
+            api_key: "cfk_node".into(),
+            egress: st,
+        };
+        let mut data = data;
+        if data.get("wordlist_url").is_some() {
+            data["wordlist_url"] = json!(format!("{}/wl", platform.url));
+        }
+        let cmd = json!({
+            "type": "operation", "operation_id": op_id, "workflow_id": WF,
+            "op_type": op_type, "pre_claimed": true, "data": data,
+        });
+        let client = ctx.pub_clone.clone();
+        ops::test_engines::with(&[(ext, port)], run_operation(cmd, ctx)).await;
+        client.flush().await.unwrap();
+        let done = nats.wait_for("completed").await.expect("no completed");
+        let subject = nats
+            .published()
+            .into_iter()
+            .find(|(_, v)| v["type"] == "completed")
+            .map(|(s, _)| s)
+            .unwrap();
+        (done, subject, nats.types(), port)
+    }
+
+    async fn assert_failed_with_reason(op_type: &str, ext: &str, engine: &str, data: Value) {
+        let op_id = format!("op-{op_type}-{}", data.as_object().map_or(0, |m| m.len()));
+        let (done, subject, types, port) = run_unreachable(&op_id, op_type, ext, data).await;
+        assert_eq!(subject, format!("cfx.results.{NODE}"), "{op_type}");
+        assert_eq!(done["code"], 1, "{op_type}: {done}");
+        assert_eq!(done["job_id"], format!("{WF}-{op_id}"), "{op_type}: {done}");
+        assert_eq!(done["workflow_id"], WF, "{op_type}: {done}");
+        assert_eq!(done["operation_id"], op_id.as_str(), "{op_type}: {done}");
+        assert_eq!(done["node_id"], NODE, "{op_type}: {done}");
+        let why = done["error"].as_str().unwrap_or_default();
+        assert!(
+            why.starts_with(&format!(
+                "{engine} daemon unreachable on 127.0.0.1:{port} ("
+            )),
+            "{op_type}: {done}"
+        );
+        assert!(
+            why.ends_with(&format!("Is `{engine} --daemon` running?")),
+            "{op_type}: {done}"
+        );
+        assert!(
+            !types.iter().any(|t| t == "operation_completed"),
+            "{op_type} reported an op that never ran as done: {types:?}"
+        );
+        assert!(!op_is_done(&op_id), "{op_type}");
+    }
+
+    #[tokio::test]
+    async fn a_vuln_scan_with_plessor_down_says_so() {
+        let data = json!({"target": "http://127.0.0.1:9/"});
+        assert_failed_with_reason("vuln-scan-1", "cortex", "plessor", data).await;
+    }
+
+    #[tokio::test]
+    async fn a_service_scan_with_toolmark_down_says_so() {
+        let data = json!({"target": "http://127.0.0.1:9/"});
+        assert_failed_with_reason("service-enum-1", "scout", "toolmark", data).await;
+    }
+
+    #[tokio::test]
+    async fn a_crawl_with_ambulo_down_says_so() {
+        let data = json!({"seed": "http://127.0.0.1:9/"});
+        assert_failed_with_reason("web-crawl-1", "mach", "ambulo", data).await;
+    }
+
+    #[tokio::test]
+    async fn a_takeover_check_with_voyage_down_says_so() {
+        let data = json!({"domain": "example.test"});
+        assert_failed_with_reason("takeover-1", "voyage", "voyage", data).await;
+    }
+
+    #[tokio::test]
+    async fn origin_discovery_with_voyage_down_says_so() {
+        let data = json!({"domain": "example.test"});
+        assert_failed_with_reason("origin-discovery-1", "voyage", "voyage", data).await;
+    }
+
+    #[tokio::test]
+    async fn subdomain_enumeration_with_voyage_down_says_so() {
+        let data = json!({"domain": "example.test", "disable_active": true});
+        assert_failed_with_reason("subdomain-enum-ds", "voyage", "voyage", data).await;
+    }
+
+    #[tokio::test]
+    async fn a_port_probe_with_doorward_down_says_so() {
+        let data = json!({"host": "127.0.0.1", "port": 22});
+        assert_failed_with_reason("network-scan-ds", "pulse", "doorward", data).await;
+    }
+
+    #[tokio::test]
+    async fn a_port_batch_with_doorward_down_says_so() {
+        let data = json!({"targets": ["127.0.0.1"], "ports": "22", "tasks": 1});
+        assert_failed_with_reason("network-scan-db", "pulse", "doorward", data).await;
+    }
+
+    /// A probe that could not reach ambulo used to be reported as done with nothing
+    /// found, which reads exactly like a path that is not there.
+    #[tokio::test]
+    async fn a_content_probe_with_ambulo_down_says_so() {
+        let data = json!({"mode": "probe", "probe_url": "http://127.0.0.1:9/x"});
+        assert_failed_with_reason("content-discovery-ds", "mach", "ambulo", data).await;
+    }
+
+    #[tokio::test]
+    async fn a_content_scan_with_ambulo_down_says_so() {
+        let data = json!({"url": "http://127.0.0.1:9/", "wordlist_url": ""});
+        assert_failed_with_reason("content-discovery-db", "mach", "ambulo", data).await;
+    }
+}

@@ -47,6 +47,16 @@ pub(crate) fn engine_addr(ext: &str) -> String {
     }
 }
 
+/// Why an op failed when engine `ext` could not be reached, worded for whoever reads the
+/// scan as well as for the node's log.
+pub(crate) fn unreachable(ext: &str, e: &std::io::Error) -> String {
+    let name = crate::toolchain::public_name(ext);
+    format!(
+        "{name} daemon unreachable on {} ({e}). Is `{name} --daemon` running?",
+        engine_addr(ext)
+    )
+}
+
 /// Why an op could not get its request to an engine.
 pub(crate) enum EngineOpen {
     /// The engine is not listening, or the request could not be written. The op
@@ -132,6 +142,33 @@ pub async fn publish_egress(
         .await;
 }
 
+/// End an op that could not run at all: `completed` with code 1 on the result subject,
+/// as nodes have always sent it, now naming the op, the node and why. A control plane
+/// that does not read the reason sees the same `completed` it always has. Nothing goes on
+/// the status subject, where an `operation_completed` reads as an op that ran and found
+/// nothing.
+pub async fn publish_failed(
+    pubc: &async_nats::Client,
+    result_subj: &str,
+    op_id: &str,
+    workflow_id: &str,
+    node_id: &str,
+    why: &str,
+) {
+    let msg = serde_json::json!({
+        "type": "completed",
+        "job_id": format!("{workflow_id}-{op_id}"),
+        "workflow_id": workflow_id,
+        "operation_id": op_id,
+        "node_id": node_id,
+        "code": 1,
+        "error": why,
+    });
+    let _ = pubc
+        .publish(result_subj.to_string(), msg.to_string().into())
+        .await;
+}
+
 /// End an op that did not run: a coverage note saying why, the egress summary when it
 /// has one, then `operation_completed` with no findings and the reason as its error.
 /// The op is not marked done, so a later dispatch runs it.
@@ -171,7 +208,7 @@ pub async fn publish_refused(
 /// The NATS publish context the terminal helpers need, borrowed from the locals
 /// each op already destructured out of [`OpEnv`]. Owns the two byte-identical
 /// terminal sequences every single-daemon op repeats: the connect-failure
-/// `completed{code:1}` and the success tail (`completed{code:0}` + optional final
+/// `completed{code:1}` with its reason, and the success tail (`completed{code:0}` + optional final
 /// `operation_progress` + `operation_completed`). The per-event relay (finding ->
 /// `result`, throttled progress) stays in each op, since its event vocabulary and
 /// payload shaping differ.
@@ -232,18 +269,18 @@ impl Relay<'_> {
         .await;
     }
 
-    /// The engine daemon was unreachable: publish `completed{code:1}` on the
-    /// result subject. The op logs its own engine-specific message and returns.
-    pub async fn publish_failed(&self) {
-        let msg = serde_json::json!({
-            "type": "completed",
-            "job_id": self.job_id(),
-            "code": 1
-        });
-        let _ = self
-            .pubc
-            .publish(self.result_subj.to_string(), msg.to_string().into())
-            .await;
+    /// The op could not run: log why, then publish it. See [`publish_failed`].
+    pub async fn fail(&self, why: &str) {
+        eprintln!("[op] FAIL {why}");
+        publish_failed(
+            self.pubc,
+            self.result_subj,
+            self.op_id,
+            self.workflow_id,
+            self.node_id,
+            why,
+        )
+        .await;
     }
 
     /// Publish the success terminal sequence: `completed{code:0}` on the result

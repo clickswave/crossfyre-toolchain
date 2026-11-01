@@ -313,11 +313,7 @@ pub async fn handle(env: OpEnv) {
             return;
         }
         Err(super::EngineOpen::Unreachable(e)) => {
-            eprintln!(
-                "[op] FAIL plessor daemon unreachable on {} ({e}). Is `plessor --daemon` running?",
-                super::engine_addr("cortex")
-            );
-            relay.publish_failed().await;
+            relay.fail(&super::unreachable("cortex", &e)).await;
             return;
         }
     }

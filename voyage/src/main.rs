@@ -132,12 +132,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Completions subcommand - print a shell completion script (no daemon needed)
     // -----------------------------------------------------------------------
     if let Some(Commands::Completions { shell }) = &cli.command {
-        clap_complete::generate(
-            *shell,
-            &mut Cli::command(),
-            "voyage",
-            &mut std::io::stdout(),
-        );
+        let mut script = Vec::new();
+        clap_complete::generate(*shell, &mut Cli::command(), "voyage", &mut script);
+        print_all(&script)?;
         return Ok(());
     }
 
@@ -279,6 +276,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// Write `bytes` to stdout. A reader that stops early, as `head` does, closes the pipe,
+/// and that is not an error: the rest was not wanted. clap_complete panics on any failed
+/// write, so what it generates is kept in memory and written from here.
+fn print_all(bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    match out.write_all(bytes).and_then(|()| out.flush()) {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        done => done,
+    }
 }
 
 async fn handle_db(args: DbArgs, port: u16) -> Result<(), Box<dyn std::error::Error>> {

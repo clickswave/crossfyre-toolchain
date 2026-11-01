@@ -247,11 +247,7 @@ async fn run_toolmark(
             return;
         }
         Err(super::EngineOpen::Unreachable(e)) => {
-            eprintln!(
-                "[op] FAIL toolmark daemon unreachable on {} ({e}). Is `toolmark --daemon` running?",
-                super::engine_addr("scout")
-            );
-            relay.publish_failed().await;
+            relay.fail(&super::unreachable("scout", &e)).await;
             return;
         }
     }

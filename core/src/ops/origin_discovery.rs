@@ -106,16 +106,7 @@ pub async fn handle(env: OpEnv) {
             }
         }
         Err(e) => {
-            eprintln!("[op] FAIL Cannot connect to voyage daemon: {e}");
-            let msg = serde_json::json!({
-                "type": "completed",
-                "job_id": format!("{}-{}", workflow_id, op_id),
-                "workflow_id": workflow_id,
-                "code": 1
-            });
-            let _ = pub_clone
-                .publish(result_subj.clone(), msg.to_string().into())
-                .await;
+            relay.fail(&super::unreachable("voyage", &e)).await;
             return;
         }
     }

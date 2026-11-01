@@ -37,6 +37,8 @@
 //! which the caller passes through. The last line is always a `completed`, and the
 //! exit status says the same thing: 0 when the script finished, 1 when it raised,
 //! 2 when the job could not be read or names another protocol.
+//!
+//! `cfx-script --version` prints `cfx-script <version>` and reads no job.
 
 mod runtime;
 
@@ -58,6 +60,12 @@ struct Job {
 }
 
 fn main() {
+    // `cfx-script --version` says which one is installed, for an update that finds no
+    // record of it. Anything else is a job on stdin, as always.
+    if std::env::args_os().nth(1).is_some_and(|a| a == "--version") {
+        println!("cfx-script {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let mut pipe = Messages::new(take_stdout());
     let job = match read_job() {
         Ok(job) => job,

@@ -62,9 +62,13 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(out)
 
     def _redirect(self):
-        host = self.headers.get("Host") or "127.0.0.1"
+        # The address this server listens on, not the client's Host header, which
+        # would put whatever the client sent into a response header. The path loses
+        # any CR or LF for the same reason.
+        host, port = self.server.server_address[:2]
+        path = self.path.replace("\r", "").replace("\n", "")
         self.send_response(302)
-        self.send_header("Location", f"https://{host}{self.path}")
+        self.send_header("Location", f"https://{host}:{port}{path}")
         self.send_header("Content-Length", "0")
         self.end_headers()
 

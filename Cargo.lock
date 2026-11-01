@@ -110,7 +110,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "ambulo"
-version = "0.0.20"
+version = "0.0.21"
 dependencies = [
  "adaptive",
  "base64 0.22.1",
@@ -673,7 +673,7 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
 name = "cfx-script"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "cfx_core",
  "dguard",
@@ -1232,7 +1232,7 @@ checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 
 [[package]]
 name = "crossfyre"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "cfx_bridge",
  "cfx_core",
@@ -1550,7 +1550,7 @@ dependencies = [
 
 [[package]]
 name = "doorward"
-version = "0.0.13"
+version = "0.0.14"
 dependencies = [
  "adaptive",
  "cfx_tui",
@@ -2845,8 +2845,6 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 [[package]]
 name = "lru"
 version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "227748d55f2f0ab4735d87fd623798cb6b664512fe979705f829c9f81c934465"
 
 [[package]]
 name = "lru"
@@ -3033,7 +3031,7 @@ dependencies = [
 
 [[package]]
 name = "node"
-version = "0.1.48"
+version = "0.1.49"
 dependencies = [
  "cfx_core",
  "clap",
@@ -3517,7 +3515,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "plessor"
-version = "0.0.30"
+version = "0.0.31"
 dependencies = [
  "adaptive",
  "aes-gcm",
@@ -5528,7 +5526,7 @@ checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
 name = "toolmark"
-version = "0.0.12"
+version = "0.0.13"
 dependencies = [
  "adaptive",
  "base64 0.22.1",
@@ -5874,7 +5872,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voyage"
-version = "0.0.13"
+version = "0.0.14"
 dependencies = [
  "adaptive",
  "cfx_tui",
