@@ -115,7 +115,20 @@ pub async fn handle(env: OpEnv) {
                 return;
             }
             Ok(Err(super::EngineOpen::Unreachable(e))) => {
-                eprintln!("[op] FAIL Cannot connect to ambulo daemon: {e}");
+                // ambulo was never asked, so this is not a path that is missing. Reported
+                // as done with nothing found, it read exactly like one.
+                let why = super::unreachable("mach", &e);
+                eprintln!("[op] FAIL {why}");
+                super::publish_failed(
+                    &pub_clone,
+                    &result_subj,
+                    &op_id,
+                    &workflow_id,
+                    &node_id,
+                    &why,
+                )
+                .await;
+                return;
             }
         }
 
@@ -212,12 +225,20 @@ pub async fn handle(env: OpEnv) {
         // Fallback to local common.txt
         wordlist_path = "/opt/crossfyre/wordlists/common.txt".to_string();
         if !std::path::Path::new(&wordlist_path).exists() {
-            eprintln!("[op] FAIL No wordlist available");
-            let msg = serde_json::json!({
-                "type": "completed", "job_id": op_id,
-                "code": 1
-            });
-            let _ = pub_clone.publish(result_subj, msg.to_string().into()).await;
+            let why = format!(
+                "no wordlist: the scan's wordlist could not be downloaded and {wordlist_path} \
+                 does not exist"
+            );
+            eprintln!("[op] FAIL {why}");
+            super::publish_failed(
+                &pub_clone,
+                &result_subj,
+                &op_id,
+                &workflow_id,
+                &node_id,
+                &why,
+            )
+            .await;
             return;
         }
     }
@@ -569,15 +590,17 @@ pub async fn handle(env: OpEnv) {
                 return;
             }
             Err(super::EngineOpen::Unreachable(e)) => {
-                eprintln!("[op] FAIL Cannot connect to ambulo daemon: {e}");
-                let msg = serde_json::json!({
-                    "type": "completed",
-                    "job_id": format!("{}-{}", workflow_id, op_id),
-                    "code": 1
-                });
-                let _ = pub_clone
-                    .publish(result_subj.clone(), msg.to_string().into())
-                    .await;
+                let why = super::unreachable("mach", &e);
+                eprintln!("[op] FAIL {why}");
+                super::publish_failed(
+                    &pub_clone,
+                    &result_subj,
+                    &op_id,
+                    &workflow_id,
+                    &node_id,
+                    &why,
+                )
+                .await;
                 return;
             }
         }

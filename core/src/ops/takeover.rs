@@ -72,12 +72,8 @@ pub async fn handle(env: OpEnv) {
             relay.refuse(&why).await;
             return;
         }
-        Err(super::EngineOpen::Unreachable(_)) => {
-            eprintln!(
-                "[op] FAIL voyage daemon unreachable on {}. Is `voyage --daemon` running?",
-                super::engine_addr("voyage")
-            );
-            relay.publish_failed().await;
+        Err(super::EngineOpen::Unreachable(e)) => {
+            relay.fail(&super::unreachable("voyage", &e)).await;
             return;
         }
     };

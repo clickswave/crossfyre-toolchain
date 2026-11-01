@@ -246,20 +246,20 @@ pub async fn handle(env: OpEnv) {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_secs();
+                let why = super::unreachable("pulse", &e);
                 if now_secs.saturating_sub(LAST_LOG.load(Ordering::Relaxed)) >= 60 {
                     LAST_LOG.store(now_secs, Ordering::Relaxed);
-                    eprintln!(
-                        "[op] FAIL doorward daemon unreachable on {} ({e}). Is `doorward --daemon` running? (suppressing further messages for 60s)",
-                        super::engine_addr("pulse")
-                    );
+                    eprintln!("[op] FAIL {why} (suppressing further messages for 60s)");
                 }
-                let msg = serde_json::json!({
-                    "type": "completed",
-                    "job_id": format!("{}-{}", workflow_id, op_id),
-                    "workflow_id": workflow_id,
-                    "code": 1
-                });
-                let _ = pub_clone.publish(result_subj, msg.to_string().into()).await;
+                super::publish_failed(
+                    &pub_clone,
+                    &result_subj,
+                    &op_id,
+                    &workflow_id,
+                    &node_id,
+                    &why,
+                )
+                .await;
             }
         }
         return;
@@ -430,19 +430,20 @@ pub async fn handle(env: OpEnv) {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs();
+            let why = super::unreachable("pulse", &e);
             if now_secs.saturating_sub(LAST_LOG.load(Ordering::Relaxed)) >= 60 {
                 LAST_LOG.store(now_secs, Ordering::Relaxed);
-                eprintln!(
-                    "[op] FAIL Cannot connect to doorward daemon: {e} (suppressing further messages for 60s)"
-                );
+                eprintln!("[op] FAIL {why} (suppressing further messages for 60s)");
             }
-            let msg = serde_json::json!({
-                "type": "completed",
-                "job_id": format!("{}-{}", workflow_id, op_id),
-                "workflow_id": workflow_id,
-                "code": 1
-            });
-            let _ = pub_clone.publish(result_subj, msg.to_string().into()).await;
+            super::publish_failed(
+                &pub_clone,
+                &result_subj,
+                &op_id,
+                &workflow_id,
+                &node_id,
+                &why,
+            )
+            .await;
         }
     }
 }

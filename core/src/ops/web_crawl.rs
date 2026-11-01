@@ -196,11 +196,7 @@ pub async fn handle(env: OpEnv) {
             return;
         }
         Err(super::EngineOpen::Unreachable(e)) => {
-            eprintln!(
-                "[op] FAIL ambulo daemon unreachable on {} for crawl ({e}). Is `ambulo --daemon` running?",
-                super::engine_addr("mach")
-            );
-            relay.publish_failed().await;
+            relay.fail(&super::unreachable("mach", &e)).await;
             return;
         }
     }
