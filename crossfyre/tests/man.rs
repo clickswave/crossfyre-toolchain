@@ -21,6 +21,25 @@ fn man_page_names_crossfyre_and_its_subcommands() {
     }
 }
 
+/// `crossfyre man | head` closes the pipe early, which is not a failure of the command.
+#[test]
+fn a_reader_that_stops_early_is_not_an_error() {
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    drop(reader);
+    let out = Command::new(env!("CARGO_BIN_EXE_crossfyre"))
+        .arg("man")
+        .stdout(writer)
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("runs");
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn man_is_hidden_from_help() {
     let out = Command::new(env!("CARGO_BIN_EXE_crossfyre"))
