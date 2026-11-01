@@ -1,6 +1,6 @@
 # crossfyre mcp
 
-`crossfyre mcp` serves `toolmark` and `plessor` to an MCP client over stdio. An agent can fingerprint a service, test endpoints for injection and replay single requests. It needs no account. With an MCP key it can also reach a Crossfyre Cloud workspace; see [Cloud](#cloud), which is not live yet. Tool calls are refused for any destination the scope file you write does not list; requests an engine makes on its own are covered under [Known limits](#known-limits).
+`crossfyre mcp` serves `toolmark` and `plessor` to an MCP client over stdio. An agent can fingerprint a service, test endpoints for injection and replay single requests. It needs no account. With an MCP key it can also reach a Crossfyre Cloud workspace; see [Cloud](#cloud). Tool calls are refused for any destination the scope file you write does not list; requests an engine makes on its own are covered under [Known limits](#known-limits).
 
 It is in crossfyre 0.1.38 and later, and needs the `toolmark` and `plessor` released with it. An older engine daemon is refused before anything is sent, because it cannot be told to dial only the addresses the server checked or to leave redirects alone.
 
@@ -167,13 +167,13 @@ Limits that come with it:
 
 ## Cloud
 
-**The Cloud side is not live yet.** The platform routes these tools call, the Agent access page that makes keys, and the approval page are not deployed, so there is nothing to log in to today. What follows describes the client, which is built and tested against a stand-in for the platform.
+Cloud mode has been live on crossfyre.io since 1 November 2026. Setting it up from the dashboard side is covered at https://crossfyre.io/docs/mcp; this section describes the client.
 
 With an MCP key, the same `crossfyre mcp` also reaches one workspace on the platform: its scans, results, verdicts, assets and nodes, and, with a launch key, scans started on the workspace's nodes. Without a key nothing changes: the tool list, the results and the audit log are what they are above.
 
 ### Keys
 
-As the platform is designed, a key is made in Settings, Agent access. It is `cfm_` and 32 hex characters, bound to one workspace, and expires after 7, 30 or 90 days. It is one of two kinds:
+A key is made in the dashboard's Settings, Agent access. It is `cfm_` and 32 hex characters, bound to one workspace, and expires after 7, 30 or 90 days. It is one of two kinds:
 
 - read: scans, results, verdicts, assets, nodes and the scope;
 - launch: also starts and stops scans on the workspace's nodes. Making one asks you to confirm that you are authorised to test every entry in the workspace's scope at that moment, and the key can launch only against those entries, as long as they stay in the scope. An entry added later needs confirming again.
