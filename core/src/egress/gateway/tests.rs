@@ -397,6 +397,9 @@ async fn connections_over_the_cap_are_closed_unanswered() {
 /// to open anything else.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connections_that_never_authenticate_count_against_the_cap() {
+    // Both ends of 300 connections are in this process, past the 256 descriptors a
+    // macOS shell starts with. The node raises its limit at start the same way.
+    crate::os::raise_open_file_limit().unwrap();
     let gw = Gateway::bind_with(resolver(&[]), Timeouts::default(), IDLE, 1)
         .await
         .unwrap();

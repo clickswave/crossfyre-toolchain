@@ -60,16 +60,26 @@ pub fn direct_settings(rev: i64) -> Value {
     json!({"v": 1, "rev": rev, "mode": "direct", "proxy": null})
 }
 
-/// A port that refuses every connection for as long as the socket returned with it is
-/// held. It is bound, never listens, and is not shared, so no listener another test
-/// starts meanwhile can be given the same port. A port taken from a listener and then
-/// freed can be, and that test's "dead" proxy then answers.
-pub fn refusing_port() -> (tokio::net::TcpSocket, u16) {
-    let s = tokio::net::TcpSocket::new_v4().unwrap();
-    s.set_reuseaddr(false).unwrap();
-    s.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-    let port = s.local_addr().unwrap().port();
-    (s, port)
+/// A port that refuses every connection for as long as the value returned with it is
+/// held. The port is the local end of a connection this makes to itself, so no
+/// listener another test starts meanwhile can be given it, and a connection from
+/// anywhere else finds nothing listening and is reset. A port taken from a listener
+/// and then freed can be given out again, and that test's "dead" proxy then answers.
+///
+/// A socket that is bound and never listens holds the port too, but macOS drops a
+/// connection to it without an answer, so the caller waits out its connect timeout
+/// instead of being refused.
+pub fn refusing_port() -> (HeldPort, u16) {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let near = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+    let (far, _) = l.accept().unwrap();
+    let port = near.local_addr().unwrap().port();
+    (HeldPort { _ends: (near, far) }, port)
+}
+
+/// Both ends of the connection that holds a [`refusing_port`].
+pub struct HeldPort {
+    _ends: (std::net::TcpStream, std::net::TcpStream),
 }
 
 /// A client for the fakes that ignores any proxy variable the test runs under.
