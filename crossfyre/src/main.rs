@@ -631,12 +631,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 None => cfx_core::toolchain::print_extension_usage("remove"),
             },
             ExtensionAction::Update { name, force } => {
-                cfx_core::toolchain::install::update(
+                let updated = cfx_core::toolchain::install::update(
                     name.as_deref(),
                     env!("CARGO_PKG_VERSION"),
                     force,
                 )
                 .await?;
+                if !updated.succeeded() {
+                    std::process::exit(1);
+                }
             }
             ExtensionAction::Start { name } => cfx_core::toolchain::service::start(&name)?,
             ExtensionAction::Stop { name } => cfx_core::toolchain::service::stop(&name)?,
@@ -738,12 +741,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // Here and in `node init` only, both run by a person: the node's own update
             // runs as a root service and leaves a home directory alone.
             cfx_core::toolchain::rcfile::fix_for_invoking_user();
-            let self_updated = updated?;
-            if self_updated && cfx_core::toolchain::service::node_service_exists() {
+            let updated = updated?;
+            if updated.restart && cfx_core::toolchain::service::node_service_exists() {
                 step("Restarting the node service to pick up the new binary...");
                 let _ = cfx_core::toolchain::service::restart(
                     cfx_core::toolchain::service::NODE_TARGET,
                 );
+            }
+            // A component that needed an update and did not get one fails the command,
+            // after the restart that whatever did update needs.
+            if !updated.succeeded() {
+                std::process::exit(1);
             }
         }
         Commands::Status => {
