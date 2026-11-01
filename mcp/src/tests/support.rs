@@ -24,8 +24,10 @@ pub(crate) struct TempDir(PathBuf);
 
 impl TempDir {
     pub(crate) fn new() -> Self {
-        let p =
-            std::env::temp_dir().join(format!("cfx-mcp-test-{}", uuid::Uuid::new_v4().simple()));
+        // Short: a fake Workbench's socket goes in control/ under it, and macOS refuses a
+        // socket path over 103 bytes, 49 of which its temp directory already takes.
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let p = std::env::temp_dir().join(format!("cfx-mcp-{}", &id[..16]));
         std::fs::create_dir(&p).expect("temp dir");
         #[cfg(unix)]
         {

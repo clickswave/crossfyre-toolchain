@@ -13,14 +13,14 @@ use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Named short: the Workbench stand-in puts its socket three levels under this, and
+/// macOS refuses a socket path over 103 bytes, 49 of which its temp directory takes.
 fn temp_dir(tag: &str) -> std::path::PathBuf {
+    static N: AtomicUsize = AtomicUsize::new(0);
     let d = std::env::temp_dir().join(format!(
-        "crossfyre-mcp-{tag}-{}-{}",
+        "cfx-{tag}-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        N.fetch_add(1, Ordering::SeqCst)
     ));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(d.join("mcp")).unwrap();
