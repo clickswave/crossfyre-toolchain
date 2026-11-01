@@ -132,12 +132,9 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             .await
         }
         Some(Commands::Completions { shell }) => {
-            clap_complete::generate(
-                shell,
-                &mut Cli::command(),
-                "plessor",
-                &mut std::io::stdout(),
-            );
+            let mut script = Vec::new();
+            clap_complete::generate(shell, &mut Cli::command(), "plessor", &mut script);
+            print_all(&script)?;
             Ok(())
         }
         None => {
@@ -243,6 +240,18 @@ fn inject_requests(
             (origin, req)
         })
         .collect())
+}
+
+/// Write `bytes` to stdout. A reader that stops early, as `head` does, closes the pipe,
+/// and that is not an error: the rest was not wanted. clap_complete panics on any failed
+/// write, so what it generates is kept in memory and written from here.
+fn print_all(bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    match out.write_all(bytes).and_then(|()| out.flush()) {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        done => done,
+    }
 }
 
 async fn send_stream(
