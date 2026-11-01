@@ -534,6 +534,11 @@ async fn the_end_of_an_upload_reaches_an_https_proxy() {
 /// The bytes of a connection that is still open are in the summary. An engine's client
 /// keeps its connections in a pool after the op's last request, and the op's summary is
 /// taken as soon as the engine says it is done, before the pool closes them.
+///
+/// One tunnel carries three requests and stays open, as a pooled connection does. A
+/// pooling client is not used here: it can open a second connection when a request
+/// starts before the previous one is back in its pool, and how many it opens is not
+/// what this checks.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_summary_counts_the_bytes_of_open_connections() {
     let rec = Recorder::start(to_loopback).await;
@@ -542,22 +547,10 @@ async fn the_summary_counts_the_bytes_of_open_connections() {
     let lease = gw
         .lease("op", "proxy-1", Arc::new(recorder_upstream(&rec)), false)
         .unwrap();
-    // An engine's client: a keep-alive pool, sending through the lease's URL.
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .proxy(reqwest::Proxy::all(lease.proxy_url()).unwrap())
-        .build()
-        .unwrap();
+    let mut open = through(&lease, "app.example.test", fx.port).await.unwrap();
     for _ in 0..3 {
-        let body = client
-            .get(format!("http://app.example.test:{}/", fx.port))
-            .send()
-            .await
-            .unwrap()
-            .text()
-            .await
-            .unwrap();
-        assert_eq!(body.len(), 5000);
+        let body = keep_alive_get(&mut open, "app.example.test").await;
+        assert_eq!(body, 5000);
     }
     let mut s = lease.summary();
     for _ in 0..50 {
@@ -567,16 +560,38 @@ async fn the_summary_counts_the_bytes_of_open_connections() {
         tokio::time::sleep(Duration::from_millis(20)).await;
         s = lease.summary();
     }
-    assert_eq!(
-        s["connections"], 1,
-        "the pool did not keep its connection: {s}"
-    );
+    assert_eq!(s["connections"], 1, "{s}");
     assert!(s["bytes_up"].as_u64().unwrap() > 0, "{s}");
     assert!(
         s["bytes_down"].as_u64().unwrap() >= 15000,
         "15000 body bytes came back through the open connection: {s}"
     );
-    drop(client);
+    assert_eq!(fx.connections(), 1);
+    drop(open);
+}
+
+/// One GET on a connection that stays open afterwards. Returns the body's length.
+async fn keep_alive_get(t: &mut Tunnel, host: &str) -> usize {
+    t.write_all(format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        let mut b = [0u8; 1];
+        t.read_exact(&mut b).await.unwrap();
+        head.push(b[0]);
+    }
+    let head = String::from_utf8(head).unwrap();
+    let len: usize = head
+        .lines()
+        .find_map(|l| l.strip_prefix("Content-Length: "))
+        .expect("a Content-Length")
+        .trim()
+        .parse()
+        .unwrap();
+    let mut body = vec![0u8; len];
+    t.read_exact(&mut body).await.unwrap();
+    len
 }
 
 /// A team proxy that reaches only one kind of address: the other kind is answered
