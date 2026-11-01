@@ -11,22 +11,33 @@ use std::collections::HashMap;
 ///
 /// Every source is best-effort. One failing or timing out costs its results and
 /// nothing else, so the merge below runs over whatever came back.
+///
+/// The sources are third parties, not the target, but they are asked about the
+/// target, so the questions go out the way the rest of the op's traffic does.
 pub async fn execute(
     domain: &str,
     user_agent: &str,
     exclude_sources: &[String],
+    egress: &transport::Egress,
 ) -> Result<HashMap<String, String>, Box<dyn std::error::Error + Send + Sync>> {
-    let client = reqwest::Client::builder()
-        .user_agent(user_agent)
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?;
+    // A plain client that says who it is: no browser emulation for a provider's API.
+    let client = transport::build_client(
+        transport::ClientConfig {
+            timeout: Some(std::time::Duration::from_secs(15)),
+            redirect: transport::Redirect::Limited(10),
+            user_agent: Some(user_agent.to_string()),
+            emulate: false,
+            ..Default::default()
+        },
+        egress,
+    )?;
 
     let skipped = |name: &str| exclude_sources.iter().any(|s| s == name);
 
     // Each arm resolves to the source's names, or an empty vec if it was
     // excluded or errored. `join!` polls them on one task, so this needs no
     // spawning and no 'static bounds on the borrowed client.
-    let (crtsh, certspotter, hackertarget, alienvault, urlscan) = tokio::join!(
+    let (crtsh, certspotter, hackertarget, alienvault, urlscan, subdomain_center) = tokio::join!(
         async {
             if skipped("crt.sh") {
                 return vec![];
@@ -87,15 +98,29 @@ pub async fn execute(
                 }
             }
         },
+        async {
+            if skipped("subdomain.center") {
+                return vec![];
+            }
+            match crate::scanners::providers::subdomain_center::fetch(&client, domain).await {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("[WARN] subdomain.center error: {e}");
+                    vec![]
+                }
+            }
+        },
     );
 
     // Merged in a fixed order so the recorded `source` for a name found by more
     // than one provider is deterministic (last writer wins), regardless of which
-    // request happened to finish first.
+    // request happened to finish first. subdomain.center aggregates the others,
+    // so it goes first and a name keeps the source that found it originally.
     let mut results: HashMap<String, String> = HashMap::new();
-    for (prefix, source) in crtsh
+    for (prefix, source) in subdomain_center
         .into_iter()
-        .map(|p| (p, "crt.sh"))
+        .map(|p| (p, "subdomain.center"))
+        .chain(crtsh.into_iter().map(|p| (p, "crt.sh")))
         .chain(certspotter.into_iter().map(|p| (p, "certspotter")))
         .chain(hackertarget.into_iter().map(|p| (p, "hackertarget")))
         .chain(urlscan.into_iter().map(|p| (p, "urlscan")))

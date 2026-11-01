@@ -26,14 +26,24 @@ fn run_within(stdin: &str, limit: Duration) -> Run {
     run_with_env(stdin, &[], limit)
 }
 
+/// Held while a helper starts. macOS has no pipe2, so std makes each pipe and marks it
+/// close-on-exec in a second step, and a helper that another test thread starts in
+/// between inherits the pipe. The descriptor test then counts it as the helper's leak.
+static SPAWNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn run_with_env(stdin: &str, env: &[(&str, &std::ffi::OsStr)], limit: Duration) -> Run {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cfx-script"))
-        .envs(env.iter().copied())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("cfx-script starts");
+    let mut child = {
+        let _alone = SPAWNING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Command::new(env!("CARGO_BIN_EXE_cfx-script"))
+            .envs(env.iter().copied())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("cfx-script starts")
+    };
     // A helper that waits for something that never happens would hang the whole run, so
     // it is killed after `limit`. The child is not reaped until wait_with_output returns,
     // so its pid cannot have been reused when the kill is sent.

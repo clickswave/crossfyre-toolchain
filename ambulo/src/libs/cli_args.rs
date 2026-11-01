@@ -285,6 +285,11 @@ pub struct ScanArgs {
     /// (stealth is the same as gentle).
     #[arg(long, default_value_t = format!("balanced"))]
     pub posture: String,
+
+    /// Where the scan's connections go. Not a flag: a scan run from the command line
+    /// inherits, and the daemon sets it from the egress wrapper a node sends.
+    #[arg(skip)]
+    pub egress: transport::Egress,
 }
 
 // Re-export FuzzArgs as Args so the rest of the codebase is unchanged.
@@ -420,6 +425,18 @@ impl ScanArgs {
             .map_err(|e| e.to_string())?;
 
         Ok(())
+    }
+}
+
+/// Scan arguments as the command line gives them by default, for tests.
+#[cfg(test)]
+pub(crate) fn defaults_for_tests() -> ScanArgs {
+    match Cli::try_parse_from(["ambulo", "scan", "--url", "http://h/::FUZZ::"])
+        .unwrap()
+        .command
+    {
+        Some(Commands::Scan(args)) => args,
+        other => panic!("not a scan: {other:?}"),
     }
 }
 

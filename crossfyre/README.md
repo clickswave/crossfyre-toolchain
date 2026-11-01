@@ -20,7 +20,11 @@ crossfyre update                # update the CLI and installed engines from the 
 
 crossfyre status                # overview: daemons, engines, database
 crossfyre doctor                # check the environment for common problems
+
+crossfyre mcp                   # serve toolmark and plessor to an MCP client (see MCP.md)
 ```
+
+`crossfyre mcp`, from 0.1.38, is described in [MCP.md](MCP.md): the scope file it reads, the tools, and how to add it to a client.
 
 ## Running scripts
 

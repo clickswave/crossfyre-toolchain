@@ -17,7 +17,9 @@ pub async fn handle(env: OpEnv) {
         http,
         api_url,
         api_key,
+        egress,
     } = env;
+    let lease = egress.as_deref();
 
     // Wordlist-free crawl via the ambulo daemon (port 4441),
     // streaming discovered URLs into the shared asset graph.
@@ -63,7 +65,7 @@ pub async fn handle(env: OpEnv) {
     // request auth (headers/cookies) and hand it to ambulo.
     if let Some(cid) = data["credential_id"].as_str().filter(|s| !s.is_empty()) {
         let host = target_host(&seed);
-        match creds::resolve_auth(&http, &api_url, &api_key, cid, &host).await {
+        match creds::resolve_auth(&http, &api_url, &api_key, cid, &host, lease).await {
             Ok(auth) => {
                 if let Some(cr) = crawl_req.as_object_mut() {
                     cr.insert("auth".into(), auth);
@@ -80,6 +82,7 @@ pub async fn handle(env: OpEnv) {
         op_id: &op_id,
         workflow_id: &workflow_id,
         node_id: &node_id,
+        egress: lease,
     };
 
     let mut found_count: i64 = 0;
@@ -87,16 +90,8 @@ pub async fn handle(env: OpEnv) {
     let mut total: i64 = 0;
     let mut last_prog = std::time::Instant::now();
 
-    let conn = tokio::net::TcpStream::connect(crate::toolchain::config::engine_addr("mach")).await;
-    match conn {
-        Ok(stream) => {
-            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-            let (reader, mut writer) = stream.into_split();
-            let mut req_str = dguard::encode(&crawl_req);
-            req_str.push('\n');
-            let _ = writer.write_all(req_str.as_bytes()).await;
-
-            let mut lines = BufReader::new(reader).lines();
+    match super::open_engine("mach", &crawl_req, lease).await {
+        Ok((mut lines, writer)) => {
             while let Ok(Some(line)) = lines.next_line().await {
                 if !workflow_id.is_empty() && is_workflow_cancelled(&workflow_id) {
                     println!(
@@ -196,10 +191,14 @@ pub async fn handle(env: OpEnv) {
                 }
             }
         }
-        Err(e) => {
+        Err(super::EngineOpen::Refused(why)) => {
+            relay.refuse(&why).await;
+            return;
+        }
+        Err(super::EngineOpen::Unreachable(e)) => {
             eprintln!(
                 "[op] FAIL ambulo daemon unreachable on {} for crawl ({e}). Is `ambulo --daemon` running?",
-                crate::toolchain::config::engine_addr("mach")
+                super::engine_addr("mach")
             );
             relay.publish_failed().await;
             return;

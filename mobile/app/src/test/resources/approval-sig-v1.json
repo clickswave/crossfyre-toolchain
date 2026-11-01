@@ -1,0 +1,13 @@
+{
+  "about": "A P-256 approval signature made by the JVM's java.security, as Android's keystore makes them. Shared with the platform's verifier.",
+  "public_key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEWZvyGyUjzDybeSXqtr4NoAu90IqPu1OkdJeIzvZBPF0v71fVpFVOYVcQgwP5tHtdC3xI1KcvR3ow7JYiydCyHA==",
+  "fingerprint": "c43d c7f8 29be 7f89",
+  "approval_id": "3f9c1e0b-6a2d-4b8e-9c71-0d5e2f4a8b13",
+  "decision": "approve",
+  "summary_json": "{\"action\":{\"label\":\"Launch a vulnerability scan\",\"risk\":[\"fleet\",\"active\",\"traffic\"],\"tool\":\"start_vuln_scan\",\"writes\":false},\"expires_at\":\"2026-10-30T09:22:44Z\",\"id\":\"3f9c1e0b-6a2d-4b8e-9c71-0d5e2f4a8b13\",\"nodes\":[{\"id\":\"n-1\",\"name\":\"fra-1\"},{\"id\":\"n-2\",\"name\":\"blr-2\"}],\"options\":{\"severity_min\":\"medium\"},\"reason\":\"Confirm the SQL injection found earlier\",\"request_digest\":\"5d41402abc4b2a76b9719d911017c5925d41402abc4b2a76b9719d911017c592\",\"requested_at\":\"2026-10-30T09:12:44Z\",\"requester\":{\"client\":\"agent-cli 2.1.4\",\"ip\":\"203.0.113.9\",\"key_name\":\"cfm_ab12cd34, kali laptop\",\"location\":\"Pune, IN\",\"username\":\"asha\"},\"targets\":[{\"admitted_by\":{\"added_by\":\"asha\",\"added_on\":\"2026-10-12\",\"entry\":\"app.example.com\",\"note\":\"SOW 14\"},\"host\":\"app.example.com\",\"target\":\"https://app.example.com\"}],\"v\":1,\"workspace\":{\"id\":\"8c0f2b7e-1d4a-4e55-a0a9-3b1f6c2d9e70\",\"name\":\"Acme external\",\"org\":\"Acme\"}}",
+  "digest": "2704f7c1a4e99037a8f4be8200497b486940373c219b149907b84476c18953fa",
+  "signed_at": 1793345642,
+  "approver_id": "5b0f6d0e-7a34-4c1b-9b43-0a8f6a5e2f11",
+  "signing_bytes_b64": "Y3Jvc3NmeXJlLWFwcHJvdmFsLXYxCjNmOWMxZTBiLTZhMmQtNGI4ZS05YzcxLTBkNWUyZjRhOGIxMwphcHByb3ZlCjI3MDRmN2MxYTRlOTkwMzdhOGY0YmU4MjAwNDk3YjQ4Njk0MDM3M2MyMTliMTQ5OTA3Yjg0NDc2YzE4OTUzZmEKMTc5MzM0NTY0Mgo1YjBmNmQwZS03YTM0LTRjMWItOWI0My0wYThmNmE1ZTJmMTE=",
+  "signature": "MEQCIEDHpvcSKTl4OlExWzQi9+JQce0q2AE/kCPCL1qx97gEAiBJ0a91lCbgTvL8LX72YZtPvWOgIeWnWZVu8/Rc01KdiA=="
+}

@@ -97,6 +97,23 @@ pub struct InjectParams {
     /// ours.
     #[serde(default)]
     pub block_internal: bool,
+    /// Follow redirects, up to three. Absent = true, which is how every pass has run.
+    /// A caller that checks each destination itself sets it false, because a hop this
+    /// engine follows is one that caller never sees.
+    #[serde(default = "d_true")]
+    pub follow_redirects: bool,
+    /// Names pinned to addresses, `[["app.example.com", "203.0.113.7:443"], ...]`,
+    /// used on every connection the pass makes. A caller that has already decided
+    /// which addresses of a name may be dialled sends them, so the name is not looked
+    /// up again here and answered with somewhere else. The opt-in smuggling probe
+    /// opens raw sockets and looks names up itself.
+    #[serde(default)]
+    pub resolve: Vec<(String, std::net::SocketAddr)>,
+    /// Where this op's connections go. Never read from the op's own fields: the
+    /// daemon sets it from the egress wrapper the request came in, and a request
+    /// without one gets `Inherit`.
+    #[serde(skip)]
+    pub egress: transport::Egress,
 }
 fn d_timeout() -> u64 {
     12_000
@@ -421,23 +438,35 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
         let _ = tx.send(json!({"type":"done","found":0}));
         return;
     }
+    // The caller's redirect policy and name pins hold for every client this pass
+    // builds, the open-redirect client and a race burst's included.
+    let redirect = if params.follow_redirects {
+        transport::Redirect::Limited(3)
+    } else {
+        transport::Redirect::None
+    };
     // Injection probes send a benign SLEEP, so the timeout floor must clear it.
-    let client = match probe::build_client(probe::ClientOpts {
-        evasive: params.evasive,
-        identify: params.identify.clone(),
-        auth: params.auth.as_ref(),
-        target: &params.target,
-        timeout_ms: params.timeout_ms,
-        block_internal: params.block_internal,
-        // Room for the DOUBLED sleep the time-based oracle uses to prove the
-        // delay tracks the number we asked for. Sized for one sleep, the
-        // confirming request times out and every real time-based finding is
-        // lost with the false ones.
-        min_timeout_ms: SLEEP_SECS * 2 * 1000 + 3000,
-    }) {
-        Some(c) => c,
-        None => {
-            let _ = tx.send(json!({"type":"error","message":"client build failed"}));
+    let client = match probe::try_build_client(
+        probe::ClientOpts {
+            evasive: params.evasive,
+            identify: params.identify.clone(),
+            auth: params.auth.as_ref(),
+            target: &params.target,
+            timeout_ms: params.timeout_ms,
+            block_internal: params.block_internal,
+            egress: &params.egress,
+            // Room for the DOUBLED sleep the time-based oracle uses to prove the
+            // delay tracks the number we asked for. Sized for one sleep, the
+            // confirming request times out and every real time-based finding is
+            // lost with the false ones.
+            min_timeout_ms: SLEEP_SECS * 2 * 1000 + 3000,
+        },
+        redirect,
+        params.resolve.clone(),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.send(json!({"type":"error","message": e}));
             return;
         }
     };
@@ -448,15 +477,20 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
         .iter()
         .skip(1)
         .filter_map(|a| {
-            probe::build_client(probe::ClientOpts {
-                evasive: params.evasive,
-                identify: params.identify.clone(),
-                auth: Some(a),
-                target: &params.target,
-                timeout_ms: params.timeout_ms,
-                min_timeout_ms: SLEEP_SECS * 2 * 1000 + 3000,
-                block_internal: params.block_internal,
-            })
+            probe::build_client_with(
+                probe::ClientOpts {
+                    evasive: params.evasive,
+                    identify: params.identify.clone(),
+                    auth: Some(a),
+                    target: &params.target,
+                    timeout_ms: params.timeout_ms,
+                    min_timeout_ms: SLEEP_SECS * 2 * 1000 + 3000,
+                    block_internal: params.block_internal,
+                    egress: &params.egress,
+                },
+                redirect,
+                params.resolve.clone(),
+            )
         })
         .collect();
     if !session_clients.is_empty() {
@@ -472,15 +506,20 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
 
     // A redirect-following client hides the 3xx + Location the open-redirect oracle needs, so build a
     // second client with redirects disabled just for that probe.
-    let client_nr = probe::build_client_no_redirect(probe::ClientOpts {
-        evasive: params.evasive,
-        identify: params.identify.clone(),
-        auth: params.auth.as_ref(),
-        target: &params.target,
-        timeout_ms: params.timeout_ms,
-        min_timeout_ms: 0,
-        block_internal: params.block_internal,
-    });
+    let client_nr = probe::build_client_with(
+        probe::ClientOpts {
+            evasive: params.evasive,
+            identify: params.identify.clone(),
+            auth: params.auth.as_ref(),
+            target: &params.target,
+            timeout_ms: params.timeout_ms,
+            min_timeout_ms: 0,
+            block_internal: params.block_internal,
+            egress: &params.egress,
+        },
+        transport::Redirect::None,
+        params.resolve.clone(),
+    );
     let oast = match &params.oast {
         Some(s) if !s.domains.is_empty() && !s.api_url.is_empty() => {
             crate::oast::OastClient::from_spec(s.domains.clone(), &s.api_url)
@@ -605,6 +644,9 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
             target: params.target.clone(),
             timeout_ms: params.timeout_ms,
             block_internal: params.block_internal,
+            redirect,
+            resolve: params.resolve.clone(),
+            egress: params.egress.clone(),
         })
     });
     // The operator's authorisation list, parsed once. Anything unparseable is
@@ -675,6 +717,10 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
     }
     let skips = Arc::new(AtomicUsize::new(0));
     let answered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let raw = Arc::new(crate::rawhttp::Route {
+        egress: params.egress.clone(),
+        block_internal: params.block_internal,
+    });
     let race_budget = Arc::new(AtomicUsize::new(if race.is_some() {
         MAX_RACE_ENDPOINTS
     } else {
@@ -769,6 +815,7 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
                 ssrf_sites: Arc::clone(&ssrf_sites),
                 race: race.clone(),
                 race_budget: Arc::clone(&race_budget),
+                raw: Arc::clone(&raw),
                 skips: Arc::clone(&skips),
                 answered: Arc::clone(&answered),
                 xml_seen: Arc::clone(&xml_seen),
@@ -1312,6 +1359,9 @@ struct EndpointCtx {
     /// small: every burst is eight real state changes on somebody's
     /// application.
     race_budget: Arc<AtomicUsize>,
+    /// How the opt-in smuggling probe's raw sockets leave this machine: the pass's
+    /// egress and private-address rule.
+    raw: Arc<crate::rawhttp::Route>,
     /// How many sites have been skipped for a missing baseline, and how many of
     /// those were spelled out.
     ///
@@ -1368,6 +1418,7 @@ async fn run_endpoint(mut ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome 
         ssrf_sites,
         race,
         race_budget,
+        raw,
         skips,
         answered,
         tx,
@@ -1498,7 +1549,9 @@ async fn run_endpoint(mut ep: InjEndpoint, ctx: EndpointCtx) -> EndpointOutcome 
     if classes.iter().any(|c| c == "smuggling")
         && crate::inject::seen_once(&xml_seen, format!("smuggle:{}", host_of(&ep.url)))
     {
-        if let Some(f) = crate::probe::spent("smuggling", crate::smuggle::probe(&ep.url)).await {
+        if let Some(f) =
+            crate::probe::spent("smuggling", crate::smuggle::probe(&ep.url, &raw)).await
+        {
             let _ = tx.send(json!({"type":"finding","data":f}));
             found += 1;
         }

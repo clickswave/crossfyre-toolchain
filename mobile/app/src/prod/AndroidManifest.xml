@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Links to an approval, https://crossfyre.io/m/approve/<id>, open in this build of
+  the app. The alerts an approval sends carry that link. Android verifies the
+  site's assetlinks.json before it treats the link as the app's; until it does,
+  the link opens the web page, which offers Deny and a way into the app.
+  The dev build has no filter, because its server moves around.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <activity android:name="io.crossfyre.mobile.MainActivity" android:exported="true">
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="crossfyre.io" android:pathPrefix="/m/approve/" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

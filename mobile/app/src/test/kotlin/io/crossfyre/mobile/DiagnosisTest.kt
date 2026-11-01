@@ -63,6 +63,27 @@ class DiagnosisTest {
     }
 
     @Test
+    fun a_token_the_server_turned_away_ends_the_sending_and_offers_a_new_pairing() {
+        val s = Stats.parse(
+            """{"flows":4,"events":9,"ingest_sent":5,"ingest_rejected":1,"token_refused":true,
+               "last_error":"the server no longer accepts this session's token (HTTP 401)"}"""
+        )
+        assertTrue(s.tokenRefused)
+        assertFalse(Stats.parse("{}").tokenRefused)
+        // Some batches went through before it was refused: not a healthy capture.
+        val d = diagnose(true, s, false, false, patching = true, renewable = true)!!
+        assertEquals(Level.DANGER, d.level)
+        assertEquals(DiagAction.PAIR_AGAIN, d.action)
+        assertTrue(d.body, d.body.contains("role", ignoreCase = true))
+        assertTrue(d.body, d.body.contains("nothing more is sent", ignoreCase = true))
+        assertEquals(d, tokenRefused(renewable = true))
+        // A QR pairing cannot renew itself.
+        val qr = diagnose(true, s, false, false, patching = true, renewable = false)!!
+        assertEquals(DiagAction.SCAN_NEW_CODE, qr.action)
+        assertFalse(qr.body, qr.body.contains("Pairing again", ignoreCase = true))
+    }
+
+    @Test
     fun a_healthy_capture_offers_the_dashboard() {
         val d = diagnose(true, stats(events = 3, sent = 3), false, false, patching = false, renewable = true)!!
         assertEquals(Level.OK, d.level)

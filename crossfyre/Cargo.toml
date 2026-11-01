@@ -1,6 +1,6 @@
 [package]
 name = "crossfyre"
-version = "0.1.37"
+version = "0.1.38"
 edition = "2024"
 license.workspace = true
 publish.workspace = true
@@ -14,7 +14,20 @@ path = "src/main.rs"
 
 [dependencies]
 cfx_core = { path = "../core" }
+cfx_mcp = { path = "../mcp" }
 oast = { path = "../oast" }
 clap = { version = "4.5.60", features = ["derive"] }
 clap_complete = "4.6.9"
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "time", "signal"] }
+clap_mangen = "0.3.3"
+# The hidden prompt for `crossfyre mcp cloud login`; already used by cfx_core's login.
+dialoguer = { version = "0.12.0", features = ["password"] }
+# The Workbench's data directory, where a running one says how `crossfyre mcp` reaches it.
+dirs = "6.0.0"
+
+[dev-dependencies]
+# tests/mcp_stdio.rs speaks JSON-RPC to the binary and checks the audit log's hash.
+serde_json = "1"
+sha2 = "0.10"
+# The stand-in Workbench in tests/mcp_stdio.rs speaks the same messages a real one does.
+cfx_bridge = { path = "../bridge" }

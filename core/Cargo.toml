@@ -32,7 +32,9 @@ nkeys = "0.4.5"
 # via `.use_native_tls()` so it can reach real-world / legacy origins (old gov & enterprise sites that
 # only offer RSA-kx / CBC ciphers like TLS_RSA_WITH_AES_128_CBC_SHA256, which rustls does not implement).
 # Every other reqwest client keeps rustls (the default), so this changes reach for the proxy only.
-reqwest = { version = "0.13.2", features = ["json", "cookies", "native-tls-vendored"] }
+# `socks` lets the node send a proxied node's Bench requests, logins and checks through
+# its own gateway, which is a SOCKS5 server on loopback.
+reqwest = { version = "0.13.2", features = ["json", "cookies", "native-tls-vendored", "socks"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = "0.10"
@@ -44,7 +46,14 @@ flate2 = "1.1"
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 tempfile = "3"
 sysinfo = "0.33"
-tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "time", "signal", "process", "io-util", "net"] }
+tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "time", "signal", "process", "io-util", "net", "sync"] }
+# The gateway a proxied node's engines send through: a SOCKS5 server for them, and a
+# client for the team proxy behind it.
+cfx_tunnel = { path = "../tunnel" }
+# The gateway's per-op credentials.
+getrandom = "0.3"
+# The gateway's place for a scope check on each connection, unused until that check lands.
+cfx_scope = { path = "../scope" }
 # Web Tracer Method 2 (local intercepting proxy): a Burp-style MITM proxy built in-process so capture
 # needs only a browser (no Wireshark). rcgen mints a session CA + per-host leaf certs; hyper serves
 # HTTP/1.1 over the tokio-rustls-terminated tunnel; reqwest (above) forwards to the origin.
@@ -55,6 +64,10 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 tokio-rustls = "0.26"
 toml = "1.0.3"
+
+[dev-dependencies]
+# A recording SOCKS5 proxy and counting listeners, for the gateway's tests.
+cfx_tunnel = { path = "../tunnel", features = ["recorder"] }
 
 # Windows: the node supervisor runs as a service (windows-service), the engines as
 # scheduled tasks registered through the Task Scheduler's COM interface (the `windows`

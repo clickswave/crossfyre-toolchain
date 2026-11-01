@@ -114,6 +114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             adaptive_rate: false,
             adaptive_resilience: false,
             posture: "balanced".to_string(),
+            egress: transport::Egress::Inherit,
         };
 
         // Postgres being briefly unreachable is not a reason to exit: systemd

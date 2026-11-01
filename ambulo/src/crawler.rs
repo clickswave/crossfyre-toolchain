@@ -91,6 +91,11 @@ pub struct CrawlParams {
     /// navigation, which costs seconds rather than milliseconds.
     #[serde(default = "d_browser_pages")]
     pub browser_pages: usize,
+    /// Where the crawl's connections go. Never read from the request's own fields:
+    /// the daemon sets it from the egress wrapper, and a request without one gets
+    /// `Inherit`.
+    #[serde(skip)]
+    pub egress: transport::Egress,
 }
 
 fn d_browser_pages() -> usize {
@@ -791,21 +796,24 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
     } else {
         None
     };
-    let client = match transport::build_scan_client(transport::ScanClient {
-        identity_headers: &ident.headers,
-        user_agent: &ident.user_agent,
-        auth: params.auth.as_ref(),
-        attribution_token: token,
-        emulate: !matches!(mode, adaptive::identity::Mode::Fast),
-        timeout: Some(std::time::Duration::from_millis(
-            params.timeout_ms.max(1000),
-        )),
-        redirect: transport::Redirect::Limited(5),
-        accept_invalid_certs: true,
-        cookie_store: true,
-        resolve: Vec::new(),
-        ..Default::default()
-    }) {
+    let client = match transport::build_scan_client(
+        transport::ScanClient {
+            identity_headers: &ident.headers,
+            user_agent: &ident.user_agent,
+            auth: params.auth.as_ref(),
+            attribution_token: token,
+            emulate: !matches!(mode, adaptive::identity::Mode::Fast),
+            timeout: Some(std::time::Duration::from_millis(
+                params.timeout_ms.max(1000),
+            )),
+            redirect: transport::Redirect::Limited(5),
+            accept_invalid_certs: true,
+            cookie_store: true,
+            resolve: Vec::new(),
+            ..Default::default()
+        },
+        &params.egress,
+    ) {
         Ok(c) => c,
         Err(e) => {
             let _ = tx.send(CrawlEvent::error(format!("client build failed: {e}")));
@@ -855,6 +863,11 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
     .await;
 
     while !frontier.is_empty() && pages_crawled < max_pages {
+        // Nobody reads the crawl any more: its client went away, or the node stopped
+        // the op. Going on would only be traffic at somebody's site.
+        if tx.is_closed() {
+            return;
+        }
         // Take a wave of up to `tasks` URLs without exceeding the page budget.
         let mut wave: Vec<Queued> = Vec::new();
         while wave.len() < tasks && pages_crawled + (wave.len() as u32) < max_pages {
@@ -1061,6 +1074,10 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
         }
     }
 
+    if tx.is_closed() {
+        return;
+    }
+
     // Probe API-spec locations AFTER the link crawl so the burst of probe requests
     // (some apps rate-limit / serve their SPA for unknown paths) can't perturb the
     // main crawl. A bare REST API exposes no HTML/JS to crawl, but its
@@ -1078,6 +1095,11 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
     let _ = tx.send(CrawlEvent::done(pages_crawled));
 }
 
+/// The note a proxied crawl gets in place of the headless tier.
+pub(crate) const HEADLESS_SKIPPED: &str = "headless tier skipped: Chrome cannot authenticate to \
+     a SOCKS proxy, and this crawl sends through one. Endpoints that only exist once the \
+     application is running were NOT looked for.";
+
 /// Drive a real browser over the seed and the client-side routes, and report
 /// what the running application asked for.
 ///
@@ -1091,6 +1113,13 @@ async fn run_browser_tier(
     client_routes: &[Url],
     tx: &mpsc::UnboundedSender<CrawlEvent>,
 ) {
+    // Chrome is started with no proxy of its own, and it cannot authenticate to a
+    // SOCKS proxy, so through one it would load every page from this machine's own
+    // address. Skipped, and said, as on a machine with no browser.
+    if params.egress.is_proxied() {
+        let _ = tx.send(CrawlEvent::note(HEADLESS_SKIPPED.to_string()));
+        return;
+    }
     let Some(exe) = crate::browser::find_browser() else {
         let _ = tx.send(CrawlEvent::note(
             "the headless tier was requested but no browser was found. Set AMBULO_BROWSER to a \

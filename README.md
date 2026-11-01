@@ -97,6 +97,8 @@ In a terminal `voyage`, `doorward` and `ambulo` draw a live dashboard. `toolmark
 
 From 0.1.38, `crossfyre completions <shell>` prints a completion script for bash, zsh, fish, powershell or elvish: `crossfyre completions bash > ~/.local/share/bash-completion/completions/crossfyre`. Each engine takes the same command, as in `voyage completions zsh`.
 
+From 0.1.38, `crossfyre mcp` serves `toolmark` and `plessor` to an MCP client over stdio, so an agent can fingerprint a service, test endpoints for injection and replay single requests, and refuses any destination that a scope file you write does not list. See [crossfyre/MCP.md](crossfyre/MCP.md).
+
 ## When one machine is not enough
 
 Enrol the host as a node and the same engines run under the [Crossfyre platform](https://crossfyre.io), with a fleet of nodes, scheduled scans, pacing tuned to each target, and one dashboard for your team:
@@ -151,6 +153,7 @@ Every engine can run as a daemon (`--daemon`) that its client talks to over loop
 | [`transport`](transport/) | The engines' HTTP client. |
 | [`dguard`](dguard/) | The daemon listener policy. |
 | [`scope`](scope/) | The destinations an operator may test, and the guard that refuses the rest. |
+| [`mcp`](mcp/) | The `crossfyre mcp` server: the engines as MCP tools, fenced by a scope file you write, with an audit line for every call. |
 | [`spec`](spec/) | Reads OpenAPI, Swagger, Postman, HAR and Insomnia files. |
 | [`surface`](surface/) | Describes a scanned attack surface and diffs it between runs. |
 | [`adaptive`](adaptive/) | The engines' pacing and retry decisions, with an untuned baseline. |

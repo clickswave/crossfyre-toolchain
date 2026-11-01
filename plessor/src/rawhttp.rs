@@ -8,12 +8,41 @@
 //! `unsafe: true` is sent through this path so the bytes reach the target
 //! unchanged. TLS uses the same accept-any-cert posture as the reqwest client
 //! (plessor scans hosts with self-signed / mismatched certs).
+//!
+//! Every connection is opened by `transport::dial`, with the egress and the
+//! private-address rule the caller names in a [`Route`], so a raw send leaves the
+//! machine the same way the op's HTTP client does.
 
+use std::net::SocketAddr;
 #[cfg(not(feature = "impersonate"))]
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use transport::Tunnel;
+
+/// How a raw send's connection leaves this machine, and what it may reach. No
+/// default: a caller names the op's egress, as every HTTP client build does.
+#[derive(Clone, Debug)]
+pub struct Route {
+    pub egress: transport::Egress,
+    /// Refuse private and reserved destinations, as the op's HTTP client does.
+    pub block_internal: bool,
+}
+
+impl Route {
+    /// The certificate policy a send on this route runs under: the caller's, except
+    /// through a proxy the node was given, where the origin always has to prove who it
+    /// is. The proxy carries the TLS bytes, so one that answered with a certificate of
+    /// its own would read the request and write the response, as it would for the op's
+    /// HTTP client, which checks certificates there too.
+    pub fn verify(&self, asked: Verify) -> Verify {
+        if matches!(self.egress, transport::Egress::Proxy(_)) {
+            Verify::WebPki
+        } else {
+            asked
+        }
+    }
+}
 
 pub struct RawResp {
     pub status: u16,
@@ -29,6 +58,7 @@ pub struct RawReq<'a> {
     pub headers: &'a [(String, String)],
     pub body: Option<String>,
     pub timeout: Duration,
+    pub route: &'a Route,
 }
 
 /// Cap on how much of a response we read. Without it a hostile (or broken) target
@@ -41,19 +71,22 @@ pub async fn send(req: RawReq<'_>) -> Option<RawResp> {
     let request = build_request(&req, &host, port, https, &target);
     // A template probe, so Verify::Any: plessor scans hosts whose certificates are
     // expired, self-signed or for another name, and refusing to look at them would
-    // remove most internal applications from what it can test.
-    let raw = tokio::time::timeout(req.timeout, async {
+    // remove most internal applications from what it can test. Not through a proxy the
+    // node was given: see `Route::verify`.
+    let to = req.timeout;
+    let raw = tokio::time::timeout(to, async {
+        let stream = dial(req.route, &host, port, None, to).await?;
         if https {
             send_tls(
+                stream,
                 &host,
-                port,
                 request.as_bytes(),
                 ReadUntil::Closed,
-                Verify::Any,
+                req.route.verify(Verify::Any),
             )
             .await
         } else {
-            send_plain(&host, port, request.as_bytes(), ReadUntil::Closed).await
+            send_plain(stream, request.as_bytes(), ReadUntil::Closed).await
         }
     })
     .await
@@ -337,11 +370,13 @@ where
     Some(buf)
 }
 
-/// The scanners' sender: read to close, and accept any certificate.
+/// The scanners' sender: read to close, and accept any certificate, except through a
+/// proxy the node was given (see [`Route::verify`]).
 ///
 /// Both of those are deliberate and neither is a default worth changing here. See
 /// [`ReadUntil::Closed`] and [`Verify::Any`].
 pub async fn send_exact(
+    route: &Route,
     host: &str,
     port: u16,
     https: bool,
@@ -349,6 +384,7 @@ pub async fn send_exact(
     timeout: Duration,
 ) -> (Option<Vec<u8>>, Duration) {
     let (out, took) = send_until(
+        route,
         host,
         port,
         https,
@@ -367,7 +403,9 @@ pub async fn send_exact(
 /// has to be able to tell "nothing is listening there" from "the certificate did not
 /// check out", because those send them to completely different places, and under
 /// [`Verify::WebPki`] the second one is newly possible.
+#[allow(clippy::too_many_arguments)]
 pub async fn send_until(
+    route: &Route,
     host: &str,
     port: u16,
     https: bool,
@@ -376,12 +414,38 @@ pub async fn send_until(
     until: ReadUntil,
     verify: Verify,
 ) -> (Result<Vec<u8>, SendFail>, Duration) {
+    send_until_via(route, host, port, None, https, data, timeout, until, verify).await
+}
+
+/// [`send_until`], connecting to `connect` when it is given instead of resolving `host`.
+///
+/// For a caller that has already looked the name up and decided which address it may
+/// go to. Letting the connect resolve it again would allow a second answer that differs
+/// from the one that was checked. `host` is still the name the request is for: it is
+/// the TLS server name, and the bytes are sent as given.
+///
+/// `connect` has to be on `port`. One on another port is refused without dialling,
+/// because it would reach a service nobody looked at. A pin through a proxy is
+/// refused too: the proxy would look the name up again.
+#[allow(clippy::too_many_arguments)]
+pub async fn send_until_via(
+    route: &Route,
+    host: &str,
+    port: u16,
+    connect: Option<SocketAddr>,
+    https: bool,
+    data: &[u8],
+    timeout: Duration,
+    until: ReadUntil,
+    verify: Verify,
+) -> (Result<Vec<u8>, SendFail>, Duration) {
     let start = std::time::Instant::now();
     let out = match tokio::time::timeout(timeout, async {
+        let stream = dial(route, host, port, connect, timeout).await?;
         if https {
-            send_tls(host, port, data, until, verify).await
+            send_tls(stream, host, data, until, route.verify(verify)).await
         } else {
-            send_plain(host, port, data, until).await
+            send_plain(stream, data, until).await
         }
     })
     .await
@@ -397,15 +461,33 @@ pub fn split_url(url: &str) -> Option<(bool, String, u16, String)> {
     split(url)
 }
 
-async fn send_plain(
+/// The one place a raw send opens its connection: through the route's egress, at the
+/// pinned address when there is one. `transport::dial` refuses a pin on another port
+/// and a pin through a proxy without dialling.
+async fn dial(
+    route: &Route,
     host: &str,
     port: u16,
+    pin: Option<SocketAddr>,
+    timeout: Duration,
+) -> Result<Tunnel, SendFail> {
+    transport::dial(
+        &route.egress,
+        host,
+        port,
+        route.block_internal,
+        timeout,
+        pin,
+    )
+    .await
+    .map_err(|e| SendFail::Connect(e.to_string()))
+}
+
+async fn send_plain(
+    mut stream: Tunnel,
     data: &[u8],
     until: ReadUntil,
 ) -> Result<Vec<u8>, SendFail> {
-    let mut stream = TcpStream::connect((host, port))
-        .await
-        .map_err(|e| SendFail::Connect(e.to_string()))?;
     stream
         .write_all(data)
         .await
@@ -432,8 +514,8 @@ async fn send_plain(
 // fingerprint a WAF flags, but the open toolchain ships no browser emulation.
 #[cfg(not(feature = "impersonate"))]
 async fn send_tls(
+    stream: Tunnel,
     host: &str,
-    port: u16,
     data: &[u8],
     until: ReadUntil,
     verify: Verify,
@@ -441,9 +523,6 @@ async fn send_tls(
     let connector = tokio_rustls::TlsConnector::from(tls_config(verify));
     let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
         .map_err(|e| SendFail::Tls(format!("{host} is not a usable server name: {e}")))?;
-    let stream = TcpStream::connect((host, port))
-        .await
-        .map_err(|e| SendFail::Connect(e.to_string()))?;
     let mut tls = connector
         .connect(server_name, stream)
         .await
@@ -473,8 +552,8 @@ async fn send_tls(
 // match the rest of plessor (it scans hosts with self-signed / mismatched certs).
 #[cfg(feature = "impersonate")]
 async fn send_tls(
+    stream: Tunnel,
     host: &str,
-    port: u16,
     data: &[u8],
     until: ReadUntil,
     verify: Verify,
@@ -511,9 +590,6 @@ async fn send_tls(
     if verify == Verify::Any {
         cfg.set_verify_hostname(false);
     }
-    let stream = TcpStream::connect((host, port))
-        .await
-        .map_err(|e| SendFail::Connect(e.to_string()))?;
     let mut tls = tokio_boring2::connect(cfg, host, stream)
         .await
         .map_err(|e| SendFail::Tls(e.to_string()))?;

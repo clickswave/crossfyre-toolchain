@@ -1,0 +1,19 @@
+[package]
+name = "cfx_cloud_wire"
+version = "0.0.1"
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+homepage = "https://clickswave.org"
+repository = "https://github.com/clickswave/crossfyre-toolchain"
+keywords = ["mcp", "api", "pentest"]
+description = "The requests and answers of the Cloud API that `crossfyre mcp` calls, and the refusal codes it sends back."
+authors = ["Clickswave <team@clickswave.org>"]
+
+# A leaf, so the platform can build against the same definitions the open client
+# does. It describes only what a client already sees on the wire: nothing about how a
+# scan is dispatched, paced or assigned.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# Scan results and asset attributes are engine JSON the client passes through as data.
+serde_json = "1"

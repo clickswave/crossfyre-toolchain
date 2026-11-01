@@ -50,6 +50,7 @@ private fun MainScreen(m: AppModel) {
     val tab = if (m.tab == "patch" && !m.patch.available) "home" else m.tab
     LaunchedEffect(tab) {
         if (tab == "patch" || tab == "tracer" || tab == "home") m.loadApps()
+        if (tab == "activity") m.refreshActivity()
         m.refreshPatchStates()
     }
     Column(Modifier.fillMaxSize()) {
@@ -57,6 +58,7 @@ private fun MainScreen(m: AppModel) {
             Push.Certificate -> AppBar("Certificate", onBack = { m.push = null })
             is Push.App -> AppBar(m.facts[p.pkg]?.label ?: m.labelOf(p.pkg), onBack = { m.push = null })
             Push.Licences -> AppBar("Open source licences", onBack = { m.push = null })
+            Push.Node -> AppBar("Node", onBack = { m.push = null })
             null -> when (tab) {
                 "home" -> AppBar(brand = true) { EnvChip(m) }
                 "tracer" -> AppBar("Tracer") {
@@ -64,7 +66,10 @@ private fun MainScreen(m: AppModel) {
                     IconBtn(R.drawable.ic_question, "What capture does to this phone") { m.overlay = Overlay.HowTo }
                 }
                 "patch" -> AppBar("Patch a pinned app") { EnvChip(m) }
-                "node" -> AppBar("Node") { EnvChip(m) }
+                "activity" -> AppBar("Activity") {
+                    EnvChip(m)
+                    if (m.signedIn) IconBtn(R.drawable.ic_arrow_counter_clockwise, "Refresh") { m.refreshActivity() }
+                }
                 else -> AppBar("Settings") { EnvChip(m) }
             }
         }
@@ -73,11 +78,12 @@ private fun MainScreen(m: AppModel) {
                 Push.Certificate -> Content("certificate") { CertificateContent(m) }
                 is Push.App -> Content("app-${p.pkg}") { AppContent(m, p.pkg) }
                 Push.Licences -> Content("licences") { LicencesContent(m) }
+                Push.Node -> Content("node") { NodeContent() }
                 null -> when (tab) {
                     "home" -> Content("home") { HomeContent(m) }
                     "tracer" -> Content("tracer") { TracerContent(m) }
                     "patch" -> Content("patch") { PatchContent(m) }
-                    "node" -> Content("node") { NodeContent() }
+                    "activity" -> Content("activity") { ActivityContent(m) }
                     else -> Content("settings") { SettingsContent(m) }
                 }
             }
@@ -87,7 +93,8 @@ private fun MainScreen(m: AppModel) {
                 TabSpec("home", R.drawable.ic_house, "Home"),
                 TabSpec("tracer", R.drawable.ic_broadcast, "Tracer", live = m.phase == Phase.CAPTURING),
                 if (m.patch.available) TabSpec("patch", R.drawable.ic_package, "Patch") else null,
-                TabSpec("node", R.drawable.ic_hard_drives, "Node", locked = true),
+                // Activity took the place of the locked Node tab. Node is a row on Home.
+                TabSpec("activity", R.drawable.ic_clock, "Activity", badge = m.waiting.size),
                 TabSpec("settings", R.drawable.ic_gear_six, "Settings"),
             ),
             current = tab,

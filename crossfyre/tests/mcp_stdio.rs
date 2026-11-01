@@ -1,0 +1,1147 @@
+//! `crossfyre mcp` spoken to over its real stdin and stdout, the way a client runs it.
+//!
+//! A stand-in toolmark daemon on loopback plays the engine and makes one request to
+//! whatever target it is given, so the out-of-scope listener counting zero means the
+//! server refused before the engine was ever asked.
+
+use serde_json::{Value, json};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, channel};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// Named short: the Workbench stand-in puts its socket three levels under this, and
+/// macOS refuses a socket path over 103 bytes, 49 of which its temp directory takes.
+fn temp_dir(tag: &str) -> std::path::PathBuf {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let d = std::env::temp_dir().join(format!(
+        "cfx-{tag}-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(d.join("mcp")).unwrap();
+    // The server refuses a scope file others could change, whatever the umask made.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(d.join("mcp"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    d
+}
+
+/// Removes a test's data directory when it goes out of scope, unwinding from a failed
+/// assertion included.
+struct RemoveOnDrop(std::path::PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn a_failed_test_leaves_no_data_dir_behind() {
+    let data = temp_dir("unwind");
+    let probe = data.clone();
+    let failed = std::panic::catch_unwind(move || {
+        let _gone = RemoveOnDrop(data.clone());
+        std::fs::write(data.join("mcp/cloud.toml"), "key = \"cfm_x\"\n").unwrap();
+        panic!("an assertion failed part way through");
+    });
+    assert!(failed.is_err());
+    assert!(!probe.exists(), "{} was left behind", probe.display());
+}
+
+fn write_scope(data: &std::path::Path, text: &str) {
+    let p = data.join("mcp/scope.toml");
+    std::fs::write(&p, text).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
+fn write_config(data: &std::path::Path, toolmark: u16, plessor: u16) {
+    std::fs::write(
+        data.join("config.toml"),
+        format!(
+            "[postgres]\nhost = \"127.0.0.1\"\nport = {}\nuser = \"crossfyre\"\n\
+             db_name = \"crossfyre\"\n\n[container]\n\n[extensions]\ntoolmark = {toolmark}\n\
+             plessor = {plessor}\n",
+            closed_port()
+        ),
+    )
+    .unwrap();
+}
+
+/// Read request lines from an engine client, answering the capabilities question,
+/// until the operation arrives.
+fn read_op(r: &mut impl BufRead, w: &mut TcpStream, caps: &Value) -> Option<Value> {
+    loop {
+        let mut line = String::new();
+        if r.read_line(&mut line).ok()? == 0 {
+            return None;
+        }
+        let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+        if v["operation"] != "capabilities" {
+            return Some(v);
+        }
+        writeln!(w, "{caps}").ok()?;
+    }
+}
+
+fn closed_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// An HTTP listener that counts connections.
+fn target() -> (u16, Arc<AtomicUsize>) {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let n = Arc::new(AtomicUsize::new(0));
+    let c = Arc::clone(&n);
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(mut s) = s else { return };
+            c.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        }
+    });
+    (port, n)
+}
+
+/// A toolmark daemon stand-in: records each op, requests the target once, and answers
+/// with one technology and the service record.
+fn toolmark() -> (u16, Arc<Mutex<Vec<Value>>>) {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let ops = Arc::new(Mutex::new(Vec::new()));
+    let o = Arc::clone(&ops);
+    let caps = json!({"type": "capabilities", "fingerprint": ["resolve", "block_internal"]});
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(s) = s else { return };
+            let mut w = s.try_clone().unwrap();
+            let Some(op) = read_op(&mut BufReader::new(s), &mut w, &caps) else {
+                continue;
+            };
+            o.lock().unwrap().push(op.clone());
+            let t = op["target"].as_str().unwrap_or("");
+            if let Some(hp) = t.strip_prefix("http://").and_then(|r| r.split('/').next())
+                && let Ok(mut c) = TcpStream::connect(hp)
+            {
+                let _ = c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+                let _ = c.read(&mut [0u8; 256]);
+            }
+            for ev in [
+                json!({"type": "ack", "target": t}),
+                json!({"type": "finding", "data": {"type": "technology", "source": "scout",
+                    "severity": "info", "name": "nginx", "category": "web-server",
+                    "version": "1.25.3", "cpe": "", "confidence": 100, "evidence": "server"}}),
+                json!({"type": "finding", "data": {"type": "service", "source": "scout",
+                    "severity": "info", "status_code": 200, "title": "t", "server": "nginx"}}),
+                json!({"type": "done"}),
+            ] {
+                let _ = writeln!(w, "{ev}");
+            }
+        }
+    });
+    (port, ops)
+}
+
+/// A plessor daemon stand-in that acknowledges a scan, sends nothing more, and
+/// counts the cancel lines it is sent.
+#[cfg(unix)]
+fn plessor() -> (u16, Arc<AtomicUsize>) {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let cancels = Arc::new(AtomicUsize::new(0));
+    let c = Arc::clone(&cancels);
+    let caps = json!({"type": "capabilities", "cancel": true,
+                      "inject": ["follow_redirects", "resolve"]});
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(s) = s else { return };
+            let (c, caps) = (Arc::clone(&c), caps.clone());
+            std::thread::spawn(move || {
+                let mut w = s.try_clone().unwrap();
+                let mut r = BufReader::new(s);
+                let Some(op) = read_op(&mut r, &mut w, &caps) else {
+                    return;
+                };
+                let _ = writeln!(
+                    w,
+                    "{}",
+                    json!({"type": "ack", "target": op["target"], "cancellable": true})
+                );
+                let mut line = String::new();
+                while r.read_line(&mut line).unwrap_or(0) > 0 {
+                    if line.contains("\"cancel\"") {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        let _ = writeln!(w, "{}", json!({"type": "done", "cancelled": true}));
+                        return;
+                    }
+                    line.clear();
+                }
+            });
+        }
+    });
+    (port, cancels)
+}
+
+fn spawn(data: &std::path::Path) -> Child {
+    spawn_with(data, &[])
+}
+
+fn spawn_with(data: &std::path::Path, args: &[&str]) -> Child {
+    spawn_env(data, args, &[])
+}
+
+/// `crossfyre mcp` with no proxy, Cloud key or daemon token from the environment the
+/// tests run in, and with `vars` set.
+fn spawn_env(data: &std::path::Path, args: &[&str], vars: &[(&str, &str)]) -> Child {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_crossfyre"));
+    cmd.arg("--data-dir")
+        .arg(data)
+        .arg("mcp")
+        .args(args)
+        // Its own Workbench directory, so a Workbench the person running the tests has
+        // open is never seen.
+        .env("CROSSFYRE_WORKBENCH_DIR", data.join("wb"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for v in [
+        "CFX_DAEMON_TOKEN",
+        "CROSSFYRE_MCP_CLOUD_KEY",
+        "CROSSFYRE_MCP_CLOUD_URL",
+        "CROSSFYRE_EGRESS_PROXY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
+        cmd.env_remove(v);
+    }
+    cmd.envs(vars.iter().copied());
+    cmd.spawn().expect("crossfyre runs")
+}
+
+fn wait_exit(child: &mut Child, within: Duration) -> std::process::ExitStatus {
+    let start = Instant::now();
+    loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            return s;
+        }
+        if start.elapsed() > within {
+            let _ = child.kill();
+            panic!("crossfyre mcp did not exit within {within:?}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+struct Client {
+    stdin: ChildStdin,
+    lines: Receiver<String>,
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+impl Client {
+    /// Read the child's stdout on a thread, keeping every line it writes.
+    fn attach(child: &mut Child) -> (Client, Arc<Mutex<Vec<String>>>) {
+        let stdout = child.stdout.take().unwrap();
+        let all_lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (tx, rx) = channel();
+        let keep = Arc::clone(&all_lines);
+        std::thread::spawn(move || {
+            for l in BufReader::new(stdout).lines() {
+                let Ok(l) = l else { return };
+                keep.lock().unwrap().push(l.clone());
+                if tx.send(l).is_err() {
+                    return;
+                }
+            }
+        });
+        let c = Client {
+            stdin: child.stdin.take().unwrap(),
+            lines: rx,
+            seen: Arc::new(Mutex::new(Vec::new())),
+        };
+        (c, all_lines)
+    }
+
+    /// `initialize` and `notifications/initialized`, as a client with or without
+    /// elicitation.
+    fn initialize(&mut self, elicitation: bool) -> Value {
+        let caps = if elicitation {
+            json!({"elicitation": {}})
+        } else {
+            json!({})
+        };
+        self.send(
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": caps,
+            "clientInfo": {"name": "stdio-test", "version": "1.0"}}}),
+        );
+        let init = self.reply(1)["result"].clone();
+        self.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+        init
+    }
+
+    fn send(&mut self, v: Value) {
+        writeln!(self.stdin, "{v}").unwrap();
+        self.stdin.flush().unwrap();
+    }
+
+    fn next(&self) -> Value {
+        let l = self
+            .lines
+            .recv_timeout(Duration::from_secs(20))
+            .expect("a line from the server");
+        serde_json::from_str(&l).expect("stdout carries JSON only")
+    }
+
+    /// The response to request `id`, answering any confirmation the server asks for
+    /// with yes on the way.
+    fn reply(&mut self, id: u64) -> Value {
+        loop {
+            let v = self.next();
+            if v["method"] == "elicitation/create" {
+                let field = v["params"]["requestedSchema"]["required"][0].clone();
+                let mut content = json!({});
+                content[field.as_str().unwrap()] = json!(true);
+                self.send(json!({"jsonrpc": "2.0", "id": v["id"],
+                                 "result": {"action": "accept", "content": content}}));
+                self.seen.lock().unwrap().push("elicitation".into());
+                continue;
+            }
+            if v["id"] == json!(id) {
+                return v;
+            }
+        }
+    }
+
+    fn call(&mut self, id: u64, name: &str, args: Value) -> Value {
+        self.send(json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+                         "params": {"name": name, "arguments": args}}));
+        self.reply(id)["result"].clone()
+    }
+}
+
+#[test]
+fn a_client_session_over_stdio() {
+    let (port_in, hits_in) = target();
+    let (port_out, hits_out) = target();
+    let (tm_port, ops) = toolmark();
+    let data = temp_dir("session");
+    write_config(&data, tm_port, closed_port());
+    let scope_text = format!("entries = [\"127.0.0.1:{port_in}\"]\n");
+    write_scope(&data, &scope_text);
+
+    let mut child = spawn(&data);
+    let mut stderr = child.stderr.take().unwrap();
+    let (mut c, all_lines) = Client::attach(&mut child);
+
+    let init = c.initialize(true);
+    assert_eq!(init["protocolVersion"], "2025-11-25", "{init}");
+    assert_eq!(init["serverInfo"]["name"], "crossfyre", "{init}");
+    assert!(init["capabilities"]["tools"].is_object(), "{init}");
+    // Declared whether or not a Workbench is running, since one can start later.
+    assert_eq!(init["capabilities"]["tools"]["listChanged"], true, "{init}");
+
+    c.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+    let tools = c.reply(2)["result"]["tools"].clone();
+    assert_eq!(tools.as_array().unwrap().len(), 11);
+
+    let r = c.call(
+        3,
+        "check_scope",
+        json!({"targets": [format!("127.0.0.1:{port_in}"), format!("127.0.0.1:{port_out}")]}),
+    );
+    let admitted: Vec<bool> = r["structuredContent"]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["admitted"].as_bool().unwrap())
+        .collect();
+    assert_eq!(admitted, [true, false]);
+
+    let r = c.call(
+        4,
+        "fingerprint",
+        json!({"url": format!("http://127.0.0.1:{port_out}/")}),
+    );
+    assert_eq!(r["isError"], true, "{r}");
+    assert!(r.get("structuredContent").is_none());
+    assert_eq!(hits_out.load(Ordering::SeqCst), 0);
+    assert_eq!(ops.lock().unwrap().len(), 0);
+
+    let r = c.call(
+        5,
+        "fingerprint",
+        json!({"url": format!("http://127.0.0.1:{port_in}/")}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(
+        r["structuredContent"]["technologies"][0]["name"], "nginx",
+        "{r}"
+    );
+    assert_eq!(
+        *c.seen.lock().unwrap(),
+        ["elicitation"],
+        "asked once, before traffic"
+    );
+    assert_eq!(ops.lock().unwrap().len(), 1);
+    assert_eq!(ops.lock().unwrap()[0]["follow_redirects"], false);
+    assert!(hits_in.load(Ordering::SeqCst) >= 1);
+    assert_eq!(hits_out.load(Ordering::SeqCst), 0);
+
+    let r = c.call(6, "get_scope", json!({}));
+    assert_eq!(r["structuredContent"]["state"], "loaded");
+    let sha = r["structuredContent"]["sha256"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    c.send(json!({"jsonrpc": "2.0", "id": 7, "method": "ping"}));
+    assert_eq!(c.reply(7)["result"], json!({}));
+
+    drop(c.stdin);
+    let status = wait_exit(&mut child, Duration::from_secs(5));
+    assert!(status.success(), "{status:?}");
+
+    for l in all_lines.lock().unwrap().iter() {
+        let v: Value = serde_json::from_str(l).expect("only JSON on stdout");
+        assert_eq!(v["jsonrpc"], "2.0", "{l}");
+    }
+    let mut err = String::new();
+    stderr.read_to_string(&mut err).unwrap();
+    assert!(err.contains(&sha[..12]), "{err}");
+
+    let audit = std::fs::read_to_string(data.join("mcp/audit.jsonl")).unwrap();
+    let calls: Vec<Value> = audit
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|v| v["event"] == "call")
+        .collect();
+    assert_eq!(calls.len(), 4, "{audit}");
+    let expected = sha256_hex(scope_text.as_bytes());
+    assert_eq!(sha, expected);
+    assert!(calls.iter().all(|v| v["scope_sha256"] == expected.as_str()));
+    assert_eq!(calls[1]["reason"], "out_of_scope");
+    assert_eq!(calls[2]["confirmation"], "elicited");
+    assert!(audit.contains("\"event\":\"start\"") && audit.contains("\"event\":\"stop\""));
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+/// A proxy would look a name up again, past the address the server checked, so with
+/// `CROSSFYRE_EGRESS_PROXY` set a request to a name is refused: neither sent through
+/// the proxy nor around it.
+#[test]
+fn with_an_egress_proxy_set_a_request_to_a_name_is_refused() {
+    let (port, hits) = target();
+    let (proxy_port, via_proxy) = target();
+    let data = temp_dir("egress-proxy");
+    write_config(&data, closed_port(), closed_port());
+    write_scope(
+        &data,
+        &format!("entries = [\"localhost:{port}\"]\nallow_private = true\n"),
+    );
+    let proxy = format!("http://127.0.0.1:{proxy_port}");
+    let mut child = spawn_env(&data, &[], &[("CROSSFYRE_EGRESS_PROXY", &proxy)]);
+    let (mut c, _) = Client::attach(&mut child);
+    c.initialize(true);
+
+    let s = c.call(2, "status", json!({}));
+    assert_eq!(s["structuredContent"]["egress_proxy"], true, "{s}");
+    let hints = s["structuredContent"]["hints"].to_string();
+    assert!(
+        hints.contains("CROSSFYRE_EGRESS_PROXY is set, so requests to names are refused"),
+        "{hints}"
+    );
+
+    let r = c.call(
+        3,
+        "send_http_request",
+        json!({"method": "GET", "url": format!("http://localhost:{port}/")}),
+    );
+    assert_eq!(r["isError"], true, "{r}");
+    assert!(r.to_string().contains("CROSSFYRE_EGRESS_PROXY"), "{r}");
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "sent around the proxy");
+    assert_eq!(
+        via_proxy.load(Ordering::SeqCst),
+        0,
+        "sent through the proxy"
+    );
+
+    drop(c.stdin);
+    let status = wait_exit(&mut child, Duration::from_secs(5));
+    assert!(status.success(), "{status:?}");
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+fn sha256_hex(b: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(b)
+        .iter()
+        .map(|x| format!("{x:02x}"))
+        .collect()
+}
+
+fn audit_calls(data: &std::path::Path) -> (String, Vec<Value>) {
+    let audit = std::fs::read_to_string(data.join("mcp/audit.jsonl")).unwrap();
+    let calls = audit
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|v| v["event"] == "call")
+        .collect();
+    (audit, calls)
+}
+
+#[test]
+fn a_call_the_protocol_layer_cannot_read_is_still_logged() {
+    let data = temp_dir("unreadable");
+    write_config(&data, closed_port(), closed_port());
+    write_scope(&data, "entries = [\"app.example.test\"]\n");
+    let mut child = spawn(&data);
+    let (mut c, _) = Client::attach(&mut child);
+    c.initialize(false);
+
+    let bad = [
+        json!({"name": "get_scope", "arguments": "not an object"}),
+        json!({"name": "get_scope", "arguments": [1, 2]}),
+        json!({"arguments": {}}),
+    ];
+    for (i, params) in bad.iter().enumerate() {
+        let id = 10 + i as u64;
+        c.send(json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": params}));
+        let r = c.reply(id);
+        assert_eq!(r["error"]["code"], -32602, "{r}");
+    }
+    drop(c.stdin);
+    assert!(wait_exit(&mut child, Duration::from_secs(10)).success());
+
+    let (audit, calls) = audit_calls(&data);
+    assert_eq!(calls.len(), bad.len(), "{audit}");
+    assert!(
+        calls
+            .iter()
+            .all(|l| l["reason"] == "invalid_arguments" && l["decision"] == "error"),
+        "{audit}"
+    );
+    assert_eq!(calls[0]["tool"], "get_scope");
+    assert!(calls[2]["tool"].is_null());
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_stops_the_scans_and_closes_the_log() {
+    let (port_in, _) = target();
+    let (pl_port, cancels) = plessor();
+    let data = temp_dir("sigterm");
+    write_config(&data, closed_port(), pl_port);
+    write_scope(&data, &format!("entries = [\"127.0.0.1:{port_in}\"]\n"));
+    let mut child = spawn(&data);
+    let (mut c, _) = Client::attach(&mut child);
+    c.initialize(false);
+
+    let r = c.call(
+        2,
+        "test_injection",
+        json!({"url": format!("http://127.0.0.1:{port_in}/?q=1")}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let scan_id = r["structuredContent"]["scan_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(r["structuredContent"]["status"], "running", "{r}");
+
+    let killed = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let status = wait_exit(&mut child, Duration::from_secs(10));
+    assert!(status.success(), "{status:?}");
+
+    let (audit, _) = audit_calls(&data);
+    assert!(audit.contains("\"event\":\"stop\""), "{audit}");
+    let job: Value = serde_json::from_str(
+        &std::fs::read_to_string(data.join(format!("mcp/jobs/{scan_id}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(job["status"], "interrupted", "{job}");
+    assert_eq!(
+        cancels.load(Ordering::SeqCst),
+        1,
+        "plessor was not told to stop"
+    );
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+#[test]
+fn an_entry_that_does_not_parse_stops_the_start() {
+    let data = temp_dir("bad");
+    write_scope(&data, "entries = [\"not a host\"]\n");
+    let mut child = spawn(&data);
+    // Stdin stays open: the server has to fail without waiting for a client.
+    let _stdin = child.stdin.take();
+    let status = wait_exit(&mut child, Duration::from_secs(10));
+    let mut out = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut out)
+        .unwrap();
+    let mut err = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut err)
+        .unwrap();
+    assert_eq!(status.code(), Some(2), "{err}");
+    assert!(out.is_empty(), "stdout must stay empty: {out}");
+    assert!(err.contains("\"not a host\""), "{err}");
+    assert!(
+        !data.join("mcp/audit.jsonl").exists(),
+        "nothing ran, so nothing is logged"
+    );
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+const CLOUD_KEY: &str = "cfm_0123456789abcdef0123456789abcdef";
+
+/// A Cloud API that answers `whoami` for [`CLOUD_KEY`] with a read key, and counts the
+/// requests it reads.
+fn fake_cloud() -> (u16, Arc<AtomicUsize>) {
+    fake_cloud_revoking_after(usize::MAX)
+}
+
+/// [`fake_cloud`], answering only its first `n` requests: every later one is refused
+/// as a revoked key would be.
+fn fake_cloud_revoking_after(n_ok: usize) -> (u16, Arc<AtomicUsize>) {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let n = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&n);
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(mut s) = s else { return };
+            let nth = seen.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut r = BufReader::new(s.try_clone().unwrap());
+            let mut head = Vec::new();
+            let mut len = 0usize;
+            loop {
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                }
+                head.push(line);
+            }
+            let mut body = vec![0u8; len];
+            let _ = r.read_exact(&mut body);
+            let authorised = head.iter().any(|h| {
+                h.trim() == format!("authorization: Bearer {CLOUD_KEY}").as_str()
+                    || h.trim() == format!("Authorization: Bearer {CLOUD_KEY}").as_str()
+            });
+            let (status, data) = if authorised && nth > n_ok {
+                (401, json!({"reason": "key_revoked"}))
+            } else if authorised {
+                (
+                    200,
+                    json!({
+                    "key": {"id": "k", "prefix": "cfm_01234567", "name": "laptop",
+                            "permission": "read", "expires_at": "2027-01-28T09:00:00Z"},
+                    "user": {"id": "u", "username": "dev"},
+                    "workspace": {"id": "11111111-2222-4333-8444-555555555555", "name": "Acme"},
+                    "plan": "Pro",
+                    "limits": {"running_workflows": 0, "max_concurrent_workflows": 5,
+                               "monthly_used": 0, "monthly_cap": 100,
+                               "launches_left_this_hour": 10, "key_concurrent_cap": 5},
+                    "approval": {"policy": "risky", "fallback": true, "phone_registered": false},
+                    "scope": {"current": 1, "attested": 1, "effective": 1,
+                              "effective_sha256": "00"}}),
+                )
+            } else {
+                (401, json!({"reason": "key_invalid"}))
+            };
+            let body =
+                json!({"status": status, "message": "", "errors": [], "data": data}).to_string();
+            let _ = write!(
+                s,
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\nx-crossfyre-call-id: call-1\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    (port, n)
+}
+
+/// The Cloud key file `crossfyre mcp cloud login` writes, for `key` at `api_url`.
+fn write_cloud_key(data: &std::path::Path, api_url: &str, key: &str) {
+    let key_file = data.join("mcp/cloud.toml");
+    std::fs::write(
+        &key_file,
+        format!("api_url = \"{api_url}\"\nkey = \"{key}\"\n"),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
+fn tool_names(tools: &Value) -> Vec<String> {
+    tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn a_cloud_key_adds_the_cloud_tools_and_appears_in_no_output() {
+    let (port, asked) = fake_cloud();
+    let data = temp_dir("cloud");
+    write_config(&data, closed_port(), closed_port());
+    write_scope(&data, "entries = [\"app.example.test\"]\n");
+    write_cloud_key(&data, &format!("http://127.0.0.1:{port}"), CLOUD_KEY);
+    let secret = &CLOUD_KEY[4..];
+
+    let mut child = spawn(&data);
+    let mut stderr = child.stderr.take().unwrap();
+    let (mut c, all_lines) = Client::attach(&mut child);
+    let init = c.initialize(false);
+    assert!(
+        init["instructions"].as_str().unwrap().contains("cs_"),
+        "{init}"
+    );
+    c.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+    let tools = c.reply(2)["result"]["tools"].clone();
+    let names: Vec<&str> = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names.len(), 15, "{names:?}");
+    assert!(names.contains(&"whoami") && !names.contains(&"start_vuln_scan"));
+    let who = c.call(3, "whoami", json!({}));
+    assert_eq!(
+        who["structuredContent"]["key"]["permission"], "read",
+        "{who}"
+    );
+    let status = c.call(4, "status", json!({}));
+    assert_eq!(
+        status["structuredContent"]["cloud"]["state"], "ready",
+        "{status}"
+    );
+    drop(c.stdin);
+    assert!(wait_exit(&mut child, Duration::from_secs(10)).success());
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        2,
+        "whoami at start, then the tool"
+    );
+
+    let mut err = String::new();
+    stderr.read_to_string(&mut err).unwrap();
+    assert!(err.contains("Cloud ready (key cfm_01234567)"), "{err}");
+    let out = all_lines.lock().unwrap().join("\n");
+    let (audit, _) = audit_calls(&data);
+    for (what, text) in [
+        ("stderr", &err),
+        ("stdout", &out),
+        ("the audit log", &audit),
+    ] {
+        assert!(!text.contains(secret), "{what} holds the key");
+    }
+
+    // --no-cloud: the local server, exactly.
+    let mut child = spawn_with(&data, &["--no-cloud"]);
+    let (mut c, _) = Client::attach(&mut child);
+    c.initialize(false);
+    c.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+    let tools = c.reply(2)["result"]["tools"].clone();
+    assert_eq!(tools.as_array().unwrap().len(), 11);
+    drop(c.stdin);
+    assert!(wait_exit(&mut child, Duration::from_secs(10)).success());
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        2,
+        "--no-cloud asked the Cloud"
+    );
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+/// A key the platform refuses partway through a session takes the Cloud tools away,
+/// and the client hears of it once, whether or not a Workbench is being watched too.
+#[test]
+fn a_key_refused_mid_session_changes_the_list_once() {
+    for mode in ["auto", "off"] {
+        // whoami at start is answered; everything after is refused as revoked.
+        let (port, _) = fake_cloud_revoking_after(1);
+        let data = temp_dir(&format!("revoked-{mode}"));
+        write_config(&data, closed_port(), closed_port());
+        write_scope(&data, "entries = [\"app.example.test\"]\n");
+        write_cloud_key(&data, &format!("http://127.0.0.1:{port}"), CLOUD_KEY);
+        let mut child = spawn_with(&data, &["--workbench", mode]);
+        let _stderr = child.stderr.take();
+        let (mut c, all_lines) = Client::attach(&mut child);
+        c.initialize(false);
+        c.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+        let before = tool_names(&c.reply(2)["result"]["tools"]);
+        assert_eq!(before.len(), 15, "{mode}: {before:?}");
+
+        let r = c.call(3, "whoami", json!({}));
+        assert_eq!(r["isError"], true, "{mode}: {r}");
+        assert!(
+            r["content"][0]["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("\"reason\":\"cloud_key_rejected\"")),
+            "{mode}: {r}"
+        );
+        // Past the Workbench watcher's next look and the gap it keeps between two
+        // announcements.
+        std::thread::sleep(Duration::from_millis(4500));
+        let told = all_lines
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| {
+                serde_json::from_str::<Value>(l)
+                    .is_ok_and(|v| v["method"] == "notifications/tools/list_changed")
+            })
+            .count();
+        assert_eq!(
+            told, 1,
+            "--workbench {mode}: tools/list_changed sent {told} times"
+        );
+        c.send(json!({"jsonrpc": "2.0", "id": 4, "method": "tools/list"}));
+        let after = tool_names(&c.reply(4)["result"]["tools"]);
+        assert_eq!(after.len(), 11, "{mode}: {after:?}");
+
+        drop(c);
+        wait_exit(&mut child, Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(&data);
+    }
+}
+
+/// A Workbench stand-in on a Unix socket: writes its endpoint file under `dir`, answers
+/// the handshake with every method and a project open, and then reads requests without
+/// answering them. Returns how many clients it welcomed.
+#[cfg(unix)]
+fn workbench(dir: &std::path::Path) -> Arc<AtomicUsize> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+    let control = dir.join("control");
+    std::fs::create_dir_all(&control).unwrap();
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&control, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // This process stands in for the Workbench, so the file names its pid.
+    let pid = std::process::id();
+    let socket = control.join(format!("{pid}.sock"));
+    let listener = UnixListener::bind(&socket).unwrap();
+    let token = "5e".repeat(32);
+    let endpoint = cfx_bridge::Endpoint {
+        v: cfx_bridge::ENDPOINT_VERSION,
+        app: cfx_bridge::ENDPOINT_APP.into(),
+        app_version: "0.1.2".into(),
+        pid,
+        started_ms: 1_798_619_564_512,
+        protocol: cfx_bridge::PROTOCOL,
+        agent_access: true,
+        socket: Some(socket.display().to_string()),
+        token: Some(token.clone()),
+        why: None,
+    };
+    let path = control.join(format!("{pid}.json"));
+    std::fs::write(&path, serde_json::to_vec(&endpoint).unwrap()).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let welcomed = Arc::new(AtomicUsize::new(0));
+    let w = Arc::clone(&welcomed);
+    std::thread::spawn(move || {
+        for s in listener.incoming() {
+            let Ok(s) = s else { return };
+            let (token, w) = (token.clone(), Arc::clone(&w));
+            std::thread::spawn(move || {
+                let mut out = s.try_clone().unwrap();
+                let mut r = BufReader::new(s);
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                let Ok(cfx_bridge::Handshake::Hello(hello)) = serde_json::from_str(&line) else {
+                    return;
+                };
+                if hello.token != token {
+                    return;
+                }
+                let welcome = cfx_bridge::Handshake::Welcome(cfx_bridge::Welcome {
+                    protocol: cfx_bridge::PROTOCOL,
+                    app_version: "0.1.2".into(),
+                    pid,
+                    capabilities: cfx_bridge::Method::ALL
+                        .iter()
+                        .map(|m| m.as_str().to_string())
+                        .collect(),
+                    project: Some(cfx_bridge::ProjectInfo {
+                        uid: "3f9a0c21be7d44c1a0e5b6f1c2d3e4f5".into(),
+                        name: "acme-q4".into(),
+                        exchanges: 3,
+                    }),
+                });
+                if out
+                    .write_all(cfx_bridge::to_line(&welcome).as_bytes())
+                    .is_err()
+                {
+                    return;
+                }
+                w.fetch_add(1, Ordering::SeqCst);
+                line.clear();
+                while r.read_line(&mut line).unwrap_or(0) > 0 {
+                    line.clear();
+                }
+            });
+        }
+    });
+    welcomed
+}
+
+#[cfg(unix)]
+#[test]
+fn a_workbench_that_starts_later_changes_the_tool_list() {
+    let data = temp_dir("workbench");
+    write_config(&data, closed_port(), closed_port());
+    write_scope(&data, "entries = [\"app.example.test\"]\n");
+    let mut child = spawn(&data);
+    let _stderr = child.stderr.take();
+    let (mut c, _) = Client::attach(&mut child);
+    c.initialize(false);
+    c.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+    let tools = c.reply(2)["result"]["tools"].clone();
+    assert_eq!(tools.as_array().unwrap().len(), 11);
+
+    let welcomed = workbench(&data.join("wb"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let line = c
+            .lines
+            .recv_timeout(left)
+            .expect("notifications/tools/list_changed within 5 s");
+        let v: Value = serde_json::from_str(&line).unwrap();
+        if v["method"] == "notifications/tools/list_changed" {
+            break;
+        }
+    }
+    assert_eq!(welcomed.load(Ordering::SeqCst), 1);
+    c.send(json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}));
+    let tools = c.reply(3)["result"]["tools"].clone();
+    let names: Vec<&str> = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names.len(), 18, "{names:?}");
+    assert!(names.contains(&"workbench_replay"), "{names:?}");
+
+    drop(c);
+    wait_exit(&mut child, Duration::from_secs(10));
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+/// Against a running platform rather than a stand-in, as an agent would use it: log in
+/// with an MCP key, `whoami`, check the scope, a launch in scope held for a person, and
+/// one out of scope refused before anything is made.
+///
+/// Skipped unless `CROSSFYRE_DEV_CLOUD=1`. It needs:
+///
+/// - `CROSSFYRE_DEV_CLOUD_URL`: the dashboard origin that serves `/api/v1/mcp`
+///   (default `http://localhost:12004`, a dev stack's web server);
+/// - `CROSSFYRE_DEV_CLOUD_KEY`: a launch key (`cfm_...`) for a workspace set to ask about
+///   every launch, whose owner has no phone registered and allows the fallback;
+/// - `CROSSFYRE_DEV_CLOUD_TARGET`: a host in the scope the key's owner confirmed;
+/// - an online node in that workspace with the crawl engine.
+///
+/// The held launch is withdrawn before the test ends, so the workspace is left as it was
+/// found. The key's hourly launch limit is not: each run asks for two launches, and the
+/// platform counts both against the key's ten an hour, the refused one included and the
+/// withdrawn one not given back. So one key does about five runs an hour, and a run with
+/// fewer than two launches left stops at `whoami` and says so.
+///
+/// The data directory is removed however the test ends, since the login saves the key
+/// there in full.
+#[test]
+fn a_dev_cloud_holds_a_launch_in_scope_and_refuses_one_outside() {
+    if std::env::var("CROSSFYRE_DEV_CLOUD").as_deref() != Ok("1") {
+        eprintln!("skipped: set CROSSFYRE_DEV_CLOUD=1 to run against a dev platform");
+        return;
+    }
+    let need = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| panic!("CROSSFYRE_DEV_CLOUD=1 needs {name}"))
+    };
+    let api_url = std::env::var("CROSSFYRE_DEV_CLOUD_URL")
+        .unwrap_or_else(|_| "http://localhost:12004".into())
+        .trim_end_matches('/')
+        .to_string();
+    let key = need("CROSSFYRE_DEV_CLOUD_KEY");
+    let target = need("CROSSFYRE_DEV_CLOUD_TARGET");
+    let inside = format!("https://{target}/");
+    let outside = format!("https://outside-{}.example.net/", std::process::id());
+    let secret = key.strip_prefix("cfm_").expect("an MCP key").to_string();
+
+    let data = temp_dir("dev-cloud");
+    let _gone = RemoveOnDrop(data.clone());
+    write_config(&data, closed_port(), closed_port());
+    // No entries: the scope file narrows nothing, and the platform decides alone.
+    write_scope(&data, "entries = []\n");
+
+    // Log in: the key is checked with the platform, then saved for the server.
+    let mut login = Command::new(env!("CARGO_BIN_EXE_crossfyre"))
+        .arg("--data-dir")
+        .arg(&data)
+        .args(["mcp", "cloud", "login", "--api-url", &api_url])
+        .env_remove("CROSSFYRE_MCP_CLOUD_KEY")
+        .env_remove("CROSSFYRE_MCP_CLOUD_URL")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(login.stdin.take().unwrap(), "{key}").unwrap();
+    let out = login.wait_with_output().unwrap();
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "login: {said}");
+    assert!(
+        said.contains(&key[..12]) && said.contains("launch"),
+        "{said}"
+    );
+    assert!(!said.contains(&secret), "login printed the key");
+
+    let mut child = spawn(&data);
+    let mut stderr = child.stderr.take().unwrap();
+    let (mut c, all_lines) = Client::attach(&mut child);
+    // A client that shows no forms, so the held launch comes back as its handle.
+    c.initialize(false);
+    c.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+    let names = tool_names(&c.reply(2)["result"]["tools"]);
+    for t in [
+        "whoami",
+        "check_scope",
+        "start_crawl",
+        "get_scan",
+        "cancel_scan",
+    ] {
+        assert!(names.iter().any(|n| n == t), "{t} not listed: {names:?}");
+    }
+
+    let who = c.call(3, "whoami", json!({}));
+    let w = &who["structuredContent"];
+    assert_eq!(w["key"]["permission"], "launch", "{who}");
+    assert_eq!(w["key"]["prefix"], &key[..12], "{who}");
+    assert_eq!(w["approval"]["policy"], "always", "{who}");
+    assert_eq!(w["approval"]["phone_registered"], false, "{who}");
+    let left = w["limits"]["launches_left_this_hour"].as_u64().unwrap_or(0);
+    assert!(
+        left >= 2,
+        "this key has {left} launches left this hour and a run asks for two: wait for \
+         the hour to pass, or use another key"
+    );
+
+    let checked = c.call(
+        4,
+        "check_scope",
+        json!({"targets": [inside, outside], "kind": "url"}),
+    );
+    let allowed: Vec<Value> = checked["structuredContent"]["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{checked}"))
+        .iter()
+        .map(|r| r["cloud_launch_allowed"].clone())
+        .collect();
+    assert_eq!(allowed, vec![json!(true), json!(false)], "{checked}");
+
+    // In scope: held for a person, and the answer is the handle and where to decide it.
+    let held = c.call(5, "start_crawl", json!({"url": inside, "max_depth": 1}));
+    let h = &held["structuredContent"];
+    assert_ne!(held["isError"], true, "{held}");
+    assert_eq!(h["status"], "awaiting_approval", "{held}");
+    let ap = h["scan_id"].as_str().unwrap_or("").to_string();
+    assert!(ap.starts_with("ap_"), "{held}");
+    assert_eq!(h["approval"]["fallback"], true, "{held}");
+    let page = h["approval"]["approve_url"].as_str().unwrap_or("");
+    assert!(page.starts_with(&format!("{api_url}/m/approve/")), "{held}");
+    let seen = c.call(6, "get_scan", json!({"scan_id": ap}));
+    assert_eq!(
+        seen["structuredContent"]["status"], "awaiting_approval",
+        "{seen}"
+    );
+
+    // Out of scope: refused by the platform, and nothing held or started.
+    let refused = c.call(7, "start_crawl", json!({"url": outside}));
+    assert_eq!(refused["isError"], true, "{refused}");
+    let text = refused["content"][0]["text"].as_str().unwrap_or("");
+    assert!(text.contains("\"reason\":\"out_of_scope\""), "{text}");
+    assert!(text.contains("\"at\":\"cloud_scope\""), "{text}");
+    assert!(!text.contains("ap_") && !text.contains("cs_"), "{text}");
+
+    // Withdraw the held launch.
+    let gone = c.call(8, "cancel_scan", json!({"scan_id": ap}));
+    assert_ne!(gone["isError"], true, "{gone}");
+    assert_eq!(gone["structuredContent"]["cancel"], "withdrawn", "{gone}");
+
+    drop(c.stdin);
+    assert!(wait_exit(&mut child, Duration::from_secs(20)).success());
+    let mut err = String::new();
+    stderr.read_to_string(&mut err).unwrap();
+    let stdout = all_lines.lock().unwrap().join("\n");
+    let (audit, calls) = audit_calls(&data);
+    for (what, text) in [
+        ("stderr", &err),
+        ("stdout", &stdout),
+        ("the audit log", &audit),
+    ] {
+        assert!(!text.contains(&secret), "{what} holds the key");
+    }
+    // Every Cloud call carries the platform's record of it.
+    let cloud_calls: Vec<&Value> = calls.iter().filter(|l| l["backend"] == "cloud").collect();
+    assert!(cloud_calls.len() >= 5, "{audit}");
+    assert!(
+        cloud_calls.iter().all(|l| l["cloud_call_id"].is_string()),
+        "{audit}"
+    );
+}

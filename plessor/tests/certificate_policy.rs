@@ -14,7 +14,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use plessor::rawhttp::{ReadUntil, SendFail, Verify, send_until};
+use plessor::rawhttp::{ReadUntil, Route, SendFail, Verify, send_until};
+
+/// Straight to the origin, as these sends always went.
+const DIRECT: Route = Route {
+    egress: transport::Egress::Direct,
+    block_internal: false,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -73,6 +79,7 @@ async fn self_signed_server() -> u16 {
 async fn trusting_any_certificate_reaches_a_self_signed_origin() {
     let port = self_signed_server().await;
     let (out, _) = send_until(
+        &DIRECT,
         "localhost",
         port,
         true,
@@ -95,6 +102,7 @@ async fn trusting_any_certificate_reaches_a_self_signed_origin() {
 async fn checking_certificates_refuses_the_same_origin() {
     let port = self_signed_server().await;
     let (out, _) = send_until(
+        &DIRECT,
         "localhost",
         port,
         true,
@@ -132,6 +140,7 @@ async fn the_policy_is_what_decides() {
     let req = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
 
     let (lax, _) = send_until(
+        &DIRECT,
         "localhost",
         port,
         true,
@@ -142,6 +151,7 @@ async fn the_policy_is_what_decides() {
     )
     .await;
     let (strict, _) = send_until(
+        &DIRECT,
         "localhost",
         port,
         true,
@@ -154,4 +164,50 @@ async fn the_policy_is_what_decides() {
 
     assert!(lax.is_ok(), "Verify::Any should reach it");
     assert!(strict.is_err(), "Verify::WebPki should not");
+}
+
+/// Through a proxy the node was given, the certificate is checked whatever the caller
+/// asked for, by the scanners' senders too. The proxy carries the TLS bytes, so one
+/// that answered with a certificate of its own would read the request and write the
+/// response a finding is made from.
+#[tokio::test]
+async fn through_a_proxy_the_certificate_is_checked_whatever_was_asked() {
+    use cfx_tunnel::recorder::{PASS, Recorder, USER, to_loopback};
+    let port = self_signed_server().await;
+    // Joins every destination to the same port on loopback: here, the origin above.
+    let rec = Recorder::start(to_loopback).await;
+    let route = Route {
+        egress: transport::Egress::Proxy(format!("socks5h://{USER}:{PASS}@127.0.0.1:{}", rec.port)),
+        block_internal: false,
+    };
+    let req = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+
+    let (asked_any, _) = send_until(
+        &route,
+        "localhost",
+        port,
+        true,
+        req,
+        Duration::from_secs(5),
+        ReadUntil::Framed,
+        Verify::Any,
+    )
+    .await;
+    match asked_any {
+        Err(SendFail::Tls(_)) => {}
+        Err(other) => panic!("refused, but not for the certificate: {other}"),
+        Ok(body) => panic!(
+            "a certificate nothing vouches for was accepted through the proxy: {:?}",
+            String::from_utf8_lossy(&body)
+        ),
+    }
+    // The scanners' sender, which accepts any certificate when sent directly.
+    let (scanner, _) =
+        plessor::rawhttp::send_exact(&route, "localhost", port, true, req, Duration::from_secs(5))
+            .await;
+    assert!(
+        scanner.is_none(),
+        "the scanners' send was answered through the proxy"
+    );
+    assert_eq!(rec.joined(), 2, "the proxy carried both connections");
 }

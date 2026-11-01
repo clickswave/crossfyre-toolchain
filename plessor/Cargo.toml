@@ -1,6 +1,6 @@
 [package]
 name = "plessor"
-version = "0.0.29"
+version = "0.0.30"
 edition = "2024"
 license.workspace = true
 publish.workspace = true
@@ -49,6 +49,8 @@ regex = "1"
 uuid = { version = "1.18.0", features = ["v4"] }
 
 [dev-dependencies]
+# A recording SOCKS5 proxy and counting listeners for the egress tests.
+cfx_tunnel = { path = "../tunnel", features = ["recorder"] }
 # To mint a certificate nothing trusts, which is what the certificate-policy test needs
 # an origin to present.
 rcgen = "0.13"

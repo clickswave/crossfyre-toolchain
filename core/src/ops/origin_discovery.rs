@@ -6,6 +6,10 @@
 use super::{OpEnv, Relay};
 use crate::*;
 
+/// Why a proxied node does not run origin discovery.
+pub const PROXIED: &str =
+    "Origin discovery connects to candidate addresses directly and cannot run through a proxy";
+
 pub async fn handle(env: OpEnv) {
     let OpEnv {
         op_id,
@@ -15,6 +19,7 @@ pub async fn handle(env: OpEnv) {
         pub_clone,
         status_subj,
         result_subj,
+        egress,
         ..
     } = env;
 
@@ -40,14 +45,23 @@ pub async fn handle(env: OpEnv) {
         op_id: &op_id,
         workflow_id: &workflow_id,
         node_id: &node_id,
+        egress: egress.as_deref(),
     };
 
+    // Origin discovery has to reach each candidate address itself to see whether it
+    // is the origin, and a proxy would answer for it instead. voyage refuses it
+    // through a proxy too; the node does not send it.
+    if egress.is_some() {
+        relay.refuse(PROXIED).await;
+        return;
+    }
+
     let mut found_count = 0;
-    match tokio::net::TcpStream::connect(crate::toolchain::config::engine_addr("voyage")).await {
+    match tokio::net::TcpStream::connect(super::engine_addr("voyage")).await {
         Ok(stream) => {
             use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
             let (reader, mut writer) = stream.into_split();
-            let mut req_str = dguard::encode(&voyage_req);
+            let mut req_str = crate::egress::state::encode_for_engine(&voyage_req, None);
             req_str.push('\n');
             let _ = writer.write_all(req_str.as_bytes()).await;
 

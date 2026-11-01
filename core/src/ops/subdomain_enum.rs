@@ -16,7 +16,9 @@ pub async fn handle(env: OpEnv) {
         http,
         api_url,
         api_key,
+        egress,
     } = env;
+    let lease = egress.as_deref();
 
     // Subdomain enumeration via voyage daemon (port 4442)
     let domain = data["domain"].as_str().unwrap_or("").to_string();
@@ -137,18 +139,8 @@ pub async fn handle(env: OpEnv) {
             "block_internal": data["block_internal"].as_bool().unwrap_or(false),
         });
 
-        let conn =
-            tokio::net::TcpStream::connect(crate::toolchain::config::engine_addr("voyage")).await;
-        match conn {
-            Ok(stream) => {
-                use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-                let (reader, mut writer) = stream.into_split();
-                let mut req_str = dguard::encode(&voyage_req);
-                req_str.push('\n');
-                let _ = writer.write_all(req_str.as_bytes()).await;
-
-                let mut lines = BufReader::new(reader).lines();
-
+        match super::open_engine("voyage", &voyage_req, lease).await {
+            Ok((mut lines, writer)) => {
                 while let Ok(Some(line)) = lines.next_line().await {
                     if line.trim().is_empty() {
                         continue;
@@ -238,7 +230,21 @@ pub async fn handle(env: OpEnv) {
                     return;
                 }
             }
-            Err(e) => {
+            Err(super::EngineOpen::Refused(why)) => {
+                eprintln!("[op] {op_id} not run: {why}");
+                super::publish_refused(
+                    &pub_clone,
+                    &status_subj,
+                    &op_id,
+                    &workflow_id,
+                    &node_id,
+                    lease,
+                    &why,
+                )
+                .await;
+                return;
+            }
+            Err(super::EngineOpen::Unreachable(e)) => {
                 eprintln!("[op] FAIL Cannot connect to voyage daemon: {e}");
                 let msg = serde_json::json!({
                     "type": "completed",
@@ -267,6 +273,15 @@ pub async fn handle(env: OpEnv) {
         .publish(result_subj.clone(), done_msg.to_string().into())
         .await;
 
+    super::publish_egress(
+        &pub_clone,
+        &status_subj,
+        &op_id,
+        &workflow_id,
+        &node_id,
+        lease,
+    )
+    .await;
     mark_op_done(&op_id);
     let status_msg = serde_json::json!({
         "type": "operation_completed",

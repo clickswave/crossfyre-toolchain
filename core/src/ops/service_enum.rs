@@ -28,7 +28,9 @@ pub async fn handle(env: OpEnv) {
         http,
         api_url,
         api_key,
+        egress,
     } = env;
+    let lease = egress.as_deref();
 
     // Web/service fingerprinting via the toolmark daemon (port 4444).
     // Toolmark streams `finding` events whose `data` is the finding
@@ -72,6 +74,7 @@ pub async fn handle(env: OpEnv) {
             &pub_clone,
             &status_subj,
             &result_subj,
+            lease,
         )
         .await;
         return;
@@ -91,7 +94,7 @@ pub async fn handle(env: OpEnv) {
     // into request auth and hand it to toolmark.
     if let Some(cid) = data["credential_id"].as_str().filter(|s| !s.is_empty()) {
         let host = target_host(&target);
-        match creds::resolve_auth(&http, &api_url, &api_key, cid, &host).await {
+        match creds::resolve_auth(&http, &api_url, &api_key, cid, &host, lease).await {
             Ok(auth) => {
                 if let Some(cr) = toolmark_req.as_object_mut() {
                     cr.insert("auth".into(), auth);
@@ -109,6 +112,7 @@ pub async fn handle(env: OpEnv) {
         &pub_clone,
         &status_subj,
         &result_subj,
+        lease,
     )
     .await;
 }
@@ -158,6 +162,7 @@ async fn run_toolmark(
     pub_clone: &async_nats::Client,
     status_subj: &str,
     result_subj: &str,
+    lease: Option<&super::Lease>,
 ) {
     let relay = Relay {
         pubc: pub_clone,
@@ -166,19 +171,12 @@ async fn run_toolmark(
         op_id,
         workflow_id,
         node_id,
+        egress: lease,
     };
 
     let mut found_count: i64 = 0;
-    let conn = tokio::net::TcpStream::connect(crate::toolchain::config::engine_addr("scout")).await;
-    match conn {
-        Ok(stream) => {
-            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-            let (reader, mut writer) = stream.into_split();
-            let mut req_str = dguard::encode(&req);
-            req_str.push('\n');
-            let _ = writer.write_all(req_str.as_bytes()).await;
-
-            let mut lines = BufReader::new(reader).lines();
+    match super::open_engine("scout", &req, lease).await {
+        Ok((mut lines, writer)) => {
             while let Ok(Some(line)) = lines.next_line().await {
                 if !workflow_id.is_empty() && is_workflow_cancelled(workflow_id) {
                     drop(lines);
@@ -244,10 +242,14 @@ async fn run_toolmark(
                 }
             }
         }
-        Err(e) => {
+        Err(super::EngineOpen::Refused(why)) => {
+            relay.refuse(&why).await;
+            return;
+        }
+        Err(super::EngineOpen::Unreachable(e)) => {
             eprintln!(
                 "[op] FAIL toolmark daemon unreachable on {} ({e}). Is `toolmark --daemon` running?",
-                crate::toolchain::config::engine_addr("scout")
+                super::engine_addr("scout")
             );
             relay.publish_failed().await;
             return;

@@ -35,6 +35,20 @@ pub struct FpParams {
     /// node, so fingerprinting sees the authenticated surface.
     #[serde(default)]
     pub auth: Option<AuthSpec>,
+    /// Names pinned to addresses, `[["app.example.com", "203.0.113.7:443"], ...]`. A
+    /// caller that has already decided which addresses of a name may be dialled sends
+    /// them, so the name is not looked up again here and answered with somewhere else.
+    #[serde(default)]
+    pub resolve: Vec<(String, std::net::SocketAddr)>,
+    /// Refuse private and reserved addresses for any name that is not pinned. See
+    /// `transport::ClientConfig::block_internal`.
+    #[serde(default)]
+    pub block_internal: bool,
+    /// Where the op's connections go. Never read from the request's own fields: the
+    /// daemon sets it from the egress wrapper, and a request without one gets
+    /// `Inherit`.
+    #[serde(skip)]
+    pub egress: transport::Egress,
 }
 fn d_timeout() -> u64 {
     8000
@@ -73,25 +87,28 @@ pub async fn run(params: FpParams, tx: mpsc::UnboundedSender<Value>) {
     } else {
         None
     };
-    let client = match transport::build_scan_client(transport::ScanClient {
-        identity_headers: &ident.headers,
-        user_agent: &ident.user_agent,
-        auth: params.auth.as_ref(),
-        attribution_token: token,
-        emulate: !matches!(mode, adaptive::identity::Mode::Fast),
-        timeout: Some(std::time::Duration::from_millis(
-            params.timeout_ms.clamp(1000, 120_000),
-        )),
-        redirect: if params.follow_redirects {
-            transport::Redirect::Limited(5)
-        } else {
-            transport::Redirect::None
+    let client = match transport::build_scan_client(
+        transport::ScanClient {
+            identity_headers: &ident.headers,
+            user_agent: &ident.user_agent,
+            auth: params.auth.as_ref(),
+            attribution_token: token,
+            emulate: !matches!(mode, adaptive::identity::Mode::Fast),
+            timeout: Some(std::time::Duration::from_millis(
+                params.timeout_ms.clamp(1000, 120_000),
+            )),
+            redirect: if params.follow_redirects {
+                transport::Redirect::Limited(5)
+            } else {
+                transport::Redirect::None
+            },
+            accept_invalid_certs: true,
+            cookie_store: true,
+            resolve: params.resolve.clone(),
+            block_internal: params.block_internal,
         },
-        accept_invalid_certs: true,
-        cookie_store: true,
-        resolve: Vec::new(),
-        ..Default::default()
-    }) {
+        &params.egress,
+    ) {
         Ok(c) => c,
         Err(e) => {
             let _ = tx.send(json!({"type":"error","message":format!("client build failed: {e}")}));

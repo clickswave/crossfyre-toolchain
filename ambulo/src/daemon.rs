@@ -27,10 +27,26 @@ struct DaemonRequest {
     save: bool,
     #[serde(flatten)]
     params: Value,
+    /// From the egress wrapper, never from the request's own fields.
+    #[serde(skip)]
+    egress: transport::Egress,
 }
 
 fn default_response_mode() -> String {
     "queue".to_string()
+}
+
+/// One request line: the operation it asks for, unwrapped, with the egress its
+/// wrapper names. An error is the message the client is answered with, and nothing
+/// is sent anywhere.
+fn parse_request(line: &str) -> Result<DaemonRequest, String> {
+    let v: Value = serde_json::from_str(line).map_err(|e| format!("Invalid JSON: {e}"))?;
+    let (inner, wire) = dguard::split_egress(v)?;
+    let egress = transport::Egress::from_request(wire)?;
+    let mut req: DaemonRequest =
+        serde_json::from_value(inner).map_err(|e| format!("Invalid request: {e}"))?;
+    req.egress = egress;
+    Ok(req)
 }
 
 #[derive(Debug, Serialize)]
@@ -89,6 +105,9 @@ struct ScanParams {
     identify: Option<String>,
     #[serde(default)]
     auth: ScanAuth,
+    /// Set by the daemon from the egress wrapper. See `DaemonRequest::egress`.
+    #[serde(skip)]
+    egress: transport::Egress,
 }
 
 fn default_evasive() -> bool {
@@ -186,36 +205,12 @@ pub async fn run_on(listener: TcpListener, db: AmbuloDb) -> Result<(), Box<dyn s
     gate.announce("Ambulo", addr);
 
     let db = Arc::new(db);
-    let probe_client = Arc::new(transport::build_client(transport::ClientConfig {
-        timeout: Some(std::time::Duration::from_secs(10)),
-        redirect: transport::Redirect::Limited(10),
-        accept_invalid_certs: false,
-        cookie_store: false,
-        user_agent: Some(
-            adaptive::identity::resolve(&adaptive::identity::Mode::Evasive, None).user_agent,
-        ),
-        browser_headers: transport::HeaderMap::new(),
-        extra_headers: transport::HeaderMap::new(),
-        emulate: true,
-        resolve: Vec::new(),
-        ..Default::default()
-    })?);
+    // Shared by every probe that comes without an egress wrapper. A wrapped probe
+    // gets clients of its own, built with its egress.
+    let probe_client = Arc::new(build_probe_client(true, &transport::Egress::Inherit)?);
     // Second client that does NOT follow redirects, for the wizard's
     // "Follow Redirects = off" probes (reqwest sets redirect policy per-client).
-    let probe_client_noredirect = Arc::new(transport::build_client(transport::ClientConfig {
-        timeout: Some(std::time::Duration::from_secs(10)),
-        redirect: transport::Redirect::None,
-        accept_invalid_certs: false,
-        cookie_store: false,
-        user_agent: Some(
-            adaptive::identity::resolve(&adaptive::identity::Mode::Evasive, None).user_agent,
-        ),
-        browser_headers: transport::HeaderMap::new(),
-        extra_headers: transport::HeaderMap::new(),
-        emulate: true,
-        resolve: Vec::new(),
-        ..Default::default()
-    })?);
+    let probe_client_noredirect = Arc::new(build_probe_client(false, &transport::Egress::Inherit)?);
 
     // Background task: delete expired probe_results + GC old scans every 5 min.
     {
@@ -275,6 +270,34 @@ pub async fn run_on(listener: TcpListener, db: AmbuloDb) -> Result<(), Box<dyn s
     }
 }
 
+/// The client the single-URL probe sends with.
+fn build_probe_client(
+    follow_redirects: bool,
+    egress: &transport::Egress,
+) -> Result<Client, transport::BuildError> {
+    transport::build_client(
+        transport::ClientConfig {
+            timeout: Some(std::time::Duration::from_secs(10)),
+            redirect: if follow_redirects {
+                transport::Redirect::Limited(10)
+            } else {
+                transport::Redirect::None
+            },
+            accept_invalid_certs: false,
+            cookie_store: false,
+            user_agent: Some(
+                adaptive::identity::resolve(&adaptive::identity::Mode::Evasive, None).user_agent,
+            ),
+            browser_headers: transport::HeaderMap::new(),
+            extra_headers: transport::HeaderMap::new(),
+            emulate: true,
+            resolve: Vec::new(),
+            ..Default::default()
+        },
+        egress,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Connection handler
 // ---------------------------------------------------------------------------
@@ -315,14 +338,15 @@ async fn handle_connection(
             break;
         }
 
-        let req = match serde_json::from_str::<DaemonRequest>(&line) {
-            Err(e) => {
+        let req = match parse_request(&line) {
+            Err(message) => {
                 write_json(
                     &mut writer,
                     &serde_json::json!({
+                        "type": "error",
                         "operation_id": Uuid::new_v4().to_string(),
                         "status": "error",
-                        "message": format!("Invalid JSON: {}", e),
+                        "message": message,
                     }),
                 )
                 .await?;
@@ -330,6 +354,21 @@ async fn handle_connection(
             }
             Ok(r) => r,
         };
+
+        // What this daemon honours beyond the original protocol, asked before an
+        // operation is sent. The connection stays open for the one that follows.
+        if req.operation == "capabilities" {
+            write_json(
+                &mut writer,
+                &serde_json::json!({
+                    "type": "capabilities",
+                    // The version of the egress wrapper this daemon reads.
+                    "egress": transport::WIRE_VERSION,
+                }),
+            )
+            .await?;
+            continue;
+        }
 
         // Stream mode takes over the connection for the duration of the operation.
         if req.response == "stream" {
@@ -379,7 +418,10 @@ async fn handle_stream_scan(
     let operation_id = Uuid::new_v4().to_string();
 
     let scan_params: ScanParams = match serde_json::from_value(req.params.clone()) {
-        Ok(p) => p,
+        Ok(p) => ScanParams {
+            egress: req.egress.clone(),
+            ..p
+        },
         Err(e) => {
             write_json(
                 &mut writer,
@@ -496,7 +538,10 @@ async fn handle_stream_crawl(
     mut writer: OwnedWriteHalf,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let params: crate::crawler::CrawlParams = match serde_json::from_value(req.params.clone()) {
-        Ok(p) => p,
+        Ok(p) => crate::crawler::CrawlParams {
+            egress: req.egress.clone(),
+            ..p
+        },
         Err(e) => {
             write_json(
                 &mut writer,
@@ -537,7 +582,10 @@ async fn dispatch(
     match req.operation.as_str() {
         "scan" => {
             let scan_params: ScanParams = match serde_json::from_value(req.params.clone()) {
-                Ok(p) => p,
+                Ok(p) => ScanParams {
+                    egress: req.egress.clone(),
+                    ..p
+                },
                 Err(e) => {
                     return DaemonResponse {
                         operation_id,
@@ -586,8 +634,22 @@ async fn dispatch(
                     };
                 }
             };
-            // Pick the client whose redirect policy matches the request.
-            let client = if probe_params.follow_redirects {
+            // Pick the client whose redirect policy matches the request. The shared
+            // clients send the way an unwrapped request always has; a wrapped one
+            // gets its own, with its egress.
+            let client = if req.egress != transport::Egress::Inherit {
+                match build_probe_client(probe_params.follow_redirects, &req.egress) {
+                    Ok(c) => Arc::new(c),
+                    Err(e) => {
+                        return DaemonResponse {
+                            operation_id: probe_params.operation_id,
+                            status: "error".to_string(),
+                            results: None,
+                            message: Some(format!("client build failed: {e}")),
+                        };
+                    }
+                }
+            } else if probe_params.follow_redirects {
                 probe_client
             } else {
                 probe_client_noredirect
@@ -864,6 +926,7 @@ fn build_args(params: &ScanParams, endpoint: String, http_method: HttpMethod) ->
         posture: params.posture.clone(),
         evasive: params.evasive,
         identify: params.identify.clone(),
+        egress: params.egress.clone(),
     }
 }
 
@@ -920,5 +983,303 @@ async fn run_probe(params: ProbeParams, client: Arc<Client>, db: Arc<AmbuloDb>) 
             results: None,
             message: Some(e.to_string()),
         },
+    }
+}
+
+#[cfg(test)]
+mod egress_tests {
+    //! The egress wrapper. A fixture that counts its connections sits behind a
+    //! recording SOCKS5 proxy; every connection the fixture accepts has to be one
+    //! the proxy opened, so a connection made around the proxy shows up as the
+    //! difference.
+    use super::*;
+    use cfx_tunnel::recorder::{Fixture, Recorder, to_loopback};
+    use std::time::Duration;
+    use tokio::io::AsyncBufReadExt;
+
+    const PAGE: &str = "<html><body><a href=\"/a\">a</a> <a href=\"/b\">b</a></body></html>";
+
+    async fn daemon() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let db = Arc::new(AmbuloDb::unconnected(
+            &crate::libs::cli_args::defaults_for_tests(),
+        ));
+        let follow = Arc::new(build_probe_client(true, &transport::Egress::Inherit).unwrap());
+        let stay = Arc::new(build_probe_client(false, &transport::Egress::Inherit).unwrap());
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(handle_connection(
+                    stream,
+                    dguard::Gate::default(),
+                    Arc::clone(&db),
+                    Arc::clone(&follow),
+                    Arc::clone(&stay),
+                ));
+            }
+        });
+        port
+    }
+
+    /// Send one line and read until `done`, a reply that is not a stream event, or
+    /// the connection closing.
+    async fn exchange(dport: u16, op: &Value) -> Vec<Value> {
+        let stream = TcpStream::connect(("127.0.0.1", dport)).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut lines = BufReader::new(r).lines();
+        let mut line = op.to_string();
+        line.push('\n');
+        w.write_all(line.as_bytes()).await.unwrap();
+        let mut events = Vec::new();
+        while let Ok(Ok(Some(l))) =
+            tokio::time::timeout(Duration::from_secs(60), lines.next_line()).await
+        {
+            let Ok(ev) = serde_json::from_str::<Value>(&l) else {
+                continue;
+            };
+            let last = ev.get("type").is_none()
+                || ["done", "error", "capabilities"].contains(&ev["type"].as_str().unwrap_or(""));
+            events.push(ev);
+            if last {
+                break;
+            }
+        }
+        events
+    }
+
+    fn wrapped(inner: Value, proxy: &Recorder) -> Value {
+        dguard::wrap_egress(&inner, &serde_json::json!({"v": 1, "proxy": proxy.url()}))
+    }
+
+    fn assert_all_through(fx: &Fixture, proxy: &Recorder, events: &[Value]) {
+        assert!(
+            fx.connections() > 0,
+            "nothing reached the target: {events:?}"
+        );
+        assert_eq!(
+            fx.connections(),
+            proxy.joined(),
+            "the target accepted connections the proxy did not open"
+        );
+        assert!(proxy.seen().iter().all(|t| t.port == fx.port));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_wrapped_probe_reaches_the_target_only_through_the_proxy() {
+        let fx = Fixture::http("text/html", PAGE.into()).await;
+        let proxy = Recorder::start(to_loopback).await;
+        let dport = daemon().await;
+        for follow in [true, false] {
+            let op = serde_json::json!({
+                "operation": "probe",
+                "response": "instant",
+                "operation_id": "op-1",
+                "url": format!("{}/admin", fx.base()),
+                "follow_redirects": follow,
+            });
+            let events = exchange(dport, &wrapped(op, &proxy)).await;
+            assert_eq!(
+                events.last().map(|e| &e["status"]),
+                Some(&"found".into()),
+                "{events:?}"
+            );
+        }
+        assert_all_through(&fx, &proxy, &[]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_wrapped_crawl_reaches_the_target_only_through_the_proxy() {
+        let fx = Fixture::http("text/html", PAGE.into()).await;
+        let proxy = Recorder::start(to_loopback).await;
+        let dport = daemon().await;
+        let op = serde_json::json!({
+            "operation": "crawl",
+            "response": "stream",
+            "seed": fx.base(),
+            "max_pages": 5,
+            "evasive": false,
+        });
+        let events = exchange(dport, &wrapped(op, &proxy)).await;
+        assert!(
+            fx.requests().iter().any(|l| l.starts_with("GET /a ")),
+            "the crawl did not follow a link: {:?}",
+            fx.requests()
+        );
+        assert_all_through(&fx, &proxy, &events);
+    }
+
+    /// A site whose every page links to ten pages nobody has asked for yet, so a crawl
+    /// of it never runs out. Returns its port and how many requests it has had.
+    async fn endless_site() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&count);
+        tokio::spawn(async move {
+            while let Ok((s, _)) = l.accept().await {
+                let seen = Arc::clone(&seen);
+                tokio::spawn(async move {
+                    let (r, mut w) = s.into_split();
+                    let mut lines = BufReader::new(r).lines();
+                    let Ok(Some(first)) = lines.next_line().await else {
+                        return;
+                    };
+                    while let Ok(Some(l)) = lines.next_line().await {
+                        if l.is_empty() {
+                            break;
+                        }
+                    }
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    let path = first.split_whitespace().nth(1).unwrap_or("/");
+                    let base = path.trim_end_matches('/');
+                    let links: String = (0..10)
+                        .map(|i| format!("<a href=\"{base}/p{i}\">p{i}</a> "))
+                        .collect();
+                    let body = format!("<html><body>{links}</body></html>");
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+                         Connection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = w.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        (port, count)
+    }
+
+    /// A crawl stops once the client that asked for it is gone: the node closes the
+    /// connection when it stops an op, and a crawl nobody reads is only traffic at
+    /// somebody's site, from wherever this engine sends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_crawl_stops_when_its_client_goes_away() {
+        use std::sync::atomic::Ordering;
+        let (port, count) = endless_site().await;
+        let dport = daemon().await;
+        let op = serde_json::json!({
+            "operation": "crawl",
+            "response": "stream",
+            "seed": format!("http://127.0.0.1:{port}/"),
+            "max_pages": 100000,
+            "max_depth": 20,
+            "tasks": 2,
+            "delay": 10,
+            "evasive": false,
+        });
+        let stream = TcpStream::connect(("127.0.0.1", dport)).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut lines = BufReader::new(r).lines();
+        w.write_all(format!("{op}\n").as_bytes()).await.unwrap();
+        let mut fetched = 0;
+        while fetched < 5 {
+            let line = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+                .await
+                .expect("the crawl went quiet")
+                .unwrap()
+                .expect("the crawl ended");
+            // A fetched page is reported with the status it answered.
+            if line.contains("\"status_code\"") {
+                fetched += 1;
+            }
+        }
+        drop(lines);
+        drop(w);
+        // Requests already in flight finish; after them, nothing more is asked for.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let settled = count.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        let later = count.load(Ordering::SeqCst);
+        assert!(
+            later <= settled + 2,
+            "the crawl went on without its client: {settled} requests, then {later} a second later"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_proxied_crawl_skips_the_headless_tier_and_says_so() {
+        let fx = Fixture::http("text/html", PAGE.into()).await;
+        let proxy = Recorder::start(to_loopback).await;
+        let dport = daemon().await;
+        let op = serde_json::json!({
+            "operation": "crawl",
+            "response": "stream",
+            "seed": fx.base(),
+            "max_pages": 2,
+            "evasive": false,
+            "browser": true,
+        });
+        let events = exchange(dport, &wrapped(op, &proxy)).await;
+        assert!(
+            events.iter().any(|e| e["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("headless tier skipped"))),
+            "{events:?}"
+        );
+        assert_all_through(&fx, &proxy, &events);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_wrapped_op_with_an_unknown_egress_version_is_refused_unsent() {
+        let fx = Fixture::http("text/html", PAGE.into()).await;
+        let dport = daemon().await;
+        let op = serde_json::json!({
+            "operation": "crawl",
+            "response": "stream",
+            "seed": fx.base(),
+        });
+        let events = exchange(
+            dport,
+            &dguard::wrap_egress(&op, &serde_json::json!({"v": 2, "proxy": null})),
+        )
+        .await;
+        assert!(dguard::is_error(&events[0].to_string()), "{events:?}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(fx.connections(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wrapped_capabilities_name_the_egress_version() {
+        let dport = daemon().await;
+        let events = exchange(
+            dport,
+            &dguard::wrap_egress(
+                &serde_json::json!({"operation": "capabilities"}),
+                &serde_json::json!({"v": 1, "proxy": null}),
+            ),
+        )
+        .await;
+        assert_eq!(events[0]["type"], "capabilities", "{events:?}");
+        assert_eq!(events[0]["egress"], 1, "{events:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn content_discovery_probes_go_through_the_scan_egress() {
+        // The content-discovery scan keeps its state in the database, so its
+        // prober is driven here directly, built from the arguments a wrapped
+        // scan gets.
+        let fx = Fixture::http("text/html", PAGE.into()).await;
+        let proxy = Recorder::start(to_loopback).await;
+        let params: ScanParams = serde_json::from_value(serde_json::json!({
+            "endpoint": format!("{}/::FUZZ::", fx.base()),
+            "wordlist": "/dev/null",
+            "evasive": false,
+        }))
+        .unwrap();
+        let params = ScanParams {
+            egress: transport::Egress::Proxy(proxy.url()),
+            ..params
+        };
+        let args = build_args(&params, params.endpoint.clone(), HttpMethod::Get);
+        let prober = crate::prober::Prober::new(&args).await.unwrap();
+        let work = crate::libs::ambulo_db::Work {
+            url: format!("{}/admin", fx.base()),
+            entry_id: 1,
+            method: "get".into(),
+        };
+        let got = prober.probe_url(&work, false).await;
+        assert!(got.is_ok(), "the probe did not arrive");
+        assert_eq!(fx.requests(), ["GET /admin HTTP/1.1"]);
+        assert_all_through(&fx, &proxy, &[]);
     }
 }

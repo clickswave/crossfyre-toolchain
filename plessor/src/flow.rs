@@ -649,6 +649,11 @@ pub struct FlowParams {
     pub identify: Option<String>,
     #[serde(default)]
     pub block_internal: bool,
+    /// Where this op's connections go. Never read from the op's own fields: the
+    /// daemon sets it from the egress wrapper the request came in, and a request
+    /// without one gets `Inherit`.
+    #[serde(skip)]
+    pub egress: transport::Egress,
 }
 
 fn d_timeout() -> u64 {
@@ -672,6 +677,7 @@ async fn replay(p: &FlowParams, skip: Option<usize>) -> Option<Vec<u16>> {
         timeout_ms: p.timeout_ms,
         min_timeout_ms: 0,
         block_internal: p.block_internal,
+        egress: &p.egress,
     })?;
 
     let mut statuses = vec![0u16; p.steps.len()];
@@ -733,6 +739,7 @@ async fn replay_values(
         timeout_ms: p.timeout_ms,
         min_timeout_ms: 0,
         block_internal: p.block_internal,
+        egress: &p.egress,
     })?;
     let mut statuses = vec![0u16; steps.len()];
     let mut fresh: HashMap<(usize, String), String> = HashMap::new();
@@ -1109,6 +1116,7 @@ async fn replay_with_repeat(p: &FlowParams) -> Option<(u16, u16)> {
         timeout_ms: p.timeout_ms,
         min_timeout_ms: 0,
         block_internal: p.block_internal,
+        egress: &p.egress,
     })?;
     let mut fresh: HashMap<(usize, String), String> = HashMap::new();
     let last = p.steps.len() - 1;

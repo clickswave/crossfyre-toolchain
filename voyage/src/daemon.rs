@@ -21,10 +21,26 @@ struct DaemonRequest {
     save: bool,
     #[serde(flatten)]
     params: Value,
+    /// From the egress wrapper, never from the request's own fields.
+    #[serde(skip)]
+    egress: transport::Egress,
 }
 
 fn default_response_mode() -> String {
     "queue".to_string()
+}
+
+/// One request line: the operation it asks for, unwrapped, with the egress its
+/// wrapper names. An error is the message the client is answered with, and nothing
+/// is sent anywhere.
+fn parse_request(line: &str) -> Result<DaemonRequest, String> {
+    let v: Value = serde_json::from_str(line).map_err(|e| format!("Invalid JSON: {e}"))?;
+    let (inner, wire) = dguard::split_egress(v)?;
+    let egress = transport::Egress::from_request(wire)?;
+    let mut req: DaemonRequest =
+        serde_json::from_value(inner).map_err(|e| format!("Invalid request: {e}"))?;
+    req.egress = egress;
+    Ok(req)
 }
 
 #[derive(Debug, Serialize)]
@@ -91,6 +107,9 @@ struct EnumParams {
     /// authorised enum gets.
     #[serde(default)]
     block_internal: bool,
+    /// Set by the daemon from the egress wrapper. See `DaemonRequest::egress`.
+    #[serde(skip)]
+    egress: transport::Egress,
 }
 
 fn default_posture() -> String {
@@ -224,14 +243,15 @@ async fn handle_connection(
             break;
         }
 
-        let req = match serde_json::from_str::<DaemonRequest>(&line) {
-            Err(e) => {
+        let req = match parse_request(&line) {
+            Err(message) => {
                 write_json(
                     &mut writer,
                     &serde_json::json!({
+                        "type": "error",
                         "operation_id": Uuid::new_v4().to_string(),
                         "status": "error",
-                        "message": format!("Invalid JSON: {}", e),
+                        "message": message,
                     }),
                 )
                 .await?;
@@ -239,6 +259,21 @@ async fn handle_connection(
             }
             Ok(r) => r,
         };
+
+        // What this daemon honours beyond the original protocol, asked before an
+        // operation is sent. The connection stays open for the one that follows.
+        if req.operation == "capabilities" {
+            write_json(
+                &mut writer,
+                &serde_json::json!({
+                    "type": "capabilities",
+                    // The version of the egress wrapper this daemon reads.
+                    "egress": transport::WIRE_VERSION,
+                }),
+            )
+            .await?;
+            continue;
+        }
 
         // Stream mode takes over the connection for the duration of the scan.
         // Routed by operation first: each stream handler parses its own params,
@@ -287,7 +322,10 @@ async fn handle_stream_enum(
     let operation_id = Uuid::new_v4().to_string();
 
     let params: EnumParams = match serde_json::from_value(req.params.clone()) {
-        Ok(p) => p,
+        Ok(p) => EnumParams {
+            egress: req.egress.clone(),
+            ..p
+        },
         Err(e) => {
             write_json(
                 &mut writer,
@@ -388,7 +426,10 @@ async fn dispatch(req: DaemonRequest, db: Arc<VoyageDb>) -> DaemonResponse {
     match req.operation.as_str() {
         "enum" => {
             let params: EnumParams = match serde_json::from_value(req.params.clone()) {
-                Ok(p) => p,
+                Ok(p) => EnumParams {
+                    egress: req.egress.clone(),
+                    ..p
+                },
                 Err(e) => {
                     return DaemonResponse {
                         operation_id,
@@ -483,11 +524,20 @@ async fn dispatch(req: DaemonRequest, db: Arc<VoyageDb>) -> DaemonResponse {
                     };
                 }
             };
+            if let Some(why) = crate::scanners::origin::refused(&req.egress) {
+                return DaemonResponse {
+                    operation_id,
+                    status: "error".to_string(),
+                    results: None,
+                    message: Some(why.to_string()),
+                };
+            }
             let noop = |_: String| {};
             let findings = crate::scanners::origin::discover(
                 &params.domain,
                 params.timeout_ms,
                 params.evasive,
+                &req.egress,
                 &noop,
             )
             .await;
@@ -579,6 +629,7 @@ async fn prepare_enum(
             &params.domain,
             &params.passive_user_agent,
             &params.exclude_passive_sources,
+            &params.egress,
         )
         .await
         {
@@ -655,6 +706,7 @@ async fn prepare_enum(
         posture: params.posture.clone(),
         evasive: params.evasive,
         identify: params.identify.clone(),
+        egress: params.egress.clone(),
     };
 
     let scanner = Scanner::new(config, Arc::clone(db));
@@ -874,7 +926,7 @@ async fn handle_stream_axfr(
 
     let mut total = 0usize;
     for (label, addr) in servers {
-        let t = crate::axfr::transfer(&zone, addr, timeout).await;
+        let t = crate::axfr::transfer(&zone, addr, timeout, &req.egress).await;
         if let Some(why) = &t.refused {
             write_json(
                 &mut writer,
@@ -932,6 +984,43 @@ async fn handle_stream_axfr(
     Ok(())
 }
 
+/// The confirmation fetch's client.
+///
+/// An explicit User-Agent and no browser emulation, deliberately. This path serves
+/// the public free tools, which reach hosts whose owners have not asked us to scan
+/// them; the only defensible posture there is to say who we are. Evasion belongs to
+/// scans a customer authorised on their own property.
+///
+/// It goes out the way the op's egress says, like every other client: a takeover
+/// check is an op a node runs too, and a proxied node's must not go out from its own
+/// address. Without a wrapper it inherits, which with `block_internal` uses no proxy
+/// from the environment.
+fn takeover_client(
+    params: &TakeoverParams,
+    ua: &str,
+    egress: &transport::Egress,
+) -> Result<transport::Client, transport::BuildError> {
+    transport::build_client(
+        transport::ClientConfig {
+            timeout: Some(std::time::Duration::from_millis(params.timeout_ms)),
+            // No redirects on the guarded path: a followed redirect is a second
+            // destination the caller chose and we did not check. The confirmation
+            // fetch only needs the provider's own not-configured page, which is
+            // served directly, so nothing legitimate is lost.
+            redirect: if params.block_internal {
+                transport::Redirect::None
+            } else {
+                transport::Redirect::Limited(3)
+            },
+            user_agent: Some(ua.to_string()),
+            emulate: false,
+            block_internal: params.block_internal,
+            ..Default::default()
+        },
+        egress,
+    )
+}
+
 async fn handle_stream_takeover(
     req: DaemonRequest,
     mut writer: OwnedWriteHalf,
@@ -960,27 +1049,7 @@ async fn handle_stream_takeover(
         params.user_agent.trim().to_string()
     };
 
-    // Plain reqwest with an explicit User-Agent, deliberately NOT the transport
-    // layer's browser-emulating identity. This path serves the public free
-    // tools, which reach hosts whose owners have not asked us to scan them; the
-    // only defensible posture there is to say who we are. Evasion belongs to
-    // scans a customer authorised on their own property.
-    let mut builder = reqwest::Client::builder()
-        .user_agent(&ua)
-        .timeout(std::time::Duration::from_millis(params.timeout_ms))
-        // No redirects on the guarded path: a followed redirect is a second
-        // destination the caller chose and we did not check. The confirmation
-        // fetch only needs the provider's own not-configured page, which is
-        // served directly, so nothing legitimate is lost.
-        .redirect(if params.block_internal {
-            reqwest::redirect::Policy::none()
-        } else {
-            reqwest::redirect::Policy::limited(3)
-        });
-    if params.block_internal {
-        builder = builder.dns_resolver(std::sync::Arc::new(transport::guard::PublicOnlyResolver));
-    }
-    let client = match builder.build() {
+    let client = match takeover_client(&params, &ua, &req.egress) {
         Ok(c) => c,
         Err(e) => {
             write_json(
@@ -1003,7 +1072,7 @@ async fn handle_stream_takeover(
     } else if !params.domain.trim().is_empty() {
         let domain = params.domain.trim().to_lowercase();
         let mut found: Vec<String> =
-            match crate::scanners::passive_scan::execute(&domain, &ua, &[]).await {
+            match crate::scanners::passive_scan::execute(&domain, &ua, &[], &req.egress).await {
                 Ok(map) => map.into_keys().collect(),
                 Err(e) => {
                     eprintln!("[takeover] passive enum failed for {domain}: {e}");
@@ -1208,5 +1277,281 @@ mod wordlist_tests {
             Ok(None)
         ));
         assert!(matches!(active_wordlist(&enum_params("", false)), Ok(None)));
+    }
+}
+
+#[cfg(test)]
+mod egress_tests {
+    //! The egress wrapper. Fixtures that count their connections sit behind a
+    //! recording SOCKS5 proxy; every connection a fixture accepts has to be one the
+    //! proxy opened, so a connection made around the proxy shows up as the
+    //! difference. DNS goes to a server on loopback that knows no names, so nothing
+    //! here leaves the machine.
+    use super::*;
+    use cfx_tunnel::recorder::{Fixture, Recorder, name_of, to_loopback};
+    use std::time::Duration;
+    use tokio::io::AsyncBufReadExt;
+
+    const ONLY_THE_PROXY: &str = "only-the-proxy-knows.invalid";
+
+    async fn daemon() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let db = Arc::new(VoyageDb::unconnected());
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(handle_connection(
+                    stream,
+                    dguard::Gate::default(),
+                    Arc::clone(&db),
+                ));
+            }
+        });
+        port
+    }
+
+    /// A DNS server on loopback that answers every query "no such name", so a
+    /// lookup ends at once and none goes anywhere else.
+    async fn local_dns() -> String {
+        let s = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("127.0.0.1:{}", s.local_addr().unwrap().port());
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, from)) = s.recv_from(&mut buf).await {
+                if n < 12 {
+                    continue;
+                }
+                // A response (QR), recursion available, NXDOMAIN.
+                buf[2] |= 0x80;
+                buf[3] = 0x80 | 3;
+                let _ = s.send_to(&buf[..n], from).await;
+            }
+        });
+        addr
+    }
+
+    async fn exchange(dport: u16, op: &Value) -> Vec<Value> {
+        let stream = TcpStream::connect(("127.0.0.1", dport)).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut lines = BufReader::new(r).lines();
+        let mut line = op.to_string();
+        line.push('\n');
+        w.write_all(line.as_bytes()).await.unwrap();
+        let mut events = Vec::new();
+        while let Ok(Ok(Some(l))) =
+            tokio::time::timeout(Duration::from_secs(60), lines.next_line()).await
+        {
+            let Ok(ev) = serde_json::from_str::<Value>(&l) else {
+                continue;
+            };
+            let last = ev.get("type").is_none()
+                || ["done", "error", "capabilities"].contains(&ev["type"].as_str().unwrap_or(""));
+            events.push(ev);
+            if last {
+                break;
+            }
+        }
+        events
+    }
+
+    fn proxied(proxy: &Recorder) -> transport::Egress {
+        transport::Egress::Proxy(proxy.url())
+    }
+
+    fn wrapped(inner: Value, proxy: &Recorder) -> Value {
+        dguard::wrap_egress(&inner, &serde_json::json!({"v": 1, "proxy": proxy.url()}))
+    }
+
+    fn assert_all_through(fx: &Fixture, proxy: &Recorder) {
+        assert!(fx.connections() > 0, "nothing reached the target");
+        assert_eq!(
+            fx.connections(),
+            proxy.joined(),
+            "the target accepted connections the proxy did not open"
+        );
+    }
+
+    /// The passive providers, as the sources name their hosts.
+    fn providers(proxy: &Recorder) -> Vec<String> {
+        let mut v: Vec<String> = proxy
+            .seen()
+            .iter()
+            .filter_map(|t| name_of(t).map(str::to_string))
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_wrapped_takeover_asks_its_passive_sources_through_the_proxy() {
+        // Every provider is joined to a listener that hangs up, so each source
+        // fails fast and nothing is fetched from anywhere real.
+        let fx = Fixture::banner(b"").await;
+        let to = fx.port;
+        let proxy = Recorder::start(move |_| Some(([127, 0, 0, 1], to).into())).await;
+        let dport = daemon().await;
+        let op = serde_json::json!({
+            "operation": "takeover",
+            "response": "stream",
+            "domain": "example.test",
+            "dns_server": local_dns().await,
+            "timeout_ms": 3000,
+        });
+        let events = exchange(dport, &wrapped(op, &proxy)).await;
+        assert!(
+            events.iter().any(|e| e["type"] == "done"),
+            "the check did not finish: {events:?}"
+        );
+        let asked = providers(&proxy);
+        assert!(asked.iter().any(|h| h == "crt.sh"), "{asked:?}");
+        assert!(asked.len() >= 5, "{asked:?}");
+        assert_all_through(&fx, &proxy);
+    }
+
+    #[tokio::test]
+    async fn the_passive_sources_go_through_the_egress_they_are_given() {
+        let fx = Fixture::banner(b"").await;
+        let to = fx.port;
+        let proxy = Recorder::start(move |_| Some(([127, 0, 0, 1], to).into())).await;
+        let found = crate::scanners::passive_scan::execute(
+            "example.test",
+            "voyage-test",
+            &[],
+            &proxied(&proxy),
+        )
+        .await
+        .unwrap();
+        assert!(found.is_empty());
+        assert!(providers(&proxy).iter().any(|h| h == "crt.sh"));
+        assert_all_through(&fx, &proxy);
+    }
+
+    #[tokio::test]
+    async fn enum_http_probing_goes_through_the_egress() {
+        let fx = Fixture::http("text/html", "ok".into()).await;
+        let proxy = Recorder::start(to_loopback).await;
+        let config = EnumConfig {
+            scan_id: "s".into(),
+            domain: "example.test".into(),
+            tasks: 1,
+            interval_ms: 0,
+            exclude_passive_sources: vec![],
+            exclude_active_techniques: vec![],
+            http_probing_ports: vec![fx.port],
+            https_probing_ports: vec![],
+            active_user_agent: "voyage-test".into(),
+            passive_user_agent: "voyage-test".into(),
+            active_random_user_agent: false,
+            dns_server: local_dns().await,
+            adaptive_rate: false,
+            adaptive_resilience: false,
+            posture: "balanced".into(),
+            evasive: false,
+            identify: None,
+            block_internal: false,
+            egress: proxied(&proxy),
+        };
+        let client = crate::scanner::probe_client(&config, "voyage-test").unwrap();
+        let got = crate::scanners::techniques::http_probing::execute(
+            &client,
+            &ONLY_THE_PROXY.to_string(),
+            &[fx.port],
+        )
+        .await;
+        assert!(got.is_ok(), "the probe did not arrive");
+        assert_eq!(fx.requests().len(), 1);
+        assert_eq!(
+            proxy.seen().iter().filter_map(name_of).collect::<Vec<_>>(),
+            [ONLY_THE_PROXY]
+        );
+        assert_all_through(&fx, &proxy);
+    }
+
+    #[tokio::test]
+    async fn the_takeover_fetch_goes_through_the_egress() {
+        let fx = Fixture::http("text/html", "ok".into()).await;
+        let proxy = Recorder::start(to_loopback).await;
+        let params: TakeoverParams = serde_json::from_value(serde_json::json!({
+            "hosts": [ONLY_THE_PROXY],
+            "block_internal": true,
+        }))
+        .unwrap();
+        let client = takeover_client(&params, "voyage-test", &proxied(&proxy)).unwrap();
+        let r = client
+            .get(format!("http://{ONLY_THE_PROXY}:{}/", fx.port))
+            .send()
+            .await
+            .expect("through the proxy");
+        assert_eq!(r.status().as_u16(), 200);
+        assert_all_through(&fx, &proxy);
+    }
+
+    #[tokio::test]
+    async fn a_zone_transfer_dials_the_nameserver_through_the_egress() {
+        let fx = Fixture::banner(b"").await;
+        let proxy = Recorder::start(to_loopback).await;
+        let ns: std::net::SocketAddr = ([127, 0, 0, 1], fx.port).into();
+        let t = crate::axfr::transfer("example.test", ns, Duration::from_secs(2), &proxied(&proxy))
+            .await;
+        assert!(t.refused.is_some());
+        assert_eq!(proxy.seen().len(), 1);
+        assert_eq!(proxy.seen()[0].port, fx.port);
+        assert_all_through(&fx, &proxy);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_proxied_origin_op_is_refused_with_a_note() {
+        let proxy = Recorder::start(to_loopback).await;
+        let dport = daemon().await;
+        let op = serde_json::json!({
+            "operation": "origin",
+            "response": "instant",
+            "domain": "example.test",
+        });
+        let events = exchange(dport, &wrapped(op, &proxy)).await;
+        assert_eq!(events[0]["status"], "error", "{events:?}");
+        assert!(
+            events[0]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("cannot run through a proxy"),
+            "{events:?}"
+        );
+        assert_eq!(proxy.connections(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_wrapped_op_with_an_unknown_egress_version_is_refused_unsent() {
+        let proxy = Recorder::start(to_loopback).await;
+        let dport = daemon().await;
+        let op = serde_json::json!({
+            "operation": "takeover",
+            "response": "stream",
+            "hosts": ["example.test"],
+            "dns_server": local_dns().await,
+        });
+        let events = exchange(
+            dport,
+            &dguard::wrap_egress(&op, &serde_json::json!({"v": 2, "proxy": proxy.url()})),
+        )
+        .await;
+        assert!(dguard::is_error(&events[0].to_string()), "{events:?}");
+        assert_eq!(proxy.connections(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wrapped_capabilities_name_the_egress_version() {
+        let dport = daemon().await;
+        let events = exchange(
+            dport,
+            &dguard::wrap_egress(
+                &serde_json::json!({"operation": "capabilities"}),
+                &serde_json::json!({"v": 1, "proxy": null}),
+            ),
+        )
+        .await;
+        assert_eq!(events[0]["type"], "capabilities", "{events:?}");
+        assert_eq!(events[0]["egress"], 1, "{events:?}");
     }
 }

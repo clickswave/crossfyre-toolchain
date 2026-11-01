@@ -62,6 +62,10 @@ impl std::fmt::Display for Rule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Rule::Host(h) => write!(f, "{h}"),
+            // `::1:8080` would read back as an address on every port.
+            Rule::HostPort(h, p) if h.parse::<std::net::Ipv6Addr>().is_ok() => {
+                write!(f, "[{h}]:{p}")
+            }
             Rule::HostPort(h, p) => write!(f, "{h}:{p}"),
             Rule::Suffix(b) => write!(f, "*.{b}"),
             Rule::Net(n, bits) => write!(f, "{n}/{bits}"),
@@ -118,8 +122,10 @@ fn parse_one(raw: &str) -> Option<Rule> {
     }
 
     if let Some(rest) = e.strip_prefix("*.") {
-        // `*.com` is not an authorisation, it is an accident.
-        if !rest.contains('.') || rest.starts_with('.') {
+        // `*.com` is not an authorisation, it is an accident. Nor is `*.0.0.1`: a
+        // host ending in a number is an address to a URL parser, so that base could
+        // only ever match addresses, whichever network they are on.
+        if !rest.contains('.') || rest.starts_with('.') || ends_in_number(rest) {
             return None;
         }
         return Some(Rule::Suffix(rest.to_string()));
@@ -174,6 +180,17 @@ fn parse_one(raw: &str) -> Option<Rule> {
     Some(Rule::Host(e))
 }
 
+/// Does this name end in a label a URL parser reads as a number, decimal or hex
+/// after `0x`? Such a host is parsed as an IPv4 address, not looked up as a name.
+fn ends_in_number(name: &str) -> bool {
+    let last = name.trim_end_matches('.').rsplit('.').next().unwrap_or("");
+    !last.is_empty()
+        && (last.bytes().all(|b| b.is_ascii_digit())
+            || last
+                .strip_prefix("0x")
+                .is_some_and(|h| h.bytes().all(|b| b.is_ascii_hexdigit())))
+}
+
 impl Scope {
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
@@ -193,27 +210,104 @@ impl Scope {
     /// `host` is the bare hostname or address with no port and no brackets;
     /// `port` is the URL's port, explicit or defaulted from its scheme.
     pub fn admits(&self, host: &str, port: Option<u16>) -> bool {
-        let h = host
-            .trim()
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .to_lowercase();
-        if h.is_empty() {
-            return false;
-        }
-        self.rules.iter().any(|r| match r {
-            Rule::Host(name) => *name == h,
-            Rule::HostPort(name, p) => *name == h && port == Some(*p),
-            // The leading dot is what stops `*.example.com` admitting
-            // `evil-example.com`, which is the whole reason suffix rules are
-            // dangerous when written as a plain `ends_with`.
-            Rule::Suffix(base) => h.len() > base.len() + 1 && h.ends_with(&format!(".{base}")),
-            Rule::Net(net, bits) => h
-                .parse::<IpAddr>()
-                .map(|ip| in_net(&ip, net, *bits))
-                .unwrap_or(false),
-        })
+        self.matching(host, port).is_some()
     }
+
+    /// The entry that admits this host and port, as it would be typed, or `None`.
+    ///
+    /// The same question as [`Scope::admits`], answered with the entry that admitted
+    /// it, so a launch can say which line of the list it rests on and a person can
+    /// check that line or remove it. When several entries admit, the first in list
+    /// order is named.
+    pub fn matching(&self, host: &str, port: Option<u16>) -> Option<String> {
+        let h = bare(host);
+        if h.is_empty() {
+            return None;
+        }
+        let addr = h.parse::<IpAddr>().ok();
+        self.rules
+            .iter()
+            .find(|r| match r {
+                Rule::Host(name) => *name == h,
+                Rule::HostPort(name, p) => *name == h && port == Some(*p),
+                // The leading dot is what stops `*.example.com` admitting
+                // `evil-example.com`, which is the whole reason suffix rules are
+                // dangerous when written as a plain `ends_with`. An address is never a
+                // subdomain of anything, whatever its digits happen to end with.
+                Rule::Suffix(base) => {
+                    addr.is_none() && h.len() > base.len() + 1 && h.ends_with(&format!(".{base}"))
+                }
+                Rule::Net(net, bits) => addr.is_some_and(|ip| in_net(&ip, net, *bits)),
+            })
+            .map(|r| r.to_string())
+    }
+
+    /// The entry that admits every address in `ip/bits`, or `None`.
+    ///
+    /// A range entry admits a range it contains whole. A single address entry admits
+    /// only the range that is that one address, a /32 or a /128. A `host:port` entry
+    /// never does, because whatever reaches a range reaches every port on it. Families
+    /// never mix, and a prefix longer than the family has is not a range.
+    pub fn matching_range(&self, ip: IpAddr, bits: u8) -> Option<String> {
+        let max = if ip.is_ipv4() { 32 } else { 128 };
+        if bits > max {
+            return None;
+        }
+        self.rules
+            .iter()
+            .find(|r| match r {
+                // A wider prefix than the rule's would reach addresses the rule does not
+                // list, however the two happen to line up.
+                Rule::Net(net, nb) => *nb <= bits && in_net(&ip, net, *nb),
+                Rule::Host(name) => bits == max && name.parse::<IpAddr>().is_ok_and(|a| a == ip),
+                Rule::HostPort(..) | Rule::Suffix(_) => false,
+            })
+            .map(|r| r.to_string())
+    }
+
+    /// The entry that admits working under a domain, or `None`.
+    ///
+    /// `active` means names under `domain` are going to be contacted, so only a `*.`
+    /// entry whose base is `domain` or a parent of it covers it: that is the one form of
+    /// entry that says every name below is in. Passive enumeration contacts none of
+    /// them, so the domain written down on its own (with or without a port) is also
+    /// enough there.
+    ///
+    /// An address is never a zone, and nor is a name that ends in a number, since a URL
+    /// parser reads that as an address.
+    pub fn matching_zone(&self, domain: &str, active: bool) -> Option<String> {
+        let d = bare(domain);
+        if d.is_empty() || d.parse::<IpAddr>().is_ok() || ends_in_number(&d) {
+            return None;
+        }
+        self.rules
+            .iter()
+            .find(|r| match r {
+                // The leading dot again: `*.example.com` does not cover
+                // `evil-example.com` or anything under it.
+                Rule::Suffix(base) => d == *base || d.ends_with(&format!(".{base}")),
+                Rule::Host(name) | Rule::HostPort(name, _) => !active && *name == d,
+                Rule::Net(..) => false,
+            })
+            .map(|r| r.to_string())
+    }
+
+    pub fn admits_range(&self, ip: IpAddr, bits: u8) -> bool {
+        self.matching_range(ip, bits).is_some()
+    }
+
+    pub fn admits_zone(&self, domain: &str, active: bool) -> bool {
+        self.matching_zone(domain, active).is_some()
+    }
+}
+
+/// A host as the rules hold one: trimmed, lowercased, and an IPv6 address out of its
+/// brackets.
+fn bare(host: &str) -> String {
+    host.trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_lowercase()
 }
 
 /// Containment, per family. A v4 address is never inside a v6 range and the
@@ -343,6 +437,10 @@ pub enum Point {
     /// request they typed and watched. Named apart because several go out from one click,
     /// so a refusal here is one of a set and reads differently from a single send.
     Replay,
+    /// A send an agent asked for through `crossfyre mcp`, rather than one the operator
+    /// typed. Named apart so the record can answer which sends no person made, which is
+    /// the first question anyone asks of a refusal on that path.
+    Agent,
 }
 
 impl Point {
@@ -352,6 +450,7 @@ impl Point {
             Point::Request => "request",
             Point::Repeater => "repeater",
             Point::Replay => "replay",
+            Point::Agent => "agent",
         }
     }
 
@@ -363,6 +462,7 @@ impl Point {
             "request" => Some(Point::Request),
             "repeater" => Some(Point::Repeater),
             "replay" => Some(Point::Replay),
+            "agent" => Some(Point::Agent),
             _ => None,
         }
     }
@@ -590,6 +690,28 @@ mod tests {
     }
 
     #[test]
+    fn a_wildcard_never_admits_an_address() {
+        // A URL parser reads any host whose last label is a number as an IPv4
+        // address, so `*.0.0.1` could only ever match addresses: 127.0.0.1, 10.0.0.1
+        // and every other one ending in .0.0.1, private or not.
+        for bad in ["*.0.0.1", "*.168.1.1", "*.example.123", "*.a.0x7f"] {
+            let (_, rejected) = Policy::from_entries(&[bad.to_string()]);
+            assert_eq!(rejected, vec![bad.to_string()], "{bad} should be refused");
+        }
+        // And a suffix rule does not match an address however it was made.
+        let s = Scope {
+            rules: vec![Rule::Suffix("0.1".into())],
+        };
+        assert!(!s.admits("127.0.0.1", Some(80)));
+        assert!(!s.admits("10.0.0.1", Some(80)));
+        assert!(!s.admits("::ffff:10.0.0.1", Some(80)));
+        // Names with numbers in them are still names.
+        let s = scope(&["*.10.example.com", "*.example.com"]);
+        assert!(s.admits("a.10.example.com", Some(443)));
+        assert!(s.admits("1.example.com", Some(443)));
+    }
+
+    #[test]
     fn nothing_written_down_admits_everything() {
         // A project that has never had a scope set must carry everything. If this
         // refused, turning the feature on would brick every project anybody already has
@@ -672,6 +794,32 @@ mod tests {
         assert_eq!(p.entries(), written);
         let (again, _) = Policy::from_entries(&p.entries());
         assert_eq!(again.entries(), written);
+    }
+
+    #[test]
+    fn an_ipv6_entry_with_a_port_keeps_its_brackets() {
+        // Without them `::1:8080` is itself an IPv6 address, so the entry would come back
+        // as a different host on every port rather than ::1 on port 8080.
+        let written = [
+            "[::1]:8080".to_string(),
+            "[fd00::5]:443".into(),
+            "::2".into(),
+            "fd00::/8".into(),
+        ];
+        let (p, rejected) = Policy::from_entries(&written);
+        assert!(rejected.is_empty());
+        assert_eq!(p.entries(), written);
+        let (again, rejected) = Policy::from_entries(&p.entries());
+        assert!(rejected.is_empty());
+        assert_eq!(again.entries(), written);
+        assert!(again.admits("::1", 8080));
+        assert!(!again.admits("::1", 80));
+        assert!(!again.admits("::1:8080", 8080));
+        let s = scope(&["[::1]:8080"]);
+        assert_eq!(
+            s.matching("[::1]", Some(8080)).as_deref(),
+            Some("[::1]:8080")
+        );
     }
 
     // ----- Guard: refusing is also recording -----
@@ -763,9 +911,11 @@ mod tests {
             Point::Request,
             Point::Repeater,
             Point::Replay,
+            Point::Agent,
         ] {
             assert_eq!(Point::parse(p.as_str()), Some(p), "{p:?} round trips");
         }
+        assert_eq!(Point::parse("agent"), Some(Point::Agent));
         assert_eq!(Point::parse("something-else"), None);
     }
 
@@ -889,5 +1039,183 @@ mod tests {
     fn entries_are_case_insensitive_and_trimmed() {
         let s = scope(&["  API.Example.COM  "]);
         assert!(s.admits("api.example.com", None));
+    }
+
+    // ----- Which entry: the lookups that name the line of the list -----
+
+    #[test]
+    fn matching_names_the_entry_and_admits_agrees_with_it() {
+        let s = scope(&[
+            "api.example.com",
+            "x.test:8443",
+            "*.example.com",
+            "10.0.0.0/8",
+            "[::1]",
+            "jira",
+        ]);
+        let cases: &[(&str, Option<u16>, Option<&str>)] = &[
+            ("api.example.com", Some(443), Some("api.example.com")),
+            ("API.Example.com", None, Some("api.example.com")),
+            ("x.test", Some(8443), Some("x.test:8443")),
+            ("x.test", Some(443), None),
+            ("x.test", None, None),
+            ("a.example.com", Some(80), Some("*.example.com")),
+            ("example.com", Some(443), None),
+            ("evil-example.com", Some(443), None),
+            ("10.1.2.3", Some(22), Some("10.0.0.0/8")),
+            ("11.0.0.1", None, None),
+            ("[::1]", Some(80), Some("::1")),
+            ("::1", None, Some("::1")),
+            ("jira", Some(443), Some("jira")),
+            ("jira.example.org", Some(443), None),
+            ("", None, None),
+        ];
+        for (host, port, want) in cases {
+            assert_eq!(s.matching(host, *port).as_deref(), *want, "{host} {port:?}");
+            assert_eq!(
+                s.admits(host, *port),
+                want.is_some(),
+                "admits says the same for {host} {port:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_entry_named_is_the_first_that_admits() {
+        let s = scope(&["*.example.com", "api.example.com"]);
+        assert_eq!(
+            s.matching("api.example.com", Some(443)).as_deref(),
+            Some("*.example.com")
+        );
+    }
+
+    #[test]
+    fn a_range_is_admitted_only_by_an_entry_that_holds_all_of_it() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+
+        let s = scope(&["10.9.0.0/16"]);
+        assert_eq!(
+            s.matching_range(ip("10.9.1.0"), 24).as_deref(),
+            Some("10.9.0.0/16"),
+            "a /24 inside a /16"
+        );
+        assert!(s.admits_range(ip("10.9.0.0"), 16), "the rule's own range");
+        assert!(
+            s.admits_range(ip("10.9.1.77"), 24),
+            "host bits past the prefix do not matter"
+        );
+        assert!(!s.admits_range(ip("10.0.0.0"), 8), "a /8 around the /16");
+        assert!(
+            !s.admits_range(ip("10.9.1.0"), 8),
+            "the same /8 written with an address inside the /16"
+        );
+        assert!(!s.admits_range(ip("10.10.0.0"), 24), "a /24 beside it");
+
+        let s = scope(&["192.168.1.0/24"]);
+        assert!(
+            !s.admits_range(ip("192.168.0.0"), 16),
+            "a /16 against a /24 rule reaches addresses the rule does not list"
+        );
+        assert!(
+            !s.admits_range(ip("192.168.1.0"), 16),
+            "however the /16 is written"
+        );
+        assert!(s.admits_range(ip("192.168.1.128"), 25));
+
+        let s = scope(&["10.0.0.5", "10.0.0.6:22", "fd00::7"]);
+        assert_eq!(
+            s.matching_range(ip("10.0.0.5"), 32).as_deref(),
+            Some("10.0.0.5"),
+            "a /32 against the single address"
+        );
+        assert!(
+            !s.admits_range(ip("10.0.0.4"), 31),
+            "a single address is not a /31"
+        );
+        assert!(
+            !s.admits_range(ip("10.0.0.6"), 32),
+            "a host:port entry is one port, and a range reaches all of them"
+        );
+        assert!(s.admits_range(ip("fd00::7"), 128));
+        assert!(!s.admits_range(ip("fd00::7"), 127));
+
+        let s = scope(&["::/0"]);
+        assert!(
+            !s.admits_range(ip("10.0.0.0"), 8),
+            "a v4 range against a v6 rule"
+        );
+        assert!(s.admits_range(ip("fd00::"), 8));
+
+        let s = scope(&["0.0.0.0/0"]);
+        assert!(s.admits_range(ip("203.0.113.0"), 24));
+        assert!(s.admits_range(ip("0.0.0.0"), 0), "all of v4");
+        assert!(!s.admits_range(ip("::"), 0), "and none of v6");
+        assert!(
+            !s.admits_range(ip("10.0.0.0"), 33),
+            "a prefix longer than the family is not a range"
+        );
+
+        let s = scope(&["*.example.com", "example.com"]);
+        assert!(
+            !s.admits_range(ip("93.184.216.34"), 32),
+            "names are not ranges"
+        );
+    }
+
+    #[test]
+    fn a_zone_is_covered_by_a_wildcard_and_passively_by_its_own_name() {
+        let s = scope(&["*.example.com"]);
+        assert_eq!(
+            s.matching_zone("example.com", true).as_deref(),
+            Some("*.example.com"),
+            "the wildcard's own base, active"
+        );
+        assert!(s.admits_zone("a.example.com", true), "a zone below it");
+        assert!(s.admits_zone("example.com", false), "and passive as well");
+        for outside in [
+            "example.com.evil.net",
+            "evil-example.com",
+            "com",
+            "xexample.com",
+        ] {
+            assert!(!s.admits_zone(outside, true), "{outside} active");
+            assert!(!s.admits_zone(outside, false), "{outside} passive");
+        }
+
+        let s = scope(&["example.com"]);
+        assert_eq!(
+            s.matching_zone("example.com", false).as_deref(),
+            Some("example.com"),
+            "the name alone allows passive enumeration"
+        );
+        assert!(
+            !s.admits_zone("example.com", true),
+            "and never active, since that contacts every name found"
+        );
+        assert!(
+            !s.admits_zone("a.example.com", false),
+            "a name covers only itself"
+        );
+
+        let s = scope(&["example.com:443"]);
+        assert!(s.admits_zone("example.com", false));
+        assert!(!s.admits_zone("example.com", true));
+
+        let s = scope(&["a.example.com"]);
+        assert!(
+            !s.admits_zone("example.com", false),
+            "a name does not cover its parent"
+        );
+    }
+
+    #[test]
+    fn an_address_is_never_a_zone() {
+        let s = scope(&["10.0.0.0/8", "10.0.0.1", "[::1]", "1.2.3", "*.example.com"]);
+        for addr in [
+            "10.0.0.1", "10.2.3.4", "::1", "[::1]", "1.2.3", "a.0x7f", "",
+        ] {
+            assert!(!s.admits_zone(addr, false), "{addr} passive");
+            assert!(!s.admits_zone(addr, true), "{addr} active");
+        }
     }
 }

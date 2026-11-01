@@ -319,8 +319,14 @@ async fn handle_origin(args: OriginArgs) -> Result<(), Box<dyn std::error::Error
     }
 
     let log = |line: String| eprintln!("  {line}");
+    let egress = transport::Egress::Inherit;
+    if let Some(why) = scanners::origin::refused(&egress) {
+        eprintln!("Error: {why}. CROSSFYRE_EGRESS_PROXY is set.");
+        std::process::exit(1);
+    }
     let findings =
-        scanners::origin::discover(&args.domain, args.timeout, !args.no_evasive, &log).await;
+        scanners::origin::discover(&args.domain, args.timeout, !args.no_evasive, &egress, &log)
+            .await;
 
     if args.json {
         let arr: Vec<serde_json::Value> = findings

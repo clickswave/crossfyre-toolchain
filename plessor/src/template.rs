@@ -158,6 +158,8 @@ fn references_oob(req: &HttpReq) -> bool {
 /// Execute a template against `base` (e.g. "https://example.com"), returning
 /// confirmed matches. Response-based matchers are re-requested once (reproduce);
 /// out-of-band (interactsh) requests are confirmed by an actual OAST callback.
+/// `unsafe` requests go out over raw sockets by `raw`, the op's egress.
+#[allow(clippy::too_many_arguments)]
 pub async fn eval_template(
     client: &Client,
     base: &str,
@@ -166,6 +168,7 @@ pub async fn eval_template(
     oob_reg: Option<&crate::oast::OastReg>,
     oob_queue: Option<&crate::inject::OobQueue>,
     evasive: bool,
+    raw: &crate::rawhttp::Route,
 ) -> Vec<Match> {
     let mut out = Vec::new();
     for req in &tmpl.http {
@@ -233,7 +236,7 @@ pub async fn eval_template(
                 // GENERATE + DETECT: issue the request. `unsafe` templates go over
                 // the raw sender (verbatim request-target); everything else via
                 // reqwest.
-                let r1 = match send_variant(client, &method, req.unsafe_raw, &v).await {
+                let r1 = match send_variant(client, raw, &method, req.unsafe_raw, &v).await {
                     Some(r) => r,
                     None => continue,
                 };
@@ -272,7 +275,7 @@ pub async fn eval_template(
                 };
 
                 // CONFIRM: re-issue the winning variant once; must match again.
-                let r2 = match send_variant(client, &method, req.unsafe_raw, &winner).await {
+                let r2 = match send_variant(client, raw, &method, req.unsafe_raw, &winner).await {
                     Some(r) => r,
                     None => continue,
                 };
@@ -403,12 +406,13 @@ fn apply_oob(v: &mut ReqVariant, host: &str) {
 /// templates (verbatim request-target), reqwest otherwise.
 async fn send_variant(
     client: &Client,
+    raw: &crate::rawhttp::Route,
     method: &str,
     unsafe_raw: bool,
     v: &ReqVariant,
 ) -> Option<Resp> {
     if unsafe_raw {
-        fetch_raw(method, v).await
+        fetch_raw(raw, method, v).await
     } else {
         fetch(client, method, v).await
     }
@@ -433,13 +437,14 @@ fn resp_is_blocked(r: &Resp) -> bool {
     .is_challenge()
 }
 
-async fn fetch_raw(method: &str, v: &ReqVariant) -> Option<Resp> {
+async fn fetch_raw(raw: &crate::rawhttp::Route, method: &str, v: &ReqVariant) -> Option<Resp> {
     let r = crate::rawhttp::send(crate::rawhttp::RawReq {
         method,
         url: &v.url,
         headers: &v.headers,
         body: v.body.clone(),
         timeout: std::time::Duration::from_secs(10),
+        route: raw,
     })
     .await?;
     Some(Resp {

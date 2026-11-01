@@ -38,6 +38,47 @@ class ServiceCommandsTest {
         assertEquals(listOf("native"), failed)
     }
 
+    /** A [TokenWatch] whose looks run when the test says, and the stops it asked for. */
+    private class Watched(var stats: String?) {
+        val due = ArrayDeque<() -> Unit>()
+        var stops = 0
+        val watch = TokenWatch({ stats }, { stops++ }) { ms, look ->
+            assertEquals(TokenWatch.EVERY_MS, ms)
+            due.addLast(look)
+        }
+
+        fun tick() = due.removeFirst()()
+    }
+
+    @Test
+    fun a_capture_whose_token_the_server_refused_stops_itself_once() {
+        val w = Watched("""{"events": 3, "token_refused": false}""")
+        w.watch.start()
+        w.tick()
+        assertEquals(0, w.stops)
+        assertEquals("it keeps looking while the token is taken", 1, w.due.size)
+        // Nothing from the native side yet, or nothing readable: look again later.
+        w.stats = null
+        w.tick()
+        w.stats = "not json"
+        w.tick()
+        assertEquals(0, w.stops)
+        w.stats = """{"events": 4, "token_refused": true}"""
+        w.tick()
+        assertEquals(1, w.stops)
+        assertTrue("it stops looking once it has stopped the capture", w.due.isEmpty())
+    }
+
+    @Test
+    fun a_capture_stopped_for_another_reason_is_not_stopped_again() {
+        val w = Watched("""{"token_refused": true}""")
+        w.watch.start()
+        w.watch.cancel()
+        w.tick()
+        assertEquals(0, w.stops)
+        assertTrue(w.due.isEmpty())
+    }
+
     @Test
     fun a_second_stop_does_nothing() {
         var count = 0

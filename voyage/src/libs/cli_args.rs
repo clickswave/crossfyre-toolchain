@@ -164,7 +164,7 @@ pub struct ScanArgs {
     #[arg(long, default_value_t = false)]
     pub disable_active_enum: bool,
 
-    /// Passive sources to exclude (crt.sh, certspotter, hackertarget, alienvault, urlscan)
+    /// Passive sources to exclude (crt.sh, certspotter, hackertarget, alienvault, urlscan, subdomain.center)
     #[arg(long)]
     pub exclude_passive_source: Vec<String>,
 
@@ -264,7 +264,7 @@ impl ScanArgs {
         // --- Passive enum ---
         self.disable_passive_enum = !Confirm::with_theme(&theme)
             .with_prompt(
-                "Run passive enumeration? (crt.sh, certspotter, hackertarget, alienvault, urlscan)",
+                "Run passive enumeration? (crt.sh, certspotter, hackertarget, alienvault, urlscan, subdomain.center)",
             )
             .default(!self.disable_passive_enum)
             .interact()

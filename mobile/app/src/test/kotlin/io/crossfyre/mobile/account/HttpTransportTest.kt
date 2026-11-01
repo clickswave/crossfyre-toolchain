@@ -24,6 +24,7 @@ class HttpTransportTest {
     @Volatile private var seenType: String? = null
     @Volatile private var seenBody: String? = null
     @Volatile private var answer: Pair<Int, String> = 200 to "{}"
+    @Volatile private var extraHeaders: String = ""
 
     /** A one-request-at-a-time HTTP responder: enough to see what the transport sends. */
     @Before
@@ -55,7 +56,7 @@ class HttpTransportTest {
                     seenBody = String(body, Charsets.UTF_8)
                     val bytes = answer.second.toByteArray()
                     val out = s.getOutputStream()
-                    out.write("HTTP/1.1 ${answer.first} X\r\nContent-Type: application/json\r\nContent-Length: ${bytes.size}\r\nConnection: close\r\n\r\n".toByteArray())
+                    out.write("HTTP/1.1 ${answer.first} X\r\nContent-Type: application/json\r\n${extraHeaders}Content-Length: ${bytes.size}\r\nConnection: close\r\n\r\n".toByteArray())
                     out.write(bytes)
                     out.flush()
                 }
@@ -93,6 +94,18 @@ class HttpTransportTest {
         val r = HttpTransport().post("$base/x", "{}")
         assertEquals(409, r.status)
         assertTrue(r.body, r.body.contains("use_google"))
+    }
+
+    @Test
+    fun a_rate_limit_brings_the_wait_it_asked_for() {
+        answer = 429 to """{"status":429,"message":"Too many requests","errors":[],"data":{"reason":"rate_limited"}}"""
+        extraHeaders = "Retry-After: 60\r\n"
+        assertEquals(60L, HttpTransport().post("$base/x", "{}").retryAfterSeconds)
+        // A date, or nothing at all, is no number of seconds.
+        extraHeaders = "Retry-After: Sat, 31 Oct 2026 14:00:00 GMT\r\n"
+        assertEquals(null, HttpTransport().post("$base/x", "{}").retryAfterSeconds)
+        extraHeaders = ""
+        assertEquals(null, HttpTransport().post("$base/x", "{}").retryAfterSeconds)
     }
 
     @Test(expected = IOException::class)

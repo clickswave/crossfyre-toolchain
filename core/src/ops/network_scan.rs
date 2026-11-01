@@ -4,6 +4,10 @@
 use super::OpEnv;
 use crate::*;
 
+/// Why a proxied node does not run a port scan.
+pub const PROXIED: &str = "Port scans cannot run on a node that sends through a proxy: each \
+                           port is connected to directly, from this node's own address";
+
 pub async fn handle(env: OpEnv) {
     let OpEnv {
         op_id,
@@ -16,7 +20,24 @@ pub async fn handle(env: OpEnv) {
         http,
         api_url,
         api_key,
+        egress,
     } = env;
+
+    // A port scan connects to each port itself, which no proxy can carry, so a node
+    // that sends through one does not run it rather than run it from its own address.
+    if egress.is_some() {
+        super::publish_refused(
+            &pub_clone,
+            &status_subj,
+            &op_id,
+            &workflow_id,
+            &node_id,
+            egress.as_deref(),
+            PROXIED,
+        )
+        .await;
+        return;
+    }
 
     // Single-port probe mode: data has host+port
     if let Some(host) = data["host"].as_str().map(|s| s.to_string()) {
@@ -60,8 +81,7 @@ pub async fn handle(env: OpEnv) {
         // can grep for known-open ones (53, 80, 5432, etc).
         let log_sample = true;
         let mut found_count = 0;
-        let conn =
-            tokio::net::TcpStream::connect(crate::toolchain::config::engine_addr("pulse")).await;
+        let conn = tokio::net::TcpStream::connect(super::engine_addr("pulse")).await;
         match conn {
             Ok(stream) => {
                 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -75,7 +95,7 @@ pub async fn handle(env: OpEnv) {
                 #[allow(deprecated)]
                 let _ = stream.set_linger(Some(std::time::Duration::ZERO));
                 let (reader, mut writer) = stream.into_split();
-                let mut req_str = dguard::encode(&doorward_req);
+                let mut req_str = crate::egress::state::encode_for_engine(&doorward_req, None);
                 req_str.push('\n');
                 if log_sample {
                     println!(
@@ -230,7 +250,7 @@ pub async fn handle(env: OpEnv) {
                     LAST_LOG.store(now_secs, Ordering::Relaxed);
                     eprintln!(
                         "[op] FAIL doorward daemon unreachable on {} ({e}). Is `doorward --daemon` running? (suppressing further messages for 60s)",
-                        crate::toolchain::config::engine_addr("pulse")
+                        super::engine_addr("pulse")
                     );
                 }
                 let msg = serde_json::json!({
@@ -295,7 +315,7 @@ pub async fn handle(env: OpEnv) {
         doorward_req["max_concurrency"] = serde_json::json!(mc);
     }
 
-    let conn = tokio::net::TcpStream::connect(crate::toolchain::config::engine_addr("pulse")).await;
+    let conn = tokio::net::TcpStream::connect(super::engine_addr("pulse")).await;
     match conn {
         Ok(stream) => {
             use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -309,7 +329,7 @@ pub async fn handle(env: OpEnv) {
             #[allow(deprecated)]
             let _ = stream.set_linger(Some(std::time::Duration::ZERO));
             let (reader, mut writer) = stream.into_split();
-            let mut req_str = dguard::encode(&doorward_req);
+            let mut req_str = crate::egress::state::encode_for_engine(&doorward_req, None);
             req_str.push('\n');
             let _ = writer.write_all(req_str.as_bytes()).await;
 

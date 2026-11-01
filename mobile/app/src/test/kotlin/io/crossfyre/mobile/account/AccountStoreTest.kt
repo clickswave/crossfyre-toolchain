@@ -134,4 +134,36 @@ class AccountStoreTest {
         assertNull(store.workspace())
         assertTrue(values.map.keys.none { it.startsWith("workspace") })
     }
+
+    @Test
+    fun signing_out_forgets_the_approver_so_the_phone_no_longer_counts_as_one() {
+        val values = MapValues()
+        val store = AccountStore(values, FlipSealer())
+        store.saveSignIn(signedIn)
+        store.approverId = "5b0f6d0e-7a34-4c1b-9b43-0a8f6a5e2f11"
+        store.approverFingerprint = "ab12 cd34 ef56 7890"
+        store.enrollingApproverId = "0c3e9a51-58f2-4c6b-a2d4-7e1f9b0d3a62"
+        store.revokesOwed = setOf("ap-1", "ap-2")
+
+        store.signOut()
+
+        assertNull(store.approverId)
+        assertNull(store.approverFingerprint)
+        assertNull(store.enrollingApproverId)
+        assertTrue(store.revokesOwed.isEmpty())
+        assertTrue(values.map.keys.none { it.startsWith("approver") })
+    }
+
+    @Test
+    fun the_revokes_owed_come_back_as_they_were_written_and_junk_reads_as_none() {
+        val values = MapValues()
+        val store = AccountStore(values, FlipSealer())
+        assertTrue(store.revokesOwed.isEmpty())
+        store.revokesOwed = setOf("b, with a comma", "a")
+        assertEquals(setOf("a", "b, with a comma"), AccountStore(values, FlipSealer()).revokesOwed)
+        store.revokesOwed = emptySet()
+        assertTrue(values.map.keys.none { it.startsWith("approver") })
+        values.map["approver_revokes_owed"] = "not json"
+        assertTrue(store.revokesOwed.isEmpty())
+    }
 }

@@ -1,6 +1,7 @@
 package io.crossfyre.mobile
 
 import android.app.Application
+import android.app.KeyguardManager
 import android.content.Intent
 import android.net.VpnService
 import android.os.Build
@@ -28,6 +29,29 @@ import io.crossfyre.mobile.account.SignedIn
 import io.crossfyre.mobile.account.StoredUser
 import io.crossfyre.mobile.account.Workspace
 import io.crossfyre.mobile.account.awaitApproval
+import android.security.keystore.KeyPermanentlyInvalidatedException
+import android.security.keystore.UserNotAuthenticatedException
+import io.crossfyre.mobile.approve.ActivityEvent
+import io.crossfyre.mobile.approve.ActivityScope
+import io.crossfyre.mobile.approve.ApprovalApi
+import io.crossfyre.mobile.approve.ApprovalIds
+import io.crossfyre.mobile.approve.ApprovalProtocol
+import io.crossfyre.mobile.approve.HistoryRow
+import io.crossfyre.mobile.approve.InboxItem
+import io.crossfyre.mobile.approve.PendingApproval
+import io.crossfyre.mobile.approve.PollPolicy
+import io.crossfyre.mobile.approve.Quiet
+import io.crossfyre.mobile.approve.ServerClock
+import io.crossfyre.mobile.approve.StopAnswer
+import io.crossfyre.mobile.approve.approvalView
+import io.crossfyre.mobile.approve.ApproverKeys
+import io.crossfyre.mobile.approve.ApproverLedger
+import io.crossfyre.mobile.approve.EnrolState
+import io.crossfyre.mobile.approve.KeyGone
+import io.crossfyre.mobile.approve.KeyPresence
+import io.crossfyre.mobile.approve.KeystoreApproverKeys
+import io.crossfyre.mobile.approve.NoScreenLock
+import io.crossfyre.mobile.approve.enrol
 import io.crossfyre.mobile.apps.AppFacts
 import io.crossfyre.mobile.apps.Apps
 import io.crossfyre.mobile.apps.InstalledApp
@@ -42,6 +66,8 @@ import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.security.Signature
+import java.time.Instant
 
 enum class Route { SIGN_IN, DEVICE, WORKSPACES, MAIN }
 
@@ -50,6 +76,8 @@ sealed interface Push {
     data object Certificate : Push
     data class App(val pkg: String) : Push
     data object Licences : Push
+    /** The node placeholder, reached from Home now that its tab is Activity. */
+    data object Node : Push
 }
 
 /** Sheets and dialogs drawn over the current screen. */
@@ -69,6 +97,15 @@ sealed interface Overlay {
     data object SignOut : Overlay
     data object Unpair : Overlay
     data class Licence(val name: String, val licence: String) : Overlay
+    /** What turning on approvals does, before it does it. */
+    data object ApprovalsExplain : Overlay
+    /** Waiting for the browser to confirm this phone as an approver. */
+    data object Enrol : Overlay
+    data object ApprovalsOff : Overlay
+    /** One approval, by id, waiting or just settled. */
+    data class Approval(val id: String) : Overlay
+    /** One row of the activity log. */
+    data class Event(val id: Long) : Overlay
 }
 
 /** Things only the activity can do: Android's own prompts, pickers and other apps. */
@@ -81,9 +118,15 @@ sealed interface Effect {
     data class OpenUrl(val url: String) : Effect
     data object NotificationSettings : Effect
     data object SecuritySettings : Effect
+    /** Ask for the unlock that lets the approval key sign the approval being made. */
+    data class Authenticate(val id: String, val title: String, val description: String) : Effect
 }
 
 enum class DeviceStatus { OPENING, WAITING, DENIED, EXPIRED, ERROR }
+
+/** Whether this phone approves agent actions for the account. */
+enum class ApproverState { OFF, ENROLLING, ACTIVE, BROKEN }
+enum class EnrolStatus { STARTING, WAITING, DENIED, EXPIRED, ERROR }
 enum class ListStatus { LOADING, READY, ERROR, EMPTY }
 
 data class Toast(val text: String, val icon: Int)
@@ -233,6 +276,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
     private fun keyName() = "Crossfyre Mobile: ${Build.MODEL}"
 
     private fun signedInAs(s: SignedIn, via: String) {
+        siError = null
         store.saveSignIn(s)
         store.signedInWith = via
         signedInWith = via
@@ -381,6 +425,11 @@ class AppModel(app: Application) : AndroidViewModel(app) {
         refreshCert()
         refreshNotifications()
         if (route == Route.MAIN) refreshPatchStates()
+        // Back from Android's settings with the screen lock removed: the keystore
+        // has dropped the key, so say so now rather than at the next Approve.
+        if (approverState == ApproverState.ACTIVE && approverKeys.presence() == KeyPresence.ABSENT) approverBroke(LOCK_CHANGED)
+        settleRevokes()
+        if (route == Route.MAIN && tab == "activity" && push == null) refreshActivity()
     }
 
     fun pairSelected() {
@@ -408,6 +457,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
                     session.paired()
                     qrEnded = false
                     revoked = false
+                    sessionRefused = false
                     route = Route.MAIN
                     tab = "home"
                     push = null
@@ -424,6 +474,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
     /** The key no longer works. Everything the account gave the phone goes; the device things stay. */
     private fun signedOut() {
         if (running) stopCapture()
+        forgetApprover()
         store.signOut()
         Pairing.clear(ctx)
         pairing = null
@@ -434,30 +485,62 @@ class AppModel(app: Application) : AndroidViewModel(app) {
         say("You have been signed out. Sign in again.", R.drawable.ic_info)
     }
 
+    /** A sign-out waiting for the server to answer. */
+    var signingOut by mutableStateOf(false)
+        private set
+
+    /**
+     * Sign out on the server, then here. The approvers this phone holds, is
+     * enrolling or still owes a revoke for are revoked while the key that sends
+     * the revokes still works, then the key itself, and only after that does the
+     * phone forget any of it. A sign-out the server did not confirm still signs
+     * the phone out, and the sign-in screen says what the server may still count.
+     */
     fun signOut() {
-        overlay = null
+        if (signingOut) return
         val key = store.key()
         if (running) stopCapture()
-        // Revoke on the server as well, so signing a lost phone out is not only
-        // local. Best effort: a phone with no signal still signs out here.
-        if (key != null) viewModelScope.launch(Dispatchers.IO) { api().logout(key) }
-        store.signOut()
-        Pairing.clear(ctx)
-        pairing = null
-        workspace = null
-        user = null
-        signedInWith = null
-        revoked = false
-        route = Route.SIGN_IN
-        tab = "home"
-        push = null
-        say("Signed out. This phone's key was revoked.")
+        // An enrolment waiting for the browser stops here, so its approver is
+        // among the ones revoked.
+        enrolJob?.cancel()
+        enrolJob = null
+        signingOut = true
+        viewModelScope.launch {
+            val noKey = Outcome.Failed(Problem.Broken(0, "The account key could not be read on this phone."))
+            // Shorter waits than other calls: the person is looking at a busy
+            // button, and a phone the server never hears from signs out anyway.
+            val quick = HttpTransport(5_000, 10_000)
+            val left = withContext(Dispatchers.IO) {
+                approverLedger.signOut(
+                    revoke = { id -> if (key == null) noKey else ApprovalApi(origin, quick).revoke(key, id) },
+                    logout = { if (key == null) noKey else AccountApi(origin, quick).logout(key) },
+                )
+            }
+            signingOut = false
+            forgetApprover()
+            store.signOut()
+            Pairing.clear(ctx)
+            pairing = null
+            workspace = null
+            user = null
+            signedInWith = null
+            revoked = false
+            route = Route.SIGN_IN
+            tab = "home"
+            push = null
+            overlay = null
+            when (val n = signOutNotice(left, host)) {
+                null -> say("Signed out. This phone's key was revoked.")
+                else -> siError = n
+            }
+        }
     }
 
     /** "Sign in again" after a revoked key, or "Sign in" from a QR pairing: back to the front door. */
     fun toSignIn() {
         if (revoked || signedIn) {
             if (running) stopCapture()
+            forgetApprover()
             store.signOut()
             Pairing.clear(ctx)
             pairing = null
@@ -530,6 +613,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
         store.saveWorkspace(null)
         workspace = null
         qrEnded = false
+        sessionRefused = false
         route = Route.MAIN
         tab = "home"
         push = null
@@ -566,6 +650,12 @@ class AppModel(app: Application) : AndroidViewModel(app) {
         private set
     var renewing by mutableStateOf(false)
         private set
+    /**
+     * The server turned the session's token away and capture was stopped for it.
+     * Cleared by the next start or pairing.
+     */
+    var sessionRefused by mutableStateOf(false)
+        private set
     private val watch = StartWatch()
     private var wasActive = false
 
@@ -587,6 +677,9 @@ class AppModel(app: Application) : AndroidViewModel(app) {
             else -> Route.SIGN_IN
         }
         qrEnded = pairing != null && !store.pairedFromAccount && Pairing.ended(ctx) && !TracerVpnService.active
+        // The last capture stopped because the server refused its token, perhaps by the
+        // service while the app was closed.
+        sessionRefused = pairing != null && Pairing.refused(ctx) && !TracerVpnService.active
         if (route == Route.WORKSPACES) loadWorkspaces()
         if (TracerVpnService.active) {
             // The foreground service kept the process alive while the app was
@@ -598,6 +691,19 @@ class AppModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(Dispatchers.IO) { patch.tidy() }
         refreshCert()
         checkKey()
+        // The id survived but the key did not: the keystore was wiped, or the
+        // data was restored onto another phone.
+        if (store.approverId != null && approverKeys.presence() == KeyPresence.ABSENT) {
+            approverBroke("The approval key is gone from this phone, so it no longer approves. Turn Approvals on again to make a new one.")
+        }
+        // The app closed while the browser page was open. The page may still
+        // be confirmed, so the approver it was for is revoked with the rest.
+        if (approverLedger.abandoned()) {
+            approverKeys.delete()
+            approverTrouble = "The app closed before the browser confirmed this phone, so approvals were not turned on. Turn them on again."
+            approverState = ApproverState.BROKEN
+        }
+        settleRevokes()
     }
 
     /**
@@ -669,13 +775,28 @@ class AppModel(app: Application) : AndroidViewModel(app) {
             }
             if (live) since = TracerVpnService.startedAt
             if (wasActive && !live) {
-                // Stopped from the notification, or by Android: the session ended.
+                // Stopped from the notification, by Android, or by the service once the
+                // server refused the token: the session ended.
                 session.ended()
                 if (!fromAccount && pairing != null) qrEnded = true
+                if (Pairing.refused(ctx) && !sessionRefused) {
+                    sessionRefused = true
+                    say("The server stopped accepting this phone's requests, so capture stopped.", R.drawable.ic_warning)
+                }
             }
             wasActive = live
             if (live) {
                 stats = withContext(Dispatchers.Default) { runCatching { Stats.parse(Native.captureStats()) }.getOrNull() }
+                // Once: the service takes a moment to go, and polls meanwhile still see it.
+                if (stats?.tokenRefused == true && !sessionRefused) {
+                    // Nothing captured from here on could be delivered, so the tunnel
+                    // stops rather than keep reading traffic for nobody. The service
+                    // watches for this too, and stops it while the app is closed.
+                    Pairing.markRefused(ctx)
+                    stopCapture()
+                    sessionRefused = true
+                    say("The server stopped accepting this phone's requests, so capture stopped.", R.drawable.ic_warning)
+                }
             } else if (phase == Phase.IDLE) {
                 stats = null
             }
@@ -762,6 +883,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun launchCapture() {
+        sessionRefused = false
         viewModelScope.launch {
             // Make the certificate on disk the one capture presents. The native
             // side keeps the last one it loaded in memory, and after a reset that
@@ -838,6 +960,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun diagnosis(): Diag? {
+        if (phase == Phase.IDLE && sessionRefused) return tokenRefused(renewable = fromAccount)
         if (phase != Phase.CAPTURING) return null
         val inScope = if (scope.effectiveMode == Scope.ONLY) scopeApps.toList() else emptyList()
         return diagnose(
@@ -1049,6 +1172,774 @@ class AppModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun notificationSettings() = emit(Effect.NotificationSettings)
+
+    // ── Approvals ────────────────────────────────────────────────────────────
+
+    /** Whether the phone has a screen lock, without which no key can need an unlock. */
+    val deviceSecure: Boolean
+        get() = ctx.getSystemService(KeyguardManager::class.java)?.isDeviceSecure == true
+
+    val approverKeys: ApproverKeys = KeystoreApproverKeys(deviceSecure = { deviceSecure })
+    private fun approvals() = ApprovalApi(origin, HttpTransport())
+
+    var approverState by mutableStateOf(
+        if (store.approverId != null && approverKeys.presence() != KeyPresence.ABSENT) ApproverState.ACTIVE else ApproverState.OFF
+    )
+        private set
+    var approverFingerprint by mutableStateOf(store.approverFingerprint)
+        private set
+
+    /** Why a phone that approved no longer can, in a sentence. */
+    var approverTrouble by mutableStateOf<String?>(null)
+        private set
+
+    var enrolStatus by mutableStateOf(EnrolStatus.STARTING)
+        private set
+    var enrolFingerprint by mutableStateOf("")
+        private set
+    var enrolError by mutableStateOf<Notice?>(null)
+        private set
+    private var enrolUrl = ""
+    private var enrolJob: Job? = null
+
+    /** The Settings row: explain first, show the wait, or offer to turn it off. */
+    fun openApprovals() {
+        overlay = when (approverState) {
+            ApproverState.OFF, ApproverState.BROKEN -> Overlay.ApprovalsExplain
+            ApproverState.ENROLLING -> Overlay.Enrol
+            ApproverState.ACTIVE -> Overlay.ApprovalsOff
+        }
+    }
+
+    /**
+     * Make the key, send its public half, and wait for the browser.
+     *
+     * The wait runs in the model's scope rather than the screen's, because the
+     * person leaves the app for the browser to confirm, and the confirmation is
+     * what the wait is for.
+     */
+    fun turnOnApprovals() {
+        if (signingOut) return
+        val key = store.key() ?: return signedOut()
+        if (!deviceSecure) {
+            overlay = Overlay.ApprovalsExplain
+            return
+        }
+        enrolJob?.cancel()
+        store.enrollingApproverId?.let { approverLedger.letGo(it) }
+        approverState = ApproverState.ENROLLING
+        approverTrouble = null
+        enrolStatus = EnrolStatus.STARTING
+        enrolError = null
+        enrolFingerprint = ""
+        overlay = Overlay.Enrol
+        settleRevokes()
+        enrolJob = viewModelScope.launch {
+            val api = approvals()
+            val made = withContext(Dispatchers.IO) { runCatching { approverKeys.create() } }
+            val spki = made.getOrElse { e ->
+                return@launch enrolFailed(Notice(Level.DANGER, "Couldn't make the approval key.", keyTrouble(e)))
+            }
+            // The ledger hears how it ended, whatever happens here, and revokes an
+            // approver that was started and not confirmed.
+            val result = withContext(Dispatchers.IO) {
+                enrol(
+                    api, key, store.deviceId(), deviceName(), spki, approverLedger,
+                    opened = { e ->
+                        withContext(Dispatchers.Main) {
+                            enrolFingerprint = e.fingerprint
+                            enrolUrl = e.confirmUrl
+                            enrolStatus = EnrolStatus.WAITING
+                            emit(Effect.OpenUrl(e.confirmUrl))
+                        }
+                    },
+                    sleep = { ms -> delay(ms) }, now = { SystemClock.elapsedRealtime() },
+                )
+            }
+            when {
+                result is Outcome.Ok && result.value == EnrolState.ACTIVE -> {
+                    approverFingerprint = store.approverFingerprint
+                    approverState = ApproverState.ACTIVE
+                    if (overlay == Overlay.Enrol) overlay = null
+                    say("This phone now approves agent actions.")
+                    // What only a phone that approves may read.
+                    loadInbox()
+                    loadActivity()
+                }
+                result is Outcome.Ok && result.value == EnrolState.DENIED -> enrolEnded(EnrolStatus.DENIED)
+                result is Outcome.Ok -> enrolEnded(EnrolStatus.EXPIRED)
+                result is Outcome.Failed && result.problem == Problem.SignedOut -> {
+                    enrolFailed(null)
+                    signedOut()
+                }
+                result is Outcome.Failed && reasonOf(result.problem) == io.crossfyre.mobile.account.Refusal.UNKNOWN -> enrolEnded(EnrolStatus.EXPIRED)
+                result is Outcome.Failed -> enrolFailed(enrolNotice(result.problem, host))
+            }
+        }
+    }
+
+    private fun deviceName(): String = Build.MODEL.trim().take(48).ifEmpty { "Android phone" }
+
+    private fun enrolEnded(status: EnrolStatus) {
+        approverKeys.delete()
+        approverState = ApproverState.OFF
+        enrolStatus = status
+    }
+
+    private fun enrolFailed(n: Notice?) {
+        approverKeys.delete()
+        approverState = ApproverState.OFF
+        enrolError = n
+        enrolStatus = EnrolStatus.ERROR
+    }
+
+    fun reopenEnrol() {
+        if (enrolUrl.isNotEmpty()) emit(Effect.OpenUrl(enrolUrl))
+    }
+
+    /** Stop waiting. The half-made approver is revoked so a later confirm does nothing. */
+    fun cancelEnrol() {
+        val job = enrolJob
+        job?.cancel()
+        enrolJob = null
+        // Whichever of this and the cancelled wait gets there first lets the
+        // approver go; the revoke is sent once the wait has stopped.
+        store.enrollingApproverId?.let { approverLedger.letGo(it) }
+        approverKeys.delete()
+        if (approverState == ApproverState.ENROLLING) approverState = ApproverState.OFF
+        overlay = null
+        viewModelScope.launch {
+            job?.join()
+            settleRevokes()
+        }
+    }
+
+    fun turnOffApprovals() {
+        overlay = null
+        // The key is deleted here whatever the server says, and a phone with no
+        // key cannot sign anything. The revoke is owed until the server confirms
+        // it, so that no request waits on an approver that can no longer sign.
+        store.approverId?.let { approverLedger.letGo(it) }
+        settleRevokes()
+        forgetApprover()
+        say("This phone no longer approves agent actions.", R.drawable.ic_info)
+    }
+
+    /** Delete the key and forget the approver. Every sign-out comes through here. */
+    private fun forgetApprover() {
+        clearActivity()
+        enrolJob?.cancel()
+        enrolJob = null
+        approverKeys.delete()
+        store.approverId = null
+        store.approverFingerprint = null
+        approverFingerprint = null
+        approverTrouble = null
+        approverState = ApproverState.OFF
+    }
+
+    /**
+     * The key is gone or no longer works: Android invalidates a key that needs an
+     * unlock when the lock screen is removed. The phone stops approving and says
+     * why; turning approvals on again makes a new key.
+     */
+    private fun approverBroke(why: String) {
+        store.approverId?.let { approverLedger.letGo(it) }
+        settleRevokes()
+        approverKeys.delete()
+        approverFingerprint = null
+        approverTrouble = why
+        approverState = ApproverState.BROKEN
+        // Nothing asks for the list again until approvals are back on, so what
+        // it held would stand on Home as waiting for a phone that cannot sign.
+        pending = emptyList()
+        settled.clear()
+        signing = null
+        if (overlay is Overlay.Approval) {
+            overlay = null
+            say("This phone stopped approving. The Activity tab says why.", R.drawable.ic_info)
+        }
+    }
+
+    val approverLedger = ApproverLedger(store)
+    private var settling = false
+    private var settleAgain = false
+
+    /**
+     * Send the revokes still owed, while there is a key to send them with. One
+     * round runs at a time; an approver let go of during a round gets another.
+     */
+    private fun settleRevokes() {
+        val key = store.key() ?: return
+        if (approverLedger.owed.isEmpty()) return
+        if (settling) {
+            settleAgain = true
+            return
+        }
+        settling = true
+        viewModelScope.launch {
+            try {
+                do {
+                    settleAgain = false
+                    val r = withContext(Dispatchers.IO) { approverLedger.settle { id -> approvals().revoke(key, id) } }
+                    if (r is Outcome.Failed && r.problem == Problem.SignedOut) {
+                        revoked = true
+                        break
+                    }
+                } while (settleAgain)
+            } finally {
+                settling = false
+            }
+        }
+    }
+
+    private val LOCK_CHANGED = "Android retired the approval key, which happens when the screen lock is removed. Turn Approvals on again to make a new one."
+
+    private fun keyTrouble(e: Throwable): String = when (e) {
+        is NoScreenLock -> "Set a screen lock on this phone first. The approval key needs it to ask for an unlock."
+        else -> "Android refused to make it: ${e.message ?: e.javaClass.simpleName}. Nothing was sent."
+    }
+
+    // ── Approvals: waiting, deciding, and the activity log ───────────────────
+    //
+    // Nothing below is written to storage. It lives here while the app is open,
+    // the way the kept requests do, and goes with the process.
+
+    var pending by mutableStateOf<List<PendingApproval>>(emptyList())
+        private set
+
+    /** What Home and the tab badge say is waiting: [pending], while this phone approves. */
+    val waiting: List<PendingApproval> get() = waitingForYou(approverState, pending)
+
+    /** Approvals that stopped waiting while this app watched, with what became of them. */
+    private val settled = mutableStateMapOf<String, PendingApproval>()
+    var pendingTrouble by mutableStateOf<String?>(null)
+        private set
+    private var serverClock: ServerClock? = null
+
+    var history by mutableStateOf<List<HistoryRow>>(emptyList())
+        private set
+    var historyStatus by mutableStateOf(ListStatus.LOADING)
+        private set
+
+    var activity by mutableStateOf<List<ActivityEvent>>(emptyList())
+        private set
+    var activityStatus by mutableStateOf(ListStatus.LOADING)
+        private set
+    var activityNotice by mutableStateOf<Notice?>(null)
+        private set
+    var activityNext by mutableStateOf<Long?>(null)
+        private set
+    var activityMoreBusy by mutableStateOf(false)
+        private set
+    private var activityJob: Job? = null
+    var activityScope by mutableStateOf<ActivityScope>(ActivityScope.Account)
+        private set
+
+    /** The account's notifications, read only while this phone approves. */
+    var inbox by mutableStateOf(InboxList())
+        private set
+    var inboxStatus by mutableStateOf(ListStatus.LOADING)
+        private set
+    var inboxNotice by mutableStateOf<Notice?>(null)
+        private set
+    var inboxMoreBusy by mutableStateOf(false)
+        private set
+    private var inboxJob: Job? = null
+
+    /** The decided request whose stop is on its way, and why the last stop did not go through. */
+    var stopping by mutableStateOf<String?>(null)
+        private set
+    var stopNotice by mutableStateOf<Notice?>(null)
+        private set
+
+    /** The wait a 429 from the phone's routes asked for, during which nothing here asks again on its own. */
+    private val quiet = Quiet()
+    private fun quietNow(): Boolean = !quiet.open(SystemClock.elapsedRealtime())
+
+    /** The views the log can be read in: this phone's workspace when it came from the account, and the account's own. */
+    val activityScopes: List<ActivityScope>
+        get() = listOfNotNull(
+            workspace?.takeIf { fromAccount }?.let { ActivityScope.Workspace(it.id, it.name) },
+            ActivityScope.Account,
+        )
+
+    /** The approval whose answer is on its way, and why it was refused if it was. */
+    var deciding by mutableStateOf<String?>(null)
+        private set
+    var decisionNotice by mutableStateOf<Notice?>(null)
+        private set
+
+    /**
+     * A signature waiting for its unlock: an approve or a stop, for which
+     * approval, and when it was signed by the server's clock.
+     */
+    private class Signing(
+        val id: String,
+        val decision: String,
+        val digest: String,
+        val signedAt: Long,
+        val approverId: String,
+        /** A stop signed a second time, after the platform said the first one's time was off. */
+        val again: Boolean = false,
+    ) {
+        val bytes: ByteArray = ApprovalProtocol.signingBytes(id, decision, digest, signedAt, approverId)
+        val stop: Boolean get() = decision == ApprovalProtocol.STOP
+    }
+    private var signing: Signing? = null
+
+    /** Where a signature that could not be made is explained: the approval sheet, or above Recent decisions for a stop. */
+    private fun signingTrouble(s: Signing?, n: Notice) {
+        if (s?.stop == true) stopNotice = n else decisionNotice = n
+    }
+
+    /** The server's time now, by its own clock carried on this phone's monotonic one. */
+    fun serverNow(elapsed: Long = SystemClock.elapsedRealtime()): Instant =
+        serverClock?.now(elapsed) ?: Instant.now()
+
+    /** The approval the sheet shows: still waiting, or as it was when it stopped. */
+    fun approvalFor(id: String): PendingApproval? = pending.firstOrNull { it.id == id } ?: settled[id]
+
+    /**
+     * Ask for what is waiting, while the app is in front.
+     *
+     * Started under the activity's STARTED lifecycle, so it stops the moment the
+     * app is out of sight and starts again, fast, when it comes back.
+     */
+    suspend fun watchApprovals() {
+        val resumedAt = SystemClock.elapsedRealtime()
+        while (true) {
+            if (approverState == ApproverState.ACTIVE && !quietNow()) refreshPending()
+            delay(PollPolicy.next(SystemClock.elapsedRealtime() - resumedAt, pending.isNotEmpty()))
+        }
+    }
+
+    suspend fun refreshPending() {
+        val key = store.key() ?: return
+        val mine = store.approverId ?: return
+        val r = withContext(Dispatchers.IO) { approvals().pending(key) }
+        when (r) {
+            is Outcome.Ok -> {
+                // The phone stopped approving, or became another approver, while
+                // this was on its way: the list is for an approver that is gone.
+                if (approverState != ApproverState.ACTIVE || store.approverId != mine) return
+                pendingTrouble = null
+                r.value.serverTime?.let { serverClock = ServerClock(it, SystemClock.elapsedRealtime()) }
+                val approver = r.value.approver
+                if (approver == null || approver.id != mine || approver.status != "active") {
+                    approverBroke("This phone's approval was revoked, in the dashboard or by signing this phone's key out. Turn Approvals on again to approve here.")
+                    return
+                }
+                val now = r.value.approvals.filter { it.status == "pending" }
+                val gone = pending.filter { old -> now.none { it.id == old.id } }
+                for (g in gone) if (!settled.containsKey(g.id)) settled[g.id] = g.copy(status = "closed")
+                pending = now
+                if (gone.isNotEmpty()) loadHistory()
+            }
+            is Outcome.Failed -> {
+                quiet.heard(r.problem, SystemClock.elapsedRealtime())
+                if (r.problem == Problem.SignedOut) {
+                    revoked = true
+                    pending = emptyList()
+                } else {
+                    pendingTrouble = when (val p = r.problem) {
+                        is Problem.Unreachable -> "Couldn't reach $host. Trying again."
+                        else -> if (reasonOf(p) == io.crossfyre.mobile.account.Refusal.RATE_LIMITED) {
+                            "$host asked this phone to slow down. Asking again in a minute."
+                        } else {
+                            p.text
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * What a refusal from one of the phone's routes means beyond its own
+     * section: a key that no longer works, a limit to wait out, or a phone the
+     * platform may no longer count as an approver. The pending list names this
+     * phone's approver, so it is what is asked whether the phone still approves.
+     */
+    private fun phoneTrouble(p: Problem) {
+        if (p == Problem.SignedOut) revoked = true
+        quiet.heard(p, SystemClock.elapsedRealtime())
+        if (reasonOf(p) == io.crossfyre.mobile.account.Refusal.APPROVER_INACTIVE && approverState == ApproverState.ACTIVE) {
+            viewModelScope.launch { refreshPending() }
+        }
+    }
+
+    /** What the Activity tab reads when it is opened, and on Refresh. Nothing, while a 429's wait runs. */
+    fun refreshActivity() {
+        if (!signedIn || quietNow()) return
+        if (approverState == ApproverState.ACTIVE) viewModelScope.launch { refreshPending() }
+        loadHistory()
+        loadInbox()
+        loadActivity()
+    }
+
+    fun loadHistory() {
+        if (quietNow()) return
+        val key = store.key() ?: return
+        if (history.isEmpty()) historyStatus = ListStatus.LOADING
+        viewModelScope.launch {
+            when (val r = withContext(Dispatchers.IO) { approvals().history(key) }) {
+                is Outcome.Ok -> {
+                    // A stop is signed at the platform's time, and this is the
+                    // answer its button was drawn from.
+                    r.value.serverTime?.let { serverClock = ServerClock(it, SystemClock.elapsedRealtime()) }
+                    history = r.value.rows
+                    historyStatus = if (r.value.rows.isEmpty()) ListStatus.EMPTY else ListStatus.READY
+                }
+                is Outcome.Failed -> {
+                    phoneTrouble(r.problem)
+                    historyStatus = ListStatus.ERROR
+                }
+            }
+        }
+    }
+
+    /** The newest page of notifications, or with [more] the page after the last one shown. Only while this phone approves. */
+    fun loadInbox(more: Boolean = false) {
+        if (approverState != ApproverState.ACTIVE || quietNow()) return
+        val key = store.key() ?: return
+        val page = if (more) inbox.page + 1 else 1
+        if (more && !inbox.more) return
+        inboxJob?.cancel()
+        inboxMoreBusy = more
+        if (!more && inbox.items.isEmpty()) inboxStatus = ListStatus.LOADING
+        inboxJob = viewModelScope.launch {
+            val r = withContext(Dispatchers.IO) { approvals().inbox(key, page) }
+            inboxMoreBusy = false
+            when (r) {
+                is Outcome.Ok -> {
+                    inbox = inbox.with(r.value)
+                    inboxNotice = null
+                    inboxStatus = if (inbox.items.isEmpty()) ListStatus.EMPTY else ListStatus.READY
+                }
+                is Outcome.Failed -> {
+                    phoneTrouble(r.problem)
+                    inboxNotice = io.crossfyre.mobile.inboxNotice(r.problem, host)
+                    if (!more) inboxStatus = ListStatus.ERROR
+                }
+            }
+        }
+    }
+
+    /**
+     * A notification was tapped: it is marked read, and its link, when it is a
+     * page on this app's own server, opens. A request waiting for this phone
+     * opens here, where it can be approved; any other page opens in a Custom Tab.
+     */
+    fun openNotification(n: InboxItem) {
+        if (!n.read) markRead(listOf(n.id))
+        val url = notificationUrl(origin, n.link) ?: return
+        if (ApprovalIds.fromLink(url, origin) != null) openLink(url) else emit(Effect.OpenUrl(url))
+    }
+
+    fun markAllRead() = markRead(null)
+
+    /** Mark [ids] read, or every notification with null. The dot goes when the server says it went. */
+    private fun markRead(ids: List<String>?) {
+        val key = store.key() ?: return
+        viewModelScope.launch {
+            val r = withContext(Dispatchers.IO) {
+                if (ids == null) approvals().inboxReadAll(key) else approvals().inboxRead(key, ids)
+            }
+            when (r) {
+                is Outcome.Ok -> inbox = if (ids == null) inbox.allRead(r.value.unread) else inbox.read(ids, r.value.unread)
+                is Outcome.Failed -> {
+                    phoneTrouble(r.problem)
+                    inboxNotice = markReadNotice(r.problem, host)
+                }
+            }
+        }
+    }
+
+    fun chooseActivityScope(scope: ActivityScope) {
+        if (scope == activityScope) return
+        activityScope = scope
+        activity = emptyList()
+        loadActivity()
+    }
+
+    /** The newest page of the log, or with [more] the page after the last one shown. */
+    fun loadActivity(more: Boolean = false) {
+        // The platform answers the log only for a phone that approves.
+        if (!ACTIVITY_LOG || approverState != ApproverState.ACTIVE || quietNow()) return
+        val key = store.key() ?: return
+        if (activityScope !in activityScopes) activityScope = activityScopes.first()
+        val scope = activityScope
+        val before = if (more) activityNext ?: return else null
+        activityJob?.cancel()
+        if (more) activityMoreBusy = true else if (activity.isEmpty()) activityStatus = ListStatus.LOADING
+        activityJob = viewModelScope.launch {
+            val r = withContext(Dispatchers.IO) { approvals().activity(key, scope, before) }
+            activityMoreBusy = false
+            if (scope != activityScope) return@launch
+            when (r) {
+                is Outcome.Ok -> {
+                    activity = if (more) activity + r.value.events.filter { e -> activity.none { it.id == e.id } } else r.value.events
+                    activityNext = r.value.nextBeforeId
+                    activityNotice = null
+                    activityStatus = if (activity.isEmpty()) ListStatus.EMPTY else ListStatus.READY
+                }
+                is Outcome.Failed -> {
+                    phoneTrouble(r.problem)
+                    activityNotice = io.crossfyre.mobile.activityNotice(r.problem, host)
+                    if (!more) activityStatus = ListStatus.ERROR
+                }
+            }
+        }
+    }
+
+    private fun clearActivity() {
+        activityJob?.cancel()
+        inboxJob?.cancel()
+        pending = emptyList()
+        settled.clear()
+        history = emptyList()
+        activity = emptyList()
+        activityNext = null
+        inbox = InboxList()
+        inboxStatus = ListStatus.LOADING
+        inboxNotice = null
+        serverClock = null
+        signing = null
+        deciding = null
+        decisionNotice = null
+        stopping = null
+        stopNotice = null
+        quiet.clear()
+    }
+
+    fun openApproval(id: String) {
+        decisionNotice = null
+        overlay = Overlay.Approval(id)
+    }
+
+    /**
+     * Approve: check what is on screen once more, fix the bytes to sign, and ask
+     * for the unlock. Nothing is sent until the keystore has signed.
+     */
+    fun approve(id: String) {
+        val a = pending.firstOrNull { it.id == id } ?: return
+        val view = approvalView(a, serverNow(), approverState == ApproverState.ACTIVE)
+        if (!view.canApprove || deciding != null) return
+        val approverId = store.approverId ?: return
+        signing = Signing(id, ApprovalProtocol.APPROVE, a.digest, serverNow().epochSecond, approverId)
+        decisionNotice = null
+        val s = view.summary
+        val what = listOfNotNull(s?.action?.label?.ifEmpty { null }, s?.workspace?.name?.ifEmpty { null }?.let { "in $it" }).joinToString(" ")
+        emit(Effect.Authenticate(id, "Approve agent action", what.ifEmpty { "Unlock to sign your approval." }))
+    }
+
+    /** For the Android 11 prompt: a signature for the unlock to authorise, or null when the key cannot be used. */
+    fun signatureForUnlock(id: String): Signature? {
+        val s = signing?.takeIf { it.id == id } ?: return null
+        return try {
+            approverKeys.signature()
+        } catch (e: KeyPermanentlyInvalidatedException) {
+            signing = null
+            approverBroke(LOCK_CHANGED)
+            overlay = null
+            null
+        } catch (e: KeyGone) {
+            signing = null
+            approverBroke(LOCK_CHANGED)
+            overlay = null
+            null
+        } catch (e: Exception) {
+            signing = null
+            signingTrouble(s, Notice(Level.DANGER, "Couldn't use the approval key.", e.message ?: e.javaClass.simpleName))
+            null
+        }
+    }
+
+    /**
+     * The person unlocked. Sign the fixed bytes, with the signature the prompt
+     * authorised, or on Android 10 and earlier with one made inside the fifteen
+     * seconds the unlock opened, and send the approval.
+     */
+    fun unlocked(id: String, authorised: Signature?) {
+        val s = signing?.takeIf { it.id == id } ?: return
+        signing = null
+        val der = try {
+            val sig = authorised ?: approverKeys.signature()
+            sig.update(s.bytes)
+            sig.sign()
+        } catch (e: KeyPermanentlyInvalidatedException) {
+            approverBroke(LOCK_CHANGED)
+            overlay = null
+            return
+        } catch (e: KeyGone) {
+            approverBroke(LOCK_CHANGED)
+            overlay = null
+            return
+        } catch (e: UserNotAuthenticatedException) {
+            signingTrouble(
+                s,
+                if (s.stop) Notice(Level.WARN, "The unlock ran out before the stop was signed.", "Nothing was sent. Tap Stop again.")
+                else Notice(Level.WARN, "The unlock ran out before the approval was signed.", "Nothing was sent. Tap Approve again."),
+            )
+            return
+        } catch (e: Exception) {
+            signingTrouble(s, Notice(Level.DANGER, if (s.stop) "Couldn't sign the stop." else "Couldn't sign the approval.", e.message ?: e.javaClass.simpleName))
+            return
+        }
+        if (s.stop) sendStop(s, der) else decide(id, approving = true) { api, key -> api.approve(key, id, s.approverId, s.signedAt, der) }
+    }
+
+    /** Android 8 to 10: the lock screen answered for the approve in progress. */
+    fun lockConfirmed(ok: Boolean) {
+        val id = signing?.id ?: return
+        if (ok) unlocked(id, null) else unlockCancelled(id, null)
+    }
+
+    /** The unlock was cancelled or failed: nothing is signed and nothing is sent. */
+    fun unlockCancelled(id: String, why: String?) {
+        val s = signing?.takeIf { it.id == id }
+        if (s != null) signing = null
+        if (!why.isNullOrBlank()) signingTrouble(s, Notice(Level.INFO, if (s?.stop == true) "Not stopped." else "Not approved.", why))
+    }
+
+    /**
+     * Stop the scan a decided request launched. The phone signs `stop` over the
+     * request's digest at the platform's time, after an unlock, the way it signs
+     * an approve; nothing is sent until the keystore has signed.
+     */
+    fun stopScan(id: String) {
+        val h = history.firstOrNull { it.id == id } ?: return
+        if (!stoppable(h) || approverState != ApproverState.ACTIVE || stopping != null) return
+        val approverId = store.approverId ?: return
+        stopNotice = null
+        askToStop(Signing(id, ApprovalProtocol.STOP, h.digest, serverNow().epochSecond, approverId), h)
+    }
+
+    private fun askToStop(s: Signing, h: HistoryRow) {
+        signing = s
+        val what = listOf(h.actionLabel, h.workspaceName.ifEmpty { null }?.let { "in $it" }.orEmpty()).filter { it.isNotEmpty() }.joinToString(" ")
+        val description = when {
+            s.again -> "The server's clock and this phone's disagreed, so nothing was stopped yet. Unlock once more to stop it."
+            what.isNotEmpty() -> what
+            else -> "Unlock to sign the stop."
+        }
+        emit(Effect.Authenticate(s.id, "Stop agent scan", description))
+    }
+
+    private fun sendStop(s: Signing, der: ByteArray) {
+        val key = store.key() ?: return signedOut()
+        stopping = s.id
+        stopNotice = null
+        viewModelScope.launch {
+            val r = withContext(Dispatchers.IO) { approvals().stop(key, s.id, s.approverId, s.signedAt, der) }
+            stopping = null
+            when (r) {
+                is Outcome.Ok -> when (val v = r.value) {
+                    is StopAnswer.Stopped -> {
+                        say("Stopped. Crossfyre is cancelling what the scan had running.")
+                        loadHistory()
+                        loadActivity()
+                    }
+                    is StopAnswer.Stale -> {
+                        // Signed at a time the platform does not accept: take its
+                        // clock from the answer, and sign once more at its time.
+                        serverClock = ServerClock(v.serverTime, SystemClock.elapsedRealtime())
+                        val h = history.firstOrNull { it.id == s.id }
+                        if (!s.again && h != null && approverState == ApproverState.ACTIVE && store.approverId == s.approverId) {
+                            askToStop(Signing(s.id, ApprovalProtocol.STOP, s.digest, serverNow().epochSecond, s.approverId, again = true), h)
+                        } else {
+                            stopNotice = io.crossfyre.mobile.stopNotice(
+                                Problem.Refused(422, "stale_signature", io.crossfyre.mobile.account.Refusal.STALE_SIGNATURE), host,
+                            )
+                        }
+                    }
+                }
+                is Outcome.Failed -> {
+                    phoneTrouble(r.problem)
+                    if (r.problem == Problem.SignedOut) return@launch
+                    stopNotice = io.crossfyre.mobile.stopNotice(r.problem, host)
+                    when (reasonOf(r.problem)) {
+                        io.crossfyre.mobile.account.Refusal.NOT_RUNNING,
+                        io.crossfyre.mobile.account.Refusal.NOT_LAUNCHED,
+                        io.crossfyre.mobile.account.Refusal.UNKNOWN -> loadHistory()
+                        else -> Unit
+                    }
+                }
+            }
+        }
+    }
+
+    /** Deny: no unlock, because refusing is safe from anywhere. */
+    fun deny(id: String) {
+        if (deciding != null) return
+        decide(id, approving = false) { api, key -> api.deny(key, id) }
+    }
+
+    private fun decide(id: String, approving: Boolean, call: (ApprovalApi, String) -> Outcome<String>) {
+        val key = store.key() ?: return signedOut()
+        val was = pending.firstOrNull { it.id == id }
+        deciding = id
+        decisionNotice = null
+        viewModelScope.launch {
+            val r = withContext(Dispatchers.IO) { call(approvals(), key) }
+            deciding = null
+            when (r) {
+                is Outcome.Ok -> {
+                    val status = r.value.ifEmpty { if (approving) "approved" else "denied" }
+                    was?.let { settled[id] = it.copy(status = status) }
+                    pending = pending.filter { it.id != id }
+                    if (overlay == Overlay.Approval(id)) overlay = null
+                    say(if (approving) "Approved. Crossfyre goes ahead with it now." else "Denied. Nothing was started.")
+                    loadHistory()
+                    loadActivity()
+                }
+                is Outcome.Failed -> {
+                    if (r.problem == Problem.SignedOut) {
+                        revoked = true
+                        overlay = null
+                        return@launch
+                    }
+                    decisionNotice = io.crossfyre.mobile.decisionNotice(r.problem, host)
+                    when (reasonOf(r.problem)) {
+                        io.crossfyre.mobile.account.Refusal.APPROVER_INACTIVE -> approverBroke(
+                            "The server no longer takes this phone's approvals. Turn Approvals on again to approve here."
+                        )
+                        io.crossfyre.mobile.account.Refusal.NOT_PENDING,
+                        io.crossfyre.mobile.account.Refusal.APPROVAL_EXPIRED,
+                        io.crossfyre.mobile.account.Refusal.UNKNOWN -> {
+                            was?.let { settled[id] = it.copy(status = "closed") }
+                            pending = pending.filter { it.id != id }
+                            loadHistory()
+                        }
+                        else -> Unit
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * A link to `/m/approve/<id>` on this app's own server, from a notification
+     * or the dashboard. Anything else, including the same path on another host,
+     * opens nothing.
+     */
+    fun openLink(link: String?) {
+        val id = link?.let { ApprovalIds.fromLink(it, origin) } ?: return
+        if (!signedIn) return say("Sign in to approve agent actions on this phone.", R.drawable.ic_info)
+        if (route == Route.MAIN) {
+            tab = "activity"
+            push = null
+        }
+        if (approverState != ApproverState.ACTIVE) {
+            return say("Turn on Approvals in Settings to approve on this phone.", R.drawable.ic_info)
+        }
+        viewModelScope.launch {
+            if (pending.none { it.id == id }) refreshPending()
+            if (approvalFor(id) != null) openApproval(id)
+            else say("That approval is no longer waiting.", R.drawable.ic_info)
+        }
+    }
 
     // ── Appearance ───────────────────────────────────────────────────────────
 

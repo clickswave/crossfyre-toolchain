@@ -1,0 +1,32 @@
+[package]
+name = "cfx_tunnel"
+version = "0.0.1"
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+homepage = "https://clickswave.org"
+repository = "https://github.com/clickswave/crossfyre-toolchain"
+keywords = ["proxy", "socks5", "tunnel"]
+description = "TCP tunnels through SOCKS4, SOCKS5, HTTP and HTTPS proxies, and the server side of SOCKS5 with a user name and password."
+authors = ["Clickswave <team@clickswave.org>"]
+
+# No HTTP client in here: `transport` dials through this crate and the node's
+# gateway serves and dials with it, so it sits below both.
+[dependencies]
+tokio = { version = "1", features = ["net", "io-util", "time"] }
+# An HTTPS proxy is spoken to over TLS. The provider is named rather than taken from
+# the process: the engines link both ring and aws-lc-rs, and rustls panics at the
+# first handshake when it has to pick one of two by itself.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1"
+
+[features]
+# A recording SOCKS5 proxy and counting listeners for the engines' egress tests.
+# Only test builds turn it on, through a dev-dependency.
+recorder = ["tokio/rt"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "io-util", "time", "macros", "rt", "rt-multi-thread"] }
+# A local HTTPS proxy for the TLS tests, with a certificate made on the spot.
+rcgen = "0.13"
