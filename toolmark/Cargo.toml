@@ -1,6 +1,6 @@
 [package]
 name = "toolmark"
-version = "0.0.12"
+version = "0.0.13"
 edition = "2024"
 license.workspace = true
 publish.workspace = true
