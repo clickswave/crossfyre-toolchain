@@ -12,7 +12,9 @@ members = ["capture", "core", "node", "crossfyre", "tui", "ambulo", "voyage", "d
 # `adaptive-private` in first-party builds, and Cargo cannot override a member.
 # Both are excluded so a member (the stub or the drop-in, same package name) is
 # still built as a dependency but not as a standalone member.
-exclude = ["adaptive", "adaptive-private"]
+# `vendor` holds third-party crates patched in below. They are dependencies, not
+# members, so the workspace's tests, lints and formatting leave them as published.
+exclude = ["adaptive", "adaptive-private", "vendor"]
 
 # Every crate here is Apache-2.0, the licence in LICENSE, and none is published to
 # crates.io. A publish there is permanent and would fix a name and a licence for good,
@@ -38,3 +40,15 @@ publish = false
 # If a future change makes this host-hostile, exclude it from the build job
 # rather than dropping it from the workspace: the `cfx_capture` path dependency
 # resolves because it is a member.
+
+# lru 0.13.0 with two upstream soundness fixes that lru shipped only in later
+# releases: `IterMut::next` and `next_back` take a shared reference to the key
+# (GHSA-rhfx-m35p-ff5j, RUSTSEC-2026-0002, fixed in 0.16.3), and `pop` unlinks a
+# node before it frees it and drops the key (RUSTSEC-2026-0253, fixed in 0.18.2).
+# The one user of lru 0.13 is wreq 5.3.0 in the `impersonate` build, and no wreq
+# release before 0.16 accepts a fixed lru. The copy is the crates.io 0.13.0 package
+# with upstream's own change for each applied and nothing else. The patch matches the
+# ^0.13 requirement only; ratatui's lru 0.18 still comes from crates.io. Drop this
+# once wreq moves past lru 0.13.
+[patch.crates-io]
+lru = { path = "vendor/lru-0.13.0" }
