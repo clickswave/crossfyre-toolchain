@@ -71,6 +71,192 @@ fn installed_ext_version(ext: &str) -> Option<String> {
     }
 }
 
+/// The version in `sidecar`, or when there is none, the version the binary at `bin`
+/// reports. The installer places the CLI, the node and cfx-script without a sidecar, and
+/// an update that read the missing record as an old binary downloaded the same version
+/// again and counted it as updated.
+fn recorded_or_reported(
+    sidecar: &Path,
+    bin: &Path,
+    name: &str,
+    envs: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+) -> Option<String> {
+    let recorded = fs::read_to_string(sidecar)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    recorded.or_else(|| reported_version(bin, name, envs))
+}
+
+/// What `<bin> --version` says the version is, when it answers `<name> <version>` and
+/// exits 0 within a few seconds. A cfx-script from before it took `--version` reads the
+/// flag as no job, and refuses the empty stdin it is given with status 2, so it has no
+/// version to report.
+fn reported_version(
+    bin: &Path,
+    name: &str,
+    envs: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+) -> Option<String> {
+    let mut command = Command::new(bin);
+    command
+        .arg("--version")
+        .envs(envs)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut busy = 0;
+    let mut child = loop {
+        match command.spawn() {
+            // As in `helper_starts`: a process forked while the file was open for writing
+            // holds it until it execs.
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && busy < 100 => {
+                busy += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(_) => return None,
+            Ok(child) => break child,
+        }
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let out = child.wait_with_output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_reported_version(&String::from_utf8_lossy(&out.stdout), name)
+}
+
+/// The version in a `--version` line that names `name`, as clap writes it.
+fn parse_reported_version(stdout: &str, name: &str) -> Option<String> {
+    let mut words = stdout.lines().next()?.split_whitespace();
+    if words.next()? != name {
+        return None;
+    }
+    let version = words.next()?;
+    version
+        .starts_with(|c: char| c.is_ascii_digit())
+        .then(|| version.to_string())
+}
+
+/// The version of the node worker in the bin directory, if there is one.
+fn installed_node_version() -> Option<String> {
+    let bin = ext_bin_path("node");
+    if !bin.exists() {
+        return None;
+    }
+    recorded_or_reported(
+        &get_bin_dir().join("node.version"),
+        &bin,
+        "node",
+        Vec::new(),
+    )
+}
+
+/// The version of the cfx-script in the bin directory, if there is one.
+fn installed_helper_version() -> Option<String> {
+    let bin = ext_bin_path(CFX_SCRIPT);
+    if !bin.exists() {
+        return None;
+    }
+    let envs = crate::executor::python_env(&bin);
+    recorded_or_reported(&ext_version_file(CFX_SCRIPT), &bin, CFX_SCRIPT, envs)
+}
+
+/// The record of a cfx-script release that was downloaded and could not start on this
+/// host: its version on the first line, then what it wrote. While the release is still
+/// that version, an update does not download it again only to find the same thing, each
+/// time, unless what it lacked is here now or `--force` is given. A cfx-script that starts
+/// removes the record.
+fn cannot_start_file() -> PathBuf {
+    get_bin_dir().join(format!("{CFX_SCRIPT}.cannot-start"))
+}
+
+fn record_cannot_start(version: &str, output: &str) {
+    let _ = fs::write(cannot_start_file(), format!("{version}\n{output}\n"));
+}
+
+/// What the cfx-script of `version` wrote when it could not start here, if one did and
+/// nothing has changed since that would let it start now.
+fn still_cannot_start(version: &str) -> Option<String> {
+    let text = fs::read_to_string(cannot_start_file()).ok()?;
+    let (recorded, output) = text.split_once('\n')?;
+    if recorded.trim() != version {
+        return None;
+    }
+    let output = output.trim();
+    if missing_library(output).is_some_and(library_loads) {
+        return None;
+    }
+    Some(output.to_string())
+}
+
+/// The shared library that the dynamic loader could not find, from what it wrote:
+/// `error while loading shared libraries: libpython3.11.so.1.0: cannot open ...`.
+fn missing_library(output: &str) -> Option<&str> {
+    let (_, rest) = output.split_once("error while loading shared libraries: ")?;
+    let name = rest.split(':').next()?.trim();
+    (!name.is_empty() && !name.contains('/')).then_some(name)
+}
+
+/// Can this process load the shared library `name`, from wherever the dynamic loader
+/// would look for it? It is loaded and let go again; libpython does nothing when loaded.
+#[cfg(unix)]
+fn library_loads(name: &str) -> bool {
+    let Ok(name) = std::ffi::CString::new(name) else {
+        return false;
+    };
+    // SAFETY: a valid C string, and the handle is closed only when the load succeeded.
+    unsafe {
+        let handle = libc::dlopen(name.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL);
+        if handle.is_null() {
+            return false;
+        }
+        libc::dlclose(handle);
+    }
+    true
+}
+
+#[cfg(not(unix))]
+fn library_loads(_name: &str) -> bool {
+    false
+}
+
+/// Why a cfx-script could not start here, and what would let it, from what it wrote.
+fn cannot_start_note(output: &str) -> String {
+    let Some(lib) = missing_library(output) else {
+        return format!("{output}. `crossfyre update --force` downloads it and tries it again.");
+    };
+    let mut note = format!("It needs {lib}, which this host does not have.");
+    if let Some(package) = lib
+        .strip_suffix(".so.1.0")
+        .filter(|p| p.starts_with("libpython3."))
+    {
+        let how = if Path::new("/usr/bin/apt-get").exists() {
+            format!("sudo apt install {package}")
+        } else {
+            format!("the package that provides {lib}")
+        };
+        note.push_str(&format!(
+            " Install it ({how}) where your system has it, and the next update installs \
+             cfx-script; where there is no {package}, this release's cfx-script cannot run \
+             here."
+        ));
+    }
+    note
+}
+
 /// The manifest keys `component` may be published under, in the order to try them: an
 /// engine's public name first, then its legacy name and its id. A manifest from before
 /// the rename has only the legacy key, and one from after it has both, so the CLI does
@@ -490,8 +676,9 @@ pub enum HelperOutcome {
 /// Install or refresh the cfx-script helper from the release manifest: download it,
 /// check its sha256, unpack it beside node and run it once before it replaces anything.
 /// Its version is recorded in `cfx-script.version`, as node's is in `node.version`, so a
-/// later update can tell whether it is current. A cfx-script that the installer placed
-/// has no such record and is replaced once.
+/// later update can tell whether it is current; one with no record is asked for its
+/// version. A release that could not start here is not downloaded again while nothing
+/// has changed (`still_cannot_start`).
 pub async fn install_cfx_script(
     manifest: &Manifest,
     force: bool,
@@ -504,9 +691,12 @@ pub async fn install_cfx_script(
     };
     let version = comp.version.clone();
     let dest = ext_bin_path(CFX_SCRIPT);
-    let replaced = installed_ext_version(CFX_SCRIPT).filter(|_| dest.exists());
+    let replaced = installed_helper_version();
     if replaced.as_deref() == Some(version.as_str()) && !force {
         return Ok(HelperOutcome::Current { version });
+    }
+    if !force && let Some(output) = still_cannot_start(&version) {
+        return Ok(HelperOutcome::CannotStart { version, output });
     }
 
     let tmp_dir = tempfile::tempdir()?;
@@ -520,9 +710,11 @@ pub async fn install_cfx_script(
     }
     place_bundled_python(&extracted, &dest)?;
     if let Some(output) = place_helper_if_it_starts(&extracted, &dest)? {
+        record_cannot_start(&version, &output);
         return Ok(HelperOutcome::CannotStart { version, output });
     }
     let _ = fs::write(ext_version_file(CFX_SCRIPT), &version);
+    let _ = fs::remove_file(cannot_start_file());
     Ok(HelperOutcome::Installed { version, replaced })
 }
 
@@ -544,9 +736,9 @@ fn report_cfx_script(result: Result<HelperOutcome, Box<dyn std::error::Error>>) 
             ext_bin_path(CFX_SCRIPT).display()
         ),
         Ok(HelperOutcome::CannotStart { version, output }) => eprintln!(
-            "[!] cfx-script {version} cannot start here, so it was not installed and {}. \
-             {output}",
-            without_new_helper()
+            "[!] cfx-script {version} cannot start here, so it was not installed and {}. {}",
+            without_new_helper(),
+            cannot_start_note(&output)
         ),
         Ok(
             HelperOutcome::Current { .. } | HelperOutcome::NotInRelease | HelperOutcome::Owned(_),
@@ -772,19 +964,157 @@ fn remove_stopped_binary(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// What `update` did with each component it looked at. A component that is not installed
+/// here, such as the node on a host that never ran `node init`, is in none of the counts.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Updated {
+    /// The CLI or the node worker was replaced, and the node service should restart.
+    pub restart: bool,
+    pub changed: usize,
+    pub current: usize,
+    /// Left as they were for a reason no update can change, such as a cfx-script that
+    /// this host cannot start. Not a failure, but not up to date either.
+    pub skipped: usize,
+    /// Needed an update that this user may not write, because the bin directory belongs
+    /// to root (or on Windows, to administrators).
+    pub need_rights: usize,
+    /// Needed an update, and it failed.
+    pub failed: usize,
+}
+
+impl Updated {
+    /// Did every component that needed an update get one? `crossfyre update` exits
+    /// non-zero when not.
+    pub fn succeeded(&self) -> bool {
+        self.need_rights == 0 && self.failed == 0
+    }
+
+    /// The line that closes the update. It says "up to date" only when nothing was
+    /// skipped, refused or failed: printing it under a row that said a component failed
+    /// is what made a failed update read as a successful one.
+    fn summary(&self) -> String {
+        if self.changed == 0 && self.skipped == 0 && self.succeeded() {
+            return "Everything is up to date.".to_string();
+        }
+        let mut parts = Vec::new();
+        if self.changed > 0 {
+            let s = if self.changed == 1 { "" } else { "s" };
+            parts.push(format!("Updated {} component{s}", self.changed));
+        }
+        if self.current > 0 {
+            parts.push(format!("{} already current", self.current));
+        }
+        if self.skipped > 0 {
+            parts.push(format!("{} skipped", self.skipped));
+        }
+        if self.need_rights > 0 {
+            let s = if self.need_rights == 1 { "s" } else { "" };
+            parts.push(format!("{} need{s} {}", self.need_rights, RIGHTS));
+        }
+        if self.failed > 0 {
+            parts.push(format!("{} failed", self.failed));
+        }
+        let line = parts.join(", ");
+        if self.changed == 0 {
+            format!("Nothing was updated: {line}.")
+        } else {
+            format!("{line}.")
+        }
+    }
+}
+
+/// What a user who may not write the bin directory lacks.
+const RIGHTS: &str = if cfg!(windows) {
+    "an elevated prompt"
+} else {
+    "root"
+};
+
+/// Can this process create files in `dir`, or create `dir` itself? Asked before anything
+/// is downloaded, so that an update run by a user who may not write the bin directory
+/// says what it needs at once. Without it, each component was downloaded and then failed
+/// with a bare "Permission denied (os error 13)" when it was moved into place.
+fn can_write_in(dir: &Path) -> bool {
+    let mut at = dir;
+    while !at.is_dir() {
+        match at.parent() {
+            Some(parent) => at = parent,
+            None => return false,
+        }
+    }
+    tempfile::Builder::new()
+        .prefix(".crossfyre-")
+        .tempfile_in(at)
+        .is_ok()
+}
+
+/// Show that `name` is being updated, on a terminal, where its result line replaces it.
+/// Anywhere else the `\r` replaces nothing, and the two ran together on one line.
+fn show_progress(name: &str) {
+    use super::ui::*;
+    use std::io::IsTerminal;
+    if std::io::stdout().is_terminal() {
+        print!("    {} {name:<10} {}", dot(), dim("updating\u{2026}"));
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+}
+
+/// The result line for a component whose progress `show_progress` showed.
+fn show_result(line: &str) {
+    use std::io::IsTerminal;
+    if std::io::stdout().is_terminal() {
+        println!("\r{line}          ");
+    } else {
+        println!("{line}");
+    }
+}
+
+/// A second line under a component's row, for what a short status cannot say.
+fn show_detail(text: &str) {
+    println!("      {}", super::ui::dim(text));
+}
+
+/// `old -> new`, or just `new`, in the column the other rows put their version in, when
+/// the old version is not known or is the same.
+fn version_change(old: Option<&str>, new: &str) -> String {
+    use super::ui::*;
+    match old {
+        Some(old) if !old.is_empty() && old != new => format!("{DIM}{old} \u{2192}{RESET} {new}"),
+        _ => ver(new),
+    }
+}
+
+/// The row for a component this user may not update.
+fn needs_rights_row(name: &str, mid: &str) -> String {
+    use super::ui::*;
+    row(
+        &bang(),
+        name,
+        mid,
+        &format!("{YELLOW}needs {RIGHTS}{RESET}"),
+    )
+}
+
 /// `crossfyre update [self|<ext>|all]`. With no target: update self plus
-/// every installed extension. Returns true if the crossfyre binary itself
-/// was replaced (caller should restart).
+/// every installed extension.
 pub async fn update(
     target: Option<&str>,
     current_version: &str,
     force: bool,
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> Result<Updated, Box<dyn std::error::Error>> {
     // First, so what follows sees every engine under its public name.
     super::migrate::renamed_engines();
     let manifest = fetch_manifest().await?;
-    let mut self_updated = false;
+    update_with(&manifest, target, current_version, force).await
+}
 
+/// `update` against a manifest already fetched.
+async fn update_with(
+    manifest: &Manifest,
+    target: Option<&str>,
+    current_version: &str,
+    force: bool,
+) -> Result<Updated, Box<dyn std::error::Error>> {
     let (do_self, exts): (bool, Vec<&str>) = match target {
         Some("self") => (true, vec![]),
         Some("all") | None => (true, installed_extensions()),
@@ -796,8 +1126,9 @@ pub async fn update(
     println!("  {BOLD}Crossfyre update{RESET}   {}", dim(origin_host()));
     println!();
 
-    let mut changed = 0usize;
-    let mut current = 0usize;
+    let mut out = Updated::default();
+    let bin_dir = get_bin_dir();
+    let writable = can_write_in(&bin_dir);
 
     // Suppress the per-service status lines from install/service ops - this
     // command renders its own summary. No `?` runs between the toggle pair, so
@@ -811,46 +1142,48 @@ pub async fn update(
             let name = super::public_name(ext);
             if let Some(m) = packaging::owner(ext) {
                 println!("{}", row(&check(), name, "", &dim(&update_note(m))));
-                current += 1;
+                out.current += 1;
                 continue;
             }
-            let want = manifest_version(&manifest, ext);
+            let want = manifest_version(manifest, ext);
             let have = installed_ext_version(ext);
             let up_to_date = ext_bin_path(ext).exists()
                 && !want.is_empty()
                 && have.as_deref() == Some(want.as_str());
             if up_to_date && !force {
                 println!("{}", row(&check(), name, &ver(&want), &dim("up to date")));
-                current += 1;
+                out.current += 1;
                 continue;
             }
-            print!("    {} {name:<10} {}", dot(), dim("updating…"));
-            let _ = std::io::Write::flush(&mut std::io::stdout());
-            match install_one(&manifest, ext, true, true).await {
+            if !writable {
+                println!(
+                    "{}",
+                    needs_rights_row(name, &version_change(have.as_deref(), &want))
+                );
+                out.need_rights += 1;
+                continue;
+            }
+            show_progress(name);
+            match install_one(manifest, ext, true, true).await {
                 Ok(()) => {
                     let _ = service::start(ext);
-                    let mid = match &have {
-                        Some(old) if !old.is_empty() && *old != want => {
-                            format!("{DIM}{old} \u{2192}{RESET} {want}")
-                        }
-                        _ => want.clone(),
-                    };
-                    println!(
-                        "\r{}          ",
-                        row(&check(), name, &mid, &format!("{GREEN}updated{RESET}"))
-                    );
-                    changed += 1;
+                    let mid = version_change(have.as_deref(), &want);
+                    show_result(&row(
+                        &check(),
+                        name,
+                        &mid,
+                        &format!("{GREEN}updated{RESET}"),
+                    ));
+                    out.changed += 1;
                 }
                 Err(e) => {
-                    println!(
-                        "\r{}          ",
-                        row(
-                            &bang(),
-                            name,
-                            "",
-                            &format!("{YELLOW}failed{RESET} {}", dim(&e.to_string()))
-                        )
-                    );
+                    show_result(&row(
+                        &bang(),
+                        name,
+                        "",
+                        &format!("{YELLOW}failed{RESET} {}", dim(&e.to_string())),
+                    ));
+                    out.failed += 1;
                 }
             }
         }
@@ -861,7 +1194,16 @@ pub async fn update(
     if do_self {
         println!("  {}", dim("Core"));
 
-        let want = manifest_version(&manifest, "crossfyre");
+        let want = manifest_version(manifest, "crossfyre");
+        // Where the update writes the CLI first (see `cli_targets`).
+        let cli_dir = std::env::current_exe()
+            .ok()
+            .and_then(|exe| {
+                let stable = bin_dir.join(ext_file_name("crossfyre"));
+                cli_targets(&exe, &stable).into_iter().next()
+            })
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| bin_dir.clone());
         if let Some(m) = packaging::owner("crossfyre") {
             println!(
                 "{}",
@@ -872,174 +1214,187 @@ pub async fn update(
                     &dim(&update_note(m))
                 )
             );
-            current += 1;
+            out.current += 1;
         } else if !want.is_empty() && want == current_version && !force {
             println!(
                 "{}",
                 row(&check(), "crossfyre", &ver(&want), &dim("up to date"))
             );
-            current += 1;
+            out.current += 1;
+        } else if !can_write_in(&cli_dir) {
+            println!(
+                "{}",
+                needs_rights_row("crossfyre", &version_change(Some(current_version), &want))
+            );
+            out.need_rights += 1;
         } else {
-            print!("    {} {:<10} {}", dot(), "crossfyre", dim("updating…"));
-            let _ = std::io::Write::flush(&mut std::io::stdout());
-            match self_update(&manifest, current_version, true, force).await {
+            show_progress("crossfyre");
+            match self_update(manifest, current_version, true, force).await {
                 Ok(true) => {
-                    let mid = format!("{DIM}{current_version} \u{2192}{RESET} {want}");
-                    println!(
-                        "\r{}          ",
-                        row(
-                            &check(),
-                            "crossfyre",
-                            &mid,
-                            &format!("{GREEN}updated{RESET}")
-                        )
-                    );
-                    self_updated = true;
-                    changed += 1;
+                    let mid = version_change(Some(current_version), &want);
+                    show_result(&row(
+                        &check(),
+                        "crossfyre",
+                        &mid,
+                        &format!("{GREEN}updated{RESET}"),
+                    ));
+                    out.restart = true;
+                    out.changed += 1;
                 }
                 Ok(false) => {
-                    println!(
-                        "\r{}          ",
-                        row(&check(), "crossfyre", &ver(&want), &dim("up to date"))
-                    );
-                    current += 1;
+                    show_result(&row(&check(), "crossfyre", &ver(&want), &dim("up to date")));
+                    out.current += 1;
                 }
                 Err(e) => {
-                    println!(
-                        "\r{}          ",
-                        row(
-                            &bang(),
-                            "crossfyre",
-                            "",
-                            &format!("{YELLOW}failed{RESET} {}", dim(&e.to_string()))
-                        )
-                    );
+                    show_result(&row(
+                        &bang(),
+                        "crossfyre",
+                        "",
+                        &format!("{YELLOW}failed{RESET} {}", dim(&e.to_string())),
+                    ));
+                    out.failed += 1;
                 }
             }
         }
 
-        // node worker (version tracked via the node.version sidecar).
-        let nwant = manifest_version(&manifest, "node");
-        let nhave = fs::read_to_string(get_bin_dir().join("node.version"))
-            .ok()
-            .map(|s| s.trim().to_string());
-        let node_ok = get_bin_dir().join(ext_file_name("node")).exists()
-            && !nwant.is_empty()
-            && nhave.as_deref() == Some(nwant.as_str());
+        // The node worker. One that is not here is not installed by an update: `node
+        // init` sets a node up, and a CLI that Homebrew or apt installed runs without one.
+        let nwant = manifest_version(manifest, "node");
+        let node_installed = ext_bin_path("node").exists();
         if let Some(m) = packaging::owner("node") {
             println!("{}", row(&check(), "node", "", &dim(&update_note(m))));
-            current += 1;
-        } else if node_ok && !force {
-            println!(
-                "{}",
-                row(&check(), "node", &ver(&nwant), &dim("up to date"))
-            );
-            current += 1;
+            out.current += 1;
+        } else if !node_installed {
+            println!("{}", row(&dot(), "node", "", &dim("not installed")));
         } else {
-            print!("    {} {:<10} {}", dot(), "node", dim("updating…"));
-            let _ = std::io::Write::flush(&mut std::io::stdout());
-            match download_node(&manifest, true, force).await {
-                Ok(true) => {
-                    let mid = match &nhave {
-                        Some(old) if !old.is_empty() && *old != nwant => {
-                            format!("{DIM}{old} \u{2192}{RESET} {nwant}")
-                        }
-                        _ => nwant.clone(),
-                    };
-                    println!(
-                        "\r{}          ",
-                        row(&check(), "node", &mid, &format!("{GREEN}updated{RESET}"))
-                    );
-                    self_updated = true;
-                    changed += 1;
-                }
-                Ok(false) => {
-                    println!(
-                        "\r{}          ",
-                        row(&check(), "node", &ver(&nwant), &dim("up to date"))
-                    );
-                    current += 1;
-                }
-                Err(e) => {
-                    println!(
-                        "\r{}          ",
-                        row(
+            let nhave = installed_node_version();
+            if !nwant.is_empty() && nhave.as_deref() == Some(nwant.as_str()) && !force {
+                println!(
+                    "{}",
+                    row(&check(), "node", &ver(&nwant), &dim("up to date"))
+                );
+                out.current += 1;
+            } else if !writable {
+                println!(
+                    "{}",
+                    needs_rights_row("node", &version_change(nhave.as_deref(), &nwant))
+                );
+                out.need_rights += 1;
+            } else {
+                show_progress("node");
+                match download_node(manifest, true, force).await {
+                    Ok(true) => {
+                        let mid = version_change(nhave.as_deref(), &nwant);
+                        show_result(&row(
+                            &check(),
+                            "node",
+                            &mid,
+                            &format!("{GREEN}updated{RESET}"),
+                        ));
+                        out.restart = true;
+                        out.changed += 1;
+                    }
+                    Ok(false) => {
+                        show_result(&row(&check(), "node", &ver(&nwant), &dim("up to date")));
+                        out.current += 1;
+                    }
+                    Err(e) => {
+                        show_result(&row(
                             &bang(),
                             "node",
                             "",
-                            &format!("{YELLOW}skipped{RESET} {}", dim(&e.to_string()))
-                        )
-                    );
+                            &format!("{YELLOW}failed{RESET} {}", dim(&e.to_string())),
+                        ));
+                        out.failed += 1;
+                    }
                 }
             }
         }
 
-        // The cfx-script helper beside node. Optional, as in the installer, so a failure
-        // is a warning, and a release without one is passed over in silence. A new one
-        // needs no restart: every job starts it afresh.
-        let hwant = manifest_version(&manifest, CFX_SCRIPT);
-        let helper_ok = ext_bin_path(CFX_SCRIPT).exists()
-            && installed_ext_version(CFX_SCRIPT).as_deref() == Some(hwant.as_str());
+        // The cfx-script helper beside node. Optional, as in the installer, and a release
+        // without one is passed over in silence. A new one needs no restart: every job
+        // starts it afresh.
+        let hwant = manifest_version(manifest, CFX_SCRIPT);
+        let helper_installed = ext_bin_path(CFX_SCRIPT).exists();
+        // The row and the note for a cfx-script this host cannot start.
+        let skipped_row = row(
+            &bang(),
+            CFX_SCRIPT,
+            &ver(&hwant),
+            &format!(
+                "{YELLOW}skipped{RESET} {}",
+                dim("cannot start on this host")
+            ),
+        );
+        let skipped_note = |output: &str| {
+            format!(
+                "{} Until it can, {}.",
+                cannot_start_note(output),
+                without_new_helper()
+            )
+        };
         if let Some(m) = packaging::owner(CFX_SCRIPT) {
             println!("{}", row(&check(), CFX_SCRIPT, "", &dim(&update_note(m))));
-            current += 1;
+            out.current += 1;
+        } else if !hwant.is_empty() && !helper_installed && !node_installed {
+            println!("{}", row(&dot(), CFX_SCRIPT, "", &dim("not installed")));
         } else if !hwant.is_empty() {
-            if helper_ok && !force {
+            let hhave = installed_helper_version();
+            if hhave.as_deref() == Some(hwant.as_str()) && !force {
                 println!(
                     "{}",
                     row(&check(), CFX_SCRIPT, &ver(&hwant), &dim("up to date"))
                 );
-                current += 1;
+                out.current += 1;
+            } else if let Some(output) = still_cannot_start(&hwant).filter(|_| !force) {
+                println!("{skipped_row}");
+                show_detail(&skipped_note(&output));
+                out.skipped += 1;
+            } else if !writable {
+                println!(
+                    "{}",
+                    needs_rights_row(CFX_SCRIPT, &version_change(hhave.as_deref(), &hwant))
+                );
+                out.need_rights += 1;
             } else {
-                print!("    {} {:<10} {}", dot(), CFX_SCRIPT, dim("updating…"));
-                let _ = std::io::Write::flush(&mut std::io::stdout());
-                let line = match install_cfx_script(&manifest, force).await {
+                show_progress(CFX_SCRIPT);
+                match install_cfx_script(manifest, force).await {
                     Ok(HelperOutcome::Installed { version, replaced }) => {
-                        let mid = match &replaced {
-                            Some(old) if !old.is_empty() && *old != version => {
-                                format!("{DIM}{old} \u{2192}{RESET} {version}")
-                            }
-                            _ => version.clone(),
-                        };
-                        changed += 1;
-                        row(
+                        let mid = version_change(replaced.as_deref(), &version);
+                        show_result(&row(
                             &check(),
                             CFX_SCRIPT,
                             &mid,
                             &format!("{GREEN}updated{RESET}"),
-                        )
+                        ));
+                        out.changed += 1;
                     }
                     Ok(HelperOutcome::Current { .. } | HelperOutcome::NotInRelease) => {
-                        current += 1;
-                        row(&check(), CFX_SCRIPT, &ver(&hwant), &dim("up to date"))
+                        show_result(&row(&check(), CFX_SCRIPT, &ver(&hwant), &dim("up to date")));
+                        out.current += 1;
                     }
                     Ok(HelperOutcome::Owned(m)) => {
-                        current += 1;
-                        row(&check(), CFX_SCRIPT, "", &dim(&update_note(m)))
+                        show_result(&row(&check(), CFX_SCRIPT, "", &dim(&update_note(m))));
+                        out.current += 1;
                     }
-                    Ok(HelperOutcome::CannotStart { output, .. }) => row(
-                        &bang(),
-                        CFX_SCRIPT,
-                        "",
-                        &format!(
-                            "{YELLOW}skipped{RESET} {}",
-                            dim(&format!(
-                                "it cannot start here, so it was not installed and {}. {output}",
-                                without_new_helper()
-                            ))
-                        ),
-                    ),
-                    Err(e) => row(
-                        &bang(),
-                        CFX_SCRIPT,
-                        "",
-                        &format!(
-                            "{YELLOW}failed{RESET} {}",
-                            dim(&format!("{e}. Until it installs, {}", without_new_helper()))
-                        ),
-                    ),
-                };
-                println!("\r{line}          ");
+                    Ok(HelperOutcome::CannotStart { output, .. }) => {
+                        show_result(&skipped_row);
+                        show_detail(&skipped_note(&output));
+                        out.skipped += 1;
+                    }
+                    Err(e) => {
+                        show_result(&row(
+                            &bang(),
+                            CFX_SCRIPT,
+                            "",
+                            &format!(
+                                "{YELLOW}failed{RESET} {}",
+                                dim(&format!("{e}. Until it installs, {}", without_new_helper()))
+                            ),
+                        ));
+                        out.failed += 1;
+                    }
+                }
             }
         }
         println!();
@@ -1048,20 +1403,30 @@ pub async fn update(
     service::set_quiet(false);
 
     // ── Summary ───────────────────────────────────────────────────────
-    if changed == 0 {
-        println!("  {GREEN}Everything is up to date.{RESET}");
+    let colour = if out.succeeded() && out.skipped == 0 {
+        GREEN
     } else {
-        let plural = if changed == 1 { "" } else { "s" };
+        YELLOW
+    };
+    println!("  {BOLD}{colour}{}{RESET}", out.summary());
+    if out.need_rights > 0 {
+        let mut again = String::from("crossfyre update");
+        if let Some(t) = target {
+            again.push(' ');
+            again.push_str(t);
+        }
+        if force {
+            again.push_str(" --force");
+        }
+        let them = if out.need_rights == 1 { "it" } else { "them" };
         println!(
-            "  {BOLD}{GREEN}Updated {changed} component{plural}{RESET}{}",
-            dim(&format!(", {current} already current"))
+            "  Run {} to update {them}.",
+            bold(&crate::os::elevated(&again))
         );
     }
     println!();
 
-    // Returns true when the node service should be restarted (CLI and/or node
-    // worker binary changed).
-    Ok(self_updated)
+    Ok(out)
 }
 
 fn installed_extensions() -> Vec<&'static str> {
@@ -1158,14 +1523,20 @@ fn cli_targets(exe: &Path, stable: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// The crossfyre CLI version recorded on disk by `self_update`. Empty when never
-/// recorded. Used by callers that cannot read the running CLI's env! version
-/// (e.g. the node worker's dashboard-triggered self-update).
+/// The version of the crossfyre CLI in the bin directory: the one `self_update` recorded,
+/// or, with no record, the one it reports. Empty when neither is known. Used by callers
+/// that cannot read the running CLI's env! version (e.g. the node worker's
+/// dashboard-triggered self-update).
 pub fn installed_cli_version() -> String {
-    std::fs::read_to_string(get_bin_dir().join("crossfyre.version"))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default()
+    let dir = get_bin_dir();
+    let bin = dir.join(ext_file_name("crossfyre"));
+    recorded_or_reported(
+        &dir.join("crossfyre.version"),
+        &bin,
+        "crossfyre",
+        Vec::new(),
+    )
+    .unwrap_or_default()
 }
 
 /// Copy the running binary to the stable install path
@@ -1192,7 +1563,7 @@ pub fn ensure_self_installed() -> Result<std::path::PathBuf, Box<dyn std::error:
 /// so it must sit next to crossfyre.
 /// Returns true when the node binary was (re)written, i.e. the caller should
 /// restart the node service. Skips the download when the installed version
-/// already matches the manifest (tracked via a sidecar version file).
+/// already matches the manifest: the one its sidecar records, or the one it reports.
 pub async fn download_node(
     manifest: &Manifest,
     quiet: bool,
@@ -1204,10 +1575,7 @@ pub async fn download_node(
     let (comp, artifact) = resolve_artifact(manifest, "node")?;
     let stable = get_bin_dir().join(ext_file_name("node"));
     let ver_file = get_bin_dir().join("node.version");
-    let installed = std::fs::read_to_string(&ver_file)
-        .ok()
-        .map(|s| s.trim().to_string());
-    if stable.exists() && installed.as_deref() == Some(comp.version.as_str()) && !force {
+    if installed_node_version().as_deref() == Some(comp.version.as_str()) && !force {
         return Ok(false); // already current
     }
 
@@ -1283,9 +1651,10 @@ pub async fn ensure_node_installed() -> Result<(), Box<dyn std::error::Error>> {
                 helper.display()
             ),
             Ok(Some(output)) => eprintln!(
-                "[!] {} cannot start here, so it was not installed and {}. {output}",
+                "[!] {} cannot start here, so it was not installed and {}. {}",
                 sib.display(),
-                without_new_helper()
+                without_new_helper(),
+                cannot_start_note(&output)
             ),
             Err(e) => report_cfx_script(Err(e)),
         }
@@ -1856,5 +2225,302 @@ mod tests {
             .expect("exit 0 is not the refusal");
         assert!(output.contains("exit status: 0"), "{output}");
         assert!(!dest.exists());
+    }
+
+    // ---------------------------------------------------------------------------
+    // Updating what the installer placed
+    // ---------------------------------------------------------------------------
+
+    /// Have this test's thread keep everything but the engine named in it in `dir`, as a
+    /// package with that bin_dir would, and own nothing else.
+    fn bin_dir_at(dir: &Path) {
+        packaged(&format!(
+            r#"{{"manager":"nix","owns":["ambulo"],"bin_dir":"{}"}}"#,
+            dir.display()
+        ));
+    }
+
+    /// A stand-in for a binary that prints `<name> <version>` for `--version`, as the CLI,
+    /// the node and cfx-script do, and otherwise reads its stdin and exits 2.
+    #[cfg(unix)]
+    fn reports(dir: &Path, name: &str, version: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(name);
+        fs::write(
+            &p,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo '{name} {version}'; exit 0; fi\n\
+                 cat >/dev/null\nexit 2\n"
+            ),
+        )
+        .expect("write");
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    /// A cfx-script from before it took `--version`: it reads the flag as no job.
+    #[cfg(unix)]
+    fn old_helper(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(CFX_SCRIPT);
+        fs::write(&p, "#!/bin/sh\ncat >/dev/null\nexit 2\n").expect("write");
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    /// What a cfx-script built against Python 3.11 writes on a host without it.
+    const NO_LIBPYTHON: &str = "/opt/crossfyre/bin/cfx-script.new: error while loading \
+        shared libraries: libpython3.11.so.1.0: cannot open shared object file: No such \
+        file or directory";
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_node_with_no_version_record_is_asked_for_its_version() {
+        // The installer writes no node.version. The first update took that for an old
+        // node, downloaded the same version again and reported it as updated.
+        let s = Scratch::new("node-reports");
+        bin_dir_at(&s.0);
+        reports(&s.0, "node", "9.9.9");
+        let replaced = download_node(&full_manifest("9.9.9"), true, false)
+            .await
+            .expect("nothing to download");
+        assert!(
+            !replaced,
+            "a node that reports the release's version is current"
+        );
+        assert_eq!(installed_node_version().as_deref(), Some("9.9.9"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_update_right_after_the_installer_changes_nothing() {
+        let s = Scratch::new("fresh-install");
+        bin_dir_at(&s.0);
+        reports(&s.0, "crossfyre", "9.9.9");
+        reports(&s.0, "node", "9.9.9");
+        reports(&s.0, CFX_SCRIPT, "9.9.9");
+        let out = update_with(&full_manifest("9.9.9"), Some("self"), "9.9.9", false)
+            .await
+            .expect("runs");
+        assert_eq!(
+            out,
+            Updated {
+                current: 3,
+                ..Updated::default()
+            }
+        );
+        assert_eq!(out.summary(), "Everything is up to date.");
+        assert_eq!(installed_cli_version(), "9.9.9");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_helper_that_reports_no_version_is_not_taken_for_the_release() {
+        let s = Scratch::new("old-helper");
+        bin_dir_at(&s.0);
+        old_helper(&s.0);
+        assert_eq!(installed_helper_version(), None);
+        fs::write(s.join("cfx-script.version"), "9.9.9\n").expect("write");
+        assert_eq!(installed_helper_version().as_deref(), Some("9.9.9"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_user_who_may_not_write_the_bin_directory_is_told_it_needs_root() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root writes it regardless
+        }
+        let s = Scratch::new("read-only");
+        bin_dir_at(&s.0);
+        reports(&s.0, "node", "0.0.1");
+        reports(&s.0, CFX_SCRIPT, "9.9.9");
+        fs::set_permissions(&s.0, fs::Permissions::from_mode(0o555)).expect("lock");
+        let out = update_with(&full_manifest("9.9.9"), Some("self"), "9.9.9", false).await;
+        fs::set_permissions(&s.0, fs::Permissions::from_mode(0o755)).expect("unlock");
+        let out = out.expect("runs");
+        // Said before anything is downloaded, rather than a Permission denied after.
+        assert_eq!(
+            out,
+            Updated {
+                current: 2,
+                need_rights: 1,
+                ..Updated::default()
+            }
+        );
+        assert!(!out.succeeded());
+        assert_eq!(
+            out.summary(),
+            "Nothing was updated: 2 already current, 1 needs root."
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_update_installs_no_node_and_no_helper_that_are_not_there() {
+        // A CLI from Homebrew or apt, on a host that never ran `node init`. The update
+        // used to fetch a node into /opt/crossfyre/bin, which as the brew user failed with
+        // Permission denied, and then said everything was up to date.
+        let s = Scratch::new("cli-only");
+        packaged(&format!(
+            r#"{{"manager":"brew","owns":["crossfyre"],"bin_dir":"{}"}}"#,
+            s.join("bin").display()
+        ));
+        let out = update_with(&full_manifest("9.9.9"), None, "9.9.8", false)
+            .await
+            .expect("runs");
+        assert_eq!(
+            out,
+            Updated {
+                current: 1,
+                ..Updated::default()
+            }
+        );
+        assert!(!s.join("bin").exists(), "nothing was put anywhere");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_helper_that_could_not_start_is_not_downloaded_again() {
+        let s = Scratch::new("cannot-start");
+        bin_dir_at(&s.0);
+        reports(&s.0, "node", "9.9.9");
+        let missing = NO_LIBPYTHON.replace("libpython3.11", "libpython0.0");
+        fs::write(
+            s.join("cfx-script.cannot-start"),
+            format!("9.9.9\n{missing}\n"),
+        )
+        .expect("write");
+        // There is no artifact to download in this test, so getting as far as a download
+        // is an error rather than this.
+        let outcome = install_cfx_script(&full_manifest("9.9.9"), false)
+            .await
+            .expect("decided without a download");
+        let HelperOutcome::CannotStart { version, output } = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(version, "9.9.9");
+        assert_eq!(output, missing);
+
+        let out = update_with(&full_manifest("9.9.9"), Some("self"), "9.9.9", false)
+            .await
+            .expect("runs");
+        assert_eq!(
+            out,
+            Updated {
+                current: 2,
+                skipped: 1,
+                ..Updated::default()
+            }
+        );
+        assert!(
+            out.succeeded(),
+            "a host without the Python is not a failure"
+        );
+        assert_eq!(
+            out.summary(),
+            "Nothing was updated: 2 already current, 1 skipped."
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_record_holds_back_only_its_own_version_and_only_while_the_library_is_missing() {
+        let s = Scratch::new("record");
+        bin_dir_at(&s.0);
+        let missing = NO_LIBPYTHON.replace("libpython3.11", "libpython0.0");
+        fs::write(cannot_start_file(), format!("1.0.0\n{missing}\n")).expect("write");
+        assert_eq!(
+            still_cannot_start("1.0.0").as_deref(),
+            Some(missing.as_str())
+        );
+        assert_eq!(still_cannot_start("1.0.1"), None, "a new release is tried");
+
+        // The library it lacked is here now: libc stands in for a libpython installed
+        // since, and is on every Unix this runs on.
+        let libc = if cfg!(target_os = "macos") {
+            "libSystem.B.dylib"
+        } else {
+            "libc.so.6"
+        };
+        let found = NO_LIBPYTHON.replace("libpython3.11.so.1.0", libc);
+        fs::write(cannot_start_file(), format!("1.0.0\n{found}\n")).expect("write");
+        assert_eq!(still_cannot_start("1.0.0"), None);
+
+        // Anything else holds until the release changes, or --force.
+        fs::write(cannot_start_file(), "1.0.0\nKilled\n").expect("write");
+        assert_eq!(still_cannot_start("1.0.0").as_deref(), Some("Killed"));
+    }
+
+    #[test]
+    fn the_note_names_the_missing_library_and_the_package_with_it() {
+        assert_eq!(missing_library(NO_LIBPYTHON), Some("libpython3.11.so.1.0"));
+        assert_eq!(missing_library("Killed"), None);
+        let note = cannot_start_note(NO_LIBPYTHON);
+        assert!(
+            note.starts_with("It needs libpython3.11.so.1.0, which this host does not have."),
+            "{note}"
+        );
+        assert!(note.contains("libpython3.11"), "{note}");
+        let other = cannot_start_note("Killed");
+        assert!(other.contains("--force"), "{other}");
+    }
+
+    #[test]
+    fn a_version_is_read_only_from_a_line_that_names_the_binary() {
+        assert_eq!(
+            parse_reported_version("node 0.1.48\n", "node").as_deref(),
+            Some("0.1.48")
+        );
+        assert_eq!(parse_reported_version("crossfyre 0.1.38\n", "node"), None);
+        assert_eq!(parse_reported_version("node\n", "node"), None);
+        assert_eq!(
+            parse_reported_version(r#"{"type":"log","job_id":""}"#, CFX_SCRIPT),
+            None
+        );
+    }
+
+    #[test]
+    fn up_to_date_is_said_only_when_nothing_was_skipped_refused_or_failed() {
+        let current = Updated {
+            current: 3,
+            ..Updated::default()
+        };
+        assert_eq!(current.summary(), "Everything is up to date.");
+        for (out, said) in [
+            (
+                Updated {
+                    current: 2,
+                    skipped: 1,
+                    ..Updated::default()
+                },
+                "Nothing was updated: 2 already current, 1 skipped.",
+            ),
+            (
+                Updated {
+                    current: 1,
+                    failed: 2,
+                    ..Updated::default()
+                },
+                "Nothing was updated: 1 already current, 2 failed.",
+            ),
+            (
+                Updated {
+                    changed: 1,
+                    current: 1,
+                    need_rights: 2,
+                    ..Updated::default()
+                },
+                "Updated 1 component, 1 already current, 2 need root.",
+            ),
+        ] {
+            assert_eq!(out.summary().replace("an elevated prompt", "root"), said);
+        }
+        assert!(current.succeeded());
+        assert!(
+            !Updated {
+                failed: 1,
+                ..Updated::default()
+            }
+            .succeeded()
+        );
     }
 }

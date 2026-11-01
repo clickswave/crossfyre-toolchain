@@ -602,6 +602,23 @@ fn only_one_completed_when_the_script_signals_and_then_returns() {
     assert_eq!(types(&r), ["completed"]);
 }
 
+/// `--version` answers without reading a job, so an update can ask an installed helper
+/// which one it is. It is given an empty stdin, as the update gives it: a helper that
+/// read that as a job would refuse it with status 2 and print a message instead.
+#[test]
+fn version_names_the_helper_and_its_version_and_reads_no_job() {
+    let out = Command::new(env!("CARGO_BIN_EXE_cfx-script"))
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .expect("cfx-script starts");
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("cfx-script {}\n", env!("CARGO_PKG_VERSION"))
+    );
+}
+
 #[test]
 fn a_job_that_is_not_json_is_refused_with_code_two() {
     let r = run("this is not a job");

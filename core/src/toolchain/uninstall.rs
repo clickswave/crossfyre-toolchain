@@ -234,16 +234,20 @@ fn clear_tree(dir: &Path, later: &mut dyn FnMut(&Path)) -> bool {
 
 /// Every file name a component may have in the bin directory, with the name of its version
 /// sidecar: the CLI, the node, cfx-script, and each engine under its public name and the
-/// name it had before.
+/// name it had before. cfx-script also has the record of a release that could not start.
 fn component_files(component: &str) -> Vec<String> {
     let mut names = vec![component.to_string()];
     if let Some(old) = super::engine(component).and_then(|e| e.legacy) {
         names.push(old.to_string());
     }
-    names
+    let mut files: Vec<String> = names
         .into_iter()
         .flat_map(|n| [file_name(&n), format!("{n}.version")])
-        .collect()
+        .collect();
+    if component == "cfx-script" {
+        files.push("cfx-script.cannot-start".to_string());
+    }
+    files
 }
 
 /// The components uninstall may find in the bin directory, by public name.
@@ -441,6 +445,7 @@ mod tests {
             "node",
             "node.version",
             "cfx-script",
+            "cfx-script.cannot-start",
             "plessor",
             "plessor.version",
             "cortex",
