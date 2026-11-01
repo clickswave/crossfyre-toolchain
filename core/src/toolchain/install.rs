@@ -174,6 +174,89 @@ fn installed_helper_version() -> Option<String> {
     recorded_or_reported(&ext_version_file(CFX_SCRIPT), &bin, CFX_SCRIPT, envs)
 }
 
+/// The record of a cfx-script release that was downloaded and could not start on this
+/// host: its version on the first line, then what it wrote. While the release is still
+/// that version, an update does not download it again only to find the same thing, each
+/// time, unless what it lacked is here now or `--force` is given. A cfx-script that starts
+/// removes the record.
+fn cannot_start_file() -> PathBuf {
+    get_bin_dir().join(format!("{CFX_SCRIPT}.cannot-start"))
+}
+
+fn record_cannot_start(version: &str, output: &str) {
+    let _ = fs::write(cannot_start_file(), format!("{version}\n{output}\n"));
+}
+
+/// What the cfx-script of `version` wrote when it could not start here, if one did and
+/// nothing has changed since that would let it start now.
+fn still_cannot_start(version: &str) -> Option<String> {
+    let text = fs::read_to_string(cannot_start_file()).ok()?;
+    let (recorded, output) = text.split_once('\n')?;
+    if recorded.trim() != version {
+        return None;
+    }
+    let output = output.trim();
+    if missing_library(output).is_some_and(library_loads) {
+        return None;
+    }
+    Some(output.to_string())
+}
+
+/// The shared library that the dynamic loader could not find, from what it wrote:
+/// `error while loading shared libraries: libpython3.11.so.1.0: cannot open ...`.
+fn missing_library(output: &str) -> Option<&str> {
+    let (_, rest) = output.split_once("error while loading shared libraries: ")?;
+    let name = rest.split(':').next()?.trim();
+    (!name.is_empty() && !name.contains('/')).then_some(name)
+}
+
+/// Can this process load the shared library `name`, from wherever the dynamic loader
+/// would look for it? It is loaded and let go again; libpython does nothing when loaded.
+#[cfg(unix)]
+fn library_loads(name: &str) -> bool {
+    let Ok(name) = std::ffi::CString::new(name) else {
+        return false;
+    };
+    // SAFETY: a valid C string, and the handle is closed only when the load succeeded.
+    unsafe {
+        let handle = libc::dlopen(name.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL);
+        if handle.is_null() {
+            return false;
+        }
+        libc::dlclose(handle);
+    }
+    true
+}
+
+#[cfg(not(unix))]
+fn library_loads(_name: &str) -> bool {
+    false
+}
+
+/// Why a cfx-script could not start here, and what would let it, from what it wrote.
+fn cannot_start_note(output: &str) -> String {
+    let Some(lib) = missing_library(output) else {
+        return format!("{output}. `crossfyre update --force` downloads it and tries it again.");
+    };
+    let mut note = format!("It needs {lib}, which this host does not have.");
+    if let Some(package) = lib
+        .strip_suffix(".so.1.0")
+        .filter(|p| p.starts_with("libpython3."))
+    {
+        let how = if Path::new("/usr/bin/apt-get").exists() {
+            format!("sudo apt install {package}")
+        } else {
+            format!("the package that provides {lib}")
+        };
+        note.push_str(&format!(
+            " Install it ({how}) where your system has it, and the next update installs \
+             cfx-script; where there is no {package}, this release's cfx-script cannot run \
+             here."
+        ));
+    }
+    note
+}
+
 /// The manifest keys `component` may be published under, in the order to try them: an
 /// engine's public name first, then its legacy name and its id. A manifest from before
 /// the rename has only the legacy key, and one from after it has both, so the CLI does
@@ -594,7 +677,8 @@ pub enum HelperOutcome {
 /// check its sha256, unpack it beside node and run it once before it replaces anything.
 /// Its version is recorded in `cfx-script.version`, as node's is in `node.version`, so a
 /// later update can tell whether it is current; one with no record is asked for its
-/// version.
+/// version. A release that could not start here is not downloaded again while nothing
+/// has changed (`still_cannot_start`).
 pub async fn install_cfx_script(
     manifest: &Manifest,
     force: bool,
@@ -611,6 +695,9 @@ pub async fn install_cfx_script(
     if replaced.as_deref() == Some(version.as_str()) && !force {
         return Ok(HelperOutcome::Current { version });
     }
+    if !force && let Some(output) = still_cannot_start(&version) {
+        return Ok(HelperOutcome::CannotStart { version, output });
+    }
 
     let tmp_dir = tempfile::tempdir()?;
     let zip_path = tmp_dir.path().join(&artifact.file);
@@ -623,9 +710,11 @@ pub async fn install_cfx_script(
     }
     place_bundled_python(&extracted, &dest)?;
     if let Some(output) = place_helper_if_it_starts(&extracted, &dest)? {
+        record_cannot_start(&version, &output);
         return Ok(HelperOutcome::CannotStart { version, output });
     }
     let _ = fs::write(ext_version_file(CFX_SCRIPT), &version);
+    let _ = fs::remove_file(cannot_start_file());
     Ok(HelperOutcome::Installed { version, replaced })
 }
 
@@ -647,9 +736,9 @@ fn report_cfx_script(result: Result<HelperOutcome, Box<dyn std::error::Error>>) 
             ext_bin_path(CFX_SCRIPT).display()
         ),
         Ok(HelperOutcome::CannotStart { version, output }) => eprintln!(
-            "[!] cfx-script {version} cannot start here, so it was not installed and {}. \
-             {output}",
-            without_new_helper()
+            "[!] cfx-script {version} cannot start here, so it was not installed and {}. {}",
+            without_new_helper(),
+            cannot_start_note(&output)
         ),
         Ok(
             HelperOutcome::Current { .. } | HelperOutcome::NotInRelease | HelperOutcome::Owned(_),
@@ -1237,8 +1326,13 @@ async fn update_with(
                 dim("cannot start on this host")
             ),
         );
-        let skipped_note =
-            |output: &str| format!("{output}. Until it can, {}.", without_new_helper());
+        let skipped_note = |output: &str| {
+            format!(
+                "{} Until it can, {}.",
+                cannot_start_note(output),
+                without_new_helper()
+            )
+        };
         if let Some(m) = packaging::owner(CFX_SCRIPT) {
             println!("{}", row(&check(), CFX_SCRIPT, "", &dim(&update_note(m))));
             out.current += 1;
@@ -1252,6 +1346,10 @@ async fn update_with(
                     row(&check(), CFX_SCRIPT, &ver(&hwant), &dim("up to date"))
                 );
                 out.current += 1;
+            } else if let Some(output) = still_cannot_start(&hwant).filter(|_| !force) {
+                println!("{skipped_row}");
+                show_detail(&skipped_note(&output));
+                out.skipped += 1;
             } else if !writable {
                 println!(
                     "{}",
@@ -1553,9 +1651,10 @@ pub async fn ensure_node_installed() -> Result<(), Box<dyn std::error::Error>> {
                 helper.display()
             ),
             Ok(Some(output)) => eprintln!(
-                "[!] {} cannot start here, so it was not installed and {}. {output}",
+                "[!] {} cannot start here, so it was not installed and {}. {}",
                 sib.display(),
-                without_new_helper()
+                without_new_helper(),
+                cannot_start_note(&output)
             ),
             Err(e) => report_cfx_script(Err(e)),
         }
@@ -2167,6 +2266,11 @@ mod tests {
         fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).expect("chmod");
     }
 
+    /// What a cfx-script built against Python 3.11 writes on a host without it.
+    const NO_LIBPYTHON: &str = "/opt/crossfyre/bin/cfx-script.new: error while loading \
+        shared libraries: libpython3.11.so.1.0: cannot open shared object file: No such \
+        file or directory";
+
     #[cfg(unix)]
     #[tokio::test]
     async fn a_node_with_no_version_record_is_asked_for_its_version() {
@@ -2271,6 +2375,93 @@ mod tests {
             }
         );
         assert!(!s.join("bin").exists(), "nothing was put anywhere");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_helper_that_could_not_start_is_not_downloaded_again() {
+        let s = Scratch::new("cannot-start");
+        bin_dir_at(&s.0);
+        reports(&s.0, "node", "9.9.9");
+        let missing = NO_LIBPYTHON.replace("libpython3.11", "libpython0.0");
+        fs::write(
+            s.join("cfx-script.cannot-start"),
+            format!("9.9.9\n{missing}\n"),
+        )
+        .expect("write");
+        // There is no artifact to download in this test, so getting as far as a download
+        // is an error rather than this.
+        let outcome = install_cfx_script(&full_manifest("9.9.9"), false)
+            .await
+            .expect("decided without a download");
+        let HelperOutcome::CannotStart { version, output } = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(version, "9.9.9");
+        assert_eq!(output, missing);
+
+        let out = update_with(&full_manifest("9.9.9"), Some("self"), "9.9.9", false)
+            .await
+            .expect("runs");
+        assert_eq!(
+            out,
+            Updated {
+                current: 2,
+                skipped: 1,
+                ..Updated::default()
+            }
+        );
+        assert!(
+            out.succeeded(),
+            "a host without the Python is not a failure"
+        );
+        assert_eq!(
+            out.summary(),
+            "Nothing was updated: 2 already current, 1 skipped."
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_record_holds_back_only_its_own_version_and_only_while_the_library_is_missing() {
+        let s = Scratch::new("record");
+        bin_dir_at(&s.0);
+        let missing = NO_LIBPYTHON.replace("libpython3.11", "libpython0.0");
+        fs::write(cannot_start_file(), format!("1.0.0\n{missing}\n")).expect("write");
+        assert_eq!(
+            still_cannot_start("1.0.0").as_deref(),
+            Some(missing.as_str())
+        );
+        assert_eq!(still_cannot_start("1.0.1"), None, "a new release is tried");
+
+        // The library it lacked is here now: libc stands in for a libpython installed
+        // since, and is on every Unix this runs on.
+        let libc = if cfg!(target_os = "macos") {
+            "libSystem.B.dylib"
+        } else {
+            "libc.so.6"
+        };
+        let found = NO_LIBPYTHON.replace("libpython3.11.so.1.0", libc);
+        fs::write(cannot_start_file(), format!("1.0.0\n{found}\n")).expect("write");
+        assert_eq!(still_cannot_start("1.0.0"), None);
+
+        // Anything else holds until the release changes, or --force.
+        fs::write(cannot_start_file(), "1.0.0\nKilled\n").expect("write");
+        assert_eq!(still_cannot_start("1.0.0").as_deref(), Some("Killed"));
+    }
+
+    #[test]
+    fn the_note_names_the_missing_library_and_the_package_with_it() {
+        assert_eq!(missing_library(NO_LIBPYTHON), Some("libpython3.11.so.1.0"));
+        assert_eq!(missing_library("Killed"), None);
+        let note = cannot_start_note(NO_LIBPYTHON);
+        assert!(
+            note.starts_with("It needs libpython3.11.so.1.0, which this host does not have."),
+            "{note}"
+        );
+        assert!(note.contains("libpython3.11"), "{note}");
+        let other = cannot_start_note("Killed");
+        assert!(other.contains("--force"), "{other}");
     }
 
     #[test]
