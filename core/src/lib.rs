@@ -2143,6 +2143,32 @@ fn toolchain_health(
     status
 }
 
+/// The engines a heartbeat reports, by id, in [`toolchain::ENGINES`] order, each with
+/// whether it is installed on this host: every engine `installed` says the host has,
+/// and any other that the node's own list (`listed`) names.
+///
+/// Engines are installed per host, not per node, so a node can run an engine its list
+/// leaves out when another node on the host installed it, or it was installed after
+/// the node was set up, and the control plane only learns that from here. An engine on
+/// the list but not on the host is still reported, as it always was, with `installed`
+/// false. Which engines are reported changes only what the heartbeat says: ops reach
+/// their engine by its port whatever is on the list.
+fn heartbeat_engines(
+    listed: &[String],
+    installed: impl Fn(&str) -> bool,
+) -> Vec<(&'static str, bool)> {
+    toolchain::ENGINES
+        .iter()
+        .map(|e| (e.id, installed(e.id)))
+        .filter(|(id, here)| {
+            *here
+                || listed
+                    .iter()
+                    .any(|l| toolchain::engine(l).is_some_and(|e| e.id == *id))
+        })
+        .collect()
+}
+
 /// Run the registered node at `paths` until it is stopped. `node_version` is the node
 /// binary's own version, which the heartbeat reports.
 pub async fn run_daemon(
@@ -2738,14 +2764,17 @@ pub async fn run_daemon(
                 last_rx = rx_now;
                 last_tx = tx_now;
 
-                // Probe only installed extension daemon ports. Ports come from
+                // Probe the daemon port of every engine installed on this host and
+                // of any other this node lists (heartbeat_engines). Ports come from
                 // the host config.toml (via engine_port), so a custom port is
                 // both probed and reported to the dashboard correctly.
                 let ext_status: serde_json::Value = {
                     let mut map = serde_json::Map::new();
                     let mut ask = Vec::new();
-                    for ext in crate::toolchain::EXTENSIONS {
-                        if !config.extensions.iter().any(|e| e == ext) { continue; }
+                    for (ext, installed) in heartbeat_engines(
+                        &config.extensions,
+                        crate::toolchain::config::is_extension_installed,
+                    ) {
                         let port = crate::toolchain::config::engine_port(ext);
                         let running = std::net::TcpStream::connect_timeout(
                             &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
@@ -2758,7 +2787,8 @@ pub async fn run_daemon(
                         }
                         map.insert(ext.to_string(), serde_json::json!({
                             "port": port,
-                            "running": running
+                            "running": running,
+                            "installed": installed
                         }));
                     }
                     let answers = futures_util::future::join_all(ask.iter().map(|(_, addr)| {
@@ -3521,6 +3551,30 @@ mod heartbeat_tests {
         assert_eq!(status["postgres"]["port"], 4440);
         assert_eq!(status["postgres"]["running"], true);
         assert!(status.get("managed_by").is_none(), "{status}");
+    }
+
+    /// A node set up with an empty engine list, on a host where another node
+    /// installed doorward, ran a port scan with it while the dashboard said doorward
+    /// was not installed on it: the heartbeat reported only the node's own list.
+    #[test]
+    fn the_heartbeat_reports_every_engine_installed_on_the_host() {
+        let on_host = |id: &str| id == "pulse" || id == "cortex";
+        assert_eq!(
+            heartbeat_engines(&[], on_host),
+            vec![("pulse", true), ("cortex", true)]
+        );
+        // The node's own list still counts, installed or not, under any of an
+        // engine's names, and nothing is reported twice.
+        let listed = [
+            "mach".to_string(),
+            "doorward".to_string(),
+            "postgres".to_string(),
+        ];
+        assert_eq!(
+            heartbeat_engines(&listed, on_host),
+            vec![("mach", false), ("pulse", true), ("cortex", true)]
+        );
+        assert!(heartbeat_engines(&[], |_| false).is_empty());
     }
 
     #[test]
