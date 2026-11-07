@@ -125,11 +125,20 @@ or requests that can change data on a target. The phone is where you say yes.
   words, and every string is stripped of control and invisible characters before
   it is drawn. If the text does not match the digest the server sent with it, the
   phone offers only Deny.
-- **Checked while the app is open.** There is no push notification and no Google
-  service in the app. While it is on screen it asks crossfyre.io for waiting
-  approvals every five seconds for two minutes, then every fifteen. With the app
-  closed, requests reach you through the alerts you set up in the dashboard, and
-  a link to `https://crossfyre.io/m/approve/<id>` opens the request in the app.
+- **Pushed when it arrives.** While the phone approves, the app gets a push
+  token from Firebase Cloud Messaging and hands it to crossfyre.io with its own
+  key. When a request or any other notification reaches your inbox,
+  crossfyre.io pushes the phone through Google with the kind of notification,
+  its id and a link made of ids, never its text. The app reads the notification
+  from crossfyre.io and shows it: a request on the Approvals channel, which
+  opens it in the app, and anything else on Alerts, which opens the Activity tab.
+  The lock screen says that something arrived, not what. Turning Approvals off
+  or signing out deletes the token. A phone without Google Play services, or a
+  build without `firebase.properties`, gets no push; the app then asks
+  crossfyre.io for waiting approvals every five seconds for two minutes while it
+  is on screen, then every fifteen, and the alerts you set up in the dashboard
+  still reach you. A link to `https://crossfyre.io/m/approve/<id>` opens the
+  request in the app either way.
 - **Stopping what you approved.** While a scan you approved is running, Recent
   decisions offers Stop. The stop is signed like an approval, after the same
   unlock and over the same request, with `stop` where an approval says
@@ -207,6 +216,11 @@ gradle wrapper pins gradle 8.13 and verifies the distribution checksum.
 
 Without a signing key the release builds are **unsigned**, which Android will
 not install. That is deliberate: see `app/build.gradle.kts`.
+
+Push needs `firebase.properties` at this directory's root, with the Firebase
+project's `apiKey`, `projectId` and `senderId`, and each environment's app id as
+`prod.appId`, `staging.appId` and `dev.appId`. These name the app to Firebase and
+are not secrets. Without the file the app builds and runs with no push.
 
 ## Reproducible builds
 

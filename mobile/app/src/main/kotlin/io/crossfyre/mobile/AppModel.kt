@@ -35,6 +35,7 @@ import io.crossfyre.mobile.approve.ActivityEvent
 import io.crossfyre.mobile.approve.ActivityScope
 import io.crossfyre.mobile.approve.ApprovalApi
 import io.crossfyre.mobile.approve.ApprovalIds
+import io.crossfyre.mobile.push.PushSetup
 import io.crossfyre.mobile.approve.ApprovalProtocol
 import io.crossfyre.mobile.approve.HistoryRow
 import io.crossfyre.mobile.approve.InboxItem
@@ -111,6 +112,8 @@ sealed interface Overlay {
 /** Things only the activity can do: Android's own prompts, pickers and other apps. */
 sealed interface Effect {
     data object AskNotifications : Effect
+    /** Android 13 and later: ask to show approvals and alerts, once the phone approves. */
+    data object AskAlerts : Effect
     data class AskVpn(val intent: Intent) : Effect
     data object Scan : Effect
     data class SaveCa(val fileName: String) : Effect
@@ -704,6 +707,8 @@ class AppModel(app: Application) : AndroidViewModel(app) {
             approverState = ApproverState.BROKEN
         }
         settleRevokes()
+        // Firebase may have rotated the token while the app was closed.
+        if (approverState == ApproverState.ACTIVE) startPush(ask = false)
     }
 
     /**
@@ -1265,6 +1270,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
                     // What only a phone that approves may read.
                     loadInbox()
                     loadActivity()
+                    startPush(ask = true)
                 }
                 result is Outcome.Ok && result.value == EnrolState.DENIED -> enrolEnded(EnrolStatus.DENIED)
                 result is Outcome.Ok -> enrolEnded(EnrolStatus.EXPIRED)
@@ -1327,6 +1333,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
 
     /** Delete the key and forget the approver. Every sign-out comes through here. */
     private fun forgetApprover() {
+        stopPush()
         clearActivity()
         enrolJob?.cancel()
         enrolJob = null
@@ -1344,6 +1351,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
      * why; turning approvals on again makes a new key.
      */
     private fun approverBroke(why: String) {
+        stopPush()
         store.approverId?.let { approverLedger.letGo(it) }
         settleRevokes()
         approverKeys.delete()
@@ -1917,6 +1925,56 @@ class AppModel(app: Application) : AndroidViewModel(app) {
                 }
             }
         }
+    }
+
+    // ── Push ─────────────────────────────────────────────────────────────────
+
+    /** Whether crossfyre.io pushes this phone. Null until the phone has asked. */
+    var pushOn by mutableStateOf<Boolean?>(null)
+        private set
+
+    /**
+     * Give crossfyre.io this phone's push token. With [ask], also ask Android
+     * for leave to show notifications, the first time only: a push that cannot
+     * be shown is no use.
+     */
+    private fun startPush(ask: Boolean) {
+        val key = store.key() ?: return
+        if (ask && Build.VERSION.SDK_INT >= 33 && !prefs.alertsAsked &&
+            !NotificationManagerCompat.from(ctx).areNotificationsEnabled()
+        ) emit(Effect.AskAlerts)
+        viewModelScope.launch {
+            val r = withContext(Dispatchers.IO) { PushSetup.register(approvals(), key) }
+            pushOn = when (r) {
+                null -> false
+                is Outcome.Ok -> r.value
+                is Outcome.Failed -> pushOn
+            }
+        }
+    }
+
+    /** Stop the pushes: whatever happens to the server call, the token is deleted. */
+    private fun stopPush() {
+        val key = runCatching { store.key() }.getOrNull()
+        pushOn = null
+        viewModelScope.launch(Dispatchers.IO) { PushSetup.drop(approvals(), key) }
+    }
+
+    fun alertsAnswered() {
+        prefs.alertsAsked = true
+        refreshNotifications()
+    }
+
+    /**
+     * A tap on a push. An approval opens the request; anything else opens the
+     * Activity tab, where the notification is at the top.
+     */
+    fun openPushed(link: String?) {
+        if (link != null && ApprovalIds.fromLink(link, origin) != null) return openLink(link)
+        if (!signedIn || route != Route.MAIN) return
+        tab = "activity"
+        push = null
+        loadInbox()
     }
 
     /**

@@ -25,6 +25,18 @@ ZXing core
   Apache-2.0
   Copyright ZXing authors
 
+Firebase Cloud Messaging, Installations and common
+  Apache-2.0
+  Copyright Google LLC
+
+Google data transport
+  Apache-2.0
+  Copyright Google LLC
+
+Google Play services client libraries (base, basement, cloud messaging, stats, tasks)
+  Android Software Development Kit License, developer.android.com/studio/terms
+  Copyright Google LLC
+
 Inter
   OFL-1.1
   Copyright 2020 The Inter Project Authors

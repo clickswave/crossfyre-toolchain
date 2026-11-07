@@ -51,6 +51,24 @@ class KeySource(prop: String, env: String) {
 val releaseKey = KeySource("", "CROSSFYRE_ANDROID_")
 val uploadKey = KeySource("upload.", "CROSSFYRE_ANDROID_UPLOAD_")
 
+// ── Push ─────────────────────────────────────────────────────────────────────
+//
+// Firebase Cloud Messaging wakes the app when an approval is waiting. The app
+// starts Firebase itself from these values rather than through the
+// google-services plugin, so a build without them simply has no push and asks
+// crossfyre.io while it is open, as before.
+//
+// firebase.properties at the mobile root: apiKey, projectId, senderId, and the
+// Firebase app id of each environment as prod.appId, staging.appId and
+// dev.appId. These identify the app to Firebase and are not secrets; the key
+// that sends pushes is crossfyre.io's and never reaches the app.
+val firebaseProps = Properties().apply {
+    val f = rootProject.file("firebase.properties")
+    if (f.exists()) FileInputStream(f).use { load(it) }
+}
+
+fun firebaseValue(name: String): String = "\"" + (firebaseProps.getProperty(name) ?: "").trim() + "\""
+
 android {
     namespace = "io.crossfyre.mobile"
     compileSdk = 36
@@ -64,6 +82,9 @@ android {
         // arm64 for real devices, x86_64 for the emulator.
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        buildConfigField("String", "FCM_API_KEY", firebaseValue("apiKey"))
+        buildConfigField("String", "FCM_PROJECT_ID", firebaseValue("projectId"))
+        buildConfigField("String", "FCM_SENDER_ID", firebaseValue("senderId"))
     }
 
     signingConfigs {
@@ -117,6 +138,7 @@ android {
     productFlavors {
         create("prod") {
             dimension = "env"
+            buildConfigField("String", "FCM_APP_ID", firebaseValue("prod.appId"))
             // No suffix: production is the bare id.
             resValue("string", "app_name", "Crossfyre Mobile")
             buildConfigField("String", "DEFAULT_ORIGIN", "\"https://crossfyre.io\"")
@@ -125,6 +147,7 @@ android {
         }
         create("staging") {
             dimension = "env"
+            buildConfigField("String", "FCM_APP_ID", firebaseValue("staging.appId"))
             applicationIdSuffix = ".staging"
             resValue("string", "app_name", "Crossfyre Mobile Staging")
             buildConfigField("String", "DEFAULT_ORIGIN", "\"https://staging.crossfyre.io\"")
@@ -133,6 +156,7 @@ android {
         }
         create("dev") {
             dimension = "env"
+            buildConfigField("String", "FCM_APP_ID", firebaseValue("dev.appId"))
             applicationIdSuffix = ".dev"
             resValue("string", "app_name", "Crossfyre Mobile Dev")
             // The emulator reaches the host's loopback at 10.0.2.2. A phone uses the
@@ -209,6 +233,14 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:1.4.2")
     implementation("androidx.camera:camera-view:1.4.2")
     implementation("com.google.zxing:core:3.5.3")
+    // Push: wakes the app when an approval is waiting. It brings Google Play
+    // services' messaging client and Firebase Installations with it; a phone
+    // without Play services gets no push and the app asks while open.
+    implementation("com.google.firebase:firebase-messaging:24.1.0")
+    // Play services brings androidx.fragment 1.0, which predates the activity
+    // result API every permission prompt here uses. Nothing here uses fragments;
+    // this only lifts the version that comes along.
+    implementation("androidx.fragment:fragment:1.8.5")
 
     testImplementation("junit:junit:4.13.2")
     // android.jar's org.json is a stub in JVM tests; this is the real one.
