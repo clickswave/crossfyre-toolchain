@@ -79,7 +79,14 @@ alloc-no-stdlib 2.0.4
   BSD-3-Clause
   Copyright (c) 2016 Dropbox, Inc.
 
+alloc-no-stdlib 3.0.0
+  BSD-3-Clause
+  Copyright (c) 2016 Dropbox, Inc.
+
 alloc-stdlib 0.2.4
+  BSD-3-Clause
+
+alloc-stdlib 0.3.0
   BSD-3-Clause
 
 allocator-api2 0.2.21
@@ -107,7 +114,7 @@ arrayvec 0.7.8
   copyright license to reproduce, prepare Derivative Works of,
   Copyright (c) Ulrik Sverdrup "bluss" 2015-2023
 
-async-compression 0.4.42
+async-compression 0.4.51
   MIT OR Apache-2.0
   copyright notice that is included in or attached to the work
   copyright license to reproduce, prepare Derivative Works of,
@@ -147,6 +154,12 @@ base64 0.22.1
   copyright license to reproduce, prepare Derivative Works of,
   Copyright (c) 2015 Alice Maz
 
+base64 0.23.1
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2025 Alice Maz, Marshall Pierce
+
 bitflags 2.13.1
   MIT OR Apache-2.0
   copyright notice that is included in or attached to the work
@@ -158,7 +171,16 @@ brotli 8.0.4
   Copyright (c) 2016 Dropbox, Inc.
   Copyright (c) 2009, 2010, 2013-2016 by the Brotli Authors.
 
+brotli 9.1.1
+  BSD-3-Clause AND MIT
+  Copyright (c) 2016 Dropbox, Inc.
+  Copyright (c) 2009, 2010, 2013-2016 by the Brotli Authors.
+
 brotli-decompressor 5.0.3
+  BSD-3-Clause/MIT
+  Copyright (c) 2016 Dropbox, Inc.
+
+brotli-decompressor 6.2.0
   BSD-3-Clause/MIT
   Copyright (c) 2016 Dropbox, Inc.
 
@@ -198,13 +220,13 @@ combine 4.6.7
   MIT
   Copyright (c) 2015 Markus Westerlind
 
-compression-codecs 0.4.38
+compression-codecs 0.4.46
   MIT OR Apache-2.0
   copyright notice that is included in or attached to the work
   copyright license to reproduce, prepare Derivative Works of,
   Copyright (c) 2018 the rustasync developers
 
-compression-core 0.4.32
+compression-core 0.4.34
   MIT OR Apache-2.0
   copyright notice that is included in or attached to the work
   copyright license to reproduce, prepare Derivative Works of,
@@ -428,7 +450,7 @@ hyper-rustls 0.27.9
   Copyright (c) 2016, Joseph Birr-Pixton <jpixton@gmail.com>
   Copyright (c) 2016 Joseph Birr-Pixton <jpixton@gmail.com>
 
-hyper-util 0.1.20
+hyper-util 0.1.21
   MIT
   Copyright (c) 2023-2025 Sean McArthur
 
@@ -758,7 +780,7 @@ rustls-pki-types 1.15.1
   Copyright 2023 Dirkjan Ochtman
   Copyright (c) 2023 Dirkjan Ochtman <dirkjan@ochtman.nl>
 
-rustls-webpki 0.103.15
+rustls-webpki 0.103.16
   ISC
   Copyright 2015 Brian Smith.
   copyright notice and this permission notice appear in all copies.
@@ -813,6 +835,12 @@ smallvec 1.15.2
   copyright notice that is included in or attached to the work
   copyright license to reproduce, prepare Derivative Works of,
   Copyright (c) 2018 The Servo Project Developers
+
+socket2 0.5.10
+  MIT OR Apache-2.0
+  copyright notice that is included in or attached to the work
+  copyright license to reproduce, prepare Derivative Works of,
+  Copyright (c) 2014 Alex Crichton
 
 socket2 0.6.5
   MIT OR Apache-2.0
@@ -988,7 +1016,7 @@ want 0.3.1
 webpki-roots 0.26.11
   CDLA-Permissive-2.0
 
-webpki-roots 1.0.9
+webpki-roots 1.0.10
   CDLA-Permissive-2.0
 
 writeable 0.6.3
@@ -1051,20 +1079,16 @@ zerovec-derive 0.11.3
 zmij 1.0.23
   MIT
 
-zstd 0.13.3
-  MIT
-  Copyright (c) 2016 Alexandre Bury
+zstd 0.14.3
+  BSD-3-Clause
+  Copyright (c) 2026, Alexandre Bury
 
-zstd-safe 7.2.4
-  MIT OR Apache-2.0
-  copyright notice that is included in or attached to the work
-  copyright license to reproduce, prepare Derivative Works of,
-  Copyright (c) 2016 Alexandre Bury
+zstd-safe 8.2.0
+  BSD-3-Clause
+  Copyright (c) 2026, Alexandre Bury
 
-zstd-sys 2.0.16+zstd.1.5.7
-  MIT/Apache-2.0
-  copyright notice that is included in or attached to the work
-  copyright license to reproduce, prepare Derivative Works of,
-  Copyright (c) 2016-present, Facebook, Inc. All rights reserved.
-  Copyright (c) 2016 Alexandre Bury
+zstd-sys 2.1.2+zstd.1.5.7
+  BSD-3-Clause
+  Copyright (c) 2026, Alexandre Bury
+  Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
 
