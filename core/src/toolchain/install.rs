@@ -196,7 +196,11 @@ fn still_cannot_start(version: &str) -> Option<String> {
         return None;
     }
     let output = output.trim();
-    if missing_library(output).is_some_and(library_loads) {
+    // A libpython3 the loader could not find is the one a release's python folder brings.
+    // A CLI from before the folder staged the helper without it and recorded that, and
+    // this one stages the two together, so it tries that release again.
+    let retry = |lib: &str| lib.starts_with("libpython3.") || library_loads(lib);
+    if missing_library(output).is_some_and(retry) {
         return None;
     }
     Some(output.to_string())
@@ -2567,6 +2571,12 @@ exit 127"#;
         };
         let found = NO_LIBPYTHON.replace("libpython3.11.so.1.0", libc);
         fs::write(cannot_start_file(), format!("1.0.0\n{found}\n")).expect("write");
+        assert_eq!(still_cannot_start("1.0.0"), None);
+
+        // A libpython3 it lacked is the one its python folder brings, which a CLI from
+        // before the folder did not stage with it, so the release is tried again.
+        let unstaged = NO_LIBPYTHON.replace("libpython3.11", "libpython3.99");
+        fs::write(cannot_start_file(), format!("1.0.0\n{unstaged}\n")).expect("write");
         assert_eq!(still_cannot_start("1.0.0"), None);
 
         // Anything else holds until the release changes, or --force.
