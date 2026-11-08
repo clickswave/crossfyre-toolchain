@@ -190,10 +190,30 @@ pub fn run(scope: Scope, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Have Windows remove the file or the empty directory at `path` when the machine next
 /// starts. Queued deepest first, so each directory is empty by its turn.
+///
+/// A file is first renamed aside, which Windows allows for a running executable, and
+/// the new name is what gets queued. Queueing the original name meant that installing
+/// again before the restart put the new crossfyre.exe exactly where the queued delete
+/// pointed, and the restart removed the fresh install.
 #[cfg(windows)]
 fn remove_at_restart(path: &Path) {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_DELAY_UNTIL_REBOOT, MoveFileExW};
+    let aside;
+    let path = if path.is_dir() {
+        path
+    } else {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        aside = aside_name(path, &format!("{}-{nanos}", std::process::id()));
+        if std::fs::rename(path, &aside).is_ok() {
+            aside.as_path()
+        } else {
+            path
+        }
+    };
     let wide: Vec<u16> = path
         .as_os_str()
         .encode_wide()
@@ -204,6 +224,18 @@ fn remove_at_restart(path: &Path) {
     unsafe {
         MoveFileExW(wide.as_ptr(), std::ptr::null(), MOVEFILE_DELAY_UNTIL_REBOOT);
     }
+}
+
+/// Where `remove_at_restart` moves a file it cannot remove now: beside it, under a name
+/// no install writes, so the delete queued for the restart can only ever hit this copy.
+/// Same directory, so the rename never crosses a volume.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn aside_name(path: &Path, tag: &str) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    path.with_file_name(format!("{name}.removed-{tag}"))
 }
 
 /// Remove `dir` and everything in it that can be removed now, and hand to `later`
@@ -356,6 +388,30 @@ pub fn cleanup_legacy_orionchain() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The delete Windows runs at the restart must point at a name an install never
+    // writes, or reinstalling before the restart loses the new crossfyre.exe.
+    #[test]
+    fn a_file_left_for_the_restart_is_queued_under_a_name_no_install_writes() {
+        let exe = Path::new("C:/Users/a/AppData/Local/Crossfyre/bin/crossfyre.exe");
+        let aside = aside_name(exe, "4242-17");
+        assert_eq!(
+            aside.parent(),
+            exe.parent(),
+            "same directory, so the rename stays on one volume"
+        );
+        assert_ne!(aside, exe);
+        assert_eq!(aside.file_name().unwrap(), "crossfyre.exe.removed-4242-17");
+        for c in components() {
+            for f in component_files(c) {
+                assert_ne!(
+                    aside.file_name().unwrap().to_string_lossy(),
+                    f,
+                    "{c} installs {f}"
+                );
+            }
+        }
+    }
 
     // A directory others cannot write stands in for a program Windows will not let go
     // of: what is in it cannot be removed, and nothing else should wait for a restart.
