@@ -15,6 +15,11 @@ class AppPrefs(ctx: Context) {
         get() = p.getBoolean("disclosed", false)
         set(v) = p.edit().putBoolean("disclosed", v).apply()
 
+    /** Android has been asked to show approvals and alerts, whatever it answered. */
+    var alertsAsked: Boolean
+        get() = p.getBoolean("alerts_asked", false)
+        set(v) = p.edit().putBoolean("alerts_asked", v).apply()
+
     /** Android has been asked to show the capture notification, whatever it answered. */
     var notificationsAsked: Boolean
         get() = p.getBoolean("notif_asked", false)

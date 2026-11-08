@@ -486,4 +486,36 @@ class ApprovalApiTest {
             .activity(key, ActivityScope.Account))
         assertEquals(Problem.Refused(400, "Export the activity log from the dashboard"), export)
     }
+
+    // ── push ──────────────────────────────────────────────────────────────
+
+    @Test
+    fun registering_sends_the_key_and_the_token_and_reads_whether_the_server_pushes() {
+        val fake = Fake(envelope(200, "Registered", JSONObject().put("push", true)), envelope(200, "Registered", JSONObject().put("push", false)))
+        assertEquals(true, ok(api(fake).pushRegister(key, "tok:1")))
+        assertEquals(false, ok(api(fake).pushRegister(key, "tok:1")))
+        val (url, body) = fake.calls.first()
+        assertEquals("https://crossfyre.io/api/v1/cli/push/register", url)
+        assertEquals(setOf("api_key", "token"), body.keySet())
+        assertEquals("tok:1", body.getString("token"))
+    }
+
+    @Test
+    fun registering_from_a_phone_that_does_not_approve_says_so() {
+        val inactive = envelope(403, "approver_inactive", JSONObject().put("approver_inactive", true))
+        assertEquals(Refusal.APPROVER_INACTIVE, reasonOf(problem(api(Fake(inactive)).pushRegister(key, "t"))))
+        assertEquals(Problem.SignedOut, problem(api(Fake(envelope(401, "Invalid key"))).pushRegister(key, "t")))
+        assertEquals(Refusal.APPROVALS_OFF, reasonOf(problem(api(Fake(envelope(404, "off", JSONObject().put("reason", "mcp_disabled")))).pushRegister(key, "t"))))
+        // A missing route is not read as any of the above.
+        assertTrue(problem(api(Fake(envelope(404, "Not Found"))).pushRegister(key, "t")) !is Problem.SignedOut)
+    }
+
+    @Test
+    fun unregistering_sends_the_token_to_its_own_route() {
+        val fake = Fake(envelope(200, "Unregistered", JSONObject().put("removed", 0)))
+        ok(api(fake).pushUnregister(key, "tok:2"))
+        val (url, body) = fake.calls.single()
+        assertEquals("https://crossfyre.io/api/v1/cli/push/unregister", url)
+        assertEquals("tok:2", body.getString("token"))
+    }
 }

@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -29,6 +30,7 @@
     </queries>
 
     <application
+        android:name=".CrossfyreApp"
         android:allowBackup="false"
         android:networkSecurityConfig="@xml/network_security_config"
         android:icon="@mipmap/ic_launcher"
@@ -49,14 +51,38 @@
             </intent-filter>
         </activity>
 
+        <!-- Push: Firebase hands the app a waiting approval or alert. The app
+             starts Firebase itself (CrossfyreApp), so Firebase's own start-up
+             provider is removed, and no push token is made until the phone
+             approves: auto-init is off and the app asks for a token then. -->
+        <service
+            android:name=".push.PushService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
+        </service>
+        <provider
+            android:name="com.google.firebase.provider.FirebaseInitProvider"
+            android:authorities="${applicationId}.firebaseinitprovider"
+            tools:node="remove" />
+        <meta-data
+            android:name="firebase_messaging_auto_init_enabled"
+            android:value="false" />
+        <meta-data
+            android:name="firebase_analytics_collection_enabled"
+            android:value="false" />
+        <meta-data
+            android:name="delivery_metrics_exported_to_big_query_enabled"
+            android:value="false" />
+
         <!-- Portrait QR scanner (CameraX + ML Kit). -->
         <activity
             android:name=".ScannerActivity"
             android:theme="@style/Theme.CrossfyreMobile.Scanner"
             android:screenOrientation="portrait"
             android:exported="false"
-            tools:ignore="LockedOrientationActivity"
-            xmlns:tools="http://schemas.android.com/tools" />
+            tools:ignore="LockedOrientationActivity" />
 
         <!-- The capture VPN. BIND_VPN_SERVICE is granted to the system so only the OS can bind it. -->
         <service

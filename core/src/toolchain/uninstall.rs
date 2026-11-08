@@ -123,6 +123,11 @@ pub fn run(scope: Scope, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
                 for f in unowned_files(&bin, p) {
                     let _ = std::fs::remove_file(f);
                 }
+                if !p.owns("cfx-script")
+                    && let Some(python) = fetched_python(&bin)
+                {
+                    let _ = std::fs::remove_dir_all(python);
+                }
                 let cli = std::env::current_exe().ok();
                 if bin.starts_with(root) && !has_files_under(p, &bin, root, cli.as_deref()) {
                     let _ = std::fs::remove_dir_all(root);
@@ -190,10 +195,30 @@ pub fn run(scope: Scope, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Have Windows remove the file or the empty directory at `path` when the machine next
 /// starts. Queued deepest first, so each directory is empty by its turn.
+///
+/// A file is first renamed aside, which Windows allows for a running executable, and
+/// the new name is what gets queued. Queueing the original name meant that installing
+/// again before the restart put the new crossfyre.exe exactly where the queued delete
+/// pointed, and the restart removed the fresh install.
 #[cfg(windows)]
 fn remove_at_restart(path: &Path) {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_DELAY_UNTIL_REBOOT, MoveFileExW};
+    let aside;
+    let path = if path.is_dir() {
+        path
+    } else {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        aside = aside_name(path, &format!("{}-{nanos}", std::process::id()));
+        if std::fs::rename(path, &aside).is_ok() {
+            aside.as_path()
+        } else {
+            path
+        }
+    };
     let wide: Vec<u16> = path
         .as_os_str()
         .encode_wide()
@@ -204,6 +229,18 @@ fn remove_at_restart(path: &Path) {
     unsafe {
         MoveFileExW(wide.as_ptr(), std::ptr::null(), MOVEFILE_DELAY_UNTIL_REBOOT);
     }
+}
+
+/// Where `remove_at_restart` moves a file it cannot remove now: beside it, under a name
+/// no install writes, so the delete queued for the restart can only ever hit this copy.
+/// Same directory, so the rename never crosses a volume.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn aside_name(path: &Path, tag: &str) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    path.with_file_name(format!("{name}.removed-{tag}"))
 }
 
 /// Remove `dir` and everything in it that can be removed now, and hand to `later`
@@ -266,6 +303,22 @@ fn unowned_files(bin_dir: &Path, p: &Packaging) -> Vec<PathBuf> {
         .flat_map(component_files)
         .map(|f| bin_dir.join(f))
         .collect()
+}
+
+/// The python folder the CLI put beside a cfx-script it fetched into `bin_dir`, when it is
+/// one: a directory, not a link, with a libpython in its lib folder. Anything else of that
+/// name is not ours, and a package's bin_dir may be shared with other files.
+#[cfg(not(windows))]
+fn fetched_python(bin_dir: &Path) -> Option<PathBuf> {
+    let dir = bin_dir.join(crate::executor::BUNDLED_PYTHON_DIR);
+    if !std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
+        return None;
+    }
+    let has_libpython = std::fs::read_dir(dir.join("lib"))
+        .ok()?
+        .flatten()
+        .any(|e| e.file_name().to_string_lossy().starts_with("libpython3"));
+    has_libpython.then_some(dir)
 }
 
 /// Does the package have a file under `root`: its packaging.json, the CLI at `cli` when
@@ -356,6 +409,30 @@ pub fn cleanup_legacy_orionchain() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The delete Windows runs at the restart must point at a name an install never
+    // writes, or reinstalling before the restart loses the new crossfyre.exe.
+    #[test]
+    fn a_file_left_for_the_restart_is_queued_under_a_name_no_install_writes() {
+        let exe = Path::new("C:/Users/a/AppData/Local/Crossfyre/bin/crossfyre.exe");
+        let aside = aside_name(exe, "4242-17");
+        assert_eq!(
+            aside.parent(),
+            exe.parent(),
+            "same directory, so the rename stays on one volume"
+        );
+        assert_ne!(aside, exe);
+        assert_eq!(aside.file_name().unwrap(), "crossfyre.exe.removed-4242-17");
+        for c in components() {
+            for f in component_files(c) {
+                assert_ne!(
+                    aside.file_name().unwrap().to_string_lossy(),
+                    f,
+                    "{c} installs {f}"
+                );
+            }
+        }
+    }
 
     // A directory others cannot write stands in for a program Windows will not let go
     // of: what is in it cannot be removed, and nothing else should wait for a restart.
@@ -457,6 +534,24 @@ mod tests {
         let root = Path::new(INSTALL_ROOT);
         let cli = Path::new("/usr/bin/crossfyre");
         assert!(!has_files_under(&apt, bin, root, Some(cli)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_python_folder_with_a_libpython_in_it_is_taken_for_the_fetched_one() {
+        let bin = std::env::temp_dir().join(format!("cfx-uninstall-python-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bin);
+        std::fs::create_dir_all(&bin).expect("mkdir");
+        assert_eq!(fetched_python(&bin), None);
+        // /usr/bin/python is a link to python3 on many systems.
+        std::os::unix::fs::symlink("python3", bin.join("python")).expect("link");
+        assert_eq!(fetched_python(&bin), None);
+        std::fs::remove_file(bin.join("python")).expect("unlink");
+        std::fs::create_dir_all(bin.join("python").join("lib")).expect("mkdir");
+        assert_eq!(fetched_python(&bin), None, "a folder without a libpython");
+        std::fs::write(bin.join("python/lib/libpython3.13.so.1.0"), b"").expect("write");
+        assert_eq!(fetched_python(&bin), Some(bin.join("python")));
+        let _ = std::fs::remove_dir_all(&bin);
     }
 
     #[test]

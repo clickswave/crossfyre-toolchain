@@ -613,6 +613,8 @@ val LICENCES = listOf(
         "AndroidX and Jetpack Compose" to "Apache-2.0",
         "CameraX" to "Apache-2.0",
         "ZXing" to "Apache-2.0",
+        "Firebase Cloud Messaging" to "Apache-2.0",
+        "Google Play services client libraries" to "Android Software Development Kit License, developer.android.com/studio/terms",
     ),
     "Capture core" to listOf(
         "rustls" to "Apache-2.0, ISC or MIT",

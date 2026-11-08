@@ -24,6 +24,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
+import io.crossfyre.mobile.push.PushSetup
 import io.crossfyre.mobile.ui.Appearance
 import io.crossfyre.mobile.ui.AppRoot
 import io.crossfyre.mobile.ui.CrossfyreTheme
@@ -50,6 +51,11 @@ class MainActivity : ComponentActivity() {
     // manifest entry alone does nothing: it has to be asked for. A foreground
     // service starts anyway, so without asking, capture ran with no notification,
     // and the notification is how a capture admits to existing and offers a Stop.
+    // Approvals and alerts arrive as notifications too, asked for once the phone
+    // approves. Its answer starts nothing else, unlike the capture's.
+    private val alertConsent =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { model.alertsAnswered() }
+
     private val notificationConsent =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) {
             // Read back from the system rather than from this argument, because
@@ -101,7 +107,7 @@ class MainActivity : ComponentActivity() {
                 model.effects.collect { handle(it) }
             }
         }
-        if (savedInstanceState == null) model.openLink(intent?.dataString)
+        if (savedInstanceState == null) openFrom(intent)
 
         setContent {
             val appearance = Appearance.of(model.appearance)
@@ -120,7 +126,12 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        model.openLink(intent.dataString)
+        openFrom(intent)
+    }
+
+    private fun openFrom(intent: Intent?) {
+        if (intent?.getBooleanExtra(PushSetup.EXTRA_PUSHED, false) == true) model.openPushed(intent.dataString)
+        else model.openLink(intent?.dataString)
     }
 
     override fun onResume() {
@@ -130,6 +141,10 @@ class MainActivity : ComponentActivity() {
 
     private fun handle(e: Effect) {
         when (e) {
+            Effect.AskAlerts -> {
+                if (Build.VERSION.SDK_INT >= 33) alertConsent.launch(Manifest.permission.POST_NOTIFICATIONS)
+                else model.alertsAnswered()
+            }
             Effect.AskNotifications -> {
                 if (Build.VERSION.SDK_INT >= 33) notificationConsent.launch(Manifest.permission.POST_NOTIFICATIONS)
                 else model.notificationsAnswered()

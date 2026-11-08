@@ -38,8 +38,16 @@
 //! exit status says the same thing: 0 when the script finished, 1 when it raised,
 //! 2 when the job could not be read or names another protocol.
 //!
+//! A Linux release is built with the `bundled-python` feature and carries its own
+//! CPython in a `python` folder beside the binary (see `bundled`). That one starts
+//! before the job is read, so a helper given an empty stdin exits with 2 only when its
+//! Python started, which is what the installers check. When it cannot start, the helper
+//! says why on stderr and in a `log`, and exits with 1.
+//!
 //! `cfx-script --version` prints `cfx-script <version>` and reads no job.
 
+#[cfg(feature = "bundled-python")]
+mod bundled;
 mod runtime;
 
 use pyo3::prelude::*;
@@ -67,6 +75,19 @@ fn main() {
         return;
     }
     let mut pipe = Messages::new(take_stdout());
+    #[cfg(feature = "bundled-python")]
+    if let Err(message) = bundled::start() {
+        eprintln!("{message}");
+        pipe.send(&CfxMessage::Log {
+            job_id: String::new(),
+            message,
+        });
+        pipe.send(&CfxMessage::Completed {
+            job_id: String::new(),
+            code: 1,
+        });
+        std::process::exit(1);
+    }
     let job = match read_job() {
         Ok(job) => job,
         Err(message) => {

@@ -383,6 +383,21 @@ class ApprovalApi(origin: String, private val transport: Transport) {
         }
     }
 
+    /** Push to this token from now on. The answer says whether the server can push at all. */
+    fun pushRegister(key: String, token: String): Outcome<Boolean> =
+        call("push/register", JSONObject().put("api_key", key).put("token", token)) { a ->
+            phoneRefusal(a) ?: when {
+                a.ok -> Outcome.Ok(a.data?.optBoolean("push", false) == true)
+                else -> a.refusal()
+            }
+        }
+
+    /** Stop pushing to this token. A token the server does not hold is as dropped as it gets. */
+    fun pushUnregister(key: String, token: String): Outcome<Unit> =
+        call("push/unregister", JSONObject().put("api_key", key).put("token", token)) { a ->
+            phoneRefusal(a) ?: if (a.ok) Outcome.Ok(Unit) else a.refusal()
+        }
+
     /** Mark these notifications read. Ids that are not the account's, or already read, change nothing. */
     fun inboxRead(key: String, ids: List<String>): Outcome<InboxMarked> =
         markRead(JSONObject().put("api_key", key).put("ids", JSONArray(ids)))
