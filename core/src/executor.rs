@@ -81,8 +81,14 @@ pub fn helper_path() -> Option<PathBuf> {
 /// Python's stable ABI (see cfx-script's Cargo.toml).
 pub const PYTHON_MIN: (u32, u32) = (3, 10);
 
+/// The folder beside the helper that holds the Python a release ships it with: the
+/// embeddable package on Windows, and on Linux a CPython the helper loads from there and
+/// from nowhere else, through the `$ORIGIN/python/lib` rpath it is linked with.
+pub const BUNDLED_PYTHON_DIR: &str = "python";
+
 /// What the helper at `helper` has to be started with to find a Python. Nothing outside
-/// Windows: there the dynamic loader finds libpython by itself.
+/// Windows: on Linux the helper finds the Python beside it by its rpath, and on macOS
+/// the framework by the rpaths the release build gives it.
 ///
 /// On Windows the helper loads python3.dll, the stable-ABI library every CPython
 /// install has, and Windows looks for it beside the helper and then on PATH. A Python
@@ -120,7 +126,7 @@ pub fn python_env(helper: &Path) -> Vec<(std::ffi::OsString, std::ffi::OsString)
 #[cfg(windows)]
 fn find_python(helper: &Path) -> Option<(PathBuf, bool)> {
     use crate::os::win::{Hive, reg_string, reg_subkeys};
-    let bundled = helper.parent()?.join("python");
+    let bundled = helper.parent()?.join(BUNDLED_PYTHON_DIR);
     if bundled.join("python3.dll").is_file() {
         return Some((bundled, false));
     }
@@ -206,9 +212,9 @@ fn explain_exit(status: Option<std::process::ExitStatus>, tail: &[String]) -> St
         .find(|l| l.contains("libpython") || l.contains("error while loading shared libraries"));
     if let Some(line) = python {
         return format!(
-            "cfx-script could not start: {line}. It runs .cfx scripts with the Python it was \
-             built against; install that Python's shared library, or build cfx-script on \
-             this machine. Nothing else in Crossfyre needs Python."
+            "cfx-script could not start: {line}. It runs .cfx scripts with the Python in the \
+             {BUNDLED_PYTHON_DIR} folder beside it, which `crossfyre update --force` installs \
+             again with it. Nothing else in Crossfyre needs Python."
         );
     }
     let how = match status {
@@ -625,6 +631,7 @@ exit 1"#,
         match r {
             ExecutionResult::Error { message } => {
                 assert!(message.contains("libpython3.11"), "{message}");
+                assert!(message.contains("update --force"), "{message}");
                 assert!(
                     message.contains("Nothing else in Crossfyre needs Python"),
                     "{message}"

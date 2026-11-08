@@ -239,19 +239,13 @@ fn cannot_start_note(output: &str) -> String {
         return format!("{output}. `crossfyre update --force` downloads it and tries it again.");
     };
     let mut note = format!("It needs {lib}, which this host does not have.");
-    if let Some(package) = lib
-        .strip_suffix(".so.1.0")
-        .filter(|p| p.starts_with("libpython3."))
-    {
-        let how = if Path::new("/usr/bin/apt-get").exists() {
-            format!("sudo apt install {package}")
-        } else {
-            format!("the package that provides {lib}")
-        };
+    if lib.starts_with("libpython3.") {
+        // A release's cfx-script brings its own libpython, in the python folder beside
+        // it, and loads no other: one the host installed would be refused.
         note.push_str(&format!(
-            " Install it ({how}) where your system has it, and the next update installs \
-             cfx-script; where there is no {package}, this release's cfx-script cannot run \
-             here."
+            " cfx-script brings its own in the {} folder beside it, which did not come \
+             with this one. `crossfyre update --force` downloads the two again.",
+            crate::executor::BUNDLED_PYTHON_DIR
         ));
     }
     note
@@ -557,32 +551,36 @@ fn move_aside_if_running(dest: &Path) {
     }
 }
 
-/// The folder holding the embeddable Python package a Windows cfx-script can be shipped
-/// with (see `executor::python_env`), copied from beside `src` to beside `dest` when
-/// there is one there. Nothing on other platforms, where the helper finds the Python it
-/// was built against by itself.
-fn place_bundled_python(src: &Path, dest: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    if !cfg!(windows) {
-        return Ok(());
-    }
-    let (Some(from_dir), Some(to_dir)) = (src.parent(), dest.parent()) else {
-        return Ok(());
+/// The folder of the Python a release's cfx-script comes with, beside `src`, when there is
+/// one: python.org's embeddable package on Windows, with python3.dll in it, and on Linux
+/// a CPython with its libpython and standard library under lib/ (see
+/// `executor::BUNDLED_PYTHON_DIR`).
+fn bundled_python_beside(src: &Path) -> Option<PathBuf> {
+    let dir = src.parent()?.join(crate::executor::BUNDLED_PYTHON_DIR);
+    let there = if cfg!(windows) {
+        dir.join("python3.dll").is_file()
+    } else {
+        dir.join("lib").is_dir()
     };
-    let from = from_dir.join("python");
-    if !from.join("python3.dll").is_file() {
-        return Ok(());
-    }
-    let to = to_dir.join("python");
-    let staged = to_dir.join("python.new");
-    let _ = fs::remove_dir_all(&staged);
-    copy_dir(&from, &staged)?;
-    // A script running now holds the old DLLs open, which stops them being removed but
-    // not their folder being renamed.
-    let old = to_dir.join(format!("python.old-{}", std::process::id()));
+    there.then_some(dir)
+}
+
+/// Put the folder `staged` at `<dir>/python`, in place of whatever is there. A script
+/// running now holds the old files open, which stops them being removed on Windows but
+/// not their folder being renamed, so the old folder is moved aside first and removed
+/// after.
+fn swap_bundled_python(staged: &Path, dir: &Path) -> std::io::Result<()> {
+    let to = dir.join(crate::executor::BUNDLED_PYTHON_DIR);
+    let old = dir.join(format!(
+        "{}.old-{}",
+        crate::executor::BUNDLED_PYTHON_DIR,
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&old);
     if to.exists() {
         fs::rename(&to, &old)?;
     }
-    fs::rename(&staged, &to)?;
+    fs::rename(staged, &to)?;
     let _ = fs::remove_dir_all(&old);
     Ok(())
 }
@@ -638,19 +636,48 @@ fn helper_starts(path: &Path) -> Result<(), String> {
 
 /// Put the cfx-script at `src` at `dest`, but only if it starts here. It is staged
 /// beside `dest` and run from there, as the installer does, because the temp directory
-/// may be on a filesystem mounted noexec. `Some(output)` when it cannot start: the
-/// staged copy is removed and `dest` is left as it was.
+/// may be on a filesystem mounted noexec. `Some(output)` when it cannot start: what was
+/// staged is removed and `dest` is left as it was.
+///
+/// A cfx-script with a python folder beside it (`bundled_python_beside`) is staged with
+/// a copy of that folder, in a directory of their own beside `dest`, and run there. On
+/// Linux it loads libpython from `$ORIGIN/python/lib`, so only a helper run beside the
+/// new folder proves that the two start together. Once it has, the folder replaces the
+/// one beside `dest`, then the helper replaces `dest`.
 fn place_helper_if_it_starts(
     src: &Path,
     dest: &Path,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let staged = stage_binary(src, dest)?;
-    if let Err(output) = helper_starts(&staged) {
-        let _ = fs::remove_file(&staged);
-        return Ok(Some(output));
-    }
-    commit_staged(&staged, dest)?;
-    Ok(None)
+    let Some(python) = bundled_python_beside(src) else {
+        let staged = stage_binary(src, dest)?;
+        if let Err(output) = helper_starts(&staged) {
+            let _ = fs::remove_file(&staged);
+            return Ok(Some(output));
+        }
+        commit_staged(&staged, dest)?;
+        return Ok(None);
+    };
+    let (Some(dir), Some(name)) = (dest.parent(), dest.file_name()) else {
+        return Err(format!("{} is not a file path", dest.display()).into());
+    };
+    let mut staging_name = name.to_os_string();
+    staging_name.push(".new.d");
+    let staging = dir.join(staging_name);
+    let _ = fs::remove_dir_all(&staging);
+    let placed = (|| -> Result<Option<String>, Box<dyn std::error::Error>> {
+        fs::create_dir_all(&staging)?;
+        let staged = stage_binary(src, &staging.join(name))?;
+        let staged_python = staging.join(crate::executor::BUNDLED_PYTHON_DIR);
+        copy_dir(&python, &staged_python)?;
+        if let Err(output) = helper_starts(&staged) {
+            return Ok(Some(output));
+        }
+        swap_bundled_python(&staged_python, dir)?;
+        commit_staged(&staged, dest)?;
+        Ok(None)
+    })();
+    let _ = fs::remove_dir_all(&staging);
+    placed
 }
 
 /// What `install_cfx_script` did.
@@ -708,7 +735,6 @@ pub async fn install_cfx_script(
     if !extracted.exists() {
         return Err("cfx-script binary not found inside its zip".into());
     }
-    place_bundled_python(&extracted, &dest)?;
     if let Some(output) = place_helper_if_it_starts(&extracted, &dest)? {
         record_cannot_start(&version, &output);
         return Ok(HelperOutcome::CannotStart { version, output });
@@ -1639,12 +1665,6 @@ pub async fn ensure_node_installed() -> Result<(), Box<dyn std::error::Error>> {
         // From the same build as a node beside it. Its version is unknown, so none is
         // recorded, and the next update replaces it with the manifest's.
         let _ = fs::remove_file(ext_version_file(CFX_SCRIPT));
-        if let Err(e) = place_bundled_python(&sib, &helper) {
-            eprintln!(
-                "[!] could not copy the Python beside {}: {e}",
-                sib.display()
-            );
-        }
         match place_helper_if_it_starts(&sib, &helper) {
             Ok(None) => println!(
                 "[+] Installed cfx-script to {} (runs .cfx scripts)",
@@ -2227,6 +2247,110 @@ mod tests {
         assert!(!dest.exists());
     }
 
+    /// A release's python folder beside `src`, as its zip unpacks: lib/ with a file that
+    /// says which one it is.
+    #[cfg(unix)]
+    fn python_beside(src: &Path, which: &str) {
+        let lib = src.parent().unwrap().join("python").join("lib");
+        fs::create_dir_all(lib.join("python3.13")).expect("mkdir");
+        fs::write(lib.join("which"), which).expect("write");
+        fs::write(lib.join("python3.13").join("os.py"), "").expect("write");
+    }
+
+    /// A stand-in for a Linux cfx-script, which loads libpython from the python folder
+    /// beside wherever it is run: it starts only when that folder is the new release's.
+    #[cfg(unix)]
+    const STARTS_BESIDE_NEW: &str = r#"[ "$(cat "$(dirname "$0")/python/lib/which" 2>/dev/null)" = new ] && exit 2
+echo "cfx-script: error while loading shared libraries: libpython3.13.so.1.0: cannot open shared object file" >&2
+exit 127"#;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_helper_with_a_python_folder_is_tried_beside_that_folder_and_placed_with_it() {
+        let s = Scratch::new("helper-bundled");
+        fs::create_dir_all(s.join("unpacked")).expect("mkdir");
+        let src = fake_helper(&s, "unpacked/cfx-script", STARTS_BESIDE_NEW);
+        python_beside(&src, "new");
+        let bin = s.join("bin");
+        let dest = bin.join("cfx-script");
+        // What an earlier release left: its helper and its Python.
+        fs::create_dir_all(bin.join("python").join("lib")).expect("mkdir");
+        fs::write(bin.join("python").join("lib").join("which"), "old").expect("write");
+        fs::write(bin.join("python").join("lib").join("stale"), "x").expect("write");
+        fs::write(&dest, b"the-old-one").expect("write");
+
+        let failed = place_helper_if_it_starts(&src, &dest).expect("place");
+        assert_eq!(failed, None, "the staged helper ran beside the new folder");
+        assert_eq!(
+            fs::read(&dest).expect("read"),
+            fs::read(&src).expect("read")
+        );
+        assert_eq!(mode_of(&dest), 0o755);
+        let lib = bin.join("python").join("lib");
+        assert_eq!(fs::read_to_string(lib.join("which")).expect("read"), "new");
+        assert!(lib.join("python3.13").join("os.py").is_file());
+        assert!(
+            !lib.join("stale").exists(),
+            "the old folder is replaced, not merged"
+        );
+        let mut left: Vec<_> = fs::read_dir(&bin)
+            .expect("read")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            ["cfx-script", "python"],
+            "nothing staged or old is left"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_helper_that_cannot_start_beside_its_python_leaves_the_old_helper_and_python() {
+        let s = Scratch::new("helper-bundled-broken");
+        fs::create_dir_all(s.join("unpacked")).expect("mkdir");
+        let src = fake_helper(&s, "unpacked/cfx-script", STARTS_BESIDE_NEW);
+        // A folder that is not what this helper needs.
+        python_beside(&src, "broken");
+        let bin = s.join("bin");
+        let dest = bin.join("cfx-script");
+        fs::create_dir_all(bin.join("python").join("lib")).expect("mkdir");
+        fs::write(bin.join("python").join("lib").join("which"), "old").expect("write");
+        fs::write(&dest, b"the-old-one").expect("write");
+
+        let output = place_helper_if_it_starts(&src, &dest)
+            .expect("place")
+            .expect("it cannot start");
+        assert!(output.contains("libpython3.13.so.1.0"), "{output}");
+        assert_eq!(fs::read(&dest).expect("read"), b"the-old-one");
+        assert_eq!(
+            fs::read_to_string(bin.join("python").join("lib").join("which")).expect("read"),
+            "old"
+        );
+        assert!(
+            !bin.join("cfx-script.new.d").exists(),
+            "nothing is left staged"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_helper_with_a_python_folder_is_placed_where_none_was_before() {
+        let s = Scratch::new("helper-bundled-fresh");
+        fs::create_dir_all(s.join("unpacked")).expect("mkdir");
+        let src = fake_helper(&s, "unpacked/cfx-script", STARTS_BESIDE_NEW);
+        python_beside(&src, "new");
+        let dest = s.join("bin").join("cfx-script");
+        assert_eq!(place_helper_if_it_starts(&src, &dest).expect("place"), None);
+        assert_eq!(
+            fs::read_to_string(s.join("bin").join("python").join("lib").join("which"))
+                .expect("read"),
+            "new"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Updating what the installer placed
     // ---------------------------------------------------------------------------
@@ -2459,7 +2583,10 @@ mod tests {
             note.starts_with("It needs libpython3.11.so.1.0, which this host does not have."),
             "{note}"
         );
-        assert!(note.contains("libpython3.11"), "{note}");
+        // The release's own Python is what is missing, not a package of the host's.
+        assert!(note.contains("python folder beside it"), "{note}");
+        assert!(note.contains("update --force"), "{note}");
+        assert!(!note.contains("apt install"), "{note}");
         let other = cannot_start_note("Killed");
         assert!(other.contains("--force"), "{other}");
     }

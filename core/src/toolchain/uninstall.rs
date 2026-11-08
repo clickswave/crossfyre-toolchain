@@ -123,6 +123,11 @@ pub fn run(scope: Scope, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
                 for f in unowned_files(&bin, p) {
                     let _ = std::fs::remove_file(f);
                 }
+                if !p.owns("cfx-script")
+                    && let Some(python) = fetched_python(&bin)
+                {
+                    let _ = std::fs::remove_dir_all(python);
+                }
                 let cli = std::env::current_exe().ok();
                 if bin.starts_with(root) && !has_files_under(p, &bin, root, cli.as_deref()) {
                     let _ = std::fs::remove_dir_all(root);
@@ -298,6 +303,22 @@ fn unowned_files(bin_dir: &Path, p: &Packaging) -> Vec<PathBuf> {
         .flat_map(component_files)
         .map(|f| bin_dir.join(f))
         .collect()
+}
+
+/// The python folder the CLI put beside a cfx-script it fetched into `bin_dir`, when it is
+/// one: a directory, not a link, with a libpython in its lib folder. Anything else of that
+/// name is not ours, and a package's bin_dir may be shared with other files.
+#[cfg(not(windows))]
+fn fetched_python(bin_dir: &Path) -> Option<PathBuf> {
+    let dir = bin_dir.join(crate::executor::BUNDLED_PYTHON_DIR);
+    if !std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
+        return None;
+    }
+    let has_libpython = std::fs::read_dir(dir.join("lib"))
+        .ok()?
+        .flatten()
+        .any(|e| e.file_name().to_string_lossy().starts_with("libpython3"));
+    has_libpython.then_some(dir)
 }
 
 /// Does the package have a file under `root`: its packaging.json, the CLI at `cli` when
@@ -513,6 +534,24 @@ mod tests {
         let root = Path::new(INSTALL_ROOT);
         let cli = Path::new("/usr/bin/crossfyre");
         assert!(!has_files_under(&apt, bin, root, Some(cli)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_python_folder_with_a_libpython_in_it_is_taken_for_the_fetched_one() {
+        let bin = std::env::temp_dir().join(format!("cfx-uninstall-python-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bin);
+        std::fs::create_dir_all(&bin).expect("mkdir");
+        assert_eq!(fetched_python(&bin), None);
+        // /usr/bin/python is a link to python3 on many systems.
+        std::os::unix::fs::symlink("python3", bin.join("python")).expect("link");
+        assert_eq!(fetched_python(&bin), None);
+        std::fs::remove_file(bin.join("python")).expect("unlink");
+        std::fs::create_dir_all(bin.join("python").join("lib")).expect("mkdir");
+        assert_eq!(fetched_python(&bin), None, "a folder without a libpython");
+        std::fs::write(bin.join("python/lib/libpython3.13.so.1.0"), b"").expect("write");
+        assert_eq!(fetched_python(&bin), Some(bin.join("python")));
+        let _ = std::fs::remove_dir_all(&bin);
     }
 
     #[test]
