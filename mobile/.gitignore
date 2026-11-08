@@ -22,3 +22,7 @@ logs/
 keystore.properties
 *.jks
 *.keystore
+
+# Push config: the Firebase app ids push needs (see README). The build that
+# publishes the app supplies it; a build without it runs with no push.
+firebase.properties
