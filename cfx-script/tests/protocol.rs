@@ -656,3 +656,89 @@ def run():
     assert_eq!(types(&r), ["result", "result", "completed"]);
     assert_eq!(notes.replace("\r\n", "\n"), "notes\n");
 }
+
+/// A Linux release's helper runs the CPython in the python folder beside it: the one
+/// sys.prefix names, whatever the host's own Python is and whatever its PYTHON*
+/// variables say. These run against the test binary with that folder put
+/// beside it, as the release build does.
+#[cfg(feature = "bundled-python")]
+#[test]
+fn the_python_beside_the_helper_is_the_one_a_script_runs_in_and_the_hosts_settings_stay_out() {
+    let beside = std::path::Path::new(env!("CARGO_BIN_EXE_cfx-script"))
+        .parent()
+        .unwrap()
+        .join("python");
+    let beside = std::fs::canonicalize(beside).expect("a python folder beside the test binary");
+    let r = run_with_env(
+        &job(r#"
+import cfxs, os, sys
+def run():
+    cfxs.connect().send_result({
+        "prefix": os.path.realpath(sys.prefix),
+        "stdlib": os.path.realpath(os.__file__),
+        "path": sys.path,
+        "user_site": bool(sys.flags.no_user_site),
+    })
+"#),
+        &[
+            ("PYTHONHOME", "/nowhere".as_ref()),
+            ("PYTHONPATH", "/somewhere/else".as_ref()),
+        ],
+        LIMIT,
+    );
+    assert_eq!(r.status, 0, "stderr: {}", r.stderr);
+    let data = &r.messages[0]["data"];
+    assert_eq!(data["prefix"], beside.to_str().unwrap());
+    assert!(
+        data["stdlib"]
+            .as_str()
+            .unwrap()
+            .starts_with(beside.join("lib").to_str().unwrap()),
+        "{data}"
+    );
+    let path = data["path"].to_string();
+    assert!(!path.contains("/somewhere/else"), "{path}");
+    assert_eq!(data["user_site"], true);
+}
+
+/// A python folder without its standard library is refused before the job is read, so
+/// the installers' check with an empty stdin, which wants status 2, fails and says why.
+#[cfg(feature = "bundled-python")]
+#[test]
+fn a_python_folder_without_its_standard_library_is_refused_before_the_job_is_read() {
+    let real = std::path::Path::new(env!("CARGO_BIN_EXE_cfx-script"));
+    let libpython = std::fs::read_dir(real.parent().unwrap().join("python").join("lib"))
+        .expect("a python folder beside the test binary")
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().ends_with(".so.1.0"))
+        })
+        .expect("a libpython beside the test binary");
+    let dir = std::env::temp_dir().join(format!("cfx-script-no-stdlib-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("python").join("lib")).unwrap();
+    std::fs::copy(real, dir.join("cfx-script")).unwrap();
+    // A copy: the loader reports a link by the file it points to, which is the folder
+    // beside the test binary, and the helper would refuse that for another reason.
+    std::fs::copy(
+        &libpython,
+        dir.join("python")
+            .join("lib")
+            .join(libpython.file_name().unwrap()),
+    )
+    .unwrap();
+    let out = Command::new(dir.join("cfx-script"))
+        .stdin(Stdio::null())
+        .output()
+        .expect("cfx-script starts");
+    let _ = std::fs::remove_dir_all(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains("holds no standard library"), "{stderr}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let last: serde_json::Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
+    assert_eq!(last["type"], "completed");
+    assert_eq!(last["code"], 1);
+}

@@ -23,13 +23,19 @@ serde_json = "1.0.149"
 # Build for Python's stable ABI, as Windows and macOS builds always are (below). Here so
 # that a Linux build can run the tests against the same code: `--features abi3`.
 abi3 = ["pyo3/abi3-py310"]
+# Linux releases: load the CPython shipped in a python folder beside the binary and no
+# other, so that the helper starts on any Linux whatever Python it has or lacks (see
+# src/bundled.rs and build.rs). The release build points pyo3 at that CPython with
+# PYO3_CONFIG_FILE. Without the feature, a Linux build links the libpython of the
+# machine it is built on, which is what `cargo test` uses.
+bundled-python = []
 
 # Windows and macOS have no system Python a release could be built against, so the
 # helper is built for the stable ABI and loads whichever CPython 3.10 or later the
 # machine has. On Windows that is python3.dll, the same name in every CPython there,
 # linked with raw-dylib, so no import library and no Windows Python is needed to build
-# it (`executor::python_env` says where it is looked for). Linux keeps linking the
-# versioned libpython of the build machine. The minimum here is
+# it (`executor::python_env` says where it is looked for). A Linux release links the
+# CPython it ships with instead (`bundled-python`, above). The minimum here is
 # `executor::PYTHON_MIN`. On macOS the build reads it from the Python that
 # PYO3_PYTHON names, which has to be set: the Xcode tools' python3 is 3.9.
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
