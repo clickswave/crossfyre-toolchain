@@ -25,7 +25,7 @@ cfx_cloud_wire = { path = "../cloud_wire" }
 reqwest = { version = "0.12.22", default-features = false, features = ["rustls-tls"] }
 # Pinned: the protocol layer is upgraded on purpose, with the tools/list snapshot
 # test updated in the same change.
-rmcp = { version = "=3.5.1", default-features = false, features = ["server", "transport-io", "elicitation"] }
+rmcp = { version = "=3.9.0", default-features = false, features = ["server", "transport-io", "elicitation"] }
 tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "time", "sync", "signal"] }
 tokio-util = "0.7"
 serde = { version = "1", features = ["derive"] }

@@ -1,0 +1,114 @@
+{
+  "release": "20261026",
+  "version": "3.13.18",
+  "collected_from": {
+    "x86_64": {
+      "archive": "cpython-3.13.18+20261026-x86_64-unknown-linux-gnu-pgo+lto-full.tar.zst",
+      "sha256": "f003449a05408c2e4b184f2a7abd1ea277081ff1a9100289075243ab5ed81207"
+    },
+    "aarch64": {
+      "archive": "cpython-3.13.18+20261026-aarch64-unknown-linux-gnu-pgo+lto-full.tar.zst",
+      "sha256": "069e9ae72f35f8ac743e1dad224417b07a3728971bc8333fe08b78e4c24bee12"
+    },
+    "cpython-3.13.18-license.rst": {
+      "url": "https://raw.githubusercontent.com/python/cpython/v3.13.18/Doc/license.rst",
+      "sha256": "952ac05720d7f1dcb63589b35eb0931b1442eb250230a4ad31198eddf0ad6abc"
+    }
+  },
+  "left_out": {
+    "LICENSE.bdb.txt": "Berkeley DB, linked by _dbm only, which is left out",
+    "LICENSE.tcl.txt": "Tcl, for tkinter, which is left out",
+    "LICENSE.tix.txt": "Tix, for tkinter, which is left out",
+    "LICENSE.libX11.txt": "libX11, for Tk, which is left out",
+    "LICENSE.libXau.txt": "libXau, for Tk, which is left out",
+    "LICENSE.libxcb.txt": "libxcb, for Tk, which is left out",
+    "LICENSE.zlib-ng.txt": "zlib-ng, which this build does not compile in: it uses zlib",
+    "LICENSE.zstd.txt": "zstd, which CPython 3.13 has no module for"
+  },
+  "components": [
+    {
+      "name": "CPython 3.13.18",
+      "licence": "PSF-2.0, with the other terms and the incorporated software it lists",
+      "what": "the interpreter and its standard library",
+      "file": "cpython-3.13.18-license.rst",
+      "from": "Doc/license.rst in CPython 3.13.18's source, tag v3.13.18 of github.com/python/cpython"
+    },
+    {
+      "name": "OpenSSL 3",
+      "licence": "Apache-2.0",
+      "what": "used by ssl and hashlib",
+      "file": "LICENSE.openssl-3.txt",
+      "from": "licenses/LICENSE.openssl-3.txt in python-build-standalone's full archive of release 20261026"
+    },
+    {
+      "name": "libffi",
+      "licence": "MIT",
+      "what": "used by ctypes",
+      "file": "LICENSE.libffi.txt",
+      "from": "licenses/LICENSE.libffi.txt in python-build-standalone's full archive of release 20261026"
+    },
+    {
+      "name": "SQLite",
+      "licence": "public domain",
+      "what": "used by sqlite3",
+      "file": "LICENSE.sqlite.txt",
+      "from": "licenses/LICENSE.sqlite.txt in python-build-standalone's full archive of release 20261026"
+    },
+    {
+      "name": "liblzma, from XZ Utils",
+      "licence": "0BSD",
+      "what": "used by lzma",
+      "file": "LICENSE.liblzma.txt",
+      "from": "licenses/LICENSE.liblzma.txt in python-build-standalone's full archive of release 20261026"
+    },
+    {
+      "name": "bzip2",
+      "licence": "bzip2-1.0.6",
+      "what": "used by bz2",
+      "file": "LICENSE.bzip2.txt",
+      "from": "licenses/LICENSE.bzip2.txt in python-build-standalone's full archive of release 20261026"
+    },
+    {
+      "name": "zlib",
+      "licence": "Zlib",
+      "what": "used by zlib and binascii",
+      "file": "LICENSE.zlib.txt",
+      "from": "licenses/LICENSE.zlib.txt in python-build-standalone's full archive of release 20261026"
+    },
+    {
+      "name": "Expat",
+      "licence": "MIT",
+      "what": "used by pyexpat and so xml.etree and xml.dom",
+      "file": "LICENSE.expat.txt",
+      "from": "licenses/LICENSE.expat.txt in python-build-standalone's full archive of release 20261026"
+    },
+    {
+      "name": "mpdecimal",
+      "licence": "BSD-2-Clause",
+      "what": "used by decimal",
+      "file": "LICENSE.mpdecimal.txt",
+      "from": "licenses/LICENSE.mpdecimal.txt in python-build-standalone's full archive of release 20261026"
+    },
+    {
+      "name": "libuuid, from util-linux",
+      "licence": "BSD-3-Clause",
+      "what": "used by uuid",
+      "file": "LICENSE.libuuid.txt",
+      "from": "licenses/LICENSE.libuuid.txt in python-build-standalone's full archive of release 20261026"
+    },
+    {
+      "name": "ncurses",
+      "licence": "X11",
+      "what": "used by curses and readline",
+      "file": "LICENSE.ncurses.txt",
+      "from": "licenses/LICENSE.ncurses.txt in python-build-standalone's full archive of release 20261026"
+    },
+    {
+      "name": "libedit",
+      "licence": "BSD-3-Clause",
+      "what": "used by readline, in place of GNU readline",
+      "file": "LICENSE.libedit.txt",
+      "from": "licenses/LICENSE.libedit.txt in python-build-standalone's full archive of release 20261026"
+    }
+  ]
+}

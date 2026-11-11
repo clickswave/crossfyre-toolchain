@@ -91,29 +91,61 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
+            python_arch: x86_64
+            python_sha256: df15fe60d3ff55bf9dcf25824b5572756bb8816ff93865a273d3301d7066a8b7
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
+            python_arch: aarch64
+            python_sha256: 578d9da1983463ffb0c8c98ab0da2f18177f44069328eb0af847860c1eb05c3e
+    env:
+      # The Python cfx-script goes out with on Linux: CPython as python-build-standalone
+      # builds it, the install_only_stripped archive of one release for each arch, pinned
+      # by the sha256 in the matrix above. Its licence texts are committed under
+      # cfx-script/linux-python for this pin, and scripts/linux_python.py refuses to
+      # write the notices for another.
+      LINUX_PYTHON: "3.13.18"
+      LINUX_PYTHON_RELEASE: "20261026"
     steps:
       - uses: actions/checkout@v4
 
-      # cfx-script, the .cfx runner, embeds Python and so links libpython; it is
-      # the only binary here that does, which is what lets the CLI and node start
-      # on any Linux. rust:bookworm has the interpreter but not the headers, so the
-      # link fails on -lpython3.11 without this. Debian bookworm ships 3.11, so a
-      # host that runs .cfx scripts needs libpython3.11.
-      - name: Install the libpython cfx-script links
+      # cfx-script, the .cfx runner, embeds Python and so links libpython; it is the
+      # only binary here that does, which is what lets the CLI and node start on any
+      # Linux. It is built against the CPython it goes out with, in a python folder
+      # beside it, and loads that one alone, so it starts whatever Python the host has
+      # or lacks. Earlier releases linked bookworm's libpython3.11 and did not start
+      # on a host without exactly that library.
+      #
+      # The folder holds libpython and the standard library, without tkinter, IDLE,
+      # turtle, ensurepip, pip, the build configuration and lib-dynload, which holds
+      # only _tkinter and _dbm. linux_python.py also writes pyo3.cfg, which
+      # PYO3_CONFIG_FILE names below, so pyo3 builds against this Python without
+      # running it.
+      - name: Fetch the CPython cfx-script goes out with
         run: |
-          apt-get update -qq
-          apt-get install -y --no-install-recommends libpython3.11-dev
-          python3 --version
+          set -euo pipefail
+          mkdir -p target
+          archive="cpython-$LINUX_PYTHON%2B$LINUX_PYTHON_RELEASE-${{ matrix.python_arch }}-unknown-linux-gnu-install_only_stripped.tar.gz"
+          curl -fsSL --retry 3 -o target/linux-python.tar.gz \
+            "https://github.com/astral-sh/python-build-standalone/releases/download/$LINUX_PYTHON_RELEASE/$archive"
+          echo "${{ matrix.python_sha256 }}  target/linux-python.tar.gz" | sha256sum -c -
+          python3 -I scripts/linux_python.py folder --archive target/linux-python.tar.gz \
+            --sha256 "${{ matrix.python_sha256 }}" --version "$LINUX_PYTHON" \
+            --out "$PWD/target/linux-python"
 
+      # bundled-python links cfx-script with DT_RPATH $ORIGIN/python/lib, which the
+      # loader searches before LD_LIBRARY_PATH and the system's directories (see
+      # cfx-script/build.rs). It changes nothing in the other binaries.
       - name: Build the workspace binaries
         run: |
           set -euo pipefail
+          export PYO3_CONFIG_FILE="$PWD/target/linux-python/pyo3.cfg"
           cargo build --release --locked \
             -p crossfyre -p plessor -p ambulo -p voyage -p doorward -p toolmark -p node -p oast \
-            -p cfx-script
+            -p cfx-script --features cfx-script/bundled-python
 
+      # The python folder goes beside cfx-script as the first-party zip lays it out,
+      # byte for byte the archive's files, with the licences of everything its
+      # libpython compiles in beside the binaries.
       - name: Stage the artifacts
         id: stage
         run: |
@@ -122,12 +154,32 @@ jobs:
           mkdir -p "$out"
           for b in crossfyre plessor ambulo voyage doorward toolmark node oast cfx-script; do
             cp "target/release/$b" "$out/$b"
+            strip "$out/$b"
           done
-          strip "$out"/* 2>/dev/null || true
+          python3 -I scripts/linux_python.py check "$out/cfx-script" --version "$LINUX_PYTHON"
+          cp -R target/linux-python/python "$out/python"
+          python3 -I scripts/linux_python.py notices --version "$LINUX_PYTHON" \
+            --release "$LINUX_PYTHON_RELEASE" --out "$out/THIRD-PARTY-NOTICES-PYTHON.txt"
           tar -C "$out" -czf "crossfyre-toolchain-${{ matrix.target }}.tar.gz" .
           sha256sum "crossfyre-toolchain-${{ matrix.target }}.tar.gz" \
             > "crossfyre-toolchain-${{ matrix.target }}.tar.gz.sha256"
           cat "crossfyre-toolchain-${{ matrix.target }}.tar.gz.sha256"
+
+      # What goes out has to start: each binary prints its version from a copy of the
+      # archive unpacked elsewhere, so cfx-script finds only the python folder that
+      # came with it. Given no job, cfx-script refuses the empty stdin with exit status
+      # 2, which it reaches only once that Python has started.
+      - name: The binaries start
+        run: |
+          set -euo pipefail
+          dir="$(mktemp -d)"
+          tar -C "$dir" -xzf "crossfyre-toolchain-${{ matrix.target }}.tar.gz"
+          for b in crossfyre plessor ambulo voyage doorward toolmark node oast cfx-script; do
+            "$dir/$b" --version
+          done
+          rc=0
+          "$dir/cfx-script" </dev/null || rc=$?
+          test "$rc" -eq 2
 
       - uses: actions/upload-artifact@v4
         with:
@@ -404,10 +456,14 @@ jobs:
             to open it. Clear that once the checks below pass:
             `xattr -d com.apple.quarantine <file>`. One fetched with curl is not
             quarantined. `cfx-script` needs a Python; everything else starts without
-            one. On Linux it loads the libpython3.11 it was built against. On macOS it
-            loads CPython 3.10 or later from python.org's framework or Homebrew's. On
-            Windows the zip carries python.org's embeddable Python in a `python`
-            folder beside it, which it loads first.
+            one. On Linux the archive carries CPython 3.13 from python-build-standalone
+            in a `python` folder beside it, which it loads and no other, so it starts
+            whatever Python the host has or lacks; keep the folder beside the binary
+            when you move it. `THIRD-PARTY-NOTICES-PYTHON.txt` holds the licences of
+            that CPython and what it compiles in. On macOS it loads CPython 3.10 or
+            later from python.org's framework or Homebrew's. On Windows the zip
+            carries python.org's embeddable Python in a `python` folder beside it,
+            which it loads first.
 
             ## Verifying it
 
