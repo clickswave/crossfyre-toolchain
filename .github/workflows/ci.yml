@@ -49,7 +49,7 @@ permissions:
 jobs:
   open-core:
     name: open-core boundary
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
 
@@ -92,9 +92,33 @@ jobs:
 
   build:
     name: build and test
-    runs-on: ubuntu-latest
+    # The Linux jobs name their image, for the same reason the toolchain below is
+    # pinned. ubuntu-latest is moving from 24.04 to 26.04 a few jobs at a time
+    # (October to November 2026), and the first run here to land on 26.04 restored a
+    # target directory built on 24.04 and could not link cfx-script: pyo3 still named
+    # that image's Python 3.12. Moving to the next image should be a commit.
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
+
+      # cfx-script links libpython on Linux. Without PYO3_PYTHON, pyo3 runs the first
+      # python3 on PATH and only rebuilds when PATH itself changes, not when the image
+      # swaps the interpreter behind it. 3.13 is the minor version the Linux release
+      # ships with cfx-script (LINUX_PYTHON in release.yml).
+      - uses: actions/setup-python@v5
+        id: python
+        with:
+          python-version: "3.13"
+
+      # PYO3_PYTHON goes to every later step, so none of them builds against another
+      # Python. ImageOS (ubuntu26 and the like) goes into the cache key with the
+      # Python version: a target directory is only reused on the image and Python
+      # it was built with. An image's weekly updates keep the same key.
+      - name: Point pyo3 at that Python
+        id: env
+        run: |
+          echo "PYO3_PYTHON=${{ steps.python.outputs.python-path }}" >> "$GITHUB_ENV"
+          echo "image=$ImageOS" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust
         # Pinned rather than `stable`. 1.88.0 is the real floor, set by the
@@ -119,8 +143,8 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
+          key: cargo-${{ steps.env.outputs.image }}-py${{ steps.python.outputs.python-version }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-${{ steps.env.outputs.image }}-py${{ steps.python.outputs.python-version }}-
 
       - name: Check (all targets, including tests and benches)
         run: cargo check --workspace --all-targets --locked
@@ -231,7 +255,7 @@ jobs:
 
   oracles:
     name: detection regression
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # ambulo's daemon mode talks to postgres, so the ambulo cases need one. Without
     # it they failed on every run with "Cannot read toolchain config", and
     # because CI only triggers on main they had never run at all: they were
@@ -270,6 +294,10 @@ jobs:
           rustup toolchain install 1.88.0 --profile minimal --no-self-update
           rustup default 1.88.0
 
+      - name: Name the image for the cache key
+        id: env
+        run: echo "image=$ImageOS" >> "$GITHUB_OUTPUT"
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -278,8 +306,8 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: oracles-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: oracles-${{ runner.os }}-
+          key: oracles-${{ steps.env.outputs.image }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: oracles-${{ steps.env.outputs.image }}-
 
       - name: Build the engines under test
         run: cargo build --locked -p plessor -p ambulo
@@ -301,7 +329,7 @@ jobs:
           TOML
 
       - name: Run the oracle cases
-        # The headless case needs a browser. ubuntu-latest ships Chrome, and the
+        # The headless case needs a browser. The runner image ships Chrome, and the
         # runner skips that case LOUDLY rather than passing quietly if it is ever
         # absent, which is the same rule the engine follows.
         #
@@ -319,7 +347,7 @@ jobs:
 
   fmt:
     name: rustfmt
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Required. This is green as of the workspace-wide rustfmt pass, and it also
     # guards the fix that made `cargo fmt` work on a public checkout at all: the
     # egress module used to declare two cfg-gated `mod imp;` arms, and rustfmt
@@ -336,7 +364,7 @@ jobs:
 
   clippy:
     name: clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Required as of the clippy cleanup: the workspace is at zero warnings, and
     # `-D warnings` keeps it there. Every remaining `#[allow(...)]` in the tree
     # carries a comment saying why, so a future warning means new code, not
@@ -349,6 +377,19 @@ jobs:
           rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy --no-self-update
           rustup default 1.88.0
 
+      # As in the build job: cfx-script's pyo3 is checked against a named Python, and
+      # the cache follows the image and that Python.
+      - uses: actions/setup-python@v5
+        id: python
+        with:
+          python-version: "3.13"
+
+      - name: Point pyo3 at that Python
+        id: env
+        run: |
+          echo "PYO3_PYTHON=${{ steps.python.outputs.python-path }}" >> "$GITHUB_ENV"
+          echo "image=$ImageOS" >> "$GITHUB_OUTPUT"
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -357,8 +398,8 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: lint-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: lint-${{ runner.os }}-
+          key: lint-${{ steps.env.outputs.image }}-py${{ steps.python.outputs.python-version }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: lint-${{ steps.env.outputs.image }}-py${{ steps.python.outputs.python-version }}-
 
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -457,7 +498,7 @@ jobs:
 
   audit:
     name: dependency advisories
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # The engines parse untrusted input from scan targets, so a DoS-class
     # advisory in a DNS or QUIC parser matters more here than its CVSS suggests.
     #
