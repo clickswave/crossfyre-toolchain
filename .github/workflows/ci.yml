@@ -502,7 +502,7 @@ jobs:
     # The engines parse untrusted input from scan targets, so a DoS-class
     # advisory in a DNS or QUIC parser matters more here than its CVSS suggests.
     #
-    # With the two ignores below this is currently CLEAN, so it is enforced on
+    # With the ignores below this is currently CLEAN, so it is enforced on
     # the daily schedule and left non-blocking on push/PR. That split is
     # deliberate: an advisory published upstream overnight would otherwise turn
     # an unrelated pull request red, and the reflex when that happens is to add
@@ -513,9 +513,22 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
+      # The ignore of RUSTSEC-2026-0459 below holds only while no build compiles
+      # libsqlite3-sys. cargo tree prints nothing for a crate that is in the lock
+      # file and outside the build graph, here with every feature on every target.
+      - name: libsqlite3-sys stays out of every build
+        run: |
+          set -eu
+          tree=$(cargo tree --locked --workspace --all-features --target all \
+            -e normal,build -i libsqlite3-sys)
+          if [ -n "$tree" ]; then
+            echo "$tree"
+            echo "::error::libsqlite3-sys is now compiled; upgrade it and drop the ignore of RUSTSEC-2026-0459"
+            exit 1
+          fi
       # Ignored by ID, with the reasoning recorded so it can be re-checked
       # rather than inherited on faith. Re-examine each whenever rsa,
-      # rustls-pemfile or boring2 move.
+      # rustls-pemfile or sqlx move.
       #
       #   RUSTSEC-2023-0071  rsa: Marvin timing sidechannel in RSA decryption.
       #     Open since 2023; the fix needs modular exponentiation reworked
@@ -539,20 +552,20 @@ jobs:
       #     not a vulnerability, on a crate reached via axum-server and
       #     rustls-native-certs.
       #
-      #   RUSTSEC-2026-0391, RUSTSEC-2026-0398, RUSTSEC-2026-0403  zstd 0.13 and
-      #     zstd-safe 7. Everything of ours is on the patched zstd 0.14.3 and
-      #     zstd-safe 8.2.0; the old pair is left only by boring2 4.15.15 (the
-      #     impersonate build), whose last stable release still asks for 0.13.
-      #     boring2 calls nothing but zstd::encode_all and zstd::decode_all, for
-      #     TLS certificate compression. 0391 is in the with_context
-      #     constructors, which those never use; 0398 is in the seekable
-      #     feature, which nothing enables; 0403 is in DCtx::decompress_stream,
-      #     and the advisory names decode_all as unaffected. Drop all three once
-      #     boring2 moves to zstd 0.14.
+      #   RUSTSEC-2026-0459  libsqlite3-sys 0.30.1 bundles a SQLite with
+      #     CVE-2026-119375, fixed in 0.39. It is in Cargo.lock and in no build.
+      #     sqlx 0.8 names sqlx-sqlite in weak features ("sqlx-sqlite?/chrono"),
+      #     and Cargo writes an optional dependency named that way into the lock
+      #     file even when nothing enables it. ambulo, voyage and doorward turn on
+      #     sqlx's postgres feature and not sqlite, so libsqlite3-sys is never
+      #     compiled; the step above fails if that changes. No sqlx release can
+      #     take the fix (0.8.6 asks for ^0.30.1, 0.9.0 for below 0.38), and
+      #     cargo update cannot remove it. Drop this once an sqlx release allows
+      #     0.39 and we move to it, and upgrade rather than ignore if anything
+      #     starts building SQLite.
       #
       # Everything else must stay visible and get fixed.
       - name: Audit
         run: >-
           cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2025-0134
-          --ignore RUSTSEC-2026-0391 --ignore RUSTSEC-2026-0398
-          --ignore RUSTSEC-2026-0403
+          --ignore RUSTSEC-2026-0459
