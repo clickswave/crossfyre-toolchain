@@ -127,21 +127,45 @@ data class Pairing(val apiUrl: String, val workflowId: String, val token: String
 }
 
 /**
- * The device's own answer to full capture.
+ * The device's own answer to full requests, for one pairing.
  *
  * The control plane can ask for full capture (headers and bodies rather than
- * request shape); this is the only thing that grants it. Kept separate from the
- * pairing so that re-pairing cannot quietly carry consent with it, and default
- * false so the app's stated privacy behaviour is what actually happens.
+ * request shape) and for each request to be held for a decision; this is the
+ * only thing that grants either. A yes is kept with the pairing it was given
+ * for, the server and the session, and is not a yes for any other. It used to
+ * be one switch for the whole phone, so turning it on for your own workspace
+ * and later pairing with somebody else's server by QR gave that server full
+ * requests as well. Off by default, so the app's stated privacy behaviour is
+ * what actually happens.
+ *
+ * A yes kept before it was tied to a pairing is not read. It was given on a
+ * consent sheet that did not mention holding requests, so it is asked again.
  */
 object FullCapturePrefs {
     private const val PREFS = "capture"
+    /** The pairing the yes was given for, as [keyOf] writes it. */
+    private const val GIVEN_FOR = "allow_full_for"
+    /** The yes from before it was tied to a pairing. */
+    private const val UNTIED = "allow_full"
 
-    fun allowed(ctx: Context): Boolean =
-        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean("allow_full", false)
+    /** What a yes is kept against. Pairing again renews the token, not the session, so it keeps the yes. */
+    fun keyOf(p: Pairing): String = "${p.apiUrl}\n${p.workflowId}"
 
-    fun set(ctx: Context, allow: Boolean) {
-        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean("allow_full", allow).apply()
+    /** Whether a yes given for [givenFor] covers [pairing]. */
+    fun covers(givenFor: String?, pairing: Pairing?): Boolean =
+        givenFor != null && pairing != null && givenFor == keyOf(pairing)
+
+    /** The pairing the yes was given for, or null when there is none. */
+    fun givenFor(ctx: Context): String? =
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(GIVEN_FOR, null)
+
+    fun allowed(ctx: Context, pairing: Pairing?): Boolean = covers(givenFor(ctx), pairing)
+
+    /** Allow full requests for [pairing], or take the yes back. */
+    fun set(ctx: Context, pairing: Pairing?, allow: Boolean) {
+        val e = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(UNTIED)
+        if (allow && pairing != null) e.putString(GIVEN_FOR, keyOf(pairing)) else e.remove(GIVEN_FOR)
+        e.apply()
     }
 }
 

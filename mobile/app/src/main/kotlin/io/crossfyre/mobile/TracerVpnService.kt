@@ -126,8 +126,9 @@ class TracerVpnService : VpnService() {
             return
         }
         tun = pfd
-        // Device-side consent for full capture. The server can ask; only this grants.
-        val allowFull = FullCapturePrefs.allowed(this)
+        // Device-side consent for full capture. The server can ask; only this grants,
+        // and only for the pairing it was given for.
+        val allowFull = FullCapturePrefs.allowed(this, pair)
         Pairing.markRefused(this, false)
         val ok = Native.startCapture(pfd.fd, pair.apiUrl, pair.workflowId, pair.token, allowFull)
         startedAt = System.currentTimeMillis()

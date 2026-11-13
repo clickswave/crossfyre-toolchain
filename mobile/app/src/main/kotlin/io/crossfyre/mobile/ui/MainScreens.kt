@@ -303,7 +303,7 @@ fun TracerContent(m: AppModel) {
         )
         CfxRow(
             title = "Send full requests", icon = R.drawable.ic_cloud_arrow_up,
-            sub = if (m.fullCapture) "On: headers and bodies go too, credentials included, when the session in the dashboard asks for them."
+            sub = if (m.fullCapture) "On for this pairing: headers and bodies go too, credentials included, and requests can be held for review, when the session in the dashboard asks."
             else "Off: only the shape of each request leaves the phone. Values, headers and bodies stay here.",
             note = if (locked) "Stop capture to change this." else null,
             trailing = { CfxSwitch(m.fullCapture, enabled = !locked, label = "Send full requests") { m.toggleFull() } },

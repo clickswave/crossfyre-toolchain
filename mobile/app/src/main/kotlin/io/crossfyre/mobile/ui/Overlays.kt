@@ -204,7 +204,7 @@ fun BoxScope.Overlays(m: AppModel) {
                 style = T.body(),
             )
             Text("With it on, the session can also hold each request until someone in the workspace sends it on or drops it, and they can change it before it goes.", style = T.body())
-            Text("The workspace can ask for full requests. Only this switch grants them, and it stays off until you turn it on here.", style = T.body())
+            Text("The workspace can ask for full requests. Only this switch grants them, and it stays off until you turn it on here. It covers this pairing only, and any other session gets nothing until you turn it on there.", style = T.body())
             Authz()
         }
 
@@ -302,6 +302,9 @@ fun BoxScope.Overlays(m: AppModel) {
                     if (m.patch.available) " Pairing also lets this server supply the app builds you install from the Patch tab." else "",
                 style = T.hint(),
             )
+            if (m.fullCapture && !m.fullCaptureCovers(o.pairing)) {
+                Text("Send full requests is on for the current pairing. It will be off for this one until you turn it on for it.", style = T.hint())
+            }
         }
 
         Overlay.PairInvalid -> CfxDialog(

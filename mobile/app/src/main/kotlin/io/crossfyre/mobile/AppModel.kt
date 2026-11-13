@@ -456,6 +456,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
             wsBusy = false
             when (r) {
                 is Outcome.Ok -> {
+                    val fullWasOn = fullCapture
                     Pairing.persist(ctx, r.value.pairing)
                     pairing = r.value.pairing
                     store.pairedFromAccount = true
@@ -470,7 +471,8 @@ class AppModel(app: Application) : AndroidViewModel(app) {
                     route = Route.MAIN
                     tab = "home"
                     push = null
-                    say("Paired with ${chosen.name}")
+                    // A yes to full requests is for one session, and this may be another.
+                    say(if (fullWasOn && !fullCapture) "Paired with ${chosen.name}. Send full requests is off for it." else "Paired with ${chosen.name}")
                 }
                 is Outcome.Failed -> {
                     if (r.problem == Problem.SignedOut) return@launch signedOut()
@@ -672,8 +674,13 @@ class AppModel(app: Application) : AndroidViewModel(app) {
     val scopeApps = mutableStateListOf<String>()
     val scope: Scope get() = Scope(scopeMode, scopeApps.toList())
     var scopeQuery by mutableStateOf("")
-    var fullCapture by mutableStateOf(FullCapturePrefs.allowed(app))
-        private set
+    /** The pairing the device's yes to full requests was given for (see [FullCapturePrefs]). */
+    private var fullGivenFor by mutableStateOf(FullCapturePrefs.givenFor(app))
+    /** Full requests are allowed for the pairing in use. A yes given for another pairing is not one. */
+    val fullCapture: Boolean get() = FullCapturePrefs.covers(fullGivenFor, pairing)
+
+    /** Whether the yes to full requests, if there is one, would carry over to [p]. */
+    fun fullCaptureCovers(p: Pairing): Boolean = FullCapturePrefs.covers(fullGivenFor, p)
     private var preflightAcknowledged = false
 
     private fun boot() {
@@ -754,16 +761,17 @@ class AppModel(app: Application) : AndroidViewModel(app) {
         when {
             phase != Phase.IDLE -> say("Stop capture to change this.", R.drawable.ic_info)
             fullCapture -> {
-                fullCapture = false
-                FullCapturePrefs.set(ctx, false)
+                FullCapturePrefs.set(ctx, pairing, false)
+                fullGivenFor = null
             }
             else -> overlay = Overlay.FullConsent
         }
     }
 
     fun allowFull() {
-        fullCapture = true
-        FullCapturePrefs.set(ctx, true)
+        val p = pairing
+        FullCapturePrefs.set(ctx, p, true)
+        fullGivenFor = p?.let(FullCapturePrefs::keyOf)
         overlay = null
     }
 

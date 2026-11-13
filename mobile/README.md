@@ -31,7 +31,8 @@ prompt appears.
   header values and bodies stay on the phone unless you turn on
   **Send full requests**, which asks first and stays off until you do. With it
   on, a session can also hold each request until someone in the workspace sends
-  it on, changed or not, or drops it.
+  it on, changed or not, or drops it. The switch covers the pairing it was
+  turned on for and no other session.
 - **You choose the scope.** Scope starts as the whole phone. Narrow it to
   chosen apps, or exclude some, before starting. The app never captures itself.
 - **It says when it is running.** A notification with a Stop button shows for
