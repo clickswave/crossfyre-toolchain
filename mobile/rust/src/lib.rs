@@ -209,7 +209,7 @@ pub extern "system" fn Java_io_crossfyre_mobile_Native_startCapture<'local>(
     let device_allows_full = allow_full_capture != 0;
     rt.spawn(async move {
         // Ask the control plane whether this session wants full capture / manual interception, then
-        // build the capture config (a gate is installed only in manual mode).
+        // build the capture config from that and this device's own answer (see `capture_cfg`).
         let http = reqwest::Client::new();
         let session_cfg = intercept::fetch_capture_config(
             &http,
@@ -219,57 +219,14 @@ pub extern "system" fn Java_io_crossfyre_mobile_Native_startCapture<'local>(
             device_allows_full,
         )
         .await;
-        let (server_full, mode) = (session_cfg.full_capture, session_cfg.intercept_mode.clone());
-        // The server may REQUEST full capture; the device decides. Previously the
-        // response alone flipped this on, so a control plane (including one
-        // reached by scanning someone else's QR) could turn shape-only capture
-        // into full headers and bodies, while the app's own screen told the user
-        // that bodies and secrets never leave the device.
-        let full = server_full && device_allows_full;
-        if server_full && !device_allows_full {
-            log::info!("capture config: server asked for full capture; device has not allowed it");
-        }
-        log::info!("capture config: full={full} intercept_mode={mode}");
-        let gate: Option<Arc<dyn cfx_capture::InterceptGate>> = if mode == "manual" {
-            Some(Arc::new(intercept::HttpGate {
-                client: http,
-                api_url: cfg_api,
-                workflow_id: cfg_wf,
-                token: cfg_token,
-            }))
-        } else {
-            None
-        };
-        if !session_cfg.bypass_hosts.is_empty() {
-            log::info!(
-                "bypassing {} host(s) without interception: {}",
-                session_cfg.bypass_hosts.len(),
-                session_cfg.bypass_hosts.join(", ")
-            );
-        }
-        let capture_cfg = cfx_capture::CaptureCfg {
-            full,
-            gate,
-            bypass_hosts: session_cfg.bypass_hosts,
-            // No local store on the phone yet. Captured exchanges go to the control plane
-            // through `tx`, which is what the mobile app has always done.
-            sink: None,
-            // The phone has no project settings to carry this, and an app that silently
-            // accepted any origin certificate would be a worse trade here than on a
-            // desktop: the operator is not the only person using the handset.
-            trust_any_upstream_cert: false,
-            // None. A client certificate belongs to a project and the mobile app has none
-            // yet, which is the same reason the scope below is unrestricted.
-            client_identity: None,
-            // Straight out, which is what the phone has always done. An upstream proxy is
-            // a desktop answer to a corporate network; a handset on one reaches the
-            // internet through its carrier instead.
-            egress: cfx_capture::Egress::Direct,
-            // Unrestricted, which is what the phone has always been. The scope belongs to
-            // a project and the mobile app has none yet; when it gets one this becomes the
-            // guard that project owns, not a second list to keep in step.
-            scope: None,
-        };
+        let capture_cfg = capture_cfg(
+            session_cfg,
+            device_allows_full,
+            http,
+            cfg_api,
+            cfg_wf,
+            cfg_token,
+        );
         if let Err(e) = netstack::run(tun_fd, ca, egress, tx, capture_cfg).await {
             log::error!("netstack ended: {e}");
         }
@@ -279,6 +236,89 @@ pub extern "system" fn Java_io_crossfyre_mobile_Native_startCapture<'local>(
     *slot = Some(rt);
     log::info!("startCapture: capture running on tun fd {tun_fd}");
     1
+}
+
+/// How one capture runs: what the session asked for, cut down to what this device allows.
+///
+/// The control plane's answer is a request. Anything that sends more than the shape of a
+/// request off the phone also needs the device's own "Send full requests", and this is the
+/// one place that answer is applied, so a setting added later is added next to the check.
+fn capture_cfg(
+    session: cfx_capture::CaptureConfig,
+    device_allows_full: bool,
+    http: reqwest::Client,
+    api_url: String,
+    workflow_id: String,
+    token: String,
+) -> cfx_capture::CaptureCfg {
+    // The server may REQUEST full capture; the device decides. Previously the
+    // response alone flipped this on, so a control plane (including one
+    // reached by scanning someone else's QR) could turn shape-only capture
+    // into full headers and bodies, while the app's own screen told the user
+    // that bodies and secrets never leave the device.
+    let full = session.full_capture && device_allows_full;
+    if session.full_capture && !device_allows_full {
+        log::info!("capture config: server asked for full capture; device has not allowed it");
+    }
+    // Holding a request for a decision sends all of it, the query values, every header
+    // value and the body, because that is what someone in the dashboard reads before
+    // sending it on. The answer can come back edited, and the phone then sends the edit
+    // with the app's own cookies. So it takes the same yes as full capture. Until now the
+    // server asking was enough, so a session set to Manual held and could rewrite the
+    // requests of a phone that had full requests off.
+    let holds = session.is_manual() && device_allows_full;
+    if session.is_manual() && !device_allows_full {
+        log::info!(
+            "capture config: server asked to hold requests; device has not allowed full requests"
+        );
+    }
+    log::info!(
+        "capture config: full={full} intercept_mode={} holding={holds}",
+        session.intercept_mode
+    );
+    let gate: Option<Arc<dyn cfx_capture::InterceptGate>> = if holds {
+        // Shown on the phone while capture runs. An app waiting on someone in the
+        // dashboard otherwise just looks broken.
+        stats::HOLDING.store(1, std::sync::atomic::Ordering::Relaxed);
+        Some(Arc::new(intercept::HttpGate {
+            client: http,
+            api_url,
+            workflow_id,
+            token,
+        }))
+    } else {
+        None
+    };
+    if !session.bypass_hosts.is_empty() {
+        log::info!(
+            "bypassing {} host(s) without interception: {}",
+            session.bypass_hosts.len(),
+            session.bypass_hosts.join(", ")
+        );
+    }
+    cfx_capture::CaptureCfg {
+        full,
+        gate,
+        bypass_hosts: session.bypass_hosts,
+        // No local store on the phone yet. Captured exchanges go to the control plane
+        // through `tx`, which is what the mobile app has always done.
+        sink: None,
+        // The phone has no project settings to carry this, and an app that silently
+        // accepted any origin certificate would be a worse trade here than on a
+        // desktop: the operator is not the only person using the handset.
+        trust_any_upstream_cert: false,
+        // None. A client certificate belongs to a project and the mobile app has none
+        // yet, which is the same reason the scope below is unrestricted.
+        client_identity: None,
+        // Straight out, which is what the phone has always done. An upstream proxy is
+        // a desktop answer to a corporate network; a handset on one reaches the
+        // internet through its carrier instead.
+        egress: cfx_capture::Egress::Direct,
+        // Unrestricted, which is what the phone has always been. The scope belongs to
+        // a project and the mobile app has none yet; when it gets one this becomes the
+        // guard that project owns, not a second list to keep in step.
+        scope: None,
+    }
 }
 
 /// Stop capturing. Idempotent, and returns at once.
@@ -438,5 +478,236 @@ mod tests {
                 "{export} names a class other than {package}.Native, so nothing can call it"
             );
         }
+    }
+}
+
+/// What the control plane can make the phone do, set against what the device allowed.
+///
+/// A capture runs here end to end except for the tunnel: the config comes from a stand-in
+/// control plane, the capture is set up by the function `startCapture` uses, and an app's
+/// request goes through `cfx_capture::serve_mitm_flow` to a loopback origin, the way the
+/// netstack hands over a flow.
+#[cfg(test)]
+mod consent {
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// One request as a stand-in server read it.
+    struct Seen {
+        head: String,
+        body: Vec<u8>,
+    }
+
+    impl Seen {
+        fn line(&self) -> &str {
+            self.head.lines().next().unwrap_or("")
+        }
+    }
+
+    async fn read_request(s: &mut TcpStream) -> Option<Seen> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let body_at = loop {
+            let k = s.read(&mut chunk).await.ok()?;
+            if k == 0 {
+                return None;
+            }
+            buf.extend_from_slice(&chunk[..k]);
+            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..body_at]).to_string();
+        let lower = head.to_ascii_lowercase();
+        let len: usize = lower
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
+        while buf.len() < body_at + len {
+            let k = s.read(&mut chunk).await.ok()?;
+            if k == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..k]);
+        }
+        Some(Seen {
+            head,
+            body: buf[body_at..].to_vec(),
+        })
+    }
+
+    /// A server that answers each request with `answer` and keeps what it was sent.
+    async fn serve(answer: fn(&Seen) -> &'static str) -> (SocketAddr, Arc<Mutex<Vec<Seen>>>) {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = l.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                let kept = Arc::clone(&kept);
+                tokio::spawn(async move {
+                    let Some(req) = read_request(&mut s).await else {
+                        return;
+                    };
+                    let body = answer(&req);
+                    kept.lock().unwrap().push(req);
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = s.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        (at, seen)
+    }
+
+    /// A control plane whose session asks for full capture and manual interception, and
+    /// sends every held request back edited, to another path with another body.
+    fn control_plane(req: &Seen) -> &'static str {
+        match req.line().split_whitespace().nth(1).unwrap_or("") {
+            "/api/v1/web-trace/config" => {
+                r#"{"status":200,"message":"ok","errors":[],"data":{"full_capture":true,"intercept_mode":"manual"}}"#
+            }
+            "/api/v1/web-trace/intercept-hold" => {
+                r#"{"status":200,"message":"ok","errors":[],"data":{"intercept_id":7}}"#
+            }
+            "/api/v1/web-trace/intercept-poll" => {
+                r#"{"status":200,"message":"ok","errors":[],"data":{"decision":"forward","modified":true,"method":"POST","path":"/elsewhere","req_headers":[["host","origin.test"]],"req_body":"to=someone-else"}}"#
+            }
+            _ => r#"{"status":404,"message":"no such route","errors":[],"data":null}"#,
+        }
+    }
+
+    fn origin(_: &Seen) -> &'static str {
+        r#"{"ok":true}"#
+    }
+
+    /// One app request, carrying a cookie, a bearer token, a query value and a body, through a
+    /// capture set up as `startCapture` sets it up. Returns what the control plane was sent,
+    /// what the origin was sent, and what the app got back.
+    async fn one_request(device_allows_full: bool) -> (Vec<Seen>, Vec<Seen>, String) {
+        crate::install_crypto_provider();
+        let (control_at, control) = serve(control_plane).await;
+        let (origin_at, reached) = serve(origin).await;
+        let api_url = format!("http://{control_at}");
+        let http = reqwest::Client::new();
+        let session = crate::intercept::fetch_capture_config(
+            &http,
+            &api_url,
+            "wf-1",
+            "cfxt_test",
+            device_allows_full,
+        )
+        .await;
+        assert!(session.is_manual(), "{session:?}");
+        let cfg = crate::capture_cfg(
+            session,
+            device_allows_full,
+            http,
+            api_url,
+            "wf-1".into(),
+            "cfxt_test".into(),
+        );
+        let ca = Arc::new(cfx_capture::generate_ca().unwrap());
+        let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
+        let (mut app, flow) = tokio::io::duplex(64 * 1024);
+        let served = tokio::spawn(cfx_capture::serve_mitm_flow(
+            flow,
+            "127.0.0.1".into(),
+            origin_at.port(),
+            ca,
+            cfx_capture::Egress::Direct,
+            tx,
+            cfg,
+        ));
+        let body = "amount=100&pin=SECRET-PIN";
+        let request = format!(
+            "POST /transfer?token=SECRET-QUERY HTTP/1.1\r\nHost: {origin_at}\r\n\
+             Cookie: sid=SECRET-COOKIE\r\nAuthorization: Bearer SECRET-TOKEN\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        );
+        app.write_all(request.as_bytes()).await.unwrap();
+        let mut answer = Vec::new();
+        tokio::time::timeout(Duration::from_secs(20), app.read_to_end(&mut answer))
+            .await
+            .expect("the app got no answer")
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), served).await;
+        let control = std::mem::take(&mut *control.lock().unwrap());
+        let reached = std::mem::take(&mut *reached.lock().unwrap());
+        let answer = String::from_utf8_lossy(&answer).into_owned();
+        (control, reached, answer)
+    }
+
+    fn holding() -> serde_json::Value {
+        let s: serde_json::Value = serde_json::from_str(&crate::stats::snapshot_json()).unwrap();
+        s["holding"].clone()
+    }
+
+    // The counters are process globals, so these hold the lock every test that touches them
+    // holds. The runtime is each test's own, so nothing else on it waits for the lock.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn with_full_requests_off_nothing_is_held_and_nothing_is_edited() {
+        let _held = crate::stats::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::stats::reset();
+        let (control, reached, answer) = one_request(false).await;
+
+        // Asking for the config is all the phone sent the control plane, and that carried
+        // no value from the app's request.
+        let sent: Vec<&str> = control.iter().map(Seen::line).collect();
+        assert_eq!(sent, ["POST /api/v1/web-trace/config HTTP/1.1"]);
+        for r in &control {
+            let text = format!("{}{}", r.head, String::from_utf8_lossy(&r.body));
+            assert!(!text.contains("SECRET"), "a value left the phone: {text}");
+        }
+        // The origin got the request the app sent, not an edit made in the dashboard.
+        assert_eq!(reached.len(), 1);
+        assert_eq!(
+            reached[0].line(),
+            "POST /transfer?token=SECRET-QUERY HTTP/1.1"
+        );
+        assert_eq!(reached[0].body, b"amount=100&pin=SECRET-PIN");
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert_eq!(holding(), false);
+        crate::stats::reset();
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn with_full_requests_on_a_manual_session_holds_and_may_edit() {
+        let _held = crate::stats::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::stats::reset();
+        let (control, reached, answer) = one_request(true).await;
+
+        let hold = control
+            .iter()
+            .find(|r| r.line() == "POST /api/v1/web-trace/intercept-hold HTTP/1.1")
+            .expect("nothing was held");
+        let held = String::from_utf8_lossy(&hold.body);
+        assert!(
+            held.contains("SECRET-COOKIE") && held.contains("SECRET-PIN"),
+            "{held}"
+        );
+        // Sent on as edited in the dashboard, which this device's yes allows.
+        assert_eq!(reached.len(), 1);
+        assert_eq!(reached[0].line(), "POST /elsewhere HTTP/1.1");
+        assert_eq!(reached[0].body, b"to=someone-else");
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert_eq!(holding(), true);
+        crate::stats::reset();
     }
 }

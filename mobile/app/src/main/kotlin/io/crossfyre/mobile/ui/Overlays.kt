@@ -203,6 +203,7 @@ fun BoxScope.Overlays(m: AppModel) {
                 marked("Headers and bodies will go to **${m.destination}** on ${m.pairingHost}, as well as the shape of each request. That includes whatever the apps send: passwords, session tokens, cookies and personal data."),
                 style = T.body(),
             )
+            Text("With it on, the session can also hold each request until someone in the workspace sends it on or drops it, and they can change it before it goes.", style = T.body())
             Text("The workspace can ask for full requests. Only this switch grants them, and it stays off until you turn it on here.", style = T.body())
             Authz()
         }

@@ -162,6 +162,12 @@ fun CaptureCard(m: AppModel, tracer: Boolean) {
         if (phase == Phase.CAPTURING && m.fullCapture) {
             Banner(Level.DANGER, "Full requests are on.", "Headers and bodies, credentials included, are being sent to ${m.destination}.")
         }
+        if (phase == Phase.CAPTURING && m.stats?.holding == true) {
+            Banner(
+                Level.WARN, "Requests wait for the dashboard.",
+                "Each request is held until someone in ${m.destination} sends it on or drops it, and they can change it before it goes. After about two minutes without a decision it goes on unchanged.",
+            )
+        }
         when {
             phase == Phase.STARTING || m.renewing ->
                 CfxButton("Starting…", Kind.SECONDARY, block = true, busy = true, enabled = false) {}

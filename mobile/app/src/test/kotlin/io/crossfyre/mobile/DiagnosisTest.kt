@@ -84,6 +84,14 @@ class DiagnosisTest {
     }
 
     @Test
+    fun the_core_says_when_requests_wait_for_the_dashboard() {
+        assertTrue(Stats.parse("""{"flows":2,"events":1,"holding":true}""").holding)
+        assertFalse(Stats.parse("""{"holding":false}""").holding)
+        // A core from before it said so reads as not holding.
+        assertFalse(Stats.parse("{}").holding)
+    }
+
+    @Test
     fun a_healthy_capture_offers_the_dashboard() {
         val d = diagnose(true, stats(events = 3, sent = 3), false, false, patching = false, renewable = true)!!
         assertEquals(Level.OK, d.level)

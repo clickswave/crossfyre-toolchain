@@ -32,6 +32,7 @@ counters!(
     INGEST_FAILED,   // ingest POST could not be delivered (network/TLS)
     QUIC_DROPPED,    // HTTP/3 flows blackholed to force TCP fallback (invisible traffic)
     TOKEN_REFUSED,   // 1 once the server turned the session's token away: nothing more is sent
+    HOLDING,         // 1 when each request waits for a decision in the dashboard before it goes on
 );
 
 fn last_event() -> &'static Mutex<String> {
@@ -122,6 +123,7 @@ pub fn snapshot_json() -> String {
         "ingest_failed": g(&INGEST_FAILED),
         "quic_dropped": g(&QUIC_DROPPED),
         "token_refused": g(&TOKEN_REFUSED) > 0,
+        "holding": g(&HOLDING) > 0,
         "last_event": le,
         "last_error": lerr,
     })

@@ -17,6 +17,8 @@ internal data class Stats(
     val quicDropped: Long,
     val lastEvent: String, val lastError: String,
     val tokenRefused: Boolean = false,
+    /** Each request waits for a decision in the dashboard before it goes on. */
+    val holding: Boolean = false,
 ) {
     /** Requests were captured and none of them could be delivered. */
     val notSent: Boolean get() = events > 0 && ingestSent == 0L && (ingestRejected > 0 || ingestFailed > 0)
@@ -30,6 +32,7 @@ internal data class Stats(
                 o.optLong("quic_dropped"),
                 o.optString("last_event"), o.optString("last_error"),
                 o.optBoolean("token_refused", false),
+                o.optBoolean("holding", false),
             )
         }
     }

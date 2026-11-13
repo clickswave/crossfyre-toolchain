@@ -1,7 +1,8 @@
-//! Full-capture config fetch + the manual-interception gate. In manual mode the tracer parks each
-//! request with the control plane (`intercept-hold`) and blocks until a human forwards or drops it
-//! (`intercept-poll`), so the browser/app request does not proceed until approved. Fail-open: any
-//! control-plane error or a long wait defaults to Forward so the user's traffic is never wedged.
+//! Full-capture config fetch + the manual-interception gate. In manual mode, on a device that allows
+//! full requests, the tracer parks each request with the control plane (`intercept-hold`) and blocks
+//! until a human forwards or drops it (`intercept-poll`), so the browser/app request does not
+//! proceed until approved. Fail-open: any control-plane error or a long wait defaults to Forward so
+//! the user's traffic is never wedged.
 
 use std::pin::Pin;
 use std::time::Duration;
@@ -98,6 +99,10 @@ fn edited_from(d: &serde_json::Value) -> EditedRequest {
     }
 }
 
+/// Parks each request with the control plane and sends on whatever is decided there.
+///
+/// It sends the whole request, values included, and may be told to send an edited one, so it
+/// is installed only when the device allows full requests (`capture_cfg` in lib.rs).
 pub struct HttpGate {
     pub client: reqwest::Client,
     pub api_url: String,
