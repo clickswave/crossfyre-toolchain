@@ -285,6 +285,7 @@ fn capture_cfg(
             api_url,
             workflow_id,
             token,
+            wait: intercept::WAIT,
         }))
     } else {
         None
@@ -541,6 +542,9 @@ mod consent {
         })
     }
 
+    /// What a stand-in answers to read a request and never reply.
+    const HANG: &str = "HANG";
+
     /// A server that answers each request with `answer` and keeps what it was sent.
     async fn serve(answer: fn(&Seen) -> &'static str) -> (SocketAddr, Arc<Mutex<Vec<Seen>>>) {
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -556,6 +560,10 @@ mod consent {
                     };
                     let body = answer(&req);
                     kept.lock().unwrap().push(req);
+                    if body == HANG {
+                        // A control plane that took the request and went quiet.
+                        std::future::pending::<()>().await;
+                    }
                     let reply = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
                          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -585,14 +593,41 @@ mod consent {
         }
     }
 
+    /// A control plane whose session asks for full capture and runs in auto, and that would
+    /// hold and edit whatever it is sent to hold.
+    fn auto_control_plane(req: &Seen) -> &'static str {
+        match req.line().split_whitespace().nth(1).unwrap_or("") {
+            "/api/v1/web-trace/config" => {
+                r#"{"status":200,"message":"ok","errors":[],"data":{"full_capture":true,"intercept_mode":"auto"}}"#
+            }
+            _ => control_plane(req),
+        }
+    }
+
+    /// A control plane that takes a hold and then never answers a poll.
+    fn silent_control_plane(req: &Seen) -> &'static str {
+        match req.line().split_whitespace().nth(1).unwrap_or("") {
+            "/api/v1/web-trace/intercept-poll" => HANG,
+            _ => control_plane(req),
+        }
+    }
+
     fn origin(_: &Seen) -> &'static str {
         r#"{"ok":true}"#
+    }
+
+    /// The JSON body of a request a stand-in kept.
+    fn body_json(r: &Seen) -> serde_json::Value {
+        serde_json::from_slice(&r.body).unwrap_or_default()
     }
 
     /// One app request, carrying a cookie, a bearer token, a query value and a body, through a
     /// capture set up as `startCapture` sets it up. Returns what the control plane was sent,
     /// what the origin was sent, and what the app got back.
-    async fn one_request(device_allows_full: bool) -> (Vec<Seen>, Vec<Seen>, String) {
+    async fn one_request(
+        device_allows_full: bool,
+        control_plane: fn(&Seen) -> &'static str,
+    ) -> (Vec<Seen>, Vec<Seen>, String) {
         crate::install_crypto_provider();
         let (control_at, control) = serve(control_plane).await;
         let (origin_at, reached) = serve(origin).await;
@@ -606,7 +641,6 @@ mod consent {
             device_allows_full,
         )
         .await;
-        assert!(session.is_manual(), "{session:?}");
         let cfg = crate::capture_cfg(
             session,
             device_allows_full,
@@ -662,12 +696,16 @@ mod consent {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         crate::stats::reset();
-        let (control, reached, answer) = one_request(false).await;
+        let (control, reached, answer) = one_request(false, control_plane).await;
 
         // Asking for the config is all the phone sent the control plane, and that carried
         // no value from the app's request.
         let sent: Vec<&str> = control.iter().map(Seen::line).collect();
         assert_eq!(sent, ["POST /api/v1/web-trace/config HTTP/1.1"]);
+        // And it said that this device allows neither.
+        let asked = body_json(&control[0]);
+        assert_eq!(asked["device_full_capture"], false, "{asked}");
+        assert_eq!(asked["device_allows_hold"], false, "{asked}");
         for r in &control {
             let text = format!("{}{}", r.head, String::from_utf8_lossy(&r.body));
             assert!(!text.contains("SECRET"), "a value left the phone: {text}");
@@ -691,8 +729,10 @@ mod consent {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         crate::stats::reset();
-        let (control, reached, answer) = one_request(true).await;
+        let (control, reached, answer) = one_request(true, control_plane).await;
 
+        let asked = body_json(&control[0]);
+        assert_eq!(asked["device_allows_hold"], true, "{asked}");
         let hold = control
             .iter()
             .find(|r| r.line() == "POST /api/v1/web-trace/intercept-hold HTTP/1.1")
@@ -702,6 +742,8 @@ mod consent {
             held.contains("SECRET-COOKIE") && held.contains("SECRET-PIN"),
             "{held}"
         );
+        // The control plane stores a hold only when the hold itself carries the device's yes.
+        assert_eq!(body_json(hold)["device_allows_hold"], true, "{held}");
         // Sent on as edited in the dashboard, which this device's yes allows.
         assert_eq!(reached.len(), 1);
         assert_eq!(reached[0].line(), "POST /elsewhere HTTP/1.1");
@@ -709,5 +751,65 @@ mod consent {
         assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
         assert_eq!(holding(), true);
         crate::stats::reset();
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn with_full_requests_on_an_auto_session_holds_nothing() {
+        let _held = crate::stats::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::stats::reset();
+        let (control, reached, answer) = one_request(true, auto_control_plane).await;
+
+        // The switch allows holding; the session did not ask for it.
+        let sent: Vec<&str> = control.iter().map(Seen::line).collect();
+        assert_eq!(sent, ["POST /api/v1/web-trace/config HTTP/1.1"]);
+        assert_eq!(reached.len(), 1);
+        assert_eq!(
+            reached[0].line(),
+            "POST /transfer?token=SECRET-QUERY HTTP/1.1"
+        );
+        assert_eq!(reached[0].body, b"amount=100&pin=SECRET-PIN");
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert_eq!(holding(), false);
+        crate::stats::reset();
+    }
+
+    #[tokio::test]
+    async fn a_request_nobody_decides_goes_on_unchanged_when_the_wait_is_over() {
+        crate::install_crypto_provider();
+        // The control plane takes the hold and then goes quiet, as one on a dead link does.
+        let (control_at, control) = serve(silent_control_plane).await;
+        let gate = crate::intercept::HttpGate {
+            client: reqwest::Client::new(),
+            api_url: format!("http://{control_at}"),
+            workflow_id: "wf-1".into(),
+            token: "cfxt_test".into(),
+            wait: Duration::from_secs(3),
+        };
+        let started = std::time::Instant::now();
+        let decision = tokio::time::timeout(
+            Duration::from_secs(20),
+            cfx_capture::InterceptGate::decide(&gate, "GET", "https://origin.test/", &[], b""),
+        )
+        .await
+        .expect("the request was still waiting after 20 s");
+        assert!(
+            matches!(decision, cfx_capture::InterceptDecision::Forward),
+            "the request did not go on unchanged"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        let polled = control
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.line() == "POST /api/v1/web-trace/intercept-poll HTTP/1.1")
+            .count();
+        assert!(polled >= 1, "it never asked for a decision");
     }
 }

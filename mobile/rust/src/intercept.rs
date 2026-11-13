@@ -1,11 +1,13 @@
 //! Full-capture config fetch + the manual-interception gate. In manual mode, on a device that allows
 //! full requests, the tracer parks each request with the control plane (`intercept-hold`) and blocks
 //! until a human forwards or drops it (`intercept-poll`), so the browser/app request does not
-//! proceed until approved. Fail-open: any control-plane error or a long wait defaults to Forward so
-//! the user's traffic is never wedged.
+//! proceed until approved. Fail-open: any control-plane error, or no decision within [`WAIT`],
+//! defaults to Forward so the user's traffic is never wedged.
 
 use std::pin::Pin;
 use std::time::Duration;
+
+use tokio::time::Instant;
 
 use cfx_capture::{EditedRequest, InterceptDecision, InterceptGate};
 use serde_json::json;
@@ -24,12 +26,16 @@ use serde_json::json;
 /// This returns the whole config rather than a tuple of the two fields anyone
 /// happened to need first: a session carries bypass hosts now, and a tuple is how
 /// the next setting gets silently dropped on one client.
+///
+/// `device_allows_full` is the device's own "Send full requests". It answers for holding
+/// too: a held request is sent whole and can come back changed, and the switch's consent
+/// sheet says so.
 pub async fn fetch_capture_config(
     client: &reqwest::Client,
     api_url: &str,
     workflow_id: &str,
     token: &str,
-    device_full_capture: bool,
+    device_allows_full: bool,
 ) -> cfx_capture::CaptureConfig {
     let url = format!(
         "{}{}",
@@ -41,7 +47,8 @@ pub async fn fetch_capture_config(
     let body = cfx_capture::CaptureConfig::request_body_with_device(
         workflow_id,
         token,
-        device_full_capture,
+        device_allows_full,
+        device_allows_full,
     );
     match client.post(&url).json(&body).send().await {
         Ok(r) => match r.json::<serde_json::Value>().await {
@@ -99,6 +106,17 @@ fn edited_from(d: &serde_json::Value) -> EditedRequest {
     }
 }
 
+/// How long a request waits for a decision before it goes on unchanged.
+pub const WAIT: Duration = Duration::from_secs(120);
+
+/// The longest any one call to the control plane may take. Without a limit a call on a
+/// connection that had gone quiet never returned, so a request could wait far past
+/// [`WAIT`], and the control plane forgets a held request ten minutes after it was held.
+const CALL: Duration = Duration::from_secs(10);
+
+/// How often a held request asks whether it has been decided.
+const POLL_EVERY: Duration = Duration::from_secs(1);
+
 /// Parks each request with the control plane and sends on whatever is decided there.
 ///
 /// It sends the whole request, values included, and may be told to send an edited one, so it
@@ -108,6 +126,8 @@ pub struct HttpGate {
     pub api_url: String,
     pub workflow_id: String,
     pub token: String,
+    /// How long each request waits for a decision: [`WAIT`].
+    pub wait: Duration,
 }
 
 impl HttpGate {
@@ -118,6 +138,9 @@ impl HttpGate {
         headers: &[(String, String)],
         body: &[u8],
     ) -> InterceptDecision {
+        // One deadline for the whole wait, the hold included, however the calls go.
+        let deadline = Instant::now() + self.wait;
+        let left = || deadline.saturating_duration_since(Instant::now());
         let base = self.api_url.trim_end_matches('/');
         let hdr_json: Vec<[String; 2]> = headers
             .iter()
@@ -130,11 +153,15 @@ impl HttpGate {
             "url": url,
             "req_headers": hdr_json,
             "req_body": String::from_utf8_lossy(body),
+            // This gate runs only on a device that allows holding, and the control plane
+            // stores a hold only when the hold itself says so.
+            "device_allows_hold": true,
         });
         let resp = self
             .client
             .post(format!("{base}/api/v1/web-trace/intercept-hold"))
             .json(&hold)
+            .timeout(left().min(CALL))
             .send()
             .await;
         let id = match resp {
@@ -153,15 +180,20 @@ impl HttpGate {
             return InterceptDecision::Forward;
         }; // fail-open
 
-        // Poll until a human decides, or ~2 min elapses (then fail-open to Forward).
+        // Poll until a human decides, or the wait runs out (then fail-open to Forward).
         let poll =
             json!({ "workflow_id": self.workflow_id, "token": self.token, "intercept_id": id });
-        for _ in 0..120 {
-            tokio::time::sleep(Duration::from_secs(1)).await;
+        loop {
+            tokio::time::sleep(left().min(POLL_EVERY)).await;
+            let rest = left();
+            if rest.is_zero() {
+                return InterceptDecision::Forward;
+            }
             match self
                 .client
                 .post(format!("{base}/api/v1/web-trace/intercept-poll"))
                 .json(&poll)
+                .timeout(rest.min(CALL))
                 .send()
                 .await
             {
@@ -187,7 +219,6 @@ impl HttpGate {
                 Err(_) => continue,
             }
         }
-        InterceptDecision::Forward
     }
 }
 

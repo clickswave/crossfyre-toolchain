@@ -81,21 +81,28 @@ impl CaptureConfig {
         serde_json::json!({ "workflow_id": workflow_id, "token": token })
     }
 
-    /// Same, plus what THIS client decided about full capture.
+    /// Same, plus what THIS client decided about full capture and about holding.
     ///
     /// Full capture takes two yeses: the session asks for it and the device
     /// grants it. Only the client knows the second one, and until it said so the
     /// control plane could not tell "nothing was captured" from "the device
     /// declined", so an empty Requests tab had no explanation anywhere.
+    ///
+    /// Holding each request for a decision takes the device's yes as well, since a
+    /// held request is sent whole and can come back changed. The control plane asks
+    /// a client to hold only when it says `device_allows_hold`, so a client that
+    /// does not say is never asked.
     pub fn request_body_with_device(
         workflow_id: &str,
         token: &str,
         device_full_capture: bool,
+        device_allows_hold: bool,
     ) -> serde_json::Value {
         serde_json::json!({
             "workflow_id": workflow_id,
             "token": token,
             "device_full_capture": device_full_capture,
+            "device_allows_hold": device_allows_hold,
         })
     }
 
@@ -183,8 +190,11 @@ mod tests {
 
     #[test]
     fn request_body_carries_the_device_answer() {
-        let b = CaptureConfig::request_body_with_device("wf-1", "tok", false);
+        let b = CaptureConfig::request_body_with_device("wf-1", "tok", false, false);
         assert_eq!(b["workflow_id"], "wf-1");
         assert_eq!(b["device_full_capture"], false);
+        assert_eq!(b["device_allows_hold"], false);
+        let b = CaptureConfig::request_body_with_device("wf-1", "tok", true, true);
+        assert_eq!(b["device_allows_hold"], true);
     }
 }
