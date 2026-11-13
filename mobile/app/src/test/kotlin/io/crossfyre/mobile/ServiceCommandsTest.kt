@@ -80,6 +80,33 @@ class ServiceCommandsTest {
     }
 
     @Test
+    fun the_service_hears_when_requests_start_and_stop_waiting_for_the_dashboard() {
+        val heard = mutableListOf<Boolean>()
+        var stats: String? = """{"events": 1}"""
+        val due = ArrayDeque<() -> Unit>()
+        val watch = TokenWatch({ stats }, {}, holding = { heard += it }) { _, look -> due.addLast(look) }
+        watch.start()
+        due.removeFirst()()
+        assertEquals("nothing to say while nothing is held", emptyList<Boolean>(), heard)
+        stats = """{"events": 2, "holding": true}"""
+        due.removeFirst()()
+        due.removeFirst()()
+        assertEquals("said once, not on every look", listOf(true), heard)
+        stats = "not json"
+        due.removeFirst()()
+        assertEquals(listOf(true), heard)
+        stats = """{"holding": false}"""
+        due.removeFirst()()
+        assertEquals(listOf(true, false), heard)
+    }
+
+    @Test
+    fun the_notification_says_when_requests_wait_for_the_dashboard() {
+        assertEquals("Capturing traffic for authorized testing", captureNotice(holding = false))
+        assertTrue(captureNotice(holding = true).contains("dashboard"))
+    }
+
+    @Test
     fun a_second_stop_does_nothing() {
         var count = 0
         val t = Teardown(listOf("tunnel" to { count++ }))
