@@ -35,6 +35,7 @@ import io.crossfyre.mobile.patch.PATCH_STAGES
 import io.crossfyre.mobile.patch.PatchJob
 import io.crossfyre.mobile.patch.PatchState
 import io.crossfyre.mobile.patch.PatchStep
+import io.crossfyre.mobile.patch.askToAllow
 import io.crossfyre.mobile.patch.result
 
 /** The note under an app in the scope and patch lists, with its colour. */
@@ -181,6 +182,22 @@ private fun Note(icon: Int, text: String) {
 @Composable
 fun BoxScope.PatchSheets(m: AppModel, job: PatchJob) {
     val c = cfx
+    val ask = job.askToAllow()
+    if (ask != null) {
+        val (title, first, second) = ask
+        Sheet(
+            title = { SheetTitle(title) },
+            onDismiss = null,
+            foot = {
+                CfxButton("Open settings", Kind.PRIMARY, block = true) { m.allowInstalls() }
+                CfxButton("Cancel", Kind.GHOST, block = true) { m.cancelPatch() }
+            },
+        ) {
+            Text(marked(first), style = T.body())
+            Text(second, style = T.body())
+        }
+        return
+    }
     if (job.running) {
         Sheet(
             title = { SheetTitle("Patching ${job.label}") },

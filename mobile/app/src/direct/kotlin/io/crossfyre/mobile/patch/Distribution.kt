@@ -6,6 +6,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageInstaller
+import android.net.Uri
+import android.provider.Settings
 import androidx.core.content.ContextCompat
 import io.crossfyre.mobile.Pairing
 import io.crossfyre.mobile.apps.AppFacts
@@ -43,6 +45,11 @@ object Distribution {
  * off the uninstall's success rather than fired alongside it, so the old package
  * is definitely gone first; otherwise the install is treated as an update and
  * fails with INSTALL_FAILED_UPDATE_INCOMPATIBLE.
+ *
+ * Removing first means the original is only ever removed while Android lets
+ * this app install apps. Without that, Android removes the original, then asks
+ * for the permission before installing, and a Cancel there leaves neither app.
+ * So a patch checks before it reads anything, and again just before the swap.
  */
 internal class DirectPatchFeature(private val app: Context) : PatchFeature {
 
@@ -50,6 +57,8 @@ internal class DirectPatchFeature(private val app: Context) : PatchFeature {
     private val _job = MutableStateFlow<PatchJob?>(null)
     private val _exportable = MutableStateFlow<String?>(null)
     private var work: Job? = null
+    /** Reads and uploads the app, for a patch waiting to be allowed to install apps before it starts. */
+    private var pendingBuild: (() -> Unit)? = null
     private var pendingInstall: List<File>? = null
     private var exportFiles: List<File>? = null
     private var caForJob: String? = null
@@ -67,12 +76,13 @@ internal class DirectPatchFeature(private val app: Context) : PatchFeature {
             val status = i.getIntExtra(PackageInstaller.EXTRA_STATUS, -1)
             val current = _job.value
             if (status == PackageInstaller.STATUS_PENDING_USER_ACTION) {
-                // Only ever launch a handed-over Intent while a patch of ours is in
-                // flight. Belt and braces with RECEIVER_NOT_EXPORTED: launching an
-                // arbitrary Intent from this context is the valuable half of an
-                // intent-redirection bug, so it should not be reachable at a moment
-                // when no install is pending either.
-                if (current == null || !current.running) return
+                // Only ever launch a handed-over Intent while a removal or an
+                // install of ours is waiting on Android. Belt and braces with
+                // RECEIVER_NOT_EXPORTED: launching an arbitrary Intent from this
+                // context is the valuable half of an intent-redirection bug, so it
+                // should not be reachable at a moment when none is pending either,
+                // such as while a patch waits to be allowed to install apps.
+                if (current == null || (current.step != PatchStep.UNINSTALL && current.step != PatchStep.INSTALL)) return
                 @Suppress("DEPRECATION")
                 val confirm = i.getParcelableExtra<Intent>(Intent.EXTRA_INTENT) ?: return
                 confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -163,14 +173,54 @@ internal class DirectPatchFeature(private val app: Context) : PatchFeature {
 
     override fun start(pkg: String, label: String, sizeMb: Int, pairing: Pairing, ca: File, caFingerprint: String?) {
         if (_job.value?.running == true) return
+        pendingInstall = null
+        caForJob = caFingerprint
+        pendingBuild = { build(pkg, pairing, ca) }
+        advance(PatchJob(pkg, label, sizeMb, PatchStep.READ))
+    }
+
+    override fun carryOn() {
+        val j = _job.value ?: return
+        if (j.step == PatchStep.ALLOW_INSTALLS) advance(j)
+    }
+
+    override fun allowInstallsIntent(): Intent =
+        Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${app.packageName}"))
+
+    /**
+     * Move a patch on from either point that leads to an install: starting, or
+     * the swap once the patched build is ready. This is the only way to
+     * [uninstall], and it asks Android whether this app may install apps at
+     * this moment, not before the server step. See [onwards].
+     */
+    private fun advance(from: PatchJob) {
+        val next = from.onwards(app.packageManager.canRequestPackageInstalls())
+        _job.value = next
+        when (next.step) {
+            PatchStep.READ -> {
+                val b = pendingBuild
+                pendingBuild = null
+                if (b != null) b() else _job.value = null
+            }
+            PatchStep.UNINSTALL -> try {
+                uninstall(next.pkg)
+            } catch (e: Exception) {
+                finishWithout()
+                _job.value = next.copy(
+                    step = PatchStep.FAILED,
+                    message = e.message?.takeIf { m -> m.isNotBlank() } ?: "Android would not start removing the original.",
+                )
+            }
+            else -> Unit
+        }
+    }
+
+    private fun build(pkg: String, pairing: Pairing, ca: File) {
         // buildPatched clears the scratch directory on entry, so anything left
         // exportable from a previous patch is about to stop existing. Drop the
         // offer now rather than letting it fail when taken up.
         exportFiles = null
         _exportable.value = null
-        pendingInstall = null
-        caForJob = caFingerprint
-        _job.value = PatchJob(pkg, label, sizeMb, PatchStep.READ)
         work = scope.launch {
             try {
                 val files = Patcher.buildPatched(app, pkg, pairing.apiUrl, pairing.workflowId, pairing.token, ca) { step ->
@@ -182,8 +232,7 @@ internal class DirectPatchFeature(private val app: Context) : PatchFeature {
                     }
                 }
                 pendingInstall = files
-                _job.update { it?.copy(step = PatchStep.UNINSTALL, pct = 100f) }
-                uninstall(pkg)
+                _job.value?.let { advance(it.copy(built = true, pct = 100f)) }
             } catch (e: CancellationException) {
                 // Cancelling is a normal outcome, not a failure, and must not read
                 // like one. Leave nothing half-set.
@@ -210,6 +259,16 @@ internal class DirectPatchFeature(private val app: Context) : PatchFeature {
     }
 
     override fun cancel() {
+        val j = _job.value
+        if (j?.step == PatchStep.ALLOW_INSTALLS) {
+            // Nothing of ours is running and the original is still installed.
+            // A build made for it is dropped; before one, the scratch directory
+            // still holds the last patch's export, so it is left alone.
+            pendingBuild = null
+            if (j.built) finishWithout()
+            _job.value = null
+            return
+        }
         work?.cancel()
     }
 

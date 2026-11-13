@@ -59,6 +59,7 @@ import io.crossfyre.mobile.apps.InstalledApp
 import io.crossfyre.mobile.patch.Distribution
 import io.crossfyre.mobile.patch.PatchFeature
 import io.crossfyre.mobile.patch.PatchState
+import io.crossfyre.mobile.patch.PatchStep
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
@@ -121,6 +122,8 @@ sealed interface Effect {
     data class OpenUrl(val url: String) : Effect
     data object NotificationSettings : Effect
     data object SecuritySettings : Effect
+    /** Android's page for letting this app install apps, which a patch waits on. */
+    data class AllowInstalls(val intent: Intent) : Effect
     /** Ask for the unlock that lets the approval key sign the approval being made. */
     data class Authenticate(val id: String, val title: String, val description: String) : Effect
 }
@@ -427,6 +430,9 @@ class AppModel(app: Application) : AndroidViewModel(app) {
         if (route == Route.WORKSPACES && wsStatus == ListStatus.EMPTY) loadWorkspaces()
         refreshCert()
         refreshNotifications()
+        // Back from Android's settings with installs allowed: a patch waiting
+        // on that carries on without another tap.
+        patch.carryOn()
         if (route == Route.MAIN) refreshPatchStates()
         // Back from Android's settings with the screen lock removed: the keystore
         // has dropped the key, so say so now rather than at the next Approve.
@@ -1057,6 +1063,16 @@ class AppModel(app: Application) : AndroidViewModel(app) {
             val f = facts[pkg]
             patch.start(pkg, f?.label ?: labelOf(pkg), f?.sizeMb ?: 0, p, ca, cert.fingerprint)
         }
+    }
+
+    /**
+     * Off to Android's settings to let this app install apps. If that is
+     * already done, the waiting patch carries on instead.
+     */
+    fun allowInstalls() {
+        patch.carryOn()
+        if (patch.job.value?.step != PatchStep.ALLOW_INSTALLS) return
+        patch.allowInstallsIntent()?.let { emit(Effect.AllowInstalls(it)) }
     }
 
     fun cancelPatch() {

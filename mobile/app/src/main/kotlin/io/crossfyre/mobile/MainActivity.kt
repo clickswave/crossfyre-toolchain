@@ -159,6 +159,10 @@ class MainActivity : ComponentActivity() {
                 Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", packageName, null)),
             )
             Effect.SecuritySettings -> open(Intent(Settings.ACTION_SECURITY_SETTINGS), Intent(Settings.ACTION_SETTINGS))
+            is Effect.AllowInstalls -> open(
+                e.intent,
+                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", packageName, null)),
+            )
             is Effect.Authenticate -> if (Build.VERSION.SDK_INT >= 30) unlockPrompt(e) else confirmLock(e)
         }
     }

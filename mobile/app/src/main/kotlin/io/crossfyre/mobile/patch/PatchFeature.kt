@@ -1,5 +1,6 @@
 package io.crossfyre.mobile.patch
 
+import android.content.Intent
 import io.crossfyre.mobile.Pairing
 import io.crossfyre.mobile.apps.AppFacts
 import kotlinx.coroutines.flow.StateFlow
@@ -55,6 +56,15 @@ interface PatchFeature {
 
     fun start(pkg: String, label: String, sizeMb: Int, pairing: Pairing, ca: File, caFingerprint: String?)
 
+    /**
+     * Back in view, perhaps from Android's settings: a patch waiting at
+     * [PatchStep.ALLOW_INSTALLS] carries on if this app may now install apps.
+     */
+    fun carryOn()
+
+    /** Android's page for letting this app install apps, or null in a build that cannot patch. */
+    fun allowInstallsIntent(): Intent?
+
     fun cancel()
 
     /** Close a finished job's result. */
@@ -77,6 +87,12 @@ val PATCH_STAGES = listOf(
 )
 
 enum class PatchStep {
+    /**
+     * Waiting for the person to let this app install apps in Android's
+     * settings: before reading the app, or once [PatchJob.built], before
+     * removing the original. Nothing on the phone has changed.
+     */
+    ALLOW_INSTALLS,
     READ, UPLOAD, SERVER, DOWNLOAD,
     /** Android's prompt to remove the original is up. */
     UNINSTALL,
@@ -99,6 +115,7 @@ enum class PatchStep {
  * @param pct progress within the current step, 0 to 100, where the step has any.
  * @param message the reason a patch failed. When [fromServer] it is the server's
  *   own sentence, written for whoever holds the phone.
+ * @param built the patched build is ready and kept, waiting to replace the original.
  */
 data class PatchJob(
     val pkg: String,
@@ -108,6 +125,7 @@ data class PatchJob(
     val pct: Float = 0f,
     val message: String? = null,
     val fromServer: Boolean = false,
+    val built: Boolean = false,
 ) {
     val running: Boolean get() = step.ordinal <= PatchStep.INSTALLING.ordinal
 
@@ -120,6 +138,7 @@ data class PatchJob(
     /** Which of [PATCH_STAGES] is under way. */
     val stage: Int
         get() = when (step) {
+            PatchStep.ALLOW_INSTALLS -> if (built) 4 else 0
             PatchStep.READ -> 0
             PatchStep.UPLOAD -> 1
             PatchStep.SERVER -> 2
@@ -133,6 +152,7 @@ data class PatchJob(
      */
     val meter: Float?
         get() = when (step) {
+            PatchStep.ALLOW_INSTALLS -> if (built) 99.5f else 0f
             PatchStep.READ -> 3f
             PatchStep.UPLOAD -> 5f + 0.40f * pct
             PatchStep.SERVER -> null
@@ -148,8 +168,43 @@ data class PatchJob(
             PatchStep.SERVER -> "The slow part: a few minutes for a large app. The server says when it is done, not how far along it is, so the bar moves slowly here."
             PatchStep.DOWNLOAD -> "${pct.toInt()}%, checked against the server's checksum"
             PatchStep.INSTALLING -> "Installing…"
-            else -> "Android asks you to confirm both. The first time, it also asks you to allow installs from Crossfyre Mobile."
+            else -> "Android asks you to confirm both."
         }
+}
+
+/**
+ * Where this patch goes from either point that leads to an install: starting,
+ * and removing the original once the patched build is [PatchJob.built].
+ *
+ * The swap removes the original first, because the patched build is signed by
+ * another key and Android will not take it as an update. If Android will not
+ * let this app install apps, it then refuses the patched build as well, and
+ * the phone is left with neither. So without that permission the patch waits
+ * at [PatchStep.ALLOW_INSTALLS]. [canInstall] is to be asked at the moment of
+ * going on rather than remembered from the start: the server step takes
+ * minutes, and the permission can be turned off meanwhile.
+ */
+fun PatchJob.onwards(canInstall: Boolean): PatchJob = copy(
+    step = when {
+        !canInstall -> PatchStep.ALLOW_INSTALLS
+        built -> PatchStep.UNINSTALL
+        else -> PatchStep.READ
+    },
+)
+
+/** What a patch waiting at [PatchStep.ALLOW_INSTALLS] says: title, then two lines. */
+fun PatchJob.askToAllow(): Triple<String, String, String>? = when {
+    step != PatchStep.ALLOW_INSTALLS -> null
+    built -> Triple(
+        "Allow installs to finish",
+        "The patched build is ready, but Crossfyre Mobile can only install it once you turn on **Allow from this source** in Android settings.",
+        "$label is still installed. When you come back with it on, Android asks you to remove the original and install the patched build. Cancel keeps $label as it is.",
+    )
+    else -> Triple(
+        "Allow installs first",
+        "Crossfyre Mobile can only install the patched build once you turn on **Allow from this source** in Android settings.",
+        "Nothing has been read or uploaded yet. The patch starts when you come back with it on.",
+    )
 }
 
 /** What a finished patch says, by outcome: title, then two lines. */
