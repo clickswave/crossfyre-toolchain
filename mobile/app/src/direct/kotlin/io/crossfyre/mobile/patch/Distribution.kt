@@ -191,12 +191,14 @@ internal class DirectPatchFeature(private val app: Context) : PatchFeature {
      * Move a patch on from either point that leads to an install: starting, or
      * the swap once the patched build is ready. This is the only way to
      * [uninstall], and it asks Android whether this app may install apps at
-     * this moment, not before the server step. See [onwards].
+     * this moment, not before the server step, and looks at the staged build
+     * as it is on disk now. See [onwards].
      */
     private fun advance(from: PatchJob) {
-        val next = from.onwards(app.packageManager.canRequestPackageInstalls())
+        val next = from.onwards(app.packageManager.canRequestPackageInstalls(), buildKept(pendingInstall))
         _job.value = next
         when (next.step) {
+            PatchStep.FAILED -> finishWithout()
             PatchStep.READ -> {
                 val b = pendingBuild
                 pendingBuild = null

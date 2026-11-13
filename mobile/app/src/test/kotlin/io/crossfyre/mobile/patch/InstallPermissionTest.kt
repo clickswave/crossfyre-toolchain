@@ -37,7 +37,7 @@ class InstallPermissionTest {
     @Test
     fun a_ready_build_keeps_the_original_when_the_permission_was_withdrawn_meanwhile() {
         // Allowed at the start, turned off while the server worked.
-        val j = job(PatchStep.DOWNLOAD, built = true).onwards(canInstall = false)
+        val j = job(PatchStep.DOWNLOAD, built = true).onwards(canInstall = false, kept = true)
         assertEquals(PatchStep.ALLOW_INSTALLS, j.step)
         assertTrue("the patched build is kept", j.built)
         assertTrue("it can still be called off with the original in place", j.cancellable)
@@ -46,7 +46,7 @@ class InstallPermissionTest {
 
     @Test
     fun a_ready_build_with_the_permission_goes_on_to_remove_the_original() {
-        assertEquals(PatchStep.UNINSTALL, job(PatchStep.DOWNLOAD, built = true).onwards(canInstall = true).step)
+        assertEquals(PatchStep.UNINSTALL, job(PatchStep.DOWNLOAD, built = true).onwards(canInstall = true, kept = true).step)
     }
 
     @Test
@@ -55,15 +55,15 @@ class InstallPermissionTest {
         assertEquals(PatchStep.ALLOW_INSTALLS, before.onwards(canInstall = false).step)
         assertEquals(PatchStep.READ, before.onwards(canInstall = true).step)
 
-        val ready = job(PatchStep.DOWNLOAD, built = true).onwards(canInstall = false)
-        assertEquals(PatchStep.ALLOW_INSTALLS, ready.onwards(canInstall = false).step)
-        assertEquals(PatchStep.UNINSTALL, ready.onwards(canInstall = true).step)
+        val ready = job(PatchStep.DOWNLOAD, built = true).onwards(canInstall = false, kept = true)
+        assertEquals(PatchStep.ALLOW_INSTALLS, ready.onwards(canInstall = false, kept = true).step)
+        assertEquals(PatchStep.UNINSTALL, ready.onwards(canInstall = true, kept = true).step)
     }
 
     @Test
     fun nothing_goes_on_to_remove_the_original_without_the_permission() {
         for (step in PatchStep.entries) for (built in listOf(false, true)) {
-            assertNotEquals("$step, built=$built", PatchStep.UNINSTALL, job(step, built).onwards(canInstall = false).step)
+            assertNotEquals("$step, built=$built", PatchStep.UNINSTALL, job(step, built).onwards(canInstall = false, kept = true).step)
         }
     }
 

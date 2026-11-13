@@ -183,14 +183,26 @@ data class PatchJob(
  * at [PatchStep.ALLOW_INSTALLS]. [canInstall] is to be asked at the moment of
  * going on rather than remembered from the start: the server step takes
  * minutes, and the permission can be turned off meanwhile.
+ *
+ * [kept] says the patched build is still whole on disk (see [buildKept]). It
+ * waits in the app's cache, which Android may clear when storage runs low, and
+ * removing the original with nothing to install in its place is the same loss
+ * as above. A build that is gone ends the patch with the original installed.
+ * Left unsaid, it counts as gone, so a ready build is never swapped in on trust.
  */
-fun PatchJob.onwards(canInstall: Boolean): PatchJob = copy(
-    step = when {
-        !canInstall -> PatchStep.ALLOW_INSTALLS
-        built -> PatchStep.UNINSTALL
-        else -> PatchStep.READ
-    },
-)
+fun PatchJob.onwards(canInstall: Boolean, kept: Boolean = false): PatchJob = when {
+    built && !kept -> copy(
+        step = PatchStep.FAILED,
+        message = "The patched build was cleared from this phone before it could be installed. Patch it again.",
+    )
+    !canInstall -> copy(step = PatchStep.ALLOW_INSTALLS)
+    built -> copy(step = PatchStep.UNINSTALL)
+    else -> copy(step = PatchStep.READ)
+}
+
+/** Every file of a staged patched build is still there and not empty. */
+fun buildKept(files: List<File>?): Boolean =
+    !files.isNullOrEmpty() && files.all { it.isFile && it.length() > 0 }
 
 /** What a patch waiting at [PatchStep.ALLOW_INSTALLS] says: title, then two lines. */
 fun PatchJob.askToAllow(): Triple<String, String, String>? = when {
