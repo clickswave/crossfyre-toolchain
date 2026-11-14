@@ -681,7 +681,10 @@ pub struct Config {
     /// credentials. The node runs as root on a default install, so this is the
     /// difference between compromising the platform and compromising the host.
     ///
-    /// Set `remote_exec = true` in `nodes.d/<node-id>.toml` to allow it.
+    /// Set `remote_exec = true` in `nodes.d/<node-id>.toml` to allow it. The file
+    /// belongs to root (administrators, on Windows), so it is edited with sudo
+    /// (`sudoedit`) or from an elevated prompt; the node service runs no config that
+    /// another account could change (see [`toolchain::node_config`]).
     #[serde(default)]
     pub remote_exec: bool,
 }
@@ -963,18 +966,36 @@ pub fn discover_nodes(base: &std::path::Path) -> Result<Vec<String>, Box<dyn std
         };
         // Validate it parses as a node config so `--boot` doesn't spawn a
         // daemon that's just going to die on a malformed file.
-        // As root, through a reader that refuses a link: the operator owns nodes.d, and
-        // the error below would print part of whatever file a link here named.
-        match toolchain::sudo_user::read_to_string(&path)
-            .map_err(|e| e.to_string())
-            .and_then(|s| toml::from_str::<Config>(&s).map_err(|e| e.to_string()))
-        {
-            Ok(_) => ids.push(stem.to_string()),
-            Err(e) => eprintln!("[boot] WARNING: skipping {path:?} - not a valid node config: {e}"),
+        // As root, through a reader that refuses a link (the operator owns nodes.d, and
+        // the error below would print part of whatever file a link here named) and a
+        // file anyone but root could have written.
+        match toolchain::node_config::read(&path) {
+            Ok(s) => match toml::from_str::<Config>(&s) {
+                Ok(_) => ids.push(stem.to_string()),
+                Err(e) => {
+                    eprintln!("[boot] WARNING: skipping {path:?} - not a valid node config: {e}")
+                }
+            },
+            // Without root, a config only root can read is still a registered node.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::PermissionDenied
+                    && !toolchain::node_config::privileged() =>
+            {
+                ids.push(stem.to_string())
+            }
+            Err(e) => eprintln!("[boot] WARNING: skipping {path:?}: {e}"),
         }
     }
     ids.sort();
     Ok(ids)
+}
+
+/// Read and parse the node config at `path` for a daemon about to run it. Run as root
+/// (or elevated, on Windows), a config another account owns or can write is refused:
+/// see [`toolchain::node_config`].
+pub fn load_node_config(path: &std::path::Path) -> Result<Config, Box<dyn std::error::Error>> {
+    let text = toolchain::node_config::read(path)?;
+    Ok(toml::from_str(&text)?)
 }
 
 /// One-time migration for hosts initialized before the `nodes.d` layout:
@@ -1006,7 +1027,8 @@ pub fn migrate_legacy_config(base: &std::path::Path) {
         if legacy_net.is_dir() && !paths.network_dir.exists() {
             let _ = toolchain::sudo_user::rename(&legacy_net, &paths.network_dir);
         }
-        chown_to_sudo_user(&paths.config);
+        // The config itself stays as it is: the tree chown leaves node configs alone,
+        // and taking over an earlier release's configs is node_config's.
         chown_tree_to_sudo_user(&nodes_dir(base));
     }
 }
@@ -1063,6 +1085,8 @@ pub async fn run_boot(
 
     // Pull a pre-nodes.d single-node install into the new layout if present.
     migrate_legacy_config(base);
+    // Node configs an earlier release handed to the operator become root's, once.
+    toolchain::node_config::take_over_earlier_configs(base);
     // Engines still installed under the names they had before: carry them over
     // before any node starts using them.
     toolchain::migrate::renamed_engines();
@@ -1687,7 +1711,8 @@ pub async fn run_init(
     };
     let config_path = &paths.config;
     let config_toml = toml::to_string(&config)?;
-    write_secret_file(config_path, &config_toml)?;
+    // Under sudo it stays root's, as the node service requires.
+    toolchain::node_config::write(config_path, &config_toml)?;
     end();
     section("Configure");
     ok(&format!(
@@ -1847,8 +1872,8 @@ pub async fn run_init(
     }
 
     // If we ran under sudo, hand ownership of the data dir back to the
-    // invoking user so the next non-sudo `--init` (or a plain `cat config.toml`)
-    // can still read & write it.
+    // invoking user so the next non-sudo `--init` can still read & write it. The
+    // node configs in it stay root's: the root node service runs what they say.
     chown_tree_to_sudo_user(&config_dir);
 
     end();
@@ -2102,11 +2127,10 @@ pub async fn refresh_node_state(
 
     // Persist so next restart also has fresh creds if refresh fails.
     let config_toml = toml::to_string(&config)?;
-    write_secret_file(config_path, &config_toml)?;
-    // Daemon often runs as root via sudo - the file we just wrote is now
-    // root-owned. Hand it back to the invoking user so non-sudo tools can
-    // still read it.
-    chown_to_sudo_user(config_path);
+    toolchain::node_config::write(config_path, &config_toml)?;
+    // The daemon runs as root. The config stays root's, since this daemon runs what it
+    // says; what else it wrote under nodes.d goes back to the invoking user (the tree
+    // chown leaves node configs alone).
     if let Some(parent) = config_path.parent() {
         chown_tree_to_sudo_user(parent);
     }
@@ -2307,10 +2331,12 @@ pub async fn run_daemon(
     }
 
     // Load config
+    // A daemon started on its own, or by the supervisor of an earlier release, takes
+    // over an earlier release's configs as the supervisor does.
+    toolchain::node_config::take_over_earlier_configs(&paths.base);
     // Repair installs written before the config was mode-restricted.
     repair_secret_file_mode(&config_path);
-    let config_str = toolchain::sudo_user::read_to_string(&config_path)?;
-    let mut config: Config = toml::from_str(&config_str)?;
+    let mut config = load_node_config(&config_path)?;
 
     println!("Configuration loaded successfully.");
 
@@ -3779,6 +3805,65 @@ mod security_tests {
         assert!(
             !elsewhere.path().join("n.toml").exists(),
             "moved the config into the link's target"
+        );
+    }
+
+    /// The node service runs as root and reads node configs from nodes.d in the
+    /// operator's config root, which the operator's account can write. A config that
+    /// account wrote decides which broker and API the node trusts and whether it runs
+    /// the commands they send, so it must not become a root daemon.
+    #[cfg(unix)]
+    const AN_OPERATOR_WRITTEN_CONFIG: &str = "api_key = \"x\"\nnode_id = \"evil\"\n\
+        api_url = \"http://127.0.0.1:8000\"\nnats_url = \"nats://127.0.0.1:4223\"\n\
+        remote_exec = true\n";
+
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_scan_skips_a_node_config_another_account_owns() {
+        if running_as_root() {
+            eprintln!("skipped: the test's files would belong to root");
+            return;
+        }
+        let base = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(base.path().join("nodes.d")).unwrap();
+        write_secret_file(
+            &base.path().join("nodes.d/evil.toml"),
+            AN_OPERATOR_WRITTEN_CONFIG,
+        )
+        .unwrap();
+
+        let _root = toolchain::sudo_user::act_as_root();
+        let ids = discover_nodes(base.path()).unwrap();
+
+        assert!(
+            ids.is_empty(),
+            "a root scan took a config another account owns: {ids:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_daemon_refuses_a_node_config_another_account_owns() {
+        if running_as_root() {
+            eprintln!("skipped: the test's files would belong to root");
+            return;
+        }
+        let base = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(base.path().join("nodes.d")).unwrap();
+        let p = base.path().join("nodes.d/evil.toml");
+        write_secret_file(&p, AN_OPERATOR_WRITTEN_CONFIG).unwrap();
+
+        let _root = toolchain::sudo_user::act_as_root();
+        let loaded = load_node_config(&p);
+
+        assert!(
+            loaded.is_err(),
+            "a root daemon loaded a config another account owns"
         );
     }
 

@@ -113,38 +113,16 @@ pub fn host(
 /// masks, for `service::judge_admin_only`.
 pub fn security_of(path: &Path) -> Result<super::service::Secured, String> {
     use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
-    use windows_sys::Win32::Security::Authorization::{
-        ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
-    };
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
-        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, INHERIT_ONLY_ACE,
-        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
     };
-    // Only allow entries are read. A deny entry can only narrow what they grant, so
-    // leaving it out errs towards refusing a path, never towards trusting one.
-    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
-
-    fn sid_string(sid: PSID) -> String {
-        let mut out: *mut u16 = std::ptr::null_mut();
-        // SAFETY: `sid` points into a security descriptor that is still alive, and the
-        // string ConvertSidToStringSidW allocates is freed here.
-        unsafe {
-            if ConvertSidToStringSidW(sid, &mut out) == 0 || out.is_null() {
-                return "an unreadable account".to_string();
-            }
-            let len = (0..).take_while(|&i| *out.add(i) != 0).count();
-            let s = String::from_utf16_lossy(std::slice::from_raw_parts(out, len));
-            LocalFree(out.cast());
-            s
-        }
-    }
-
     let wide: Vec<u16> = path.as_os_str().encode_wide_with_nul();
     let mut owner: PSID = std::ptr::null_mut();
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-    // SAFETY: every out-pointer is valid, the descriptor is freed below, and the ACEs are
-    // read within the bounds the ACL's own count gives.
+    // SAFETY: every out-pointer is valid, and the descriptor is freed below once the
+    // owner and access list that point into it have been read.
     unsafe {
         let status = GetNamedSecurityInfoW(
             wide.as_ptr(),
@@ -163,13 +141,95 @@ pub fn security_of(path: &Path) -> Result<super::service::Secured, String> {
                 std::io::Error::from_raw_os_error(status as i32)
             ));
         }
-        let mut out = super::service::Secured {
-            path: path.to_path_buf(),
-            owner: sid_string(owner),
-            allows: None,
-        };
-        if !dacl.is_null() {
-            let mut allows = Vec::new();
+        let out = secured(path, owner, dacl);
+        LocalFree(sd.cast());
+        Ok(out)
+    }
+}
+
+/// [`security_of`] for a file already open, so what is judged is what is then read,
+/// whatever its name has been changed to meanwhile. `path` is only shown.
+pub fn security_of_file(
+    file: &std::fs::File,
+    path: &Path,
+) -> Result<super::service::Secured, String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    };
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: as in `security_of`; the handle stays open for the length of the call.
+    unsafe {
+        let status = GetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut sd,
+        );
+        if status != ERROR_SUCCESS {
+            return Err(format!(
+                "{}: {}",
+                path.display(),
+                std::io::Error::from_raw_os_error(status as i32)
+            ));
+        }
+        let out = secured(path, owner, dacl);
+        LocalFree(sd.cast());
+        Ok(out)
+    }
+}
+
+/// The owner and the allow entries of a security descriptor, as `security_of` returns
+/// them.
+///
+/// # Safety
+/// `owner` and `dacl` must point into a security descriptor that is still alive.
+unsafe fn secured(
+    path: &Path,
+    owner: windows_sys::Win32::Security::PSID,
+    dacl: *mut windows_sys::Win32::Security::ACL,
+) -> super::service::Secured {
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACE_HEADER, GetAce, INHERIT_ONLY_ACE, PSID,
+    };
+    // Only allow entries are read. A deny entry can only narrow what they grant, so
+    // leaving it out errs towards refusing a path, never towards trusting one.
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+
+    fn sid_string(sid: PSID) -> String {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+        let mut out: *mut u16 = std::ptr::null_mut();
+        // SAFETY: `sid` points into a security descriptor that is still alive, and the
+        // string ConvertSidToStringSidW allocates is freed here.
+        unsafe {
+            if ConvertSidToStringSidW(sid, &mut out) == 0 || out.is_null() {
+                return "an unreadable account".to_string();
+            }
+            let len = (0..).take_while(|&i| *out.add(i) != 0).count();
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(out, len));
+            LocalFree(out.cast());
+            s
+        }
+    }
+
+    let mut out = super::service::Secured {
+        path: path.to_path_buf(),
+        owner: sid_string(owner),
+        allows: None,
+    };
+    if !dacl.is_null() {
+        let mut allows = Vec::new();
+        // SAFETY: the ACEs are read within the bounds the ACL's own count gives.
+        unsafe {
             for i in 0..(*dacl).AceCount as u32 {
                 let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
                 if GetAce(dacl, i, &mut ace) == 0 {
@@ -185,11 +245,164 @@ pub fn security_of(path: &Path) -> Result<super::service::Secured, String> {
                 let sid = (&allowed.SidStart as *const u32).cast_mut().cast();
                 allows.push((sid_string(sid), allowed.Mask));
             }
-            out.allows = Some(allows);
         }
-        LocalFree(sd.cast());
-        Ok(out)
+        out.allows = Some(allows);
     }
+    out
+}
+
+/// Owned by the Administrators group, with an access list that lets LocalSystem and
+/// administrators do anything and nobody else anything, and inherits nothing from the
+/// directory it is in. What a file the node service takes orders from has to be.
+const ADMIN_ONLY_SDDL: &str = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
+
+/// [`ADMIN_ONLY_SDDL`] as a security descriptor, freed on drop.
+struct AdminOnly(windows_sys::Win32::Security::PSECURITY_DESCRIPTOR);
+
+impl AdminOnly {
+    fn new() -> std::io::Result<Self> {
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        let sddl = std::ffi::OsStr::new(ADMIN_ONLY_SDDL).encode_wide_with_nul();
+        let mut sd = std::ptr::null_mut();
+        // SAFETY: `sddl` is NUL-terminated and `sd` is a valid out-pointer; the
+        // descriptor it receives is freed by Drop.
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self(sd))
+    }
+}
+
+impl Drop for AdminOnly {
+    fn drop(&mut self) {
+        // SAFETY: allocated by ConvertStringSecurityDescriptorToSecurityDescriptorW.
+        unsafe { windows_sys::Win32::Foundation::LocalFree(self.0.cast()) };
+    }
+}
+
+/// Creates a new file at `path` that only administrators and LocalSystem can open, for
+/// writing. It is admin-only from the moment it exists, so no other process can have
+/// opened it before. Fails if anything is already at `path`.
+pub fn create_admin_only(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+    let sd = AdminOnly::new()?;
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd.0,
+        bInheritHandle: 0,
+    };
+    let wide = path.as_os_str().encode_wide_with_nul();
+    // SAFETY: `wide` is NUL-terminated, `sa` and the descriptor it points to outlive the
+    // call, and the handle returned is owned by the File made from it.
+    unsafe {
+        let h = CreateFileW(
+            wide.as_ptr(),
+            GENERIC_WRITE,
+            0,
+            &sa,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        );
+        if h == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(std::fs::File::from_raw_handle(h))
+    }
+}
+
+/// Gives the open `file` the owner and access list of [`create_admin_only`]. `file`
+/// must have been opened with READ_CONTROL, WRITE_DAC and WRITE_OWNER.
+pub fn make_admin_only(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    let sd = AdminOnly::new()?;
+    let mut owner = std::ptr::null_mut();
+    let mut dacl = std::ptr::null_mut();
+    let mut present = 0;
+    let mut defaulted = 0;
+    // SAFETY: the out-pointers are valid, and the owner and access list point into
+    // `sd`, which outlives the SetSecurityInfo call.
+    unsafe {
+        if GetSecurityDescriptorOwner(sd.0, &mut owner, &mut defaulted) == 0
+            || GetSecurityDescriptorDacl(sd.0, &mut present, &mut dacl, &mut defaulted) == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let status = SetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            owner,
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null(),
+        );
+        if status != ERROR_SUCCESS {
+            return Err(std::io::Error::from_raw_os_error(status as i32));
+        }
+    }
+    Ok(())
+}
+
+/// Opens the regular file at `path` with `access`, refusing a link or junction (which is
+/// opened as itself, not followed) and a file with a second name, which can be any file
+/// on the same volume.
+pub fn open_plain(path: &Path, access: u32) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_FLAG_OPEN_REPARSE_POINT, GetFileInformationByHandle,
+    };
+    let file = std::fs::OpenOptions::new()
+        .access_mode(access)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is valid, and the call writes no
+    // more than its size.
+    let info = unsafe {
+        let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+        if GetFileInformationByHandle(file.as_raw_handle(), &mut info) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        info
+    };
+    if info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is a link or a directory, not a file", path.display()),
+        ));
+    }
+    if info.nNumberOfLinks > 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} has another name (a hard link)", path.display()),
+        ));
+    }
+    Ok(file)
 }
 
 /// `OsStr` to a NUL-terminated wide string.

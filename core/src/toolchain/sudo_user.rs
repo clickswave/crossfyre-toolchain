@@ -425,7 +425,7 @@ mod root_link_tests {
 
         let tree = t.path().join("crossfyre");
         fs::create_dir_all(tree.join("nodes.d")).expect("tree");
-        let own = tree.join("nodes.d/a.toml");
+        let own = tree.join("nodes.d/a.pid");
         fs::write(&own, "x").expect("own");
         symlink(&outside_dir, tree.join("nodes.d/e")).expect("dir link");
         symlink(&preload, tree.join("nodes.d/zz.pid")).expect("file link");
@@ -440,6 +440,41 @@ mod root_link_tests {
         assert_eq!(fs::metadata(&outside_dir).unwrap().gid(), before_dir);
         assert_eq!(fs::metadata(&outside_file).unwrap().gid(), before_file);
         assert_eq!(fs::metadata(&preload).unwrap().gid(), before_preload);
+    }
+
+    /// Node configs are root's: the root node service runs whatever they say, so
+    /// handing the tree back to the operator must leave them out, whether the walk
+    /// starts at the data dir (after `node init`) or at nodes.d (after a daemon start).
+    #[test]
+    fn the_tree_chown_leaves_node_configs_with_root() {
+        let Some(gid) = other_gid() else {
+            eprintln!("skipped: this account is in only one group");
+            return;
+        };
+        let uid = unsafe { libc::geteuid() };
+        for start_at_nodes_dir in [false, true] {
+            let t = tempfile::tempdir().expect("tempdir");
+            let tree = t.path().join("crossfyre");
+            let nodes = tree.join("nodes.d");
+            fs::create_dir_all(nodes.join("n.network")).expect("tree");
+            let config = nodes.join("n.toml");
+            fs::write(&config, "x").expect("config");
+            let pid = nodes.join("n.pid");
+            fs::write(&pid, "1").expect("pid");
+            let tunnel = nodes.join("n.network/wg0.conf");
+            fs::write(&tunnel, "x").expect("tunnel");
+            let before = fs::metadata(&config).unwrap().gid();
+
+            chown_recursive(if start_at_nodes_dir { &nodes } else { &tree }, uid, gid);
+
+            assert_eq!(
+                fs::metadata(&config).unwrap().gid(),
+                before,
+                "a node config was handed over (walk from nodes.d: {start_at_nodes_dir})"
+            );
+            assert_eq!(fs::metadata(&pid).unwrap().gid(), gid);
+            assert_eq!(fs::metadata(&tunnel).unwrap().gid(), gid);
+        }
     }
 
     #[test]

@@ -300,12 +300,27 @@ pub fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
 /// links and changed through its fd, so swapping an entry between the check and the
 /// change reaches nothing else. Returns the first error; the rest of the tree is still
 /// walked.
+///
+/// Node configs (`nodes.d/*.toml`) are left alone: they stay root's, because the root
+/// node service runs what they say. See [`super::node_config`].
 pub fn chown_tree(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
     let (dirs, name) = split(path)?;
     let dir = open_dir(&dirs, false, None)?;
+    let in_nodes_dir = dirs.last().is_some_and(|d| is_nodes_dir(d));
+    if in_nodes_dir && is_node_config(&name) {
+        return Ok(());
+    }
     // The start point is opened like any entry below it: in the operator's home, it
     // can be a link as easily as anything inside it.
     chown_entry(dir.as_raw_fd(), &name, uid, gid, 0)
+}
+
+fn is_nodes_dir(name: &CStr) -> bool {
+    name.to_bytes() == super::node_config::NODES_DIR.as_bytes()
+}
+
+fn is_node_config(name: &CStr) -> bool {
+    name.to_bytes().ends_with(b".toml")
 }
 
 fn chown_entry(dir: RawFd, name: &CStr, uid: u32, gid: u32, depth: usize) -> io::Result<()> {
@@ -341,7 +356,11 @@ fn chown_entry(dir: RawFd, name: &CStr, uid: u32, gid: u32, depth: usize) -> io:
         first_err = Some(io::Error::last_os_error());
     }
     if dir_entry && depth < MAX_DEPTH {
+        let nodes_dir = is_nodes_dir(name);
         for child in list(fd.as_raw_fd())? {
+            if nodes_dir && is_node_config(&child) {
+                continue;
+            }
             if let Err(e) = chown_entry(fd.as_raw_fd(), &child, uid, gid, depth + 1) {
                 first_err.get_or_insert(e);
             }

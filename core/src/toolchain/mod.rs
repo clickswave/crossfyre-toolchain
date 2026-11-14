@@ -15,6 +15,7 @@ pub mod db;
 pub mod doctor;
 pub mod install;
 pub mod migrate;
+pub mod node_config;
 pub mod oast;
 pub mod packaging;
 pub mod rcfile;
