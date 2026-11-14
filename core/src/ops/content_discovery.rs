@@ -344,32 +344,29 @@ pub async fn handle(env: OpEnv) {
     if recurse
         && let Some(rw_url) = data["recurse_wordlist_url"].as_str()
         && !rw_url.is_empty()
+        && let Ok(resp) = reqwest::get(rw_url).await
+        && let Ok(body) = resp.text().await
     {
-        if let Ok(resp) = reqwest::get(rw_url).await
-            && let Ok(body) = resp.text().await
-        {
-            let name = format!("cfx-wl-recurse-{op_id}.txt");
-            match super::handoff::put(&mut handoff, &name, body.as_bytes()) {
-                Ok(path) => {
-                    recurse_wordlist_path = path;
-                    recurse_wl_lines = body.lines().filter(|l| !l.trim().is_empty()).count() as i64;
-                    println!("[op] recursion wordlist downloaded ({recurse_wl_lines} lines)");
-                }
-                Err(e) => {
-                    let why =
-                        format!("the recursion wordlist could not be written for ambulo: {e}");
-                    eprintln!("[op] FAIL {why}");
-                    super::publish_failed(
-                        &pub_clone,
-                        &result_subj,
-                        &op_id,
-                        &workflow_id,
-                        &node_id,
-                        &why,
-                    )
-                    .await;
-                    return;
-                }
+        let name = format!("cfx-wl-recurse-{op_id}.txt");
+        match super::handoff::put(&mut handoff, &name, body.as_bytes()) {
+            Ok(path) => {
+                recurse_wordlist_path = path;
+                recurse_wl_lines = body.lines().filter(|l| !l.trim().is_empty()).count() as i64;
+                println!("[op] recursion wordlist downloaded ({recurse_wl_lines} lines)");
+            }
+            Err(e) => {
+                let why = format!("the recursion wordlist could not be written for ambulo: {e}");
+                eprintln!("[op] FAIL {why}");
+                super::publish_failed(
+                    &pub_clone,
+                    &result_subj,
+                    &op_id,
+                    &workflow_id,
+                    &node_id,
+                    &why,
+                )
+                .await;
+                return;
             }
         }
     }
