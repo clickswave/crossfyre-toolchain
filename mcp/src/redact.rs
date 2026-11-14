@@ -17,17 +17,29 @@ use std::sync::LazyLock;
 pub(crate) const MASK: &str = "[redacted]";
 
 /// Names masked wherever they appear in them: `x-auth-token`, `client_secret`,
-/// `session_id`, `api_key`.
-const NAME_WORDS: [&str; 6] = ["token", "secret", "session", "auth", "key", "passw"];
+/// `session_id`, `api_key`, `PHPSESSID`, `X-Goog-Signature`.
+const NAME_WORDS: [&str; 8] = [
+    "token",
+    "secret",
+    "session",
+    "sessid",
+    "auth",
+    "key",
+    "passw",
+    "signature",
+];
 /// Names masked only when they are the whole name. `code` is the OAuth authorization
-/// code a login redirect carries.
-const NAMES: [&str; 6] = [
+/// code a login redirect carries, `sid` the session id phpBB and Engine.IO put in a
+/// query, and `sig` an Azure shared access signature.
+const NAMES: [&str; 8] = [
     "authorization",
     "proxy-authorization",
     "cookie",
     "set-cookie",
     "x-api-key",
     "code",
+    "sid",
+    "sig",
 ];
 
 /// A header, query parameter or form field whose value should not be shown.
@@ -132,11 +144,65 @@ pub(crate) fn redact_text(s: &str) -> String {
             p.re.replace_all(&out, p.with).into_owned()
         };
     }
+    mask_nested_members(&out)
+}
+
+/// `"name":` with one of those names, followed by the start of an object or an array.
+static NESTED_MEMBER: LazyLock<Regex> = LazyLock::new(|| {
+    let member = sensitive_names(r#"^"\\"#);
+    Regex::new(&format!(r#"(?i)"{member}"\s*:\s*[\[{{]"#)).expect("redaction pattern")
+});
+
+/// A JSON member with one of those names whose value is an object or an array, which
+/// the member pattern does not reach, loses the whole value: `"session":{"id":"..."}`
+/// becomes `"session":"[redacted]"`. A value a body cap cut off is masked to the end of
+/// what was captured. Brackets inside strings are stepped over.
+fn mask_nested_members(s: &str) -> String {
+    if !NESTED_MEMBER.is_match(s) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut from = 0;
+    while let Some(m) = NESTED_MEMBER.find_at(s, from) {
+        let open = m.end() - 1;
+        let (mut depth, mut in_str, mut esc) = (0usize, false, false);
+        let mut end = s.len();
+        for (i, c) in s[open..].char_indices() {
+            if in_str {
+                match (esc, c) {
+                    (true, _) => esc = false,
+                    (false, '\\') => esc = true,
+                    (false, '"') => in_str = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                '"' => in_str = true,
+                '{' | '[' => depth += 1,
+                '}' | ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        out.push_str(&s[from..open]);
+        out.push('"');
+        out.push_str(MASK);
+        out.push('"');
+        from = end;
+    }
+    out.push_str(&s[from..]);
     out
 }
 
-/// Mask the values of query and fragment parameters with sensitive names, and any
-/// password in the authority. Text that does not parse as a URL is masked as free
+/// Mask the values of query and fragment parameters with sensitive names, any password
+/// in the authority, and the path and user name as free text, which is what masks a
+/// `;jsessionid=` path parameter. Text that does not parse as a URL is masked as free
 /// text.
 pub(crate) fn redact_url(s: &str) -> String {
     let Ok(mut url) = transport::Url::parse(s) else {
@@ -144,6 +210,16 @@ pub(crate) fn redact_url(s: &str) -> String {
     };
     if url.password().is_some() {
         let _ = url.set_password(Some(MASK));
+    }
+    let user = url.username().to_string();
+    let masked = redact_text(&user);
+    if masked != user {
+        let _ = url.set_username(&masked);
+    }
+    let path = url.path().to_string();
+    let masked = redact_text(&path);
+    if masked != path {
+        url.set_path(&masked);
     }
     if url.query().is_some() {
         let pairs: Vec<(String, String)> = url
@@ -455,10 +531,23 @@ mod unit {
             "session_id",
             "client_secret",
             "password",
+            "PHPSESSID",
+            "sid",
+            "sig",
+            "signature",
+            "X-Goog-Signature",
         ] {
             assert!(sensitive_name(n), "{n}");
         }
-        for n in ["accept", "content-type", "q", "page"] {
+        for n in [
+            "accept",
+            "content-type",
+            "q",
+            "page",
+            "side",
+            "inside",
+            "signal",
+        ] {
             assert!(!sensitive_name(n), "{n}");
         }
     }
@@ -514,6 +603,59 @@ mod unit {
         let r = redact_url("http://h.test/cb?code=CCC1&next=%2Fhome");
         assert!(!r.contains("CCC1"), "{r}");
         assert!(r.contains("next="), "{r}");
+    }
+
+    /// A session id rewritten into the path, the session and signature names PHP,
+    /// phpBB, Engine.IO, Azure, Laravel and Google use, and a token in the user name.
+    #[test]
+    fn a_url_loses_session_ids_in_its_path_and_signatures_in_its_query() {
+        let r = redact_url("https://portal.example.test/app/home;jsessionid=8F3APATH?x=1");
+        assert!(!r.contains("8F3APATH"), "{r}");
+        assert!(
+            r.contains("/app/home;jsessionid=") && r.ends_with("?x=1"),
+            "{r}"
+        );
+        let r = redact_url("http://h.test/a;PHPSESSID=PS1/b");
+        assert!(!r.contains("PS1"), "{r}");
+        let r = redact_url(
+            "http://h.test/f?PHPSESSID=Q1&sid=Q2&sig=Q3&signature=Q4&X-Goog-Signature=Q5\
+             &X-Amz-Signature=Q6&sessid=Q7&side=keep1&inside=keep2",
+        );
+        for secret in ["Q1", "Q2", "Q3", "Q4", "Q5", "Q6", "Q7"] {
+            assert!(!r.contains(secret), "{secret} survived: {r}");
+        }
+        assert!(
+            r.contains("side=keep1") && r.contains("inside=keep2"),
+            "{r}"
+        );
+        let r = redact_url("https://ghp_0123456789abcdefghijklmnopqrstuvwxyz@h.test/r");
+        assert!(!r.contains("0123456789abcdef"), "{r}");
+    }
+
+    /// The member pattern reaches a string value only, so an object or array under a
+    /// secret name is masked whole, and a body cut off inside one is masked to its end.
+    #[test]
+    fn json_members_with_secret_names_and_object_values_are_masked_whole() {
+        let r = redact_text(
+            r#"{"session": {"id": "NJ1", "exp": 5}, "tokens": ["NJ2", {"v": "NJ3"}], "q": {"keep": "k1"}, "n": "k2"}"#,
+        );
+        for secret in ["NJ1", "NJ2", "NJ3"] {
+            assert!(!r.contains(secret), "{secret} survived: {r}");
+        }
+        assert_eq!(
+            r,
+            r#"{"session": "[redacted]", "tokens": "[redacted]", "q": {"keep": "k1"}, "n": "k2"}"#
+        );
+        // A brace inside a string does not end the value early.
+        let r = redact_text(r#"{"auth":{"note":"a } \" ]","key":"NJ4"},"after":1}"#);
+        assert_eq!(r, r#"{"auth":"[redacted]","after":1}"#);
+        // Nested under an ordinary name, and cut off by the body cap.
+        let r = redact_text(r#"{"data":{"user":{"session":{"id":"NJ5","more"#);
+        assert!(!r.contains("NJ5"), "{r}");
+        assert!(
+            r.starts_with(r#"{"data":{"user":{"session":"[redacted]""#),
+            "{r}"
+        );
     }
 
     #[test]

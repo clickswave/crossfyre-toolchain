@@ -468,7 +468,7 @@ mod reads {
                 "workbench_list_history",
                 json!({"host": "App.Example.Test", "method": "get", "origins": ["agent", "proxy"],
                        "status_min": 200, "status_max": 299, "since": "2026-10-30T00:00:00Z",
-                       "url_contains": "/a", "search": "login", "limit": 10}),
+                       "search": "login", "limit": 10}),
             )
             .await;
         let v = ok(&r).clone();
@@ -569,6 +569,143 @@ mod reads {
         let sent = &b.fake.params(Method::History)[1];
         assert_eq!(sent["cursor"]["id"], last_id);
         assert_eq!(v2["rows"][0]["exchange"], handle(UID_A, last_id + 1));
+    }
+
+    /// A history that filters the way the Workbench does: `url_contains` against the
+    /// stored URL, case folded, newest first, `limit` rows a page.
+    fn filtering_history(urls: Vec<(i64, String)>) -> WbOpts {
+        WbOpts::default().answer(Method::History, move |c, _| {
+            let Call::History(p) = c else { unreachable!() };
+            let needle = p.filter.url_contains.as_deref().map(str::to_lowercase);
+            let mut found: Vec<HistoryRow> = urls
+                .iter()
+                .filter(|(id, _)| p.cursor.is_none_or(|c| *id > c.id))
+                .filter(|(_, u)| needle.as_ref().is_none_or(|n| u.to_lowercase().contains(n)))
+                .map(|(id, u)| row(*id, u))
+                .collect();
+            let more = found.len() > p.limit as usize;
+            found.truncate(p.limit as usize);
+            let next = found.last().filter(|_| more).map(|r| HistoryCursor {
+                at_ms: r.at_ms,
+                id: r.id,
+            });
+            Ok(serde_json::to_value(HistoryResult { rows: found, next }).unwrap())
+        })
+    }
+
+    /// `url_contains` is matched against the URL as it is shown. A term reaching into a
+    /// masked value finds nothing, the same nothing a wrong guess finds, so the value
+    /// cannot be read back one character at a time.
+    #[tokio::test]
+    async fn url_contains_cannot_read_back_a_masked_value() {
+        let urls = vec![
+            (
+                1,
+                "http://app.example.test/cb?access_token=Zq9VAL&x=1".to_string(),
+            ),
+            (
+                2,
+                "http://app.example.test/app;jsessionid=JS1VAL/home".to_string(),
+            ),
+        ];
+        let b = bench_with(base(), filtering_history(urls)).await;
+        let peer = FakePeer::new(Elicit::None);
+        let mut seen = Vec::new();
+        for term in [
+            "access_token=z",
+            "access_token=zq9",
+            "access_token=y",
+            "Zq9VAL",
+            "VAL&x=1",
+            "jsessionid=js1",
+            "JS1VAL",
+        ] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_list_history",
+                    json!({"url_contains": term, "limit": 1}),
+                )
+                .await;
+            let v = ok(&r).clone();
+            seen.push((term, v["rows"].clone(), v["next_cursor"].clone()));
+        }
+        for (term, rows, next) in &seen {
+            assert_eq!(rows, &json!([]), "{term} found a row: {rows}");
+            assert!(next.is_null(), "{term} left a cursor: {next}");
+        }
+        // A term in the shown part still finds its row.
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_list_history",
+                json!({"url_contains": "x=1"}),
+            )
+            .await;
+        let v = ok(&r).clone();
+        assert_eq!(v["rows"].as_array().unwrap().len(), 1, "{v}");
+        assert_eq!(v["rows"][0]["exchange"], handle(UID_A, 1));
+    }
+
+    /// Rows the Workbench matched but the shown URL does not hold are skipped, and pages
+    /// are read until enough are kept. The cursor starts after the last row kept.
+    #[tokio::test]
+    async fn url_contains_pages_past_rows_that_match_only_inside_a_masked_value() {
+        let urls: Vec<(i64, String)> = (1..=250)
+            .map(|i| {
+                let name = if i % 50 == 0 { "q" } else { "token" };
+                (i, format!("http://app.example.test/p?{name}=hit{i}"))
+            })
+            .collect();
+        let b = bench_with(base(), filtering_history(urls)).await;
+        let peer = FakePeer::new(Elicit::None);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_list_history",
+                json!({"url_contains": "HIT", "limit": 2}),
+            )
+            .await;
+        let v = ok(&r).clone();
+        let ids: Vec<&str> = v["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["exchange"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, [handle(UID_A, 50), handle(UID_A, 100)], "{v}");
+        let next = v["next_cursor"].as_str().unwrap().to_string();
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_list_history",
+                json!({"url_contains": "HIT", "limit": 2, "cursor": next}),
+            )
+            .await;
+        let v = ok(&r).clone();
+        let ids: Vec<&str> = v["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["exchange"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, [handle(UID_A, 150), handle(UID_A, 200)], "{v}");
+        let next = v["next_cursor"].as_str().unwrap().to_string();
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_list_history",
+                json!({"url_contains": "HIT", "limit": 2, "cursor": next}),
+            )
+            .await;
+        let v = ok(&r).clone();
+        assert_eq!(v["rows"].as_array().unwrap().len(), 1, "{v}");
+        assert_eq!(v["rows"][0]["exchange"], handle(UID_A, 250));
+        assert!(v["next_cursor"].is_null(), "{v}");
+        // The Workbench is still asked to narrow by the term, a page at a time.
+        let sent = &b.fake.params(Method::History)[0];
+        assert_eq!(sent["filter"]["url_contains"], "HIT");
+        assert_eq!(sent["limit"], 100);
     }
 
     /// An exchange carrying a secret in every place one turns up.

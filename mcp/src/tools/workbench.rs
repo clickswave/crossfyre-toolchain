@@ -36,6 +36,10 @@ const HEADER_VALUE_MAX: usize = 1024;
 const HEADERS_TOTAL_MAX: usize = 8 * 1024;
 /// A URL or path from a list row.
 const URL_MAX: usize = 2048;
+/// Rows asked for at a time while `url_contains` is matched against the shown URL, and
+/// the most pages one call reads before it hands back a cursor instead.
+const HISTORY_MATCH_PAGE: u32 = 100;
+const HISTORY_MATCH_PAGES: u32 = 20;
 
 pub(crate) async fn run(
     mcp: &Mcp,
@@ -637,6 +641,17 @@ async fn list_history(
     )
     .await?;
     note.workbench = Some(o.audit());
+    let redact = mcp.settings.redact;
+    // The Workbench matches `url_contains` against the stored URL. With masking on, a
+    // term reaching into a masked value would say what the value holds, one guess at a
+    // time, so a row is kept only when the URL as shown holds the term too. Pages are
+    // then read until enough rows are kept, so a row matched only inside a masked value
+    // leaves no trace in the rows or the cursor.
+    let needle = a
+        .url_contains
+        .as_deref()
+        .filter(|_| redact)
+        .map(str::to_ascii_lowercase);
     let filter = HistoryFilter {
         host: a.host.map(|h| h.trim().to_ascii_lowercase()),
         method: a.method.map(|m| m.trim().to_ascii_uppercase()),
@@ -648,45 +663,74 @@ async fn list_history(
         since_ms,
         until_ms: None,
     };
-    let call = Call::History(HistoryParams {
+    let mut params = HistoryParams {
         project_uid: o.project.uid.clone(),
         filter,
         cursor: match cursor {
             Some(Cursor::History { at, .. }) => Some(at),
             _ => None,
         },
-        limit,
-    });
-    let r: HistoryResult = ask(&o, &call, REQUEST_WAIT, ct)
-        .await?
-        .map_err(|e| bridge_refusal(e, &o, "Nothing was read."))?;
+        limit: if needle.is_some() {
+            HISTORY_MATCH_PAGE
+        } else {
+            limit
+        },
+    };
 
-    let redact = mcp.settings.redact;
     let mut rows: Vec<(Value, cfx_bridge::HistoryCursor)> = Vec::new();
-    for row in &r.rows {
-        let Some(handle) = o.handle(row.id) else {
-            continue;
-        };
-        rows.push((
-            json!({
-                "exchange": handle,
-                "at": rfc3339(row.at_ms),
-                "method": untrusted::clean(&row.method, 32),
-                "host": untrusted::clean(&row.host, 200),
-                "status": row.status,
-                "origin": origin_str(&row.origin),
-                "req_len": row.req_len,
-                "resp_len": row.resp_len,
-                "target_data": {"untrusted": true, "url": shown_url(&row.url, redact)},
-            }),
-            cfx_bridge::HistoryCursor {
+    let mut after = None;
+    for page in 1.. {
+        let call = Call::History(params.clone());
+        let r: HistoryResult = ask(&o, &call, REQUEST_WAIT, ct)
+            .await?
+            .map_err(|e| bridge_refusal(e, &o, "Nothing was read."))?;
+        after = r.next;
+        for (i, row) in r.rows.iter().enumerate() {
+            let Some(handle) = o.handle(row.id) else {
+                continue;
+            };
+            let url = shown_url(&row.url, redact);
+            if let Some(n) = &needle
+                && !url.to_ascii_lowercase().contains(n.as_str())
+            {
+                continue;
+            }
+            let at = cfx_bridge::HistoryCursor {
                 at_ms: row.at_ms,
                 id: row.id,
-            },
-        ));
+            };
+            rows.push((
+                json!({
+                    "exchange": handle,
+                    "at": rfc3339(row.at_ms),
+                    "method": untrusted::clean(&row.method, 32),
+                    "host": untrusted::clean(&row.host, 200),
+                    "status": row.status,
+                    "origin": origin_str(&row.origin),
+                    "req_len": row.req_len,
+                    "resp_len": row.resp_len,
+                    "target_data": {"untrusted": true, "url": url},
+                }),
+                at,
+            ));
+            if rows.len() >= limit as usize {
+                if i + 1 < r.rows.len() {
+                    after = Some(at);
+                }
+                break;
+            }
+        }
+        if needle.is_none()
+            || rows.len() >= limit as usize
+            || after.is_none()
+            || page >= HISTORY_MATCH_PAGES
+        {
+            break;
+        }
+        params.cursor = after;
     }
     let tag = o.tag();
-    let mut next = r.next.map(|at| Cursor::History { project: tag, at });
+    let mut next = after.map(|at| Cursor::History { project: tag, at });
     let mut truncated = false;
     let build = |rows: &[(Value, cfx_bridge::HistoryCursor)], next: &Option<Cursor>, cut: bool| {
         json!({
