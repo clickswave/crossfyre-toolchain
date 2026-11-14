@@ -829,9 +829,11 @@ pub fn print_privilege_banner(needs_root: bool) {
 ///
 ///   <base>/nodes.d/<node-id>.toml       <- config (what `--init` writes)
 ///   <base>/nodes.d/<node-id>.pid        <- daemon PID lock
-///   <base>/nodes.d/<node-id>.network/   <- egress config + logs
+///   <base>/nodes.d/<node-id>.network/   <- egress config + logs, without root
 ///
-/// `base` itself is the value resolved from `--data-dir` / `$SUDO_USER`.
+/// `base` itself is the value resolved from `--data-dir` / `$SUDO_USER`. Run as root on
+/// Linux or macOS, the network dir is root's instead: see
+/// [`toolchain::node_config::network_dir`].
 pub struct NodePaths {
     base: std::path::PathBuf,
     node_id: String,
@@ -848,7 +850,7 @@ impl NodePaths {
             node_id: node_id.to_string(),
             config: nodes_dir.join(format!("{node_id}.toml")),
             pid: nodes_dir.join(format!("{node_id}.pid")),
-            network_dir: nodes_dir.join(format!("{node_id}.network")),
+            network_dir: toolchain::node_config::network_dir(&nodes_dir, node_id),
         }
     }
 }
@@ -1024,8 +1026,9 @@ pub fn migrate_legacy_config(base: &std::path::Path) {
     if toolchain::sudo_user::rename(&legacy, &paths.config).is_ok() {
         println!("[migrate] Moved legacy config.toml -> {:?}", paths.config);
         let legacy_net = base.join("network");
-        if legacy_net.is_dir() && !paths.network_dir.exists() {
-            let _ = toolchain::sudo_user::rename(&legacy_net, &paths.network_dir);
+        let net_dir = toolchain::node_config::operator_network_dir(&nodes_dir(base), &cfg.node_id);
+        if legacy_net.is_dir() && !net_dir.exists() {
+            let _ = toolchain::sudo_user::rename(&legacy_net, &net_dir);
         }
         // The config itself stays as it is: the tree chown leaves node configs alone,
         // and taking over an earlier release's configs is node_config's.
@@ -1274,8 +1277,12 @@ pub fn remove_node_files(base: &std::path::Path, node_id: &str) -> std::io::Resu
     if paths.pid.exists() {
         let _ = toolchain::sudo_user::remove_file(&paths.pid);
     }
-    if paths.network_dir.exists() {
-        let _ = toolchain::sudo_user::remove_dir_all(&paths.network_dir);
+    // Root's network dir, and the one in nodes.d that an earlier release used.
+    let operator_net = toolchain::node_config::operator_network_dir(&nodes_dir(base), node_id);
+    for dir in [&paths.network_dir, &operator_net] {
+        if dir.exists() {
+            let _ = toolchain::sudo_user::remove_dir_all(dir);
+        }
     }
     Ok(())
 }
@@ -1474,7 +1481,9 @@ pub async fn run_node_remove(
         let mut removed = 0usize;
         for id in &ids {
             let paths = NodePaths::new(base, id);
-            let cfg: Config = match fs::read_to_string(&paths.config)
+            // As root, a config another account could have written names an API root
+            // would otherwise call, and remove the node on its answer.
+            let cfg: Config = match toolchain::node_config::read(&paths.config)
                 .ok()
                 .and_then(|s| toml::from_str(&s).ok())
             {
@@ -1583,6 +1592,10 @@ pub async fn run_init(
     field("Control plane", api_url);
     field("Data directory", &data_dir.display().to_string());
     print_privilege_banner(false);
+    // Before anything is written: on a host with no node service yet, record that there
+    // is nothing from an earlier release to take over, so the service installed below
+    // never hands root a config the operator's account put in nodes.d.
+    toolchain::node_config::settle_before_init(data_dir)?;
 
     let client = reqwest::Client::new();
 
@@ -1693,6 +1706,7 @@ pub async fn run_init(
         .to_string();
 
     // -- Network identity (VPN tunnel set on the dashboard) -------------
+    toolchain::node_config::prepare_network_dir(&nd, &paths.node_id)?;
     let network = egress::process_network_config(&json_resp["network_config"], &paths.network_dir);
 
     // Write nodes.d/<node-id>.toml (with extensions list + network section)
@@ -2130,7 +2144,8 @@ pub async fn refresh_node_state(
     toolchain::node_config::write(config_path, &config_toml)?;
     // The daemon runs as root. The config stays root's, since this daemon runs what it
     // says; what else it wrote under nodes.d goes back to the invoking user (the tree
-    // chown leaves node configs alone).
+    // chown leaves node configs alone). Its tunnel config is not under nodes.d: see
+    // node_config::network_dir.
     if let Some(parent) = config_path.parent() {
         chown_tree_to_sudo_user(parent);
     }
@@ -2337,6 +2352,8 @@ pub async fn run_daemon(
     // Repair installs written before the config was mode-restricted.
     repair_secret_file_mode(&config_path);
     let mut config = load_node_config(&config_path)?;
+    // As root, the tunnel config goes to a directory only root can change.
+    toolchain::node_config::prepare_network_dir(&nodes_dir(&paths.base), &paths.node_id)?;
 
     println!("Configuration loaded successfully.");
 
@@ -3758,6 +3775,21 @@ mod security_tests {
         assert!(
             e.join("n.network/wg0.conf").exists(),
             "removed the network dir"
+        );
+    }
+
+    /// Root runs the tunnel config in a node's network dir (wg-quick and OpenVPN run the
+    /// hooks it names), so a node run as root keeps it outside the operator's tree.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_node_keeps_its_tunnel_config_out_of_the_operators_tree() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let _root = toolchain::sudo_user::act_as_root();
+        let paths = NodePaths::new(base.path(), "n");
+        assert!(
+            !paths.network_dir.starts_with(base.path()),
+            "a root node's network dir is {:?}, in the operator's tree",
+            paths.network_dir
         );
     }
 

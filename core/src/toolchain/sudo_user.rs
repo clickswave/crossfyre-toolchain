@@ -473,6 +473,8 @@ mod root_link_tests {
                 "a node config was handed over (walk from nodes.d: {start_at_nodes_dir})"
             );
             assert_eq!(fs::metadata(&pid).unwrap().gid(), gid);
+            // Where a node without root keeps its tunnel config. A node run as root keeps
+            // it in a directory of root's outside this tree.
             assert_eq!(fs::metadata(&tunnel).unwrap().gid(), gid);
         }
     }

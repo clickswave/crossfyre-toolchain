@@ -224,6 +224,71 @@ pub fn replace_file(
     mode: u32,
     owner: Option<(u32, u32)>,
 ) -> io::Result<()> {
+    replace(path, contents, mode, owner, false)
+}
+
+/// [`replace_file`], for a file that nobody but root may change. The new file is refused
+/// when it was made with an access list, which on macOS it copies from an inheritable
+/// entry on the directory: such an entry can let another account open the file before a
+/// byte is written, and an open file stays open whatever is changed on it later.
+pub fn replace_root_file(
+    path: &Path,
+    contents: &[u8],
+    mode: u32,
+    owner: Option<(u32, u32)>,
+) -> io::Result<()> {
+    replace(path, contents, mode, owner, true)
+}
+
+/// Whether the file or directory open at `fd` has an extended access list. On macOS an
+/// entry in one grants access whatever the mode bits say. On Linux a POSIX access list
+/// is capped by the group bits of the mode, which the checks here read already, so this
+/// is always false there.
+pub fn has_extended_acl(fd: RawFd) -> io::Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn acl_get_fd_np(fd: libc::c_int, ty: libc::c_int) -> *mut libc::c_void;
+            fn acl_get_entry(
+                acl: *mut libc::c_void,
+                entry_id: libc::c_int,
+                entry: *mut *mut libc::c_void,
+            ) -> libc::c_int;
+            fn acl_free(obj: *mut libc::c_void) -> libc::c_int;
+        }
+        // From <sys/acl.h>.
+        const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+        const ACL_FIRST_ENTRY: libc::c_int = 0;
+        // SAFETY: `fd` is open; a list returned is freed below.
+        let acl = unsafe { acl_get_fd_np(fd, ACL_TYPE_EXTENDED) };
+        if acl.is_null() {
+            let e = io::Error::last_os_error();
+            // ENOENT is how macOS says the file has no list.
+            return match e.raw_os_error() {
+                Some(libc::ENOENT) | Some(libc::ENOTSUP) | Some(libc::EOPNOTSUPP) => Ok(false),
+                _ => Err(e),
+            };
+        }
+        let mut entry = std::ptr::null_mut();
+        // SAFETY: `acl` is a list from acl_get_fd_np and `entry` a valid out-pointer.
+        let first = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) };
+        unsafe { acl_free(acl) };
+        Ok(first == 0)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = fd;
+        Ok(false)
+    }
+}
+
+fn replace(
+    path: &Path,
+    contents: &[u8],
+    mode: u32,
+    owner: Option<(u32, u32)>,
+    strict: bool,
+) -> io::Result<()> {
     let (dirs, name) = split(path)?;
     let dir = open_dir(&dirs, false, None)?;
     // O_EXCL: a name someone else made first, link or not, is never opened.
@@ -247,6 +312,17 @@ pub fn replace_file(
     };
     let result = (|| {
         let mut f = File::from(fd);
+        if strict && has_extended_acl(f.as_raw_fd())? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "not writing {}: a file made in that directory gets an access list from \
+                     it, which can let other accounts change the file. Remove the \
+                     directory's list (sudo chmod -N on it) and try again.",
+                    path.display()
+                ),
+            ));
+        }
         f.write_all(contents)?;
         if let Some((uid, gid)) = owner {
             check(unsafe { libc::fchown(f.as_raw_fd(), uid, gid) })?;
@@ -284,6 +360,20 @@ pub fn rename(from: &Path, to: &Path) -> io::Result<()> {
         )
     })
     .map(|_| ())
+}
+
+/// Sets the mode of the directory at `path`, through its fd, after checking that this
+/// process owns it.
+pub fn set_dir_mode(path: &Path, mode: u32) -> io::Result<()> {
+    let dir = open_dir(&names(path)?, false, None)?;
+    let st = fstat(dir.as_raw_fd())?;
+    if st.st_uid != unsafe { libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} belongs to uid {}", path.display(), st.st_uid),
+        ));
+    }
+    check(unsafe { libc::fchmod(dir.as_raw_fd(), (mode & 0o7777) as libc::mode_t) }).map(|_| ())
 }
 
 /// Sets the mode of the regular file at `path`, through its fd.

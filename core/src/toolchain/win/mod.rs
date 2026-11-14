@@ -326,47 +326,6 @@ pub fn create_admin_only(path: &Path) -> std::io::Result<std::fs::File> {
     }
 }
 
-/// Gives the open `file` the owner and access list of [`create_admin_only`]. `file`
-/// must have been opened with READ_CONTROL, WRITE_DAC and WRITE_OWNER.
-pub fn make_admin_only(file: &std::fs::File) -> std::io::Result<()> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
-    use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
-    use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
-        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-    };
-    let sd = AdminOnly::new()?;
-    let mut owner = std::ptr::null_mut();
-    let mut dacl = std::ptr::null_mut();
-    let mut present = 0;
-    let mut defaulted = 0;
-    // SAFETY: the out-pointers are valid, and the owner and access list point into
-    // `sd`, which outlives the SetSecurityInfo call.
-    unsafe {
-        if GetSecurityDescriptorOwner(sd.0, &mut owner, &mut defaulted) == 0
-            || GetSecurityDescriptorDacl(sd.0, &mut present, &mut dacl, &mut defaulted) == 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
-        let status = SetSecurityInfo(
-            file.as_raw_handle(),
-            SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION
-                | DACL_SECURITY_INFORMATION
-                | PROTECTED_DACL_SECURITY_INFORMATION,
-            owner,
-            std::ptr::null_mut(),
-            dacl,
-            std::ptr::null(),
-        );
-        if status != ERROR_SUCCESS {
-            return Err(std::io::Error::from_raw_os_error(status as i32));
-        }
-    }
-    Ok(())
-}
-
 /// Opens the regular file at `path` with `access`, refusing a link or junction (which is
 /// opened as itself, not followed) and a file with a second name, which can be any file
 /// on the same volume.
