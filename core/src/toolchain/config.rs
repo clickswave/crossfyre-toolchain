@@ -200,24 +200,6 @@ pub fn egress_env_path() -> PathBuf {
     }
 }
 
-/// Where a file the node hands to an engine is written, such as a downloaded wordlist
-/// the engine then reads by its path: `/tmp/<name>` on Unix, as it always has been. On
-/// Windows the node runs as LocalSystem, whose temporary directory the operator, whom
-/// the engines run as, cannot read, so it is the toolchain directory's `tmp`, in the
-/// operator's profile, which both can.
-pub fn handoff_path(name: &str) -> String {
-    #[cfg(windows)]
-    {
-        let dir = get_toolchain_dir().join("tmp");
-        let _ = fs::create_dir_all(&dir);
-        dir.join(name).display().to_string()
-    }
-    #[cfg(not(windows))]
-    {
-        format!("/tmp/{name}")
-    }
-}
-
 /// Where the services write their logs on macOS and Windows, which have no journal: the
 /// toolchain directory's `logs`, beside the configs they describe and readable by the
 /// same person. Linux services log to the journal instead.

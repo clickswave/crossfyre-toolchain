@@ -182,24 +182,32 @@ pub async fn handle(env: OpEnv) {
     // Download wordlist - supports both formats:
     // One input: "wordlist_url" (single presigned chunk URL)
     // Or: "wordlists" array with [{ id, url }]
+    // Downloaded lists are handed to ambulo in a directory of this op's own, removed
+    // when the op ends. A list that was downloaded but could not be written fails the op.
+    let mut handoff = None;
     let mut wordlist_path = String::new();
+    let mut handoff_failed = None;
 
     if let Some(wl_url) = data["wordlist_url"].as_str() {
         // single chunk URL
         if !wl_url.is_empty() {
-            let tmp = crate::toolchain::config::handoff_path(&format!("cfx-wl-chunk-{op_id}.txt"));
             println!("[op] Downloading wordlist chunk...");
             if let Ok(resp) = reqwest::get(wl_url).await
                 && let Ok(body) = resp.text().await
             {
-                let _ = std::fs::write(&tmp, &body);
-                wordlist_path = tmp;
-                let lines = body.lines().count();
-                println!(
-                    "[op] OK Chunk downloaded ({} lines, {} bytes)",
-                    lines,
-                    body.len()
-                );
+                let name = format!("cfx-wl-chunk-{op_id}.txt");
+                match super::handoff::put(&mut handoff, &name, body.as_bytes()) {
+                    Ok(path) => {
+                        wordlist_path = path;
+                        let lines = body.lines().count();
+                        println!(
+                            "[op] OK Chunk downloaded ({} lines, {} bytes)",
+                            lines,
+                            body.len()
+                        );
+                    }
+                    Err(e) => handoff_failed = Some(e),
+                }
             }
         }
     } else if let Some(wls) = data["wordlists"].as_array() {
@@ -208,17 +216,36 @@ pub async fn handle(env: OpEnv) {
             let dl_url = first["url"].as_str().unwrap_or("");
             if !dl_url.is_empty() {
                 let wl_id = first["id"].as_str().unwrap_or("wordlist");
-                let tmp = crate::toolchain::config::handoff_path(&format!("cfx-wl-{wl_id}.txt"));
                 println!("[op] Downloading wordlist: {wl_id}");
                 if let Ok(resp) = reqwest::get(dl_url).await
                     && let Ok(body) = resp.text().await
                 {
-                    let _ = std::fs::write(&tmp, &body);
-                    wordlist_path = tmp;
-                    println!("[op] OK Wordlist downloaded ({} bytes)", body.len());
+                    let name = format!("cfx-wl-{wl_id}.txt");
+                    match super::handoff::put(&mut handoff, &name, body.as_bytes()) {
+                        Ok(path) => {
+                            wordlist_path = path;
+                            println!("[op] OK Wordlist downloaded ({} bytes)", body.len());
+                        }
+                        Err(e) => handoff_failed = Some(e),
+                    }
                 }
             }
         }
+    }
+
+    if let Some(e) = handoff_failed {
+        let why = format!("the wordlist could not be written for ambulo: {e}");
+        eprintln!("[op] FAIL {why}");
+        super::publish_failed(
+            &pub_clone,
+            &result_subj,
+            &op_id,
+            &workflow_id,
+            &node_id,
+            &why,
+        )
+        .await;
+        return;
     }
 
     if wordlist_path.is_empty() {
@@ -318,14 +345,32 @@ pub async fn handle(env: OpEnv) {
         && let Some(rw_url) = data["recurse_wordlist_url"].as_str()
         && !rw_url.is_empty()
     {
-        let tmp = crate::toolchain::config::handoff_path(&format!("cfx-wl-recurse-{op_id}.txt"));
         if let Ok(resp) = reqwest::get(rw_url).await
             && let Ok(body) = resp.text().await
         {
-            let _ = std::fs::write(&tmp, &body);
-            recurse_wordlist_path = tmp;
-            recurse_wl_lines = body.lines().filter(|l| !l.trim().is_empty()).count() as i64;
-            println!("[op] recursion wordlist downloaded ({recurse_wl_lines} lines)");
+            let name = format!("cfx-wl-recurse-{op_id}.txt");
+            match super::handoff::put(&mut handoff, &name, body.as_bytes()) {
+                Ok(path) => {
+                    recurse_wordlist_path = path;
+                    recurse_wl_lines = body.lines().filter(|l| !l.trim().is_empty()).count() as i64;
+                    println!("[op] recursion wordlist downloaded ({recurse_wl_lines} lines)");
+                }
+                Err(e) => {
+                    let why =
+                        format!("the recursion wordlist could not be written for ambulo: {e}");
+                    eprintln!("[op] FAIL {why}");
+                    super::publish_failed(
+                        &pub_clone,
+                        &result_subj,
+                        &op_id,
+                        &workflow_id,
+                        &node_id,
+                        &why,
+                    )
+                    .await;
+                    return;
+                }
+            }
         }
     }
 

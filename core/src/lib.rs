@@ -4249,6 +4249,9 @@ mod op_failure_tests {
         if data.get("wordlist_url").is_some() {
             data["wordlist_url"] = json!(format!("{}/wl", platform.url));
         }
+        if let Some(first) = data.pointer_mut("/wordlists/0") {
+            first["url"] = json!(format!("{}/wl", platform.url));
+        }
         let cmd = json!({
             "type": "operation", "operation_id": op_id, "workflow_id": WF,
             "op_type": op_type, "pre_claimed": true, "data": data,
@@ -4353,6 +4356,44 @@ mod op_failure_tests {
     async fn a_content_scan_with_ambulo_down_says_so() {
         let data = json!({"url": "http://127.0.0.1:9/", "wordlist_url": ""});
         assert_failed_with_reason("content-discovery-db", "mach", "ambulo", data).await;
+    }
+
+    /// A downloaded wordlist used to be written to a fixed name in /tmp, following
+    /// whatever was already there. One planted there as a link to another file must not
+    /// have that file overwritten.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_downloaded_wordlist_is_not_written_through_a_planted_link() {
+        for (op_type, ext, engine, prefix) in [
+            ("subdomain-enum-ds", "voyage", "voyage", "cfx-wl-sub-"),
+            ("content-discovery-db", "mach", "ambulo", "cfx-wl-"),
+        ] {
+            let scratch = tempfile::tempdir().unwrap();
+            let victim = scratch.path().join("victim");
+            std::fs::write(&victim, "kept\n").unwrap();
+            let id = format!("planted-{}-{op_type}", std::process::id());
+            let planted = std::path::PathBuf::from("/tmp").join(format!("{prefix}{id}.txt"));
+            let _ = std::fs::remove_file(&planted);
+            std::os::unix::fs::symlink(&victim, &planted).unwrap();
+            let data = json!({
+                "domain": "example.test",
+                "url": "http://127.0.0.1:9/",
+                "wordlists": [{"id": id, "url": ""}],
+            });
+            let op_id = format!("op-planted-{op_type}");
+            let (done, ..) = run_unreachable(&op_id, op_type, ext, data).await;
+            let _ = std::fs::remove_file(&planted);
+            assert_eq!(
+                std::fs::read_to_string(&victim).unwrap(),
+                "kept\n",
+                "{op_type} wrote its wordlist through a link it did not make"
+            );
+            let why = done["error"].as_str().unwrap_or_default();
+            assert!(
+                why.starts_with(&format!("{engine} daemon unreachable")),
+                "{op_type}: {done}"
+            );
+        }
     }
 }
 
