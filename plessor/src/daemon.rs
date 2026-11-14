@@ -98,23 +98,12 @@ async fn handle_connection(stream: TcpStream, gate: dguard::Gate) -> Result<(), 
         if line.is_empty() {
             continue;
         }
-        // The bind address is the primary boundary. This is the second one, for
-        // deployments that used CFX_DAEMON_BIND to move the listener off loopback;
-        // with no token configured it is a no-op.
-        if !gate.allows(
-            serde_json::from_str::<serde_json::Value>(&line)
-                .ok()
-                .as_ref()
-                .and_then(|v| v.get("token"))
-                .and_then(|t| t.as_str()),
-        ) {
-            // Same `type`/`message` envelope as every other reply: a client that
-            // breaks on `type == "error"` has to recognise this one, or it waits
-            // for a line that never comes. Then close, rather than leaving an
-            // unauthenticated peer a socket to retry on.
-            let _ = writer
-                .write_all(b"{\"type\":\"error\",\"message\":\"unauthorized\"}\n")
-                .await;
+        // A line that is not a JSON object is not from a client (an HTTP request
+        // from a web page starts that way), and a request without the configured
+        // token is not from an authorised one. Either ends the connection, so
+        // nothing written after that line is ever read as a request.
+        if let Some(reply) = gate.refusal(&line) {
+            let _ = writer.write_all(reply.as_bytes()).await;
             break;
         }
 
@@ -780,5 +769,76 @@ mod tests {
         );
         assert_eq!(fx.connections(), 0);
         assert_eq!(proxy.connections(), 0);
+    }
+}
+
+#[cfg(test)]
+mod http_request_tests {
+    //! A web page open in the operator's browser can POST to this port. The browser
+    //! writes a request line and headers before the body the page chose, so the
+    //! connection has to end at the request line, before the body is read.
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn daemon() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(serve(listener, dguard::Gate::default()));
+        port
+    }
+
+    /// Sends `raw` and returns the lines the daemon wrote back, and whether it
+    /// closed the connection.
+    async fn send(port: u16, raw: &str) -> (Vec<String>, bool) {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        s.write_all(raw.as_bytes()).await.unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        let closed = loop {
+            match tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => break true,
+                Ok(Ok(n)) => got.extend_from_slice(&buf[..n]),
+                Err(_) => break false,
+            }
+        };
+        let lines = String::from_utf8_lossy(&got)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        (lines, closed)
+    }
+
+    #[tokio::test]
+    async fn an_http_post_is_closed_at_its_request_line() {
+        let port = daemon().await;
+        let body = "{\"operation\":\"capabilities\"}\n";
+        let raw = format!(
+            "POST / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://page.test\r\n\
+             Content-Type: text/plain;charset=UTF-8\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let (lines, closed) = send(port, &raw).await;
+        assert!(closed, "the connection stayed open: {lines:?}");
+        assert!(
+            lines.len() <= 1,
+            "answered the HTTP lines one by one: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("capabilities")),
+            "read the body as a request: {lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_line_that_is_json_but_not_an_object_closes_too() {
+        let port = daemon().await;
+        let (lines, closed) = send(port, "[1]\n{\"operation\":\"capabilities\"}\n").await;
+        assert!(closed, "the connection stayed open: {lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.contains("capabilities")),
+            "read on past the first line: {lines:?}"
+        );
     }
 }

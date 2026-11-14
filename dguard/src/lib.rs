@@ -98,6 +98,27 @@ impl Gate {
         ct_eq(expected.as_bytes(), given.as_bytes())
     }
 
+    /// The reply that ends a connection at `line`, or `None` when the line may go
+    /// on to the daemon's request parser.
+    ///
+    /// Every client of these daemons writes one JSON object per line, so a line
+    /// that is not one did not come from a client. The case that matters is HTTP:
+    /// a web page open in the operator's browser can POST to a loopback port, and
+    /// the browser writes a request line and headers ahead of the body the page
+    /// chose. Answering each of those lines and reading on reaches the body and
+    /// runs it as a request. Closing at the first one never reads that far, and
+    /// no request line or header can parse as a JSON object.
+    pub fn refusal(&self, line: &str) -> Option<&'static str> {
+        let Ok(serde_json::Value::Object(req)) = serde_json::from_str(line) else {
+            return Some(NOT_A_REQUEST);
+        };
+        if self.allows(req.get("token").and_then(|t| t.as_str())) {
+            None
+        } else {
+            Some(UNAUTHORIZED)
+        }
+    }
+
     /// Prints the listener's posture once at start.
     ///
     /// Worth the line on stdout: "unauthenticated on every interface" was the old
@@ -121,6 +142,16 @@ impl Gate {
         }
     }
 }
+
+/// Sent before closing on a line that is not a JSON object. It carries both
+/// `type` and `status` so a client that reads either sees an error.
+const NOT_A_REQUEST: &str =
+    "{\"type\":\"error\",\"status\":\"error\",\"message\":\"not a JSON request\"}\n";
+
+/// Sent before closing on a request without the configured token, in the same
+/// `type`/`message` envelope as every other reply: a client that breaks on
+/// `type == "error"` has to recognise it, or it waits for a line that never comes.
+const UNAUTHORIZED: &str = "{\"type\":\"error\",\"message\":\"unauthorized\"}\n";
 
 /// Length-checked constant-time byte comparison.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
@@ -177,6 +208,40 @@ mod tests {
         assert!(!g.allows(Some("sekri")));
         assert!(!g.allows(Some("sekrit ")));
         assert!(g.enabled());
+    }
+
+    #[test]
+    fn a_line_that_is_not_a_json_object_is_refused() {
+        let open = Gate { secret: None };
+        for line in [
+            "POST / HTTP/1.1",
+            "Host: 127.0.0.1:4441",
+            "Content-Type: text/plain;charset=UTF-8",
+            "GET /?{\"operation\":\"scan\"} HTTP/1.1",
+            "[{\"operation\":\"scan\"}]",
+            "\"scan\"",
+            "1",
+            "{\"operation\":",
+        ] {
+            assert_eq!(open.refusal(line), Some(NOT_A_REQUEST), "{line}");
+        }
+        assert_eq!(open.refusal("{\"operation\":\"scan\"}"), None);
+        // A JSON object that is not a valid request still reaches the parser,
+        // which answers it and keeps the connection, as before.
+        assert_eq!(open.refusal("{}"), None);
+    }
+
+    #[test]
+    fn the_token_is_checked_after_the_shape() {
+        let g = Gate {
+            secret: Some("sekrit".into()),
+        };
+        assert_eq!(g.refusal("POST / HTTP/1.1"), Some(NOT_A_REQUEST));
+        assert_eq!(g.refusal("{\"operation\":\"scan\"}"), Some(UNAUTHORIZED));
+        assert_eq!(
+            g.refusal("{\"operation\":\"scan\",\"token\":\"sekrit\"}"),
+            None
+        );
     }
 
     #[test]
