@@ -1123,12 +1123,11 @@ mod node {
     /// instead, before anything is written, and fixes the plist for the next load.
     pub fn adopt_root_log() {
         use std::os::fd::AsRawFd;
-        // Only the service: root, started by launchd, its output going to a file.
+        // Only the service: root, started by launchd. Whatever launchd opened for its
+        // output is replaced, a file or not: a link there could as well have led to a
+        // pipe or a terminal the operator reads.
         let launched = unsafe { libc::geteuid() == 0 && libc::getppid() == 1 };
-        let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
-        let to_file = unsafe { libc::fstat(1, st.as_mut_ptr()) } == 0
-            && unsafe { st.assume_init() }.st_mode & libc::S_IFMT == libc::S_IFREG;
-        if !launched || !to_file {
+        if !launched {
             return;
         }
         // Without the log, nowhere: never on through the file launchd opened.
