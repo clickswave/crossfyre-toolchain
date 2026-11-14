@@ -153,9 +153,9 @@ pub fn up() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Make a container from an earlier release safe, if there is one: it was published
-/// on every interface and let anyone in without a password. Its data is kept. Returns
-/// whether anything changed. Runs at every node start, which is how an upgraded host
-/// is repaired, and before the database is started. An error means a container may
+/// on every interface and let anyone in without a password. The engines' rows are kept
+/// (see [`rebuild`]). Returns whether anything changed. Runs at every node start, which
+/// is how an upgraded host is repaired, and before the database is started. An error means a container may
 /// still be open, including when Docker could not be asked about one config.toml names.
 pub fn secure_existing() -> Result<bool, Box<dyn std::error::Error>> {
     let path = get_config_path();
@@ -441,16 +441,6 @@ const INSPECT_WAIT: Duration = Duration::from_secs(60);
 
 /// `cmd`'s output, or an error once `limit` has passed, when it is killed.
 fn output_within(mut cmd: Command, limit: Duration) -> std::io::Result<std::process::Output> {
-    use std::io::Read;
-    fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut p) = pipe {
-                let _ = p.read_to_end(&mut buf);
-            }
-            buf
-        })
-    }
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -477,6 +467,17 @@ fn output_within(mut cmd: Command, limit: Duration) -> std::io::Result<std::proc
         status,
         stdout: stdout.join().unwrap_or_default(),
         stderr: stderr.join().unwrap_or_default(),
+    })
+}
+
+/// Everything `pipe` says, read on a thread of its own so the child never blocks on it.
+fn drain(pipe: Option<impl std::io::Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut p) = pipe {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
     })
 }
 
@@ -782,8 +783,8 @@ fn secure_using(
         }
     }
 
-    // A server left from an interrupted run below, on the same data volume. It has
-    // to be gone before anything else starts on that volume.
+    // A server left from an interrupted run below, on the old data volume. It has to
+    // be gone before anything else starts on that volume.
     if inspect(&scratch)?.is_some() {
         docker_ok(&["rm", "-f", &scratch])?;
     }
@@ -795,30 +796,13 @@ fn secure_using(
     if current.is_none() {
         current = inspect(name)?;
     }
-    match (current.as_ref(), inspect(&staged)?) {
-        // A move that stopped after the old container was removed: finish it. The copy
-        // is the only container left with the data, so a copy that fails is stopped but
-        // kept. Which kind of container it was moved from is not known any more, so the
-        // copy is repaired offline as one that let anyone in before it is started.
-        (None, Some(info)) => {
-            let staged_id = info["Id"]
-                .as_str()
-                .ok_or("the database container has no id")?;
-            let password = if is_local_host(&config.postgres.host) {
-                let (config, _) = ensure_postgres_password_at(config_path)?;
-                config.postgres.password.unwrap_or_default()
-            } else {
-                new_postgres_password()?
-            };
-            let was_running = info["State"]["Running"].as_bool().unwrap_or(false);
-            docker_ok(&["stop", staged_id])
-                .and_then(|()| repair_offline(&info, staged_id, &scratch, &user, &password))
-                .and_then(|()| check_moved(&staged, &user, false))
-                .and_then(|()| match was_running {
-                    true => docker_ok(&["start", staged_id]),
-                    false => Ok(()),
-                })
-                .map_err(|e| format!("{e}. {STOPPED}"))?;
+    let mut assume_open = false;
+    match (current.is_some(), inspect(&staged)?) {
+        (_, None) => {}
+        // A move or rebuild that stopped after the old container was removed. Both
+        // remove it only once the copy is complete and has its password, so all that
+        // is left is to give the copy its name.
+        (false, Some(info)) if made_as(&info).is_some() => {
             docker_ok(&["rename", &staged, name])?;
             let mut updated = load_config_at(config_path)?;
             updated.container.id = info["Id"].as_str().map(str::to_string);
@@ -827,36 +811,30 @@ fn secure_using(
             // The interrupted run may have made the password the engines now need.
             return Ok(true);
         }
-        // A move that stopped after the copy was made but before the old container
-        // was removed. The copy is only ever made once the old one is stopped and its
-        // password is set, so it is the one to keep, once it passes the check the
-        // interrupted run did not get to.
-        (Some(old), Some(info)) if assess(&info).safe() => {
-            let old_id = old["Id"]
-                .as_str()
-                .ok_or("the database container has no id")?;
-            if assess(old).trust {
-                check_moved(&staged, &user, true).map_err(|e| format!("{e}. {STOPPED}"))?;
+        // One that stopped before the old container was removed: start again from the
+        // old one. A rebuilt copy has a data volume of its own, which goes with it; any
+        // other copy shares the old container's.
+        (true, Some(info)) => {
+            let mut rm = vec!["rm", "-f"];
+            if made_as(&info) == Some(REBUILT) {
+                rm.push("-v");
             }
-            docker_ok(&["rm", old_id])?;
+            rm.push(&staged);
+            docker_ok(&rm)?;
+        }
+        // A copy on the old data volume that this release did not make, with no other
+        // container left: its data is treated as having been open to anyone.
+        (false, Some(_)) => {
             docker_ok(&["rename", &staged, name])?;
-            let mut updated = load_config_at(config_path)?;
-            updated.container.id = info["Id"].as_str().map(str::to_string);
-            save_config_at(config_path, &updated)?;
-            println!("Finished moving the toolchain database to 127.0.0.1 with a password.");
-            return Ok(true);
+            current = inspect(name)?;
+            assume_open = true;
         }
-        // Not one of ours to finish. Removing it without -v leaves the data volume,
-        // which the old container still holds.
-        (Some(_), Some(_)) => {
-            docker_ok(&["rm", "-f", &staged])?;
-        }
-        _ => {}
     }
     let Some(info) = current else {
         return Ok(false);
     };
-    let exposure = assess(&info);
+    let mut exposure = assess(&info);
+    exposure.trust |= assume_open;
     if exposure.safe() {
         if lacks_restart_policy(&info)
             && let Some(id) = info["Id"].as_str()
@@ -900,7 +878,7 @@ fn secure_using(
                 format!("{e}. It may still let clients in without a password; stop it by hand")
             })?;
         }
-        secure_trusting(
+        rebuild(
             &info,
             &id,
             &scratch,
@@ -911,15 +889,7 @@ fn secure_using(
         )
         .map_err(|e| format!("{e}. {STOPPED}"))?
     } else {
-        replace(
-            &info,
-            &id,
-            &staged,
-            name,
-            &config.postgres,
-            &password,
-            false,
-        )?
+        replace(&info, &id, &staged, name, &config.postgres, &password)?
     };
     let mut updated = load_config_at(config_path)?;
     updated.container.id = Some(new_id.clone());
@@ -945,9 +915,172 @@ const STOPPED: &str = "The toolchain database container let clients in without a
      such as Docker restarting, run `crossfyre db restart` to try again. To start again with \
      an empty database instead (scan state is lost): crossfyre db down, then crossfyre db up";
 
-/// Secure a stopped container that was made to let anyone in: repair it offline, then
-/// replace it with a loopback-only one that is checked before the old one is removed.
-fn secure_trusting(
+/// The label on a container this toolchain made in place of another, saying how.
+const MADE_AS: &str = "io.crossfyre.db";
+/// A new cluster on a data volume of its own, holding the engines' rows from a
+/// container that let anyone in. The old container is removed only once it is complete
+/// and has its password.
+const REBUILT: &str = "rebuilt";
+/// The data volume of a container that already needed a password, published on
+/// loopback instead. The old container is removed once it is made.
+const MOVED: &str = "moved";
+/// Holds the data volume of a container that let anyone in, and never runs a server.
+const KEPT: &str = "kept-open-data";
+
+/// How a container was made in place of another, from its `docker inspect` record.
+fn made_as(info: &serde_json::Value) -> Option<&str> {
+    info["Config"]["Labels"][MADE_AS].as_str()
+}
+
+/// `docker run` arguments as [`run_args`] makes them, with the container labelled as
+/// made `how` and the extra arguments `more` given before the image.
+fn labelled_run_args(
+    name: &str,
+    pg: &PostgresSection,
+    image: &str,
+    volumes_from: Option<&str>,
+    how: &str,
+    more: &[String],
+) -> Vec<String> {
+    let mut args = run_args(name, pg, image, volumes_from);
+    let image = args.pop().unwrap_or_default();
+    args.push("--label".to_string());
+    args.push(format!("{MADE_AS}={how}"));
+    args.extend(more.iter().cloned());
+    args.push(image);
+    args
+}
+
+/// The databases the engines keep their scan state in, each with the statements its
+/// engine runs to make its tables, in that order, which their foreign keys allow. They
+/// are the engines' own `create_tables` statements, and a test holds the two together.
+const ENGINE_SCHEMA: &[(&str, &[&str])] = &[
+    (
+        "mach",
+        &[
+            "CREATE TABLE IF NOT EXISTS wordlists ( id BIGSERIAL PRIMARY KEY, name TEXT NOT \
+             NULL, hash TEXT UNIQUE )",
+            "CREATE TABLE IF NOT EXISTS words ( id BIGSERIAL PRIMARY KEY, word TEXT NOT NULL, \
+             wordlist_id BIGINT NOT NULL, FOREIGN KEY (wordlist_id) REFERENCES wordlists(id) )",
+            "CREATE TABLE IF NOT EXISTS scans ( id BIGSERIAL PRIMARY KEY, config_hash TEXT NOT \
+             NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL DEFAULT \
+             NOW()::TEXT, updated_at TEXT NOT NULL DEFAULT NOW()::TEXT, notifications TEXT NOT \
+             NULL DEFAULT '{}', wordlist_id BIGINT, method TEXT NOT NULL, FOREIGN KEY \
+             (wordlist_id) REFERENCES wordlists(id) )",
+            "CREATE TABLE IF NOT EXISTS urls ( id BIGSERIAL PRIMARY KEY, url TEXT NOT NULL, \
+             scan_id BIGINT NOT NULL, FOREIGN KEY (scan_id) REFERENCES scans(id) )",
+            "CREATE TABLE IF NOT EXISTS scan_entries ( id BIGSERIAL PRIMARY KEY, scan_id \
+             BIGINT, url_id BIGINT, word_id BIGINT, status TEXT, request_status INTEGER NOT \
+             NULL DEFAULT 0, headers TEXT, headers_length BIGINT NOT NULL, body BYTEA, \
+             body_length BIGINT NOT NULL, FOREIGN KEY (scan_id) REFERENCES scans(id), FOREIGN \
+             KEY (url_id) REFERENCES urls(id), FOREIGN KEY (word_id) REFERENCES words(id) )",
+            "CREATE INDEX IF NOT EXISTS scan_entries_scan_status_idx ON scan_entries(scan_id, \
+             status)",
+            "CREATE TABLE IF NOT EXISTS logs ( id BIGSERIAL PRIMARY KEY, scan_id BIGINT NOT \
+             NULL, level TEXT NOT NULL DEFAULT 'debug', description TEXT NOT NULL, created_at \
+             TEXT NOT NULL DEFAULT NOW()::TEXT )",
+            "CREATE TABLE IF NOT EXISTS operations ( id TEXT PRIMARY KEY, operation TEXT NOT \
+             NULL, params TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued', result TEXT, \
+             created_at TEXT NOT NULL DEFAULT NOW()::TEXT, updated_at TEXT NOT NULL DEFAULT \
+             NOW()::TEXT )",
+            "CREATE TABLE IF NOT EXISTS probe_results ( id BIGSERIAL PRIMARY KEY, operation_id \
+             TEXT NOT NULL, url TEXT NOT NULL, status TEXT NOT NULL, code INTEGER NOT NULL \
+             DEFAULT 0, body_length BIGINT NOT NULL DEFAULT 0, headers_length BIGINT NOT NULL \
+             DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), delete_after \
+             TIMESTAMPTZ NOT NULL )",
+        ],
+    ),
+    (
+        "voyage",
+        &[
+            "CREATE TABLE IF NOT EXISTS scans ( id TEXT PRIMARY KEY, config_hash TEXT NOT NULL \
+             UNIQUE, domain TEXT NOT NULL, wordlist_path TEXT NOT NULL DEFAULT '', status TEXT \
+             NOT NULL DEFAULT 'created', created_at TEXT NOT NULL DEFAULT NOW()::TEXT, \
+             updated_at TEXT NOT NULL DEFAULT NOW()::TEXT )",
+            "CREATE TABLE IF NOT EXISTS scan_entries ( id BIGSERIAL PRIMARY KEY, scan_id TEXT \
+             NOT NULL REFERENCES scans(id), full_subdomain TEXT NOT NULL, status TEXT NOT NULL \
+             DEFAULT 'queued', method TEXT NOT NULL DEFAULT 'active', source TEXT NOT NULL \
+             DEFAULT '', created_at TEXT NOT NULL DEFAULT NOW()::TEXT, updated_at TEXT NOT \
+             NULL DEFAULT NOW()::TEXT, UNIQUE (scan_id, full_subdomain) )",
+            "CREATE TABLE IF NOT EXISTS logs ( id BIGSERIAL PRIMARY KEY, scan_id TEXT, level \
+             TEXT NOT NULL DEFAULT 'info', message TEXT NOT NULL, created_at TEXT NOT NULL \
+             DEFAULT NOW()::TEXT )",
+            "CREATE TABLE IF NOT EXISTS operations ( id TEXT PRIMARY KEY, operation TEXT NOT \
+             NULL, params TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'queued', \
+             result TEXT, created_at TEXT NOT NULL DEFAULT NOW()::TEXT, updated_at TEXT NOT \
+             NULL DEFAULT NOW()::TEXT )",
+            "CREATE TABLE IF NOT EXISTS probe_results ( id BIGSERIAL PRIMARY KEY, operation_id \
+             TEXT NOT NULL, domain TEXT NOT NULL, found BOOLEAN NOT NULL DEFAULT false, \
+             technique TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
+             delete_after TIMESTAMPTZ NOT NULL )",
+        ],
+    ),
+    (
+        "pulse",
+        &[
+            "CREATE TABLE IF NOT EXISTS scans ( id TEXT PRIMARY KEY, config_hash TEXT NOT \
+             NULL, targets TEXT NOT NULL, ports TEXT NOT NULL, technique TEXT NOT NULL DEFAULT \
+             'connect', status TEXT NOT NULL DEFAULT 'pending', created_at TEXT DEFAULT \
+             NOW()::TEXT, updated_at TEXT DEFAULT NOW()::TEXT )",
+            "CREATE TABLE IF NOT EXISTS scan_entries ( id BIGSERIAL PRIMARY KEY, scan_id TEXT \
+             NOT NULL REFERENCES scans(id), host TEXT NOT NULL, port INTEGER NOT NULL, status \
+             TEXT NOT NULL DEFAULT 'queued', service TEXT, banner TEXT, latency_ms BIGINT \
+             DEFAULT 0, created_at TEXT DEFAULT NOW()::TEXT, updated_at TEXT DEFAULT \
+             NOW()::TEXT, UNIQUE (scan_id, host, port) )",
+            "CREATE TABLE IF NOT EXISTS logs ( id BIGSERIAL PRIMARY KEY, scan_id TEXT, level \
+             TEXT DEFAULT 'info', message TEXT NOT NULL, created_at TEXT DEFAULT NOW()::TEXT )",
+            "CREATE TABLE IF NOT EXISTS operations ( id TEXT PRIMARY KEY, operation TEXT NOT \
+             NULL, params TEXT DEFAULT '{}', status TEXT DEFAULT 'queued', result TEXT, \
+             created_at TEXT DEFAULT NOW()::TEXT, updated_at TEXT DEFAULT NOW()::TEXT )",
+            "CREATE TABLE IF NOT EXISTS probe_results ( id BIGSERIAL PRIMARY KEY, operation_id \
+             TEXT NOT NULL, host TEXT NOT NULL, port INTEGER NOT NULL, status TEXT NOT NULL, \
+             service TEXT, banner TEXT, latency_ms BIGINT DEFAULT 0, created_at TIMESTAMPTZ \
+             DEFAULT NOW(), delete_after TIMESTAMPTZ NOT NULL )",
+        ],
+    ),
+];
+
+/// The table a statement in [`ENGINE_SCHEMA`] makes, if it makes one.
+fn table_of(statement: &str) -> Option<&str> {
+    statement
+        .strip_prefix("CREATE TABLE IF NOT EXISTS ")?
+        .split_whitespace()
+        .next()
+}
+
+/// Sets every sequence a column owns to carry on after the largest value copied in.
+const RESET_SEQUENCES: &str = "DO $$\n\
+DECLARE r record;\n\
+BEGIN\n\
+  FOR r IN SELECT s.oid::regclass AS seq, d.refobjid::regclass AS tbl, a.attname\n\
+    FROM pg_class s\n\
+    JOIN pg_depend d ON d.classid = 'pg_class'::regclass AND d.objid = s.oid\n\
+      AND d.refclassid = 'pg_class'::regclass AND d.deptype = 'a'\n\
+    JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid\n\
+    WHERE s.relkind = 'S'\n\
+  LOOP\n\
+    EXECUTE format('SELECT setval(%L, coalesce(max(%I), 0) + 1, false) FROM %s',\n\
+      r.seq, r.attname, r.tbl);\n\
+  END LOOP;\n\
+END $$;\n";
+
+/// What [`copy_engine_rows`] copied.
+#[derive(Debug, Default)]
+struct Copied {
+    tables: usize,
+    rows: u64,
+    /// The engines' tables that were in the old database but are left empty, and why.
+    left_empty: Vec<String>,
+}
+
+/// Rebuild the database of the stopped container `id`, which let anyone in. Anyone
+/// could change that cluster as its superuser, in more ways than a check of it can be
+/// sure to find, so nothing of it is used again but the rows of the engines' tables: a
+/// new container gets a new cluster made by the image, the toolchain makes the engines'
+/// tables in it, and only their rows are copied over, as data, from a copy of the old
+/// server with no network. The old data volume is kept, in a container that never runs
+/// a server. Returns the new container's id.
+fn rebuild(
     info: &serde_json::Value,
     id: &str,
     scratch: &str,
@@ -956,65 +1089,346 @@ fn secure_trusting(
     pg: &PostgresSection,
     password: &str,
 ) -> Result<String, String> {
-    repair_offline(info, id, scratch, &pg.user, password)?;
-    // Port bindings are fixed when a container is made, so the loopback-only one is a
-    // new container on the same data volume and the same image.
-    replace(info, id, staged, name, pg, password, true)
+    let image = info["Image"]
+        .as_str()
+        .ok_or("the database container has no image")?;
+    // What else shapes what initdb makes, so the new cluster matches the old one.
+    let mut initdb = Vec::new();
+    for e in info["Config"]["Env"].as_array().into_iter().flatten() {
+        let Some(e) = e.as_str() else { continue };
+        if ["POSTGRES_INITDB_ARGS=", "LANG=", "LC_ALL="]
+            .iter()
+            .any(|p| e.starts_with(p))
+        {
+            initdb.push("-e".to_string());
+            initdb.push(e.to_string());
+        }
+    }
+    // The new container is published on the database port, which the stopped one no
+    // longer holds. Until the rows are in, it has a password nobody knows, so no engine
+    // starts on a half filled database.
+    let loading = new_postgres_password().map_err(|e| e.to_string())?;
+    let out = docker()
+        .args(labelled_run_args(staged, pg, image, None, REBUILT, &initdb))
+        .env(PASSWORD_ENV, &loading)
+        .output()
+        .map_err(|e| format!("docker run: {e}"))?;
+    if !out.status.success() {
+        let _ = docker().args(["rm", "-f", "-v", staged]).output();
+        return Err(format!(
+            "could not make the new database container: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let new_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let done = wait_initialized(staged, &pg.user)
+        .and_then(|()| {
+            on_server(info, id, scratch, &pg.user, |old| {
+                copy_engine_rows(old, staged, &pg.user)
+            })
+        })
+        .and_then(|copied| set_password(staged, &pg.user, password).map(|()| copied))
+        .and_then(|copied| keep_old_data(image, id, name).map(|kept| (copied, kept)));
+    let (copied, kept) = match done {
+        Ok(done) => done,
+        Err(e) => {
+            // Its volume is its own, and holds nothing the old one does not.
+            let _ = docker().args(["rm", "-f", "-v", staged]).output();
+            return Err(e);
+        }
+    };
+    // Without -v: the old data volume now belongs to the container that keeps it.
+    docker_ok(&["rm", id])?;
+    docker_ok(&["rename", staged, name])?;
+    tell_rebuilt(&copied, &kept);
+    Ok(new_id)
 }
 
-/// Make the data of the stopped container `id`, which let anyone in, fit to serve the
-/// engines again, on a copy of its server with no network. Anyone could change that
-/// database as its superuser, and the engines connect as the superuser too, so
-/// anything added that would run in their sessions makes it refuse the database
-/// outright. Otherwise it sets the password, takes login away from every other role,
-/// and resets settings made with ALTER SYSTEM or for a role or database.
-fn repair_offline(
-    info: &serde_json::Value,
-    id: &str,
-    scratch: &str,
-    user: &str,
-    password: &str,
-) -> Result<(), String> {
-    let reference = format!("{scratch}-ref");
-    let undone = on_server(info, id, scratch, user, |server| {
-        let found = examine(server, user, info, &reference)?;
-        if !found.added.is_empty() {
-            return Err(format!(
-                "it holds things the toolchain never makes, which someone may have added \
-                 while it let anyone in, and which could run code when the engines use it: \
-                 {}. It is not started again",
-                found.added.join("; ")
-            ));
-        }
-        set_password(server, user, password)?;
-        let mut sql = String::new();
-        for role in &found.logins {
-            sql.push_str(&format!(
-                "ALTER ROLE {} NOLOGIN PASSWORD NULL;\n",
-                sql_ident(role)
-            ));
-        }
-        sql.push_str("DELETE FROM pg_catalog.pg_db_role_setting;\nALTER SYSTEM RESET ALL;\n");
-        psql(server, user, "postgres", &sql)?;
-        Ok(found.undone)
-    })?;
-    warn_about(&undone);
-    Ok(())
+/// Wait until the image has made the cluster in a new container and runs its server
+/// for good. While it sets up, it runs one on its socket only.
+fn wait_initialized(id: &str, user: &str) -> Result<(), String> {
+    wait_until(id, || {
+        docker()
+            .args(["exec", "-u", "postgres", id, "pg_isready", "-q", "-h"])
+            .args(["127.0.0.1", "-U", user, "-d", "postgres"])
+            .status()
+            .is_ok_and(|s| s.success())
+    })
 }
 
-/// The pg_hba.conf a repaired container gets: the image's own socket rules, and a
-/// password for every client that connects over the network.
-const KNOWN_HBA: &str = "# Written by crossfyre when this database was secured.\n\
-local all all trust\n\
-local replication all trust\n\
-host all all all scram-sha-256\n\
-host replication all all scram-sha-256\n";
+/// Make the engines' databases and tables on the new server `new`, for each engine
+/// whose database the old server `old` has, and copy their rows over. A table whose
+/// rows cannot be copied is left empty and named in what is returned.
+fn copy_engine_rows(old: &str, new: &str, user: &str) -> Result<Copied, String> {
+    let mut copied = Copied::default();
+    for (db, statements) in ENGINE_SCHEMA {
+        let found = psql_rows(
+            old,
+            user,
+            "postgres",
+            &format!(
+                "SELECT datallowconn FROM pg_catalog.pg_database WHERE datname = {}",
+                sql_literal(db)
+            ),
+        )?;
+        // The engine never ran here.
+        let Some(allowed) = found.first() else {
+            continue;
+        };
+        psql(
+            new,
+            user,
+            "postgres",
+            &format!("CREATE DATABASE {};\n", sql_ident(db)),
+        )?;
+        let mut ddl = "SET search_path = public;\n".to_string();
+        for s in *statements {
+            ddl.push_str(s);
+            ddl.push_str(";\n");
+        }
+        psql(new, user, db, &ddl)?;
+        for table in statements.iter().filter_map(|s| table_of(s)) {
+            let result = if allowed == "t" {
+                copy_table(old, new, user, db, table)
+            } else {
+                Err("its database takes no connections".to_string())
+            };
+            match result {
+                Ok(rows) => {
+                    copied.tables += 1;
+                    copied.rows += rows;
+                }
+                Err(e) => copied.left_empty.push(format!("{db}.{table}: {e}")),
+            }
+        }
+        psql(new, user, db, RESET_SEQUENCES)?;
+    }
+    Ok(copied)
+}
+
+/// Whether `line` from COPY's text format is one row of `fields` columns and nothing
+/// else. COPY writes a tab, newline or carriage return inside a value as an escape, so
+/// a row is one line with one tab between each two values; and a line that is only
+/// `\.` would end the data early.
+fn one_row(line: &[u8], fields: usize) -> bool {
+    line != b"\\."
+        && !line.contains(&b'\r')
+        && line.iter().filter(|&&b| b == b'\t').count() + 1 == fields
+}
+
+/// Copy the rows of the engines' table `table` in database `db` from the old server to
+/// the new one, as data only: the columns the toolchain's table has that the old one
+/// has too, in COPY's text format, each line checked by [`one_row`] before the new
+/// server reads it. The new server loads them in one transaction that commits only if
+/// the table then holds as many rows as were sent. Returns that number.
+fn copy_table(old: &str, new: &str, user: &str, db: &str, table: &str) -> Result<u64, String> {
+    use std::io::{BufRead, Write};
+    let qualified = format!("public.{}", sql_ident(table));
+    let ours = psql_rows(
+        new,
+        user,
+        db,
+        &format!(
+            "SELECT attname FROM pg_catalog.pg_attribute WHERE attrelid = \
+             {}::pg_catalog.regclass AND attnum > 0 AND NOT attisdropped ORDER BY attnum",
+            sql_literal(&qualified)
+        ),
+    )?;
+    let theirs = psql_rows(
+        old,
+        user,
+        db,
+        &format!(
+            "SELECT a.attname FROM pg_catalog.pg_attribute a \
+             JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'public' AND c.relname = {} AND c.relkind = 'r' \
+             AND a.attnum > 0 AND NOT a.attisdropped",
+            sql_literal(table)
+        ),
+    )?;
+    if theirs.is_empty() {
+        return Err("it is not a table in the old database".to_string());
+    }
+    let columns: Vec<String> = ours
+        .iter()
+        .filter(|c| theirs.contains(c))
+        .map(|c| sql_ident(c))
+        .collect();
+    let target = format!("{qualified} ({})", columns.join(", "));
+
+    let mut export = docker()
+        .args(["exec", "-u", "postgres", "-e", &session_options(old)])
+        .args(["-e", "PGCLIENTENCODING=UTF8", old, "psql", "-X", "-q"])
+        .args([
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-U",
+            user,
+            "-d",
+            &conninfo(db),
+            "-c",
+        ])
+        .arg(format!("COPY {target} TO STDOUT"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("docker exec: {e}"))?;
+    let export_err = drain(export.stderr.take());
+    let mut import = match docker()
+        .args([
+            "exec",
+            "-i",
+            "-u",
+            "postgres",
+            "-e",
+            "PGCLIENTENCODING=UTF8",
+        ])
+        .args([new, "psql", "-X", "-q", "-v", "ON_ERROR_STOP=1", "-U", user])
+        .args(["-d", &conninfo(db)])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            let _ = export.kill();
+            let _ = export.wait();
+            return Err(format!("docker exec: {e}"));
+        }
+    };
+    let import_err = drain(import.stderr.take());
+    let said = |handle: std::thread::JoinHandle<Vec<u8>>| {
+        String::from_utf8_lossy(&handle.join().unwrap_or_default())
+            .trim()
+            .to_string()
+    };
+
+    // Ends with what was sent, or why it stopped. Without a COMMIT the new server keeps
+    // none of it, whatever happens to either side.
+    let mut sink = import.stdin.take();
+    let sent = (|| -> Result<u64, String> {
+        let sink = sink.as_mut().ok_or("docker exec: no stdin")?;
+        let source = export.stdout.take().ok_or("docker exec: no stdout")?;
+        let io = |e: std::io::Error| format!("copying rows: {e}");
+        writeln!(sink, "BEGIN;\nCOPY {target} FROM STDIN;").map_err(io)?;
+        let mut reader = std::io::BufReader::new(source);
+        let mut line = Vec::new();
+        let mut rows = 0u64;
+        loop {
+            line.clear();
+            if reader.read_until(b'\n', &mut line).map_err(io)? == 0 {
+                return Ok(rows);
+            }
+            if line.last() == Some(&b'\n') {
+                line.pop();
+            }
+            if !one_row(&line, columns.len()) {
+                return Err(format!(
+                    "row {} is not one row of {} values",
+                    rows + 1,
+                    columns.len()
+                ));
+            }
+            sink.write_all(&line).map_err(io)?;
+            sink.write_all(b"\n").map_err(io)?;
+            rows += 1;
+        }
+    })();
+    let sent = match sent {
+        Ok(rows) => rows,
+        Err(e) => {
+            let _ = export.kill();
+            let _ = export.wait();
+            drop(sink);
+            let _ = import.kill();
+            let _ = import.wait();
+            return Err(e);
+        }
+    };
+    let exported = export.wait().map_err(|e| format!("docker exec: {e}"))?;
+    if !exported.success() {
+        drop(sink);
+        let _ = import.kill();
+        let _ = import.wait();
+        return Err(format!("reading it failed: {}", said(export_err)));
+    }
+    let finish = format!(
+        "\\.\nDO $$ BEGIN IF (SELECT count(*) FROM {qualified}) <> {sent} THEN \
+         RAISE EXCEPTION 'it holds a different number of rows than were sent'; \
+         END IF; END $$;\nCOMMIT;\n"
+    );
+    let wrote = sink
+        .as_mut()
+        .map(|s| s.write_all(finish.as_bytes()))
+        .unwrap_or_else(|| Err(std::io::Error::other("no stdin")));
+    drop(sink);
+    let imported = import.wait().map_err(|e| format!("docker exec: {e}"))?;
+    if wrote.is_err() || !imported.success() {
+        return Err(format!("loading it failed: {}", said(import_err)));
+    }
+    Ok(sent)
+}
+
+/// Keep the data volume of the old container `id` in a new container that holds it
+/// and never runs a server, and return that container's name.
+fn keep_old_data(image: &str, id: &str, name: &str) -> Result<String, String> {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    let kept = format!("{name}-old-{secs}");
+    docker_ok(&[
+        "create",
+        "--name",
+        &kept,
+        "--network",
+        "none",
+        "--label",
+        &format!("{MADE_AS}={KEPT}"),
+        "--volumes-from",
+        id,
+        "--entrypoint",
+        "true",
+        image,
+    ])?;
+    Ok(kept)
+}
+
+fn tell_rebuilt(copied: &Copied, kept: &str) {
+    eprintln!(
+        "[db] WARNING the toolchain database accepted connections without a password, so it \
+         was rebuilt: a new database with the engines' tables, holding only their rows ({} \
+         in {} tables). Roles, settings and anything else in the old database were not \
+         carried over; set again any you made yourself.",
+        copied.rows, copied.tables
+    );
+    for t in &copied.left_empty {
+        eprintln!("[db]   left empty: {t}");
+    }
+    eprintln!(
+        "[db] Anyone could write to it while it was open, so review scan results from that \
+         time before relying on them."
+    );
+    eprintln!(
+        "[db] The old data is kept in the stopped container {kept}, which never runs a \
+         server. Remove it when you no longer need it: docker rm -v {kept}"
+    );
+}
+
+/// The pg_hba.conf the copy of an old server is started with: clients on its socket
+/// only, which is how the repair reads it.
+const KNOWN_HBA: &str = "# Written by crossfyre to copy the engines' rows from this data.\n\
+local all all trust\n";
 
 /// Starts a server on the data directory with [`KNOWN_HBA`] in place. Settings given
 /// on the command line win over postgresql.conf and ALTER SYSTEM, so whatever was set
-/// there neither keeps psql out nor runs anything while the repair looks at it: no
+/// there neither keeps psql out nor runs anything while the engines' rows are read: no
 /// libraries loaded at start, no archiving, no background vacuum running expressions,
-/// no event triggers. A recovery signal file would make it run restore_command, and
+/// no event triggers. It has no network, so even code it does run reaches nothing but
+/// the old data and what it hands back, which is read as rows and nothing else. A recovery signal file would make it run restore_command, and
 /// this database is never a standby. The file is removed before it is written, so a
 /// link in its place is not followed.
 const SCRATCH_SCRIPT: &str = r#"set -e
@@ -1224,45 +1638,6 @@ fn psql_rows(id: &str, user: &str, db: &str, sql: &str) -> Result<Vec<String>, S
         .collect())
 }
 
-/// The rows of `select` as COPY writes them: fields as COPY's text format has them,
-/// with `\N` for a null. A query given to COPY calls no function or operator but the
-/// ones it names, and these name none.
-fn copy_rows(id: &str, user: &str, db: &str, select: &str) -> Result<Vec<Vec<String>>, String> {
-    Ok(parse_copy(&psql(
-        id,
-        user,
-        db,
-        &format!("COPY ({select}) TO STDOUT;\n"),
-    )?))
-}
-
-fn parse_copy(text: &str) -> Vec<Vec<String>> {
-    text.lines()
-        .filter(|l| !l.is_empty())
-        .map(|l| l.split('\t').map(str::to_string).collect())
-        .collect()
-}
-
-/// A text field from COPY as the value it stands for.
-fn unescape_copy(field: &str) -> String {
-    let mut out = String::new();
-    let mut chars = field.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some('r') => out.push('\r'),
-            Some(other) => out.push(other),
-            None => out.push('\\'),
-        }
-    }
-    out
-}
-
 fn sql_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
@@ -1285,549 +1660,9 @@ fn set_password(id: &str, user: &str, password: &str) -> Result<(), String> {
     .map(|_| ())
 }
 
-/// Network rules that let a client in without its password: anything but a password
-/// check or a refusal. The image's own trust rules for the container's loopback are
-/// allowed, since no client outside the container connects from there. A file with
-/// errors counts too, since the server keeps its previous rules.
-const OPEN_RULES: &str = "SELECT count(*) FROM pg_hba_file_rules WHERE error IS NOT NULL \
-     OR (type LIKE 'host%' AND auth_method NOT IN ('scram-sha-256', 'md5', 'reject') \
-     AND NOT (auth_method = 'trust' AND coalesce(address, '') IN ('127.0.0.1', '::1') \
-     AND coalesce(netmask, '') IN ('255.255.255.255', 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff')))";
-
-/// Check a moved container's running server: no network rule may let a client in
-/// without the password, whatever its settings made it read. A container that was
-/// not running is started for the check and stopped again, and one that fails it is
-/// stopped, and removed too when `remove` says the old container still holds the data.
-fn check_moved(target: &str, user: &str, remove: bool) -> Result<(), String> {
-    let running =
-        inspect(target)?.ok_or("the moved database container is gone")?["State"]["Running"]
-            .as_bool()
-            .unwrap_or(false);
-    if !running {
-        docker_ok(&["start", target])?;
-    }
-    let result = wait_ready(target, user).and_then(|()| {
-        match psql_rows(target, user, "postgres", OPEN_RULES)?
-            .first()
-            .map(String::as_str)
-        {
-            Some("0") => Ok(()),
-            n => Err(format!(
-                "the moved database container still has {} rule(s) in pg_hba.conf that let \
-                 a client in without a password, or errors",
-                n.unwrap_or("?")
-            )),
-        }
-    });
-    if result.is_err() || !running {
-        let _ = docker().args(["stop", target]).output();
-    }
-    if result.is_err() && remove {
-        let _ = docker().args(["rm", "-f", target]).output();
-    }
-    result
-}
-
-/// Objects numbered below this were made by initdb; anything numbered from it on was
-/// added later.
-const FIRST_NORMAL_OID: u32 = 16384;
-
-/// What an object added after initdb may be.
-#[derive(Clone, Copy)]
-enum Added {
-    /// Nothing the engines make, so anything added is refused.
-    Refused,
-    /// The row types of the engines' tables.
-    Allowed,
-    /// Only the internal triggers behind a foreign key.
-    ForeignKey,
-    /// Only a column default the engines use: a constant, now() or a sequence.
-    PlainDefault,
-    /// Only one without an expression.
-    NoExpression,
-}
-
-/// The catalogs that hold code a session can end up running, and what the engines
-/// add to each. In every database, rows made by initdb must match a new database's
-/// from the same image exactly, which also covers a built-in function that was
-/// replaced or edited in place.
-const CATALOGS: &[(&str, &str, Added)] = &[
-    (
-        "functions",
-        "SELECT * FROM pg_catalog.pg_proc",
-        Added::Refused,
-    ),
-    (
-        "aggregates",
-        "SELECT * FROM pg_catalog.pg_aggregate",
-        Added::Refused,
-    ),
-    ("types", "SELECT * FROM pg_catalog.pg_type", Added::Allowed),
-    (
-        "operators",
-        "SELECT * FROM pg_catalog.pg_operator",
-        Added::Refused,
-    ),
-    ("casts", "SELECT * FROM pg_catalog.pg_cast", Added::Refused),
-    (
-        "rules and views",
-        "SELECT * FROM pg_catalog.pg_rewrite",
-        Added::Refused,
-    ),
-    (
-        "languages",
-        "SELECT * FROM pg_catalog.pg_language",
-        Added::Refused,
-    ),
-    (
-        "access methods",
-        "SELECT * FROM pg_catalog.pg_am",
-        Added::Refused,
-    ),
-    (
-        "operator classes",
-        "SELECT * FROM pg_catalog.pg_opclass",
-        Added::Refused,
-    ),
-    (
-        "operator families",
-        "SELECT * FROM pg_catalog.pg_opfamily",
-        Added::Refused,
-    ),
-    (
-        "index operators",
-        "SELECT * FROM pg_catalog.pg_amop",
-        Added::Refused,
-    ),
-    (
-        "index support functions",
-        "SELECT * FROM pg_catalog.pg_amproc",
-        Added::Refused,
-    ),
-    (
-        "conversions",
-        "SELECT * FROM pg_catalog.pg_conversion",
-        Added::Refused,
-    ),
-    (
-        "text search parsers",
-        "SELECT * FROM pg_catalog.pg_ts_parser",
-        Added::Refused,
-    ),
-    (
-        "text search templates",
-        "SELECT * FROM pg_catalog.pg_ts_template",
-        Added::Refused,
-    ),
-    (
-        "extensions",
-        "SELECT * FROM pg_catalog.pg_extension",
-        Added::Refused,
-    ),
-    (
-        "event triggers",
-        "SELECT * FROM pg_catalog.pg_event_trigger",
-        Added::Refused,
-    ),
-    (
-        "row security policies",
-        "SELECT * FROM pg_catalog.pg_policy",
-        Added::Refused,
-    ),
-    (
-        "publications",
-        "SELECT * FROM pg_catalog.pg_publication",
-        Added::Refused,
-    ),
-    (
-        "transforms",
-        "SELECT * FROM pg_catalog.pg_transform",
-        Added::Refused,
-    ),
-    (
-        "foreign data wrappers",
-        "SELECT * FROM pg_catalog.pg_foreign_data_wrapper",
-        Added::Refused,
-    ),
-    (
-        "foreign servers",
-        "SELECT * FROM pg_catalog.pg_foreign_server",
-        Added::Refused,
-    ),
-    (
-        "extended statistics",
-        "SELECT * FROM pg_catalog.pg_statistic_ext",
-        Added::Refused,
-    ),
-    (
-        "partitioned tables",
-        "SELECT * FROM pg_catalog.pg_partitioned_table",
-        Added::Refused,
-    ),
-    (
-        "triggers",
-        "SELECT oid, tgfoid, tgisinternal, tgconstraint FROM pg_catalog.pg_trigger",
-        Added::ForeignKey,
-    ),
-    (
-        "column defaults",
-        "SELECT oid, adbin FROM pg_catalog.pg_attrdef",
-        Added::PlainDefault,
-    ),
-    (
-        "constraints",
-        "SELECT oid, conbin FROM pg_catalog.pg_constraint",
-        Added::NoExpression,
-    ),
-    (
-        "indexes",
-        "SELECT indexrelid, indexprs, indpred FROM pg_catalog.pg_index",
-        Added::NoExpression,
-    ),
-];
-
-/// Settings that run commands, load code, or pick the files the server reads its
-/// rules from or writes its log to. The image sets none of them in a file.
-const RISKY_SETTINGS: &[&str] = &[
-    "archive_command",
-    "archive_library",
-    "restore_command",
-    "archive_cleanup_command",
-    "recovery_end_command",
-    "shared_preload_libraries",
-    "session_preload_libraries",
-    "local_preload_libraries",
-    "dynamic_library_path",
-    "jit_provider",
-    "ssl_passphrase_command",
-    "hba_file",
-    "ident_file",
-    "logging_collector",
-    "log_directory",
-    "log_filename",
-];
-
-/// Functions a column default the engines make may call.
-const DEFAULT_FUNCTIONS: &[&str] = &["now", "nextval", "int8", "int4", "int2"];
-
-/// Expression nodes such a default is made of.
-const DEFAULT_NODES: &[&str] = &[
-    "FUNCEXPR",
-    "CONST",
-    "COERCEVIAIO",
-    "RELABELTYPE",
-    "SQLVALUEFUNCTION",
-];
-
-#[derive(Default, Debug)]
-struct Examined {
-    /// Things that may run code: the database is refused.
-    added: Vec<String>,
-    /// Things the repair undoes, said once it has.
-    undone: Vec<String>,
-    /// Roles besides the engines' own that can log in.
-    logins: Vec<String>,
-}
-
-/// Look over a database that was open to anyone, on the offline copy `server`,
-/// against a new one made from the same image in a container named `reference`.
-fn examine(
-    server: &str,
-    user: &str,
-    info: &serde_json::Value,
-    reference: &str,
-) -> Result<Examined, String> {
-    let mut found = Examined::default();
-    let roles = copy_rows(
-        server,
-        user,
-        "postgres",
-        "SELECT oid, rolname, rolcanlogin FROM pg_catalog.pg_authid",
-    )?;
-    let mut bootstrap = None;
-    for r in &roles {
-        let [oid, name, login] = &r[..] else { continue };
-        let name = unescape_copy(name);
-        if oid == "10" {
-            bootstrap = Some(name.clone());
-        }
-        if login == "t" && name != user {
-            found
-                .undone
-                .push(format!("role {name} could log in; it no longer can"));
-            found.logins.push(name);
-        }
-    }
-    let bootstrap = bootstrap.ok_or("the database has no bootstrap superuser")?;
-    for r in copy_rows(
-        server,
-        user,
-        "postgres",
-        "SELECT setconfig FROM pg_catalog.pg_db_role_setting",
-    )? {
-        found.undone.push(format!(
-            "settings for a role or database, now reset: {}",
-            r[0]
-        ));
-    }
-    for r in copy_rows(
-        server,
-        user,
-        "postgres",
-        "SELECT name, sourcefile FROM pg_catalog.pg_file_settings",
-    )? {
-        let [name, file] = &r[..] else { continue };
-        if file.ends_with("postgresql.auto.conf") {
-            found
-                .undone
-                .push(format!("setting {name} made with ALTER SYSTEM, now reset"));
-        } else if RISKY_SETTINGS.contains(&name.as_str()) {
-            found.added.push(format!("setting {name} in {file}"));
-        }
-    }
-    for r in copy_rows(
-        server,
-        user,
-        "postgres",
-        "SELECT subname FROM pg_catalog.pg_subscription",
-    )? {
-        found.added.push(format!("subscription {}", r[0]));
-    }
-    let databases = copy_rows(
-        server,
-        user,
-        "postgres",
-        "SELECT datname, datallowconn FROM pg_catalog.pg_database",
-    )?;
-    let fresh = with_reference(info, reference, &bootstrap, |r| {
-        dump_catalogs(r, &bootstrap, "template1")
-    })?;
-    let known = Known::from(&fresh);
-    for d in &databases {
-        let [db, allowed] = &d[..] else { continue };
-        let db = unescape_copy(db);
-        if allowed != "t" {
-            if db != "template0" {
-                found.added.push(format!(
-                    "database {db} refuses connections, so it cannot be checked"
-                ));
-            }
-            continue;
-        }
-        let ours = dump_catalogs(server, user, &db)?;
-        found.added.extend(compare(&db, &ours, &fresh, &known));
-    }
-    Ok(found)
-}
-
-type Catalogs = Vec<Vec<Vec<String>>>;
-
-/// Every catalog in [`CATALOGS`] in database `db`, in that order, in one session.
-fn dump_catalogs(id: &str, user: &str, db: &str) -> Result<Catalogs, String> {
-    // Unguessable, so no row can pass for the line between two catalogs.
-    let marker = new_postgres_password().map_err(|e| e.to_string())?;
-    let mut script = String::new();
-    for (_, select, _) in CATALOGS {
-        script.push_str(&format!("\\echo {marker}\nCOPY ({select}) TO STDOUT;\n"));
-    }
-    let out = psql(id, user, db, &script)?;
-    let mut sections: Catalogs = Vec::new();
-    for line in out.lines() {
-        if line == marker {
-            sections.push(Vec::new());
-        } else if let Some(rows) = sections.last_mut() {
-            rows.extend(parse_copy(line));
-        }
-    }
-    if sections.len() != CATALOGS.len() {
-        return Err(format!("the catalogs of database {db} could not be read"));
-    }
-    Ok(sections)
-}
-
-/// What a new database says about the functions an engine's table may use.
-struct Known {
-    defaults: std::collections::BTreeSet<String>,
-    foreign_keys: std::collections::BTreeSet<String>,
-}
-
-impl Known {
-    fn from(fresh: &Catalogs) -> Self {
-        let mut known = Known {
-            defaults: Default::default(),
-            foreign_keys: Default::default(),
-        };
-        for row in &fresh[0] {
-            let (Some(oid), Some(name)) = (row.first(), row.get(1)) else {
-                continue;
-            };
-            if DEFAULT_FUNCTIONS.contains(&name.as_str()) {
-                known.defaults.insert(oid.clone());
-            }
-            if name.starts_with("RI_FKey_") {
-                known.foreign_keys.insert(oid.clone());
-            }
-        }
-        known
-    }
-
-    fn accepts(&self, added: Added, row: &[String]) -> bool {
-        match added {
-            Added::Refused => false,
-            Added::Allowed => true,
-            Added::ForeignKey => {
-                matches!(row, [_, func, internal, constraint]
-                    if internal == "t" && constraint != "0" && self.foreign_keys.contains(func))
-            }
-            Added::PlainDefault => {
-                matches!(row, [_, tree] if plain_default(tree, &self.defaults))
-            }
-            Added::NoExpression => row.iter().skip(1).all(|f| f == "\\N"),
-        }
-    }
-}
-
-/// Whether a stored default expression is only a constant, a cast, now() or a
-/// sequence, as the engines' defaults are.
-fn plain_default(tree: &str, functions: &std::collections::BTreeSet<String>) -> bool {
-    let after =
-        |i: usize, f: fn(&char) -> bool| -> String { tree[i..].chars().take_while(f).collect() };
-    let nodes_ok = tree.match_indices('{').all(|(i, _)| {
-        let tag = after(i + 1, char::is_ascii_uppercase);
-        tag.is_empty() || DEFAULT_NODES.contains(&tag.as_str())
-    });
-    let functions_ok = tree
-        .match_indices(":funcid ")
-        .all(|(i, m)| functions.contains(&after(i + m.len(), char::is_ascii_digit)));
-    nodes_ok && functions_ok
-}
-
-/// Where database `db`'s catalogs differ from a new database's, besides what the
-/// engines add.
-fn compare(db: &str, ours: &Catalogs, fresh: &Catalogs, known: &Known) -> Vec<String> {
-    use std::collections::BTreeSet;
-    let mut found = Vec::new();
-    for (i, (label, _, added)) in CATALOGS.iter().enumerate() {
-        let built_in: BTreeSet<&Vec<String>> = fresh[i].iter().collect();
-        let mut kept = BTreeSet::new();
-        let mut names = BTreeSet::new();
-        let (mut changed, mut extra) = (0, 0);
-        for row in &ours[i] {
-            let initdb = row
-                .first()
-                .and_then(|k| k.parse::<u32>().ok())
-                .is_none_or(|k| k < FIRST_NORMAL_OID);
-            if initdb && built_in.contains(row) {
-                kept.insert(row);
-                continue;
-            }
-            if initdb {
-                changed += 1;
-            } else if known.accepts(*added, row) {
-                continue;
-            } else {
-                extra += 1;
-            }
-            // The function's name says the most about what it is.
-            if i == 0 {
-                if let Some(name) = row.get(1) {
-                    names.insert(unescape_copy(name));
-                }
-            }
-        }
-        // A row edited in place is one that is new and one that is gone.
-        let changed = changed.max(built_in.len() - kept.len());
-        if changed + extra == 0 {
-            continue;
-        }
-        let mut line = format!("{db}: {label}:");
-        if changed > 0 {
-            line.push_str(&format!(" {changed} built-in row(s) changed"));
-        }
-        if extra > 0 {
-            line.push_str(&format!(" {extra} added"));
-        }
-        if !names.is_empty() {
-            let shown: Vec<_> = names.into_iter().take(5).collect();
-            line.push_str(&format!(" ({})", shown.join(", ")));
-        }
-        found.push(line);
-    }
-    found
-}
-
-/// Run `f` against a new database made from the same image as the container `info`
-/// describes, as initdb makes it for the same bootstrap user, in a container with no
-/// network that is removed afterwards with its volume.
-fn with_reference<T>(
-    info: &serde_json::Value,
-    name: &str,
-    bootstrap: &str,
-    f: impl FnOnce(&str) -> Result<T, String>,
-) -> Result<T, String> {
-    let image = info["Image"]
-        .as_str()
-        .ok_or("the database container has no image")?;
-    let _ = docker().args(["rm", "-f", "-v", name]).output();
-    let mut args: Vec<String> = ["run", "-d", "--name", name, "--network", "none"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    args.push("-e".to_string());
-    args.push(format!("POSTGRES_USER={bootstrap}"));
-    args.push("-e".to_string());
-    args.push("POSTGRES_HOST_AUTH_METHOD=trust".to_string());
-    // What else shapes what initdb makes.
-    for e in info["Config"]["Env"].as_array().into_iter().flatten() {
-        let Some(e) = e.as_str() else { continue };
-        if ["POSTGRES_INITDB_ARGS=", "LANG=", "LC_ALL="]
-            .iter()
-            .any(|p| e.starts_with(p))
-        {
-            args.push("-e".to_string());
-            args.push(e.to_string());
-        }
-    }
-    args.push(image.to_string());
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let result = docker_ok(&arg_refs).and_then(|()| {
-        // The image's first start runs a server on its socket only while it sets up,
-        // then the real one, which also listens on the container's own loopback.
-        wait_until(name, || {
-            docker()
-                .args(["exec", "-u", "postgres", name, "pg_isready", "-q", "-h"])
-                .args(["127.0.0.1", "-U", bootstrap, "-d", "template1"])
-                .status()
-                .is_ok_and(|s| s.success())
-        })
-        .and_then(|()| f(name))
-    });
-    let _ = docker().args(["rm", "-f", "-v", name]).output();
-    result
-}
-
-fn warn_about(undone: &[String]) {
-    if undone.is_empty() {
-        return;
-    }
-    eprintln!(
-        "[db] WARNING the toolchain database accepted connections without a password, and \
-         someone may have changed it while it was open. The repair undid these:"
-    );
-    for c in undone {
-        eprintln!("[db]   {c}");
-    }
-    eprintln!(
-        "[db] Set again any of these you made yourself. To start again with an empty \
-         database instead (scan state is lost): crossfyre db down, then crossfyre db up."
-    );
-}
-
-/// Replace the container `old` with one named `name` that is published on loopback,
-/// mounts the same volumes and runs the same image. Returns the new container's id.
-/// With `check`, the old container let anyone in: the new one must pass
-/// [`check_moved`] before the old one is removed, and a failure leaves the old one
-/// stopped rather than starting it again.
+/// Replace the container `old`, which already needed a password, with one named `name`
+/// that is published on loopback, mounts the same volumes and runs the same image.
+/// Returns the new container's id.
 fn replace(
     info: &serde_json::Value,
     old: &str,
@@ -1835,7 +1670,6 @@ fn replace(
     name: &str,
     pg: &PostgresSection,
     password: &str,
-    check: bool,
 ) -> Result<String, String> {
     let image = info["Image"]
         .as_str()
@@ -1844,14 +1678,14 @@ fn replace(
     // Two servers must never share a data directory, and the new one needs the port.
     docker_ok(&["stop", old])?;
     let out = docker()
-        .args(run_args(staged, pg, image, Some(old)))
+        .args(labelled_run_args(staged, pg, image, Some(old), MOVED, &[]))
         .env(PASSWORD_ENV, password)
         .output()
         .map_err(|e| format!("docker run: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
         let _ = docker().args(["rm", "-f", staged]).output();
-        if was_running && !check {
+        if was_running {
             let _ = docker().args(["start", old]).output();
         }
         return Err(format!(
@@ -1859,9 +1693,6 @@ fn replace(
         ));
     }
     let new_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if check {
-        check_moved(staged, &pg.user, true)?;
-    }
     // Without -v: the data volume now belongs to the new container as well.
     docker_ok(&["rm", old])?;
     docker_ok(&["rename", staged, name])?;
@@ -2096,19 +1927,14 @@ mod tests {
     }
 
     #[test]
-    fn a_repaired_database_asks_every_network_client_for_its_password() {
-        let rules: Vec<Vec<&str>> = KNOWN_HBA
+    fn the_copy_of_an_old_server_takes_no_network_clients() {
+        let rules: Vec<&str> = KNOWN_HBA
             .lines()
-            .filter(|l| !l.trim_start().starts_with('#'))
-            .map(|l| l.split_whitespace().collect())
+            .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
             .collect();
-        assert!(rules.iter().any(|r| r[0] == "host"));
-        for r in &rules {
-            match r[0] {
-                "local" => {}
-                "host" => assert_eq!(r.last(), Some(&"scram-sha-256"), "{r:?}"),
-                other => panic!("unexpected rule type {other}"),
-            }
+        assert!(!rules.is_empty());
+        for r in rules {
+            assert!(r.starts_with("local "), "{r}");
         }
     }
 
@@ -2297,79 +2123,91 @@ mod tests {
         assert!(!lock_file_usable(false, 1, 1000, 0, None));
     }
 
-    #[test]
-    fn only_the_defaults_the_engines_use_count_as_plain() {
-        let ok: std::collections::BTreeSet<String> = ["1299", "1574", "481"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let now = "{FUNCEXPR :funcid 1299 :funcresulttype 1184 :funcretset false \
-                   :funcvariadic false :funcformat 0 :funccollid 0 :inputcollid 0 \
-                   :args <> :location 70}";
-        assert!(plain_default(now, &ok));
-        assert!(plain_default(
-            &format!("{{COERCEVIAIO :arg {now} :resulttype 25 :resultcollid 100}}"),
-            &ok
-        ));
-        assert!(plain_default(
-            "{CONST :consttype 25 :consttypmod -1 :constcollid 100 :constlen -1 \
-             :constbyval false :constisnull false :location 63 :constvalue 11 [ 44 0 0 0 112 \
-             101 110 100 105 110 103 ]}",
-            &ok
-        ));
-        assert!(!plain_default(
-            "{FUNCEXPR :funcid 2311 :funcresulttype 25 :args ({CONST :consttype 25})}",
-            &ok
-        ));
-        assert!(!plain_default(
-            "{OPEXPR :opno 98 :opfuncid 0 :opresulttype 16 :args <>}",
-            &ok
-        ));
-        assert!(!plain_default("{SUBLINK :subLinkType 4}", &ok));
+    /// The statements the engines run to make their tables, from their sources, with
+    /// whitespace made single spaces.
+    fn engine_statements(source: &str) -> Vec<String> {
+        let text = source.replace("\\\n", "");
+        let mut out = Vec::new();
+        for start in ["CREATE TABLE IF NOT EXISTS", "CREATE INDEX IF NOT EXISTS"] {
+            for (i, _) in text.match_indices(start) {
+                let end = text[i..].find(['"', '#']).map_or(text.len(), |e| i + e);
+                out.push(
+                    text[i..end]
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+            }
+        }
+        out.sort();
+        out
     }
 
     #[test]
-    fn a_catalog_that_differs_from_a_new_database_is_named() {
-        fn rows(r: &[&[&str]]) -> Vec<Vec<String>> {
-            r.iter()
-                .map(|row| row.iter().map(|f| f.to_string()).collect())
-                .collect()
+    fn the_engines_tables_are_made_as_the_engines_make_them() {
+        let sources = [
+            (
+                "mach",
+                include_str!("../../../ambulo/src/libs/ambulo_db.rs"),
+            ),
+            (
+                "voyage",
+                include_str!("../../../voyage/src/libs/voyage_db.rs"),
+            ),
+            (
+                "pulse",
+                include_str!("../../../doorward/src/libs/doorward_db.rs"),
+            ),
+        ];
+        assert_eq!(ENGINE_SCHEMA.len(), sources.len());
+        for (db, source) in sources {
+            let (_, ours) = ENGINE_SCHEMA
+                .iter()
+                .find(|(d, _)| *d == db)
+                .unwrap_or_else(|| panic!("no tables for {db}"));
+            let mut ours: Vec<String> = ours
+                .iter()
+                .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+                .collect();
+            ours.sort();
+            assert_eq!(ours, engine_statements(source), "{db}");
         }
-        let mut fresh: Catalogs = vec![Vec::new(); CATALOGS.len()];
-        fresh[0] = rows(&[
-            &["1299", "now", "internal"],
-            &["1574", "nextval", "internal"],
-            &["1644", "RI_FKey_check_ins", "internal"],
-        ]);
-        let known = Known::from(&fresh);
-        let trig = CATALOGS.iter().position(|c| c.0 == "triggers").unwrap();
-        let defaults = CATALOGS
-            .iter()
-            .position(|c| c.0 == "column defaults")
-            .unwrap();
-        let types = CATALOGS.iter().position(|c| c.0 == "types").unwrap();
+    }
 
-        // The engines' own: a row type, a foreign key's trigger, a sequence default.
-        let mut ours = fresh.clone();
-        ours[types] = rows(&[&["16390", "scans"]]);
-        ours[trig] = rows(&[&["16400", "1644", "t", "16399"]]);
-        ours[defaults] = rows(&[&["16401", "{FUNCEXPR :funcid 1574 :args <>}"]]);
-        assert!(compare("mach", &ours, &fresh, &known).is_empty());
-
-        // A built-in replaced, a function added, a trigger of someone's own.
-        let mut ours = fresh.clone();
-        ours[0][0] = vec!["1299".into(), "now".into(), "sql".into()];
-        ours[0].push(vec!["16500".into(), "helper".into(), "plpgsql".into()]);
-        ours[trig] = rows(&[&["16400", "16500", "f", "0"]]);
-        let found = compare("mach", &ours, &fresh, &known);
-        assert_eq!(found.len(), 2, "{found:?}");
-        assert!(found[0].starts_with("mach: functions: 1 built-in row(s) changed 1 added"));
-        assert!(
-            found[0].contains("helper") && found[0].contains("now"),
-            "{}",
-            found[0]
+    #[test]
+    fn every_table_is_made_after_the_tables_it_refers_to() {
+        for (db, statements) in ENGINE_SCHEMA {
+            let mut made: Vec<&str> = Vec::new();
+            for s in *statements {
+                for (i, _) in s.match_indices("REFERENCES ") {
+                    let target = s[i + "REFERENCES ".len()..]
+                        .split(['(', ' '])
+                        .next()
+                        .unwrap();
+                    assert!(made.contains(&target), "{db}: {target} before {s}");
+                }
+                if let Some(t) = table_of(s) {
+                    made.push(t);
+                }
+            }
+        }
+        assert_eq!(
+            table_of("CREATE TABLE IF NOT EXISTS logs ( id TEXT )"),
+            Some("logs")
         );
-        assert!(found[1].starts_with("mach: triggers:"), "{}", found[1]);
+        assert_eq!(table_of("CREATE INDEX IF NOT EXISTS i ON logs(id)"), None);
+    }
+
+    #[test]
+    fn only_a_line_that_is_one_whole_row_is_passed_on() {
+        assert!(one_row(b"1\tcommon\t\\N", 3));
+        assert!(one_row(b"1\ta\\tb\\nc\\\\d\th", 3));
+        assert!(one_row(b"", 1));
+        assert!(!one_row(b"1\tcommon", 3));
+        assert!(!one_row(b"1\tcommon\th\textra", 3));
+        assert!(!one_row(b"\\.", 1));
+        assert!(!one_row(b"\\.\r", 1));
+        assert!(!one_row(b"1\ta\rb\th", 3));
     }
 
     #[test]
@@ -2406,14 +2244,26 @@ mod tests {
                     name.to_string(),
                     format!("{name}-new"),
                     format!("{name}-fix"),
-                    format!("{name}-fix-ref"),
                 ])
             }
         }
         impl Drop for Cleanup {
             fn drop(&mut self) {
                 let mut volumes = Vec::new();
-                for name in &self.0 {
+                let mut names = self.0.clone();
+                // The containers that keep old data, named after the time they were made.
+                if let Ok(out) = docker()
+                    .args(["ps", "-a", "--format", "{{.Names}}", "--filter"])
+                    .arg(format!("name={}-old-", self.0[0]))
+                    .output()
+                {
+                    names.extend(
+                        String::from_utf8_lossy(&out.stdout)
+                            .lines()
+                            .map(str::to_string),
+                    );
+                }
+                for name in &names {
                     if let Ok(Some(info)) = inspect(name) {
                         for m in info["Mounts"].as_array().into_iter().flatten() {
                             if let Some(v) = m["Name"].as_str() {
@@ -2537,12 +2387,8 @@ mod tests {
             let old_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
             write_config(&cfg, port, Some(&old_id));
             wait_tcp_ready(&name);
-            psql_over_tcp(
-                &name,
-                None,
-                "CREATE TABLE kept(v text); INSERT INTO kept VALUES ('row')",
-            )
-            .expect("the 0.1.42 container lets anyone in");
+            psql_over_tcp(&name, None, "SELECT 1").expect("the 0.1.42 container lets anyone in");
+            seed_mach(&name);
             let (_, gateway) = bridge(&name);
             assert!(
                 reachable(&gateway, port),
@@ -2585,8 +2431,13 @@ mod tests {
             );
             assert!(psql_over_tcp(&name, Some("wrong"), "SELECT 1").is_err());
             assert_eq!(
-                psql_over_tcp(&name, Some(&password), "SELECT v FROM kept").unwrap(),
-                "row",
+                sql_in(
+                    &name,
+                    "mach",
+                    "SELECT name FROM wordlists WHERE hash = 'h1'"
+                )
+                .unwrap(),
+                "common",
                 "the data survived"
             );
 
@@ -2745,12 +2596,7 @@ mod tests {
             let cfg = dir.path().join("config.toml");
             let port = free_port();
             let id = open_0_1_42(&name, port);
-            psql_over_tcp(
-                &name,
-                None,
-                "CREATE TABLE kept(v text); INSERT INTO kept VALUES ('row')",
-            )
-            .unwrap();
+            seed_mach(&name);
             docker_ok(&["stop", &id]).unwrap();
             write_config(&cfg, port, Some(&id));
 
@@ -2766,14 +2612,53 @@ mod tests {
             wait_tcp_ready(&name);
             assert!(psql_over_tcp(&name, None, "SELECT 1").is_err());
             assert_eq!(
-                psql_over_tcp(&name, Some(&password), "SELECT v FROM kept").unwrap(),
-                "row"
+                psql_over_tcp(&name, Some(&password), "SELECT 1").unwrap(),
+                "1"
             );
+            assert_eq!(
+                sql_in(&name, "mach", "SELECT count(*) FROM wordlists").unwrap(),
+                "2"
+            );
+        }
+
+        /// A container made with `labelled_run_args`, as `rebuild` makes it, on a data
+        /// volume of its own. Returns its id.
+        fn rebuilt_copy(
+            name: &str,
+            config: &ToolchainConfig,
+            image: &str,
+            password: &str,
+        ) -> String {
+            let out = docker()
+                .args(labelled_run_args(
+                    &format!("{name}-new"),
+                    &config.postgres,
+                    image,
+                    None,
+                    REBUILT,
+                    &[],
+                ))
+                .env(PASSWORD_ENV, password)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        fn image_of(target: &str) -> String {
+            inspect(target).unwrap().unwrap()["Image"]
+                .as_str()
+                .unwrap()
+                .to_string()
         }
 
         #[test]
         #[ignore = "needs Docker and the postgres image"]
-        fn a_move_interrupted_after_the_copy_started_is_finished() {
+        fn a_rebuild_stopped_before_the_old_container_was_removed_starts_again() {
             let name = format!("cfx-dbtest-resume-{}", std::process::id());
             let _cleanup = Cleanup::for_name(&name);
             let dir = tempfile::tempdir().unwrap();
@@ -2781,31 +2666,13 @@ mod tests {
             let port = free_port();
             let old_id = open_0_1_42(&name, port);
             write_config(&cfg, port, Some(&old_id));
+            seed_mach(&name);
             let (config, _) = ensure_postgres_password_at(&cfg).unwrap();
             let password = config.postgres.password.clone().unwrap();
-            // Everything up to removing the old container, as `replace` does it.
-            set_password(&name, "postgres", &password).unwrap();
-            sh_as_postgres(
-                &name,
-                "printf 'local all all trust\\nhost all all all scram-sha-256\\n' > \"$PGDATA/pg_hba.conf\"",
-            );
-            let image = inspect(&old_id).unwrap().unwrap()["Image"]
-                .as_str()
-                .unwrap()
-                .to_string();
             docker_ok(&["stop", &old_id]).unwrap();
-            let out = docker()
-                .args(run_args(
-                    &format!("{name}-new"),
-                    &config.postgres,
-                    &image,
-                    Some(&old_id),
-                ))
-                .env(PASSWORD_ENV, &password)
-                .output()
-                .unwrap();
-            assert!(out.status.success());
-            let staged_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            // A copy whose rows were not all in when the run stopped.
+            let leftover = rebuilt_copy(&name, &config, &image_of(&old_id), "half-done");
+            let leftover_volumes = mounts(&leftover);
 
             assert!(secure_at(&name, &cfg).unwrap());
 
@@ -2814,11 +2681,22 @@ mod tests {
                 "the old container is gone"
             );
             let now = inspect(&name).unwrap().unwrap();
-            assert_eq!(now["Id"].as_str(), Some(staged_id.as_str()));
-            assert!(is_running(&name), "the database that was running still is");
+            assert_ne!(now["Id"].as_str(), Some(leftover.as_str()));
+            for v in &leftover_volumes {
+                assert!(
+                    docker_ok(&["volume", "inspect", v]).is_err(),
+                    "the half filled copy's volume {v} is left behind"
+                );
+            }
+            docker_ok(&["start", &name]).unwrap();
+            wait_tcp_ready(&name);
             assert_eq!(
-                load_config_at(&cfg).unwrap().container.id.as_deref(),
-                Some(staged_id.as_str())
+                sql_in(&name, "mach", "SELECT count(*) FROM wordlists").unwrap(),
+                "2"
+            );
+            assert_eq!(
+                psql_over_tcp(&name, Some(&password), "SELECT 1").unwrap(),
+                "1"
             );
         }
 
@@ -2857,54 +2735,136 @@ mod tests {
             assert!(psql_over_tcp(&name, None, "SELECT 1").is_err());
         }
 
+        /// Every engine table's rows as text, in one value per table.
+        fn engine_rows(name: &str) -> Vec<String> {
+            let mut out = Vec::new();
+            for (db, statements) in ENGINE_SCHEMA {
+                for table in statements.iter().filter_map(|s| table_of(s)) {
+                    out.push(format!(
+                        "{db}.{table}: {}",
+                        sql_in(
+                            name,
+                            db,
+                            &format!(
+                                "SELECT count(*) || ' ' || coalesce(md5(string_agg(t::text, '|' \
+                                 ORDER BY t::text)), '') FROM public.{table} t"
+                            ),
+                        )
+                        .unwrap()
+                    ));
+                }
+            }
+            out
+        }
+
         #[test]
         #[ignore = "needs Docker and the postgres image"]
-        fn the_engines_own_tables_are_not_taken_for_anything_added() {
-            let name = format!("cfx-dbtest-fresh-{}", std::process::id());
+        fn the_rows_of_every_engine_are_carried_over() {
+            let name = format!("cfx-dbtest-rows-{}", std::process::id());
             let _cleanup = Cleanup::for_name(&name);
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = dir.path().join("config.toml");
             let port = free_port();
             let id = open_0_1_42(&name, port);
-            // As the engines make them: a database of their own, tables with foreign
-            // keys, the defaults they use, and an index.
-            psql_over_tcp(&name, None, "CREATE DATABASE mach").unwrap();
-            let (ip, _) = bridge(&name);
-            let out = docker()
-                .args([
-                    "exec", &name, "psql", "-w", "-X", "-h", &ip, "-U", "postgres",
-                ])
-                .args(["-d", "mach", "-v", "ON_ERROR_STOP=1", "-c"])
-                .arg(
-                    "CREATE TABLE wordlists (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, \
-                     hash TEXT UNIQUE); \
-                     CREATE TABLE scans (id BIGSERIAL PRIMARY KEY, \
-                     status TEXT NOT NULL DEFAULT 'pending', \
-                     created_at TEXT NOT NULL DEFAULT NOW()::TEXT, \
-                     notifications TEXT NOT NULL DEFAULT '{}', wordlist_id BIGINT, \
-                     FOREIGN KEY (wordlist_id) REFERENCES wordlists(id)); \
-                     CREATE TABLE probe_results (id BIGSERIAL PRIMARY KEY, \
-                     code INTEGER NOT NULL DEFAULT 0, body_length BIGINT NOT NULL DEFAULT 0, \
-                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()); \
-                     CREATE INDEX IF NOT EXISTS scans_status_idx ON scans(wordlist_id, status); \
-                     INSERT INTO wordlists (name) VALUES ('w'); ANALYZE",
-                )
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            docker_ok(&["stop", &id]).unwrap();
-            let info = inspect(&id).unwrap().unwrap();
-
-            let found = on_server(&info, &id, &format!("{name}-fix"), "postgres", |s| {
-                examine(s, "postgres", &info, &format!("{name}-fix-ref"))
-            })
+            write_config(&cfg, port, Some(&id));
+            for (db, statements) in ENGINE_SCHEMA {
+                sql_in(&name, "postgres", &format!("CREATE DATABASE {db}")).unwrap();
+                sql_in(&name, db, &statements.join("; ")).unwrap();
+            }
+            let later = "NOW() + INTERVAL '1 day'";
+            for (db, sql) in [
+                (
+                    "mach",
+                    "INSERT INTO wordlists (name, hash) VALUES ('common', 'h1'); \
+                     INSERT INTO words (word, wordlist_id) VALUES ('admin', 1), \
+                     (E'odd\\tword\\n', 1), ('\\x', 1); \
+                     INSERT INTO scans (config_hash, method, wordlist_id) VALUES ('c', 'GET', 1); \
+                     INSERT INTO urls (url, scan_id) VALUES ('https://a.example/', 1); \
+                     INSERT INTO scan_entries (scan_id, url_id, word_id, status, headers, \
+                     headers_length, body, body_length) VALUES (1, 1, 2, 'found', \
+                     E'a: b\\r\\n', 6, '\\x00090a0d5c2e'::bytea, 6), \
+                     (1, 1, 1, 'queued', NULL, 0, NULL, 0); \
+                     INSERT INTO logs (scan_id, description) VALUES (1, 'started'); \
+                     INSERT INTO operations (id, operation, params) VALUES ('op1', 'fuzz', '{}')",
+                ),
+                (
+                    "voyage",
+                    "INSERT INTO scans (id, config_hash, domain) VALUES ('s1', 'c', 'a.example'); \
+                     INSERT INTO scan_entries (scan_id, full_subdomain, source) VALUES \
+                     ('s1', 'www.a.example', 'crt'); \
+                     INSERT INTO logs (message) VALUES ('x')",
+                ),
+                (
+                    "pulse",
+                    "INSERT INTO scans (id, config_hash, targets, ports) VALUES \
+                     ('p1', 'c', '10.0.0.1', '22'); \
+                     INSERT INTO scan_entries (scan_id, host, port, banner) VALUES \
+                     ('p1', '10.0.0.1', 22, E'SSH-2.0\\r\\n')",
+                ),
+            ] {
+                sql_in(&name, db, sql).unwrap();
+            }
+            sql_in(
+                &name,
+                "mach",
+                &format!(
+                    "INSERT INTO probe_results (operation_id, url, status, delete_after) \
+                     VALUES ('op1', 'https://a.example/x', 'found', {later})"
+                ),
+            )
+            .unwrap();
+            let before = engine_rows(&name);
+            // A column an older engine did not have yet, and a table whose rows no
+            // longer fit the engine's.
+            sql_in(
+                &name,
+                "voyage",
+                "ALTER TABLE scan_entries DROP COLUMN source",
+            )
+            .unwrap();
+            sql_in(
+                &name,
+                "pulse",
+                "ALTER TABLE probe_results ALTER COLUMN port TYPE text; \
+                 INSERT INTO probe_results (operation_id, host, port, status, delete_after) \
+                 VALUES ('o', 'h', 'none', 'open', NOW())",
+            )
             .unwrap();
 
-            assert!(found.added.is_empty(), "{:?}", found.added);
-            assert!(found.undone.is_empty(), "{:?}", found.undone);
-            assert!(inspect(&format!("{name}-fix-ref")).unwrap().is_none());
+            assert!(secure_at(&name, &cfg).unwrap());
+
+            wait_tcp_ready(&name);
+            let after = engine_rows(&name);
+            for (b, a) in before.iter().zip(&after) {
+                if b.starts_with("voyage.scan_entries") || b.starts_with("pulse.probe_results") {
+                    continue;
+                }
+                assert_eq!(a, b);
+            }
+            assert_eq!(
+                sql_in(
+                    &name,
+                    "voyage",
+                    "SELECT full_subdomain || '|' || source FROM scan_entries"
+                )
+                .unwrap(),
+                "www.a.example|",
+                "a column the old table lacks gets the engine's default"
+            );
+            assert_eq!(
+                sql_in(&name, "pulse", "SELECT count(*) FROM probe_results").unwrap(),
+                "0",
+                "rows that do not fit are left out"
+            );
+            assert_eq!(
+                sql_in(
+                    &name,
+                    "mach",
+                    "INSERT INTO words (word, wordlist_id) VALUES ('next', 1) RETURNING id"
+                )
+                .unwrap(),
+                "4"
+            );
         }
 
         /// A shell script run in the container as the postgres account.
@@ -3008,7 +2968,8 @@ mod tests {
             write_config(&cfg, port, Some(&id));
             sh_as_postgres(
                 &name,
-                "printf 'local all all trust\\nhost all all all trust\\n' > \"$PGDATA/x_hba.conf\"",
+                "printf 'local all all trust\\nhost all all all trust\\n' > \"$PGDATA/x_hba.conf\" && \
+                 echo \"hba_file = '$PGDATA/x_hba.conf'\" >> \"$PGDATA/postgresql.conf\"",
             );
             let pgdata = local_value(&name, "SHOW data_directory");
             psql_over_tcp(
@@ -3052,8 +3013,11 @@ mod tests {
             assert_eq!(
                 local_value(
                     &name,
+                    // The image's own rules for the container's loopback, which no
+                    // client outside the container connects from, are allowed.
                     "SELECT string_agg(DISTINCT auth_method, ',') FROM pg_hba_file_rules \
-                     WHERE type LIKE 'host%' AND auth_method NOT IN ('scram-sha-256', 'reject')"
+                     WHERE type LIKE 'host%' AND auth_method NOT IN ('scram-sha-256', 'reject') \
+                     AND coalesce(address, '') NOT IN ('127.0.0.1', '::1')"
                 ),
                 "",
                 "a rule for network clients that does not check the password is left"
@@ -3062,38 +3026,7 @@ mod tests {
 
         #[test]
         #[ignore = "needs Docker and the postgres image"]
-        fn an_auth_file_the_repair_cannot_replace_leaves_the_database_stopped() {
-            let name = format!("cfx-dbtest-conf-{}", std::process::id());
-            let _cleanup = Cleanup::for_name(&name);
-            let dir = tempfile::tempdir().unwrap();
-            let cfg = dir.path().join("config.toml");
-            let port = free_port();
-            let id = open_0_1_42(&name, port);
-            write_config(&cfg, port, Some(&id));
-            // Named in postgresql.conf itself, which the repair does not rewrite.
-            sh_as_postgres(
-                &name,
-                "printf 'local all all trust\\nhost all all all trust\\n' > \"$PGDATA/x_hba.conf\" && \
-                 echo \"hba_file = '$PGDATA/x_hba.conf'\" >> \"$PGDATA/postgresql.conf\"",
-            );
-
-            let result = secure_at(&name, &cfg);
-
-            assert!(
-                !running_open(&id) && !running_open(&name) && !running_open(&format!("{name}-new")),
-                "a container lets a client in without a password after {result:?}"
-            );
-            assert!(result.is_err(), "{result:?}");
-            assert!(!reachable("127.0.0.1", port));
-            assert!(
-                inspect(&format!("{name}-new")).unwrap().is_none(),
-                "a copy that failed the check is not kept for the next run to finish"
-            );
-        }
-
-        #[test]
-        #[ignore = "needs Docker and the postgres image"]
-        fn a_move_interrupted_after_the_old_container_was_removed_restarts_the_engines() {
+        fn a_rebuild_stopped_after_the_old_container_was_removed_is_finished() {
             let name = format!("cfx-dbtest-resume2-{}", std::process::id());
             let _cleanup = Cleanup::for_name(&name);
             let dir = tempfile::tempdir().unwrap();
@@ -3103,29 +3036,10 @@ mod tests {
             write_config(&cfg, port, Some(&old_id));
             let (config, _) = ensure_postgres_password_at(&cfg).unwrap();
             let password = config.postgres.password.clone().unwrap();
-            set_password(&name, "postgres", &password).unwrap();
-            sh_as_postgres(
-                &name,
-                "printf 'local all all trust\\nhost all all all scram-sha-256\\n' > \"$PGDATA/pg_hba.conf\"",
-            );
-            let image = inspect(&old_id).unwrap().unwrap()["Image"]
-                .as_str()
-                .unwrap()
-                .to_string();
             docker_ok(&["stop", &old_id]).unwrap();
-            let out = docker()
-                .args(run_args(
-                    &format!("{name}-new"),
-                    &config.postgres,
-                    &image,
-                    Some(&old_id),
-                ))
-                .env(PASSWORD_ENV, &password)
-                .output()
-                .unwrap();
-            assert!(out.status.success());
-            let staged_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            docker_ok(&["rm", &old_id]).unwrap();
+            let staged_id = rebuilt_copy(&name, &config, &image_of(&old_id), &password);
+            // The run had already handed the old data to a container that keeps it.
+            docker_ok(&["rm", "-v", &old_id]).unwrap();
 
             assert!(
                 secure_at(&name, &cfg).unwrap(),
@@ -3139,129 +3053,12 @@ mod tests {
                 load_config_at(&cfg).unwrap().container.id.as_deref(),
                 Some(staged_id.as_str())
             );
-        }
-
-        #[test]
-        #[ignore = "needs Docker and the postgres image"]
-        fn settings_made_while_it_was_open_do_not_outlast_the_repair() {
-            let name = format!("cfx-dbtest-settings-{}", std::process::id());
-            let _cleanup = Cleanup::for_name(&name);
-            let dir = tempfile::tempdir().unwrap();
-            let cfg = dir.path().join("config.toml");
-            let port = free_port();
-            let id = open_0_1_42(&name, port);
-            write_config(&cfg, port, Some(&id));
-            psql_over_tcp(
-                &name,
-                None,
-                "CREATE ROLE visitor LOGIN PASSWORD 'visitor'; \
-                 ALTER ROLE postgres SET work_mem = '7MB'",
-            )
-            .unwrap();
-            for sql in [
-                "ALTER SYSTEM SET archive_mode = 'on'",
-                "ALTER SYSTEM SET archive_command = 'touch \"$PGDATA/archived\"'",
-            ] {
-                psql_over_tcp(&name, None, sql).unwrap();
-            }
-
-            assert!(secure_at(&name, &cfg).unwrap());
-
             wait_tcp_ready(&name);
-            // A finished WAL segment is what an archive command runs for.
-            local_value(&name, "SELECT pg_switch_wal()");
-            std::thread::sleep(Duration::from_secs(5));
-            let out = docker()
-                .args(["exec", &name, "sh", "-c", "test -e \"$PGDATA/archived\""])
-                .status()
-                .unwrap();
-            assert!(
-                !out.success(),
-                "a command set while it was open ran after the repair"
-            );
-            assert_eq!(local_value(&name, "SHOW archive_mode"), "off");
-            assert_eq!(
-                local_value(&name, "SELECT count(*) FROM pg_db_role_setting"),
-                "0"
-            );
-            let (ip, _) = bridge(&name);
-            let visitor = docker()
-                .args([
-                    "exec",
-                    "-e",
-                    "PGPASSWORD=visitor",
-                    &name,
-                    "psql",
-                    "-w",
-                    "-X",
-                ])
-                .args([
-                    "-h", &ip, "-U", "visitor", "-d", "postgres", "-c", "SELECT 1",
-                ])
-                .output()
-                .unwrap();
-            assert!(
-                !visitor.status.success(),
-                "a role made while it was open can still log in"
-            );
             assert!(psql_over_tcp(&name, None, "SELECT 1").is_err());
-        }
-
-        /// A 0.1.42 container that `change` altered while it was open: the repair must
-        /// refuse it and leave it stopped, with nothing published.
-        fn is_refused_and_stopped(tag: &str, change: impl Fn(&str)) {
-            let name = format!("cfx-dbtest-{tag}-{}", std::process::id());
-            let _cleanup = Cleanup::for_name(&name);
-            let dir = tempfile::tempdir().unwrap();
-            let cfg = dir.path().join("config.toml");
-            let port = free_port();
-            let id = open_0_1_42(&name, port);
-            write_config(&cfg, port, Some(&id));
-            change(&name);
-
-            let result = secure_at(&name, &cfg);
-
-            assert!(result.is_err(), "{tag}: {result:?}");
-            assert!(!is_running(&id), "{tag}: left running");
-            assert!(!reachable("127.0.0.1", port), "{tag}: still published");
-            assert!(
-                inspect(&format!("{name}-new")).unwrap().is_none(),
-                "{tag}: a copy was made"
+            assert_eq!(
+                psql_over_tcp(&name, Some(&password), "SELECT 1").unwrap(),
+                "1"
             );
-        }
-
-        #[test]
-        #[ignore = "needs Docker and the postgres image"]
-        fn code_added_while_it_was_open_leaves_it_stopped() {
-            is_refused_and_stopped("builtin", |name| {
-                psql_over_tcp(
-                    name,
-                    None,
-                    "CREATE OR REPLACE FUNCTION pg_catalog.now() RETURNS timestamptz \
-                     LANGUAGE sql AS 'SELECT statement_timestamp()'",
-                )
-                .unwrap();
-            });
-            is_refused_and_stopped("default", |name| {
-                psql_over_tcp(name, None, "CREATE TABLE notes(body text DEFAULT md5('x'))")
-                    .unwrap();
-            });
-            is_refused_and_stopped("evtrig", |name| {
-                psql_over_tcp(
-                    name,
-                    None,
-                    "CREATE FUNCTION noop() RETURNS event_trigger LANGUAGE plpgsql AS \
-                     'BEGIN END'; \
-                     CREATE EVENT TRIGGER noop ON ddl_command_end EXECUTE FUNCTION noop()",
-                )
-                .unwrap();
-            });
-            is_refused_and_stopped("conf", |name| {
-                sh_as_postgres(
-                    name,
-                    "echo \"archive_command = 'true'\" >> \"$PGDATA/postgresql.conf\"",
-                );
-            });
         }
 
         #[test]
@@ -3306,6 +3103,275 @@ mod tests {
             assert_eq!(
                 psql_over_tcp(&name, Some(&password), "SELECT 1").unwrap(),
                 "1"
+            );
+        }
+
+        /// SQL in database `db` over the container's socket. One statement per call
+        /// when it is one that cannot run in a transaction.
+        fn sql_in(name: &str, db: &str, sql: &str) -> Result<String, String> {
+            let out = docker()
+                .args(["exec", "-u", "postgres", name, "psql", "-X", "-q"])
+                .args([
+                    "-v",
+                    "ON_ERROR_STOP=1",
+                    "-U",
+                    "postgres",
+                    "-d",
+                    db,
+                    "-tAc",
+                    sql,
+                ])
+                .output()
+                .unwrap();
+            if out.status.success() {
+                Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+            } else {
+                Err(String::from_utf8_lossy(&out.stderr).to_string())
+            }
+        }
+
+        /// Some of ambulo's tables and rows, as the engine makes them.
+        fn seed_mach(name: &str) {
+            sql_in(name, "postgres", "CREATE DATABASE mach").unwrap();
+            sql_in(
+                name,
+                "mach",
+                "CREATE TABLE wordlists (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, \
+                 hash TEXT UNIQUE); \
+                 CREATE TABLE scans (id BIGSERIAL PRIMARY KEY, config_hash TEXT NOT NULL, \
+                 status TEXT NOT NULL DEFAULT 'pending', \
+                 created_at TEXT NOT NULL DEFAULT NOW()::TEXT, \
+                 updated_at TEXT NOT NULL DEFAULT NOW()::TEXT, \
+                 notifications TEXT NOT NULL DEFAULT '{}', wordlist_id BIGINT, \
+                 method TEXT NOT NULL, FOREIGN KEY (wordlist_id) REFERENCES wordlists(id)); \
+                 INSERT INTO wordlists (name, hash) VALUES ('common', 'h1'), \
+                 (E'tab\\there', NULL); \
+                 INSERT INTO scans (config_hash, method, wordlist_id) VALUES ('c1', 'GET', 2)",
+            )
+            .unwrap();
+        }
+
+        fn mounts(target: &str) -> Vec<String> {
+            inspect(target).unwrap().expect("container exists")["Mounts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|m| m["Name"].as_str().map(str::to_string))
+                .collect()
+        }
+
+        #[test]
+        #[ignore = "needs Docker and the postgres image"]
+        fn a_type_added_to_an_engine_table_does_not_outlast_the_repair() {
+            let name = format!("cfx-dbtest-domain-{}", std::process::id());
+            let _cleanup = Cleanup::for_name(&name);
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = dir.path().join("config.toml");
+            let port = free_port();
+            let id = open_0_1_42(&name, port);
+            write_config(&cfg, port, Some(&id));
+            seed_mach(&name);
+            sql_in(
+                &name,
+                "mach",
+                "CREATE DOMAIN tag AS text DEFAULT 'planted'; ALTER TABLE scans ADD COLUMN t tag",
+            )
+            .unwrap();
+
+            assert!(secure_at(&name, &cfg).unwrap());
+
+            wait_tcp_ready(&name);
+            assert_eq!(
+                sql_in(
+                    &name,
+                    "mach",
+                    "SELECT count(*) FROM pg_type WHERE oid >= 16384 AND typtype NOT IN ('c', 'b')"
+                )
+                .unwrap(),
+                "0",
+                "a type added while it was open is still there"
+            );
+            assert_eq!(
+                sql_in(
+                    &name,
+                    "mach",
+                    "SELECT count(*) FROM pg_attribute WHERE attrelid = 'scans'::regclass \
+                     AND attname = 't'"
+                )
+                .unwrap(),
+                "0"
+            );
+            assert_eq!(
+                sql_in(
+                    &name,
+                    "mach",
+                    "SELECT string_agg(coalesce(hash, '-') || ':' || name, ',' ORDER BY id) \
+                     FROM wordlists"
+                )
+                .unwrap(),
+                "h1:common,-:tab\there",
+                "the engines' rows are kept as they were"
+            );
+            assert_eq!(
+                sql_in(
+                    &name,
+                    "mach",
+                    "INSERT INTO scans (config_hash, method) VALUES ('c2', 'GET') RETURNING id"
+                )
+                .unwrap(),
+                "2",
+                "new rows carry on from the old ids"
+            );
+        }
+
+        #[test]
+        #[ignore = "needs Docker and the postgres image"]
+        fn settings_files_added_while_it_was_open_do_not_outlast_the_repair() {
+            let name = format!("cfx-dbtest-confd-{}", std::process::id());
+            let _cleanup = Cleanup::for_name(&name);
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = dir.path().join("config.toml");
+            let port = free_port();
+            let id = open_0_1_42(&name, port);
+            write_config(&cfg, port, Some(&id));
+            seed_mach(&name);
+            sh_as_postgres(
+                &name,
+                "mkdir -p \"$PGDATA/conf.d\" && \
+                 printf \"archive_mode = on\\narchive_command = 'touch archived'\\n\" \
+                 > \"$PGDATA/conf.d/extra.conf\" && \
+                 echo \"include_dir 'conf.d'\" >> \"$PGDATA/postgresql.conf\"",
+            );
+
+            let result = secure_at(&name, &cfg);
+
+            assert!(result.unwrap());
+            wait_tcp_ready(&name);
+            assert_eq!(local_value(&name, "SHOW archive_mode"), "off");
+            assert_eq!(
+                local_value(
+                    &name,
+                    "SELECT count(*) FROM pg_file_settings WHERE sourcefile LIKE '%conf.d%'"
+                ),
+                "0"
+            );
+            sql_in(&name, "mach", "INSERT INTO wordlists (name) VALUES ('w')").unwrap();
+            local_value(&name, "SELECT pg_switch_wal()");
+            std::thread::sleep(Duration::from_secs(5));
+            let ran = docker()
+                .args(["exec", &name, "sh", "-c", "test -e \"$PGDATA/archived\""])
+                .status()
+                .unwrap();
+            assert!(!ran.success(), "a command from the old settings ran");
+        }
+
+        #[test]
+        #[ignore = "needs Docker and the postgres image"]
+        fn only_the_engines_rows_are_carried_over() {
+            let name = format!("cfx-dbtest-rebuild-{}", std::process::id());
+            let _cleanup = Cleanup::for_name(&name);
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = dir.path().join("config.toml");
+            let port = free_port();
+            let id = open_0_1_42(&name, port);
+            write_config(&cfg, port, Some(&id));
+            seed_mach(&name);
+            sql_in(&name, "postgres", "CREATE DATABASE extra").unwrap();
+            for (db, sql) in [
+                (
+                    "crossfyre",
+                    "CREATE TABLE notes(v text); INSERT INTO notes VALUES ('x')",
+                ),
+                (
+                    "mach",
+                    "CREATE OR REPLACE FUNCTION pg_catalog.now() RETURNS timestamptz \
+                     LANGUAGE sql AS 'SELECT statement_timestamp()'",
+                ),
+                (
+                    "mach",
+                    "CREATE FUNCTION noop() RETURNS event_trigger LANGUAGE plpgsql AS \
+                     'BEGIN END'; \
+                     CREATE EVENT TRIGGER noop ON ddl_command_end EXECUTE FUNCTION noop()",
+                ),
+                ("mach", "SELECT lo_from_bytea(424242, 'x')"),
+                (
+                    "postgres",
+                    "CREATE ROLE visitor LOGIN PASSWORD 'visitor'; \
+                     ALTER ROLE postgres SET work_mem = '7MB'",
+                ),
+                ("postgres", "ALTER SYSTEM SET work_mem = '9MB'"),
+            ] {
+                sql_in(&name, db, sql).unwrap();
+            }
+            let old_volumes = mounts(&id);
+            assert!(!old_volumes.is_empty());
+
+            assert!(secure_at(&name, &cfg).unwrap());
+
+            wait_tcp_ready(&name);
+            let new_volumes = mounts(&name);
+            assert!(
+                new_volumes.iter().all(|v| !old_volumes.contains(v)),
+                "the repaired container still runs on the old data directory"
+            );
+            for v in &old_volumes {
+                assert!(
+                    docker_ok(&["volume", "inspect", v]).is_ok(),
+                    "the old data volume {v} was deleted"
+                );
+            }
+            for (db, sql, want) in [
+                (
+                    "postgres",
+                    "SELECT count(*) FROM pg_database WHERE datname = 'extra'",
+                    "0",
+                ),
+                (
+                    "crossfyre",
+                    "SELECT count(*) FROM pg_class WHERE relname = 'notes'",
+                    "0",
+                ),
+                (
+                    "mach",
+                    "SELECT l.lanname FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang \
+                     WHERE p.proname = 'now'",
+                    "internal",
+                ),
+                ("mach", "SELECT count(*) FROM pg_event_trigger", "0"),
+                (
+                    "mach",
+                    "SELECT count(*) FROM pg_proc WHERE proname = 'noop'",
+                    "0",
+                ),
+                ("mach", "SELECT count(*) FROM pg_largeobject_metadata", "0"),
+                (
+                    "postgres",
+                    "SELECT count(*) FROM pg_roles WHERE rolname = 'visitor'",
+                    "0",
+                ),
+                ("postgres", "SELECT count(*) FROM pg_db_role_setting", "0"),
+                (
+                    "postgres",
+                    "SELECT count(*) FROM pg_file_settings WHERE name = 'work_mem'",
+                    "0",
+                ),
+                (
+                    "mach",
+                    "SELECT count(*) FROM scans WHERE config_hash = 'c1'",
+                    "1",
+                ),
+            ] {
+                assert_eq!(sql_in(&name, db, sql).unwrap(), want, "{db}: {sql}");
+            }
+            let password = load_config_at(&cfg).unwrap().postgres.password.unwrap();
+            assert!(psql_over_tcp(&name, None, "SELECT 1").is_err());
+            assert_eq!(
+                psql_over_tcp(&name, Some(&password), "SELECT 1").unwrap(),
+                "1"
+            );
+            assert!(
+                !secure_at(&name, &cfg).unwrap(),
+                "a second run changes nothing"
             );
         }
     }

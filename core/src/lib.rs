@@ -1042,8 +1042,8 @@ pub async fn run_boot(
     // before any node starts using them.
     toolchain::migrate::renamed_engines();
     // A database container made by 0.1.42 or earlier was published on every
-    // interface with no password. Move it to loopback with a password, keeping its
-    // data. Nodes do not use it, so they start meanwhile rather than wait on Docker,
+    // interface with no password. Rebuild it on loopback with a password, keeping the
+    // engines' rows. Nodes do not use it, so they start meanwhile rather than wait on Docker,
     // which may be slow to answer or not running yet.
     let securing = std::thread::spawn(|| {
         if let Err(e) = toolchain::db::secure_existing() {
