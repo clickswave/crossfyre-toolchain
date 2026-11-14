@@ -48,10 +48,19 @@ use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 /// How deep [`remove_dir_all`] goes, as in `root_fs`.
 const MAX_DEPTH: usize = 32;
 
-/// What a directory on the way is opened with: enough to open what is in it, list it
-/// and read its access list.
+/// What a directory that is listed or removed is opened with: enough to open what is
+/// in it, list it and read its access list.
 const DIR_ACCESS: u32 =
     FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE;
+
+/// What a directory on the way is opened with while it may be found to be the
+/// administrators' alone: enough to open what is in it and read its access list.
+const JUDGE_ACCESS: u32 = FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE;
+
+/// What a directory on the way is opened with below one another account can change,
+/// where its access list no longer matters: enough to open what is in it. A directory
+/// that lets this account through but not list it or read its access list still works.
+const PASS_ACCESS: u32 = FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 
 /// Every file here is opened sharing all access, as std opens files, so the operator's
 /// own tools keep working on them.
@@ -301,7 +310,9 @@ fn rename_handle(file: RawHandle, dir: &Dir, name: &OsStr) -> io::Result<()> {
 fn rename_with(file: RawHandle, dir: &Dir, name: &OsStr, class: i32, flags: u32) -> io::Result<()> {
     let wide: Vec<u16> = name.encode_wide().collect();
     let head = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName);
-    let size = head + wide.len() * 2;
+    // Never less than the whole structure, which the system asks for even when the
+    // name is shorter than the room the structure keeps for it.
+    let size = (head + wide.len() * 2).max(std::mem::size_of::<FILE_RENAME_INFORMATION>());
     // u64s, so the buffer is aligned for the structure's handle.
     let mut buf = vec![0u64; size.div_ceil(8)];
     // SAFETY: the buffer is zeroed, aligned and at least `size` bytes long, which holds
@@ -383,12 +394,20 @@ fn split(path: &Path) -> io::Result<(PathBuf, Vec<OsString>, OsString)> {
 /// administrator can change; anywhere else it is refused.
 fn walk(root: &Path, dirs: &[OsString], create: bool) -> io::Result<Dir> {
     use std::os::windows::fs::OpenOptionsExt;
-    // The root of a drive or a share is the machine's, as `/` is on Unix.
-    let top = std::fs::OpenOptions::new()
-        .access_mode(DIR_ACCESS)
-        .share_mode(SHARE_ALL)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(root)?;
+    // The root of a drive or a share is the machine's, as `/` is on Unix. One whose
+    // access list this account cannot read is passed through, and then nothing below
+    // it counts as the administrators' alone.
+    let open_root = |access: u32| {
+        std::fs::OpenOptions::new()
+            .access_mode(access)
+            .share_mode(SHARE_ALL)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(root)
+    };
+    let top = match open_root(JUDGE_ACCESS) {
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => open_root(PASS_ACCESS)?,
+        other => other?,
+    };
     let mut cur = Dir {
         handle: OwnedHandle::from(top),
         fixed: true,
@@ -396,25 +415,39 @@ fn walk(root: &Path, dirs: &[OsString], create: bool) -> io::Result<Dir> {
     };
     for name in dirs {
         let shown = cur.path.join(name);
-        let opened = nt_open(
-            cur.raw(),
-            name,
-            DIR_ACCESS,
-            FILE_OPEN,
-            FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
-            None,
-        );
-        let entry = match opened {
-            Err(e) if create && e.kind() == io::ErrorKind::NotFound => nt_open(
+        // Only while every level so far is the administrators' is this one's access
+        // list read; below that, passing through is all that is asked.
+        let tries: &[u32] = if cur.fixed {
+            &[JUDGE_ACCESS, PASS_ACCESS]
+        } else {
+            &[PASS_ACCESS]
+        };
+        let mut opened = Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        for &access in tries {
+            opened = nt_open(
                 cur.raw(),
                 name,
-                DIR_ACCESS,
-                FILE_OPEN_IF,
+                access,
+                FILE_OPEN,
                 FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
                 None,
-            )?,
-            other => other?,
-        };
+            );
+            opened = match opened {
+                Err(e) if create && e.kind() == io::ErrorKind::NotFound => nt_open(
+                    cur.raw(),
+                    name,
+                    access,
+                    FILE_OPEN_IF,
+                    FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
+                    None,
+                ),
+                other => other,
+            };
+            if !matches!(&opened, Err(e) if e.kind() == io::ErrorKind::PermissionDenied) {
+                break;
+            }
+        }
+        let entry = opened?;
         let i = info(&entry)?;
         let fixed = cur.fixed && admin_only(&entry, &cur.handle, &shown);
         let handle = if is_link(&i) {
@@ -424,7 +457,7 @@ fn walk(root: &Path, dirs: &[OsString], create: bool) -> io::Result<Dir> {
             let target = nt_open(
                 cur.raw(),
                 name,
-                DIR_ACCESS,
+                JUDGE_ACCESS,
                 FILE_OPEN,
                 FILE_DIRECTORY_FILE,
                 None,
@@ -788,6 +821,15 @@ mod tests {
         assert_eq!(fs::read_to_string(&p).unwrap(), "newer\n");
         assert_eq!(read_to_string(&p).unwrap(), "newer\n");
         assert_eq!(fs::read_dir(t.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_file_is_renamed_to_a_name_of_one_letter() {
+        let t = tempfile::tempdir().unwrap();
+        fs::write(t.path().join("long-name"), "moved\n").unwrap();
+        rename(&t.path().join("long-name"), &t.path().join("b")).unwrap();
+        assert_eq!(fs::read_to_string(t.path().join("b")).unwrap(), "moved\n");
+        assert!(!t.path().join("long-name").exists());
     }
 
     // The supervisor, `node status` and the engines read these files while the node
