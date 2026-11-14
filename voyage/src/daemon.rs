@@ -589,20 +589,40 @@ fn active_wordlist(params: &EnumParams) -> Result<Option<std::fs::File>, String>
     dguard::open_wordlist(&params.wordlist).map(|(_, file)| Some(file))
 }
 
+/// What a saved scan is found again by. Without an active wordlist it is the domain
+/// and the wordlist argument, as it always was. With one it is the domain and the
+/// words themselves, the way ambulo finds a wordlist by its content: the node hands
+/// each op its wordlist under a new directory, so a key built from the path would
+/// start a new scan, and leave all of its rows behind, on every op.
+fn scan_key(domain: &str, wordlist: &str, words: Option<&[String]>) -> String {
+    use sha2::Digest;
+    let config = match words {
+        None => serde_json::json!({ "domain": domain, "wordlist": wordlist }),
+        Some(words) => {
+            let mut digest = sha2::Sha512::new();
+            for word in words {
+                digest.update(word.as_bytes());
+                digest.update(b"\n");
+            }
+            serde_json::json!({ "domain": domain, "words": format!("{:x}", digest.finalize()) })
+        }
+    };
+    crate::libs::sha::sha512(config.to_string())
+}
+
 async fn prepare_enum(
     params: &EnumParams,
     db: &Arc<VoyageDb>,
 ) -> Result<(Scanner, usize), Box<dyn std::error::Error + Send + Sync>> {
-    let wordlist = active_wordlist(params)?;
-    // Compute config hash from domain + wordlist path
-    let config_str = serde_json::json!({
-        "domain": &params.domain,
-        "wordlist": &params.wordlist,
-    })
-    .to_string();
-    let config_hash = crate::libs::sha::sha512(config_str)
-        .await
-        .map_err(|e| format!("Hash error: {e}"))?;
+    let words = match active_wordlist(params)? {
+        Some(file) => Some(
+            crate::libs::wordlist::read_lines_from(file)
+                .await
+                .map_err(|e| format!("Wordlist error: {e}"))?,
+        ),
+        None => None,
+    };
+    let config_hash = scan_key(&params.domain, &params.wordlist, words.as_deref());
 
     let scan_id = db
         .get_or_create_scan(&config_hash, &params.domain, &params.wordlist)
@@ -644,11 +664,7 @@ async fn prepare_enum(
     }
 
     // Active wordlist - insert entries with status="queued"
-    if let Some(wordlist) = wordlist {
-        let words = crate::libs::wordlist::read_lines_from(wordlist)
-            .await
-            .map_err(|e| format!("Wordlist error: {e}"))?;
-
+    if let Some(words) = words {
         let entries: Vec<(String, String, String, String)> = words
             .iter()
             .filter(|w| !w.trim().is_empty())
@@ -1238,6 +1254,51 @@ async fn handle_stream_takeover(
 #[cfg(test)]
 mod wordlist_tests {
     use super::*;
+
+    fn lines(words: &[&str]) -> Vec<String> {
+        words.iter().map(|w| w.to_string()).collect()
+    }
+
+    // The node writes the same list to a new path for every op. Keyed by the path,
+    // each op made a scan of its own and none of them was ever removed.
+    #[test]
+    fn the_same_words_under_another_path_find_the_same_scan() {
+        let words = lines(&["www", "api"]);
+        assert_eq!(
+            scan_key(
+                "example.com",
+                "/tmp/cfx-handoff-a/cfx-wl-sub-x.txt",
+                Some(&words)
+            ),
+            scan_key(
+                "example.com",
+                "/tmp/cfx-handoff-b/cfx-wl-sub-x.txt",
+                Some(&words)
+            ),
+        );
+        assert_ne!(
+            scan_key("example.com", "/tmp/a.txt", Some(&words)),
+            scan_key("example.org", "/tmp/a.txt", Some(&words)),
+        );
+    }
+
+    #[test]
+    fn other_words_under_the_same_path_are_another_scan() {
+        assert_ne!(
+            scan_key("example.com", "/srv/wl.txt", Some(&lines(&["www"]))),
+            scan_key("example.com", "/srv/wl.txt", Some(&lines(&["www", "api"]))),
+        );
+    }
+
+    // A passive-only scan saved by an earlier release is still found.
+    #[test]
+    fn without_an_active_wordlist_the_key_is_unchanged() {
+        let before = serde_json::json!({ "domain": "example.com", "wordlist": "/srv/wl.txt" });
+        assert_eq!(
+            scan_key("example.com", "/srv/wl.txt", None),
+            crate::libs::sha::sha512(before.to_string()),
+        );
+    }
 
     fn enum_params(wordlist: &str, disable_active: bool) -> EnumParams {
         serde_json::from_value(serde_json::json!({
