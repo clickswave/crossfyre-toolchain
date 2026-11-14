@@ -91,7 +91,7 @@ doorward scan --targets 10.0.0.0/24 --ports top-1000 --service-detection
 ambulo scan --url https://example.com/::FUZZ:: --wordlist-path /usr/share/seclists/Discovery/Web-Content/common.txt
 ```
 
-Wordlists are read only from a few directories, since the daemon would otherwise read any file a request names: `/usr/share/wordlists`, `/usr/share/seclists` and the temp directory on Linux, and Homebrew's seclists on macOS. Add your own with `CFX_WORDLIST_ROOTS`, separated like `PATH`.
+Wordlists are read only from a few directories, since the daemon would otherwise read any file a request names: `/usr/share/wordlists` and `/usr/share/seclists` on Linux, and Homebrew's seclists on macOS. The temp directory is read only for the lists the node hands over. Add your own directories with `CFX_WORDLIST_ROOTS`, separated like `PATH`.
 
 In a terminal `voyage`, `doorward` and `ambulo` draw a live dashboard. `toolmark` and `plessor` finish a single target in seconds, so they print JSON unless you put `--tui` before `scan`, as in `toolmark --tui scan https://example.com`. Piped or redirected, every engine writes newline-delimited JSON, one event per line, and exits non-zero if the run ends in an error. `voyage`, `doorward` and `ambulo` save findings as they go, so a stopped scan resumes where it left off. Add `--help` to any command for the rest.
 

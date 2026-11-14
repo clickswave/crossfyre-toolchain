@@ -541,21 +541,59 @@ const ROOTS_SEPARATED: &str = if cfg!(windows) {
     "colon-separated"
 };
 
-/// Directories a wordlist may be read from without configuration.
+/// The name every directory the node makes for one op's hand-over files starts with.
+pub const HANDOFF_PREFIX: &str = "cfx-handoff-";
+
+/// Directories any wordlist may be read from without configuration.
 ///
-/// These are the places wordlists actually come from in normal operation: where the
-/// node hands remote lists over as `cfx-wl-<id>.txt`, and where the bundled default
-/// ships. On Linux the hand-over is the temp dir and the default is in
-/// `/opt/crossfyre/wordlists`, and the distro paths are included because they are
-/// where operators keep lists on a scanning host. macOS hands over in /tmp too, which
-/// is not a process's own temp dir there (that is a per-user directory under
-/// /var/folders), and Homebrew's seclists are where operators keep lists. Windows
-/// hands over in the toolchain directory's `tmp` (the node runs as LocalSystem, whose
-/// temp dir the engines cannot read) and ships the default under Program Files.
+/// These are where the bundled default ships and where operators keep lists on a
+/// scanning host: `/opt/crossfyre/wordlists` and the distro paths on Linux, Homebrew's
+/// seclists on macOS, Program Files on Windows. The temporary directories are not
+/// among them; see [`handoff_roots`].
 fn default_roots() -> Vec<std::path::PathBuf> {
     use std::path::PathBuf;
     #[cfg(windows)]
     {
+        let program_files =
+            std::env::var_os("ProgramFiles").unwrap_or_else(|| r"C:\Program Files".into());
+        vec![
+            PathBuf::from(program_files)
+                .join("Crossfyre")
+                .join("wordlists"),
+        ]
+    }
+    #[cfg(target_os = "macos")]
+    {
+        vec![
+            PathBuf::from("/opt/crossfyre/wordlists"),
+            PathBuf::from("/opt/homebrew/share/seclists"),
+            PathBuf::from("/usr/local/share/seclists"),
+        ]
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        vec![
+            PathBuf::from("/opt/crossfyre/wordlists"),
+            PathBuf::from("/usr/share/wordlists"),
+            PathBuf::from("/usr/share/seclists"),
+        ]
+    }
+}
+
+/// Directories the node hands downloaded wordlists over in, from which only a file
+/// directly inside one of its `cfx-handoff-*` directories is read.
+///
+/// The daemon takes a path from whoever reaches its port, and these directories hold
+/// much more than wordlists: anything the operator keeps in a temporary directory, in
+/// subdirectories other accounts cannot list, could otherwise be named and read. On
+/// Unix the node hands over in /tmp, which on macOS is not a process's own temp dir
+/// (that is a per-user directory under /var/folders). Windows hands over in the
+/// toolchain directory's `tmp` (the node runs as LocalSystem, whose temp dir the
+/// engines cannot read).
+fn handoff_roots() -> Vec<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        use std::path::PathBuf;
         let mut roots = vec![std::env::temp_dir()];
         // The engine host names the toolchain directory; without it, the default one.
         let toolchain = std::env::var_os("CROSSFYRE_TOOLCHAIN_DIR")
@@ -565,33 +603,29 @@ fn default_roots() -> Vec<std::path::PathBuf> {
         if let Some(dir) = toolchain {
             roots.push(dir.join("tmp"));
         }
-        let program_files =
-            std::env::var_os("ProgramFiles").unwrap_or_else(|| r"C:\Program Files".into());
-        roots.push(
-            PathBuf::from(program_files)
-                .join("Crossfyre")
-                .join("wordlists"),
-        );
         roots
     }
     #[cfg(target_os = "macos")]
     {
-        vec![
-            std::env::temp_dir(),
-            PathBuf::from("/tmp"),
-            PathBuf::from("/opt/crossfyre/wordlists"),
-            PathBuf::from("/opt/homebrew/share/seclists"),
-            PathBuf::from("/usr/local/share/seclists"),
-        ]
+        vec![std::env::temp_dir(), std::path::PathBuf::from("/tmp")]
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        vec![
-            std::env::temp_dir(),
-            PathBuf::from("/opt/crossfyre/wordlists"),
-            PathBuf::from("/usr/share/wordlists"),
-            PathBuf::from("/usr/share/seclists"),
-        ]
+        vec![std::env::temp_dir()]
+    }
+}
+
+/// Whether `rel`, a path below a hand-over root, names a file directly inside one of
+/// the node's `cfx-handoff-*` directories.
+fn is_handoff_file(rel: &std::path::Path) -> bool {
+    use std::path::Component;
+    let mut c = rel.components();
+    match (c.next(), c.next(), c.next()) {
+        (Some(Component::Normal(dir)), Some(Component::Normal(_)), None) => dir
+            .to_str()
+            .and_then(|d| d.strip_prefix(HANDOFF_PREFIX))
+            .is_some_and(|rest| !rest.is_empty()),
+        _ => false,
     }
 }
 
@@ -608,6 +642,7 @@ fn roots_from(value: &str) -> Vec<std::path::PathBuf> {
 }
 
 /// Every directory a wordlist may be read from, defaults plus [`WORDLIST_ROOTS_ENV`].
+/// The node's hand-over directories come on top: see [`handoff_roots`].
 pub fn wordlist_roots() -> Vec<std::path::PathBuf> {
     let mut roots = default_roots();
     if let Ok(extra) = std::env::var(WORDLIST_ROOTS_ENV) {
@@ -616,7 +651,8 @@ pub fn wordlist_roots() -> Vec<std::path::PathBuf> {
     roots
 }
 
-/// Resolve a caller-supplied wordlist path, refusing anything outside [`wordlist_roots`].
+/// Resolve a caller-supplied wordlist path, refusing anything outside [`wordlist_roots`]
+/// that the node did not hand over.
 ///
 /// `wordlist` is a filesystem path chosen by whoever sent the request, and the
 /// scanner reads the file and emits one HTTP request per line to a target the
@@ -628,13 +664,23 @@ pub fn wordlist_roots() -> Vec<std::path::PathBuf> {
 /// into a denied directory are both resolved before the comparison rather than
 /// pattern-matched beforehand.
 pub fn resolve_wordlist(wordlist: &str) -> Result<std::path::PathBuf, String> {
-    resolve_wordlist_in(wordlist, &wordlist_roots())
+    resolve_wordlist_with(wordlist, &wordlist_roots(), &handoff_roots())
 }
 
 /// The containment decision, without reading the environment. See [`bind_addr_from`].
 pub fn resolve_wordlist_in(
     wordlist: &str,
     roots: &[std::path::PathBuf],
+) -> Result<std::path::PathBuf, String> {
+    resolve_wordlist_with(wordlist, roots, &[])
+}
+
+/// [`resolve_wordlist_in`] that also takes a file directly inside a `cfx-handoff-*`
+/// directory of one of `handoff`, and nothing else there.
+fn resolve_wordlist_with(
+    wordlist: &str,
+    roots: &[std::path::PathBuf],
+    handoff: &[std::path::PathBuf],
 ) -> Result<std::path::PathBuf, String> {
     let raw = wordlist.trim();
     if raw.is_empty() {
@@ -651,23 +697,40 @@ pub fn resolve_wordlist_in(
             }
         }
     }
+    let mut in_handoff_root = false;
+    for root in handoff {
+        if let Ok(root) = std::fs::canonicalize(root) {
+            if let Ok(rel) = real.strip_prefix(&root) {
+                if is_handoff_file(rel) {
+                    return Ok(real);
+                }
+                in_handoff_root = true;
+            }
+        }
+    }
+    let why = if in_handoff_root {
+        "is in a temporary directory, where only the lists the node hands over are read"
+    } else {
+        "is outside the permitted directories"
+    };
     Err(format!(
-        "wordlist {} is outside the permitted directories. Move it under one of \
-         them, or add its directory to {} ({}).",
+        "wordlist {} {why}. Move it under one of the permitted directories, or add its \
+         directory to {} ({}).",
         real.display(),
         WORDLIST_ROOTS_ENV,
         ROOTS_SEPARATED
     ))
 }
 
-/// Open a caller-supplied wordlist once, refusing anything outside [`wordlist_roots`].
+/// Open a caller-supplied wordlist once, refusing anything outside [`wordlist_roots`]
+/// that the node did not hand over.
 ///
 /// Returns the checked path and the handle every later read has to use, so what is
 /// read is the file that was checked. Anything that is not a regular file is refused.
 /// On Unix the path is opened one directory at a time without following symlinks,
 /// and only through directories no other account can change: see [`open_beneath`].
 pub fn open_wordlist(wordlist: &str) -> Result<(std::path::PathBuf, std::fs::File), String> {
-    open_wordlist_in(wordlist, &wordlist_roots())
+    open_wordlist_with(wordlist, &wordlist_roots(), &handoff_roots())
 }
 
 /// [`open_wordlist`] with the roots given rather than read from the environment.
@@ -675,7 +738,15 @@ pub fn open_wordlist_in(
     wordlist: &str,
     roots: &[std::path::PathBuf],
 ) -> Result<(std::path::PathBuf, std::fs::File), String> {
-    let real = resolve_wordlist_in(wordlist, roots)?;
+    open_wordlist_with(wordlist, roots, &[])
+}
+
+fn open_wordlist_with(
+    wordlist: &str,
+    roots: &[std::path::PathBuf],
+    handoff: &[std::path::PathBuf],
+) -> Result<(std::path::PathBuf, std::fs::File), String> {
+    let real = resolve_wordlist_with(wordlist, roots, handoff)?;
     #[cfg(unix)]
     let file = open_beneath(&real, Operator::current())?;
     #[cfg(not(unix))]
@@ -703,9 +774,12 @@ fn not_a_regular_file(real: &std::path::Path) -> String {
 struct Operator {
     uid: u32,
     /// The account's primary group when no other account is in it: named after the
-    /// account and listing no other member. Write access for that group is write
-    /// access for nobody else.
+    /// account, listing no other member, and no other account's primary group. Write
+    /// access for that group is write access for nobody else.
     private_gid: Option<u32>,
+    /// macOS's admin group, whose members administer the machine through sudo and so
+    /// can already change any directory. Homebrew makes its prefix writable by it.
+    admin_gid: Option<u32>,
 }
 
 #[cfg(unix)]
@@ -716,7 +790,30 @@ impl Operator {
         Operator {
             uid,
             private_gid: private_group_of(uid),
+            admin_gid: admin_group(),
         }
+    }
+
+    /// Whether write access for group `gid` is write access for no account that could
+    /// not change the directory anyway.
+    fn trusts_group(&self, gid: u32) -> bool {
+        self.private_gid == Some(gid) || self.admin_gid == Some(gid)
+    }
+}
+
+/// The admin group on macOS, gid 80, when it is there under that name.
+#[cfg(unix)]
+fn admin_group() -> Option<u32> {
+    #[cfg(target_os = "macos")]
+    {
+        const ADMIN: u32 = 80;
+        group_entry(ADMIN)
+            .filter(|g| g.name == b"admin")
+            .map(|_| ADMIN)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
     }
 }
 
@@ -746,9 +843,16 @@ fn private_group_of(uid: u32) -> Option<u32> {
     }
 }
 
-/// Whether group `gid` is named `name` and lists no member but `name`.
+/// A group's name and the members it lists.
 #[cfg(unix)]
-fn group_is_only(gid: libc::gid_t, name: &[u8]) -> bool {
+struct GroupEntry {
+    name: Vec<u8>,
+    members: Vec<Vec<u8>>,
+}
+
+/// The group `gid`, if there is one.
+#[cfg(unix)]
+fn group_entry(gid: libc::gid_t) -> Option<GroupEntry> {
     use std::ffi::CStr;
     let mut buf: Vec<libc::c_char> = vec![0; 4096];
     loop {
@@ -762,26 +866,69 @@ fn group_is_only(gid: libc::gid_t, name: &[u8]) -> bool {
             continue;
         }
         if rc != 0 || found.is_null() || grp.gr_name.is_null() {
-            return false;
+            return None;
         }
         // SAFETY: on success gr_name is a NUL-terminated string and gr_mem a
         // NULL-terminated array of them, all inside `buf`.
-        if unsafe { CStr::from_ptr(grp.gr_name) }.to_bytes() != name {
-            return false;
-        }
+        let name = unsafe { CStr::from_ptr(grp.gr_name) }.to_bytes().to_vec();
+        let mut members = Vec::new();
         let mut member = grp.gr_mem;
         while !member.is_null() {
             let m = unsafe { *member };
             if m.is_null() {
                 break;
             }
-            if unsafe { CStr::from_ptr(m) }.to_bytes() != name {
-                return false;
-            }
+            members.push(unsafe { CStr::from_ptr(m) }.to_bytes().to_vec());
             member = unsafe { member.add(1) };
         }
-        return true;
+        return Some(GroupEntry { name, members });
     }
+}
+
+/// The names of the accounts whose primary group is `gid`. An account is in its
+/// primary group without the group listing it.
+#[cfg(unix)]
+fn primary_members(gid: libc::gid_t) -> Vec<Vec<u8>> {
+    // getpwent walks one process-wide cursor, so one walk at a time.
+    static WALK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _walk = WALK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut names = Vec::new();
+    // SAFETY: setpwent, getpwent and endpwent have no preconditions. Each entry
+    // getpwent returns is read before the next call, which may overwrite it.
+    unsafe {
+        libc::setpwent();
+        loop {
+            let pwd = libc::getpwent();
+            if pwd.is_null() {
+                break;
+            }
+            if (*pwd).pw_gid == gid && !(*pwd).pw_name.is_null() {
+                names.push(std::ffi::CStr::from_ptr((*pwd).pw_name).to_bytes().to_vec());
+            }
+        }
+        libc::endpwent();
+    }
+    names
+}
+
+/// Whether group `gid` is named `name` and has no member but `name`.
+#[cfg(unix)]
+fn group_is_only(gid: libc::gid_t, name: &[u8]) -> bool {
+    let Some(group) = group_entry(gid) else {
+        return false;
+    };
+    // The account database is walked only for a group that could pass.
+    only_member(name, &group, &[]) && only_member(name, &group, &primary_members(gid))
+}
+
+/// The decision behind [`group_is_only`]: the group is named `name`, and neither its
+/// listed members nor the accounts in `primary`, those whose primary group it is,
+/// include anyone else.
+#[cfg(unix)]
+fn only_member(name: &[u8], group: &GroupEntry, primary: &[Vec<u8>]) -> bool {
+    group.name == name
+        && group.members.iter().all(|m| m == name)
+        && primary.iter().all(|m| m == name)
 }
 
 /// Open `real`, a canonical path, one component at a time from `/` without following
@@ -884,7 +1031,7 @@ fn open_at(
 /// Whether the directory open at `dir` is one the wordlist may be reached through.
 ///
 /// `Ok(true)` is a sticky directory other accounts can write; `Ok(false)` one only
-/// this account and root can. `Err(None)` means it is not a directory at all, which
+/// this account, root and a group [`Operator::trusts_group`] can. `Err(None)` means it is not a directory at all, which
 /// can only be a name changed under the walk.
 #[cfg(unix)]
 fn trusted_dir(
@@ -908,7 +1055,7 @@ fn trusted_dir(
     }
     let mode = meta.mode();
     let others_write = mode & 0o002 != 0;
-    let group_write = mode & 0o020 != 0 && op.private_gid != Some(meta.gid());
+    let group_write = mode & 0o020 != 0 && !op.trusts_group(meta.gid());
     let shared = others_write || group_write;
     if shared && mode & 0o1000 == 0 {
         return Err(Some(format!(
@@ -1011,7 +1158,69 @@ mod wordlist_tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn on_macos_the_node_s_hand_over_directory_is_a_root() {
-        assert!(default_roots().contains(&std::path::PathBuf::from("/tmp")));
+        assert!(handoff_roots().contains(&std::path::PathBuf::from("/tmp")));
+    }
+
+    // A temporary directory holds whatever the operator keeps there, so it is not a
+    // place any wordlist may come from, only the ones the node hands over.
+    #[test]
+    fn the_temp_dir_takes_only_hand_overs() {
+        assert!(!default_roots().contains(&std::env::temp_dir()));
+        assert!(handoff_roots().contains(&std::env::temp_dir()));
+    }
+
+    #[test]
+    fn in_a_hand_over_root_only_the_node_s_hand_over_files_are_read() {
+        let tmp = scratch_root("handoff-root");
+        let mkdir = |p: &std::path::Path| {
+            std::fs::create_dir(p).unwrap();
+            #[cfg(unix)]
+            chmod(p, 0o700);
+        };
+        // The node's layout: a new cfx-handoff-* directory per op, the list in it.
+        let op = tmp.join("cfx-handoff-a1B2c3");
+        mkdir(&op);
+        let wl = op.join("cfx-wl-sub-1.txt");
+        std::fs::write(&wl, "www\n").unwrap();
+        let open = |p: &std::path::Path| {
+            open_wordlist_with(p.to_str().unwrap(), &[], std::slice::from_ref(&tmp))
+        };
+        assert!(open(&wl).is_ok());
+
+        // Anything else the operator keeps there, even behind a directory only the
+        // operator can open, is not a wordlist.
+        let private = tmp.join("private");
+        mkdir(&private);
+        let secret = private.join("secret.toml");
+        std::fs::write(&secret, "token = \"x\"\n").unwrap();
+        let loose = tmp.join("loose.txt");
+        std::fs::write(&loose, "a\n").unwrap();
+        let deeper = op.join("sub");
+        mkdir(&deeper);
+        std::fs::write(deeper.join("wl.txt"), "a\n").unwrap();
+        let bare = tmp.join(HANDOFF_PREFIX);
+        mkdir(&bare);
+        std::fs::write(bare.join("wl.txt"), "a\n").unwrap();
+        for p in [
+            secret.clone(),
+            loose,
+            deeper.join("wl.txt"),
+            bare.join("wl.txt"),
+        ] {
+            let err = open(&p).unwrap_err();
+            assert!(err.contains("only the lists the node hands over"), "{err}");
+            assert!(err.contains(WORDLIST_ROOTS_ENV), "{err}");
+        }
+        // Naming the directory as a root of its own still works.
+        assert!(
+            open_wordlist_with(
+                secret.to_str().unwrap(),
+                std::slice::from_ref(&private),
+                std::slice::from_ref(&tmp)
+            )
+            .is_ok()
+        );
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     /// A fresh directory under the temp dir, used as the only root.
@@ -1099,6 +1308,7 @@ mod wordlist_tests {
         let someone_else = Operator {
             uid: me.uid + 1,
             private_gid: None,
+            admin_gid: None,
         };
         let err = open_beneath(&p, someone_else).unwrap_err();
         assert!(err.contains("belongs to another account"), "{err}");
@@ -1121,15 +1331,96 @@ mod wordlist_tests {
         let private = Operator {
             uid,
             private_gid: Some(gid),
+            admin_gid: None,
         };
         assert!(open_beneath(&p, private).is_ok());
         let shared = Operator {
             uid,
             private_gid: None,
+            admin_gid: None,
         };
         let err = open_beneath(&p, shared).unwrap_err();
         assert!(err.contains("can be written by other accounts"), "{err}");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    // Homebrew makes its prefix writable by the admin group on macOS, so its seclists
+    // are reached through directories that group can write. Its members can already
+    // change any directory through sudo.
+    #[cfg(unix)]
+    #[test]
+    fn group_write_is_trusted_for_the_admin_group() {
+        use std::os::unix::fs::MetadataExt;
+        let root = scratch_root("admin");
+        let dir = root.join("share");
+        std::fs::create_dir(&dir).unwrap();
+        chmod(&dir, 0o775);
+        let p = dir.join("wl.txt");
+        std::fs::write(&p, "a\n").unwrap();
+        let gid = std::fs::metadata(&dir).unwrap().gid();
+        let uid = Operator::current().uid;
+        let admin = Operator {
+            uid,
+            private_gid: None,
+            admin_gid: Some(gid),
+        };
+        assert!(open_beneath(&p, admin).is_ok());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn on_macos_a_directory_the_admin_group_can_write_is_trusted() {
+        let me = Operator::current();
+        assert_eq!(me.admin_gid, Some(80));
+        let root = scratch_root("brew");
+        let dir = root.join("share");
+        std::fs::create_dir(&dir).unwrap();
+        chmod(&dir, 0o775);
+        let p = dir.join("wl.txt");
+        std::fs::write(&p, "a\n").unwrap();
+        // Only an account in the admin group can give it a directory.
+        if std::os::unix::fs::chown(&dir, None, Some(80)).is_ok() {
+            assert!(open_beneath(&p, me).is_ok());
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // Elsewhere a group called admin is just a group.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn off_macos_no_admin_group_is_trusted() {
+        assert_eq!(Operator::current().admin_gid, None);
+    }
+
+    // An account is in its primary group without the group listing it, so a group
+    // named after the operator that is another account's primary group is shared.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_that_is_another_account_s_primary_group_is_not_private() {
+        let own = GroupEntry {
+            name: b"op".to_vec(),
+            members: vec![],
+        };
+        assert!(only_member(b"op", &own, &[b"op".to_vec()]));
+        let shared = [b"op".to_vec(), b"other".to_vec()];
+        assert!(!only_member(b"op", &own, &shared));
+        let listed = GroupEntry {
+            name: b"op".to_vec(),
+            members: vec![b"op".to_vec(), b"other".to_vec()],
+        };
+        assert!(!only_member(b"op", &listed, &[]));
+        let named = GroupEntry {
+            name: b"staff".to_vec(),
+            members: vec![],
+        };
+        assert!(!only_member(b"op", &named, &[]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_account_database_walk_finds_primary_members() {
+        assert!(primary_members(0).iter().any(|n| n == b"root"));
     }
 
     // In a directory other accounts can write, its names can change between any two
@@ -1211,6 +1502,26 @@ mod wordlist_tests {
         chmod(&single, 0o600);
         assert!(open_wordlist_in(single.to_str().unwrap(), &[root.clone()]).is_ok());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    // Through the defaults, as a request reaches the daemon: a file the operator keeps
+    // in the temp dir, behind a directory no other account can open, is not read.
+    #[test]
+    fn a_private_file_in_the_temp_dir_is_not_a_wordlist_by_default() {
+        if std::env::var_os(WORDLIST_ROOTS_ENV).is_some() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("dguard-private-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        #[cfg(unix)]
+        chmod(&dir, 0o700);
+        let secret = dir.join("secret.toml");
+        std::fs::write(&secret, "token = \"x\"\n").unwrap();
+        let got = open_wordlist(secret.to_str().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+        let err = got.expect_err("read a private file from the temp dir");
+        assert!(err.contains(WORDLIST_ROOTS_ENV), "{err}");
     }
 
     #[test]

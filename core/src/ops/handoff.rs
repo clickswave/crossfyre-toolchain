@@ -32,7 +32,7 @@ impl Handoff {
 
     fn new_in(base: &Path) -> io::Result<Handoff> {
         let mut builder = tempfile::Builder::new();
-        builder.prefix("cfx-handoff-");
+        builder.prefix(dguard::HANDOFF_PREFIX);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -247,12 +247,12 @@ mod tests {
     }
 
     // The engines still accept the file: the path they are given opens under their own
-    // wordlist rules.
+    // wordlist rules, which read only the node's hand-overs from the temp dir.
     #[test]
     fn the_engines_accept_the_handed_off_file() {
         let handoff = Handoff::new().unwrap();
         let path = handoff.write("cfx-wl-sub-default.txt", b"www\n").unwrap();
-        let (_, mut f) = dguard::open_wordlist_in(&path, &[PathBuf::from("/tmp")]).unwrap();
+        let (_, mut f) = dguard::open_wordlist(&path).unwrap();
         let mut s = String::new();
         std::io::Read::read_to_string(&mut f, &mut s).unwrap();
         assert_eq!(s, "www\n");

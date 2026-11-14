@@ -75,9 +75,14 @@ mod tests {
     /// A file the test process can read that is in none of the wordlist roots.
     const OUTSIDE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
 
-    /// A fresh directory in the temp dir, which is one of the default roots.
+    /// A fresh directory in the temp dir laid out as the node hands wordlists over,
+    /// the only shape the default roots read there.
     fn scratch(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("ambulo-wl-{tag}-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!(
+            "{}ambulo-{tag}-{}",
+            dguard::HANDOFF_PREFIX,
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         // Writable by its owner alone, whatever the umask.

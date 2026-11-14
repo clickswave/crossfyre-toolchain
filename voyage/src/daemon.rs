@@ -1318,11 +1318,18 @@ mod wordlist_tests {
     }
 
     #[test]
-    fn a_wordlist_in_the_temp_dir_is_read_and_none_is_needed_without_active_enum() {
-        let inside = std::env::temp_dir().join(format!("voyage-wl-{}.txt", std::process::id()));
+    fn a_handed_over_wordlist_is_read_and_none_is_needed_without_active_enum() {
+        let dir = std::env::temp_dir().join(format!(
+            "{}voyage-{}",
+            dguard::HANDOFF_PREFIX,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let inside = dir.join("cfx-wl-sub-1.txt");
         std::fs::write(&inside, "www\n").expect("write");
         let got = active_wordlist(&enum_params(&inside.to_string_lossy(), false));
-        let _ = std::fs::remove_file(&inside);
+        let _ = std::fs::remove_dir_all(&dir);
         assert!(matches!(got, Ok(Some(_))), "{got:?}");
         let outside = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
         assert!(matches!(
@@ -1338,7 +1345,11 @@ mod wordlist_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn the_words_come_from_the_file_that_was_checked_not_from_its_name() {
-        let dir = std::env::temp_dir().join(format!("voyage-wl-swap-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "{}voyage-swap-{}",
+            dguard::HANDOFF_PREFIX,
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
         let wl = dir.join("wl.txt");
