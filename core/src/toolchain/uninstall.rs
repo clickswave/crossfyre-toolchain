@@ -87,7 +87,7 @@ pub fn run(scope: Scope, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
         for e in ENGINES {
             for key in std::iter::once(e.name).chain(e.legacy) {
                 let d = dir.join(format!("crossfyre-{key}.service.d"));
-                if d.is_dir() && std::fs::remove_dir_all(&d).is_ok() {
+                if d.is_dir() && super::sudo_user::remove_dir_all(&d).is_ok() {
                     ok(&format!("Removed {}", d.display()));
                 }
             }
@@ -179,7 +179,9 @@ pub fn run(scope: Scope, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
     section("Config");
     if scope.purge {
         let dir = get_toolchain_dir();
-        let _ = std::fs::remove_dir_all(&dir);
+        // The operator's directory, removed elevated or as root: no following a link on
+        // the way there.
+        let _ = super::sudo_user::remove_dir_all(&dir);
         ok(&format!(
             "Purged config root {} (node registrations included).",
             dir.display()
@@ -361,7 +363,7 @@ pub fn cleanup_legacy_orionchain() {
             .join(".config/systemd/user")
             .join(&svc);
         if unit.exists() {
-            let _ = std::fs::remove_file(&unit);
+            let _ = super::sudo_user::remove_file(&unit);
             println!("[migrate] Removed old service {svc}");
         }
     }
@@ -381,7 +383,7 @@ pub fn cleanup_legacy_orionchain() {
             let _ = cmd_as_invoking_user("launchctl")
                 .args(["unload", "-w", &plist.to_string_lossy()])
                 .output();
-            let _ = std::fs::remove_file(&plist);
+            let _ = super::sudo_user::remove_file(&plist);
             println!("[migrate] Removed old launchd agent for {tool}");
         }
     }
@@ -401,7 +403,7 @@ pub fn cleanup_legacy_orionchain() {
         }
     }
     if legacy_cfg.exists() {
-        match std::fs::remove_dir_all(&legacy_cfg) {
+        match super::sudo_user::remove_dir_all(&legacy_cfg) {
             Ok(_) => println!("[migrate] Removed {}", legacy_cfg.display()),
             Err(e) => eprintln!("[migrate] Could not remove {}: {}", legacy_cfg.display(), e),
         }

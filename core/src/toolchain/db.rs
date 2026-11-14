@@ -695,6 +695,11 @@ fn lock_file_usable(is_file: bool, links: u64, owner: u32, me: u32, operator: Op
 #[cfg(windows)]
 fn try_lock(path: &Path) -> std::io::Result<Option<std::fs::File>> {
     use std::os::windows::fs::OpenOptionsExt;
+    // The node service runs as LocalSystem in the operator's directory, where a link at
+    // any level would have it make or hold a file somewhere else.
+    if sudo_user::root_guards() {
+        return super::win::admin_fs::open_lock(path);
+    }
     // Opened unshared, the file cannot be opened again until this handle closes.
     match std::fs::OpenOptions::new()
         .read(true)
@@ -4051,5 +4056,38 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod elevated_lock_tests {
+    use super::*;
+    use crate::toolchain::sudo_user::{act_as_root, junction};
+
+    #[test]
+    fn an_elevated_lock_is_not_made_through_a_junction() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let victim = t.path().join("victim");
+        std::fs::create_dir(&victim).expect("victim");
+        let data = t.path().join("crossfyre");
+        junction(&data, &victim);
+        let _root = act_as_root();
+        let got = try_lock(&data.join("db.lock"));
+        assert!(got.is_err(), "an elevated lock opened through a junction");
+        assert!(
+            !victim.join("db.lock").exists(),
+            "an elevated lock created db.lock through a junction"
+        );
+    }
+
+    #[test]
+    fn an_elevated_lock_is_held_until_dropped() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let path = t.path().join("db.lock");
+        let _root = act_as_root();
+        let held = try_lock(&path).expect("lock").expect("free");
+        assert!(try_lock(&path).expect("second try").is_none());
+        drop(held);
+        assert!(try_lock(&path).expect("again").is_some());
     }
 }

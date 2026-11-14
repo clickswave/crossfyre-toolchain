@@ -32,7 +32,8 @@ use windows_sys::Wdk::Storage::FileSystem::{
     FileRenameInformationEx, NtCreateFile, NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{
-    ERROR_NO_MORE_FILES, HANDLE, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
+    ERROR_NO_MORE_FILES, ERROR_SHARING_VIOLATION, HANDLE, OBJ_CASE_INSENSITIVE,
+    RtlNtStatusToDosError, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, DELETE, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY,
@@ -162,7 +163,7 @@ impl Dir {
     }
 }
 
-/// Opens `name` in the directory `dir`, a single name, never a path.
+/// Opens `name` in the directory `dir`, a single name, never a path, sharing all access.
 fn nt_open(
     dir: RawHandle,
     name: &OsStr,
@@ -170,6 +171,19 @@ fn nt_open(
     disposition: u32,
     options: u32,
     security: Option<&super::AdminOnly>,
+) -> io::Result<OwnedHandle> {
+    nt_open_shared(dir, name, access, disposition, options, security, SHARE_ALL)
+}
+
+/// [`nt_open`] with the sharing given.
+fn nt_open_shared(
+    dir: RawHandle,
+    name: &OsStr,
+    access: u32,
+    disposition: u32,
+    options: u32,
+    security: Option<&super::AdminOnly>,
+    share: u32,
 ) -> io::Result<OwnedHandle> {
     let wide: Vec<u16> = name.encode_wide().collect();
     let separator = |c: &u16| *c == b'\\' as u16 || *c == b'/' as u16 || *c == 0;
@@ -205,7 +219,7 @@ fn nt_open(
             &mut io_status,
             std::ptr::null(),
             0,
-            SHARE_ALL,
+            share,
             disposition,
             options | FILE_SYNCHRONOUS_IO_NONALERT,
             std::ptr::null(),
@@ -474,6 +488,38 @@ fn open_in(dir: &Dir, name: &OsStr, access: u32) -> io::Result<File> {
 pub fn open_file(path: &Path, access: u32) -> io::Result<File> {
     let (root, dirs, name) = split(path)?;
     open_in(&walk(&root, &dirs, false)?, &name, access)
+}
+
+/// Opens the lock file at `path` for reading and writing, unshared, making it if it is
+/// missing: nothing else can open it until the handle closes. `Ok(None)` when another
+/// process has it open. A link at its name is refused, and so, in a directory another
+/// account can change, is a file with a second name, which can be any file on the
+/// volume.
+pub fn open_lock(path: &Path) -> io::Result<Option<File>> {
+    let (root, dirs, name) = split(path)?;
+    let dir = walk(&root, &dirs, false)?;
+    let h = match nt_open_shared(
+        dir.raw(),
+        &name,
+        FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+        FILE_OPEN_IF,
+        FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
+        None,
+        0,
+    ) {
+        Ok(h) => h,
+        Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let shown = dir.path.join(&name);
+    let i = info(&h)?;
+    if is_link(&i) {
+        return Err(refused_link(&shown));
+    }
+    if !dir.fixed && i.nNumberOfLinks > 1 {
+        return Err(second_name(&shown));
+    }
+    Ok(Some(File::from(h)))
 }
 
 pub fn read_to_string(path: &Path) -> io::Result<String> {
