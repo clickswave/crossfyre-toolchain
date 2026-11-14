@@ -61,10 +61,20 @@ fn ca_paths() -> (std::path::PathBuf, std::path::PathBuf) {
 /// the user already installed, so they install it exactly once.
 fn load_or_generate_ca() -> Result<SessionCa, BoxErr> {
     let (cert_path, key_path) = ca_paths();
+    load_or_generate_ca_at(&cert_path, &key_path)
+}
+
+/// Under sudo the directory is the operator's, so the reads and writes here go through
+/// the helpers that, as root, follow no link the operator could leave in it.
+fn load_or_generate_ca_at(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> Result<SessionCa, BoxErr> {
+    use super::sudo_user;
     if cert_path.exists() && key_path.exists() {
         match (
-            std::fs::read_to_string(&cert_path),
-            std::fs::read_to_string(&key_path),
+            sudo_user::read_to_string(cert_path),
+            sudo_user::read_to_string(key_path),
         ) {
             (Ok(cert_pem), Ok(key_pem)) => match capture::load_ca(&cert_pem, &key_pem) {
                 Ok(ca) => return Ok(ca),
@@ -77,15 +87,19 @@ fn load_or_generate_ca() -> Result<SessionCa, BoxErr> {
     }
     let ca = capture::generate_ca()?;
     if let Some(parent) = cert_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        let _ = sudo_user::create_dir_all_for_invoking_user(parent);
     }
-    let _ = std::fs::write(&cert_path, ca.pem.as_bytes());
-    if std::fs::write(&key_path, ca.key.serialize_pem().as_bytes()).is_ok() {
-        // The CA private key can mint a trusted cert for ANY site: keep it owner-only.
+    let _ = sudo_user::write_for_invoking_user(cert_path, ca.pem.as_bytes(), 0o644);
+    // The CA private key can mint a trusted cert for ANY site: keep it owner-only. As
+    // root the write sets that mode itself; otherwise it applies only to a new file.
+    if sudo_user::write_for_invoking_user(key_path, ca.key.serialize_pem().as_bytes(), 0o600)
+        .is_ok()
+        && !sudo_user::root_guards()
+    {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+            let _ = std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600));
         }
     }
     Ok(ca)
@@ -605,9 +619,21 @@ pub async fn run_proxy(cfg: TraceConfig) -> Result<(), BoxErr> {
         .map(|a| a.to_string())
         .unwrap_or(addr.clone());
 
-    // Write the CA so a bring-your-own browser can trust it.
-    let ca_path = std::env::temp_dir().join(format!("cfx-trace-ca-{}.pem", std::process::id()));
+    // Write the CA so a bring-your-own browser can trust it, into a directory of this
+    // run's own rather than a fixed name in the shared temp dir, where a link someone
+    // left would be followed. The browser profile goes there too. Both go when the run
+    // ends.
+    let scratch = tempfile::Builder::new().prefix("cfx-trace-").tempdir()?;
+    let ca_path = scratch.path().join("ca.pem");
     std::fs::write(&ca_path, ca.pem.as_bytes()).ok();
+    #[cfg(unix)]
+    {
+        // Another account's browser (the operator's, under sudo) has to read the file,
+        // so the directory may be passed through, though not listed or changed.
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&ca_path, std::fs::Permissions::from_mode(0o644));
+        let _ = std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o711));
+    }
 
     println!(
         "Web Tracer: local proxy on {bound} (session {})",
@@ -668,8 +694,7 @@ pub async fn run_proxy(cfg: TraceConfig) -> Result<(), BoxErr> {
     let mut browser_child = None;
     if let Some(browser) = &cfg.browser {
         let found = capture::browser::Browser::at(super::trace::browser_binary(browser));
-        let profile =
-            std::env::temp_dir().join(format!("cfx-trace-profile-{}", std::process::id()));
+        let profile = scratch.path().join("profile");
         let port = bound
             .rsplit(':')
             .next()
@@ -798,7 +823,7 @@ pub async fn run_proxy(cfg: TraceConfig) -> Result<(), BoxErr> {
     if let Some(mut b) = browser_child {
         let _ = b.start_kill();
     }
-    let _ = std::fs::remove_file(&ca_path);
+    drop(scratch);
     println!("\nWeb Tracer: session ended, {total} endpoints captured.");
     Ok(())
 }
@@ -930,3 +955,31 @@ sudo update-ca-trust</pre>
 </div>
 </body>
 </html>"#;
+
+#[cfg(all(test, unix))]
+mod root_link_tests {
+    use super::*;
+
+    /// `sudo crossfyre trace` keeps its CA in the operator's toolchain directory. A link
+    /// left there must not carry root's write of the CA key to another file.
+    #[test]
+    fn a_root_trace_does_not_write_its_ca_through_a_linked_directory() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let elsewhere = t.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("ca-key.pem"), "kept\n").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, t.path().join("web-tracer")).unwrap();
+
+        let _root = crate::toolchain::sudo_user::act_as_root();
+        let _ = load_or_generate_ca_at(
+            &t.path().join("web-tracer/ca-cert.pem"),
+            &t.path().join("web-tracer/ca-key.pem"),
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(elsewhere.join("ca-key.pem")).unwrap(),
+            "kept\n"
+        );
+        assert!(!elsewhere.join("ca-cert.pem").exists());
+    }
+}

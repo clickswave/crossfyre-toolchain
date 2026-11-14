@@ -636,15 +636,20 @@ fn lock_db(config_path: &Path, wait: Duration) -> Result<DbLock, String> {
 fn try_lock(path: &Path) -> std::io::Result<Option<std::fs::File>> {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
-    // No following a link: this may run as root in the operator's directory.
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
+    // No following a link: this may run as root in the operator's directory, where a
+    // link at any level, not only the last, would move the lock somewhere else.
+    let file = if sudo_user::root_guards() {
+        super::root_fs::open_lock(path, 0o600)?
+    } else {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?
+    };
     // Nor a hard link to someone else's file, which the chown below would hand over.
     {
         use std::os::unix::fs::MetadataExt;
@@ -2674,6 +2679,21 @@ mod tests {
         let cfg = dir.path().join("config.toml");
         std::fs::hard_link(&target, lock_path(&cfg)).unwrap();
         assert!(try_lock(&lock_path(&cfg)).is_err());
+    }
+
+    /// The node service takes this lock as root in the operator's toolchain directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_lock_is_not_created_through_a_linked_directory() {
+        let t = tempfile::tempdir().unwrap();
+        let elsewhere = t.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, t.path().join("crossfyre")).unwrap();
+        let cfg = t.path().join("crossfyre/config.toml");
+
+        let _root = crate::toolchain::sudo_user::act_as_root();
+        assert!(try_lock(&lock_path(&cfg)).is_err());
+        assert!(!elsewhere.join("db.lock").exists());
     }
 
     // Against a real Docker daemon. Run with:

@@ -312,6 +312,12 @@ pub fn install_node_service(
     Ok(())
 }
 
+/// Run first thing by the node supervisor on macOS: see `node::adopt_root_log`.
+#[cfg(target_os = "macos")]
+pub fn adopt_root_node_log() {
+    node::adopt_root_log();
+}
+
 /// The node worker the node unit runs: the one in the bin directory.
 pub fn node_binary() -> std::path::PathBuf {
     super::config::get_bin_dir().join(super::config::ext_file_name("node"))
@@ -582,14 +588,15 @@ fn job_entries(label: &str, args: &[String], log: &std::path::Path) -> Vec<(&'st
 
 /// The launchd daemon for the node supervisor on macOS, the counterpart of
 /// [`node_unit`]: the node worker in the bin directory supervising the nodes under
-/// `data_dir`, told which CLI set it up, and, under sudo, which user it acts for.
+/// `data_dir`, told which CLI set it up, and, under sudo, which user it acts for. It
+/// logs to [`NODE_LOG`].
 pub fn node_plist(
     node_exe: &std::path::Path,
     cli: &std::path::Path,
     data_dir: &std::path::Path,
     sudo_user: Option<&str>,
-    log: &std::path::Path,
 ) -> String {
+    let log = std::path::Path::new(NODE_LOG);
     let args = [
         node_exe.display().to_string(),
         "supervise".to_string(),
@@ -615,6 +622,34 @@ pub fn node_plist(
 
 /// The launchd label of the node supervisor on macOS.
 pub const NODE_LABEL: &str = "io.crossfyre.node";
+
+/// Where the root node service on macOS logs: a directory only root can change.
+/// launchd opens this path itself, as root, following any link in it, so it cannot be
+/// in the operator's data dir as it once was.
+pub const NODE_LOG: &str = "/var/log/crossfyre/node.log";
+
+/// `plist`, as [`node_plist`] writes it, with both log entries pointed at `log`; None
+/// when they already are, or when it has no log entries.
+pub fn retarget_log(plist: &str, log: &std::path::Path) -> Option<String> {
+    let want = format!(
+        "<string>{}</string>",
+        plist_string(&log.display().to_string())
+    );
+    let mut out = plist.to_string();
+    let mut found = false;
+    for key in ["StandardOutPath", "StandardErrorPath"] {
+        let head = format!("<key>{key}</key>\n  ");
+        let Some(at) = out.find(&head) else { continue };
+        let start = at + head.len();
+        let Some(len) = out[start..].find("</string>") else {
+            continue;
+        };
+        let end = start + len + "</string>".len();
+        found = true;
+        out.replace_range(start..end, &want);
+    }
+    (found && out != plist).then_some(out)
+}
 
 /// The launchd agent for an engine on macOS: the CLI's `extension host <engine>`, which
 /// starts the engine's daemon (see [`host`]).
@@ -989,16 +1024,9 @@ mod node {
         // The daemon runs the node worker as root, so it has to be a file only root can
         // replace.
         super::root_may_run(&super::node_binary())?;
-        let logs = data_dir.join("logs");
-        super::super::sudo_user::create_dir_all_for_invoking_user(&logs)?;
-        super::super::sudo_user::chown_to_invoking_user(&logs);
-        let body = super::node_plist(
-            &super::node_binary(),
-            cli,
-            data_dir,
-            sudo_user.as_deref(),
-            &logs.join("node.log"),
-        );
+        // Made here, root's, before launchd opens it.
+        drop(open_root_log()?);
+        let body = super::node_plist(&super::node_binary(), cli, data_dir, sudo_user.as_deref());
         let fresh = !exists();
         fs::write(PLIST, body)?;
         // launchd refuses a daemon whose plist anyone but root could write.
@@ -1029,6 +1057,9 @@ mod node {
 
     pub fn action(action: &str) -> Result<(), Box<dyn std::error::Error>> {
         require_root()?;
+        if matches!(action, "start" | "restart") {
+            retarget_plist();
+        }
         launchd::act(DOMAIN, super::NODE_LABEL, PLIST, action)?;
         if !super::quiet() {
             super::svc_ok(&format!(
@@ -1050,6 +1081,65 @@ mod node {
 
     pub fn exists() -> bool {
         std::path::Path::new(PLIST).exists()
+    }
+
+    /// [`super::NODE_LOG`], open for appending: root's, readable by the admin group,
+    /// which is who may run `sudo` on a Mac.
+    fn open_root_log() -> std::io::Result<fs::File> {
+        let admin = unsafe { libc::getgrnam(c"admin".as_ptr()) };
+        let group = (!admin.is_null()).then(|| unsafe { (*admin).gr_gid });
+        super::super::root_fs::open_log(std::path::Path::new(super::NODE_LOG), group)
+    }
+
+    /// Points a daemon plist from an earlier release, which logs to the operator's data
+    /// dir, at [`super::NODE_LOG`]. launchd reads it at the next load: `node restart`,
+    /// the restart `crossfyre update` does, or a reboot.
+    fn retarget_plist() {
+        let Ok(body) = fs::read_to_string(PLIST) else {
+            return;
+        };
+        let Some(new) = super::retarget_log(&body, std::path::Path::new(super::NODE_LOG)) else {
+            return;
+        };
+        // The log has to be there, and root's, before launchd is told to open it.
+        if let Err(e) = open_root_log() {
+            eprintln!("[!] could not prepare {}: {e}", super::NODE_LOG);
+            return;
+        }
+        match super::super::root_fs::replace_file(
+            std::path::Path::new(PLIST),
+            new.as_bytes(),
+            0o644,
+            Some((0, 0)),
+        ) {
+            Ok(()) => println!("[node] the node service now logs to {}", super::NODE_LOG),
+            Err(e) => eprintln!("[!] could not update {PLIST}: {e}"),
+        }
+    }
+
+    /// Run first thing by the node supervisor. Under a plist from an earlier release,
+    /// launchd opened the service's output in the operator's data dir, as root and
+    /// through any link left there. This sends the output to [`super::NODE_LOG`]
+    /// instead, before anything is written, and fixes the plist for the next load.
+    pub fn adopt_root_log() {
+        use std::os::fd::AsRawFd;
+        // Only the service: root, started by launchd, its output going to a file.
+        let launched = unsafe { libc::geteuid() == 0 && libc::getppid() == 1 };
+        let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        let to_file = unsafe { libc::fstat(1, st.as_mut_ptr()) } == 0
+            && unsafe { st.assume_init() }.st_mode & libc::S_IFMT == libc::S_IFREG;
+        if !launched || !to_file {
+            return;
+        }
+        // Without the log, nowhere: never on through the file launchd opened.
+        let out = open_root_log().or_else(|_| fs::OpenOptions::new().write(true).open("/dev/null"));
+        if let Ok(out) = out {
+            unsafe {
+                libc::dup2(out.as_raw_fd(), 1);
+                libc::dup2(out.as_raw_fd(), 2);
+            }
+        }
+        retarget_plist();
     }
 }
 
@@ -1487,7 +1577,6 @@ mod tests {
             Path::new("/opt/crossfyre/bin/crossfyre"),
             Path::new("/Users/op/Library/Application Support/crossfyre"),
             Some("op"),
-            Path::new("/Users/op/Library/Application Support/crossfyre/logs/node.log"),
         );
         assert!(
             plist.contains("<string>io.crossfyre.node</string>"),
@@ -1510,14 +1599,50 @@ mod tests {
             "<key>CROSSFYRE_CLI</key>\n    <string>/opt/crossfyre/bin/crossfyre</string>"
         ));
         assert!(plist.contains("<key>SUDO_USER</key>\n    <string>op</string>"));
-        let without = node_plist(
+        let without = node_plist(Path::new("/n"), Path::new("/c"), Path::new("/d"), None);
+        assert!(!without.contains("SUDO_USER"), "{without}");
+    }
+
+    /// launchd opens the log itself, as root, and follows a link it finds there. In the
+    /// operator's data dir, a link left at that name sends root's output into any file.
+    #[test]
+    fn the_macos_node_daemon_logs_where_only_root_can_write() {
+        let data = "/Users/op/Library/Application Support/crossfyre";
+        let plist = node_plist(
             Path::new("/n"),
             Path::new("/c"),
-            Path::new("/d"),
-            None,
-            Path::new("/l"),
+            Path::new(data),
+            Some("op"),
         );
-        assert!(!without.contains("SUDO_USER"), "{without}");
+        let log = format!("<string>{NODE_LOG}</string>");
+        assert!(
+            plist.contains(&format!("<key>StandardOutPath</key>\n  {log}")),
+            "{plist}"
+        );
+        assert!(
+            plist.contains(&format!("<key>StandardErrorPath</key>\n  {log}")),
+            "{plist}"
+        );
+        assert!(!plist.contains(&format!("{data}/logs")), "{plist}");
+    }
+
+    /// A daemon plist written by an earlier release is pointed at the new log, and left
+    /// otherwise as it was.
+    #[test]
+    fn an_old_node_plist_is_pointed_at_the_root_log() {
+        let data = Path::new("/Users/op/Library/Application Support/crossfyre");
+        let old = node_plist(Path::new("/n"), Path::new("/c"), data, Some("op")).replace(
+            NODE_LOG,
+            "/Users/op/Library/Application Support/crossfyre/logs/node.log",
+        );
+        let new = retarget_log(&old, Path::new(NODE_LOG)).expect("rewritten");
+        assert_eq!(
+            new,
+            node_plist(Path::new("/n"), Path::new("/c"), data, Some("op"))
+        );
+        assert_eq!(retarget_log(&new, Path::new(NODE_LOG)), None);
+        // A plist with no log entries at all is left alone.
+        assert_eq!(retarget_log("<plist></plist>", Path::new(NODE_LOG)), None);
     }
 
     #[test]

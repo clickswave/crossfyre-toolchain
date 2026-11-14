@@ -279,7 +279,8 @@ pub fn load_config() -> Result<ToolchainConfig, Box<dyn std::error::Error>> {
 pub(crate) fn load_config_at(
     path: &std::path::Path,
 ) -> Result<ToolchainConfig, Box<dyn std::error::Error>> {
-    let contents = fs::read_to_string(path)?;
+    // The node service reads this as root from the operator's home.
+    let contents = super::sudo_user::read_to_string(path)?;
     let config: ToolchainConfig = toml::from_str(&contents)?;
     Ok(config)
 }
@@ -442,6 +443,44 @@ pub(crate) fn load_or_create_config_at(
         );
     }
     load_config_at(path)
+}
+
+#[cfg(all(test, unix))]
+mod root_link_tests {
+    use super::*;
+
+    const A_CONFIG: &str = "[postgres]\nhost = \"localhost\"\nport = 4440\nuser = \"postgres\"\n\
+                            db_name = \"crossfyre\"\n\n[container]\n";
+
+    /// The node service reads the toolchain config as root from the operator's home.
+    #[test]
+    fn a_root_read_of_the_config_does_not_follow_a_link() {
+        let t = tempfile::tempdir().unwrap();
+        let elsewhere = t.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("config.toml"), A_CONFIG).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, t.path().join("crossfyre")).unwrap();
+
+        let _root = crate::toolchain::sudo_user::act_as_root();
+        assert!(load_config_at(&t.path().join("crossfyre/config.toml")).is_err());
+    }
+
+    /// Nor does a FIFO left at its name hang the service.
+    #[test]
+    fn a_root_read_of_the_config_does_not_wait_on_a_fifo() {
+        let t = tempfile::tempdir().unwrap();
+        let fifo = t.path().join("config.toml");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _root = crate::toolchain::sudo_user::act_as_root();
+            let _ = tx.send(load_config_at(&fifo).is_err());
+        });
+        let refused = rx.recv_timeout(std::time::Duration::from_secs(3));
+        assert_eq!(refused, Ok(true), "hung on a FIFO or read it");
+    }
 }
 
 #[cfg(test)]

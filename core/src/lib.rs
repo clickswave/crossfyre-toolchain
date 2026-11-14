@@ -1055,6 +1055,10 @@ pub async fn run_boot(
     force: bool,
     base: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Before anything is written: on macOS the service's output may still be going to
+    // a file launchd opened in the operator's data dir.
+    #[cfg(target_os = "macos")]
+    toolchain::service::adopt_root_node_log();
     println!("Booting Crossfyre nodes from {base:?}...");
 
     // Pull a pre-nodes.d single-node install into the new layout if present.
@@ -1236,16 +1240,18 @@ impl std::fmt::Display for NodeDeleted {
 impl std::error::Error for NodeDeleted {}
 
 /// Delete a node's on-disk registration: config + pid lock + network dir.
+///
+/// Under sudo, no link in the operator's nodes.d is followed on the way to any of them.
 pub fn remove_node_files(base: &std::path::Path, node_id: &str) -> std::io::Result<()> {
     let paths = NodePaths::new(base, node_id);
     if paths.config.exists() {
-        fs::remove_file(&paths.config)?;
+        toolchain::sudo_user::remove_file(&paths.config)?;
     }
     if paths.pid.exists() {
-        let _ = fs::remove_file(&paths.pid);
+        let _ = toolchain::sudo_user::remove_file(&paths.pid);
     }
     if paths.network_dir.exists() {
-        let _ = fs::remove_dir_all(&paths.network_dir);
+        let _ = toolchain::sudo_user::remove_dir_all(&paths.network_dir);
     }
     Ok(())
 }
@@ -2283,7 +2289,7 @@ pub async fn run_daemon(
     struct PidGuard(std::path::PathBuf);
     impl Drop for PidGuard {
         fn drop(&mut self) {
-            let _ = fs::remove_file(&self.0);
+            let _ = toolchain::sudo_user::remove_file(&self.0);
         }
     }
     let _pid_guard = PidGuard(pid_path);
@@ -3497,12 +3503,46 @@ pub async fn run_script(
 /// the binary and written out on connect. Rewritten every time so a truncated or
 /// tampered copy on disk cannot persist.
 fn write_origin_root_cert() -> std::io::Result<std::path::PathBuf> {
-    const ORIGIN_ROOT: &str = include_str!("../assets/cloudflare-origin-root.pem");
     let dir = std::env::var("CFX_CONFIG_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
-    std::fs::create_dir_all(&dir)?;
+        .ok()
+        .map(std::path::PathBuf::from);
+    stage_origin_root_cert(dir.as_deref())
+}
+
+const ORIGIN_ROOT: &str = include_str!("../assets/cloudflare-origin-root.pem");
+
+/// Writes the root to `dir`, or with no `dir` to a directory of this process's own in
+/// the temp dir. The temp dir is shared with every account, and on macOS a link left
+/// at a fixed name there is followed even by root; a fresh directory only this account
+/// can enter has nothing anyone else put in it.
+fn stage_origin_root_cert(dir: Option<&std::path::Path>) -> std::io::Result<std::path::PathBuf> {
+    let Some(dir) = dir else {
+        static OWN: std::sync::Mutex<Option<tempfile::TempDir>> = std::sync::Mutex::new(None);
+        let mut own = OWN.lock().unwrap_or_else(|e| e.into_inner());
+        // Made again if a temp cleaner took it while the node was running.
+        if !own.as_ref().is_some_and(|d| d.path().is_dir()) {
+            let mut b = tempfile::Builder::new();
+            b.prefix("cfx-nats-");
+            #[cfg(unix)]
+            b.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700));
+            *own = Some(b.tempdir()?);
+        }
+        let path = own
+            .as_ref()
+            .expect("made above")
+            .path()
+            .join("cfx-nats-root.pem");
+        std::fs::write(&path, ORIGIN_ROOT)?;
+        return Ok(path);
+    };
     let path = dir.join("cfx-nats-root.pem");
+    #[cfg(unix)]
+    if toolchain::sudo_user::root_guards() {
+        toolchain::root_fs::create_dir_all(dir, None)?;
+        toolchain::root_fs::replace_file(&path, ORIGIN_ROOT.as_bytes(), 0o644, None)?;
+        return Ok(path);
+    }
+    std::fs::create_dir_all(dir)?;
     std::fs::write(&path, ORIGIN_ROOT)?;
     Ok(path)
 }
@@ -3623,6 +3663,106 @@ mod security_tests {
 
         let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o644, "chmodded the link's target");
+    }
+
+    /// A hard link is a second name for the same file, and on macOS (or a Linux host
+    /// with fs.protected_hardlinks off) the operator can make one to a root file they
+    /// cannot read. The scan must not read it, or its parse error quotes the file.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_scan_does_not_read_a_hard_linked_node_config() {
+        let base = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(base.path().join("nodes.d")).unwrap();
+        let outside = tempfile::tempdir().expect("tempdir");
+        let target = outside.path().join("shadow");
+        fs::write(&target, A_NODE_CONFIG).unwrap();
+        fs::hard_link(&target, base.path().join("nodes.d/s.toml")).unwrap();
+
+        let _root = toolchain::sudo_user::act_as_root();
+        let ids = discover_nodes(base.path()).unwrap();
+
+        assert!(
+            ids.is_empty(),
+            "read a hard-linked file as a node config: {ids:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_repair_does_not_chmod_a_hard_linked_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(base.path().join("nodes.d")).unwrap();
+        let outside = tempfile::tempdir().expect("tempdir");
+        let target = outside.path().join("hosts");
+        fs::write(&target, "127.0.0.1 localhost\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::hard_link(&target, base.path().join("nodes.d/n.toml")).unwrap();
+
+        let _root = toolchain::sudo_user::act_as_root();
+        repair_secret_file_mode(&base.path().join("nodes.d/n.toml"));
+
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "chmodded the other name's file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removing_a_node_as_root_does_not_pass_through_a_linked_nodes_dir() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let e = elsewhere.path();
+        fs::write(e.join("n.toml"), A_NODE_CONFIG).unwrap();
+        fs::write(e.join("n.pid"), "1").unwrap();
+        fs::create_dir(e.join("n.network")).unwrap();
+        fs::write(e.join("n.network/wg0.conf"), "x").unwrap();
+        std::os::unix::fs::symlink(e, base.path().join("nodes.d")).unwrap();
+
+        let _root = toolchain::sudo_user::act_as_root();
+        let _ = remove_node_files(base.path(), "n");
+
+        assert!(
+            e.join("n.toml").exists(),
+            "removed the config through a link"
+        );
+        assert!(
+            e.join("n.pid").exists(),
+            "removed the pid file through a link"
+        );
+        assert!(
+            e.join("n.network/wg0.conf").exists(),
+            "removed the network dir"
+        );
+    }
+
+    /// The broker's root certificate used to go to a fixed name in the temp dir, which
+    /// on macOS is shared with every account and follows a link left at that name.
+    #[cfg(unix)]
+    #[test]
+    fn the_broker_root_is_staged_in_a_directory_of_its_own() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = stage_origin_root_cert(None).expect("staged");
+        let dir = path.parent().expect("dir");
+        assert_ne!(dir, std::env::temp_dir().as_path(), "{path:?}");
+        let mode = fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "{dir:?} is {mode:o}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), ORIGIN_ROOT);
+        // Staged again on a reconnect, in the same place.
+        assert_eq!(stage_origin_root_cert(None).unwrap(), path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_broker_root_write_does_not_follow_a_link() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let victim = dir.path().join("victim");
+        fs::write(&victim, "kept\n").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join("cfx-nats-root.pem")).unwrap();
+
+        let _root = toolchain::sudo_user::act_as_root();
+        let _ = stage_origin_root_cert(Some(dir.path()));
+
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "kept\n");
     }
 
     #[cfg(unix)]

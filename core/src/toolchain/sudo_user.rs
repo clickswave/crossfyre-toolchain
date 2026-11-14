@@ -295,6 +295,26 @@ pub fn read_to_string(path: &std::path::Path) -> std::io::Result<String> {
     std::fs::read_to_string(path)
 }
 
+/// Remove the file or link at `path`. As root, a link below a directory another account
+/// can change is not followed on the way there.
+pub fn remove_file(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if root_guards() {
+        return super::root_fs::remove_file(path);
+    }
+    std::fs::remove_file(path)
+}
+
+/// Remove the directory at `path` and everything in it. As root, a link below a
+/// directory another account can change is not followed on the way there.
+pub fn remove_dir_all(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if root_guards() {
+        return super::root_fs::remove_dir_all(path);
+    }
+    std::fs::remove_dir_all(path)
+}
+
 #[cfg(all(test, unix))]
 mod root_link_tests {
     use super::*;
