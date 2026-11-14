@@ -52,29 +52,83 @@ pub fn ensure_up() -> Result<(), Box<dyn std::error::Error>> {
     load_or_create_config()?;
     secure_existing()?;
     let config = load_config()?;
-    if running(&config) {
-        println!("Postgres container already running.");
-        return Ok(());
-    }
-    // A container that starts is never recreated here, which would leave its data
-    // behind: a server recovering after an unclean stop can take a while to answer.
-    if start(&config).unwrap_or(false) {
-        let deadline = Instant::now() + START_WAIT;
-        while Instant::now() < deadline {
-            if running(&config) {
-                return Ok(());
-            }
-            std::thread::sleep(Duration::from_millis(500));
+    let target = resolve_container(&config);
+    let recorded = config.container.id.is_some();
+    let container = match inspect(&target) {
+        Ok(found) => found,
+        Err(e) if recorded => return Err(e.into()),
+        // No Docker here, and no container ever recorded.
+        Err(_) => None,
+    };
+    match plan(container.as_ref(), recorded, running(&config)) {
+        Plan::Up => {
+            println!("Postgres is already running.");
+            return Ok(());
         }
+        Plan::Make => return up(),
+        Plan::Start => {}
+    }
+    // A container that is there is never recreated here, which would leave its data
+    // behind: a server recovering after an unclean stop can take a while to answer, and
+    // one that cannot start may only have found its port taken.
+    if !start(&config)? {
         return Err(format!(
-            "the database container started but does not answer on 127.0.0.1:{}; see \
-             `docker logs {}`, or make a new, empty one with `crossfyre db up`",
-            config.postgres.port,
-            resolve_container(&config)
+            "the database container did not start. If something else listens on \
+             127.0.0.1:{}, stop it and run `crossfyre db start`; see `docker logs {target}`",
+            config.postgres.port
         )
         .into());
     }
-    up()
+    let deadline = Instant::now() + START_WAIT;
+    while Instant::now() < deadline {
+        if is_up(&target) && running(&config) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    Err(format!(
+        "the database container started but does not answer on 127.0.0.1:{}; see \
+         `docker logs {target}`, or make a new, empty one with `crossfyre db up`",
+        config.postgres.port
+    )
+    .into())
+}
+
+/// What [`ensure_up`] does about the database.
+#[derive(Debug, PartialEq, Eq)]
+enum Plan {
+    /// It is up: nothing to do.
+    Up,
+    /// Start the container that is there.
+    Start,
+    /// Make a new container.
+    Make,
+}
+
+/// What to do given the `docker inspect` record of the container config.toml names (or
+/// of the default one), whether config.toml records one, and whether something answers
+/// on the database port. While the container is stopped anyone can listen on its port,
+/// so a container of ours is up only when Docker says it is running.
+fn plan(container: Option<&serde_json::Value>, recorded: bool, port_answers: bool) -> Plan {
+    match container {
+        Some(info) if info["State"]["Running"].as_bool() == Some(true) => Plan::Up,
+        Some(_) => Plan::Start,
+        // No container of ours, ever: a database the operator runs on this host.
+        None if !recorded && port_answers => Plan::Up,
+        None => Plan::Make,
+    }
+}
+
+/// The restart policy the database container is made with, so it is back on its port
+/// when Docker starts after a reboot rather than whenever someone next starts it.
+const RESTART_POLICY: &str = "unless-stopped";
+
+/// Whether a container was made without a restart policy, as earlier releases made it.
+fn lacks_restart_policy(info: &serde_json::Value) -> bool {
+    matches!(
+        info["HostConfig"]["RestartPolicy"]["Name"].as_str(),
+        None | Some("" | "no")
+    )
 }
 
 /// How long a started container has to answer on its port.
@@ -153,6 +207,8 @@ fn run_args(
         "-d".to_string(),
         "--name".to_string(),
         name.to_string(),
+        "--restart".to_string(),
+        RESTART_POLICY.to_string(),
         "-p".to_string(),
         publish_arg(pg.port),
         "-e".to_string(),
@@ -802,6 +858,15 @@ fn secure_using(
     };
     let exposure = assess(&info);
     if exposure.safe() {
+        if lacks_restart_policy(&info)
+            && let Some(id) = info["Id"].as_str()
+            && let Err(e) = docker_ok(&["update", "--restart", RESTART_POLICY, id])
+        {
+            eprintln!(
+                "[db] the database container will not start by itself after a reboot ({e}); \
+                 run `crossfyre db start` after one"
+            );
+        }
         return Ok(false);
     }
 
@@ -1916,6 +1981,43 @@ mod tests {
         assert_eq!(flag_value(&args, "--name"), vec!["x-new"]);
     }
 
+    #[test]
+    fn the_container_comes_back_after_a_reboot() {
+        let args = run_args(CONTAINER_NAME, &pg(), IMAGE, None);
+        assert_eq!(flag_value(&args, "--restart"), vec!["unless-stopped"]);
+    }
+
+    /// Something else on the database port while the container is stopped is not the
+    /// database: the container is started, and never replaced, which would leave its
+    /// data behind.
+    #[test]
+    fn the_container_says_whether_the_database_is_up_not_the_port() {
+        let stopped = serde_json::json!({"State": {"Running": false}});
+        let running = serde_json::json!({"State": {"Running": true}});
+        assert_eq!(plan(Some(&stopped), true, true), Plan::Start);
+        assert_eq!(plan(Some(&stopped), false, true), Plan::Start);
+        assert_eq!(plan(Some(&stopped), true, false), Plan::Start);
+        assert_eq!(plan(Some(&running), true, true), Plan::Up);
+        assert_eq!(plan(Some(&running), true, false), Plan::Up);
+        // A container config.toml names that is gone is made again.
+        assert_eq!(plan(None, true, true), Plan::Make);
+        assert_eq!(plan(None, true, false), Plan::Make);
+        // With no container of ours, a database on the port is the operator's own.
+        assert_eq!(plan(None, false, true), Plan::Up);
+        assert_eq!(plan(None, false, false), Plan::Make);
+    }
+
+    #[test]
+    fn a_container_without_a_restart_policy_is_given_one() {
+        let policy =
+            |name: &str| serde_json::json!({"HostConfig": {"RestartPolicy": {"Name": name}}});
+        assert!(lacks_restart_policy(&policy("no")));
+        assert!(lacks_restart_policy(&policy("")));
+        assert!(lacks_restart_policy(&serde_json::json!({"HostConfig": {}})));
+        assert!(!lacks_restart_policy(&policy("unless-stopped")));
+        assert!(!lacks_restart_policy(&policy("always")));
+    }
+
     fn inspected(host_ip: &str, env: &[&str]) -> serde_json::Value {
         serde_json::json!({
             "Id": "abc",
@@ -2523,6 +2625,48 @@ mod tests {
                 "1"
             );
             assert!(!secure_at(&name, &cfg).unwrap(), "nothing left to secure");
+            let info = inspect(&name).unwrap().unwrap();
+            assert_eq!(info["HostConfig"]["RestartPolicy"]["Name"], RESTART_POLICY);
+        }
+
+        /// A loopback container with a password but no restart policy, as made before
+        /// the policy, is given one and otherwise left alone.
+        #[test]
+        #[ignore = "needs Docker and the postgres image"]
+        fn a_safe_container_without_a_restart_policy_is_given_one() {
+            let name = format!("cfx-dbtest-policy-{}", std::process::id());
+            let _cleanup = Cleanup::for_name(&name);
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = dir.path().join("config.toml");
+            let port = free_port();
+            let out = docker()
+                .args([
+                    "run",
+                    "-d",
+                    "--name",
+                    &name,
+                    "-p",
+                    &format!("127.0.0.1:{port}:5432"),
+                ])
+                .args(["-e", "POSTGRES_PASSWORD=pw", IMAGE])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            write_config(&cfg, port, Some(&id));
+            assert!(lacks_restart_policy(&inspect(&id).unwrap().unwrap()));
+
+            assert!(
+                !secure_at(&name, &cfg).unwrap(),
+                "a safe container was replaced"
+            );
+            let info = inspect(&id).unwrap().unwrap();
+            assert_eq!(info["HostConfig"]["RestartPolicy"]["Name"], RESTART_POLICY);
+            assert_eq!(info["Id"], id.as_str());
         }
 
         /// A container made exactly as `db up` made it in 0.1.42 for a config without

@@ -798,11 +798,12 @@ pub fn wrapper_refusal(engine: &str, first_line: &str) -> Option<String> {
 /// Whether the engine listening on `addr` sends a wrapped op through the proxy it names:
 /// `Some(true)` for an engine that reads egress version 1, `Some(false)` for one that
 /// does not (an engine older than the wrapper, or doorward, which reads the wrapper and
-/// sends nothing through a proxy), and `None` when it did not answer.
+/// sends nothing through a proxy), and `None` when it did not answer or its listener is
+/// not the engines' (see [`crate::ops::listener`]).
 pub async fn engine_reads_egress(addr: &str) -> Option<bool> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let probe = async {
-        let s = tokio::net::TcpStream::connect(addr).await.ok()?;
+        let s = crate::ops::listener::connect(addr).await.ok()?;
         let (r, mut w) = s.into_split();
         let req = dguard::wrap_egress(
             &json!({"operation": "capabilities"}),

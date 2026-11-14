@@ -2182,6 +2182,16 @@ fn heartbeat_engines(
         .collect()
 }
 
+/// Whether an engine listens on 127.0.0.1:`port`, as the heartbeat reports it. A
+/// listener the engines' account does not own is not one.
+fn engine_listening(port: u16) -> bool {
+    ops::listener::connect_blocking(
+        std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        std::time::Duration::from_millis(200),
+    )
+    .is_ok()
+}
+
 /// Run the registered node at `paths` until it is stopped. `node_version` is the node
 /// binary's own version, which the heartbeat reports.
 pub async fn run_daemon(
@@ -2789,10 +2799,7 @@ pub async fn run_daemon(
                         crate::toolchain::config::is_extension_installed,
                     ) {
                         let port = crate::toolchain::config::engine_port(ext);
-                        let running = std::net::TcpStream::connect_timeout(
-                            &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-                            std::time::Duration::from_millis(200),
-                        ).is_ok();
+                        let running = engine_listening(port);
                         if !running {
                             engine_egress.remove(ext);
                         } else if engine_egress.due(ext, std::time::Instant::now()) {
@@ -4337,5 +4344,199 @@ mod op_failure_tests {
     async fn a_content_scan_with_ambulo_down_says_so() {
         let data = json!({"url": "http://127.0.0.1:9/", "wordlist_url": ""});
         assert_failed_with_reason("content-discovery-db", "mach", "ambulo", data).await;
+    }
+}
+
+#[cfg(test)]
+mod impostor_engine_tests {
+    use super::*;
+    use egress::state::EgressState;
+    use egress::testkit::{FakeNats, FakePlatform, direct_settings, http, resolver};
+    use serde_json::{Value, json};
+    use std::sync::{Arc, Mutex};
+
+    const NODE: &str = "node-i";
+    const WF: &str = "wf-impostor";
+    const MARK: &str = "IMPOSTOR";
+
+    /// A listener on an engine's port that is not the engine: it keeps whatever is sent
+    /// to it and answers every connection with results of its own.
+    struct Impostor {
+        port: u16,
+        got: Arc<Mutex<Vec<u8>>>,
+    }
+
+    fn impostor() -> Impostor {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let kept = got.clone();
+        std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+            for conn in l.incoming() {
+                let Ok(mut conn) = conn else { return };
+                let kept = kept.clone();
+                std::thread::spawn(move || {
+                    let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                    let mut line = String::new();
+                    let _ = std::io::BufReader::new(conn.try_clone().unwrap()).read_line(&mut line);
+                    kept.lock().unwrap().extend_from_slice(line.as_bytes());
+                    for answer in [
+                        json!({"type": "capabilities", "egress": 1}),
+                        json!({"type": "finding", "template_id": MARK, "url": "http://impostor.test/"}),
+                        json!({"type": "found", "url": format!("http://{MARK}.test/")}),
+                        json!({"status": "completed", "results": [{"host": MARK, "port": 1}]}),
+                    ] {
+                        let _ = conn.write_all(format!("{answer}\n").as_bytes());
+                    }
+                });
+            }
+        });
+        Impostor { port, got }
+    }
+
+    /// Any account but this test's own: the impostor's listener is then another's.
+    fn others() -> Vec<u32> {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        vec![unsafe { libc::geteuid() }.wrapping_add(1)]
+    }
+
+    /// What went wrong when `op_type` ran with an impostor on `ext`'s port, if anything.
+    async fn run_against_impostor(op_type: &str, ext: &str, data: Value) -> Result<(), String> {
+        let imp = impostor();
+        let op_id = format!("op-imp-{op_type}");
+        let nats = FakeNats::start().await;
+        let platform = FakePlatform::start(|_, _| (200, json!("word"))).await;
+        let st = EgressState::new(resolver(&[]));
+        st.apply_authorize(&direct_settings(1));
+        let ctx = OpCtx {
+            pub_clone: nats.client().await,
+            status_subj: format!("cfx.node.{NODE}.status"),
+            result_subj: format!("cfx.results.{NODE}"),
+            node_id: NODE.into(),
+            http: http(),
+            api_url: platform.url.clone(),
+            api_key: "cfk_node".into(),
+            egress: st,
+        };
+        let mut data = data;
+        if data.get("wordlist_url").is_some() {
+            data["wordlist_url"] = json!(format!("{}/wl", platform.url));
+        }
+        let cmd = json!({
+            "type": "operation", "operation_id": op_id, "workflow_id": WF,
+            "op_type": op_type, "pre_claimed": true, "data": data,
+        });
+        let client = ctx.pub_clone.clone();
+        ops::listener::TRUSTED
+            .scope(
+                others(),
+                ops::test_engines::with(&[(ext, imp.port)], run_operation(cmd, ctx)),
+            )
+            .await;
+        client.flush().await.unwrap();
+        let done = nats.wait_for("completed").await.expect("no completed");
+        let got = String::from_utf8_lossy(&imp.got.lock().unwrap()).to_string();
+        if !got.is_empty() {
+            return Err(format!(
+                "{op_type} sent the op to a listener the engines do not own: {got}"
+            ));
+        }
+        let why = done["error"].as_str().unwrap_or_default();
+        if done["code"] != 1 || !why.contains("nothing was sent to it") {
+            return Err(format!("{op_type}: {done}"));
+        }
+        match nats
+            .published()
+            .into_iter()
+            .find(|(_, v)| v.to_string().contains(MARK))
+        {
+            Some((_, v)) => Err(format!("{op_type} published the impostor's answer: {v}")),
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn no_op_is_sent_to_a_listener_another_account_owns() {
+        let cases = [
+            (
+                "vuln-scan-1",
+                "cortex",
+                json!({"target": "http://127.0.0.1:9/"}),
+            ),
+            (
+                "service-enum-1",
+                "scout",
+                json!({"target": "http://127.0.0.1:9/"}),
+            ),
+            (
+                "web-crawl-1",
+                "mach",
+                json!({"seed": "http://127.0.0.1:9/"}),
+            ),
+            ("takeover-1", "voyage", json!({"domain": "example.test"})),
+            (
+                "origin-discovery-1",
+                "voyage",
+                json!({"domain": "example.test"}),
+            ),
+            (
+                "subdomain-enum-ds",
+                "voyage",
+                json!({"domain": "example.test", "disable_active": true}),
+            ),
+            (
+                "network-scan-ds",
+                "pulse",
+                json!({"host": "127.0.0.1", "port": 22}),
+            ),
+            (
+                "network-scan-db",
+                "pulse",
+                json!({"targets": ["127.0.0.1"], "ports": "22", "tasks": 1}),
+            ),
+            (
+                "content-discovery-ds",
+                "mach",
+                json!({"mode": "probe", "probe_url": "http://127.0.0.1:9/x"}),
+            ),
+            (
+                "content-discovery-db",
+                "mach",
+                json!({"url": "http://127.0.0.1:9/", "wordlist_url": ""}),
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (op_type, ext, data) in cases {
+            if let Err(e) = run_against_impostor(op_type, ext, data).await {
+                wrong.push(e);
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// The heartbeat used to call any listener a running engine, so the dashboard showed
+    /// the node healthy while an impostor held the port.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_heartbeat_does_not_call_an_impostor_a_running_engine() {
+        let imp = impostor();
+        assert!(engine_listening(imp.port));
+        let seen = ops::listener::TRUSTED.sync_scope(others(), || engine_listening(imp.port));
+        assert!(!seen, "an impostor was reported as the running engine");
+    }
+
+    /// Nor does it ask the impostor whether it sends through the proxy and believe it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_egress_question_is_not_put_to_an_impostor() {
+        let imp = impostor();
+        let addr = format!("127.0.0.1:{}", imp.port);
+        let answer = ops::listener::TRUSTED
+            .scope(others(), egress::state::engine_reads_egress(&addr))
+            .await;
+        assert_eq!(answer, None);
+        assert!(imp.got.lock().unwrap().is_empty());
     }
 }
