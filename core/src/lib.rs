@@ -966,6 +966,13 @@ pub fn discover_nodes(base: &std::path::Path) -> Result<Vec<String>, Box<dyn std
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
+        // The stem is the node id, and the service prints ids to its log. Ids the
+        // control plane hands out never hold a control character, and a line break in
+        // one would let a file name write whole lines of root's log.
+        if stem.chars().any(char::is_control) {
+            eprintln!("[boot] WARNING: skipping {path:?} - not a node id");
+            continue;
+        }
         // Validate it parses as a node config so `--boot` doesn't spawn a
         // daemon that's just going to die on a malformed file.
         // As root, through a reader that refuses a link (the operator owns nodes.d, and
@@ -3728,6 +3735,24 @@ mod security_tests {
             ids.is_empty(),
             "read a hard-linked file as a node config: {ids:?}"
         );
+    }
+
+    /// A node id is the file name, and the service prints it to root's log. A name
+    /// with a line break in it would put a line of the operator's choosing there.
+    #[cfg(unix)]
+    #[test]
+    fn a_scan_skips_a_node_config_whose_name_holds_a_control_character() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let nd = base.path().join("nodes.d");
+        fs::create_dir(&nd).unwrap();
+        fs::write(nd.join("ok.toml"), A_NODE_CONFIG).unwrap();
+        fs::write(nd.join("x\ninjected line\n#.toml"), A_NODE_CONFIG).unwrap();
+        fs::write(nd.join("tab\there.toml"), A_NODE_CONFIG).unwrap();
+        fs::write(nd.join("esc\u{1b}[2J.toml"), A_NODE_CONFIG).unwrap();
+
+        let ids = discover_nodes(base.path()).unwrap();
+
+        assert_eq!(ids, vec!["ok".to_string()]);
     }
 
     #[cfg(unix)]
