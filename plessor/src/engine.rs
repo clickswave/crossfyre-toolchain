@@ -489,12 +489,28 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
             .as_ref()
             .and_then(|s| crate::oast::OastClient::from_spec(s.domains.clone(), &s.api_url))
             .or_else(crate::oast::OastClient::from_env);
+        // The out-of-band API gets a client of its own, so the session the scan carries
+        // for the target does not go there.
+        let oast_http = oast.as_ref().and_then(|_| {
+            crate::probe::oast_client_or_say(
+                crate::probe::oast_client(
+                    params.evasive,
+                    params.identify.clone(),
+                    &params.target,
+                    params.timeout_ms,
+                    params.block_internal,
+                    &params.egress,
+                    false,
+                ),
+                &tx,
+            )
+        });
         // One correlation for the scan's out-of-band templates, polled once at
         // the end rather than six seconds per template.
         let mut oob_reg = None;
-        if let Some(oc) = oast.as_ref() {
+        if let (Some(oc), Some(http)) = (oast.as_ref(), oast_http.as_ref()) {
             for attempt in 0..3 {
-                if let Some(r) = oc.register(&client).await {
+                if let Some(r) = oc.register(http).await {
                     oob_reg = Some(r);
                     break;
                 }
@@ -581,7 +597,9 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
         }
 
         // Out-of-band template callbacks, collected once for the whole scan.
-        if let (Some(oc), Some(reg)) = (oast.as_ref(), oob_reg.as_ref()) {
+        if let (Some(oc), Some(reg), Some(http)) =
+            (oast.as_ref(), oob_reg.as_ref(), oast_http.as_ref())
+        {
             let pending: Vec<crate::inject::PendingOob> = oob_queue
                 .lock()
                 .map(|mut v| std::mem::take(&mut *v))
@@ -592,7 +610,7 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
                     if wait > 0 {
                         tokio::time::sleep(Duration::from_millis(wait)).await;
                     }
-                    hosts = oc.poll_hosts(&client, reg).await;
+                    hosts = oc.poll_hosts(http, reg).await;
                     if !hosts.is_empty() {
                         break;
                     }
@@ -604,7 +622,7 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
                     }
                 }
             }
-            oc.deregister(&client, reg).await;
+            oc.deregister(http, reg).await;
         }
     }
 

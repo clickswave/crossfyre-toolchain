@@ -163,6 +163,9 @@ pub(crate) struct StubOpts {
     /// Play a daemon from before the `capabilities` operation, which answers it with
     /// `Unknown operation` and ignores the options it does not know.
     pub old: bool,
+    /// Play a plessor from 0.1.42, which honours `follow_redirects` and `resolve` but
+    /// cannot be told to check certificates.
+    pub no_verify_certs: bool,
     /// A pause before each of `events`, so a client sees them arrive one at a time.
     pub delay_ms: u64,
 }
@@ -240,9 +243,13 @@ pub(crate) async fn stub_engine(opts: StubOpts) -> Stub {
                     }
                     let answer = if opts.old {
                         json!({"type": "error", "message": "Unknown operation: capabilities"})
-                    } else {
+                    } else if opts.no_verify_certs {
                         json!({"type": "capabilities", "cancel": true,
                                "inject": ["follow_redirects", "resolve"],
+                               "fingerprint": ["resolve", "block_internal"]})
+                    } else {
+                        json!({"type": "capabilities", "cancel": true,
+                               "inject": ["follow_redirects", "resolve", "verify_certs"],
                                "fingerprint": ["resolve", "block_internal"]})
                     };
                     let mut a = answer.to_string();

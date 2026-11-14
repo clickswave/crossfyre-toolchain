@@ -73,6 +73,10 @@ pub struct ClientOpts<'a> {
     /// Where the client's connections go: the op's own egress, which the daemon
     /// read off the request. Required, for the reason this struct exists.
     pub egress: &'a transport::Egress,
+    /// Check the server's certificate. Off for a scan, which has to reach expired,
+    /// self-signed and internal-CA hosts. On where the caller hands in a session that
+    /// must not be sent to whoever answers the handshake.
+    pub verify_certs: bool,
 }
 
 /// Build an evasion-aware scan client.
@@ -109,6 +113,7 @@ pub fn try_build_client(
         min_timeout_ms,
         block_internal,
         egress,
+        verify_certs,
     } = o;
     let mode = adaptive::identity::Mode::from_flags(evasive, identify);
     let seed = (!target.is_empty()).then_some(target);
@@ -124,7 +129,7 @@ pub fn try_build_client(
                 timeout_ms.clamp(1000, 120_000).max(min_timeout_ms),
             )),
             redirect,
-            accept_invalid_certs: true,
+            accept_invalid_certs: !verify_certs,
             cookie_store: true,
             resolve,
             block_internal,
@@ -132,6 +137,55 @@ pub fn try_build_client(
         egress,
     )
     .map_err(|e| format!("client build failed: {e}"))
+}
+
+/// A client for the out-of-band API, which is not the target. It has no `auth`, so a
+/// session handed in for the target is never sent there, and none of the target's name
+/// pins.
+pub fn oast_client(
+    evasive: bool,
+    identify: Option<String>,
+    target: &str,
+    timeout_ms: u64,
+    block_internal: bool,
+    egress: &transport::Egress,
+    verify_certs: bool,
+) -> Result<Client, String> {
+    try_build_client(
+        ClientOpts {
+            evasive,
+            identify,
+            auth: None,
+            target,
+            timeout_ms,
+            min_timeout_ms: 0,
+            block_internal,
+            egress,
+            verify_certs,
+        },
+        transport::Redirect::Limited(3),
+        Vec::new(),
+    )
+}
+
+/// The out-of-band API's client, or a line saying out-of-band checks are off when one
+/// cannot be built.
+pub fn oast_client_or_say(
+    built: Result<Client, String>,
+    tx: &tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+) -> Option<Client> {
+    built
+        .map_err(|e| {
+            let _ = tx.send(serde_json::json!({
+                "type": "log",
+                "message": format!(
+                    "out-of-band callbacks are UNAVAILABLE (no client for the out-of-band \
+                     API: {e}). Blind command injection, blind SSRF and blind XXE cannot be \
+                     confirmed in this run; their absence from the results is not evidence."
+                )
+            }));
+        })
+        .ok()
 }
 
 /// Send one request with an optional `(body, content-type)` and read the capped response.

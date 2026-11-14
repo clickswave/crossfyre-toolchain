@@ -678,6 +678,7 @@ async fn replay(p: &FlowParams, skip: Option<usize>) -> Option<Vec<u16>> {
         min_timeout_ms: 0,
         block_internal: p.block_internal,
         egress: &p.egress,
+        verify_certs: false,
     })?;
 
     let mut statuses = vec![0u16; p.steps.len()];
@@ -740,6 +741,7 @@ async fn replay_values(
         min_timeout_ms: 0,
         block_internal: p.block_internal,
         egress: &p.egress,
+        verify_certs: false,
     })?;
     let mut statuses = vec![0u16; steps.len()];
     let mut fresh: HashMap<(usize, String), String> = HashMap::new();
@@ -1117,6 +1119,7 @@ async fn replay_with_repeat(p: &FlowParams) -> Option<(u16, u16)> {
         min_timeout_ms: 0,
         block_internal: p.block_internal,
         egress: &p.egress,
+        verify_certs: false,
     })?;
     let mut fresh: HashMap<(usize, String), String> = HashMap::new();
     let last = p.steps.len() - 1;

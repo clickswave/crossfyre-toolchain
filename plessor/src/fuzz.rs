@@ -93,6 +93,7 @@ pub async fn run(mut params: FuzzParams, tx: mpsc::UnboundedSender<Value>) {
             min_timeout_ms: 3000,
             block_internal: params.block_internal,
             egress: &params.egress,
+            verify_certs: false,
         },
         transport::Redirect::Limited(3),
         Vec::new(),

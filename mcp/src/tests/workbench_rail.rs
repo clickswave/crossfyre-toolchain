@@ -1926,6 +1926,34 @@ mod injection {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_plessor_that_cannot_check_certificates_is_not_handed_the_session() {
+        let plessor = stub_engine(StubOpts {
+            no_verify_certs: true,
+            ..Default::default()
+        })
+        .await;
+        let b = bench_with(
+            scope(&["app.example.test".into()], "")
+                .resolver(names())
+                .plessor(plessor.port),
+            get_items(),
+        )
+        .await;
+        let peer = FakePeer::new(Elicit::Accept);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_test_injection",
+                json!({"exchange": handle(4), "wait_seconds": 2}),
+            )
+            .await;
+        assert_eq!(reason(&r), "engine_unavailable", "{}", r.text);
+        assert!(r.text.contains("certificates"), "{}", r.text);
+        assert!(plessor.ops().is_empty(), "{:?}", plessor.ops());
+        assert_eq!(peer.asked(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_captured_session_goes_to_plessor_and_nowhere_else() {
         let plessor = stub_engine(StubOpts::default()).await;
         let b = bench_with(
@@ -1951,6 +1979,8 @@ mod injection {
         assert_eq!(ops.len(), 1);
         let op = &ops[0];
         assert_eq!(op["auth"]["cookies"], "sid=S1-ck");
+        // Sent only past a certificate that checks out.
+        assert_eq!(op["verify_certs"], true, "{op}");
         let h = op["auth"]["headers"].as_object().unwrap();
         assert_eq!(h["authorization"], "Bearer S3-bearer");
         assert_eq!(h["x-csrf-token"], "S8-csrf");

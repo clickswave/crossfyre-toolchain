@@ -351,14 +351,16 @@ pub(crate) async fn start_scan(
             ),
         ));
     }
-    mcp.require(
-        &mut conn,
-        "plessor",
-        port,
-        "inject",
-        &["follow_redirects", "resolve"],
-    )
-    .await?;
+    // A captured session goes out only past a certificate that checks out, as the
+    // Workbench sends it. plessor otherwise accepts any certificate, so whoever answered
+    // the handshake for the host would be sent the session.
+    let options: &[&str] = if plan.auth.is_some() {
+        &["follow_redirects", "resolve", "verify_certs"]
+    } else {
+        &["follow_redirects", "resolve"]
+    };
+    mcp.require(&mut conn, "plessor", port, "inject", options)
+        .await?;
     let clearance = mcp.confirm(pending, peer, plan.write, note, ct).await?;
     if ct.is_cancelled() {
         return Err(Refusal::new(
@@ -385,6 +387,7 @@ pub(crate) async fn start_scan(
     });
     if let Some(auth) = plan.auth {
         op["auth"] = auth;
+        op["verify_certs"] = Value::Bool(true);
     }
 
     let start_lock = mcp.scan_start.lock().await;

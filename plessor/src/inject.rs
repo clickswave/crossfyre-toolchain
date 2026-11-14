@@ -109,6 +109,15 @@ pub struct InjectParams {
     /// opens raw sockets and looks names up itself.
     #[serde(default)]
     pub resolve: Vec<(String, std::net::SocketAddr)>,
+    /// Check certificates on every connection the pass's HTTP clients make, the
+    /// out-of-band API's included. Absent = false, which is how every pass has run: a
+    /// scan has to reach hosts whose certificates are expired, self-signed or for
+    /// another name. A caller that hands in a session captured where certificates were
+    /// checked sets it, so the session is not sent to whoever answers the handshake for
+    /// that host. The opt-in smuggling probe's raw sends carry no session and are not
+    /// covered.
+    #[serde(default)]
+    pub verify_certs: bool,
     /// Where this op's connections go. Never read from the op's own fields: the
     /// daemon sets it from the egress wrapper the request came in, and a request
     /// without one gets `Inherit`.
@@ -460,6 +469,7 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
             // confirming request times out and every real time-based finding is
             // lost with the false ones.
             min_timeout_ms: SLEEP_SECS * 2 * 1000 + 3000,
+            verify_certs: params.verify_certs,
         },
         redirect,
         params.resolve.clone(),
@@ -487,6 +497,7 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
                     min_timeout_ms: SLEEP_SECS * 2 * 1000 + 3000,
                     block_internal: params.block_internal,
                     egress: &params.egress,
+                    verify_certs: params.verify_certs,
                 },
                 redirect,
                 params.resolve.clone(),
@@ -516,6 +527,7 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
             min_timeout_ms: 0,
             block_internal: params.block_internal,
             egress: &params.egress,
+            verify_certs: params.verify_certs,
         },
         transport::Redirect::None,
         params.resolve.clone(),
@@ -526,6 +538,22 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
         }
         _ => crate::oast::OastClient::from_env(),
     };
+    // Registering, polling and deregistering go through a client of their own, so the
+    // session handed in for the target does not go to the out-of-band API.
+    let oast_http = oast.as_ref().and_then(|_| {
+        probe::oast_client_or_say(
+            probe::oast_client(
+                params.evasive,
+                params.identify.clone(),
+                &params.target,
+                params.timeout_ms,
+                params.block_internal,
+                &params.egress,
+                params.verify_certs,
+            ),
+            &tx,
+        )
+    });
 
     let handed_in = params.endpoints.len();
     // Endpoints that have somewhere to inject go first, because the cap below
@@ -602,9 +630,9 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
     // quietly stops testing a whole class is the worst failure mode there is:
     // the report looks the same as a clean one.
     let mut oob_reg: Option<Arc<crate::oast::OastReg>> = None;
-    if let Some(oc) = oast.as_ref() {
+    if let (Some(oc), Some(http)) = (oast.as_ref(), oast_http.as_ref()) {
         for attempt in 0..3 {
-            if let Some(r) = oc.register(&client).await {
+            if let Some(r) = oc.register(http).await {
                 oob_reg = Some(Arc::new(r));
                 break;
             }
@@ -647,6 +675,7 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
             redirect,
             resolve: params.resolve.clone(),
             egress: params.egress.clone(),
+            verify_certs: params.verify_certs,
         })
     });
     // The operator's authorisation list, parsed once. Anything unparseable is
@@ -915,7 +944,8 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
     // Out-of-band callbacks, collected once. Everything that was going to call
     // back has had the whole pass to do it; this is the grace period for a
     // target that queues its outbound requests, not a per-payload wait.
-    if let (Some(oc), Some(reg)) = (oast.as_ref(), oob_reg.as_ref()) {
+    if let (Some(oc), Some(reg), Some(http)) = (oast.as_ref(), oob_reg.as_ref(), oast_http.as_ref())
+    {
         let pending: Vec<PendingOob> = oob_queue
             .lock()
             .map(|mut v| std::mem::take(&mut *v))
@@ -933,7 +963,7 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
                 if wait > 0 {
                     tokio::time::sleep(Duration::from_millis(wait)).await;
                 }
-                hosts = oc.poll_hosts(&client, reg).await;
+                hosts = oc.poll_hosts(http, reg).await;
                 if !hosts.is_empty() {
                     break;
                 }
@@ -947,7 +977,7 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
                 }
             }
         }
-        oc.deregister(&client, reg).await;
+        oc.deregister(http, reg).await;
     }
 
     // The escalation pass. A file read that discloses a configuration file also
