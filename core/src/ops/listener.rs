@@ -6,7 +6,8 @@
 //! and what comes back is published as the scan's results, so the node sends only to a
 //! listener that runs as the account the engines run as, or as root. On Linux the
 //! kernel says who owns the engine's end of a connection. Elsewhere it cannot be asked
-//! this way, and the connection is used as it always was.
+//! this way, nor on a Linux whose tables list no sockets, and the connection is used as
+//! it always was.
 
 use std::io;
 use std::net::SocketAddr;
@@ -18,34 +19,46 @@ pub(crate) async fn connect(addr: &str) -> io::Result<tokio::net::TcpStream> {
     let stream = tokio::net::TcpStream::connect(addr).await?;
     let ends = (stream.local_addr()?, stream.peer_addr()?);
     let trusted = trusted();
-    let mut verdict = owned_by(owners(ends), &trusted);
+    // Reading the kernel's tables takes a few milliseconds on a host with many
+    // connections, so it is done off the runtime's workers.
+    tokio::task::spawn_blocking(move || check(ends, &trusted))
+        .await
+        .map_err(io::Error::other)?
+        .map_err(|e| e.into_io(ends.1))?;
+    Ok(stream)
+}
+
+/// [`connect`] without a runtime, waiting at most `timeout` for the connection.
+pub fn connect_blocking(addr: SocketAddr, timeout: Duration) -> io::Result<std::net::TcpStream> {
+    connect_blocking_trusting(addr, timeout, &trusted())
+}
+
+/// [`connect_blocking`], taking only listeners of the accounts in `trusted` for an
+/// engine.
+pub fn connect_blocking_trusting(
+    addr: SocketAddr,
+    timeout: Duration,
+    trusted: &[u32],
+) -> io::Result<std::net::TcpStream> {
+    let stream = std::net::TcpStream::connect_timeout(&addr, timeout)?;
+    let ends = (stream.local_addr()?, stream.peer_addr()?);
+    check(ends, trusted).map_err(|e| e.into_io(ends.1))?;
+    Ok(stream)
+}
+
+/// Whether the engine's end of the connection `ends` belongs to a trusted account.
+fn check(ends: (SocketAddr, SocketAddr), trusted: &[u32]) -> Result<(), NotOurs> {
+    let mut verdict = owned_by(owners(ends), trusted);
     // The engine's end is listed as soon as the connect returns, but a busy machine is
     // given a moment.
     for _ in 0..4 {
         if !matches!(verdict, Err(Unlisted)) {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        verdict = owned_by(owners(ends), &trusted);
-    }
-    verdict.map_err(|e| e.into_io(ends.1))?;
-    Ok(stream)
-}
-
-/// [`connect`] without a runtime, waiting at most `timeout` for the connection.
-pub(crate) fn connect_blocking(addr: SocketAddr, timeout: Duration) -> io::Result<()> {
-    let stream = std::net::TcpStream::connect_timeout(&addr, timeout)?;
-    let ends = (stream.local_addr()?, stream.peer_addr()?);
-    let trusted = trusted();
-    let mut verdict = owned_by(owners(ends), &trusted);
-    for _ in 0..4 {
-        if !matches!(verdict, Err(Unlisted)) {
-            break;
-        }
         std::thread::sleep(Duration::from_millis(20));
-        verdict = owned_by(owners(ends), &trusted);
+        verdict = owned_by(owners(ends), trusted);
     }
-    verdict.map_err(|e| e.into_io(ends.1))
+    verdict
 }
 
 /// Why a listener is not taken for an engine.
@@ -93,7 +106,7 @@ pub(crate) fn owned_by(owners: Owners, trusted: &[u32]) -> Result<(), NotOurs> {
 /// The accounts whose listeners are the engines: root, this process's own and, when it
 /// acts for an operator under sudo (as the node service does), the operator's, whose
 /// own services the engines are.
-fn trusted() -> Vec<u32> {
+pub fn trusted() -> Vec<u32> {
     #[cfg(test)]
     if let Ok(uids) = TRUSTED.try_with(Clone::clone) {
         return uids;
@@ -103,10 +116,23 @@ fn trusted() -> Vec<u32> {
 
 #[cfg(unix)]
 fn production_trusted() -> Vec<u32> {
+    static KNOWN: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    if let Some(uids) = KNOWN.get() {
+        return uids.clone();
+    }
     // SAFETY: geteuid has no preconditions and cannot fail.
-    let mut uids = vec![0, unsafe { libc::geteuid() }];
-    if let Some((uid, ..)) = crate::toolchain::sudo_user::sudo_user_info() {
+    let euid = unsafe { libc::geteuid() };
+    let mut uids = vec![0, euid];
+    let operator = crate::toolchain::sudo_user::sudo_user_info();
+    if let Some((uid, ..)) = operator {
         uids.push(uid);
+    }
+    // A name SUDO_USER gives that could not be looked up, as when a directory service
+    // does not answer for a moment, is looked up again next time rather than left out
+    // for good.
+    let named = euid == 0 && std::env::var("SUDO_USER").is_ok_and(|u| !u.is_empty() && u != "root");
+    if operator.is_some() || !named {
+        let _ = KNOWN.set(uids.clone());
     }
     uids
 }
@@ -128,12 +154,26 @@ tokio::task_local! {
 /// `ends.0` and whose engine end is `ends.1`.
 #[cfg(target_os = "linux")]
 fn owners(ends: (SocketAddr, SocketAddr)) -> Owners {
-    let (local, peer) = ends;
+    let tables: Vec<String> = ["/proc/net/tcp", "/proc/net/tcp6"]
+        .iter()
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .collect();
+    listed(&tables, ends)
+}
+
+/// [`owners`] from the kernel's tcp `tables`.
+#[cfg(any(test, target_os = "linux"))]
+fn listed(tables: &[String], (local, peer): (SocketAddr, SocketAddr)) -> Owners {
+    // This end is listed before the connect returns. A kernel that lists not even this
+    // one lists no sockets at all, as on WSL 1 and in some sandboxes, and cannot be
+    // asked who listens: the listener is taken as on the systems without these tables.
+    if tables.iter().all(|t| owners_in(t, local, peer).is_empty()) {
+        return None;
+    }
     Some(
-        ["/proc/net/tcp", "/proc/net/tcp6"]
+        tables
             .iter()
-            .filter_map(|p| std::fs::read_to_string(p).ok())
-            .flat_map(|t| owners_in(&t, peer, local))
+            .flat_map(|t| owners_in(t, peer, local))
             .collect(),
     )
 }
@@ -209,6 +249,28 @@ mod tests {
              0: 0000000000000000FFFF00000100007F:115D 0000000000000000FFFF00000100007F:A028 01 00000000:00000000 00:00000000 00000000  1002        0 4 1 0\n";
         assert_eq!(owners_in(v6, engine, node), vec![1002]);
         assert!(owners_in("header\nnot a line\n", engine, node).is_empty());
+    }
+
+    #[cfg(target_endian = "little")]
+    #[test]
+    fn a_kernel_that_lists_no_sockets_is_not_asked() {
+        let header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+        let ends: (SocketAddr, SocketAddr) = (
+            "127.0.0.1:41000".parse().unwrap(),
+            "127.0.0.1:4445".parse().unwrap(),
+        );
+        // WSL 1 and some sandboxes list no sockets at all, not even this end.
+        assert_eq!(listed(&[header.into(), header.into()], ends), None);
+        assert_eq!(listed(&[], ends), None);
+        // This end is listed and the engine's is not: that is a listener with no owner.
+        let ours = format!(
+            "{header}   0: 0100007F:A028 0100007F:115D 01 00000000:00000000 00:00000000 00000000  1000        0 3 1 0\n"
+        );
+        assert_eq!(listed(&[ours.clone()], ends), Some(vec![]));
+        let both = format!(
+            "{ours}   1: 0100007F:115D 0100007F:A028 01 00000000:00000000 00:00000000 00000000  1001        0 2 1 0\n"
+        );
+        assert_eq!(listed(&[header.into(), both], ends), Some(vec![1001]));
     }
 
     #[test]

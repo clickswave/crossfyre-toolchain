@@ -13,6 +13,15 @@ mod egress;
 pub mod executor;
 pub mod oast;
 mod ops;
+
+/// Connecting to an engine on its loopback port, for the helpers that talk to engines
+/// themselves: a listener the engines' account does not own is refused before anything
+/// is sent to it.
+pub mod engine_link {
+    pub use crate::ops::listener::{
+        connect_blocking as connect, connect_blocking_trusting as connect_trusting, trusted,
+    };
+}
 pub mod os;
 pub mod toolchain;
 
