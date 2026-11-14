@@ -1,18 +1,19 @@
-use std::io::{Read, Seek};
+use std::io::Read;
+use std::sync::Arc;
 
-/// The wordlist a scan reads: opened once, with the hash and the words both taken
-/// from that one handle.
+/// The wordlist a scan reads, read once: the hash and the words both come from the
+/// same bytes.
 ///
-/// The path in a request is checked against the permitted directories, and a name
-/// opened again after that check can by then be a different file. So nothing here
-/// opens the wordlist by name: [`dguard::open_wordlist`] opens it, checks the open
-/// file, and every read after that goes through the handle it returned.
+/// [`dguard::open_wordlist`] opens the file inside the permitted directories and
+/// checks the handle it returns. That handle is read to the end here and nothing
+/// opens the wordlist again, so the words stored under a hash are always the words
+/// that were hashed, even if the file is rewritten while the scan is set up.
 #[derive(Debug)]
 pub struct WordlistConfig {
     pub path: String,
     pub name: String,
     pub hash: String,
-    file: std::fs::File,
+    bytes: Arc<Vec<u8>>,
 }
 
 impl WordlistConfig {
@@ -30,37 +31,33 @@ impl WordlistConfig {
             .ok_or("[ERROR] Invalid wordlist name")?
             .to_string();
 
-        let hash = sha512_of(file.try_clone()?).await?;
+        let (bytes, hash) = read_and_hash(file).await?;
 
         Ok(WordlistConfig {
             path: real.to_string_lossy().into_owned(),
             name,
             hash,
-            file,
+            bytes: Arc::new(bytes),
         })
     }
 
-    /// The words, read from the handle the hash was taken from.
+    /// The words, from the bytes the hash was taken of.
     pub async fn lines(&self) -> Result<Vec<String>, std::io::Error> {
-        crate::libs::utils::read_lines_from(self.file.try_clone()?).await
+        let bytes = self.bytes.clone();
+        tokio::task::spawn_blocking(move || crate::libs::utils::split_lines(&bytes))
+            .await
+            .map_err(std::io::Error::other)?
     }
 }
 
-/// The SHA-512 of a whole file, from its start, on the blocking pool.
-async fn sha512_of(mut file: std::fs::File) -> Result<String, std::io::Error> {
+/// The whole of a file and its SHA-512, from one read on the blocking pool.
+async fn read_and_hash(mut file: std::fs::File) -> Result<(Vec<u8>, String), std::io::Error> {
     use sha2::Digest;
     tokio::task::spawn_blocking(move || {
-        file.rewind()?;
-        let mut hasher = sha2::Sha512::new();
-        let mut buffer = [0; 64 * 1024];
-        loop {
-            let n = file.read(&mut buffer)?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buffer[..n]);
-        }
-        Ok(format!("{:x}", hasher.finalize()))
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let hash = format!("{:x}", sha2::Sha512::digest(&bytes));
+        Ok((bytes, hash))
     })
     .await
     .map_err(std::io::Error::other)?
@@ -70,7 +67,7 @@ async fn sha512_of(mut file: std::fs::File) -> Result<String, std::io::Error> {
 mod tests {
     use super::WordlistConfig;
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -83,6 +80,8 @@ mod tests {
         let d = std::env::temp_dir().join(format!("ambulo-wl-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
+        // Writable by its owner alone, whatever the umask.
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
         d
     }
 
@@ -124,10 +123,32 @@ mod tests {
         assert_eq!(cfg.lines().await.unwrap(), ["a", "b"]);
     }
 
-    // The request names a FIFO in a directory the sender owns. The check passes, the
-    // reader then waits on the FIFO, and while it waits the sender swaps the name
-    // for a symlink to a file outside every root. Nothing outside the roots may come
-    // back, whether the wordlist is refused or read.
+    #[tokio::test]
+    async fn the_words_are_the_bytes_that_were_hashed_even_if_the_file_is_rewritten() {
+        use sha2::Digest;
+        let dir = scratch("rewrite");
+        let wl = dir.join("wl.txt");
+        std::fs::write(&wl, "alpha\nbeta\n").unwrap();
+        let cfg = WordlistConfig::new(wl.to_str().unwrap()).await.unwrap();
+        // The same file, rewritten in place rather than replaced.
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&wl)
+            .unwrap();
+        f.write_all(b"gamma\n").unwrap();
+        drop(f);
+        let lines = cfg.lines().await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            cfg.hash,
+            format!("{:x}", sha2::Sha512::digest(b"alpha\nbeta\n"))
+        );
+        assert_eq!(lines, ["alpha", "beta"]);
+    }
+
+    // A FIFO whose name is replaced by a symlink while it is being opened. Nothing
+    // outside the roots may come back, whether the wordlist is refused or read.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_fifo_swapped_for_a_symlink_mid_read_reads_nothing_outside_the_roots() {
         let dir = scratch("fifo");

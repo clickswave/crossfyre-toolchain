@@ -597,14 +597,10 @@ pub fn resolve_wordlist_in(
 
 /// Open a caller-supplied wordlist once, refusing anything outside [`wordlist_roots`].
 ///
-/// Returns the checked path and the handle every later read has to use. Checking a
-/// path and then opening it again by name is not containment: the name can be
-/// pointed somewhere else in between, and a FIFO in a shared temp directory holds
-/// the reader at exactly that point for as long as the sender likes. So the file
-/// is opened once, without following a final symlink and without blocking on a
-/// FIFO, and the handle is then checked rather than the name: it has to be a
-/// regular file, and the path resolved again afterwards has to be inside a root
-/// and name that same file.
+/// Returns the checked path and the handle every later read has to use, so what is
+/// read is the file that was checked. Anything that is not a regular file is refused.
+/// On Unix the path is opened one directory at a time without following symlinks,
+/// and only through directories no other account can change: see [`open_beneath`].
 pub fn open_wordlist(wordlist: &str) -> Result<(std::path::PathBuf, std::fs::File), String> {
     open_wordlist_in(wordlist, &wordlist_roots())
 }
@@ -615,72 +611,248 @@ pub fn open_wordlist_in(
     roots: &[std::path::PathBuf],
 ) -> Result<(std::path::PathBuf, std::fs::File), String> {
     let real = resolve_wordlist_in(wordlist, roots)?;
-    let file = open_no_follow(&real)
-        .map_err(|e| format!("wordlist {} cannot be opened: {e}", real.display()))?;
-    verify_opened(&file, &real, wordlist, roots)?;
+    #[cfg(unix)]
+    let file = open_beneath(&real, Operator::current())?;
+    #[cfg(not(unix))]
+    let file = {
+        let file = std::fs::File::open(&real)
+            .map_err(|e| format!("wordlist {} cannot be opened: {e}", real.display()))?;
+        let meta = file
+            .metadata()
+            .map_err(|e| format!("wordlist {} cannot be read: {e}", real.display()))?;
+        if !meta.is_file() {
+            return Err(not_a_regular_file(&real));
+        }
+        file
+    };
     Ok((real, file))
 }
 
+fn not_a_regular_file(real: &std::path::Path) -> String {
+    format!("wordlist {} is not a regular file", real.display())
+}
+
+/// The account the engine runs as, which decides whose directories it can trust.
 #[cfg(unix)]
-fn open_no_follow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    // O_NONBLOCK so that opening a FIFO returns at once instead of waiting for a
-    // writer; the handle is refused below. It changes nothing for a regular file.
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
+#[derive(Clone, Copy, Debug)]
+struct Operator {
+    uid: u32,
+    /// The account's primary group when no other account is in it: named after the
+    /// account and listing no other member. Write access for that group is write
+    /// access for nobody else.
+    private_gid: Option<u32>,
 }
 
-#[cfg(not(unix))]
-fn open_no_follow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    std::fs::File::open(path)
+#[cfg(unix)]
+impl Operator {
+    fn current() -> Operator {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        Operator {
+            uid,
+            private_gid: private_group_of(uid),
+        }
+    }
 }
 
-/// Whether `file`, opened from `real`, is the wordlist `wordlist` names and one this
-/// daemon may read.
-fn verify_opened(
-    file: &std::fs::File,
-    real: &std::path::Path,
-    wordlist: &str,
-    roots: &[std::path::PathBuf],
-) -> Result<(), String> {
+/// The primary group of `uid` when it is private to that account.
+#[cfg(unix)]
+fn private_group_of(uid: u32) -> Option<u32> {
+    let mut buf: Vec<libc::c_char> = vec![0; 4096];
+    loop {
+        // SAFETY: an all-zero passwd is a valid out-parameter, and getpwuid_r writes
+        // only into it and `buf`, whose length it is given.
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+        let rc =
+            unsafe { libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut found) };
+        if rc == libc::ERANGE && buf.len() < 1 << 20 {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        if rc != 0 || found.is_null() || pwd.pw_name.is_null() {
+            return None;
+        }
+        // SAFETY: on success pw_name is a NUL-terminated string inside `buf`.
+        let name = unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) }
+            .to_bytes()
+            .to_vec();
+        return group_is_only(pwd.pw_gid, &name).then_some(pwd.pw_gid);
+    }
+}
+
+/// Whether group `gid` is named `name` and lists no member but `name`.
+#[cfg(unix)]
+fn group_is_only(gid: libc::gid_t, name: &[u8]) -> bool {
+    use std::ffi::CStr;
+    let mut buf: Vec<libc::c_char> = vec![0; 4096];
+    loop {
+        // SAFETY: as in private_group_of, for getgrgid_r and a group.
+        let mut grp: libc::group = unsafe { std::mem::zeroed() };
+        let mut found: *mut libc::group = std::ptr::null_mut();
+        let rc =
+            unsafe { libc::getgrgid_r(gid, &mut grp, buf.as_mut_ptr(), buf.len(), &mut found) };
+        if rc == libc::ERANGE && buf.len() < 1 << 20 {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        if rc != 0 || found.is_null() || grp.gr_name.is_null() {
+            return false;
+        }
+        // SAFETY: on success gr_name is a NUL-terminated string and gr_mem a
+        // NULL-terminated array of them, all inside `buf`.
+        if unsafe { CStr::from_ptr(grp.gr_name) }.to_bytes() != name {
+            return false;
+        }
+        let mut member = grp.gr_mem;
+        while !member.is_null() {
+            let m = unsafe { *member };
+            if m.is_null() {
+                break;
+            }
+            if unsafe { CStr::from_ptr(m) }.to_bytes() != name {
+                return false;
+            }
+            member = unsafe { member.add(1) };
+        }
+        return true;
+    }
+}
+
+/// Open `real`, a canonical path, one component at a time from `/` without following
+/// any symlink, and return the regular file at its end.
+///
+/// Each directory on the way has to be one that only this account or root can
+/// change, so no name on the path can have been made, moved or removed by anyone
+/// else. A directory every account can write is accepted only with the sticky bit,
+/// as /tmp has: there other accounts can add names but cannot remove or rename one
+/// that leads to a file they do not own. A name they added could still be a second
+/// hard link to another account's file, so in such a directory a file with more
+/// than one link is read only when every account may read it anyway.
+#[cfg(unix)]
+fn open_beneath(real: &std::path::Path, op: Operator) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Component;
+
+    let changed = || {
+        format!(
+            "wordlist {} changed while it was being opened",
+            real.display()
+        )
+    };
+    let mut names = Vec::new();
+    for c in real.components() {
+        match c {
+            Component::RootDir => {}
+            Component::Normal(n) => names.push(n),
+            _ => return Err(changed()),
+        }
+    }
+    let Some((file_name, dirs)) = names.split_last() else {
+        return Err(not_a_regular_file(real));
+    };
+    let opening = |e: std::io::Error| match e.raw_os_error() {
+        Some(libc::ELOOP) | Some(libc::ENOTDIR) => changed(),
+        _ => format!("wordlist {} cannot be opened: {e}", real.display()),
+    };
+
+    let mut at = std::path::PathBuf::from("/");
+    let mut dir = open_at(None, std::ffi::OsStr::new("/"), DIR_FLAGS).map_err(opening)?;
+    let mut shared = trusted_dir(&dir, &at, op).map_err(|e| e.unwrap_or_else(changed))?;
+    for name in dirs {
+        at.push(name);
+        dir = open_at(Some(&dir), name, DIR_FLAGS).map_err(opening)?;
+        shared = trusted_dir(&dir, &at, op).map_err(|e| e.unwrap_or_else(changed))?;
+    }
+    // O_NONBLOCK so that a FIFO is opened at once and then refused below, rather than
+    // holding this call until something writes to it. A regular file is unaffected.
+    let file = open_at(
+        Some(&dir),
+        file_name,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+    )
+    .map_err(opening)?;
     let meta = file
         .metadata()
         .map_err(|e| format!("wordlist {} cannot be read: {e}", real.display()))?;
     if !meta.is_file() {
-        return Err(format!("wordlist {} is not a regular file", real.display()));
+        return Err(not_a_regular_file(real));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        // A directory on the way to the file can still have been swapped between the
-        // first check and the open. Resolving again now and comparing the file it
-        // names with the one that is open catches that, whichever way round it went.
-        let now = resolve_wordlist_in(wordlist, roots)?;
-        let named = std::fs::metadata(&now)
-            .map_err(|e| format!("wordlist {} cannot be read: {e}", now.display()))?;
-        if (named.dev(), named.ino()) != (meta.dev(), meta.ino()) {
-            return Err(format!(
-                "wordlist {} changed while it was being opened",
-                real.display()
-            ));
-        }
-        // A hard link gives a file a second name inside a root without moving it, and
-        // where hard links to other people's files are allowed (macOS, or Linux
-        // without fs.protected_hardlinks) that name could belong to anyone. A file
-        // with more than one name is read only when every user may read it anyway.
-        if meta.nlink() > 1 && meta.mode() & 0o004 == 0 {
-            return Err(format!(
-                "wordlist {} has more than one hard link and is not readable by everyone. \
-                 Copy it to a file of its own.",
-                real.display()
-            ));
-        }
+    if shared && meta.nlink() > 1 && meta.mode() & 0o004 == 0 {
+        return Err(format!(
+            "wordlist {} has more than one hard link and is not readable by everyone. \
+             Copy it to a file of its own.",
+            real.display()
+        ));
     }
-    #[cfg(not(unix))]
-    let _ = (wordlist, roots);
-    Ok(())
+    Ok(file)
+}
+
+/// How each directory on the way is opened. On Linux O_PATH lets a directory that
+/// may be searched but not listed be passed through, as a path lookup would.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const DIR_FLAGS: libc::c_int = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW;
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+const DIR_FLAGS: libc::c_int = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW;
+
+#[cfg(unix)]
+fn open_at(
+    dir: Option<&std::fs::File>,
+    name: &std::ffi::OsStr,
+    flags: libc::c_int,
+) -> std::io::Result<std::fs::File> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    let c = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let at = dir.map_or(libc::AT_FDCWD, |d| d.as_raw_fd());
+    // SAFETY: `c` is NUL-terminated and outlives the call; nothing is created, so no
+    // mode argument is read.
+    let fd = unsafe { libc::openat(at, c.as_ptr(), flags | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a new descriptor that nothing else owns.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// Whether the directory open at `dir` is one the wordlist may be reached through.
+///
+/// `Ok(true)` is a sticky directory other accounts can write; `Ok(false)` one only
+/// this account and root can. `Err(None)` means it is not a directory at all, which
+/// can only be a name changed under the walk.
+#[cfg(unix)]
+fn trusted_dir(
+    dir: &std::fs::File,
+    at: &std::path::Path,
+    op: Operator,
+) -> Result<bool, Option<String>> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = dir
+        .metadata()
+        .map_err(|e| Some(format!("{} cannot be read: {e}", at.display())))?;
+    if !meta.is_dir() {
+        return Err(None);
+    }
+    if meta.uid() != op.uid && meta.uid() != 0 {
+        return Err(Some(format!(
+            "wordlist directory {} belongs to another account, which could change what \
+             is in it. Move the wordlist to a directory of your own.",
+            at.display()
+        )));
+    }
+    let mode = meta.mode();
+    let others_write = mode & 0o002 != 0;
+    let group_write = mode & 0o020 != 0 && op.private_gid != Some(meta.gid());
+    let shared = others_write || group_write;
+    if shared && mode & 0o1000 == 0 {
+        return Err(Some(format!(
+            "wordlist directory {} can be written by other accounts. Move the wordlist \
+             to a directory only you can write.",
+            at.display()
+        )));
+    }
+    Ok(shared)
 }
 
 #[cfg(test)]
@@ -782,6 +954,9 @@ mod wordlist_tests {
         let d = std::env::temp_dir().join(format!("dguard-open-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
+        // Writable by its owner alone, whatever the umask.
+        #[cfg(unix)]
+        chmod(&d, 0o755);
         std::fs::canonicalize(d).unwrap()
     }
 
@@ -809,8 +984,6 @@ mod wordlist_tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    // A FIFO holds whoever opens it until somebody writes, which is how the name was
-    // kept open to swapping between the check and the read. It is refused at once.
     #[cfg(unix)]
     #[test]
     fn a_fifo_is_refused_without_waiting_for_a_writer() {
@@ -823,35 +996,155 @@ mod wordlist_tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    // The open handle has to be the file the path names once it is resolved again.
+    #[cfg(unix)]
+    fn chmod(p: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    // The walk is given a path that was canonical when it was checked. A symlink that
+    // has taken the place of a directory or of the file since then is not followed.
     #[cfg(unix)]
     #[test]
-    fn a_handle_that_is_not_the_file_the_path_now_names_is_refused() {
-        let root = scratch_root("swap");
-        let a = root.join("a.txt");
-        let b = root.join("b.txt");
-        std::fs::write(&a, "a\n").unwrap();
-        std::fs::write(&b, "b\n").unwrap();
-        let opened = std::fs::File::open(&b).unwrap();
-        let err = verify_opened(&opened, &a, a.to_str().unwrap(), &[root.clone()]).unwrap_err();
-        assert!(err.contains("changed while it was being opened"), "{err}");
+    fn a_symlink_on_the_way_is_not_followed() {
+        let root = scratch_root("symlink");
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/wl.txt"), "a\n").unwrap();
+        std::os::unix::fs::symlink(root.join("sub"), root.join("dir")).unwrap();
+        std::os::unix::fs::symlink(root.join("sub/wl.txt"), root.join("file")).unwrap();
+        for p in [root.join("dir/wl.txt"), root.join("file")] {
+            let err = open_beneath(&p, Operator::current()).unwrap_err();
+            assert!(err.contains("changed while it was being opened"), "{err}");
+        }
+        assert!(open_beneath(&root.join("sub/wl.txt"), Operator::current()).is_ok());
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
     #[test]
-    fn a_private_file_with_a_second_hard_link_is_refused_and_a_public_one_is_not() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = scratch_root("links");
-        let elsewhere = root.join("private.txt");
-        let named = root.join("wl.txt");
-        std::fs::write(&elsewhere, "secret\n").unwrap();
-        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o600)).unwrap();
-        std::fs::hard_link(&elsewhere, &named).unwrap();
-        let err = open_wordlist_in(named.to_str().unwrap(), &[root.clone()]).unwrap_err();
+    fn a_directory_that_belongs_to_another_account_is_refused() {
+        let me = Operator::current();
+        if me.uid == 0 {
+            // Root's own directories are trusted for every account.
+            return;
+        }
+        let root = scratch_root("owner");
+        let p = root.join("wl.txt");
+        std::fs::write(&p, "a\n").unwrap();
+        let someone_else = Operator {
+            uid: me.uid + 1,
+            private_gid: None,
+        };
+        let err = open_beneath(&p, someone_else).unwrap_err();
+        assert!(err.contains("belongs to another account"), "{err}");
+        assert!(open_beneath(&p, me).is_ok());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_write_is_trusted_only_for_the_accounts_private_group() {
+        use std::os::unix::fs::MetadataExt;
+        let root = scratch_root("group");
+        let dir = root.join("g");
+        std::fs::create_dir(&dir).unwrap();
+        chmod(&dir, 0o770);
+        let p = dir.join("wl.txt");
+        std::fs::write(&p, "a\n").unwrap();
+        let gid = std::fs::metadata(&dir).unwrap().gid();
+        let uid = Operator::current().uid;
+        let private = Operator {
+            uid,
+            private_gid: Some(gid),
+        };
+        assert!(open_beneath(&p, private).is_ok());
+        let shared = Operator {
+            uid,
+            private_gid: None,
+        };
+        let err = open_beneath(&p, shared).unwrap_err();
+        assert!(err.contains("can be written by other accounts"), "{err}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // In a directory other accounts can write, its names can change between any two
+    // looks at them, so nothing learned about the file found there would hold. The
+    // directory is refused, whatever its names point at from one moment to the next.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_others_can_write_is_refused_however_its_names_change() {
+        use std::io::Read;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let root = scratch_root("race");
+        let open = root.join("open");
+        std::fs::create_dir(&open).unwrap();
+        chmod(&open, 0o777);
+        let outside = scratch_root("race-outside");
+        let private = outside.join("private.txt");
+        std::fs::write(&private, "secret\n").unwrap();
+        chmod(&private, 0o600);
+        let wl = open.join("wl");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let changer = {
+            let (private, wl, stop) = (private.clone(), wl.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let _ = std::fs::hard_link(&private, &wl);
+                    let _ = std::fs::remove_file(&wl);
+                }
+            })
+        };
+        let (mut refused, mut leaked) = (0, None);
+        for _ in 0..2000 {
+            match open_wordlist_in(wl.to_str().unwrap(), &[root.clone()]) {
+                Ok((_, mut f)) => {
+                    let mut got = String::new();
+                    let _ = f.read_to_string(&mut got);
+                    if got.contains("secret") {
+                        leaked = Some(got);
+                        break;
+                    }
+                }
+                Err(e) if e.contains("can be written by other accounts") => refused += 1,
+                Err(_) => {}
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+        changer.join().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside);
+        assert_eq!(leaked, None, "read a file outside the roots");
+        assert!(refused > 0);
+    }
+
+    // A sticky directory every account can write, such as /tmp, is where the node
+    // hands wordlists over. Other accounts can add a hard link there but cannot remove
+    // one to a file they do not own, so a second link is a stable sign.
+    #[cfg(unix)]
+    #[test]
+    fn in_a_sticky_shared_directory_a_private_file_with_a_second_link_is_refused() {
+        let root = scratch_root("sticky");
+        let shared = root.join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        chmod(&shared, 0o1777);
+        let private = root.join("private.txt");
+        std::fs::write(&private, "secret\n").unwrap();
+        chmod(&private, 0o600);
+        let linked = shared.join("wl.txt");
+        std::fs::hard_link(&private, &linked).unwrap();
+        let err = open_wordlist_in(linked.to_str().unwrap(), &[root.clone()]).unwrap_err();
         assert!(err.contains("hard link"), "{err}");
-        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(open_wordlist_in(named.to_str().unwrap(), &[root.clone()]).is_ok());
+        // Outside a shared directory a second link changes nothing.
+        assert!(open_wordlist_in(private.to_str().unwrap(), &[root.clone()]).is_ok());
+        chmod(&private, 0o644);
+        assert!(open_wordlist_in(linked.to_str().unwrap(), &[root.clone()]).is_ok());
+        // A private file of its own, as the node writes, is read.
+        let single = shared.join("cfx-wl-1.txt");
+        std::fs::write(&single, "a\n").unwrap();
+        chmod(&single, 0o600);
+        assert!(open_wordlist_in(single.to_str().unwrap(), &[root.clone()]).is_ok());
         let _ = std::fs::remove_dir_all(root);
     }
 
