@@ -4246,8 +4246,10 @@ mod op_failure_tests {
             egress: st,
         };
         let mut data = data;
-        if data.get("wordlist_url").is_some() {
-            data["wordlist_url"] = json!(format!("{}/wl", platform.url));
+        for key in ["wordlist_url", "recurse_wordlist_url"] {
+            if data.get(key).is_some() {
+                data[key] = json!(format!("{}/wl", platform.url));
+            }
         }
         if let Some(first) = data.pointer_mut("/wordlists/0") {
             first["url"] = json!(format!("{}/wl", platform.url));
@@ -4360,40 +4362,109 @@ mod op_failure_tests {
 
     /// A downloaded wordlist used to be written to a fixed name in /tmp, following
     /// whatever was already there. One planted there as a link to another file must not
-    /// have that file overwritten.
+    /// have that file overwritten, whichever of the five downloads it is.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_downloaded_wordlist_is_not_written_through_a_planted_link() {
-        for (op_type, ext, engine, prefix) in [
-            ("subdomain-enum-ds", "voyage", "voyage", "cfx-wl-sub-"),
-            ("content-discovery-db", "mach", "ambulo", "cfx-wl-"),
-        ] {
+        let pid = std::process::id();
+        let wl = format!("planted-{pid}");
+        let cases = [
+            (
+                "subdomain-enum-ds",
+                "voyage",
+                "voyage",
+                format!("op-planted-sub-wl-{pid}"),
+                format!("cfx-wl-sub-{wl}.txt"),
+                json!({"domain": "example.test", "wordlists": [{"id": wl, "url": ""}]}),
+            ),
+            (
+                "subdomain-enum-ds",
+                "voyage",
+                "voyage",
+                format!("op-planted-sub-url-{pid}"),
+                format!("cfx-wl-sub-op-planted-sub-url-{pid}.txt"),
+                json!({"domain": "example.test", "wordlist_url": ""}),
+            ),
+            (
+                "content-discovery-db",
+                "mach",
+                "ambulo",
+                format!("op-planted-cd-wl-{pid}"),
+                format!("cfx-wl-{wl}.txt"),
+                json!({"url": "http://127.0.0.1:9/", "wordlists": [{"id": wl, "url": ""}]}),
+            ),
+            (
+                "content-discovery-db",
+                "mach",
+                "ambulo",
+                format!("op-planted-cd-url-{pid}"),
+                format!("cfx-wl-chunk-op-planted-cd-url-{pid}.txt"),
+                json!({"url": "http://127.0.0.1:9/", "wordlist_url": ""}),
+            ),
+            (
+                "content-discovery-db",
+                "mach",
+                "ambulo",
+                format!("op-planted-cd-rec-{pid}"),
+                format!("cfx-wl-recurse-op-planted-cd-rec-{pid}.txt"),
+                json!({
+                    "url": "http://127.0.0.1:9/",
+                    "wordlist_url": "",
+                    "recurse": true,
+                    "recurse_depth": 1,
+                    "recurse_wordlist_url": "",
+                }),
+            ),
+        ];
+        for (op_type, ext, engine, op_id, name, data) in cases {
             let scratch = tempfile::tempdir().unwrap();
             let victim = scratch.path().join("victim");
             std::fs::write(&victim, "kept\n").unwrap();
-            let id = format!("planted-{}-{op_type}", std::process::id());
-            let planted = std::path::PathBuf::from("/tmp").join(format!("{prefix}{id}.txt"));
+            let planted = std::path::PathBuf::from("/tmp").join(&name);
             let _ = std::fs::remove_file(&planted);
             std::os::unix::fs::symlink(&victim, &planted).unwrap();
-            let data = json!({
-                "domain": "example.test",
-                "url": "http://127.0.0.1:9/",
-                "wordlists": [{"id": id, "url": ""}],
-            });
-            let op_id = format!("op-planted-{op_type}");
             let (done, ..) = run_unreachable(&op_id, op_type, ext, data).await;
             let _ = std::fs::remove_file(&planted);
             assert_eq!(
                 std::fs::read_to_string(&victim).unwrap(),
                 "kept\n",
-                "{op_type} wrote its wordlist through a link it did not make"
+                "{op_type} wrote {name} through a link it did not make"
             );
             let why = done["error"].as_str().unwrap_or_default();
             assert!(
                 why.starts_with(&format!("{engine} daemon unreachable")),
-                "{op_type}: {done}"
+                "{op_type} {name}: {done}"
             );
         }
+    }
+
+    /// A wordlist that downloaded but could not be written fails the op with the reason,
+    /// rather than sending the engine a path to a file that is not the list. Here the
+    /// recursion list's name is one the op has already written.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_wordlist_that_could_not_be_written_fails_the_op() {
+        let op_id = format!("op-unwritten-{}", std::process::id());
+        let data = json!({
+            "url": "http://127.0.0.1:9/",
+            "wordlists": [{"id": format!("recurse-{op_id}"), "url": ""}],
+            "recurse": true,
+            "recurse_depth": 1,
+            "recurse_wordlist_url": "",
+        });
+        let (done, _, types, _) =
+            run_unreachable(&op_id, "content-discovery-db", "mach", data).await;
+        let _ = std::fs::remove_file(format!("/tmp/cfx-wl-recurse-{op_id}.txt"));
+        assert_eq!(done["code"], 1, "{done}");
+        let why = done["error"].as_str().unwrap_or_default();
+        assert!(
+            why.starts_with("the recursion wordlist could not be written for ambulo: "),
+            "{done}"
+        );
+        assert!(
+            !types.iter().any(|t| t == "operation_completed"),
+            "{types:?}"
+        );
     }
 }
 
