@@ -48,6 +48,11 @@ dialoguer = "0.11"
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["sink"] }
 
+[target.'cfg(unix)'.dependencies]
+# Handing the browser its DevTools pipe on fds 3 and 4.
+libc = "0.2"
+
 [dev-dependencies]
 # A recording SOCKS5 proxy and counting listeners for the egress tests.
 cfx_tunnel = { path = "../tunnel", features = ["recorder"] }
+

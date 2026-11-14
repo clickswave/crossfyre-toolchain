@@ -1131,7 +1131,7 @@ async fn run_browser_tier(
     };
     let no_sandbox =
         dguard::env_renamed("AMBULO_BROWSER_NO_SANDBOX", "MACH_BROWSER_NO_SANDBOX").is_some();
-    let browser = match crate::browser::Browser::launch(&exe, no_sandbox).await {
+    let (browser, mut cdp) = match crate::browser::Browser::launch(&exe, no_sandbox).await {
         Ok(b) => b,
         Err(e) => {
             let _ = tx.send(CrawlEvent::note(format!(
@@ -1141,18 +1141,6 @@ async fn run_browser_tier(
             return;
         }
     };
-    let mut cdp = match crate::browser::Cdp::connect(&browser.ws_url).await {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = tx.send(CrawlEvent::note(format!(
-                "the headless tier could not attach to the browser ({e}). Endpoints that only \
-                 exist once the application is running were NOT looked for in this crawl."
-            )));
-            browser.shutdown().await;
-            return;
-        }
-    };
-
     // The seed first, then the routes the static tiers recovered. Those routes
     // are the lazily-loaded sections - the admin area, the reports section - and
     // loading one makes the application fetch its own data, which is the whole

@@ -749,13 +749,6 @@ async fn prepare_scan(
     db: &Arc<AmbuloDb>,
     isolate: Option<&str>,
 ) -> Result<(Scanner, usize, i64), Box<dyn std::error::Error + Send + Sync>> {
-    // Every scan path reaches here, so this is the one place the wordlist has to
-    // be contained. `wordlist` is a filesystem path from the request and the
-    // scanner emits one request per line to a target the same request names,
-    // which made an arbitrary file readable one line at a time by anyone who
-    // could reach this daemon.
-    dguard::resolve_wordlist(&params.wordlist)?;
-
     let http_method = parse_method(&params.method);
 
     let mut endpoint = params.endpoint.clone();
@@ -772,6 +765,12 @@ async fn prepare_scan(
 
     let config = build_args(params, endpoint, http_method);
 
+    // Every scan path reaches here, so this is the one place the wordlist has to
+    // be contained. `wordlist` is a filesystem path from the request and the
+    // scanner emits one request per line to a target the same request names,
+    // which made an arbitrary file readable one line at a time by anyone who
+    // could reach this daemon. WordlistConfig opens it once, inside the
+    // permitted directories, and reads only through that handle.
     let wordlist_config = crate::libs::wordlist_config::WordlistConfig::new(&params.wordlist)
         .await
         .map_err(|e| format!("Wordlist error: {e}"))?;

@@ -590,11 +590,14 @@ async fn dispatch(req: DaemonRequest, db: Arc<VoyageDb>) -> DaemonResponse {
 /// `wordlist` is a path from the request, and the enum sends one DNS query per line for
 /// a domain the same request names, so without the check any file the daemon can read
 /// went out a line at a time to whoever answers for that domain.
-fn active_wordlist(params: &EnumParams) -> Result<Option<std::path::PathBuf>, String> {
+///
+/// Opened here, once, and read later through this handle: a name checked now and
+/// opened again after the passive sources have run can by then be another file.
+fn active_wordlist(params: &EnumParams) -> Result<Option<std::fs::File>, String> {
     if params.disable_active || params.wordlist.is_empty() {
         return Ok(None);
     }
-    dguard::resolve_wordlist(&params.wordlist).map(Some)
+    dguard::open_wordlist(&params.wordlist).map(|(_, file)| Some(file))
 }
 
 async fn prepare_enum(
@@ -652,8 +655,8 @@ async fn prepare_enum(
     }
 
     // Active wordlist - insert entries with status="queued"
-    if let Some(wordlist) = &wordlist {
-        let words = crate::libs::wordlist::read_lines(&wordlist.to_string_lossy())
+    if let Some(wordlist) = wordlist {
+        let words = crate::libs::wordlist::read_lines_from(wordlist)
             .await
             .map_err(|e| format!("Wordlist error: {e}"))?;
 
@@ -1277,6 +1280,31 @@ mod wordlist_tests {
             Ok(None)
         ));
         assert!(matches!(active_wordlist(&enum_params("", false)), Ok(None)));
+    }
+
+    // The enum reads its words after the passive sources have run, long after the
+    // check. What it reads then has to be the file that was checked, not whatever
+    // the name has been pointed at since.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_words_come_from_the_file_that_was_checked_not_from_its_name() {
+        let dir = std::env::temp_dir().join(format!("voyage-wl-swap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let wl = dir.join("wl.txt");
+        std::fs::write(&wl, "www\n").expect("write");
+        let opened = active_wordlist(&enum_params(&wl.to_string_lossy(), false))
+            .expect("contained")
+            .expect("active");
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"), &link)
+            .expect("symlink");
+        std::fs::rename(&link, &wl).expect("swap");
+        let words = crate::libs::wordlist::read_lines_from(opened)
+            .await
+            .expect("read");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(words, ["www"]);
     }
 }
 

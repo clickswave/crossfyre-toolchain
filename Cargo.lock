@@ -124,6 +124,7 @@ dependencies = [
  "dialoguer 0.11.0",
  "dirs 5.0.1",
  "futures-util",
+ "libc",
  "rand 0.9.5",
  "ratatui",
  "regex",
@@ -1460,6 +1461,7 @@ dependencies = [
 name = "dguard"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serde_json",
  "tokio",
 ]

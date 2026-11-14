@@ -1,4 +1,3 @@
-use crate::libs;
 use crate::libs::wordlist_config::WordlistConfig;
 use crate::scanner::{LogTotals, Logs, ScanResult, ScanResults};
 use sqlx::postgres::PgConnectOptions;
@@ -474,7 +473,7 @@ impl AmbuloDb {
         .fetch_one(&self.pool)
         .await?;
 
-        let words = libs::utils::read_lines(&wordlist_config.path).await?;
+        let words = wordlist_config.lines().await?;
         self.create_words(&wordlist.id, &words).await?;
 
         Ok(wordlist)

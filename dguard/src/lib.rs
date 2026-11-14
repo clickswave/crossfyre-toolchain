@@ -595,6 +595,94 @@ pub fn resolve_wordlist_in(
     ))
 }
 
+/// Open a caller-supplied wordlist once, refusing anything outside [`wordlist_roots`].
+///
+/// Returns the checked path and the handle every later read has to use. Checking a
+/// path and then opening it again by name is not containment: the name can be
+/// pointed somewhere else in between, and a FIFO in a shared temp directory holds
+/// the reader at exactly that point for as long as the sender likes. So the file
+/// is opened once, without following a final symlink and without blocking on a
+/// FIFO, and the handle is then checked rather than the name: it has to be a
+/// regular file, and the path resolved again afterwards has to be inside a root
+/// and name that same file.
+pub fn open_wordlist(wordlist: &str) -> Result<(std::path::PathBuf, std::fs::File), String> {
+    open_wordlist_in(wordlist, &wordlist_roots())
+}
+
+/// [`open_wordlist`] with the roots given rather than read from the environment.
+pub fn open_wordlist_in(
+    wordlist: &str,
+    roots: &[std::path::PathBuf],
+) -> Result<(std::path::PathBuf, std::fs::File), String> {
+    let real = resolve_wordlist_in(wordlist, roots)?;
+    let file = open_no_follow(&real)
+        .map_err(|e| format!("wordlist {} cannot be opened: {e}", real.display()))?;
+    verify_opened(&file, &real, wordlist, roots)?;
+    Ok((real, file))
+}
+
+#[cfg(unix)]
+fn open_no_follow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // O_NONBLOCK so that opening a FIFO returns at once instead of waiting for a
+    // writer; the handle is refused below. It changes nothing for a regular file.
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_no_follow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
+/// Whether `file`, opened from `real`, is the wordlist `wordlist` names and one this
+/// daemon may read.
+fn verify_opened(
+    file: &std::fs::File,
+    real: &std::path::Path,
+    wordlist: &str,
+    roots: &[std::path::PathBuf],
+) -> Result<(), String> {
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("wordlist {} cannot be read: {e}", real.display()))?;
+    if !meta.is_file() {
+        return Err(format!("wordlist {} is not a regular file", real.display()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // A directory on the way to the file can still have been swapped between the
+        // first check and the open. Resolving again now and comparing the file it
+        // names with the one that is open catches that, whichever way round it went.
+        let now = resolve_wordlist_in(wordlist, roots)?;
+        let named = std::fs::metadata(&now)
+            .map_err(|e| format!("wordlist {} cannot be read: {e}", now.display()))?;
+        if (named.dev(), named.ino()) != (meta.dev(), meta.ino()) {
+            return Err(format!(
+                "wordlist {} changed while it was being opened",
+                real.display()
+            ));
+        }
+        // A hard link gives a file a second name inside a root without moving it, and
+        // where hard links to other people's files are allowed (macOS, or Linux
+        // without fs.protected_hardlinks) that name could belong to anyone. A file
+        // with more than one name is read only when every user may read it anyway.
+        if meta.nlink() > 1 && meta.mode() & 0o004 == 0 {
+            return Err(format!(
+                "wordlist {} has more than one hard link and is not readable by everyone. \
+                 Copy it to a file of its own.",
+                real.display()
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (wordlist, roots);
+    Ok(())
+}
+
 #[cfg(test)]
 mod wordlist_tests {
     use super::*;
@@ -687,6 +775,93 @@ mod wordlist_tests {
     #[test]
     fn on_macos_the_node_s_hand_over_directory_is_a_root() {
         assert!(default_roots().contains(&std::path::PathBuf::from("/tmp")));
+    }
+
+    /// A fresh directory under the temp dir, used as the only root.
+    fn scratch_root(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("dguard-open-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::canonicalize(d).unwrap()
+    }
+
+    #[test]
+    fn a_regular_file_inside_a_root_opens_and_reads_through_the_handle() {
+        use std::io::Read;
+        let root = scratch_root("plain");
+        let p = root.join("wl.txt");
+        std::fs::write(&p, "admin\n").unwrap();
+        let (real, mut f) = open_wordlist_in(p.to_str().unwrap(), &[root.clone()]).unwrap();
+        assert_eq!(real, p);
+        let mut got = String::new();
+        f.read_to_string(&mut got).unwrap();
+        assert_eq!(got, "admin\n");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_directory_inside_a_root_is_not_a_wordlist() {
+        let root = scratch_root("dir");
+        let d = root.join("sub");
+        std::fs::create_dir(&d).unwrap();
+        let err = open_wordlist_in(d.to_str().unwrap(), &[root.clone()]).unwrap_err();
+        assert!(err.contains("not a regular file"), "{err}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // A FIFO holds whoever opens it until somebody writes, which is how the name was
+    // kept open to swapping between the check and the read. It is refused at once.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_refused_without_waiting_for_a_writer() {
+        let root = scratch_root("fifo");
+        let p = root.join("wl");
+        let c = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let err = open_wordlist_in(p.to_str().unwrap(), &[root.clone()]).unwrap_err();
+        assert!(err.contains("not a regular file"), "{err}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // The open handle has to be the file the path names once it is resolved again.
+    #[cfg(unix)]
+    #[test]
+    fn a_handle_that_is_not_the_file_the_path_now_names_is_refused() {
+        let root = scratch_root("swap");
+        let a = root.join("a.txt");
+        let b = root.join("b.txt");
+        std::fs::write(&a, "a\n").unwrap();
+        std::fs::write(&b, "b\n").unwrap();
+        let opened = std::fs::File::open(&b).unwrap();
+        let err = verify_opened(&opened, &a, a.to_str().unwrap(), &[root.clone()]).unwrap_err();
+        assert!(err.contains("changed while it was being opened"), "{err}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_private_file_with_a_second_hard_link_is_refused_and_a_public_one_is_not() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch_root("links");
+        let elsewhere = root.join("private.txt");
+        let named = root.join("wl.txt");
+        std::fs::write(&elsewhere, "secret\n").unwrap();
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::hard_link(&elsewhere, &named).unwrap();
+        let err = open_wordlist_in(named.to_str().unwrap(), &[root.clone()]).unwrap_err();
+        assert!(err.contains("hard link"), "{err}");
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(open_wordlist_in(named.to_str().unwrap(), &[root.clone()]).is_ok());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn opening_still_refuses_a_file_outside_every_root() {
+        let root = scratch_root("outside");
+        let outside = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+        let err = open_wordlist_in(outside, &[root.clone()]).unwrap_err();
+        assert!(err.contains(WORDLIST_ROOTS_ENV), "{err}");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

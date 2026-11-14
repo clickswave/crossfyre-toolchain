@@ -6,11 +6,18 @@ use std::io::BufRead;
 /// Read on the blocking pool with std's buffered reader, so the whole file is one
 /// task rather than an await per line. A file that is not UTF-8 is an error, never
 /// a list cut short at the bad byte.
+#[cfg(test)]
 pub async fn read_lines(file_path: &str) -> Result<Vec<String>, std::io::Error> {
-    let path = file_path.to_owned();
+    read_lines_from(std::fs::File::open(file_path)?).await
+}
+
+/// [`read_lines`] from a file that is already open, starting at its beginning
+/// whatever has been read from it before.
+pub async fn read_lines_from(mut file: std::fs::File) -> Result<Vec<String>, std::io::Error> {
     tokio::task::spawn_blocking(move || {
+        std::io::Seek::rewind(&mut file)?;
         let mut kept = Vec::new();
-        for line in std::io::BufReader::new(std::fs::File::open(path)?).lines() {
+        for line in std::io::BufReader::new(file).lines() {
             let line = line?;
             if !line.is_empty() {
                 kept.push(line);
