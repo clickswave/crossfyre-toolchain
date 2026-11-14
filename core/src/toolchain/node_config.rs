@@ -247,6 +247,11 @@ fn claim_record() -> io::Result<bool> {
 }
 
 /// The `.toml` files in `nodes_dir`, skipping what cannot be listed.
+///
+/// Also skipped, with a warning that quotes the path: a name holding a control
+/// character. Callers print these paths to the service's log, which is root's, and a
+/// line break in a name would write lines of its own there. The node scan never runs
+/// such a file either, since no node id holds one.
 fn configs_in(nodes_dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(nodes_dir) else {
         return Vec::new();
@@ -255,6 +260,14 @@ fn configs_in(nodes_dir: &Path) -> Vec<PathBuf> {
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("toml"))
+        .filter(|p| {
+            let name = p.file_name().unwrap_or_default().to_string_lossy();
+            let plain = !name.chars().any(char::is_control);
+            if !plain {
+                eprintln!("[node] WARNING: skipping {p:?}: not a node config's name");
+            }
+            plain
+        })
         .collect()
 }
 
@@ -607,6 +620,35 @@ mod tests {
 
         assert_eq!(mode(&later), 0o666, "a later file was taken over");
         assert!(read(&later).is_err(), "a later file was accepted");
+    }
+
+    /// The take-over runs as root and prints each config's path to the service's log.
+    /// A file name with a line break in it would write lines of its own there, so such
+    /// a file is left alone, as the node scan leaves it.
+    #[test]
+    fn a_take_over_skips_a_config_whose_name_holds_a_control_character() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let nodes = t.path().join("nodes.d");
+        fs::create_dir(&nodes).unwrap();
+        let ok = nodes.join("ok.toml");
+        let odd = [
+            nodes.join("x\ninjected line\n#.toml"),
+            nodes.join("tab\there.toml"),
+            nodes.join("esc\u{1b}[2J.toml"),
+        ];
+        for p in std::iter::once(&ok).chain(&odd) {
+            fs::write(p, A_CONFIG).unwrap();
+            fs::set_permissions(p, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        let _root = super::super::sudo_user::act_as_root();
+        let _trusted = imp::trust_self();
+        settle(&nodes, || claim(&t.path().join("taken-over")), || true).unwrap();
+
+        assert_eq!(mode(&ok), 0o600, "the plain config was not taken over");
+        for p in &odd {
+            assert_eq!(mode(p), 0o644, "{p:?} was taken over");
+        }
     }
 
     /// On a host where no node service ran configs as root before (a new install, or
