@@ -577,20 +577,73 @@ mod create_dir_tests {
 }
 
 /// Makes `link` a junction to the directory `target`, as any account can without
-/// elevation.
+/// elevation. Made here rather than by `mklink /J`, so tests that run beside it see no
+/// child process start while their sockets are open.
 #[cfg(all(test, windows))]
 pub(crate) fn junction(link: &std::path::Path, target: &std::path::Path) {
-    let out = std::process::Command::new("cmd")
-        .args(["/c", "mklink", "/J"])
-        .arg(link)
-        .arg(target)
-        .output()
-        .expect("cmd");
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00A4;
+    const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+
+    let target = std::path::absolute(target).expect("absolute target");
+    let wide = |s: &std::ffi::OsStr| s.encode_wide().collect::<Vec<u16>>();
+    let print = wide(target.as_os_str());
+    let mut substitute = wide(std::ffi::OsStr::new("\\??\\"));
+    substitute.extend_from_slice(&print);
+    // The mount point's fields: the two names' offsets and lengths, then both names,
+    // each followed by a NUL.
+    let sub_bytes = (substitute.len() * 2) as u16;
+    let print_bytes = (print.len() * 2) as u16;
+    let mut names: Vec<u16> = substitute.clone();
+    names.push(0);
+    names.extend_from_slice(&print);
+    names.push(0);
+    let data_len = (8 + names.len() * 2) as u16;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(&IO_REPARSE_TAG_MOUNT_POINT.to_le_bytes());
+    buf.extend_from_slice(&data_len.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&sub_bytes.to_le_bytes());
+    buf.extend_from_slice(&(sub_bytes + 2).to_le_bytes());
+    buf.extend_from_slice(&print_bytes.to_le_bytes());
+    for c in names {
+        buf.extend_from_slice(&c.to_le_bytes());
+    }
+
+    std::fs::create_dir(link).expect("junction directory");
+    let dir = std::fs::OpenOptions::new()
+        .access_mode(FILE_GENERIC_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(link)
+        .expect("open junction directory");
+    let mut returned = 0u32;
+    // SAFETY: `buf` is a whole mount point reparse buffer of the length given, and the
+    // handle is open for writing.
+    let ok = unsafe {
+        DeviceIoControl(
+            dir.as_raw_handle(),
+            FSCTL_SET_REPARSE_POINT,
+            buf.as_ptr().cast(),
+            buf.len() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
     assert!(
-        out.status.success(),
-        "mklink /J {}: {}",
+        ok != 0,
+        "junction {} -> {}: {}",
         link.display(),
-        String::from_utf8_lossy(&out.stdout)
+        target.display(),
+        std::io::Error::last_os_error()
     );
 }
 
@@ -609,6 +662,18 @@ mod elevated_link_tests {
         fs::create_dir(&data).expect("data");
         junction(&data.join("nodes.d"), &victim);
         (t, data, victim)
+    }
+
+    // Every test here is only as good as the junction it makes.
+    #[test]
+    fn a_junction_made_for_a_test_leads_to_its_target() {
+        use std::os::windows::fs::MetadataExt;
+        let (_t, data, victim) = linked_tree();
+        let link = data.join("nodes.d");
+        let attributes = fs::symlink_metadata(&link).expect("link").file_attributes();
+        assert_ne!(attributes & 0x400, 0, "not a reparse point");
+        fs::write(link.join("through"), "x").expect("write through");
+        assert!(victim.join("through").exists());
     }
 
     #[test]
