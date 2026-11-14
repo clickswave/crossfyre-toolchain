@@ -291,21 +291,61 @@ pub fn is_extension_installed(ext: &str) -> bool {
 }
 
 pub fn load_config() -> Result<ToolchainConfig, Box<dyn std::error::Error>> {
-    let path = get_config_path();
+    load_config_at(&get_config_path())
+}
+
+pub(crate) fn load_config_at(
+    path: &std::path::Path,
+) -> Result<ToolchainConfig, Box<dyn std::error::Error>> {
     let contents = fs::read_to_string(path)?;
     let config: ToolchainConfig = toml::from_str(&contents)?;
     Ok(config)
 }
 
 pub fn save_config(config: &ToolchainConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let dir = get_toolchain_dir();
-    super::sudo_user::create_dir_all_for_invoking_user(&dir)?;
+    save_config_at(&get_config_path(), config)
+}
 
-    let path = get_config_path();
+/// The file holds the database password, so it is written owner-only. The engine
+/// daemons that read it run as the same account the file is handed back to.
+pub(crate) fn save_config_at(
+    path: &std::path::Path,
+    config: &ToolchainConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(dir) = path.parent() {
+        super::sudo_user::create_dir_all_for_invoking_user(dir)?;
+    }
     let toml_string = toml::to_string(config)?;
-    fs::write(&path, toml_string)?;
-    super::sudo_user::chown_to_invoking_user(&path);
+    crate::write_secret_file(path, &toml_string)?;
+    super::sudo_user::chown_to_invoking_user(path);
     Ok(())
+}
+
+/// A new random password for the toolchain database: 32 bytes as hex.
+pub fn new_postgres_password() -> Result<String, Box<dyn std::error::Error>> {
+    let mut b = [0u8; 32];
+    getrandom::fill(&mut b).map_err(|e| format!("no randomness for a database password: {e}"))?;
+    Ok(b.iter().map(|x| format!("{x:02x}")).collect())
+}
+
+/// The config at `path` with a database password, generating and saving one if the
+/// file has none. The flag says whether one was generated, which means anything
+/// that read the file earlier (the engine daemons) still holds the old settings.
+pub(crate) fn ensure_postgres_password_at(
+    path: &std::path::Path,
+) -> Result<(ToolchainConfig, bool), Box<dyn std::error::Error>> {
+    let mut config = load_config_at(path)?;
+    if config
+        .postgres
+        .password
+        .as_deref()
+        .is_some_and(|p| !p.is_empty())
+    {
+        return Ok((config, false));
+    }
+    config.postgres.password = Some(new_postgres_password()?);
+    save_config_at(path, &config)?;
+    Ok((config, true))
 }
 
 /// Resolve an extension daemon's port from `config.toml`, falling back to the
@@ -402,15 +442,24 @@ pub fn rewrite_legacy_keys(path: &std::path::Path) -> Result<bool, Box<dyn std::
 /// Defaults are sane for a single-host install; operators can edit
 /// `config.toml` afterwards to point at an external Postgres.
 pub fn load_or_create_config() -> Result<ToolchainConfig, Box<dyn std::error::Error>> {
-    if !get_config_path().exists() {
-        let config = ToolchainConfig::default();
-        save_config(&config)?;
+    load_or_create_config_at(&get_config_path())
+}
+
+/// A new file gets a generated database password, so the container `crossfyre db up`
+/// makes from it, and the engines that read it, never run without one.
+pub(crate) fn load_or_create_config_at(
+    path: &std::path::Path,
+) -> Result<ToolchainConfig, Box<dyn std::error::Error>> {
+    if !path.exists() {
+        let mut config = ToolchainConfig::default();
+        config.postgres.password = Some(new_postgres_password()?);
+        save_config_at(path, &config)?;
         println!(
             "[config] Wrote default toolchain config: {}",
-            get_config_path().display()
+            path.display()
         );
     }
-    load_config()
+    load_config_at(path)
 }
 
 #[cfg(test)]
@@ -553,5 +602,72 @@ mod tests {
             let p = ExtensionPorts::from_entries_in(RENAMED, order.clone());
             assert_eq!(p.get("cortex"), 5002, "{order:?}");
         }
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn a_new_config_has_a_database_password_and_is_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = load_or_create_config_at(&path).unwrap();
+        let pw = cfg.postgres.password.expect("a generated password");
+        assert_eq!(pw.len(), 64);
+        assert!(pw.chars().all(|c| c.is_ascii_hexdigit()));
+        #[cfg(unix)]
+        assert_eq!(mode(&path), 0o600);
+        // The next load reads it back rather than making another.
+        assert_eq!(
+            load_or_create_config_at(&path).unwrap().postgres.password,
+            Some(pw)
+        );
+    }
+
+    #[test]
+    fn a_config_without_a_password_gets_one_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[postgres]\nhost = \"localhost\"\nport = 4440\nuser = \"postgres\"\n\
+             db_name = \"crossfyre\"\n\n[container]\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let (cfg, generated) = ensure_postgres_password_at(&path).unwrap();
+        assert!(generated);
+        let pw = cfg.postgres.password.expect("a password");
+        assert_eq!(
+            load_config_at(&path).unwrap().postgres.password,
+            Some(pw.clone())
+        );
+        #[cfg(unix)]
+        assert_eq!(mode(&path), 0o600, "tightened when the password went in");
+        let (again, generated) = ensure_postgres_password_at(&path).unwrap();
+        assert!(!generated);
+        assert_eq!(again.postgres.password, Some(pw));
+    }
+
+    #[test]
+    fn an_operator_password_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[postgres]\nhost = \"db.internal\"\nport = 5432\nuser = \"cfx\"\n\
+             password = \"mine\"\ndb_name = \"crossfyre\"\n\n[container]\n",
+        )
+        .unwrap();
+        let (cfg, generated) = ensure_postgres_password_at(&path).unwrap();
+        assert!(!generated);
+        assert_eq!(cfg.postgres.password.as_deref(), Some("mine"));
     }
 }
