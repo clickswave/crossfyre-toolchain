@@ -6,8 +6,8 @@
 //! and what comes back is published as the scan's results, so the node sends only to a
 //! listener that runs as the account the engines run as, or as root. On Linux the
 //! kernel says who owns the engine's end of a connection. Elsewhere it cannot be asked
-//! this way, nor on a Linux whose tables list no sockets, and the connection is used as
-//! it always was.
+//! this way, nor on a Linux whose tables list no sockets at all, and the connection is
+//! used as it always was.
 
 use std::io;
 use std::net::SocketAddr;
@@ -161,13 +161,17 @@ fn owners(ends: (SocketAddr, SocketAddr)) -> Owners {
     listed(&tables, ends)
 }
 
-/// [`owners`] from the kernel's tcp `tables`.
+/// [`owners`] from the kernel's tcp `tables`, those of them that could be read.
 #[cfg(any(test, target_os = "linux"))]
 fn listed(tables: &[String], (local, peer): (SocketAddr, SocketAddr)) -> Owners {
-    // This end is listed before the connect returns. A kernel that lists not even this
-    // one lists no sockets at all, as on WSL 1 and in some sandboxes, and cannot be
-    // asked who listens: the listener is taken as on the systems without these tables.
-    if tables.iter().all(|t| owners_in(t, local, peer).is_empty()) {
+    // A kernel whose tables list no sockets at all, not even this end's, as on WSL 1
+    // and in some sandboxes, cannot be asked who listens: the listener is taken as on
+    // the systems without these tables. Tables that could not be read, or that list
+    // other sockets but neither end of this one, say nothing, and nothing is taken on
+    // their word: the engine's end shows as unlisted, which is asked again and then
+    // refused.
+    let no_sockets = |t: &String| t.lines().skip(1).all(|l| l.trim().is_empty());
+    if !tables.is_empty() && tables.iter().all(no_sockets) {
         return None;
     }
     Some(
@@ -261,7 +265,7 @@ mod tests {
         );
         // WSL 1 and some sandboxes list no sockets at all, not even this end.
         assert_eq!(listed(&[header.into(), header.into()], ends), None);
-        assert_eq!(listed(&[], ends), None);
+        assert_eq!(listed(&[header.into()], ends), None);
         // This end is listed and the engine's is not: that is a listener with no owner.
         let ours = format!(
             "{header}   0: 0100007F:A028 0100007F:115D 01 00000000:00000000 00:00000000 00000000  1000        0 3 1 0\n"
@@ -271,6 +275,26 @@ mod tests {
             "{ours}   1: 0100007F:115D 0100007F:A028 01 00000000:00000000 00:00000000 00000000  1001        0 2 1 0\n"
         );
         assert_eq!(listed(&[header.into(), both], ends), Some(vec![1001]));
+    }
+
+    #[cfg(target_endian = "little")]
+    #[test]
+    fn tables_that_say_nothing_of_this_connection_refuse_it() {
+        let header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+        let ends: (SocketAddr, SocketAddr) = (
+            "127.0.0.1:41000".parse().unwrap(),
+            "127.0.0.1:4445".parse().unwrap(),
+        );
+        // Neither table could be read: nothing says who listens, so no one is taken.
+        assert_eq!(listed(&[], ends), Some(vec![]));
+        // The tables list sockets but neither end of this one, as when a read misses
+        // entries that move while it runs: that is asked again, not taken.
+        let elsewhere = format!(
+            "{header}   0: 0100007F:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 9 1 0\n"
+        );
+        assert_eq!(listed(&[elsewhere.clone()], ends), Some(vec![]));
+        assert_eq!(listed(&[elsewhere, header.into()], ends), Some(vec![]));
+        assert_eq!(owned_by(Some(vec![]), &[0, 1000]), Err(Unlisted));
     }
 
     #[test]

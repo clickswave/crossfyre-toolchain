@@ -4468,7 +4468,8 @@ mod op_failure_tests {
     }
 }
 
-#[cfg(test)]
+/// Linux only: elsewhere the kernel is not asked who owns an engine's port.
+#[cfg(all(test, target_os = "linux"))]
 mod impostor_engine_tests {
     use super::*;
     use egress::state::EgressState;
@@ -4577,7 +4578,6 @@ mod impostor_engine_tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn no_op_is_sent_to_a_listener_another_account_owns() {
         let cases = [
@@ -4639,7 +4639,6 @@ mod impostor_engine_tests {
 
     /// The heartbeat used to call any listener a running engine, so the dashboard showed
     /// the node healthy while an impostor held the port.
-    #[cfg(target_os = "linux")]
     #[test]
     fn the_heartbeat_does_not_call_an_impostor_a_running_engine() {
         let imp = impostor();
@@ -4649,7 +4648,6 @@ mod impostor_engine_tests {
     }
 
     /// Nor does it ask the impostor whether it sends through the proxy and believe it.
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn the_egress_question_is_not_put_to_an_impostor() {
         let imp = impostor();
