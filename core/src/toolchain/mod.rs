@@ -19,6 +19,8 @@ pub mod oast;
 pub mod packaging;
 pub mod rcfile;
 pub mod release_sig;
+#[cfg(unix)]
+pub mod root_fs;
 pub mod service;
 pub mod status;
 pub mod sudo_user;

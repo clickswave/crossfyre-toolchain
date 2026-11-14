@@ -990,7 +990,7 @@ mod node {
         // replace.
         super::root_may_run(&super::node_binary())?;
         let logs = data_dir.join("logs");
-        fs::create_dir_all(&logs)?;
+        super::super::sudo_user::create_dir_all_for_invoking_user(&logs)?;
         super::super::sudo_user::chown_to_invoking_user(&logs);
         let body = super::node_plist(
             &super::node_binary(),
@@ -1123,8 +1123,8 @@ mod node {
 mod imp {
     use super::super::config::ext_bin_path;
     use super::super::sudo_user::{
-        chown_to_invoking_user, cmd_as_invoking_user, create_dir_all_for_invoking_user,
-        invoking_user_home,
+        cmd_as_invoking_user, create_dir_all_for_invoking_user, invoking_user_home,
+        write_for_invoking_user,
     };
     use std::fs;
 
@@ -1176,9 +1176,10 @@ mod imp {
         let dir = unit_dir();
         let svc = service_name(super::super::public_name(ext));
         create_dir_all_for_invoking_user(&dir)?;
-        fs::write(dir.join(&svc), unit_body(ext))?;
-        // Written into the user's home as root - chown it back.
-        chown_to_invoking_user(&dir);
+        // Written into the user's home as root, and handed back to them. Only this one
+        // file: the rest of this directory holds the person's own units, and the ones
+        // they enabled are links to files their packages own.
+        write_for_invoking_user(&dir.join(&svc), unit_body(ext).as_bytes(), 0o644)?;
         let _ = cmd_as_invoking_user("systemctl")
             .args(["--user", "daemon-reload"])
             .status();
@@ -1249,8 +1250,8 @@ mod imp {
 #[cfg(target_os = "macos")]
 mod imp {
     use super::super::sudo_user::{
-        chown_to_invoking_user, create_dir_all_for_invoking_user, invoking_user_home,
-        sudo_user_info,
+        create_dir_all_for_invoking_user, invoking_user_home, sudo_user_info,
+        write_for_invoking_user,
     };
     use super::launchd;
     use std::fs;
@@ -1290,9 +1291,8 @@ mod imp {
             key,
             &logs.join(format!("{key}.log")),
         );
-        fs::write(plist_path(key), body)?;
-        // Written into the user's home as root - chown it back.
-        chown_to_invoking_user(&dir);
+        // Written into the user's home as root, and handed back to them.
+        write_for_invoking_user(&plist_path(key), body.as_bytes(), 0o644)?;
         // Off until `enable`, as a new unit is. A plist in LaunchAgents is otherwise
         // loaded at the user's next login.
         if fresh {

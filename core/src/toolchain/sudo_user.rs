@@ -158,7 +158,15 @@ pub fn first_missing(dir: &std::path::Path) -> Option<std::path::PathBuf> {
 /// Under sudo, creating `~/Library/LaunchAgents/` or `~/.config/crossfyre/toolchain/`
 /// made each missing level root's, and handing back only the last one left the rest
 /// root-owned in the person's home. Directories that were already there keep their owner.
+///
+/// As root, no link below a directory another account can change is followed: see
+/// [`super::root_fs`].
 pub fn create_dir_all_for_invoking_user(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if root_guards() {
+        let owner = sudo_user_info().map(|(uid, gid, _, _)| (uid, gid));
+        return super::root_fs::create_dir_all(dir, owner);
+    }
     let top = first_missing(dir);
     std::fs::create_dir_all(dir)?;
     if let Some(top) = top {
@@ -171,6 +179,9 @@ pub fn create_dir_all_for_invoking_user(dir: &std::path::Path) -> std::io::Resul
 /// any failures are logged to stderr but don't abort the caller. We use
 /// this after writing things into the user's home so the user can read /
 /// edit them later without sudo.
+///
+/// Links in the tree are left alone, as are files with a second name elsewhere: see
+/// [`super::root_fs::chown_tree`].
 #[cfg(unix)]
 pub fn chown_to_invoking_user(path: &std::path::Path) {
     let Some((uid, gid, _, _)) = sudo_user_info() else {
@@ -183,26 +194,274 @@ pub fn chown_to_invoking_user(_path: &std::path::Path) {}
 
 #[cfg(unix)]
 fn chown_recursive(path: &std::path::Path, uid: u32, gid: u32) {
-    use std::ffi::CString;
-    if let Ok(cpath) = CString::new(path.to_string_lossy().as_bytes()) {
-        unsafe {
-            // errno symbol differs by libc (__errno_location on Linux,
-            // __error on macOS); last_os_error() is portable across both.
-            if libc::chown(cpath.as_ptr(), uid, gid) != 0 {
-                eprintln!(
-                    "[!] chown {} failed: {}",
-                    path.display(),
-                    std::io::Error::last_os_error()
-                );
-            }
-        }
-    }
-    if path.is_dir()
-        && let Ok(rd) = std::fs::read_dir(path)
+    if let Err(e) = super::root_fs::chown_tree(path, uid, gid)
+        && e.kind() != std::io::ErrorKind::NotFound
     {
-        for entry in rd.flatten() {
-            chown_recursive(&entry.path(), uid, gid);
+        eprintln!("[!] chown {} failed: {e}", path.display());
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static ACT_AS_ROOT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this process runs as root, and so must not follow links in a tree another
+/// account can change.
+pub(crate) fn root_guards() -> bool {
+    #[cfg(test)]
+    if ACT_AS_ROOT.with(|c| c.get()) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// Makes [`root_guards`] true on this thread until dropped, so a test can take the
+/// paths a root process takes without being root.
+#[cfg(test)]
+pub(crate) struct ActAsRoot;
+
+#[cfg(test)]
+pub(crate) fn act_as_root() -> ActAsRoot {
+    ACT_AS_ROOT.with(|c| c.set(true));
+    ActAsRoot
+}
+
+#[cfg(test)]
+impl Drop for ActAsRoot {
+    fn drop(&mut self) {
+        ACT_AS_ROOT.with(|c| c.set(false));
+    }
+}
+
+/// Write `contents` to `path`, owned by the invoking user.
+///
+/// As root this replaces whatever is at `path` with a new file of `mode`, and refuses a
+/// link anywhere below a directory another account can change; see
+/// [`super::root_fs::replace_file`]. Otherwise it is a plain write, and `mode` applies
+/// only when the file is new, so a person's own symlinked config keeps working.
+pub fn write_for_invoking_user(
+    path: &std::path::Path,
+    contents: &[u8],
+    mode: u32,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        if root_guards() {
+            let owner = sudo_user_info().map(|(uid, gid, _, _)| (uid, gid));
+            return super::root_fs::replace_file(path, contents, mode, owner);
         }
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(mode)
+            .open(path)?;
+        f.write_all(contents)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+        std::fs::write(path, contents)
+    }
+}
+
+/// Rename `from` to `to`. As root, a link below a directory another account can change
+/// is not followed on the way to either.
+pub fn rename(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if root_guards() {
+        return super::root_fs::rename(from, to);
+    }
+    std::fs::rename(from, to)
+}
+
+/// Read `path` as text. As root, a link below a directory another account can change
+/// is refused, as is anything but a regular file.
+pub fn read_to_string(path: &std::path::Path) -> std::io::Result<String> {
+    #[cfg(unix)]
+    if root_guards() {
+        return super::root_fs::read_to_string(path);
+    }
+    std::fs::read_to_string(path)
+}
+
+#[cfg(all(test, unix))]
+mod root_link_tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::{MetadataExt, symlink};
+
+    /// A group this account belongs to other than its current one, so a test can see
+    /// a chown land without being root. None on a host where it has only one.
+    fn other_gid() -> Option<u32> {
+        let mut groups = vec![0 as libc::gid_t; 256];
+        let n = unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
+        if n < 0 {
+            return None;
+        }
+        let own = unsafe { libc::getegid() };
+        groups[..n as usize].iter().copied().find(|g| *g != own)
+    }
+
+    #[test]
+    fn a_root_write_replaces_a_planted_link_and_leaves_its_target_alone() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let victim = t.path().join("victim");
+        fs::write(&victim, "root's file\n").expect("victim");
+        let tree = t.path().join("nodes.d");
+        fs::create_dir(&tree).expect("tree");
+        let pid = tree.join("zz.pid");
+        symlink(&victim, &pid).expect("link");
+
+        let _root = act_as_root();
+        write_for_invoking_user(&pid, b"4242", 0o644).expect("write");
+
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "root's file\n");
+        let meta = fs::symlink_metadata(&pid).unwrap();
+        assert!(meta.file_type().is_file(), "the link is still there");
+        assert_eq!(fs::read_to_string(&pid).unwrap(), "4242");
+    }
+
+    #[test]
+    fn a_root_write_replaces_a_hard_link_and_leaves_the_other_name_alone() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let victim = t.path().join("victim");
+        fs::write(&victim, "root's file\n").expect("victim");
+        let tree = t.path().join("nodes.d");
+        fs::create_dir(&tree).expect("tree");
+        let cfg = tree.join("zz.toml");
+        fs::hard_link(&victim, &cfg).expect("hard link");
+
+        let _root = act_as_root();
+        write_for_invoking_user(&cfg, b"api_key = \"k\"\n", 0o600).expect("write");
+
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "root's file\n");
+        assert_eq!(fs::read_to_string(&cfg).unwrap(), "api_key = \"k\"\n");
+    }
+
+    #[test]
+    fn a_root_write_will_not_pass_through_a_linked_directory() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let etc = t.path().join("etc");
+        fs::create_dir(&etc).expect("etc");
+        fs::write(etc.join("config.toml"), "root's config\n").expect("config");
+        let home = t.path().join("home");
+        fs::create_dir(&home).expect("home");
+        symlink(&etc, home.join("nodes.d")).expect("link");
+
+        let _root = act_as_root();
+        let r = write_for_invoking_user(&home.join("nodes.d/config.toml"), b"x", 0o600);
+
+        assert!(r.is_err(), "wrote through a linked directory");
+        assert_eq!(
+            fs::read_to_string(etc.join("config.toml")).unwrap(),
+            "root's config\n"
+        );
+    }
+
+    #[test]
+    fn creating_directories_as_root_will_not_pass_through_a_link() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let etc = t.path().join("etc");
+        fs::create_dir(&etc).expect("etc");
+        let home = t.path().join("home");
+        fs::create_dir(&home).expect("home");
+        symlink(&etc, home.join("crossfyre")).expect("link");
+
+        let _root = act_as_root();
+        let r = create_dir_all_for_invoking_user(&home.join("crossfyre/toolchain/logs"));
+
+        assert!(r.is_err(), "created directories through a link");
+        assert!(!etc.join("toolchain").exists());
+    }
+
+    #[test]
+    fn the_tree_chown_leaves_files_behind_links_alone() {
+        let Some(gid) = other_gid() else {
+            eprintln!("skipped: this account is in only one group");
+            return;
+        };
+        let uid = unsafe { libc::geteuid() };
+        let t = tempfile::tempdir().expect("tempdir");
+        let outside_dir = t.path().join("etc");
+        fs::create_dir(&outside_dir).expect("etc");
+        let outside_file = outside_dir.join("shadow");
+        fs::write(&outside_file, "x").expect("file");
+        let preload = t.path().join("ld.so.preload");
+        fs::write(&preload, "x").expect("file");
+        let before_dir = fs::metadata(&outside_dir).unwrap().gid();
+        let before_file = fs::metadata(&outside_file).unwrap().gid();
+        let before_preload = fs::metadata(&preload).unwrap().gid();
+
+        let tree = t.path().join("crossfyre");
+        fs::create_dir_all(tree.join("nodes.d")).expect("tree");
+        let own = tree.join("nodes.d/a.toml");
+        fs::write(&own, "x").expect("own");
+        symlink(&outside_dir, tree.join("nodes.d/e")).expect("dir link");
+        symlink(&preload, tree.join("nodes.d/zz.pid")).expect("file link");
+
+        chown_recursive(&tree, uid, gid);
+
+        assert_eq!(
+            fs::metadata(&own).unwrap().gid(),
+            gid,
+            "the tree itself was not chowned"
+        );
+        assert_eq!(fs::metadata(&outside_dir).unwrap().gid(), before_dir);
+        assert_eq!(fs::metadata(&outside_file).unwrap().gid(), before_file);
+        assert_eq!(fs::metadata(&preload).unwrap().gid(), before_preload);
+    }
+
+    #[test]
+    fn the_tree_chown_leaves_a_hard_linked_file_alone() {
+        let Some(gid) = other_gid() else {
+            eprintln!("skipped: this account is in only one group");
+            return;
+        };
+        let uid = unsafe { libc::geteuid() };
+        let t = tempfile::tempdir().expect("tempdir");
+        let victim = t.path().join("sudoers");
+        fs::write(&victim, "x").expect("file");
+        let before = fs::metadata(&victim).unwrap().gid();
+        let tree = t.path().join("crossfyre");
+        fs::create_dir(&tree).expect("tree");
+        fs::hard_link(&victim, tree.join("s.toml")).expect("hard link");
+
+        chown_recursive(&tree, uid, gid);
+
+        assert_eq!(fs::metadata(&victim).unwrap().gid(), before);
+    }
+
+    /// A start point that is itself a link is not followed either: the data dir the
+    /// root service is pointed at sits in the operator's home.
+    #[test]
+    fn the_tree_chown_does_not_follow_a_link_at_its_root() {
+        let Some(gid) = other_gid() else {
+            eprintln!("skipped: this account is in only one group");
+            return;
+        };
+        let uid = unsafe { libc::geteuid() };
+        let t = tempfile::tempdir().expect("tempdir");
+        let etc = t.path().join("etc");
+        fs::create_dir(&etc).expect("etc");
+        fs::write(etc.join("passwd"), "x").expect("file");
+        let before = fs::metadata(etc.join("passwd")).unwrap().gid();
+        let start = t.path().join("logs");
+        symlink(&etc, &start).expect("link");
+
+        chown_recursive(&start, uid, gid);
+
+        assert_eq!(fs::metadata(etc.join("passwd")).unwrap().gid(), before);
     }
 }
 

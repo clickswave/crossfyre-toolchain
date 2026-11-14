@@ -865,9 +865,16 @@ pub fn nodes_dir(base: &std::path::Path) -> std::path::PathBuf {
 ///
 /// The permissions are set before the bytes land where possible, so there is no
 /// window in which the file exists with the secret in it and the wider mode.
+///
+/// Run as root, it writes through [`toolchain::sudo_user::write_for_invoking_user`],
+/// which replaces the file rather than writing into whatever `path` names and hands it
+/// to the invoking user.
 pub fn write_secret_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     {
+        if toolchain::sudo_user::root_guards() {
+            return toolchain::sudo_user::write_for_invoking_user(path, contents.as_bytes(), 0o600);
+        }
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let mut f = fs::OpenOptions::new()
@@ -898,9 +905,21 @@ pub fn write_secret_file(path: &std::path::Path, contents: &str) -> std::io::Res
 #[cfg(unix)]
 pub fn repair_secret_file_mode(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
-    let Ok(meta) = fs::metadata(path) else { return };
+    // Through the file's own fd, opened without following a link when root: a chmod by
+    // path would land on whatever a link there names.
+    let file = if toolchain::sudo_user::root_guards() {
+        toolchain::root_fs::open_file(path)
+    } else {
+        fs::File::open(path)
+    };
+    let Ok(file) = file else { return };
+    let Ok(meta) = file.metadata() else { return };
     let mode = meta.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 && fs::set_permissions(path, fs::Permissions::from_mode(0o600)).is_ok() {
+    if mode & 0o077 != 0
+        && file
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .is_ok()
+    {
         eprintln!(
             "[security] {} was mode {:o} (group/other readable) and holds node \
              credentials; tightened to 600. Rotate this node's key if the host \
@@ -944,7 +963,9 @@ pub fn discover_nodes(base: &std::path::Path) -> Result<Vec<String>, Box<dyn std
         };
         // Validate it parses as a node config so `--boot` doesn't spawn a
         // daemon that's just going to die on a malformed file.
-        match fs::read_to_string(&path)
+        // As root, through a reader that refuses a link: the operator owns nodes.d, and
+        // the error below would print part of whatever file a link here named.
+        match toolchain::sudo_user::read_to_string(&path)
             .map_err(|e| e.to_string())
             .and_then(|s| toml::from_str::<Config>(&s).map_err(|e| e.to_string()))
         {
@@ -965,7 +986,7 @@ pub fn migrate_legacy_config(base: &std::path::Path) {
     if !legacy.is_file() {
         return;
     }
-    let Ok(text) = fs::read_to_string(&legacy) else {
+    let Ok(text) = toolchain::sudo_user::read_to_string(&legacy) else {
         return;
     };
     let Ok(cfg) = toml::from_str::<Config>(&text) else {
@@ -975,15 +996,15 @@ pub fn migrate_legacy_config(base: &std::path::Path) {
     if paths.config.exists() {
         return; // already migrated
     }
-    if let Err(e) = fs::create_dir_all(nodes_dir(base)) {
+    if let Err(e) = toolchain::sudo_user::create_dir_all_for_invoking_user(&nodes_dir(base)) {
         eprintln!("[migrate] Could not create nodes.d: {e}");
         return;
     }
-    if fs::rename(&legacy, &paths.config).is_ok() {
+    if toolchain::sudo_user::rename(&legacy, &paths.config).is_ok() {
         println!("[migrate] Moved legacy config.toml -> {:?}", paths.config);
         let legacy_net = base.join("network");
         if legacy_net.is_dir() && !paths.network_dir.exists() {
-            let _ = fs::rename(&legacy_net, &paths.network_dir);
+            let _ = toolchain::sudo_user::rename(&legacy_net, &paths.network_dir);
         }
         chown_to_sudo_user(&paths.config);
         chown_tree_to_sudo_user(&nodes_dir(base));
@@ -1611,7 +1632,7 @@ pub async fn run_init(
     // Create config root + nodes.d if they don't exist yet.
     let nd = nodes_dir(data_dir);
     if !nd.exists() {
-        fs::create_dir_all(&nd)?;
+        toolchain::sudo_user::create_dir_all_for_invoking_user(&nd)?;
         step(&format!("Created {}", nd.display()));
     }
 
@@ -1671,7 +1692,7 @@ pub async fn run_init(
     // Write session file (placeholder empty file for now)
     let session_path = config_dir.join("session");
     if !session_path.exists() {
-        fs::write(&session_path, "")?;
+        toolchain::sudo_user::write_for_invoking_user(&session_path, b"", 0o644)?;
         step("Session initialized");
     }
 
@@ -2227,11 +2248,14 @@ pub async fn run_daemon(
 
     // --- PID lock: scoped to this node-id, so multiple nodes can coexist in
     // the same config root - each holds its own `nodes.d/<node-id>.pid`. ---
-    fs::create_dir_all(nodes_dir(&paths.base))?;
+    //
+    // This runs as root, before the config is read, in a directory the operator owns:
+    // every access below goes through helpers that do not follow a link there.
+    toolchain::sudo_user::create_dir_all_for_invoking_user(&nodes_dir(&paths.base))?;
     let pid_path = paths.pid.clone();
 
     if pid_path.exists() {
-        let existing_pid_str = fs::read_to_string(&pid_path).unwrap_or_default();
+        let existing_pid_str = toolchain::sudo_user::read_to_string(&pid_path).unwrap_or_default();
         let existing_pid: u32 = existing_pid_str.trim().parse().unwrap_or(0);
         if existing_pid > 0 && os::process_alive(existing_pid) {
             if force {
@@ -2254,8 +2278,7 @@ pub async fn run_daemon(
     }
     // Write our own PID
     let my_pid = std::process::id();
-    fs::write(&pid_path, my_pid.to_string())?;
-    chown_to_sudo_user(&pid_path);
+    toolchain::sudo_user::write_for_invoking_user(&pid_path, my_pid.to_string().as_bytes(), 0o644)?;
     // Remove PID file on exit (best-effort via a drop guard)
     struct PidGuard(std::path::PathBuf);
     impl Drop for PidGuard {
@@ -2280,7 +2303,7 @@ pub async fn run_daemon(
     // Load config
     // Repair installs written before the config was mode-restricted.
     repair_secret_file_mode(&config_path);
-    let config_str = fs::read_to_string(&config_path)?;
+    let config_str = toolchain::sudo_user::read_to_string(&config_path)?;
     let mut config: Config = toml::from_str(&config_str)?;
 
     println!("Configuration loaded successfully.");
@@ -3537,6 +3560,86 @@ mod security_tests {
         let mode = fs::metadata(&p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "repair left {mode:o}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The node service runs as root over a config root the operator owns. A link the
+    /// operator leaves there must not carry root's reads, writes and chmods to files
+    /// outside it.
+    #[cfg(unix)]
+    fn node_root_with_link(name: &str, target: &std::path::Path) -> tempfile::TempDir {
+        let t = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(t.path().join("nodes.d")).expect("nodes.d");
+        std::os::unix::fs::symlink(target, t.path().join("nodes.d").join(name)).expect("link");
+        t
+    }
+
+    #[cfg(unix)]
+    const A_NODE_CONFIG: &str =
+        "api_key = \"k\"\nnode_id = \"n\"\napi_url = \"http://127.0.0.1:9\"\n";
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_secret_write_does_not_write_through_a_link() {
+        let outside = tempfile::tempdir().expect("tempdir");
+        let victim = outside.path().join("ld.so.preload");
+        fs::write(&victim, "kept\n").unwrap();
+        let base = node_root_with_link("n.toml", &victim);
+
+        let _root = toolchain::sudo_user::act_as_root();
+        write_secret_file(&base.path().join("nodes.d/n.toml"), A_NODE_CONFIG).unwrap();
+
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "kept\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_scan_does_not_read_a_node_config_through_a_link() {
+        let outside = tempfile::tempdir().expect("tempdir");
+        let target = outside.path().join("shadow");
+        fs::write(&target, A_NODE_CONFIG).unwrap();
+        let base = node_root_with_link("s.toml", &target);
+
+        let _root = toolchain::sudo_user::act_as_root();
+        let ids = discover_nodes(base.path()).unwrap();
+
+        assert!(
+            ids.is_empty(),
+            "read a linked file as a node config: {ids:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_repair_does_not_chmod_through_a_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let outside = tempfile::tempdir().expect("tempdir");
+        let target = outside.path().join("passwd");
+        fs::write(&target, "x").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        let base = node_root_with_link("n.toml", &target);
+
+        let _root = toolchain::sudo_user::act_as_root();
+        repair_secret_file_mode(&base.path().join("nodes.d/n.toml"));
+
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "chmodded the link's target");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_legacy_migration_does_not_move_a_config_through_a_linked_nodes_dir() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink(elsewhere.path(), base.path().join("nodes.d")).unwrap();
+        fs::write(base.path().join("config.toml"), A_NODE_CONFIG).unwrap();
+
+        let _root = toolchain::sudo_user::act_as_root();
+        migrate_legacy_config(base.path());
+
+        assert!(
+            !elsewhere.path().join("n.toml").exists(),
+            "moved the config into the link's target"
+        );
     }
 
     /// H-2: shell_exec and .cfx run control-plane input in this process's

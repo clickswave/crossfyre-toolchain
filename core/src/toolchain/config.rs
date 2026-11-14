@@ -400,7 +400,7 @@ pub fn apply_ports_from_json(
 /// The file loads either way; this keeps what a person reads in it current. Returns
 /// whether the file was written. A missing file is not an error.
 pub fn rewrite_legacy_keys(path: &std::path::Path) -> Result<bool, Box<dyn std::error::Error>> {
-    let Ok(text) = fs::read_to_string(path) else {
+    let Ok(text) = super::sudo_user::read_to_string(path) else {
         return Ok(false);
     };
     let value: toml::Value = toml::from_str(&text)?;
@@ -415,7 +415,7 @@ pub fn rewrite_legacy_keys(path: &std::path::Path) -> Result<bool, Box<dyn std::
         return Ok(false);
     }
     let config: ToolchainConfig = toml::from_str(&text)?;
-    fs::write(path, toml::to_string(&config)?)?;
+    crate::write_secret_file(path, &toml::to_string(&config)?)?;
     super::sudo_user::chown_to_invoking_user(path);
     Ok(true)
 }

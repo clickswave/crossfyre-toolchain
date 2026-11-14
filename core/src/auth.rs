@@ -57,9 +57,16 @@ pub fn load_account(data_dir: &Path) -> Option<Account> {
 
 pub fn save_account(data_dir: &Path, account: &Account) -> Result<(), Box<dyn std::error::Error>> {
     if !data_dir.exists() {
-        std::fs::create_dir_all(data_dir)?;
+        crate::toolchain::sudo_user::create_dir_all_for_invoking_user(data_dir)?;
     }
     let path = account_path(data_dir);
+    // Under sudo this writes into the person's home as root: replace the file without
+    // following a link there, and hand it to them.
+    if crate::toolchain::sudo_user::root_guards() {
+        let body = toml::to_string(account)?;
+        crate::toolchain::sudo_user::write_for_invoking_user(&path, body.as_bytes(), 0o600)?;
+        return Ok(());
+    }
     // The mode goes on a fresh file BEFORE the key does. Writing and then chmodding, which
     // is what this did, leaves a window in which the credential exists at the process
     // umask, and a key that leaked during it has leaked.
