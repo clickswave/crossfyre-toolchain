@@ -100,10 +100,13 @@ pub fn run(scope: Scope, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
     if scope.keep_data {
         warn("Database container kept (--keep-data).");
     } else {
-        let _ = std::process::Command::new("docker")
-            .args(["rm", "-f", "crossfyre-postgres"])
-            .output();
-        ok("Removed database container (if it existed).");
+        let removed = super::db::remove_all();
+        if removed.is_empty() {
+            ok("No database container to remove.");
+        }
+        for name in removed {
+            ok(&format!("Removed database container {name} and its data."));
+        }
     }
 
     // The install dir (binaries are already gone; this removes the tree,
