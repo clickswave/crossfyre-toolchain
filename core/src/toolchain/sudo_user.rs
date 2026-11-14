@@ -160,12 +160,16 @@ pub fn first_missing(dir: &std::path::Path) -> Option<std::path::PathBuf> {
 /// root-owned in the person's home. Directories that were already there keep their owner.
 ///
 /// As root, no link below a directory another account can change is followed: see
-/// [`super::root_fs`].
+/// [`super::root_fs`], and on Windows, when elevated, `win::admin_fs`.
 pub fn create_dir_all_for_invoking_user(dir: &std::path::Path) -> std::io::Result<()> {
     #[cfg(unix)]
     if root_guards() {
         let owner = sudo_user_info().map(|(uid, gid, _, _)| (uid, gid));
         return super::root_fs::create_dir_all(dir, owner);
+    }
+    #[cfg(windows)]
+    if root_guards() {
+        return super::win::admin_fs::create_dir_all(dir).map(|_| ());
     }
     let top = first_missing(dir);
     std::fs::create_dir_all(dir)?;
@@ -206,8 +210,8 @@ thread_local! {
     static ACT_AS_ROOT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Whether this process runs as root, and so must not follow links in a tree another
-/// account can change.
+/// Whether this process runs as root, or elevated on Windows (the node service runs as
+/// LocalSystem), and so must not follow links in a tree another account can change.
 pub(crate) fn root_guards() -> bool {
     #[cfg(test)]
     if ACT_AS_ROOT.with(|c| c.get()) {
@@ -217,7 +221,12 @@ pub(crate) fn root_guards() -> bool {
     {
         unsafe { libc::geteuid() == 0 }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        static ELEVATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ELEVATED.get_or_init(crate::os::is_elevated)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         false
     }
@@ -268,7 +277,15 @@ pub fn write_for_invoking_user(
             .open(path)?;
         f.write_all(contents)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let _ = mode;
+        if root_guards() {
+            return super::win::admin_fs::replace_file(path, contents, false);
+        }
+        std::fs::write(path, contents)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = mode;
         std::fs::write(path, contents)
@@ -282,6 +299,10 @@ pub fn rename(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<(
     if root_guards() {
         return super::root_fs::rename(from, to);
     }
+    #[cfg(windows)]
+    if root_guards() {
+        return super::win::admin_fs::rename(from, to);
+    }
     std::fs::rename(from, to)
 }
 
@@ -291,6 +312,10 @@ pub fn read_to_string(path: &std::path::Path) -> std::io::Result<String> {
     #[cfg(unix)]
     if root_guards() {
         return super::root_fs::read_to_string(path);
+    }
+    #[cfg(windows)]
+    if root_guards() {
+        return super::win::admin_fs::read_to_string(path);
     }
     std::fs::read_to_string(path)
 }
@@ -302,6 +327,10 @@ pub fn remove_file(path: &std::path::Path) -> std::io::Result<()> {
     if root_guards() {
         return super::root_fs::remove_file(path);
     }
+    #[cfg(windows)]
+    if root_guards() {
+        return super::win::admin_fs::remove_file(path);
+    }
     std::fs::remove_file(path)
 }
 
@@ -311,6 +340,10 @@ pub fn remove_dir_all(path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(unix)]
     if root_guards() {
         return super::root_fs::remove_dir_all(path);
+    }
+    #[cfg(windows)]
+    if root_guards() {
+        return super::win::admin_fs::remove_dir_all(path);
     }
     std::fs::remove_dir_all(path)
 }
@@ -540,5 +573,110 @@ mod create_dir_tests {
         );
         std::fs::create_dir_all(&deep).expect("dirs");
         assert_eq!(first_missing(&deep), None);
+    }
+}
+
+/// Makes `link` a junction to the directory `target`, as any account can without
+/// elevation.
+#[cfg(all(test, windows))]
+pub(crate) fn junction(link: &std::path::Path, target: &std::path::Path) {
+    let out = std::process::Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .output()
+        .expect("cmd");
+    assert!(
+        out.status.success(),
+        "mklink /J {}: {}",
+        link.display(),
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[cfg(all(test, windows))]
+mod elevated_link_tests {
+    use super::*;
+    use std::fs;
+
+    /// A data dir whose `nodes.d` is a junction to `victim`, a directory the operator's
+    /// account could not otherwise write.
+    fn linked_tree() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let t = tempfile::tempdir().expect("tempdir");
+        let victim = t.path().join("victim");
+        fs::create_dir(&victim).expect("victim");
+        let data = t.path().join("crossfyre");
+        fs::create_dir(&data).expect("data");
+        junction(&data.join("nodes.d"), &victim);
+        (t, data, victim)
+    }
+
+    #[test]
+    fn an_elevated_write_will_not_pass_through_a_junction() {
+        let (_t, data, victim) = linked_tree();
+        let _root = act_as_root();
+        let r = write_for_invoking_user(&data.join("nodes.d").join("n.pid"), b"4242", 0o644);
+        assert!(r.is_err(), "wrote through a junction");
+        assert!(!victim.join("n.pid").exists());
+    }
+
+    #[test]
+    fn an_elevated_remove_will_not_pass_through_a_junction() {
+        let (_t, data, victim) = linked_tree();
+        fs::write(victim.join("n.pid"), "system's file\n").expect("victim file");
+        let _root = act_as_root();
+        let r = remove_file(&data.join("nodes.d").join("n.pid"));
+        assert!(r.is_err(), "removed through a junction");
+        assert_eq!(
+            fs::read_to_string(victim.join("n.pid")).unwrap(),
+            "system's file\n"
+        );
+    }
+
+    #[test]
+    fn an_elevated_read_will_not_pass_through_a_junction() {
+        let (_t, data, victim) = linked_tree();
+        fs::write(victim.join("n.toml"), "secret\n").expect("victim file");
+        let _root = act_as_root();
+        assert!(read_to_string(&data.join("nodes.d").join("n.toml")).is_err());
+    }
+
+    #[test]
+    fn an_elevated_rename_will_not_pass_through_a_junction() {
+        let (_t, data, victim) = linked_tree();
+        fs::write(victim.join("a"), "system's file\n").expect("victim file");
+        let _root = act_as_root();
+        let nodes = data.join("nodes.d");
+        assert!(rename(&nodes.join("a"), &nodes.join("b")).is_err());
+        assert!(victim.join("a").exists());
+        assert!(!victim.join("b").exists());
+    }
+
+    #[test]
+    fn an_elevated_tree_removal_will_not_pass_through_a_junction() {
+        let (_t, data, victim) = linked_tree();
+        fs::create_dir(victim.join("n.network")).expect("victim dir");
+        fs::write(victim.join("n.network").join("keep"), "x").expect("victim file");
+        let _root = act_as_root();
+        assert!(remove_dir_all(&data.join("nodes.d").join("n.network")).is_err());
+        assert!(victim.join("n.network").join("keep").exists());
+    }
+
+    #[test]
+    fn creating_directories_elevated_will_not_pass_through_a_junction() {
+        let (_t, data, victim) = linked_tree();
+        let _root = act_as_root();
+        let r = create_dir_all_for_invoking_user(&data.join("nodes.d").join("logs"));
+        assert!(r.is_err(), "created a directory through a junction");
+        assert!(!victim.join("logs").exists());
+    }
+
+    #[test]
+    fn an_elevated_secret_write_will_not_pass_through_a_junction() {
+        let (_t, data, victim) = linked_tree();
+        let _root = act_as_root();
+        let r = crate::write_secret_file(&data.join("nodes.d").join("config.toml"), "x");
+        assert!(r.is_err(), "wrote through a junction");
+        assert!(!victim.join("config.toml").exists());
     }
 }

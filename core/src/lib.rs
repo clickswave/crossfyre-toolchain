@@ -871,9 +871,9 @@ pub fn nodes_dir(base: &std::path::Path) -> std::path::PathBuf {
 /// The permissions are set before the bytes land where possible, so there is no
 /// window in which the file exists with the secret in it and the wider mode.
 ///
-/// Run as root, it writes through [`toolchain::sudo_user::write_for_invoking_user`],
-/// which replaces the file rather than writing into whatever `path` names and hands it
-/// to the invoking user.
+/// Run as root, or elevated on Windows, it writes through
+/// [`toolchain::sudo_user::write_for_invoking_user`], which replaces the file rather than
+/// writing into whatever `path` names and hands it to the invoking user.
 pub fn write_secret_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -896,6 +896,9 @@ pub fn write_secret_file(path: &std::path::Path, contents: &str) -> std::io::Res
     }
     #[cfg(not(unix))]
     {
+        if toolchain::sudo_user::root_guards() {
+            return toolchain::sudo_user::write_for_invoking_user(path, contents.as_bytes(), 0o600);
+        }
         fs::write(path, contents)
     }
 }

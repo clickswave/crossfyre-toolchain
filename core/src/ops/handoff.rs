@@ -9,13 +9,15 @@
 //! On Unix it is made under `/tmp`, which the engines accept wordlists from. On Windows
 //! the node runs as LocalSystem, whose temporary directory the operator, whom the
 //! engines run as, cannot read, so it is made under the toolchain directory's `tmp`, in
-//! the operator's profile, which both can.
+//! the operator's profile, which both can. There the operator's account could swap a
+//! directory on the way for a link, so the node makes the op's directory and its files
+//! relative to handles it holds, follows no link to them, and removes them the same way.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 pub(crate) struct Handoff {
-    dir: tempfile::TempDir,
+    dir: Place,
     #[cfg(unix)]
     handle: std::fs::File,
     /// The account the engines run as when it is not this process's: the operator a
@@ -31,6 +33,12 @@ impl Handoff {
     }
 
     fn new_in(base: &Path) -> io::Result<Handoff> {
+        #[cfg(windows)]
+        if crate::toolchain::sudo_user::root_guards() {
+            return Ok(Handoff {
+                dir: Place::Held(Held::new_in(base)?),
+            });
+        }
         let mut builder = tempfile::Builder::new();
         builder.prefix(dguard::HANDOFF_PREFIX);
         #[cfg(unix)]
@@ -46,17 +54,27 @@ impl Handoff {
             if let Some((uid, gid)) = owner {
                 std::os::unix::fs::fchown(&handle, Some(uid), Some(gid))?;
             }
-            Ok(Handoff { dir, handle, owner })
+            Ok(Handoff {
+                dir: Place::Temp(dir),
+                handle,
+                owner,
+            })
         }
         #[cfg(not(unix))]
         {
-            Ok(Handoff { dir })
+            Ok(Handoff {
+                dir: Place::Temp(dir),
+            })
         }
     }
 
     /// The directory the files are written to.
     pub(crate) fn dir(&self) -> &Path {
-        self.dir.path()
+        match &self.dir {
+            Place::Temp(t) => t.path(),
+            #[cfg(windows)]
+            Place::Held(h) => h.path(),
+        }
     }
 
     /// Write `body` to a new file called `name` in this op's directory and return the
@@ -68,7 +86,7 @@ impl Handoff {
         let mut file = self.create(&name)?;
         file.write_all(body)?;
         file.flush()?;
-        Ok(self.dir.path().join(&name).display().to_string())
+        Ok(self.dir().join(&name).display().to_string())
     }
 
     #[cfg(unix)]
@@ -99,10 +117,73 @@ impl Handoff {
 
     #[cfg(not(unix))]
     fn create(&self, name: &str) -> io::Result<std::fs::File> {
+        #[cfg(windows)]
+        if let Place::Held(h) = &self.dir {
+            return h.create(name);
+        }
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(self.dir.path().join(name))
+            .open(self.dir().join(name))
+    }
+}
+
+/// Where an op's files are.
+enum Place {
+    /// A directory removed by path when the op ends.
+    Temp(tempfile::TempDir),
+    /// Elevated on Windows: see [`Held`].
+    #[cfg(windows)]
+    Held(Held),
+}
+
+/// A directory made in the operator's tree by an elevated node, held open for the op,
+/// with its files made and removed through its handle.
+#[cfg(windows)]
+struct Held(Option<crate::toolchain::win::admin_fs::Dir>);
+
+#[cfg(windows)]
+impl Held {
+    fn new_in(base: &Path) -> io::Result<Held> {
+        const LETTERS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let parent = crate::toolchain::win::admin_fs::open_dir(base)?;
+        let mut attempt = 0;
+        loop {
+            let mut random = [0u8; 8];
+            getrandom::fill(&mut random).map_err(|e| io::Error::other(e.to_string()))?;
+            let mut name = dguard::HANDOFF_PREFIX.to_string();
+            name.extend(
+                random
+                    .iter()
+                    .map(|b| LETTERS[*b as usize % LETTERS.len()] as char),
+            );
+            match parent.create_dir(std::ffi::OsStr::new(&name)) {
+                Ok(dir) => return Ok(Held(Some(dir))),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && attempt < 16 => attempt += 1,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn path(&self) -> &Path {
+        self.0.as_ref().expect("held until dropped").path()
+    }
+
+    fn create(&self, name: &str) -> io::Result<std::fs::File> {
+        let dir = self.0.as_ref().expect("held until dropped");
+        dir.create_new(std::ffi::OsStr::new(name))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Held {
+    fn drop(&mut self) {
+        if let Some(dir) = self.0.take() {
+            let shown = dir.path().to_path_buf();
+            if let Err(e) = dir.remove_all() {
+                eprintln!("[op] could not remove {}: {e}", shown.display());
+            }
+        }
     }
 }
 
@@ -140,7 +221,7 @@ fn base_dir() -> io::Result<PathBuf> {
     #[cfg(windows)]
     {
         let dir = crate::toolchain::config::get_toolchain_dir().join("tmp");
-        std::fs::create_dir_all(&dir)?;
+        crate::toolchain::sudo_user::create_dir_all_for_invoking_user(&dir)?;
         Ok(dir)
     }
     #[cfg(not(windows))]
@@ -256,5 +337,48 @@ mod tests {
         let mut s = String::new();
         std::io::Read::read_to_string(&mut f, &mut s).unwrap();
         assert_eq!(s, "www\n");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    // The node runs as LocalSystem and makes these in the operator's toolchain dir.
+    #[test]
+    fn an_elevated_node_makes_no_directory_through_a_junction() {
+        let t = tempfile::tempdir().unwrap();
+        let victim = t.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        let base = t.path().join("tmp");
+        crate::toolchain::sudo_user::junction(&base, &victim);
+
+        let _root = crate::toolchain::sudo_user::act_as_root();
+        let made = Handoff::new_in(&base).and_then(|h| h.write("cfx-wl-x.txt", b"www\n"));
+        assert!(made.is_err(), "made {made:?} through a junction");
+        let left: Vec<_> = std::fs::read_dir(&victim).unwrap().collect();
+        assert!(left.is_empty(), "left {left:?} behind");
+    }
+
+    #[test]
+    fn an_elevated_node_hands_files_over_and_removes_them_after() {
+        let base = tempfile::tempdir().unwrap();
+        let _root = crate::toolchain::sudo_user::act_as_root();
+        let h = Handoff::new_in(base.path()).unwrap();
+        let path = h.write("cfx-wl-x.txt", b"www\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "www\n");
+        assert!(h.write("cfx-wl-x.txt", b"two\n").is_err());
+        let p = PathBuf::from(&path);
+        assert_eq!(p.parent(), Some(h.dir()));
+        assert!(
+            h.dir()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(dguard::HANDOFF_PREFIX)
+        );
+        let dir = h.dir().to_path_buf();
+        drop(h);
+        assert!(!dir.exists(), "left {dir:?}");
     }
 }

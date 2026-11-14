@@ -27,18 +27,7 @@ pub const NODES_DIR: &str = "nodes.d";
 /// Whether this process runs as root, or elevated on Windows, and so must take a node
 /// config only from a file that only root or an administrator can change.
 pub fn privileged() -> bool {
-    #[cfg(unix)]
-    {
-        super::sudo_user::root_guards()
-    }
-    #[cfg(windows)]
-    {
-        crate::os::is_elevated()
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        false
-    }
+    super::sudo_user::root_guards()
 }
 
 /// Read the node config at `path`. When privileged, a file that another account owns
@@ -429,10 +418,9 @@ mod imp {
 
 #[cfg(windows)]
 mod imp {
-    use super::super::win;
-    use std::io::{self, Read, Write};
+    use super::super::win::admin_fs;
+    use std::io::{self, Read};
     use std::path::Path;
-    use std::sync::atomic::{AtomicU32, Ordering};
 
     /// An access right, from winnt.h.
     const GENERIC_READ: u32 = 0x8000_0000;
@@ -451,47 +439,18 @@ mod imp {
     }
 
     pub(super) fn read_trusted(path: &Path) -> io::Result<String> {
-        let mut f = win::open_plain(path, GENERIC_READ)?;
-        let secured = win::security_of_file(&f, path).map_err(io::Error::other)?;
+        let mut f = admin_fs::open_file(path, GENERIC_READ)?;
+        let secured = super::super::win::security_of_file(&f, path).map_err(io::Error::other)?;
         super::super::service::judge_admin_only(&[secured]).map_err(|why| refused(path, why))?;
         let mut s = String::new();
         f.read_to_string(&mut s)?;
         Ok(s)
     }
 
-    static SEQ: AtomicU32 = AtomicU32::new(0);
-
+    /// A new file that only administrators and LocalSystem can open, from the moment it
+    /// exists, renamed over `path` without following a link on the way.
     pub(super) fn write_trusted(path: &Path, contents: &[u8]) -> io::Result<()> {
-        let dir = path.parent().unwrap_or(Path::new("."));
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
-        let name = name.unwrap_or_default();
-        let mut attempt = 0;
-        let (tmp, f) = loop {
-            let n = SEQ.fetch_add(1, Ordering::Relaxed);
-            let tmp = dir.join(format!(".{name}.{}.{n}.tmp", std::process::id()));
-            match win::create_admin_only(&tmp) {
-                Ok(f) => break (tmp, f),
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && attempt < 16 => attempt += 1,
-                Err(e) => return Err(e),
-            }
-        };
-        fn finish(
-            mut f: std::fs::File,
-            contents: &[u8],
-            tmp: &Path,
-            path: &Path,
-        ) -> io::Result<()> {
-            f.write_all(contents)?;
-            f.sync_all()?;
-            // Closed before the rename, which a handle still open would make fail.
-            drop(f);
-            std::fs::rename(tmp, path)
-        }
-        let result = finish(f, contents, &tmp, path);
-        if result.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        result
+        admin_fs::replace_file(path, contents, true)
     }
 
     /// Replace each config with a new admin-only file of the same content, so a handle
@@ -499,7 +458,7 @@ mod imp {
     pub(super) fn take_over_all(nodes_dir: &Path) {
         for path in super::configs_in(nodes_dir) {
             let mut text = Vec::new();
-            let read = win::open_plain(&path, GENERIC_READ)
+            let read = admin_fs::open_file(&path, GENERIC_READ)
                 .and_then(|f| f.take(1 << 20).read_to_end(&mut text));
             if let Err(e) = read {
                 eprintln!("[node] not taking over {}: {e}", path.display());
@@ -764,5 +723,27 @@ mod tests {
             !network_dir(&nodes, "m").join("auth.txt").exists(),
             "copied through a link"
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn an_elevated_config_write_will_not_pass_through_a_junction() {
+        let t = tempfile::tempdir().unwrap();
+        let victim = t.path().join("victim");
+        fs::create_dir(&victim).unwrap();
+        let nodes = t.path().join(NODES_DIR);
+        super::super::sudo_user::junction(&nodes, &victim);
+
+        let _root = super::super::sudo_user::act_as_root();
+        let r = write(&nodes.join("n.toml"), "api_key = \"k\"\n");
+        assert!(r.is_err(), "wrote through a junction");
+        assert!(!victim.join("n.toml").exists());
+        let left: Vec<_> = fs::read_dir(&victim).unwrap().collect();
+        assert!(left.is_empty(), "left {left:?} behind");
     }
 }

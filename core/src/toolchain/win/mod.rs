@@ -1,6 +1,7 @@
 // Windows: the service manager, the Task Scheduler, and what a process running under
 // either needs that a terminal would otherwise have given it.
 
+pub mod admin_fs;
 pub mod scm;
 pub mod tasks;
 
@@ -16,19 +17,7 @@ const LOG_LIMIT: u64 = 10 * 1024 * 1024;
 pub fn log_to(path: &Path) {
     use std::os::windows::io::IntoRawHandle;
     use windows_sys::Win32::System::Console::{STD_ERROR_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle};
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if std::fs::metadata(path).is_ok_and(|m| m.len() > LOG_LIMIT) {
-        let mut old = path.as_os_str().to_owned();
-        old.push(".1");
-        let _ = std::fs::rename(path, old);
-    }
-    let Ok(file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    else {
+    let Some(file) = open_log(path) else {
         return;
     };
     // The handle has to outlive every write, so it is never closed.
@@ -38,6 +27,32 @@ pub fn log_to(path: &Path) {
         SetStdHandle(STD_OUTPUT_HANDLE, handle);
         SetStdHandle(STD_ERROR_HANDLE, handle);
     }
+}
+
+/// The log at `path`, opened for appending, after starting it afresh when it has
+/// reached [`LOG_LIMIT`].
+///
+/// The node service runs as LocalSystem and logs into the operator's data dir, so when
+/// elevated no link on the way is followed: see [`admin_fs`].
+fn open_log(path: &Path) -> Option<std::fs::File> {
+    if super::sudo_user::root_guards() {
+        return admin_fs::open_log(path, LOG_LIMIT)
+            .inspect_err(|e| eprintln!("[service] could not open {}: {e}", path.display()))
+            .ok();
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > LOG_LIMIT) {
+        let mut old = path.as_os_str().to_owned();
+        old.push(".1");
+        let _ = std::fs::rename(path, old);
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
 }
 
 /// Put this process in a job that ends every process in it when the job's last handle
@@ -153,6 +168,15 @@ pub fn security_of_file(
     file: &std::fs::File,
     path: &Path,
 ) -> Result<super::service::Secured, String> {
+    use std::os::windows::io::AsHandle;
+    security_of_handle(file.as_handle(), path)
+}
+
+/// [`security_of_file`] for any open handle, a directory's included.
+pub fn security_of_handle(
+    handle: std::os::windows::io::BorrowedHandle<'_>,
+    path: &Path,
+) -> Result<super::service::Secured, String> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
     use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
@@ -165,7 +189,7 @@ pub fn security_of_file(
     // SAFETY: as in `security_of`; the handle stays open for the length of the call.
     unsafe {
         let status = GetSecurityInfo(
-            file.as_raw_handle(),
+            handle.as_raw_handle(),
             SE_FILE_OBJECT,
             OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
             &mut owner,
@@ -290,80 +314,6 @@ impl Drop for AdminOnly {
     }
 }
 
-/// Creates a new file at `path` that only administrators and LocalSystem can open, for
-/// writing. It is admin-only from the moment it exists, so no other process can have
-/// opened it before. Fails if anything is already at `path`.
-pub fn create_admin_only(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::windows::io::FromRawHandle;
-    use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
-    use windows_sys::Win32::Storage::FileSystem::{
-        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
-    };
-    let sd = AdminOnly::new()?;
-    let sa = SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: sd.0,
-        bInheritHandle: 0,
-    };
-    let wide = path.as_os_str().encode_wide_with_nul();
-    // SAFETY: `wide` is NUL-terminated, `sa` and the descriptor it points to outlive the
-    // call, and the handle returned is owned by the File made from it.
-    unsafe {
-        let h = CreateFileW(
-            wide.as_ptr(),
-            GENERIC_WRITE,
-            0,
-            &sa,
-            CREATE_NEW,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
-            std::ptr::null_mut(),
-        );
-        if h == INVALID_HANDLE_VALUE {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(std::fs::File::from_raw_handle(h))
-    }
-}
-
-/// Opens the regular file at `path` with `access`, refusing a link or junction (which is
-/// opened as itself, not followed) and a file with a second name, which can be any file
-/// on the same volume.
-pub fn open_plain(path: &Path, access: u32) -> std::io::Result<std::fs::File> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_FLAG_OPEN_REPARSE_POINT, GetFileInformationByHandle,
-    };
-    let file = std::fs::OpenOptions::new()
-        .access_mode(access)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)?;
-    // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is valid, and the call writes no
-    // more than its size.
-    let info = unsafe {
-        let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
-        if GetFileInformationByHandle(file.as_raw_handle(), &mut info) == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        info
-    };
-    if info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{} is a link or a directory, not a file", path.display()),
-        ));
-    }
-    if info.nNumberOfLinks > 1 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{} has another name (a hard link)", path.display()),
-        ));
-    }
-    Ok(file)
-}
-
 /// `OsStr` to a NUL-terminated wide string.
 trait WideNul {
     fn encode_wide_with_nul(&self) -> Vec<u16>;
@@ -373,5 +323,64 @@ impl WideNul for std::ffi::OsStr {
     fn encode_wide_with_nul(&self) -> Vec<u16> {
         use std::os::windows::ffi::OsStrExt;
         self.encode_wide().chain(std::iter::once(0)).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// A file of `len` bytes at `path`, without writing them.
+    fn sized(path: &Path, len: u64) {
+        fs::File::create(path).unwrap().set_len(len).unwrap();
+    }
+
+    #[test]
+    fn a_log_past_its_limit_is_kept_as_the_old_one_and_started_afresh() {
+        for elevated in [false, true] {
+            let t = tempfile::tempdir().unwrap();
+            let log = t.path().join("logs").join("node.log");
+            fs::create_dir(t.path().join("logs")).unwrap();
+            sized(&log, LOG_LIMIT + 1);
+
+            let _root = elevated.then(super::super::sudo_user::act_as_root);
+            let mut f = open_log(&log).expect("log");
+            std::io::Write::write_all(&mut f, b"started\n").unwrap();
+            drop(f);
+
+            let old = t.path().join("logs").join("node.log.1");
+            assert_eq!(fs::metadata(&old).unwrap().len(), LOG_LIMIT + 1);
+            assert_eq!(fs::read_to_string(&log).unwrap(), "started\n");
+
+            // Below the limit, it is appended to.
+            let mut f = open_log(&log).expect("log");
+            std::io::Write::write_all(&mut f, b"again\n").unwrap();
+            drop(f);
+            assert_eq!(fs::read_to_string(&log).unwrap(), "started\nagain\n");
+        }
+    }
+
+    #[test]
+    fn an_elevated_log_is_not_moved_or_opened_through_a_junction() {
+        let t = tempfile::tempdir().unwrap();
+        let victim = t.path().join("victim");
+        fs::create_dir(&victim).unwrap();
+        sized(&victim.join("node.log"), LOG_LIMIT + 1);
+        let logs = t.path().join("logs");
+        super::super::sudo_user::junction(&logs, &victim);
+
+        let _root = super::super::sudo_user::act_as_root();
+        let opened = open_log(&logs.join("node.log"));
+
+        assert!(opened.is_none(), "opened a log through a junction");
+        assert_eq!(
+            fs::metadata(victim.join("node.log")).unwrap().len(),
+            LOG_LIMIT + 1
+        );
+        assert!(
+            !victim.join("node.log.1").exists(),
+            "moved through a junction"
+        );
     }
 }
