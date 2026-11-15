@@ -41,7 +41,8 @@ const URL_MAX: usize = 2048;
 /// thousand rows, about five seconds at [`PAGES_PER_SECOND`].
 const HISTORY_MATCH_PAGE: u32 = 100;
 const HISTORY_MATCH_PAGES: u32 = 50;
-/// The most exchanges one call reads to check `search` against what is shown.
+/// The most exchanges one call reads to check `search` against what is shown, about five
+/// seconds at [`PAGES_PER_SECOND`].
 const SEARCH_CHECKS: usize = 50;
 /// The most site map pages one call reads to sort a masked map. At 200 endpoints a page
 /// that is more than the 20,000 rows a Workbench reads for its map.
@@ -707,15 +708,22 @@ async fn list_history(
         .filter(|_| redact)
         .map(str::to_ascii_lowercase);
     // The Workbench's full-text index holds the stored text, masked values and all, so a
-    // whole masked value guessed right would find its row. The words are still sent, to
-    // narrow the rows, and each row found is then read and kept only if the words are in
-    // it as shown. A guess at a masked value finds nothing, the same as a wrong one.
+    // whole masked value guessed right would find its row, and any narrowing by the index
+    // would show in which rows are read, how long that takes and where the read stops.
+    // So the words are not sent. The rows the other filters give are read one by one and
+    // kept only if the words are in them as shown, and which rows are read follows only
+    // from those filters and the rows kept.
     let words: Vec<Vec<String>> = a
         .search
         .as_deref()
         .filter(|_| redact)
         .map(|s| s.split_whitespace().map(fts_tokens).collect())
         .unwrap_or_default();
+    if words.iter().any(Vec::is_empty) {
+        return Err(Refusal::invalid(
+            "each word of search needs a letter or digit in it",
+        ));
+    }
     let check = !words.is_empty();
     let local = needle.is_some() || check;
     let filter = HistoryFilter {
@@ -725,7 +733,7 @@ async fn list_history(
         status_max,
         origins,
         url_contains: a.url_contains.filter(|_| needle.is_none()),
-        search: a.search,
+        search: a.search.filter(|_| !check),
         since_ms,
         until_ms: None,
     };
@@ -832,11 +840,13 @@ async fn list_history(
         }
         params.cursor = after;
     }
-    // A read that stopped before it kept enough rows says so. With `search` checked the
-    // rows looked at follow from what the index found, so their number is not given.
+    // A read that stopped before it kept enough rows says so.
     let looked = (local && rows.len() < limit as usize && after.is_some()).then(|| {
         if check {
-            "; the read stopped before the end of the history".to_string()
+            format!(
+                "; {checks} exchange(s) were read to check search and the read stopped \
+                 there"
+            )
         } else {
             format!(
                 "; {read} row(s) of history were looked at for url_contains and the read \

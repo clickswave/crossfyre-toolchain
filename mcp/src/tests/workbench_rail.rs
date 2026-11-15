@@ -1730,9 +1730,10 @@ mod reads {
             assert_eq!(v["rows"].as_array().unwrap().len(), 1, "{term}: {v}");
             assert_eq!(v["rows"][0]["exchange"], handle(UID_A, id), "{term}");
         }
-        // The Workbench still narrows by the words.
-        let sent = &b.fake.params(Method::History)[0];
-        assert_eq!(sent["filter"]["search"], "482913");
+        // The words are not sent: the Workbench's index holds the masked values.
+        for sent in b.fake.params(Method::History) {
+            assert!(sent["filter"]["search"].is_null(), "{sent}");
+        }
 
         // A read that runs out of checks says it stopped and gives a cursor after the
         // last row it looked at, from which the next call goes on.
@@ -1773,6 +1774,77 @@ mod reads {
                 .await;
         assert_eq!(ok(&r)["rows"].as_array().unwrap().len(), 1);
         assert_eq!(b.fake.count(Method::Exchange), 0);
+    }
+
+    /// With masking on, a right guess at a masked value that many rows hold reads and
+    /// returns exactly what a wrong guess does: the same rows, the same cursor, the same
+    /// summary and the same number of Workbench reads, however many rows hold it.
+    #[tokio::test]
+    async fn a_right_and_a_wrong_guess_at_a_repeated_masked_value_look_the_same() {
+        let stored: Vec<_> = (1..=60)
+            .map(|i| login(i, "app.example.test", r#"{"user":"ann","password":"4829"}"#))
+            .collect();
+        let b = bench_with(base(), searching_history(stored)).await;
+        let peer = FakePeer::new(Elicit::None);
+        let mut seen = Vec::new();
+        for args in [
+            json!({"search": "4829", "limit": 1}),
+            json!({"search": "4830", "limit": 1}),
+            json!({"search": "ann 4829", "limit": 5}),
+            json!({"search": "ann 4830", "limit": 5}),
+        ] {
+            let history = b.fake.count(Method::History);
+            let exchange = b.fake.count(Method::Exchange);
+            let r =
+                b.t.call(&peer, "workbench_list_history", args.clone())
+                    .await;
+            let v = ok(&r).clone();
+            seen.push((
+                args,
+                v["rows"].clone(),
+                v["next_cursor"].clone(),
+                r.text.clone(),
+                b.fake.count(Method::History) - history,
+                b.fake.count(Method::Exchange) - exchange,
+            ));
+        }
+        for pair in seen.chunks(2) {
+            let (right, wrong) = (&pair[0], &pair[1]);
+            assert_eq!(right.1, json!([]), "{}: {}", right.0, right.1);
+            assert_eq!(
+                right.1, wrong.1,
+                "rows differ for {} and {}",
+                right.0, wrong.0
+            );
+            assert_eq!(
+                right.2, wrong.2,
+                "cursors differ for {} and {}",
+                right.0, wrong.0
+            );
+            assert_eq!(
+                right.3, wrong.3,
+                "summaries differ for {} and {}",
+                right.0, wrong.0
+            );
+            assert_eq!(
+                (right.4, right.5),
+                (wrong.4, wrong.5),
+                "reads differ for {} and {}",
+                right.0,
+                wrong.0
+            );
+        }
+        // A word with nothing to find in it is refused rather than read against every row.
+        let exchange = b.fake.count(Method::Exchange);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_list_history",
+                json!({"search": "ann !!!"}),
+            )
+            .await;
+        assert_eq!(reason(&r), "invalid_arguments", "{}", r.text);
+        assert_eq!(b.fake.count(Method::Exchange), exchange);
     }
 }
 

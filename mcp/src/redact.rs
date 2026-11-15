@@ -172,14 +172,24 @@ fn mask_nested_members(s: &str) -> String {
     let mut from = 0;
     while let Some(m) = NESTED_MEMBER.find_at(s, from) {
         let open = m.end() - 1;
-        let (mut depth, mut in_str, mut esc) = (0usize, None, false);
+        let (mut depth, mut in_str, mut esc, mut dollar) = (0usize, None, false, false);
+        // For each template literal the scan is inside a `${` of, the depth at which that
+        // `${` opened: its `}` goes back into the literal.
+        let mut held: Vec<usize> = Vec::new();
         let mut end = s.len();
         for (i, c) in s[open..].char_indices() {
             if let Some(q) = in_str {
+                let after_dollar = std::mem::take(&mut dollar);
                 match (esc, c) {
                     (true, _) => esc = false,
                     (false, '\\') => esc = true,
                     (false, c) if c == q => in_str = None,
+                    (false, '$') if q == '`' => dollar = true,
+                    (false, '{') if q == '`' && after_dollar => {
+                        held.push(depth);
+                        depth += 1;
+                        in_str = None;
+                    }
                     _ => {}
                 }
                 continue;
@@ -189,7 +199,10 @@ fn mask_nested_members(s: &str) -> String {
                 '{' | '[' => depth += 1,
                 '}' | ']' => {
                     depth -= 1;
-                    if depth == 0 {
+                    if c == '}' && held.last() == Some(&depth) {
+                        held.pop();
+                        in_str = Some('`');
+                    } else if depth == 0 {
                         end = open + i + 1;
                         break;
                     }
@@ -729,6 +742,12 @@ mod unit {
         assert_eq!(r, r#"var c = {"keys": "[redacted]", "n": 2};"#);
         let r = redact_text(r#"{"session": {"a": '}', "b": `]}"`, "c": "NJ7"}, "n": 2}"#);
         assert_eq!(r, r#"{"session": "[redacted]", "n": 2}"#);
+        // A template literal inside a template literal's `${}` does not close the outer
+        // one, and an escaped `\${` is not a `${`.
+        let r = redact_text(r#"var c = {"keys": [`${x ? `]` : 1}`, "NJ8"], "n": 2};"#);
+        assert_eq!(r, r#"var c = {"keys": "[redacted]", "n": 2};"#);
+        let r = redact_text(r#"var c = {"keys": [`\${ ]`, "NJ9"], "n": 2};"#);
+        assert_eq!(r, r#"var c = {"keys": "[redacted]", "n": 2};"#);
         // Nested under an ordinary name, and cut off by the body cap.
         let r = redact_text(r#"{"data":{"user":{"session":{"id":"NJ5","more"#);
         assert!(!r.contains("NJ5"), "{r}");

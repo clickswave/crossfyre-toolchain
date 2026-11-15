@@ -14,7 +14,7 @@ use serde_json::Value;
 const PINNED: &str = "7ec3c8d0881ede1c1dbe45e30931fecb9ea481c256ed14b56f94d5dc7e46b7a7";
 
 /// The same for `tools_workbench.json`.
-const PINNED_WORKBENCH: &str = "598fd580698ce7f906ce1b58f671b33f43ffa62e3afd1bf787e4c84c2fce974b";
+const PINNED_WORKBENCH: &str = "ee94f06fe0ae72f9c549b53782503e9b7cad21865b2406cf1d484ce2c29ba073";
 
 #[test]
 fn the_definitions_are_pinned() {
