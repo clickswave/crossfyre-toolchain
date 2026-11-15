@@ -397,9 +397,8 @@ pub async fn run(cfg: TraceConfig) -> Result<(), BoxErr> {
     use tokio::process::Command;
 
     // Keylog file the browser writes TLS secrets to and tshark reads to decrypt.
-    let keylog = std::env::temp_dir().join(format!("cfx-trace-{}.keys", std::process::id()));
-    std::fs::write(&keylog, b"").map_err(|e| format!("cannot create keylog file: {e}"))?;
-    let keylog_path = keylog.to_string_lossy().to_string();
+    let keylog = create_keylog().map_err(|e| format!("cannot create keylog file: {e}"))?;
+    let keylog_path = keylog.path.to_string_lossy().to_string();
 
     println!(
         "Web Tracer: starting capture on {} (session {})",
@@ -489,9 +488,33 @@ pub async fn run(cfg: TraceConfig) -> Result<(), BoxErr> {
     if let Some(mut b) = browser_child {
         let _ = b.start_kill();
     }
-    let _ = std::fs::remove_file(&keylog);
+    drop(keylog);
     println!("\nWeb Tracer: session ended, {total} endpoints captured.");
     Ok(())
+}
+
+/// The keylog file of one capture session. It holds TLS secrets, so it is made new, owner
+/// only, in a directory of its own with a random name, which goes when this is dropped.
+struct Keylog {
+    path: std::path::PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+fn create_keylog() -> std::io::Result<Keylog> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("cfx-trace-");
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+        opts.mode(0o600);
+    }
+    let dir = builder.tempdir()?;
+    let path = dir.path().join("session.keys");
+    opts.open(&path)?;
+    Ok(Keylog { path, _dir: dir })
 }
 
 /// The program to launch for `--browser <name>`. On Linux the browsers are on PATH under
@@ -516,6 +539,41 @@ pub fn browser_binary(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The keylog file used to sit at a fixed name in the shared temp dir, and was
+    /// created by following whatever link another account left at that name.
+    #[cfg(unix)]
+    #[test]
+    fn the_keylog_is_made_new_in_a_directory_of_its_own() {
+        use std::os::unix::fs::PermissionsExt;
+        let elsewhere = tempfile::tempdir().unwrap();
+        let victim = elsewhere.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        let fixed = std::env::temp_dir().join(format!("cfx-trace-{}.keys", std::process::id()));
+        let _ = std::fs::remove_file(&fixed);
+        std::os::unix::fs::symlink(&victim, &fixed).unwrap();
+
+        let keylog = create_keylog();
+        let _ = std::fs::remove_file(&fixed);
+        let keylog = keylog.expect("keylog");
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        let meta = std::fs::symlink_metadata(&keylog.path).unwrap();
+        assert!(meta.is_file(), "the keylog is not a plain file");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        let dir = keylog.path.parent().unwrap();
+        assert_ne!(
+            dir,
+            std::env::temp_dir(),
+            "the keylog is in the shared temp dir"
+        );
+        let dir_mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+
+        let path = keylog.path.clone();
+        drop(keylog);
+        assert!(!path.exists(), "the keylog outlived its session");
+    }
 
     #[test]
     fn redact_blanks_query_values_keeps_keys() {
