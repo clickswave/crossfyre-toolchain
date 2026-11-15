@@ -1182,21 +1182,47 @@ async fn run_browser_tier(
         }
     }
 
+    // The browser loads a document only where the crawl itself may go. A
+    // redirect, a script navigation or a frame pointing anywhere else is failed
+    // before it is sent, so a hostile page cannot use the browser to reach a host
+    // the operator never listed.
+    let gate: crate::browser::Gate = {
+        let (base, scope, host) = (seed.clone(), params.clone(), seed_host.to_string());
+        std::sync::Arc::new(move |u: &str| resolve_and_scope(u, &base, &scope, &host).is_some())
+    };
+
     let mut seen: HashSet<(String, String)> = HashSet::new();
     let mut visited = 0usize;
+    let mut refused: Vec<String> = Vec::new();
     for url in &plan {
-        let Ok(v) = crate::browser::visit(&mut cdp, url.as_str()).await else {
+        let Ok(v) = crate::browser::visit(&mut cdp, url.as_str(), gate.clone()).await else {
+            continue;
+        };
+        for r in v.refused {
+            if !refused.contains(&r) {
+                refused.push(r);
+            }
+        }
+        // What the browser read belongs to the page it ended on, which a redirect
+        // makes different from the one it was sent to. A page off the crawl's
+        // scope is dropped whole; one in scope has its links resolved against
+        // itself, so nothing it says is filed under the address asked for.
+        let Some(page) = v
+            .final_url
+            .as_deref()
+            .and_then(|f| resolve_and_scope(f, url, params, seed_host))
+        else {
             continue;
         };
         visited += 1;
         for (method, raw) in v.requests {
-            let Some(child) = resolve_and_scope(&raw, url, params, seed_host) else {
+            let Some(child) = resolve_and_scope(&raw, &page, params, seed_host) else {
                 continue;
             };
             if !seen.insert((method.clone(), child.to_string())) {
                 continue;
             }
-            let mut ev = CrawlEvent::url_candidate(&child, Some(url.to_string()), 1);
+            let mut ev = CrawlEvent::url_candidate(&child, Some(page.to_string()), 1);
             ev.method = Some(method);
             let _ = tx.send(ev);
         }
@@ -1206,17 +1232,25 @@ async fn run_browser_tier(
             let mut links = Vec::new();
             extract_html(&v.dom, &mut links);
             for raw in links {
-                let Some(child) = resolve_and_scope(&raw, url, params, seed_host) else {
+                let Some(child) = resolve_and_scope(&raw, &page, params, seed_host) else {
                     continue;
                 };
                 if !seen.insert(("GET".to_string(), child.to_string())) {
                     continue;
                 }
-                let _ = tx.send(CrawlEvent::url_candidate(&child, Some(url.to_string()), 1));
+                let _ = tx.send(CrawlEvent::url_candidate(&child, Some(page.to_string()), 1));
             }
         }
     }
     browser.shutdown().await;
+    if let Some(first) = refused.first() {
+        let _ = tx.send(CrawlEvent::note(format!(
+            "headless tier: the browser was stopped from loading {} page(s) outside this crawl's \
+             scope, the first {first}, where a redirect, a script or a frame pointed it. Nothing \
+             was sent there. To crawl that site, add its host to the crawl's scope.",
+            refused.len()
+        )));
+    }
     let _ = tx.send(CrawlEvent::note(format!(
         "headless tier: loaded {visited} page(s) in a real browser and recorded {} request(s) the \
          running application made. It navigates and never clicks, because a crawler that presses \
@@ -2323,6 +2357,10 @@ mod redirect_tests {
             params["auth"] =
                 serde_json::json!({"headers": {"X-Api-Key": "saved-key"}, "cookies": ""});
         }
+        run(params).await
+    }
+
+    async fn run(params: serde_json::Value) -> Vec<CrawlEvent> {
         let params: CrawlParams = serde_json::from_value(params).unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         run_stream(params, tx).await;
@@ -2401,5 +2439,121 @@ mod redirect_tests {
                 .any(|n| n.contains("redirect") && n.contains(&to)),
             "no note says why the crawl stopped: {notes:?}"
         );
+    }
+
+    /// A crawl with the headless tier on, or `None` when this machine has no
+    /// browser to drive.
+    async fn browser_crawl(seed: &str, scope_hosts: &[&str]) -> Option<Vec<CrawlEvent>> {
+        crate::browser::find_browser()?;
+        Some(
+            run(serde_json::json!({
+                "seed": seed,
+                "evasive": false,
+                "parse_js": false,
+                "max_pages": 5,
+                "timeout_ms": 3000,
+                "scope_hosts": scope_hosts,
+                "browser": true,
+                "browser_pages": 1,
+            }))
+            .await,
+        )
+    }
+
+    /// The seed host, which redirects every request to the other host, and the
+    /// other host, whose page links to a path with a token in its query.
+    fn seed_and_internal_page() -> (String, u16, Seen) {
+        let (b, b_seen) = listener("127.0.0.2", |_| {
+            html(r#"<html><body><a href="/internal-only?token=s3cr3t">x</a></body></html>"#)
+        });
+        let location = format!("http://127.0.0.2:{b}/");
+        let (a, _) = listener("127.0.0.1", move |_| {
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\
+                 Connection: close\r\n\r\n"
+            )
+        });
+        (format!("http://127.0.0.1:{a}/"), b, b_seen)
+    }
+
+    fn urls(events: &[CrawlEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter(|e| e.kind == "url")
+            .filter_map(|e| e.url.as_deref())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_browser_is_not_sent_past_a_redirect_off_the_crawls_scope() {
+        let (seed, _, b_seen) = seed_and_internal_page();
+        let Some(events) = browser_crawl(&seed, &[]).await else {
+            eprintln!("no browser on PATH; skipped");
+            return;
+        };
+        let urls = urls(&events);
+        assert!(
+            !urls.iter().any(|u| u.contains("internal-only")),
+            "a link from a host outside the crawl's scope was filed under the seed: {urls:?}"
+        );
+        assert!(
+            b_seen.lock().unwrap().is_empty(),
+            "the browser was sent to a host outside the crawl's scope"
+        );
+        let notes: Vec<&str> = events
+            .iter()
+            .filter(|e| e.kind == "log")
+            .filter_map(|e| e.message.as_deref())
+            .collect();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.starts_with("headless tier: the browser was stopped")
+                    && n.contains("127.0.0.2")),
+            "no note says the browser was stopped: {notes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_page_cannot_script_the_browser_onto_a_host_off_the_crawls_scope() {
+        let (b, b_seen) = listener("127.0.0.2", |_| html(r#"<a href="/internal-only">x</a>"#));
+        let page = format!(
+            r#"<html><body><script>location.href = "http://127.0.0.2:{b}/";</script></body></html>"#
+        );
+        let (a, _) = listener("127.0.0.1", move |_| html(&page));
+        let seed = format!("http://127.0.0.1:{a}/");
+        let Some(events) = browser_crawl(&seed, &[]).await else {
+            eprintln!("no browser on PATH; skipped");
+            return;
+        };
+        let urls = urls(&events);
+        assert!(
+            !urls.iter().any(|u| u.contains("internal-only")),
+            "{urls:?}"
+        );
+        assert!(
+            b_seen.lock().unwrap().is_empty(),
+            "the page's script took the browser to a host outside the crawl's scope: {:?}",
+            b_seen.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_browser_files_links_past_an_in_scope_redirect_under_the_page_it_reached() {
+        let (seed, b, b_seen) = seed_and_internal_page();
+        let Some(events) = browser_crawl(&seed, &["127.0.0.2"]).await else {
+            eprintln!("no browser on PATH; skipped");
+            return;
+        };
+        let urls = urls(&events);
+        let want = format!("http://127.0.0.2:{b}/internal-only?token=s3cr3t");
+        assert!(urls.contains(&want.as_str()), "{urls:?}");
+        assert!(
+            !urls
+                .iter()
+                .any(|u| u.starts_with(&seed) && u.contains("internal-only")),
+            "a link was resolved against the seed rather than the page it came from: {urls:?}"
+        );
+        assert!(!b_seen.lock().unwrap().is_empty());
     }
 }

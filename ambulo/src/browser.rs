@@ -30,6 +30,15 @@
 //! an application - the admin area, the reports section - and records the API
 //! calls each one makes on load, without ever pressing a button.
 //!
+//! # Where it may go
+//!
+//! Only where the crawl may go. A browser follows a redirect wherever it points
+//! and lets a page's script send it anywhere, so a target could otherwise steer
+//! it onto a host the operator never listed, including the node's own network.
+//! Every document request is held until the caller's gate answers for it, and
+//! one the gate refuses is never sent. What the browser read is filed under the
+//! page it ended on, not the address it was sent to.
+//!
 //! # Why the browser is optional and stays optional
 //!
 //! A node without Chrome must keep working exactly as before. The tier is off
@@ -160,6 +169,22 @@ pub fn launch_args(profile: &str, no_sandbox: bool) -> Vec<String> {
     a
 }
 
+/// The preferences the throwaway profile starts with.
+///
+/// Network prediction off. With it on, the browser opens connections to a host
+/// before it has decided to load anything there: to where a page's script is
+/// about to navigate, or to a link it expects to be followed. The gate in
+/// [`visit`] answers for every document request, but a preconnect is not a
+/// request and never reaches it.
+pub const PROFILE_PREFERENCES: &str = r#"{"net":{"network_prediction_options":2}}"#;
+
+/// Create the throwaway profile with [`PROFILE_PREFERENCES`] in place.
+fn write_profile(profile: &std::path::Path) -> std::io::Result<()> {
+    let default = profile.join("Default");
+    std::fs::create_dir_all(&default)?;
+    std::fs::write(default.join("Preferences"), PROFILE_PREFERENCES)
+}
+
 /// The websocket endpoint out of the line Chrome prints on stderr.
 #[cfg_attr(unix, allow(dead_code))]
 pub fn parse_ws_url(line: &str) -> Option<String> {
@@ -182,7 +207,7 @@ impl Browser {
     /// Start a browser and connect to it.
     pub async fn launch(exe: &PathBuf, no_sandbox: bool) -> Result<(Self, Cdp), String> {
         let profile = std::env::temp_dir().join(format!("ambulo-browser-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&profile).map_err(|e| format!("profile dir: {e}"))?;
+        write_profile(&profile).map_err(|e| format!("profile dir: {e}"))?;
         let args = launch_args(&profile.to_string_lossy(), no_sandbox);
         let mut cmd = Command::new(exe);
         cmd.args(&args)
@@ -324,7 +349,20 @@ pub struct Visit {
     pub requests: Vec<(String, String)>,
     /// The DOM after script has built it.
     pub dom: String,
+    /// Where the page ended up, which is not the address it was sent to when the
+    /// server redirected it. The DOM's relative links mean this page, so they are
+    /// resolved against this and not against the address asked for. `None` when
+    /// the navigation failed or the address could not be read.
+    pub final_url: Option<String>,
+    /// Documents the gate refused to load: a redirect, a script navigation or a
+    /// frame that would have taken the browser somewhere it may not go.
+    pub refused: Vec<String>,
 }
+
+/// Decides whether the browser may load a document from a URL. Asked about the
+/// page the visit starts on, every redirect hop after it, any navigation the
+/// page's own script starts, and every frame.
+pub type Gate = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// Is this a request worth recording?
 ///
@@ -409,6 +447,12 @@ pub struct Cdp {
     /// navigation command is in flight, so discarding them would throw away the
     /// answer.
     pending: Vec<Value>,
+    /// While a visit runs, what decides each paused document request. A paused
+    /// request waits for an answer, so it is answered the moment it is read,
+    /// whichever wait reads it.
+    gate: Option<Gate>,
+    /// Documents the gate refused during the current visit.
+    refused: Vec<String>,
 }
 
 impl Cdp {
@@ -417,7 +461,47 @@ impl Cdp {
             wire,
             next_id: 1,
             pending: Vec::new(),
+            gate: None,
+            refused: Vec::new(),
         }
+    }
+
+    /// Answer a paused request if `v` is one: let it through or fail it, as the
+    /// gate says. Returns whether `v` was a paused request.
+    ///
+    /// The answer is sent without waiting for its reply. Nothing is waiting on
+    /// that id, so the reply is read and dropped like any other stray.
+    async fn answer_paused(&mut self, v: &Value) -> bool {
+        if v.get("method").and_then(|m| m.as_str()) != Some("Fetch.requestPaused") {
+            return false;
+        }
+        let Some(request_id) = v.pointer("/params/requestId").and_then(|x| x.as_str()) else {
+            return true;
+        };
+        let url = v
+            .pointer("/params/request/url")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        // No gate means nothing was asked to be stopped.
+        let allowed = self.gate.as_ref().is_none_or(|g| g(url));
+        let (method, params) = if allowed {
+            ("Fetch.continueRequest", json!({"requestId": request_id}))
+        } else {
+            self.refused
+                .push(url.split('#').next().unwrap_or(url).to_string());
+            (
+                "Fetch.failRequest",
+                json!({"requestId": request_id, "errorReason": "BlockedByClient"}),
+            )
+        };
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut msg = json!({"id": id, "method": method, "params": params});
+        if let Some(s) = v.get("sessionId") {
+            msg["sessionId"] = s.clone();
+        }
+        let _ = self.wire.send(msg.to_string()).await;
+        true
     }
 
     /// Connect to a DevTools endpoint on the loopback interface.
@@ -488,6 +572,9 @@ impl Cdp {
                 }
                 return Ok(v.get("result").cloned().unwrap_or(json!({})));
             }
+            if self.answer_paused(&v).await {
+                continue;
+            }
             if v.get("method").is_some() {
                 self.pending.push(v);
             }
@@ -527,6 +614,9 @@ impl Cdp {
             let Ok(v) = serde_json::from_str::<Value>(&t) else {
                 continue;
             };
+            if self.answer_paused(&v).await {
+                continue;
+            }
             if v.get("method").and_then(|x| x.as_str()) == Some("Page.loadEventFired") {
                 soft = Some(tokio::time::Instant::now() + settle);
             }
@@ -580,7 +670,24 @@ pub fn requests_from(events: &[Value]) -> Vec<(String, String)> {
 /// A fresh target per navigation, deliberately: a single-page application that
 /// keeps state between routes would otherwise skip the data fetches on the
 /// second visit, and those fetches are the entire point.
-pub async fn visit(cdp: &mut Cdp, url: &str) -> Result<Visit, String> {
+///
+/// Every document the page would load, `url` itself, each redirect hop and any
+/// frame or script navigation, is held until `gate` answers for it, and one it
+/// refuses is never requested. Requests for scripts, images and data are not
+/// gated: they are what the page itself asks for, and they are recorded.
+pub async fn visit(cdp: &mut Cdp, url: &str, gate: Gate) -> Result<Visit, String> {
+    cdp.gate = Some(gate);
+    cdp.refused.clear();
+    let out = visit_gated(cdp, url).await;
+    cdp.gate = None;
+    let refused = std::mem::take(&mut cdp.refused);
+    out.map(|mut v| {
+        v.refused = refused;
+        v
+    })
+}
+
+async fn visit_gated(cdp: &mut Cdp, url: &str) -> Result<Visit, String> {
     let t = cdp
         .call(
             "Target.createTarget",
@@ -612,14 +719,47 @@ pub async fn visit(cdp: &mut Cdp, url: &str) -> Result<Visit, String> {
 
     let _ = cdp.call("Network.enable", json!({}), s, NAV_TIMEOUT).await;
     let _ = cdp.call("Page.enable", json!({}), s, NAV_TIMEOUT).await;
-    let nav = cdp
-        .call("Page.navigate", json!({"url": url}), s, NAV_TIMEOUT)
+    // Hold every document request until the gate has answered for it. Without
+    // this the browser follows a redirect wherever it points, as a browser does.
+    let gated = cdp
+        .call(
+            "Fetch.enable",
+            json!({"patterns": [{"urlPattern": "*", "resourceType": "Document", "requestStage": "Request"}]}),
+            s,
+            NAV_TIMEOUT,
+        )
         .await;
+    let nav = match gated {
+        Ok(_) => {
+            cdp.call("Page.navigate", json!({"url": url}), s, NAV_TIMEOUT)
+                .await
+        }
+        Err(e) => Err(e),
+    };
 
     let mut visit = Visit::default();
-    if nav.is_ok() {
+    // A navigation the gate refused fails with an error page, which is not the
+    // application and has nothing to record.
+    let failed = nav.as_ref().map_or(true, |r| {
+        r.get("errorText").is_some_and(|e| e.as_str() != Some(""))
+    });
+    if !failed {
         let events = cdp.pump(NAV_TIMEOUT, SETTLE).await;
         visit.requests = requests_from(&events);
+        if let Ok(r) = cdp
+            .call(
+                "Runtime.evaluate",
+                json!({"expression": "location.href", "returnByValue": true}),
+                s,
+                NAV_TIMEOUT,
+            )
+            .await
+        {
+            visit.final_url = r
+                .pointer("/result/value")
+                .and_then(|x| x.as_str())
+                .map(str::to_string);
+        }
         if let Ok(r) = cdp
             .call(
                 "Runtime.evaluate",
@@ -673,6 +813,23 @@ mod tests {
         // Without this the browser opens the real profile, with the operator's
         // cookies, and points it at somebody else's application.
         assert!(a.iter().any(|f| f.starts_with("--user-data-dir=")));
+    }
+
+    #[test]
+    fn the_profile_starts_with_network_prediction_off() {
+        // 2 is "never". Without it the browser connects to where a page is
+        // about to send it before the gate has been asked.
+        let dir = std::env::temp_dir().join(format!("ambulo-prefs-{}", uuid::Uuid::new_v4()));
+        write_profile(&dir).unwrap();
+        let prefs: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("Default/Preferences")).unwrap(),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            prefs.pointer("/net/network_prediction_options"),
+            Some(&json!(2))
+        );
     }
 
     #[test]
@@ -741,7 +898,12 @@ mod tests {
         let no_sandbox =
             dguard::env_renamed("AMBULO_BROWSER_NO_SANDBOX", "MACH_BROWSER_NO_SANDBOX").is_some();
         let (browser, mut cdp) = Browser::launch(&exe, no_sandbox).await.expect("launch");
-        let v = visit(&mut cdp, "data:text/html,<a href=/x>x</a>").await;
+        let v = visit(
+            &mut cdp,
+            "data:text/html,<a href=/x>x</a>",
+            std::sync::Arc::new(|_: &str| true),
+        )
+        .await;
         let port_file = browser.profile.join("DevToolsActivePort");
         let opened_a_port = port_file.exists();
         browser.shutdown().await;
