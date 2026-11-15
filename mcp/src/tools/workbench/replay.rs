@@ -16,8 +16,8 @@ use crate::peer::ClientPeer;
 use crate::tools::parse_args;
 use crate::{guard, untrusted};
 use cfx_bridge::{
-    Call, EDIT_ENTRIES_MAX, Edits, ErrorCode, ExchangeResult, McpRef, PINS_MAX, Part, ReplayParams,
-    ReplayResult,
+    Call, EDIT_ENTRIES_MAX, Edits, ErrorCode, ExchangeResult, McpRef, Origin, PINS_MAX, Part,
+    ReplayParams, ReplayResult,
 };
 use cfx_scope::Point;
 use serde::Deserialize;
@@ -224,10 +224,21 @@ pub(crate) async fn run(
     // The Workbench still dials the captured host, so behind a front end that routes by
     // Host, a name the request was not captured with gets the captured session. That
     // takes a yes, even for a read.
-    let captured: Vec<String> = stored_hosts
-        .iter()
-        .filter_map(|h| host_named(&dest.scheme, h))
-        .collect();
+    //
+    // "Another name" is decided on the text that goes out, because the Workbench sends
+    // the value as written and a front end routes on that text, not on what a URL parser
+    // would make of it. Only a plain name equal to the URL's host passes, or one the
+    // browser sent for this request through the proxy. A request the Workbench or an
+    // agent sent carries whatever Host it was given, so its Host vouches for nothing.
+    let captured: Vec<String> = if stored.origin == Origin::Proxy {
+        stored_hosts
+            .iter()
+            .filter_map(|h| plain_host(h))
+            .map(|(name, _)| name)
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut elsewhere: Vec<String> = Vec::new();
     for h in host_headers
         .iter()
@@ -236,8 +247,8 @@ pub(crate) async fn run(
     {
         let hd = guard::parse_target(&format!("{}://{}", dest.scheme, h))
             .map_err(|e| Refusal::invalid(format!("Host header: {}", untrusted::clean(&e, 200))))?;
-        if hd.host != dest.host && !captured.contains(&hd.host) && !elsewhere.contains(&hd.host) {
-            elsewhere.push(hd.host.clone());
+        if !names_dest(h, &dest, &captured) && !elsewhere.iter().any(|e| e == h) {
+            elsewhere.push(h.to_string());
         }
         let port = if h.contains(':') { hd.port } else { dest.port };
         if !mcp.guard.admit(
@@ -269,13 +280,20 @@ pub(crate) async fn run(
         ),
         None => format!("{} request", untrusted::clean(&method, 32)),
     };
-    let under = untrusted::clean(&elsewhere.join(", "), 200);
+    let under = untrusted::clean(
+        &elsewhere
+            .iter()
+            .map(|h| format!("\"{h}\""))
+            .collect::<Vec<_>>()
+            .join(", "),
+        200,
+    );
     // A yes is remembered for the captured host and the Host names it went out under,
     // so a yes for one pair never covers another.
     let pair = if elsewhere.is_empty() {
         dest.key()
     } else {
-        format!("{} under Host {}", dest.key(), elsewhere.join(","))
+        format!("{} under Host {:?}", dest.key(), elsewhere)
     };
     let write = if intent == Intent::Write {
         let host_note = if elsewhere.is_empty() {
@@ -439,15 +457,66 @@ fn bridge_label(raw: &str) -> String {
     }
 }
 
-/// The host a Host header value names, lowercased, or `None` when it names none.
-fn host_named(scheme: &str, raw: &str) -> Option<String> {
-    let t = raw.trim();
-    if t.is_empty() {
-        return None;
+/// A Host value written plainly: a name of ASCII letters, digits, dots and hyphens, or
+/// an IPv6 address in brackets, then at most a port in digits with no leading zero.
+/// Returns the name lowercased (brackets kept) and the port. Anything else, such as a
+/// percent sign, a non-ASCII letter, a slash or a `#`, is `None`: a URL parser and a
+/// front end can read such a value as two different hosts.
+fn plain_host(raw: &str) -> Option<(String, Option<u16>)> {
+    let t = raw.trim().to_ascii_lowercase();
+    let (name, port) = if t.starts_with('[') {
+        let end = t.find(']')?;
+        let inner = &t[1..end];
+        if inner.is_empty()
+            || !inner
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
+        {
+            return None;
+        }
+        (&t[..=end], &t[end + 1..])
+    } else {
+        let end = t.find(':').unwrap_or(t.len());
+        let name = &t[..end];
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        {
+            return None;
+        }
+        (name, &t[end..])
+    };
+    let port = match port {
+        "" => None,
+        p => {
+            let digits = p.strip_prefix(':')?;
+            let n: u16 = digits.parse().ok()?;
+            if n.to_string() != digits {
+                return None;
+            }
+            Some(n)
+        }
+    };
+    Some((name.to_string(), port))
+}
+
+/// Whether a Host value, as it goes out, names the host the Workbench dials (or one the
+/// browser sent this request under): the same plain name, with no port or with the
+/// URL's port or the scheme's default.
+fn names_dest(raw: &str, dest: &guard::Dest, captured: &[String]) -> bool {
+    let Some((name, port)) = plain_host(raw) else {
+        return false;
+    };
+    let default = if dest.scheme == "https" { 443 } else { 80 };
+    if port.is_some_and(|p| p != dest.port && p != default) {
+        return false;
     }
-    guard::parse_target(&format!("{scheme}://{t}"))
-        .ok()
-        .map(|d| d.host)
+    let own = match dest.ip {
+        Some(std::net::IpAddr::V6(_)) => format!("[{}]", dest.host),
+        _ => dest.host.clone(),
+    };
+    name == own || captured.contains(&name)
 }
 
 /// The Host headers the sent request will carry. An edit that names Host sets the first

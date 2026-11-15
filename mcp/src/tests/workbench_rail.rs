@@ -1550,7 +1550,9 @@ mod reads {
 mod replay {
     use super::*;
     use crate::tests::fake_wb::*;
-    use cfx_bridge::{Body, Call, ErrorBody, ErrorCode, ExchangeHandle, Method, ReplayResult};
+    use cfx_bridge::{
+        Body, Call, ErrorBody, ErrorCode, ExchangeHandle, Method, Origin, ReplayResult,
+    };
 
     fn names() -> FakeResolver {
         FakeResolver::default()
@@ -1924,8 +1926,8 @@ mod replay {
         assert_eq!(peer.asked(), 2, "the same pair is not asked about again");
         assert_eq!(b.fake.count(Method::Replay), 2);
 
-        // The URL's own host, however it is written, and a Host the request was
-        // captured with are not another host.
+        // The URL's own host in another case or with its own port, and a Host the
+        // browser sent the request with, are not another host.
         let peer = FakePeer::new(Elicit::None);
         for host in ["APP.example.test", "app.example.test:80"] {
             let r =
@@ -1952,6 +1954,71 @@ mod replay {
             .await;
         ok(&r);
         assert_eq!(b.fake.count(Method::Replay), 1);
+    }
+
+    /// The Workbench sends a Host value as written, and a front end routes on that text.
+    /// A spelling that a URL parser folds back into the captured host, or that only
+    /// starts with it, can still name another host there, so it asks.
+    #[tokio::test]
+    async fn a_host_spelled_unlike_the_captured_host_asks() {
+        let b = bench_with(base(""), get_app()).await;
+        let peer = FakePeer::new(Elicit::None);
+        for host in [
+            "app%2Eexample.test",
+            "\u{ff41}pp.example.test",
+            "app\u{ad}.example.test",
+            "app.example.test:8080",
+            "app.example.test:080",
+            "app.example.test#.other.example.test",
+            "app.example.test?.other.example.test",
+            "app.example.test/.other.example.test",
+            "app.example.test\\.other.example.test",
+        ] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1),
+                           "edits": {"headers": {"Host": host}}}),
+                )
+                .await;
+            assert_eq!(reason(&r), "not_confirmed", "{host:?}: {}", r.text);
+        }
+        assert_eq!(b.fake.count(Method::Replay), 0);
+    }
+
+    /// Only a Host the browser sent through the proxy vouches for a name. A request the
+    /// Workbench or an agent sent carries whatever Host it was given, so replaying an
+    /// earlier replay sent under another Host asks again.
+    #[tokio::test]
+    async fn a_host_from_an_earlier_replay_is_not_a_captured_host() {
+        for origin in [Origin::Agent, Origin::Replay, Origin::Repeater] {
+            let shown = format!("{origin:?}");
+            let b = bench_with(
+                base(""),
+                WbOpts::default().answer(Method::Exchange, move |c, _| {
+                    let Call::Exchange(p) = c else { unreachable!() };
+                    let mut x = default_exchange(p.id);
+                    x.url = "http://app.example.test/api/items?id=2".into();
+                    x.origin = origin.clone();
+                    x.req_headers = Some(vec![
+                        ("Host".into(), "other.example.test".into()),
+                        ("Cookie".into(), "sid=S1-ck".into()),
+                    ]);
+                    Ok(serde_json::to_value(x).unwrap())
+                }),
+            )
+            .await;
+            let r =
+                b.t.call(
+                    &FakePeer::new(Elicit::None),
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1)}),
+                )
+                .await;
+            assert_eq!(reason(&r), "not_confirmed", "{shown}: {}", r.text);
+            assert_eq!(b.fake.count(Method::Replay), 0);
+        }
     }
 
     /// A yes to writes on the captured host does not cover writes that carry its
