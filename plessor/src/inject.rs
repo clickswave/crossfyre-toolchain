@@ -1305,22 +1305,37 @@ pub(crate) fn keep_in_scope<T>(
         .collect()
 }
 
-fn in_scope(target: &str, url: &str, extra: &crate::scope::Scope) -> bool {
-    let scope = host_of(target);
-    if scope.is_empty() {
+pub(crate) fn in_scope(target: &str, url: &str, extra: &crate::scope::Scope) -> bool {
+    if host_of(target).is_empty() {
         return true;
     }
-    let host = host_of(url);
-    if host.is_empty() || host == scope {
-        return true;
-    }
+    // The host is read the way the clients that send to it read it, with the url
+    // crate. Read as text up to the first '/', `https://a.test:x@b.test/` names
+    // a.test and `https://a.test:443?@b.test/` names b.test, and the request goes
+    // to the other one in both.
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        // A reference with no host of its own is resolved against the target.
+        return host_of(url).is_empty();
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
     // A port difference on the same name is the same service to an operator who
     // named the host; a different name is not.
-    let bare = |h: &str| h.split(':').next().unwrap_or(h).to_string();
-    if bare(&host) == bare(&scope) {
+    if target_host(target).is_some_and(|t| t.eq_ignore_ascii_case(host)) {
         return true;
     }
-    extra.admits(&bare(&host), port_of(url))
+    extra.admits(host, port_of(url))
+}
+
+/// The scan target's host as the url crate reads it. A target written without a
+/// scheme is read as an http URL, which gives the same host.
+fn target_host(target: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(target)
+        .ok()
+        .filter(|u| u.has_host())
+        .or_else(|| reqwest::Url::parse(&format!("http://{target}")).ok())?;
+    parsed.host_str().map(str::to_string)
 }
 
 /// The URL's port: what it says, or what its scheme implies.
@@ -1329,21 +1344,7 @@ fn in_scope(target: &str, url: &str, extra: &crate::scope::Scope) -> bool {
 /// and a rule written `api.example.com:443` has to match `https://api.example.com/`
 /// which does not say a port at all.
 fn port_of(url: &str) -> Option<u16> {
-    let (scheme, rest) = url.split_once("://")?;
-    let host = rest.split('/').next().unwrap_or("");
-    let after = match host.rsplit_once(']') {
-        // [::1]:8080
-        Some((_, tail)) => tail.strip_prefix(':'),
-        None => host.rsplit_once(':').map(|(_, p)| p),
-    };
-    if let Some(p) = after.and_then(|p| p.parse::<u16>().ok()) {
-        return Some(p);
-    }
-    match scheme {
-        "https" => Some(443),
-        "http" => Some(80),
-        _ => None,
-    }
+    reqwest::Url::parse(url).ok()?.port_or_known_default()
 }
 
 /// Everything one endpoint worker needs. Cloned per endpoint; the clients are
@@ -5247,6 +5248,40 @@ mod scope_tests {
         assert_eq!(port_of("http://api.example.com:8080/x"), Some(8080));
         assert_eq!(port_of("http://[::1]:6379/"), Some(6379));
         assert_eq!(port_of("http://[::1]/"), Some(80));
+    }
+
+    #[test]
+    fn the_host_is_read_the_way_the_sender_reads_it() {
+        let target = "https://app.victim.example/";
+        // The text before '@' is a user name, and the request goes to the host after it.
+        assert!(!in_scope(
+            target,
+            "https://app.victim.example:x@third-party.example/x",
+            &none()
+        ));
+        assert!(!in_scope(
+            target,
+            "https://app.victim.example:443@third-party.example/x",
+            &none()
+        ));
+        // These name the target, with what follows in the query or fragment.
+        assert!(in_scope(
+            target,
+            "https://app.victim.example:443?@third-party.example/x",
+            &none()
+        ));
+        assert!(in_scope(
+            target,
+            "https://user@app.victim.example/x",
+            &none()
+        ));
+        // A rule on another host admits by that host, not by text before an '@'.
+        let (s, _) = crate::scope::parse(&["redis.internal:6379".to_string()]);
+        assert!(!in_scope(
+            target,
+            "http://redis.internal:6379@third-party.example:6379/",
+            &s
+        ));
     }
 
     #[test]

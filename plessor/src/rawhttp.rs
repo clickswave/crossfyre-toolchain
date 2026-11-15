@@ -96,8 +96,14 @@ pub async fn send(req: RawReq<'_>) -> Option<RawResp> {
 }
 
 /// Split an (unnormalised) URL into (is_https, host, port, request-target).
-/// Deliberately does NOT use url::Url, which would resolve the dot-segments we
-/// are trying to preserve.
+/// Deliberately does NOT take the request-target from url::Url, which would
+/// resolve the dot-segments we are trying to preserve.
+///
+/// The host and port are another matter. Every scope check reads a URL's host
+/// with the url crate, so a raw send has to dial the host that crate reads, or a
+/// URL a check admitted can still open a connection somewhere else. The authority
+/// ends where the url crate ends it, at the first '/', '?', '#' or '\\', and a URL
+/// whose host or port the two readings disagree on is not sent.
 fn split(url: &str) -> Option<(bool, String, u16, String)> {
     let (https, rest) = if let Some(r) = url.strip_prefix("https://") {
         (true, r)
@@ -106,10 +112,13 @@ fn split(url: &str) -> Option<(bool, String, u16, String)> {
     } else {
         return None;
     };
-    let (authority, target) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
-    };
+    let end = rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len());
+    let (authority, target) = rest.split_at(end);
+    // The url crate reads a backslash as a path separator. Sent as written it is not
+    // a request-target, and rewritten it is no longer what the caller asked for.
+    if target.starts_with('\\') {
+        return None;
+    }
     let authority = authority.rsplit('@').next().unwrap_or(authority);
     let (host, port) = match authority.rsplit_once(':') {
         Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
@@ -120,10 +129,17 @@ fn split(url: &str) -> Option<(bool, String, u16, String)> {
     if host.is_empty() {
         return None;
     }
-    let target = if target.is_empty() {
-        "/".to_string()
-    } else {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    if !parsed.host_str()?.eq_ignore_ascii_case(&host)
+        || parsed.port_or_known_default() != Some(port)
+    {
+        return None;
+    }
+    let target = if target.starts_with('/') {
         target.to_string()
+    } else {
+        // Empty, or a query or fragment straight after the authority.
+        format!("/{target}")
     };
     Some((https, host, port, target))
 }
@@ -796,6 +812,40 @@ mod tests {
         assert_eq!(host, "h.test");
         assert_eq!(port, 8443);
         assert_eq!(target, "/a?b=1");
+    }
+
+    #[test]
+    fn split_reads_the_host_the_url_crate_reads() {
+        // The scope checks read a URL's host with the url crate, which ends the
+        // authority at '?', '#' or '\\' as well as '/'. A raw send that ended it at
+        // '/' alone would read text after those as the host and dial somewhere no
+        // check ever looked at.
+        for url in [
+            "https://app.victim.example:443?@third-party.example/x",
+            "https://app.victim.example:443#@third-party.example/x",
+            "https://app.victim.example:443\\@third-party.example/x",
+            "https://app.victim.example?@third-party.example/x",
+            "http://app.victim.example\t@third-party.example/x",
+        ] {
+            let want = reqwest::Url::parse(url).expect("the url crate reads it");
+            match split(url) {
+                None => {}
+                Some((_, host, port, target)) => {
+                    assert_eq!(Some(host.as_str()), want.host_str(), "{url}");
+                    assert_eq!(Some(port), want.port_or_known_default(), "{url}");
+                    assert!(target.starts_with('/'), "{url} gave target {target}");
+                }
+            }
+        }
+        // A query straight after the authority is still sent, at the root.
+        let (_, host, port, target) = split("https://h.test:8443?a=1").unwrap();
+        assert_eq!(
+            (host.as_str(), port, target.as_str()),
+            ("h.test", 8443, "/?a=1")
+        );
+        // A user part before the host is not the host, for either reader.
+        let (_, host, _, _) = split("https://h.test:x@other.test/a").unwrap();
+        assert_eq!(host, "other.test");
     }
 
     #[test]
