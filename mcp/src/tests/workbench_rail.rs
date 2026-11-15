@@ -468,7 +468,7 @@ mod reads {
                 "workbench_list_history",
                 json!({"host": "App.Example.Test", "method": "get", "origins": ["agent", "proxy"],
                        "status_min": 200, "status_max": 299, "since": "2026-10-30T00:00:00Z",
-                       "search": "login", "limit": 10}),
+                       "limit": 10}),
             )
             .await;
         let v = ok(&r).clone();
@@ -1540,6 +1540,239 @@ mod reads {
         }
         assert_eq!(after[0], after[1]);
         assert_eq!(after[0].as_array().unwrap().len(), 3, "{}", after[0]);
+    }
+
+    /// With masking on, paging through the map with its cursor reads the map from the
+    /// Workbench once, not once a page. A call without a cursor reads it afresh, and so
+    /// does one for another host.
+    #[tokio::test]
+    async fn paging_a_masked_site_map_reads_it_once() {
+        let paths: Vec<(&'static str, u64)> =
+            vec![("/a", 1), ("/b", 1), ("/c", 1), ("/d", 1), ("/e", 1)];
+        let b = bench_with(base(), paging_site_map(paths)).await;
+        let peer = FakePeer::new(Elicit::None);
+        let mut shown = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut args = json!({"limit": 2});
+            if let Some(c) = &cursor {
+                args["cursor"] = json!(c);
+            }
+            let r = b.t.call(&peer, "workbench_get_site_map", args).await;
+            let v = ok(&r).clone();
+            for e in v["endpoints"].as_array().unwrap() {
+                shown.push(e["target_data"]["path"].as_str().unwrap().to_string());
+            }
+            cursor = v["next_cursor"].as_str().map(str::to_string);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(shown, ["/a", "/b", "/c", "/d", "/e"]);
+        assert_eq!(
+            b.fake.count(Method::SiteMap),
+            1,
+            "one read for the whole walk"
+        );
+        let r =
+            b.t.call(&peer, "workbench_get_site_map", json!({"limit": 2}))
+                .await;
+        ok(&r);
+        assert_eq!(
+            b.fake.count(Method::SiteMap),
+            2,
+            "a fresh call reads afresh"
+        );
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_get_site_map",
+                json!({"limit": 2, "host": "other.example.test"}),
+            )
+            .await;
+        ok(&r);
+        assert_eq!(
+            b.fake.count(Method::SiteMap),
+            3,
+            "another host is its own read"
+        );
+    }
+
+    /// With masking on, `url_contains` still finds a row a few thousand rows back in
+    /// one call.
+    #[tokio::test]
+    async fn url_contains_reaches_a_rare_url_deep_in_the_history() {
+        let urls: Vec<(i64, String)> = (1..=2500)
+            .map(|i| {
+                let path = if i == 2400 { "rare-admin" } else { "common" };
+                (i, format!("http://app.example.test/{path}?n={i}"))
+            })
+            .collect();
+        let b = bench_with(base(), filtering_history(urls)).await;
+        let peer = FakePeer::new(Elicit::None);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_list_history",
+                json!({"url_contains": "rare-admin", "limit": 5}),
+            )
+            .await;
+        let v = ok(&r).clone();
+        assert_eq!(v["rows"].as_array().unwrap().len(), 1, "{v}");
+        assert_eq!(v["rows"][0]["exchange"], handle(UID_A, 2400));
+        assert!(v["next_cursor"].is_null(), "{v}");
+    }
+
+    /// A project the Workbench full-text searches the way it does: every word of
+    /// `search` somewhere in the stored URL, headers or bodies, and the other filters.
+    fn searching_history(stored: Vec<cfx_bridge::ExchangeResult>) -> WbOpts {
+        let stored = std::sync::Arc::new(stored);
+        let for_history = stored.clone();
+        WbOpts::default()
+            .answer(Method::History, move |c, _| {
+                let Call::History(p) = c else { unreachable!() };
+                let words: Vec<String> = p
+                    .filter
+                    .search
+                    .as_deref()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .map(str::to_lowercase)
+                    .collect();
+                let mut found: Vec<HistoryRow> = for_history
+                    .iter()
+                    .filter(|x| p.cursor.is_none_or(|c| x.id > c.id))
+                    .filter(|x| p.filter.host.as_ref().is_none_or(|h| *h == x.host))
+                    .filter(|x| {
+                        let mut all = x.url.clone();
+                        for (k, v) in x.req_headers.iter().chain(&x.resp_headers).flatten() {
+                            all.push_str(&format!(" {k}: {v}"));
+                        }
+                        for b in [&x.req_body, &x.resp_body].into_iter().flatten() {
+                            all.push(' ');
+                            all.push_str(b.text.as_deref().unwrap_or(""));
+                        }
+                        let all = all.to_lowercase();
+                        words.iter().all(|w| all.contains(w.as_str()))
+                    })
+                    .map(|x| {
+                        let mut r = row(x.id, &x.url);
+                        r.host = x.host.clone();
+                        r
+                    })
+                    .collect();
+                let more = found.len() > p.limit as usize;
+                found.truncate(p.limit as usize);
+                let next = found.last().filter(|_| more).map(|r| HistoryCursor {
+                    at_ms: r.at_ms,
+                    id: r.id,
+                });
+                Ok(serde_json::to_value(HistoryResult { rows: found, next }).unwrap())
+            })
+            .answer(Method::Exchange, move |c, _| {
+                let Call::Exchange(p) = c else { unreachable!() };
+                let x = stored.iter().find(|x| x.id == p.id).unwrap().clone();
+                Ok(serde_json::to_value(x).unwrap())
+            })
+    }
+
+    fn login(id: i64, host: &str, body: &str) -> cfx_bridge::ExchangeResult {
+        let mut x = default_exchange(id);
+        x.host = host.into();
+        x.url = format!("http://{host}/api/login");
+        x.req_headers = Some(vec![("Content-Type".into(), "application/json".into())]);
+        x.req_body = Some(Body::text(body.into(), body.len() as u64, false));
+        x
+    }
+
+    /// With masking on, a full-text search for a whole masked value finds nothing, the
+    /// same nothing a wrong guess finds, so a short value cannot be confirmed by
+    /// guessing it. A word in what is shown still finds its row.
+    #[tokio::test]
+    async fn search_cannot_confirm_a_guess_at_a_masked_value() {
+        let stored = vec![
+            login(
+                1,
+                "app.example.test",
+                r#"{"user":"ann","password":"482913"}"#,
+            ),
+            login(
+                2,
+                "other.example.test",
+                r#"{"user":"bob","order":"771204"}"#,
+            ),
+        ];
+        let b = bench_with(base(), searching_history(stored)).await;
+        let peer = FakePeer::new(Elicit::None);
+        let mut seen = Vec::new();
+        for guess in ["482913", "482914"] {
+            for args in [
+                json!({"search": guess, "limit": 1}),
+                json!({"search": format!("ann {guess}"), "host": "app.example.test"}),
+            ] {
+                let r =
+                    b.t.call(&peer, "workbench_list_history", args.clone())
+                        .await;
+                let v = ok(&r).clone();
+                seen.push((args, v["rows"].clone(), v["next_cursor"].clone()));
+            }
+        }
+        for (args, rows, next) in &seen {
+            assert_eq!(rows, &json!([]), "{args} found a row: {rows}");
+            assert!(next.is_null(), "{args} left a cursor: {next}");
+        }
+        // Words in the shown text still find their rows.
+        for (term, id) in [("ann", 1), ("password", 1), ("771204", 2)] {
+            let r =
+                b.t.call(&peer, "workbench_list_history", json!({"search": term}))
+                    .await;
+            let v = ok(&r).clone();
+            assert_eq!(v["rows"].as_array().unwrap().len(), 1, "{term}: {v}");
+            assert_eq!(v["rows"][0]["exchange"], handle(UID_A, id), "{term}");
+        }
+        // The Workbench still narrows by the words.
+        let sent = &b.fake.params(Method::History)[0];
+        assert_eq!(sent["filter"]["search"], "482913");
+
+        // A read that runs out of checks says it stopped and gives a cursor after the
+        // last row it looked at, from which the next call goes on.
+        let mut stored: Vec<_> = (1..=60)
+            .map(|i| login(i, "app.example.test", r#"{"password":"hunter2"}"#))
+            .collect();
+        stored.push(login(61, "app.example.test", r#"{"note":"hunter2"}"#));
+        let b = bench_with(base(), searching_history(stored)).await;
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_list_history",
+                json!({"search": "hunter2", "limit": 1}),
+            )
+            .await;
+        let v = ok(&r).clone();
+        assert_eq!(v["rows"], json!([]), "{v}");
+        assert!(r.text.contains("the read stopped"), "{}", r.text);
+        assert_eq!(b.fake.count(Method::Exchange), 50);
+        let next = v["next_cursor"].as_str().unwrap().to_string();
+        assert!(next.ends_with("_50"), "{next}");
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_list_history",
+                json!({"search": "hunter2", "limit": 1, "cursor": next}),
+            )
+            .await;
+        let v = ok(&r).clone();
+        assert_eq!(v["rows"].as_array().unwrap().len(), 1, "{v}");
+        assert_eq!(v["rows"][0]["exchange"], handle(UID_A, 61));
+
+        // With masking off the rows are the Workbench's, and none is read to check.
+        let stored = vec![login(1, "app.example.test", r#"{"password":"482913"}"#)];
+        let b = bench_with(base().no_redact(), searching_history(stored)).await;
+        let r =
+            b.t.call(&peer, "workbench_list_history", json!({"search": "482913"}))
+                .await;
+        assert_eq!(ok(&r)["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(b.fake.count(Method::Exchange), 0);
     }
 }
 

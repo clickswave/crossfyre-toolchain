@@ -396,6 +396,8 @@ pub(crate) struct Mcp {
     /// A Cloud workspace, when a key is set up.
     pub cloud: crate::cloud::Slot,
     told: Mutex<Told>,
+    /// The masked site map last read, which a call that pages on with its cursor reuses.
+    pub site_map: Mutex<Option<crate::tools::workbench::MaskedMap>>,
 }
 
 impl Mcp {
@@ -437,6 +439,7 @@ impl Mcp {
             open_calls: Mutex::new(HashMap::new()),
             cloud: crate::cloud::Slot::None,
             told: Mutex::new(Told::default()),
+            site_map: Mutex::new(None),
             scope,
         }
     }

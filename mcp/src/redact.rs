@@ -161,7 +161,9 @@ static NESTED_MEMBER: LazyLock<Regex> = LazyLock::new(|| {
 /// A JSON member with one of those names whose value is an object or an array, which
 /// the member pattern does not reach, loses the whole value: `"session":{"id":"..."}`
 /// becomes `"session":"[redacted]"`. A value a body cap cut off is masked to the end of
-/// what was captured. Brackets inside strings are stepped over.
+/// what was captured. Brackets inside strings are stepped over, single-quoted and
+/// backquoted ones as well, since script text holds those, and a string that does not
+/// close is masked to the end.
 fn mask_nested_members(s: &str) -> String {
     if !NESTED_MEMBER.is_match(s) {
         return s.to_string();
@@ -170,20 +172,20 @@ fn mask_nested_members(s: &str) -> String {
     let mut from = 0;
     while let Some(m) = NESTED_MEMBER.find_at(s, from) {
         let open = m.end() - 1;
-        let (mut depth, mut in_str, mut esc) = (0usize, false, false);
+        let (mut depth, mut in_str, mut esc) = (0usize, None, false);
         let mut end = s.len();
         for (i, c) in s[open..].char_indices() {
-            if in_str {
+            if let Some(q) = in_str {
                 match (esc, c) {
                     (true, _) => esc = false,
                     (false, '\\') => esc = true,
-                    (false, '"') => in_str = false,
+                    (false, c) if c == q => in_str = None,
                     _ => {}
                 }
                 continue;
             }
             match c {
-                '"' => in_str = true,
+                '"' | '\'' | '`' => in_str = Some(c),
                 '{' | '[' => depth += 1,
                 '}' | ']' => {
                     depth -= 1;
@@ -722,6 +724,11 @@ mod unit {
         // A brace inside a string does not end the value early.
         let r = redact_text(r#"{"auth":{"note":"a } \" ]","key":"NJ4"},"after":1}"#);
         assert_eq!(r, r#"{"auth":"[redacted]","after":1}"#);
+        // Nor does one inside a single-quoted or backquoted string, as script text has.
+        let r = redact_text(r#"var c = {"keys": [1, ']', 'a \' ]', "NJ6"], "n": 2};"#);
+        assert_eq!(r, r#"var c = {"keys": "[redacted]", "n": 2};"#);
+        let r = redact_text(r#"{"session": {"a": '}', "b": `]}"`, "c": "NJ7"}, "n": 2}"#);
+        assert_eq!(r, r#"{"session": "[redacted]", "n": 2}"#);
         // Nested under an ordinary name, and cut off by the body cap.
         let r = redact_text(r#"{"data":{"user":{"session":{"id":"NJ5","more"#);
         assert!(!r.contains("NJ5"), "{r}");
