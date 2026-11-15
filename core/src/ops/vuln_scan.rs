@@ -33,12 +33,18 @@ pub async fn handle(env: OpEnv) {
 
     let host = target_host(&target);
     let mode = data["mode"].as_str().unwrap_or("scan");
+    // What the operator needs to know about a credential kept off part of the pass.
+    let mut notes: Vec<String> = Vec::new();
+    // The hosts of each credential the pass carries. The platform checked them
+    // against the target only; anything else the engine is sent to is held to them.
+    let mut cred_scopes: Vec<Vec<String>> = Vec::new();
     let mut plessor_req = if mode == "authz" {
         // Authorization testing (BOLA/BFLA): resolve the identity
         // matrix and hand plessor the endpoints + identities.
         let idents = data["identities"].as_array().cloned().unwrap_or_default();
-        let resolved =
+        let (resolved, scopes) =
             creds::resolve_identities(&http, &api_url, &api_key, &idents, &host, lease).await;
+        cred_scopes = scopes;
         serde_json::json!({
             "operation": "authz",
             "response": "stream",
@@ -179,12 +185,17 @@ pub async fn handle(env: OpEnv) {
             let want = if mode == "inject" { 4 } else { 1 };
             match creds::resolve_auth_pool(&http, &api_url, &api_key, cid, &host, want, lease).await
             {
-                Ok(pool) if !pool.is_empty() => {
+                Ok((pool, hosts)) if !pool.is_empty() => {
                     if let Some(cr) = plessor_req.as_object_mut() {
                         cr.insert("auth".into(), pool[0].clone());
                         if pool.len() > 1 {
                             cr.insert("auth_pool".into(), serde_json::json!(pool));
                         }
+                    }
+                    if mode == "graphql" {
+                        notes.extend(super::cred_scope::graphql(&mut plessor_req, &hosts));
+                    } else {
+                        cred_scopes.push(hosts);
                     }
                 }
                 Ok(_) => {}
@@ -209,6 +220,15 @@ pub async fn handle(env: OpEnv) {
         }
     }
 
+    // An endpoint on a host the credential is not for is not handed to the engine,
+    // which would send it the credential along with every other request.
+    let scopes: Vec<&[String]> = cred_scopes.iter().map(Vec::as_slice).collect();
+    notes.extend(super::cred_scope::keep_endpoints(
+        &mut plessor_req,
+        &target,
+        &scopes,
+    ));
+
     // Forward the Evasiveness switch + attribution token when the workflow set them,
     // so the operator's posture reaches plessor (which otherwise defaults to
     // evasive=true / identify=none) for both the scan and authz operations.
@@ -228,6 +248,10 @@ pub async fn handle(env: OpEnv) {
         node_id: &node_id,
         egress: lease,
     };
+    for note in &notes {
+        eprintln!("[op] {op_id}: {note}");
+        relay.publish_note(note).await;
+    }
 
     let mut found_count: i64 = 0;
     let mut processed: i64 = 0;

@@ -3,6 +3,7 @@
 //! dispatched operation: it runs the engine, streams results/progress onto
 //! NATS, and publishes the terminal `operation_completed`.
 pub mod content_discovery;
+pub(crate) mod cred_scope;
 pub(crate) mod handoff;
 pub(crate) mod listener;
 pub mod network_scan;

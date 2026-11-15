@@ -63,13 +63,17 @@ pub async fn handle(env: OpEnv) {
 
     // Authenticated crawl: resolve an attached credential into
     // request auth (headers/cookies) and hand it to ambulo.
+    let mut crawl_note: Option<String> = None;
     if let Some(cid) = data["credential_id"].as_str().filter(|s| !s.is_empty()) {
         let host = target_host(&seed);
-        match creds::resolve_auth(&http, &api_url, &api_key, cid, &host, lease).await {
-            Ok(auth) => {
+        match creds::resolve_auth_scoped(&http, &api_url, &api_key, cid, &host, lease).await {
+            Ok(a) => {
                 if let Some(cr) = crawl_req.as_object_mut() {
-                    cr.insert("auth".into(), auth);
+                    cr.insert("auth".into(), a.auth);
                 }
+                // The crawler sends the credential with every page it fetches, so it
+                // is held to the hosts the credential is for.
+                crawl_note = super::cred_scope::crawl(&mut crawl_req, &a.hosts);
             }
             Err(e) => eprintln!("[op] web-crawl credential resolve failed ({cid}): {e}"),
         }
@@ -84,6 +88,10 @@ pub async fn handle(env: OpEnv) {
         node_id: &node_id,
         egress: lease,
     };
+    if let Some(note) = &crawl_note {
+        eprintln!("[op] {op_id}: {note}");
+        relay.publish_note(note).await;
+    }
 
     let mut found_count: i64 = 0;
     let mut processed: i64 = 0;

@@ -5369,3 +5369,249 @@ mod impostor_engine_tests {
         assert!(imp.got.lock().unwrap().is_empty());
     }
 }
+
+/// A saved credential reaches only the hosts it was saved for. The platform checks
+/// those hosts against the op's target alone, and an op can send the engine on to
+/// other hosts, which it reaches carrying the credential on every request.
+#[cfg(test)]
+mod credential_scope_tests {
+    use super::*;
+    use egress::state::EgressState;
+    use egress::testkit::{
+        FakeEngine, FakeNats, FakePlatform, direct_settings, http, ok, resolver,
+    };
+    use serde_json::{Value, json};
+
+    const NODE: &str = "node-cs";
+    const TARGET: &str = "http://app.victim.test/";
+
+    /// What the engine was asked to run when `data` ran as `op_type`, and the notes
+    /// the op published. The platform holds one bearer credential saved for `hosts`.
+    async fn engine_request(
+        op_type: &str,
+        ext: &str,
+        op_id: &str,
+        data: Value,
+        hosts: Value,
+    ) -> (Value, Vec<String>) {
+        let engine = FakeEngine::start(|_| async { vec![json!({"type": "done"})] }).await;
+        let nats = FakeNats::start().await;
+        let platform = FakePlatform::start(move |path, _| {
+            if path == "/api/v1/creds/resolve" {
+                ok(json!({
+                    "name": "app", "auth_type": "bearer", "config": {},
+                    "secret": {"token": "saved-token"}, "scope_hosts": hosts.clone(),
+                }))
+            } else {
+                (404, json!({"status": 404, "message": "not here"}))
+            }
+        })
+        .await;
+        let st = EgressState::new(resolver(&[]));
+        st.apply_authorize(&direct_settings(1));
+        let ctx = OpCtx {
+            pub_clone: nats.client().await,
+            status_subj: format!("cfx.node.{NODE}.status"),
+            result_subj: format!("cfx.results.{NODE}"),
+            node_id: NODE.into(),
+            http: http(),
+            api_url: platform.url.clone(),
+            api_key: "cfk_node".into(),
+            egress: st,
+        };
+        let cmd = json!({
+            "type": "operation", "operation_id": op_id, "workflow_id": format!("wf-{op_id}"),
+            "op_type": op_type, "pre_claimed": true, "data": data,
+        });
+        let client = ctx.pub_clone.clone();
+        ops::test_engines::with(&[(ext, engine.port)], run_operation(cmd, ctx)).await;
+        client.flush().await.unwrap();
+        nats.wait_for("operation_completed").await;
+        let seen = engine.seen();
+        let req = seen.first().cloned().expect("the engine was sent nothing");
+        let req = if req["operation"] == "egress" {
+            req["inner"].clone()
+        } else {
+            req
+        };
+        let notes = nats
+            .published()
+            .into_iter()
+            .filter(|(_, v)| v["type"] == "operation_note")
+            .filter_map(|(_, v)| v["message"].as_str().map(String::from))
+            .collect();
+        (req, notes)
+    }
+
+    fn urls(req: &Value) -> Vec<String> {
+        req["endpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["url"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn endpoints() -> Value {
+        json!([
+            {"method": "GET", "url": "http://app.victim.test/a?id=1"},
+            {"method": "GET", "url": "https://m.attacker.test/x?id=1"},
+            {"method": "GET", "url": "http://app.victim.test:@m.attacker.test/y?id=1"},
+            {"method": "GET", "url": "//m.attacker.test/z?id=1"},
+            {"method": "GET", "url": "http://api.app.victim.test/b?id=1"},
+        ])
+    }
+
+    /// Injection, structure fuzzing, request-shape discovery and authorization testing
+    /// all take a list of endpoints. One on a host the credential was not saved for is
+    /// not handed to the engine with the credential, however its URL is written.
+    #[tokio::test]
+    async fn endpoints_off_the_credentials_hosts_are_not_sent_with_it() {
+        for mode in ["inject", "fuzz", "discover", "authz"] {
+            let cid = format!("cs-endpoints-{mode}");
+            let mut data = json!({
+                "target": TARGET, "mode": mode, "endpoints": endpoints(),
+                "scope": ["m.attacker.test"],
+            });
+            if mode == "authz" {
+                data["identities"] = json!([
+                    {"role": "admin", "credential_id": cid},
+                    {"role": "anonymous"},
+                ]);
+            } else {
+                data["credential_id"] = json!(cid);
+            }
+            let (req, notes) = engine_request(
+                "vuln-scan-1",
+                "cortex",
+                &format!("op-cs-{mode}"),
+                data,
+                json!(["app.victim.test"]),
+            )
+            .await;
+            let auth = if mode == "authz" {
+                req["identities"][0]["auth"].clone()
+            } else {
+                req["auth"].clone()
+            };
+            assert_eq!(
+                auth["headers"]["Authorization"], "Bearer saved-token",
+                "{mode}: {req}"
+            );
+            assert_eq!(
+                urls(&req),
+                [
+                    "http://app.victim.test/a?id=1",
+                    "http://api.app.victim.test/b?id=1"
+                ],
+                "{mode}"
+            );
+            assert!(
+                notes
+                    .iter()
+                    .any(|n| n.contains("https://m.attacker.test/x?id=1")),
+                "{mode}: the operator was not told: {notes:?}"
+            );
+        }
+    }
+
+    /// A credential that records no hosts is not restricted, on the platform or here.
+    #[tokio::test]
+    async fn a_credential_with_no_hosts_keeps_every_endpoint() {
+        let data = json!({
+            "target": TARGET, "mode": "inject", "endpoints": endpoints(),
+            "scope": ["m.attacker.test"], "credential_id": "cs-unscoped",
+        });
+        let (req, notes) =
+            engine_request("vuln-scan-1", "cortex", "op-cs-unscoped", data, json!([])).await;
+        assert_eq!(
+            req["auth"]["headers"]["Authorization"],
+            "Bearer saved-token"
+        );
+        assert_eq!(urls(&req).len(), 5, "{req}");
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    /// A GraphQL endpoint written as a URL on another host is tested without the
+    /// credential. One on the target keeps it.
+    #[tokio::test]
+    async fn a_graphql_endpoint_elsewhere_is_tested_without_the_credential() {
+        for (n, (endpoint, carries)) in [
+            ("https://m.attacker.test/graphql", false),
+            ("http://app.victim.test:@m.attacker.test/graphql", false),
+            ("/graphql", true),
+            ("https://app.victim.test/api/graphql", true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let data = json!({
+                "target": TARGET, "mode": "graphql", "graphql_endpoint": endpoint,
+                "credential_id": format!("cs-graphql-{n}"),
+            });
+            let (req, notes) = engine_request(
+                "vuln-scan-1",
+                "cortex",
+                &format!("op-cs-gql-{n}"),
+                data,
+                json!(["app.victim.test"]),
+            )
+            .await;
+            assert_eq!(req["endpoint"], endpoint);
+            if carries {
+                assert_eq!(
+                    req["auth"]["headers"]["Authorization"], "Bearer saved-token",
+                    "{endpoint}"
+                );
+            } else {
+                assert!(
+                    !req.to_string().contains("saved-token"),
+                    "{endpoint}: {req}"
+                );
+                assert!(
+                    notes.iter().any(|m| m.contains(endpoint)),
+                    "{endpoint}: {notes:?}"
+                );
+            }
+        }
+    }
+
+    /// An authenticated crawl is held to the hosts the credential was saved for: it does
+    /// not follow links off them, and its extra hosts are narrowed to the part of each
+    /// that the credential covers.
+    #[tokio::test]
+    async fn an_authenticated_crawl_stays_on_the_credentials_hosts() {
+        let data = json!({
+            "seed": TARGET, "credential_id": "cs-crawl", "follow_external": true,
+            "scope_hosts": ["m.attacker.test", "victim.test", "app.victim.test"],
+        });
+        let (req, notes) = engine_request(
+            "web-crawl-1",
+            "mach",
+            "op-cs-crawl",
+            data,
+            json!(["app.victim.test", "*.api.victim.test"]),
+        )
+        .await;
+        assert_eq!(
+            req["auth"]["headers"]["Authorization"],
+            "Bearer saved-token"
+        );
+        assert_eq!(req["follow_external"], false, "{req}");
+        assert_eq!(
+            req["scope_hosts"],
+            json!(["app.victim.test", "api.victim.test"]),
+            "{req}"
+        );
+        assert!(!notes.is_empty());
+
+        // Without a credential the crawl goes where it was told, as before.
+        let data = json!({
+            "seed": TARGET, "follow_external": true, "scope_hosts": ["m.attacker.test"],
+        });
+        let (req, _) =
+            engine_request("web-crawl-1", "mach", "op-cs-crawl-anon", data, json!([])).await;
+        assert_eq!(req["follow_external"], true);
+        assert_eq!(req["scope_hosts"], json!(["m.attacker.test"]));
+    }
+}

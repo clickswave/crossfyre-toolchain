@@ -68,26 +68,41 @@ impl AuthContext {
     }
 }
 
-// Session cache: credential_id -> (context, built_at). Login/OAuth results are
-// reused for CACHE_TTL; static contexts are cheap but cached too.
-static CACHE: Mutex<Option<HashMap<String, (AuthContext, Instant)>>> = Mutex::new(None);
+/// Request auth for one credential, with the hosts the credential is for.
+#[derive(Clone, Debug)]
+pub struct ScopedAuth {
+    /// The `auth` object the engines consume.
+    pub auth: Value,
+    /// The credential's `scope_hosts` as the platform holds them. Empty when it
+    /// records none, which the platform reads as no restriction.
+    pub hosts: Vec<String>,
+}
+
+// Session cache: credential_id -> (context, the credential's hosts, built_at).
+// Login/OAuth results are reused for CACHE_TTL; static contexts are cheap but
+// cached too.
+type CacheEntry = (AuthContext, Vec<String>, Instant);
+static CACHE: Mutex<Option<HashMap<String, CacheEntry>>> = Mutex::new(None);
 const CACHE_TTL: Duration = Duration::from_secs(600);
 
-fn cache_get(id: &str) -> Option<AuthContext> {
+fn cache_get(id: &str) -> Option<(AuthContext, Vec<String>)> {
     let guard = CACHE.lock().ok()?;
     let map = guard.as_ref()?;
-    let (ctx, at) = map.get(id)?;
+    let (ctx, hosts, at) = map.get(id)?;
     if at.elapsed() < CACHE_TTL {
-        Some(ctx.clone())
+        Some((ctx.clone(), hosts.clone()))
     } else {
         None
     }
 }
 
-fn cache_put(id: &str, ctx: &AuthContext) {
+fn cache_put(id: &str, ctx: &AuthContext, hosts: &[String]) {
     if let Ok(mut guard) = CACHE.lock() {
         let map = guard.get_or_insert_with(HashMap::new);
-        map.insert(id.to_string(), (ctx.clone(), Instant::now()));
+        map.insert(
+            id.to_string(),
+            (ctx.clone(), hosts.to_vec(), Instant::now()),
+        );
     }
 }
 
@@ -629,6 +644,9 @@ async fn oauth2_token(
 /// no `credential_id` is treated as the anonymous identity (empty auth). Entries
 /// whose credential fails to resolve are skipped (logged) so a partial matrix
 /// still runs.
+///
+/// Also returns the hosts of each credential that resolved, since every identity's
+/// auth goes to every endpoint of the pass.
 pub async fn resolve_identities(
     http: &reqwest::Client,
     api_url: &str,
@@ -636,8 +654,9 @@ pub async fn resolve_identities(
     identities: &[Value],
     host: &str,
     egress: Option<&Lease>,
-) -> Vec<Value> {
+) -> (Vec<Value>, Vec<Vec<String>>) {
     let mut out = Vec::new();
+    let mut scopes = Vec::new();
     for ident in identities {
         let role = ident["role"].as_str().unwrap_or("").trim().to_string();
         if role.is_empty() {
@@ -645,18 +664,23 @@ pub async fn resolve_identities(
         }
         let cid = ident["credential_id"].as_str().filter(|s| !s.is_empty());
         let auth = match cid {
-            Some(id) => match resolve_auth(http, api_url, node_api_key, id, host, egress).await {
-                Ok(a) => a,
-                Err(e) => {
-                    eprintln!("[op] authz identity '{role}' resolve failed ({id}): {e}");
-                    continue;
+            Some(id) => {
+                match resolve_auth_scoped(http, api_url, node_api_key, id, host, egress).await {
+                    Ok(a) => {
+                        scopes.push(a.hosts);
+                        a.auth
+                    }
+                    Err(e) => {
+                        eprintln!("[op] authz identity '{role}' resolve failed ({id}): {e}");
+                        continue;
+                    }
                 }
-            },
+            }
             None => json!({ "headers": {}, "cookies": "" }),
         };
         out.push(json!({ "role": role, "auth": auth }));
     }
-    out
+    (out, scopes)
 }
 
 /// Resolve + build + cache in one call. Returns the `auth` JSON object to inject
@@ -690,16 +714,19 @@ pub async fn resolve_auth_pool(
     host: &str,
     want: usize,
     egress: Option<&Lease>,
-) -> Result<Vec<Value>, String> {
-    let first = resolve_auth(http, api_url, node_api_key, credential_id, host, egress).await?;
+) -> Result<(Vec<Value>, Vec<String>), String> {
+    let first =
+        resolve_auth_scoped(http, api_url, node_api_key, credential_id, host, egress).await?;
+    let hosts = first.hosts;
+    let first = first.auth;
     let want = want.clamp(1, 4);
     if want == 1 {
-        return Ok(vec![first]);
+        return Ok((vec![first], hosts));
     }
     let cred = resolve(http, api_url, node_api_key, credential_id, host).await?;
     // Anything that is not a form login hands back the same material each time.
     if cred.auth_type != "login_flow" || cred.resolved_auth.is_some() {
-        return Ok(vec![first]);
+        return Ok((vec![first], hosts));
     }
     let mut out = vec![first];
     for _ in 1..want {
@@ -713,7 +740,7 @@ pub async fn resolve_auth_pool(
             }
         }
     }
-    Ok(out)
+    Ok((out, hosts))
 }
 
 pub async fn resolve_auth(
@@ -724,8 +751,26 @@ pub async fn resolve_auth(
     host: &str,
     egress: Option<&Lease>,
 ) -> Result<Value, String> {
-    if let Some(ctx) = cache_get(credential_id) {
-        return Ok(ctx.to_json());
+    resolve_auth_scoped(http, api_url, node_api_key, credential_id, host, egress)
+        .await
+        .map(|a| a.auth)
+}
+
+/// [`resolve_auth`], with the hosts the credential is for. An op whose engine may
+/// reach hosts besides `host` keeps the credential to these.
+pub async fn resolve_auth_scoped(
+    http: &reqwest::Client,
+    api_url: &str,
+    node_api_key: &str,
+    credential_id: &str,
+    host: &str,
+    egress: Option<&Lease>,
+) -> Result<ScopedAuth, String> {
+    if let Some((ctx, hosts)) = cache_get(credential_id) {
+        return Ok(ScopedAuth {
+            auth: ctx.to_json(),
+            hosts,
+        });
     }
     let cred = resolve(http, api_url, node_api_key, credential_id, host).await?;
     // Browser-brokered types (sso / oauth2 authcode) come back pre-resolved.
@@ -734,8 +779,11 @@ pub async fn resolve_auth(
     } else {
         build_context(http, &cred, egress).await?
     };
-    cache_put(credential_id, &ctx);
-    Ok(ctx.to_json())
+    cache_put(credential_id, &ctx, &cred.scope_hosts);
+    Ok(ScopedAuth {
+        auth: ctx.to_json(),
+        hosts: cred.scope_hosts,
+    })
 }
 
 // --- helpers ---------------------------------------------------------------
