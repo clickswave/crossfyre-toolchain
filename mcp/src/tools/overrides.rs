@@ -98,10 +98,15 @@ pub(crate) fn header(name: &str) -> Option<&'static str> {
 }
 
 /// Whether a decoded query or body key is the override field. PHP reads `.` and an
-/// opening `[` in a key as `_`, so `.method` reaches the target as `_method`.
+/// opening `[` in a key as `_`, so `.method` reaches the target as `_method`, and PHP
+/// and Rails read `_method[]` or `_method[0]` as the field holding a list.
 pub(crate) fn is_field(key: &str) -> bool {
+    let key = key.trim();
+    let key = match key.find('[') {
+        Some(i) if key[i..].contains(']') => &key[..i],
+        _ => key,
+    };
     let k: String = key
-        .trim()
         .chars()
         .map(|c| if c == '.' || c == '[' { '_' } else { c })
         .collect();
@@ -110,7 +115,7 @@ pub(crate) fn is_field(key: &str) -> bool {
 
 /// Percent-decoding with `+` as a space, as a form is read. Invalid escapes stay as
 /// written.
-fn decode(s: &str) -> String {
+pub(crate) fn decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -134,6 +139,21 @@ fn decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Percent-encoding of everything outside the unreserved set, the way the Workbench
+/// writes a query value or name it was given.
+pub(crate) fn encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// The decoded pairs of a query or form body. `;` separates pairs as well as `&`,
@@ -172,9 +192,13 @@ pub(crate) fn in_body(body: &str) -> Vec<Asked> {
         .filter(|(k, _)| is_field(k))
         .map(|(_, v)| Asked::new(Via::Field, Some(&v)))
         .collect();
-    // A JSON member set to null names the field and asks for nothing.
+    // A JSON member set to null names the field and asks for nothing. Every member is
+    // read, a name written twice included, since a reader that keeps the first one
+    // sees what a reader keeping the last does not. A byte order mark in front is
+    // skipped, as some readers do.
     let mut named = false;
-    if let Ok(Value::Object(members)) = serde_json::from_str::<Value>(body) {
+    let json = body.strip_prefix('\u{feff}').unwrap_or(body);
+    if let Ok(Members(members)) = serde_json::from_str::<Members>(json) {
         for (k, v) in members {
             if !is_field(&k) {
                 continue;
@@ -191,6 +215,32 @@ pub(crate) fn in_body(body: &str) -> Vec<Asked> {
         asked.push(Asked::new(Via::Body, None));
     }
     asked
+}
+
+/// The members of a JSON object in the order written, a repeated name kept each time.
+struct Members(Vec<(String, Value)>);
+
+impl<'de> serde::Deserialize<'de> for Members {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Members;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut a: A,
+            ) -> Result<Members, A::Error> {
+                let mut out = Vec::new();
+                while let Some(kv) = a.next_entry::<String, Value>()? {
+                    out.push(kv);
+                }
+                Ok(Members(out))
+            }
+        }
+        d.deserialize_map(V)
+    }
 }
 
 /// Whether `_method` stands as a name of its own in the decoded text: not part of a
@@ -268,6 +318,32 @@ mod tests {
             "",
         ] {
             assert_eq!(one(read), None, "{read}");
+        }
+    }
+
+    #[test]
+    fn a_body_or_key_in_an_unusual_shape_still_names_the_field() {
+        let one = |b: &str| first_write(in_body(b));
+        assert_eq!(
+            one("\u{feff}{\"\\u005fmethod\":\"DELETE\"}")
+                .unwrap()
+                .method
+                .as_deref(),
+            Some("DELETE")
+        );
+        assert_eq!(
+            one("{\"_method\":\"DELETE\",\"_method\":null}")
+                .unwrap()
+                .method
+                .as_deref(),
+            Some("DELETE")
+        );
+        assert_eq!(one("{\"_method\":null,\"_method\":\"GET\"}"), None);
+        for k in ["_method[]", "_method[0]", ".method[x]", "_METHOD[]"] {
+            assert!(is_field(k), "{k}");
+        }
+        for k in ["_method[", "_methods[]", "x[_method]"] {
+            assert!(!is_field(k), "{k}");
         }
     }
 

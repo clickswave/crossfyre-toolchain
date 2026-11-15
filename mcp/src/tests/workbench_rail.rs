@@ -1745,14 +1745,21 @@ mod replay {
         assert_eq!(refused_list(&r)[0]["at"], "host_header");
         assert_eq!(b.fake.count(Method::Replay), 0);
 
-        // Removing the stored Host header leaves nothing to check, and the send goes.
+        // Removing the stored Host header leaves no name for the file to check, but a
+        // front end sends a request without one to its default site, so it asks.
+        let removed = json!({"exchange": handle(UID_A, 1), "edits": {"headers": {"host": null}}});
         let r =
             b.t.call(
                 &FakePeer::new(Elicit::None),
                 "workbench_replay",
-                json!({"exchange": handle(UID_A, 1), "edits": {"headers": {"host": null}}}),
+                removed.clone(),
             )
             .await;
+        assert_eq!(reason(&r), "not_confirmed", "{}", r.text);
+        assert_eq!(b.fake.count(Method::Replay), 0);
+        let r =
+            b.t.call(&FakePeer::new(Elicit::Accept), "workbench_replay", removed)
+                .await;
         ok(&r);
         assert_eq!(b.fake.count(Method::Replay), 1);
     }
@@ -1795,10 +1802,11 @@ mod replay {
         }
         assert_eq!(b.fake.count(Method::Replay), 0);
 
-        // Removing them all leaves only the URL's host, which the file lists.
+        // Removing them all leaves only the URL's host, which the file lists. A request
+        // with no Host still asks before it goes.
         let r =
             b.t.call(
-                &peer,
+                &FakePeer::new(Elicit::Accept),
                 "workbench_replay",
                 json!({"exchange": handle(UID_A, 1), "edits": {"headers": {"host": null}}}),
             )
@@ -1985,6 +1993,153 @@ mod replay {
             assert_eq!(reason(&r), "not_confirmed", "{host:?}: {}", r.text);
         }
         assert_eq!(b.fake.count(Method::Replay), 0);
+    }
+
+    /// HTTP takes only spaces and tabs off a header value. A Host that is empty, blank,
+    /// removed or padded with other white space goes out as written and a front end can
+    /// send it to its default site, so it asks or is refused, and never goes unasked.
+    #[tokio::test]
+    async fn a_blank_removed_or_unicode_padded_host_is_not_the_captured_host() {
+        let b = bench_with(base(""), get_app()).await;
+        let peer = FakePeer::new(Elicit::None);
+        for host in [
+            json!(""),
+            json!("   "),
+            json!("\t"),
+            json!(null),
+            json!("\u{a0}"),
+            json!("\u{a0}app.example.test"),
+            json!("app.example.test\u{a0}"),
+            json!("app.example.test\u{3000}"),
+            json!("\u{3000}app.example.test"),
+            json!("app.example.test\u{85}"),
+            json!("app.example.test\u{2028}"),
+            json!("app.example.test\u{2003}"),
+        ] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1),
+                           "edits": {"headers": {"Host": host}}}),
+                )
+                .await;
+            let why = reason(&r);
+            assert!(
+                why == "not_confirmed" || why == "invalid_arguments",
+                "{host}: {}",
+                r.text
+            );
+        }
+        assert_eq!(b.fake.count(Method::Replay), 0);
+        for host in [json!(""), json!("  "), json!(null)] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1),
+                           "edits": {"headers": {"Host": host}}}),
+                )
+                .await;
+            assert_eq!(reason(&r), "not_confirmed", "{host}: {}", r.text);
+        }
+
+        // Spaces and tabs around the URL's own host are still that host.
+        for host in [
+            " app.example.test",
+            "app.example.test\t",
+            "app.example.test ",
+        ] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1),
+                           "edits": {"headers": {"Host": host}}}),
+                )
+                .await;
+            ok(&r);
+        }
+        assert_eq!(b.fake.count(Method::Replay), 3);
+
+        // A yes covers the removal it was asked about.
+        let peer = FakePeer::new(Elicit::Accept);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1),
+                       "edits": {"headers": {"Host": null}}}),
+            )
+            .await;
+        ok(&r);
+        let q = peer.questions.lock().unwrap().last().unwrap().clone();
+        assert!(q.contains("no Host header"), "{q}");
+        assert_eq!(b.fake.count(Method::Replay), 4);
+    }
+
+    /// The question shows a Host value with its invisible characters spelt out, so the
+    /// person sees why it is not the captured host.
+    #[tokio::test]
+    async fn the_host_question_shows_invisible_characters_escaped() {
+        let b = bench_with(base(""), get_app()).await;
+        let peer = FakePeer::new(Elicit::Accept);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1),
+                       "edits": {"headers": {"Host": "app\u{ad}.example.test"}}}),
+            )
+            .await;
+        ok(&r);
+        let q = peer.questions.lock().unwrap().last().unwrap().clone();
+        assert!(q.contains("app\\u{ad}.example.test"), "{q}");
+    }
+
+    /// A front end can route by a forwarding header in place of Host, so one naming
+    /// another host asks the same way.
+    #[tokio::test]
+    async fn a_forwarding_header_naming_another_host_asks() {
+        let b = bench_with(base(""), get_app()).await;
+        let peer = FakePeer::new(Elicit::None);
+        for (name, value) in [
+            ("X-Forwarded-Host", "other.example.test"),
+            ("x-forwarded-host", "app.example.test, other.example.test"),
+            ("X_Forwarded_Host", "other.example.test"),
+            ("X-Original-Host", "other.example.test"),
+            ("X-Host", "other.example.test"),
+            ("Forwarded", "for=192.0.2.1;host=other.example.test"),
+            ("Forwarded", "proto=https;Host=\"other.example.test\""),
+            ("X-Forwarded-Host", "app.example.test\u{a0}"),
+        ] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1),
+                           "edits": {"headers": {name: value}}}),
+                )
+                .await;
+            assert_eq!(reason(&r), "not_confirmed", "{name}: {value:?}: {}", r.text);
+        }
+        assert_eq!(b.fake.count(Method::Replay), 0);
+        for (name, value) in [
+            ("X-Forwarded-Host", "app.example.test"),
+            ("Forwarded", "for=192.0.2.1;proto=https"),
+            ("Forwarded", "host=app.example.test"),
+        ] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1),
+                           "edits": {"headers": {name: value}}}),
+                )
+                .await;
+            ok(&r);
+        }
+        assert_eq!(b.fake.count(Method::Replay), 3);
     }
 
     /// Only a Host the browser sent through the proxy vouches for a name. A request the
@@ -2181,6 +2336,116 @@ mod replay {
             "{q}"
         );
         assert_eq!(b.fake.count(Method::Replay), 2);
+    }
+
+    /// The Workbench applies a query edit to the `&`-separated parameters whose decoded
+    /// name is the edit's name exactly. An edit under another case or spelling, or one
+    /// aimed at a value joined by `;`, leaves the captured `_method` in the request.
+    #[tokio::test]
+    async fn a_query_edit_takes_away_only_the_parameter_the_workbench_removes() {
+        let b = bench_with(
+            base(""),
+            stored(
+                "GET",
+                "http://app.example.test/api/items?_method=DELETE",
+                "app.example.test",
+            ),
+        )
+        .await;
+        let peer = FakePeer::new(Elicit::None);
+        for edits in [
+            json!({}),
+            json!({"query": {"_METHOD": null}}),
+            json!({"query": {"_Method": "GET"}}),
+            json!({"query": {" _method": null}}),
+            json!({"query": {"_method ": "GET"}}),
+            json!({"query": {"%5Fmethod": null}}),
+            json!({"path": "/api/items?_method=DELETE", "query": {"_METHOD": null}}),
+        ] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1), "edits": edits.clone()}),
+                )
+                .await;
+            assert_eq!(reason(&r), "writes_not_allowed", "{edits}: {}", r.text);
+        }
+        assert_eq!(b.fake.count(Method::Replay), 0);
+        // The parameter itself, removed or set to a read, is gone.
+        for edits in [
+            json!({"query": {"_method": null}}),
+            json!({"query": {"_method": "GET"}}),
+        ] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1), "edits": edits.clone()}),
+                )
+                .await;
+            ok(&r);
+        }
+        assert_eq!(b.fake.count(Method::Replay), 2);
+
+        let b = bench_with(
+            base(""),
+            stored(
+                "GET",
+                "http://app.example.test/api/items?a=1;_method=DELETE",
+                "app.example.test",
+            ),
+        )
+        .await;
+        for edits in [
+            json!({"query": {"_method": null}}),
+            json!({"query": {"_method": "GET"}}),
+        ] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1), "edits": edits.clone()}),
+                )
+                .await;
+            assert_eq!(reason(&r), "writes_not_allowed", "{edits}: {}", r.text);
+        }
+        assert_eq!(b.fake.count(Method::Replay), 0);
+        // Setting `a` rewrites its whole value, the `;_method=DELETE` in it too.
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1), "edits": {"query": {"a": "2"}}}),
+            )
+            .await;
+        ok(&r);
+        assert_eq!(b.fake.count(Method::Replay), 1);
+    }
+
+    /// A body or query that names `_method` in a shape a parser may still read as the
+    /// field counts as a write: a JSON body behind a byte order mark, a key written twice,
+    /// and the field as a list.
+    #[tokio::test]
+    async fn an_override_hidden_in_an_unusual_shape_is_a_write() {
+        let b = bench_with(base(""), get_app()).await;
+        let peer = FakePeer::new(Elicit::None);
+        for edits in [
+            json!({"body": "\u{feff}{\"\\u005fmethod\":\"DELETE\"}"}),
+            json!({"body": "{\"_method\":\"DELETE\",\"_method\":null}"}),
+            json!({"query": {"_method[]": "DELETE"}}),
+            json!({"path": "/api/items?_method[0]=DELETE"}),
+        ] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1), "edits": edits.clone()}),
+                )
+                .await;
+            assert_eq!(reason(&r), "writes_not_allowed", "{edits}: {}", r.text);
+        }
+        assert_eq!(b.fake.count(Method::Replay), 0);
     }
 
     #[tokio::test]

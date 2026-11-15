@@ -47,81 +47,24 @@ fn safe(method: &str) -> bool {
     matches!(method, "GET" | "HEAD" | "OPTIONS")
 }
 
-/// What one name holds after the edits: an edit's value in place of the first, the
-/// rest as captured, and nothing after a `null`.
-fn after_edit(captured: Vec<String>, edited: Option<Option<&str>>) -> Vec<String> {
-    match edited {
-        None => captured,
-        Some(None) => Vec::new(),
-        Some(Some(v)) => std::iter::once(v.to_string())
-            .chain(captured.into_iter().skip(1))
-            .collect(),
-    }
-}
-
 /// What the request as it will be sent asks for by override, when that is not a read:
 /// a GET carrying `X-HTTP-Method-Override: DELETE` or `_method=DELETE`. Only a replaced
 /// body is read, since the captured one is not fetched for this.
 ///
-/// A header or query name is taken however it is spelt, and an edit stands in for the
-/// captured values of the name it gives, the way the Workbench applies it.
+/// The headers and query are taken as the Workbench will send them, each edit applied
+/// the way it applies one, and then read however a target may spell or split them.
 fn overriding_write(stored: &ExchangeResult, edits: &Edits) -> Option<Asked> {
-    /// Each name `is` accepts, once, in the order first seen.
-    fn names<'a>(seen: impl Iterator<Item = &'a str>, is: impl Fn(&str) -> bool) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        for n in seen.filter(|n| is(n)) {
-            if !out.iter().any(|o| o.eq_ignore_ascii_case(n.trim())) {
-                out.push(n.trim().to_string());
-            }
-        }
-        out
-    }
-    fn edited<'a>(pairs: &'a cfx_bridge::Pairs, name: &str) -> Option<Option<&'a str>> {
-        pairs
-            .iter()
-            .find(|(k, _)| k.trim().eq_ignore_ascii_case(name))
-            .map(|(_, v)| v)
-    }
     let mut asked: Vec<Asked> = Vec::new();
     let captured_headers = stored.req_headers.as_deref().unwrap_or(&[]);
-    let header_names = names(
-        captured_headers
-            .iter()
-            .map(|(k, _)| k.as_str())
-            .chain(edits.headers.iter().map(|(k, _)| k)),
-        |n| overrides::header(n).is_some(),
-    );
-    for name in header_names {
-        let Some(h) = overrides::header(&name) else {
-            continue;
-        };
-        let captured: Vec<String> = captured_headers
-            .iter()
-            .filter(|(k, _)| k.trim().eq_ignore_ascii_case(&name))
-            .map(|(_, v)| v.clone())
-            .collect();
-        for v in after_edit(captured, edited(&edits.headers, &name)) {
+    for (k, v) in sent_headers(captured_headers, &edits.headers) {
+        if let Some(h) = overrides::header(&k) {
             asked.push(Asked::new(Via::Header(h), Some(&v)));
         }
     }
-    let query = match &edits.path {
-        Some(p) => overrides::in_query(p),
-        None => overrides::in_query(&stored.url),
-    };
-    let query_names = names(
-        query
-            .iter()
-            .map(|(k, _)| k.as_str())
-            .chain(edits.query.iter().map(|(k, _)| k)),
-        overrides::is_field,
-    );
-    for name in query_names {
-        let captured: Vec<String> = query
-            .iter()
-            .filter(|(k, _)| k.trim().eq_ignore_ascii_case(&name))
-            .map(|(_, v)| v.clone())
-            .collect();
-        for v in after_edit(captured, edited(&edits.query, &name)) {
+    let target = edits.path.as_deref().unwrap_or(&stored.url);
+    let query = target.split_once('?').map_or("", |(_, q)| q);
+    for (k, v) in overrides::pairs(&sent_query(query, &edits.query)) {
+        if overrides::is_field(&k) {
             asked.push(Asked::new(Via::Query, Some(&v)));
         }
     }
@@ -200,20 +143,16 @@ pub(crate) async fn run(
         ))
     })?;
     let method = stored.method.to_ascii_uppercase();
+    let is_host = |k: &str| k.trim().eq_ignore_ascii_case("host");
     let stored_hosts: Vec<String> = stored
         .req_headers
         .as_deref()
         .unwrap_or(&[])
         .iter()
-        .filter(|(k, _)| k.trim().eq_ignore_ascii_case("host"))
+        .filter(|(k, _)| is_host(k))
         .map(|(_, v)| v.clone())
         .collect();
-    let edited_host = edits
-        .headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("host"))
-        .map(|(_, v)| v.map(str::to_string));
-    let host_headers = sent_hosts(&stored_hosts, edited_host);
+    let sent = sent_headers(stored.req_headers.as_deref().unwrap_or(&[]), &edits.headers);
 
     // The method cannot be edited, but a framework can be asked to act as if it were.
     // A GET that asks for DELETE that way is a write here too.
@@ -251,6 +190,11 @@ pub(crate) async fn run(
     // would make of it. Only a plain name equal to the URL's host passes, or one the
     // browser sent for this request through the proxy. A request the Workbench or an
     // agent sent carries whatever Host it was given, so its Host vouches for nothing.
+    // An empty Host, or none where one was captured, is not that name either: a front
+    // end sends such a request to its default site. Neither has a name to admit.
+    //
+    // A front end can route by X-Forwarded-Host or Forwarded instead, so a name those
+    // give is held to the same rule.
     let captured: Vec<String> = if stored.origin == Origin::Proxy {
         stored_hosts
             .iter()
@@ -260,16 +204,40 @@ pub(crate) async fn run(
     } else {
         Vec::new()
     };
+    // Each way the request names another host, as the question shows it.
     let mut elsewhere: Vec<String> = Vec::new();
-    for h in host_headers
+    let mut other = |what: String| {
+        if !elsewhere.contains(&what) {
+            elsewhere.push(what);
+        }
+    };
+    let host_headers: Vec<&str> = sent
         .iter()
-        .map(|h| h.trim())
-        .filter(|h| !h.is_empty())
-    {
+        .filter(|(k, _)| is_host(k))
+        .map(|(_, v)| v.as_str())
+        .collect();
+    if host_headers.is_empty() && !stored_hosts.is_empty() {
+        other("no Host header".into());
+    }
+    for (k, v) in &sent {
+        if let Some(f) = forwarding(k)
+            && forwarded_names(f, v)
+                .iter()
+                .any(|h| !names_dest(h, &dest, &captured))
+        {
+            other(format!("{f} {}", quoted(v)));
+        }
+    }
+    for raw in host_headers {
+        let h = ows(raw);
+        if h.is_empty() {
+            other(format!("Host {}", quoted(raw)));
+            continue;
+        }
         let hd = guard::parse_target(&format!("{}://{}", dest.scheme, h))
             .map_err(|e| Refusal::invalid(format!("Host header: {}", untrusted::clean(&e, 200))))?;
-        if !names_dest(h, &dest, &captured) && !elsewhere.iter().any(|e| e == h) {
-            elsewhere.push(h.to_string());
+        if !names_dest(h, &dest, &captured) {
+            other(format!("Host {}", quoted(raw)));
         }
         let port = if h.contains(':') { hd.port } else { dest.port };
         if !mcp.guard.admit(
@@ -297,28 +265,21 @@ pub(crate) async fn run(
         Some(a) => a.describe(&untrusted::clean(&method, 32)),
         None => format!("{} request", untrusted::clean(&method, 32)),
     };
-    let under = untrusted::clean(
-        &elsewhere
-            .iter()
-            .map(|h| format!("\"{h}\""))
-            .collect::<Vec<_>>()
-            .join(", "),
-        200,
-    );
+    let under = untrusted::clean(&elsewhere.join(", "), 300);
     // A yes is remembered for the captured host and the Host names it went out under,
     // so a yes for one pair never covers another.
     let pair = if elsewhere.is_empty() {
         dest.key()
     } else {
-        format!("{} under Host {:?}", dest.key(), elsewhere)
+        format!("{} with {:?}", dest.key(), elsewhere)
     };
     let write = if intent == Intent::Write {
         let host_note = if elsewhere.is_empty() {
             String::new()
         } else {
             format!(
-                " The Host header names {under}, so a server that routes by Host can hand that \
-                 session to {under}."
+                " It goes out with {under}, so a server that routes by Host or a forwarding \
+                 header can hand that session to another site."
             )
         };
         Some(WriteAsk {
@@ -334,7 +295,7 @@ pub(crate) async fn run(
                 if elsewhere.is_empty() {
                     String::new()
                 } else {
-                    format!(" under Host {under}")
+                    format!(" with {under}")
                 }
             ),
             kind: AskKind::Write,
@@ -344,9 +305,9 @@ pub(crate) async fn run(
             remember: Some(format!("read {pair}")),
             message: format!(
                 "workbench_replay will send a {asked} to {} from the Workbench project {} with \
-                 the Host header changed to {under}, carrying the cookies and headers captured \
-                 for {}. A server that routes by Host can hand that session to {under}. Allow \
-                 reads from {} to go out under Host {under} for the rest of this session?",
+                 {under}, carrying the cookies and headers captured for {}. A server that \
+                 routes by Host or a forwarding header can hand that session to another site. \
+                 Allow reads from {} to go out with {under} for the rest of this session?",
                 untrusted::clean(&dest.origin(), 200),
                 o.name(),
                 untrusted::clean(&dest.host, 200),
@@ -480,7 +441,7 @@ fn bridge_label(raw: &str) -> String {
 /// percent sign, a non-ASCII letter, a slash or a `#`, is `None`: a URL parser and a
 /// front end can read such a value as two different hosts.
 fn plain_host(raw: &str) -> Option<(String, Option<u16>)> {
-    let t = raw.trim().to_ascii_lowercase();
+    let t = ows(raw).to_ascii_lowercase();
     let (name, port) = if t.starts_with('[') {
         let end = t.find(']')?;
         let inner = &t[1..end];
@@ -536,16 +497,108 @@ fn names_dest(raw: &str, dest: &guard::Dest, captured: &[String]) -> bool {
     name == own || captured.contains(&name)
 }
 
-/// The Host headers the sent request will carry. An edit that names Host sets the first
-/// one, or adds one, and leaves any others as they were captured; `null` removes them all.
-fn sent_hosts(stored: &[String], edited: Option<Option<String>>) -> Vec<String> {
-    match edited {
-        None => stored.to_vec(),
-        Some(None) => Vec::new(),
-        Some(Some(v)) => std::iter::once(v)
-            .chain(stored.iter().skip(1).cloned())
-            .collect(),
+/// The headers the sent request will carry, as the Workbench applies header edits: a
+/// value sets the first header of that name, ignoring case, or adds one, and `null`
+/// removes every header of that name.
+fn sent_headers(stored: &[(String, String)], edits: &cfx_bridge::Pairs) -> Vec<(String, String)> {
+    let mut out = stored.to_vec();
+    for (name, value) in edits.iter() {
+        let is = |k: &str| k.trim().eq_ignore_ascii_case(name);
+        match value {
+            Some(v) => match out.iter_mut().find(|(k, _)| is(k)) {
+                Some(h) => h.1 = v.to_string(),
+                None => out.push((name.to_string(), v.to_string())),
+            },
+            None => out.retain(|(k, _)| !is(k)),
+        }
     }
+    out
+}
+
+/// The raw query the sent request will carry, as the Workbench applies query edits: to
+/// the `&`-separated parameters whose decoded name is the edit's name exactly. A value
+/// replaces the first one's value, encoded, or is added at the end, and `null` removes
+/// every one. Anything else, a pair joined by `;` included, stays as captured.
+fn sent_query(captured: &str, edits: &cfx_bridge::Pairs) -> String {
+    fn key(pair: &str) -> &str {
+        pair.split_once('=').map_or(pair, |(k, _)| k)
+    }
+    let mut pairs: Vec<String> = captured.split('&').map(str::to_string).collect();
+    for (name, value) in edits.iter() {
+        let is = |p: &str| !p.is_empty() && overrides::decode(key(p)) == name;
+        match value {
+            Some(v) => match pairs.iter_mut().find(|p| is(p)) {
+                Some(p) => *p = format!("{}={}", key(p), overrides::encode(v)),
+                None => pairs.push(format!(
+                    "{}={}",
+                    overrides::encode(name),
+                    overrides::encode(v)
+                )),
+            },
+            None => pairs.retain(|p| !is(p)),
+        }
+    }
+    pairs.join("&")
+}
+
+/// The spaces and tabs HTTP takes off either end of a header value. Any other white
+/// space is part of the value, and the Workbench sends it as written.
+fn ows(s: &str) -> &str {
+    s.trim_matches([' ', '\t'])
+}
+
+/// A value as a question shows it: in quotes, with anything but printable ASCII spelt
+/// out as an escape, so an invisible character is seen rather than dropped.
+fn quoted(raw: &str) -> String {
+    let mut out = String::from("\"");
+    for c in raw.chars() {
+        match c {
+            '"' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            ' '..='~' => out.push(c),
+            _ => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Headers a front end can route by in place of Host, by their usual spelling.
+const FORWARDING: [&str; 4] = ["X-Forwarded-Host", "X-Original-Host", "X-Host", "Forwarded"];
+
+/// The forwarding header a name is, ignoring case, with `_` read as `-`.
+fn forwarding(name: &str) -> Option<&'static str> {
+    let name = name.trim().replace('_', "-");
+    FORWARDING
+        .into_iter()
+        .find(|h| h.eq_ignore_ascii_case(&name))
+}
+
+/// The host names a forwarding header's value gives: each item of a list, or each
+/// `host=` parameter of `Forwarded`, unquoted. An empty item names nothing.
+fn forwarded_names(header: &str, value: &str) -> Vec<String> {
+    if header != "Forwarded" {
+        return value
+            .split(',')
+            .map(ows)
+            .filter(|h| !h.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
+    value
+        .split([',', ';'])
+        .filter_map(|p| p.split_once('='))
+        .filter(|(k, _)| ows(k).eq_ignore_ascii_case("host"))
+        .map(|(_, v)| {
+            let v = ows(v);
+            v.strip_prefix('"')
+                .and_then(|v| v.strip_suffix('"'))
+                .unwrap_or(v)
+                .to_string()
+        })
+        .collect()
 }
 
 /// A replay the Workbench refused or could not finish.
