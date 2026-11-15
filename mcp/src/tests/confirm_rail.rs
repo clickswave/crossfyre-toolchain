@@ -113,6 +113,47 @@ async fn test_writes_needs_the_file_and_a_yes_each_time() {
     assert_eq!(plessor.ops().len(), before);
 }
 
+/// An endpoint that asks for DELETE, PUT or PATCH through `_method` is held back like
+/// one with that method: plessor's POST and GET tests would send the field each time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_endpoint_that_asks_for_a_write_by_override_needs_test_writes() {
+    let target = listener(Reply::ok("x")).await;
+    let plessor = stub_engine(StubOpts::default()).await;
+    let t = scope(&[format!("127.0.0.1:{}", target.port)], "")
+        .plessor(plessor.port)
+        .build();
+    let peer = FakePeer::new(Elicit::Accept);
+    let u = format!("http://127.0.0.1:{}/users/42", target.port);
+    for args in [
+        json!({"endpoints": [{"url": u, "method": "POST",
+                              "body": [{"name": "_method", "value": "DELETE"}]}]}),
+        json!({"endpoints": [{"url": u, "method": "POST", "body_type": "json",
+                              "body": [{"name": "_METHOD", "value": "patch"}]}]}),
+        json!({"url": format!("{u}?id=1&_method=delete")}),
+        json!({"endpoints": [{"url": format!("{u}?.method=PUT"), "params": ["id"]}]}),
+    ] {
+        let r = t.call(&peer, "test_injection", args.clone()).await;
+        assert_eq!(reason(&r), "invalid_arguments", "{args}: {}", r.text);
+        assert!(r.text.contains("test_writes"), "{}", r.text);
+    }
+    assert_eq!(plessor.ops().len(), 0);
+    assert_eq!(peer.asked(), 0);
+
+    // Asking for POST, or a field that only ends in _method, is not held back.
+    ok(&t
+        .call(
+            &peer,
+            "test_injection",
+            json!({"endpoints": [
+                {"url": format!("{u}?_method=POST"), "params": ["id"]},
+                {"url": u, "method": "POST",
+                 "body": [{"name": "payment_method", "value": "card"}]},
+            ]}),
+        )
+        .await);
+    assert_eq!(plessor.ops().len(), 1);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_write_method_is_confirmed_once_per_host_and_port() {
     let a = listener(Reply::ok("a")).await;

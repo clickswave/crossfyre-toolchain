@@ -2074,6 +2074,10 @@ mod replay {
             json!({"form": {"_method": "DELETE"}}),
             json!({"json": {"_method": "DELETE"}}),
             json!({"body": "_method=DELETE&id=2"}),
+            json!({"headers": {"X_HTTP_Method_Override": "DELETE"}}),
+            json!({"query": {".method": "DELETE"}}),
+            json!({"path": "/api/items?a=1;_method=DELETE"}),
+            json!({"body": "id=2&%5Fmethod=DELETE"}),
         ] {
             let r =
                 b.t.call(
@@ -2097,6 +2101,41 @@ mod replay {
             .await;
         ok(&r);
         assert_eq!(b.fake.count(Method::Replay), 1);
+        // A field that only ends in _method asks for nothing.
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1),
+                       "edits": {"body": "{\"payment_method\":\"card\"}"}}),
+            )
+            .await;
+        ok(&r);
+        assert_eq!(b.fake.count(Method::Replay), 2);
+
+        // A captured header spelt with underscores asks the same.
+        let b = bench_with(
+            base(""),
+            WbOpts::default().answer(Method::Exchange, |c, _| {
+                let Call::Exchange(p) = c else { unreachable!() };
+                let mut x = default_exchange(p.id);
+                x.req_headers = Some(vec![
+                    ("Host".into(), "app.example.test".into()),
+                    ("X_HTTP_Method_Override".into(), "DELETE".into()),
+                ]);
+                Ok(serde_json::to_value(x).unwrap())
+            }),
+        )
+        .await;
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1)}),
+            )
+            .await;
+        assert_eq!(reason(&r), "writes_not_allowed", "{}", r.text);
+        assert_eq!(b.fake.count(Method::Replay), 0);
 
         // A captured GET that already carried one is a write as captured, and stops
         // being one when the edit takes the header away.
@@ -2136,7 +2175,9 @@ mod replay {
         assert_eq!(peer.asked(), 2, "then the write");
         let q = peer.questions.lock().unwrap().last().unwrap().clone();
         assert!(
-            q.contains("GET request that asks for DELETE by method override"),
+            q.contains(
+                "GET request that asks for DELETE through the X-HTTP-Method-Override header"
+            ),
             "{q}"
         );
         assert_eq!(b.fake.count(Method::Replay), 2);
@@ -2754,6 +2795,103 @@ mod injection {
             assert_eq!(b.fake.count(Method::Check), 0);
         }
         assert!(plessor.ops().is_empty());
+    }
+
+    /// A captured POST that asks for DELETE through `_method`, or a GET that asks for it
+    /// through a header or the query, is a write to plessor's target, so it waits for
+    /// test_writes the way a captured DELETE does.
+    #[tokio::test]
+    async fn a_captured_request_that_asks_for_a_write_by_override_needs_test_writes() {
+        let plessor = stub_engine(StubOpts::default()).await;
+        let with_header = |c: &Call, i: &Option<cfx_bridge::ProjectInfo>| {
+            let mut v = source(
+                "GET",
+                "http://app.example.test/api/items/2?id=2",
+                None,
+                None,
+            )(c, i)?;
+            v["req_headers"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(["X-HTTP-Method-Override", "DELETE"]));
+            Ok(v)
+        };
+        let cases: Vec<WbOpts> = vec![
+            WbOpts::default().answer(
+                Method::ScanSource,
+                source(
+                    "POST",
+                    "http://app.example.test/api/items/2",
+                    Some("application/x-www-form-urlencoded"),
+                    Some("_method=delete&name=x"),
+                ),
+            ),
+            WbOpts::default().answer(
+                Method::ScanSource,
+                source(
+                    "POST",
+                    "http://app.example.test/api/items/2",
+                    Some("application/json"),
+                    Some("{\"_method\":\"PATCH\",\"name\":\"x\"}"),
+                ),
+            ),
+            WbOpts::default().answer(
+                Method::ScanSource,
+                source(
+                    "GET",
+                    "http://app.example.test/api/items/2?id=2&_method=DELETE",
+                    None,
+                    None,
+                ),
+            ),
+            WbOpts::default().answer(Method::ScanSource, with_header),
+        ];
+        for opts in cases {
+            let b = bench_with(
+                scope(&["app.example.test".into()], "")
+                    .resolver(names())
+                    .plessor(plessor.port),
+                opts,
+            )
+            .await;
+            let r =
+                b.t.call(
+                    &FakePeer::new(Elicit::None),
+                    "workbench_test_injection",
+                    json!({"exchange": handle(1)}),
+                )
+                .await;
+            assert_eq!(reason(&r), "invalid_arguments", "{}", r.text);
+            assert!(r.text.contains("test_writes"), "{}", r.text);
+            assert_eq!(b.fake.count(Method::Check), 0);
+        }
+        assert!(plessor.ops().is_empty());
+
+        // A field that only ends in _method asks for nothing.
+        let b = bench_with(
+            scope(&["app.example.test".into()], "")
+                .resolver(names())
+                .plessor(plessor.port),
+            WbOpts::default().answer(
+                Method::ScanSource,
+                source(
+                    "POST",
+                    "http://app.example.test/api/orders",
+                    Some("application/x-www-form-urlencoded"),
+                    Some("payment_method=card&qty=1"),
+                ),
+            ),
+        )
+        .await;
+        let r =
+            b.t.call(
+                &FakePeer::new(Elicit::None),
+                "workbench_test_injection",
+                json!({"exchange": handle(1), "wait_seconds": 2}),
+            )
+            .await;
+        ok(&r);
+        assert_eq!(plessor.ops().len(), 1);
     }
 
     /// What a refusal quotes from the captured request is the target's text. It goes

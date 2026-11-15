@@ -4,6 +4,7 @@
 //! scan goes on in a task that owns the engine connection and writes the job to disk
 //! as events arrive. `get_scan` and `list_findings` read what it wrote.
 
+use super::overrides::{self, Asked, Via};
 use super::{in_range, parse_args};
 use crate::confirm::{AskKind, WriteAsk};
 use crate::core::{
@@ -168,6 +169,25 @@ fn endpoints(a: &Args) -> Result<Vec<Endpoint>, Refusal> {
         let body_type = e.body_type.unwrap_or_else(|| "form".into());
         if body_type != "form" && body_type != "json" {
             return Err(Refusal::invalid("body_type must be form or json"));
+        }
+        // plessor sends the other fields as given with every test, so an endpoint that
+        // asks the target for DELETE by override is a DELETE endpoint to it.
+        if !a.test_writes {
+            let from_query = overrides::in_query(&dest.url)
+                .into_iter()
+                .map(|(_, v)| Asked::new(Via::Query, Some(&v)));
+            let from_body = body
+                .iter()
+                .filter(|f| overrides::is_field(&f.name))
+                .map(|f| Asked::new(Via::Field, Some(f.value.as_deref().unwrap_or(""))));
+            if let Some(asked) = from_query.chain(from_body).find(Asked::beyond_post) {
+                return Err(Refusal::invalid(format!(
+                    "an endpoint is a {}, which can change or destroy data; it is tested only \
+                     with test_writes, which needs allow_writes in the scope file and a \
+                     confirmation",
+                    asked.describe(&method)
+                )));
+            }
         }
         let op = json!({
             "method": method,

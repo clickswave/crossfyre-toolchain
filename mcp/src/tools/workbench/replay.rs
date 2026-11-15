@@ -13,7 +13,8 @@ use super::{
 use crate::confirm::{AskKind, WriteAsk};
 use crate::core::{CallNote, Done, Intent, Mcp, Reason, Refusal, RefusedDest, TrafficRequest};
 use crate::peer::ClientPeer;
-use crate::tools::{OVERRIDE_FIELD, OVERRIDE_HEADERS, parse_args, query_values};
+use crate::tools::overrides::{self, Asked, Via};
+use crate::tools::parse_args;
 use crate::{guard, untrusted};
 use cfx_bridge::{
     Call, EDIT_ENTRIES_MAX, Edits, ErrorCode, ExchangeResult, McpRef, Origin, PINS_MAX, Part,
@@ -58,55 +59,95 @@ fn after_edit(captured: Vec<String>, edited: Option<Option<&str>>) -> Vec<String
     }
 }
 
-/// A method the request as it will be sent asks for by override, when that method is
-/// not a read: `DELETE` for a GET carrying `X-HTTP-Method-Override: DELETE` or
-/// `_method=DELETE`. A replaced body that names the field at all counts, since what
-/// it asks for cannot be read reliably from raw text.
-fn overriding_write(stored: &ExchangeResult, edits: &Edits) -> Option<String> {
+/// What the request as it will be sent asks for by override, when that is not a read:
+/// a GET carrying `X-HTTP-Method-Override: DELETE` or `_method=DELETE`. Only a replaced
+/// body is read, since the captured one is not fetched for this.
+///
+/// A header or query name is taken however it is spelt, and an edit stands in for the
+/// captured values of the name it gives, the way the Workbench applies it.
+fn overriding_write(stored: &ExchangeResult, edits: &Edits) -> Option<Asked> {
+    /// Each name `is` accepts, once, in the order first seen.
+    fn names<'a>(seen: impl Iterator<Item = &'a str>, is: impl Fn(&str) -> bool) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for n in seen.filter(|n| is(n)) {
+            if !out.iter().any(|o| o.eq_ignore_ascii_case(n.trim())) {
+                out.push(n.trim().to_string());
+            }
+        }
+        out
+    }
     fn edited<'a>(pairs: &'a cfx_bridge::Pairs, name: &str) -> Option<Option<&'a str>> {
         pairs
             .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .find(|(k, _)| k.trim().eq_ignore_ascii_case(name))
             .map(|(_, v)| v)
     }
-    let mut asked: Vec<String> = Vec::new();
-    for h in OVERRIDE_HEADERS {
-        let captured: Vec<String> = stored
-            .req_headers
-            .as_deref()
-            .unwrap_or(&[])
+    let mut asked: Vec<Asked> = Vec::new();
+    let captured_headers = stored.req_headers.as_deref().unwrap_or(&[]);
+    let header_names = names(
+        captured_headers
             .iter()
-            .filter(|(k, _)| k.trim().eq_ignore_ascii_case(h))
+            .map(|(k, _)| k.as_str())
+            .chain(edits.headers.iter().map(|(k, _)| k)),
+        |n| overrides::header(n).is_some(),
+    );
+    for name in header_names {
+        let Some(h) = overrides::header(&name) else {
+            continue;
+        };
+        let captured: Vec<String> = captured_headers
+            .iter()
+            .filter(|(k, _)| k.trim().eq_ignore_ascii_case(&name))
             .map(|(_, v)| v.clone())
             .collect();
-        asked.extend(after_edit(captured, edited(&edits.headers, h)));
+        for v in after_edit(captured, edited(&edits.headers, &name)) {
+            asked.push(Asked::new(Via::Header(h), Some(&v)));
+        }
     }
     let query = match &edits.path {
-        Some(p) => query_values(&format!("http://h{p}"), OVERRIDE_FIELD),
-        None => query_values(&stored.url, OVERRIDE_FIELD),
+        Some(p) => overrides::in_query(p),
+        None => overrides::in_query(&stored.url),
     };
-    asked.extend(after_edit(query, edited(&edits.query, OVERRIDE_FIELD)));
-    if let Some(Some(v)) = edited(&edits.form, OVERRIDE_FIELD) {
-        asked.push(v.to_string());
+    let query_names = names(
+        query
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .chain(edits.query.iter().map(|(k, _)| k)),
+        overrides::is_field,
+    );
+    for name in query_names {
+        let captured: Vec<String> = query
+            .iter()
+            .filter(|(k, _)| k.trim().eq_ignore_ascii_case(&name))
+            .map(|(_, v)| v.clone())
+            .collect();
+        for v in after_edit(captured, edited(&edits.query, &name)) {
+            asked.push(Asked::new(Via::Query, Some(&v)));
+        }
+    }
+    for (k, v) in edits.form.iter() {
+        if let Some(v) = v
+            && overrides::is_field(k)
+        {
+            asked.push(Asked::new(Via::Field, Some(v)));
+        }
     }
     if let Some(j) = &edits.json {
         for (k, v) in j {
-            if k.eq_ignore_ascii_case(OVERRIDE_FIELD) && !v.is_null() {
-                asked.push(v.as_str().map_or_else(|| v.to_string(), str::to_string));
+            if !overrides::is_field(k) {
+                continue;
+            }
+            match v {
+                Value::Null => {}
+                Value::String(s) => asked.push(Asked::new(Via::Field, Some(s))),
+                _ => asked.push(Asked::new(Via::Body, None)),
             }
         }
     }
-    if edits
-        .body
-        .as_deref()
-        .is_some_and(|b| b.to_ascii_lowercase().contains(OVERRIDE_FIELD))
-    {
-        asked.push("an overridden method".into());
+    if let Some(b) = edits.body.as_deref() {
+        asked.extend(overrides::in_body(b));
     }
-    asked
-        .into_iter()
-        .map(|m| m.trim().to_ascii_uppercase())
-        .find(|m| !m.is_empty() && !safe(m))
+    overrides::first_write(asked)
 }
 
 fn parse_edits(v: Option<Value>) -> Result<Edits, Refusal> {
@@ -253,11 +294,7 @@ pub(crate) async fn run(
         }
     }
     let asked = match &overridden {
-        Some(m) => format!(
-            "{} request that asks for {} by method override",
-            untrusted::clean(&method, 32),
-            untrusted::clean(m, 32)
-        ),
+        Some(a) => a.describe(&untrusted::clean(&method, 32)),
         None => format!("{} request", untrusted::clean(&method, 32)),
     };
     let under = untrusted::clean(

@@ -8,6 +8,7 @@ pub(crate) mod fingerprint;
 pub(crate) mod http;
 pub(crate) mod info;
 pub(crate) mod inject;
+pub(crate) mod overrides;
 pub(crate) mod scans;
 pub(crate) mod workbench;
 
@@ -172,23 +173,3 @@ pub(crate) fn result_size(summary: &str, value: &Value) -> usize {
         .max(value.to_string().chars().count())
 }
 
-/// Headers that many frameworks read as the method in place of the request line's.
-pub(crate) const OVERRIDE_HEADERS: [&str; 3] = [
-    "x-http-method-override",
-    "x-http-method",
-    "x-method-override",
-];
-/// The query or body field that does the same in Rails, Laravel, Symfony and others.
-pub(crate) const OVERRIDE_FIELD: &str = "_method";
-
-/// Every value a URL's query gives `name`, matched without regard to case.
-pub(crate) fn query_values(url: &str, name: &str) -> Vec<String> {
-    transport::Url::parse(url)
-        .map(|u| {
-            u.query_pairs()
-                .filter(|(k, _)| k.eq_ignore_ascii_case(name))
-                .map(|(_, v)| v.into_owned())
-                .collect()
-        })
-        .unwrap_or_default()
-}

@@ -5,7 +5,8 @@
 //! followed only when asked, by this code rather than the client, so every hop goes
 //! through the guard before anything is sent to it.
 
-use super::{OVERRIDE_FIELD, OVERRIDE_HEADERS, in_range, parse_args, query_values, result_size};
+use super::overrides::{self, Asked, Via};
+use super::{in_range, parse_args, result_size};
 use crate::confirm::{AskKind, WriteAsk};
 use crate::core::{CallNote, Clearance, Done, Intent, Mcp, Reason, Refusal, TrafficRequest};
 use crate::guard;
@@ -68,34 +69,25 @@ fn safe(method: &str) -> bool {
     matches!(method, "GET" | "HEAD" | "OPTIONS")
 }
 
-/// A method the request asks for by override, when that method is not a read:
-/// `DELETE` for a GET carrying `X-HTTP-Method-Override: DELETE` or `_method=DELETE`.
-/// A body that names the field at all counts, since what it asks for cannot be read
-/// reliably from raw text. Header names here are already lowercase.
-fn overriding_write(url: &str, headers: &[(String, String)], body: Option<&str>) -> Option<String> {
-    let mut asked: Vec<String> = headers
+/// What the request asks for by override, when that is not a read: a GET carrying
+/// `X-HTTP-Method-Override: DELETE`, `_method=DELETE` in its query, or a body that sets
+/// `_method`.
+fn overriding_write(url: &str, headers: &[(String, String)], body: Option<&str>) -> Option<Asked> {
+    let from_headers = headers
         .iter()
-        .filter(|(k, _)| OVERRIDE_HEADERS.contains(&k.as_str()))
-        .map(|(_, v)| v.clone())
-        .collect();
-    asked.extend(query_values(url, OVERRIDE_FIELD));
-    if body.is_some_and(|b| b.to_ascii_lowercase().contains(OVERRIDE_FIELD)) {
-        asked.push("an overridden method".into());
-    }
-    asked
+        .filter_map(|(k, v)| overrides::header(k).map(|h| Asked::new(Via::Header(h), Some(v))));
+    let from_query = overrides::in_query(url)
         .into_iter()
-        .map(|m| m.trim().to_ascii_uppercase())
-        .find(|m| !m.is_empty() && !safe(m))
+        .map(|(_, v)| Asked::new(Via::Query, Some(&v)));
+    let from_body = body.map(overrides::in_body).unwrap_or_default();
+    overrides::first_write(from_headers.chain(from_query).chain(from_body))
 }
 
 /// How a write question names the request: `DELETE request`, or `GET request that
-/// asks for DELETE by method override`.
-fn described(method: &str, overridden: Option<&str>) -> String {
+/// asks for DELETE through the X-HTTP-Method-Override header`.
+fn described(method: &str, overridden: Option<&Asked>) -> String {
     match overridden {
-        Some(m) => format!(
-            "{method} request that asks for {} by method override",
-            untrusted::clean(m, 32)
-        ),
+        Some(a) => a.describe(method),
         None => format!("{method} request"),
     }
 }
@@ -330,7 +322,7 @@ pub(crate) async fn run(
         message: format!(
             "send_http_request will send a {} to {}. Methods other than GET, HEAD and \
              OPTIONS can change or destroy data. Allow them to {} for the rest of this session?",
-            described(&method, overridden.as_deref()),
+            described(&method, overridden.as_ref()),
             untrusted::clean(&dest.origin(), 200),
             untrusted::clean(&dest.key(), 200)
         ),
@@ -437,12 +429,14 @@ pub(crate) async fn run(
             refused_hop = Some((shown_loc, "writes_not_allowed"));
             break sent;
         }
-        let write = (hop_writes && next.key() != current.key()).then(|| WriteAsk {
+        // Asked whenever the hop writes. A yes already given for this host and port
+        // covers it without asking again, and a plain read before it never did.
+        let write = hop_writes.then(|| WriteAsk {
             remember: Some(next.key()),
             message: format!(
                 "A redirect asks to send the {} on to {}. Allow write methods to {} for the \
                  rest of this session?",
-                described(&method, overridden.as_deref()),
+                described(&method, overridden.as_ref()),
                 untrusted::clean(&next.origin(), 200),
                 untrusted::clean(&next.key(), 200)
             ),
