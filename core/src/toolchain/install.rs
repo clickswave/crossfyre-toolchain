@@ -164,6 +164,24 @@ fn installed_node_version() -> Option<String> {
     )
 }
 
+/// Whether the node worker in the bin directory is from a release whose node, run as
+/// root, hands the configs it writes back to the operator: node 0.1.52 (shipped with
+/// crossfyre 0.1.42) and every one before it, and a worker that cannot say which
+/// version it is. False when there is no worker.
+pub fn installed_node_predates_root_configs() -> bool {
+    if !ext_bin_path("node").exists() {
+        return false;
+    }
+    let Some(v) = installed_node_version() else {
+        return true;
+    };
+    let mut parts = v.split(['.', '-', '+']).map(|p| p.parse::<u64>().ok());
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(Some(a)), Some(Some(b)), Some(Some(c))) => (a, b, c) <= (0, 1, 52),
+        _ => true,
+    }
+}
+
 /// The version of the cfx-script in the bin directory, if there is one.
 fn installed_helper_version() -> Option<String> {
     let bin = ext_bin_path(CFX_SCRIPT);
@@ -2398,6 +2416,39 @@ exit 127"#;
     const NO_LIBPYTHON: &str = "/opt/crossfyre/bin/cfx-script.new: error while loading \
         shared libraries: libpython3.11.so.1.0: cannot open shared object file: No such \
         file or directory";
+
+    /// Node 0.1.52, the worker shipped with crossfyre 0.1.42, and every one before it
+    /// hands the configs it writes back to the operator. So does a worker that cannot
+    /// say which it is. One from a later release keeps them root's, and a host with no
+    /// worker has nothing to hand back.
+    #[cfg(unix)]
+    #[test]
+    fn a_node_worker_from_0_1_42_or_before_is_an_earlier_one() {
+        let s = Scratch::new("node-predates");
+        bin_dir_at(&s.0);
+        assert!(!installed_node_predates_root_configs(), "no worker at all");
+        for (v, earlier) in [
+            ("0.1.52", true),
+            ("0.1.9", true),
+            ("0.0.99", true),
+            ("0.1.53", false),
+            ("0.1.53-rc.1", false),
+            ("0.2.0", false),
+            ("1.0.0", false),
+        ] {
+            reports(&s.0, "node", v);
+            let _ = fs::remove_file(s.0.join("node.version"));
+            assert_eq!(installed_node_predates_root_configs(), earlier, "node {v}");
+        }
+        // The version recorded beside it counts first, as for an update.
+        fs::write(s.0.join("node.version"), "0.1.51\n").unwrap();
+        assert!(installed_node_predates_root_configs(), "recorded 0.1.51");
+        // A worker that answers no version.
+        let _ = fs::remove_file(s.0.join("node.version"));
+        old_helper(&s.0);
+        fs::rename(s.0.join(CFX_SCRIPT), s.0.join("node")).unwrap();
+        assert!(installed_node_predates_root_configs(), "no version");
+    }
 
     #[cfg(unix)]
     #[tokio::test]

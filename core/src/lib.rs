@@ -1686,9 +1686,10 @@ pub async fn run_init(
     field("Control plane", api_url);
     field("Data directory", &data_dir.display().to_string());
     print_privilege_banner(false);
-    // Before anything is written: on a host with no node service yet, record that there
-    // is nothing from an earlier release to take over, so the service installed below
-    // never hands root a config the operator's account put in nodes.d.
+    // Before anything is written: on a host with no node service and no earlier node
+    // worker, record that there is nothing from an earlier release to take over, so the
+    // service installed below never hands root a config the operator's account put in
+    // nodes.d.
     toolchain::node_config::settle_before_init(data_dir)?;
 
     let client = reqwest::Client::new();

@@ -27,12 +27,15 @@ pub const NODES_DIR: &str = "nodes.d";
 /// Whether `id` can stand for a node in a file name: one plain name, so that
 /// `nodes.d/<id>.toml` and the node's network dir stay where they are meant to be. The
 /// control plane hands out UUIDs. An id read from a file's contents or taken from the
-/// command line is checked with this before any path is made from it.
+/// command line is checked with this before any path is made from it. Nor does one
+/// start with `-`, since the node is started as `node daemon <id>`, where that would
+/// read as an option.
 pub fn is_plain_node_id(id: &str) -> bool {
     // `:` too, since on Windows `C:x` joined to a path replaces it.
     !id.is_empty()
         && id != "."
         && id != ".."
+        && !id.starts_with('-')
         && !id
             .chars()
             .any(|c| matches!(c, '/' | '\\' | ':') || c.is_control())
@@ -151,11 +154,11 @@ pub fn take_over_earlier_configs(base: &Path) {
     }
 }
 
-/// Settle node configs before a privileged `node init` writes one. On a host with no
-/// node service yet, this only makes the record, so the service that init installs
-/// never takes over a file the operator's account put in nodes.d. Where a service is
-/// already installed it does nothing, and the node settles them when it next starts.
-/// An error stops init.
+/// Settle node configs before a privileged `node init` writes one. On a new host this
+/// only makes the record, so the service that init installs never takes over a file
+/// the operator's account put in nodes.d. Where a node service is already installed, or
+/// the node worker is an earlier release's, it does nothing, and the node settles them
+/// when this release's worker first starts. An error stops init.
 pub fn settle_before_init(base: &Path) -> io::Result<()> {
     if !privileged() {
         return Ok(());
@@ -164,21 +167,25 @@ pub fn settle_before_init(base: &Path) -> io::Result<()> {
         &base.join(NODES_DIR),
         claim_record,
         super::service::node_service_exists,
+        super::install::installed_node_predates_root_configs,
     )
 }
 
-/// With a node service already installed, nothing is settled here. That service may
-/// still be an earlier release's node (the CLI and the node update separately), and it
-/// hands every config it writes back to the operator. Made now, the record would stop
-/// the new node from taking those configs over when it first runs, and it would then
-/// refuse them all. So that first run settles them, as on any host upgraded from an
-/// earlier release.
+/// Nothing is settled here when a node service is already installed, or when the node
+/// worker is an earlier release's (the CLI and the node update separately, and init
+/// does not replace a worker that is there). Either way the service runs an earlier
+/// node, now or once init installs it, and that node hands every config it writes back
+/// to the operator. Made now, the record would stop the new node from taking those
+/// configs over when it first runs, and it would then refuse them all. So that first
+/// run settles them, as on any host upgraded from an earlier release. Nothing more is
+/// trusted that way than now: the earlier node already runs what is in nodes.d as root.
 fn settle_for_init(
     nodes_dir: &Path,
     claim: impl FnOnce() -> io::Result<bool>,
     service_installed: impl FnOnce() -> bool,
+    earlier_node_installed: impl FnOnce() -> bool,
 ) -> io::Result<()> {
-    if service_installed() {
+    if service_installed() || earlier_node_installed() {
         return Ok(());
     }
     settle(nodes_dir, claim, || false)
@@ -782,7 +789,7 @@ mod tests {
 
         let _root = super::super::sudo_user::act_as_root();
         let _trusted = imp::trust_self();
-        settle_for_init(&nodes, || claim(&record), || true).unwrap();
+        settle_for_init(&nodes, || claim(&record), || true, || false).unwrap();
         assert!(
             !record.exists(),
             "init made the record with a service there"
@@ -809,10 +816,82 @@ mod tests {
 
         let _root = super::super::sudo_user::act_as_root();
         let _trusted = imp::trust_self();
-        settle_for_init(&nodes, || claim(&record), || false).unwrap();
+        settle_for_init(&nodes, || claim(&record), || false, || false).unwrap();
 
         assert!(record.exists(), "init did not make the record");
         assert_eq!(mode(&planted), 0o664, "a planted config was taken over");
+    }
+
+    /// With no node service but an earlier release's node worker installed (a host set up
+    /// with `--no-service`, or one whose service was removed), the service init installs
+    /// runs that worker, which hands its configs back to the operator. So init leaves
+    /// the record to the new node here too.
+    #[test]
+    fn init_leaves_an_earlier_node_worker_s_configs_to_the_new_node() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let nodes = t.path().join("nodes.d");
+        fs::create_dir(&nodes).unwrap();
+        let earlier = nodes.join("a.toml");
+        fs::write(&earlier, A_CONFIG).unwrap();
+        fs::set_permissions(&earlier, fs::Permissions::from_mode(0o644)).unwrap();
+        let record = t.path().join("state/taken-over");
+
+        let _root = super::super::sudo_user::act_as_root();
+        let _trusted = imp::trust_self();
+        settle_for_init(&nodes, || claim(&record), || false, || true).unwrap();
+        assert!(
+            !record.exists(),
+            "init made the record with an earlier node worker there"
+        );
+
+        // Init installed the service, and the new node worker starts under it.
+        settle(&nodes, || claim(&record), || true).unwrap();
+        assert_eq!(mode(&earlier), 0o600, "the new node did not take it over");
+    }
+
+    /// A record directory that root does not own is refused, and nothing is made in it:
+    /// its owner could delete the record. Init stops on this, and the node will not
+    /// settle configs or make network dirs there.
+    #[test]
+    fn a_record_directory_root_does_not_own_is_refused() {
+        let t = tempfile::tempdir().expect("tempdir");
+        // Not ours, and writable by us, so only the owner check can refuse it.
+        let foreign = if unsafe { libc::geteuid() } == 0 {
+            let d = t.path().join("state");
+            fs::create_dir(&d).unwrap();
+            std::os::unix::fs::chown(&d, Some(65534), Some(65534)).unwrap();
+            fs::set_permissions(&d, fs::Permissions::from_mode(0o777)).unwrap();
+            d
+        } else {
+            let tmp = PathBuf::from("/tmp");
+            let md = fs::metadata(&tmp).unwrap();
+            if md.uid() == unsafe { libc::geteuid() } || md.mode() & 0o002 == 0 {
+                eprintln!("skipped: no directory here that another account owns and we can write");
+                return;
+            }
+            tmp
+        };
+        let record = foreign.join(format!("cfx-test-record-{}", std::process::id()));
+
+        let _root = super::super::sudo_user::act_as_root();
+        let made = claim(&record);
+        let left = record.exists();
+        let _ = fs::remove_file(&record);
+        let e = made.expect_err("a record was made in a directory root does not own");
+        assert!(e.to_string().contains("must belong to root"), "{e}");
+        assert!(!left, "the record was made");
+
+        let _state = imp::state_dir_at(&foreign);
+        let dirs = foreign.join(NODES_DIR);
+        let there = dirs.exists();
+        let made = prepare_network_dir(&t.path().join("home/nodes.d"), "n");
+        let left = dirs.join("n.network").exists();
+        if !there {
+            let _ = fs::remove_dir_all(&dirs);
+        }
+        let e = made.expect_err("network dirs were made in a directory root does not own");
+        assert!(e.to_string().contains("must belong to root"), "{e}");
+        assert!(!left, "a network dir was made");
     }
 
     /// The record's directory is made, or left, writable by root alone: whoever could
@@ -873,6 +952,9 @@ mod tests {
             "C:x",
             "a\nb",
             "a\0b",
+            "-x",
+            "--force",
+            "--data-dir=..",
         ] {
             assert!(!is_plain_node_id(bad), "{bad:?} passed");
         }
