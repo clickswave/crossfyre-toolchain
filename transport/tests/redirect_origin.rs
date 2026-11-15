@@ -253,3 +253,32 @@ async fn a_client_with_nothing_to_leak_still_follows_another_origin() {
     assert_eq!(r.status().as_u16(), 200);
     assert_eq!(b_seen.lock().unwrap().len(), 2);
 }
+
+#[tokio::test]
+async fn a_chain_that_starts_on_the_origin_stops_where_it_leaves() {
+    // One hop on the scanned host, then one to another origin. The first is
+    // followed with the saved headers, the second is handed back.
+    let (b, b_seen) = other_origin();
+    let to_b = format!("http://127.0.0.1:{b}/first");
+    let (a, a_seen) = listener(move |path| {
+        if path == "/start" {
+            found("/next")
+        } else {
+            found(&to_b)
+        }
+    });
+    let client = build_client(config(saved_auth()), &Egress::Direct).unwrap();
+
+    let r = client
+        .get(format!("http://127.0.0.1:{a}/start"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_nothing_reached(&b_seen);
+    assert_eq!(r.status().as_u16(), 302);
+    let seen = a_seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert!(seen[1].starts_with("get /next "), "{}", seen[1]);
+    assert!(seen[1].contains("x-api-key: saved-api-key"), "{}", seen[1]);
+}
