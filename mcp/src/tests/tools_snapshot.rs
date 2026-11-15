@@ -11,7 +11,7 @@ use crate::tools::{
 use serde_json::Value;
 
 /// sha256 of `tools.json` with CRLF read as LF, so a Windows checkout agrees.
-const PINNED: &str = "ab7a877e81faeecd4f3d208fd9fa94f4d3b4a1bf4c00615f46ac42046d60952c";
+const PINNED: &str = "479646bdd7f36b736933f979ff242d13a11695a89e1bd9c944f25d98eaba270c";
 
 /// The same for `tools_workbench.json`.
 const PINNED_WORKBENCH: &str = "a2bc88149a4049fceaa38b0e7245cfc816884bb750093b02071684689dcea8e7";

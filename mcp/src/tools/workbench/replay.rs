@@ -13,7 +13,7 @@ use super::{
 use crate::confirm::{AskKind, WriteAsk};
 use crate::core::{CallNote, Done, Intent, Mcp, Reason, Refusal, RefusedDest, TrafficRequest};
 use crate::peer::ClientPeer;
-use crate::tools::parse_args;
+use crate::tools::{OVERRIDE_FIELD, OVERRIDE_HEADERS, parse_args, query_values};
 use crate::{guard, untrusted};
 use cfx_bridge::{
     Call, EDIT_ENTRIES_MAX, Edits, ErrorCode, ExchangeResult, McpRef, Origin, PINS_MAX, Part,
@@ -46,15 +46,6 @@ fn safe(method: &str) -> bool {
     matches!(method, "GET" | "HEAD" | "OPTIONS")
 }
 
-/// Headers that many frameworks read as the method in place of the request line's.
-const OVERRIDE_HEADERS: [&str; 3] = [
-    "x-http-method-override",
-    "x-http-method",
-    "x-method-override",
-];
-/// The query or body field that does the same in Rails, Laravel, Symfony and others.
-const OVERRIDE_FIELD: &str = "_method";
-
 /// What one name holds after the edits: an edit's value in place of the first, the
 /// rest as captured, and nothing after a `null`.
 fn after_edit(captured: Vec<String>, edited: Option<Option<&str>>) -> Vec<String> {
@@ -65,17 +56,6 @@ fn after_edit(captured: Vec<String>, edited: Option<Option<&str>>) -> Vec<String
             .chain(captured.into_iter().skip(1))
             .collect(),
     }
-}
-
-fn query_values(url: &str, name: &str) -> Vec<String> {
-    transport::Url::parse(url)
-        .map(|u| {
-            u.query_pairs()
-                .filter(|(k, _)| k.eq_ignore_ascii_case(name))
-                .map(|(_, v)| v.into_owned())
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// A method the request as it will be sent asks for by override, when that method is
