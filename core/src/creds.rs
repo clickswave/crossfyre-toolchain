@@ -20,7 +20,9 @@
 //! - oauth2 / sso: delegated to the control-plane broker (not yet wired here).
 //!
 //! Built contexts are cached per credential id (with a short TTL) so we do not
-//! re-login on every request.
+//! re-login on every request. The control plane is still asked on every use,
+//! since its host check is what decides whether the auth may go to that op's
+//! target; the cache only saves rebuilding the session.
 
 use base64::Engine as _;
 use serde_json::{Value, json};
@@ -78,31 +80,39 @@ pub struct ScopedAuth {
     pub hosts: Vec<String>,
 }
 
-// Session cache: credential_id -> (context, the credential's hosts, built_at).
-// Login/OAuth results are reused for CACHE_TTL; static contexts are cheap but
-// cached too.
-type CacheEntry = (AuthContext, Vec<String>, Instant);
+// Session cache: credential_id -> (context, the credential it was built from,
+// built_at). Login/OAuth results are reused for CACHE_TTL. It holds no scope
+// decision: a hit is used only after the control plane has resolved the
+// credential for the op's own host.
+type CacheEntry = (AuthContext, u64, Instant);
 static CACHE: Mutex<Option<HashMap<String, CacheEntry>>> = Mutex::new(None);
 const CACHE_TTL: Duration = Duration::from_secs(600);
 
-fn cache_get(id: &str) -> Option<(AuthContext, Vec<String>)> {
+/// What a built context depends on, so an edited credential is built again.
+fn material(cred: &ResolvedCredential) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    cred.auth_type.hash(&mut h);
+    cred.config.to_string().hash(&mut h);
+    cred.secret.to_string().hash(&mut h);
+    h.finish()
+}
+
+fn cache_get(id: &str, material: u64) -> Option<AuthContext> {
     let guard = CACHE.lock().ok()?;
     let map = guard.as_ref()?;
-    let (ctx, hosts, at) = map.get(id)?;
-    if at.elapsed() < CACHE_TTL {
-        Some((ctx.clone(), hosts.clone()))
+    let (ctx, built_from, at) = map.get(id)?;
+    if *built_from == material && at.elapsed() < CACHE_TTL {
+        Some(ctx.clone())
     } else {
         None
     }
 }
 
-fn cache_put(id: &str, ctx: &AuthContext, hosts: &[String]) {
+fn cache_put(id: &str, material: u64, ctx: &AuthContext) {
     if let Ok(mut guard) = CACHE.lock() {
         let map = guard.get_or_insert_with(HashMap::new);
-        map.insert(
-            id.to_string(),
-            (ctx.clone(), hosts.to_vec(), Instant::now()),
-        );
+        map.insert(id.to_string(), (ctx.clone(), material, Instant::now()));
     }
 }
 
@@ -766,20 +776,24 @@ pub async fn resolve_auth_scoped(
     host: &str,
     egress: Option<&Lease>,
 ) -> Result<ScopedAuth, String> {
-    if let Some((ctx, hosts)) = cache_get(credential_id) {
-        return Ok(ScopedAuth {
-            auth: ctx.to_json(),
-            hosts,
-        });
-    }
+    // Asked on every use, cache or not: the control plane decides whether this
+    // credential may be sent to `host`, and a session cached for one host says
+    // nothing about another.
     let cred = resolve(http, api_url, node_api_key, credential_id, host).await?;
     // Browser-brokered types (sso / oauth2 authcode) come back pre-resolved.
     let ctx = if let Some(ra) = &cred.resolved_auth {
         auth_context_from_json(ra)
     } else {
-        build_context(http, &cred, egress).await?
+        let built_from = material(&cred);
+        match cache_get(credential_id, built_from) {
+            Some(ctx) => ctx,
+            None => {
+                let ctx = build_context(http, &cred, egress).await?;
+                cache_put(credential_id, built_from, &ctx);
+                ctx
+            }
+        }
     };
-    cache_put(credential_id, &ctx, &cred.scope_hosts);
     Ok(ScopedAuth {
         auth: ctx.to_json(),
         hosts: cred.scope_hosts,
@@ -845,11 +859,21 @@ mod redirect_tests {
     use std::io::{Read, Write};
     use std::sync::Arc;
 
-    type Seen = Arc<Mutex<Vec<String>>>;
+    pub(super) type Seen = Arc<Mutex<Vec<String>>>;
 
     /// A loopback listener that keeps each request (head and body) it reads and
     /// answers it with `reply(path)`.
     fn listener(ip: &str, reply: impl Fn(&str) -> String + Send + 'static) -> (u16, Seen) {
+        listener_with(ip, move |req| {
+            reply(req.split_whitespace().nth(1).unwrap_or("/"))
+        })
+    }
+
+    /// [`listener`], answering each request with `reply(whole request)`.
+    pub(super) fn listener_with(
+        ip: &str,
+        reply: impl Fn(&str) -> String + Send + 'static,
+    ) -> (u16, Seen) {
         let l = std::net::TcpListener::bind((ip, 0)).unwrap();
         let port = l.local_addr().unwrap().port();
         let seen: Seen = Arc::new(Mutex::new(Vec::new()));
@@ -878,9 +902,9 @@ mod redirect_tests {
                     }
                 }
                 let req = String::from_utf8_lossy(&req).to_string();
-                let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let answer = reply(&req);
                 log.lock().unwrap().push(req);
-                let _ = s.write_all(reply(&path).as_bytes());
+                let _ = s.write_all(answer.as_bytes());
             }
         });
         (port, seen)
@@ -980,5 +1004,121 @@ mod redirect_tests {
             let _ = oauth2_token(&reqwest::Client::new(), &c, None).await;
             assert_secret_stayed(&b_seen, "saved-client-secret");
         }
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    //! A session built for one op is reused by the next, but the platform still
+    //! decides for every op whether the credential may go to that op's host.
+    use super::redirect_tests::{Seen, listener_with};
+    use super::*;
+
+    fn reply_json(body: &Value) -> String {
+        let body = body.to_string();
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// A control plane that resolves `data` for a request naming `allowed` as
+    /// the host and refuses any other host, as /api/v1/creds/resolve does.
+    fn control_plane(allowed: &'static str, data: Arc<Mutex<Value>>) -> (String, Seen) {
+        let (port, seen) = listener_with("127.0.0.1", move |req| {
+            let body = req.split("\r\n\r\n").nth(1).unwrap_or("");
+            let asked: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+            if asked["host"].as_str() == Some(allowed) {
+                reply_json(&json!({"status": 200, "data": data.lock().unwrap().clone()}))
+            } else {
+                reply_json(&json!({
+                    "status": 403,
+                    "message": "Credential is not in scope for this host",
+                }))
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), seen)
+    }
+
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn a_cached_credential_is_still_checked_against_the_new_host() {
+        let data = Arc::new(Mutex::new(json!({
+            "name": "api token",
+            "auth_type": "bearer",
+            "config": {},
+            "secret": {"token": "saved-token"},
+            "scope_hosts": ["app.victim.example"],
+        })));
+        let (api, _) = control_plane("app.victim.example", data);
+        let http = reqwest::Client::new();
+        let id = "cache-test-host-check";
+        let ok = resolve_auth(&http, &api, "key", id, "app.victim.example", None).await;
+        assert!(ok.is_ok(), "{ok:?}");
+        let other = resolve_auth(&http, &api, "key", id, "attacker.example", None).await;
+        assert!(
+            other.is_err(),
+            "the credential was handed out for a host the platform refuses: {other:?}"
+        );
+        let other = resolve_auth_scoped(&http, &api, "key", id, "attacker.example", None).await;
+        assert!(other.is_err(), "{other:?}");
+        let (ids, _) = resolve_identities(
+            &http,
+            &api,
+            "key",
+            &[json!({"role": "user", "credential_id": id})],
+            "attacker.example",
+            None,
+        )
+        .await;
+        assert!(ids.is_empty(), "{ids:?}");
+        let pool = resolve_auth_pool(&http, &api, "key", id, "attacker.example", 1, None).await;
+        assert!(pool.is_err(), "{pool:?}");
+    }
+
+    /// A login server that counts logins and hands out a numbered session.
+    fn login_server() -> (String, Seen) {
+        let n = Arc::new(Mutex::new(0u32));
+        let (port, seen) = listener_with("127.0.0.1", move |_| {
+            let mut n = n.lock().unwrap();
+            *n += 1;
+            format!(
+                "HTTP/1.1 200 OK\r\nSet-Cookie: sid=session-{n}; Path=/\r\n\
+                 Content-Length: 2\r\nConnection: close\r\n\r\nok"
+            )
+        });
+        (format!("http://127.0.0.1:{port}/login"), seen)
+    }
+
+    #[tokio::test]
+    async fn a_login_session_is_reused_while_the_credential_is_unchanged() {
+        let (login_url, logins) = login_server();
+        let data = Arc::new(Mutex::new(json!({
+            "name": "form login",
+            "auth_type": "login_flow",
+            "config": {"login_url": login_url},
+            "secret": {"username": "alice", "password": "first-password"},
+            "scope_hosts": ["app.victim.example"],
+        })));
+        let (api, asks) = control_plane("app.victim.example", Arc::clone(&data));
+        let http = reqwest::Client::new();
+        let id = "cache-test-login-reuse";
+        let a = resolve_auth(&http, &api, "key", id, "app.victim.example", None).await;
+        let b = resolve_auth(&http, &api, "key", id, "app.victim.example", None).await;
+        assert!(a.is_ok() && b.is_ok(), "{a:?} {b:?}");
+        assert_eq!(a, b);
+        assert_eq!(logins.lock().unwrap().len(), 1, "the login was repeated");
+        assert_eq!(asks.lock().unwrap().len(), 2, "the platform was not asked");
+
+        // The credential is edited on the platform: the old session is not used.
+        data.lock().unwrap()["secret"]["password"] = json!("second-password");
+        let c = resolve_auth(&http, &api, "key", id, "app.victim.example", None).await;
+        assert!(c.is_ok(), "{c:?}");
+        assert_ne!(a, c, "a session from the old credential was reused");
+        let logins = logins.lock().unwrap();
+        assert_eq!(logins.len(), 2);
+        assert!(logins[1].contains("second-password"), "{}", logins[1]);
     }
 }
