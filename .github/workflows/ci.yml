@@ -90,6 +90,15 @@ jobs:
           test ! -e cortex/src/authz/private.rs
           echo "clean checkout resolves to the open baseline"
 
+      # The release workflow signs provenance, so what it runs is pinned by commit
+      # SHA or digest, and no third-party action shares a job with the signing
+      # permissions. Checked here because a release is too late to find out.
+      - name: The release workflow pins what it runs
+        run: |
+          set -eu
+          python3 -I scripts/test_check_release_workflow.py
+          python3 -I scripts/check_release_workflow.py
+
   build:
     name: build and test
     # The Linux jobs name their image, for the same reason the toolchain below is
