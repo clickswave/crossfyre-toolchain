@@ -1816,16 +1816,17 @@ fn resolve_and_scope(raw: &str, base: &Url, params: &CrawlParams, seed_host: &st
     url.set_fragment(None);
 
     let host = url.host_str()?.to_lowercase();
-    // `||` short-circuits left to right, so this evaluates exactly as the
-    // previous if/else-if chain did: the scope_hosts scan only runs when every
-    // cheaper check has already failed.
-    let in_scope = params.follow_external
-        || host == seed_host
+    let listed = host == seed_host
         || (params.include_subdomains && host.ends_with(&format!(".{seed_host}")))
         || params.scope_hosts.iter().any(|s| {
             let s = s.to_lowercase();
             host == s || host.ends_with(&format!(".{s}"))
         });
+    // Following external links opens the crawl to hosts nobody listed, but not
+    // to the node's own network: a page or a redirect that names a loopback,
+    // private or link-local address is not an external site. The operator can
+    // still list such a host.
+    let in_scope = listed || (params.follow_external && !is_internal_host(&host));
     if !in_scope {
         return None;
     }
@@ -1847,6 +1848,14 @@ fn resolve_and_scope(raw: &str, base: &Url, params: &CrawlParams, seed_host: &st
     }
 
     Some(url)
+}
+
+/// A host that names this machine or its network outright: an internal address
+/// literal, or `localhost` and its subdomains, which resolve to loopback.
+fn is_internal_host(host: &str) -> bool {
+    transport::guard::is_internal_literal(host)
+        || host == "localhost"
+        || host.ends_with(".localhost")
 }
 
 fn query_keys(url: &Url) -> Vec<String> {
@@ -2555,5 +2564,61 @@ mod redirect_tests {
             "a link was resolved against the seed rather than the page it came from: {urls:?}"
         );
         assert!(!b_seen.lock().unwrap().is_empty());
+    }
+
+    fn external(scope_hosts: &[&str]) -> CrawlParams {
+        serde_json::from_value(serde_json::json!({
+            "seed": "http://app.example.test/",
+            "follow_external": true,
+            "scope_hosts": scope_hosts,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn following_external_links_never_reaches_an_unlisted_internal_address() {
+        let base = Url::parse("http://app.example.test/").unwrap();
+        let p = external(&[]);
+        for raw in [
+            "http://10.0.0.5:8080/",
+            "http://127.0.0.1/admin",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]/",
+            "http://localhost:3000/",
+            "http://api.localhost/",
+        ] {
+            assert_eq!(
+                resolve_and_scope(raw, &base, &p, "app.example.test"),
+                None,
+                "{raw}"
+            );
+        }
+        assert!(
+            resolve_and_scope("https://other.example/x", &base, &p, "app.example.test").is_some()
+        );
+        // Listed by the operator, so it is theirs to reach.
+        let p = external(&["10.0.0.5"]);
+        assert!(
+            resolve_and_scope("http://10.0.0.5:8080/", &base, &p, "app.example.test").is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_crawl_following_external_links_is_not_redirected_onto_an_internal_address() {
+        let (seed, _, b_seen) = seed_and_target();
+        let events = run(serde_json::json!({
+            "seed": seed,
+            "evasive": false,
+            "parse_js": false,
+            "max_pages": 10,
+            "timeout_ms": 3000,
+            "follow_external": true,
+        }))
+        .await;
+        assert!(
+            b_seen.lock().unwrap().is_empty(),
+            "an internal address nobody listed was crawled: {:?}",
+            urls(&events)
+        );
     }
 }
