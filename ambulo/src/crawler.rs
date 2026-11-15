@@ -471,6 +471,11 @@ struct Page {
     /// serves its shell for all of them, so fetching them statically says
     /// nothing, while loading one in a browser makes it fetch its own data.
     client_routes: Vec<String>,
+    /// The `Location` of a redirect the client handed back instead of following.
+    /// A client carrying a credential does that for any redirect off the host it
+    /// was sent to. The target is also in `links`, so the crawl's own scope
+    /// decides whether to go there.
+    redirect: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -846,6 +851,10 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
     // error is not an empty page, and a crawl that cannot tell the two apart
     // reports a clean, confident, wrong result.
     let mut fetch_errors: HashMap<String, u32> = HashMap::new();
+    // Redirects to a host outside the crawl's scope, and the first one seen, so
+    // a crawl that ends at one can say where it was sent.
+    let mut off_scope_redirects: u32 = 0;
+    let mut first_off_scope: Option<(String, String)> = None;
 
     // Before walking the links, ask whether the application will simply hand
     // over its routing table. A crawl finds what is linked, and the routes worth
@@ -915,6 +924,15 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
                 // push straight to the frontier. `RouteSense` has already
                 // dropped duplicate values.
                 frontier.push_back((u, d, parent));
+            }
+
+            if let Some(loc) = &page.redirect
+                && resolve_and_scope(loc, &page.url, &params, &seed_host).is_none()
+                && let Ok(to) = page.url.join(loc)
+                && matches!(to.scheme(), "http" | "https")
+            {
+                off_scope_redirects += 1;
+                first_off_scope.get_or_insert_with(|| (page.url.to_string(), to.to_string()));
             }
 
             for raw in &page.links {
@@ -1042,6 +1060,15 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
              application, and an application that draws its settings as links will happily let \
              a crawler switch them.",
             state_verbs.join(", ")
+        )));
+    }
+    if let Some((from, to)) = &first_off_scope {
+        let _ = tx.send(CrawlEvent::note(format!(
+            "{off_scope_redirects} page(s) answered with a redirect to a host outside this crawl's \
+             scope, the first from {from} to {to}. A crawl carrying a credential or an attribution \
+             token does not follow a redirect off the host it asked, so nothing past it was \
+             crawled. To crawl that site, start from the address the redirect names or add its \
+             host to the crawl's scope.",
         )));
     }
     let failed: u32 = fetch_errors.values().sum();
@@ -1222,6 +1249,7 @@ async fn fetch_page(
         forms: Vec::new(),
         content_hash: String::new(),
         client_routes: Vec::new(),
+        redirect: None,
     };
 
     // One retry, then the truth. A small application closing a pooled connection
@@ -1238,6 +1266,17 @@ async fn fetch_page(
     match attempt {
         Ok(resp) => {
             page.status = resp.status().as_u16();
+            if resp.status().is_redirection()
+                && let Some(loc) = resp
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+            {
+                page.links.push(loc.to_string());
+                page.redirect = Some(loc.to_string());
+            }
             let ct = resp
                 .headers()
                 .get(reqwest::header::CONTENT_TYPE)
@@ -1900,6 +1939,7 @@ mod route_sense_tests {
             forms: Vec::new(),
             content_hash: String::new(),
             client_routes: Vec::new(),
+            redirect: None,
         }
     }
 
@@ -2197,5 +2237,130 @@ mod template_tests {
         assert_eq!(first.body_type, None, "the far JSON is not this call's");
         assert_eq!(second.body_type.as_deref(), Some("json"));
         assert_eq!(second.body_params, vec!["note".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    //! A crawl that carries a credential gets a redirect to another host back as
+    //! the 3xx it is, because its client does not take the credential off that
+    //! host. The crawl reads the redirect's `Location` as a link, so its own
+    //! scope decides whether to go there.
+    use super::*;
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    type Seen = Arc<Mutex<Vec<String>>>;
+
+    fn listener(ip: &str, reply: impl Fn(&str) -> String + Send + 'static) -> (u16, Seen) {
+        let l = std::net::TcpListener::bind((ip, 0)).unwrap();
+        let port = l.local_addr().unwrap().port();
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { return };
+                let mut head = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
+                log.lock().unwrap().push(head);
+                let _ = s.write_all(reply(&path).as_bytes());
+            }
+        });
+        (port, seen)
+    }
+
+    fn html(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// The seed host, which sends every request to `to`, and the host it sends
+    /// them to, which serves a page with one link.
+    fn seed_and_target() -> (String, String, Seen) {
+        let (b, b_seen) = listener("127.0.0.2", |path| {
+            if path == "/home" {
+                html(r#"<a href="/about">about</a>"#)
+            } else {
+                html("about")
+            }
+        });
+        let to = format!("http://127.0.0.2:{b}/home");
+        let location = to.clone();
+        let (a, _) = listener("127.0.0.1", move |_| {
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\
+                 Connection: close\r\n\r\n"
+            )
+        });
+        (format!("http://127.0.0.1:{a}/"), to, b_seen)
+    }
+
+    async fn crawl(seed: &str, scope_hosts: &[&str]) -> Vec<CrawlEvent> {
+        let params: CrawlParams = serde_json::from_value(serde_json::json!({
+            "seed": seed,
+            "evasive": false,
+            "parse_js": false,
+            "max_pages": 10,
+            "timeout_ms": 3000,
+            "scope_hosts": scope_hosts,
+            "auth": {"headers": {"X-Api-Key": "saved-key"}, "cookies": ""},
+        }))
+        .unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        run_stream(params, tx).await;
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_a_host_in_scope_is_crawled() {
+        let (seed, to, b_seen) = seed_and_target();
+        let events = crawl(&seed, &["127.0.0.2"]).await;
+        let fetched: Vec<&str> = events
+            .iter()
+            .filter(|e| e.kind == "url" && e.status_code == Some(200))
+            .filter_map(|e| e.url.as_deref())
+            .collect();
+        assert!(fetched.contains(&to.as_str()), "fetched: {fetched:?}");
+        assert!(
+            fetched.iter().any(|u| u.ends_with("/about")),
+            "the page past the redirect was not crawled: {fetched:?}"
+        );
+        assert!(b_seen.lock().unwrap().len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn a_redirect_out_of_scope_is_not_followed_and_is_reported() {
+        let (seed, to, b_seen) = seed_and_target();
+        let events = crawl(&seed, &[]).await;
+        assert!(
+            b_seen.lock().unwrap().is_empty(),
+            "a host outside the crawl's scope was sent the credential"
+        );
+        let notes: Vec<&str> = events
+            .iter()
+            .filter(|e| e.kind == "log")
+            .filter_map(|e| e.message.as_deref())
+            .collect();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("redirect") && n.contains(&to)),
+            "no note says why the crawl stopped: {notes:?}"
+        );
     }
 }
