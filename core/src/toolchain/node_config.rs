@@ -24,6 +24,20 @@ use std::path::{Path, PathBuf};
 /// The directory in the config root that holds one `<node-id>.toml` per node.
 pub const NODES_DIR: &str = "nodes.d";
 
+/// Whether `id` can stand for a node in a file name: one plain name, so that
+/// `nodes.d/<id>.toml` and the node's network dir stay where they are meant to be. The
+/// control plane hands out UUIDs. An id read from a file's contents or taken from the
+/// command line is checked with this before any path is made from it.
+pub fn is_plain_node_id(id: &str) -> bool {
+    // `:` too, since on Windows `C:x` joined to a path replaces it.
+    !id.is_empty()
+        && id != "."
+        && id != ".."
+        && !id
+            .chars()
+            .any(|c| matches!(c, '/' | '\\' | ':') || c.is_control())
+}
+
 /// Whether this process runs as root, or elevated on Windows, and so must take a node
 /// config only from a file that only root or an administrator can change.
 pub fn privileged() -> bool {
@@ -103,6 +117,7 @@ pub fn operator_network_dir(nodes_dir: &Path, node_id: &str) -> PathBuf {
 pub fn prepare_network_dir(nodes_dir: &Path, node_id: &str) -> io::Result<()> {
     #[cfg(unix)]
     if privileged() {
+        secure_state_dir(&root_state_dir())?;
         let dir = network_dir(nodes_dir, node_id);
         if let Some(parent) = dir.parent() {
             super::root_fs::create_dir_all(parent, None)?;
@@ -138,16 +153,80 @@ pub fn take_over_earlier_configs(base: &Path) {
 
 /// Settle node configs before a privileged `node init` writes one. On a host with no
 /// node service yet, this only makes the record, so the service that init installs
-/// never takes over a file the operator's account put in nodes.d. An error stops init.
+/// never takes over a file the operator's account put in nodes.d. Where a service is
+/// already installed it does nothing, and the node settles them when it next starts.
+/// An error stops init.
 pub fn settle_before_init(base: &Path) -> io::Result<()> {
     if !privileged() {
         return Ok(());
     }
-    settle(
+    settle_for_init(
         &base.join(NODES_DIR),
         claim_record,
         super::service::node_service_exists,
     )
+}
+
+/// With a node service already installed, nothing is settled here. That service may
+/// still be an earlier release's node (the CLI and the node update separately), and it
+/// hands every config it writes back to the operator. Made now, the record would stop
+/// the new node from taking those configs over when it first runs, and it would then
+/// refuse them all. So that first run settles them, as on any host upgraded from an
+/// earlier release.
+fn settle_for_init(
+    nodes_dir: &Path,
+    claim: impl FnOnce() -> io::Result<bool>,
+    service_installed: impl FnOnce() -> bool,
+) -> io::Result<()> {
+    if service_installed() {
+        return Ok(());
+    }
+    settle(nodes_dir, claim, || false)
+}
+
+/// For `crossfyre uninstall --purge`: remove the network dirs of nodes run as root (see
+/// [`network_dir`]), which hold the tunnel configs and credentials the control plane
+/// sent. Returns the directory removed, or None when there was none.
+/// The record stays, so a later install takes nothing over from the operator's config
+/// root. Without root the directory cannot be removed, and that is an error.
+#[cfg(unix)]
+pub fn purge_root_network_dirs() -> io::Result<Option<PathBuf>> {
+    let dir = root_state_dir().join(NODES_DIR);
+    if std::fs::symlink_metadata(&dir).is_err() {
+        return Ok(None);
+    }
+    if !privileged() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} belongs to root: run this with sudo", dir.display()),
+        ));
+    }
+    super::root_fs::remove_dir_all(&dir)?;
+    Ok(Some(dir))
+}
+
+/// On Windows the network dirs are in the operator's config root, which a purge removes.
+#[cfg(not(unix))]
+pub fn purge_root_network_dirs() -> io::Result<Option<PathBuf>> {
+    Ok(None)
+}
+
+/// Make `dir`, the directory root keeps the record and its nodes' network dirs in, and
+/// make it mode 755. One that root does not own is refused: whoever owns it could
+/// remove the record, and the next start would take over what is in nodes.d.
+#[cfg(unix)]
+fn secure_state_dir(dir: &Path) -> io::Result<()> {
+    super::root_fs::create_dir_all(dir, None)?;
+    super::root_fs::set_dir_mode(dir, 0o755).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "{} is where the node service keeps what only root may change, and it \
+                 must belong to root: {e}",
+                dir.display()
+            ),
+        )
+    })
 }
 
 /// Make the record. Only when this call made it, and a node service is installed (one
@@ -174,7 +253,7 @@ fn claim_record() -> io::Result<bool> {
 fn claim(record: &Path) -> io::Result<bool> {
     use std::io::Write;
     if let Some(dir) = record.parent() {
-        super::root_fs::create_dir_all(dir, None)?;
+        secure_state_dir(dir)?;
     }
     let mut opts = std::fs::OpenOptions::new();
     use std::os::unix::fs::OpenOptionsExt;
@@ -686,6 +765,117 @@ mod tests {
                 .is_symlink(),
             "replaced the link"
         );
+    }
+
+    /// A `node init` with root on a host whose node service is still an earlier
+    /// release's: that node hands every config it writes back to the operator, so init
+    /// leaves the take-over, and the record, to the first run of the new node.
+    #[test]
+    fn init_leaves_an_earlier_node_service_s_configs_to_the_new_node() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let nodes = t.path().join("nodes.d");
+        fs::create_dir(&nodes).unwrap();
+        let earlier = nodes.join("a.toml");
+        fs::write(&earlier, A_CONFIG).unwrap();
+        fs::set_permissions(&earlier, fs::Permissions::from_mode(0o644)).unwrap();
+        let record = t.path().join("state/taken-over");
+
+        let _root = super::super::sudo_user::act_as_root();
+        let _trusted = imp::trust_self();
+        settle_for_init(&nodes, || claim(&record), || true).unwrap();
+        assert!(
+            !record.exists(),
+            "init made the record with a service there"
+        );
+
+        // The earlier node runs and rewrites its config as the operator's.
+        fs::set_permissions(&earlier, fs::Permissions::from_mode(0o644)).unwrap();
+        // The new node, starting for the first time.
+        settle(&nodes, || claim(&record), || true).unwrap();
+        assert_eq!(mode(&earlier), 0o600, "the new node did not take it over");
+        assert_eq!(read(&earlier).unwrap(), A_CONFIG);
+    }
+
+    /// With no node service, init still makes the record and takes nothing over.
+    #[test]
+    fn init_without_a_node_service_only_makes_the_record() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let nodes = t.path().join("nodes.d");
+        fs::create_dir(&nodes).unwrap();
+        let planted = nodes.join("evil.toml");
+        fs::write(&planted, A_CONFIG).unwrap();
+        fs::set_permissions(&planted, fs::Permissions::from_mode(0o664)).unwrap();
+        let record = t.path().join("state/taken-over");
+
+        let _root = super::super::sudo_user::act_as_root();
+        let _trusted = imp::trust_self();
+        settle_for_init(&nodes, || claim(&record), || false).unwrap();
+
+        assert!(record.exists(), "init did not make the record");
+        assert_eq!(mode(&planted), 0o664, "a planted config was taken over");
+    }
+
+    /// The record's directory is made, or left, writable by root alone: whoever could
+    /// delete the record could have the next start take over what is in nodes.d.
+    #[test]
+    fn the_record_s_directory_is_root_s_alone() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let state = t.path().join("state");
+        fs::create_dir(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o777)).unwrap();
+
+        let _root = super::super::sudo_user::act_as_root();
+        claim(&state.join("taken-over")).unwrap();
+        assert_eq!(mode(&state), 0o755);
+
+        // And so is the one root's network dirs are made in.
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o777)).unwrap();
+        let _state = imp::state_dir_at(&state);
+        prepare_network_dir(&t.path().join("home/nodes.d"), "n").unwrap();
+        assert_eq!(mode(&state), 0o755);
+    }
+
+    /// A purge takes root's copies of the tunnel configs and credentials with it, and
+    /// leaves the record.
+    #[test]
+    fn a_purge_removes_root_s_network_dirs() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let state = t.path().join("state");
+        let nodes = t.path().join("home/nodes.d");
+        fs::create_dir_all(nodes.join("n.network")).unwrap();
+        fs::write(nodes.join("n.network/auth.txt"), "user\npass\n").unwrap();
+
+        let _root = super::super::sudo_user::act_as_root();
+        let _state = imp::state_dir_at(&state);
+        claim(&takeover_record()).unwrap();
+        prepare_network_dir(&nodes, "n").unwrap();
+        assert!(network_dir(&nodes, "n").join("auth.txt").exists());
+
+        let removed = purge_root_network_dirs().unwrap();
+        assert_eq!(removed, Some(state.join(NODES_DIR)));
+        assert!(!state.join(NODES_DIR).exists(), "left root's network dirs");
+        assert!(takeover_record().exists(), "removed the record");
+        assert_eq!(purge_root_network_dirs().unwrap(), None);
+    }
+
+    #[test]
+    fn only_one_plain_name_is_a_node_id() {
+        assert!(is_plain_node_id("0b7f5d0e-6a7c-4a5e-9f43-1d2b3c4d5e6f"));
+        assert!(is_plain_node_id("default-node-1"));
+        for bad in [
+            "",
+            ".",
+            "..",
+            "/tmp/victim",
+            "a/b",
+            "../x",
+            "a\\b",
+            "C:x",
+            "a\nb",
+            "a\0b",
+        ] {
+            assert!(!is_plain_node_id(bad), "{bad:?} passed");
+        }
     }
 
     /// Run as root, a node's tunnel config lives in a directory of root's, mode 700, and

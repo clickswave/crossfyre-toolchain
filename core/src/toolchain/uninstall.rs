@@ -186,6 +186,18 @@ pub fn run(scope: Scope, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
             "Purged config root {} (node registrations included).",
             dir.display()
         ));
+        // A node run as root keeps its tunnel config and credentials outside the
+        // config root, in a directory of root's.
+        match super::node_config::purge_root_network_dirs() {
+            Ok(Some(d)) => ok(&format!(
+                "Removed {} (the tunnel configs of nodes run as root).",
+                d.display()
+            )),
+            Ok(None) => {}
+            Err(e) => warn(&format!(
+                "Kept the tunnel configs of nodes run as root: {e}"
+            )),
+        }
     } else {
         warn(&format!(
             "Config root {} kept. Re-run with --purge to remove it.",

@@ -853,6 +853,21 @@ impl NodePaths {
             network_dir: toolchain::node_config::network_dir(&nodes_dir, node_id),
         }
     }
+
+    /// [`NodePaths::new`] for an id that is not a file name found in nodes.d: one read
+    /// from a config's contents, sent by the control plane or given on the command line.
+    /// Refused unless it is one plain name (see
+    /// [`toolchain::node_config::is_plain_node_id`]), so that every path made from it
+    /// stays in nodes.d and in root's state dir.
+    pub fn checked(base: &std::path::Path, node_id: &str) -> std::io::Result<Self> {
+        if !toolchain::node_config::is_plain_node_id(node_id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{node_id:?} is not a node id"),
+            ));
+        }
+        Ok(Self::new(base, node_id))
+    }
 }
 
 /// The directory that holds one `.toml` per registered node.
@@ -946,7 +961,55 @@ pub fn repair_secret_file_mode(_path: &std::path::Path) {}
 /// registered node-ids (one per `nodes.d/<id>.toml`), sorted for stable
 /// ordering. Files that don't parse as a node config are skipped with a
 /// warning so one corrupt node doesn't block the rest from booting.
+///
+/// The supervisor runs this every couple of seconds, so a skipped file is warned about
+/// once, and again only when the file or the reason changes: see [`ScanWarnings`].
 pub fn discover_nodes(base: &std::path::Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    static WARNED: std::sync::LazyLock<std::sync::Mutex<ScanWarnings>> =
+        std::sync::LazyLock::new(Default::default);
+    let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+    let (ids, lines) = scan_nodes(base, &mut warned)?;
+    for line in lines {
+        eprintln!("{line}");
+    }
+    Ok(ids)
+}
+
+/// What the node scan last said about each file it skipped. A refused config is an
+/// ordinary state to be in (a config written without root on a host whose node runs
+/// as root, say), and saying so on every rescan filled the service's log at a couple
+/// of hundred bytes every two seconds per file.
+#[derive(Default)]
+struct ScanWarnings(
+    std::collections::HashMap<std::path::PathBuf, (Option<std::time::SystemTime>, String)>,
+);
+
+impl ScanWarnings {
+    /// Whether `line` about `path` should be printed: it was not the last thing said
+    /// about that file, or the file has been modified since.
+    fn is_new(&mut self, path: &std::path::Path, line: &str) -> bool {
+        let modified = fs::symlink_metadata(path).and_then(|m| m.modified()).ok();
+        let said = (modified, line.to_string());
+        if self.0.get(path) == Some(&said) {
+            return false;
+        }
+        self.0.insert(path.to_path_buf(), said);
+        true
+    }
+
+    /// Forget every file but those skipped this time, so a file that is fixed, or gone,
+    /// is warned about afresh if it is skipped again, and the map stays as small as
+    /// nodes.d.
+    fn keep_only(&mut self, skipped: &std::collections::HashSet<std::path::PathBuf>) {
+        self.0.retain(|p, _| skipped.contains(p));
+    }
+}
+
+/// [`discover_nodes`], returning the warnings to print rather than printing them.
+fn scan_nodes(
+    base: &std::path::Path,
+    warned: &mut ScanWarnings,
+) -> Result<(Vec<String>, Vec<String>), Box<dyn std::error::Error>> {
     if !base.exists() {
         return Err(format!(
             "config root {base:?} does not exist - run `crossfyre node init` first"
@@ -961,6 +1024,7 @@ pub fn discover_nodes(base: &std::path::Path) -> Result<Vec<String>, Box<dyn std
     }
 
     let mut ids = Vec::new();
+    let mut skipped: Vec<(std::path::PathBuf, String)> = Vec::new();
     for entry in fs::read_dir(&nd)? {
         let path = entry?.path();
         if path.extension().and_then(|e| e.to_str()) != Some("toml") {
@@ -971,9 +1035,11 @@ pub fn discover_nodes(base: &std::path::Path) -> Result<Vec<String>, Box<dyn std
         };
         // The stem is the node id, and the service prints ids to its log. Ids the
         // control plane hands out never hold a control character, and a line break in
-        // one would let a file name write whole lines of root's log.
-        if stem.chars().any(char::is_control) {
-            eprintln!("[boot] WARNING: skipping {path:?} - not a node id");
+        // one would let a file name write whole lines of root's log. Nor do they hold
+        // anything else that would not do as one plain name.
+        if !toolchain::node_config::is_plain_node_id(stem) {
+            let line = format!("[boot] WARNING: skipping {path:?} - not a node id");
+            skipped.push((path, line));
             continue;
         }
         // Validate it parses as a node config so `--boot` doesn't spawn a
@@ -985,7 +1051,9 @@ pub fn discover_nodes(base: &std::path::Path) -> Result<Vec<String>, Box<dyn std
             Ok(s) => match toml::from_str::<Config>(&s) {
                 Ok(_) => ids.push(stem.to_string()),
                 Err(e) => {
-                    eprintln!("[boot] WARNING: skipping {path:?} - not a valid node config: {e}")
+                    let line =
+                        format!("[boot] WARNING: skipping {path:?} - not a valid node config: {e}");
+                    skipped.push((path, line));
                 }
             },
             // Without root, a config only root can read is still a registered node.
@@ -995,11 +1063,20 @@ pub fn discover_nodes(base: &std::path::Path) -> Result<Vec<String>, Box<dyn std
             {
                 ids.push(stem.to_string())
             }
-            Err(e) => eprintln!("[boot] WARNING: skipping {path:?}: {e}"),
+            Err(e) => {
+                let line = format!("[boot] WARNING: skipping {path:?}: {e}");
+                skipped.push((path, line));
+            }
         }
     }
     ids.sort();
-    Ok(ids)
+    warned.keep_only(&skipped.iter().map(|(p, _)| p.clone()).collect());
+    let lines = skipped
+        .into_iter()
+        .filter(|(p, line)| warned.is_new(p, line))
+        .map(|(_, line)| line)
+        .collect();
+    Ok((ids, lines))
 }
 
 /// Read and parse the node config at `path` for a daemon about to run it. Run as root
@@ -1025,7 +1102,14 @@ pub fn migrate_legacy_config(base: &std::path::Path) {
     let Ok(cfg) = toml::from_str::<Config>(&text) else {
         return;
     };
-    let paths = NodePaths::new(base, &cfg.node_id);
+    // The id is the operator's, read from their file, and root makes paths from it.
+    let Ok(paths) = NodePaths::checked(base, &cfg.node_id) else {
+        eprintln!(
+            "[migrate] Not moving {legacy:?}: its node_id {:?} is not a node id",
+            cfg.node_id
+        );
+        return;
+    };
     if paths.config.exists() {
         return; // already migrated
     }
@@ -1280,7 +1364,7 @@ impl std::error::Error for NodeDeleted {}
 ///
 /// Under sudo, no link in the operator's nodes.d is followed on the way to any of them.
 pub fn remove_node_files(base: &std::path::Path, node_id: &str) -> std::io::Result<()> {
-    let paths = NodePaths::new(base, node_id);
+    let paths = NodePaths::checked(base, node_id)?;
     if paths.config.exists() {
         toolchain::sudo_user::remove_file(&paths.config)?;
     }
@@ -1680,7 +1764,7 @@ pub async fn run_init(
     // config root stays the invoking user's home). Each node gets its own
     // `nodes.d/<node-id>.toml` so several can share one crossfyre config root.
     let config_dir = data_dir.to_path_buf();
-    let paths = NodePaths::new(data_dir, &node_id);
+    let paths = NodePaths::checked(data_dir, &node_id)?;
 
     // Create config root + nodes.d if they don't exist yet.
     let nd = nodes_dir(data_dir);
@@ -3866,6 +3950,114 @@ mod security_tests {
             !elsewhere.path().join("n.toml").exists(),
             "moved the config into the link's target"
         );
+    }
+
+    /// The legacy config.toml is the operator's, and so is the node id in it. Root
+    /// makes paths from that id only when it is one plain name, so nothing of the
+    /// operator's is moved out of their config root.
+    #[cfg(unix)]
+    #[test]
+    fn the_legacy_migration_takes_a_node_id_only_as_one_plain_name() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let victim = elsewhere.path().join("victim");
+        fs::write(
+            base.path().join("config.toml"),
+            format!(
+                "api_key = \"k\"\nnode_id = \"{}\"\napi_url = \"http://127.0.0.1:9\"\n",
+                victim.display()
+            ),
+        )
+        .unwrap();
+        fs::create_dir(base.path().join("network")).unwrap();
+
+        let _root = toolchain::sudo_user::act_as_root();
+        migrate_legacy_config(base.path());
+
+        let left: Vec<_> = fs::read_dir(elsewhere.path()).unwrap().flatten().collect();
+        assert!(left.is_empty(), "moved {left:?} out of the config root");
+        assert!(base.path().join("config.toml").exists());
+        assert!(base.path().join("network").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_legacy_migration_moves_a_plain_node_id_s_config() {
+        let base = tempfile::tempdir().expect("tempdir");
+        fs::write(base.path().join("config.toml"), A_NODE_CONFIG).unwrap();
+        fs::create_dir(base.path().join("network")).unwrap();
+
+        let _root = toolchain::sudo_user::act_as_root();
+        migrate_legacy_config(base.path());
+
+        assert_eq!(
+            fs::read_to_string(base.path().join("nodes.d/n.toml")).unwrap(),
+            A_NODE_CONFIG
+        );
+        assert!(base.path().join("nodes.d/n.network").is_dir());
+        assert!(!base.path().join("config.toml").exists());
+    }
+
+    /// A node id from the command line or the control plane names files only when it
+    /// is one plain name.
+    #[test]
+    fn node_paths_from_outside_nodes_d_take_only_a_plain_id() {
+        let base = tempfile::tempdir().expect("tempdir");
+        for bad in ["/etc/x", "../x", "a/b", ".."] {
+            assert!(NodePaths::checked(base.path(), bad).is_err(), "{bad:?}");
+            assert!(remove_node_files(base.path(), bad).is_err(), "{bad:?}");
+        }
+        let p = NodePaths::checked(base.path(), "n").unwrap();
+        assert_eq!(p.config, base.path().join("nodes.d/n.toml"));
+    }
+
+    /// The supervisor rescans every two seconds. A refused config is reported once, and
+    /// again only when it changes.
+    #[cfg(unix)]
+    #[test]
+    fn a_rescan_reports_a_refused_config_once() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let nd = base.path().join("nodes.d");
+        fs::create_dir(&nd).unwrap();
+        let p = nd.join("n.toml");
+        fs::write(&p, A_NODE_CONFIG).unwrap();
+
+        // The test's account is not root, so a root scan refuses its file.
+        let _root = toolchain::sudo_user::act_as_root();
+        let mut warned = ScanWarnings::default();
+        let (ids, lines) = scan_nodes(base.path(), &mut warned).unwrap();
+        assert!(ids.is_empty());
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        for _ in 0..3 {
+            let (_, lines) = scan_nodes(base.path(), &mut warned).unwrap();
+            assert!(lines.is_empty(), "said it again: {lines:?}");
+        }
+
+        // Changed: said again, once.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        let (_, lines) = scan_nodes(base.path(), &mut warned).unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let (_, lines) = scan_nodes(base.path(), &mut warned).unwrap();
+        assert!(lines.is_empty(), "{lines:?}");
+
+        // Gone and back: said again.
+        fs::remove_file(&p).unwrap();
+        scan_nodes(base.path(), &mut warned).unwrap();
+        fs::write(&p, A_NODE_CONFIG).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        let (_, lines) = scan_nodes(base.path(), &mut warned).unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
     }
 
     /// The node service runs as root and reads node configs from nodes.d in the
