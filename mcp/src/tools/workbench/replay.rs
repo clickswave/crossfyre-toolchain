@@ -204,40 +204,46 @@ pub(crate) async fn run(
     } else {
         Vec::new()
     };
-    // Each way the request names another host, as the question shows it.
-    let mut elsewhere: Vec<String> = Vec::new();
-    let mut other = |what: String| {
-        if !elsewhere.contains(&what) {
-            elsewhere.push(what);
+    // Each way the request names another host, as the question shows it, Host first.
+    // A forwarding value is shown only as a plain host name, so the request cannot
+    // write its own text into the question. Every entry is bounded and none is cut, so
+    // nothing can push another out of view. `keyed` holds the values as sent, for the
+    // remembered yes.
+    let mut hosts: Vec<String> = Vec::new();
+    let mut forwarded: Vec<String> = Vec::new();
+    let mut keyed: Vec<String> = Vec::new();
+    fn add(list: &mut Vec<String>, what: String) {
+        if !list.contains(&what) {
+            list.push(what);
         }
-    };
+    }
     let host_headers: Vec<&str> = sent
         .iter()
         .filter(|(k, _)| is_host(k))
         .map(|(_, v)| v.as_str())
         .collect();
     if host_headers.is_empty() && !stored_hosts.is_empty() {
-        other("no Host header".into());
-    }
-    for (k, v) in &sent {
-        if let Some(f) = forwarding(k)
-            && forwarded_names(f, v)
-                .iter()
-                .any(|h| !names_dest(h, &dest, &captured))
-        {
-            other(format!("{f} {}", quoted(v)));
-        }
+        add(&mut hosts, "no Host header".into());
+        add(&mut keyed, "no Host header".into());
     }
     for raw in host_headers {
         let h = ows(raw);
+        let shown = format!("Host {}", quoted(raw));
+        if shown.len() > SHOWN_MAX {
+            return Err(Refusal::invalid(
+                "Host header: too long to show in a question. Nothing was sent.",
+            ));
+        }
         if h.is_empty() {
-            other(format!("Host {}", quoted(raw)));
+            add(&mut hosts, shown.clone());
+            add(&mut keyed, shown);
             continue;
         }
         let hd = guard::parse_target(&format!("{}://{}", dest.scheme, h))
             .map_err(|e| Refusal::invalid(format!("Host header: {}", untrusted::clean(&e, 200))))?;
         if !names_dest(h, &dest, &captured) {
-            other(format!("Host {}", quoted(raw)));
+            add(&mut hosts, shown.clone());
+            add(&mut keyed, shown);
         }
         let port = if h.contains(':') { hd.port } else { dest.port };
         if !mcp.guard.admit(
@@ -261,17 +267,46 @@ pub(crate) async fn run(
             }]));
         }
     }
+    for (k, v) in &sent {
+        let Some(f) = forwarding(k) else { continue };
+        let mut named = false;
+        for name in forwarded_names(f, v) {
+            if names_dest(&name, &dest, &captured) {
+                continue;
+            }
+            named = true;
+            let shown = if name.len() <= NAME_MAX && plain_host(&name).is_some() {
+                format!("{f} {name}")
+            } else {
+                format!("{f} with a value that is not a plain host name")
+            };
+            add(&mut forwarded, shown);
+        }
+        if named {
+            add(&mut keyed, format!("{f} {}", quoted(v)));
+        }
+    }
+    let mut elsewhere = hosts;
+    elsewhere.extend(forwarded);
+    if elsewhere.len() > SHOWN_ENTRIES {
+        return Err(Refusal::invalid(format!(
+            "The Host and forwarding headers name {} other hosts, more than the {SHOWN_ENTRIES} \
+             a question can show. Nothing was sent.",
+            elsewhere.len()
+        )));
+    }
     let asked = match &overridden {
         Some(a) => a.describe(&untrusted::clean(&method, 32)),
         None => format!("{} request", untrusted::clean(&method, 32)),
     };
-    let under = untrusted::clean(&elsewhere.join(", "), 300);
-    // A yes is remembered for the captured host and the Host names it went out under,
+    // Every entry is printable ASCII and bounded, so this cap never cuts one.
+    let under = untrusted::clean(&elsewhere.join(", "), SHOWN_ENTRIES * (SHOWN_MAX + 2));
+    // A yes is remembered for the captured host and the Host values it went out under,
     // so a yes for one pair never covers another.
-    let pair = if elsewhere.is_empty() {
+    let pair = if keyed.is_empty() {
         dest.key()
     } else {
-        format!("{} with {:?}", dest.key(), elsewhere)
+        format!("{} with {:?}", dest.key(), keyed)
     };
     let write = if intent == Intent::Write {
         let host_note = if elsewhere.is_empty() {
@@ -566,7 +601,26 @@ fn quoted(raw: &str) -> String {
 }
 
 /// Headers a front end can route by in place of Host, by their usual spelling.
-const FORWARDING: [&str; 4] = ["X-Forwarded-Host", "X-Original-Host", "X-Host", "Forwarded"];
+const FORWARDING: [&str; 6] = [
+    "X-Forwarded-Host",
+    "X-Original-Host",
+    "X-Host",
+    "X-Forwarded-Server",
+    "X-HTTP-Host-Override",
+    "Forwarded",
+];
+
+/// The longest host name a forwarding header's entry shows: 253 characters of name,
+/// brackets and a port. A longer one is shown as not a plain host name.
+const NAME_MAX: usize = 262;
+
+/// The longest one entry of the other-host list may be as shown. A Host value longer
+/// than that, escapes included, is refused.
+const SHOWN_MAX: usize = 300;
+
+/// The most entries the other-host list shows. A request naming more is refused, so a
+/// yes never covers a name the question left out.
+const SHOWN_ENTRIES: usize = 6;
 
 /// The forwarding header a name is, ignoring case, with `_` read as `-`.
 fn forwarding(name: &str) -> Option<&'static str> {

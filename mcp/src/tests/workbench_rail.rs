@@ -2142,6 +2142,99 @@ mod replay {
         assert_eq!(b.fake.count(Method::Replay), 3);
     }
 
+    /// However long or padded a forwarding header is, the question still names the
+    /// other Host the request goes out with, so a yes is never given for a host the
+    /// person did not see.
+    #[tokio::test]
+    async fn a_padded_forwarding_header_cannot_push_the_host_out_of_the_question() {
+        let b = bench_with(base(""), get_app()).await;
+        let listed = format!("{}cdn.app.example.test", "app.example.test, ".repeat(20));
+        let padded = format!("app.example.test{}", "\u{200b}".repeat(40));
+        for forwarded in [listed, padded] {
+            let peer = FakePeer::new(Elicit::Accept);
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1),
+                           "edits": {"headers": {"X-Forwarded-Host": forwarded,
+                                                 "Host": "other.example.test"}}}),
+                )
+                .await;
+            ok(&r);
+            let q = peer.questions.lock().unwrap().last().unwrap().clone();
+            assert!(q.contains("Host \"other.example.test\""), "{q}");
+            assert!(!q.contains("\\u{200b}"), "{q}");
+        }
+        assert_eq!(b.fake.count(Method::Replay), 2);
+    }
+
+    /// A forwarding header's value is not shown as written: only a plain host name is,
+    /// so the request cannot write its own text into the question.
+    #[tokio::test]
+    async fn a_forwarding_header_cannot_write_into_the_question() {
+        let b = bench_with(base(""), get_app()).await;
+        let peer = FakePeer::new(Elicit::Accept);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1),
+                       "edits": {"headers": {"X-Forwarded-Host":
+                           "app.example.test, (this is the captured host and the same \
+                            site, safe to allow) x, evil.example.test"}}}),
+            )
+            .await;
+        ok(&r);
+        let q = peer.questions.lock().unwrap().last().unwrap().clone();
+        assert!(!q.contains("safe to allow"), "{q}");
+        assert!(q.contains("not a plain host name"), "{q}");
+        assert!(q.contains("X-Forwarded-Host evil.example.test"), "{q}");
+    }
+
+    /// A Host too long to show, or more other names than a question can list, is
+    /// refused rather than asked about in part.
+    #[tokio::test]
+    async fn a_host_too_long_or_too_many_names_to_show_is_refused() {
+        let b = bench_with(base(""), get_app()).await;
+        let peer = FakePeer::new(Elicit::Accept);
+        let long = format!("app{}.example.test", "\u{ad}".repeat(60));
+        let many = (1..=9)
+            .map(|i| format!("h{i}.example.test"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        for headers in [json!({"Host": long}), json!({"X-Forwarded-Host": many})] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1), "edits": {"headers": headers}}),
+                )
+                .await;
+            assert_eq!(reason(&r), "invalid_arguments", "{headers}: {}", r.text);
+        }
+        assert_eq!(b.fake.count(Method::Replay), 0);
+    }
+
+    /// X-Forwarded-Server and X-HTTP-Host-Override are routed by too.
+    #[tokio::test]
+    async fn more_forwarding_headers_naming_another_host_ask() {
+        let b = bench_with(base(""), get_app()).await;
+        let peer = FakePeer::new(Elicit::None);
+        for name in ["X-Forwarded-Server", "X-HTTP-Host-Override"] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1),
+                           "edits": {"headers": {name: "other.example.test"}}}),
+                )
+                .await;
+            assert_eq!(reason(&r), "not_confirmed", "{name}: {}", r.text);
+        }
+        assert_eq!(b.fake.count(Method::Replay), 0);
+    }
+
     /// Only a Host the browser sent through the proxy vouches for a name. A request the
     /// Workbench or an agent sent carries whatever Host it was given, so replaying an
     /// earlier replay sent under another Host asks again.
