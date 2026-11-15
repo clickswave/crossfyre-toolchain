@@ -472,9 +472,9 @@ struct Page {
     /// nothing, while loading one in a browser makes it fetch its own data.
     client_routes: Vec<String>,
     /// The `Location` of a redirect the client handed back instead of following.
-    /// A client carrying a credential does that for any redirect off the host it
-    /// was sent to. The target is also in `links`, so the crawl's own scope
-    /// decides whether to go there.
+    /// The crawl's client does that for any redirect off the origin it was sent
+    /// to. The target is also in `links`, so the crawl's own scope decides
+    /// whether to go there.
     redirect: Option<String>,
 }
 
@@ -1065,9 +1065,9 @@ pub async fn run_stream(params: CrawlParams, tx: mpsc::UnboundedSender<CrawlEven
     if let Some((from, to)) = &first_off_scope {
         let _ = tx.send(CrawlEvent::note(format!(
             "{off_scope_redirects} page(s) answered with a redirect to a host outside this crawl's \
-             scope, the first from {from} to {to}. A crawl carrying a credential or an attribution \
-             token does not follow a redirect off the host it asked, so nothing past it was \
-             crawled. To crawl that site, start from the address the redirect names or add its \
+             scope, the first from {from} to {to}. A crawl does not follow a redirect off the \
+             host it asked unless that host is in its scope, so nothing past it was crawled. \
+             To crawl that site, start from the address the redirect names or add its \
              host to the crawl's scope.",
         )));
     }
@@ -2242,10 +2242,10 @@ mod template_tests {
 
 #[cfg(test)]
 mod redirect_tests {
-    //! A crawl that carries a credential gets a redirect to another host back as
-    //! the 3xx it is, because its client does not take the credential off that
-    //! host. The crawl reads the redirect's `Location` as a link, so its own
-    //! scope decides whether to go there.
+    //! A crawl gets a redirect to another host back as the 3xx it is, because its
+    //! client follows a redirect only on the origin it asked. The crawl reads the
+    //! redirect's `Location` as a link, so its own scope decides whether to go
+    //! there, with or without a credential to carry.
     use super::*;
     use std::io::{Read, Write};
     use std::sync::{Arc, Mutex};
@@ -2307,16 +2307,23 @@ mod redirect_tests {
     }
 
     async fn crawl(seed: &str, scope_hosts: &[&str]) -> Vec<CrawlEvent> {
-        let params: CrawlParams = serde_json::from_value(serde_json::json!({
+        crawl_as(seed, scope_hosts, true).await
+    }
+
+    async fn crawl_as(seed: &str, scope_hosts: &[&str], with_key: bool) -> Vec<CrawlEvent> {
+        let mut params = serde_json::json!({
             "seed": seed,
             "evasive": false,
             "parse_js": false,
             "max_pages": 10,
             "timeout_ms": 3000,
             "scope_hosts": scope_hosts,
-            "auth": {"headers": {"X-Api-Key": "saved-key"}, "cookies": ""},
-        }))
-        .unwrap();
+        });
+        if with_key {
+            params["auth"] =
+                serde_json::json!({"headers": {"X-Api-Key": "saved-key"}, "cookies": ""});
+        }
+        let params: CrawlParams = serde_json::from_value(params).unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         run_stream(params, tx).await;
         let mut out = Vec::new();
@@ -2350,6 +2357,38 @@ mod redirect_tests {
         assert!(
             b_seen.lock().unwrap().is_empty(),
             "a host outside the crawl's scope was sent the credential"
+        );
+        let notes: Vec<&str> = events
+            .iter()
+            .filter(|e| e.kind == "log")
+            .filter_map(|e| e.message.as_deref())
+            .collect();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("redirect") && n.contains(&to)),
+            "no note says why the crawl stopped: {notes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_crawl_with_no_credential_stays_off_an_unlisted_host() {
+        // Nothing to leak, but the host past the redirect is not on the scope list,
+        // and what it serves must not be filed as pages of the seed.
+        let (seed, to, b_seen) = seed_and_target();
+        let events = crawl_as(&seed, &[], false).await;
+        assert!(
+            b_seen.lock().unwrap().is_empty(),
+            "a host outside the crawl's scope was crawled"
+        );
+        let urls: Vec<&str> = events
+            .iter()
+            .filter(|e| e.kind == "url")
+            .filter_map(|e| e.url.as_deref())
+            .collect();
+        assert!(
+            !urls.iter().any(|u| u.ends_with("/about")),
+            "a link from the unlisted host was filed under the seed: {urls:?}"
         );
         let notes: Vec<&str> = events
             .iter()

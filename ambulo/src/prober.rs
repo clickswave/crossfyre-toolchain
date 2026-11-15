@@ -151,6 +151,9 @@ impl Prober {
                 extra_headers: headers_map,
                 emulate: config.evasive,
                 resolve: Vec::new(),
+                // A redirect off the target's origin is reported as the 3xx it is,
+                // not followed to a host the run was not pointed at.
+                same_origin_redirects: true,
                 ..Default::default()
             },
             &config.egress,
@@ -377,6 +380,51 @@ mod tests {
         assert_eq!(
             calibration_url("http://h/app/", "::FUZZ::", "probe"),
             "http://h/app/probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_followed_redirect_stays_on_the_target() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        fn listen(reply: String) -> (u16, std::sync::Arc<AtomicUsize>) {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = l.local_addr().unwrap().port();
+            let seen = std::sync::Arc::new(AtomicUsize::new(0));
+            let count = std::sync::Arc::clone(&seen);
+            std::thread::spawn(move || {
+                for s in l.incoming() {
+                    let Ok(mut s) = s else { return };
+                    let mut buf = [0u8; 4096];
+                    if s.read(&mut buf).unwrap_or(0) > 0 {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        let _ = s.write_all(reply.as_bytes());
+                    }
+                }
+            });
+            (port, seen)
+        }
+        let (inner, inner_seen) =
+            listen("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".into());
+        let (outer, _) = listen(format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{inner}/admin\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+        ));
+        let mut args = cli_args::defaults_for_tests();
+        args.url = vec![format!("http://127.0.0.1:{outer}/::FUZZ::")];
+        args.follow_redirects = true;
+        let prober = Prober::new(&args).await.unwrap();
+        let work = Work {
+            url: format!("http://127.0.0.1:{outer}/admin"),
+            entry_id: 1,
+            method: "get".into(),
+        };
+        let got = prober.probe_url(&work, false).await.unwrap();
+        assert_eq!(got.response.status, 302);
+        assert_eq!(
+            inner_seen.load(Ordering::SeqCst),
+            0,
+            "a host the run was not pointed at was probed"
         );
     }
 }

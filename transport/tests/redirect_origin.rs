@@ -282,3 +282,31 @@ async fn a_chain_that_starts_on_the_origin_stops_where_it_leaves() {
     assert!(seen[1].starts_with("get /next "), "{}", seen[1]);
     assert!(seen[1].contains("x-api-key: saved-api-key"), "{}", seen[1]);
 }
+
+#[tokio::test]
+async fn a_scan_client_with_nothing_to_carry_stops_at_another_origin() {
+    // A scan client reads whatever the redirect target answers and files it under
+    // the host it was sent to, and the next request after a 307 or 308 carries the
+    // probe's body there. A host the operator did not list is never reached this
+    // way: the engine gets the 3xx and decides with its own scope.
+    let (b, b_seen) = other_origin();
+    let (a, _) = redirecting_to(format!("http://127.0.0.1:{b}/first"));
+    let client = build_scan_client(
+        ScanClient {
+            user_agent: "Crossfyre-Test/1.0",
+            timeout: Some(Duration::from_secs(5)),
+            ..Default::default()
+        },
+        &Egress::Direct,
+    )
+    .unwrap();
+
+    let r = client
+        .get(format!("http://127.0.0.1:{a}/out"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_nothing_reached(&b_seen);
+    assert_eq!(r.status().as_u16(), 302);
+}

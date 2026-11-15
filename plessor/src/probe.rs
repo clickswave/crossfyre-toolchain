@@ -104,13 +104,17 @@ pub fn try_build_client(
     redirect: transport::Redirect,
     resolve: Vec<(String, std::net::SocketAddr)>,
 ) -> Result<Client, String> {
-    build(o, redirect, resolve, false)
+    // A probe goes to the target, so a redirect is followed only on the target's
+    // own origin. Off it, a 307 or 308 would carry the payload to a host nobody
+    // listed, and the answer would be read as the target's.
+    build(o, redirect, resolve, true)
 }
 
 /// [`build_client`] for a caller that puts credentials on each request rather than
 /// in `auth`, such as a recorded flow's own headers: it follows a redirect only
-/// while it stays on the origin it started from. A client with `auth` does that
-/// anyway (see [`transport::ClientConfig::same_origin_redirects`]).
+/// while it stays on the origin it started from. Every target client does that
+/// (see [`transport::ClientConfig::same_origin_redirects`]); this one says so
+/// where the reason is the headers.
 pub fn build_client_keeping_origin(o: ClientOpts) -> Option<Client> {
     build(o, transport::Redirect::Limited(3), Vec::new(), true).ok()
 }
@@ -169,7 +173,7 @@ pub fn oast_client(
     egress: &transport::Egress,
     verify_certs: bool,
 ) -> Result<Client, String> {
-    try_build_client(
+    build(
         ClientOpts {
             evasive,
             identify,
@@ -183,6 +187,9 @@ pub fn oast_client(
         },
         transport::Redirect::Limited(3),
         Vec::new(),
+        // The out-of-band API is the node's own service, not a scanned target,
+        // and this client carries nothing for it.
+        false,
     )
 }
 
@@ -997,5 +1004,74 @@ mod timing_tests {
         p.touch_for_test(pace::idle_reset_ms_for_test() + 1_000);
         assert_eq!(p.delay(), 0, "an idle host should not inherit a brake");
         assert!(!p.serialising());
+    }
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    //! A probe that the target answers with a 307 or 308 would send its payload
+    //! on to wherever the `Location` points. Only the target's own origin gets it.
+    use super::*;
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    fn listener(reply: String) -> (u16, Arc<Mutex<Vec<String>>>) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { return };
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap_or(0);
+                log.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let _ = s.write_all(reply.as_bytes());
+            }
+        });
+        (port, seen)
+    }
+
+    #[tokio::test]
+    async fn a_payload_is_not_carried_to_another_origin() {
+        let (b, b_seen) =
+            listener("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".into());
+        let (a, _) = listener(format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:{b}/internal\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+        ));
+        let target = format!("http://127.0.0.1:{a}/search");
+        let client = try_build_client(
+            ClientOpts {
+                evasive: false,
+                identify: None,
+                auth: None,
+                target: &target,
+                timeout_ms: 5000,
+                min_timeout_ms: 0,
+                block_internal: false,
+                egress: &transport::Egress::Direct,
+                verify_certs: false,
+            },
+            transport::Redirect::Limited(3),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let r = client
+            .post(&target)
+            .body("q=probe-payload")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(r.status().as_u16(), 307);
+        assert!(
+            b_seen.lock().unwrap().is_empty(),
+            "another origin was sent the probe: {:?}",
+            b_seen.lock().unwrap()
+        );
     }
 }

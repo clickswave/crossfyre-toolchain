@@ -145,7 +145,11 @@ pub struct ClientConfig {
     /// Always the case for a client with any [`ClientConfig::extra_headers`], since
     /// they carry auth and the attribution token, and neither backend takes more
     /// than a fixed few header names off a request that changes host. Set this for
-    /// a client whose callers put credentials on each request instead.
+    /// a client whose callers put credentials on each request instead, and for any
+    /// client that scans a target: what the redirect target answers would be read
+    /// as the scanned host's, and a 307 or 308 sends the request body on, so a
+    /// redirect would reach hosts nobody listed, the node's own network included.
+    /// [`build_scan_client`] sets it.
     pub same_origin_redirects: bool,
 }
 
@@ -414,12 +418,18 @@ impl<'a> Default for ScanClient<'a> {
 /// Build a scan [`Client`] from a [`ScanClient`] description. Assembles the app
 /// (auth + attribution) headers and the browser (identity) headers, then defers
 /// to [`build_client`] for all backend-specific construction, egress included.
+///
+/// The client follows a redirect only while it stays on the origin of the request
+/// that started it (see [`ClientConfig::same_origin_redirects`]). A redirect
+/// anywhere else comes back as the 3xx it is, for the engine to weigh against
+/// the hosts it was asked to scan.
 pub fn build_scan_client(spec: ScanClient, egress: &Egress) -> Result<Client, BuildError> {
-    build_scan_client_with(spec, egress, false)
+    build_scan_client_with(spec, egress, true)
 }
 
 /// [`build_scan_client`] with [`ClientConfig::same_origin_redirects`] chosen by the
-/// caller, for one that puts credentials on each request rather than in `auth`.
+/// caller. Only a client that talks to a fixed service rather than to a scanned
+/// target should pass `false`, and only when it has no credential to carry.
 pub fn build_scan_client_with(
     spec: ScanClient,
     egress: &Egress,

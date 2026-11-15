@@ -257,7 +257,10 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
                 emulate: should_emulate(params.user_agent.as_deref(), &mode),
                 resolve: Vec::new(),
                 block_internal: params.block_internal,
-                same_origin_redirects: false,
+                // A template request goes to the target. Off its origin a 307 or
+                // 308 would carry the payload to a host nobody listed, and the
+                // matchers would read that host's answer as the target's.
+                same_origin_redirects: true,
             },
             &params.egress,
         )

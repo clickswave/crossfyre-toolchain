@@ -474,17 +474,75 @@ mod tests {
         })
     }
 
+    /// A target that sends `/p` to `/landing` on itself and answers that, counting
+    /// the requests that reach `/landing`.
+    async fn same_origin_redirector() -> (u16, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let landed = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&landed);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let seen = Arc::clone(&counter);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 16384];
+                    while let Ok(n) = sock.read(&mut buf).await {
+                        if n == 0 {
+                            return;
+                        }
+                        let head = String::from_utf8_lossy(&buf[..n]);
+                        let path = head.split_whitespace().nth(1).unwrap_or("");
+                        let reply = if path.starts_with("/landing") {
+                            seen.fetch_add(1, Ordering::SeqCst);
+                            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+                        } else {
+                            "HTTP/1.1 302 Found\r\nLocation: /landing\r\nContent-Length: 0\r\n\r\n"
+                        };
+                        if sock.write_all(reply.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (port, landed)
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn follow_redirects_false_keeps_every_request_on_the_target() {
+        let (sport, landed) = same_origin_redirector().await;
+        let dport = daemon().await;
+        let url = format!("http://127.0.0.1:{sport}/p?q=1");
+
+        let mut op = one_endpoint_op(&url);
+        op["follow_redirects"] = Value::Bool(false);
+        run_to_done(dport, &op).await;
+        assert_eq!(
+            landed.load(Ordering::SeqCst),
+            0,
+            "a redirect was followed with follow_redirects false"
+        );
+
+        // Left out, the old behaviour stands, so the fixture does redirect.
+        run_to_done(dport, &one_endpoint_op(&url)).await;
+        assert!(landed.load(Ordering::SeqCst) > 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_redirect_off_the_target_is_never_followed() {
+        // With follow_redirects left on, a redirect is followed only on the
+        // target's own origin. Another host, here one that answers everything, is
+        // not sent the probes.
         let (elsewhere, elsewhere_seen) = target(Duration::ZERO).await;
         let (rport, redirector_seen) =
             redirector(format!("http://127.0.0.1:{elsewhere}/admin")).await;
         let dport = daemon().await;
         let url = format!("http://127.0.0.1:{rport}/p?q=1");
 
-        let mut op = one_endpoint_op(&url);
-        op["follow_redirects"] = Value::Bool(false);
-        run_to_done(dport, &op).await;
+        run_to_done(dport, &one_endpoint_op(&url)).await;
         assert!(
             redirector_seen.load(Ordering::SeqCst) > 0,
             "nothing was sent"
@@ -492,12 +550,48 @@ mod tests {
         assert_eq!(
             elsewhere_seen.load(Ordering::SeqCst),
             0,
-            "a redirect was followed with follow_redirects false"
+            "a redirect off the target's origin was followed"
         );
+    }
 
-        // Left out, the old behaviour stands, so the fixture does redirect.
-        run_to_done(dport, &one_endpoint_op(&url)).await;
-        assert!(elsewhere_seen.load(Ordering::SeqCst) > 0);
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_template_scan_does_not_follow_a_redirect_off_the_target() {
+        let (elsewhere, elsewhere_seen) = target(Duration::ZERO).await;
+        let (rport, redirector_seen) =
+            redirector(format!("http://127.0.0.1:{elsewhere}/admin")).await;
+        let dport = daemon().await;
+        let dir = std::env::temp_dir().join(format!("plessor-redirect-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("probe.yaml"),
+            "id: redirect-probe\n\
+             info:\n  name: redirect probe\n  severity: info\n\
+             http:\n  - method: POST\n    path:\n\
+             \x20     - \"{{BaseURL}}/form\"\n    body: \"q=probe\"\n    matchers:\n\
+             \x20     - type: status\n        status:\n          - 200\n",
+        )
+        .unwrap();
+        let op = serde_json::json!({
+            "operation": "scan",
+            "response": "stream",
+            "target": format!("http://127.0.0.1:{rport}"),
+            "templates_dir": dir.to_string_lossy(),
+            "only": ["redirect-probe"],
+            "evasive": false,
+            "follow_redirects": true,
+            "timeout_ms": 5000,
+        });
+        let events = run_to_done(dport, &op).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            redirector_seen.load(Ordering::SeqCst) > 0,
+            "nothing was sent: {events:?}"
+        );
+        assert_eq!(
+            elsewhere_seen.load(Ordering::SeqCst),
+            0,
+            "a template request followed a redirect off the target"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
