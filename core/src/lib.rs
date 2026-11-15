@@ -293,11 +293,80 @@ pub fn classify_event(status: &str, code: i64) -> adaptive::ProbeClass {
     }
 }
 
-/// Host portion of a target URL, for keying per-target state.
+/// Host portion of a target URL, with its port when one is written: the host a
+/// saved credential is asked for, and the key for per-target state.
+///
+/// Read the way the engines read a target (the url crate, `http://` added when no
+/// http(s) scheme is written), so it is always the host they connect to. Splitting
+/// the text by hand disagreed with them on targets such as `a?@b`, where the
+/// engines dial `a` and the split named `b`. Empty when the engines could not
+/// parse the target either.
 pub fn target_host(url: &str) -> String {
-    let after = url.split("://").nth(1).unwrap_or(url);
-    let hostport = after.split('/').next().unwrap_or(after);
-    hostport.rsplit('@').next().unwrap_or(hostport).to_string()
+    let t = url.trim();
+    let with_scheme = if t.starts_with("http://") || t.starts_with("https://") {
+        t.to_string()
+    } else {
+        format!("http://{t}")
+    };
+    let Ok(u) = reqwest::Url::parse(&with_scheme) else {
+        return String::new();
+    };
+    match (u.host_str(), u.port()) {
+        (Some(h), Some(p)) => format!("{h}:{p}"),
+        (Some(h), None) => h.to_string(),
+        (None, _) => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod target_host_tests {
+    use super::target_host;
+
+    /// A credential is asked for on behalf of the host the engines will send it to
+    /// (the url crate's host, which every engine dials), whatever else the target's
+    /// text appears to name after an '@'.
+    #[test]
+    fn names_the_host_the_engines_dial() {
+        for (t, want) in [
+            (
+                "https://attacker.example?@app.victim.example/",
+                "attacker.example",
+            ),
+            (
+                "https://attacker.example#@app.victim.example/",
+                "attacker.example",
+            ),
+            (
+                "https://attacker.example\\@app.victim.example/",
+                "attacker.example",
+            ),
+            ("http://10.1.2.3?@app.victim.example/login", "10.1.2.3"),
+            ("attacker.example?@app.victim.example/", "attacker.example"),
+            (
+                "https://attacker.example:8443?@app.victim.example/",
+                "attacker.example:8443",
+            ),
+        ] {
+            assert_eq!(target_host(t), want, "{t}");
+        }
+    }
+
+    /// Ordinary targets read the way they always have.
+    #[test]
+    fn keeps_the_host_and_port_of_ordinary_targets() {
+        for (t, want) in [
+            ("https://app.example.com/x/y", "app.example.com"),
+            ("http://app.example.com:8080/", "app.example.com:8080"),
+            ("app.example.com", "app.example.com"),
+            ("app.example.com:8443", "app.example.com:8443"),
+            ("https://user:pw@app.example.com/", "app.example.com"),
+            ("http://10.0.0.5:3000/api", "10.0.0.5:3000"),
+            ("http://[::1]:8080/", "[::1]:8080"),
+            ("https://app.example.com/::FUZZ::", "app.example.com"),
+        ] {
+            assert_eq!(target_host(t), want, "{t}");
+        }
+    }
 }
 
 /// Context an operation needs from the node run loop: the NATS publisher and
@@ -4811,9 +4880,21 @@ mod op_failure_tests {
         ext: &str,
         data: Value,
     ) -> (Value, String, Vec<String>, u16) {
+        let platform = FakePlatform::start(|_, _| (200, json!("word"))).await;
+        run_unreachable_with(&platform, op_id, op_type, ext, data).await
+    }
+
+    /// [`run_unreachable`] against a platform the caller holds, to read what the op
+    /// asked of it.
+    async fn run_unreachable_with(
+        platform: &FakePlatform,
+        op_id: &str,
+        op_type: &str,
+        ext: &str,
+        data: Value,
+    ) -> (Value, String, Vec<String>, u16) {
         let (_held, port) = refusing_port();
         let nats = FakeNats::start().await;
-        let platform = FakePlatform::start(|_, _| (200, json!("word"))).await;
         let st = EgressState::new(resolver(&[]));
         st.apply_authorize(&direct_settings(1));
         let ctx = OpCtx {
@@ -4877,6 +4958,54 @@ mod op_failure_tests {
             "{op_type} reported an op that never ran as done: {types:?}"
         );
         assert!(!op_is_done(&op_id), "{op_type}");
+    }
+
+    /// Every op that takes a saved credential asks the platform for it on behalf of the
+    /// host its engine will connect to, so the credential's host list is checked
+    /// against that host and not against another name written into the target.
+    #[tokio::test]
+    async fn a_credential_is_asked_for_the_host_the_engine_dials() {
+        let hostile = "http://127.0.0.1:9?@app.victim.test/";
+        let cases = [
+            (
+                "vuln-scan-1",
+                "cortex",
+                json!({"target": hostile, "credential_id": "c1"}),
+            ),
+            (
+                "vuln-scan-1",
+                "cortex",
+                json!({"target": hostile, "mode": "authz",
+                       "identities": [{"role": "admin", "credential_id": "c2"}]}),
+            ),
+            (
+                "service-enum-1",
+                "scout",
+                json!({"target": hostile, "credential_id": "c3"}),
+            ),
+            (
+                "web-crawl-1",
+                "mach",
+                json!({"seed": hostile, "credential_id": "c4"}),
+            ),
+            (
+                "content-discovery-db",
+                "mach",
+                json!({"url": hostile, "wordlist_url": "", "credential_id": "c5"}),
+            ),
+        ];
+        for (n, (op_type, ext, data)) in cases.into_iter().enumerate() {
+            let platform = FakePlatform::start(|_, _| (200, json!("word"))).await;
+            let op_id = format!("op-cred-host-{n}");
+            run_unreachable_with(&platform, &op_id, op_type, ext, data).await;
+            let asked: Vec<Value> = platform
+                .requests()
+                .into_iter()
+                .filter(|(p, _)| p == "/api/v1/creds/resolve")
+                .map(|(_, b)| b["host"].clone())
+                .collect();
+            assert_eq!(asked, vec![json!("127.0.0.1:9")], "{op_type} case {n}");
+        }
     }
 
     #[tokio::test]
