@@ -75,32 +75,21 @@ fn installed_ext_version(ext: &str) -> Option<String> {
 /// reports. The installer places the CLI, the node and cfx-script without a sidecar, and
 /// an update that read the missing record as an old binary downloaded the same version
 /// again and counted it as updated.
-fn recorded_or_reported(
-    sidecar: &Path,
-    bin: &Path,
-    name: &str,
-    envs: Vec<(std::ffi::OsString, std::ffi::OsString)>,
-) -> Option<String> {
+fn recorded_or_reported(sidecar: &Path, name: &str, command: Command) -> Option<String> {
     let recorded = fs::read_to_string(sidecar)
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    recorded.or_else(|| reported_version(bin, name, envs))
+    recorded.or_else(|| reported_version(command, name))
 }
 
-/// What `<bin> --version` says the version is, when it answers `<name> <version>` and
+/// What `command --version` says the version is, when it answers `<name> <version>` and
 /// exits 0 within a few seconds. A cfx-script from before it took `--version` reads the
 /// flag as no job, and refuses the empty stdin it is given with status 2, so it has no
 /// version to report.
-fn reported_version(
-    bin: &Path,
-    name: &str,
-    envs: Vec<(std::ffi::OsString, std::ffi::OsString)>,
-) -> Option<String> {
-    let mut command = Command::new(bin);
+fn reported_version(mut command: Command, name: &str) -> Option<String> {
     command
         .arg("--version")
-        .envs(envs)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -158,9 +147,8 @@ fn installed_node_version() -> Option<String> {
     }
     recorded_or_reported(
         &get_bin_dir().join("node.version"),
-        &bin,
         "node",
-        Vec::new(),
+        Command::new(&bin),
     )
 }
 
@@ -188,8 +176,8 @@ fn installed_helper_version() -> Option<String> {
     if !bin.exists() {
         return None;
     }
-    let envs = crate::executor::python_env(&bin);
-    recorded_or_reported(&ext_version_file(CFX_SCRIPT), &bin, CFX_SCRIPT, envs)
+    let command = crate::executor::helper_command(&bin);
+    recorded_or_reported(&ext_version_file(CFX_SCRIPT), CFX_SCRIPT, command)
 }
 
 /// The record of a cfx-script release that was downloaded and could not start on this
@@ -628,8 +616,7 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
 fn helper_starts(path: &Path) -> Result<(), String> {
     let mut busy = 0;
     let out = loop {
-        let run = Command::new(path)
-            .envs(crate::executor::python_env(path))
+        let run = crate::executor::helper_command(path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -1580,9 +1567,8 @@ pub fn installed_cli_version() -> String {
     let bin = dir.join(ext_file_name("crossfyre"));
     recorded_or_reported(
         &dir.join("crossfyre.version"),
-        &bin,
         "crossfyre",
-        Vec::new(),
+        Command::new(&bin),
     )
     .unwrap_or_default()
 }
@@ -2254,6 +2240,27 @@ mod tests {
         assert!(!s.join("cfx-script.new").exists(), "nothing is left staged");
     }
 
+    /// A shell test that holds when the script runs in the folder it is in.
+    #[cfg(unix)]
+    const IN_OWN_FOLDER: &str = r#"[ "$(pwd -P)" = "$(cd "$(dirname "$0")" && pwd -P)" ]"#;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_helper_is_checked_from_its_own_folder_and_not_the_callers() {
+        // On Windows the helper's python3.dll is looked for in the working directory
+        // before PATH, and `crossfyre update` runs elevated from wherever the operator
+        // opened the terminal.
+        let s = Scratch::new("helper-cwd");
+        let src = fake_helper(
+            &s,
+            "unpacked",
+            &format!("{IN_OWN_FOLDER} || {{ echo \"ran in $(pwd)\" >&2; exit 5; }}\nexit 2"),
+        );
+        let dest = s.join("bin").join("cfx-script");
+        let failed = place_helper_if_it_starts(&src, &dest).expect("place");
+        assert_eq!(failed, None);
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_helper_that_ran_a_job_it_was_never_given_is_not_placed() {
@@ -2499,6 +2506,22 @@ exit 127"#;
         assert_eq!(installed_helper_version(), None);
         fs::write(s.join("cfx-script.version"), "9.9.9\n").expect("write");
         assert_eq!(installed_helper_version().as_deref(), Some("9.9.9"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_installed_helper_is_asked_its_version_from_its_own_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = Scratch::new("helper-version-cwd");
+        bin_dir_at(&s.0);
+        let p = s.join(CFX_SCRIPT);
+        fs::write(
+            &p,
+            format!("#!/bin/sh\n{IN_OWN_FOLDER} || exit 5\necho 'cfx-script 9.9.8'\n"),
+        )
+        .expect("write");
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert_eq!(installed_helper_version().as_deref(), Some("9.9.8"));
     }
 
     #[cfg(unix)]

@@ -9,6 +9,7 @@
 //! hands it the job on stdin, and forwards each line it writes.
 
 use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -86,22 +87,69 @@ pub const PYTHON_MIN: (u32, u32) = (3, 10);
 /// from nowhere else, through the `$ORIGIN/python/lib` rpath it is linked with.
 pub const BUNDLED_PYTHON_DIR: &str = "python";
 
-/// What the helper at `helper` has to be started with to find a Python. Nothing outside
-/// Windows: on Linux the helper finds the Python beside it by its rpath, and on macOS
-/// the framework by the rpaths the release build gives it.
+/// The variable that names the directory the caller was in. The helper starts in a
+/// folder of its own (see `helper_command`) and moves to this one once its libraries
+/// are loaded, so a script's relative paths are still the caller's.
+pub const WORKING_DIR_ENV: &str = "CFX_SCRIPT_WORKING_DIR";
+
+/// A command that starts the helper at `helper`, with what it needs to find a Python.
+///
+/// It starts in the Python folder `python_env` chose, or else in the helper's own
+/// folder, and not in the caller's working directory. Windows looks for the python3.dll
+/// the helper imports in the working directory before it looks on PATH, so a DLL left
+/// where the operator ran crossfyre (a download folder, a cloned repository, or the home
+/// directory an elevated terminal opens in for `crossfyre update`) would load in place
+/// of Python's. The caller's directory goes to the helper in `WORKING_DIR_ENV`. A
+/// relative `helper` is made absolute first, because it names a file from the caller's
+/// directory and the child would otherwise look for it from the new one.
+pub fn helper_command(helper: &Path) -> std::process::Command {
+    let folder = |p: &Path| {
+        p.parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+    };
+    let program = match folder(helper) {
+        Some(_) => std::path::absolute(helper).unwrap_or_else(|_| helper.to_path_buf()),
+        None => helper.to_path_buf(),
+    };
+    let (env, python) = python_env(&program);
+    let mut command = std::process::Command::new(&program);
+    command.envs(env);
+    let start_in = python
+        .or_else(|| folder(&program))
+        .filter(|dir| dir.is_dir());
+    match (start_in, std::env::current_dir()) {
+        (Some(dir), Ok(caller)) => {
+            command.current_dir(dir).env(WORKING_DIR_ENV, caller);
+        }
+        (Some(dir), Err(_)) => {
+            command.current_dir(dir).env_remove(WORKING_DIR_ENV);
+        }
+        (None, _) => {
+            command.env_remove(WORKING_DIR_ENV);
+        }
+    }
+    command
+}
+
+/// What the helper at `helper` has to be started with to find a Python, and the folder
+/// that Python is in. Nothing outside Windows: on Linux the helper finds the Python
+/// beside it by its rpath, and on macOS the framework by the rpaths the release build
+/// gives it.
 ///
 /// On Windows the helper loads python3.dll, the stable-ABI library every CPython
-/// install has, and Windows looks for it beside the helper and then on PATH. A Python
-/// is looked for, in order, as the embeddable package in a `python` folder beside the
-/// helper, which a release can ship so that nothing has to be installed, then among the
-/// installs registered under PEP 514 (python.org's installer, among others), newest
-/// first. The one found goes at the front of PATH, and becomes PYTHONHOME for a
-/// registered install, so its own standard library is the one loaded.
-pub fn python_env(helper: &Path) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+/// install has, and Windows looks for it beside the helper, in the working directory
+/// and then on PATH. A Python is looked for, in order, as the embeddable package in a
+/// `python` folder beside the helper, which a release can ship so that nothing has to
+/// be installed, then among the installs registered under PEP 514 (python.org's
+/// installer, among others), newest first. The one found goes at the front of PATH, and
+/// becomes PYTHONHOME for a registered install, so its own standard library is the one
+/// loaded.
+fn python_env(helper: &Path) -> (Vec<(OsString, OsString)>, Option<PathBuf>) {
     #[cfg(windows)]
     {
         let Some((dir, registered)) = find_python(helper) else {
-            return Vec::new();
+            return (Vec::new(), None);
         };
         let mut path = std::ffi::OsString::from(dir.as_os_str());
         if let Some(rest) = std::env::var_os("PATH").filter(|p| !p.is_empty()) {
@@ -110,14 +158,14 @@ pub fn python_env(helper: &Path) -> Vec<(std::ffi::OsString, std::ffi::OsString)
         }
         let mut env = vec![("PATH".into(), path)];
         if registered && std::env::var_os("PYTHONHOME").is_none() {
-            env.push(("PYTHONHOME".into(), dir.into_os_string()));
+            env.push(("PYTHONHOME".into(), dir.clone().into_os_string()));
         }
-        env
+        (env, Some(dir))
     }
     #[cfg(not(windows))]
     {
         let _ = helper;
-        Vec::new()
+        (Vec::new(), None)
     }
 }
 
@@ -239,8 +287,7 @@ pub async fn run_helper(
     toolchain_dir: Option<&Path>,
     mut on_message: impl FnMut(serde_json::Value),
 ) -> (ExecutionResult, bool) {
-    let mut command = tokio::process::Command::new(helper);
-    command.envs(python_env(helper));
+    let mut command = tokio::process::Command::from(helper_command(helper));
     match toolchain_dir {
         Some(dir) => command.env(TOOLCHAIN_DIR_ENV, dir),
         None => command.env_remove(TOOLCHAIN_DIR_ENV),
@@ -569,6 +616,49 @@ echo '{"type":"completed","job_id":"j1","code":0}'"#,
             seen[0]["message"], "yes",
             "the helper did not get the job: {seen:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn the_helper_starts_in_its_own_folder_and_is_told_where_the_caller_was() {
+        // Windows looks for the python3.dll the helper imports in the working directory
+        // before PATH, so a DLL left wherever the operator ran crossfyre would load in
+        // place of Python's. The helper starts in a folder of ours instead and moves to
+        // the caller's directory once it has loaded.
+        let h = fake_helper(
+            "cwd",
+            r#"cat >/dev/null
+printf '{"type":"log","job_id":"j1","message":"%s|%s"}\n' "$(pwd -P)" "$CFX_SCRIPT_WORKING_DIR"
+echo '{"type":"completed","job_id":"j1","code":0}'"#,
+        );
+        let (r, _, seen) = collect(&h).await;
+        assert!(matches!(r, ExecutionResult::Completed { code: 0 }), "{r:?}");
+        let ours = h.parent().unwrap().canonicalize().unwrap();
+        let caller = std::env::current_dir().unwrap();
+        assert_eq!(
+            seen[0]["message"],
+            format!("{}|{}", ours.display(), caller.display())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_helper_named_by_a_relative_path_still_starts() {
+        // The helper starts in another directory, so a relative path to it has to be
+        // read from the caller's. This one names a folder in the test's working
+        // directory, which is not there from the helper's own folder.
+        let name = format!(".cfx-helper-relative-{}", std::process::id());
+        let dir = std::env::current_dir().unwrap().join(&name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let h = dir.join("cfx-script");
+        std::fs::write(
+            &h,
+            "#!/bin/sh\ncat >/dev/null\necho '{\"type\":\"completed\",\"job_id\":\"j1\",\"code\":0}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&h, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (r, ended, _) = collect(&Path::new(&name).join("cfx-script")).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(r, ExecutionResult::Completed { code: 0 }), "{r:?}");
+        assert!(ended);
     }
 
     #[tokio::test]
