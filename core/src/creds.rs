@@ -176,6 +176,49 @@ fn target_client(
         .map_err(|e| format!("the login client could not be built: {e}"))
 }
 
+/// The redirect policy for a login or token request, whose body carries the
+/// secret. A redirect that leaves the origin of the first request is followed
+/// only when the client sends it without the body: a 303, or a 301 or 302
+/// answering a POST. A 307 or 308, or a 301 or 302 answering any other method,
+/// would send the body on unchanged, so it comes back as the 3xx it is.
+fn secret_body_redirects(method: &str) -> reqwest::redirect::Policy {
+    use reqwest::StatusCode;
+    let post = method.eq_ignore_ascii_case("POST");
+    let limit = reqwest::redirect::Policy::limited(5);
+    reqwest::redirect::Policy::custom(move |attempt| {
+        let body_dropped = attempt.status() == StatusCode::SEE_OTHER
+            || (post
+                && matches!(
+                    attempt.status(),
+                    StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND
+                ));
+        let stays = attempt
+            .previous()
+            .first()
+            .is_some_and(|from| keeps_origin(from, attempt.url()));
+        if stays || body_dropped {
+            limit.redirect(attempt)
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
+/// The same host on the same scheme and port, or the same host moved from `http`
+/// to `https` with both on their default ports.
+fn keeps_origin(from: &reqwest::Url, to: &reqwest::Url) -> bool {
+    if from.host_str() != to.host_str() {
+        return false;
+    }
+    if from.scheme() == to.scheme() {
+        return from.port_or_known_default() == to.port_or_known_default();
+    }
+    from.scheme() == "http"
+        && to.scheme() == "https"
+        && from.port().is_none()
+        && to.port().is_none()
+}
+
 /// Build a concrete AuthContext from a resolved credential. Executes a login for
 /// login_flow types; static types are built directly. `egress` is the op's lease when
 /// this node sends through a proxy; a login then goes through it.
@@ -315,10 +358,14 @@ async fn login_flow(
     let builder = reqwest::Client::builder()
         .cookie_provider(jar.clone())
         .timeout(Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::limited(5));
+        .redirect(secret_body_redirects(&method));
     let client = match egress {
         Some(lease) => target_client(builder, lease)?,
-        None => builder.build().unwrap_or_else(|_| http.clone()),
+        // Never `http` in its place: that client follows any redirect, and this
+        // request carries the password.
+        None => builder
+            .build()
+            .map_err(|e| format!("the login client could not be built: {e}"))?,
     };
 
     // Assemble the credential body plus any extra static fields.
@@ -480,7 +527,9 @@ async fn login_flow(
 /// Non-interactive OAuth2 token exchange (client_credentials / password grants).
 /// Returns a Bearer AuthContext. authorization_code is deferred to the broker.
 async fn oauth2_token(
-    http: &reqwest::Client,
+    // Kept for the shape every builder shares. The token request has a client of
+    // its own, for its redirect policy.
+    _http: &reqwest::Client,
     cred: &ResolvedCredential,
     egress: Option<&Lease>,
 ) -> Result<AuthContext, String> {
@@ -532,12 +581,14 @@ async fn oauth2_token(
         .map(|(k, v)| format!("{}={}", form_urlencode(k), form_urlencode(v)))
         .collect::<Vec<_>>()
         .join("&");
+    let builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .redirect(secret_body_redirects("POST"));
     let client = match egress {
-        Some(lease) => target_client(
-            reqwest::Client::builder().timeout(Duration::from_secs(20)),
-            lease,
-        )?,
-        None => http.clone(),
+        Some(lease) => target_client(builder, lease)?,
+        None => builder
+            .build()
+            .map_err(|e| format!("the token client could not be built: {e}"))?,
     };
     let resp = client
         .post(token_url)
@@ -735,4 +786,151 @@ fn jar_cookie_header(jar: &reqwest::cookie::Jar, url: &reqwest::Url) -> Option<S
     use reqwest::cookie::CookieStore;
     jar.cookies(url)
         .and_then(|hv| hv.to_str().ok().map(String::from))
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    //! A login or token request carries the secret in its body, and the client
+    //! sends that body on through a 307 or 308. Such a redirect to another host
+    //! must come back unfollowed.
+    use super::*;
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+
+    type Seen = Arc<Mutex<Vec<String>>>;
+
+    /// A loopback listener that keeps each request (head and body) it reads and
+    /// answers it with `reply(path)`.
+    fn listener(ip: &str, reply: impl Fn(&str) -> String + Send + 'static) -> (u16, Seen) {
+        let l = std::net::TcpListener::bind((ip, 0)).unwrap();
+        let port = l.local_addr().unwrap().port();
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { return };
+                let _ = s.set_read_timeout(Some(Duration::from_millis(300)));
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    if let Some(end) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&req[..end]).to_ascii_lowercase();
+                        let len = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if req.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let req = String::from_utf8_lossy(&req).to_string();
+                let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                log.lock().unwrap().push(req);
+                let _ = s.write_all(reply(&path).as_bytes());
+            }
+        });
+        (port, seen)
+    }
+
+    fn redirect(status: &str, location: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nLocation: {location}\r\nSet-Cookie: sid=on-login-host; Path=/\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+    }
+
+    fn other_host() -> (u16, Seen) {
+        listener("127.0.0.2", |_| {
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string()
+        })
+    }
+
+    fn cred(auth_type: &str, config: Value, secret: Value) -> ResolvedCredential {
+        ResolvedCredential {
+            name: "test".into(),
+            auth_type: auth_type.into(),
+            config,
+            secret,
+            scope_hosts: Vec::new(),
+            resolved_auth: None,
+        }
+    }
+
+    fn assert_secret_stayed(seen: &Seen, secret: &str) {
+        let seen = seen.lock().unwrap();
+        assert!(
+            !seen.iter().any(|r| r.contains(secret)),
+            "the other host was sent the secret: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_login_body_is_not_sent_on_to_another_host() {
+        for status in ["307 Temporary Redirect", "308 Permanent Redirect"] {
+            for method in ["POST", "PUT", "GET"] {
+                let (b, b_seen) = other_host();
+                let to = format!("http://127.0.0.2:{b}/collect");
+                let (a, _) = listener("127.0.0.1", move |_| redirect(status, &to));
+                let c = cred(
+                    "login_flow",
+                    json!({"login_url": format!("http://127.0.0.1:{a}/login"), "method": method}),
+                    json!({"username": "alice", "password": "saved-password"}),
+                );
+                let _ = login_flow(&reqwest::Client::new(), &c, None).await;
+                assert_secret_stayed(&b_seen, "saved-password");
+            }
+        }
+        // A 301 or 302 keeps the body of anything but a POST.
+        for method in ["PUT", "GET"] {
+            let (b, b_seen) = other_host();
+            let to = format!("http://127.0.0.2:{b}/collect");
+            let (a, _) = listener("127.0.0.1", move |_| redirect("302 Found", &to));
+            let c = cred(
+                "login_flow",
+                json!({"login_url": format!("http://127.0.0.1:{a}/login"), "method": method}),
+                json!({"username": "alice", "password": "saved-password"}),
+            );
+            let _ = login_flow(&reqwest::Client::new(), &c, None).await;
+            assert_secret_stayed(&b_seen, "saved-password");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_login_still_follows_a_redirect_that_drops_the_body() {
+        let (b, b_seen) = other_host();
+        let to = format!("http://127.0.0.2:{b}/home");
+        let (a, _) = listener("127.0.0.1", move |_| redirect("303 See Other", &to));
+        let c = cred(
+            "login_flow",
+            json!({"login_url": format!("http://127.0.0.1:{a}/login")}),
+            json!({"username": "alice", "password": "saved-password"}),
+        );
+        let _ = login_flow(&reqwest::Client::new(), &c, None).await;
+        let seen = b_seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "the 303 was not followed");
+        assert!(seen[0].starts_with("GET /home "), "{}", seen[0]);
+        assert!(!seen[0].contains("saved-password"), "{}", seen[0]);
+    }
+
+    #[tokio::test]
+    async fn a_token_request_is_not_sent_on_to_another_host() {
+        for status in ["307 Temporary Redirect", "308 Permanent Redirect"] {
+            let (b, b_seen) = other_host();
+            let to = format!("http://127.0.0.2:{b}/token");
+            let (a, _) = listener("127.0.0.1", move |_| redirect(status, &to));
+            let c = cred(
+                "oauth2",
+                json!({"token_url": format!("http://127.0.0.1:{a}/token"), "client_id": "app"}),
+                json!({"client_secret": "saved-client-secret"}),
+            );
+            let _ = oauth2_token(&reqwest::Client::new(), &c, None).await;
+            assert_secret_stayed(&b_seen, "saved-client-secret");
+        }
+    }
 }
