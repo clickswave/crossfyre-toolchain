@@ -1880,6 +1880,118 @@ mod replay {
         assert_eq!(b.fake.count(Method::Replay), 0);
     }
 
+    /// The Workbench dials the captured host and sends whatever Host header the edits
+    /// name. Behind a front end that routes by Host, an edit naming another listed host
+    /// hands the session captured for the first one to the second, so even a read asks.
+    #[tokio::test]
+    async fn a_host_edit_naming_another_host_asks_before_the_captured_session_goes() {
+        let other = json!({"exchange": handle(UID_A, 1),
+                           "edits": {"headers": {"Host": "other.example.test"}}});
+        let b = bench_with(base(""), get_app()).await;
+        let r =
+            b.t.call(
+                &FakePeer::new(Elicit::None),
+                "workbench_replay",
+                other.clone(),
+            )
+            .await;
+        assert_eq!(reason(&r), "not_confirmed", "{}", r.text);
+        assert_eq!(b.fake.count(Method::Replay), 0);
+
+        let r =
+            b.t.call(
+                &FakePeer::new(Elicit::Decline),
+                "workbench_replay",
+                other.clone(),
+            )
+            .await;
+        assert_eq!(reason(&r), "declined", "{}", r.text);
+        assert_eq!(b.fake.count(Method::Replay), 0);
+
+        let b = bench_with(base(""), get_app()).await;
+        let peer = FakePeer::new(Elicit::Accept);
+        let r = b.t.call(&peer, "workbench_replay", other.clone()).await;
+        ok(&r);
+        assert_eq!(b.fake.count(Method::Replay), 1);
+        assert_eq!(peer.asked(), 2, "the scope, then the Host");
+        let q = peer.questions.lock().unwrap().last().unwrap().clone();
+        assert!(
+            q.contains("app.example.test") && q.contains("other.example.test"),
+            "{q}"
+        );
+        let r = b.t.call(&peer, "workbench_replay", other).await;
+        ok(&r);
+        assert_eq!(peer.asked(), 2, "the same pair is not asked about again");
+        assert_eq!(b.fake.count(Method::Replay), 2);
+
+        // The URL's own host, however it is written, and a Host the request was
+        // captured with are not another host.
+        let peer = FakePeer::new(Elicit::None);
+        for host in ["APP.example.test", "app.example.test:80"] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1),
+                           "edits": {"headers": {"Host": host}}}),
+                )
+                .await;
+            ok(&r);
+        }
+        let b = bench_with(
+            base(""),
+            stored("GET", "http://app.example.test/", "other.example.test"),
+        )
+        .await;
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1)}),
+            )
+            .await;
+        ok(&r);
+        assert_eq!(b.fake.count(Method::Replay), 1);
+    }
+
+    /// A yes to writes on the captured host does not cover writes that carry its
+    /// session under another host's name.
+    #[tokio::test]
+    async fn a_write_yes_for_one_host_does_not_cover_a_host_edit() {
+        let b = bench_with(
+            base("allow_writes = true"),
+            stored(
+                "POST",
+                "http://app.example.test/api/items",
+                "app.example.test",
+            ),
+        )
+        .await;
+        let peer = FakePeer::new(Elicit::Accept);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1)}),
+            )
+            .await;
+        ok(&r);
+        assert_eq!(peer.asked(), 2, "the scope, then the write");
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1),
+                       "edits": {"headers": {"Host": "other.example.test"}}}),
+            )
+            .await;
+        ok(&r);
+        assert_eq!(peer.asked(), 3, "the write under the other Host");
+        let q = peer.questions.lock().unwrap().last().unwrap().clone();
+        assert!(q.contains("other.example.test"), "{q}");
+        assert_eq!(b.fake.count(Method::Replay), 2);
+    }
+
     /// The method cannot be edited, but many frameworks take it from a header or a
     /// `_method` field instead. A GET that asks for DELETE that way is a write.
     #[tokio::test]

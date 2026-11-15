@@ -5,7 +5,7 @@
 //! as events arrive. `get_scan` and `list_findings` read what it wrote.
 
 use super::{in_range, parse_args};
-use crate::confirm::WriteAsk;
+use crate::confirm::{AskKind, WriteAsk};
 use crate::core::{
     CallNote, Done, Intent, Mcp, Pending, Reason, Refusal, RunningJob, RunningMap, SCAN_TIME_LIMIT,
     Snap, TrafficRequest,
@@ -279,6 +279,7 @@ pub(crate) async fn run(
             untrusted::clean(&origin, 200),
             eps.len()
         ),
+        kind: AskKind::Write,
     });
     let plan = Plan {
         tool: "test_injection",

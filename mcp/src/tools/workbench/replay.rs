@@ -10,7 +10,7 @@ use super::{
     EXCHANGE_TEXTS, Open, ask, bridge_refusal, fit, parse_handle, read_exchange, route, shown_body,
     shown_headers,
 };
-use crate::confirm::WriteAsk;
+use crate::confirm::{AskKind, WriteAsk};
 use crate::core::{CallNote, Done, Intent, Mcp, Reason, Refusal, RefusedDest, TrafficRequest};
 use crate::peer::ClientPeer;
 use crate::tools::parse_args;
@@ -220,6 +220,15 @@ pub(crate) async fn run(
     // somebody else's site on a shared address. Every one the request will carry is
     // checked: a project with no scope admits whatever the Workbench is asked about, so
     // a second Host header nobody looked at here would go out unchecked.
+    //
+    // The Workbench still dials the captured host, so behind a front end that routes by
+    // Host, a name the request was not captured with gets the captured session. That
+    // takes a yes, even for a read.
+    let captured: Vec<String> = stored_hosts
+        .iter()
+        .filter_map(|h| host_named(&dest.scheme, h))
+        .collect();
+    let mut elsewhere: Vec<String> = Vec::new();
     for h in host_headers
         .iter()
         .map(|h| h.trim())
@@ -227,6 +236,9 @@ pub(crate) async fn run(
     {
         let hd = guard::parse_target(&format!("{}://{}", dest.scheme, h))
             .map_err(|e| Refusal::invalid(format!("Host header: {}", untrusted::clean(&e, 200))))?;
+        if hd.host != dest.host && !captured.contains(&hd.host) && !elsewhere.contains(&hd.host) {
+            elsewhere.push(hd.host.clone());
+        }
         let port = if h.contains(':') { hd.port } else { dest.port };
         if !mcp.guard.admit(
             &hd.host,
@@ -257,18 +269,59 @@ pub(crate) async fn run(
         ),
         None => format!("{} request", untrusted::clean(&method, 32)),
     };
-    let write = (intent == Intent::Write).then(|| WriteAsk {
-        remember: Some(dest.key()),
-        message: format!(
-            "workbench_replay will send a {asked} to {} from the Workbench project {}, with \
-             the cookies and headers that were captured, so it acts as the captured user. \
-             Methods other than GET, HEAD and OPTIONS can change or destroy data. Allow them \
-             to {} for the rest of this session?",
-            untrusted::clean(&dest.origin(), 200),
-            o.name(),
-            untrusted::clean(&dest.key(), 200)
-        ),
-    });
+    let under = untrusted::clean(&elsewhere.join(", "), 200);
+    // A yes is remembered for the captured host and the Host names it went out under,
+    // so a yes for one pair never covers another.
+    let pair = if elsewhere.is_empty() {
+        dest.key()
+    } else {
+        format!("{} under Host {}", dest.key(), elsewhere.join(","))
+    };
+    let write = if intent == Intent::Write {
+        let host_note = if elsewhere.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " The Host header names {under}, so a server that routes by Host can hand that \
+                 session to {under}."
+            )
+        };
+        Some(WriteAsk {
+            remember: Some(pair),
+            message: format!(
+                "workbench_replay will send a {asked} to {} from the Workbench project {}, with \
+                 the cookies and headers that were captured, so it acts as the captured user.\
+                 {host_note} Methods other than GET, HEAD and OPTIONS can change or destroy \
+                 data. Allow them to {}{} for the rest of this session?",
+                untrusted::clean(&dest.origin(), 200),
+                o.name(),
+                untrusted::clean(&dest.key(), 200),
+                if elsewhere.is_empty() {
+                    String::new()
+                } else {
+                    format!(" under Host {under}")
+                }
+            ),
+            kind: AskKind::Write,
+        })
+    } else if !elsewhere.is_empty() {
+        Some(WriteAsk {
+            remember: Some(format!("read {pair}")),
+            message: format!(
+                "workbench_replay will send a {asked} to {} from the Workbench project {} with \
+                 the Host header changed to {under}, carrying the cookies and headers captured \
+                 for {}. A server that routes by Host can hand that session to {under}. Allow \
+                 reads from {} to go out under Host {under} for the rest of this session?",
+                untrusted::clean(&dest.origin(), 200),
+                o.name(),
+                untrusted::clean(&dest.host, 200),
+                untrusted::clean(&dest.key(), 200)
+            ),
+            kind: AskKind::OtherHost,
+        })
+    } else {
+        None
+    };
     let clearance = mcp.confirm(pending, peer, write, note, ct).await?;
 
     // A compressed body is no use to a model, so ask for none unless the edits say
@@ -384,6 +437,17 @@ fn bridge_label(raw: &str) -> String {
         "" => "unknown".into(),
         t => t.to_string(),
     }
+}
+
+/// The host a Host header value names, lowercased, or `None` when it names none.
+fn host_named(scheme: &str, raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    guard::parse_target(&format!("{scheme}://{t}"))
+        .ok()
+        .map(|d| d.host)
 }
 
 /// The Host headers the sent request will carry. An edit that names Host sets the first

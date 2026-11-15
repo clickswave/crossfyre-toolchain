@@ -6,7 +6,7 @@
 //! through the guard before anything is sent to it.
 
 use super::{in_range, parse_args, result_size};
-use crate::confirm::WriteAsk;
+use crate::confirm::{AskKind, WriteAsk};
 use crate::core::{CallNote, Clearance, Done, Intent, Mcp, Reason, Refusal, TrafficRequest};
 use crate::guard;
 use crate::peer::ClientPeer;
@@ -295,6 +295,7 @@ pub(crate) async fn run(
             untrusted::clean(&dest.origin(), 200),
             untrusted::clean(&dest.key(), 200)
         ),
+        kind: AskKind::Write,
     });
     let mut clearance = mcp.confirm(pending, peer, write, note, ct).await?;
 
@@ -394,6 +395,7 @@ pub(crate) async fn run(
                 untrusted::clean(&next.origin(), 200),
                 untrusted::clean(&next.key(), 200)
             ),
+            kind: AskKind::Write,
         });
         match mcp.clear_hop(next.clone(), peer, write, ct).await {
             Ok(c) => {

@@ -38,12 +38,22 @@ pub(crate) struct Confirmations {
     write_hosts: Mutex<HashSet<String>>,
 }
 
-/// A write action waiting for a yes.
+/// A write action waiting for a yes, or a read that needs one for another reason.
 pub(crate) struct WriteAsk {
     /// `host:port` when the answer is remembered per destination for this process;
     /// `None` when every call asks again.
     pub remember: Option<String>,
     pub message: String,
+    pub kind: AskKind,
+}
+
+/// What a yes allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AskKind {
+    /// A request that can change or destroy data.
+    Write,
+    /// A read that carries a captured session under another host's name.
+    OtherHost,
 }
 
 impl Confirmations {
@@ -128,28 +138,34 @@ impl Confirmations {
         {
             return Ok(());
         }
-        if !peer.can_elicit_form() {
-            return Err(Refusal::new(
-                Reason::NotConfirmed,
+        let (label, cannot, declined) = match ask.kind {
+            AskKind::Write => (
+                "Allow this write action",
                 "This client cannot show the confirmation that write actions need, so the \
                  request was not sent. Use a read-only method or a client that supports \
                  elicitation.",
-            ));
+                "The write action was not confirmed, so nothing was sent.",
+            ),
+            AskKind::OtherHost => (
+                "Allow the captured session to go out under this Host",
+                "This client cannot show the confirmation that a Host header naming another \
+                 host needs, so the request was not sent. Replay without that edit, or use a \
+                 client that supports elicitation.",
+                "Sending the captured session under another host's name was not confirmed, \
+                 so nothing was sent.",
+            ),
+        };
+        if !peer.can_elicit_form() {
+            return Err(Refusal::new(Reason::NotConfirmed, cannot));
         }
-        match peer
-            .confirm(ask.message, "allow", "Allow this write action")
-            .await
-        {
+        match peer.confirm(ask.message, "allow", label).await {
             Answer::Yes => {
                 if let (Some(key), Ok(mut s)) = (ask.remember, self.write_hosts.lock()) {
                     s.insert(key);
                 }
                 Ok(())
             }
-            Answer::No => Err(Refusal::new(
-                Reason::Declined,
-                "The write action was not confirmed, so nothing was sent.",
-            )),
+            Answer::No => Err(Refusal::new(Reason::Declined, declined)),
             Answer::Dismissed => Err(not_answered()),
         }
     }

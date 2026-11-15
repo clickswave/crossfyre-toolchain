@@ -8,7 +8,7 @@
 //! the scan is cancelled if the project's scope stops admitting it or the project closes.
 
 use super::{ask, bridge_refusal, parse_handle, route};
-use crate::confirm::WriteAsk;
+use crate::confirm::{AskKind, WriteAsk};
 use crate::core::{
     CallNote, Done, Intent, Mcp, Reason, Refusal, RefusedDest, RunningJob, RunningMap,
     TrafficRequest, cancel_job,
@@ -482,6 +482,7 @@ pub(crate) async fn run(
             untrusted::clean(&origin, 200),
             o.name()
         ),
+        kind: AskKind::Write,
     });
     let on_start = keep_in_scope(
         Arc::clone(&o.inst),
