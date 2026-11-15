@@ -702,10 +702,128 @@ mod reads {
         assert_eq!(v["rows"].as_array().unwrap().len(), 1, "{v}");
         assert_eq!(v["rows"][0]["exchange"], handle(UID_A, 250));
         assert!(v["next_cursor"].is_null(), "{v}");
-        // The Workbench is still asked to narrow by the term, a page at a time.
+        // The term is not sent: the Workbench would match it against the stored URL.
+        let sent = &b.fake.params(Method::History)[0];
+        assert!(sent["filter"]["url_contains"].is_null(), "{sent}");
+        assert_eq!(sent["limit"], 100);
+
+        // With masking off the Workbench is asked to narrow by the term, as before.
+        let b = bench_with(
+            base().no_redact(),
+            filtering_history(vec![(1, "http://app.example.test/p?token=hit1".into())]),
+        )
+        .await;
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_list_history",
+                json!({"url_contains": "HIT", "limit": 2}),
+            )
+            .await;
+        assert_eq!(ok(&r)["rows"].as_array().unwrap().len(), 1);
         let sent = &b.fake.params(Method::History)[0];
         assert_eq!(sent["filter"]["url_contains"], "HIT");
-        assert_eq!(sent["limit"], 100);
+        assert_eq!(sent["limit"], 2);
+    }
+
+    /// Whether a page comes back with a cursor follows from the rows shown. A probe row
+    /// holding a guess, stored by a replay, finds itself either way, and the cursor is the
+    /// same whether or not an older row holds the guess inside a masked value.
+    #[tokio::test]
+    async fn the_history_cursor_does_not_say_whether_a_masked_value_matched() {
+        let urls = vec![
+            (1, "http://app.example.test/probe?q=zq8".to_string()),
+            (2, "http://app.example.test/probe?q=zq9".to_string()),
+            (
+                3,
+                "http://app.example.test/cb?access_token=Zq9VAL".to_string(),
+            ),
+        ];
+        let b = bench_with(base(), filtering_history(urls)).await;
+        let peer = FakePeer::new(Elicit::None);
+        let mut seen = Vec::new();
+        for term in ["zq8", "zq9"] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_list_history",
+                    json!({"url_contains": term, "limit": 1}),
+                )
+                .await;
+            let v = ok(&r).clone();
+            assert_eq!(v["rows"].as_array().unwrap().len(), 1, "{term}: {v}");
+            let next = v["next_cursor"].as_str().map(str::to_string);
+            let after = match &next {
+                Some(c) => {
+                    let r =
+                        b.t.call(
+                            &peer,
+                            "workbench_list_history",
+                            json!({"url_contains": term, "limit": 1, "cursor": c}),
+                        )
+                        .await;
+                    let v = ok(&r).clone();
+                    (
+                        v["rows"].as_array().unwrap().len(),
+                        v["next_cursor"].is_null(),
+                    )
+                }
+                None => (0, true),
+            };
+            seen.push((term, next.is_some(), after));
+        }
+        assert_eq!(seen[0].1, seen[1].1, "{seen:?}");
+        assert_eq!(seen[0].2, seen[1].2, "{seen:?}");
+    }
+
+    /// A Workbench that is still busy a page into a long read leaves the rows already
+    /// kept in the answer, with a cursor where the read stopped.
+    #[tokio::test]
+    async fn a_busy_workbench_mid_read_keeps_the_rows_already_read() {
+        let b = bench_with(
+            base(),
+            WbOpts::default().answer(Method::History, |c, _| {
+                let Call::History(p) = c else { unreachable!() };
+                if p.cursor.is_some() {
+                    return Err(cfx_bridge::ErrorBody::new(
+                        cfx_bridge::ErrorCode::Busy,
+                        "more than 20 requests in one second",
+                    ));
+                }
+                let rows: Vec<HistoryRow> = (1..=100)
+                    .map(|i| {
+                        let q = if i == 5 { "q" } else { "token" };
+                        row(i, &format!("http://app.example.test/p?{q}=hit{i}"))
+                    })
+                    .collect();
+                let next = Some(HistoryCursor {
+                    at_ms: rows[99].at_ms,
+                    id: 100,
+                });
+                Ok(serde_json::to_value(HistoryResult { rows, next }).unwrap())
+            }),
+        )
+        .await;
+        let peer = FakePeer::new(Elicit::None);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_list_history",
+                json!({"url_contains": "hit", "limit": 2}),
+            )
+            .await;
+        let v = ok(&r).clone();
+        assert_eq!(v["rows"].as_array().unwrap().len(), 1, "{v}");
+        assert_eq!(v["rows"][0]["exchange"], handle(UID_A, 5));
+        let next = v["next_cursor"].as_str().unwrap();
+        assert!(next.ends_with("_100"), "{next}");
+        assert!(
+            r.text.contains("100 row(s) of history were looked at"),
+            "{}",
+            r.text
+        );
+        // The busy page was asked for once more before the read stopped.
+        assert_eq!(b.fake.count(Method::History), 3);
     }
 
     /// An exchange carrying a secret in every place one turns up.
@@ -1253,10 +1371,11 @@ mod reads {
         assert_eq!(ok(&r)["workbench"]["project"], "beta");
     }
 
+    /// With masking off the Workbench pages the map, and the cursor is its own.
     #[tokio::test]
     async fn the_site_map_pages_with_its_own_cursor() {
         let b = bench_with(
-            base(),
+            base().no_redact(),
             WbOpts::default().answer(Method::SiteMap, |_, _| {
                 Ok(serde_json::to_value(SiteMapResult {
                     endpoints: vec![SiteMapRow {
@@ -1305,6 +1424,122 @@ mod reads {
             )
             .await;
         assert_eq!(reason(&r), "invalid_arguments");
+    }
+
+    /// A site map that pages the way the Workbench does: in (host, path, method) order of
+    /// the stored paths, `limit` rows after the cursor.
+    fn paging_site_map(paths: Vec<(&'static str, u64)>) -> WbOpts {
+        WbOpts::default().answer(Method::SiteMap, move |c, _| {
+            let Call::SiteMap(p) = c else { unreachable!() };
+            let mut all: Vec<SiteMapRow> = paths
+                .iter()
+                .map(|(path, count)| SiteMapRow {
+                    host: "app.example.test".into(),
+                    path: (*path).into(),
+                    method: "GET".into(),
+                    status: Some(200),
+                    count: *count,
+                    last_ms: 1_798_619_564_512,
+                    bytes: 10,
+                    has_query: false,
+                })
+                .collect();
+            all.sort_by(|a, b| (&a.host, &a.path, &a.method).cmp(&(&b.host, &b.path, &b.method)));
+            let mut rows: Vec<SiteMapRow> = all
+                .into_iter()
+                .filter(|r| {
+                    p.cursor.as_ref().is_none_or(|c| {
+                        (&r.host, &r.path, &r.method) > (&c.host, &c.path, &c.method)
+                    })
+                })
+                .collect();
+            let more = rows.len() > p.limit as usize;
+            rows.truncate(p.limit as usize);
+            let next = rows.last().filter(|_| more).map(|r| SiteMapCursor {
+                host: r.host.clone(),
+                path: r.path.clone(),
+                method: r.method.clone(),
+            });
+            Ok(serde_json::to_value(SiteMapResult {
+                endpoints: rows,
+                next,
+                incomplete: false,
+            })
+            .unwrap())
+        })
+    }
+
+    /// With masking on, the map is paged in the order of the paths as shown and a cursor
+    /// carries a shown path. Neither the cursor nor the order of the rows says how a
+    /// masked session id compares with a path stored by a replay, and a cursor made up
+    /// by hand cannot ask either.
+    #[tokio::test]
+    async fn the_site_map_order_and_cursor_follow_the_shown_paths() {
+        let b = bench_with(
+            base(),
+            paging_site_map(vec![
+                ("/app;jsessionid=8/x", 1),
+                ("/app;jsessionid=8F3ASECRET/home", 1),
+                ("/app;jsessionid=9/x", 1),
+                ("/login", 1),
+            ]),
+        )
+        .await;
+        let peer = FakePeer::new(Elicit::None);
+        let mut shown = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut args = json!({"limit": 1});
+            if let Some(c) = &cursor {
+                args["cursor"] = json!(c);
+            }
+            let r = b.t.call(&peer, "workbench_get_site_map", args).await;
+            let v = ok(&r).clone();
+            assert!(!v.to_string().contains("8F3A"), "{v}");
+            for e in v["endpoints"].as_array().unwrap() {
+                shown.push((
+                    e["target_data"]["path"].as_str().unwrap().to_string(),
+                    e["count"].as_u64().unwrap(),
+                ));
+            }
+            cursor = v["next_cursor"].as_str().map(str::to_string);
+            let Some(c) = &cursor else { break };
+            let Ok(cfx_bridge::Cursor::SiteMap { at, .. }) = c.parse() else {
+                panic!("{c}")
+            };
+            assert!(!at.path.contains("8F3A"), "{}", at.path);
+        }
+        assert_eq!(
+            shown,
+            [
+                ("/app;jsessionid=[redacted]/home".to_string(), 1),
+                ("/app;jsessionid=[redacted]/x".to_string(), 2),
+                ("/login".to_string(), 1),
+            ]
+        );
+        // Cursors made up on either side of the stored id start at the same row.
+        let tag = cfx_bridge::ProjectTag::of(UID_A).unwrap();
+        let mut after = Vec::new();
+        for guess in ["/app;jsessionid=8F", "/app;jsessionid=8G"] {
+            let c = cfx_bridge::Cursor::SiteMap {
+                project: tag,
+                at: SiteMapCursor {
+                    host: "app.example.test".into(),
+                    path: guess.into(),
+                    method: "GET".into(),
+                },
+            };
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_get_site_map",
+                    json!({"cursor": c.to_string(), "limit": 200}),
+                )
+                .await;
+            after.push(ok(&r)["endpoints"].clone());
+        }
+        assert_eq!(after[0], after[1]);
+        assert_eq!(after[0].as_array().unwrap().len(), 3, "{}", after[0]);
     }
 }
 
@@ -2218,7 +2453,7 @@ mod injection {
         for s in ["S1-ck", "S3-bearer", "S6-tok", "S8-csrf"] {
             assert!(!found.contains(s), "{s} in the findings file: {found}");
         }
-        assert!(found.contains("token=%5Bredacted%5D"), "{found}");
+        assert!(found.contains("token=[redacted]"), "{found}");
 
         let list =
             b.t.call(&peer, "list_findings", json!({"scan_id": scan_id}))

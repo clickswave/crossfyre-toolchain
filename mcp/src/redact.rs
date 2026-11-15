@@ -100,6 +100,11 @@ static PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
             &format!(r#"(?i)"(?P<name>{member})"\s*:\s*"(?:[^"\\]|\\.)*(?:"|\\?\z)"#),
             r#""$name":"[redacted]""#,
         ),
+        // The same with a number for a value: `"session_id": 123456`.
+        p(
+            &format!(r#"(?i)"(?P<name>{member})"\s*:\s*-?[0-9][0-9.eE+-]*"#),
+            r#""$name":"[redacted]""#,
+        ),
         // A multipart/form-data part with one of those names: its headers are kept and
         // its body, up to the next boundary or the end of what was captured, is masked.
         // `\bname` so a `filename=` is not read as the part's name.
@@ -200,54 +205,149 @@ fn mask_nested_members(s: &str) -> String {
     out
 }
 
-/// Mask the values of query and fragment parameters with sensitive names, any password
-/// in the authority, and the path and user name as free text, which is what masks a
-/// `;jsessionid=` path parameter. Text that does not parse as a URL is masked as free
-/// text.
+/// Mask a URL and keep every byte it was written with outside what is masked, so the URL
+/// as shown differs from the stored one only where a value was hidden: a search over the
+/// shown URL finds what a search over the stored one would, short of the masked values.
+///
+/// Masked: a password in the authority, a user name standing alone (`https://<token>@`
+/// is how a token rides in one) or holding a known format, the path a piece at a time
+/// ([`redact_path`]), and query and fragment parameters by name. Text that does not parse
+/// as a URL with an authority is masked as free text.
 pub(crate) fn redact_url(s: &str) -> String {
-    let Ok(mut url) = transport::Url::parse(s) else {
+    // A URL parser drops a tab or line break anywhere, so `tok\nen=` names `token`.
+    let s = &s.replace(['\t', '\n', '\r'], "");
+    let (Ok(_), Some(i)) = (transport::Url::parse(s), s.find("://")) else {
         return redact_text(s);
     };
-    if url.password().is_some() {
-        let _ = url.set_password(Some(MASK));
+    let scheme = &s[..i];
+    if !scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        || !scheme
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b))
+    {
+        return redact_text(s);
     }
-    let user = url.username().to_string();
-    let masked = redact_text(&user);
-    if masked != user {
-        let _ = url.set_username(&masked);
+    let from = i + 3;
+    let to = s[from..]
+        .find(['/', '\\', '?', '#'])
+        .map_or(s.len(), |j| from + j);
+    let mut out = String::with_capacity(s.len());
+    out.push_str(&s[..from]);
+    match s[from..to].rsplit_once('@') {
+        Some((userinfo, host)) => {
+            match userinfo.split_once(':') {
+                Some((user, _)) => {
+                    out.push_str(&redact_text(user));
+                    out.push(':');
+                    out.push_str(MASK);
+                }
+                None if !userinfo.is_empty() => out.push_str(MASK),
+                None => {}
+            }
+            out.push('@');
+            out.push_str(host);
+        }
+        None => out.push_str(&s[from..to]),
     }
-    let path = url.path().to_string();
-    let masked = redact_text(&path);
-    if masked != path {
-        url.set_path(&masked);
+    out.push_str(&redact_after_authority(&s[to..]));
+    out
+}
+
+/// `(S(...))`, an ASP.NET cookieless session in a path segment, and the `(A(...)F(...))`
+/// forms of the same.
+static COOKIELESS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\((?:[A-Za-z]\([^()]*\))+\)$").expect("redaction pattern"));
+static COOKIELESS_PART: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"([A-Za-z])\([^()]*\)").expect("redaction pattern"));
+
+/// A path masked a piece at a time, a piece being what lies between `/` and `;`. A
+/// `name=value` piece with a secret name loses its value (`;jsessionid=`), an ASP.NET
+/// cookieless segment loses what its parentheses hold, and any other piece is masked as
+/// free text. The separators and every other piece keep their bytes, so the path after
+/// a masked value is still shown.
+pub(crate) fn redact_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for part in path.split_inclusive(['/', ';']) {
+        let (piece, sep) = match part.strip_suffix(['/', ';']) {
+            Some(p) => (p, &part[p.len()..]),
+            None => (part, ""),
+        };
+        match piece.split_once('=') {
+            _ if piece.is_empty() => {}
+            Some((k, v)) if !v.is_empty() && sensitive_name(&percent_decoded(k)) => {
+                out.push_str(k);
+                out.push('=');
+                out.push_str(MASK);
+            }
+            _ if COOKIELESS.is_match(piece) => {
+                out.push_str(&COOKIELESS_PART.replace_all(piece, "$1([redacted])"));
+            }
+            _ => out.push_str(&redact_text(piece)),
+        }
+        out.push_str(sep);
     }
-    if url.query().is_some() {
-        let pairs: Vec<(String, String)> = url
-            .query_pairs()
-            .map(|(k, v)| {
-                let v = if sensitive_name(&k) {
-                    MASK.to_string()
-                } else {
-                    redact_text(&v)
-                };
-                (k.into_owned(), v)
-            })
-            .collect();
-        url.query_pairs_mut().clear().extend_pairs(pairs);
+    out
+}
+
+/// What follows the authority of a URL, or a request target that starts with `/`:
+/// `path?query#fragment`. The path is masked by [`redact_path`], query and fragment
+/// parameters whose names [`sensitive_name`] passes lose their values, and everything
+/// else keeps the bytes it was written with.
+fn redact_after_authority(t: &str) -> String {
+    let (rest, fragment) = match t.split_once('#') {
+        Some((r, f)) => (r, Some(f)),
+        None => (t, None),
+    };
+    let (path, query) = match rest.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (rest, None),
+    };
+    let pairs = |q: &str| -> String { q.split('&').map(redact_pair).collect::<Vec<_>>().join("&") };
+    let mut out = redact_path(path);
+    if let Some(q) = query {
+        out.push('?');
+        out.push_str(&pairs(q));
     }
-    // A fragment is never sent, but an OAuth implicit flow puts its tokens there, and
-    // a URL copied from a browser keeps them.
-    if let Some(fragment) = url.fragment().map(str::to_string) {
-        let masked: Vec<String> = fragment
-            .split('&')
-            .map(|pair| match pair.split_once('=') {
-                Some((k, _)) if sensitive_name(k) => format!("{k}={MASK}"),
-                _ => redact_text(pair),
-            })
-            .collect();
-        url.set_fragment(Some(&masked.join("&")));
+    if let Some(f) = fragment {
+        out.push('#');
+        out.push_str(&pairs(f));
     }
-    url.to_string()
+    out
+}
+
+/// One `name=value` query or fragment parameter. A sensitive name loses its value, and
+/// any other value is masked as free text. A value whose decoded form holds a secret,
+/// such as a URL carried encoded in it (`next=https%3A%2F%2F...%3Ftoken%3D...`), is
+/// shown decoded, masked and encoded again.
+fn redact_pair(pair: &str) -> String {
+    let Some((k, v)) = pair.split_once('=') else {
+        return redact_text(pair);
+    };
+    if sensitive_name(&percent_decoded(k)) {
+        return format!("{k}={MASK}");
+    }
+    if v.contains(['%', '+']) {
+        let decoded = percent_decoded(v);
+        let masked = redact_text(&decoded);
+        if masked != decoded {
+            return format!("{}={}", redact_text(k), encoded(&masked));
+        }
+    }
+    redact_text(pair)
+}
+
+/// A query value written back with `%XX` for the bytes that would end it or change what
+/// it means, and everything else as it is, so it stays readable.
+fn encoded(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~/:@,;=!$'()*[]?".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// `%41` as `A` and `+` as a space, for reading a parameter's name. Bytes that do not
@@ -272,10 +372,9 @@ fn percent_decoded(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// A request target as a request line carries it, `/path?query#fragment`. Query and
-/// fragment parameters whose names [`sensitive_name`] passes lose their values, and
-/// everything else keeps the bytes it was written with, so a path is shown as it was
-/// sent rather than as a URL parser would tidy it. An absolute URL is masked as a URL.
+/// A request target as a request line carries it, `/path?query#fragment`, masked by
+/// [`redact_after_authority`], so a path is shown as it was sent rather than as a URL
+/// parser would tidy it. An absolute URL is masked as a URL.
 pub(crate) fn redact_target(t: &str) -> String {
     if !t.starts_with('/') {
         return if t.contains("://") {
@@ -284,33 +383,7 @@ pub(crate) fn redact_target(t: &str) -> String {
             redact_text(t)
         };
     }
-    let (rest, fragment) = match t.split_once('#') {
-        Some((r, f)) => (r, Some(f)),
-        None => (t, None),
-    };
-    let (path, query) = match rest.split_once('?') {
-        Some((p, q)) => (p, Some(q)),
-        None => (rest, None),
-    };
-    let pairs = |q: &str| -> String {
-        q.split('&')
-            .map(|pair| match pair.split_once('=') {
-                Some((k, _)) if sensitive_name(&percent_decoded(k)) => format!("{k}={MASK}"),
-                _ => redact_text(pair),
-            })
-            .collect::<Vec<_>>()
-            .join("&")
-    };
-    let mut out = redact_text(path);
-    if let Some(q) = query {
-        out.push('?');
-        out.push_str(&pairs(q));
-    }
-    if let Some(f) = fragment {
-        out.push('#');
-        out.push_str(&pairs(f));
-    }
-    out
+    redact_after_authority(t)
 }
 
 /// `METHOD target [version]`, as a request line or a refusal's detail says it, with
@@ -655,6 +728,85 @@ mod unit {
         assert!(
             r.starts_with(r#"{"data":{"user":{"session":"[redacted]""#),
             "{r}"
+        );
+    }
+
+    /// The URL as shown keeps the bytes it was stored with outside a masked value, so a
+    /// term searched for in it is found where it was written: `/`, `:`, `@`, `,`, `%20`
+    /// in a query value are not re-encoded.
+    #[test]
+    fn a_url_keeps_its_bytes_outside_the_masked_values() {
+        let u = "http://h.test/r?next=/admin/users&redirect=https://evil.test/a&q=a%20b+c\
+                 &l=a,b@c&token=RB1#frag=/x";
+        assert_eq!(
+            redact_url(u),
+            "http://h.test/r?next=/admin/users&redirect=https://evil.test/a&q=a%20b+c\
+             &l=a,b@c&token=[redacted]#frag=/x"
+        );
+        assert_eq!(redact_url("HTTP://H.test:8080"), "HTTP://H.test:8080");
+    }
+
+    /// A value that carries a URL of its own, encoded, has that URL's secrets masked as
+    /// well, and a tab or line break the URL parser would drop does not split a name.
+    #[test]
+    fn an_encoded_url_in_a_value_is_masked_inside() {
+        let r = redact_url(
+            "http://h.test/login?next=https%3A%2F%2Fapp.test%2Fcb%3Faccess_token%3DNX1%26x%3D1\
+             &r=a+Bearer+NX2&q=1#s=%2Fcb%3Fcode%3DNX3",
+        );
+        for secret in ["NX1", "NX2", "NX3"] {
+            assert!(!r.contains(secret), "{secret} survived: {r}");
+        }
+        assert!(
+            r.contains("next=https://app.test/cb?access_token=[redacted]%26x=1&r="),
+            "{r}"
+        );
+        assert!(r.contains("&q=1#"), "{r}");
+        let r = redact_url("http://h.test/p?tok\nen=NX4&x=1");
+        assert!(!r.contains("NX4"), "{r}");
+    }
+
+    /// A path keeps what follows a masked path parameter, an ASP.NET cookieless session
+    /// is masked, and a user name with no password is masked whole.
+    #[test]
+    fn a_path_keeps_what_follows_a_masked_value() {
+        assert_eq!(
+            redact_url("https://h.test/a;jsessionid=PK1/b/c?y=2"),
+            "https://h.test/a;jsessionid=[redacted]/b/c?y=2"
+        );
+        assert_eq!(
+            redact_url("http://h.test/a;PHPSESSID=PK2;lang=en/b"),
+            "http://h.test/a;PHPSESSID=[redacted];lang=en/b"
+        );
+        assert_eq!(
+            redact_url("http://h.test/(S(pk3abcdef))/page.aspx?x=1"),
+            "http://h.test/(S([redacted]))/page.aspx?x=1"
+        );
+        assert_eq!(
+            redact_url("http://h.test/app/(A(PK4)F(PK5))/a"),
+            "http://h.test/app/(A([redacted])F([redacted]))/a"
+        );
+        assert_eq!(
+            redact_url("https://pk6opaque@h.test/r"),
+            "https://[redacted]@h.test/r"
+        );
+        assert_eq!(
+            redact_url("https://alice:PK7@h.test/r"),
+            "https://alice:[redacted]@h.test/r"
+        );
+        assert_eq!(
+            redact_request_line("GET /a;jsessionid=PK8/b?q=1 HTTP/1.1"),
+            "GET /a;jsessionid=[redacted]/b?q=1 HTTP/1.1"
+        );
+        assert_eq!(redact_path("/a;sid=PK9/b"), "/a;sid=[redacted]/b");
+    }
+
+    #[test]
+    fn json_members_with_secret_names_and_number_values_are_masked() {
+        let r = redact_text(r#"{"session_id": 123456, "otp_token":-7.5e3, "page": 2}"#);
+        assert_eq!(
+            r,
+            r#"{"session_id":"[redacted]", "otp_token":"[redacted]", "page": 2}"#
         );
     }
 
