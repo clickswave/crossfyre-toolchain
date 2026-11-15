@@ -104,6 +104,23 @@ pub fn try_build_client(
     redirect: transport::Redirect,
     resolve: Vec<(String, std::net::SocketAddr)>,
 ) -> Result<Client, String> {
+    build(o, redirect, resolve, false)
+}
+
+/// [`build_client`] for a caller that puts credentials on each request rather than
+/// in `auth`, such as a recorded flow's own headers: it follows a redirect only
+/// while it stays on the origin it started from. A client with `auth` does that
+/// anyway (see [`transport::ClientConfig::same_origin_redirects`]).
+pub fn build_client_keeping_origin(o: ClientOpts) -> Option<Client> {
+    build(o, transport::Redirect::Limited(3), Vec::new(), true).ok()
+}
+
+fn build(
+    o: ClientOpts,
+    redirect: transport::Redirect,
+    resolve: Vec<(String, std::net::SocketAddr)>,
+    same_origin_redirects: bool,
+) -> Result<Client, String> {
     let ClientOpts {
         evasive,
         identify,
@@ -118,7 +135,7 @@ pub fn try_build_client(
     let mode = adaptive::identity::Mode::from_flags(evasive, identify);
     let seed = (!target.is_empty()).then_some(target);
     let browser = adaptive::identity::resolve(&mode, seed);
-    transport::build_scan_client(
+    transport::build_scan_client_with(
         transport::ScanClient {
             identity_headers: &browser.headers,
             user_agent: &browser.user_agent,
@@ -135,6 +152,7 @@ pub fn try_build_client(
             block_internal,
         },
         egress,
+        same_origin_redirects,
     )
     .map_err(|e| format!("client build failed: {e}"))
 }

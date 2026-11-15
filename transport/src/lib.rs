@@ -137,6 +137,16 @@ pub struct ClientConfig {
     /// the like, and cannot be built while `CROSSFYRE_EGRESS_PROXY` is set. Under
     /// [`Egress::Proxy`] the filter is the proxy's job, which a node's gateway does.
     pub block_internal: bool,
+    /// Follow a redirect only while it stays on the origin of the request that
+    /// started it (the same host, port and scheme, or the same host moved from
+    /// `http` to `https` on the default ports). A redirect anywhere else comes back
+    /// to the caller as the 3xx it is.
+    ///
+    /// Always the case for a client with any [`ClientConfig::extra_headers`], since
+    /// they carry auth and the attribution token, and neither backend takes more
+    /// than a fixed few header names off a request that changes host. Set this for
+    /// a client whose callers put credentials on each request instead.
+    pub same_origin_redirects: bool,
 }
 
 impl Default for ClientConfig {
@@ -152,6 +162,7 @@ impl Default for ClientConfig {
             emulate: false,
             resolve: Vec::new(),
             block_internal: false,
+            same_origin_redirects: false,
         }
     }
 }
@@ -241,23 +252,36 @@ pub fn build_client(cfg: ClientConfig, egress: &Egress) -> Result<Client, BuildE
     if let Some(t) = cfg.timeout {
         b = b.timeout(t);
     }
+    let same_origin = cfg.same_origin_redirects || !cfg.extra_headers.is_empty();
     b = match cfg.redirect {
         Redirect::None => b.redirect(redirect::Policy::none()),
-        // The resolver above is never asked about an address written into a URL, so
-        // a hop to `http://127.0.0.1/` would get past it. Such a hop is refused here,
-        // before it is dialled.
-        Redirect::Limited(n) if cfg.block_internal => {
+        Redirect::Limited(n) if cfg.block_internal || same_origin => {
             let limit = redirect::Policy::limited(n);
+            let block_internal = cfg.block_internal;
             b.redirect(redirect::Policy::custom(move |attempt| {
-                if attempt
-                    .url()
-                    .host_str()
-                    .is_some_and(guard::is_internal_literal)
+                // The resolver above is never asked about an address written into a
+                // URL, so a hop to `http://127.0.0.1/` would get past it. Such a hop
+                // is refused here, before it is dialled.
+                if block_internal
+                    && attempt
+                        .url()
+                        .host_str()
+                        .is_some_and(guard::is_internal_literal)
                 {
-                    attempt.error(guard::NOT_PERMITTED)
-                } else {
-                    limit.redirect(attempt)
+                    return attempt.error(guard::NOT_PERMITTED);
                 }
+                // The first URL is the one the caller asked for. Every hop is held
+                // to it, not to the hop before, so a chain cannot step off the
+                // origin and carry on from there.
+                if same_origin
+                    && !attempt
+                        .previous()
+                        .first()
+                        .is_some_and(|from| keeps_origin(from, attempt.url()))
+                {
+                    return attempt.stop();
+                }
+                limit.redirect(attempt)
             }))
         }
         Redirect::Limited(n) => b.redirect(redirect::Policy::limited(n)),
@@ -322,6 +346,22 @@ pub fn build_client(cfg: ClientConfig, egress: &Egress) -> Result<Client, BuildE
     Ok(b.build()?)
 }
 
+/// True when a redirect from `from` to `to` stays where `from`'s credentials
+/// belong: the same host on the same scheme and port, or the same host moved from
+/// `http` to `https` with both on their default ports.
+fn keeps_origin(from: &Url, to: &Url) -> bool {
+    if from.host_str() != to.host_str() {
+        return false;
+    }
+    if from.scheme() == to.scheme() {
+        return from.port_or_known_default() == to.port_or_known_default();
+    }
+    from.scheme() == "http"
+        && to.scheme() == "https"
+        && from.port().is_none()
+        && to.port().is_none()
+}
+
 /// A scan client described in terms an engine already has: a resolved browser
 /// identity (headers + UA, from the private `adaptive` catalogue), optional
 /// request auth, an optional attribution token, and the per-op transport policy.
@@ -375,6 +415,16 @@ impl<'a> Default for ScanClient<'a> {
 /// (auth + attribution) headers and the browser (identity) headers, then defers
 /// to [`build_client`] for all backend-specific construction, egress included.
 pub fn build_scan_client(spec: ScanClient, egress: &Egress) -> Result<Client, BuildError> {
+    build_scan_client_with(spec, egress, false)
+}
+
+/// [`build_scan_client`] with [`ClientConfig::same_origin_redirects`] chosen by the
+/// caller, for one that puts credentials on each request rather than in `auth`.
+pub fn build_scan_client_with(
+    spec: ScanClient,
+    egress: &Egress,
+    same_origin_redirects: bool,
+) -> Result<Client, BuildError> {
     let mut extra_headers = HeaderMap::new();
     if let Some(a) = spec.auth.filter(|a| a.is_meaningful()) {
         for (k, v) in a.to_header_map().iter() {
@@ -398,6 +448,7 @@ pub fn build_scan_client(spec: ScanClient, egress: &Egress) -> Result<Client, Bu
             emulate: spec.emulate,
             resolve: spec.resolve,
             block_internal: spec.block_internal,
+            same_origin_redirects,
         },
         egress,
     )
@@ -489,6 +540,30 @@ mod tests {
         let r = client(false).get(&url).send().await.unwrap();
         assert_eq!(r.status().as_u16(), 200);
         assert_eq!(inner_seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn keeps_origin_allows_only_the_same_host_and_an_https_upgrade() {
+        let u = |s: &str| Url::parse(s).unwrap();
+        let from = u("http://app.example/login");
+        assert!(keeps_origin(&from, &u("http://app.example/home")));
+        assert!(keeps_origin(&from, &u("http://APP.example:80/home")));
+        assert!(keeps_origin(&from, &u("https://app.example/home")));
+        assert!(!keeps_origin(&from, &u("https://app.example:8443/home")));
+        assert!(!keeps_origin(&from, &u("http://app.example:8080/home")));
+        assert!(!keeps_origin(&from, &u("http://www.app.example/home")));
+        assert!(!keeps_origin(&from, &u("http://example/home")));
+        assert!(!keeps_origin(
+            &from,
+            &u("http://app.example.attacker.test/")
+        ));
+        let tls = u("https://app.example/");
+        assert!(keeps_origin(&tls, &u("https://app.example:443/next")));
+        // A move to plain text would put the credential on the wire.
+        assert!(!keeps_origin(&tls, &u("http://app.example/next")));
+        let alt = u("http://app.example:8080/");
+        assert!(!keeps_origin(&alt, &u("https://app.example:8080/")));
+        assert!(keeps_origin(&alt, &u("http://app.example:8080/next")));
     }
 
     #[test]

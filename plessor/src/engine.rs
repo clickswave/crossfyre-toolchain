@@ -257,6 +257,7 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
                 emulate: should_emulate(params.user_agent.as_deref(), &mode),
                 resolve: Vec::new(),
                 block_internal: params.block_internal,
+                same_origin_redirects: false,
             },
             &params.egress,
         )
