@@ -171,11 +171,11 @@ internal class DirectPatchFeature(private val app: Context) : PatchFeature {
         PatchPrefs.all(app).keys.forEach { if (!Apps.isInstalled(app, it)) PatchPrefs.forget(app, it) }
     }
 
-    override fun start(pkg: String, label: String, sizeMb: Int, pairing: Pairing, ca: File, caFingerprint: String?) {
+    override fun start(pkg: String, label: String, sizeMb: Int, pairing: Pairing, caPem: String, caFingerprint: String?) {
         if (_job.value?.running == true) return
         pendingInstall = null
         caForJob = caFingerprint
-        pendingBuild = { build(pkg, pairing, ca) }
+        pendingBuild = { build(pkg, pairing, caPem) }
         advance(PatchJob(pkg, label, sizeMb, PatchStep.READ))
     }
 
@@ -217,7 +217,7 @@ internal class DirectPatchFeature(private val app: Context) : PatchFeature {
         }
     }
 
-    private fun build(pkg: String, pairing: Pairing, ca: File) {
+    private fun build(pkg: String, pairing: Pairing, caPem: String) {
         // buildPatched clears the scratch directory on entry, so anything left
         // exportable from a previous patch is about to stop existing. Drop the
         // offer now rather than letting it fail when taken up.
@@ -225,7 +225,7 @@ internal class DirectPatchFeature(private val app: Context) : PatchFeature {
         _exportable.value = null
         work = scope.launch {
             try {
-                val files = Patcher.buildPatched(app, pkg, pairing.apiUrl, pairing.workflowId, pairing.token, ca) { step ->
+                val files = Patcher.buildPatched(app, pkg, pairing.apiUrl, pairing.workflowId, pairing.token, caPem) { step ->
                     _job.update { j ->
                         if (j == null || !j.running) j
                         // Monotonic within a stage: a late report never moves the bar back.

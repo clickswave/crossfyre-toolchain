@@ -56,7 +56,7 @@ object Patcher {
         apiUrl: String,
         workflowId: String,
         token: String,
-        caPem: File,
+        caPem: String,
         progress: (Step) -> Unit
     ): List<File> = withContext(Dispatchers.IO) {
         progress(Step(PatchStep.READ))
@@ -70,17 +70,11 @@ object Patcher {
         // Zip the splits + CA into one upload (base named base.apk so the server picks it as base).
         val work = File(ctx.cacheDir, "patch").apply { deleteRecursively(); mkdirs() }
         val upload = File(work, "in.zip")
-        ZipOutputStream(upload.outputStream().buffered()).use { zos ->
-            splitPaths.forEachIndexed { i, f ->
-                val name = if (f.absolutePath == ai.sourceDir) "base.apk" else "split_$i.apk"
-                zos.putNextEntry(ZipEntry(name))
-                f.inputStream().use { it.copyTo(zos) }
-                zos.closeEntry()
-            }
-            zos.putNextEntry(ZipEntry("ca.pem"))
-            caPem.inputStream().use { it.copyTo(zos) }
-            zos.closeEntry()
-        }
+        writeUpload(
+            upload,
+            splitPaths.mapIndexed { i, f -> (if (f.absolutePath == ai.sourceDir) "base.apk" else "split_$i.apk") to f },
+            caPem,
+        )
 
         val out = File(work, "out.zip")
         val uploadTotal = upload.length()
@@ -317,6 +311,25 @@ object Patcher {
             throw IllegalStateException("Patch service returned no installable build of $pkg")
         }
         patched
+    }
+
+    /**
+     * Write the upload: each split under its name, then the certificate as
+     * `ca.pem`. The certificate is written from the text it was handed, not
+     * read back from a file, so nothing can change it while the splits (tens
+     * to hundreds of megabytes) are being zipped.
+     */
+    internal fun writeUpload(upload: File, splits: List<Pair<String, File>>, caPem: String) {
+        ZipOutputStream(upload.outputStream().buffered()).use { zos ->
+            for ((name, f) in splits) {
+                zos.putNextEntry(ZipEntry(name))
+                f.inputStream().use { it.copyTo(zos) }
+                zos.closeEntry()
+            }
+            zos.putNextEntry(ZipEntry("ca.pem"))
+            zos.write(caPem.toByteArray(Charsets.UTF_8))
+            zos.closeEntry()
+        }
     }
 
     /** How long to wait for a rebuild before giving up, and how often to ask. */

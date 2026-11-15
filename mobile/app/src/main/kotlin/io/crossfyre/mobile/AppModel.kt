@@ -140,6 +140,20 @@ data class Toast(val text: String, val icon: Int)
 /** Facts about this phone's certificate, read off disk and the Android trust store. */
 data class CertInfo(val exists: Boolean, val fingerprint: String?, val madeAt: Long, val inAndroid: Boolean)
 
+/** The certificate's DER bytes from its PEM text, or null if it is not one. */
+internal fun pemDer(pem: String): ByteArray? {
+    if (!pem.contains("-----BEGIN CERTIFICATE-----")) return null
+    return runCatching {
+        java.util.Base64.getMimeDecoder().decode(
+            pem.substringAfter("-----BEGIN CERTIFICATE-----").substringBefore("-----END CERTIFICATE-----")
+        )
+    }.getOrNull()?.takeIf { it.isNotEmpty() }
+}
+
+/** SHA-256 of the certificate's DER bytes in hex, the fingerprint patches are recorded against. */
+internal fun pemFingerprint(pem: String): String? =
+    pemDer(pem)?.let { der -> java.security.MessageDigest.getInstance("SHA-256").digest(der).joinToString("") { "%02x".format(it) } }
+
 /**
  * Everything the screens show and every action they take.
  *
@@ -1065,11 +1079,16 @@ class AppModel(app: Application) : AndroidViewModel(app) {
         val p = pairing ?: return say("Pair a workspace first.", R.drawable.ic_info)
         if (qrEnded) return say("This pairing code has been used. Scan a new one first.", R.drawable.ic_info)
         viewModelScope.launch {
-            val ca = withContext(Dispatchers.IO) { ensureCaFile() }
-            if (ca == null) return@launch say("Could not create this phone's certificate.", R.drawable.ic_warning)
+            // The certificate goes to the patch as text, and the patch is recorded
+            // against the fingerprint of that same text. A file staged on the way
+            // could be swapped before the upload reads it: before Android 11 any
+            // app with storage permission can write to this app's external folder.
+            val pem = withContext(Dispatchers.IO) { caPemForSaving() }
+            val fp = pem?.let { pemFingerprint(it) }
+            if (pem == null || fp == null) return@launch say("Could not create this phone's certificate.", R.drawable.ic_warning)
             refreshCert()
             val f = facts[pkg]
-            patch.start(pkg, f?.label ?: labelOf(pkg), f?.sizeMb ?: 0, p, ca, cert.fingerprint)
+            patch.start(pkg, f?.label ?: labelOf(pkg), f?.sizeMb ?: 0, p, pem, fp)
         }
     }
 
@@ -1134,13 +1153,9 @@ class AppModel(app: Application) : AndroidViewModel(app) {
     private fun readCert(): CertInfo {
         val f = caPem
         if (!f.exists()) return CertInfo(false, null, 0L, false)
-        val der = runCatching {
-            val pem = f.readText()
-            java.util.Base64.getMimeDecoder().decode(
-                pem.substringAfter("-----BEGIN CERTIFICATE-----").substringBefore("-----END CERTIFICATE-----")
-            )
-        }.getOrNull() ?: return CertInfo(false, null, 0L, false)
-        val fp = java.security.MessageDigest.getInstance("SHA-256").digest(der).joinToString("") { "%02x".format(it) }
+        val pem = runCatching { f.readText() }.getOrNull() ?: return CertInfo(false, null, 0L, false)
+        val der = pemDer(pem) ?: return CertInfo(false, null, 0L, false)
+        val fp = pemFingerprint(pem) ?: return CertInfo(false, null, 0L, false)
         return CertInfo(true, fp, f.lastModified(), inAndroidStore(der))
     }
 
@@ -1153,18 +1168,10 @@ class AppModel(app: Application) : AndroidViewModel(app) {
     }.getOrDefault(false)
 
     /**
-     * The certificate as a file a patch can upload, made if the phone has none.
-     * Patching does not need the certificate installed in Android, so it must
-     * not need the button that installs it either.
+     * The certificate's PEM for saving or patching, made if the phone has none
+     * yet. Patching does not need the certificate installed in Android, so it
+     * must not need the button that installs it either.
      */
-    private fun ensureCaFile(): File? {
-        val pem = runCatching { Native.generateCaPem() }.getOrNull() ?: return null
-        if (pem.startsWith("ERROR")) return null
-        val out = File(ctx.getExternalFilesDir(null) ?: ctx.filesDir, caFileName)
-        return runCatching { out.writeText(pem); out }.getOrNull()
-    }
-
-    /** The certificate's PEM for saving, made if the phone has none yet. */
     fun caPemForSaving(): String? {
         val pem = runCatching { Native.generateCaPem() }.getOrNull() ?: return null
         return pem.takeUnless { it.startsWith("ERROR") }
@@ -1189,6 +1196,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
         if (running) stopCapture()
         runCatching { caPem.delete() }
         runCatching { File(ctx.filesDir, "ca.key").delete() }
+        // Earlier versions staged a copy here for patching. Nothing writes it now.
         runCatching { File(ctx.getExternalFilesDir(null), caFileName).delete() }
         patch.forgetAll()
         overlay = Overlay.RemoveOldCert

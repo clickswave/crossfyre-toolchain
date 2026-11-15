@@ -7,7 +7,6 @@ import io.crossfyre.mobile.apps.AppFacts
 import io.crossfyre.mobile.apps.Apps
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import java.io.File
 import java.io.OutputStream
 
 /**
@@ -29,7 +28,7 @@ private object NoPatching : PatchFeature {
     override fun stale(caFingerprint: String?): List<String> = emptyList()
     override fun outlook(facts: AppFacts, patched: Boolean) = Apps.outlookWithoutPatching(facts)
     override fun tidy() = Unit
-    override fun start(pkg: String, label: String, sizeMb: Int, pairing: Pairing, ca: File, caFingerprint: String?) = Unit
+    override fun start(pkg: String, label: String, sizeMb: Int, pairing: Pairing, caPem: String, caFingerprint: String?) = Unit
     override fun carryOn() = Unit
     override fun allowInstallsIntent(): Intent? = null
     override fun cancel() = Unit

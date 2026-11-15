@@ -54,7 +54,12 @@ interface PatchFeature {
     /** Housekeeping at launch: debris from a patch that was killed, records of uninstalled apps. */
     fun tidy()
 
-    fun start(pkg: String, label: String, sizeMb: Int, pairing: Pairing, ca: File, caFingerprint: String?)
+    /**
+     * Patch [pkg] to trust the certificate in [caPem], recorded against
+     * [caFingerprint], the fingerprint of that same text. The certificate is
+     * passed as text, never as a file another app might replace on the way.
+     */
+    fun start(pkg: String, label: String, sizeMb: Int, pairing: Pairing, caPem: String, caFingerprint: String?)
 
     /**
      * Back in view, perhaps from Android's settings: a patch waiting at
