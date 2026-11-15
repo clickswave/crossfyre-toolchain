@@ -271,6 +271,10 @@ pub async fn run_on(listener: TcpListener, db: AmbuloDb) -> Result<(), Box<dyn s
 }
 
 /// The client the single-URL probe sends with.
+///
+/// It follows a redirect only on the origin it was sent to. Anywhere else would
+/// report another host's status and length as the probed URL's, and a 307 or
+/// 308 would re-send a PUT, POST or DELETE there.
 fn build_probe_client(
     follow_redirects: bool,
     egress: &transport::Egress,
@@ -292,6 +296,7 @@ fn build_probe_client(
             extra_headers: transport::HeaderMap::new(),
             emulate: true,
             resolve: Vec::new(),
+            same_origin_redirects: true,
             ..Default::default()
         },
         egress,
@@ -1355,5 +1360,90 @@ mod http_request_tests {
             !lines.iter().any(|l| l.contains("capabilities")),
             "read on past the first line: {lines:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod probe_redirect_tests {
+    //! The single-URL probe follows a redirect only on the origin it was sent to.
+    //! Anywhere else, the 3xx is the answer: nothing is sent to the other host,
+    //! and its status and length are not reported as the probed URL's.
+    use super::*;
+    use std::io::{Read, Write};
+    use std::sync::Mutex;
+
+    fn listener(ip: &str, reply: impl Fn() -> String + Send + 'static) -> (u16, Arc<Mutex<u32>>) {
+        let l = std::net::TcpListener::bind((ip, 0)).unwrap();
+        let port = l.local_addr().unwrap().port();
+        let hits = Arc::new(Mutex::new(0u32));
+        let count = Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { return };
+                let mut buf = [0u8; 4096];
+                if matches!(s.read(&mut buf), Ok(n) if n > 0) {
+                    *count.lock().unwrap() += 1;
+                    let _ = s.write_all(reply().as_bytes());
+                }
+            }
+        });
+        (port, hits)
+    }
+
+    async fn probe(url: &str, method: &str) -> DaemonResponse {
+        let params: ProbeParams = serde_json::from_value(serde_json::json!({
+            "operation_id": "op", "url": url, "method": method, "follow_redirects": true,
+        }))
+        .unwrap();
+        let client = Arc::new(build_probe_client(true, &transport::Egress::Inherit).unwrap());
+        let db = Arc::new(AmbuloDb::unconnected(
+            &crate::libs::cli_args::defaults_for_tests(),
+        ));
+        run_probe(params, client, db).await
+    }
+
+    fn redirect_to(location: String) -> impl Fn() -> String + Send + 'static {
+        move || {
+            format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+        }
+    }
+
+    fn ok() -> String {
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello".to_string()
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_another_origin_is_reported_and_not_followed() {
+        let (b, b_hits) = listener("127.0.0.2", ok);
+        let (a, _) = listener("127.0.0.1", redirect_to(format!("http://127.0.0.2:{b}/x")));
+        let r = probe(&format!("http://127.0.0.1:{a}/"), "put").await;
+        assert_eq!(
+            *b_hits.lock().unwrap(),
+            0,
+            "the probe was re-sent to another host"
+        );
+        assert_eq!(r.results.as_ref().unwrap()["code"], 307, "{:?}", r.results);
+    }
+
+    #[tokio::test]
+    async fn a_redirect_on_the_same_origin_is_still_followed() {
+        let (a, _) = listener("127.0.0.1", {
+            let first = Arc::new(Mutex::new(true));
+            move || {
+                let mut f = first.lock().unwrap();
+                if std::mem::replace(&mut *f, false) {
+                    "HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\n\
+                     Connection: close\r\n\r\n"
+                        .to_string()
+                } else {
+                    ok()
+                }
+            }
+        });
+        let r = probe(&format!("http://127.0.0.1:{a}/"), "get").await;
+        assert_eq!(r.results.as_ref().unwrap()["code"], 200, "{:?}", r.results);
     }
 }
