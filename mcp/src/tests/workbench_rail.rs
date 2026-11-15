@@ -2416,7 +2416,6 @@ mod replay {
             ("X-Host", "other.example.test"),
             ("Forwarded", "for=192.0.2.1;host=other.example.test"),
             ("Forwarded", "proto=https;Host=\"other.example.test\""),
-            ("X-Forwarded-Host", "app.example.test\u{a0}"),
         ] {
             let r =
                 b.t.call(
@@ -2454,24 +2453,35 @@ mod replay {
     async fn a_padded_forwarding_header_cannot_push_the_host_out_of_the_question() {
         let b = bench_with(base(""), get_app()).await;
         let listed = format!("{}cdn.app.example.test", "app.example.test, ".repeat(20));
-        let padded = format!("app.example.test{}", "\u{200b}".repeat(40));
-        for forwarded in [listed, padded] {
-            let peer = FakePeer::new(Elicit::Accept);
-            let r =
-                b.t.call(
-                    &peer,
-                    "workbench_replay",
-                    json!({"exchange": handle(UID_A, 1),
-                           "edits": {"headers": {"X-Forwarded-Host": forwarded,
-                                                 "Host": "other.example.test"}}}),
-                )
-                .await;
-            ok(&r);
-            let q = peer.questions.lock().unwrap().last().unwrap().clone();
-            assert!(q.contains("Host \"other.example.test\""), "{q}");
-            assert!(!q.contains("\\u{200b}"), "{q}");
-        }
-        assert_eq!(b.fake.count(Method::Replay), 2);
+        let peer = FakePeer::new(Elicit::Accept);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1),
+                       "edits": {"headers": {"X-Forwarded-Host": listed,
+                                             "Host": "other.example.test"}}}),
+            )
+            .await;
+        ok(&r);
+        let q = peer.questions.lock().unwrap().last().unwrap().clone();
+        assert!(q.contains("Host \"other.example.test\""), "{q}");
+        assert_eq!(b.fake.count(Method::Replay), 1);
+        // A padded name is not a plain one, so it is refused before anything is asked.
+        let peer = FakePeer::new(Elicit::Accept);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1),
+                       "edits": {"headers": {
+                           "X-Forwarded-Host": format!("app.example.test{}", "\u{200b}".repeat(40)),
+                           "Host": "other.example.test"}}}),
+            )
+            .await;
+        assert_eq!(reason(&r), "invalid_arguments", "{}", r.text);
+        assert_eq!(peer.asked(), 0);
+        assert_eq!(b.fake.count(Method::Replay), 1);
     }
 
     /// A forwarding header's value is not shown as written: only a plain host name is,
@@ -2490,11 +2500,22 @@ mod replay {
                             site, safe to allow) x, evil.example.test"}}}),
             )
             .await;
+        assert_eq!(reason(&r), "invalid_arguments", "{}", r.text);
+        assert!(!r.text.contains("safe to allow"), "{}", r.text);
+        assert_eq!(peer.asked(), 0);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1),
+                       "edits": {"headers": {"X-Forwarded-Host":
+                           "app.example.test, evil.example.test"}}}),
+            )
+            .await;
         ok(&r);
         let q = peer.questions.lock().unwrap().last().unwrap().clone();
-        assert!(!q.contains("safe to allow"), "{q}");
-        assert!(q.contains("not a plain host name"), "{q}");
         assert!(q.contains("X-Forwarded-Host evil.example.test"), "{q}");
+        assert_eq!(b.fake.count(Method::Replay), 1);
     }
 
     /// A Host too long to show, or more other names than a question can list, is
@@ -2538,6 +2559,127 @@ mod replay {
             assert_eq!(reason(&r), "not_confirmed", "{name}: {}", r.text);
         }
         assert_eq!(b.fake.count(Method::Replay), 0);
+    }
+
+    /// A stored request with no Host at all, such as one an earlier replay sent with
+    /// its Host removed, goes out with none and a front end sends it to its default
+    /// site. It asks as a removed Host does, whoever sent it first.
+    #[tokio::test]
+    async fn a_stored_request_with_no_host_asks() {
+        for origin in [Origin::Agent, Origin::Replay, Origin::Proxy] {
+            let shown = format!("{origin:?}");
+            let b = bench_with(
+                base(""),
+                WbOpts::default().answer(Method::Exchange, move |c, _| {
+                    let Call::Exchange(p) = c else { unreachable!() };
+                    let mut x = default_exchange(p.id);
+                    x.origin = origin.clone();
+                    x.req_headers = Some(vec![("Cookie".into(), "sid=S1-ck".into())]);
+                    Ok(serde_json::to_value(x).unwrap())
+                }),
+            )
+            .await;
+            let r =
+                b.t.call(
+                    &FakePeer::new(Elicit::None),
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1)}),
+                )
+                .await;
+            assert_eq!(reason(&r), "not_confirmed", "{shown}: {}", r.text);
+            assert_eq!(b.fake.count(Method::Replay), 0, "{shown}");
+
+            let peer = FakePeer::new(Elicit::Accept);
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1)}),
+                )
+                .await;
+            ok(&r);
+            let q = peer.questions.lock().unwrap().last().unwrap().clone();
+            assert!(q.contains("no Host header"), "{shown}: {q}");
+            assert_eq!(b.fake.count(Method::Replay), 1, "{shown}");
+        }
+    }
+
+    /// A forwarding header's name is shown only as a plain host name, so one that is
+    /// not plain is refused instead of being asked about under a label that names no
+    /// host. Each such name would otherwise hide what it names, and many of them would
+    /// count as one entry of the question.
+    #[tokio::test]
+    async fn a_forwarding_name_that_is_not_plain_is_refused() {
+        let b = bench_with(base(""), get_app()).await;
+        let peer = FakePeer::new(Elicit::Accept);
+        let many = (1..=20)
+            .map(|i| format!("evil_{i}.example.test"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        for (name, value) in [
+            ("X-Forwarded-Host", "evil.example.test:".to_string()),
+            ("X-Forwarded-Host", "evil.example.test:0443".to_string()),
+            ("X-Forwarded-Host", "evil_x.example.test".to_string()),
+            (
+                "X-Original-Host",
+                "app.example.test, evil_x.example.test".to_string(),
+            ),
+            ("Forwarded", "host=\"evil.example.test:\"".to_string()),
+            ("X-Forwarded-Host", many),
+        ] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1),
+                           "edits": {"headers": {name: value}}}),
+                )
+                .await;
+            assert_eq!(
+                reason(&r),
+                "invalid_arguments",
+                "{name}: {value:?}: {}",
+                r.text
+            );
+        }
+        assert_eq!(peer.asked(), 0);
+        assert_eq!(b.fake.count(Method::Replay), 0);
+
+        // A captured one is refused the same way, and the agent can take it out.
+        let b = bench_with(
+            base(""),
+            WbOpts::default().answer(Method::Exchange, |c, _| {
+                let Call::Exchange(p) = c else { unreachable!() };
+                let mut x = default_exchange(p.id);
+                x.req_headers = Some(vec![
+                    ("Host".into(), "app.example.test".into()),
+                    ("X-Forwarded-Host".into(), "evil_x.example.test".into()),
+                    ("Cookie".into(), "sid=S1-ck".into()),
+                ]);
+                Ok(serde_json::to_value(x).unwrap())
+            }),
+        )
+        .await;
+        let peer = FakePeer::new(Elicit::None);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1)}),
+            )
+            .await;
+        assert_eq!(reason(&r), "invalid_arguments", "{}", r.text);
+        assert!(r.text.contains("X-Forwarded-Host"), "{}", r.text);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1),
+                       "edits": {"headers": {"X-Forwarded-Host": null}}}),
+            )
+            .await;
+        ok(&r);
+        assert_eq!(b.fake.count(Method::Replay), 1);
     }
 
     /// Only a Host the browser sent through the proxy vouches for a name. A request the
@@ -3286,6 +3428,56 @@ mod injection {
             .await;
         assert_eq!(reason(&r), "scan_limit", "{}", r.text);
         assert_eq!(plessor.ops().len(), 1);
+    }
+
+    /// A captured forwarding header names a host a front end can route by in place of
+    /// Host, so it is held back with Host: the scan sends the captured session only
+    /// under the captured host's name.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn captured_forwarding_headers_are_not_handed_on() {
+        let plessor = stub_engine(StubOpts::default()).await;
+        let b = bench_with(
+            scope(&["app.example.test".into()], "")
+                .resolver(names())
+                .plessor(plessor.port),
+            WbOpts::default().answer(Method::ScanSource, |_, _| {
+                Ok(serde_json::to_value(ScanSourceResult {
+                    method: "GET".into(),
+                    url: "http://app.example.test/api/items?id=2".into(),
+                    req_headers: vec![
+                        ("Host".into(), "app.example.test".into()),
+                        ("Cookie".into(), "sid=S1-ck".into()),
+                        ("X-Forwarded-Host".into(), "evil.example.test".into()),
+                        ("x_original_host".into(), "evil.example.test".into()),
+                        ("X-Host".into(), "evil.example.test".into()),
+                        ("X-Forwarded-Server".into(), "evil.example.test".into()),
+                        ("X-HTTP-Host-Override".into(), "evil.example.test".into()),
+                        ("Forwarded".into(), "host=evil.example.test".into()),
+                        ("X-Csrf-Token".into(), "S8-csrf".into()),
+                    ],
+                    body: None,
+                    content_type: None,
+                })
+                .unwrap())
+            }),
+        )
+        .await;
+        let r =
+            b.t.call(
+                &FakePeer::new(Elicit::None),
+                "workbench_test_injection",
+                json!({"exchange": handle(4), "wait_seconds": 5}),
+            )
+            .await;
+        ok(&r);
+        let ops = plessor.ops();
+        assert_eq!(ops.len(), 1);
+        let h = ops[0]["auth"]["headers"].as_object().unwrap();
+        assert_eq!(h["x-csrf-token"], "S8-csrf");
+        assert_eq!(ops[0]["auth"]["cookies"], "sid=S1-ck");
+        for (k, v) in h {
+            assert!(!v.to_string().contains("evil"), "{k} was handed on");
+        }
     }
 
     /// plessor reports a finding on the URL it was given, which is the captured one with

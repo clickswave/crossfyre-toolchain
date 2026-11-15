@@ -43,7 +43,9 @@ const SITES_MAX: usize = 50;
 
 /// Captured headers that are not handed to plessor: the ones a client sets from the
 /// request it sends, the ones that would change how the connection is used, and the
-/// ones that ask for a cached answer, since a 304 tells the scan nothing.
+/// ones that ask for a cached answer, since a 304 tells the scan nothing. The forwarding
+/// headers a front end can route by in place of Host are held back with it, so the
+/// session goes out only under the captured host's name.
 const NOT_HANDED_ON: [&str; 12] = [
     "host",
     "content-length",
@@ -208,6 +210,7 @@ fn session(src: &ScanSourceResult) -> Option<Value> {
             continue;
         }
         if NOT_HANDED_ON.contains(&name.as_str())
+            || super::replay::forwarding(&name).is_some()
             || name.starts_with("proxy-")
             || transport::HeaderName::from_bytes(name.as_bytes()).is_err()
             || transport::HeaderValue::from_str(v).is_err()

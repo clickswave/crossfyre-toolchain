@@ -190,8 +190,9 @@ pub(crate) async fn run(
     // would make of it. Only a plain name equal to the URL's host passes, or one the
     // browser sent for this request through the proxy. A request the Workbench or an
     // agent sent carries whatever Host it was given, so its Host vouches for nothing.
-    // An empty Host, or none where one was captured, is not that name either: a front
-    // end sends such a request to its default site. Neither has a name to admit.
+    // An empty Host, or none at all, is not that name either: a front end sends such a
+    // request to its default site. Neither has a name to admit. A stored request with
+    // no Host asks too, since an earlier replay may have taken it out.
     //
     // A front end can route by X-Forwarded-Host or Forwarded instead, so a name those
     // give is held to the same rule.
@@ -206,9 +207,9 @@ pub(crate) async fn run(
     };
     // Each way the request names another host, as the question shows it, Host first.
     // A forwarding value is shown only as a plain host name, so the request cannot
-    // write its own text into the question. Every entry is bounded and none is cut, so
-    // nothing can push another out of view. `keyed` holds the values as sent, for the
-    // remembered yes.
+    // write its own text into the question, and a name that is not plain is refused.
+    // Every entry is bounded and none is cut, so nothing can push another out of view.
+    // `keyed` holds the values as sent, for the remembered yes.
     let mut hosts: Vec<String> = Vec::new();
     let mut forwarded: Vec<String> = Vec::new();
     let mut keyed: Vec<String> = Vec::new();
@@ -222,7 +223,7 @@ pub(crate) async fn run(
         .filter(|(k, _)| is_host(k))
         .map(|(_, v)| v.as_str())
         .collect();
-    if host_headers.is_empty() && !stored_hosts.is_empty() {
+    if host_headers.is_empty() {
         add(&mut hosts, "no Host header".into());
         add(&mut keyed, "no Host header".into());
     }
@@ -274,13 +275,16 @@ pub(crate) async fn run(
             if names_dest(&name, &dest, &captured) {
                 continue;
             }
+            if name.len() > NAME_MAX || plain_host(&name).is_none() {
+                return Err(Refusal::invalid(format!(
+                    "{f} header: it names a host that is not written as a plain host name \
+                     (letters, digits, dots and hyphens, then at most a port), so a question \
+                     cannot show it. Give plain names, or remove the header with null. \
+                     Nothing was sent."
+                )));
+            }
             named = true;
-            let shown = if name.len() <= NAME_MAX && plain_host(&name).is_some() {
-                format!("{f} {name}")
-            } else {
-                format!("{f} with a value that is not a plain host name")
-            };
-            add(&mut forwarded, shown);
+            add(&mut forwarded, format!("{f} {name}"));
         }
         if named {
             add(&mut keyed, format!("{f} {}", quoted(v)));
@@ -611,7 +615,7 @@ const FORWARDING: [&str; 6] = [
 ];
 
 /// The longest host name a forwarding header's entry shows: 253 characters of name,
-/// brackets and a port. A longer one is shown as not a plain host name.
+/// brackets and a port. A longer one is refused.
 const NAME_MAX: usize = 262;
 
 /// The longest one entry of the other-host list may be as shown. A Host value longer
@@ -623,7 +627,7 @@ const SHOWN_MAX: usize = 300;
 const SHOWN_ENTRIES: usize = 6;
 
 /// The forwarding header a name is, ignoring case, with `_` read as `-`.
-fn forwarding(name: &str) -> Option<&'static str> {
+pub(super) fn forwarding(name: &str) -> Option<&'static str> {
     let name = name.trim().replace('_', "-");
     FORWARDING
         .into_iter()
