@@ -1215,7 +1215,6 @@ mod imp {
         cmd_as_invoking_user, create_dir_all_for_invoking_user, invoking_user_home,
         write_for_invoking_user,
     };
-    use std::fs;
 
     /// `key` is the name inside the unit name: an engine's public name, or its
     /// legacy name for a unit registered before the engine took its current one.
@@ -1279,15 +1278,24 @@ mod imp {
     }
 
     pub fn delete(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let path = unit_dir().join(service_name(ext));
-        if path.exists() {
-            fs::remove_file(&path)?;
+        if remove_unit(&unit_dir(), ext)? {
             let _ = cmd_as_invoking_user("systemctl")
                 .args(["--user", "daemon-reload"])
                 .status();
             super::svc_ok(&format!("{} removed", service_name(ext)));
         }
         Ok(())
+    }
+
+    /// Removes `ext`'s unit from `dir` when it is there, and says whether it was. `dir` is
+    /// in the operator's home, so as root no link on the way there is followed.
+    fn remove_unit(dir: &std::path::Path, ext: &str) -> std::io::Result<bool> {
+        let path = dir.join(service_name(ext));
+        if !path.exists() {
+            return Ok(false);
+        }
+        super::super::sudo_user::remove_file(&path)?;
+        Ok(true)
     }
 
     pub fn action(action: &str, ext: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -1333,6 +1341,42 @@ mod imp {
     pub fn exists(ext: &str) -> bool {
         unit_dir().join(service_name(ext)).exists()
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::toolchain::sudo_user::act_as_root;
+        use std::fs;
+
+        /// `sudo crossfyre uninstall` removes the units it made in the operator's
+        /// ~/.config/systemd/user, a directory the operator can swap for a link.
+        #[test]
+        fn removing_a_unit_as_root_will_not_pass_through_a_linked_directory() {
+            let t = tempfile::tempdir().expect("tempdir");
+            let victim = t.path().join("victim");
+            fs::create_dir(&victim).expect("victim");
+            let unit = service_name("x");
+            fs::write(victim.join(&unit), "root's file\n").expect("victim file");
+            let systemd = t.path().join("home/.config/systemd");
+            fs::create_dir_all(&systemd).expect("systemd");
+            std::os::unix::fs::symlink(&victim, systemd.join("user")).expect("link");
+
+            let _root = act_as_root();
+            let r = remove_unit(&systemd.join("user"), "x");
+
+            assert!(r.is_err(), "removed through a link");
+            assert!(victim.join(&unit).exists());
+        }
+
+        #[test]
+        fn removing_a_unit_as_root_removes_it() {
+            let t = tempfile::tempdir().expect("tempdir");
+            fs::write(t.path().join(service_name("x")), "x").expect("unit");
+            let _root = act_as_root();
+            assert!(remove_unit(t.path(), "x").expect("remove"));
+            assert!(!remove_unit(t.path(), "x").expect("again"));
+        }
+    }
 }
 
 // ── macOS: launchd user agents (extensions) ───────────────────────────
@@ -1343,7 +1387,6 @@ mod imp {
         write_for_invoking_user,
     };
     use super::launchd;
-    use std::fs;
     use std::path::PathBuf;
 
     fn label(key: &str) -> String {
@@ -1397,7 +1440,8 @@ mod imp {
         let path = plist_path(key);
         if path.exists() {
             launchd::bootout(&domain(), &label(key));
-            fs::remove_file(&path)?;
+            // In the operator's home: as root, no link on the way there is followed.
+            super::super::sudo_user::remove_file(&path)?;
             super::svc_ok(&format!("{} removed", label(key)));
         }
         Ok(())

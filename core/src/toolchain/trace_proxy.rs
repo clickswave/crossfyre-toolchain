@@ -623,9 +623,14 @@ pub async fn run_proxy(cfg: TraceConfig) -> Result<(), BoxErr> {
     // run's own rather than a fixed name in the shared temp dir, where a link someone
     // left would be followed. The browser profile goes there too. Both go when the run
     // ends.
-    let scratch = tempfile::Builder::new().prefix("cfx-trace-").tempdir()?;
+    let scratch = super::trace::scratch_dir()?;
     let ca_path = scratch.path().join("ca.pem");
-    std::fs::write(&ca_path, ca.pem.as_bytes()).ok();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&ca_path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, ca.pem.as_bytes()))
+        .ok();
     #[cfg(unix)]
     {
         // Another account's browser (the operator's, under sudo) has to read the file,
@@ -644,6 +649,9 @@ pub async fn run_proxy(cfg: TraceConfig) -> Result<(), BoxErr> {
         ca_path.display()
     );
     println!("  or browse to http://cfx through the proxy to download + install it");
+    if cfg!(windows) && super::sudo_user::root_guards() {
+        println!("  (this prompt is elevated, so the file is open to administrators only)");
+    }
 
     // Armed only under --seed-credentials; otherwise no secret is ever read.
     let seed_store: Option<SeedStore> = if cfg.seed_credentials {

@@ -280,15 +280,22 @@ unsafe fn secured(
 /// directory it is in. What a file the node service takes orders from has to be.
 const ADMIN_ONLY_SDDL: &str = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
 
+/// [`ADMIN_ONLY_SDDL`] for a directory, whose entries are passed on to what is made in it.
+const ADMIN_ONLY_DIR_SDDL: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+
 /// [`ADMIN_ONLY_SDDL`] as a security descriptor, freed on drop.
 struct AdminOnly(windows_sys::Win32::Security::PSECURITY_DESCRIPTOR);
 
 impl AdminOnly {
     fn new() -> std::io::Result<Self> {
+        Self::from_sddl(ADMIN_ONLY_SDDL)
+    }
+
+    fn from_sddl(sddl: &str) -> std::io::Result<Self> {
         use windows_sys::Win32::Security::Authorization::{
             ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
         };
-        let sddl = std::ffi::OsStr::new(ADMIN_ONLY_SDDL).encode_wide_with_nul();
+        let sddl = std::ffi::OsStr::new(sddl).encode_wide_with_nul();
         let mut sd = std::ptr::null_mut();
         // SAFETY: `sddl` is NUL-terminated and `sd` is a valid out-pointer; the
         // descriptor it receives is freed by Drop.
@@ -312,6 +319,53 @@ impl Drop for AdminOnly {
         // SAFETY: allocated by ConvertStringSecurityDescriptorToSecurityDescriptorW.
         unsafe { windows_sys::Win32::Foundation::LocalFree(self.0.cast()) };
     }
+}
+
+/// Makes a new directory with a random name starting with `prefix` in the system's temp
+/// directory, `%SystemRoot%\Temp`, and returns its path. From the moment it exists only
+/// LocalSystem and administrators may open it or anything made in it, and other accounts
+/// may add to the system's temp directory but not rename or remove what is in it. For an
+/// elevated process's scratch files: in the operator's own %TEMP%, the operator could
+/// swap their directory for a junction.
+pub fn admin_temp_dir(prefix: &str) -> std::io::Result<std::path::PathBuf> {
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+    use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
+
+    let mut buf = [0u16; 260];
+    // SAFETY: `buf` is valid for the length given. The system's directory comes from the
+    // system, not from an environment the operator could have set.
+    let n = unsafe { GetSystemWindowsDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    if n == 0 || n >= buf.len() {
+        return Err(std::io::Error::last_os_error());
+    }
+    use std::os::windows::ffi::OsStringExt;
+    let temp = Path::new(&std::ffi::OsString::from_wide(&buf[..n])).join("Temp");
+    let security = AdminOnly::from_sddl(ADMIN_ONLY_DIR_SDDL)?;
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: security.0,
+        bInheritHandle: 0,
+    };
+    for _ in 0..16 {
+        let mut random = [0u8; 8];
+        getrandom::fill(&mut random).map_err(|e| std::io::Error::other(e.to_string()))?;
+        let path = temp.join(format!("{prefix}{:016x}", u64::from_le_bytes(random)));
+        let wide = path.as_os_str().encode_wide_with_nul();
+        // SAFETY: `wide` is NUL-terminated, and `attributes` and the descriptor it points
+        // to outlive the call.
+        if unsafe { CreateDirectoryW(wide.as_ptr(), &attributes) } != 0 {
+            return Ok(path);
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(e);
+        }
+    }
+    Err(std::io::Error::other(format!(
+        "no free name for a new directory in {}",
+        temp.display()
+    )))
 }
 
 /// `OsStr` to a NUL-terminated wide string.

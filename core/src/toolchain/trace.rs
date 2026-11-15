@@ -429,6 +429,11 @@ pub async fn run(cfg: TraceConfig) -> Result<(), BoxErr> {
         }
     } else {
         println!("  set SSLKEYLOGFILE={keylog_path} in your browser, then browse your target");
+        if cfg!(windows) && super::sudo_user::root_guards() {
+            println!(
+                "  (this prompt is elevated, so only a browser started elevated can write it)"
+            );
+        }
     }
 
     let mut tshark = Command::new("tshark")
@@ -494,27 +499,64 @@ pub async fn run(cfg: TraceConfig) -> Result<(), BoxErr> {
 }
 
 /// The keylog file of one capture session. It holds TLS secrets, so it is made new, owner
-/// only, in a directory of its own with a random name, which goes when this is dropped.
+/// only, in a [`ScratchDir`], which goes when this is dropped.
 struct Keylog {
     path: std::path::PathBuf,
-    _dir: tempfile::TempDir,
+    _dir: ScratchDir,
 }
 
 fn create_keylog() -> std::io::Result<Keylog> {
-    let mut builder = tempfile::Builder::new();
-    builder.prefix("cfx-trace-");
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        builder.permissions(std::fs::Permissions::from_mode(0o700));
+        use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let dir = builder.tempdir()?;
+    let dir = scratch_dir()?;
     let path = dir.path().join("session.keys");
     opts.open(&path)?;
     Ok(Keylog { path, _dir: dir })
+}
+
+/// A directory of one capture session's own, with a random name, removed with everything
+/// in it when this is dropped. The browser and tshark are handed paths in it, and open
+/// them as this process can, so nobody else may be able to change it while they do.
+pub(crate) struct ScratchDir {
+    path: std::path::PathBuf,
+}
+
+impl ScratchDir {
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// A new [`ScratchDir`] in the temp dir, mode 700 on Unix. Elevated on Windows it is in
+/// the system's temp dir instead and open to administrators only, since the operator's
+/// %TEMP% is theirs to change; see [`super::win::admin_temp_dir`].
+pub(crate) fn scratch_dir() -> std::io::Result<ScratchDir> {
+    #[cfg(windows)]
+    if super::sudo_user::root_guards() {
+        let path = super::win::admin_temp_dir("cfx-trace-")?;
+        return Ok(ScratchDir { path });
+    }
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("cfx-trace-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(ScratchDir {
+        path: builder.tempdir()?.keep(),
+    })
 }
 
 /// The program to launch for `--browser <name>`. On Linux the browsers are on PATH under
@@ -573,6 +615,41 @@ mod tests {
         let path = keylog.path.clone();
         drop(keylog);
         assert!(!path.exists(), "the keylog outlived its session");
+    }
+
+    /// Elevated on Windows, the operator's %TEMP% is theirs to change, and a junction
+    /// they put in place of the session's directory would send what the browser, tshark
+    /// and this process write there anywhere on the machine.
+    #[cfg(windows)]
+    #[test]
+    fn an_elevated_session_dir_is_admin_only_and_outside_the_operators_temp() {
+        let _root = crate::toolchain::sudo_user::act_as_root();
+        let dir = scratch_dir().expect("scratch dir");
+        assert!(
+            !dir.path().starts_with(std::env::temp_dir()),
+            "{} is in the operator's temp dir",
+            dir.path().display()
+        );
+        let secured = crate::toolchain::win::security_of(dir.path()).expect("security");
+        const ADMINS: [&str; 2] = ["S-1-5-18", "S-1-5-32-544"];
+        if ADMINS.contains(&secured.owner.as_str()) {
+            let allows = secured.allows.expect("an access list");
+            assert!(!allows.is_empty(), "nobody may open it");
+            for (sid, _) in &allows {
+                assert!(
+                    ADMINS.contains(&sid.as_str()),
+                    "{sid} may open the session's dir"
+                );
+            }
+        } else {
+            // Wine, which these tests also run under, keeps no security a directory is
+            // made with and reports one of its own.
+            eprintln!("access list not checked: this system did not keep it");
+        }
+        std::fs::write(dir.path().join("session.keys"), "x").expect("write inside");
+        let path = dir.path().to_path_buf();
+        drop(dir);
+        assert!(!path.exists(), "the directory outlived its session");
     }
 
     #[test]

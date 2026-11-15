@@ -1,9 +1,9 @@
 // `crossfyre status [nodes|extensions|db]` - the one place to look when
-// something is off. Read-only: probes ports, pid files, and the container,
-// never mutates state.
+// something is off. Probes ports, pid files, and the container. The one thing
+// it changes is a pid file naming a process that is gone, which it removes.
 
 use super::config::{is_extension_installed, load_config};
-use super::{ENGINES, service};
+use super::{ENGINES, service, sudo_user};
 use std::path::Path;
 
 fn port_open(port: u16) -> bool {
@@ -53,6 +53,39 @@ fn control_plane(base: &Path) {
     }
 }
 
+/// What a node's pid file says about it.
+#[derive(Debug, PartialEq)]
+enum PidState {
+    Running(u32),
+    /// The file names a process that no longer exists; `cleared` when it was removed.
+    Stale {
+        cleared: bool,
+    },
+    Stopped,
+}
+
+/// Reads the pid file at `pid`, and removes it when the process it names is gone.
+///
+/// A pid file naming a process that no longer exists is leftover runtime state, not user
+/// data. Reporting it forever with no way to act on it is how a host ends up with three
+/// of four nodes reading "stale pid" indefinitely, so it is cleared and the caller says
+/// that is what happened.
+///
+/// Run as root, or elevated on Windows, the file is in the operator's nodes.d, so it is
+/// read and removed without following a link the operator could leave on the way.
+fn pid_state(pid: &Path) -> PidState {
+    match sudo_user::read_to_string(pid)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+    {
+        Some(n) if crate::os::process_alive(n) => PidState::Running(n),
+        Some(_) => PidState::Stale {
+            cleared: sudo_user::remove_file(pid).is_ok(),
+        },
+        None => PidState::Stopped,
+    }
+}
+
 /// `crossfyre node status` - registered nodes on this machine.
 pub fn nodes(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
     use super::ui::*;
@@ -78,20 +111,9 @@ pub fn nodes(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
     }
     for id in ids {
         let paths = crate::NodePaths::new(base, &id);
-        let (sym, state, pid) = match std::fs::read_to_string(&paths.pid)
-            .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok())
-        {
-            Some(pid) if crate::os::process_alive(pid) => {
-                (check(), format!("{GREEN}running{RESET}"), pid.to_string())
-            }
-            // A pid file naming a process that no longer exists is leftover
-            // runtime state, not user data. Reporting it forever with no way to
-            // act on it is how a host ends up with three of four nodes reading
-            // "stale pid" indefinitely, so clear it and say that is what
-            // happened.
-            Some(_) => {
-                let cleared = std::fs::remove_file(&paths.pid).is_ok();
+        let (sym, state, pid) = match pid_state(&paths.pid) {
+            PidState::Running(pid) => (check(), format!("{GREEN}running{RESET}"), pid.to_string()),
+            PidState::Stale { cleared } => {
                 let label = if cleared {
                     format!("{YELLOW}stale pid, cleared{RESET}")
                 } else {
@@ -99,7 +121,7 @@ pub fn nodes(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 };
                 (bang(), label, "-".to_string())
             }
-            None => (dot(), dim("stopped"), "-".to_string()),
+            PidState::Stopped => (dot(), dim("stopped"), "-".to_string()),
         };
         let mid = if pid == "-" {
             String::new()
@@ -210,4 +232,66 @@ pub fn db() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::toolchain::sudo_user::act_as_root;
+    use std::fs;
+
+    /// No process has this id: Linux caps pids far below it, and so do the others.
+    const DEAD: &str = "999999999\n";
+
+    #[test]
+    fn a_stale_pid_file_is_cleared() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let pid = t.path().join("n.pid");
+        fs::write(&pid, DEAD).expect("pid");
+        let _root = act_as_root();
+        assert_eq!(pid_state(&pid), PidState::Stale { cleared: true });
+        assert!(!pid.exists());
+    }
+
+    #[test]
+    fn a_missing_pid_file_reads_as_stopped() {
+        let t = tempfile::tempdir().expect("tempdir");
+        assert_eq!(pid_state(&t.path().join("n.pid")), PidState::Stopped);
+    }
+
+    /// Run as root, `crossfyre status` reads and clears pid files in the operator's
+    /// nodes.d, which the operator can swap for a link to a directory of root's.
+    #[cfg(unix)]
+    #[test]
+    fn an_elevated_status_will_not_clear_a_pid_file_through_a_linked_directory() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let victim = t.path().join("victim");
+        fs::create_dir(&victim).expect("victim");
+        fs::write(victim.join("n.pid"), DEAD).expect("victim file");
+        let data = t.path().join("crossfyre");
+        fs::create_dir(&data).expect("data");
+        std::os::unix::fs::symlink(&victim, data.join("nodes.d")).expect("link");
+
+        let _root = act_as_root();
+        pid_state(&data.join("nodes.d").join("n.pid"));
+
+        assert!(victim.join("n.pid").exists(), "removed through a link");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_elevated_status_will_not_clear_a_pid_file_through_a_junction() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let victim = t.path().join("victim");
+        fs::create_dir(&victim).expect("victim");
+        fs::write(victim.join("n.pid"), DEAD).expect("victim file");
+        let data = t.path().join("crossfyre");
+        fs::create_dir(&data).expect("data");
+        crate::toolchain::sudo_user::junction(&data.join("nodes.d"), &victim);
+
+        let _root = act_as_root();
+        pid_state(&data.join("nodes.d").join("n.pid"));
+
+        assert!(victim.join("n.pid").exists(), "removed through a junction");
+    }
 }
