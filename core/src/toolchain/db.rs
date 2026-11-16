@@ -441,11 +441,20 @@ const INSPECT_WAIT: Duration = Duration::from_secs(60);
 
 /// `cmd`'s output, or an error once `limit` has passed, when it is killed.
 fn output_within(mut cmd: Command, limit: Duration) -> std::io::Result<std::process::Output> {
-    let mut child = cmd
+    let child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    collect_within(child, limit)
+}
+
+/// The output of `child`, spawned with its stdout and stderr piped, or an error once
+/// `limit` has passed, when it is killed.
+fn collect_within(
+    mut child: std::process::Child,
+    limit: Duration,
+) -> std::io::Result<std::process::Output> {
     let stdout = drain(child.stdout.take());
     let stderr = drain(child.stderr.take());
     let deadline = Instant::now() + limit;
@@ -799,7 +808,10 @@ fn secure_using(
         targets.insert(0, id);
     }
     match select(cands, &targets) {
-        Ok(cli) => remember(&cli),
+        Ok(cli) => {
+            remember(&cli);
+            expire_kept(name);
+        }
         // Nothing recorded, so nothing was ever made here: a node without Docker.
         Err(_) if config.container.id.is_none() => return Ok(false),
         Err(e) => {
@@ -991,6 +1003,12 @@ const KEPT: &str = "kept-open-data";
 const WAS_RUNNING: &str = "io.crossfyre.db.was-running";
 /// The label on a container that keeps old data, naming the container it was made for.
 const KEPT_FROM: &str = "io.crossfyre.db.from";
+/// The label on a container that keeps old data, saying when it was made, in seconds
+/// since the Unix epoch.
+const KEPT_AT: &str = "io.crossfyre.db.kept-at";
+/// How many days the old data is kept after a rebuild before it is removed.
+const KEEP_OLD_DAYS: u64 = 30;
+const DAY_SECS: u64 = 24 * 60 * 60;
 
 /// How a container was made in place of another, from its `docker inspect` record.
 fn made_as(info: &serde_json::Value) -> Option<&str> {
@@ -1298,7 +1316,7 @@ fn copy_engine_rows(
         psql(new, new_user, db, &ddl)?;
         for table in statements.iter().filter_map(|s| table_of(s)) {
             let result = if allowed == "t" {
-                copy_table(old, old_user, new, new_user, db, table)
+                copy_table(old, old_user, new, new_user, db, table, COPY_LIMIT)
             } else {
                 Err(CopyFailed::DoNotFit(
                     "its database takes no connections".to_string(),
@@ -1434,6 +1452,57 @@ fn pass_rows(
     }
 }
 
+/// How long the rows of one table, or any one statement of a rebuild, may take. An old
+/// cluster can keep a lock that never goes away, such as one a prepared transaction
+/// holds, and a rebuild holds the database lock while it waits.
+const COPY_LIMIT: Duration = Duration::from_secs(30 * 60);
+
+/// Stops the containers it names once its time is up, unless it is ended first, so
+/// whatever is waiting on them in this process stops waiting.
+struct Watchdog {
+    done: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<bool>>,
+}
+
+impl Watchdog {
+    fn start(limit: Duration, containers: &[&str]) -> Self {
+        let (done, wait) = std::sync::mpsc::channel::<()>();
+        let containers: Vec<String> = containers.iter().map(|c| c.to_string()).collect();
+        let thread = std::thread::spawn(move || {
+            if wait.recv_timeout(limit) != Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                return false;
+            }
+            let mut kill = docker();
+            kill.arg("kill").args(&containers);
+            let _ = output_within(kill, INSPECT_WAIT);
+            true
+        });
+        Watchdog {
+            done: Some(done),
+            thread: Some(thread),
+        }
+    }
+
+    /// Ends it, and says whether the time was up first.
+    fn fired(mut self) -> bool {
+        drop(self.done.take());
+        self.thread
+            .take()
+            .and_then(|t| t.join().ok())
+            .unwrap_or(true)
+    }
+}
+
+/// `limit` in words.
+fn in_words(limit: Duration) -> String {
+    let secs = limit.as_secs();
+    if secs >= 60 && secs % 60 == 0 {
+        format!("{} minutes", secs / 60)
+    } else {
+        format!("{secs} seconds")
+    }
+}
+
 /// How much of what a copy's psql says on stderr is kept for the node log.
 const SAID_CAP: usize = 16 * 1024;
 
@@ -1441,8 +1510,30 @@ const SAID_CAP: usize = 16 * 1024;
 /// the new one, as data only: the columns the toolchain's table has that the old one
 /// has too, in COPY's text format, each line checked by [`pass_rows`] on its way to the
 /// new server. The new server loads them in one transaction that commits only if the
-/// table then holds as many rows as were sent. Returns that number.
+/// table then holds as many rows as were sent. Returns that number. A copy that has not
+/// finished within `limit` stops both servers and fails, which stops the rebuild.
 fn copy_table(
+    old: &str,
+    old_user: &str,
+    new: &str,
+    new_user: &str,
+    db: &str,
+    table: &str,
+    limit: Duration,
+) -> Result<u64, CopyFailed> {
+    let watchdog = Watchdog::start(limit, &[old, new]);
+    let copied = copy_rows(old, old_user, new, new_user, db, table);
+    if watchdog.fired() {
+        return Err(CopyFailed::Broken(format!(
+            "it did not finish within {}",
+            in_words(limit)
+        )));
+    }
+    copied
+}
+
+/// [`copy_table`] without its time limit.
+fn copy_rows(
     old: &str,
     old_user: &str,
     new: &str,
@@ -1655,10 +1746,7 @@ fn keep_old_data(image: &str, id: &str, name: &str) -> Result<String, String> {
     if let Some(kept) = labelled(&format!("{KEPT_FROM}={id}")).into_iter().next() {
         return Ok(kept);
     }
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or_default();
+    let secs = unix_now();
     let kept = format!("{name}-old-{secs}");
     docker_ok(&[
         "create",
@@ -1670,6 +1758,8 @@ fn keep_old_data(image: &str, id: &str, name: &str) -> Result<String, String> {
         &format!("{MADE_AS}={KEPT}"),
         "--label",
         &format!("{KEPT_FROM}={id}"),
+        "--label",
+        &format!("{KEPT_AT}={secs}"),
         "--volumes-from",
         id,
         "--entrypoint",
@@ -1677,6 +1767,88 @@ fn keep_old_data(image: &str, id: &str, name: &str) -> Result<String, String> {
         image,
     ])?;
     Ok(kept)
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
+
+/// When the container `holder` that keeps old data was made, from its label, or else
+/// from its name, which ends with the same time.
+fn kept_since(info: &serde_json::Value, holder: &str) -> Option<u64> {
+    info["Config"]["Labels"][KEPT_AT]
+        .as_str()
+        .and_then(|t| t.parse().ok())
+        .or_else(|| holder.rsplit_once("-old-")?.1.parse().ok())
+}
+
+/// What to do about a container that keeps old data.
+#[derive(Debug, PartialEq, Eq)]
+enum Holder {
+    /// Remove it with its data: it was made [`KEEP_OLD_DAYS`] ago or longer.
+    Remove,
+    /// Keep it, and say it is removed in this many days.
+    Keep(u64),
+    /// Keep it: when it was made is not known.
+    Undated,
+}
+
+fn holder_due(kept_at: Option<u64>, now: u64) -> Holder {
+    let Some(kept_at) = kept_at else {
+        return Holder::Undated;
+    };
+    let keep = KEEP_OLD_DAYS * DAY_SECS;
+    // A time ahead of the clock counts as now, so a holder is never kept for longer.
+    let left = kept_at.saturating_add(keep).saturating_sub(now).min(keep);
+    if left == 0 {
+        Holder::Remove
+    } else {
+        Holder::Keep(left.div_ceil(DAY_SECS))
+    }
+}
+
+/// What is said about the container `holder` that keeps old data, given what is done.
+fn holder_notice(holder: &str, due: &Holder, removed: Option<Result<(), String>>) -> String {
+    let what = format!(
+        "the stopped container {holder} keeps the toolchain database's data from before it \
+         was rebuilt, which may hold credentials from authenticated scans"
+    );
+    match (due, removed) {
+        (_, Some(Ok(()))) => format!(
+            "removed {holder}, which kept the toolchain database's data from before it was \
+             rebuilt, with that data, {KEEP_OLD_DAYS} days after the rebuild"
+        ),
+        (_, Some(Err(e))) => format!(
+            "WARNING {what}. It could not be removed ({e}); remove it with: docker rm -v \
+             {holder}"
+        ),
+        (Holder::Keep(days), None) => format!(
+            "WARNING {what}. It is removed with its data in {days} day{}, or remove it now: \
+             docker rm -v {holder}",
+            if *days == 1 { "" } else { "s" }
+        ),
+        (_, None) => {
+            format!("WARNING {what}. Remove it when you no longer need it: docker rm -v {holder}")
+        }
+    }
+}
+
+/// Remove each container that keeps the old data of a container named `name`, with
+/// that data, once it is [`KEEP_OLD_DAYS`] days old, and warn about each one still kept.
+fn expire_kept(name: &str) {
+    let now = unix_now();
+    for holder in kept_for(name) {
+        let Ok(Some(info)) = inspect(&holder) else {
+            continue;
+        };
+        let due = holder_due(kept_since(&info, &holder), now);
+        // Without -f: it never runs, and one that is running is not ours to remove.
+        let removed = (due == Holder::Remove).then(|| docker_ok(&["rm", "-v", &holder]));
+        eprintln!("[db] {}", holder_notice(&holder, &due, removed));
+    }
 }
 
 /// Say that the database was rebuilt, what was copied when that is known (a run that
@@ -1708,8 +1880,9 @@ fn rebuilt_notice(copied: Option<&Copied>, kept: &[String]) -> Vec<String> {
     for k in kept {
         lines.push(format!(
             "The old data is kept in the stopped container {k}, which never runs a \
-             server. It may hold credentials from authenticated scans. Remove it when you \
-             no longer need it: docker rm -v {k}"
+             server. It may hold credentials from authenticated scans. It is removed with \
+             its data {KEEP_OLD_DAYS} days after the rebuild, or remove it when you no \
+             longer need it: docker rm -v {k}"
         ));
     }
     lines
@@ -1883,7 +2056,9 @@ fn conninfo(db: &str) -> String {
 }
 
 /// Psql run inside the container over its local socket, with `sql` on stdin so a
-/// password in it is never an argument. Returns what it printed.
+/// password in it is never an argument. Returns what it printed. One that has not
+/// finished within [`COPY_LIMIT`] is killed: an old cluster can hold a lock that never
+/// goes away, and the database lock is held meanwhile.
 fn psql(id: &str, user: &str, db: &str, sql: &str) -> Result<String, String> {
     use std::io::Write;
     let mut child = docker()
@@ -1917,9 +2092,7 @@ fn psql(id: &str, user: &str, db: &str, sql: &str) -> Result<String, String> {
             .write_all(sql.as_bytes())
             .map_err(|e| format!("docker exec: {e}"))?;
     }
-    let out = child
-        .wait_with_output()
-        .map_err(|e| format!("docker exec: {e}"))?;
+    let out = collect_within(child, COPY_LIMIT).map_err(|e| format!("docker exec: {e}"))?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
     } else {
@@ -2664,6 +2837,63 @@ mod tests {
         };
         let all = rebuilt_notice(Some(&copied), &kept[..1]).join("\n");
         assert!(all.contains("5 in 2 tables") && all.contains("left empty: pulse.probe_results"));
+    }
+
+    #[test]
+    fn old_data_is_kept_for_30_days_and_then_removed() {
+        let made = 1_800_000_000;
+        assert_eq!(holder_due(Some(made), made), Holder::Keep(30));
+        assert_eq!(
+            holder_due(Some(made), made + DAY_SECS + 1),
+            Holder::Keep(29)
+        );
+        assert_eq!(
+            holder_due(Some(made), made + 30 * DAY_SECS - 1),
+            Holder::Keep(1)
+        );
+        assert_eq!(holder_due(Some(made), made + 30 * DAY_SECS), Holder::Remove);
+        assert_eq!(
+            holder_due(Some(made), made + 400 * DAY_SECS),
+            Holder::Remove
+        );
+        // A time ahead of the clock does not keep it any longer than 30 days.
+        assert_eq!(holder_due(Some(u64::MAX), made), Holder::Keep(30));
+        assert_eq!(holder_due(None, made), Holder::Undated);
+    }
+
+    #[test]
+    fn when_old_data_was_kept_is_read_from_its_label_or_its_name() {
+        let labelled = serde_json::json!({
+            "Config": { "Labels": { "io.crossfyre.db.kept-at": "1700000000" } }
+        });
+        let bare = serde_json::json!({ "Config": { "Labels": {} } });
+        assert_eq!(kept_since(&labelled, "x-old-1"), Some(1_700_000_000));
+        assert_eq!(
+            kept_since(&bare, "crossfyre-postgres-old-1790000000"),
+            Some(1_790_000_000)
+        );
+        assert_eq!(kept_since(&bare, "crossfyre-postgres-old-soon"), None);
+    }
+
+    #[test]
+    fn kept_old_data_is_warned_about_until_it_is_removed() {
+        let kept = holder_notice("h", &Holder::Keep(3), None);
+        assert!(kept.starts_with("WARNING"), "{kept}");
+        assert!(kept.contains("in 3 days"), "{kept}");
+        assert!(kept.contains("docker rm -v h"), "{kept}");
+        let failed = holder_notice("h", &Holder::Remove, Some(Err("busy".to_string())));
+        assert!(failed.starts_with("WARNING"), "{failed}");
+        assert!(failed.contains("docker rm -v h"), "{failed}");
+        let undated = holder_notice("h", &Holder::Undated, None);
+        assert!(undated.contains("docker rm -v h"), "{undated}");
+        let removed = holder_notice("h", &Holder::Remove, Some(Ok(())));
+        assert!(!removed.contains("WARNING"), "{removed}");
+    }
+
+    #[test]
+    fn a_time_limit_is_said_in_minutes_when_it_is_whole_minutes() {
+        assert_eq!(in_words(COPY_LIMIT), "30 minutes");
+        assert_eq!(in_words(Duration::from_secs(5)), "5 seconds");
     }
 
     #[test]
@@ -4025,6 +4255,132 @@ mod tests {
             let kept = holders(&name);
             assert_eq!(kept.len(), 1, "{kept:?}");
             assert_eq!(mounts(&kept[0]), old_volumes);
+            // Labelled with when it was made, which says when it is removed.
+            let info = inspect(&kept[0]).unwrap().unwrap();
+            let made: u64 = info["Config"]["Labels"][KEPT_AT]
+                .as_str()
+                .and_then(|t| t.parse().ok())
+                .expect("the time it was made");
+            assert!(unix_now().abs_diff(made) < 600, "{made}");
+        }
+
+        /// A stopped container that keeps the data volume of a removed container, as
+        /// `keep_old_data` makes it, made `age` ago. Returns its name and the volume.
+        fn holder_made_ago(name: &str, age: Duration) -> (String, String) {
+            let source = format!("{name}-src-{}", age.as_secs());
+            let out = docker()
+                .args(["create", "--name", &source, "postgres"])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let source_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let volume = mounts(&source).into_iter().next().expect("a data volume");
+            let made = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                - age.as_secs();
+            let holder = format!("{name}-old-{made}");
+            docker_ok(&[
+                "create",
+                "--name",
+                &holder,
+                "--network",
+                "none",
+                "--label",
+                "io.crossfyre.db=kept-open-data",
+                "--label",
+                &format!("io.crossfyre.db.from={source_id}"),
+                "--label",
+                &format!("io.crossfyre.db.kept-at={made}"),
+                "--volumes-from",
+                &source_id,
+                "--entrypoint",
+                "true",
+                "postgres",
+            ])
+            .unwrap();
+            docker_ok(&["rm", &source_id]).unwrap();
+            (holder, volume)
+        }
+
+        #[test]
+        #[ignore = "needs Docker and the postgres image"]
+        fn old_data_is_removed_with_its_volume_30_days_after_the_rebuild() {
+            let name = format!("cfx-dbtest-expire-{}", std::process::id());
+            let day = Duration::from_secs(24 * 60 * 60);
+            let mut cleanup = Cleanup::for_name(&name);
+            for age in [day * 31, day * 2] {
+                cleanup.0.push(format!("{name}-src-{}", age.as_secs()));
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = dir.path().join("config.toml");
+            write_config(&cfg, free_port(), None);
+            let (expired, expired_volume) = holder_made_ago(&name, day * 31);
+            let (recent, recent_volume) = holder_made_ago(&name, day * 2);
+
+            secure_at(&name, &cfg).unwrap();
+
+            assert!(
+                inspect(&expired).unwrap().is_none(),
+                "{expired} is kept after 31 days"
+            );
+            assert!(
+                docker_ok(&["volume", "inspect", &expired_volume]).is_err(),
+                "its data volume {expired_volume} is left"
+            );
+            assert!(inspect(&recent).unwrap().is_some(), "{recent} went early");
+            assert!(docker_ok(&["volume", "inspect", &recent_volume]).is_ok());
+        }
+
+        #[test]
+        #[ignore = "needs Docker and the postgres image"]
+        fn a_table_copy_that_does_not_finish_in_time_fails() {
+            let name = format!("cfx-dbtest-wedge-{}", std::process::id());
+            let _cleanup = Cleanup::for_name(&name);
+            let out = docker()
+                .args(["run", "-d", "--name", &name, "--network", "none"])
+                .args(["-e", "POSTGRES_HOST_AUTH_METHOD=trust", "postgres"])
+                .args(["postgres", "-c", "max_prepared_transactions=4"])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            wait_ready(&name, "postgres").unwrap();
+            seed_mach(&name);
+            // A prepared transaction outlives every session and a restart, and holds
+            // its lock on the table until someone commits or rolls it back.
+            psql(
+                &name,
+                "postgres",
+                "mach",
+                "BEGIN;\nLOCK TABLE public.scans IN ACCESS EXCLUSIVE MODE;\n\
+                 PREPARE TRANSACTION 'wedge';\n",
+            )
+            .unwrap();
+
+            let limit = Duration::from_secs(5);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let target = name.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(copy_table(
+                    &target, "postgres", &target, "postgres", "mach", "scans", limit,
+                ));
+            });
+            let result = rx
+                .recv_timeout(limit + Duration::from_secs(60))
+                .expect("the copy is still running a minute after its limit");
+            match result {
+                Err(CopyFailed::Broken(e)) => assert!(e.contains("did not finish"), "{e}"),
+                other => panic!("{other:?}"),
+            }
         }
 
         #[test]
