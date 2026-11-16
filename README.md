@@ -9,7 +9,7 @@
 
 </div>
 
-Five scanning engines you run from the terminal, on systems you are authorized to test. Each one works on its own, with no account, and nothing leaves your machine unless you connect it to the [Crossfyre platform](https://crossfyre.io) yourself.
+Five engines for recon and vulnerability scanning, written in Rust, that you run from the terminal on systems you are authorized to test. Each one works on its own, with no account, and nothing leaves your machine unless you connect it to the [Crossfyre platform](https://crossfyre.io) yourself.
 
 ![doorward, toolmark, ambulo and plessor run against a lab network: open ports with services and banners, the web stack, discovered paths, and findings piped through jq](.github/assets/demo.gif)
 
