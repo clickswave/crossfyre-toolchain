@@ -172,4 +172,3 @@ pub(crate) fn result_size(summary: &str, value: &Value) -> usize {
         .count()
         .max(value.to_string().chars().count())
 }
-
