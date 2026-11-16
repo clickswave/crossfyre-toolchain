@@ -1411,6 +1411,7 @@ pub fn prompt_node_key(no_prompt: bool) -> Result<String, Box<dyn std::error::Er
     }
     use std::io::Write;
     println!("\n  Create a node in the dashboard (Nodes -> create a node) to get its API key.");
+    println!("  Or stop here and run `crossfyre login` first: signed in, node init asks for no key.");
     print!("  Paste the node API key: ");
     std::io::stdout().flush()?;
     let mut line = String::new();
@@ -2564,7 +2565,7 @@ pub async fn run_daemon(
                     break Err(e);
                 }
                 eprintln!(
-                    "  Control plane not reachable yet ({e}); retrying in {}s",
+                    "  Crossfyre is not reachable yet ({e}); retrying in {}s",
                     backoff.as_secs()
                 );
                 tokio::time::sleep(backoff).await;
@@ -2586,10 +2587,7 @@ pub async fn run_daemon(
             std::process::exit(1);
         }
         eprintln!("\n  Cannot start daemon: {e}");
-        eprintln!(
-            "  crossfyre node daemon {} --force   # take over this node",
-            paths.node_id
-        );
+        eprintln!("  crossfyre node up --force   # take over the nodes on this machine");
         std::process::exit(1);
     }
 
