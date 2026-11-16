@@ -168,10 +168,14 @@ pub async fn run(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // -- Connectivity ---------------------------------------------------------
     section("Connectivity");
     let cdn = super::install::BASE_URL;
-    let cdn_ok = reqwest::get(format!("{cdn}/manifest.json"))
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false);
+    let cdn_ok = match super::release_http::http_client(super::release_http::Purpose::Check) {
+        Ok(c) => c
+            .get(format!("{cdn}/manifest.json"))
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success()),
+        Err(_) => false,
+    };
     let label = format!("release CDN reachable {}", dim(&format!("({cdn})")));
     if !check(
         &label,

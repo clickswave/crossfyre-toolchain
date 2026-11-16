@@ -760,6 +760,7 @@ dependencies = [
  "nats-jwt",
  "nkeys",
  "rcgen",
+ "regex",
  "reqwest 0.13.4",
  "rustls",
  "serde",

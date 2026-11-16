@@ -15,6 +15,7 @@ use super::config::{
     ext_bin_path, ext_file_name, file_name, get_bin_dir, is_regular_file, legacy_bin_path,
 };
 use super::packaging::{self, Manager, remove_note, update_note};
+use super::release_http::{Purpose, http_client};
 use super::service;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -327,8 +328,17 @@ pub fn platform_key() -> String {
 }
 
 pub async fn fetch_manifest() -> Result<Manifest, Box<dyn std::error::Error>> {
-    let url = format!("{BASE_URL}/manifest.json");
-    let resp = reqwest::get(&url)
+    fetch_manifest_from(BASE_URL).await
+}
+
+/// `fetch_manifest` against `base`, which a test points at a loopback origin.
+pub(crate) async fn fetch_manifest_from(
+    base: &str,
+) -> Result<Manifest, Box<dyn std::error::Error>> {
+    let url = format!("{base}/manifest.json");
+    let resp = http_client(Purpose::Check)?
+        .get(&url)
+        .send()
         .await
         .map_err(|e| format!("could not fetch release manifest ({url}): {e}"))?;
     if !resp.status().is_success() {
@@ -361,7 +371,9 @@ pub async fn fetch_manifest() -> Result<Manifest, Box<dyn std::error::Error>> {
 /// is a release-pipeline failure and the message says so rather than reading as a
 /// network problem.
 async fn fetch_signature(url: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let resp = reqwest::get(url)
+    let resp = http_client(Purpose::Check)?
+        .get(url)
+        .send()
         .await
         .map_err(|e| format!("could not fetch the release manifest signature ({url}): {e}"))?;
     if !resp.status().is_success() {
@@ -406,13 +418,17 @@ fn resolve_keys<'m>(
     Ok((comp, artifact))
 }
 
-/// Download an artifact to `dest` and verify its SHA256 against the manifest.
+/// Download an artifact to `dest` and verify its SHA256 against the manifest. `purpose`
+/// says whether it installs the component or replaces an installed copy.
 async fn download_verified(
     artifact: &Artifact,
     dest: &Path,
+    purpose: Purpose,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let url = format!("{}/{}", BASE_URL, artifact.file);
-    let resp = reqwest::get(&url)
+    let resp = http_client(purpose)?
+        .get(&url)
+        .send()
         .await
         .map_err(|e| format!("download failed ({url}): {e}"))?;
     if !resp.status().is_success() {
@@ -737,7 +753,8 @@ pub async fn install_cfx_script(
 
     let tmp_dir = tempfile::tempdir()?;
     let zip_path = tmp_dir.path().join(&artifact.file);
-    download_verified(artifact, &zip_path).await?;
+    let purpose = Purpose::replacing(replaced.is_some() || dest.exists());
+    download_verified(artifact, &zip_path, purpose).await?;
     let extract_dir = tmp_dir.path().join("extracted");
     extract_zip(&zip_path, &extract_dir)?;
     let extracted = extract_dir.join(ext_file_name(CFX_SCRIPT));
@@ -871,7 +888,8 @@ async fn install_one(
 
     let tmp_dir = tempfile::tempdir().map_err(|e| format!("Failed to create temp dir: {e}"))?;
     let zip_path = tmp_dir.path().join(&artifact.file);
-    download_verified(artifact, &zip_path).await?;
+    let purpose = Purpose::replacing(super::config::is_extension_installed(ext));
+    download_verified(artifact, &zip_path, purpose).await?;
 
     if !quiet {
         working("Installing");
@@ -1506,7 +1524,8 @@ pub async fn self_update(
     }
     let tmp_dir = tempfile::tempdir()?;
     let zip_path = tmp_dir.path().join(&artifact.file);
-    download_verified(artifact, &zip_path).await?;
+    // The CLI asking is the installed copy, so this always replaces one.
+    download_verified(artifact, &zip_path, Purpose::Update).await?;
 
     let extract_dir = tmp_dir.path().join("extracted");
     extract_zip(&zip_path, &extract_dir)?;
@@ -1615,7 +1634,7 @@ pub async fn download_node(
 
     let tmp_dir = tempfile::tempdir()?;
     let zip_path = tmp_dir.path().join(&artifact.file);
-    download_verified(artifact, &zip_path).await?;
+    download_verified(artifact, &zip_path, Purpose::replacing(stable.exists())).await?;
     let extract_dir = tmp_dir.path().join("extracted");
     extract_zip(&zip_path, &extract_dir)?;
     let extracted = extract_dir.join(ext_file_name("node"));

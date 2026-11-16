@@ -78,6 +78,8 @@ These install the `crossfyre` CLI for your own user, and the package manager kee
 
 `crossfyre update all` updates the engines. [crossfyre.io/docs/install](https://crossfyre.io/docs/install) covers the .deb, signature checks and removal.
 
+When the CLI fetches from bins.crossfyre.io, the request's User-Agent carries its name, version and platform and whether it is an install, an update or a check of the release manifest, and nothing else.
+
 ## Use
 
 ```sh

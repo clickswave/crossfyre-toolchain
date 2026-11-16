@@ -19,6 +19,7 @@ pub mod node_config;
 pub mod oast;
 pub mod packaging;
 pub mod rcfile;
+pub mod release_http;
 pub mod release_sig;
 #[cfg(unix)]
 pub mod root_fs;
