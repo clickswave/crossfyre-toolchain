@@ -42,11 +42,15 @@ pub(crate) mod testkit;
 pub use imp::{TunnelGuard, bring_up};
 
 /// Ingest a node's network config: the tunnel selection the egress impl applies.
+///
+/// `tunnel_hooks` is the node's own `tunnel_hooks` setting (see `Config::tunnel_hooks`):
+/// whether a tunnel config may run its own scripts on this host.
 pub fn process_network_config(
     raw: &serde_json::Value,
     net_dir: &std::path::Path,
+    tunnel_hooks: bool,
 ) -> Option<crate::NetworkConfig> {
-    imp::process_network_config(raw, net_dir)
+    imp::process_network_config(raw, net_dir, tunnel_hooks)
 }
 
 /// The variable older nodes wrote into the engines' environment file.

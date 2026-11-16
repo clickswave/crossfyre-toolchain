@@ -756,6 +756,11 @@ pub struct Config {
     /// another account could change (see [`toolchain::node_config`]).
     #[serde(default)]
     pub remote_exec: bool,
+    /// Whether this node's tunnel config may run programs of its own on this host,
+    /// such as OpenVPN `up`/`down` scripts or WireGuard `PostUp`. Off unless root on
+    /// this host sets `tunnel_hooks = true` in `nodes.d/<node-id>.toml`.
+    #[serde(default)]
+    pub tunnel_hooks: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
@@ -1871,7 +1876,9 @@ pub async fn run_init(
 
     // -- Network identity (VPN tunnel set on the dashboard) -------------
     toolchain::node_config::prepare_network_dir(&nd, &paths.node_id)?;
-    let network = egress::process_network_config(&json_resp["network_config"], &paths.network_dir);
+    // A fresh node has not allowed tunnel hooks; see Config::tunnel_hooks.
+    let network =
+        egress::process_network_config(&json_resp["network_config"], &paths.network_dir, false);
 
     // Write nodes.d/<node-id>.toml (with extensions list + network section)
     let config = Config {
@@ -1886,6 +1893,7 @@ pub async fn run_init(
         // Opt-in: see Config::remote_exec. A fresh node will not run control-plane
         // commands until its operator says so.
         remote_exec: false,
+        tunnel_hooks: false,
     };
     let config_path = &paths.config;
     let config_toml = toml::to_string(&config)?;
@@ -2286,7 +2294,8 @@ pub async fn refresh_node_state(
     // Refresh the network/VPN config from the server. This rewrites the
     // .ovpn / .conf on disk if the operator uploaded a new one - so an edit
     // in the dashboard plus a daemon restart is enough to switch tunnels.
-    let new_network = egress::process_network_config(&json_resp["network_config"], net_dir);
+    let new_network =
+        egress::process_network_config(&json_resp["network_config"], net_dir, config.tunnel_hooks);
     if new_network != config.network {
         if let Some(ref n) = new_network {
             println!(
@@ -2595,10 +2604,9 @@ pub async fn run_daemon(
     // routes through the configured egress. The guard tears egress down on
     // every exit path (Ctrl+C, SIGTERM, panic, normal return) and is bound to
     // `_egress_guard` so it lives the full daemon lifetime.
-    let _egress_guard = config
-        .network
-        .as_ref()
-        .and_then(|net| egress::bring_up(net, &paths.network_dir, &paths.node_id));
+    let _egress_guard = config.network.as_ref().and_then(|net| {
+        egress::bring_up(net, &paths.network_dir, &paths.node_id, config.tunnel_hooks)
+    });
 
     println!("Connecting to Jetstream at {}...", config.nats_url);
 
@@ -4248,6 +4256,17 @@ mod security_tests {
         )
         .expect("parse");
         assert!(cfg.remote_exec, "an explicit opt-in was ignored");
+    }
+
+    /// The node starts its tunnel as root from a config the platform sent. Only root on
+    /// the host, through the node's own config, lets that config run its own scripts.
+    #[test]
+    fn tunnel_hooks_are_off_unless_the_node_config_turns_them_on() {
+        let base = "api_key = \"k\"\nnode_id = \"n\"\napi_url = \"https://example.invalid\"\n";
+        let cfg: Config = toml::from_str(base).expect("a config without tunnel_hooks must parse");
+        assert!(!cfg.tunnel_hooks, "tunnel hooks defaulted ON");
+        let cfg: Config = toml::from_str(&format!("{base}tunnel_hooks = true\n")).expect("parse");
+        assert!(cfg.tunnel_hooks, "an explicit opt-in was ignored");
     }
 }
 

@@ -15,8 +15,9 @@ pub struct TunnelGuard;
 pub fn process_network_config(
     raw: &serde_json::Value,
     net_dir: &std::path::Path,
+    tunnel_hooks: bool,
 ) -> Option<NetworkConfig> {
-    let _ = net_dir;
+    let _ = (net_dir, tunnel_hooks);
     if !raw.is_object() {
         return None;
     }
@@ -36,7 +37,8 @@ pub fn bring_up(
     net: &NetworkConfig,
     net_dir: &std::path::Path,
     node_id: &str,
+    tunnel_hooks: bool,
 ) -> Option<TunnelGuard> {
-    let _ = (net, net_dir, node_id);
+    let _ = (net, net_dir, node_id, tunnel_hooks);
     None
 }
