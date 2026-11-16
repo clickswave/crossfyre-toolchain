@@ -26,6 +26,8 @@ private object NoPatching : PatchFeature {
     override fun state(pkg: String, caFingerprint: String?) = PatchState.NONE
     override fun patchedCount() = 0
     override fun stale(caFingerprint: String?): List<String> = emptyList()
+    override fun acceptsAnyCert(): List<String> = emptyList()
+    override fun uninstallIntent(pkg: String): Intent? = null
     override fun outlook(facts: AppFacts, patched: Boolean) = Apps.outlookWithoutPatching(facts)
     override fun tidy() = Unit
     override fun start(pkg: String, label: String, sizeMb: Int, pairing: Pairing, caPem: String, caFingerprint: String?) = Unit

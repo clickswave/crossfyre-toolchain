@@ -112,9 +112,13 @@ internal class DirectPatchFeature(private val app: Context) : PatchFeature {
                         // build it is. Without both the app cannot later tell a
                         // working patch from one a certificate reset or a reinstall
                         // of the original has voided.
+                        val signer = AppInspector.signerOf(app, current.pkg)
                         caForJob?.let { ca ->
-                            PatchPrefs.record(app, current.pkg, PatchPrefs.join(ca, AppInspector.signerOf(app, current.pkg)))
+                            PatchPrefs.record(app, current.pkg, PatchPrefs.join(ca, signer))
                         }
+                        // And whether it accepts any certificate, so the phone
+                        // can offer to put the original back when capture stops.
+                        PatchPrefs.recordAnyCert(app, current.pkg, current.acceptsAnyCert, signer)
                         // Hold on to what was built. The patched APK is the one
                         // artefact of the whole operation, and it used to be
                         // installed and then unreachable.
@@ -158,6 +162,13 @@ internal class DirectPatchFeature(private val app: Context) : PatchFeature {
     override fun stale(caFingerprint: String?): List<String> =
         PatchPrefs.all(app).keys.filter { state(it, caFingerprint) == PatchState.STALE }.sorted()
 
+    override fun acceptsAnyCert(): List<String> =
+        PatchPrefs.anyCert(app).filter { (pkg, signer) -> PatchPrefs.stillAnyCert(signer, AppInspector.signerOf(app, pkg)) }
+            .keys.sorted()
+
+    override fun uninstallIntent(pkg: String): Intent =
+        Intent(Intent.ACTION_DELETE, Uri.parse("package:$pkg"))
+
     override fun outlook(facts: AppFacts, patched: Boolean): String = AppInspector.outlook(facts, patched)
 
     override fun tidy() {
@@ -168,7 +179,7 @@ internal class DirectPatchFeature(private val app: Context) : PatchFeature {
         if (_job.value == null) Patcher.discardWorkspace(app)
         // Forget records of apps that are no longer installed, so the count a
         // certificate reset threatens stays honest.
-        PatchPrefs.all(app).keys.forEach { if (!Apps.isInstalled(app, it)) PatchPrefs.forget(app, it) }
+        (PatchPrefs.all(app).keys + PatchPrefs.anyCert(app).keys).forEach { if (!Apps.isInstalled(app, it)) PatchPrefs.forget(app, it) }
     }
 
     override fun start(pkg: String, label: String, sizeMb: Int, pairing: Pairing, caPem: String, caFingerprint: String?) {
@@ -225,7 +236,7 @@ internal class DirectPatchFeature(private val app: Context) : PatchFeature {
         _exportable.value = null
         work = scope.launch {
             try {
-                val files = Patcher.buildPatched(app, pkg, pairing.apiUrl, pairing.workflowId, pairing.token, caPem) { step ->
+                val built = Patcher.buildPatched(app, pkg, pairing.apiUrl, pairing.workflowId, pairing.token, caPem) { step ->
                     _job.update { j ->
                         if (j == null || !j.running) j
                         // Monotonic within a stage: a late report never moves the bar back.
@@ -233,8 +244,8 @@ internal class DirectPatchFeature(private val app: Context) : PatchFeature {
                         else j.copy(step = step.stage, pct = step.pct)
                     }
                 }
-                pendingInstall = files
-                _job.value?.let { advance(it.copy(built = true, pct = 100f)) }
+                pendingInstall = built.files
+                _job.value?.let { advance(it.copy(built = true, pct = 100f, acceptsAnyCert = built.acceptsAnyCert)) }
             } catch (e: CancellationException) {
                 // Cancelling is a normal outcome, not a failure, and must not read
                 // like one. Leave nothing half-set.

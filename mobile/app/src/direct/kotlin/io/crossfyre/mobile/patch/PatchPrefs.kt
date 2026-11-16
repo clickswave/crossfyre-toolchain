@@ -18,6 +18,31 @@ import android.content.Context
 object PatchPrefs {
     private const val PREFS = "patches"
 
+    /**
+     * Packages whose last patch accepts any certificate, each with the signer
+     * of the build we installed. Kept apart from the records above, so their
+     * format stays as earlier versions wrote it and a certificate reset, which
+     * clears those, leaves these: such a build accepts any certificate
+     * whatever this phone's certificate is.
+     */
+    private const val ANY_CERT = "patches_any_cert"
+
+    /**
+     * Note whether [pkg]'s patch, just installed and signed by [signer],
+     * accepts any certificate. An unknown signer is kept as empty.
+     */
+    fun recordAnyCert(ctx: Context, pkg: String, acceptsAnyCert: Boolean, signer: String?) {
+        val e = ctx.getSharedPreferences(ANY_CERT, Context.MODE_PRIVATE).edit()
+        if (acceptsAnyCert) e.putString(pkg, signer.orEmpty()) else e.remove(pkg)
+        e.apply()
+    }
+
+    /** Packages whose last patch accepts any certificate, with the signer noted for each. */
+    fun anyCert(ctx: Context): Map<String, String> =
+        ctx.getSharedPreferences(ANY_CERT, Context.MODE_PRIVATE).all
+            .mapNotNull { (k, v) -> (v as? String)?.let { k to it } }
+            .toMap()
+
     /** Record that [pkg] was patched with the CA identified by [caFingerprint]. */
     fun record(ctx: Context, pkg: String, caFingerprint: String) {
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -40,6 +65,7 @@ object PatchPrefs {
 
     fun forget(ctx: Context, pkg: String) {
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(pkg).apply()
+        ctx.getSharedPreferences(ANY_CERT, Context.MODE_PRIVATE).edit().remove(pkg).apply()
     }
 
     /** Every package we have patched, whether or not it is still current. */
@@ -48,6 +74,7 @@ object PatchPrefs {
             .mapNotNull { (k, v) -> (v as? String)?.let { k to it } }
             .toMap()
 
+    /** The certificate was reset. The any-certificate notes stay; see [ANY_CERT]. */
     fun clear(ctx: Context) {
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().clear().apply()
     }
@@ -67,4 +94,13 @@ object PatchPrefs {
         if (signer == null || signer != installedSigner) return PatchState.STALE
         return PatchState.CURRENT
     }
+
+    /**
+     * A build noted as accepting any certificate, signed by [noted], is still
+     * what is installed. An unknown signer counts while the app is installed:
+     * a warning about a build that has since been replaced costs less than
+     * staying quiet about one that has not.
+     */
+    fun stillAnyCert(noted: String?, installedSigner: String?): Boolean =
+        noted != null && installedSigner != null && (noted.isEmpty() || noted == installedSigner)
 }

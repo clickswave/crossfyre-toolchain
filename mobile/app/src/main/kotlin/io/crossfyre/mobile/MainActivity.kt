@@ -164,6 +164,12 @@ class MainActivity : ComponentActivity() {
                 Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", packageName, null)),
             )
             is Effect.Authenticate -> if (Build.VERSION.SDK_INT >= 30) unlockPrompt(e) else confirmLock(e)
+            is Effect.Uninstall -> runCatching { startActivity(e.intent) }
+                .onFailure { model.say("Android would not open its uninstall prompt. Uninstall the app from Android settings.", R.drawable.ic_info) }
+            is Effect.OpenStore -> open(
+                Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=${e.pkg}")),
+                Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/apps/details?id=${e.pkg}")),
+            )
         }
     }
 

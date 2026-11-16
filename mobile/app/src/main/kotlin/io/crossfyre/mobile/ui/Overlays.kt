@@ -37,6 +37,7 @@ import io.crossfyre.mobile.R
 import io.crossfyre.mobile.Scope
 import io.crossfyre.mobile.ago
 import io.crossfyre.mobile.displayHost
+import io.crossfyre.mobile.patch.restoreOffer
 
 /** The four facts of what a capture does, shared by the disclosure and the how-to sheet. */
 @Composable
@@ -378,6 +379,21 @@ fun BoxScope.Overlays(m: AppModel) {
         Overlay.ApprovalsOff -> ApprovalsOffDialog(m)
         is Overlay.Approval -> ApprovalSheet(m, o.id)
         is Overlay.Event -> EventSheet(m, o.id)
+
+        is Overlay.RestorePatched -> {
+            val (title, first, second) = restoreOffer(o.pkgs.map { m.labelOf(it) }) ?: return
+            CfxDialog(
+                title, onDismiss = null,
+                actions = {
+                    CfxButton(if (o.pkgs.size > 1) "Keep them" else "Keep", Kind.TEXT_DIM) { m.overlay = null }
+                    CfxButton("Play Store", Kind.TEXT) { m.restoreFromStore(o) }
+                    CfxButton("Uninstall", Kind.TEXT, color = c.danger) { m.restoreUninstall(o) }
+                },
+            ) {
+                Text(first)
+                Text(second)
+            }
+        }
 
         is Overlay.Licence -> Sheet(title = { SheetTitle(o.name) }, onDismiss = { m.overlay = null }, tall = true) {
             Text(o.licence, style = T.rowSub())

@@ -172,7 +172,7 @@ fun CaptureCard(m: AppModel, tracer: Boolean) {
             phase == Phase.STARTING || m.renewing ->
                 CfxButton("Starting…", Kind.SECONDARY, block = true, busy = true, enabled = false) {}
             phase == Phase.CAPTURING ->
-                CfxButton("Stop capture", Kind.DANGER, block = true, icon = R.drawable.ic_stop) { m.stopCapture() }
+                CfxButton("Stop capture", Kind.DANGER, block = true, icon = R.drawable.ic_stop) { m.stopTapped() }
             else ->
                 CfxButton("Start capture", Kind.PRIMARY, block = true, icon = R.drawable.ic_play) { m.onStartTapped() }
         }

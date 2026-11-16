@@ -108,6 +108,8 @@ sealed interface Overlay {
     data class Approval(val id: String) : Overlay
     /** One row of the activity log. */
     data class Event(val id: Long) : Overlay
+    /** Capture stopped with patched builds that accept any certificate installed, by package. */
+    data class RestorePatched(val pkgs: List<String>) : Overlay
 }
 
 /** Things only the activity can do: Android's own prompts, pickers and other apps. */
@@ -124,6 +126,10 @@ sealed interface Effect {
     data object SecuritySettings : Effect
     /** Android's page for letting this app install apps, which a patch waits on. */
     data class AllowInstalls(val intent: Intent) : Effect
+    /** Android's prompt to uninstall an app. */
+    data class Uninstall(val intent: Intent) : Effect
+    /** An app's page in the Play Store. */
+    data class OpenStore(val pkg: String) : Effect
     /** Ask for the unlock that lets the approval key sign the approval being made. */
     data class Authenticate(val id: String, val title: String, val description: String) : Effect
 }
@@ -812,6 +818,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
                 // server refused the token: the session ended.
                 session.ended()
                 if (!fromAccount && pairing != null) qrEnded = true
+                offerRestore()
                 if (Pairing.refused(ctx) && !sessionRefused) {
                     sessionRefused = true
                     say("The server stopped accepting this phone's requests, so capture stopped.", R.drawable.ic_warning)
@@ -977,6 +984,40 @@ class AppModel(app: Application) : AndroidViewModel(app) {
         wasActive = false
     }
 
+    /** The Tracer's Stop button: the session ends here. */
+    fun stopTapped() {
+        stopCapture()
+        offerRestore()
+    }
+
+    /**
+     * The session ended. A patched build that accepts any certificate is safe
+     * to use only while capture runs, so offer to put the original back, unless
+     * something else is already on screen.
+     */
+    private fun offerRestore() {
+        if (!patch.available) return
+        viewModelScope.launch {
+            val pkgs = withContext(Dispatchers.IO) { patch.acceptsAnyCert() }
+            anyCertPkgs = pkgs.toSet()
+            if (pkgs.isNotEmpty() && overlay == null) overlay = Overlay.RestorePatched(pkgs)
+        }
+    }
+
+    /** Uninstall the first app [o] names, then move on to the rest. */
+    fun restoreUninstall(o: Overlay.RestorePatched) {
+        val pkg = o.pkgs.firstOrNull() ?: return
+        overlay = o.pkgs.drop(1).takeIf { it.isNotEmpty() }?.let { Overlay.RestorePatched(it) }
+        patch.uninstallIntent(pkg)?.let { emit(Effect.Uninstall(it)) }
+    }
+
+    /** Open the Play Store at the first app [o] names, then move on to the rest. */
+    fun restoreFromStore(o: Overlay.RestorePatched) {
+        val pkg = o.pkgs.firstOrNull() ?: return
+        overlay = o.pkgs.drop(1).takeIf { it.isNotEmpty() }?.let { Overlay.RestorePatched(it) }
+        emit(Effect.OpenStore(pkg))
+    }
+
     /** The diagnosis's button. */
     fun diagAction(a: DiagAction) {
         when (a) {
@@ -1057,6 +1098,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
             val pkgs = (apps?.map { it.pkg }.orEmpty() + scopeApps).distinct()
             val states = withContext(Dispatchers.IO) { pkgs.associateWith { patch.state(it, ca) } }
             patchStates.putAll(states)
+            anyCertPkgs = withContext(Dispatchers.IO) { patch.acceptsAnyCert().toSet() }
             staleCount = withContext(Dispatchers.IO) { patch.stale(ca) }
             patchedCount = withContext(Dispatchers.IO) { patch.patchedCount() }
         }
@@ -1065,6 +1107,10 @@ class AppModel(app: Application) : AndroidViewModel(app) {
     var staleCount by mutableStateOf<List<String>>(emptyList())
         private set
     var patchedCount by mutableStateOf(0)
+        private set
+
+    /** Installed patched builds that accept any certificate, by package. */
+    var anyCertPkgs by mutableStateOf<Set<String>>(emptySet())
         private set
 
     var patchQuery by mutableStateOf("")

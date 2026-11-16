@@ -48,6 +48,15 @@ interface PatchFeature {
     /** Patched apps that will not decrypt any more, by package. */
     fun stale(caFingerprint: String?): List<String>
 
+    /**
+     * Installed apps whose build is still one this phone patched and whose
+     * patch accepts any certificate, by package. See [PatchJob.acceptsAnyCert].
+     */
+    fun acceptsAnyCert(): List<String>
+
+    /** Android's prompt to uninstall [pkg], or null in a build that cannot patch. */
+    fun uninstallIntent(pkg: String): Intent?
+
     /** The one line worth reading before spending ten minutes on a patch. */
     fun outlook(facts: AppFacts, patched: Boolean): String
 
@@ -121,6 +130,9 @@ enum class PatchStep {
  * @param message the reason a patch failed. When [fromServer] it is the server's
  *   own sentence, written for whoever holds the phone.
  * @param built the patched build is ready and kept, waiting to replace the original.
+ * @param acceptsAnyCert the server said the patched build no longer checks
+ *   certificates at all, as with a Flutter app, rather than trusting this
+ *   phone's. False when the server did not say.
  */
 data class PatchJob(
     val pkg: String,
@@ -131,6 +143,7 @@ data class PatchJob(
     val message: String? = null,
     val fromServer: Boolean = false,
     val built: Boolean = false,
+    val acceptsAnyCert: Boolean = false,
 ) {
     val running: Boolean get() = step.ordinal <= PatchStep.INSTALLING.ordinal
 
@@ -226,7 +239,11 @@ fun PatchJob.askToAllow(): Triple<String, String, String>? = when {
 
 /** What a finished patch says, by outcome: title, then two lines. */
 fun PatchJob.result(): Triple<String, String, String>? = when (step) {
-    PatchStep.DONE -> Triple(
+    PatchStep.DONE -> if (acceptsAnyCert) Triple(
+        "$label is patched",
+        "Start capture and use the app. This build accepts any certificate, not only this phone's, so with capture off anyone on the same network could read its traffic. Use it only for testing, and remove it when you are done.",
+        "Sign in to it again: removing the original cleared its data.",
+    ) else Triple(
         "$label is patched",
         "Start capture and use the app. It trusts this phone's certificate, so nothing needs installing in Android.",
         "Sign in to it again: removing the original cleared its data.",
@@ -253,4 +270,28 @@ fun PatchJob.result(): Triple<String, String, String>? = when (step) {
         "Patch again to install it, or reinstall the original from where you got it.",
     )
     else -> null
+}
+
+/** How the lists and an app's page name a current patch. */
+fun patchedLabel(acceptsAnyCert: Boolean): String =
+    if (acceptsAnyCert) "Patched: accepts any certificate" else "Patched with this certificate"
+
+/**
+ * What the phone says when capture stops and patched builds that accept any
+ * certificate are still installed, named by [labels]: title, then two lines.
+ * Null when there are none.
+ */
+fun restoreOffer(labels: List<String>): Triple<String, String, String>? {
+    val first = labels.firstOrNull() ?: return null
+    val more = labels.size - 1
+    return Triple(
+        "Put the original back?",
+        "$first is a patched build that accepts any certificate, not only this phone's. With capture off, anyone on the same network could read or change its traffic.",
+        "Uninstall it, or open the Play Store to uninstall it there and install the original. You will sign in to it again." +
+            when (more) {
+                0 -> ""
+                1 -> " One more patched app is like this."
+                else -> " $more more patched apps are like this."
+            },
+    )
 }

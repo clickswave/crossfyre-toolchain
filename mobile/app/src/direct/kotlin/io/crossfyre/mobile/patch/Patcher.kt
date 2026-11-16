@@ -35,6 +35,22 @@ object Patcher {
      */
     class ServerSaid(message: String) : IllegalStateException(message)
 
+    /**
+     * The patched files, and whether the server said the build accepts any
+     * certificate rather than trusting this phone's (see [acceptsAnyCert]).
+     */
+    class Built(val files: List<File>, val acceptsAnyCert: Boolean)
+
+    /**
+     * Whether a finished job's status says the patched build accepts any
+     * certificate. The server sets `flutter_tls_bypassed` when it turned off
+     * certificate checks in a Flutter app's own TLS, which has no trust store
+     * to add this phone's certificate to. A server that does not send the
+     * field has not said so, and that reads as false.
+     */
+    internal fun acceptsAnyCert(status: JSONObject): Boolean =
+        status.opt("flutter_tls_bypassed") == true
+
     /** Delete the scratch directory a patch works in.
      *
      * Called when a patch is cancelled or fails. The APKs staged here are tens
@@ -47,7 +63,8 @@ object Patcher {
     }
 
     /**
-     * Collect [pkg]'s splits, upload them for patching, and return the patched split files (in cache).
+     * Collect [pkg]'s splits, upload them for patching, and return the patched split files (in cache)
+     * with what the server said about them.
      * Throws on any failure (unreadable APK, network, server error). Runs off the main thread.
      */
     suspend fun buildPatched(
@@ -58,7 +75,7 @@ object Patcher {
         token: String,
         caPem: String,
         progress: (Step) -> Unit
-    ): List<File> = withContext(Dispatchers.IO) {
+    ): Built = withContext(Dispatchers.IO) {
         progress(Step(PatchStep.READ))
         val ai = ctx.packageManager.getApplicationInfo(pkg, 0)
         val splitPaths = buildList {
@@ -152,6 +169,7 @@ object Patcher {
         progress(Step(PatchStep.SERVER))
         var downloadUrl = ""
         var expectedSha = ""
+        var anyCert = false
         val deadline = System.currentTimeMillis() + PATCH_WAIT_MS
         while (System.currentTimeMillis() < deadline) {
             // delay(), not Thread.sleep(): the server phase is the longest part of
@@ -166,6 +184,7 @@ object Patcher {
                 "done" -> {
                     downloadUrl = st.optString("download_url", "")
                     expectedSha = st.optString("sha256", "")
+                    anyCert = acceptsAnyCert(st)
                     break
                 }
                 // The server writes this for the person holding the phone.
@@ -310,7 +329,7 @@ object Patcher {
             // those over nothing, and the original is about to be uninstalled.
             throw IllegalStateException("Patch service returned no installable build of $pkg")
         }
-        patched
+        Built(patched, anyCert)
     }
 
     /**
