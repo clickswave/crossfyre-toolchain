@@ -399,7 +399,7 @@ private fun ActivityLog(m: AppModel, now: Instant) {
             }
         }
         m.activityStatus == ListStatus.LOADING -> CfxList { repeat(3) { SkelRow(first = it == 0) } }
-        m.activityStatus == ListStatus.EMPTY -> Text("Nothing has happened here yet, or this account cannot read this view.", style = T.hint())
+        m.activityStatus == ListStatus.EMPTY -> Text("Nothing to show yet. If you expected activity here, this account may not be allowed to read it.", style = T.hint())
     }
 }
 
