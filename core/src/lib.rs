@@ -2655,6 +2655,7 @@ pub async fn run_daemon(
     // don't overflow and drop messages as "slow consumer".
     .subscription_capacity(1_000_000)
     .event_callback(on_event);
+    let opts = with_node_inbox(opts, &config.node_id);
 
     // TLS to the control plane.
     //
@@ -3705,6 +3706,14 @@ pub async fn run_script(
     Ok(())
 }
 
+/// Reply subjects for this node's requests and its pull consumer's deliveries
+/// go under `_INBOX_<node id>`, the one inbox prefix its broker credentials let
+/// it subscribe to. The default `_INBOX` is shared by every connection on the
+/// account, so the platform no longer grants it to nodes.
+fn with_node_inbox(opts: async_nats::ConnectOptions, node_id: &str) -> async_nats::ConnectOptions {
+    opts.custom_inbox_prefix(format!("_INBOX_{node_id}"))
+}
+
 /// Stage the Cloudflare Origin CA root next to the node config and return its
 /// path. async-nats takes a path rather than bytes, so the root is embedded in
 /// the binary and written out on connect. Rewritten every time so a truncated or
@@ -3752,6 +3761,26 @@ fn stage_origin_root_cert(dir: Option<&std::path::Path>) -> std::io::Result<std:
     std::fs::create_dir_all(dir)?;
     std::fs::write(&path, ORIGIN_ROOT)?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod inbox_tests {
+    use super::*;
+
+    /// The platform lets a node subscribe only under its own inbox prefix. A
+    /// client on the default `_INBOX` cannot read the replies to its own
+    /// JetStream requests, so its pull worker never binds.
+    #[tokio::test]
+    async fn the_node_takes_replies_under_its_own_inbox_prefix() {
+        let nats = egress::testkit::FakeNats::start().await;
+        let id = "11111111-1111-4111-8111-111111111111";
+        let client = with_node_inbox(async_nats::ConnectOptions::new(), id)
+            .connect(nats.url.as_str())
+            .await
+            .unwrap();
+        let inbox = client.new_inbox();
+        assert!(inbox.starts_with(&format!("_INBOX_{id}.")), "{inbox}");
+    }
 }
 
 #[cfg(test)]
