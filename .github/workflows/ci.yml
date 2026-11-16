@@ -169,7 +169,13 @@ jobs:
             -p ambulo -p voyage -p doorward \
             --features ambulo/tuning,voyage/tuning,doorward/tuning
 
+      # ambulo's unit tests drive the runner's Chrome too, and need what the oracles
+      # job gives it below: Chrome's sandbox does not start on the hosted runners,
+      # and the default launch timeout is marginal there.
       - name: Test
+        env:
+          AMBULO_BROWSER_NO_SANDBOX: '1'
+          AMBULO_BROWSER_LAUNCH_TIMEOUT_SECS: '90'
         run: cargo test --workspace --locked --no-fail-fast
 
   # The build and clippy jobs below, for each target the release workflow publishes
@@ -256,6 +262,13 @@ jobs:
             -p transport -p ambulo -p voyage -p toolmark -p plessor \
             --features transport/impersonate,ambulo/impersonate,voyage/impersonate,toolmark/impersonate,plessor/impersonate \
             -- -D warnings
+
+      # The redirect tests in ambulo and cfx_core listen on 127.0.0.2 as a second
+      # host. Linux and Windows answer on all of 127.0.0.0/8, and macOS only on
+      # the addresses lo0 has.
+      - name: Give lo0 a second address
+        if: runner.os == 'macOS'
+        run: sudo ifconfig lo0 alias 127.0.0.2 up
 
       - name: Test
         env:
