@@ -16,9 +16,8 @@ fn port_open(port: u16) -> bool {
 
 /// `crossfyre status` - everything at a glance.
 pub fn overview(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Crossfyre Status");
-    println!("================");
-    println!();
+    // The same header every other command prints, in place of a ruled line of its own.
+    super::ui::title("Crossfyre status", "");
     nodes(base)?;
     extensions()?;
     db()?;
@@ -34,7 +33,7 @@ fn control_plane(base: &Path) {
     use super::ui::*;
 
     println!();
-    section("Control plane");
+    section("Signed in to");
     match crate::auth::load_account(base) {
         Some(account) => {
             let url = account.api_url.trim_end_matches('/').to_string();
@@ -48,7 +47,7 @@ fn control_plane(base: &Path) {
         }
         None => {
             println!("{}", row(&dot(), "-", "", &dim("not signed in")));
-            hint("Run crossfyre login to choose one.");
+            hint("Run `crossfyre login` to sign in.");
         }
     }
 }
@@ -215,18 +214,18 @@ pub fn db() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(ref id) = config.container.id {
                 println!("  container: {}", &id[..id.len().min(12)]);
             } else {
-                println!("  container: none recorded - `crossfyre db up` to create one");
+                println!("  container: none recorded. `crossfyre db up` creates one");
             }
             // Extension binaries are useless without the db; nudge if it's down.
             if !listening && super::EXTENSIONS.iter().any(|e| is_extension_installed(e)) {
                 println!(
-                    "  hint: extensions are installed but the database is down - `crossfyre db start`"
+                    "  hint: extensions are installed but the database is down. Start it with `crossfyre db start`"
                 );
             }
         }
         Err(_) => {
             println!(
-                "  postgres: no toolchain config yet - created on first `crossfyre node init` or `crossfyre db up`"
+                "  postgres: no toolchain config yet. The first `crossfyre node init` or `crossfyre db up` creates it"
             );
         }
     }

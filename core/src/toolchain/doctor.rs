@@ -136,7 +136,7 @@ pub async fn run(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
         step(&format!(
             "no toolchain config yet {}",
             dim(&format!(
-                "({}) - created on first init",
+                "({}), created on first init",
                 config_path.display()
             ))
         ));

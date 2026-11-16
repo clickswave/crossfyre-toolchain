@@ -144,13 +144,14 @@ enum Commands {
         #[arg(long, default_value = "proxy")]
         method: String,
 
-        /// Local port for the intercepting proxy (Method 2). Default 0 = OS-assigned free port (the
+        /// Local port for the intercepting proxy. Default 0 = OS-assigned free port (the
         /// tool prints the one it picked); set a fixed port if you drive your own browser.
         #[arg(long, default_value_t = 0)]
         proxy_port: u16,
 
         /// Seed the session auth you browse with (cookies, bearer/API-key headers) into the
-        /// Credentials arsenal as encrypted, host-scoped credentials, ready for authenticated scans
+        /// saved credentials (Arsenal, then Credentials in the dashboard) as encrypted, host-scoped
+        /// credentials, ready for authenticated scans
         /// and authz testing. Off by default; only the hosts you actually visit are captured.
         #[arg(long)]
         seed_credentials: bool,
@@ -381,7 +382,7 @@ enum NodeAction {
 
 #[derive(Subcommand, Debug)]
 enum OastAction {
-    /// Install cf_oast as a systemd service on THIS box for your domain, then obtain
+    /// Install the OAST server as a systemd service (cf-oast) on this machine for your domain, then obtain
     /// a wildcard TLS cert (ACME DNS-01) and print the DNS-delegation records to add.
     /// Re-run after adding the records to finish TLS. Needs root (sudo).
     Setup {

@@ -463,7 +463,7 @@ fn verify_artifact_bytes(artifact: &Artifact, bytes: &[u8]) -> Result<(), String
     let got = format!("{:x}", hasher.finalize());
     if !got.eq_ignore_ascii_case(artifact.sha256.trim()) {
         return Err(format!(
-            "checksum mismatch for {} (expected {}, got {}) - refusing to install",
+            "checksum mismatch for {} (expected {}, got {}), refusing to install",
             artifact.file, artifact.sha256, got
         ));
     }
@@ -783,10 +783,10 @@ fn without_new_helper() -> &'static str {
 /// own update print.
 fn report_cfx_script(result: Result<HelperOutcome, Box<dyn std::error::Error>>) {
     match result {
-        Ok(HelperOutcome::Installed { version, .. }) => println!(
-            "[+] Installed cfx-script {version} to {} (runs .cfx scripts)",
+        Ok(HelperOutcome::Installed { version, .. }) => super::ui::ok(&format!(
+            "Installed cfx-script {version} to {} (runs .cfx scripts)",
             ext_bin_path(CFX_SCRIPT).display()
-        ),
+        )),
         Ok(HelperOutcome::CannotStart { version, output }) => eprintln!(
             "[!] cfx-script {version} cannot start here, so it was not installed and {}. {}",
             without_new_helper(),
@@ -1511,7 +1511,7 @@ pub async fn self_update(
     // the CLI's. That mismatch made every `crossfyre update` re-run forever.
     if comp.version == current_version && !force {
         if !quiet {
-            println!("crossfyre is already at {current_version} - nothing to update.");
+            println!("crossfyre is already at {current_version}. Nothing to update.");
         }
         return Ok(false);
     }
@@ -1552,10 +1552,10 @@ pub async fn self_update(
     let _ = std::fs::write(get_bin_dir().join("crossfyre.version"), &comp.version);
 
     if !quiet {
-        println!(
-            "[+] crossfyre updated to {} - restart the node to run it.",
+        super::ui::ok(&format!(
+            "crossfyre updated to {}. Restart the node to run it.",
             comp.version
-        );
+        ));
     }
     Ok(true)
 }
@@ -1607,7 +1607,7 @@ pub fn ensure_self_installed() -> Result<std::path::PathBuf, Box<dyn std::error:
         return Ok(stable);
     }
     place_binary(&exe, &stable)?;
-    println!("[+] Installed crossfyre binary to {}", stable.display());
+    super::ui::ok(&format!("Installed the crossfyre binary to {}", stable.display()));
     Ok(stable)
 }
 
@@ -1644,11 +1644,11 @@ pub async fn download_node(
     place_binary(&extracted, &stable)?;
     let _ = std::fs::write(&ver_file, &comp.version);
     if !quiet {
-        println!(
-            "[+] node worker updated to {} at {}",
+        super::ui::ok(&format!(
+            "node worker updated to {} at {}",
             comp.version,
             stable.display()
-        );
+        ));
     }
     Ok(true)
 }
@@ -1674,7 +1674,7 @@ pub async fn ensure_node_installed() -> Result<(), Box<dyn std::error::Error>> {
     } else if !stable.exists() {
         if let Some(sib) = sibling_of_this_binary("node") {
             place_binary(&sib, &stable)?;
-            println!("[+] Installed node binary to {}", stable.display());
+            super::ui::ok(&format!("Installed the node binary to {}", stable.display()));
         } else {
             let m = fetch_manifest().await?;
             download_node(&m, false, false).await?;
@@ -1693,10 +1693,10 @@ pub async fn ensure_node_installed() -> Result<(), Box<dyn std::error::Error>> {
         // recorded, and the next update replaces it with the manifest's.
         let _ = fs::remove_file(ext_version_file(CFX_SCRIPT));
         match place_helper_if_it_starts(&sib, &helper) {
-            Ok(None) => println!(
-                "[+] Installed cfx-script to {} (runs .cfx scripts)",
+            Ok(None) => super::ui::ok(&format!(
+                "Installed cfx-script to {} (runs .cfx scripts)",
                 helper.display()
-            ),
+            )),
             Ok(Some(output)) => eprintln!(
                 "[!] {} cannot start here, so it was not installed and {}. {}",
                 sib.display(),
