@@ -751,8 +751,15 @@ fn open_wordlist_with(
     let file = open_beneath(&real, Operator::current())?;
     #[cfg(not(unix))]
     let file = {
-        let file = std::fs::File::open(&real)
-            .map_err(|e| format!("wordlist {} cannot be opened: {e}", real.display()))?;
+        // Windows opens no directory without FILE_FLAG_BACKUP_SEMANTICS and answers
+        // "Access is denied", which would hide what is wrong with the path.
+        let file = std::fs::File::open(&real).map_err(|e| {
+            if std::fs::metadata(&real).is_ok_and(|m| !m.is_file()) {
+                not_a_regular_file(&real)
+            } else {
+                format!("wordlist {} cannot be opened: {e}", real.display())
+            }
+        })?;
         let meta = file
             .metadata()
             .map_err(|e| format!("wordlist {} cannot be read: {e}", real.display()))?;
