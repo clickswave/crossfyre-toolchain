@@ -73,6 +73,10 @@ pub struct ClientOpts<'a> {
     /// Where the client's connections go: the op's own egress, which the daemon
     /// read off the request. Required, for the reason this struct exists.
     pub egress: &'a transport::Egress,
+    /// Check the server's certificate. Off for a scan, which has to reach expired,
+    /// self-signed and internal-CA hosts. On where the caller hands in a session that
+    /// must not be sent to whoever answers the handshake.
+    pub verify_certs: bool,
 }
 
 /// Build an evasion-aware scan client.
@@ -100,6 +104,27 @@ pub fn try_build_client(
     redirect: transport::Redirect,
     resolve: Vec<(String, std::net::SocketAddr)>,
 ) -> Result<Client, String> {
+    // A probe goes to the target, so a redirect is followed only on the target's
+    // own origin. Off it, a 307 or 308 would carry the payload to a host nobody
+    // listed, and the answer would be read as the target's.
+    build(o, redirect, resolve, true)
+}
+
+/// [`build_client`] for a caller that puts credentials on each request rather than
+/// in `auth`, such as a recorded flow's own headers: it follows a redirect only
+/// while it stays on the origin it started from. Every target client does that
+/// (see [`transport::ClientConfig::same_origin_redirects`]); this one says so
+/// where the reason is the headers.
+pub fn build_client_keeping_origin(o: ClientOpts) -> Option<Client> {
+    build(o, transport::Redirect::Limited(3), Vec::new(), true).ok()
+}
+
+fn build(
+    o: ClientOpts,
+    redirect: transport::Redirect,
+    resolve: Vec<(String, std::net::SocketAddr)>,
+    same_origin_redirects: bool,
+) -> Result<Client, String> {
     let ClientOpts {
         evasive,
         identify,
@@ -109,11 +134,12 @@ pub fn try_build_client(
         min_timeout_ms,
         block_internal,
         egress,
+        verify_certs,
     } = o;
     let mode = adaptive::identity::Mode::from_flags(evasive, identify);
     let seed = (!target.is_empty()).then_some(target);
     let browser = adaptive::identity::resolve(&mode, seed);
-    transport::build_scan_client(
+    transport::build_scan_client_with(
         transport::ScanClient {
             identity_headers: &browser.headers,
             user_agent: &browser.user_agent,
@@ -124,14 +150,67 @@ pub fn try_build_client(
                 timeout_ms.clamp(1000, 120_000).max(min_timeout_ms),
             )),
             redirect,
-            accept_invalid_certs: true,
+            accept_invalid_certs: !verify_certs,
             cookie_store: true,
             resolve,
             block_internal,
         },
         egress,
+        same_origin_redirects,
     )
     .map_err(|e| format!("client build failed: {e}"))
+}
+
+/// A client for the out-of-band API, which is not the target. It has no `auth`, so a
+/// session handed in for the target is never sent there, and none of the target's name
+/// pins.
+pub fn oast_client(
+    evasive: bool,
+    identify: Option<String>,
+    target: &str,
+    timeout_ms: u64,
+    block_internal: bool,
+    egress: &transport::Egress,
+    verify_certs: bool,
+) -> Result<Client, String> {
+    build(
+        ClientOpts {
+            evasive,
+            identify,
+            auth: None,
+            target,
+            timeout_ms,
+            min_timeout_ms: 0,
+            block_internal,
+            egress,
+            verify_certs,
+        },
+        transport::Redirect::Limited(3),
+        Vec::new(),
+        // The out-of-band API is the node's own service, not a scanned target,
+        // and this client carries nothing for it.
+        false,
+    )
+}
+
+/// The out-of-band API's client, or a line saying out-of-band checks are off when one
+/// cannot be built.
+pub fn oast_client_or_say(
+    built: Result<Client, String>,
+    tx: &tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+) -> Option<Client> {
+    built
+        .map_err(|e| {
+            let _ = tx.send(serde_json::json!({
+                "type": "log",
+                "message": format!(
+                    "out-of-band callbacks are UNAVAILABLE (no client for the out-of-band \
+                     API: {e}). Blind command injection, blind SSRF and blind XXE cannot be \
+                     confirmed in this run; their absence from the results is not evidence."
+                )
+            }));
+        })
+        .ok()
 }
 
 /// Send one request with an optional `(body, content-type)` and read the capped response.
@@ -925,5 +1004,74 @@ mod timing_tests {
         p.touch_for_test(pace::idle_reset_ms_for_test() + 1_000);
         assert_eq!(p.delay(), 0, "an idle host should not inherit a brake");
         assert!(!p.serialising());
+    }
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    //! A probe that the target answers with a 307 or 308 would send its payload
+    //! on to wherever the `Location` points. Only the target's own origin gets it.
+    use super::*;
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    fn listener(reply: String) -> (u16, Arc<Mutex<Vec<String>>>) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { return };
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap_or(0);
+                log.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let _ = s.write_all(reply.as_bytes());
+            }
+        });
+        (port, seen)
+    }
+
+    #[tokio::test]
+    async fn a_payload_is_not_carried_to_another_origin() {
+        let (b, b_seen) =
+            listener("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".into());
+        let (a, _) = listener(format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:{b}/internal\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+        ));
+        let target = format!("http://127.0.0.1:{a}/search");
+        let client = try_build_client(
+            ClientOpts {
+                evasive: false,
+                identify: None,
+                auth: None,
+                target: &target,
+                timeout_ms: 5000,
+                min_timeout_ms: 0,
+                block_internal: false,
+                egress: &transport::Egress::Direct,
+                verify_certs: false,
+            },
+            transport::Redirect::Limited(3),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let r = client
+            .post(&target)
+            .body("q=probe-payload")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(r.status().as_u16(), 307);
+        assert!(
+            b_seen.lock().unwrap().is_empty(),
+            "another origin was sent the probe: {:?}",
+            b_seen.lock().unwrap()
+        );
     }
 }

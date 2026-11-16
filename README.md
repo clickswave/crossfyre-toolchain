@@ -78,6 +78,8 @@ These install the `crossfyre` CLI for your own user, and the package manager kee
 
 `crossfyre update all` updates the engines. [crossfyre.io/docs/install](https://crossfyre.io/docs/install) covers the .deb, signature checks and removal.
 
+When the CLI fetches from bins.crossfyre.io, the request's User-Agent carries its name, version and platform and whether it is an install, an update or a check of the release manifest, and nothing else.
+
 ## Use
 
 ```sh
@@ -91,7 +93,7 @@ doorward scan --targets 10.0.0.0/24 --ports top-1000 --service-detection
 ambulo scan --url https://example.com/::FUZZ:: --wordlist-path /usr/share/seclists/Discovery/Web-Content/common.txt
 ```
 
-Wordlists are read only from a few directories, since the daemon would otherwise read any file a request names: `/usr/share/wordlists`, `/usr/share/seclists` and the temp directory on Linux, and Homebrew's seclists on macOS. Add your own with `CFX_WORDLIST_ROOTS`, separated like `PATH`.
+Wordlists are read only from a few directories, since the daemon would otherwise read any file a request names: `/usr/share/wordlists` and `/usr/share/seclists` on Linux, and Homebrew's seclists on macOS. The temp directory is read only for the lists the node hands over. Add your own directories with `CFX_WORDLIST_ROOTS`, separated like `PATH`.
 
 In a terminal `voyage`, `doorward` and `ambulo` draw a live dashboard. `toolmark` and `plessor` finish a single target in seconds, so they print JSON unless you put `--tui` before `scan`, as in `toolmark --tui scan https://example.com`. Piped or redirected, every engine writes newline-delimited JSON, one event per line, and exits non-zero if the run ends in an error. `voyage`, `doorward` and `ambulo` save findings as they go, so a stopped scan resumes where it left off. Add `--help` to any command for the rest.
 
@@ -128,6 +130,8 @@ A source build sets up no services, so before the first scan start the Postgres 
 crossfyre db up
 ambulo --daemon &
 ```
+
+The container is published on 127.0.0.1 only, with a generated password kept in the toolchain's `config.toml`, which the engines read when they start.
 
 `cfx-script` embeds Python, so building it needs one. On Linux that is your distribution's Python and its development files. On macOS it has to be Python 3.10 or later, and the `python3` that comes with the Xcode command line tools is 3.9, so name another one: `PYO3_PYTHON=/opt/homebrew/bin/python3 cargo build --release`. Windows needs no Python to build it, and Python 3.10 or later to run scripts.
 

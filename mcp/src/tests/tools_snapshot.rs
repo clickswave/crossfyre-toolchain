@@ -11,10 +11,10 @@ use crate::tools::{
 use serde_json::Value;
 
 /// sha256 of `tools.json` with CRLF read as LF, so a Windows checkout agrees.
-const PINNED: &str = "ab7a877e81faeecd4f3d208fd9fa94f4d3b4a1bf4c00615f46ac42046d60952c";
+const PINNED: &str = "7ec3c8d0881ede1c1dbe45e30931fecb9ea481c256ed14b56f94d5dc7e46b7a7";
 
 /// The same for `tools_workbench.json`.
-const PINNED_WORKBENCH: &str = "0993a4467745f5cd426e4ca569e98b40569aff390b361a5593f4e54986c63b21";
+const PINNED_WORKBENCH: &str = "ee94f06fe0ae72f9c549b53782503e9b7cad21865b2406cf1d484ce2c29ba073";
 
 #[test]
 fn the_definitions_are_pinned() {

@@ -37,7 +37,9 @@ In the direct-download build, open the **Patch** tab, pick the app, and tap
 app is rewritten and re-signed so that it trusts this phone's certificate, and
 you are handed installable packages back.
 Android asks you to confirm removing the original and installing the patched
-build. No workstation, no root.
+build. The first time, the app also asks you to turn on **Allow from this
+source** for it in Android settings, before it reads anything, and it never
+removes the original while that is off. No workstation, no root.
 
 The rewriting happens as a hosted service, which is why this part needs an
 account and is not in this repository. Everything on the device side is here.

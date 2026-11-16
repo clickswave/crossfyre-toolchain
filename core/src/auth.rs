@@ -51,15 +51,24 @@ pub fn account_path(data_dir: &Path) -> PathBuf {
 }
 
 pub fn load_account(data_dir: &Path) -> Option<Account> {
-    let raw = std::fs::read_to_string(account_path(data_dir)).ok()?;
+    // Elevated or under sudo this reads from the person's directory: no following a
+    // link there.
+    let raw = crate::toolchain::sudo_user::read_to_string(&account_path(data_dir)).ok()?;
     toml::from_str(&raw).ok()
 }
 
 pub fn save_account(data_dir: &Path, account: &Account) -> Result<(), Box<dyn std::error::Error>> {
     if !data_dir.exists() {
-        std::fs::create_dir_all(data_dir)?;
+        crate::toolchain::sudo_user::create_dir_all_for_invoking_user(data_dir)?;
     }
     let path = account_path(data_dir);
+    // Under sudo this writes into the person's home as root: replace the file without
+    // following a link there, and hand it to them.
+    if crate::toolchain::sudo_user::root_guards() {
+        let body = toml::to_string(account)?;
+        crate::toolchain::sudo_user::write_for_invoking_user(&path, body.as_bytes(), 0o600)?;
+        return Ok(());
+    }
     // The mode goes on a fresh file BEFORE the key does. Writing and then chmodding, which
     // is what this did, leaves a window in which the credential exists at the process
     // umask, and a key that leaked during it has leaked.
@@ -92,7 +101,7 @@ pub fn save_account(data_dir: &Path, account: &Account) -> Result<(), Box<dyn st
 }
 
 pub fn clear_account(data_dir: &Path) -> bool {
-    std::fs::remove_file(account_path(data_dir)).is_ok()
+    crate::toolchain::sudo_user::remove_file(&account_path(data_dir)).is_ok()
 }
 
 // ---- small environment helpers ----------------------------------------
@@ -849,5 +858,59 @@ mod tests {
         let info = client_info("7.8.9");
         assert_eq!(info["version"], "7.8.9");
         assert_eq!(info["os"], os_label());
+    }
+}
+
+#[cfg(all(test, windows))]
+mod elevated_link_tests {
+    use super::*;
+    use crate::toolchain::sudo_user::{act_as_root, junction};
+
+    fn account() -> Account {
+        Account {
+            api_url: "https://crossfyre.io".to_string(),
+            api_key: "cfk_test".to_string(),
+            user_id: "u1".to_string(),
+            username: "op".to_string(),
+            email: "op@example.test".to_string(),
+        }
+    }
+
+    /// A data dir that is a junction to `victim`, which holds an account file.
+    fn linked() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let t = tempfile::tempdir().expect("tempdir");
+        let victim = t.path().join("victim");
+        std::fs::create_dir(&victim).expect("victim");
+        let body = toml::to_string(&account()).expect("toml");
+        std::fs::write(account_path(&victim), body).expect("victim file");
+        let data = t.path().join("crossfyre");
+        junction(&data, &victim);
+        (t, data, victim)
+    }
+
+    #[test]
+    fn an_elevated_logout_removes_nothing_through_a_junction() {
+        let (_t, data, victim) = linked();
+        let _root = act_as_root();
+        assert!(!clear_account(&data), "removed through a junction");
+        assert!(account_path(&victim).exists());
+    }
+
+    #[test]
+    fn an_elevated_read_of_the_account_will_not_pass_through_a_junction() {
+        let (_t, data, _victim) = linked();
+        let _root = act_as_root();
+        assert!(load_account(&data).is_none(), "read through a junction");
+    }
+
+    #[test]
+    fn an_elevated_read_and_logout_still_work_in_a_plain_directory() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let body = toml::to_string(&account()).expect("toml");
+        std::fs::write(account_path(t.path()), body).expect("account file");
+        let _root = act_as_root();
+        assert_eq!(load_account(t.path()), Some(account()));
+        assert!(clear_account(t.path()));
+        assert!(!account_path(t.path()).exists());
     }
 }

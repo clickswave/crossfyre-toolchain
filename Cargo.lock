@@ -110,7 +110,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "ambulo"
-version = "0.0.22"
+version = "0.0.23"
 dependencies = [
  "adaptive",
  "base64 0.22.1",
@@ -124,6 +124,7 @@ dependencies = [
  "dialoguer 0.11.0",
  "dirs 5.0.1",
  "futures-util",
+ "libc",
  "rand 0.9.5",
  "ratatui",
  "regex",
@@ -682,7 +683,7 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
 name = "cfx-script"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "cfx_core",
  "dguard",
@@ -759,6 +760,7 @@ dependencies = [
  "nats-jwt",
  "nkeys",
  "rcgen",
+ "regex",
  "reqwest 0.13.4",
  "rustls",
  "serde",
@@ -1238,7 +1240,7 @@ checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 
 [[package]]
 name = "crossfyre"
-version = "0.1.42"
+version = "0.1.43"
 dependencies = [
  "cfx_bridge",
  "cfx_core",
@@ -1460,6 +1462,7 @@ dependencies = [
 name = "dguard"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serde_json",
  "tokio",
 ]
@@ -1551,7 +1554,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1576,7 +1579,7 @@ dependencies = [
 
 [[package]]
 name = "doorward"
-version = "0.0.15"
+version = "0.0.16"
 dependencies = [
  "adaptive",
  "cfx_tui",
@@ -1690,7 +1693,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3065,7 +3068,7 @@ dependencies = [
 
 [[package]]
 name = "node"
-version = "0.1.52"
+version = "0.1.53"
 dependencies = [
  "cfx_core",
  "clap",
@@ -3097,7 +3100,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3549,7 +3552,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "plessor"
-version = "0.0.32"
+version = "0.0.33"
 dependencies = [
  "adaptive",
  "aes-gcm",
@@ -3739,7 +3742,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -3771,16 +3774,16 @@ dependencies = [
 
 [[package]]
 name = "quinn-udp"
-version = "0.5.15"
+version = "0.5.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35a133f956daabe89a61a685c2649f13d82d5aa4bd5d12d1277e1072a21c0694"
+checksum = "af66907df18639dcf4db56ca65490cabc4b27a97dbadd96f2926cca73298f016"
 dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4303,7 +4306,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4371,7 +4374,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs 1.0.10",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5178,7 +5181,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5573,7 +5576,7 @@ checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
 name = "toolmark"
-version = "0.0.14"
+version = "0.0.15"
 dependencies = [
  "adaptive",
  "base64 0.22.1",
@@ -5919,7 +5922,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voyage"
-version = "0.0.15"
+version = "0.0.16"
 dependencies = [
  "adaptive",
  "cfx_tui",

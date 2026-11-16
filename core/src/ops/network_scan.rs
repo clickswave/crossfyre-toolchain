@@ -81,7 +81,7 @@ pub async fn handle(env: OpEnv) {
         // can grep for known-open ones (53, 80, 5432, etc).
         let log_sample = true;
         let mut found_count = 0;
-        let conn = tokio::net::TcpStream::connect(super::engine_addr("pulse")).await;
+        let conn = super::listener::connect(&super::engine_addr("pulse")).await;
         match conn {
             Ok(stream) => {
                 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -315,7 +315,7 @@ pub async fn handle(env: OpEnv) {
         doorward_req["max_concurrency"] = serde_json::json!(mc);
     }
 
-    let conn = tokio::net::TcpStream::connect(super::engine_addr("pulse")).await;
+    let conn = super::listener::connect(&super::engine_addr("pulse")).await;
     match conn {
         Ok(stream) => {
             use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};

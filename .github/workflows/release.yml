@@ -48,7 +48,7 @@ jobs:
     name: open-core boundary
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Private drop-ins must not be in the tag
         run: |
@@ -78,7 +78,13 @@ jobs:
     # distributed ones do. Building on the runner's own image would produce
     # something that refuses to start on Debian 12 and Ubuntu 22.04, which is
     # most of the machines a scan node actually runs on.
-    container: rust:bookworm
+    #
+    # Pinned by digest: the binaries built here are the ones attested below, so the
+    # image they are built in is fixed by this commit rather than by whoever last
+    # moved the tag. The tag only says where the digest was taken from (the
+    # multi-arch index, so both runners resolve it); moving to a newer image is a
+    # commit.
+    container: rust:bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
     # The container's default shell is dash, which has no `pipefail`, so every
     # `set -euo pipefail` step died before running anything. bash is present in
     # the image; naming it here rather than per-step keeps the steps readable.
@@ -106,7 +112,7 @@ jobs:
       LINUX_PYTHON: "3.13.18"
       LINUX_PYTHON_RELEASE: "20261026"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # cfx-script, the .cfx runner, embeds Python and so links libpython; it is the
       # only binary here that does, which is what lets the CLI and node start on any
@@ -181,7 +187,7 @@ jobs:
           "$dir/cfx-script" </dev/null || rc=$?
           test "$rc" -eq 2
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dist-${{ matrix.target }}
           path: crossfyre-toolchain-${{ matrix.target }}.tar.gz*
@@ -231,12 +237,12 @@ jobs:
       WINDOWS_PYTHON: "3.13.12"
       WINDOWS_PYTHON_SHA256: "76f238f606250c87c6beac75dccd35ee99070a13490555936abb6cb64ecce3d0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # cfx-script is built for Python's stable ABI on these systems and loads any
       # CPython from 3.10. PYO3_PYTHON names the interpreter it is built with, so pyo3
       # does not pick up whichever python3 the image puts first on PATH.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         id: python
         with:
           python-version: "3.12"
@@ -250,12 +256,13 @@ jobs:
           rustc --version && cargo --version
 
       # aws-lc-sys assembles its x86_64 code with NASM on Windows, and the runner
-      # image does not carry it.
+      # image does not carry it. The version is named so the build does not take
+      # whatever was published last; the package checks the installer's hash.
       - name: Install NASM
         if: runner.os == 'Windows'
         run: |
           set -euo pipefail
-          choco install nasm -y --no-progress
+          choco install nasm --version=3.2.0 -y --no-progress
           echo "C:\\Program Files\\NASM" >> "$GITHUB_PATH"
 
       - name: Build the workspace binaries
@@ -351,28 +358,32 @@ jobs:
             test "$rc" -eq 2
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dist-${{ matrix.target }}
           path: crossfyre-toolchain-${{ matrix.target }}.${{ matrix.archive }}*
           if-no-files-found: error
 
-  publish:
-    name: attest and publish
+  attest:
+    name: attest
     needs: [build, build-native]
     runs-on: ubuntu-latest
     # `id-token` and `attestations` are what let the provenance be signed. They
     # are granted here and nowhere else in the file, so the build jobs that
-    # compile third-party code cannot mint an attestation.
+    # compile third-party code cannot mint an attestation, and this job runs only
+    # actions GitHub publishes. The release itself is uploaded by the job below,
+    # which can write to the repository but cannot sign: an action there that
+    # misbehaved could swap a file on the release, and `gh attestation verify`
+    # would then refuse it.
     permissions:
-      contents: write
+      contents: read
       id-token: write
       attestations: write
     defaults:
       run:
         shell: bash
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: dist-*
           merge-multiple: true
@@ -398,15 +409,47 @@ jobs:
       # The piece that removes "trust us". Verify with:
       #   gh attestation verify <file> --repo clickswave/crossfyre-toolchain
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018 # v1.4.4
         with:
           subject-path: |
             *.tar.gz
             *.zip
 
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sha256sums
+          path: SHA256SUMS
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: attest
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: dist-*
+          merge-multiple: true
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: sha256sums
+
+      # The same files the job above attested, checked against the sums it wrote.
+      - name: Check the archives against SHA256SUMS
+        run: |
+          set -euo pipefail
+          rm -f ./*.tar.gz.sha256 ./*.zip.sha256
+          sha256sum -c SHA256SUMS
+
       - name: Publish the release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: |
             *.tar.gz

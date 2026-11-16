@@ -21,8 +21,8 @@ use crate::{guard, redact};
 use cfx_bridge::{
     Body, Call, CheckParams, CheckResult, Cursor, Dest, Encoding, ErrorCode, ExchangeHandle,
     ExchangeParams, ExchangeResult, HistoryFilter, HistoryParams, HistoryResult, Origin, Part,
-    ProjectInfo, ProjectTag, ScopeParams, ScopeResult, SelectionResult, SiteMapParams,
-    SiteMapResult,
+    ProjectInfo, ProjectTag, ScopeParams, ScopeResult, SelectionResult, SiteMapCursor,
+    SiteMapParams, SiteMapResult, SiteMapRow,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -36,6 +36,22 @@ const HEADER_VALUE_MAX: usize = 1024;
 const HEADERS_TOTAL_MAX: usize = 8 * 1024;
 /// A URL or path from a list row.
 const URL_MAX: usize = 2048;
+/// Rows asked for at a time while `url_contains` or `search` is matched against what is
+/// shown, and the most pages one call reads before it hands back a cursor instead: five
+/// thousand rows, about five seconds at [`PAGES_PER_SECOND`].
+const HISTORY_MATCH_PAGE: u32 = 100;
+const HISTORY_MATCH_PAGES: u32 = 50;
+/// The most exchanges one call reads to check `search` against what is shown, about five
+/// seconds at [`PAGES_PER_SECOND`].
+const SEARCH_CHECKS: usize = 50;
+/// The most site map pages one call reads to sort a masked map. At 200 endpoints a page
+/// that is more than the 20,000 rows a Workbench reads for its map.
+const SITE_MAP_READ_PAGES: usize = 110;
+/// How long a masked site map one call read is paged through by the calls after it.
+const SITE_MAP_KEEP: Duration = Duration::from_secs(120);
+/// Requests one call sends a second while it reads page after page: half of what a
+/// Workbench takes on one connection, which other calls share.
+const PAGES_PER_SECOND: usize = 10;
 
 pub(crate) async fn run(
     mcp: &Mcp,
@@ -313,6 +329,48 @@ pub(crate) async fn ask<T: DeserializeOwned>(
             "The call was cancelled before the Workbench answered.",
         )),
     }
+}
+
+/// Spaces out the requests of one call that reads page after page.
+#[derive(Default)]
+struct PagePace(std::collections::VecDeque<tokio::time::Instant>);
+
+/// [`ask`] for one page of a longer read: held back while this call has sent
+/// [`PAGES_PER_SECOND`] requests in the last second, and asked once more a second later
+/// when the Workbench answers that it is busy.
+async fn ask_page<T: DeserializeOwned>(
+    o: &Open,
+    call: &Call,
+    pace: &mut PagePace,
+    ct: &CancellationToken,
+) -> Result<Result<T, BridgeErr>, Refusal> {
+    let second = Duration::from_secs(1);
+    for retry in [false, true] {
+        let now = tokio::time::Instant::now();
+        while pace.0.front().is_some_and(|t| now - *t >= second) {
+            pace.0.pop_front();
+        }
+        let until = match pace.0.front() {
+            Some(t) if pace.0.len() >= PAGES_PER_SECOND => Some(*t + second),
+            _ if retry => Some(now + second),
+            _ => None,
+        };
+        if let Some(until) = until {
+            tokio::select! {
+                _ = tokio::time::sleep_until(until) => {}
+                _ = ct.cancelled() => return Err(Refusal::new(
+                    Reason::Cancelled,
+                    "The call was cancelled before the Workbench answered.",
+                )),
+            }
+        }
+        pace.0.push_back(tokio::time::Instant::now());
+        match ask(o, call, REQUEST_WAIT, ct).await? {
+            Err(BridgeErr::Remote(b)) if b.code == ErrorCode::Busy && !retry => continue,
+            r => return Ok(r),
+        }
+    }
+    unreachable!("the second try returns")
 }
 
 /// What a Workbench error means here. `after` ends the sentence about what was or was
@@ -637,56 +695,167 @@ async fn list_history(
     )
     .await?;
     note.workbench = Some(o.audit());
+    let redact = mcp.settings.redact;
+    // The Workbench matches `url_contains` against the stored URL, so with masking on a
+    // term reaching into a masked value would say what the value holds, one guess at a
+    // time: in the rows, in whether there is a cursor, or in how far a read got. So the
+    // term is not sent. It is matched here against the URL as shown, over the rows the
+    // other filters give, read a page at a time until enough are kept. What comes back
+    // then follows from rows the caller could list without the term.
+    let needle = a
+        .url_contains
+        .as_deref()
+        .filter(|_| redact)
+        .map(str::to_ascii_lowercase);
+    // The Workbench's full-text index holds the stored text, masked values and all, so a
+    // whole masked value guessed right would find its row, and any narrowing by the index
+    // would show in which rows are read, how long that takes and where the read stops.
+    // So the words are not sent. The rows the other filters give are read one by one and
+    // kept only if the words are in them as shown, and which rows are read follows only
+    // from those filters and the rows kept.
+    let words: Vec<Vec<String>> = a
+        .search
+        .as_deref()
+        .filter(|_| redact)
+        .map(|s| s.split_whitespace().map(fts_tokens).collect())
+        .unwrap_or_default();
+    if words.iter().any(Vec::is_empty) {
+        return Err(Refusal::invalid(
+            "each word of search needs a letter or digit in it",
+        ));
+    }
+    let check = !words.is_empty();
+    let local = needle.is_some() || check;
     let filter = HistoryFilter {
         host: a.host.map(|h| h.trim().to_ascii_lowercase()),
         method: a.method.map(|m| m.trim().to_ascii_uppercase()),
         status_min,
         status_max,
         origins,
-        url_contains: a.url_contains,
-        search: a.search,
+        url_contains: a.url_contains.filter(|_| needle.is_none()),
+        search: a.search.filter(|_| !check),
         since_ms,
         until_ms: None,
     };
-    let call = Call::History(HistoryParams {
+    let mut params = HistoryParams {
         project_uid: o.project.uid.clone(),
         filter,
         cursor: match cursor {
             Some(Cursor::History { at, .. }) => Some(at),
             _ => None,
         },
-        limit,
-    });
-    let r: HistoryResult = ask(&o, &call, REQUEST_WAIT, ct)
-        .await?
-        .map_err(|e| bridge_refusal(e, &o, "Nothing was read."))?;
+        limit: if local { HISTORY_MATCH_PAGE } else { limit },
+    };
 
-    let redact = mcp.settings.redact;
     let mut rows: Vec<(Value, cfx_bridge::HistoryCursor)> = Vec::new();
-    for row in &r.rows {
-        let Some(handle) = o.handle(row.id) else {
-            continue;
+    let mut after = None;
+    let mut pace = PagePace::default();
+    let mut read = 0;
+    let mut checks = 0;
+    // The last row this call is done with, kept or not: where a read that stops partway
+    // through a page picks up again.
+    let mut done: Option<cfx_bridge::HistoryCursor> = None;
+    'pages: for page in 1.. {
+        let call = Call::History(params.clone());
+        let r: HistoryResult = match ask_page(&o, &call, &mut pace, ct).await? {
+            Ok(r) => r,
+            // Still busy a page or more into the read: the rows kept so far come back,
+            // and the cursor starts where the read stopped.
+            Err(BridgeErr::Remote(b)) if page > 1 && b.code == ErrorCode::Busy => break,
+            Err(e) => return Err(bridge_refusal(e, &o, "Nothing was read.")),
         };
-        rows.push((
-            json!({
-                "exchange": handle,
-                "at": rfc3339(row.at_ms),
-                "method": untrusted::clean(&row.method, 32),
-                "host": untrusted::clean(&row.host, 200),
-                "status": row.status,
-                "origin": origin_str(&row.origin),
-                "req_len": row.req_len,
-                "resp_len": row.resp_len,
-                "target_data": {"untrusted": true, "url": shown_url(&row.url, redact)},
-            }),
-            cfx_bridge::HistoryCursor {
+        after = r.next;
+        read += r.rows.len();
+        for row in &r.rows {
+            let at = cfx_bridge::HistoryCursor {
                 at_ms: row.at_ms,
                 id: row.id,
-            },
-        ));
+            };
+            let Some(handle) = o.handle(row.id) else {
+                done = Some(at);
+                continue;
+            };
+            let url = shown_url(&row.url, redact);
+            if let Some(n) = &needle
+                && !url.to_ascii_lowercase().contains(n.as_str())
+            {
+                done = Some(at);
+                continue;
+            }
+            if check {
+                // Out of checks, or the Workbench still busy: the rows kept so far come
+                // back, and the cursor starts after the last row looked at.
+                if checks >= SEARCH_CHECKS {
+                    after = done;
+                    break 'pages;
+                }
+                checks += 1;
+                let call = Call::Exchange(ExchangeParams {
+                    project_uid: o.project.uid.clone(),
+                    id: row.id,
+                    parts: vec![Part::Request, Part::Response],
+                    max_body_bytes: cfx_bridge::BODY_BYTES_MAX,
+                });
+                let held = match ask_page::<ExchangeResult>(&o, &call, &mut pace, ct).await? {
+                    Ok(x) => shown_holds(&x, &words),
+                    // Gone since the list was read: not a row to show.
+                    Err(BridgeErr::Remote(b)) if b.code == ErrorCode::NotFound => false,
+                    Err(BridgeErr::Remote(b)) if b.code == ErrorCode::Busy && done.is_some() => {
+                        after = done;
+                        break 'pages;
+                    }
+                    Err(e) => return Err(bridge_refusal(e, &o, "Nothing was read.")),
+                };
+                if !held {
+                    done = Some(at);
+                    continue;
+                }
+            }
+            done = Some(at);
+            rows.push((
+                json!({
+                    "exchange": handle,
+                    "at": rfc3339(row.at_ms),
+                    "method": untrusted::clean(&row.method, 32),
+                    "host": untrusted::clean(&row.host, 200),
+                    "status": row.status,
+                    "origin": origin_str(&row.origin),
+                    "req_len": row.req_len,
+                    "resp_len": row.resp_len,
+                    "target_data": {"untrusted": true, "url": url},
+                }),
+                at,
+            ));
+            if rows.len() >= limit as usize {
+                // The cursor starts after the last row kept, wherever it fell in the page,
+                // so whether there is one does not hang on the rows after it.
+                if local {
+                    after = Some(at);
+                }
+                break 'pages;
+            }
+        }
+        if !local || after.is_none() || page >= HISTORY_MATCH_PAGES {
+            break;
+        }
+        params.cursor = after;
     }
+    // A read that stopped before it kept enough rows says so.
+    let looked = (local && rows.len() < limit as usize && after.is_some()).then(|| {
+        if check {
+            format!(
+                "; {checks} exchange(s) were read to check search and the read stopped \
+                 there"
+            )
+        } else {
+            format!(
+                "; {read} row(s) of history were looked at for url_contains and the read \
+                 stopped there"
+            )
+        }
+    });
     let tag = o.tag();
-    let mut next = r.next.map(|at| Cursor::History { project: tag, at });
+    let mut next = after.map(|at| Cursor::History { project: tag, at });
     let mut truncated = false;
     let build = |rows: &[(Value, cfx_bridge::HistoryCursor)], next: &Option<Cursor>, cut: bool| {
         json!({
@@ -698,9 +867,10 @@ async fn list_history(
     };
     let summary = |n: usize, more: bool| {
         format!(
-            "{n} exchange(s) from project {} in the Workbench (pid {}), newest first{}.",
+            "{n} exchange(s) from project {} in the Workbench (pid {}), newest first{}{}.",
             o.name(),
             o.inst.pid,
+            looked.as_deref().filter(|_| more).unwrap_or(""),
             if more {
                 "; pass next_cursor for more"
             } else {
@@ -724,6 +894,51 @@ async fn list_history(
     Ok(Done {
         summary: summary(rows.len(), next.is_some()),
         value,
+    })
+}
+
+/// Text as the Workbench's full-text index splits it: runs of letters and digits, case
+/// folded.
+fn fts_tokens(s: &str) -> Vec<String> {
+    s.split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// Whether each search word is in the exchange as shown, its tokens in a row in one of
+/// the texts the index holds: the URL, the headers, the bodies.
+fn shown_holds(x: &ExchangeResult, words: &[Vec<String>]) -> bool {
+    let mut cut = false;
+    let mut headers = String::new();
+    for side in [&x.req_headers, &x.resp_headers] {
+        let shown = shown_headers(side.as_deref().unwrap_or(&[]), true, &mut cut);
+        for kv in shown.as_array().into_iter().flatten() {
+            for part in kv.as_array().into_iter().flatten() {
+                headers.push_str(part.as_str().unwrap_or(""));
+                headers.push('\n');
+            }
+        }
+    }
+    let body = |b: &Option<Body>| {
+        b.as_ref()
+            .and_then(|b| {
+                shown_body(b, cfx_bridge::BODY_BYTES_MAX as usize, true)["text"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .unwrap_or_default()
+    };
+    let texts = [
+        fts_tokens(&shown_url(&x.url, true)),
+        fts_tokens(&headers),
+        fts_tokens(&format!("{}\n{}", body(&x.req_body), body(&x.resp_body))),
+    ];
+    words.iter().all(|w| {
+        w.is_empty()
+            || texts
+                .iter()
+                .any(|t| t.windows(w.len()).any(|run| run == w.as_slice()))
     })
 }
 
@@ -974,25 +1189,35 @@ async fn get_site_map(
     )
     .await?;
     note.workbench = Some(o.audit());
-    let call = Call::SiteMap(SiteMapParams {
-        project_uid: o.project.uid.clone(),
-        host: a.host.map(|h| h.trim().to_ascii_lowercase()),
-        cursor: match cursor {
-            Some(Cursor::SiteMap { at, .. }) => Some(at),
-            _ => None,
-        },
-        limit,
-    });
-    let r: SiteMapResult = ask(&o, &call, REQUEST_WAIT, ct)
-        .await?
-        .map_err(|e| bridge_refusal(e, &o, "Nothing was read."))?;
-    let redact = mcp.settings.redact;
-    let shown_path = |p: &str| {
-        let p = untrusted::clean(p, URL_MAX);
-        if redact { redact::redact_text(&p) } else { p }
+    let host = a.host.map(|h| h.trim().to_ascii_lowercase());
+    let after = match cursor {
+        Some(Cursor::SiteMap { at, .. }) => Some(at),
+        _ => None,
     };
-    let mut rows: Vec<(Value, cfx_bridge::SiteMapCursor)> = r
-        .endpoints
+    let redact = mcp.settings.redact;
+    let (endpoints, page_next, incomplete) = if redact {
+        masked_site_map(mcp, &o, host, after, limit, ct).await?
+    } else {
+        let call = Call::SiteMap(SiteMapParams {
+            project_uid: o.project.uid.clone(),
+            host,
+            cursor: after,
+            limit,
+        });
+        let r: SiteMapResult = ask(&o, &call, REQUEST_WAIT, ct)
+            .await?
+            .map_err(|e| bridge_refusal(e, &o, "Nothing was read."))?;
+        (r.endpoints, r.next, r.incomplete)
+    };
+    // Masked rows hold their path as shown already.
+    let shown_path = |p: &str| {
+        if redact {
+            p.to_string()
+        } else {
+            untrusted::clean(p, URL_MAX)
+        }
+    };
+    let mut rows: Vec<(Value, cfx_bridge::SiteMapCursor)> = endpoints
         .iter()
         .map(|e| {
             (
@@ -1014,14 +1239,14 @@ async fn get_site_map(
         })
         .collect();
     let tag = o.tag();
-    let mut next = r.next.map(|at| Cursor::SiteMap { project: tag, at });
+    let mut next = page_next.map(|at| Cursor::SiteMap { project: tag, at });
     let mut truncated = false;
     let build = |rows: &[(Value, cfx_bridge::SiteMapCursor)], next: &Option<Cursor>, cut: bool| {
         json!({
             "workbench": o.shown(),
             "endpoints": rows.iter().map(|(v, _)| v.clone()).collect::<Vec<_>>(),
             "next_cursor": next.as_ref().map(|c| c.to_string()),
-            "incomplete": r.incomplete,
+            "incomplete": incomplete,
             "truncated": cut,
         })
     };
@@ -1035,7 +1260,7 @@ async fn get_site_map(
             } else {
                 ""
             },
-            if r.incomplete {
+            if incomplete {
                 "; the project holds more than the site map reads"
             } else {
                 ""
@@ -1057,6 +1282,147 @@ async fn get_site_map(
         summary: summary(rows.len(), next.is_some()),
         value,
     })
+}
+
+/// A site map row as shown: host, path and method.
+type MapKey = (String, String, String);
+
+/// A masked site map as one call read it, kept for the calls that page on through it
+/// with its cursor.
+pub(crate) struct MaskedMap {
+    inst: std::sync::Weak<Instance>,
+    project_uid: String,
+    host: Option<String>,
+    read_at: tokio::time::Instant,
+    rows: Arc<std::collections::BTreeMap<MapKey, SiteMapRow>>,
+    incomplete: bool,
+}
+
+/// One page of the site map as shown, sorted and paged here.
+///
+/// A Workbench pages its map in the order of the stored paths. With masking on, that
+/// order would say how a masked value compares with a path the caller had stored by a
+/// replay, and a cursor would carry the stored path itself. So the whole map is read,
+/// each path masked, rows that then agree folded into one, and the page taken in the
+/// order of what is shown. A cursor names a row as shown, and one made up by hand can
+/// only say where in the shown map to start.
+///
+/// Reading the whole map costs the Workbench a pass over the project for every page of
+/// it, so the map one call read is kept, and a call that carries a cursor for the same
+/// Workbench, project and host within [`SITE_MAP_KEEP`] pages through that copy. A call
+/// without a cursor reads the map afresh.
+async fn masked_site_map(
+    mcp: &Mcp,
+    o: &Open,
+    host: Option<String>,
+    after: Option<SiteMapCursor>,
+    limit: u32,
+    ct: &CancellationToken,
+) -> Result<(Vec<SiteMapRow>, Option<SiteMapCursor>, bool), Refusal> {
+    let kept = after.as_ref().and_then(|_| {
+        let slot = mcp.site_map.lock().ok()?;
+        let m = slot.as_ref()?;
+        (std::ptr::eq(m.inst.as_ptr(), Arc::as_ptr(&o.inst))
+            && m.project_uid == o.project.uid
+            && m.host == host
+            && m.read_at.elapsed() < SITE_MAP_KEEP)
+            .then(|| (m.rows.clone(), m.incomplete))
+    });
+    let (folded, incomplete) = match kept {
+        Some(k) => k,
+        None => {
+            let (rows, incomplete) = read_masked_map(o, host.clone(), ct).await?;
+            let rows = Arc::new(rows);
+            if let Ok(mut slot) = mcp.site_map.lock() {
+                *slot = Some(MaskedMap {
+                    inst: Arc::downgrade(&o.inst),
+                    project_uid: o.project.uid.clone(),
+                    host,
+                    read_at: tokio::time::Instant::now(),
+                    rows: rows.clone(),
+                    incomplete,
+                });
+            }
+            (rows, incomplete)
+        }
+    };
+    let from = match after {
+        Some(c) => std::ops::Bound::Excluded((c.host, c.path, c.method)),
+        None => std::ops::Bound::Unbounded,
+    };
+    let mut rows: Vec<SiteMapRow> = folded
+        .range((from, std::ops::Bound::Unbounded))
+        .map(|(_, r)| r.clone())
+        .take(limit as usize + 1)
+        .collect();
+    let more = rows.len() > limit as usize;
+    rows.truncate(limit as usize);
+    let next = rows.last().filter(|_| more).map(|r| SiteMapCursor {
+        host: r.host.clone(),
+        path: r.path.clone(),
+        method: r.method.clone(),
+    });
+    Ok((rows, next, incomplete))
+}
+
+/// The whole site map, each path masked and rows that then agree folded into one, and
+/// whether the project holds more than was read.
+async fn read_masked_map(
+    o: &Open,
+    host: Option<String>,
+    ct: &CancellationToken,
+) -> Result<(std::collections::BTreeMap<MapKey, SiteMapRow>, bool), Refusal> {
+    let cut = |s: &str, max: usize| untrusted::cap_bytes(s, max).0;
+    let mut folded: std::collections::BTreeMap<MapKey, SiteMapRow> = Default::default();
+    let mut params = SiteMapParams {
+        project_uid: o.project.uid.clone(),
+        host,
+        cursor: None,
+        limit: cfx_bridge::SITE_MAP_LIMIT_MAX,
+    };
+    let mut pace = PagePace::default();
+    let mut incomplete = false;
+    for page in 1.. {
+        let call = Call::SiteMap(params.clone());
+        let r: SiteMapResult = ask_page(o, &call, &mut pace, ct)
+            .await?
+            .map_err(|e| bridge_refusal(e, o, "Nothing was read."))?;
+        incomplete |= r.incomplete;
+        for e in r.endpoints {
+            let path = redact::redact_path(&untrusted::clean(&e.path, URL_MAX));
+            let key = (
+                cut(&e.host, cfx_bridge::SITE_MAP_CURSOR_HOST_MAX),
+                cut(&path, cfx_bridge::SITE_MAP_CURSOR_PATH_MAX),
+                cut(&e.method, cfx_bridge::SITE_MAP_CURSOR_METHOD_MAX),
+            );
+            let row = folded.entry(key.clone()).or_insert_with(|| SiteMapRow {
+                host: key.0,
+                path: key.1,
+                method: key.2,
+                status: None,
+                count: 0,
+                last_ms: i64::MIN,
+                bytes: 0,
+                has_query: false,
+            });
+            row.count = row.count.saturating_add(e.count);
+            row.bytes = row.bytes.saturating_add(e.bytes);
+            row.has_query |= e.has_query;
+            if e.last_ms >= row.last_ms {
+                row.last_ms = e.last_ms;
+                row.status = e.status;
+            }
+        }
+        match r.next {
+            Some(n) if page < SITE_MAP_READ_PAGES => params.cursor = Some(n),
+            Some(_) => {
+                incomplete = true;
+                break;
+            }
+            None => break,
+        }
+    }
+    Ok((folded, incomplete))
 }
 
 #[derive(Deserialize)]

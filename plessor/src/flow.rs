@@ -666,7 +666,7 @@ fn d_timeout() -> u64 {
 /// each time is what makes it a fresh session: the jar starts empty, so the
 /// flow's own login is the only thing that can authenticate it.
 async fn replay(p: &FlowParams, skip: Option<usize>) -> Option<Vec<u16>> {
-    let client: Client = probe::build_client(ClientOpts {
+    let client: Client = probe::build_client_keeping_origin(ClientOpts {
         evasive: p.evasive,
         identify: p.identify.clone(),
         // Deliberately no auth. A recorded flow that begins with a login
@@ -678,6 +678,7 @@ async fn replay(p: &FlowParams, skip: Option<usize>) -> Option<Vec<u16>> {
         min_timeout_ms: 0,
         block_internal: p.block_internal,
         egress: &p.egress,
+        verify_certs: false,
     })?;
 
     let mut statuses = vec![0u16; p.steps.len()];
@@ -731,7 +732,7 @@ async fn replay_values(
     steps: &[Step],
     swap: Option<(usize, &str, &str)>,
 ) -> Option<(Vec<u16>, HashMap<(usize, String), String>, Vec<String>)> {
-    let client: Client = probe::build_client(ClientOpts {
+    let client: Client = probe::build_client_keeping_origin(ClientOpts {
         evasive: p.evasive,
         identify: p.identify.clone(),
         auth: None,
@@ -740,6 +741,7 @@ async fn replay_values(
         min_timeout_ms: 0,
         block_internal: p.block_internal,
         egress: &p.egress,
+        verify_certs: false,
     })?;
     let mut statuses = vec![0u16; steps.len()];
     let mut fresh: HashMap<(usize, String), String> = HashMap::new();
@@ -1108,7 +1110,7 @@ async fn cross_identity(p: &FlowParams, label: &str, tx: &mpsc::UnboundedSender<
 /// Replay the flow, then send its last step a second time on the same session.
 /// Returns the two statuses of that final step.
 async fn replay_with_repeat(p: &FlowParams) -> Option<(u16, u16)> {
-    let client: Client = probe::build_client(ClientOpts {
+    let client: Client = probe::build_client_keeping_origin(ClientOpts {
         evasive: p.evasive,
         identify: p.identify.clone(),
         auth: None,
@@ -1117,6 +1119,7 @@ async fn replay_with_repeat(p: &FlowParams) -> Option<(u16, u16)> {
         min_timeout_ms: 0,
         block_internal: p.block_internal,
         egress: &p.egress,
+        verify_certs: false,
     })?;
     let mut fresh: HashMap<(usize, String), String> = HashMap::new();
     let last = p.steps.len() - 1;
@@ -1151,4 +1154,69 @@ async fn replay_with_repeat(p: &FlowParams) -> Option<(u16, u16)> {
         }
     }
     Some((first_status, second_status))
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    /// A loopback listener that answers every request with `reply` and keeps the
+    /// request heads it read.
+    fn listener(reply: String) -> (u16, Arc<Mutex<Vec<String>>>) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { return };
+                let mut head = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                log.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&head).to_ascii_lowercase());
+                let _ = s.write_all(reply.as_bytes());
+            }
+        });
+        (port, seen)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recorded_header_stays_on_the_origin_it_was_recorded_for() {
+        let (b, b_seen) =
+            listener("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".into());
+        let (a, _) = listener(format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{b}/c\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+        ));
+        let mut p: FlowParams = serde_json::from_value(json!({
+            "target": format!("http://127.0.0.1:{a}/"),
+            "steps": [{
+                "method": "GET",
+                "url": format!("http://127.0.0.1:{a}/out"),
+                "headers": [["X-Api-Key", "recorded-key"]],
+                "status": 302,
+            }],
+            "timeout_ms": 5000,
+        }))
+        .unwrap();
+        p.egress = transport::Egress::Direct;
+
+        let statuses = replay(&p, None).await.expect("the replay ran");
+
+        assert!(
+            b_seen.lock().unwrap().is_empty(),
+            "another origin got the recorded header: {:?}",
+            b_seen.lock().unwrap()
+        );
+        assert_eq!(statuses, vec![302]);
+    }
 }

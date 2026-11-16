@@ -4,8 +4,9 @@
 //! scan goes on in a task that owns the engine connection and writes the job to disk
 //! as events arrive. `get_scan` and `list_findings` read what it wrote.
 
+use super::overrides::{self, Asked, Via};
 use super::{in_range, parse_args};
-use crate::confirm::WriteAsk;
+use crate::confirm::{AskKind, WriteAsk};
 use crate::core::{
     CallNote, Done, Intent, Mcp, Pending, Reason, Refusal, RunningJob, RunningMap, SCAN_TIME_LIMIT,
     Snap, TrafficRequest,
@@ -169,6 +170,25 @@ fn endpoints(a: &Args) -> Result<Vec<Endpoint>, Refusal> {
         if body_type != "form" && body_type != "json" {
             return Err(Refusal::invalid("body_type must be form or json"));
         }
+        // plessor sends the other fields as given with every test, so an endpoint that
+        // asks the target for DELETE by override is a DELETE endpoint to it.
+        if !a.test_writes {
+            let from_query = overrides::in_query(&dest.url)
+                .into_iter()
+                .map(|(_, v)| Asked::new(Via::Query, Some(&v)));
+            let from_body = body
+                .iter()
+                .filter(|f| overrides::is_field(&f.name))
+                .map(|f| Asked::new(Via::Field, Some(f.value.as_deref().unwrap_or(""))));
+            if let Some(asked) = from_query.chain(from_body).find(Asked::beyond_post) {
+                return Err(Refusal::invalid(format!(
+                    "an endpoint is a {}, which can change or destroy data; it is tested only \
+                     with test_writes, which needs allow_writes in the scope file and a \
+                     confirmation",
+                    asked.describe(&method)
+                )));
+            }
+        }
         let op = json!({
             "method": method,
             "url": dest.url,
@@ -279,6 +299,7 @@ pub(crate) async fn run(
             untrusted::clean(&origin, 200),
             eps.len()
         ),
+        kind: AskKind::Write,
     });
     let plan = Plan {
         tool: "test_injection",
@@ -351,14 +372,16 @@ pub(crate) async fn start_scan(
             ),
         ));
     }
-    mcp.require(
-        &mut conn,
-        "plessor",
-        port,
-        "inject",
-        &["follow_redirects", "resolve"],
-    )
-    .await?;
+    // A captured session goes out only past a certificate that checks out, as the
+    // Workbench sends it. plessor otherwise accepts any certificate, so whoever answered
+    // the handshake for the host would be sent the session.
+    let options: &[&str] = if plan.auth.is_some() {
+        &["follow_redirects", "resolve", "verify_certs"]
+    } else {
+        &["follow_redirects", "resolve"]
+    };
+    mcp.require(&mut conn, "plessor", port, "inject", options)
+        .await?;
     let clearance = mcp.confirm(pending, peer, plan.write, note, ct).await?;
     if ct.is_cancelled() {
         return Err(Refusal::new(
@@ -385,6 +408,7 @@ pub(crate) async fn start_scan(
     });
     if let Some(auth) = plan.auth {
         op["auth"] = auth;
+        op["verify_certs"] = Value::Bool(true);
     }
 
     let start_lock = mcp.scan_start.lock().await;

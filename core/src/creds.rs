@@ -20,7 +20,9 @@
 //! - oauth2 / sso: delegated to the control-plane broker (not yet wired here).
 //!
 //! Built contexts are cached per credential id (with a short TTL) so we do not
-//! re-login on every request.
+//! re-login on every request. The control plane is still asked on every use,
+//! since its host check is what decides whether the auth may go to that op's
+//! target; the cache only saves rebuilding the session.
 
 use base64::Engine as _;
 use serde_json::{Value, json};
@@ -68,26 +70,49 @@ impl AuthContext {
     }
 }
 
-// Session cache: credential_id -> (context, built_at). Login/OAuth results are
-// reused for CACHE_TTL; static contexts are cheap but cached too.
-static CACHE: Mutex<Option<HashMap<String, (AuthContext, Instant)>>> = Mutex::new(None);
+/// Request auth for one credential, with the hosts the credential is for.
+#[derive(Clone, Debug)]
+pub struct ScopedAuth {
+    /// The `auth` object the engines consume.
+    pub auth: Value,
+    /// The credential's `scope_hosts` as the platform holds them. Empty when it
+    /// records none, which the platform reads as no restriction.
+    pub hosts: Vec<String>,
+}
+
+// Session cache: credential_id -> (context, the credential it was built from,
+// built_at). Login/OAuth results are reused for CACHE_TTL. It holds no scope
+// decision: a hit is used only after the control plane has resolved the
+// credential for the op's own host.
+type CacheEntry = (AuthContext, u64, Instant);
+static CACHE: Mutex<Option<HashMap<String, CacheEntry>>> = Mutex::new(None);
 const CACHE_TTL: Duration = Duration::from_secs(600);
 
-fn cache_get(id: &str) -> Option<AuthContext> {
+/// What a built context depends on, so an edited credential is built again.
+fn material(cred: &ResolvedCredential) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    cred.auth_type.hash(&mut h);
+    cred.config.to_string().hash(&mut h);
+    cred.secret.to_string().hash(&mut h);
+    h.finish()
+}
+
+fn cache_get(id: &str, material: u64) -> Option<AuthContext> {
     let guard = CACHE.lock().ok()?;
     let map = guard.as_ref()?;
-    let (ctx, at) = map.get(id)?;
-    if at.elapsed() < CACHE_TTL {
+    let (ctx, built_from, at) = map.get(id)?;
+    if *built_from == material && at.elapsed() < CACHE_TTL {
         Some(ctx.clone())
     } else {
         None
     }
 }
 
-fn cache_put(id: &str, ctx: &AuthContext) {
+fn cache_put(id: &str, material: u64, ctx: &AuthContext) {
     if let Ok(mut guard) = CACHE.lock() {
         let map = guard.get_or_insert_with(HashMap::new);
-        map.insert(id.to_string(), (ctx.clone(), Instant::now()));
+        map.insert(id.to_string(), (ctx.clone(), material, Instant::now()));
     }
 }
 
@@ -174,6 +199,49 @@ fn target_client(
         .proxy(proxy)
         .build()
         .map_err(|e| format!("the login client could not be built: {e}"))
+}
+
+/// The redirect policy for a login or token request, whose body carries the
+/// secret. A redirect that leaves the origin of the first request is followed
+/// only when the client sends it without the body: a 303, or a 301 or 302
+/// answering a POST. A 307 or 308, or a 301 or 302 answering any other method,
+/// would send the body on unchanged, so it comes back as the 3xx it is.
+fn secret_body_redirects(method: &str) -> reqwest::redirect::Policy {
+    use reqwest::StatusCode;
+    let post = method.eq_ignore_ascii_case("POST");
+    let limit = reqwest::redirect::Policy::limited(5);
+    reqwest::redirect::Policy::custom(move |attempt| {
+        let body_dropped = attempt.status() == StatusCode::SEE_OTHER
+            || (post
+                && matches!(
+                    attempt.status(),
+                    StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND
+                ));
+        let stays = attempt
+            .previous()
+            .first()
+            .is_some_and(|from| keeps_origin(from, attempt.url()));
+        if stays || body_dropped {
+            limit.redirect(attempt)
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
+/// The same host on the same scheme and port, or the same host moved from `http`
+/// to `https` with both on their default ports.
+fn keeps_origin(from: &reqwest::Url, to: &reqwest::Url) -> bool {
+    if from.host_str() != to.host_str() {
+        return false;
+    }
+    if from.scheme() == to.scheme() {
+        return from.port_or_known_default() == to.port_or_known_default();
+    }
+    from.scheme() == "http"
+        && to.scheme() == "https"
+        && from.port().is_none()
+        && to.port().is_none()
 }
 
 /// Build a concrete AuthContext from a resolved credential. Executes a login for
@@ -315,10 +383,14 @@ async fn login_flow(
     let builder = reqwest::Client::builder()
         .cookie_provider(jar.clone())
         .timeout(Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::limited(5));
+        .redirect(secret_body_redirects(&method));
     let client = match egress {
         Some(lease) => target_client(builder, lease)?,
-        None => builder.build().unwrap_or_else(|_| http.clone()),
+        // Never `http` in its place: that client follows any redirect, and this
+        // request carries the password.
+        None => builder
+            .build()
+            .map_err(|e| format!("the login client could not be built: {e}"))?,
     };
 
     // Assemble the credential body plus any extra static fields.
@@ -480,7 +552,9 @@ async fn login_flow(
 /// Non-interactive OAuth2 token exchange (client_credentials / password grants).
 /// Returns a Bearer AuthContext. authorization_code is deferred to the broker.
 async fn oauth2_token(
-    http: &reqwest::Client,
+    // Kept for the shape every builder shares. The token request has a client of
+    // its own, for its redirect policy.
+    _http: &reqwest::Client,
     cred: &ResolvedCredential,
     egress: Option<&Lease>,
 ) -> Result<AuthContext, String> {
@@ -532,12 +606,14 @@ async fn oauth2_token(
         .map(|(k, v)| format!("{}={}", form_urlencode(k), form_urlencode(v)))
         .collect::<Vec<_>>()
         .join("&");
+    let builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .redirect(secret_body_redirects("POST"));
     let client = match egress {
-        Some(lease) => target_client(
-            reqwest::Client::builder().timeout(Duration::from_secs(20)),
-            lease,
-        )?,
-        None => http.clone(),
+        Some(lease) => target_client(builder, lease)?,
+        None => builder
+            .build()
+            .map_err(|e| format!("the token client could not be built: {e}"))?,
     };
     let resp = client
         .post(token_url)
@@ -578,6 +654,9 @@ async fn oauth2_token(
 /// no `credential_id` is treated as the anonymous identity (empty auth). Entries
 /// whose credential fails to resolve are skipped (logged) so a partial matrix
 /// still runs.
+///
+/// Also returns the hosts of each credential that resolved, since every identity's
+/// auth goes to every endpoint of the pass.
 pub async fn resolve_identities(
     http: &reqwest::Client,
     api_url: &str,
@@ -585,8 +664,9 @@ pub async fn resolve_identities(
     identities: &[Value],
     host: &str,
     egress: Option<&Lease>,
-) -> Vec<Value> {
+) -> (Vec<Value>, Vec<Vec<String>>) {
     let mut out = Vec::new();
+    let mut scopes = Vec::new();
     for ident in identities {
         let role = ident["role"].as_str().unwrap_or("").trim().to_string();
         if role.is_empty() {
@@ -594,18 +674,23 @@ pub async fn resolve_identities(
         }
         let cid = ident["credential_id"].as_str().filter(|s| !s.is_empty());
         let auth = match cid {
-            Some(id) => match resolve_auth(http, api_url, node_api_key, id, host, egress).await {
-                Ok(a) => a,
-                Err(e) => {
-                    eprintln!("[op] authz identity '{role}' resolve failed ({id}): {e}");
-                    continue;
+            Some(id) => {
+                match resolve_auth_scoped(http, api_url, node_api_key, id, host, egress).await {
+                    Ok(a) => {
+                        scopes.push(a.hosts);
+                        a.auth
+                    }
+                    Err(e) => {
+                        eprintln!("[op] authz identity '{role}' resolve failed ({id}): {e}");
+                        continue;
+                    }
                 }
-            },
+            }
             None => json!({ "headers": {}, "cookies": "" }),
         };
         out.push(json!({ "role": role, "auth": auth }));
     }
-    out
+    (out, scopes)
 }
 
 /// Resolve + build + cache in one call. Returns the `auth` JSON object to inject
@@ -639,16 +724,19 @@ pub async fn resolve_auth_pool(
     host: &str,
     want: usize,
     egress: Option<&Lease>,
-) -> Result<Vec<Value>, String> {
-    let first = resolve_auth(http, api_url, node_api_key, credential_id, host, egress).await?;
+) -> Result<(Vec<Value>, Vec<String>), String> {
+    let first =
+        resolve_auth_scoped(http, api_url, node_api_key, credential_id, host, egress).await?;
+    let hosts = first.hosts;
+    let first = first.auth;
     let want = want.clamp(1, 4);
     if want == 1 {
-        return Ok(vec![first]);
+        return Ok((vec![first], hosts));
     }
     let cred = resolve(http, api_url, node_api_key, credential_id, host).await?;
     // Anything that is not a form login hands back the same material each time.
     if cred.auth_type != "login_flow" || cred.resolved_auth.is_some() {
-        return Ok(vec![first]);
+        return Ok((vec![first], hosts));
     }
     let mut out = vec![first];
     for _ in 1..want {
@@ -662,7 +750,7 @@ pub async fn resolve_auth_pool(
             }
         }
     }
-    Ok(out)
+    Ok((out, hosts))
 }
 
 pub async fn resolve_auth(
@@ -673,18 +761,43 @@ pub async fn resolve_auth(
     host: &str,
     egress: Option<&Lease>,
 ) -> Result<Value, String> {
-    if let Some(ctx) = cache_get(credential_id) {
-        return Ok(ctx.to_json());
-    }
+    resolve_auth_scoped(http, api_url, node_api_key, credential_id, host, egress)
+        .await
+        .map(|a| a.auth)
+}
+
+/// [`resolve_auth`], with the hosts the credential is for. An op whose engine may
+/// reach hosts besides `host` keeps the credential to these.
+pub async fn resolve_auth_scoped(
+    http: &reqwest::Client,
+    api_url: &str,
+    node_api_key: &str,
+    credential_id: &str,
+    host: &str,
+    egress: Option<&Lease>,
+) -> Result<ScopedAuth, String> {
+    // Asked on every use, cache or not: the control plane decides whether this
+    // credential may be sent to `host`, and a session cached for one host says
+    // nothing about another.
     let cred = resolve(http, api_url, node_api_key, credential_id, host).await?;
     // Browser-brokered types (sso / oauth2 authcode) come back pre-resolved.
     let ctx = if let Some(ra) = &cred.resolved_auth {
         auth_context_from_json(ra)
     } else {
-        build_context(http, &cred, egress).await?
+        let built_from = material(&cred);
+        match cache_get(credential_id, built_from) {
+            Some(ctx) => ctx,
+            None => {
+                let ctx = build_context(http, &cred, egress).await?;
+                cache_put(credential_id, built_from, &ctx);
+                ctx
+            }
+        }
     };
-    cache_put(credential_id, &ctx);
-    Ok(ctx.to_json())
+    Ok(ScopedAuth {
+        auth: ctx.to_json(),
+        hosts: cred.scope_hosts,
+    })
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -735,4 +848,277 @@ fn jar_cookie_header(jar: &reqwest::cookie::Jar, url: &reqwest::Url) -> Option<S
     use reqwest::cookie::CookieStore;
     jar.cookies(url)
         .and_then(|hv| hv.to_str().ok().map(String::from))
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    //! A login or token request carries the secret in its body, and the client
+    //! sends that body on through a 307 or 308. Such a redirect to another host
+    //! must come back unfollowed.
+    use super::*;
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+
+    pub(super) type Seen = Arc<Mutex<Vec<String>>>;
+
+    /// A loopback listener that keeps each request (head and body) it reads and
+    /// answers it with `reply(path)`.
+    fn listener(ip: &str, reply: impl Fn(&str) -> String + Send + 'static) -> (u16, Seen) {
+        listener_with(ip, move |req| {
+            reply(req.split_whitespace().nth(1).unwrap_or("/"))
+        })
+    }
+
+    /// [`listener`], answering each request with `reply(whole request)`.
+    pub(super) fn listener_with(
+        ip: &str,
+        reply: impl Fn(&str) -> String + Send + 'static,
+    ) -> (u16, Seen) {
+        let l = std::net::TcpListener::bind((ip, 0)).unwrap();
+        let port = l.local_addr().unwrap().port();
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { return };
+                let _ = s.set_read_timeout(Some(Duration::from_millis(300)));
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    if let Some(end) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&req[..end]).to_ascii_lowercase();
+                        let len = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if req.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let req = String::from_utf8_lossy(&req).to_string();
+                let answer = reply(&req);
+                log.lock().unwrap().push(req);
+                let _ = s.write_all(answer.as_bytes());
+            }
+        });
+        (port, seen)
+    }
+
+    fn redirect(status: &str, location: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nLocation: {location}\r\nSet-Cookie: sid=on-login-host; Path=/\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+    }
+
+    fn other_host() -> (u16, Seen) {
+        listener("127.0.0.2", |_| {
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string()
+        })
+    }
+
+    fn cred(auth_type: &str, config: Value, secret: Value) -> ResolvedCredential {
+        ResolvedCredential {
+            name: "test".into(),
+            auth_type: auth_type.into(),
+            config,
+            secret,
+            scope_hosts: Vec::new(),
+            resolved_auth: None,
+        }
+    }
+
+    fn assert_secret_stayed(seen: &Seen, secret: &str) {
+        let seen = seen.lock().unwrap();
+        assert!(
+            !seen.iter().any(|r| r.contains(secret)),
+            "the other host was sent the secret: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_login_body_is_not_sent_on_to_another_host() {
+        for status in ["307 Temporary Redirect", "308 Permanent Redirect"] {
+            for method in ["POST", "PUT", "GET"] {
+                let (b, b_seen) = other_host();
+                let to = format!("http://127.0.0.2:{b}/collect");
+                let (a, _) = listener("127.0.0.1", move |_| redirect(status, &to));
+                let c = cred(
+                    "login_flow",
+                    json!({"login_url": format!("http://127.0.0.1:{a}/login"), "method": method}),
+                    json!({"username": "alice", "password": "saved-password"}),
+                );
+                let _ = login_flow(&reqwest::Client::new(), &c, None).await;
+                assert_secret_stayed(&b_seen, "saved-password");
+            }
+        }
+        // A 301 or 302 keeps the body of anything but a POST.
+        for method in ["PUT", "GET"] {
+            let (b, b_seen) = other_host();
+            let to = format!("http://127.0.0.2:{b}/collect");
+            let (a, _) = listener("127.0.0.1", move |_| redirect("302 Found", &to));
+            let c = cred(
+                "login_flow",
+                json!({"login_url": format!("http://127.0.0.1:{a}/login"), "method": method}),
+                json!({"username": "alice", "password": "saved-password"}),
+            );
+            let _ = login_flow(&reqwest::Client::new(), &c, None).await;
+            assert_secret_stayed(&b_seen, "saved-password");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_login_still_follows_a_redirect_that_drops_the_body() {
+        let (b, b_seen) = other_host();
+        let to = format!("http://127.0.0.2:{b}/home");
+        let (a, _) = listener("127.0.0.1", move |_| redirect("303 See Other", &to));
+        let c = cred(
+            "login_flow",
+            json!({"login_url": format!("http://127.0.0.1:{a}/login")}),
+            json!({"username": "alice", "password": "saved-password"}),
+        );
+        let _ = login_flow(&reqwest::Client::new(), &c, None).await;
+        let seen = b_seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "the 303 was not followed");
+        assert!(seen[0].starts_with("GET /home "), "{}", seen[0]);
+        assert!(!seen[0].contains("saved-password"), "{}", seen[0]);
+    }
+
+    #[tokio::test]
+    async fn a_token_request_is_not_sent_on_to_another_host() {
+        for status in ["307 Temporary Redirect", "308 Permanent Redirect"] {
+            let (b, b_seen) = other_host();
+            let to = format!("http://127.0.0.2:{b}/token");
+            let (a, _) = listener("127.0.0.1", move |_| redirect(status, &to));
+            let c = cred(
+                "oauth2",
+                json!({"token_url": format!("http://127.0.0.1:{a}/token"), "client_id": "app"}),
+                json!({"client_secret": "saved-client-secret"}),
+            );
+            let _ = oauth2_token(&reqwest::Client::new(), &c, None).await;
+            assert_secret_stayed(&b_seen, "saved-client-secret");
+        }
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    //! A session built for one op is reused by the next, but the platform still
+    //! decides for every op whether the credential may go to that op's host.
+    use super::redirect_tests::{Seen, listener_with};
+    use super::*;
+
+    fn reply_json(body: &Value) -> String {
+        let body = body.to_string();
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// A control plane that resolves `data` for a request naming `allowed` as
+    /// the host and refuses any other host, as /api/v1/creds/resolve does.
+    fn control_plane(allowed: &'static str, data: Arc<Mutex<Value>>) -> (String, Seen) {
+        let (port, seen) = listener_with("127.0.0.1", move |req| {
+            let body = req.split("\r\n\r\n").nth(1).unwrap_or("");
+            let asked: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+            if asked["host"].as_str() == Some(allowed) {
+                reply_json(&json!({"status": 200, "data": data.lock().unwrap().clone()}))
+            } else {
+                reply_json(&json!({
+                    "status": 403,
+                    "message": "Credential is not in scope for this host",
+                }))
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), seen)
+    }
+
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn a_cached_credential_is_still_checked_against_the_new_host() {
+        let data = Arc::new(Mutex::new(json!({
+            "name": "api token",
+            "auth_type": "bearer",
+            "config": {},
+            "secret": {"token": "saved-token"},
+            "scope_hosts": ["app.victim.example"],
+        })));
+        let (api, _) = control_plane("app.victim.example", data);
+        let http = reqwest::Client::new();
+        let id = "cache-test-host-check";
+        let ok = resolve_auth(&http, &api, "key", id, "app.victim.example", None).await;
+        assert!(ok.is_ok(), "{ok:?}");
+        let other = resolve_auth(&http, &api, "key", id, "attacker.example", None).await;
+        assert!(
+            other.is_err(),
+            "the credential was handed out for a host the platform refuses: {other:?}"
+        );
+        let other = resolve_auth_scoped(&http, &api, "key", id, "attacker.example", None).await;
+        assert!(other.is_err(), "{other:?}");
+        let (ids, _) = resolve_identities(
+            &http,
+            &api,
+            "key",
+            &[json!({"role": "user", "credential_id": id})],
+            "attacker.example",
+            None,
+        )
+        .await;
+        assert!(ids.is_empty(), "{ids:?}");
+        let pool = resolve_auth_pool(&http, &api, "key", id, "attacker.example", 1, None).await;
+        assert!(pool.is_err(), "{pool:?}");
+    }
+
+    /// A login server that counts logins and hands out a numbered session.
+    fn login_server() -> (String, Seen) {
+        let n = Arc::new(Mutex::new(0u32));
+        let (port, seen) = listener_with("127.0.0.1", move |_| {
+            let mut n = n.lock().unwrap();
+            *n += 1;
+            format!(
+                "HTTP/1.1 200 OK\r\nSet-Cookie: sid=session-{n}; Path=/\r\n\
+                 Content-Length: 2\r\nConnection: close\r\n\r\nok"
+            )
+        });
+        (format!("http://127.0.0.1:{port}/login"), seen)
+    }
+
+    #[tokio::test]
+    async fn a_login_session_is_reused_while_the_credential_is_unchanged() {
+        let (login_url, logins) = login_server();
+        let data = Arc::new(Mutex::new(json!({
+            "name": "form login",
+            "auth_type": "login_flow",
+            "config": {"login_url": login_url},
+            "secret": {"username": "alice", "password": "first-password"},
+            "scope_hosts": ["app.victim.example"],
+        })));
+        let (api, asks) = control_plane("app.victim.example", Arc::clone(&data));
+        let http = reqwest::Client::new();
+        let id = "cache-test-login-reuse";
+        let a = resolve_auth(&http, &api, "key", id, "app.victim.example", None).await;
+        let b = resolve_auth(&http, &api, "key", id, "app.victim.example", None).await;
+        assert!(a.is_ok() && b.is_ok(), "{a:?} {b:?}");
+        assert_eq!(a, b);
+        assert_eq!(logins.lock().unwrap().len(), 1, "the login was repeated");
+        assert_eq!(asks.lock().unwrap().len(), 2, "the platform was not asked");
+
+        // The credential is edited on the platform: the old session is not used.
+        data.lock().unwrap()["secret"]["password"] = json!("second-password");
+        let c = resolve_auth(&http, &api, "key", id, "app.victim.example", None).await;
+        assert!(c.is_ok(), "{c:?}");
+        assert_ne!(a, c, "a session from the old credential was reused");
+        let logins = logins.lock().unwrap();
+        assert_eq!(logins.len(), 2);
+        assert!(logins[1].contains("second-password"), "{}", logins[1]);
+    }
 }

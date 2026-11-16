@@ -41,6 +41,8 @@ class TracerVpnService : VpnService() {
         const val MODE_EXCEPT = "except"
         private const val TAG = "cfx-mobile"
         private const val CHANNEL = "capture"
+        /** The capture notification's id, the one the foreground service shows. */
+        private const val NOTICE = 1
 
         /** Live while the capture VPN is up. The foreground service keeps the process alive, so the UI
          *  can read this on relaunch to restore its running state after the app was closed. */
@@ -126,14 +128,15 @@ class TracerVpnService : VpnService() {
             return
         }
         tun = pfd
-        // Device-side consent for full capture. The server can ask; only this grants.
-        val allowFull = FullCapturePrefs.allowed(this)
+        // Device-side consent for full capture. The server can ask; only this grants,
+        // and only for the pairing it was given for.
+        val allowFull = FullCapturePrefs.allowed(this, pair)
         Pairing.markRefused(this, false)
         val ok = Native.startCapture(pfd.fd, pair.apiUrl, pair.workflowId, pair.token, allowFull)
         startedAt = System.currentTimeMillis()
         active = true
         // Watched here rather than by the app, which looks only while it is on screen.
-        tokenWatch = TokenWatch({ Native.captureStats() }, ::stopForRefusedToken) { ms, look ->
+        tokenWatch = TokenWatch({ Native.captureStats() }, ::stopForRefusedToken, holding = ::showHolding) { ms, look ->
             main.postDelayed({ look() }, ms)
         }.also { it.start() }
         Log.i(TAG, "capture started: mode=$effectiveMode apps=${apps.joinToString().ifEmpty { "-" }} native=$ok")
@@ -200,14 +203,8 @@ class TracerVpnService : VpnService() {
         stopSelf()
     }
 
-    /** Returns false when Android refused the foreground service, having said why. */
-    private fun startForegroundCompat(): Boolean {
-        val nm = getSystemService(NotificationManager::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            nm.createNotificationChannel(
-                NotificationChannel(CHANNEL, "Capture", NotificationManager.IMPORTANCE_LOW)
-            )
-        }
+    /** The capture notification, saying whether requests wait for the dashboard (see [captureNotice]). */
+    private fun notification(holding: Boolean): Notification {
         // Tap opens the app; a Stop action tears down capture without opening the app.
         val piFlags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         val openPi = PendingIntent.getActivity(
@@ -216,19 +213,37 @@ class TracerVpnService : VpnService() {
         val stopPi = PendingIntent.getService(
             this, 1, Intent(this, TracerVpnService::class.java).setAction(ACTION_STOP), piFlags
         )
-        val n: Notification = Notification.Builder(this, CHANNEL)
+        return Notification.Builder(this, CHANNEL)
             .setContentTitle(getString(R.string.app_name))
-            .setContentText("Capturing traffic for authorized testing")
+            .setContentText(captureNotice(holding))
             .setSmallIcon(R.drawable.ic_broadcast)
             .setOngoing(true)
             .setContentIntent(openPi)
             .addAction(Notification.Action.Builder(null, "Stop capture", stopPi).build())
             .build()
+    }
+
+    /** Requests started or stopped waiting for the dashboard. */
+    private fun showHolding(holding: Boolean) {
+        if (!active) return
+        runCatching { getSystemService(NotificationManager::class.java).notify(NOTICE, notification(holding)) }
+            .onFailure { Log.w(TAG, "could not update the capture notification: $it") }
+    }
+
+    /** Returns false when Android refused the foreground service, having said why. */
+    private fun startForegroundCompat(): Boolean {
+        val nm = getSystemService(NotificationManager::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            nm.createNotificationChannel(
+                NotificationChannel(CHANNEL, "Capture", NotificationManager.IMPORTANCE_LOW)
+            )
+        }
+        val n = notification(holding = false)
         return try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED)
+                startForeground(NOTICE, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED)
             } else {
-                startForeground(1, n)
+                startForeground(NOTICE, n)
             }
             true
         } catch (e: Exception) {

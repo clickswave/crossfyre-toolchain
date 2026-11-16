@@ -37,6 +37,7 @@ import io.crossfyre.mobile.R
 import io.crossfyre.mobile.Scope
 import io.crossfyre.mobile.ago
 import io.crossfyre.mobile.displayHost
+import io.crossfyre.mobile.patch.restoreOffer
 
 /** The four facts of what a capture does, shared by the disclosure and the how-to sheet. */
 @Composable
@@ -203,7 +204,8 @@ fun BoxScope.Overlays(m: AppModel) {
                 marked("Headers and bodies will go to **${m.destination}** on ${m.pairingHost}, as well as the shape of each request. That includes whatever the apps send: passwords, session tokens, cookies and personal data."),
                 style = T.body(),
             )
-            Text("The workspace can ask for full requests. Only this switch grants them, and it stays off until you turn it on here.", style = T.body())
+            Text("With it on, the session can also hold each request until someone in the workspace sends it on or drops it, and they can change it before it goes.", style = T.body())
+            Text("The workspace can ask for full requests. Only this switch grants them, and it stays off until you turn it on here. It covers this pairing only, and any other session gets nothing until you turn it on there.", style = T.body())
             Authz()
         }
 
@@ -301,6 +303,9 @@ fun BoxScope.Overlays(m: AppModel) {
                     if (m.patch.available) " Pairing also lets this server supply the app builds you install from the Patch tab." else "",
                 style = T.hint(),
             )
+            if (m.fullCapture && !m.fullCaptureCovers(o.pairing)) {
+                Text("Send full requests is on for the current pairing. It will be off for this one until you turn it on for it.", style = T.hint())
+            }
         }
 
         Overlay.PairInvalid -> CfxDialog(
@@ -374,6 +379,21 @@ fun BoxScope.Overlays(m: AppModel) {
         Overlay.ApprovalsOff -> ApprovalsOffDialog(m)
         is Overlay.Approval -> ApprovalSheet(m, o.id)
         is Overlay.Event -> EventSheet(m, o.id)
+
+        is Overlay.RestorePatched -> {
+            val (title, first, second) = restoreOffer(o.pkgs.map { m.labelOf(it) }) ?: return
+            CfxDialog(
+                title, onDismiss = null,
+                actions = {
+                    CfxButton(if (o.pkgs.size > 1) "Keep them" else "Keep", Kind.TEXT_DIM) { m.overlay = null }
+                    CfxButton("Play Store", Kind.TEXT) { m.restoreFromStore(o) }
+                    CfxButton("Uninstall", Kind.TEXT, color = c.danger) { m.restoreUninstall(o) }
+                },
+            ) {
+                Text(first)
+                Text(second)
+            }
+        }
 
         is Overlay.Licence -> Sheet(title = { SheetTitle(o.name) }, onDismiss = { m.overlay = null }, tall = true) {
             Text(o.licence, style = T.rowSub())

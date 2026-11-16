@@ -271,6 +271,10 @@ pub async fn run_on(listener: TcpListener, db: AmbuloDb) -> Result<(), Box<dyn s
 }
 
 /// The client the single-URL probe sends with.
+///
+/// It follows a redirect only on the origin it was sent to. Anywhere else would
+/// report another host's status and length as the probed URL's, and a 307 or
+/// 308 would re-send a PUT, POST or DELETE there.
 fn build_probe_client(
     follow_redirects: bool,
     egress: &transport::Egress,
@@ -292,6 +296,7 @@ fn build_probe_client(
             extra_headers: transport::HeaderMap::new(),
             emulate: true,
             resolve: Vec::new(),
+            same_origin_redirects: true,
             ..Default::default()
         },
         egress,
@@ -318,23 +323,12 @@ async fn handle_connection(
             continue;
         }
 
-        // The bind address is the primary boundary. This is the second one, for
-        // deployments that used CFX_DAEMON_BIND to move the listener off loopback;
-        // with no token configured it is a no-op.
-        if !gate.allows(
-            serde_json::from_str::<serde_json::Value>(&line)
-                .ok()
-                .as_ref()
-                .and_then(|v| v.get("token"))
-                .and_then(|t| t.as_str()),
-        ) {
-            // Same `type`/`message` envelope as every other reply: a client that
-            // breaks on `type == "error"` has to recognise this one, or it waits
-            // for a line that never comes. Then close, rather than leaving an
-            // unauthenticated peer a socket to retry on.
-            let _ = writer
-                .write_all(b"{\"type\":\"error\",\"message\":\"unauthorized\"}\n")
-                .await;
+        // A line that is not a JSON object is not from a client (an HTTP request
+        // from a web page starts that way), and a request without the configured
+        // token is not from an authorised one. Either ends the connection, so
+        // nothing written after that line is ever read as a request.
+        if let Some(reply) = gate.refusal(&line) {
+            let _ = writer.write_all(reply.as_bytes()).await;
             break;
         }
 
@@ -749,13 +743,6 @@ async fn prepare_scan(
     db: &Arc<AmbuloDb>,
     isolate: Option<&str>,
 ) -> Result<(Scanner, usize, i64), Box<dyn std::error::Error + Send + Sync>> {
-    // Every scan path reaches here, so this is the one place the wordlist has to
-    // be contained. `wordlist` is a filesystem path from the request and the
-    // scanner emits one request per line to a target the same request names,
-    // which made an arbitrary file readable one line at a time by anyone who
-    // could reach this daemon.
-    dguard::resolve_wordlist(&params.wordlist)?;
-
     let http_method = parse_method(&params.method);
 
     let mut endpoint = params.endpoint.clone();
@@ -772,6 +759,12 @@ async fn prepare_scan(
 
     let config = build_args(params, endpoint, http_method);
 
+    // Every scan path reaches here, so this is the one place the wordlist has to
+    // be contained. `wordlist` is a filesystem path from the request and the
+    // scanner emits one request per line to a target the same request names,
+    // which made an arbitrary file readable one line at a time by anyone who
+    // could reach this daemon. WordlistConfig opens it once, inside the
+    // permitted directories, and reads only through that handle.
     let wordlist_config = crate::libs::wordlist_config::WordlistConfig::new(&params.wordlist)
         .await
         .map_err(|e| format!("Wordlist error: {e}"))?;
@@ -1281,5 +1274,176 @@ mod egress_tests {
         assert!(got.is_ok(), "the probe did not arrive");
         assert_eq!(fx.requests(), ["GET /admin HTTP/1.1"]);
         assert_all_through(&fx, &proxy, &[]);
+    }
+}
+
+#[cfg(test)]
+mod http_request_tests {
+    //! A web page open in the operator's browser can POST to this port. The browser
+    //! writes a request line and headers before the body the page chose, so the
+    //! connection has to end at the request line, before the body is read.
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn daemon() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let db = Arc::new(AmbuloDb::unconnected(
+            &crate::libs::cli_args::defaults_for_tests(),
+        ));
+        let follow = Arc::new(build_probe_client(true, &transport::Egress::Inherit).unwrap());
+        let stay = Arc::new(build_probe_client(false, &transport::Egress::Inherit).unwrap());
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(handle_connection(
+                    stream,
+                    dguard::Gate::default(),
+                    Arc::clone(&db),
+                    Arc::clone(&follow),
+                    Arc::clone(&stay),
+                ));
+            }
+        });
+        port
+    }
+
+    /// Sends `raw` and returns the lines the daemon wrote back, and whether it
+    /// closed the connection.
+    async fn send(port: u16, raw: &str) -> (Vec<String>, bool) {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        s.write_all(raw.as_bytes()).await.unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        let closed = loop {
+            match tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => break true,
+                Ok(Ok(n)) => got.extend_from_slice(&buf[..n]),
+                Err(_) => break false,
+            }
+        };
+        let lines = String::from_utf8_lossy(&got)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        (lines, closed)
+    }
+
+    #[tokio::test]
+    async fn an_http_post_is_closed_at_its_request_line() {
+        let port = daemon().await;
+        let body = "{\"operation\":\"capabilities\"}\n";
+        let raw = format!(
+            "POST / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://page.test\r\n\
+             Content-Type: text/plain;charset=UTF-8\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let (lines, closed) = send(port, &raw).await;
+        assert!(closed, "the connection stayed open: {lines:?}");
+        assert!(
+            lines.len() <= 1,
+            "answered the HTTP lines one by one: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("capabilities")),
+            "read the body as a request: {lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_line_that_is_json_but_not_an_object_closes_too() {
+        let port = daemon().await;
+        let (lines, closed) = send(port, "[1]\n{\"operation\":\"capabilities\"}\n").await;
+        assert!(closed, "the connection stayed open: {lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.contains("capabilities")),
+            "read on past the first line: {lines:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod probe_redirect_tests {
+    //! The single-URL probe follows a redirect only on the origin it was sent to.
+    //! Anywhere else, the 3xx is the answer: nothing is sent to the other host,
+    //! and its status and length are not reported as the probed URL's.
+    use super::*;
+    use std::io::{Read, Write};
+    use std::sync::Mutex;
+
+    fn listener(ip: &str, reply: impl Fn() -> String + Send + 'static) -> (u16, Arc<Mutex<u32>>) {
+        let l = std::net::TcpListener::bind((ip, 0)).unwrap();
+        let port = l.local_addr().unwrap().port();
+        let hits = Arc::new(Mutex::new(0u32));
+        let count = Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { return };
+                let mut buf = [0u8; 4096];
+                if matches!(s.read(&mut buf), Ok(n) if n > 0) {
+                    *count.lock().unwrap() += 1;
+                    let _ = s.write_all(reply().as_bytes());
+                }
+            }
+        });
+        (port, hits)
+    }
+
+    async fn probe(url: &str, method: &str) -> DaemonResponse {
+        let params: ProbeParams = serde_json::from_value(serde_json::json!({
+            "operation_id": "op", "url": url, "method": method, "follow_redirects": true,
+        }))
+        .unwrap();
+        let client = Arc::new(build_probe_client(true, &transport::Egress::Inherit).unwrap());
+        let db = Arc::new(AmbuloDb::unconnected(
+            &crate::libs::cli_args::defaults_for_tests(),
+        ));
+        run_probe(params, client, db).await
+    }
+
+    fn redirect_to(location: String) -> impl Fn() -> String + Send + 'static {
+        move || {
+            format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+        }
+    }
+
+    fn ok() -> String {
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello".to_string()
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_another_origin_is_reported_and_not_followed() {
+        let (b, b_hits) = listener("127.0.0.2", ok);
+        let (a, _) = listener("127.0.0.1", redirect_to(format!("http://127.0.0.2:{b}/x")));
+        let r = probe(&format!("http://127.0.0.1:{a}/"), "put").await;
+        assert_eq!(
+            *b_hits.lock().unwrap(),
+            0,
+            "the probe was re-sent to another host"
+        );
+        assert_eq!(r.results.as_ref().unwrap()["code"], 307, "{:?}", r.results);
+    }
+
+    #[tokio::test]
+    async fn a_redirect_on_the_same_origin_is_still_followed() {
+        let (a, _) = listener("127.0.0.1", {
+            let first = Arc::new(Mutex::new(true));
+            move || {
+                let mut f = first.lock().unwrap();
+                if std::mem::replace(&mut *f, false) {
+                    "HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\n\
+                     Connection: close\r\n\r\n"
+                        .to_string()
+                } else {
+                    ok()
+                }
+            }
+        });
+        let r = probe(&format!("http://127.0.0.1:{a}/"), "get").await;
+        assert_eq!(r.results.as_ref().unwrap()["code"], 200, "{:?}", r.results);
     }
 }

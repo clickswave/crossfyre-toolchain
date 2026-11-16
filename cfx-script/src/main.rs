@@ -29,7 +29,9 @@
 //! cfx-script from releases that speak differently would otherwise misread each
 //! other. The caller's toolchain directory, where engine ports are configured, comes
 //! in the environment as `CFX_SCRIPT_TOOLCHAIN_DIR`, because a path need not be UTF-8
-//! and a JSON string must be.
+//! and a JSON string must be. The caller starts the helper in a folder of its own and
+//! names its own working directory in `CFX_SCRIPT_WORKING_DIR`, and the helper moves
+//! there once the job has been read, before the script runs.
 //!
 //! stdout carries nothing else. Before Python starts, the helper moves the pipe it was
 //! given as stdout to a descriptor of its own and points fd 1 at stderr, so `print()`,
@@ -102,6 +104,20 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // The caller starts the helper in a folder of its own, so that Windows finds
+    // python3.dll there rather than in whatever directory the operator was in, and names
+    // that directory here. Python's libraries are loaded by now, and the script's
+    // relative paths are the caller's.
+    if let Some(dir) =
+        std::env::var_os(cfx_core::executor::WORKING_DIR_ENV).filter(|dir| !dir.is_empty())
+    {
+        if let Err(e) = std::env::set_current_dir(&dir) {
+            eprintln!(
+                "cfx-script: could not move to {}: {e}",
+                std::path::Path::new(&dir).display()
+            );
+        }
+    }
     // The caller's toolchain directory, so engine ports come from the same config.toml
     // the caller reads. Read as an OsStr: it need not be UTF-8.
     if let Some(dir) =

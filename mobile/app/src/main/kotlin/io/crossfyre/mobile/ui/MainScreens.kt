@@ -162,11 +162,17 @@ fun CaptureCard(m: AppModel, tracer: Boolean) {
         if (phase == Phase.CAPTURING && m.fullCapture) {
             Banner(Level.DANGER, "Full requests are on.", "Headers and bodies, credentials included, are being sent to ${m.destination}.")
         }
+        if (phase == Phase.CAPTURING && m.stats?.holding == true) {
+            Banner(
+                Level.WARN, "Requests wait for the dashboard.",
+                "Each request is held until someone in ${m.destination} sends it on or drops it, and they can change it before it goes. After about two minutes without a decision it goes on unchanged.",
+            )
+        }
         when {
             phase == Phase.STARTING || m.renewing ->
                 CfxButton("Starting…", Kind.SECONDARY, block = true, busy = true, enabled = false) {}
             phase == Phase.CAPTURING ->
-                CfxButton("Stop capture", Kind.DANGER, block = true, icon = R.drawable.ic_stop) { m.stopCapture() }
+                CfxButton("Stop capture", Kind.DANGER, block = true, icon = R.drawable.ic_stop) { m.stopTapped() }
             else ->
                 CfxButton("Start capture", Kind.PRIMARY, block = true, icon = R.drawable.ic_play) { m.onStartTapped() }
         }
@@ -297,7 +303,7 @@ fun TracerContent(m: AppModel) {
         )
         CfxRow(
             title = "Send full requests", icon = R.drawable.ic_cloud_arrow_up,
-            sub = if (m.fullCapture) "On: headers and bodies go too, credentials included, when the session in the dashboard asks for them."
+            sub = if (m.fullCapture) "On for this pairing: headers and bodies go too, credentials included, and requests can be held for review, when the session in the dashboard asks."
             else "Off: only the shape of each request leaves the phone. Values, headers and bodies stay here.",
             note = if (locked) "Stop capture to change this." else null,
             trailing = { CfxSwitch(m.fullCapture, enabled = !locked, label = "Send full requests") { m.toggleFull() } },

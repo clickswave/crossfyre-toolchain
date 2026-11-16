@@ -1,5 +1,6 @@
 package io.crossfyre.mobile.patch
 
+import android.content.Intent
 import io.crossfyre.mobile.Pairing
 import io.crossfyre.mobile.apps.AppFacts
 import kotlinx.coroutines.flow.StateFlow
@@ -47,13 +48,36 @@ interface PatchFeature {
     /** Patched apps that will not decrypt any more, by package. */
     fun stale(caFingerprint: String?): List<String>
 
+    /**
+     * Installed apps whose build is still one this phone patched and whose
+     * patch accepts any certificate, by package. See [PatchJob.acceptsAnyCert].
+     */
+    fun acceptsAnyCert(): List<String>
+
+    /** Android's prompt to uninstall [pkg], or null in a build that cannot patch. */
+    fun uninstallIntent(pkg: String): Intent?
+
     /** The one line worth reading before spending ten minutes on a patch. */
     fun outlook(facts: AppFacts, patched: Boolean): String
 
     /** Housekeeping at launch: debris from a patch that was killed, records of uninstalled apps. */
     fun tidy()
 
-    fun start(pkg: String, label: String, sizeMb: Int, pairing: Pairing, ca: File, caFingerprint: String?)
+    /**
+     * Patch [pkg] to trust the certificate in [caPem], recorded against
+     * [caFingerprint], the fingerprint of that same text. The certificate is
+     * passed as text, never as a file another app might replace on the way.
+     */
+    fun start(pkg: String, label: String, sizeMb: Int, pairing: Pairing, caPem: String, caFingerprint: String?)
+
+    /**
+     * Back in view, perhaps from Android's settings: a patch waiting at
+     * [PatchStep.ALLOW_INSTALLS] carries on if this app may now install apps.
+     */
+    fun carryOn()
+
+    /** Android's page for letting this app install apps, or null in a build that cannot patch. */
+    fun allowInstallsIntent(): Intent?
 
     fun cancel()
 
@@ -77,6 +101,12 @@ val PATCH_STAGES = listOf(
 )
 
 enum class PatchStep {
+    /**
+     * Waiting for the person to let this app install apps in Android's
+     * settings: before reading the app, or once [PatchJob.built], before
+     * removing the original. Nothing on the phone has changed.
+     */
+    ALLOW_INSTALLS,
     READ, UPLOAD, SERVER, DOWNLOAD,
     /** Android's prompt to remove the original is up. */
     UNINSTALL,
@@ -99,6 +129,10 @@ enum class PatchStep {
  * @param pct progress within the current step, 0 to 100, where the step has any.
  * @param message the reason a patch failed. When [fromServer] it is the server's
  *   own sentence, written for whoever holds the phone.
+ * @param built the patched build is ready and kept, waiting to replace the original.
+ * @param acceptsAnyCert the server said the patched build no longer checks
+ *   certificates at all, as with a Flutter app, rather than trusting this
+ *   phone's. False when the server did not say.
  */
 data class PatchJob(
     val pkg: String,
@@ -108,6 +142,8 @@ data class PatchJob(
     val pct: Float = 0f,
     val message: String? = null,
     val fromServer: Boolean = false,
+    val built: Boolean = false,
+    val acceptsAnyCert: Boolean = false,
 ) {
     val running: Boolean get() = step.ordinal <= PatchStep.INSTALLING.ordinal
 
@@ -120,6 +156,7 @@ data class PatchJob(
     /** Which of [PATCH_STAGES] is under way. */
     val stage: Int
         get() = when (step) {
+            PatchStep.ALLOW_INSTALLS -> if (built) 4 else 0
             PatchStep.READ -> 0
             PatchStep.UPLOAD -> 1
             PatchStep.SERVER -> 2
@@ -133,6 +170,7 @@ data class PatchJob(
      */
     val meter: Float?
         get() = when (step) {
+            PatchStep.ALLOW_INSTALLS -> if (built) 99.5f else 0f
             PatchStep.READ -> 3f
             PatchStep.UPLOAD -> 5f + 0.40f * pct
             PatchStep.SERVER -> null
@@ -148,13 +186,64 @@ data class PatchJob(
             PatchStep.SERVER -> "The slow part: a few minutes for a large app. The server says when it is done, not how far along it is, so the bar moves slowly here."
             PatchStep.DOWNLOAD -> "${pct.toInt()}%, checked against the server's checksum"
             PatchStep.INSTALLING -> "Installing…"
-            else -> "Android asks you to confirm both. The first time, it also asks you to allow installs from Crossfyre Mobile."
+            else -> "Android asks you to confirm both."
         }
+}
+
+/**
+ * Where this patch goes from either point that leads to an install: starting,
+ * and removing the original once the patched build is [PatchJob.built].
+ *
+ * The swap removes the original first, because the patched build is signed by
+ * another key and Android will not take it as an update. If Android will not
+ * let this app install apps, it then refuses the patched build as well, and
+ * the phone is left with neither. So without that permission the patch waits
+ * at [PatchStep.ALLOW_INSTALLS]. [canInstall] is to be asked at the moment of
+ * going on rather than remembered from the start: the server step takes
+ * minutes, and the permission can be turned off meanwhile.
+ *
+ * [kept] says the patched build is still whole on disk (see [buildKept]). It
+ * waits in the app's cache, which Android may clear when storage runs low, and
+ * removing the original with nothing to install in its place is the same loss
+ * as above. A build that is gone ends the patch with the original installed.
+ * Left unsaid, it counts as gone, so a ready build is never swapped in on trust.
+ */
+fun PatchJob.onwards(canInstall: Boolean, kept: Boolean = false): PatchJob = when {
+    built && !kept -> copy(
+        step = PatchStep.FAILED,
+        message = "The patched build was cleared from this phone before it could be installed. Patch it again.",
+    )
+    !canInstall -> copy(step = PatchStep.ALLOW_INSTALLS)
+    built -> copy(step = PatchStep.UNINSTALL)
+    else -> copy(step = PatchStep.READ)
+}
+
+/** Every file of a staged patched build is still there and not empty. */
+fun buildKept(files: List<File>?): Boolean =
+    !files.isNullOrEmpty() && files.all { it.isFile && it.length() > 0 }
+
+/** What a patch waiting at [PatchStep.ALLOW_INSTALLS] says: title, then two lines. */
+fun PatchJob.askToAllow(): Triple<String, String, String>? = when {
+    step != PatchStep.ALLOW_INSTALLS -> null
+    built -> Triple(
+        "Allow installs to finish",
+        "The patched build is ready, but Crossfyre Mobile can only install it once you turn on **Allow from this source** in Android settings.",
+        "$label is still installed. When you come back with it on, Android asks you to remove the original and install the patched build. Cancel keeps $label as it is.",
+    )
+    else -> Triple(
+        "Allow installs first",
+        "Crossfyre Mobile can only install the patched build once you turn on **Allow from this source** in Android settings.",
+        "Nothing has been read or uploaded yet. The patch starts when you come back with it on.",
+    )
 }
 
 /** What a finished patch says, by outcome: title, then two lines. */
 fun PatchJob.result(): Triple<String, String, String>? = when (step) {
-    PatchStep.DONE -> Triple(
+    PatchStep.DONE -> if (acceptsAnyCert) Triple(
+        "$label is patched",
+        "Start capture and use the app. This build accepts any certificate, not only this phone's, so with capture off anyone on the same network could read its traffic. Use it only for testing, and remove it when you are done.",
+        "Sign in to it again: removing the original cleared its data.",
+    ) else Triple(
         "$label is patched",
         "Start capture and use the app. It trusts this phone's certificate, so nothing needs installing in Android.",
         "Sign in to it again: removing the original cleared its data.",
@@ -181,4 +270,28 @@ fun PatchJob.result(): Triple<String, String, String>? = when (step) {
         "Patch again to install it, or reinstall the original from where you got it.",
     )
     else -> null
+}
+
+/** How the lists and an app's page name a current patch. */
+fun patchedLabel(acceptsAnyCert: Boolean): String =
+    if (acceptsAnyCert) "Patched: accepts any certificate" else "Patched with this certificate"
+
+/**
+ * What the phone says when capture stops and patched builds that accept any
+ * certificate are still installed, named by [labels]: title, then two lines.
+ * Null when there are none.
+ */
+fun restoreOffer(labels: List<String>): Triple<String, String, String>? {
+    val first = labels.firstOrNull() ?: return null
+    val more = labels.size - 1
+    return Triple(
+        "Put the original back?",
+        "$first is a patched build that accepts any certificate, not only this phone's. With capture off, anyone on the same network could read or change its traffic.",
+        "Uninstall it, or open the Play Store to uninstall it there and install the original. You will sign in to it again." +
+            when (more) {
+                0 -> ""
+                1 -> " One more patched app is like this."
+                else -> " $more more patched apps are like this."
+            },
+    )
 }

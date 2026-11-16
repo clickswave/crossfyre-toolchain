@@ -396,6 +396,8 @@ pub(crate) struct Mcp {
     /// A Cloud workspace, when a key is set up.
     pub cloud: crate::cloud::Slot,
     told: Mutex<Told>,
+    /// The masked site map last read, which a call that pages on with its cursor reuses.
+    pub site_map: Mutex<Option<crate::tools::workbench::MaskedMap>>,
 }
 
 impl Mcp {
@@ -437,6 +439,7 @@ impl Mcp {
             open_calls: Mutex::new(HashMap::new()),
             cloud: crate::cloud::Slot::None,
             told: Mutex::new(Told::default()),
+            site_map: Mutex::new(None),
             scope,
         }
     }
@@ -535,10 +538,15 @@ impl Mcp {
                 Reason::EngineUnavailable,
                 format!(
                     "{name} on 127.0.0.1:{port} is older than crossfyre mcp needs: it cannot be \
-                     told to dial only the addresses this server checked, or to leave redirects \
-                     alone, so nothing was sent. Update it with `crossfyre extension update \
-                     {name}`, restart it with `crossfyre extension restart {name}`, and call \
-                     again."
+                     told to dial only the addresses this server checked, {}, so nothing was \
+                     sent. Update it with `crossfyre extension update {name}`, restart it with \
+                     `crossfyre extension restart {name}`, and call again.",
+                    if options.contains(&"verify_certs") {
+                        "to leave redirects alone, or to check certificates before it sends a \
+                         captured session"
+                    } else {
+                        "or to leave redirects alone"
+                    }
                 ),
             )),
             Support::Failed(why) => Err(Refusal::new(

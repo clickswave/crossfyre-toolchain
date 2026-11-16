@@ -89,7 +89,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Cmd::Supervise { force } => cfx_core::run_boot(force, &base).await?,
         Cmd::Daemon { node_id, force } => {
-            let paths = cfx_core::NodePaths::new(&base, &node_id);
+            let paths = cfx_core::NodePaths::checked(&base, &node_id)?;
             cfx_core::run_daemon(force, &paths, env!("CARGO_PKG_VERSION")).await?;
         }
         #[cfg(windows)]

@@ -1,7 +1,9 @@
 package io.crossfyre.mobile
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -34,6 +36,22 @@ class PairingTest {
     fun http_to_a_public_host_is_never_allowed() {
         assertNull(Pairing.normaliseApiUrl("http://crossfyre.io", allowLocalHttp = true))
         assertNull(Pairing.normaliseApiUrl("http://172.32.0.1:12004", allowLocalHttp = true))
+    }
+
+    @Test
+    fun a_yes_to_full_requests_covers_only_the_pairing_it_was_given_for() {
+        val mine = Pairing("https://crossfyre.io", "wf-mine", "cfxt_1")
+        val given = FullCapturePrefs.keyOf(mine)
+        assertTrue(FullCapturePrefs.covers(given, mine))
+        // Pairing again renews the token, not the session.
+        assertTrue(FullCapturePrefs.covers(given, mine.copy(token = "cfxt_2")))
+        // Somebody else's server, by QR, even for a session id that matches.
+        assertFalse(FullCapturePrefs.covers(given, Pairing("https://elsewhere.example", "wf-mine", "cfxt_1")))
+        // Another session on the same server: another workspace, or a colleague's QR.
+        assertFalse(FullCapturePrefs.covers(given, mine.copy(workflowId = "wf-other")))
+        // No yes at all, or nothing paired.
+        assertFalse(FullCapturePrefs.covers(null, mine))
+        assertFalse(FullCapturePrefs.covers(given, null))
     }
 
     @Test

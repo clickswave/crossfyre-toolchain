@@ -142,3 +142,61 @@ async fn no_engine_sends_anything_to_a_host_outside_the_scope() {
         );
     }
 }
+
+/// A listener that answers each connection once, closes it, and counts connections.
+async fn answering_once() -> (u16, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let seen = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&seen);
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await;
+            });
+        }
+    });
+    (port, seen)
+}
+
+/// The smuggling probe opens its own sockets, reading the host out of the URL with
+/// its own parser. Whatever URL the scope check let through, the probe has to dial
+/// the host that check saw. Each URL below is admitted for the target's host and
+/// also has another host name in it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_smuggling_probe_dials_only_the_host_the_scope_check_saw() {
+    let (tport, tseen) = answering_once().await;
+    let (oport, oseen) = answering_once().await;
+    let target = format!("http://127.0.0.1:{tport}/");
+    let route = crate::rawhttp::Route {
+        egress: transport::Egress::Direct,
+        block_internal: false,
+    };
+    let none = crate::scope::Scope::default();
+    for url in [
+        format!("http://127.0.0.1:{tport}?@localhost:{oport}/x"),
+        format!("http://127.0.0.1:{tport}#@localhost:{oport}/x"),
+        format!("http://127.0.0.1:{tport}\\@localhost:{oport}/x"),
+    ] {
+        // The same order the injection pass uses: the fence, then the probe.
+        if crate::inject::in_scope(&target, &url, &none) {
+            let _ = crate::smuggle::probe(&url, &route).await;
+        }
+    }
+    assert_eq!(
+        oseen.load(Ordering::SeqCst),
+        0,
+        "the probe connected to a host the scope check never admitted"
+    );
+    assert!(
+        tseen.load(Ordering::SeqCst) > 0,
+        "the probe sent nothing to the target either, so this proves nothing"
+    );
+}

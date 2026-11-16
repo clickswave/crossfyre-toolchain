@@ -42,11 +42,15 @@ pub(crate) mod testkit;
 pub use imp::{TunnelGuard, bring_up};
 
 /// Ingest a node's network config: the tunnel selection the egress impl applies.
+///
+/// `tunnel_hooks` is the node's own `tunnel_hooks` setting (see `Config::tunnel_hooks`):
+/// whether a tunnel config may run its own scripts on this host.
 pub fn process_network_config(
     raw: &serde_json::Value,
     net_dir: &std::path::Path,
+    tunnel_hooks: bool,
 ) -> Option<crate::NetworkConfig> {
-    imp::process_network_config(raw, net_dir)
+    imp::process_network_config(raw, net_dir, tunnel_hooks)
 }
 
 /// The variable older nodes wrote into the engines' environment file.
@@ -72,8 +76,12 @@ fn is_legacy_env(text: &str) -> bool {
 /// now a per-op lease, so that file would only route a direct node's traffic through a
 /// proxy nobody switched on. A file with anything else in it was written by a person
 /// and is left alone. Returns whether the file was removed.
+///
+/// The daemon does this as root (LocalSystem on Windows) in the operator's tree, so it
+/// reads and removes through helpers that follow no link there.
 pub fn cleanup_legacy_env_file_at(path: &std::path::Path) -> std::io::Result<bool> {
-    let text = match std::fs::read_to_string(path) {
+    use crate::toolchain::sudo_user;
+    let text = match sudo_user::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e),
@@ -81,7 +89,7 @@ pub fn cleanup_legacy_env_file_at(path: &std::path::Path) -> std::io::Result<boo
     if !is_legacy_env(&text) {
         return Ok(false);
     }
-    std::fs::remove_file(path)?;
+    sudo_user::remove_file(path)?;
     Ok(true)
 }
 
@@ -139,5 +147,24 @@ mod tests {
             );
             assert_eq!(std::fs::read_to_string(&path).unwrap(), kept);
         }
+    }
+
+    /// The node service checks and removes this file as root (LocalSystem on Windows)
+    /// in the operator's tree: a link on the way there is not followed.
+    #[cfg(windows)]
+    #[test]
+    fn an_elevated_cleanup_will_not_remove_through_a_junction() {
+        let t = tempfile::tempdir().unwrap();
+        let victim = t.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        let legacy = "CROSSFYRE_EGRESS_PROXY=socks5://u:p@gw.example.net:1080\n";
+        std::fs::write(victim.join("egress.env"), legacy).unwrap();
+        let data = t.path().join("crossfyre");
+        crate::toolchain::sudo_user::junction(&data, &victim);
+
+        let _root = crate::toolchain::sudo_user::act_as_root();
+        let r = cleanup_legacy_env_file_at(&data.join("egress.env"));
+        assert!(!matches!(r, Ok(true)), "removed through a junction");
+        assert!(victim.join("egress.env").exists());
     }
 }

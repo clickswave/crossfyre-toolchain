@@ -8,6 +8,7 @@ pub(crate) mod fingerprint;
 pub(crate) mod http;
 pub(crate) mod info;
 pub(crate) mod inject;
+pub(crate) mod overrides;
 pub(crate) mod scans;
 pub(crate) mod workbench;
 

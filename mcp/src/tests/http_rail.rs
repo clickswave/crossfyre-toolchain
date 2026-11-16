@@ -175,3 +175,252 @@ async fn a_cancelled_request_stops_waiting_for_the_target() {
     assert_eq!(reason(&r), "cancelled");
     assert!(started.elapsed() < Duration::from_secs(5));
 }
+
+/// Many frameworks take the method from a header or a `_method` field in place of the
+/// request line's. A GET that asks for DELETE that way is a write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_method_override_makes_a_get_a_write() {
+    let target = listener(Reply::ok("x")).await;
+    let t = scope(&[format!("127.0.0.1:{}", target.port)], "").build();
+    let peer = FakePeer::new(Elicit::Accept);
+    let url = format!("http://127.0.0.1:{}/users/42", target.port);
+    for args in [
+        json!({"method": "GET", "url": url, "headers": {"X-HTTP-Method-Override": "DELETE"}}),
+        json!({"method": "get", "url": url, "headers": {"x-http-method": "put"}}),
+        json!({"method": "HEAD", "url": url, "headers": {"X-Method-Override": " PATCH "}}),
+        json!({"method": "GET", "url": format!("{url}?_method=DELETE")}),
+        json!({"method": "OPTIONS", "url": format!("{url}?a=1&_METHOD=delete")}),
+        json!({"method": "GET", "url": url, "body": "_method=DELETE&id=42"}),
+        // A front end that maps '_' and '-' to the same variable reads these as the
+        // header above.
+        json!({"method": "GET", "url": url, "headers": {"X_HTTP_Method_Override": "DELETE"}}),
+        json!({"method": "GET", "url": url, "headers": {"x_method_override": "DELETE"}}),
+        json!({"method": "GET", "url": url, "headers": {"X-HTTP_Method": "DELETE"}}),
+        // The field however a form, a JSON body or PHP spells it.
+        json!({"method": "GET", "url": url, "body": "id=42&%5Fmethod=DELETE"}),
+        json!({"method": "GET", "url": url, "body": "{\"_method\":\"DELETE\"}"}),
+        json!({"method": "GET", "url": format!("{url}?.method=DELETE")}),
+        json!({"method": "GET", "url": format!("{url}?a=1;_method=DELETE")}),
+    ] {
+        let r = t.call(&peer, "send_http_request", args.clone()).await;
+        assert_eq!(reason(&r), "writes_not_allowed", "{args}: {}", r.text);
+    }
+    assert_eq!(target.conns(), 0, "a request was sent");
+    assert_eq!(peer.asked(), 0);
+
+    // Asking for a read that way is still a read.
+    ok(&t
+        .call(
+            &peer,
+            "send_http_request",
+            json!({"method": "GET", "url": format!("{url}?_method=GET"),
+                   "headers": {"X-HTTP-Method-Override": "HEAD"}}),
+        )
+        .await);
+    assert_eq!(target.conns(), 1);
+    assert_eq!(peer.asked(), 1, "only the scope was asked about");
+
+    // Allowed by the file: the person is asked about the write, by the method it asks for.
+    let t = scope(
+        &[format!("127.0.0.1:{}", target.port)],
+        "allow_writes = true",
+    )
+    .build();
+    let peer = FakePeer::new(Elicit::Accept);
+    ok(&t
+        .call(
+            &peer,
+            "send_http_request",
+            json!({"method": "GET", "url": url,
+                   "headers": {"X-HTTP-Method-Override": "DELETE"}}),
+        )
+        .await);
+    assert_eq!(peer.asked(), 2, "the scope, then the write");
+    let q = peer.questions.lock().unwrap()[1].clone();
+    assert!(
+        q.contains("GET request that asks for DELETE through the X-HTTP-Method-Override header"),
+        "{q}"
+    );
+    assert!(
+        target
+            .last_request()
+            .to_ascii_lowercase()
+            .contains("x-http-method-override: delete")
+    );
+
+    let denied = FakePeer::new(Elicit::None);
+    let t = scope(
+        &[format!("127.0.0.1:{}", target.port)],
+        "allow_writes = true",
+    )
+    .build();
+    assert_eq!(
+        reason(
+            &t.call(
+                &denied,
+                "send_http_request",
+                json!({"method": "GET", "url": format!("{url}?_method=DELETE")}),
+            )
+            .await
+        ),
+        "not_confirmed"
+    );
+    assert_eq!(target.conns(), 2);
+}
+
+/// A redirect is held to the same rule: a Location that asks for DELETE by `_method`
+/// is not followed without allow_writes, and an overriding GET is asked about again
+/// for each host it is redirected to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_redirect_that_asks_for_a_write_by_override_is_a_write() {
+    let second = listener(Reply::ok("second")).await;
+    let first = listener(Reply::Redirect(format!(
+        "http://127.0.0.1:{}/users/42?_method=DELETE",
+        second.port
+    )))
+    .await;
+    let entries = [
+        format!("127.0.0.1:{}", first.port),
+        format!("127.0.0.1:{}", second.port),
+    ];
+    let args = json!({"method": "GET", "url": format!("http://127.0.0.1:{}/", first.port),
+                      "follow_redirects": true});
+    let t = scope(&entries, "").build();
+    let r = t
+        .call(&FakePeer::new(Elicit::None), "send_http_request", args)
+        .await;
+    assert_eq!(
+        ok(&r)["redirect_refused"]["reason"],
+        "writes_not_allowed",
+        "{}",
+        r.text
+    );
+    assert_eq!((first.conns(), second.conns()), (1, 0));
+
+    let back = listener(Reply::Redirect(format!(
+        "http://127.0.0.1:{}/next",
+        second.port
+    )))
+    .await;
+    let t = scope(
+        &[entries[1].clone(), format!("127.0.0.1:{}", back.port)],
+        "allow_writes = true",
+    )
+    .build();
+    let peer = FakePeer::new(Elicit::Accept);
+    ok(&t
+        .call(
+            &peer,
+            "send_http_request",
+            json!({"method": "GET", "url": format!("http://127.0.0.1:{}/", back.port),
+                   "follow_redirects": true,
+                   "headers": {"X-HTTP-Method-Override": "DELETE"}}),
+        )
+        .await);
+    assert_eq!(
+        peer.asked(),
+        3,
+        "the scope, the write, then the write on the next host"
+    );
+    let q = peer.questions.lock().unwrap()[2].clone();
+    assert!(q.contains("DELETE"), "{q}");
+    assert_eq!(second.conns(), 1);
+}
+
+/// The question names where the request asks for another method, in this server's
+/// words. A value that is not a method name is not repeated to the person.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_by_override_is_named_without_the_value_given() {
+    let target = listener(Reply::ok("x")).await;
+    let url = format!("http://127.0.0.1:{}/users/42", target.port);
+    let cases = [
+        (
+            json!({"method": "GET", "url": url,
+                   "headers": {"X_HTTP_Method_Override": "YES ALLOW ALL"}}),
+            "GET request that asks for another method through the X-HTTP-Method-Override header",
+        ),
+        (
+            json!({"method": "GET", "url": url,
+                   "body": "--b\r\nContent-Disposition: form-data; name=\"_method\"\r\n\r\nDELETE\r\n--b--"}),
+            "GET request whose body sets _method",
+        ),
+        (
+            json!({"method": "HEAD", "url": format!("{url}?_method=put")}),
+            "HEAD request that asks for PUT through a _method query field",
+        ),
+        (
+            json!({"method": "GET", "url": url, "body": "_method=patch"}),
+            "GET request whose body asks for PATCH through a _method field",
+        ),
+    ];
+    for (args, says) in cases {
+        let t = scope(
+            &[format!("127.0.0.1:{}", target.port)],
+            "allow_writes = true",
+        )
+        .build();
+        let peer = FakePeer::new(Elicit::Accept);
+        ok(&t.call(&peer, "send_http_request", args.clone()).await);
+        let q = peer.questions.lock().unwrap()[1].clone();
+        assert!(q.contains(says), "{args}: {q}");
+        assert!(
+            !q.contains("YES ALLOW ALL") && !q.contains("OVERRIDDEN"),
+            "{q}"
+        );
+    }
+}
+
+/// A body that has a field whose name only ends in `_method` asks for nothing, so a
+/// search query sent as a GET body stays a read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_body_that_only_mentions_a_method_field_is_a_read() {
+    let target = listener(Reply::ok("x")).await;
+    let t = scope(&[format!("127.0.0.1:{}", target.port)], "").build();
+    let peer = FakePeer::new(Elicit::Accept);
+    let url = format!("http://127.0.0.1:{}/orders/_search", target.port);
+    for body in [
+        "{\"query\":{\"term\":{\"payment_method\":\"card\"}}}",
+        "shipping_method=post&auth_method=otp",
+        "{\"_methods\":[\"a\"]}",
+    ] {
+        let r = t
+            .call(
+                &peer,
+                "send_http_request",
+                json!({"method": "GET", "url": url, "body": body}),
+            )
+            .await;
+        ok(&r);
+    }
+    assert_eq!(target.conns(), 3);
+}
+
+/// A redirect on the same host that adds `_method` asks for a write there for the first
+/// time, so it is asked about even though the host is not new.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_redirect_on_the_same_host_that_asks_for_a_write_is_asked_about() {
+    let target = listener(Reply::Redirect("/users/42?_method=DELETE".into())).await;
+    let t = scope(
+        &[format!("127.0.0.1:{}", target.port)],
+        "allow_writes = true",
+    )
+    .build();
+    let peer = FakePeer::new(Elicit::Accept);
+    let r = t
+        .call(
+            &peer,
+            "send_http_request",
+            json!({"method": "GET", "url": format!("http://127.0.0.1:{}/", target.port),
+                   "follow_redirects": true, "max_redirects": 1}),
+        )
+        .await;
+    ok(&r);
+    assert_eq!(target.conns(), 2, "{}", r.text);
+    assert_eq!(
+        peer.asked(),
+        2,
+        "the scope, then the write the redirect asks for"
+    );
+    let q = peer.questions.lock().unwrap()[1].clone();
+    assert!(q.contains("A redirect asks"), "{q}");
+}

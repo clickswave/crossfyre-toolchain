@@ -41,16 +41,23 @@ internal class Teardown(private val steps: List<Pair<String, () -> Unit>>) {
  * service asks the native side every [EVERY_MS] instead and stops the capture
  * itself, once, while it runs.
  *
+ * The same look tells the service when requests start or stop waiting for a
+ * decision in the dashboard, for the notification to say so: the app is usually
+ * in the background then too.
+ *
  * @param stats the native side's counters as JSON, or null when it has none.
  * @param refused stops the capture.
+ * @param holding hears whether requests wait for the dashboard, each time that changes.
  * @param after runs the next look after a delay.
  */
 internal class TokenWatch(
     private val stats: () -> String?,
     private val refused: () -> Unit,
+    private val holding: (Boolean) -> Unit = {},
     private val after: (Long, () -> Unit) -> Unit,
 ) {
     private var on = false
+    private var held = false
 
     fun start() {
         on = true
@@ -65,10 +72,15 @@ internal class TokenWatch(
     private fun look() {
         if (!on) return
         val json = runCatching { stats() }.getOrNull()
-        if (json != null && runCatching { Stats.parse(json).tokenRefused }.getOrDefault(false)) {
+        val now = json?.let { runCatching { Stats.parse(it) }.getOrNull() }
+        if (now?.tokenRefused == true) {
             on = false
             refused()
             return
+        }
+        if (now != null && now.holding != held) {
+            held = now.holding
+            holding(held)
         }
         after(EVERY_MS, ::look)
     }
@@ -77,3 +89,11 @@ internal class TokenWatch(
         const val EVERY_MS = 1_000L
     }
 }
+
+/**
+ * What the capture notification says. While each request waits for a decision in
+ * the dashboard it says that, because the person is usually in another app then,
+ * and an app waiting on somebody else otherwise just looks broken.
+ */
+internal fun captureNotice(holding: Boolean): String =
+    if (holding) "Requests wait for the dashboard before they go on" else "Capturing traffic for authorized testing"

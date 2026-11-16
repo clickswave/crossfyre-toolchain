@@ -32,11 +32,25 @@ fn run_within(stdin: &str, limit: Duration) -> Run {
 static SPAWNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn run_with_env(stdin: &str, env: &[(&str, &std::ffi::OsStr)], limit: Duration) -> Run {
+    run_in(stdin, None, env, limit)
+}
+
+/// `run_with_env`, with the helper started in `dir` when one is given.
+fn run_in(
+    stdin: &str,
+    dir: Option<&std::path::Path>,
+    env: &[(&str, &std::ffi::OsStr)],
+    limit: Duration,
+) -> Run {
     let mut child = {
         let _alone = SPAWNING
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Command::new(env!("CARGO_BIN_EXE_cfx-script"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cfx-script"));
+        if let Some(dir) = dir {
+            command.current_dir(dir);
+        }
+        command
             .envs(env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -336,6 +350,42 @@ fn the_toolchain_dir_comes_from_the_environment_even_when_it_is_not_utf8() {
     assert_eq!(r.status, 0, "stderr: {}", r.stderr);
     assert_eq!(types(&r), ["result", "completed"]);
     assert_eq!(r.messages[0]["data"]["port"], 5999);
+}
+
+#[test]
+fn a_script_runs_in_the_directory_its_caller_was_in_not_the_one_it_started_in() {
+    // The caller starts the helper in a folder of its own, so that Windows finds
+    // python3.dll there and not in whatever directory the operator ran crossfyre from,
+    // and names its own directory in CFX_SCRIPT_WORKING_DIR. A script's relative paths
+    // are the caller's.
+    let base = std::env::temp_dir().join(format!("cfx-script-cwd-{}", std::process::id()));
+    let started = base.join("started");
+    let caller = base.join("caller");
+    std::fs::create_dir_all(&started).unwrap();
+    std::fs::create_dir_all(&caller).unwrap();
+    std::fs::write(caller.join("targets.txt"), "from the caller").unwrap();
+    let r = run_in(
+        &job("import cfxs, os\ndef run():\n    \
+             cfxs.connect().send_result({'cwd': os.getcwd(), \
+             'read': open('targets.txt').read()})\n"),
+        Some(&started),
+        &[("CFX_SCRIPT_WORKING_DIR", caller.as_os_str())],
+        LIMIT,
+    );
+    let seen = r.messages.first().map(|m| {
+        let cwd = m["data"]["cwd"].as_str().unwrap_or("").to_string();
+        (
+            std::path::Path::new(&cwd).canonicalize().ok(),
+            m["data"]["read"].clone(),
+        )
+    });
+    let caller = caller.canonicalize().unwrap();
+    let _ = std::fs::remove_dir_all(&base);
+    assert_eq!(r.status, 0, "stderr: {}", r.stderr);
+    assert_eq!(types(&r), ["result", "completed"]);
+    let (cwd, read) = seen.unwrap();
+    assert_eq!(cwd, Some(caller));
+    assert_eq!(read, "from the caller");
 }
 
 #[cfg(unix)]

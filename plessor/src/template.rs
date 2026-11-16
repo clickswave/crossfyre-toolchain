@@ -1397,4 +1397,55 @@ mod tests {
         };
         assert!(super::matches_one(&m, &resp));
     }
+
+    #[test]
+    fn open_redirect_confirms_on_the_landing_page_or_the_location_it_was_handed() {
+        // A client carrying a credential or an attribution token gets a redirect
+        // to another host back unfollowed, so the template has to read the
+        // redirect itself as well as the page it lands on.
+        let t = super::PACK
+            .iter()
+            .find(|t| t.id == "open-redirect-param")
+            .expect("open-redirect template in the pack");
+        let req = &t.http[0];
+        let resp = |status: u16, headers: &str, body: &str| super::Resp {
+            url: "http://app.test/?next=https://example.com/".to_string(),
+            status,
+            headers: headers.to_string(),
+            body: body.to_string(),
+        };
+        let landing = "<h1>Example Domain</h1><p>for use in illustrative examples in documents</p>";
+        assert!(super::matches_all(req, &resp(200, "", landing)));
+        for location in [
+            "https://example.com/",
+            "http://example.com",
+            "//example.com/",
+            "https://example.com:443/path",
+        ] {
+            let h = format!("content-length: 0\nlocation: {location}\n");
+            for status in [301, 302, 303, 307, 308] {
+                assert!(
+                    super::matches_all(req, &resp(status, &h, "")),
+                    "{status} to {location} should match"
+                );
+            }
+        }
+        // A redirect that stays on the site, or only names example.com, is not one.
+        for location in [
+            "/login?next=https://example.com/",
+            "https://app.test/?next=https://example.com/",
+            "https://example.com.app.test/",
+            "https://notexample.com/",
+        ] {
+            let h = format!("location: {location}\n");
+            assert!(
+                !super::matches_all(req, &resp(302, &h, "")),
+                "302 to {location} should not match"
+            );
+        }
+        assert!(!super::matches_all(
+            req,
+            &resp(200, "location: https://example.com/\n", "")
+        ));
+    }
 }

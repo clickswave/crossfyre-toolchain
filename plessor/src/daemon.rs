@@ -98,23 +98,12 @@ async fn handle_connection(stream: TcpStream, gate: dguard::Gate) -> Result<(), 
         if line.is_empty() {
             continue;
         }
-        // The bind address is the primary boundary. This is the second one, for
-        // deployments that used CFX_DAEMON_BIND to move the listener off loopback;
-        // with no token configured it is a no-op.
-        if !gate.allows(
-            serde_json::from_str::<serde_json::Value>(&line)
-                .ok()
-                .as_ref()
-                .and_then(|v| v.get("token"))
-                .and_then(|t| t.as_str()),
-        ) {
-            // Same `type`/`message` envelope as every other reply: a client that
-            // breaks on `type == "error"` has to recognise this one, or it waits
-            // for a line that never comes. Then close, rather than leaving an
-            // unauthenticated peer a socket to retry on.
-            let _ = writer
-                .write_all(b"{\"type\":\"error\",\"message\":\"unauthorized\"}\n")
-                .await;
+        // A line that is not a JSON object is not from a client (an HTTP request
+        // from a web page starts that way), and a request without the configured
+        // token is not from an authorised one. Either ends the connection, so
+        // nothing written after that line is ever read as a request.
+        if let Some(reply) = gate.refusal(&line) {
+            let _ = writer.write_all(reply.as_bytes()).await;
             break;
         }
 
@@ -151,7 +140,7 @@ async fn handle_connection(stream: TcpStream, gate: dguard::Gate) -> Result<(), 
                     &serde_json::json!({
                         "type": "capabilities",
                         "cancel": true,
-                        "inject": ["follow_redirects", "resolve"],
+                        "inject": ["follow_redirects", "resolve", "verify_certs"],
                         // The version of the egress wrapper this daemon reads.
                         "egress": transport::WIRE_VERSION,
                     }),
@@ -485,17 +474,75 @@ mod tests {
         })
     }
 
+    /// A target that sends `/p` to `/landing` on itself and answers that, counting
+    /// the requests that reach `/landing`.
+    async fn same_origin_redirector() -> (u16, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let landed = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&landed);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let seen = Arc::clone(&counter);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 16384];
+                    while let Ok(n) = sock.read(&mut buf).await {
+                        if n == 0 {
+                            return;
+                        }
+                        let head = String::from_utf8_lossy(&buf[..n]);
+                        let path = head.split_whitespace().nth(1).unwrap_or("");
+                        let reply = if path.starts_with("/landing") {
+                            seen.fetch_add(1, Ordering::SeqCst);
+                            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+                        } else {
+                            "HTTP/1.1 302 Found\r\nLocation: /landing\r\nContent-Length: 0\r\n\r\n"
+                        };
+                        if sock.write_all(reply.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (port, landed)
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn follow_redirects_false_keeps_every_request_on_the_target() {
+        let (sport, landed) = same_origin_redirector().await;
+        let dport = daemon().await;
+        let url = format!("http://127.0.0.1:{sport}/p?q=1");
+
+        let mut op = one_endpoint_op(&url);
+        op["follow_redirects"] = Value::Bool(false);
+        run_to_done(dport, &op).await;
+        assert_eq!(
+            landed.load(Ordering::SeqCst),
+            0,
+            "a redirect was followed with follow_redirects false"
+        );
+
+        // Left out, the old behaviour stands, so the fixture does redirect.
+        run_to_done(dport, &one_endpoint_op(&url)).await;
+        assert!(landed.load(Ordering::SeqCst) > 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_redirect_off_the_target_is_never_followed() {
+        // With follow_redirects left on, a redirect is followed only on the
+        // target's own origin. Another host, here one that answers everything, is
+        // not sent the probes.
         let (elsewhere, elsewhere_seen) = target(Duration::ZERO).await;
         let (rport, redirector_seen) =
             redirector(format!("http://127.0.0.1:{elsewhere}/admin")).await;
         let dport = daemon().await;
         let url = format!("http://127.0.0.1:{rport}/p?q=1");
 
-        let mut op = one_endpoint_op(&url);
-        op["follow_redirects"] = Value::Bool(false);
-        run_to_done(dport, &op).await;
+        run_to_done(dport, &one_endpoint_op(&url)).await;
         assert!(
             redirector_seen.load(Ordering::SeqCst) > 0,
             "nothing was sent"
@@ -503,12 +550,48 @@ mod tests {
         assert_eq!(
             elsewhere_seen.load(Ordering::SeqCst),
             0,
-            "a redirect was followed with follow_redirects false"
+            "a redirect off the target's origin was followed"
         );
+    }
 
-        // Left out, the old behaviour stands, so the fixture does redirect.
-        run_to_done(dport, &one_endpoint_op(&url)).await;
-        assert!(elsewhere_seen.load(Ordering::SeqCst) > 0);
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_template_scan_does_not_follow_a_redirect_off_the_target() {
+        let (elsewhere, elsewhere_seen) = target(Duration::ZERO).await;
+        let (rport, redirector_seen) =
+            redirector(format!("http://127.0.0.1:{elsewhere}/admin")).await;
+        let dport = daemon().await;
+        let dir = std::env::temp_dir().join(format!("plessor-redirect-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("probe.yaml"),
+            "id: redirect-probe\n\
+             info:\n  name: redirect probe\n  severity: info\n\
+             http:\n  - method: POST\n    path:\n\
+             \x20     - \"{{BaseURL}}/form\"\n    body: \"q=probe\"\n    matchers:\n\
+             \x20     - type: status\n        status:\n          - 200\n",
+        )
+        .unwrap();
+        let op = serde_json::json!({
+            "operation": "scan",
+            "response": "stream",
+            "target": format!("http://127.0.0.1:{rport}"),
+            "templates_dir": dir.to_string_lossy(),
+            "only": ["redirect-probe"],
+            "evasive": false,
+            "follow_redirects": true,
+            "timeout_ms": 5000,
+        });
+        let events = run_to_done(dport, &op).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            redirector_seen.load(Ordering::SeqCst) > 0,
+            "nothing was sent: {events:?}"
+        );
+        assert_eq!(
+            elsewhere_seen.load(Ordering::SeqCst),
+            0,
+            "a template request followed a redirect off the target"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -537,7 +620,7 @@ mod tests {
             .await
             .expect("an answer");
         assert_eq!(caps["type"], "capabilities", "{caps}");
-        for want in ["follow_redirects", "resolve"] {
+        for want in ["follow_redirects", "resolve", "verify_certs"] {
             assert!(
                 caps["inject"]
                     .as_array()
@@ -780,5 +863,279 @@ mod tests {
         );
         assert_eq!(fx.connections(), 0);
         assert_eq!(proxy.connections(), 0);
+    }
+}
+
+#[cfg(test)]
+mod http_request_tests {
+    //! A web page open in the operator's browser can POST to this port. The browser
+    //! writes a request line and headers before the body the page chose, so the
+    //! connection has to end at the request line, before the body is read.
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn daemon() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(serve(listener, dguard::Gate::default()));
+        port
+    }
+
+    /// Sends `raw` and returns the lines the daemon wrote back, and whether it
+    /// closed the connection.
+    async fn send(port: u16, raw: &str) -> (Vec<String>, bool) {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        s.write_all(raw.as_bytes()).await.unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        let closed = loop {
+            match tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => break true,
+                Ok(Ok(n)) => got.extend_from_slice(&buf[..n]),
+                Err(_) => break false,
+            }
+        };
+        let lines = String::from_utf8_lossy(&got)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        (lines, closed)
+    }
+
+    #[tokio::test]
+    async fn an_http_post_is_closed_at_its_request_line() {
+        let port = daemon().await;
+        let body = "{\"operation\":\"capabilities\"}\n";
+        let raw = format!(
+            "POST / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://page.test\r\n\
+             Content-Type: text/plain;charset=UTF-8\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let (lines, closed) = send(port, &raw).await;
+        assert!(closed, "the connection stayed open: {lines:?}");
+        assert!(
+            lines.len() <= 1,
+            "answered the HTTP lines one by one: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("capabilities")),
+            "read the body as a request: {lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_line_that_is_json_but_not_an_object_closes_too() {
+        let port = daemon().await;
+        let (lines, closed) = send(port, "[1]\n{\"operation\":\"capabilities\"}\n").await;
+        assert!(closed, "the connection stayed open: {lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.contains("capabilities")),
+            "read on past the first line: {lines:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod session_tls_tests {
+    //! A session handed in as `auth` goes only where it can be trusted to go: past a
+    //! certificate check when the caller asks for one, and never to the OAST API.
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    const COOKIE: &str = "sid=SESSION-COOKIE-7f3a";
+    const BEARER: &str = "Bearer SESSION-BEARER-91c2";
+
+    async fn daemon() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(serve(listener, dguard::Gate::default()));
+        port
+    }
+
+    /// Every request a fixture read, as text.
+    type Seen = Arc<Mutex<Vec<String>>>;
+
+    async fn answer<S>(mut sock: S, seen: Seen, reply: &'static [u8])
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let mut buf = [0u8; 16384];
+        loop {
+            match sock.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    seen.lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase());
+                    if sock.write_all(reply).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    const PAGE: &[u8] =
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 2\r\n\r\nok";
+
+    /// An HTTPS origin whose certificate nothing vouches for, which is what a machine
+    /// in the middle presents.
+    async fn self_signed_origin() -> (u16, Seen) {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("mint");
+        let der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
+        let key =
+            rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).expect("key");
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("tls protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(vec![der], key)
+        .expect("server config");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let seen: Seen = Arc::default();
+        let s = Arc::clone(&seen);
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (acceptor, s) = (acceptor.clone(), Arc::clone(&s));
+                tokio::spawn(async move {
+                    if let Ok(tls) = acceptor.accept(stream).await {
+                        answer(tls, s, PAGE).await;
+                    }
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    /// A plain HTTP listener that answers every request with `reply`.
+    async fn plain(reply: &'static [u8]) -> (u16, Seen) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let seen: Seen = Arc::default();
+        let s = Arc::clone(&seen);
+        tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(answer(sock, Arc::clone(&s), reply));
+            }
+        });
+        (port, seen)
+    }
+
+    async fn run_to_done(dport: u16, op: &Value) -> Vec<Value> {
+        let stream = TcpStream::connect(("127.0.0.1", dport)).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut lines = BufReader::new(r).lines();
+        let mut line = op.to_string();
+        line.push('\n');
+        w.write_all(line.as_bytes()).await.unwrap();
+        let mut events = Vec::new();
+        loop {
+            let l = tokio::time::timeout(Duration::from_secs(120), lines.next_line())
+                .await
+                .expect("the operation ended without a done")
+                .unwrap()
+                .expect("the daemon closed before done");
+            let Ok(ev) = serde_json::from_str::<Value>(&l) else {
+                continue;
+            };
+            let done = ev["type"] == "done";
+            events.push(ev);
+            if done {
+                return events;
+            }
+        }
+    }
+
+    fn with_session(url: &str) -> Value {
+        serde_json::json!({
+            "operation": "inject",
+            "response": "stream",
+            "target": url,
+            "endpoints": [{"method": "GET", "url": url}],
+            "classes": ["xss"],
+            "evasive": false,
+            "follow_redirects": false,
+            "auth": {"cookies": COOKIE, "headers": {"authorization": BEARER}},
+        })
+    }
+
+    fn carried_session(seen: &Seen) -> usize {
+        let cookie = COOKIE.to_ascii_lowercase();
+        let bearer = BEARER.to_ascii_lowercase();
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.contains(&cookie) || r.contains(&bearer))
+            .count()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn verify_certs_keeps_a_session_from_an_origin_nothing_vouches_for() {
+        let (port, seen) = self_signed_origin().await;
+        let dport = daemon().await;
+        let url = format!("https://localhost:{port}/p?q=1");
+        let pin = serde_json::json!([["localhost", format!("127.0.0.1:{port}")]]);
+
+        let mut op = with_session(&url);
+        op["resolve"] = pin.clone();
+        op["verify_certs"] = Value::Bool(true);
+        run_to_done(dport, &op).await;
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            0,
+            "requests were sent past a certificate that does not check out"
+        );
+
+        // Left out, the old behaviour stands for the callers that rely on it, which
+        // also shows the fixture is reachable at all.
+        let mut op = with_session(&url);
+        op["resolve"] = pin;
+        run_to_done(dport, &op).await;
+        assert!(carried_session(&seen) > 0, "the fixture was never reached");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_oast_api_is_not_sent_the_session() {
+        let (tport, target_seen) = plain(PAGE).await;
+        let (oport, oast_seen) = plain(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 12\r\n\r\n{\"ok\":false}",
+        )
+        .await;
+        let dport = daemon().await;
+        let mut op = with_session(&format!("http://127.0.0.1:{tport}/p?q=1"));
+        op["oast"] = serde_json::json!({
+            "domains": ["oast.invalid"],
+            "api_url": format!("http://127.0.0.1:{oport}"),
+        });
+        run_to_done(dport, &op).await;
+        assert!(
+            carried_session(&target_seen) > 0,
+            "the target never got the session"
+        );
+        assert!(
+            !oast_seen.lock().unwrap().is_empty(),
+            "the OAST API was never asked to register"
+        );
+        assert_eq!(
+            carried_session(&oast_seen),
+            0,
+            "the session went to the OAST API: {:?}",
+            oast_seen.lock().unwrap()
+        );
     }
 }

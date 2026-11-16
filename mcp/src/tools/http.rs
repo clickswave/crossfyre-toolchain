@@ -5,8 +5,9 @@
 //! followed only when asked, by this code rather than the client, so every hop goes
 //! through the guard before anything is sent to it.
 
+use super::overrides::{self, Asked, Via};
 use super::{in_range, parse_args, result_size};
-use crate::confirm::WriteAsk;
+use crate::confirm::{AskKind, WriteAsk};
 use crate::core::{CallNote, Clearance, Done, Intent, Mcp, Reason, Refusal, TrafficRequest};
 use crate::guard;
 use crate::peer::ClientPeer;
@@ -66,6 +67,29 @@ struct Args {
 
 fn safe(method: &str) -> bool {
     matches!(method, "GET" | "HEAD" | "OPTIONS")
+}
+
+/// What the request asks for by override, when that is not a read: a GET carrying
+/// `X-HTTP-Method-Override: DELETE`, `_method=DELETE` in its query, or a body that sets
+/// `_method`.
+fn overriding_write(url: &str, headers: &[(String, String)], body: Option<&str>) -> Option<Asked> {
+    let from_headers = headers
+        .iter()
+        .filter_map(|(k, v)| overrides::header(k).map(|h| Asked::new(Via::Header(h), Some(v))));
+    let from_query = overrides::in_query(url)
+        .into_iter()
+        .map(|(_, v)| Asked::new(Via::Query, Some(&v)));
+    let from_body = body.map(overrides::in_body).unwrap_or_default();
+    overrides::first_write(from_headers.chain(from_query).chain(from_body))
+}
+
+/// How a write question names the request: `DELETE request`, or `GET request that
+/// asks for DELETE through the X-HTTP-Method-Override header`.
+fn described(method: &str, overridden: Option<&Asked>) -> String {
+    match overridden {
+        Some(a) => a.describe(method),
+        None => format!("{method} request"),
+    }
 }
 
 struct Sent {
@@ -244,7 +268,14 @@ pub(crate) async fn run(
         }
     }
 
-    let intent = if safe(&method) {
+    // A framework can be asked to act on another method than the request line's. A GET
+    // that asks for DELETE that way is a write here too.
+    let overridden = if safe(&method) {
+        overriding_write(&dest.url, &headers, a.body.as_deref())
+    } else {
+        None
+    };
+    let intent = if safe(&method) && overridden.is_none() {
         Intent::Read
     } else {
         Intent::Write
@@ -289,12 +320,13 @@ pub(crate) async fn run(
     let write = (intent == Intent::Write).then(|| WriteAsk {
         remember: Some(dest.key()),
         message: format!(
-            "send_http_request will send a {method} request to {}. Methods other than GET, \
-             HEAD and OPTIONS can change or destroy data. Allow them to {} for the rest of this \
-             session?",
+            "send_http_request will send a {} to {}. Methods other than GET, HEAD and \
+             OPTIONS can change or destroy data. Allow them to {} for the rest of this session?",
+            described(&method, overridden.as_ref()),
             untrusted::clean(&dest.origin(), 200),
             untrusted::clean(&dest.key(), 200)
         ),
+        kind: AskKind::Write,
     });
     let mut clearance = mcp.confirm(pending, peer, write, note, ct).await?;
 
@@ -386,14 +418,29 @@ pub(crate) async fn run(
         if next.origin() != current.origin() {
             headers.retain(|(k, _)| crosses_origins(k));
         }
-        let write = (!safe(&method) && next.key() != current.key()).then(|| WriteAsk {
+        let overridden = if safe(&method) {
+            overriding_write(&next.url, &headers, body.as_deref())
+        } else {
+            None
+        };
+        let hop_writes = !safe(&method) || overridden.is_some();
+        // The Location can carry a `_method` of its own, and the file may not allow writes.
+        if hop_writes && !mcp.scope.allow_writes {
+            refused_hop = Some((shown_loc, "writes_not_allowed"));
+            break sent;
+        }
+        // Asked whenever the hop writes. A yes already given for this host and port
+        // covers it without asking again, and a plain read before it never did.
+        let write = hop_writes.then(|| WriteAsk {
             remember: Some(next.key()),
             message: format!(
-                "A redirect asks to send the {method} request on to {}. Allow write methods to \
-                 {} for the rest of this session?",
+                "A redirect asks to send the {} on to {}. Allow write methods to {} for the \
+                 rest of this session?",
+                described(&method, overridden.as_ref()),
                 untrusted::clean(&next.origin(), 200),
                 untrusted::clean(&next.key(), 200)
             ),
+            kind: AskKind::Write,
         });
         match mcp.clear_hop(next.clone(), peer, write, ct).await {
             Ok(c) => {

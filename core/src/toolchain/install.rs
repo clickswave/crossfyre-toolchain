@@ -15,6 +15,7 @@ use super::config::{
     ext_bin_path, ext_file_name, file_name, get_bin_dir, is_regular_file, legacy_bin_path,
 };
 use super::packaging::{self, Manager, remove_note, update_note};
+use super::release_http::{Purpose, http_client};
 use super::service;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -75,32 +76,21 @@ fn installed_ext_version(ext: &str) -> Option<String> {
 /// reports. The installer places the CLI, the node and cfx-script without a sidecar, and
 /// an update that read the missing record as an old binary downloaded the same version
 /// again and counted it as updated.
-fn recorded_or_reported(
-    sidecar: &Path,
-    bin: &Path,
-    name: &str,
-    envs: Vec<(std::ffi::OsString, std::ffi::OsString)>,
-) -> Option<String> {
+fn recorded_or_reported(sidecar: &Path, name: &str, command: Command) -> Option<String> {
     let recorded = fs::read_to_string(sidecar)
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    recorded.or_else(|| reported_version(bin, name, envs))
+    recorded.or_else(|| reported_version(command, name))
 }
 
-/// What `<bin> --version` says the version is, when it answers `<name> <version>` and
+/// What `command --version` says the version is, when it answers `<name> <version>` and
 /// exits 0 within a few seconds. A cfx-script from before it took `--version` reads the
 /// flag as no job, and refuses the empty stdin it is given with status 2, so it has no
 /// version to report.
-fn reported_version(
-    bin: &Path,
-    name: &str,
-    envs: Vec<(std::ffi::OsString, std::ffi::OsString)>,
-) -> Option<String> {
-    let mut command = Command::new(bin);
+fn reported_version(mut command: Command, name: &str) -> Option<String> {
     command
         .arg("--version")
-        .envs(envs)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -158,10 +148,27 @@ fn installed_node_version() -> Option<String> {
     }
     recorded_or_reported(
         &get_bin_dir().join("node.version"),
-        &bin,
         "node",
-        Vec::new(),
+        Command::new(&bin),
     )
+}
+
+/// Whether the node worker in the bin directory is from a release whose node, run as
+/// root, hands the configs it writes back to the operator: node 0.1.52 (shipped with
+/// crossfyre 0.1.42) and every one before it, and a worker that cannot say which
+/// version it is. False when there is no worker.
+pub fn installed_node_predates_root_configs() -> bool {
+    if !ext_bin_path("node").exists() {
+        return false;
+    }
+    let Some(v) = installed_node_version() else {
+        return true;
+    };
+    let mut parts = v.split(['.', '-', '+']).map(|p| p.parse::<u64>().ok());
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(Some(a)), Some(Some(b)), Some(Some(c))) => (a, b, c) <= (0, 1, 52),
+        _ => true,
+    }
 }
 
 /// The version of the cfx-script in the bin directory, if there is one.
@@ -170,8 +177,8 @@ fn installed_helper_version() -> Option<String> {
     if !bin.exists() {
         return None;
     }
-    let envs = crate::executor::python_env(&bin);
-    recorded_or_reported(&ext_version_file(CFX_SCRIPT), &bin, CFX_SCRIPT, envs)
+    let command = crate::executor::helper_command(&bin);
+    recorded_or_reported(&ext_version_file(CFX_SCRIPT), CFX_SCRIPT, command)
 }
 
 /// The record of a cfx-script release that was downloaded and could not start on this
@@ -321,8 +328,17 @@ pub fn platform_key() -> String {
 }
 
 pub async fn fetch_manifest() -> Result<Manifest, Box<dyn std::error::Error>> {
-    let url = format!("{BASE_URL}/manifest.json");
-    let resp = reqwest::get(&url)
+    fetch_manifest_from(BASE_URL).await
+}
+
+/// `fetch_manifest` against `base`, which a test points at a loopback origin.
+pub(crate) async fn fetch_manifest_from(
+    base: &str,
+) -> Result<Manifest, Box<dyn std::error::Error>> {
+    let url = format!("{base}/manifest.json");
+    let resp = http_client(Purpose::Check)?
+        .get(&url)
+        .send()
         .await
         .map_err(|e| format!("could not fetch release manifest ({url}): {e}"))?;
     if !resp.status().is_success() {
@@ -355,7 +371,9 @@ pub async fn fetch_manifest() -> Result<Manifest, Box<dyn std::error::Error>> {
 /// is a release-pipeline failure and the message says so rather than reading as a
 /// network problem.
 async fn fetch_signature(url: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let resp = reqwest::get(url)
+    let resp = http_client(Purpose::Check)?
+        .get(url)
+        .send()
         .await
         .map_err(|e| format!("could not fetch the release manifest signature ({url}): {e}"))?;
     if !resp.status().is_success() {
@@ -400,13 +418,17 @@ fn resolve_keys<'m>(
     Ok((comp, artifact))
 }
 
-/// Download an artifact to `dest` and verify its SHA256 against the manifest.
+/// Download an artifact to `dest` and verify its SHA256 against the manifest. `purpose`
+/// says whether it installs the component or replaces an installed copy.
 async fn download_verified(
     artifact: &Artifact,
     dest: &Path,
+    purpose: Purpose,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let url = format!("{}/{}", BASE_URL, artifact.file);
-    let resp = reqwest::get(&url)
+    let resp = http_client(purpose)?
+        .get(&url)
+        .send()
         .await
         .map_err(|e| format!("download failed ({url}): {e}"))?;
     if !resp.status().is_success() {
@@ -610,8 +632,7 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
 fn helper_starts(path: &Path) -> Result<(), String> {
     let mut busy = 0;
     let out = loop {
-        let run = Command::new(path)
-            .envs(crate::executor::python_env(path))
+        let run = crate::executor::helper_command(path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -732,7 +753,8 @@ pub async fn install_cfx_script(
 
     let tmp_dir = tempfile::tempdir()?;
     let zip_path = tmp_dir.path().join(&artifact.file);
-    download_verified(artifact, &zip_path).await?;
+    let purpose = Purpose::replacing(replaced.is_some() || dest.exists());
+    download_verified(artifact, &zip_path, purpose).await?;
     let extract_dir = tmp_dir.path().join("extracted");
     extract_zip(&zip_path, &extract_dir)?;
     let extracted = extract_dir.join(ext_file_name(CFX_SCRIPT));
@@ -866,7 +888,8 @@ async fn install_one(
 
     let tmp_dir = tempfile::tempdir().map_err(|e| format!("Failed to create temp dir: {e}"))?;
     let zip_path = tmp_dir.path().join(&artifact.file);
-    download_verified(artifact, &zip_path).await?;
+    let purpose = Purpose::replacing(super::config::is_extension_installed(ext));
+    download_verified(artifact, &zip_path, purpose).await?;
 
     if !quiet {
         working("Installing");
@@ -1501,7 +1524,8 @@ pub async fn self_update(
     }
     let tmp_dir = tempfile::tempdir()?;
     let zip_path = tmp_dir.path().join(&artifact.file);
-    download_verified(artifact, &zip_path).await?;
+    // The CLI asking is the installed copy, so this always replaces one.
+    download_verified(artifact, &zip_path, Purpose::Update).await?;
 
     let extract_dir = tmp_dir.path().join("extracted");
     extract_zip(&zip_path, &extract_dir)?;
@@ -1562,9 +1586,8 @@ pub fn installed_cli_version() -> String {
     let bin = dir.join(ext_file_name("crossfyre"));
     recorded_or_reported(
         &dir.join("crossfyre.version"),
-        &bin,
         "crossfyre",
-        Vec::new(),
+        Command::new(&bin),
     )
     .unwrap_or_default()
 }
@@ -1611,7 +1634,7 @@ pub async fn download_node(
 
     let tmp_dir = tempfile::tempdir()?;
     let zip_path = tmp_dir.path().join(&artifact.file);
-    download_verified(artifact, &zip_path).await?;
+    download_verified(artifact, &zip_path, Purpose::replacing(stable.exists())).await?;
     let extract_dir = tmp_dir.path().join("extracted");
     extract_zip(&zip_path, &extract_dir)?;
     let extracted = extract_dir.join(ext_file_name("node"));
@@ -2236,6 +2259,27 @@ mod tests {
         assert!(!s.join("cfx-script.new").exists(), "nothing is left staged");
     }
 
+    /// A shell test that holds when the script runs in the folder it is in.
+    #[cfg(unix)]
+    const IN_OWN_FOLDER: &str = r#"[ "$(pwd -P)" = "$(cd "$(dirname "$0")" && pwd -P)" ]"#;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_helper_is_checked_from_its_own_folder_and_not_the_callers() {
+        // On Windows the helper's python3.dll is looked for in the working directory
+        // before PATH, and `crossfyre update` runs elevated from wherever the operator
+        // opened the terminal.
+        let s = Scratch::new("helper-cwd");
+        let src = fake_helper(
+            &s,
+            "unpacked",
+            &format!("{IN_OWN_FOLDER} || {{ echo \"ran in $(pwd)\" >&2; exit 5; }}\nexit 2"),
+        );
+        let dest = s.join("bin").join("cfx-script");
+        let failed = place_helper_if_it_starts(&src, &dest).expect("place");
+        assert_eq!(failed, None);
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_helper_that_ran_a_job_it_was_never_given_is_not_placed() {
@@ -2399,6 +2443,39 @@ exit 127"#;
         shared libraries: libpython3.11.so.1.0: cannot open shared object file: No such \
         file or directory";
 
+    /// Node 0.1.52, the worker shipped with crossfyre 0.1.42, and every one before it
+    /// hands the configs it writes back to the operator. So does a worker that cannot
+    /// say which it is. One from a later release keeps them root's, and a host with no
+    /// worker has nothing to hand back.
+    #[cfg(unix)]
+    #[test]
+    fn a_node_worker_from_0_1_42_or_before_is_an_earlier_one() {
+        let s = Scratch::new("node-predates");
+        bin_dir_at(&s.0);
+        assert!(!installed_node_predates_root_configs(), "no worker at all");
+        for (v, earlier) in [
+            ("0.1.52", true),
+            ("0.1.9", true),
+            ("0.0.99", true),
+            ("0.1.53", false),
+            ("0.1.53-rc.1", false),
+            ("0.2.0", false),
+            ("1.0.0", false),
+        ] {
+            reports(&s.0, "node", v);
+            let _ = fs::remove_file(s.0.join("node.version"));
+            assert_eq!(installed_node_predates_root_configs(), earlier, "node {v}");
+        }
+        // The version recorded beside it counts first, as for an update.
+        fs::write(s.0.join("node.version"), "0.1.51\n").unwrap();
+        assert!(installed_node_predates_root_configs(), "recorded 0.1.51");
+        // A worker that answers no version.
+        let _ = fs::remove_file(s.0.join("node.version"));
+        old_helper(&s.0);
+        fs::rename(s.0.join(CFX_SCRIPT), s.0.join("node")).unwrap();
+        assert!(installed_node_predates_root_configs(), "no version");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn a_node_with_no_version_record_is_asked_for_its_version() {
@@ -2448,6 +2525,22 @@ exit 127"#;
         assert_eq!(installed_helper_version(), None);
         fs::write(s.join("cfx-script.version"), "9.9.9\n").expect("write");
         assert_eq!(installed_helper_version().as_deref(), Some("9.9.9"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_installed_helper_is_asked_its_version_from_its_own_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = Scratch::new("helper-version-cwd");
+        bin_dir_at(&s.0);
+        let p = s.join(CFX_SCRIPT);
+        fs::write(
+            &p,
+            format!("#!/bin/sh\n{IN_OWN_FOLDER} || exit 5\necho 'cfx-script 9.9.8'\n"),
+        )
+        .expect("write");
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert_eq!(installed_helper_version().as_deref(), Some("9.9.8"));
     }
 
     #[cfg(unix)]

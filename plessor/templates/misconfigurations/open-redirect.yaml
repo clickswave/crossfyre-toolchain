@@ -2,7 +2,7 @@ id: open-redirect-param
 info:
   name: Open redirect via redirect parameter
   severity: medium
-  description: A redirect/return parameter sends the user to an attacker-controlled external origin. Confirmed by following the redirect to example.com and observing its content, which proves the destination is not constrained to the site.
+  description: A redirect/return parameter sends the user to an attacker-controlled external origin. Confirmed either by following the redirect to example.com and observing its content, or, when the scan's client does not follow a redirect to another host, by a 3xx whose Location is example.com itself. Either proves the destination is not constrained to the site.
   tags: misconfig,redirect
   metadata:
     category: misconfigurations
@@ -15,14 +15,9 @@ http:
       - "{{BaseURL}}/?next=https://example.com/"
       - "{{BaseURL}}/?returnUrl=https://example.com/"
       - "{{BaseURL}}/?redirect_uri=https://example.com/"
-    matchers-condition: and
     matchers:
-      - type: word
-        part: body
-        words:
-          - "Example Domain"
-          - "illustrative examples in documents"
-        condition: and
-      - type: status
-        status:
-          - 200
+      - type: dsl
+        condition: or
+        dsl:
+          - 'status_code == 200 && contains(body, "Example Domain") && contains(body, "illustrative examples in documents")'
+          - 'status_code >= 300 && status_code < 400 && regex("(?m)^location: *(https?:)?//example[.]com(:(80|443))?([/?#]|$)", headers)'

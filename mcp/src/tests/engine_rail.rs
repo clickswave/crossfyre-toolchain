@@ -82,6 +82,29 @@ async fn an_address_needs_no_pin_and_still_gets_redirects_off() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scan_without_a_session_still_runs_on_a_plessor_from_0_1_42() {
+    let target = listener(Reply::ok("x")).await;
+    let plessor = stub_engine(StubOpts {
+        no_verify_certs: true,
+        ..Default::default()
+    })
+    .await;
+    let t = scope(&[format!("127.0.0.1:{}", target.port)], "")
+        .plessor(plessor.port)
+        .build();
+    ok(&t
+        .call(
+            &FakePeer::new(Elicit::None),
+            "test_injection",
+            json!({"url": format!("http://127.0.0.1:{}/?q=1", target.port)}),
+        )
+        .await);
+    let op = &plessor.ops()[0];
+    assert!(op.get("auth").is_none(), "{op}");
+    assert!(op.get("verify_certs").is_none(), "{op}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_engine_too_old_to_be_fenced_is_not_used() {
     let target = listener(Reply::ok("x")).await;
     // Both would request the target if they were sent an operation.

@@ -13,6 +13,15 @@ mod egress;
 pub mod executor;
 pub mod oast;
 mod ops;
+
+/// Connecting to an engine on its loopback port, for the helpers that talk to engines
+/// themselves: a listener the engines' account does not own is refused before anything
+/// is sent to it.
+pub mod engine_link {
+    pub use crate::ops::listener::{
+        connect_blocking as connect, connect_blocking_trusting as connect_trusting, trusted,
+    };
+}
 pub mod os;
 pub mod toolchain;
 
@@ -284,11 +293,80 @@ pub fn classify_event(status: &str, code: i64) -> adaptive::ProbeClass {
     }
 }
 
-/// Host portion of a target URL, for keying per-target state.
+/// Host portion of a target URL, with its port when one is written: the host a
+/// saved credential is asked for, and the key for per-target state.
+///
+/// Read the way the engines read a target (the url crate, `http://` added when no
+/// http(s) scheme is written), so it is always the host they connect to. Splitting
+/// the text by hand disagreed with them on targets such as `a?@b`, where the
+/// engines dial `a` and the split named `b`. Empty when the engines could not
+/// parse the target either.
 pub fn target_host(url: &str) -> String {
-    let after = url.split("://").nth(1).unwrap_or(url);
-    let hostport = after.split('/').next().unwrap_or(after);
-    hostport.rsplit('@').next().unwrap_or(hostport).to_string()
+    let t = url.trim();
+    let with_scheme = if t.starts_with("http://") || t.starts_with("https://") {
+        t.to_string()
+    } else {
+        format!("http://{t}")
+    };
+    let Ok(u) = reqwest::Url::parse(&with_scheme) else {
+        return String::new();
+    };
+    match (u.host_str(), u.port()) {
+        (Some(h), Some(p)) => format!("{h}:{p}"),
+        (Some(h), None) => h.to_string(),
+        (None, _) => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod target_host_tests {
+    use super::target_host;
+
+    /// A credential is asked for on behalf of the host the engines will send it to
+    /// (the url crate's host, which every engine dials), whatever else the target's
+    /// text appears to name after an '@'.
+    #[test]
+    fn names_the_host_the_engines_dial() {
+        for (t, want) in [
+            (
+                "https://attacker.example?@app.victim.example/",
+                "attacker.example",
+            ),
+            (
+                "https://attacker.example#@app.victim.example/",
+                "attacker.example",
+            ),
+            (
+                "https://attacker.example\\@app.victim.example/",
+                "attacker.example",
+            ),
+            ("http://10.1.2.3?@app.victim.example/login", "10.1.2.3"),
+            ("attacker.example?@app.victim.example/", "attacker.example"),
+            (
+                "https://attacker.example:8443?@app.victim.example/",
+                "attacker.example:8443",
+            ),
+        ] {
+            assert_eq!(target_host(t), want, "{t}");
+        }
+    }
+
+    /// Ordinary targets read the way they always have.
+    #[test]
+    fn keeps_the_host_and_port_of_ordinary_targets() {
+        for (t, want) in [
+            ("https://app.example.com/x/y", "app.example.com"),
+            ("http://app.example.com:8080/", "app.example.com:8080"),
+            ("app.example.com", "app.example.com"),
+            ("app.example.com:8443", "app.example.com:8443"),
+            ("https://user:pw@app.example.com/", "app.example.com"),
+            ("http://10.0.0.5:3000/api", "10.0.0.5:3000"),
+            ("http://[::1]:8080/", "[::1]:8080"),
+            ("https://app.example.com/::FUZZ::", "app.example.com"),
+        ] {
+            assert_eq!(target_host(t), want, "{t}");
+        }
+    }
 }
 
 /// Context an operation needs from the node run loop: the NATS publisher and
@@ -672,9 +750,17 @@ pub struct Config {
     /// credentials. The node runs as root on a default install, so this is the
     /// difference between compromising the platform and compromising the host.
     ///
-    /// Set `remote_exec = true` in `nodes.d/<node-id>.toml` to allow it.
+    /// Set `remote_exec = true` in `nodes.d/<node-id>.toml` to allow it. The file
+    /// belongs to root (administrators, on Windows), so it is edited with sudo
+    /// (`sudoedit`) or from an elevated prompt; the node service runs no config that
+    /// another account could change (see [`toolchain::node_config`]).
     #[serde(default)]
     pub remote_exec: bool,
+    /// Whether this node's tunnel config may run programs of its own on this host,
+    /// such as OpenVPN `up`/`down` scripts or WireGuard `PostUp`. Off unless root on
+    /// this host sets `tunnel_hooks = true` in `nodes.d/<node-id>.toml`.
+    #[serde(default)]
+    pub tunnel_hooks: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
@@ -817,9 +903,11 @@ pub fn print_privilege_banner(needs_root: bool) {
 ///
 ///   <base>/nodes.d/<node-id>.toml       <- config (what `--init` writes)
 ///   <base>/nodes.d/<node-id>.pid        <- daemon PID lock
-///   <base>/nodes.d/<node-id>.network/   <- egress config + logs
+///   <base>/nodes.d/<node-id>.network/   <- egress config + logs, without root
 ///
-/// `base` itself is the value resolved from `--data-dir` / `$SUDO_USER`.
+/// `base` itself is the value resolved from `--data-dir` / `$SUDO_USER`. Run as root on
+/// Linux or macOS, the network dir is root's instead: see
+/// [`toolchain::node_config::network_dir`].
 pub struct NodePaths {
     base: std::path::PathBuf,
     node_id: String,
@@ -836,8 +924,23 @@ impl NodePaths {
             node_id: node_id.to_string(),
             config: nodes_dir.join(format!("{node_id}.toml")),
             pid: nodes_dir.join(format!("{node_id}.pid")),
-            network_dir: nodes_dir.join(format!("{node_id}.network")),
+            network_dir: toolchain::node_config::network_dir(&nodes_dir, node_id),
         }
+    }
+
+    /// [`NodePaths::new`] for an id that is not a file name found in nodes.d: one read
+    /// from a config's contents, sent by the control plane or given on the command line.
+    /// Refused unless it is one plain name (see
+    /// [`toolchain::node_config::is_plain_node_id`]), so that every path made from it
+    /// stays in nodes.d and in root's state dir.
+    pub fn checked(base: &std::path::Path, node_id: &str) -> std::io::Result<Self> {
+        if !toolchain::node_config::is_plain_node_id(node_id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{node_id:?} is not a node id"),
+            ));
+        }
+        Ok(Self::new(base, node_id))
     }
 }
 
@@ -856,9 +959,16 @@ pub fn nodes_dir(base: &std::path::Path) -> std::path::PathBuf {
 ///
 /// The permissions are set before the bytes land where possible, so there is no
 /// window in which the file exists with the secret in it and the wider mode.
+///
+/// Run as root, or elevated on Windows, it writes through
+/// [`toolchain::sudo_user::write_for_invoking_user`], which replaces the file rather than
+/// writing into whatever `path` names and hands it to the invoking user.
 pub fn write_secret_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     {
+        if toolchain::sudo_user::root_guards() {
+            return toolchain::sudo_user::write_for_invoking_user(path, contents.as_bytes(), 0o600);
+        }
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let mut f = fs::OpenOptions::new()
@@ -875,6 +985,9 @@ pub fn write_secret_file(path: &std::path::Path, contents: &str) -> std::io::Res
     }
     #[cfg(not(unix))]
     {
+        if toolchain::sudo_user::root_guards() {
+            return toolchain::sudo_user::write_for_invoking_user(path, contents.as_bytes(), 0o600);
+        }
         fs::write(path, contents)
     }
 }
@@ -889,9 +1002,21 @@ pub fn write_secret_file(path: &std::path::Path, contents: &str) -> std::io::Res
 #[cfg(unix)]
 pub fn repair_secret_file_mode(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
-    let Ok(meta) = fs::metadata(path) else { return };
+    // Through the file's own fd, opened without following a link when root: a chmod by
+    // path would land on whatever a link there names.
+    let file = if toolchain::sudo_user::root_guards() {
+        toolchain::root_fs::open_file(path)
+    } else {
+        fs::File::open(path)
+    };
+    let Ok(file) = file else { return };
+    let Ok(meta) = file.metadata() else { return };
     let mode = meta.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 && fs::set_permissions(path, fs::Permissions::from_mode(0o600)).is_ok() {
+    if mode & 0o077 != 0
+        && file
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .is_ok()
+    {
         eprintln!(
             "[security] {} was mode {:o} (group/other readable) and holds node \
              credentials; tightened to 600. Rotate this node's key if the host \
@@ -910,7 +1035,55 @@ pub fn repair_secret_file_mode(_path: &std::path::Path) {}
 /// registered node-ids (one per `nodes.d/<id>.toml`), sorted for stable
 /// ordering. Files that don't parse as a node config are skipped with a
 /// warning so one corrupt node doesn't block the rest from booting.
+///
+/// The supervisor runs this every couple of seconds, so a skipped file is warned about
+/// once, and again only when the file or the reason changes: see [`ScanWarnings`].
 pub fn discover_nodes(base: &std::path::Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    static WARNED: std::sync::LazyLock<std::sync::Mutex<ScanWarnings>> =
+        std::sync::LazyLock::new(Default::default);
+    let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+    let (ids, lines) = scan_nodes(base, &mut warned)?;
+    for line in lines {
+        eprintln!("{line}");
+    }
+    Ok(ids)
+}
+
+/// What the node scan last said about each file it skipped. A refused config is an
+/// ordinary state to be in (a config written without root on a host whose node runs
+/// as root, say), and saying so on every rescan filled the service's log at a couple
+/// of hundred bytes every two seconds per file.
+#[derive(Default)]
+struct ScanWarnings(
+    std::collections::HashMap<std::path::PathBuf, (Option<std::time::SystemTime>, String)>,
+);
+
+impl ScanWarnings {
+    /// Whether `line` about `path` should be printed: it was not the last thing said
+    /// about that file, or the file has been modified since.
+    fn is_new(&mut self, path: &std::path::Path, line: &str) -> bool {
+        let modified = fs::symlink_metadata(path).and_then(|m| m.modified()).ok();
+        let said = (modified, line.to_string());
+        if self.0.get(path) == Some(&said) {
+            return false;
+        }
+        self.0.insert(path.to_path_buf(), said);
+        true
+    }
+
+    /// Forget every file but those skipped this time, so a file that is fixed, or gone,
+    /// is warned about afresh if it is skipped again, and the map stays as small as
+    /// nodes.d.
+    fn keep_only(&mut self, skipped: &std::collections::HashSet<std::path::PathBuf>) {
+        self.0.retain(|p, _| skipped.contains(p));
+    }
+}
+
+/// [`discover_nodes`], returning the warnings to print rather than printing them.
+fn scan_nodes(
+    base: &std::path::Path,
+    warned: &mut ScanWarnings,
+) -> Result<(Vec<String>, Vec<String>), Box<dyn std::error::Error>> {
     if !base.exists() {
         return Err(format!(
             "config root {base:?} does not exist - run `crossfyre node init` first"
@@ -925,6 +1098,7 @@ pub fn discover_nodes(base: &std::path::Path) -> Result<Vec<String>, Box<dyn std
     }
 
     let mut ids = Vec::new();
+    let mut skipped: Vec<(std::path::PathBuf, String)> = Vec::new();
     for entry in fs::read_dir(&nd)? {
         let path = entry?.path();
         if path.extension().and_then(|e| e.to_str()) != Some("toml") {
@@ -933,18 +1107,58 @@ pub fn discover_nodes(base: &std::path::Path) -> Result<Vec<String>, Box<dyn std
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
+        // The stem is the node id, and the service prints ids to its log. Ids the
+        // control plane hands out never hold a control character, and a line break in
+        // one would let a file name write whole lines of root's log. Nor do they hold
+        // anything else that would not do as one plain name.
+        if !toolchain::node_config::is_plain_node_id(stem) {
+            let line = format!("[boot] WARNING: skipping {path:?} - not a node id");
+            skipped.push((path, line));
+            continue;
+        }
         // Validate it parses as a node config so `--boot` doesn't spawn a
         // daemon that's just going to die on a malformed file.
-        match fs::read_to_string(&path)
-            .map_err(|e| e.to_string())
-            .and_then(|s| toml::from_str::<Config>(&s).map_err(|e| e.to_string()))
-        {
-            Ok(_) => ids.push(stem.to_string()),
-            Err(e) => eprintln!("[boot] WARNING: skipping {path:?} - not a valid node config: {e}"),
+        // As root, through a reader that refuses a link (the operator owns nodes.d, and
+        // the error below would print part of whatever file a link here named) and a
+        // file anyone but root could have written.
+        match toolchain::node_config::read(&path) {
+            Ok(s) => match toml::from_str::<Config>(&s) {
+                Ok(_) => ids.push(stem.to_string()),
+                Err(e) => {
+                    let line =
+                        format!("[boot] WARNING: skipping {path:?} - not a valid node config: {e}");
+                    skipped.push((path, line));
+                }
+            },
+            // Without root, a config only root can read is still a registered node.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::PermissionDenied
+                    && !toolchain::node_config::privileged() =>
+            {
+                ids.push(stem.to_string())
+            }
+            Err(e) => {
+                let line = format!("[boot] WARNING: skipping {path:?}: {e}");
+                skipped.push((path, line));
+            }
         }
     }
     ids.sort();
-    Ok(ids)
+    warned.keep_only(&skipped.iter().map(|(p, _)| p.clone()).collect());
+    let lines = skipped
+        .into_iter()
+        .filter(|(p, line)| warned.is_new(p, line))
+        .map(|(_, line)| line)
+        .collect();
+    Ok((ids, lines))
+}
+
+/// Read and parse the node config at `path` for a daemon about to run it. Run as root
+/// (or elevated, on Windows), a config another account owns or can write is refused:
+/// see [`toolchain::node_config`].
+pub fn load_node_config(path: &std::path::Path) -> Result<Config, Box<dyn std::error::Error>> {
+    let text = toolchain::node_config::read(path)?;
+    Ok(toml::from_str(&text)?)
 }
 
 /// One-time migration for hosts initialized before the `nodes.d` layout:
@@ -956,27 +1170,36 @@ pub fn migrate_legacy_config(base: &std::path::Path) {
     if !legacy.is_file() {
         return;
     }
-    let Ok(text) = fs::read_to_string(&legacy) else {
+    let Ok(text) = toolchain::sudo_user::read_to_string(&legacy) else {
         return;
     };
     let Ok(cfg) = toml::from_str::<Config>(&text) else {
         return;
     };
-    let paths = NodePaths::new(base, &cfg.node_id);
+    // The id is the operator's, read from their file, and root makes paths from it.
+    let Ok(paths) = NodePaths::checked(base, &cfg.node_id) else {
+        eprintln!(
+            "[migrate] Not moving {legacy:?}: its node_id {:?} is not a node id",
+            cfg.node_id
+        );
+        return;
+    };
     if paths.config.exists() {
         return; // already migrated
     }
-    if let Err(e) = fs::create_dir_all(nodes_dir(base)) {
+    if let Err(e) = toolchain::sudo_user::create_dir_all_for_invoking_user(&nodes_dir(base)) {
         eprintln!("[migrate] Could not create nodes.d: {e}");
         return;
     }
-    if fs::rename(&legacy, &paths.config).is_ok() {
+    if toolchain::sudo_user::rename(&legacy, &paths.config).is_ok() {
         println!("[migrate] Moved legacy config.toml -> {:?}", paths.config);
         let legacy_net = base.join("network");
-        if legacy_net.is_dir() && !paths.network_dir.exists() {
-            let _ = fs::rename(&legacy_net, &paths.network_dir);
+        let net_dir = toolchain::node_config::operator_network_dir(&nodes_dir(base), &cfg.node_id);
+        if legacy_net.is_dir() && !net_dir.exists() {
+            let _ = toolchain::sudo_user::rename(&legacy_net, &net_dir);
         }
-        chown_to_sudo_user(&paths.config);
+        // The config itself stays as it is: the tree chown leaves node configs alone,
+        // and taking over an earlier release's configs is node_config's.
         chown_tree_to_sudo_user(&nodes_dir(base));
     }
 }
@@ -1025,13 +1248,33 @@ pub async fn run_boot(
     force: bool,
     base: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Before anything is written: on macOS the service's output may still be going to
+    // a file launchd opened in the operator's data dir.
+    #[cfg(target_os = "macos")]
+    toolchain::service::adopt_root_node_log();
     println!("Booting Crossfyre nodes from {base:?}...");
 
     // Pull a pre-nodes.d single-node install into the new layout if present.
     migrate_legacy_config(base);
+    // Node configs an earlier release handed to the operator become root's, once.
+    toolchain::node_config::take_over_earlier_configs(base);
     // Engines still installed under the names they had before: carry them over
     // before any node starts using them.
     toolchain::migrate::renamed_engines();
+    // A database container made by 0.1.42 or earlier was published on every
+    // interface with no password. Rebuild it on loopback with a password, keeping the
+    // engines' rows. Nodes do not use it, so they start meanwhile rather than wait on Docker,
+    // which may be slow to answer or not running yet.
+    let securing = std::thread::spawn(|| {
+        if let Err(e) = toolchain::db::secure_existing() {
+            eprintln!(
+                "[db] FAIL could not secure the toolchain database container: {e}. If \
+                 Docker could not be asked, it may still accept connections from the \
+                 network without a password. Run `crossfyre db restart` from the account \
+                 that runs Docker to secure it, or stop it with `crossfyre db stop`."
+            );
+        }
+    });
 
     let node_ids = discover_nodes(base)?;
     if node_ids.is_empty() {
@@ -1039,6 +1282,8 @@ pub async fn run_boot(
             "No nodes registered under {:?}.\nRegister one with: crossfyre node init",
             nodes_dir(base)
         );
+        // Not cut short halfway through a move.
+        let _ = securing.join();
         std::process::exit(1);
     }
 
@@ -1190,16 +1435,22 @@ impl std::fmt::Display for NodeDeleted {
 impl std::error::Error for NodeDeleted {}
 
 /// Delete a node's on-disk registration: config + pid lock + network dir.
+///
+/// Under sudo, no link in the operator's nodes.d is followed on the way to any of them.
 pub fn remove_node_files(base: &std::path::Path, node_id: &str) -> std::io::Result<()> {
-    let paths = NodePaths::new(base, node_id);
+    let paths = NodePaths::checked(base, node_id)?;
     if paths.config.exists() {
-        fs::remove_file(&paths.config)?;
+        toolchain::sudo_user::remove_file(&paths.config)?;
     }
     if paths.pid.exists() {
-        let _ = fs::remove_file(&paths.pid);
+        let _ = toolchain::sudo_user::remove_file(&paths.pid);
     }
-    if paths.network_dir.exists() {
-        let _ = fs::remove_dir_all(&paths.network_dir);
+    // Root's network dir, and the one in nodes.d that an earlier release used.
+    let operator_net = toolchain::node_config::operator_network_dir(&nodes_dir(base), node_id);
+    for dir in [&paths.network_dir, &operator_net] {
+        if dir.exists() {
+            let _ = toolchain::sudo_user::remove_dir_all(dir);
+        }
     }
     Ok(())
 }
@@ -1398,7 +1649,9 @@ pub async fn run_node_remove(
         let mut removed = 0usize;
         for id in &ids {
             let paths = NodePaths::new(base, id);
-            let cfg: Config = match fs::read_to_string(&paths.config)
+            // As root, a config another account could have written names an API root
+            // would otherwise call, and remove the node on its answer.
+            let cfg: Config = match toolchain::node_config::read(&paths.config)
                 .ok()
                 .and_then(|s| toml::from_str(&s).ok())
             {
@@ -1507,6 +1760,11 @@ pub async fn run_init(
     field("Control plane", api_url);
     field("Data directory", &data_dir.display().to_string());
     print_privilege_banner(false);
+    // Before anything is written: on a host with no node service and no earlier node
+    // worker, record that there is nothing from an earlier release to take over, so the
+    // service installed below never hands root a config the operator's account put in
+    // nodes.d.
+    toolchain::node_config::settle_before_init(data_dir)?;
 
     let client = reqwest::Client::new();
 
@@ -1581,12 +1839,12 @@ pub async fn run_init(
     // config root stays the invoking user's home). Each node gets its own
     // `nodes.d/<node-id>.toml` so several can share one crossfyre config root.
     let config_dir = data_dir.to_path_buf();
-    let paths = NodePaths::new(data_dir, &node_id);
+    let paths = NodePaths::checked(data_dir, &node_id)?;
 
     // Create config root + nodes.d if they don't exist yet.
     let nd = nodes_dir(data_dir);
     if !nd.exists() {
-        fs::create_dir_all(&nd)?;
+        toolchain::sudo_user::create_dir_all_for_invoking_user(&nd)?;
         step(&format!("Created {}", nd.display()));
     }
 
@@ -1617,7 +1875,10 @@ pub async fn run_init(
         .to_string();
 
     // -- Network identity (VPN tunnel set on the dashboard) -------------
-    let network = egress::process_network_config(&json_resp["network_config"], &paths.network_dir);
+    toolchain::node_config::prepare_network_dir(&nd, &paths.node_id)?;
+    // A fresh node has not allowed tunnel hooks; see Config::tunnel_hooks.
+    let network =
+        egress::process_network_config(&json_resp["network_config"], &paths.network_dir, false);
 
     // Write nodes.d/<node-id>.toml (with extensions list + network section)
     let config = Config {
@@ -1632,10 +1893,12 @@ pub async fn run_init(
         // Opt-in: see Config::remote_exec. A fresh node will not run control-plane
         // commands until its operator says so.
         remote_exec: false,
+        tunnel_hooks: false,
     };
     let config_path = &paths.config;
     let config_toml = toml::to_string(&config)?;
-    write_secret_file(config_path, &config_toml)?;
+    // Under sudo it stays root's, as the node service requires.
+    toolchain::node_config::write(config_path, &config_toml)?;
     end();
     section("Configure");
     ok(&format!(
@@ -1646,7 +1909,7 @@ pub async fn run_init(
     // Write session file (placeholder empty file for now)
     let session_path = config_dir.join("session");
     if !session_path.exists() {
-        fs::write(&session_path, "")?;
+        toolchain::sudo_user::write_for_invoking_user(&session_path, b"", 0o644)?;
         step("Session initialized");
     }
 
@@ -1795,8 +2058,8 @@ pub async fn run_init(
     }
 
     // If we ran under sudo, hand ownership of the data dir back to the
-    // invoking user so the next non-sudo `--init` (or a plain `cat config.toml`)
-    // can still read & write it.
+    // invoking user so the next non-sudo `--init` can still read & write it. The
+    // node configs in it stay root's: the root node service runs what they say.
     chown_tree_to_sudo_user(&config_dir);
 
     end();
@@ -2031,7 +2294,8 @@ pub async fn refresh_node_state(
     // Refresh the network/VPN config from the server. This rewrites the
     // .ovpn / .conf on disk if the operator uploaded a new one - so an edit
     // in the dashboard plus a daemon restart is enough to switch tunnels.
-    let new_network = egress::process_network_config(&json_resp["network_config"], net_dir);
+    let new_network =
+        egress::process_network_config(&json_resp["network_config"], net_dir, config.tunnel_hooks);
     if new_network != config.network {
         if let Some(ref n) = new_network {
             println!(
@@ -2050,11 +2314,11 @@ pub async fn refresh_node_state(
 
     // Persist so next restart also has fresh creds if refresh fails.
     let config_toml = toml::to_string(&config)?;
-    write_secret_file(config_path, &config_toml)?;
-    // Daemon often runs as root via sudo - the file we just wrote is now
-    // root-owned. Hand it back to the invoking user so non-sudo tools can
-    // still read it.
-    chown_to_sudo_user(config_path);
+    toolchain::node_config::write(config_path, &config_toml)?;
+    // The daemon runs as root. The config stays root's, since this daemon runs what it
+    // says; what else it wrote under nodes.d goes back to the invoking user (the tree
+    // chown leaves node configs alone). Its tunnel config is not under nodes.d: see
+    // node_config::network_dir.
     if let Some(parent) = config_path.parent() {
         chown_tree_to_sudo_user(parent);
     }
@@ -2081,13 +2345,10 @@ fn reconcile_ports(ports_json: &serde_json::Value) -> Vec<String> {
         return changed;
     }
     // Postgres port moved: re-provision the container on the new port.
-    if changed.iter().any(|c| c == "postgres") {
-        match toolchain::config::load_config() {
-            Ok(cfg) => {
-                let _ = toolchain::db::up(&cfg);
-            }
-            Err(e) => eprintln!("[ports] FAIL reload config for db: {e}"),
-        }
+    if changed.iter().any(|c| c == "postgres")
+        && let Err(e) = toolchain::db::up()
+    {
+        eprintln!("[ports] FAIL re-provision the database: {e}");
     }
     // Engine port moved: rewrite its unit (ExecStart reads config.toml) + restart.
     for ext in changed.iter().filter(|c| c.as_str() != "postgres") {
@@ -2169,6 +2430,16 @@ fn heartbeat_engines(
         .collect()
 }
 
+/// Whether an engine listens on 127.0.0.1:`port`, as the heartbeat reports it. A
+/// listener the engines' account does not own is not one.
+fn engine_listening(port: u16) -> bool {
+    ops::listener::connect_blocking(
+        std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        std::time::Duration::from_millis(200),
+    )
+    .is_ok()
+}
+
 /// Run the registered node at `paths` until it is stopped. `node_version` is the node
 /// binary's own version, which the heartbeat reports.
 pub async fn run_daemon(
@@ -2195,11 +2466,14 @@ pub async fn run_daemon(
 
     // --- PID lock: scoped to this node-id, so multiple nodes can coexist in
     // the same config root - each holds its own `nodes.d/<node-id>.pid`. ---
-    fs::create_dir_all(nodes_dir(&paths.base))?;
+    //
+    // This runs as root, before the config is read, in a directory the operator owns:
+    // every access below goes through helpers that do not follow a link there.
+    toolchain::sudo_user::create_dir_all_for_invoking_user(&nodes_dir(&paths.base))?;
     let pid_path = paths.pid.clone();
 
     if pid_path.exists() {
-        let existing_pid_str = fs::read_to_string(&pid_path).unwrap_or_default();
+        let existing_pid_str = toolchain::sudo_user::read_to_string(&pid_path).unwrap_or_default();
         let existing_pid: u32 = existing_pid_str.trim().parse().unwrap_or(0);
         if existing_pid > 0 && os::process_alive(existing_pid) {
             if force {
@@ -2222,13 +2496,12 @@ pub async fn run_daemon(
     }
     // Write our own PID
     let my_pid = std::process::id();
-    fs::write(&pid_path, my_pid.to_string())?;
-    chown_to_sudo_user(&pid_path);
+    toolchain::sudo_user::write_for_invoking_user(&pid_path, my_pid.to_string().as_bytes(), 0o644)?;
     // Remove PID file on exit (best-effort via a drop guard)
     struct PidGuard(std::path::PathBuf);
     impl Drop for PidGuard {
         fn drop(&mut self) {
-            let _ = fs::remove_file(&self.0);
+            let _ = toolchain::sudo_user::remove_file(&self.0);
         }
     }
     let _pid_guard = PidGuard(pid_path);
@@ -2246,10 +2519,14 @@ pub async fn run_daemon(
     }
 
     // Load config
+    // A daemon started on its own, or by the supervisor of an earlier release, takes
+    // over an earlier release's configs as the supervisor does.
+    toolchain::node_config::take_over_earlier_configs(&paths.base);
     // Repair installs written before the config was mode-restricted.
     repair_secret_file_mode(&config_path);
-    let config_str = fs::read_to_string(&config_path)?;
-    let mut config: Config = toml::from_str(&config_str)?;
+    let mut config = load_node_config(&config_path)?;
+    // As root, the tunnel config goes to a directory only root can change.
+    toolchain::node_config::prepare_network_dir(&nodes_dir(&paths.base), &paths.node_id)?;
 
     println!("Configuration loaded successfully.");
 
@@ -2327,10 +2604,9 @@ pub async fn run_daemon(
     // routes through the configured egress. The guard tears egress down on
     // every exit path (Ctrl+C, SIGTERM, panic, normal return) and is bound to
     // `_egress_guard` so it lives the full daemon lifetime.
-    let _egress_guard = config
-        .network
-        .as_ref()
-        .and_then(|net| egress::bring_up(net, &paths.network_dir, &paths.node_id));
+    let _egress_guard = config.network.as_ref().and_then(|net| {
+        egress::bring_up(net, &paths.network_dir, &paths.node_id, config.tunnel_hooks)
+    });
 
     println!("Connecting to Jetstream at {}...", config.nats_url);
 
@@ -2387,6 +2663,7 @@ pub async fn run_daemon(
     // don't overflow and drop messages as "slow consumer".
     .subscription_capacity(1_000_000)
     .event_callback(on_event);
+    let opts = with_node_inbox(opts, &config.node_id);
 
     // TLS to the control plane.
     //
@@ -2776,10 +3053,7 @@ pub async fn run_daemon(
                         crate::toolchain::config::is_extension_installed,
                     ) {
                         let port = crate::toolchain::config::engine_port(ext);
-                        let running = std::net::TcpStream::connect_timeout(
-                            &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-                            std::time::Duration::from_millis(200),
-                        ).is_ok();
+                        let running = engine_listening(port);
                         if !running {
                             engine_egress.remove(ext);
                         } else if engine_egress.due(ext, std::time::Instant::now()) {
@@ -3208,8 +3482,15 @@ pub async fn run_daemon(
                             }
                             Some("start_postgres") => {
                                 println!("\n[toolchain] Starting PostgreSQL...");
-                                let success = match toolchain::db::ensure_up() {
-                                    Ok(()) => { println!("[toolchain] OK PostgreSQL started"); true }
+                                // Blocking, and slow when a container from an earlier release
+                                // has to be secured first.
+                                let started = tokio::task::spawn_blocking(|| {
+                                    toolchain::db::ensure_up().map_err(|e| e.to_string())
+                                })
+                                .await;
+                                let success = match started {
+                                    Ok(Ok(())) => { println!("[toolchain] OK PostgreSQL started"); true }
+                                    Ok(Err(e)) => { eprintln!("[toolchain] FAIL PostgreSQL failed to start: {e}"); false }
                                     Err(e) => { eprintln!("[toolchain] FAIL PostgreSQL failed to start: {e}"); false }
                                 };
 
@@ -3433,19 +3714,81 @@ pub async fn run_script(
     Ok(())
 }
 
+/// Reply subjects for this node's requests and its pull consumer's deliveries
+/// go under `_INBOX_<node id>`, the one inbox prefix its broker credentials let
+/// it subscribe to. The default `_INBOX` is shared by every connection on the
+/// account, so the platform no longer grants it to nodes.
+fn with_node_inbox(opts: async_nats::ConnectOptions, node_id: &str) -> async_nats::ConnectOptions {
+    opts.custom_inbox_prefix(format!("_INBOX_{node_id}"))
+}
+
 /// Stage the Cloudflare Origin CA root next to the node config and return its
 /// path. async-nats takes a path rather than bytes, so the root is embedded in
 /// the binary and written out on connect. Rewritten every time so a truncated or
 /// tampered copy on disk cannot persist.
 fn write_origin_root_cert() -> std::io::Result<std::path::PathBuf> {
-    const ORIGIN_ROOT: &str = include_str!("../assets/cloudflare-origin-root.pem");
     let dir = std::env::var("CFX_CONFIG_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
-    std::fs::create_dir_all(&dir)?;
+        .ok()
+        .map(std::path::PathBuf::from);
+    stage_origin_root_cert(dir.as_deref())
+}
+
+const ORIGIN_ROOT: &str = include_str!("../assets/cloudflare-origin-root.pem");
+
+/// Writes the root to `dir`, or with no `dir` to a directory of this process's own in
+/// the temp dir. The temp dir is shared with every account, and on macOS a link left
+/// at a fixed name there is followed even by root; a fresh directory only this account
+/// can enter has nothing anyone else put in it.
+fn stage_origin_root_cert(dir: Option<&std::path::Path>) -> std::io::Result<std::path::PathBuf> {
+    let Some(dir) = dir else {
+        static OWN: std::sync::Mutex<Option<tempfile::TempDir>> = std::sync::Mutex::new(None);
+        let mut own = OWN.lock().unwrap_or_else(|e| e.into_inner());
+        // Made again if a temp cleaner took it while the node was running.
+        if !own.as_ref().is_some_and(|d| d.path().is_dir()) {
+            let mut b = tempfile::Builder::new();
+            b.prefix("cfx-nats-");
+            #[cfg(unix)]
+            b.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700));
+            *own = Some(b.tempdir()?);
+        }
+        let path = own
+            .as_ref()
+            .expect("made above")
+            .path()
+            .join("cfx-nats-root.pem");
+        std::fs::write(&path, ORIGIN_ROOT)?;
+        return Ok(path);
+    };
     let path = dir.join("cfx-nats-root.pem");
+    #[cfg(unix)]
+    if toolchain::sudo_user::root_guards() {
+        toolchain::root_fs::create_dir_all(dir, None)?;
+        toolchain::root_fs::replace_file(&path, ORIGIN_ROOT.as_bytes(), 0o644, None)?;
+        return Ok(path);
+    }
+    std::fs::create_dir_all(dir)?;
     std::fs::write(&path, ORIGIN_ROOT)?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod inbox_tests {
+    use super::*;
+
+    /// The platform lets a node subscribe only under its own inbox prefix. A
+    /// client on the default `_INBOX` cannot read the replies to its own
+    /// JetStream requests, so its pull worker never binds.
+    #[tokio::test]
+    async fn the_node_takes_replies_under_its_own_inbox_prefix() {
+        let nats = egress::testkit::FakeNats::start().await;
+        let id = "11111111-1111-4111-8111-111111111111";
+        let client = with_node_inbox(async_nats::ConnectOptions::new(), id)
+            .connect(nats.url.as_str())
+            .await
+            .unwrap();
+        let inbox = client.new_inbox();
+        assert!(inbox.starts_with(&format!("_INBOX_{id}.")), "{inbox}");
+    }
 }
 
 #[cfg(test)]
@@ -3503,6 +3846,386 @@ mod security_tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// The node service runs as root over a config root the operator owns. A link the
+    /// operator leaves there must not carry root's reads, writes and chmods to files
+    /// outside it.
+    #[cfg(unix)]
+    fn node_root_with_link(name: &str, target: &std::path::Path) -> tempfile::TempDir {
+        let t = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(t.path().join("nodes.d")).expect("nodes.d");
+        std::os::unix::fs::symlink(target, t.path().join("nodes.d").join(name)).expect("link");
+        t
+    }
+
+    #[cfg(unix)]
+    const A_NODE_CONFIG: &str =
+        "api_key = \"k\"\nnode_id = \"n\"\napi_url = \"http://127.0.0.1:9\"\n";
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_secret_write_does_not_write_through_a_link() {
+        let outside = tempfile::tempdir().expect("tempdir");
+        let victim = outside.path().join("ld.so.preload");
+        fs::write(&victim, "kept\n").unwrap();
+        let base = node_root_with_link("n.toml", &victim);
+
+        let _root = toolchain::sudo_user::act_as_root();
+        write_secret_file(&base.path().join("nodes.d/n.toml"), A_NODE_CONFIG).unwrap();
+
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "kept\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_scan_does_not_read_a_node_config_through_a_link() {
+        let outside = tempfile::tempdir().expect("tempdir");
+        let target = outside.path().join("shadow");
+        fs::write(&target, A_NODE_CONFIG).unwrap();
+        let base = node_root_with_link("s.toml", &target);
+
+        let _root = toolchain::sudo_user::act_as_root();
+        let ids = discover_nodes(base.path()).unwrap();
+
+        assert!(
+            ids.is_empty(),
+            "read a linked file as a node config: {ids:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_repair_does_not_chmod_through_a_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let outside = tempfile::tempdir().expect("tempdir");
+        let target = outside.path().join("passwd");
+        fs::write(&target, "x").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        let base = node_root_with_link("n.toml", &target);
+
+        let _root = toolchain::sudo_user::act_as_root();
+        repair_secret_file_mode(&base.path().join("nodes.d/n.toml"));
+
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "chmodded the link's target");
+    }
+
+    /// A hard link is a second name for the same file, and on macOS (or a Linux host
+    /// with fs.protected_hardlinks off) the operator can make one to a root file they
+    /// cannot read. The scan must not read it, or its parse error quotes the file.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_scan_does_not_read_a_hard_linked_node_config() {
+        let base = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(base.path().join("nodes.d")).unwrap();
+        let outside = tempfile::tempdir().expect("tempdir");
+        let target = outside.path().join("shadow");
+        fs::write(&target, A_NODE_CONFIG).unwrap();
+        fs::hard_link(&target, base.path().join("nodes.d/s.toml")).unwrap();
+
+        let _root = toolchain::sudo_user::act_as_root();
+        let ids = discover_nodes(base.path()).unwrap();
+
+        assert!(
+            ids.is_empty(),
+            "read a hard-linked file as a node config: {ids:?}"
+        );
+    }
+
+    /// A node id is the file name, and the service prints it to root's log. A name
+    /// with a line break in it would put a line of the operator's choosing there.
+    #[cfg(unix)]
+    #[test]
+    fn a_scan_skips_a_node_config_whose_name_holds_a_control_character() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let nd = base.path().join("nodes.d");
+        fs::create_dir(&nd).unwrap();
+        fs::write(nd.join("ok.toml"), A_NODE_CONFIG).unwrap();
+        fs::write(nd.join("x\ninjected line\n#.toml"), A_NODE_CONFIG).unwrap();
+        fs::write(nd.join("tab\there.toml"), A_NODE_CONFIG).unwrap();
+        fs::write(nd.join("esc\u{1b}[2J.toml"), A_NODE_CONFIG).unwrap();
+
+        let ids = discover_nodes(base.path()).unwrap();
+
+        assert_eq!(ids, vec!["ok".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_repair_does_not_chmod_a_hard_linked_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(base.path().join("nodes.d")).unwrap();
+        let outside = tempfile::tempdir().expect("tempdir");
+        let target = outside.path().join("hosts");
+        fs::write(&target, "127.0.0.1 localhost\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::hard_link(&target, base.path().join("nodes.d/n.toml")).unwrap();
+
+        let _root = toolchain::sudo_user::act_as_root();
+        repair_secret_file_mode(&base.path().join("nodes.d/n.toml"));
+
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "chmodded the other name's file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removing_a_node_as_root_does_not_pass_through_a_linked_nodes_dir() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let e = elsewhere.path();
+        fs::write(e.join("n.toml"), A_NODE_CONFIG).unwrap();
+        fs::write(e.join("n.pid"), "1").unwrap();
+        fs::create_dir(e.join("n.network")).unwrap();
+        fs::write(e.join("n.network/wg0.conf"), "x").unwrap();
+        std::os::unix::fs::symlink(e, base.path().join("nodes.d")).unwrap();
+
+        let _root = toolchain::sudo_user::act_as_root();
+        let _ = remove_node_files(base.path(), "n");
+
+        assert!(
+            e.join("n.toml").exists(),
+            "removed the config through a link"
+        );
+        assert!(
+            e.join("n.pid").exists(),
+            "removed the pid file through a link"
+        );
+        assert!(
+            e.join("n.network/wg0.conf").exists(),
+            "removed the network dir"
+        );
+    }
+
+    /// Root runs the tunnel config in a node's network dir (wg-quick and OpenVPN run the
+    /// hooks it names), so a node run as root keeps it outside the operator's tree.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_node_keeps_its_tunnel_config_out_of_the_operators_tree() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let _root = toolchain::sudo_user::act_as_root();
+        let paths = NodePaths::new(base.path(), "n");
+        assert!(
+            !paths.network_dir.starts_with(base.path()),
+            "a root node's network dir is {:?}, in the operator's tree",
+            paths.network_dir
+        );
+    }
+
+    /// The broker's root certificate used to go to a fixed name in the temp dir, which
+    /// on macOS is shared with every account and follows a link left at that name.
+    #[cfg(unix)]
+    #[test]
+    fn the_broker_root_is_staged_in_a_directory_of_its_own() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = stage_origin_root_cert(None).expect("staged");
+        let dir = path.parent().expect("dir");
+        assert_ne!(dir, std::env::temp_dir().as_path(), "{path:?}");
+        let mode = fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "{dir:?} is {mode:o}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), ORIGIN_ROOT);
+        // Staged again on a reconnect, in the same place.
+        assert_eq!(stage_origin_root_cert(None).unwrap(), path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_broker_root_write_does_not_follow_a_link() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let victim = dir.path().join("victim");
+        fs::write(&victim, "kept\n").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join("cfx-nats-root.pem")).unwrap();
+
+        let _root = toolchain::sudo_user::act_as_root();
+        let _ = stage_origin_root_cert(Some(dir.path()));
+
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "kept\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_legacy_migration_does_not_move_a_config_through_a_linked_nodes_dir() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink(elsewhere.path(), base.path().join("nodes.d")).unwrap();
+        fs::write(base.path().join("config.toml"), A_NODE_CONFIG).unwrap();
+
+        let _root = toolchain::sudo_user::act_as_root();
+        migrate_legacy_config(base.path());
+
+        assert!(
+            !elsewhere.path().join("n.toml").exists(),
+            "moved the config into the link's target"
+        );
+    }
+
+    /// The legacy config.toml is the operator's, and so is the node id in it. Root
+    /// makes paths from that id only when it is one plain name, so nothing of the
+    /// operator's is moved out of their config root.
+    #[cfg(unix)]
+    #[test]
+    fn the_legacy_migration_takes_a_node_id_only_as_one_plain_name() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let victim = elsewhere.path().join("victim");
+        fs::write(
+            base.path().join("config.toml"),
+            format!(
+                "api_key = \"k\"\nnode_id = \"{}\"\napi_url = \"http://127.0.0.1:9\"\n",
+                victim.display()
+            ),
+        )
+        .unwrap();
+        fs::create_dir(base.path().join("network")).unwrap();
+
+        let _root = toolchain::sudo_user::act_as_root();
+        migrate_legacy_config(base.path());
+
+        let left: Vec<_> = fs::read_dir(elsewhere.path()).unwrap().flatten().collect();
+        assert!(left.is_empty(), "moved {left:?} out of the config root");
+        assert!(base.path().join("config.toml").exists());
+        assert!(base.path().join("network").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_legacy_migration_moves_a_plain_node_id_s_config() {
+        let base = tempfile::tempdir().expect("tempdir");
+        fs::write(base.path().join("config.toml"), A_NODE_CONFIG).unwrap();
+        fs::create_dir(base.path().join("network")).unwrap();
+
+        let _root = toolchain::sudo_user::act_as_root();
+        migrate_legacy_config(base.path());
+
+        assert_eq!(
+            fs::read_to_string(base.path().join("nodes.d/n.toml")).unwrap(),
+            A_NODE_CONFIG
+        );
+        assert!(base.path().join("nodes.d/n.network").is_dir());
+        assert!(!base.path().join("config.toml").exists());
+    }
+
+    /// A node id from the command line or the control plane names files only when it
+    /// is one plain name.
+    #[test]
+    fn node_paths_from_outside_nodes_d_take_only_a_plain_id() {
+        let base = tempfile::tempdir().expect("tempdir");
+        for bad in ["/etc/x", "../x", "a/b", ".."] {
+            assert!(NodePaths::checked(base.path(), bad).is_err(), "{bad:?}");
+            assert!(remove_node_files(base.path(), bad).is_err(), "{bad:?}");
+        }
+        let p = NodePaths::checked(base.path(), "n").unwrap();
+        assert_eq!(p.config, base.path().join("nodes.d/n.toml"));
+    }
+
+    /// The supervisor rescans every two seconds. A refused config is reported once, and
+    /// again only when it changes.
+    #[cfg(unix)]
+    #[test]
+    fn a_rescan_reports_a_refused_config_once() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let nd = base.path().join("nodes.d");
+        fs::create_dir(&nd).unwrap();
+        let p = nd.join("n.toml");
+        fs::write(&p, A_NODE_CONFIG).unwrap();
+
+        // The test's account is not root, so a root scan refuses its file.
+        let _root = toolchain::sudo_user::act_as_root();
+        let mut warned = ScanWarnings::default();
+        let (ids, lines) = scan_nodes(base.path(), &mut warned).unwrap();
+        assert!(ids.is_empty());
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        for _ in 0..3 {
+            let (_, lines) = scan_nodes(base.path(), &mut warned).unwrap();
+            assert!(lines.is_empty(), "said it again: {lines:?}");
+        }
+
+        // Changed: said again, once.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        let (_, lines) = scan_nodes(base.path(), &mut warned).unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let (_, lines) = scan_nodes(base.path(), &mut warned).unwrap();
+        assert!(lines.is_empty(), "{lines:?}");
+
+        // Gone and back: said again.
+        fs::remove_file(&p).unwrap();
+        scan_nodes(base.path(), &mut warned).unwrap();
+        fs::write(&p, A_NODE_CONFIG).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        let (_, lines) = scan_nodes(base.path(), &mut warned).unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+    }
+
+    /// The node service runs as root and reads node configs from nodes.d in the
+    /// operator's config root, which the operator's account can write. A config that
+    /// account wrote decides which broker and API the node trusts and whether it runs
+    /// the commands they send, so it must not become a root daemon.
+    #[cfg(unix)]
+    const AN_OPERATOR_WRITTEN_CONFIG: &str = "api_key = \"x\"\nnode_id = \"evil\"\n\
+        api_url = \"http://127.0.0.1:8000\"\nnats_url = \"nats://127.0.0.1:4223\"\n\
+        remote_exec = true\n";
+
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_scan_skips_a_node_config_another_account_owns() {
+        if running_as_root() {
+            eprintln!("skipped: the test's files would belong to root");
+            return;
+        }
+        let base = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(base.path().join("nodes.d")).unwrap();
+        write_secret_file(
+            &base.path().join("nodes.d/evil.toml"),
+            AN_OPERATOR_WRITTEN_CONFIG,
+        )
+        .unwrap();
+
+        let _root = toolchain::sudo_user::act_as_root();
+        let ids = discover_nodes(base.path()).unwrap();
+
+        assert!(
+            ids.is_empty(),
+            "a root scan took a config another account owns: {ids:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_daemon_refuses_a_node_config_another_account_owns() {
+        if running_as_root() {
+            eprintln!("skipped: the test's files would belong to root");
+            return;
+        }
+        let base = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(base.path().join("nodes.d")).unwrap();
+        let p = base.path().join("nodes.d/evil.toml");
+        write_secret_file(&p, AN_OPERATOR_WRITTEN_CONFIG).unwrap();
+
+        let _root = toolchain::sudo_user::act_as_root();
+        let loaded = load_node_config(&p);
+
+        assert!(
+            loaded.is_err(),
+            "a root daemon loaded a config another account owns"
+        );
+    }
+
     /// H-2: shell_exec and .cfx run control-plane input in this process's
     /// privileges, and the node runs as root on a default install. Server-side
     /// authorization cannot protect the host from a compromised control plane or
@@ -3533,6 +4256,17 @@ mod security_tests {
         )
         .expect("parse");
         assert!(cfg.remote_exec, "an explicit opt-in was ignored");
+    }
+
+    /// The node starts its tunnel as root from a config the platform sent. Only root on
+    /// the host, through the node's own config, lets that config run its own scripts.
+    #[test]
+    fn tunnel_hooks_are_off_unless_the_node_config_turns_them_on() {
+        let base = "api_key = \"k\"\nnode_id = \"n\"\napi_url = \"https://example.invalid\"\n";
+        let cfg: Config = toml::from_str(base).expect("a config without tunnel_hooks must parse");
+        assert!(!cfg.tunnel_hooks, "tunnel hooks defaulted ON");
+        let cfg: Config = toml::from_str(&format!("{base}tunnel_hooks = true\n")).expect("parse");
+        assert!(cfg.tunnel_hooks, "an explicit opt-in was ignored");
     }
 }
 
@@ -4194,9 +4928,21 @@ mod op_failure_tests {
         ext: &str,
         data: Value,
     ) -> (Value, String, Vec<String>, u16) {
+        let platform = FakePlatform::start(|_, _| (200, json!("word"))).await;
+        run_unreachable_with(&platform, op_id, op_type, ext, data).await
+    }
+
+    /// [`run_unreachable`] against a platform the caller holds, to read what the op
+    /// asked of it.
+    async fn run_unreachable_with(
+        platform: &FakePlatform,
+        op_id: &str,
+        op_type: &str,
+        ext: &str,
+        data: Value,
+    ) -> (Value, String, Vec<String>, u16) {
         let (_held, port) = refusing_port();
         let nats = FakeNats::start().await;
-        let platform = FakePlatform::start(|_, _| (200, json!("word"))).await;
         let st = EgressState::new(resolver(&[]));
         st.apply_authorize(&direct_settings(1));
         let ctx = OpCtx {
@@ -4210,8 +4956,13 @@ mod op_failure_tests {
             egress: st,
         };
         let mut data = data;
-        if data.get("wordlist_url").is_some() {
-            data["wordlist_url"] = json!(format!("{}/wl", platform.url));
+        for key in ["wordlist_url", "recurse_wordlist_url"] {
+            if data.get(key).is_some() {
+                data[key] = json!(format!("{}/wl", platform.url));
+            }
+        }
+        if let Some(first) = data.pointer_mut("/wordlists/0") {
+            first["url"] = json!(format!("{}/wl", platform.url));
         }
         let cmd = json!({
             "type": "operation", "operation_id": op_id, "workflow_id": WF,
@@ -4255,6 +5006,54 @@ mod op_failure_tests {
             "{op_type} reported an op that never ran as done: {types:?}"
         );
         assert!(!op_is_done(&op_id), "{op_type}");
+    }
+
+    /// Every op that takes a saved credential asks the platform for it on behalf of the
+    /// host its engine will connect to, so the credential's host list is checked
+    /// against that host and not against another name written into the target.
+    #[tokio::test]
+    async fn a_credential_is_asked_for_the_host_the_engine_dials() {
+        let hostile = "http://127.0.0.1:9?@app.victim.test/";
+        let cases = [
+            (
+                "vuln-scan-1",
+                "cortex",
+                json!({"target": hostile, "credential_id": "c1"}),
+            ),
+            (
+                "vuln-scan-1",
+                "cortex",
+                json!({"target": hostile, "mode": "authz",
+                       "identities": [{"role": "admin", "credential_id": "c2"}]}),
+            ),
+            (
+                "service-enum-1",
+                "scout",
+                json!({"target": hostile, "credential_id": "c3"}),
+            ),
+            (
+                "web-crawl-1",
+                "mach",
+                json!({"seed": hostile, "credential_id": "c4"}),
+            ),
+            (
+                "content-discovery-db",
+                "mach",
+                json!({"url": hostile, "wordlist_url": "", "credential_id": "c5"}),
+            ),
+        ];
+        for (n, (op_type, ext, data)) in cases.into_iter().enumerate() {
+            let platform = FakePlatform::start(|_, _| (200, json!("word"))).await;
+            let op_id = format!("op-cred-host-{n}");
+            run_unreachable_with(&platform, &op_id, op_type, ext, data).await;
+            let asked: Vec<Value> = platform
+                .requests()
+                .into_iter()
+                .filter(|(p, _)| p == "/api/v1/creds/resolve")
+                .map(|(_, b)| b["host"].clone())
+                .collect();
+            assert_eq!(asked, vec![json!("127.0.0.1:9")], "{op_type} case {n}");
+        }
     }
 
     #[tokio::test]
@@ -4317,5 +5116,550 @@ mod op_failure_tests {
     async fn a_content_scan_with_ambulo_down_says_so() {
         let data = json!({"url": "http://127.0.0.1:9/", "wordlist_url": ""});
         assert_failed_with_reason("content-discovery-db", "mach", "ambulo", data).await;
+    }
+
+    /// A downloaded wordlist used to be written to a fixed name in /tmp, following
+    /// whatever was already there. One planted there as a link to another file must not
+    /// have that file overwritten, whichever of the five downloads it is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_downloaded_wordlist_is_not_written_through_a_planted_link() {
+        let pid = std::process::id();
+        let wl = format!("planted-{pid}");
+        let cases = [
+            (
+                "subdomain-enum-ds",
+                "voyage",
+                "voyage",
+                format!("op-planted-sub-wl-{pid}"),
+                format!("cfx-wl-sub-{wl}.txt"),
+                json!({"domain": "example.test", "wordlists": [{"id": wl, "url": ""}]}),
+            ),
+            (
+                "subdomain-enum-ds",
+                "voyage",
+                "voyage",
+                format!("op-planted-sub-url-{pid}"),
+                format!("cfx-wl-sub-op-planted-sub-url-{pid}.txt"),
+                json!({"domain": "example.test", "wordlist_url": ""}),
+            ),
+            (
+                "content-discovery-db",
+                "mach",
+                "ambulo",
+                format!("op-planted-cd-wl-{pid}"),
+                format!("cfx-wl-{wl}.txt"),
+                json!({"url": "http://127.0.0.1:9/", "wordlists": [{"id": wl, "url": ""}]}),
+            ),
+            (
+                "content-discovery-db",
+                "mach",
+                "ambulo",
+                format!("op-planted-cd-url-{pid}"),
+                format!("cfx-wl-chunk-op-planted-cd-url-{pid}.txt"),
+                json!({"url": "http://127.0.0.1:9/", "wordlist_url": ""}),
+            ),
+            (
+                "content-discovery-db",
+                "mach",
+                "ambulo",
+                format!("op-planted-cd-rec-{pid}"),
+                format!("cfx-wl-recurse-op-planted-cd-rec-{pid}.txt"),
+                json!({
+                    "url": "http://127.0.0.1:9/",
+                    "wordlist_url": "",
+                    "recurse": true,
+                    "recurse_depth": 1,
+                    "recurse_wordlist_url": "",
+                }),
+            ),
+        ];
+        for (op_type, ext, engine, op_id, name, data) in cases {
+            let scratch = tempfile::tempdir().unwrap();
+            let victim = scratch.path().join("victim");
+            std::fs::write(&victim, "kept\n").unwrap();
+            let planted = std::path::PathBuf::from("/tmp").join(&name);
+            let _ = std::fs::remove_file(&planted);
+            std::os::unix::fs::symlink(&victim, &planted).unwrap();
+            let (done, ..) = run_unreachable(&op_id, op_type, ext, data).await;
+            let _ = std::fs::remove_file(&planted);
+            assert_eq!(
+                std::fs::read_to_string(&victim).unwrap(),
+                "kept\n",
+                "{op_type} wrote {name} through a link it did not make"
+            );
+            let why = done["error"].as_str().unwrap_or_default();
+            assert!(
+                why.starts_with(&format!("{engine} daemon unreachable")),
+                "{op_type} {name}: {done}"
+            );
+        }
+    }
+
+    /// A wordlist that downloaded but could not be written fails the op with the reason,
+    /// rather than sending the engine a path to a file that is not the list. Here the
+    /// recursion list's name is one the op has already written.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_wordlist_that_could_not_be_written_fails_the_op() {
+        let op_id = format!("op-unwritten-{}", std::process::id());
+        let data = json!({
+            "url": "http://127.0.0.1:9/",
+            "wordlists": [{"id": format!("recurse-{op_id}"), "url": ""}],
+            "recurse": true,
+            "recurse_depth": 1,
+            "recurse_wordlist_url": "",
+        });
+        let (done, _, types, _) =
+            run_unreachable(&op_id, "content-discovery-db", "mach", data).await;
+        let _ = std::fs::remove_file(format!("/tmp/cfx-wl-recurse-{op_id}.txt"));
+        assert_eq!(done["code"], 1, "{done}");
+        let why = done["error"].as_str().unwrap_or_default();
+        assert!(
+            why.starts_with("the recursion wordlist could not be written for ambulo: "),
+            "{done}"
+        );
+        assert!(
+            !types.iter().any(|t| t == "operation_completed"),
+            "{types:?}"
+        );
+    }
+}
+
+/// Linux only: elsewhere the kernel is not asked who owns an engine's port.
+#[cfg(all(test, target_os = "linux"))]
+mod impostor_engine_tests {
+    use super::*;
+    use egress::state::EgressState;
+    use egress::testkit::{FakeNats, FakePlatform, direct_settings, http, resolver};
+    use serde_json::{Value, json};
+    use std::sync::{Arc, Mutex};
+
+    const NODE: &str = "node-i";
+    const WF: &str = "wf-impostor";
+    const MARK: &str = "IMPOSTOR";
+
+    /// A listener on an engine's port that is not the engine: it keeps whatever is sent
+    /// to it and answers every connection with results of its own.
+    struct Impostor {
+        port: u16,
+        got: Arc<Mutex<Vec<u8>>>,
+    }
+
+    fn impostor() -> Impostor {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let kept = got.clone();
+        std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+            for conn in l.incoming() {
+                let Ok(mut conn) = conn else { return };
+                let kept = kept.clone();
+                std::thread::spawn(move || {
+                    let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                    let mut line = String::new();
+                    let _ = std::io::BufReader::new(conn.try_clone().unwrap()).read_line(&mut line);
+                    kept.lock().unwrap().extend_from_slice(line.as_bytes());
+                    for answer in [
+                        json!({"type": "capabilities", "egress": 1}),
+                        json!({"type": "finding", "template_id": MARK, "url": "http://impostor.test/"}),
+                        json!({"type": "found", "url": format!("http://{MARK}.test/")}),
+                        json!({"status": "completed", "results": [{"host": MARK, "port": 1}]}),
+                    ] {
+                        let _ = conn.write_all(format!("{answer}\n").as_bytes());
+                    }
+                });
+            }
+        });
+        Impostor { port, got }
+    }
+
+    /// Any account but this test's own: the impostor's listener is then another's.
+    fn others() -> Vec<u32> {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        vec![unsafe { libc::geteuid() }.wrapping_add(1)]
+    }
+
+    /// What went wrong when `op_type` ran with an impostor on `ext`'s port, if anything.
+    async fn run_against_impostor(op_type: &str, ext: &str, data: Value) -> Result<(), String> {
+        let imp = impostor();
+        let op_id = format!("op-imp-{op_type}");
+        let nats = FakeNats::start().await;
+        let platform = FakePlatform::start(|_, _| (200, json!("word"))).await;
+        let st = EgressState::new(resolver(&[]));
+        st.apply_authorize(&direct_settings(1));
+        let ctx = OpCtx {
+            pub_clone: nats.client().await,
+            status_subj: format!("cfx.node.{NODE}.status"),
+            result_subj: format!("cfx.results.{NODE}"),
+            node_id: NODE.into(),
+            http: http(),
+            api_url: platform.url.clone(),
+            api_key: "cfk_node".into(),
+            egress: st,
+        };
+        let mut data = data;
+        if data.get("wordlist_url").is_some() {
+            data["wordlist_url"] = json!(format!("{}/wl", platform.url));
+        }
+        let cmd = json!({
+            "type": "operation", "operation_id": op_id, "workflow_id": WF,
+            "op_type": op_type, "pre_claimed": true, "data": data,
+        });
+        let client = ctx.pub_clone.clone();
+        ops::listener::TRUSTED
+            .scope(
+                others(),
+                ops::test_engines::with(&[(ext, imp.port)], run_operation(cmd, ctx)),
+            )
+            .await;
+        client.flush().await.unwrap();
+        let done = nats.wait_for("completed").await.expect("no completed");
+        let got = String::from_utf8_lossy(&imp.got.lock().unwrap()).to_string();
+        if !got.is_empty() {
+            return Err(format!(
+                "{op_type} sent the op to a listener the engines do not own: {got}"
+            ));
+        }
+        let why = done["error"].as_str().unwrap_or_default();
+        if done["code"] != 1 || !why.contains("nothing was sent to it") {
+            return Err(format!("{op_type}: {done}"));
+        }
+        match nats
+            .published()
+            .into_iter()
+            .find(|(_, v)| v.to_string().contains(MARK))
+        {
+            Some((_, v)) => Err(format!("{op_type} published the impostor's answer: {v}")),
+            None => Ok(()),
+        }
+    }
+
+    #[tokio::test]
+    async fn no_op_is_sent_to_a_listener_another_account_owns() {
+        let cases = [
+            (
+                "vuln-scan-1",
+                "cortex",
+                json!({"target": "http://127.0.0.1:9/"}),
+            ),
+            (
+                "service-enum-1",
+                "scout",
+                json!({"target": "http://127.0.0.1:9/"}),
+            ),
+            (
+                "web-crawl-1",
+                "mach",
+                json!({"seed": "http://127.0.0.1:9/"}),
+            ),
+            ("takeover-1", "voyage", json!({"domain": "example.test"})),
+            (
+                "origin-discovery-1",
+                "voyage",
+                json!({"domain": "example.test"}),
+            ),
+            (
+                "subdomain-enum-ds",
+                "voyage",
+                json!({"domain": "example.test", "disable_active": true}),
+            ),
+            (
+                "network-scan-ds",
+                "pulse",
+                json!({"host": "127.0.0.1", "port": 22}),
+            ),
+            (
+                "network-scan-db",
+                "pulse",
+                json!({"targets": ["127.0.0.1"], "ports": "22", "tasks": 1}),
+            ),
+            (
+                "content-discovery-ds",
+                "mach",
+                json!({"mode": "probe", "probe_url": "http://127.0.0.1:9/x"}),
+            ),
+            (
+                "content-discovery-db",
+                "mach",
+                json!({"url": "http://127.0.0.1:9/", "wordlist_url": ""}),
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (op_type, ext, data) in cases {
+            if let Err(e) = run_against_impostor(op_type, ext, data).await {
+                wrong.push(e);
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// The heartbeat used to call any listener a running engine, so the dashboard showed
+    /// the node healthy while an impostor held the port.
+    #[test]
+    fn the_heartbeat_does_not_call_an_impostor_a_running_engine() {
+        let imp = impostor();
+        assert!(engine_listening(imp.port));
+        let seen = ops::listener::TRUSTED.sync_scope(others(), || engine_listening(imp.port));
+        assert!(!seen, "an impostor was reported as the running engine");
+    }
+
+    /// Nor does it ask the impostor whether it sends through the proxy and believe it.
+    #[tokio::test]
+    async fn the_egress_question_is_not_put_to_an_impostor() {
+        let imp = impostor();
+        let addr = format!("127.0.0.1:{}", imp.port);
+        let answer = ops::listener::TRUSTED
+            .scope(others(), egress::state::engine_reads_egress(&addr))
+            .await;
+        assert_eq!(answer, None);
+        assert!(imp.got.lock().unwrap().is_empty());
+    }
+}
+
+/// A saved credential reaches only the hosts it was saved for. The platform checks
+/// those hosts against the op's target alone, and an op can send the engine on to
+/// other hosts, which it reaches carrying the credential on every request.
+#[cfg(test)]
+mod credential_scope_tests {
+    use super::*;
+    use egress::state::EgressState;
+    use egress::testkit::{
+        FakeEngine, FakeNats, FakePlatform, direct_settings, http, ok, resolver,
+    };
+    use serde_json::{Value, json};
+
+    const NODE: &str = "node-cs";
+    const TARGET: &str = "http://app.victim.test/";
+
+    /// What the engine was asked to run when `data` ran as `op_type`, and the notes
+    /// the op published. The platform holds one bearer credential saved for `hosts`.
+    async fn engine_request(
+        op_type: &str,
+        ext: &str,
+        op_id: &str,
+        data: Value,
+        hosts: Value,
+    ) -> (Value, Vec<String>) {
+        let engine = FakeEngine::start(|_| async { vec![json!({"type": "done"})] }).await;
+        let nats = FakeNats::start().await;
+        let platform = FakePlatform::start(move |path, _| {
+            if path == "/api/v1/creds/resolve" {
+                ok(json!({
+                    "name": "app", "auth_type": "bearer", "config": {},
+                    "secret": {"token": "saved-token"}, "scope_hosts": hosts.clone(),
+                }))
+            } else {
+                (404, json!({"status": 404, "message": "not here"}))
+            }
+        })
+        .await;
+        let st = EgressState::new(resolver(&[]));
+        st.apply_authorize(&direct_settings(1));
+        let ctx = OpCtx {
+            pub_clone: nats.client().await,
+            status_subj: format!("cfx.node.{NODE}.status"),
+            result_subj: format!("cfx.results.{NODE}"),
+            node_id: NODE.into(),
+            http: http(),
+            api_url: platform.url.clone(),
+            api_key: "cfk_node".into(),
+            egress: st,
+        };
+        let cmd = json!({
+            "type": "operation", "operation_id": op_id, "workflow_id": format!("wf-{op_id}"),
+            "op_type": op_type, "pre_claimed": true, "data": data,
+        });
+        let client = ctx.pub_clone.clone();
+        ops::test_engines::with(&[(ext, engine.port)], run_operation(cmd, ctx)).await;
+        client.flush().await.unwrap();
+        nats.wait_for("operation_completed").await;
+        let seen = engine.seen();
+        let req = seen.first().cloned().expect("the engine was sent nothing");
+        let req = if req["operation"] == "egress" {
+            req["inner"].clone()
+        } else {
+            req
+        };
+        let notes = nats
+            .published()
+            .into_iter()
+            .filter(|(_, v)| v["type"] == "operation_note")
+            .filter_map(|(_, v)| v["message"].as_str().map(String::from))
+            .collect();
+        (req, notes)
+    }
+
+    fn urls(req: &Value) -> Vec<String> {
+        req["endpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["url"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn endpoints() -> Value {
+        json!([
+            {"method": "GET", "url": "http://app.victim.test/a?id=1"},
+            {"method": "GET", "url": "https://m.attacker.test/x?id=1"},
+            {"method": "GET", "url": "http://app.victim.test:@m.attacker.test/y?id=1"},
+            {"method": "GET", "url": "//m.attacker.test/z?id=1"},
+            {"method": "GET", "url": "http://api.app.victim.test/b?id=1"},
+        ])
+    }
+
+    /// Injection, structure fuzzing, request-shape discovery and authorization testing
+    /// all take a list of endpoints. One on a host the credential was not saved for is
+    /// not handed to the engine with the credential, however its URL is written.
+    #[tokio::test]
+    async fn endpoints_off_the_credentials_hosts_are_not_sent_with_it() {
+        for mode in ["inject", "fuzz", "discover", "authz"] {
+            let cid = format!("cs-endpoints-{mode}");
+            let mut data = json!({
+                "target": TARGET, "mode": mode, "endpoints": endpoints(),
+                "scope": ["m.attacker.test"],
+            });
+            if mode == "authz" {
+                data["identities"] = json!([
+                    {"role": "admin", "credential_id": cid},
+                    {"role": "anonymous"},
+                ]);
+            } else {
+                data["credential_id"] = json!(cid);
+            }
+            let (req, notes) = engine_request(
+                "vuln-scan-1",
+                "cortex",
+                &format!("op-cs-{mode}"),
+                data,
+                json!(["app.victim.test"]),
+            )
+            .await;
+            let auth = if mode == "authz" {
+                req["identities"][0]["auth"].clone()
+            } else {
+                req["auth"].clone()
+            };
+            assert_eq!(
+                auth["headers"]["Authorization"], "Bearer saved-token",
+                "{mode}: {req}"
+            );
+            assert_eq!(
+                urls(&req),
+                [
+                    "http://app.victim.test/a?id=1",
+                    "http://api.app.victim.test/b?id=1"
+                ],
+                "{mode}"
+            );
+            assert!(
+                notes
+                    .iter()
+                    .any(|n| n.contains("https://m.attacker.test/x?id=1")),
+                "{mode}: the operator was not told: {notes:?}"
+            );
+        }
+    }
+
+    /// A credential that records no hosts is not restricted, on the platform or here.
+    #[tokio::test]
+    async fn a_credential_with_no_hosts_keeps_every_endpoint() {
+        let data = json!({
+            "target": TARGET, "mode": "inject", "endpoints": endpoints(),
+            "scope": ["m.attacker.test"], "credential_id": "cs-unscoped",
+        });
+        let (req, notes) =
+            engine_request("vuln-scan-1", "cortex", "op-cs-unscoped", data, json!([])).await;
+        assert_eq!(
+            req["auth"]["headers"]["Authorization"],
+            "Bearer saved-token"
+        );
+        assert_eq!(urls(&req).len(), 5, "{req}");
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    /// A GraphQL endpoint written as a URL on another host is tested without the
+    /// credential. One on the target keeps it.
+    #[tokio::test]
+    async fn a_graphql_endpoint_elsewhere_is_tested_without_the_credential() {
+        for (n, (endpoint, carries)) in [
+            ("https://m.attacker.test/graphql", false),
+            ("http://app.victim.test:@m.attacker.test/graphql", false),
+            ("/graphql", true),
+            ("https://app.victim.test/api/graphql", true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let data = json!({
+                "target": TARGET, "mode": "graphql", "graphql_endpoint": endpoint,
+                "credential_id": format!("cs-graphql-{n}"),
+            });
+            let (req, notes) = engine_request(
+                "vuln-scan-1",
+                "cortex",
+                &format!("op-cs-gql-{n}"),
+                data,
+                json!(["app.victim.test"]),
+            )
+            .await;
+            assert_eq!(req["endpoint"], endpoint);
+            if carries {
+                assert_eq!(
+                    req["auth"]["headers"]["Authorization"], "Bearer saved-token",
+                    "{endpoint}"
+                );
+            } else {
+                assert!(
+                    !req.to_string().contains("saved-token"),
+                    "{endpoint}: {req}"
+                );
+                assert!(
+                    notes.iter().any(|m| m.contains(endpoint)),
+                    "{endpoint}: {notes:?}"
+                );
+            }
+        }
+    }
+
+    /// An authenticated crawl is held to the hosts the credential was saved for: it does
+    /// not follow links off them, and its extra hosts are narrowed to the part of each
+    /// that the credential covers.
+    #[tokio::test]
+    async fn an_authenticated_crawl_stays_on_the_credentials_hosts() {
+        let data = json!({
+            "seed": TARGET, "credential_id": "cs-crawl", "follow_external": true,
+            "scope_hosts": ["m.attacker.test", "victim.test", "app.victim.test"],
+        });
+        let (req, notes) = engine_request(
+            "web-crawl-1",
+            "mach",
+            "op-cs-crawl",
+            data,
+            json!(["app.victim.test", "*.api.victim.test"]),
+        )
+        .await;
+        assert_eq!(
+            req["auth"]["headers"]["Authorization"],
+            "Bearer saved-token"
+        );
+        assert_eq!(req["follow_external"], false, "{req}");
+        assert_eq!(
+            req["scope_hosts"],
+            json!(["app.victim.test", "api.victim.test"]),
+            "{req}"
+        );
+        assert!(!notes.is_empty());
+
+        // Without a credential the crawl goes where it was told, as before.
+        let data = json!({
+            "seed": TARGET, "follow_external": true, "scope_hosts": ["m.attacker.test"],
+        });
+        let (req, _) =
+            engine_request("web-crawl-1", "mach", "op-cs-crawl-anon", data, json!([])).await;
+        assert_eq!(req["follow_external"], true);
+        assert_eq!(req["scope_hosts"], json!(["m.attacker.test"]));
     }
 }

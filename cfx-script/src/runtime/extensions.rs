@@ -112,6 +112,22 @@ pub struct DaemonExtension {
     port: u16,
 }
 
+/// How long a script waits for an engine to take its connection.
+const CONNECT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Connect to the engine on 127.0.0.1:`port`. What a script sends an engine can carry
+/// the target's credentials, and what comes back becomes the job's results, so a
+/// listener the engines' account does not own (another account can take the port
+/// while the engine is stopped) is refused before anything is written to it.
+fn connect(port: u16) -> std::io::Result<std::net::TcpStream> {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    #[cfg(test)]
+    if let Some(uids) = TRUSTED.with(|t| t.borrow().clone()) {
+        return cfx_core::engine_link::connect_trusting(addr, CONNECT_WAIT, &uids);
+    }
+    cfx_core::engine_link::connect(addr, CONNECT_WAIT)
+}
+
 #[pymethods]
 impl DaemonExtension {
     /// Send a raw JSON request to the daemon and return the response.
@@ -122,8 +138,7 @@ impl DaemonExtension {
         let value: serde_json::Value = pythonize::depythonize(&request)?;
         let port = self.port;
 
-        // Synchronous TCP - we're inside spawn_blocking so this is fine
-        let response = std::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+        let response = connect(port)
             .and_then(|mut stream| {
                 use std::io::{BufRead, Write};
                 stream.set_nodelay(true)?;
@@ -197,7 +212,7 @@ impl DaemonExtension {
         let port = self.port;
         let name = self.name.clone();
 
-        let events = std::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+        let events = connect(port)
             .and_then(|mut stream| {
                 use std::io::{BufRead, Write};
                 stream.set_nodelay(true)?;
@@ -298,7 +313,7 @@ impl DaemonExtension {
         let port = self.port;
         let name = self.name.clone();
 
-        let response = std::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+        let response = connect(port)
             .and_then(|mut stream| {
                 use std::io::{BufRead, Write};
                 stream.set_nodelay(true)?;
@@ -414,4 +429,113 @@ pub fn make_module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     m.add_class::<Extension>()?;
     m.add_class::<DaemonExtension>()?;
     Ok(m)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// A test's word for which accounts the engines run as: a listener another account
+    /// owns cannot be made in a test that runs as one account, so the test says its own
+    /// account is not one of them instead.
+    static TRUSTED: std::cell::RefCell<Option<Vec<u32>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    /// A listener on an engine's port that is not the engine. It answers every request
+    /// as an engine would and reports how many bytes it was sent.
+    fn impostor() -> (u16, std::thread::JoinHandle<usize>) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let seen = std::thread::spawn(move || {
+            l.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            let mut total = 0;
+            while std::time::Instant::now() < deadline {
+                let Ok((mut s, _)) = l.accept() else {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                };
+                s.set_nonblocking(false).unwrap();
+                s.set_read_timeout(Some(std::time::Duration::from_millis(300)))
+                    .unwrap();
+                let mut buf = [0u8; 4096];
+                if let Ok(n) = s.read(&mut buf) {
+                    total += n;
+                }
+                let _ =
+                    s.write_all(b"{\"type\":\"done\",\"found\":\"https://planted.example/\"}\n");
+                break;
+            }
+            total
+        });
+        (port, seen)
+    }
+
+    /// Any account but this test's own: the impostor's listener is then another's.
+    fn others() -> Vec<u32> {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        vec![unsafe { libc::geteuid() }.wrapping_add(1)]
+    }
+
+    #[test]
+    fn a_script_sends_nothing_to_a_listener_another_account_owns() {
+        type Ask = fn(&DaemonExtension, Python<'_>) -> PyResult<Py<PyAny>>;
+        let ask: [(&str, Ask); 3] = [
+            ("send", |ext, py| {
+                let d = PyDict::new(py);
+                d.set_item("operation", "probe")?;
+                d.set_item("headers", vec![("Authorization", "Bearer secret")])?;
+                ext.send(py, d)
+            }),
+            ("stream", |ext, py| {
+                let d = PyDict::new(py);
+                d.set_item("operation", "takeover")?;
+                d.set_item("cookie", "session=secret")?;
+                ext.stream(py, d)
+            }),
+            ("probe", |ext, py| {
+                ext.probe(py, "https://example.com/", "GET", None, 0)
+            }),
+        ];
+        let mut wrong = Vec::new();
+        for (how, call) in ask {
+            let (port, seen) = impostor();
+            let ext = DaemonExtension {
+                name: "mach".into(),
+                port,
+            };
+            TRUSTED.with(|t| *t.borrow_mut() = Some(others()));
+            let answer = Python::attach(|py| call(&ext, py).map(|_| ()));
+            TRUSTED.with(|t| *t.borrow_mut() = None);
+            let sent = seen.join().unwrap();
+            if sent != 0 {
+                wrong.push(format!(
+                    "{how} sent {sent} bytes to a listener the engines do not own"
+                ));
+            }
+            if answer.is_ok() {
+                wrong.push(format!("{how} took the impostor's answer"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[test]
+    fn a_script_reaches_an_engine_this_account_runs() {
+        let (port, seen) = impostor();
+        let ext = DaemonExtension {
+            name: "mach".into(),
+            port,
+        };
+        let answer = Python::attach(|py| {
+            let d = PyDict::new(py);
+            d.set_item("operation", "probe")?;
+            ext.send(py, d).map(|_| ())
+        });
+        assert!(seen.join().unwrap() > 0);
+        answer.unwrap();
+    }
 }

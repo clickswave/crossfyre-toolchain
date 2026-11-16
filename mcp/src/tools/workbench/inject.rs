@@ -8,7 +8,7 @@
 //! the scan is cancelled if the project's scope stops admitting it or the project closes.
 
 use super::{ask, bridge_refusal, parse_handle, route};
-use crate::confirm::WriteAsk;
+use crate::confirm::{AskKind, WriteAsk};
 use crate::core::{
     CallNote, Done, Intent, Mcp, Reason, Refusal, RefusedDest, RunningJob, RunningMap,
     TrafficRequest, cancel_job,
@@ -16,6 +16,7 @@ use crate::core::{
 use crate::jobs::{self, JobStore};
 use crate::peer::ClientPeer;
 use crate::tools::inject::{Plan, parse_classes, start_scan};
+use crate::tools::overrides::{self, Asked, Via};
 use crate::tools::{in_range, parse_args};
 use crate::workbench::{Instance, REQUEST_WAIT};
 use crate::{guard, redact, untrusted};
@@ -42,7 +43,9 @@ const SITES_MAX: usize = 50;
 
 /// Captured headers that are not handed to plessor: the ones a client sets from the
 /// request it sends, the ones that would change how the connection is used, and the
-/// ones that ask for a cached answer, since a 304 tells the scan nothing.
+/// ones that ask for a cached answer, since a 304 tells the scan nothing. The forwarding
+/// headers a front end can route by in place of Host are held back with it, so the
+/// session goes out only under the captured host's name.
 const NOT_HANDED_ON: [&str; 12] = [
     "host",
     "content-length",
@@ -172,6 +175,28 @@ fn names_shown(names: &[String]) -> Value {
     )
 }
 
+/// What the captured request asks for by override, when that is beyond what plessor
+/// tests without test_writes: a POST whose form sets `_method=delete`, or a GET carrying
+/// `X-HTTP-Method-Override: DELETE`.
+fn overriding_write(src: &ScanSourceResult) -> Option<Asked> {
+    let from_headers = src
+        .req_headers
+        .iter()
+        .filter_map(|(k, v)| overrides::header(k).map(|h| Asked::new(Via::Header(h), Some(v))));
+    let from_query = overrides::in_query(&src.url)
+        .into_iter()
+        .map(|(_, v)| Asked::new(Via::Query, Some(&v)));
+    let from_body = src
+        .body
+        .as_deref()
+        .map(overrides::in_body)
+        .unwrap_or_default();
+    from_headers
+        .chain(from_query)
+        .chain(from_body)
+        .find(Asked::beyond_post)
+}
+
 /// The captured cookies and headers, as plessor's `auth`. `None` when there are none.
 fn session(src: &ScanSourceResult) -> Option<Value> {
     let mut headers = Map::new();
@@ -185,6 +210,7 @@ fn session(src: &ScanSourceResult) -> Option<Value> {
             continue;
         }
         if NOT_HANDED_ON.contains(&name.as_str())
+            || super::replay::forwarding(&name).is_some()
             || name.starts_with("proxy-")
             || transport::HeaderName::from_bytes(name.as_bytes()).is_err()
             || transport::HeaderValue::from_str(v).is_err()
@@ -324,6 +350,17 @@ pub(crate) async fn run(
         return Err(Refusal::invalid(format!(
             "this is a {method} request, which can change or destroy data; it is tested only \
              with test_writes, which needs allow_writes in the scope file and a confirmation"
+        )));
+    }
+    // plessor sends the captured headers, query and body with every test, so a request
+    // that asks the target for DELETE by override is a DELETE to it.
+    if !a.test_writes
+        && let Some(asked) = overriding_write(&src)
+    {
+        return Err(Refusal::invalid(format!(
+            "this is a {}, which can change or destroy data; it is tested only with \
+             test_writes, which needs allow_writes in the scope file and a confirmation",
+            asked.describe(&method)
         )));
     }
     let dest = guard::parse_target(&src.url).map_err(|e| {
@@ -482,6 +519,7 @@ pub(crate) async fn run(
             untrusted::clean(&origin, 200),
             o.name()
         ),
+        kind: AskKind::Write,
     });
     let on_start = keep_in_scope(
         Arc::clone(&o.inst),

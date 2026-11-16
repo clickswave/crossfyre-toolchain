@@ -30,6 +30,15 @@
 //! an application - the admin area, the reports section - and records the API
 //! calls each one makes on load, without ever pressing a button.
 //!
+//! # Where it may go
+//!
+//! Only where the crawl may go. A browser follows a redirect wherever it points
+//! and lets a page's script send it anywhere, so a target could otherwise steer
+//! it onto a host the operator never listed, including the node's own network.
+//! Every document request is held until the caller's gate answers for it, and
+//! one the gate refuses is never sent. What the browser read is filed under the
+//! page it ended on, not the address it was sent to.
+//!
 //! # Why the browser is optional and stays optional
 //!
 //! A node without Chrome must keep working exactly as before. The tier is off
@@ -107,15 +116,26 @@ pub fn find_browser() -> Option<PathBuf> {
     None
 }
 
+/// How the browser is driven.
+///
+/// On Unix, a pipe on the browser's fds 3 and 4 that only this process holds. A
+/// DevTools port, even one on loopback, can be attached to by any account on the
+/// machine, and whoever attaches drives a browser that runs as the operator, local
+/// files included.
+#[cfg(unix)]
+const DEBUGGING: &str = "--remote-debugging-pipe";
+/// Elsewhere, a port. Port 0: the OS picks, and the browser prints what it picked.
+/// A fixed port races every other crawl on the machine.
+#[cfg(not(unix))]
+const DEBUGGING: &str = "--remote-debugging-port=0";
+
 /// The flags the browser is launched with.
 ///
 /// Split out and tested because each one is here for a reason and a future edit
 /// that drops the wrong one turns a crawl into a data leak or a sandbox escape.
 pub fn launch_args(profile: &str, no_sandbox: bool) -> Vec<String> {
     let mut a: Vec<String> = vec![
-        // Port 0: the OS picks, and the browser prints what it picked. A fixed
-        // port races every other crawl on the machine.
-        "--remote-debugging-port=0".into(),
+        DEBUGGING.into(),
         "--headless=new".into(),
         // A throwaway profile per run. Without this the browser reuses the
         // operator's real profile, with their cookies and their logged-in
@@ -149,73 +169,168 @@ pub fn launch_args(profile: &str, no_sandbox: bool) -> Vec<String> {
     a
 }
 
+/// The preferences the throwaway profile starts with.
+///
+/// Network prediction off. With it on, the browser opens connections to a host
+/// before it has decided to load anything there: to where a page's script is
+/// about to navigate, or to a link it expects to be followed. The gate in
+/// [`visit`] answers for every document request, but a preconnect is not a
+/// request and never reaches it.
+pub const PROFILE_PREFERENCES: &str = r#"{"net":{"network_prediction_options":2}}"#;
+
+/// Create the throwaway profile with [`PROFILE_PREFERENCES`] in place.
+fn write_profile(profile: &std::path::Path) -> std::io::Result<()> {
+    let default = profile.join("Default");
+    std::fs::create_dir_all(&default)?;
+    std::fs::write(default.join("Preferences"), PROFILE_PREFERENCES)
+}
+
 /// The websocket endpoint out of the line Chrome prints on stderr.
+#[cfg_attr(unix, allow(dead_code))]
 pub fn parse_ws_url(line: &str) -> Option<String> {
     let i = line.find("ws://")?;
     Some(line[i..].trim().to_string())
 }
 
-/// A launched browser, its throwaway profile, and the endpoint to drive it.
+/// A launched browser and its throwaway profile.
 pub struct Browser {
     child: Child,
     profile: PathBuf,
-    pub ws_url: String,
 }
 
+/// The note for a browser that died before it could be driven.
+const EXITED_EARLY: &str = "the browser exited before it was ready. On a container this \
+     usually means it needs --no-sandbox; set AMBULO_BROWSER_NO_SANDBOX=1 to allow that, \
+     knowing it removes renderer isolation.";
+
 impl Browser {
-    pub async fn launch(exe: &PathBuf, no_sandbox: bool) -> Result<Self, String> {
+    /// Start a browser and connect to it.
+    pub async fn launch(exe: &PathBuf, no_sandbox: bool) -> Result<(Self, Cdp), String> {
         let profile = std::env::temp_dir().join(format!("ambulo-browser-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&profile).map_err(|e| format!("profile dir: {e}"))?;
+        write_profile(&profile).map_err(|e| format!("profile dir: {e}"))?;
         let args = launch_args(&profile.to_string_lossy(), no_sandbox);
-        let mut child = Command::new(exe)
-            .args(&args)
+        let mut cmd = Command::new(exe);
+        cmd.args(&args)
             .arg("about:blank")
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| format!("could not start {}: {e}", exe.display()))?;
-
-        let stderr = child.stderr.take().ok_or("no stderr from the browser")?;
-        let mut lines = BufReader::new(stderr).lines();
-        let deadline = tokio::time::Instant::now() + launch_timeout();
-        let ws_url = loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                let _ = child.kill().await;
+            .kill_on_drop(true);
+        match start(cmd, exe).await {
+            Ok((child, cdp)) => Ok((Browser { child, profile }, cdp)),
+            Err(e) => {
+                // kill_on_drop has ended the process; the profile is ours to remove.
                 let _ = std::fs::remove_dir_all(&profile);
-                return Err("the browser never reported a debugging endpoint".into());
+                Err(e)
             }
-            match tokio::time::timeout(remaining, lines.next_line()).await {
-                Ok(Ok(Some(l))) => {
-                    if let Some(u) = parse_ws_url(&l) {
-                        break u;
-                    }
-                }
-                // Stream ended, or an error: the browser died on startup.
-                Ok(Ok(None)) | Ok(Err(_)) => {
-                    let _ = child.kill().await;
-                    let _ = std::fs::remove_dir_all(&profile);
-                    return Err(
-                        "the browser exited before it was ready. On a container this \
-                                usually means it needs --no-sandbox; set AMBULO_BROWSER_NO_SANDBOX=1 \
-                                to allow that, knowing it removes renderer isolation."
-                            .into(),
-                    );
-                }
-                Err(_) => continue,
-            }
-        };
-        Ok(Browser {
-            child,
-            profile,
-            ws_url,
-        })
+        }
     }
 
     pub async fn shutdown(mut self) {
         let _ = self.child.kill().await;
         let _ = std::fs::remove_dir_all(&self.profile);
+    }
+}
+
+/// Spawn the browser with a DevTools pipe and wait until it answers on it.
+#[cfg(unix)]
+async fn start(mut cmd: Command, exe: &std::path::Path) -> Result<(Child, Cdp), String> {
+    use std::os::fd::{AsRawFd, OwnedFd};
+    let pipe_err = |e: std::io::Error| format!("devtools pipe: {e}");
+    // Both ends are close-on-exec, so nothing but the two the browser is given
+    // below reaches it, or any other process this one starts.
+    let (commands_r, commands_w) = std::io::pipe().map_err(pipe_err)?;
+    let (replies_r, replies_w) = std::io::pipe().map_err(pipe_err)?;
+    let (child_in, child_out) = (commands_r.as_raw_fd(), replies_w.as_raw_fd());
+    cmd.stderr(Stdio::null());
+    // SAFETY: only fcntl and dup2 run between fork and exec, and both are
+    // async-signal-safe. The copies to 10 and up come first so that neither dup2
+    // can overwrite the other's source; dup2 clears close-on-exec on 3 and 4.
+    unsafe {
+        cmd.pre_exec(move || {
+            let a = libc::fcntl(child_in, libc::F_DUPFD_CLOEXEC, 10);
+            let b = libc::fcntl(child_out, libc::F_DUPFD_CLOEXEC, 10);
+            if a < 0 || b < 0 || libc::dup2(a, 3) < 0 || libc::dup2(b, 4) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("could not start {}: {e}", exe.display()))?;
+    // The browser holds its own ends now. Closing ours is what makes its exit read
+    // as the end of the pipe.
+    drop(commands_r);
+    drop(replies_w);
+    let tx = tokio::net::unix::pipe::Sender::from_owned_fd(OwnedFd::from(commands_w))
+        .map_err(pipe_err)?;
+    let rx = tokio::net::unix::pipe::Receiver::from_owned_fd(OwnedFd::from(replies_r))
+        .map_err(pipe_err)?;
+    let mut cdp = Cdp::new(Wire::Pipe {
+        tx,
+        rx: BufReader::new(rx),
+        partial: Vec::new(),
+    });
+    match cdp
+        .call("Browser.getVersion", json!({}), None, launch_timeout())
+        .await
+    {
+        Ok(_) => Ok((child, cdp)),
+        Err(e) => {
+            // A browser that died has closed the pipe, possibly a moment before
+            // its exit can be collected.
+            let exited = tokio::time::timeout(Duration::from_secs(2), child.wait())
+                .await
+                .is_ok();
+            let _ = child.kill().await;
+            if exited {
+                Err(EXITED_EARLY.into())
+            } else {
+                Err(format!(
+                    "the browser never answered on its DevTools pipe ({e})"
+                ))
+            }
+        }
+    }
+}
+
+/// Spawn the browser on a port the OS picks, read the endpoint off its stderr and
+/// connect to it.
+#[cfg(not(unix))]
+async fn start(mut cmd: Command, exe: &std::path::Path) -> Result<(Child, Cdp), String> {
+    let mut child = cmd
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not start {}: {e}", exe.display()))?;
+
+    let stderr = child.stderr.take().ok_or("no stderr from the browser")?;
+    let mut lines = BufReader::new(stderr).lines();
+    let deadline = tokio::time::Instant::now() + launch_timeout();
+    let ws_url = loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            let _ = child.kill().await;
+            return Err("the browser never reported a debugging endpoint".into());
+        }
+        match tokio::time::timeout(remaining, lines.next_line()).await {
+            Ok(Ok(Some(l))) => {
+                if let Some(u) = parse_ws_url(&l) {
+                    break u;
+                }
+            }
+            // Stream ended, or an error: the browser died on startup.
+            Ok(Ok(None)) | Ok(Err(_)) => {
+                let _ = child.kill().await;
+                return Err(EXITED_EARLY.into());
+            }
+            Err(_) => continue,
+        }
+    };
+    match Cdp::connect(&ws_url).await {
+        Ok(cdp) => Ok((child, cdp)),
+        Err(e) => {
+            let _ = child.kill().await;
+            Err(e)
+        }
     }
 }
 
@@ -234,7 +349,20 @@ pub struct Visit {
     pub requests: Vec<(String, String)>,
     /// The DOM after script has built it.
     pub dom: String,
+    /// Where the page ended up, which is not the address it was sent to when the
+    /// server redirected it. The DOM's relative links mean this page, so they are
+    /// resolved against this and not against the address asked for. `None` when
+    /// the navigation failed or the address could not be read.
+    pub final_url: Option<String>,
+    /// Documents the gate refused to load: a redirect, a script navigation or a
+    /// frame that would have taken the browser somewhere it may not go.
+    pub refused: Vec<String>,
 }
+
+/// Decides whether the browser may load a document from a URL. Asked about the
+/// page the visit starts on, every redirect hop after it, any navigation the
+/// page's own script starts, and every frame.
+pub type Gate = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// Is this a request worth recording?
 ///
@@ -251,19 +379,131 @@ pub fn worth_recording(url: &str) -> bool {
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
 
+/// What a DevTools connection runs over.
+enum Wire {
+    /// A websocket to the port the browser picked.
+    #[cfg_attr(unix, allow(dead_code))]
+    Socket(tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>),
+    /// The browser's fds 3 and 4: one JSON message per NUL-terminated chunk.
+    #[cfg(unix)]
+    Pipe {
+        tx: tokio::net::unix::pipe::Sender,
+        rx: BufReader<tokio::net::unix::pipe::Receiver>,
+        /// A message read in part when a wait timed out, kept for the next read.
+        partial: Vec<u8>,
+    },
+}
+
+impl Wire {
+    async fn send(&mut self, text: String) -> Result<(), String> {
+        match self {
+            Wire::Socket(ws) => ws
+                .send(Message::Text(text))
+                .await
+                .map_err(|e| e.to_string()),
+            #[cfg(unix)]
+            Wire::Pipe { tx, .. } => {
+                use tokio::io::AsyncWriteExt;
+                let mut bytes = text.into_bytes();
+                bytes.push(0);
+                tx.write_all(&bytes).await.map_err(|e| e.to_string())
+            }
+        }
+    }
+
+    /// The next text message, or `None` once the browser has gone. Safe to drop
+    /// part way, as a timeout does: nothing read so far is lost.
+    async fn recv(&mut self) -> Option<String> {
+        match self {
+            Wire::Socket(ws) => loop {
+                match ws.next().await? {
+                    Ok(Message::Text(t)) => return Some(t),
+                    Ok(_) => continue,
+                    Err(_) => return None,
+                }
+            },
+            #[cfg(unix)]
+            Wire::Pipe { rx, partial, .. } => loop {
+                rx.read_until(0, partial).await.ok()?;
+                if partial.pop() != Some(0) {
+                    // End of the pipe, with or without half a message before it.
+                    return None;
+                }
+                if let Ok(m) = String::from_utf8(std::mem::take(partial)) {
+                    return Some(m);
+                }
+            },
+        }
+    }
+}
+
 /// A DevTools connection: send commands, receive replies and events on one
-/// socket, matched by id.
+/// channel, matched by id.
 pub struct Cdp {
-    ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    wire: Wire,
     next_id: u64,
     /// Events that arrived while waiting for a command reply. Kept rather than
     /// dropped: the requests this tier exists to record arrive exactly while a
     /// navigation command is in flight, so discarding them would throw away the
     /// answer.
     pending: Vec<Value>,
+    /// While a visit runs, what decides each paused document request. A paused
+    /// request waits for an answer, so it is answered the moment it is read,
+    /// whichever wait reads it.
+    gate: Option<Gate>,
+    /// Documents the gate refused during the current visit.
+    refused: Vec<String>,
 }
 
 impl Cdp {
+    fn new(wire: Wire) -> Self {
+        Cdp {
+            wire,
+            next_id: 1,
+            pending: Vec::new(),
+            gate: None,
+            refused: Vec::new(),
+        }
+    }
+
+    /// Answer a paused request if `v` is one: let it through or fail it, as the
+    /// gate says. Returns whether `v` was a paused request.
+    ///
+    /// The answer is sent without waiting for its reply. Nothing is waiting on
+    /// that id, so the reply is read and dropped like any other stray.
+    async fn answer_paused(&mut self, v: &Value) -> bool {
+        if v.get("method").and_then(|m| m.as_str()) != Some("Fetch.requestPaused") {
+            return false;
+        }
+        let Some(request_id) = v.pointer("/params/requestId").and_then(|x| x.as_str()) else {
+            return true;
+        };
+        let url = v
+            .pointer("/params/request/url")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        // No gate means nothing was asked to be stopped.
+        let allowed = self.gate.as_ref().is_none_or(|g| g(url));
+        let (method, params) = if allowed {
+            ("Fetch.continueRequest", json!({"requestId": request_id}))
+        } else {
+            self.refused
+                .push(url.split('#').next().unwrap_or(url).to_string());
+            (
+                "Fetch.failRequest",
+                json!({"requestId": request_id, "errorReason": "BlockedByClient"}),
+            )
+        };
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut msg = json!({"id": id, "method": method, "params": params});
+        if let Some(s) = v.get("sessionId") {
+            msg["sessionId"] = s.clone();
+        }
+        let _ = self.wire.send(msg.to_string()).await;
+        true
+    }
+
     /// Connect to a DevTools endpoint on the loopback interface.
     ///
     /// A plain TCP stream rather than the crate's `connect_async`, for two
@@ -271,6 +511,7 @@ impl Cdp {
     /// protocol has no use for. And it means the address is resolved HERE,
     /// where it can be refused: a DevTools endpoint is total control over a
     /// browser, and nothing should ever drive one across a network.
+    #[cfg_attr(unix, allow(dead_code))]
     pub async fn connect(ws_url: &str) -> Result<Self, String> {
         let addr = ws_authority(ws_url).ok_or("devtools: unparseable endpoint")?;
         let sock: std::net::SocketAddr = addr
@@ -288,11 +529,7 @@ impl Cdp {
         let (ws, _) = tokio_tungstenite::client_async(ws_url, stream)
             .await
             .map_err(|e| format!("devtools handshake: {e}"))?;
-        Ok(Cdp {
-            ws,
-            next_id: 1,
-            pending: Vec::new(),
-        })
+        Ok(Cdp::new(Wire::Socket(ws)))
     }
 
     /// Send one command and wait for its reply, buffering any events that
@@ -310,8 +547,8 @@ impl Cdp {
         if let Some(s) = session {
             msg["sessionId"] = json!(s);
         }
-        self.ws
-            .send(Message::Text(msg.to_string()))
+        self.wire
+            .send(msg.to_string())
             .await
             .map_err(|e| format!("devtools send {method}: {e}"))?;
 
@@ -321,10 +558,11 @@ impl Cdp {
             if left.is_zero() {
                 return Err(format!("devtools {method}: no reply"));
             }
-            let Ok(Some(Ok(m))) = tokio::time::timeout(left, self.ws.next()).await else {
-                return Err(format!("devtools {method}: connection ended"));
+            let t = match tokio::time::timeout(left, self.wire.recv()).await {
+                Ok(Some(t)) => t,
+                Ok(None) => return Err(format!("devtools {method}: connection ended")),
+                Err(_) => return Err(format!("devtools {method}: no reply")),
             };
-            let Message::Text(t) = m else { continue };
             let Ok(v) = serde_json::from_str::<Value>(&t) else {
                 continue;
             };
@@ -333,6 +571,9 @@ impl Cdp {
                     return Err(format!("devtools {method}: {e}"));
                 }
                 return Ok(v.get("result").cloned().unwrap_or(json!({})));
+            }
+            if self.answer_paused(&v).await {
+                continue;
             }
             if v.get("method").is_some() {
                 self.pending.push(v);
@@ -362,17 +603,20 @@ impl Cdp {
                 Some(s) => (s - now).min(hard - now),
                 None => hard - now,
             };
-            let Ok(Some(Ok(m))) = tokio::time::timeout(left, self.ws.next()).await else {
+            let t = match tokio::time::timeout(left, self.wire.recv()).await {
+                Ok(Some(t)) => t,
+                // The browser has gone; nothing more is coming.
+                Ok(None) => break,
                 // A timeout here is the normal quiet end of a page.
-                if soft.is_some() {
-                    break;
-                }
-                continue;
+                Err(_) if soft.is_some() => break,
+                Err(_) => continue,
             };
-            let Message::Text(t) = m else { continue };
             let Ok(v) = serde_json::from_str::<Value>(&t) else {
                 continue;
             };
+            if self.answer_paused(&v).await {
+                continue;
+            }
             if v.get("method").and_then(|x| x.as_str()) == Some("Page.loadEventFired") {
                 soft = Some(tokio::time::Instant::now() + settle);
             }
@@ -385,6 +629,7 @@ impl Cdp {
 }
 
 /// `host:port` out of a `ws://host:port/path` endpoint.
+#[cfg_attr(unix, allow(dead_code))]
 pub fn ws_authority(ws_url: &str) -> Option<String> {
     let rest = ws_url.strip_prefix("ws://")?;
     let authority = rest.split('/').next()?;
@@ -425,7 +670,24 @@ pub fn requests_from(events: &[Value]) -> Vec<(String, String)> {
 /// A fresh target per navigation, deliberately: a single-page application that
 /// keeps state between routes would otherwise skip the data fetches on the
 /// second visit, and those fetches are the entire point.
-pub async fn visit(cdp: &mut Cdp, url: &str) -> Result<Visit, String> {
+///
+/// Every document the page would load, `url` itself, each redirect hop and any
+/// frame or script navigation, is held until `gate` answers for it, and one it
+/// refuses is never requested. Requests for scripts, images and data are not
+/// gated: they are what the page itself asks for, and they are recorded.
+pub async fn visit(cdp: &mut Cdp, url: &str, gate: Gate) -> Result<Visit, String> {
+    cdp.gate = Some(gate);
+    cdp.refused.clear();
+    let out = visit_gated(cdp, url).await;
+    cdp.gate = None;
+    let refused = std::mem::take(&mut cdp.refused);
+    out.map(|mut v| {
+        v.refused = refused;
+        v
+    })
+}
+
+async fn visit_gated(cdp: &mut Cdp, url: &str) -> Result<Visit, String> {
     let t = cdp
         .call(
             "Target.createTarget",
@@ -457,14 +719,47 @@ pub async fn visit(cdp: &mut Cdp, url: &str) -> Result<Visit, String> {
 
     let _ = cdp.call("Network.enable", json!({}), s, NAV_TIMEOUT).await;
     let _ = cdp.call("Page.enable", json!({}), s, NAV_TIMEOUT).await;
-    let nav = cdp
-        .call("Page.navigate", json!({"url": url}), s, NAV_TIMEOUT)
+    // Hold every document request until the gate has answered for it. Without
+    // this the browser follows a redirect wherever it points, as a browser does.
+    let gated = cdp
+        .call(
+            "Fetch.enable",
+            json!({"patterns": [{"urlPattern": "*", "resourceType": "Document", "requestStage": "Request"}]}),
+            s,
+            NAV_TIMEOUT,
+        )
         .await;
+    let nav = match gated {
+        Ok(_) => {
+            cdp.call("Page.navigate", json!({"url": url}), s, NAV_TIMEOUT)
+                .await
+        }
+        Err(e) => Err(e),
+    };
 
     let mut visit = Visit::default();
-    if nav.is_ok() {
+    // A navigation the gate refused fails with an error page, which is not the
+    // application and has nothing to record.
+    let failed = nav.as_ref().map_or(true, |r| {
+        r.get("errorText").is_some_and(|e| e.as_str() != Some(""))
+    });
+    if !failed {
         let events = cdp.pump(NAV_TIMEOUT, SETTLE).await;
         visit.requests = requests_from(&events);
+        if let Ok(r) = cdp
+            .call(
+                "Runtime.evaluate",
+                json!({"expression": "location.href", "returnByValue": true}),
+                s,
+                NAV_TIMEOUT,
+            )
+            .await
+        {
+            visit.final_url = r
+                .pointer("/result/value")
+                .and_then(|x| x.as_str())
+                .map(str::to_string);
+        }
         if let Ok(r) = cdp
             .call(
                 "Runtime.evaluate",
@@ -521,6 +816,23 @@ mod tests {
     }
 
     #[test]
+    fn the_profile_starts_with_network_prediction_off() {
+        // 2 is "never". Without it the browser connects to where a page is
+        // about to send it before the gate has been asked.
+        let dir = std::env::temp_dir().join(format!("ambulo-prefs-{}", uuid::Uuid::new_v4()));
+        write_profile(&dir).unwrap();
+        let prefs: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("Default/Preferences")).unwrap(),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            prefs.pointer("/net/network_prediction_options"),
+            Some(&json!(2))
+        );
+    }
+
+    #[test]
     fn the_browser_does_not_phone_home() {
         let a = launch_args("/tmp/p", false);
         for must in [
@@ -548,6 +860,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(unix))]
     #[test]
     fn the_port_is_chosen_by_the_os() {
         // A fixed port races every other crawl on the machine.
@@ -555,6 +868,69 @@ mod tests {
             launch_args("/tmp/p", false)
                 .iter()
                 .any(|f| f == "--remote-debugging-port=0")
+        );
+    }
+
+    // A DevTools port on loopback is open to every local account, and whoever
+    // attaches drives a browser running as the operator. On Unix the browser
+    // talks over a pipe only this process holds.
+    #[cfg(unix)]
+    #[test]
+    fn on_unix_the_browser_opens_no_debugging_port() {
+        let a = launch_args("/tmp/p", false);
+        assert!(
+            !a.iter().any(|f| f.starts_with("--remote-debugging-port")),
+            "{a:?}"
+        );
+        assert!(a.iter().any(|f| f == "--remote-debugging-pipe"), "{a:?}");
+    }
+
+    // Against a real browser when one is installed. Chrome writes the port it
+    // listens on to DevToolsActivePort in the profile, so the file existing means a
+    // port was opened.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_real_browser_is_driven_without_a_port() {
+        let Some(exe) = find_browser() else {
+            eprintln!("no browser on PATH; skipped");
+            return;
+        };
+        let no_sandbox =
+            dguard::env_renamed("AMBULO_BROWSER_NO_SANDBOX", "MACH_BROWSER_NO_SANDBOX").is_some();
+        let (browser, mut cdp) = Browser::launch(&exe, no_sandbox).await.expect("launch");
+        let v = visit(
+            &mut cdp,
+            "data:text/html,<a href=/x>x</a>",
+            std::sync::Arc::new(|_: &str| true),
+        )
+        .await;
+        let port_file = browser.profile.join("DevToolsActivePort");
+        let opened_a_port = port_file.exists();
+        browser.shutdown().await;
+        let v = v.expect("visit");
+        assert!(v.dom.contains("href=\"/x\""), "{}", v.dom);
+        assert!(!opened_a_port, "the browser listened on a DevTools port");
+    }
+
+    // A browser that dies at once closes its end of the pipe, which has to read as
+    // a failed start straight away rather than as a wait for the launch timeout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_browser_that_exits_at_once_is_reported_without_waiting() {
+        let exe = PathBuf::from("/usr/bin/false");
+        if !exe.is_file() {
+            return;
+        }
+        let started = tokio::time::Instant::now();
+        let err = match Browser::launch(&exe, false).await {
+            Ok(_) => panic!("a process that exits cannot be driven"),
+            Err(e) => e,
+        };
+        assert!(err.contains("exited before it was ready"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
         );
     }
 

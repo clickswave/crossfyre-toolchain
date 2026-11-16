@@ -57,7 +57,7 @@ pub async fn handle(env: OpEnv) {
     }
 
     let mut found_count = 0;
-    match tokio::net::TcpStream::connect(super::engine_addr("voyage")).await {
+    match super::listener::connect(&super::engine_addr("voyage")).await {
         Ok(stream) => {
             use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
             let (reader, mut writer) = stream.into_split();

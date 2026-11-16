@@ -9,7 +9,8 @@
 //! outright is caught the same way: an engine's op takes the egress the daemon read
 //! off the request, and `Inherit` or `Direct` written into op code would drop it.
 //!
-//! Test code (`#[cfg(test)]` items) and comments are not read.
+//! Test code (`#[cfg(test)]` items, and the files a `#[cfg(test)] mod name;`
+//! declares) and comments are not read.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -148,6 +149,51 @@ fn non_test_lines(src: &str) -> Vec<(usize, &str)> {
     out
 }
 
+/// The files `src`, the source of `file`, declares as test modules with
+/// `#[cfg(test)] mod name;`. They are test code as a whole, as an inline
+/// `#[cfg(test)]` module is.
+fn test_module_files(file: &Path, src: &str) -> Vec<PathBuf> {
+    // A module of lib.rs, main.rs or mod.rs sits beside it, one of any other file
+    // in a directory named after that file.
+    let dir = match file.file_name().and_then(|n| n.to_str()) {
+        Some("lib.rs" | "main.rs" | "mod.rs") => file.parent().unwrap_or(file).to_path_buf(),
+        _ => file.with_extension(""),
+    };
+    let lines: Vec<&str> = src.lines().map(str::trim).collect();
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let Some(rest) = line.strip_prefix("#[cfg(test)]") else {
+            continue;
+        };
+        // The item is on the same line, or on the next one that is not another
+        // attribute or a comment.
+        let item = match rest.trim() {
+            "" => lines[i + 1..]
+                .iter()
+                .find(|l| !l.is_empty() && !l.starts_with("#[") && !l.starts_with("//"))
+                .copied(),
+            same_line => Some(same_line),
+        };
+        if let Some(name) = item.and_then(declared_module) {
+            out.push(dir.join(format!("{name}.rs")));
+            out.push(dir.join(name).join("mod.rs"));
+        }
+    }
+    out
+}
+
+/// The name in `mod name;`, with or without a visibility, and None for anything
+/// else, an inline `mod name { ... }` included.
+fn declared_module(item: &str) -> Option<&str> {
+    let item = ["pub(crate) ", "pub(super) ", "pub "]
+        .iter()
+        .find_map(|v| item.strip_prefix(v))
+        .unwrap_or(item);
+    let name = item.strip_prefix("mod ")?.strip_suffix(';')?.trim();
+    (!name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        .then_some(name)
+}
+
 /// The index of the line after the item that starts at `from`.
 fn end_of_item(lines: &[&str], from: usize) -> usize {
     let mut depth = 0i32;
@@ -207,15 +253,26 @@ fn engine_code_opens_no_connection_except_through_transport() {
     assert!(files.len() > 40, "the engines' sources were not found");
     files.sort();
 
+    let sources: Vec<(PathBuf, String)> = files
+        .iter()
+        .map(|f| (f.clone(), std::fs::read_to_string(f).unwrap()))
+        .collect();
+    let test_files: Vec<PathBuf> = sources
+        .iter()
+        .flat_map(|(f, src)| test_module_files(f, src))
+        .collect();
+
     let mut found: BTreeMap<(String, &str), Vec<usize>> = BTreeMap::new();
-    for f in &files {
+    for (f, src) in &sources {
+        if test_files.contains(f) {
+            continue;
+        }
         let rel = f
             .strip_prefix(&root)
             .unwrap()
             .to_string_lossy()
             .replace('\\', "/");
-        let src = std::fs::read_to_string(f).unwrap();
-        for (n, line) in non_test_lines(&src) {
+        for (n, line) in non_test_lines(src) {
             if line.trim_start().starts_with("//") {
                 continue;
             }
@@ -270,4 +327,55 @@ fn test_code_and_comments_are_not_read() {
     let one_line = "#[cfg(test)]\nuse x::y;\nfn z() {}\n";
     let kept: Vec<usize> = non_test_lines(one_line).iter().map(|(n, _)| *n).collect();
     assert_eq!(kept, [3]);
+}
+
+#[test]
+fn a_file_declared_as_a_test_module_is_not_read() {
+    let lib = Path::new("/w/plessor/src/lib.rs");
+    let src = "#[cfg(test)]\n\
+               mod rail;\n\
+               mod plain;\n\
+               #[cfg(test)] mod same_line;\n\
+               #[cfg(test)]\n\
+               mod tests {\n\
+                   use super::*;\n\
+               }\n";
+    let skipped = test_module_files(lib, src);
+    let src_dir = Path::new("/w/plessor/src");
+    assert!(skipped.contains(&src_dir.join("rail.rs")), "{skipped:?}");
+    assert!(
+        skipped.contains(&src_dir.join("rail").join("mod.rs")),
+        "{skipped:?}"
+    );
+    assert!(
+        skipped.contains(&src_dir.join("same_line.rs")),
+        "{skipped:?}"
+    );
+    // A plain `mod plain;` is engine code and is still read, and an inline test
+    // module names no file.
+    assert!(
+        !skipped
+            .iter()
+            .any(|p| p.to_string_lossy().contains("plain") || p.to_string_lossy().contains("tests")),
+        "{skipped:?}"
+    );
+    // A file other than lib.rs, main.rs or mod.rs keeps its modules in a directory
+    // named after it.
+    let other = test_module_files(
+        Path::new("/w/plessor/src/scan.rs"),
+        "#[cfg(test)]\nmod rail;\n",
+    );
+    let scan = src_dir.join("scan");
+    assert_eq!(
+        other,
+        [scan.join("rail.rs"), scan.join("rail").join("mod.rs")]
+    );
+    let in_mod = test_module_files(
+        Path::new("/w/plessor/src/scan/mod.rs"),
+        "#[cfg(test)]\nmod rail;\n",
+    );
+    assert_eq!(
+        in_mod,
+        [scan.join("rail.rs"), scan.join("rail").join("mod.rs")]
+    );
 }

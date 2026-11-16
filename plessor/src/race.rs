@@ -110,6 +110,8 @@ pub struct Recipe {
     pub resolve: Vec<(String, std::net::SocketAddr)>,
     /// The pass's egress, so the burst goes out the way the rest of the pass does.
     pub egress: transport::Egress,
+    /// The pass's certificate policy, since the burst carries the same session.
+    pub verify_certs: bool,
 }
 
 /// A finding, or an explanation of why there is not one.
@@ -310,6 +312,7 @@ pub async fn probe(recipe: &Recipe, ep: &InjEndpoint) -> Outcome {
                     min_timeout_ms: 0,
                     block_internal: recipe.block_internal,
                     egress: &recipe.egress,
+                    verify_certs: recipe.verify_certs,
                 },
                 recipe.redirect,
                 recipe.resolve.clone(),

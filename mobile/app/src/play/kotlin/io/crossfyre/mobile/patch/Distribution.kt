@@ -1,12 +1,12 @@
 package io.crossfyre.mobile.patch
 
 import android.content.Context
+import android.content.Intent
 import io.crossfyre.mobile.Pairing
 import io.crossfyre.mobile.apps.AppFacts
 import io.crossfyre.mobile.apps.Apps
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import java.io.File
 import java.io.OutputStream
 
 /**
@@ -26,9 +26,13 @@ private object NoPatching : PatchFeature {
     override fun state(pkg: String, caFingerprint: String?) = PatchState.NONE
     override fun patchedCount() = 0
     override fun stale(caFingerprint: String?): List<String> = emptyList()
+    override fun acceptsAnyCert(): List<String> = emptyList()
+    override fun uninstallIntent(pkg: String): Intent? = null
     override fun outlook(facts: AppFacts, patched: Boolean) = Apps.outlookWithoutPatching(facts)
     override fun tidy() = Unit
-    override fun start(pkg: String, label: String, sizeMb: Int, pairing: Pairing, ca: File, caFingerprint: String?) = Unit
+    override fun start(pkg: String, label: String, sizeMb: Int, pairing: Pairing, caPem: String, caFingerprint: String?) = Unit
+    override fun carryOn() = Unit
+    override fun allowInstallsIntent(): Intent? = null
     override fun cancel() = Unit
     override fun dismiss() = Unit
     override fun export(out: OutputStream) = "This build cannot patch apps."

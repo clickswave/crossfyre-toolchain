@@ -168,10 +168,14 @@ pub async fn run(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // -- Connectivity ---------------------------------------------------------
     section("Connectivity");
     let cdn = super::install::BASE_URL;
-    let cdn_ok = reqwest::get(format!("{cdn}/manifest.json"))
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false);
+    let cdn_ok = match super::release_http::http_client(super::release_http::Purpose::Check) {
+        Ok(c) => c
+            .get(format!("{cdn}/manifest.json"))
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success()),
+        Err(_) => false,
+    };
     let label = format!("release CDN reachable {}", dim(&format!("({cdn})")));
     if !check(
         &label,
@@ -185,7 +189,9 @@ pub async fn run(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(ids) = crate::discover_nodes(base) {
         for id in ids {
             let paths = crate::NodePaths::new(base, &id);
-            let Ok(text) = std::fs::read_to_string(&paths.config) else {
+            // As root, through the reader that refuses a config another account could
+            // have written: root would otherwise call whatever API it names.
+            let Ok(text) = super::node_config::read(&paths.config) else {
                 continue;
             };
             let Ok(cfg) = toml::from_str::<crate::Config>(&text) else {

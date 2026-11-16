@@ -144,6 +144,14 @@ pub async fn run(params: FpParams, tx: mpsc::UnboundedSender<Value>) {
 
     let title = extract_title(&body);
     let server = signatures::header_val(&headers, "server");
+    // A 3xx here is a redirect that was not followed: the client follows one
+    // only on the target's own origin, or none at all with follow_redirects
+    // off. Where it pointed is reported, so the finding says what the target
+    // does rather than reading as a site with nothing on it.
+    let redirect_location = (300..400)
+        .contains(&status)
+        .then(|| signatures::header_val(&headers, "location"))
+        .flatten();
     let detections = signatures::detect(&headers, &cookies, &body);
     let (waf, cdn) = signatures::waf_cdn(&headers, &cookies);
 
@@ -220,6 +228,7 @@ pub async fn run(params: FpParams, tx: mpsc::UnboundedSender<Value>) {
             "source": "scout",
             "severity": "info",
             "status_code": status,
+            "redirect_location": redirect_location,
             "title": title,
             "server": server,
             "favicon": favicon,
@@ -395,5 +404,53 @@ mod normalize_target_tests {
     fn empty_is_none() {
         assert!(normalize_target("").is_none());
         assert!(normalize_target("   ").is_none());
+    }
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    //! A redirect off the target's origin is not followed, so the service
+    //! finding describes the redirect itself. It says where the redirect
+    //! pointed, so a 301 on an apex reads as "this sends you to www" rather
+    //! than as an empty site.
+    use super::*;
+    use std::io::{Read, Write};
+
+    #[tokio::test]
+    async fn the_service_finding_names_a_redirect_it_did_not_follow() {
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { return };
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(
+                    b"HTTP/1.1 301 Moved Permanently\r\nLocation: https://www.example.test/\r\n\
+                      Content-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let params: FpParams = serde_json::from_value(json!({
+            "target": format!("http://127.0.0.1:{port}/"),
+            "evasive": false,
+            "favicon": false,
+            "timeout_ms": 3000,
+        }))
+        .unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        run(params, tx).await;
+        let mut service = None;
+        while let Ok(ev) = rx.try_recv() {
+            if ev.pointer("/data/type") == Some(&json!("service")) {
+                service = Some(ev["data"].clone());
+            }
+        }
+        let service = service.expect("no service finding");
+        assert_eq!(service["status_code"], 301);
+        assert_eq!(
+            service["redirect_location"], "https://www.example.test/",
+            "{service}"
+        );
     }
 }

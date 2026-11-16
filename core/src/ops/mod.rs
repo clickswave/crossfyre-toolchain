@@ -3,6 +3,9 @@
 //! dispatched operation: it runs the engine, streams results/progress onto
 //! NATS, and publishes the terminal `operation_completed`.
 pub mod content_discovery;
+pub(crate) mod cred_scope;
+pub(crate) mod handoff;
+pub(crate) mod listener;
 pub mod network_scan;
 pub mod origin_discovery;
 pub mod service_enum;
@@ -95,7 +98,7 @@ pub(crate) async fn open_engine(
     egress: Option<&Lease>,
 ) -> Result<(EngineLines, tokio::net::tcp::OwnedWriteHalf), EngineOpen> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    let stream = tokio::net::TcpStream::connect(engine_addr(ext))
+    let stream = listener::connect(&engine_addr(ext))
         .await
         .map_err(EngineOpen::Unreachable)?;
     let (reader, mut writer) = stream.into_split();

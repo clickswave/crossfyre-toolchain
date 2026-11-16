@@ -223,23 +223,12 @@ async fn handle_connection(
             continue;
         }
 
-        // The bind address is the primary boundary. This is the second one, for
-        // deployments that used CFX_DAEMON_BIND to move the listener off loopback;
-        // with no token configured it is a no-op.
-        if !gate.allows(
-            serde_json::from_str::<serde_json::Value>(&line)
-                .ok()
-                .as_ref()
-                .and_then(|v| v.get("token"))
-                .and_then(|t| t.as_str()),
-        ) {
-            // Same `type`/`message` envelope as every other reply: a client that
-            // breaks on `type == "error"` has to recognise this one, or it waits
-            // for a line that never comes. Then close, rather than leaving an
-            // unauthenticated peer a socket to retry on.
-            let _ = writer
-                .write_all(b"{\"type\":\"error\",\"message\":\"unauthorized\"}\n")
-                .await;
+        // A line that is not a JSON object is not from a client (an HTTP request
+        // from a web page starts that way), and a request without the configured
+        // token is not from an authorised one. Either ends the connection, so
+        // nothing written after that line is ever read as a request.
+        if let Some(reply) = gate.refusal(&line) {
+            let _ = writer.write_all(reply.as_bytes()).await;
             break;
         }
 
@@ -590,27 +579,50 @@ async fn dispatch(req: DaemonRequest, db: Arc<VoyageDb>) -> DaemonResponse {
 /// `wordlist` is a path from the request, and the enum sends one DNS query per line for
 /// a domain the same request names, so without the check any file the daemon can read
 /// went out a line at a time to whoever answers for that domain.
-fn active_wordlist(params: &EnumParams) -> Result<Option<std::path::PathBuf>, String> {
+///
+/// Opened here, once, and read later through this handle: a name checked now and
+/// opened again after the passive sources have run can by then be another file.
+fn active_wordlist(params: &EnumParams) -> Result<Option<std::fs::File>, String> {
     if params.disable_active || params.wordlist.is_empty() {
         return Ok(None);
     }
-    dguard::resolve_wordlist(&params.wordlist).map(Some)
+    dguard::open_wordlist(&params.wordlist).map(|(_, file)| Some(file))
+}
+
+/// What a saved scan is found again by. Without an active wordlist it is the domain
+/// and the wordlist argument, as it always was. With one it is the domain and the
+/// words themselves, the way ambulo finds a wordlist by its content: the node hands
+/// each op its wordlist under a new directory, so a key built from the path would
+/// start a new scan, and leave all of its rows behind, on every op.
+fn scan_key(domain: &str, wordlist: &str, words: Option<&[String]>) -> String {
+    use sha2::Digest;
+    let config = match words {
+        None => serde_json::json!({ "domain": domain, "wordlist": wordlist }),
+        Some(words) => {
+            let mut digest = sha2::Sha512::new();
+            for word in words {
+                digest.update(word.as_bytes());
+                digest.update(b"\n");
+            }
+            serde_json::json!({ "domain": domain, "words": format!("{:x}", digest.finalize()) })
+        }
+    };
+    crate::libs::sha::sha512(config.to_string())
 }
 
 async fn prepare_enum(
     params: &EnumParams,
     db: &Arc<VoyageDb>,
 ) -> Result<(Scanner, usize), Box<dyn std::error::Error + Send + Sync>> {
-    let wordlist = active_wordlist(params)?;
-    // Compute config hash from domain + wordlist path
-    let config_str = serde_json::json!({
-        "domain": &params.domain,
-        "wordlist": &params.wordlist,
-    })
-    .to_string();
-    let config_hash = crate::libs::sha::sha512(config_str)
-        .await
-        .map_err(|e| format!("Hash error: {e}"))?;
+    let words = match active_wordlist(params)? {
+        Some(file) => Some(
+            crate::libs::wordlist::read_lines_from(file)
+                .await
+                .map_err(|e| format!("Wordlist error: {e}"))?,
+        ),
+        None => None,
+    };
+    let config_hash = scan_key(&params.domain, &params.wordlist, words.as_deref());
 
     let scan_id = db
         .get_or_create_scan(&config_hash, &params.domain, &params.wordlist)
@@ -652,11 +664,7 @@ async fn prepare_enum(
     }
 
     // Active wordlist - insert entries with status="queued"
-    if let Some(wordlist) = &wordlist {
-        let words = crate::libs::wordlist::read_lines(&wordlist.to_string_lossy())
-            .await
-            .map_err(|e| format!("Wordlist error: {e}"))?;
-
+    if let Some(words) = words {
         let entries: Vec<(String, String, String, String)> = words
             .iter()
             .filter(|w| !w.trim().is_empty())
@@ -1247,6 +1255,51 @@ async fn handle_stream_takeover(
 mod wordlist_tests {
     use super::*;
 
+    fn lines(words: &[&str]) -> Vec<String> {
+        words.iter().map(|w| w.to_string()).collect()
+    }
+
+    // The node writes the same list to a new path for every op. Keyed by the path,
+    // each op made a scan of its own and none of them was ever removed.
+    #[test]
+    fn the_same_words_under_another_path_find_the_same_scan() {
+        let words = lines(&["www", "api"]);
+        assert_eq!(
+            scan_key(
+                "example.com",
+                "/tmp/cfx-handoff-a/cfx-wl-sub-x.txt",
+                Some(&words)
+            ),
+            scan_key(
+                "example.com",
+                "/tmp/cfx-handoff-b/cfx-wl-sub-x.txt",
+                Some(&words)
+            ),
+        );
+        assert_ne!(
+            scan_key("example.com", "/tmp/a.txt", Some(&words)),
+            scan_key("example.org", "/tmp/a.txt", Some(&words)),
+        );
+    }
+
+    #[test]
+    fn other_words_under_the_same_path_are_another_scan() {
+        assert_ne!(
+            scan_key("example.com", "/srv/wl.txt", Some(&lines(&["www"]))),
+            scan_key("example.com", "/srv/wl.txt", Some(&lines(&["www", "api"]))),
+        );
+    }
+
+    // A passive-only scan saved by an earlier release is still found.
+    #[test]
+    fn without_an_active_wordlist_the_key_is_unchanged() {
+        let before = serde_json::json!({ "domain": "example.com", "wordlist": "/srv/wl.txt" });
+        assert_eq!(
+            scan_key("example.com", "/srv/wl.txt", None),
+            crate::libs::sha::sha512(before.to_string()),
+        );
+    }
+
     fn enum_params(wordlist: &str, disable_active: bool) -> EnumParams {
         serde_json::from_value(serde_json::json!({
             "domain": "example.com",
@@ -1265,11 +1318,18 @@ mod wordlist_tests {
     }
 
     #[test]
-    fn a_wordlist_in_the_temp_dir_is_read_and_none_is_needed_without_active_enum() {
-        let inside = std::env::temp_dir().join(format!("voyage-wl-{}.txt", std::process::id()));
+    fn a_handed_over_wordlist_is_read_and_none_is_needed_without_active_enum() {
+        let dir = std::env::temp_dir().join(format!(
+            "{}voyage-{}",
+            dguard::HANDOFF_PREFIX,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let inside = dir.join("cfx-wl-sub-1.txt");
         std::fs::write(&inside, "www\n").expect("write");
         let got = active_wordlist(&enum_params(&inside.to_string_lossy(), false));
-        let _ = std::fs::remove_file(&inside);
+        let _ = std::fs::remove_dir_all(&dir);
         assert!(matches!(got, Ok(Some(_))), "{got:?}");
         let outside = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
         assert!(matches!(
@@ -1277,6 +1337,35 @@ mod wordlist_tests {
             Ok(None)
         ));
         assert!(matches!(active_wordlist(&enum_params("", false)), Ok(None)));
+    }
+
+    // The enum reads its words after the passive sources have run, long after the
+    // check. What it reads then has to be the file that was checked, not whatever
+    // the name has been pointed at since.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_words_come_from_the_file_that_was_checked_not_from_its_name() {
+        let dir = std::env::temp_dir().join(format!(
+            "{}voyage-swap-{}",
+            dguard::HANDOFF_PREFIX,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let wl = dir.join("wl.txt");
+        std::fs::write(&wl, "www\n").expect("write");
+        let opened = active_wordlist(&enum_params(&wl.to_string_lossy(), false))
+            .expect("contained")
+            .expect("active");
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"), &link)
+            .expect("symlink");
+        std::fs::rename(&link, &wl).expect("swap");
+        let words = crate::libs::wordlist::read_lines_from(opened)
+            .await
+            .expect("read");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(words, ["www"]);
     }
 }
 
@@ -1553,5 +1642,85 @@ mod egress_tests {
         .await;
         assert_eq!(events[0]["type"], "capabilities", "{events:?}");
         assert_eq!(events[0]["egress"], 1, "{events:?}");
+    }
+}
+
+#[cfg(test)]
+mod http_request_tests {
+    //! A web page open in the operator's browser can POST to this port. The browser
+    //! writes a request line and headers before the body the page chose, so the
+    //! connection has to end at the request line, before the body is read.
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn daemon() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let db = Arc::new(VoyageDb::unconnected());
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(handle_connection(
+                    stream,
+                    dguard::Gate::default(),
+                    Arc::clone(&db),
+                ));
+            }
+        });
+        port
+    }
+
+    /// Sends `raw` and returns the lines the daemon wrote back, and whether it
+    /// closed the connection.
+    async fn send(port: u16, raw: &str) -> (Vec<String>, bool) {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        s.write_all(raw.as_bytes()).await.unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        let closed = loop {
+            match tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => break true,
+                Ok(Ok(n)) => got.extend_from_slice(&buf[..n]),
+                Err(_) => break false,
+            }
+        };
+        let lines = String::from_utf8_lossy(&got)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        (lines, closed)
+    }
+
+    #[tokio::test]
+    async fn an_http_post_is_closed_at_its_request_line() {
+        let port = daemon().await;
+        let body = "{\"operation\":\"capabilities\"}\n";
+        let raw = format!(
+            "POST / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://page.test\r\n\
+             Content-Type: text/plain;charset=UTF-8\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let (lines, closed) = send(port, &raw).await;
+        assert!(closed, "the connection stayed open: {lines:?}");
+        assert!(
+            lines.len() <= 1,
+            "answered the HTTP lines one by one: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("capabilities")),
+            "read the body as a request: {lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_line_that_is_json_but_not_an_object_closes_too() {
+        let port = daemon().await;
+        let (lines, closed) = send(port, "[1]\n{\"operation\":\"capabilities\"}\n").await;
+        assert!(closed, "the connection stayed open: {lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.contains("capabilities")),
+            "read on past the first line: {lines:?}"
+        );
     }
 }

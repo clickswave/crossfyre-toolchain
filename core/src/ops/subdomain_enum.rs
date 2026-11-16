@@ -27,34 +27,45 @@ pub async fn handle(env: OpEnv) {
     let disable_passive = data["disable_passive"].as_bool().unwrap_or(false);
     let disable_active = data["disable_active"].as_bool().unwrap_or(false);
 
-    // Download wordlist for active enum if available
+    // Download wordlist for active enum if available. It is handed to voyage in a
+    // directory of this op's own, removed when the op ends.
+    let mut handoff = None;
     let mut wordlist_path = String::new();
     if !disable_active {
-        if let Some(wl_url) = data["wordlist_url"].as_str() {
-            if !wl_url.is_empty() {
-                let tmp =
-                    crate::toolchain::config::handoff_path(&format!("cfx-wl-sub-{op_id}.txt"));
-                if let Ok(resp) = reqwest::get(wl_url).await
-                    && let Ok(body) = resp.text().await
-                {
-                    let _ = std::fs::write(&tmp, &body);
-                    wordlist_path = tmp;
-                }
-            }
+        let download = if let Some(wl_url) = data["wordlist_url"].as_str() {
+            (!wl_url.is_empty()).then(|| (wl_url.to_string(), format!("cfx-wl-sub-{op_id}.txt")))
         } else if let Some(wls) = data["wordlists"].as_array()
             && let Some(first) = wls.first()
         {
             let dl_url = first["url"].as_str().unwrap_or("");
-            if !dl_url.is_empty() {
-                let tmp = crate::toolchain::config::handoff_path(&format!(
-                    "cfx-wl-sub-{}.txt",
-                    first["id"].as_str().unwrap_or("wl")
-                ));
-                if let Ok(resp) = reqwest::get(dl_url).await
-                    && let Ok(body) = resp.text().await
-                {
-                    let _ = std::fs::write(&tmp, &body);
-                    wordlist_path = tmp;
+            (!dl_url.is_empty()).then(|| {
+                (
+                    dl_url.to_string(),
+                    format!("cfx-wl-sub-{}.txt", first["id"].as_str().unwrap_or("wl")),
+                )
+            })
+        } else {
+            None
+        };
+        if let Some((dl_url, name)) = download
+            && let Ok(resp) = reqwest::get(&dl_url).await
+            && let Ok(body) = resp.text().await
+        {
+            match super::handoff::put(&mut handoff, &name, body.as_bytes()) {
+                Ok(path) => wordlist_path = path,
+                Err(e) => {
+                    let why = format!("the wordlist could not be written for voyage: {e}");
+                    eprintln!("[op] FAIL {why}");
+                    super::publish_failed(
+                        &pub_clone,
+                        &result_subj,
+                        &op_id,
+                        &workflow_id,
+                        &node_id,
+                        &why,
+                    )
+                    .await;
+                    return;
                 }
             }
         }

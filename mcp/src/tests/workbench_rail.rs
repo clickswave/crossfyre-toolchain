@@ -468,7 +468,7 @@ mod reads {
                 "workbench_list_history",
                 json!({"host": "App.Example.Test", "method": "get", "origins": ["agent", "proxy"],
                        "status_min": 200, "status_max": 299, "since": "2026-10-30T00:00:00Z",
-                       "url_contains": "/a", "search": "login", "limit": 10}),
+                       "limit": 10}),
             )
             .await;
         let v = ok(&r).clone();
@@ -569,6 +569,261 @@ mod reads {
         let sent = &b.fake.params(Method::History)[1];
         assert_eq!(sent["cursor"]["id"], last_id);
         assert_eq!(v2["rows"][0]["exchange"], handle(UID_A, last_id + 1));
+    }
+
+    /// A history that filters the way the Workbench does: `url_contains` against the
+    /// stored URL, case folded, newest first, `limit` rows a page.
+    fn filtering_history(urls: Vec<(i64, String)>) -> WbOpts {
+        WbOpts::default().answer(Method::History, move |c, _| {
+            let Call::History(p) = c else { unreachable!() };
+            let needle = p.filter.url_contains.as_deref().map(str::to_lowercase);
+            let mut found: Vec<HistoryRow> = urls
+                .iter()
+                .filter(|(id, _)| p.cursor.is_none_or(|c| *id > c.id))
+                .filter(|(_, u)| needle.as_ref().is_none_or(|n| u.to_lowercase().contains(n)))
+                .map(|(id, u)| row(*id, u))
+                .collect();
+            let more = found.len() > p.limit as usize;
+            found.truncate(p.limit as usize);
+            let next = found.last().filter(|_| more).map(|r| HistoryCursor {
+                at_ms: r.at_ms,
+                id: r.id,
+            });
+            Ok(serde_json::to_value(HistoryResult { rows: found, next }).unwrap())
+        })
+    }
+
+    /// `url_contains` is matched against the URL as it is shown. A term reaching into a
+    /// masked value finds nothing, the same nothing a wrong guess finds, so the value
+    /// cannot be read back one character at a time.
+    #[tokio::test]
+    async fn url_contains_cannot_read_back_a_masked_value() {
+        let urls = vec![
+            (
+                1,
+                "http://app.example.test/cb?access_token=Zq9VAL&x=1".to_string(),
+            ),
+            (
+                2,
+                "http://app.example.test/app;jsessionid=JS1VAL/home".to_string(),
+            ),
+        ];
+        let b = bench_with(base(), filtering_history(urls)).await;
+        let peer = FakePeer::new(Elicit::None);
+        let mut seen = Vec::new();
+        for term in [
+            "access_token=z",
+            "access_token=zq9",
+            "access_token=y",
+            "Zq9VAL",
+            "VAL&x=1",
+            "jsessionid=js1",
+            "JS1VAL",
+        ] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_list_history",
+                    json!({"url_contains": term, "limit": 1}),
+                )
+                .await;
+            let v = ok(&r).clone();
+            seen.push((term, v["rows"].clone(), v["next_cursor"].clone()));
+        }
+        for (term, rows, next) in &seen {
+            assert_eq!(rows, &json!([]), "{term} found a row: {rows}");
+            assert!(next.is_null(), "{term} left a cursor: {next}");
+        }
+        // A term in the shown part still finds its row.
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_list_history",
+                json!({"url_contains": "x=1"}),
+            )
+            .await;
+        let v = ok(&r).clone();
+        assert_eq!(v["rows"].as_array().unwrap().len(), 1, "{v}");
+        assert_eq!(v["rows"][0]["exchange"], handle(UID_A, 1));
+    }
+
+    /// Rows the Workbench matched but the shown URL does not hold are skipped, and pages
+    /// are read until enough are kept. The cursor starts after the last row kept.
+    #[tokio::test]
+    async fn url_contains_pages_past_rows_that_match_only_inside_a_masked_value() {
+        let urls: Vec<(i64, String)> = (1..=250)
+            .map(|i| {
+                let name = if i % 50 == 0 { "q" } else { "token" };
+                (i, format!("http://app.example.test/p?{name}=hit{i}"))
+            })
+            .collect();
+        let b = bench_with(base(), filtering_history(urls)).await;
+        let peer = FakePeer::new(Elicit::None);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_list_history",
+                json!({"url_contains": "HIT", "limit": 2}),
+            )
+            .await;
+        let v = ok(&r).clone();
+        let ids: Vec<&str> = v["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["exchange"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, [handle(UID_A, 50), handle(UID_A, 100)], "{v}");
+        let next = v["next_cursor"].as_str().unwrap().to_string();
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_list_history",
+                json!({"url_contains": "HIT", "limit": 2, "cursor": next}),
+            )
+            .await;
+        let v = ok(&r).clone();
+        let ids: Vec<&str> = v["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["exchange"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, [handle(UID_A, 150), handle(UID_A, 200)], "{v}");
+        let next = v["next_cursor"].as_str().unwrap().to_string();
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_list_history",
+                json!({"url_contains": "HIT", "limit": 2, "cursor": next}),
+            )
+            .await;
+        let v = ok(&r).clone();
+        assert_eq!(v["rows"].as_array().unwrap().len(), 1, "{v}");
+        assert_eq!(v["rows"][0]["exchange"], handle(UID_A, 250));
+        assert!(v["next_cursor"].is_null(), "{v}");
+        // The term is not sent: the Workbench would match it against the stored URL.
+        let sent = &b.fake.params(Method::History)[0];
+        assert!(sent["filter"]["url_contains"].is_null(), "{sent}");
+        assert_eq!(sent["limit"], 100);
+
+        // With masking off the Workbench is asked to narrow by the term, as before.
+        let b = bench_with(
+            base().no_redact(),
+            filtering_history(vec![(1, "http://app.example.test/p?token=hit1".into())]),
+        )
+        .await;
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_list_history",
+                json!({"url_contains": "HIT", "limit": 2}),
+            )
+            .await;
+        assert_eq!(ok(&r)["rows"].as_array().unwrap().len(), 1);
+        let sent = &b.fake.params(Method::History)[0];
+        assert_eq!(sent["filter"]["url_contains"], "HIT");
+        assert_eq!(sent["limit"], 2);
+    }
+
+    /// Whether a page comes back with a cursor follows from the rows shown. A probe row
+    /// holding a guess, stored by a replay, finds itself either way, and the cursor is the
+    /// same whether or not an older row holds the guess inside a masked value.
+    #[tokio::test]
+    async fn the_history_cursor_does_not_say_whether_a_masked_value_matched() {
+        let urls = vec![
+            (1, "http://app.example.test/probe?q=zq8".to_string()),
+            (2, "http://app.example.test/probe?q=zq9".to_string()),
+            (
+                3,
+                "http://app.example.test/cb?access_token=Zq9VAL".to_string(),
+            ),
+        ];
+        let b = bench_with(base(), filtering_history(urls)).await;
+        let peer = FakePeer::new(Elicit::None);
+        let mut seen = Vec::new();
+        for term in ["zq8", "zq9"] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_list_history",
+                    json!({"url_contains": term, "limit": 1}),
+                )
+                .await;
+            let v = ok(&r).clone();
+            assert_eq!(v["rows"].as_array().unwrap().len(), 1, "{term}: {v}");
+            let next = v["next_cursor"].as_str().map(str::to_string);
+            let after = match &next {
+                Some(c) => {
+                    let r =
+                        b.t.call(
+                            &peer,
+                            "workbench_list_history",
+                            json!({"url_contains": term, "limit": 1, "cursor": c}),
+                        )
+                        .await;
+                    let v = ok(&r).clone();
+                    (
+                        v["rows"].as_array().unwrap().len(),
+                        v["next_cursor"].is_null(),
+                    )
+                }
+                None => (0, true),
+            };
+            seen.push((term, next.is_some(), after));
+        }
+        assert_eq!(seen[0].1, seen[1].1, "{seen:?}");
+        assert_eq!(seen[0].2, seen[1].2, "{seen:?}");
+    }
+
+    /// A Workbench that is still busy a page into a long read leaves the rows already
+    /// kept in the answer, with a cursor where the read stopped.
+    #[tokio::test]
+    async fn a_busy_workbench_mid_read_keeps_the_rows_already_read() {
+        let b = bench_with(
+            base(),
+            WbOpts::default().answer(Method::History, |c, _| {
+                let Call::History(p) = c else { unreachable!() };
+                if p.cursor.is_some() {
+                    return Err(cfx_bridge::ErrorBody::new(
+                        cfx_bridge::ErrorCode::Busy,
+                        "more than 20 requests in one second",
+                    ));
+                }
+                let rows: Vec<HistoryRow> = (1..=100)
+                    .map(|i| {
+                        let q = if i == 5 { "q" } else { "token" };
+                        row(i, &format!("http://app.example.test/p?{q}=hit{i}"))
+                    })
+                    .collect();
+                let next = Some(HistoryCursor {
+                    at_ms: rows[99].at_ms,
+                    id: 100,
+                });
+                Ok(serde_json::to_value(HistoryResult { rows, next }).unwrap())
+            }),
+        )
+        .await;
+        let peer = FakePeer::new(Elicit::None);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_list_history",
+                json!({"url_contains": "hit", "limit": 2}),
+            )
+            .await;
+        let v = ok(&r).clone();
+        assert_eq!(v["rows"].as_array().unwrap().len(), 1, "{v}");
+        assert_eq!(v["rows"][0]["exchange"], handle(UID_A, 5));
+        let next = v["next_cursor"].as_str().unwrap();
+        assert!(next.ends_with("_100"), "{next}");
+        assert!(
+            r.text.contains("100 row(s) of history were looked at"),
+            "{}",
+            r.text
+        );
+        // The busy page was asked for once more before the read stopped.
+        assert_eq!(b.fake.count(Method::History), 3);
     }
 
     /// An exchange carrying a secret in every place one turns up.
@@ -1116,10 +1371,11 @@ mod reads {
         assert_eq!(ok(&r)["workbench"]["project"], "beta");
     }
 
+    /// With masking off the Workbench pages the map, and the cursor is its own.
     #[tokio::test]
     async fn the_site_map_pages_with_its_own_cursor() {
         let b = bench_with(
-            base(),
+            base().no_redact(),
             WbOpts::default().answer(Method::SiteMap, |_, _| {
                 Ok(serde_json::to_value(SiteMapResult {
                     endpoints: vec![SiteMapRow {
@@ -1169,6 +1425,427 @@ mod reads {
             .await;
         assert_eq!(reason(&r), "invalid_arguments");
     }
+
+    /// A site map that pages the way the Workbench does: in (host, path, method) order of
+    /// the stored paths, `limit` rows after the cursor.
+    fn paging_site_map(paths: Vec<(&'static str, u64)>) -> WbOpts {
+        WbOpts::default().answer(Method::SiteMap, move |c, _| {
+            let Call::SiteMap(p) = c else { unreachable!() };
+            let mut all: Vec<SiteMapRow> = paths
+                .iter()
+                .map(|(path, count)| SiteMapRow {
+                    host: "app.example.test".into(),
+                    path: (*path).into(),
+                    method: "GET".into(),
+                    status: Some(200),
+                    count: *count,
+                    last_ms: 1_798_619_564_512,
+                    bytes: 10,
+                    has_query: false,
+                })
+                .collect();
+            all.sort_by(|a, b| (&a.host, &a.path, &a.method).cmp(&(&b.host, &b.path, &b.method)));
+            let mut rows: Vec<SiteMapRow> = all
+                .into_iter()
+                .filter(|r| {
+                    p.cursor.as_ref().is_none_or(|c| {
+                        (&r.host, &r.path, &r.method) > (&c.host, &c.path, &c.method)
+                    })
+                })
+                .collect();
+            let more = rows.len() > p.limit as usize;
+            rows.truncate(p.limit as usize);
+            let next = rows.last().filter(|_| more).map(|r| SiteMapCursor {
+                host: r.host.clone(),
+                path: r.path.clone(),
+                method: r.method.clone(),
+            });
+            Ok(serde_json::to_value(SiteMapResult {
+                endpoints: rows,
+                next,
+                incomplete: false,
+            })
+            .unwrap())
+        })
+    }
+
+    /// With masking on, the map is paged in the order of the paths as shown and a cursor
+    /// carries a shown path. Neither the cursor nor the order of the rows says how a
+    /// masked session id compares with a path stored by a replay, and a cursor made up
+    /// by hand cannot ask either.
+    #[tokio::test]
+    async fn the_site_map_order_and_cursor_follow_the_shown_paths() {
+        let b = bench_with(
+            base(),
+            paging_site_map(vec![
+                ("/app;jsessionid=8/x", 1),
+                ("/app;jsessionid=8F3ASECRET/home", 1),
+                ("/app;jsessionid=9/x", 1),
+                ("/login", 1),
+            ]),
+        )
+        .await;
+        let peer = FakePeer::new(Elicit::None);
+        let mut shown = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut args = json!({"limit": 1});
+            if let Some(c) = &cursor {
+                args["cursor"] = json!(c);
+            }
+            let r = b.t.call(&peer, "workbench_get_site_map", args).await;
+            let v = ok(&r).clone();
+            assert!(!v.to_string().contains("8F3A"), "{v}");
+            for e in v["endpoints"].as_array().unwrap() {
+                shown.push((
+                    e["target_data"]["path"].as_str().unwrap().to_string(),
+                    e["count"].as_u64().unwrap(),
+                ));
+            }
+            cursor = v["next_cursor"].as_str().map(str::to_string);
+            let Some(c) = &cursor else { break };
+            let Ok(cfx_bridge::Cursor::SiteMap { at, .. }) = c.parse() else {
+                panic!("{c}")
+            };
+            assert!(!at.path.contains("8F3A"), "{}", at.path);
+        }
+        assert_eq!(
+            shown,
+            [
+                ("/app;jsessionid=[redacted]/home".to_string(), 1),
+                ("/app;jsessionid=[redacted]/x".to_string(), 2),
+                ("/login".to_string(), 1),
+            ]
+        );
+        // Cursors made up on either side of the stored id start at the same row.
+        let tag = cfx_bridge::ProjectTag::of(UID_A).unwrap();
+        let mut after = Vec::new();
+        for guess in ["/app;jsessionid=8F", "/app;jsessionid=8G"] {
+            let c = cfx_bridge::Cursor::SiteMap {
+                project: tag,
+                at: SiteMapCursor {
+                    host: "app.example.test".into(),
+                    path: guess.into(),
+                    method: "GET".into(),
+                },
+            };
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_get_site_map",
+                    json!({"cursor": c.to_string(), "limit": 200}),
+                )
+                .await;
+            after.push(ok(&r)["endpoints"].clone());
+        }
+        assert_eq!(after[0], after[1]);
+        assert_eq!(after[0].as_array().unwrap().len(), 3, "{}", after[0]);
+    }
+
+    /// With masking on, paging through the map with its cursor reads the map from the
+    /// Workbench once, not once a page. A call without a cursor reads it afresh, and so
+    /// does one for another host.
+    #[tokio::test]
+    async fn paging_a_masked_site_map_reads_it_once() {
+        let paths: Vec<(&'static str, u64)> =
+            vec![("/a", 1), ("/b", 1), ("/c", 1), ("/d", 1), ("/e", 1)];
+        let b = bench_with(base(), paging_site_map(paths)).await;
+        let peer = FakePeer::new(Elicit::None);
+        let mut shown = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut args = json!({"limit": 2});
+            if let Some(c) = &cursor {
+                args["cursor"] = json!(c);
+            }
+            let r = b.t.call(&peer, "workbench_get_site_map", args).await;
+            let v = ok(&r).clone();
+            for e in v["endpoints"].as_array().unwrap() {
+                shown.push(e["target_data"]["path"].as_str().unwrap().to_string());
+            }
+            cursor = v["next_cursor"].as_str().map(str::to_string);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(shown, ["/a", "/b", "/c", "/d", "/e"]);
+        assert_eq!(
+            b.fake.count(Method::SiteMap),
+            1,
+            "one read for the whole walk"
+        );
+        let r =
+            b.t.call(&peer, "workbench_get_site_map", json!({"limit": 2}))
+                .await;
+        ok(&r);
+        assert_eq!(
+            b.fake.count(Method::SiteMap),
+            2,
+            "a fresh call reads afresh"
+        );
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_get_site_map",
+                json!({"limit": 2, "host": "other.example.test"}),
+            )
+            .await;
+        ok(&r);
+        assert_eq!(
+            b.fake.count(Method::SiteMap),
+            3,
+            "another host is its own read"
+        );
+    }
+
+    /// With masking on, `url_contains` still finds a row a few thousand rows back in
+    /// one call.
+    #[tokio::test]
+    async fn url_contains_reaches_a_rare_url_deep_in_the_history() {
+        let urls: Vec<(i64, String)> = (1..=2500)
+            .map(|i| {
+                let path = if i == 2400 { "rare-admin" } else { "common" };
+                (i, format!("http://app.example.test/{path}?n={i}"))
+            })
+            .collect();
+        let b = bench_with(base(), filtering_history(urls)).await;
+        let peer = FakePeer::new(Elicit::None);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_list_history",
+                json!({"url_contains": "rare-admin", "limit": 5}),
+            )
+            .await;
+        let v = ok(&r).clone();
+        assert_eq!(v["rows"].as_array().unwrap().len(), 1, "{v}");
+        assert_eq!(v["rows"][0]["exchange"], handle(UID_A, 2400));
+        assert!(v["next_cursor"].is_null(), "{v}");
+    }
+
+    /// A project the Workbench full-text searches the way it does: every word of
+    /// `search` somewhere in the stored URL, headers or bodies, and the other filters.
+    fn searching_history(stored: Vec<cfx_bridge::ExchangeResult>) -> WbOpts {
+        let stored = std::sync::Arc::new(stored);
+        let for_history = stored.clone();
+        WbOpts::default()
+            .answer(Method::History, move |c, _| {
+                let Call::History(p) = c else { unreachable!() };
+                let words: Vec<String> = p
+                    .filter
+                    .search
+                    .as_deref()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .map(str::to_lowercase)
+                    .collect();
+                let mut found: Vec<HistoryRow> = for_history
+                    .iter()
+                    .filter(|x| p.cursor.is_none_or(|c| x.id > c.id))
+                    .filter(|x| p.filter.host.as_ref().is_none_or(|h| *h == x.host))
+                    .filter(|x| {
+                        let mut all = x.url.clone();
+                        for (k, v) in x.req_headers.iter().chain(&x.resp_headers).flatten() {
+                            all.push_str(&format!(" {k}: {v}"));
+                        }
+                        for b in [&x.req_body, &x.resp_body].into_iter().flatten() {
+                            all.push(' ');
+                            all.push_str(b.text.as_deref().unwrap_or(""));
+                        }
+                        let all = all.to_lowercase();
+                        words.iter().all(|w| all.contains(w.as_str()))
+                    })
+                    .map(|x| {
+                        let mut r = row(x.id, &x.url);
+                        r.host = x.host.clone();
+                        r
+                    })
+                    .collect();
+                let more = found.len() > p.limit as usize;
+                found.truncate(p.limit as usize);
+                let next = found.last().filter(|_| more).map(|r| HistoryCursor {
+                    at_ms: r.at_ms,
+                    id: r.id,
+                });
+                Ok(serde_json::to_value(HistoryResult { rows: found, next }).unwrap())
+            })
+            .answer(Method::Exchange, move |c, _| {
+                let Call::Exchange(p) = c else { unreachable!() };
+                let x = stored.iter().find(|x| x.id == p.id).unwrap().clone();
+                Ok(serde_json::to_value(x).unwrap())
+            })
+    }
+
+    fn login(id: i64, host: &str, body: &str) -> cfx_bridge::ExchangeResult {
+        let mut x = default_exchange(id);
+        x.host = host.into();
+        x.url = format!("http://{host}/api/login");
+        x.req_headers = Some(vec![("Content-Type".into(), "application/json".into())]);
+        x.req_body = Some(Body::text(body.into(), body.len() as u64, false));
+        x
+    }
+
+    /// With masking on, a full-text search for a whole masked value finds nothing, the
+    /// same nothing a wrong guess finds, so a short value cannot be confirmed by
+    /// guessing it. A word in what is shown still finds its row.
+    #[tokio::test]
+    async fn search_cannot_confirm_a_guess_at_a_masked_value() {
+        let stored = vec![
+            login(
+                1,
+                "app.example.test",
+                r#"{"user":"ann","password":"482913"}"#,
+            ),
+            login(
+                2,
+                "other.example.test",
+                r#"{"user":"bob","order":"771204"}"#,
+            ),
+        ];
+        let b = bench_with(base(), searching_history(stored)).await;
+        let peer = FakePeer::new(Elicit::None);
+        let mut seen = Vec::new();
+        for guess in ["482913", "482914"] {
+            for args in [
+                json!({"search": guess, "limit": 1}),
+                json!({"search": format!("ann {guess}"), "host": "app.example.test"}),
+            ] {
+                let r =
+                    b.t.call(&peer, "workbench_list_history", args.clone())
+                        .await;
+                let v = ok(&r).clone();
+                seen.push((args, v["rows"].clone(), v["next_cursor"].clone()));
+            }
+        }
+        for (args, rows, next) in &seen {
+            assert_eq!(rows, &json!([]), "{args} found a row: {rows}");
+            assert!(next.is_null(), "{args} left a cursor: {next}");
+        }
+        // Words in the shown text still find their rows.
+        for (term, id) in [("ann", 1), ("password", 1), ("771204", 2)] {
+            let r =
+                b.t.call(&peer, "workbench_list_history", json!({"search": term}))
+                    .await;
+            let v = ok(&r).clone();
+            assert_eq!(v["rows"].as_array().unwrap().len(), 1, "{term}: {v}");
+            assert_eq!(v["rows"][0]["exchange"], handle(UID_A, id), "{term}");
+        }
+        // The words are not sent: the Workbench's index holds the masked values.
+        for sent in b.fake.params(Method::History) {
+            assert!(sent["filter"]["search"].is_null(), "{sent}");
+        }
+
+        // A read that runs out of checks says it stopped and gives a cursor after the
+        // last row it looked at, from which the next call goes on.
+        let mut stored: Vec<_> = (1..=60)
+            .map(|i| login(i, "app.example.test", r#"{"password":"hunter2"}"#))
+            .collect();
+        stored.push(login(61, "app.example.test", r#"{"note":"hunter2"}"#));
+        let b = bench_with(base(), searching_history(stored)).await;
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_list_history",
+                json!({"search": "hunter2", "limit": 1}),
+            )
+            .await;
+        let v = ok(&r).clone();
+        assert_eq!(v["rows"], json!([]), "{v}");
+        assert!(r.text.contains("the read stopped"), "{}", r.text);
+        assert_eq!(b.fake.count(Method::Exchange), 50);
+        let next = v["next_cursor"].as_str().unwrap().to_string();
+        assert!(next.ends_with("_50"), "{next}");
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_list_history",
+                json!({"search": "hunter2", "limit": 1, "cursor": next}),
+            )
+            .await;
+        let v = ok(&r).clone();
+        assert_eq!(v["rows"].as_array().unwrap().len(), 1, "{v}");
+        assert_eq!(v["rows"][0]["exchange"], handle(UID_A, 61));
+
+        // With masking off the rows are the Workbench's, and none is read to check.
+        let stored = vec![login(1, "app.example.test", r#"{"password":"482913"}"#)];
+        let b = bench_with(base().no_redact(), searching_history(stored)).await;
+        let r =
+            b.t.call(&peer, "workbench_list_history", json!({"search": "482913"}))
+                .await;
+        assert_eq!(ok(&r)["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(b.fake.count(Method::Exchange), 0);
+    }
+
+    /// With masking on, a right guess at a masked value that many rows hold reads and
+    /// returns exactly what a wrong guess does: the same rows, the same cursor, the same
+    /// summary and the same number of Workbench reads, however many rows hold it.
+    #[tokio::test]
+    async fn a_right_and_a_wrong_guess_at_a_repeated_masked_value_look_the_same() {
+        let stored: Vec<_> = (1..=60)
+            .map(|i| login(i, "app.example.test", r#"{"user":"ann","password":"4829"}"#))
+            .collect();
+        let b = bench_with(base(), searching_history(stored)).await;
+        let peer = FakePeer::new(Elicit::None);
+        let mut seen = Vec::new();
+        for args in [
+            json!({"search": "4829", "limit": 1}),
+            json!({"search": "4830", "limit": 1}),
+            json!({"search": "ann 4829", "limit": 5}),
+            json!({"search": "ann 4830", "limit": 5}),
+        ] {
+            let history = b.fake.count(Method::History);
+            let exchange = b.fake.count(Method::Exchange);
+            let r =
+                b.t.call(&peer, "workbench_list_history", args.clone())
+                    .await;
+            let v = ok(&r).clone();
+            seen.push((
+                args,
+                v["rows"].clone(),
+                v["next_cursor"].clone(),
+                r.text.clone(),
+                b.fake.count(Method::History) - history,
+                b.fake.count(Method::Exchange) - exchange,
+            ));
+        }
+        for pair in seen.chunks(2) {
+            let (right, wrong) = (&pair[0], &pair[1]);
+            assert_eq!(right.1, json!([]), "{}: {}", right.0, right.1);
+            assert_eq!(
+                right.1, wrong.1,
+                "rows differ for {} and {}",
+                right.0, wrong.0
+            );
+            assert_eq!(
+                right.2, wrong.2,
+                "cursors differ for {} and {}",
+                right.0, wrong.0
+            );
+            assert_eq!(
+                right.3, wrong.3,
+                "summaries differ for {} and {}",
+                right.0, wrong.0
+            );
+            assert_eq!(
+                (right.4, right.5),
+                (wrong.4, wrong.5),
+                "reads differ for {} and {}",
+                right.0,
+                wrong.0
+            );
+        }
+        // A word with nothing to find in it is refused rather than read against every row.
+        let exchange = b.fake.count(Method::Exchange);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_list_history",
+                json!({"search": "ann !!!"}),
+            )
+            .await;
+        assert_eq!(reason(&r), "invalid_arguments", "{}", r.text);
+        assert_eq!(b.fake.count(Method::Exchange), exchange);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1178,7 +1855,9 @@ mod reads {
 mod replay {
     use super::*;
     use crate::tests::fake_wb::*;
-    use cfx_bridge::{Body, Call, ErrorBody, ErrorCode, ExchangeHandle, Method, ReplayResult};
+    use cfx_bridge::{
+        Body, Call, ErrorBody, ErrorCode, ExchangeHandle, Method, Origin, ReplayResult,
+    };
 
     fn names() -> FakeResolver {
         FakeResolver::default()
@@ -1371,14 +2050,21 @@ mod replay {
         assert_eq!(refused_list(&r)[0]["at"], "host_header");
         assert_eq!(b.fake.count(Method::Replay), 0);
 
-        // Removing the stored Host header leaves nothing to check, and the send goes.
+        // Removing the stored Host header leaves no name for the file to check, but a
+        // front end sends a request without one to its default site, so it asks.
+        let removed = json!({"exchange": handle(UID_A, 1), "edits": {"headers": {"host": null}}});
         let r =
             b.t.call(
                 &FakePeer::new(Elicit::None),
                 "workbench_replay",
-                json!({"exchange": handle(UID_A, 1), "edits": {"headers": {"host": null}}}),
+                removed.clone(),
             )
             .await;
+        assert_eq!(reason(&r), "not_confirmed", "{}", r.text);
+        assert_eq!(b.fake.count(Method::Replay), 0);
+        let r =
+            b.t.call(&FakePeer::new(Elicit::Accept), "workbench_replay", removed)
+                .await;
         ok(&r);
         assert_eq!(b.fake.count(Method::Replay), 1);
     }
@@ -1421,10 +2107,11 @@ mod replay {
         }
         assert_eq!(b.fake.count(Method::Replay), 0);
 
-        // Removing them all leaves only the URL's host, which the file lists.
+        // Removing them all leaves only the URL's host, which the file lists. A request
+        // with no Host still asks before it goes.
         let r =
             b.t.call(
-                &peer,
+                &FakePeer::new(Elicit::Accept),
                 "workbench_replay",
                 json!({"exchange": handle(UID_A, 1), "edits": {"headers": {"host": null}}}),
             )
@@ -1508,6 +2195,565 @@ mod replay {
         assert_eq!(b.fake.count(Method::Replay), 0);
     }
 
+    /// The Workbench dials the captured host and sends whatever Host header the edits
+    /// name. Behind a front end that routes by Host, an edit naming another listed host
+    /// hands the session captured for the first one to the second, so even a read asks.
+    #[tokio::test]
+    async fn a_host_edit_naming_another_host_asks_before_the_captured_session_goes() {
+        let other = json!({"exchange": handle(UID_A, 1),
+                           "edits": {"headers": {"Host": "other.example.test"}}});
+        let b = bench_with(base(""), get_app()).await;
+        let r =
+            b.t.call(
+                &FakePeer::new(Elicit::None),
+                "workbench_replay",
+                other.clone(),
+            )
+            .await;
+        assert_eq!(reason(&r), "not_confirmed", "{}", r.text);
+        assert_eq!(b.fake.count(Method::Replay), 0);
+
+        let r =
+            b.t.call(
+                &FakePeer::new(Elicit::Decline),
+                "workbench_replay",
+                other.clone(),
+            )
+            .await;
+        assert_eq!(reason(&r), "declined", "{}", r.text);
+        assert_eq!(b.fake.count(Method::Replay), 0);
+
+        let b = bench_with(base(""), get_app()).await;
+        let peer = FakePeer::new(Elicit::Accept);
+        let r = b.t.call(&peer, "workbench_replay", other.clone()).await;
+        ok(&r);
+        assert_eq!(b.fake.count(Method::Replay), 1);
+        assert_eq!(peer.asked(), 2, "the scope, then the Host");
+        let q = peer.questions.lock().unwrap().last().unwrap().clone();
+        assert!(
+            q.contains("app.example.test") && q.contains("other.example.test"),
+            "{q}"
+        );
+        let r = b.t.call(&peer, "workbench_replay", other).await;
+        ok(&r);
+        assert_eq!(peer.asked(), 2, "the same pair is not asked about again");
+        assert_eq!(b.fake.count(Method::Replay), 2);
+
+        // The URL's own host in another case or with its own port, and a Host the
+        // browser sent the request with, are not another host.
+        let peer = FakePeer::new(Elicit::None);
+        for host in ["APP.example.test", "app.example.test:80"] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1),
+                           "edits": {"headers": {"Host": host}}}),
+                )
+                .await;
+            ok(&r);
+        }
+        let b = bench_with(
+            base(""),
+            stored("GET", "http://app.example.test/", "other.example.test"),
+        )
+        .await;
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1)}),
+            )
+            .await;
+        ok(&r);
+        assert_eq!(b.fake.count(Method::Replay), 1);
+    }
+
+    /// The Workbench sends a Host value as written, and a front end routes on that text.
+    /// A spelling that a URL parser folds back into the captured host, or that only
+    /// starts with it, can still name another host there, so it asks.
+    #[tokio::test]
+    async fn a_host_spelled_unlike_the_captured_host_asks() {
+        let b = bench_with(base(""), get_app()).await;
+        let peer = FakePeer::new(Elicit::None);
+        for host in [
+            "app%2Eexample.test",
+            "\u{ff41}pp.example.test",
+            "app\u{ad}.example.test",
+            "app.example.test:8080",
+            "app.example.test:080",
+            "app.example.test#.other.example.test",
+            "app.example.test?.other.example.test",
+            "app.example.test/.other.example.test",
+            "app.example.test\\.other.example.test",
+        ] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1),
+                           "edits": {"headers": {"Host": host}}}),
+                )
+                .await;
+            assert_eq!(reason(&r), "not_confirmed", "{host:?}: {}", r.text);
+        }
+        assert_eq!(b.fake.count(Method::Replay), 0);
+    }
+
+    /// HTTP takes only spaces and tabs off a header value. A Host that is empty, blank,
+    /// removed or padded with other white space goes out as written and a front end can
+    /// send it to its default site, so it asks or is refused, and never goes unasked.
+    #[tokio::test]
+    async fn a_blank_removed_or_unicode_padded_host_is_not_the_captured_host() {
+        let b = bench_with(base(""), get_app()).await;
+        let peer = FakePeer::new(Elicit::None);
+        for host in [
+            json!(""),
+            json!("   "),
+            json!("\t"),
+            json!(null),
+            json!("\u{a0}"),
+            json!("\u{a0}app.example.test"),
+            json!("app.example.test\u{a0}"),
+            json!("app.example.test\u{3000}"),
+            json!("\u{3000}app.example.test"),
+            json!("app.example.test\u{85}"),
+            json!("app.example.test\u{2028}"),
+            json!("app.example.test\u{2003}"),
+        ] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1),
+                           "edits": {"headers": {"Host": host}}}),
+                )
+                .await;
+            let why = reason(&r);
+            assert!(
+                why == "not_confirmed" || why == "invalid_arguments",
+                "{host}: {}",
+                r.text
+            );
+        }
+        assert_eq!(b.fake.count(Method::Replay), 0);
+        for host in [json!(""), json!("  "), json!(null)] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1),
+                           "edits": {"headers": {"Host": host}}}),
+                )
+                .await;
+            assert_eq!(reason(&r), "not_confirmed", "{host}: {}", r.text);
+        }
+
+        // Spaces and tabs around the URL's own host are still that host.
+        for host in [
+            " app.example.test",
+            "app.example.test\t",
+            "app.example.test ",
+        ] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1),
+                           "edits": {"headers": {"Host": host}}}),
+                )
+                .await;
+            ok(&r);
+        }
+        assert_eq!(b.fake.count(Method::Replay), 3);
+
+        // A yes covers the removal it was asked about.
+        let peer = FakePeer::new(Elicit::Accept);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1),
+                       "edits": {"headers": {"Host": null}}}),
+            )
+            .await;
+        ok(&r);
+        let q = peer.questions.lock().unwrap().last().unwrap().clone();
+        assert!(q.contains("no Host header"), "{q}");
+        assert_eq!(b.fake.count(Method::Replay), 4);
+    }
+
+    /// The question shows a Host value with its invisible characters spelt out, so the
+    /// person sees why it is not the captured host.
+    #[tokio::test]
+    async fn the_host_question_shows_invisible_characters_escaped() {
+        let b = bench_with(base(""), get_app()).await;
+        let peer = FakePeer::new(Elicit::Accept);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1),
+                       "edits": {"headers": {"Host": "app\u{ad}.example.test"}}}),
+            )
+            .await;
+        ok(&r);
+        let q = peer.questions.lock().unwrap().last().unwrap().clone();
+        assert!(q.contains("app\\u{ad}.example.test"), "{q}");
+    }
+
+    /// A front end can route by a forwarding header in place of Host, so one naming
+    /// another host asks the same way.
+    #[tokio::test]
+    async fn a_forwarding_header_naming_another_host_asks() {
+        let b = bench_with(base(""), get_app()).await;
+        let peer = FakePeer::new(Elicit::None);
+        for (name, value) in [
+            ("X-Forwarded-Host", "other.example.test"),
+            ("x-forwarded-host", "app.example.test, other.example.test"),
+            ("X_Forwarded_Host", "other.example.test"),
+            ("X-Original-Host", "other.example.test"),
+            ("X-Host", "other.example.test"),
+            ("Forwarded", "for=192.0.2.1;host=other.example.test"),
+            ("Forwarded", "proto=https;Host=\"other.example.test\""),
+        ] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1),
+                           "edits": {"headers": {name: value}}}),
+                )
+                .await;
+            assert_eq!(reason(&r), "not_confirmed", "{name}: {value:?}: {}", r.text);
+        }
+        assert_eq!(b.fake.count(Method::Replay), 0);
+        for (name, value) in [
+            ("X-Forwarded-Host", "app.example.test"),
+            ("Forwarded", "for=192.0.2.1;proto=https"),
+            ("Forwarded", "host=app.example.test"),
+        ] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1),
+                           "edits": {"headers": {name: value}}}),
+                )
+                .await;
+            ok(&r);
+        }
+        assert_eq!(b.fake.count(Method::Replay), 3);
+    }
+
+    /// However long or padded a forwarding header is, the question still names the
+    /// other Host the request goes out with, so a yes is never given for a host the
+    /// person did not see.
+    #[tokio::test]
+    async fn a_padded_forwarding_header_cannot_push_the_host_out_of_the_question() {
+        let b = bench_with(base(""), get_app()).await;
+        let listed = format!("{}cdn.app.example.test", "app.example.test, ".repeat(20));
+        let peer = FakePeer::new(Elicit::Accept);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1),
+                       "edits": {"headers": {"X-Forwarded-Host": listed,
+                                             "Host": "other.example.test"}}}),
+            )
+            .await;
+        ok(&r);
+        let q = peer.questions.lock().unwrap().last().unwrap().clone();
+        assert!(q.contains("Host \"other.example.test\""), "{q}");
+        assert_eq!(b.fake.count(Method::Replay), 1);
+        // A padded name is not a plain one, so it is refused before anything is asked.
+        let peer = FakePeer::new(Elicit::Accept);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1),
+                       "edits": {"headers": {
+                           "X-Forwarded-Host": format!("app.example.test{}", "\u{200b}".repeat(40)),
+                           "Host": "other.example.test"}}}),
+            )
+            .await;
+        assert_eq!(reason(&r), "invalid_arguments", "{}", r.text);
+        assert_eq!(peer.asked(), 0);
+        assert_eq!(b.fake.count(Method::Replay), 1);
+    }
+
+    /// A forwarding header's value is not shown as written: only a plain host name is,
+    /// so the request cannot write its own text into the question.
+    #[tokio::test]
+    async fn a_forwarding_header_cannot_write_into_the_question() {
+        let b = bench_with(base(""), get_app()).await;
+        let peer = FakePeer::new(Elicit::Accept);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1),
+                       "edits": {"headers": {"X-Forwarded-Host":
+                           "app.example.test, (this is the captured host and the same \
+                            site, safe to allow) x, evil.example.test"}}}),
+            )
+            .await;
+        assert_eq!(reason(&r), "invalid_arguments", "{}", r.text);
+        assert!(!r.text.contains("safe to allow"), "{}", r.text);
+        assert_eq!(peer.asked(), 0);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1),
+                       "edits": {"headers": {"X-Forwarded-Host":
+                           "app.example.test, evil.example.test"}}}),
+            )
+            .await;
+        ok(&r);
+        let q = peer.questions.lock().unwrap().last().unwrap().clone();
+        assert!(q.contains("X-Forwarded-Host evil.example.test"), "{q}");
+        assert_eq!(b.fake.count(Method::Replay), 1);
+    }
+
+    /// A Host too long to show, or more other names than a question can list, is
+    /// refused rather than asked about in part.
+    #[tokio::test]
+    async fn a_host_too_long_or_too_many_names_to_show_is_refused() {
+        let b = bench_with(base(""), get_app()).await;
+        let peer = FakePeer::new(Elicit::Accept);
+        let long = format!("app{}.example.test", "\u{ad}".repeat(60));
+        let many = (1..=9)
+            .map(|i| format!("h{i}.example.test"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        for headers in [json!({"Host": long}), json!({"X-Forwarded-Host": many})] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1), "edits": {"headers": headers}}),
+                )
+                .await;
+            assert_eq!(reason(&r), "invalid_arguments", "{headers}: {}", r.text);
+        }
+        assert_eq!(b.fake.count(Method::Replay), 0);
+    }
+
+    /// X-Forwarded-Server and X-HTTP-Host-Override are routed by too.
+    #[tokio::test]
+    async fn more_forwarding_headers_naming_another_host_ask() {
+        let b = bench_with(base(""), get_app()).await;
+        let peer = FakePeer::new(Elicit::None);
+        for name in ["X-Forwarded-Server", "X-HTTP-Host-Override"] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1),
+                           "edits": {"headers": {name: "other.example.test"}}}),
+                )
+                .await;
+            assert_eq!(reason(&r), "not_confirmed", "{name}: {}", r.text);
+        }
+        assert_eq!(b.fake.count(Method::Replay), 0);
+    }
+
+    /// A stored request with no Host at all, such as one an earlier replay sent with
+    /// its Host removed, goes out with none and a front end sends it to its default
+    /// site. It asks as a removed Host does, whoever sent it first.
+    #[tokio::test]
+    async fn a_stored_request_with_no_host_asks() {
+        for origin in [Origin::Agent, Origin::Replay, Origin::Proxy] {
+            let shown = format!("{origin:?}");
+            let b = bench_with(
+                base(""),
+                WbOpts::default().answer(Method::Exchange, move |c, _| {
+                    let Call::Exchange(p) = c else { unreachable!() };
+                    let mut x = default_exchange(p.id);
+                    x.origin = origin.clone();
+                    x.req_headers = Some(vec![("Cookie".into(), "sid=S1-ck".into())]);
+                    Ok(serde_json::to_value(x).unwrap())
+                }),
+            )
+            .await;
+            let r =
+                b.t.call(
+                    &FakePeer::new(Elicit::None),
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1)}),
+                )
+                .await;
+            assert_eq!(reason(&r), "not_confirmed", "{shown}: {}", r.text);
+            assert_eq!(b.fake.count(Method::Replay), 0, "{shown}");
+
+            let peer = FakePeer::new(Elicit::Accept);
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1)}),
+                )
+                .await;
+            ok(&r);
+            let q = peer.questions.lock().unwrap().last().unwrap().clone();
+            assert!(q.contains("no Host header"), "{shown}: {q}");
+            assert_eq!(b.fake.count(Method::Replay), 1, "{shown}");
+        }
+    }
+
+    /// A forwarding header's name is shown only as a plain host name, so one that is
+    /// not plain is refused instead of being asked about under a label that names no
+    /// host. Each such name would otherwise hide what it names, and many of them would
+    /// count as one entry of the question.
+    #[tokio::test]
+    async fn a_forwarding_name_that_is_not_plain_is_refused() {
+        let b = bench_with(base(""), get_app()).await;
+        let peer = FakePeer::new(Elicit::Accept);
+        let many = (1..=20)
+            .map(|i| format!("evil_{i}.example.test"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        for (name, value) in [
+            ("X-Forwarded-Host", "evil.example.test:".to_string()),
+            ("X-Forwarded-Host", "evil.example.test:0443".to_string()),
+            ("X-Forwarded-Host", "evil_x.example.test".to_string()),
+            (
+                "X-Original-Host",
+                "app.example.test, evil_x.example.test".to_string(),
+            ),
+            ("Forwarded", "host=\"evil.example.test:\"".to_string()),
+            ("X-Forwarded-Host", many),
+        ] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1),
+                           "edits": {"headers": {name: value}}}),
+                )
+                .await;
+            assert_eq!(
+                reason(&r),
+                "invalid_arguments",
+                "{name}: {value:?}: {}",
+                r.text
+            );
+        }
+        assert_eq!(peer.asked(), 0);
+        assert_eq!(b.fake.count(Method::Replay), 0);
+
+        // A captured one is refused the same way, and the agent can take it out.
+        let b = bench_with(
+            base(""),
+            WbOpts::default().answer(Method::Exchange, |c, _| {
+                let Call::Exchange(p) = c else { unreachable!() };
+                let mut x = default_exchange(p.id);
+                x.req_headers = Some(vec![
+                    ("Host".into(), "app.example.test".into()),
+                    ("X-Forwarded-Host".into(), "evil_x.example.test".into()),
+                    ("Cookie".into(), "sid=S1-ck".into()),
+                ]);
+                Ok(serde_json::to_value(x).unwrap())
+            }),
+        )
+        .await;
+        let peer = FakePeer::new(Elicit::None);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1)}),
+            )
+            .await;
+        assert_eq!(reason(&r), "invalid_arguments", "{}", r.text);
+        assert!(r.text.contains("X-Forwarded-Host"), "{}", r.text);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1),
+                       "edits": {"headers": {"X-Forwarded-Host": null}}}),
+            )
+            .await;
+        ok(&r);
+        assert_eq!(b.fake.count(Method::Replay), 1);
+    }
+
+    /// Only a Host the browser sent through the proxy vouches for a name. A request the
+    /// Workbench or an agent sent carries whatever Host it was given, so replaying an
+    /// earlier replay sent under another Host asks again.
+    #[tokio::test]
+    async fn a_host_from_an_earlier_replay_is_not_a_captured_host() {
+        for origin in [Origin::Agent, Origin::Replay, Origin::Repeater] {
+            let shown = format!("{origin:?}");
+            let b = bench_with(
+                base(""),
+                WbOpts::default().answer(Method::Exchange, move |c, _| {
+                    let Call::Exchange(p) = c else { unreachable!() };
+                    let mut x = default_exchange(p.id);
+                    x.url = "http://app.example.test/api/items?id=2".into();
+                    x.origin = origin.clone();
+                    x.req_headers = Some(vec![
+                        ("Host".into(), "other.example.test".into()),
+                        ("Cookie".into(), "sid=S1-ck".into()),
+                    ]);
+                    Ok(serde_json::to_value(x).unwrap())
+                }),
+            )
+            .await;
+            let r =
+                b.t.call(
+                    &FakePeer::new(Elicit::None),
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1)}),
+                )
+                .await;
+            assert_eq!(reason(&r), "not_confirmed", "{shown}: {}", r.text);
+            assert_eq!(b.fake.count(Method::Replay), 0);
+        }
+    }
+
+    /// A yes to writes on the captured host does not cover writes that carry its
+    /// session under another host's name.
+    #[tokio::test]
+    async fn a_write_yes_for_one_host_does_not_cover_a_host_edit() {
+        let b = bench_with(
+            base("allow_writes = true"),
+            stored(
+                "POST",
+                "http://app.example.test/api/items",
+                "app.example.test",
+            ),
+        )
+        .await;
+        let peer = FakePeer::new(Elicit::Accept);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1)}),
+            )
+            .await;
+        ok(&r);
+        assert_eq!(peer.asked(), 2, "the scope, then the write");
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1),
+                       "edits": {"headers": {"Host": "other.example.test"}}}),
+            )
+            .await;
+        ok(&r);
+        assert_eq!(peer.asked(), 3, "the write under the other Host");
+        let q = peer.questions.lock().unwrap().last().unwrap().clone();
+        assert!(q.contains("other.example.test"), "{q}");
+        assert_eq!(b.fake.count(Method::Replay), 2);
+    }
+
     /// The method cannot be edited, but many frameworks take it from a header or a
     /// `_method` field instead. A GET that asks for DELETE that way is a write.
     #[tokio::test]
@@ -1523,6 +2769,10 @@ mod replay {
             json!({"form": {"_method": "DELETE"}}),
             json!({"json": {"_method": "DELETE"}}),
             json!({"body": "_method=DELETE&id=2"}),
+            json!({"headers": {"X_HTTP_Method_Override": "DELETE"}}),
+            json!({"query": {".method": "DELETE"}}),
+            json!({"path": "/api/items?a=1;_method=DELETE"}),
+            json!({"body": "id=2&%5Fmethod=DELETE"}),
         ] {
             let r =
                 b.t.call(
@@ -1546,6 +2796,41 @@ mod replay {
             .await;
         ok(&r);
         assert_eq!(b.fake.count(Method::Replay), 1);
+        // A field that only ends in _method asks for nothing.
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1),
+                       "edits": {"body": "{\"payment_method\":\"card\"}"}}),
+            )
+            .await;
+        ok(&r);
+        assert_eq!(b.fake.count(Method::Replay), 2);
+
+        // A captured header spelt with underscores asks the same.
+        let b = bench_with(
+            base(""),
+            WbOpts::default().answer(Method::Exchange, |c, _| {
+                let Call::Exchange(p) = c else { unreachable!() };
+                let mut x = default_exchange(p.id);
+                x.req_headers = Some(vec![
+                    ("Host".into(), "app.example.test".into()),
+                    ("X_HTTP_Method_Override".into(), "DELETE".into()),
+                ]);
+                Ok(serde_json::to_value(x).unwrap())
+            }),
+        )
+        .await;
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1)}),
+            )
+            .await;
+        assert_eq!(reason(&r), "writes_not_allowed", "{}", r.text);
+        assert_eq!(b.fake.count(Method::Replay), 0);
 
         // A captured GET that already carried one is a write as captured, and stops
         // being one when the edit takes the header away.
@@ -1585,10 +2870,122 @@ mod replay {
         assert_eq!(peer.asked(), 2, "then the write");
         let q = peer.questions.lock().unwrap().last().unwrap().clone();
         assert!(
-            q.contains("GET request that asks for DELETE by method override"),
+            q.contains(
+                "GET request that asks for DELETE through the X-HTTP-Method-Override header"
+            ),
             "{q}"
         );
         assert_eq!(b.fake.count(Method::Replay), 2);
+    }
+
+    /// The Workbench applies a query edit to the `&`-separated parameters whose decoded
+    /// name is the edit's name exactly. An edit under another case or spelling, or one
+    /// aimed at a value joined by `;`, leaves the captured `_method` in the request.
+    #[tokio::test]
+    async fn a_query_edit_takes_away_only_the_parameter_the_workbench_removes() {
+        let b = bench_with(
+            base(""),
+            stored(
+                "GET",
+                "http://app.example.test/api/items?_method=DELETE",
+                "app.example.test",
+            ),
+        )
+        .await;
+        let peer = FakePeer::new(Elicit::None);
+        for edits in [
+            json!({}),
+            json!({"query": {"_METHOD": null}}),
+            json!({"query": {"_Method": "GET"}}),
+            json!({"query": {" _method": null}}),
+            json!({"query": {"_method ": "GET"}}),
+            json!({"query": {"%5Fmethod": null}}),
+            json!({"path": "/api/items?_method=DELETE", "query": {"_METHOD": null}}),
+        ] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1), "edits": edits.clone()}),
+                )
+                .await;
+            assert_eq!(reason(&r), "writes_not_allowed", "{edits}: {}", r.text);
+        }
+        assert_eq!(b.fake.count(Method::Replay), 0);
+        // The parameter itself, removed or set to a read, is gone.
+        for edits in [
+            json!({"query": {"_method": null}}),
+            json!({"query": {"_method": "GET"}}),
+        ] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1), "edits": edits.clone()}),
+                )
+                .await;
+            ok(&r);
+        }
+        assert_eq!(b.fake.count(Method::Replay), 2);
+
+        let b = bench_with(
+            base(""),
+            stored(
+                "GET",
+                "http://app.example.test/api/items?a=1;_method=DELETE",
+                "app.example.test",
+            ),
+        )
+        .await;
+        for edits in [
+            json!({"query": {"_method": null}}),
+            json!({"query": {"_method": "GET"}}),
+        ] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1), "edits": edits.clone()}),
+                )
+                .await;
+            assert_eq!(reason(&r), "writes_not_allowed", "{edits}: {}", r.text);
+        }
+        assert_eq!(b.fake.count(Method::Replay), 0);
+        // Setting `a` rewrites its whole value, the `;_method=DELETE` in it too.
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_replay",
+                json!({"exchange": handle(UID_A, 1), "edits": {"query": {"a": "2"}}}),
+            )
+            .await;
+        ok(&r);
+        assert_eq!(b.fake.count(Method::Replay), 1);
+    }
+
+    /// A body or query that names `_method` in a shape a parser may still read as the
+    /// field counts as a write: a JSON body behind a byte order mark, a key written twice,
+    /// and the field as a list.
+    #[tokio::test]
+    async fn an_override_hidden_in_an_unusual_shape_is_a_write() {
+        let b = bench_with(base(""), get_app()).await;
+        let peer = FakePeer::new(Elicit::None);
+        for edits in [
+            json!({"body": "\u{feff}{\"\\u005fmethod\":\"DELETE\"}"}),
+            json!({"body": "{\"_method\":\"DELETE\",\"_method\":null}"}),
+            json!({"query": {"_method[]": "DELETE"}}),
+            json!({"path": "/api/items?_method[0]=DELETE"}),
+        ] {
+            let r =
+                b.t.call(
+                    &peer,
+                    "workbench_replay",
+                    json!({"exchange": handle(UID_A, 1), "edits": edits.clone()}),
+                )
+                .await;
+            assert_eq!(reason(&r), "writes_not_allowed", "{edits}: {}", r.text);
+        }
+        assert_eq!(b.fake.count(Method::Replay), 0);
     }
 
     #[tokio::test]
@@ -1926,6 +3323,34 @@ mod injection {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_plessor_that_cannot_check_certificates_is_not_handed_the_session() {
+        let plessor = stub_engine(StubOpts {
+            no_verify_certs: true,
+            ..Default::default()
+        })
+        .await;
+        let b = bench_with(
+            scope(&["app.example.test".into()], "")
+                .resolver(names())
+                .plessor(plessor.port),
+            get_items(),
+        )
+        .await;
+        let peer = FakePeer::new(Elicit::Accept);
+        let r =
+            b.t.call(
+                &peer,
+                "workbench_test_injection",
+                json!({"exchange": handle(4), "wait_seconds": 2}),
+            )
+            .await;
+        assert_eq!(reason(&r), "engine_unavailable", "{}", r.text);
+        assert!(r.text.contains("certificates"), "{}", r.text);
+        assert!(plessor.ops().is_empty(), "{:?}", plessor.ops());
+        assert_eq!(peer.asked(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_captured_session_goes_to_plessor_and_nowhere_else() {
         let plessor = stub_engine(StubOpts::default()).await;
         let b = bench_with(
@@ -1951,6 +3376,8 @@ mod injection {
         assert_eq!(ops.len(), 1);
         let op = &ops[0];
         assert_eq!(op["auth"]["cookies"], "sid=S1-ck");
+        // Sent only past a certificate that checks out.
+        assert_eq!(op["verify_certs"], true, "{op}");
         let h = op["auth"]["headers"].as_object().unwrap();
         assert_eq!(h["authorization"], "Bearer S3-bearer");
         assert_eq!(h["x-csrf-token"], "S8-csrf");
@@ -2003,6 +3430,56 @@ mod injection {
         assert_eq!(plessor.ops().len(), 1);
     }
 
+    /// A captured forwarding header names a host a front end can route by in place of
+    /// Host, so it is held back with Host: the scan sends the captured session only
+    /// under the captured host's name.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn captured_forwarding_headers_are_not_handed_on() {
+        let plessor = stub_engine(StubOpts::default()).await;
+        let b = bench_with(
+            scope(&["app.example.test".into()], "")
+                .resolver(names())
+                .plessor(plessor.port),
+            WbOpts::default().answer(Method::ScanSource, |_, _| {
+                Ok(serde_json::to_value(ScanSourceResult {
+                    method: "GET".into(),
+                    url: "http://app.example.test/api/items?id=2".into(),
+                    req_headers: vec![
+                        ("Host".into(), "app.example.test".into()),
+                        ("Cookie".into(), "sid=S1-ck".into()),
+                        ("X-Forwarded-Host".into(), "evil.example.test".into()),
+                        ("x_original_host".into(), "evil.example.test".into()),
+                        ("X-Host".into(), "evil.example.test".into()),
+                        ("X-Forwarded-Server".into(), "evil.example.test".into()),
+                        ("X-HTTP-Host-Override".into(), "evil.example.test".into()),
+                        ("Forwarded".into(), "host=evil.example.test".into()),
+                        ("X-Csrf-Token".into(), "S8-csrf".into()),
+                    ],
+                    body: None,
+                    content_type: None,
+                })
+                .unwrap())
+            }),
+        )
+        .await;
+        let r =
+            b.t.call(
+                &FakePeer::new(Elicit::None),
+                "workbench_test_injection",
+                json!({"exchange": handle(4), "wait_seconds": 5}),
+            )
+            .await;
+        ok(&r);
+        let ops = plessor.ops();
+        assert_eq!(ops.len(), 1);
+        let h = ops[0]["auth"]["headers"].as_object().unwrap();
+        assert_eq!(h["x-csrf-token"], "S8-csrf");
+        assert_eq!(ops[0]["auth"]["cookies"], "sid=S1-ck");
+        for (k, v) in h {
+            assert!(!v.to_string().contains("evil"), "{k} was handed on");
+        }
+    }
+
     /// plessor reports a finding on the URL it was given, which is the captured one with
     /// its query values, and its evidence can carry the request it sent. Neither may put
     /// the captured secrets in the scan's findings file, and `--no-redact` does not bring
@@ -2051,7 +3528,7 @@ mod injection {
         for s in ["S1-ck", "S3-bearer", "S6-tok", "S8-csrf"] {
             assert!(!found.contains(s), "{s} in the findings file: {found}");
         }
-        assert!(found.contains("token=%5Bredacted%5D"), "{found}");
+        assert!(found.contains("token=[redacted]"), "{found}");
 
         let list =
             b.t.call(&peer, "list_findings", json!({"scan_id": scan_id}))
@@ -2173,6 +3650,103 @@ mod injection {
             assert_eq!(b.fake.count(Method::Check), 0);
         }
         assert!(plessor.ops().is_empty());
+    }
+
+    /// A captured POST that asks for DELETE through `_method`, or a GET that asks for it
+    /// through a header or the query, is a write to plessor's target, so it waits for
+    /// test_writes the way a captured DELETE does.
+    #[tokio::test]
+    async fn a_captured_request_that_asks_for_a_write_by_override_needs_test_writes() {
+        let plessor = stub_engine(StubOpts::default()).await;
+        let with_header = |c: &Call, i: &Option<cfx_bridge::ProjectInfo>| {
+            let mut v = source(
+                "GET",
+                "http://app.example.test/api/items/2?id=2",
+                None,
+                None,
+            )(c, i)?;
+            v["req_headers"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(["X-HTTP-Method-Override", "DELETE"]));
+            Ok(v)
+        };
+        let cases: Vec<WbOpts> = vec![
+            WbOpts::default().answer(
+                Method::ScanSource,
+                source(
+                    "POST",
+                    "http://app.example.test/api/items/2",
+                    Some("application/x-www-form-urlencoded"),
+                    Some("_method=delete&name=x"),
+                ),
+            ),
+            WbOpts::default().answer(
+                Method::ScanSource,
+                source(
+                    "POST",
+                    "http://app.example.test/api/items/2",
+                    Some("application/json"),
+                    Some("{\"_method\":\"PATCH\",\"name\":\"x\"}"),
+                ),
+            ),
+            WbOpts::default().answer(
+                Method::ScanSource,
+                source(
+                    "GET",
+                    "http://app.example.test/api/items/2?id=2&_method=DELETE",
+                    None,
+                    None,
+                ),
+            ),
+            WbOpts::default().answer(Method::ScanSource, with_header),
+        ];
+        for opts in cases {
+            let b = bench_with(
+                scope(&["app.example.test".into()], "")
+                    .resolver(names())
+                    .plessor(plessor.port),
+                opts,
+            )
+            .await;
+            let r =
+                b.t.call(
+                    &FakePeer::new(Elicit::None),
+                    "workbench_test_injection",
+                    json!({"exchange": handle(1)}),
+                )
+                .await;
+            assert_eq!(reason(&r), "invalid_arguments", "{}", r.text);
+            assert!(r.text.contains("test_writes"), "{}", r.text);
+            assert_eq!(b.fake.count(Method::Check), 0);
+        }
+        assert!(plessor.ops().is_empty());
+
+        // A field that only ends in _method asks for nothing.
+        let b = bench_with(
+            scope(&["app.example.test".into()], "")
+                .resolver(names())
+                .plessor(plessor.port),
+            WbOpts::default().answer(
+                Method::ScanSource,
+                source(
+                    "POST",
+                    "http://app.example.test/api/orders",
+                    Some("application/x-www-form-urlencoded"),
+                    Some("payment_method=card&qty=1"),
+                ),
+            ),
+        )
+        .await;
+        let r =
+            b.t.call(
+                &FakePeer::new(Elicit::None),
+                "workbench_test_injection",
+                json!({"exchange": handle(1), "wait_seconds": 2}),
+            )
+            .await;
+        ok(&r);
+        assert_eq!(plessor.ops().len(), 1);
     }
 
     /// What a refusal quotes from the captured request is the target's text. It goes

@@ -59,6 +59,7 @@ import io.crossfyre.mobile.apps.InstalledApp
 import io.crossfyre.mobile.patch.Distribution
 import io.crossfyre.mobile.patch.PatchFeature
 import io.crossfyre.mobile.patch.PatchState
+import io.crossfyre.mobile.patch.PatchStep
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
@@ -107,6 +108,8 @@ sealed interface Overlay {
     data class Approval(val id: String) : Overlay
     /** One row of the activity log. */
     data class Event(val id: Long) : Overlay
+    /** Capture stopped with patched builds that accept any certificate installed, by package. */
+    data class RestorePatched(val pkgs: List<String>) : Overlay
 }
 
 /** Things only the activity can do: Android's own prompts, pickers and other apps. */
@@ -121,6 +124,12 @@ sealed interface Effect {
     data class OpenUrl(val url: String) : Effect
     data object NotificationSettings : Effect
     data object SecuritySettings : Effect
+    /** Android's page for letting this app install apps, which a patch waits on. */
+    data class AllowInstalls(val intent: Intent) : Effect
+    /** Android's prompt to uninstall an app. */
+    data class Uninstall(val intent: Intent) : Effect
+    /** An app's page in the Play Store. */
+    data class OpenStore(val pkg: String) : Effect
     /** Ask for the unlock that lets the approval key sign the approval being made. */
     data class Authenticate(val id: String, val title: String, val description: String) : Effect
 }
@@ -136,6 +145,20 @@ data class Toast(val text: String, val icon: Int)
 
 /** Facts about this phone's certificate, read off disk and the Android trust store. */
 data class CertInfo(val exists: Boolean, val fingerprint: String?, val madeAt: Long, val inAndroid: Boolean)
+
+/** The certificate's DER bytes from its PEM text, or null if it is not one. */
+internal fun pemDer(pem: String): ByteArray? {
+    if (!pem.contains("-----BEGIN CERTIFICATE-----")) return null
+    return runCatching {
+        java.util.Base64.getMimeDecoder().decode(
+            pem.substringAfter("-----BEGIN CERTIFICATE-----").substringBefore("-----END CERTIFICATE-----")
+        )
+    }.getOrNull()?.takeIf { it.isNotEmpty() }
+}
+
+/** SHA-256 of the certificate's DER bytes in hex, the fingerprint patches are recorded against. */
+internal fun pemFingerprint(pem: String): String? =
+    pemDer(pem)?.let { der -> java.security.MessageDigest.getInstance("SHA-256").digest(der).joinToString("") { "%02x".format(it) } }
 
 /**
  * Everything the screens show and every action they take.
@@ -427,6 +450,9 @@ class AppModel(app: Application) : AndroidViewModel(app) {
         if (route == Route.WORKSPACES && wsStatus == ListStatus.EMPTY) loadWorkspaces()
         refreshCert()
         refreshNotifications()
+        // Back from Android's settings with installs allowed: a patch waiting
+        // on that carries on without another tap.
+        patch.carryOn()
         if (route == Route.MAIN) refreshPatchStates()
         // Back from Android's settings with the screen lock removed: the keystore
         // has dropped the key, so say so now rather than at the next Approve.
@@ -450,6 +476,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
             wsBusy = false
             when (r) {
                 is Outcome.Ok -> {
+                    val fullWasOn = fullCapture
                     Pairing.persist(ctx, r.value.pairing)
                     pairing = r.value.pairing
                     store.pairedFromAccount = true
@@ -464,7 +491,8 @@ class AppModel(app: Application) : AndroidViewModel(app) {
                     route = Route.MAIN
                     tab = "home"
                     push = null
-                    say("Paired with ${chosen.name}")
+                    // A yes to full requests is for one session, and this may be another.
+                    say(if (fullWasOn && !fullCapture) "Paired with ${chosen.name}. Send full requests is off for it." else "Paired with ${chosen.name}")
                 }
                 is Outcome.Failed -> {
                     if (r.problem == Problem.SignedOut) return@launch signedOut()
@@ -666,8 +694,13 @@ class AppModel(app: Application) : AndroidViewModel(app) {
     val scopeApps = mutableStateListOf<String>()
     val scope: Scope get() = Scope(scopeMode, scopeApps.toList())
     var scopeQuery by mutableStateOf("")
-    var fullCapture by mutableStateOf(FullCapturePrefs.allowed(app))
-        private set
+    /** The pairing the device's yes to full requests was given for (see [FullCapturePrefs]). */
+    private var fullGivenFor by mutableStateOf(FullCapturePrefs.givenFor(app))
+    /** Full requests are allowed for the pairing in use. A yes given for another pairing is not one. */
+    val fullCapture: Boolean get() = FullCapturePrefs.covers(fullGivenFor, pairing)
+
+    /** Whether the yes to full requests, if there is one, would carry over to [p]. */
+    fun fullCaptureCovers(p: Pairing): Boolean = FullCapturePrefs.covers(fullGivenFor, p)
     private var preflightAcknowledged = false
 
     private fun boot() {
@@ -748,16 +781,17 @@ class AppModel(app: Application) : AndroidViewModel(app) {
         when {
             phase != Phase.IDLE -> say("Stop capture to change this.", R.drawable.ic_info)
             fullCapture -> {
-                fullCapture = false
-                FullCapturePrefs.set(ctx, false)
+                FullCapturePrefs.set(ctx, pairing, false)
+                fullGivenFor = null
             }
             else -> overlay = Overlay.FullConsent
         }
     }
 
     fun allowFull() {
-        fullCapture = true
-        FullCapturePrefs.set(ctx, true)
+        val p = pairing
+        FullCapturePrefs.set(ctx, p, true)
+        fullGivenFor = p?.let(FullCapturePrefs::keyOf)
         overlay = null
     }
 
@@ -784,6 +818,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
                 // server refused the token: the session ended.
                 session.ended()
                 if (!fromAccount && pairing != null) qrEnded = true
+                offerRestore()
                 if (Pairing.refused(ctx) && !sessionRefused) {
                     sessionRefused = true
                     say("The server stopped accepting this phone's requests, so capture stopped.", R.drawable.ic_warning)
@@ -949,6 +984,40 @@ class AppModel(app: Application) : AndroidViewModel(app) {
         wasActive = false
     }
 
+    /** The Tracer's Stop button: the session ends here. */
+    fun stopTapped() {
+        stopCapture()
+        offerRestore()
+    }
+
+    /**
+     * The session ended. A patched build that accepts any certificate is safe
+     * to use only while capture runs, so offer to put the original back, unless
+     * something else is already on screen.
+     */
+    private fun offerRestore() {
+        if (!patch.available) return
+        viewModelScope.launch {
+            val pkgs = withContext(Dispatchers.IO) { patch.acceptsAnyCert() }
+            anyCertPkgs = pkgs.toSet()
+            if (pkgs.isNotEmpty() && overlay == null) overlay = Overlay.RestorePatched(pkgs)
+        }
+    }
+
+    /** Uninstall the first app [o] names, then move on to the rest. */
+    fun restoreUninstall(o: Overlay.RestorePatched) {
+        val pkg = o.pkgs.firstOrNull() ?: return
+        overlay = o.pkgs.drop(1).takeIf { it.isNotEmpty() }?.let { Overlay.RestorePatched(it) }
+        patch.uninstallIntent(pkg)?.let { emit(Effect.Uninstall(it)) }
+    }
+
+    /** Open the Play Store at the first app [o] names, then move on to the rest. */
+    fun restoreFromStore(o: Overlay.RestorePatched) {
+        val pkg = o.pkgs.firstOrNull() ?: return
+        overlay = o.pkgs.drop(1).takeIf { it.isNotEmpty() }?.let { Overlay.RestorePatched(it) }
+        emit(Effect.OpenStore(pkg))
+    }
+
     /** The diagnosis's button. */
     fun diagAction(a: DiagAction) {
         when (a) {
@@ -1029,6 +1098,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
             val pkgs = (apps?.map { it.pkg }.orEmpty() + scopeApps).distinct()
             val states = withContext(Dispatchers.IO) { pkgs.associateWith { patch.state(it, ca) } }
             patchStates.putAll(states)
+            anyCertPkgs = withContext(Dispatchers.IO) { patch.acceptsAnyCert().toSet() }
             staleCount = withContext(Dispatchers.IO) { patch.stale(ca) }
             patchedCount = withContext(Dispatchers.IO) { patch.patchedCount() }
         }
@@ -1037,6 +1107,10 @@ class AppModel(app: Application) : AndroidViewModel(app) {
     var staleCount by mutableStateOf<List<String>>(emptyList())
         private set
     var patchedCount by mutableStateOf(0)
+        private set
+
+    /** Installed patched builds that accept any certificate, by package. */
+    var anyCertPkgs by mutableStateOf<Set<String>>(emptySet())
         private set
 
     var patchQuery by mutableStateOf("")
@@ -1051,12 +1125,27 @@ class AppModel(app: Application) : AndroidViewModel(app) {
         val p = pairing ?: return say("Pair a workspace first.", R.drawable.ic_info)
         if (qrEnded) return say("This pairing code has been used. Scan a new one first.", R.drawable.ic_info)
         viewModelScope.launch {
-            val ca = withContext(Dispatchers.IO) { ensureCaFile() }
-            if (ca == null) return@launch say("Could not create this phone's certificate.", R.drawable.ic_warning)
+            // The certificate goes to the patch as text, and the patch is recorded
+            // against the fingerprint of that same text. A file staged on the way
+            // could be swapped before the upload reads it: before Android 11 any
+            // app with storage permission can write to this app's external folder.
+            val pem = withContext(Dispatchers.IO) { caPemForSaving() }
+            val fp = pem?.let { pemFingerprint(it) }
+            if (pem == null || fp == null) return@launch say("Could not create this phone's certificate.", R.drawable.ic_warning)
             refreshCert()
             val f = facts[pkg]
-            patch.start(pkg, f?.label ?: labelOf(pkg), f?.sizeMb ?: 0, p, ca, cert.fingerprint)
+            patch.start(pkg, f?.label ?: labelOf(pkg), f?.sizeMb ?: 0, p, pem, fp)
         }
+    }
+
+    /**
+     * Off to Android's settings to let this app install apps. If that is
+     * already done, the waiting patch carries on instead.
+     */
+    fun allowInstalls() {
+        patch.carryOn()
+        if (patch.job.value?.step != PatchStep.ALLOW_INSTALLS) return
+        patch.allowInstallsIntent()?.let { emit(Effect.AllowInstalls(it)) }
     }
 
     fun cancelPatch() {
@@ -1110,13 +1199,9 @@ class AppModel(app: Application) : AndroidViewModel(app) {
     private fun readCert(): CertInfo {
         val f = caPem
         if (!f.exists()) return CertInfo(false, null, 0L, false)
-        val der = runCatching {
-            val pem = f.readText()
-            java.util.Base64.getMimeDecoder().decode(
-                pem.substringAfter("-----BEGIN CERTIFICATE-----").substringBefore("-----END CERTIFICATE-----")
-            )
-        }.getOrNull() ?: return CertInfo(false, null, 0L, false)
-        val fp = java.security.MessageDigest.getInstance("SHA-256").digest(der).joinToString("") { "%02x".format(it) }
+        val pem = runCatching { f.readText() }.getOrNull() ?: return CertInfo(false, null, 0L, false)
+        val der = pemDer(pem) ?: return CertInfo(false, null, 0L, false)
+        val fp = pemFingerprint(pem) ?: return CertInfo(false, null, 0L, false)
         return CertInfo(true, fp, f.lastModified(), inAndroidStore(der))
     }
 
@@ -1129,18 +1214,10 @@ class AppModel(app: Application) : AndroidViewModel(app) {
     }.getOrDefault(false)
 
     /**
-     * The certificate as a file a patch can upload, made if the phone has none.
-     * Patching does not need the certificate installed in Android, so it must
-     * not need the button that installs it either.
+     * The certificate's PEM for saving or patching, made if the phone has none
+     * yet. Patching does not need the certificate installed in Android, so it
+     * must not need the button that installs it either.
      */
-    private fun ensureCaFile(): File? {
-        val pem = runCatching { Native.generateCaPem() }.getOrNull() ?: return null
-        if (pem.startsWith("ERROR")) return null
-        val out = File(ctx.getExternalFilesDir(null) ?: ctx.filesDir, caFileName)
-        return runCatching { out.writeText(pem); out }.getOrNull()
-    }
-
-    /** The certificate's PEM for saving, made if the phone has none yet. */
     fun caPemForSaving(): String? {
         val pem = runCatching { Native.generateCaPem() }.getOrNull() ?: return null
         return pem.takeUnless { it.startsWith("ERROR") }
@@ -1165,6 +1242,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
         if (running) stopCapture()
         runCatching { caPem.delete() }
         runCatching { File(ctx.filesDir, "ca.key").delete() }
+        // Earlier versions staged a copy here for patching. Nothing writes it now.
         runCatching { File(ctx.getExternalFilesDir(null), caFileName).delete() }
         patch.forgetAll()
         overlay = Overlay.RemoveOldCert

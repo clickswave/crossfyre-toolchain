@@ -68,6 +68,8 @@ toml = "1.0.3"
 [dev-dependencies]
 # A recording SOCKS5 proxy and counting listeners, for the gateway's tests.
 cfx_tunnel = { path = "../tunnel", features = ["recorder"] }
+# The shape of the release client's User-Agent.
+regex = "1"
 
 # Windows: the node supervisor runs as a service (windows-service), the engines as
 # scheduled tasks registered through the Task Scheduler's COM interface (the `windows`
@@ -82,14 +84,18 @@ windows = { version = "0.57", features = [
     "Win32_System_Variant",
 ] }
 windows-sys = { version = "0.61", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
+    "Win32_System_IO",
     "Win32_System_JobObjects",
     "Win32_System_Registry",
     "Win32_System_Services",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",

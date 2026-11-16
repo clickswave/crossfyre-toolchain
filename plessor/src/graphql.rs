@@ -348,6 +348,7 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
             min_timeout_ms: 8000,
             block_internal: params.block_internal,
             egress: &params.egress,
+            verify_certs: false,
         },
         transport::Redirect::Limited(3),
         Vec::new(),
@@ -367,9 +368,24 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
     };
     // One correlation for the whole GraphQL pass, and one queue of findings
     // waiting on it.
-    let oob_reg = match oast.as_ref() {
-        Some(oc) => oc.register(&client).await,
-        None => None,
+    // The out-of-band API gets a client of its own, so the session does not go there.
+    let oast_http = oast.as_ref().and_then(|_| {
+        probe::oast_client_or_say(
+            probe::oast_client(
+                params.evasive,
+                params.identify.clone(),
+                &params.target,
+                params.timeout_ms,
+                params.block_internal,
+                &params.egress,
+                false,
+            ),
+            &tx,
+        )
+    });
+    let oob_reg = match (oast.as_ref(), oast_http.as_ref()) {
+        (Some(oc), Some(http)) => oc.register(http).await,
+        _ => None,
     };
     let oob_queue: crate::inject::OobQueue = Default::default();
 
@@ -512,6 +528,7 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
                 min_timeout_ms: 8000,
                 block_internal: params.block_internal,
                 egress: &params.egress,
+                verify_certs: false,
             });
             let mut confirmed: Vec<String> = Vec::new();
             let mut unread: Vec<String> = Vec::new();
@@ -611,6 +628,7 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
             min_timeout_ms: 8000,
             block_internal: params.block_internal,
             egress: &params.egress,
+            verify_certs: false,
         });
         // Privileged operations that were named and deliberately not invoked.
         let mut declined: Vec<String> = Vec::new();
@@ -776,6 +794,7 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
                     min_timeout_ms: 8000,
                     block_internal: params.block_internal,
                     egress: &params.egress,
+                    verify_certs: false,
                 }) {
                     clients.push((id.role.as_str(), c));
                 }
@@ -1129,7 +1148,8 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
     }
 
     // Out-of-band callbacks, collected once for the whole pass.
-    if let (Some(oc), Some(reg)) = (oast.as_ref(), oob_reg.as_ref()) {
+    if let (Some(oc), Some(reg), Some(http)) = (oast.as_ref(), oob_reg.as_ref(), oast_http.as_ref())
+    {
         let pending: Vec<crate::inject::PendingOob> = oob_queue
             .lock()
             .map(|mut v| std::mem::take(&mut *v))
@@ -1140,7 +1160,7 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
                 if wait > 0 {
                     tokio::time::sleep(Duration::from_millis(wait)).await;
                 }
-                hosts = oc.poll_hosts(&client, reg).await;
+                hosts = oc.poll_hosts(http, reg).await;
                 if !hosts.is_empty() {
                     break;
                 }
@@ -1152,7 +1172,7 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
                 }
             }
         }
-        oc.deregister(&client, reg).await;
+        oc.deregister(http, reg).await;
     }
 
     let _ = tx.send(json!({"type":"done","found":found}));

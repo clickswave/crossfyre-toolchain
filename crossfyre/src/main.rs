@@ -509,6 +509,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // as nodes.d and auth.toml, so an isolated node set gets its own database
     // and its own engine ports rather than quietly sharing the global ones.
     cfx_core::toolchain::config::set_toolchain_dir(base.clone());
+    // Named in the User-Agent of requests to the release origin.
+    cfx_core::toolchain::release_http::set_version(env!("CARGO_PKG_VERSION"));
 
     // No account gate here on purpose. The engines are free, and every command
     // that isn't node enrolment is either local or served from the PUBLIC

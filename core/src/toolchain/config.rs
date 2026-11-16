@@ -200,24 +200,6 @@ pub fn egress_env_path() -> PathBuf {
     }
 }
 
-/// Where a file the node hands to an engine is written, such as a downloaded wordlist
-/// the engine then reads by its path: `/tmp/<name>` on Unix, as it always has been. On
-/// Windows the node runs as LocalSystem, whose temporary directory the operator, whom
-/// the engines run as, cannot read, so it is the toolchain directory's `tmp`, in the
-/// operator's profile, which both can.
-pub fn handoff_path(name: &str) -> String {
-    #[cfg(windows)]
-    {
-        let dir = get_toolchain_dir().join("tmp");
-        let _ = fs::create_dir_all(&dir);
-        dir.join(name).display().to_string()
-    }
-    #[cfg(not(windows))]
-    {
-        format!("/tmp/{name}")
-    }
-}
-
 /// Where the services write their logs on macOS and Windows, which have no journal: the
 /// toolchain directory's `logs`, beside the configs they describe and readable by the
 /// same person. Linux services log to the journal instead.
@@ -291,21 +273,62 @@ pub fn is_extension_installed(ext: &str) -> bool {
 }
 
 pub fn load_config() -> Result<ToolchainConfig, Box<dyn std::error::Error>> {
-    let path = get_config_path();
-    let contents = fs::read_to_string(path)?;
+    load_config_at(&get_config_path())
+}
+
+pub(crate) fn load_config_at(
+    path: &std::path::Path,
+) -> Result<ToolchainConfig, Box<dyn std::error::Error>> {
+    // The node service reads this as root from the operator's home.
+    let contents = super::sudo_user::read_to_string(path)?;
     let config: ToolchainConfig = toml::from_str(&contents)?;
     Ok(config)
 }
 
 pub fn save_config(config: &ToolchainConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let dir = get_toolchain_dir();
-    super::sudo_user::create_dir_all_for_invoking_user(&dir)?;
+    save_config_at(&get_config_path(), config)
+}
 
-    let path = get_config_path();
+/// The file holds the database password, so it is written owner-only. The engine
+/// daemons that read it run as the same account the file is handed back to.
+pub(crate) fn save_config_at(
+    path: &std::path::Path,
+    config: &ToolchainConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(dir) = path.parent() {
+        super::sudo_user::create_dir_all_for_invoking_user(dir)?;
+    }
     let toml_string = toml::to_string(config)?;
-    fs::write(&path, toml_string)?;
-    super::sudo_user::chown_to_invoking_user(&path);
+    crate::write_secret_file(path, &toml_string)?;
+    super::sudo_user::chown_to_invoking_user(path);
     Ok(())
+}
+
+/// A new random password for the toolchain database: 32 bytes as hex.
+pub fn new_postgres_password() -> Result<String, Box<dyn std::error::Error>> {
+    let mut b = [0u8; 32];
+    getrandom::fill(&mut b).map_err(|e| format!("no randomness for a database password: {e}"))?;
+    Ok(b.iter().map(|x| format!("{x:02x}")).collect())
+}
+
+/// The config at `path` with a database password, generating and saving one if the
+/// file has none. The flag says whether one was generated, which means anything
+/// that read the file earlier (the engine daemons) still holds the old settings.
+pub(crate) fn ensure_postgres_password_at(
+    path: &std::path::Path,
+) -> Result<(ToolchainConfig, bool), Box<dyn std::error::Error>> {
+    let mut config = load_config_at(path)?;
+    if config
+        .postgres
+        .password
+        .as_deref()
+        .is_some_and(|p| !p.is_empty())
+    {
+        return Ok((config, false));
+    }
+    config.postgres.password = Some(new_postgres_password()?);
+    save_config_at(path, &config)?;
+    Ok((config, true))
 }
 
 /// Resolve an extension daemon's port from `config.toml`, falling back to the
@@ -378,7 +401,7 @@ pub fn apply_ports_from_json(
 /// The file loads either way; this keeps what a person reads in it current. Returns
 /// whether the file was written. A missing file is not an error.
 pub fn rewrite_legacy_keys(path: &std::path::Path) -> Result<bool, Box<dyn std::error::Error>> {
-    let Ok(text) = fs::read_to_string(path) else {
+    let Ok(text) = super::sudo_user::read_to_string(path) else {
         return Ok(false);
     };
     let value: toml::Value = toml::from_str(&text)?;
@@ -393,7 +416,7 @@ pub fn rewrite_legacy_keys(path: &std::path::Path) -> Result<bool, Box<dyn std::
         return Ok(false);
     }
     let config: ToolchainConfig = toml::from_str(&text)?;
-    fs::write(path, toml::to_string(&config)?)?;
+    crate::write_secret_file(path, &toml::to_string(&config)?)?;
     super::sudo_user::chown_to_invoking_user(path);
     Ok(true)
 }
@@ -402,15 +425,62 @@ pub fn rewrite_legacy_keys(path: &std::path::Path) -> Result<bool, Box<dyn std::
 /// Defaults are sane for a single-host install; operators can edit
 /// `config.toml` afterwards to point at an external Postgres.
 pub fn load_or_create_config() -> Result<ToolchainConfig, Box<dyn std::error::Error>> {
-    if !get_config_path().exists() {
-        let config = ToolchainConfig::default();
-        save_config(&config)?;
+    load_or_create_config_at(&get_config_path())
+}
+
+/// A new file gets a generated database password, so the container `crossfyre db up`
+/// makes from it, and the engines that read it, never run without one.
+pub(crate) fn load_or_create_config_at(
+    path: &std::path::Path,
+) -> Result<ToolchainConfig, Box<dyn std::error::Error>> {
+    if !path.exists() {
+        let mut config = ToolchainConfig::default();
+        config.postgres.password = Some(new_postgres_password()?);
+        save_config_at(path, &config)?;
         println!(
             "[config] Wrote default toolchain config: {}",
-            get_config_path().display()
+            path.display()
         );
     }
-    load_config()
+    load_config_at(path)
+}
+
+#[cfg(all(test, unix))]
+mod root_link_tests {
+    use super::*;
+
+    const A_CONFIG: &str = "[postgres]\nhost = \"localhost\"\nport = 4440\nuser = \"postgres\"\n\
+                            db_name = \"crossfyre\"\n\n[container]\n";
+
+    /// The node service reads the toolchain config as root from the operator's home.
+    #[test]
+    fn a_root_read_of_the_config_does_not_follow_a_link() {
+        let t = tempfile::tempdir().unwrap();
+        let elsewhere = t.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("config.toml"), A_CONFIG).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, t.path().join("crossfyre")).unwrap();
+
+        let _root = crate::toolchain::sudo_user::act_as_root();
+        assert!(load_config_at(&t.path().join("crossfyre/config.toml")).is_err());
+    }
+
+    /// Nor does a FIFO left at its name hang the service.
+    #[test]
+    fn a_root_read_of_the_config_does_not_wait_on_a_fifo() {
+        let t = tempfile::tempdir().unwrap();
+        let fifo = t.path().join("config.toml");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _root = crate::toolchain::sudo_user::act_as_root();
+            let _ = tx.send(load_config_at(&fifo).is_err());
+        });
+        let refused = rx.recv_timeout(std::time::Duration::from_secs(3));
+        assert_eq!(refused, Ok(true), "hung on a FIFO or read it");
+    }
 }
 
 #[cfg(test)]
@@ -553,5 +623,72 @@ mod tests {
             let p = ExtensionPorts::from_entries_in(RENAMED, order.clone());
             assert_eq!(p.get("cortex"), 5002, "{order:?}");
         }
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn a_new_config_has_a_database_password_and_is_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = load_or_create_config_at(&path).unwrap();
+        let pw = cfg.postgres.password.expect("a generated password");
+        assert_eq!(pw.len(), 64);
+        assert!(pw.chars().all(|c| c.is_ascii_hexdigit()));
+        #[cfg(unix)]
+        assert_eq!(mode(&path), 0o600);
+        // The next load reads it back rather than making another.
+        assert_eq!(
+            load_or_create_config_at(&path).unwrap().postgres.password,
+            Some(pw)
+        );
+    }
+
+    #[test]
+    fn a_config_without_a_password_gets_one_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[postgres]\nhost = \"localhost\"\nport = 4440\nuser = \"postgres\"\n\
+             db_name = \"crossfyre\"\n\n[container]\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let (cfg, generated) = ensure_postgres_password_at(&path).unwrap();
+        assert!(generated);
+        let pw = cfg.postgres.password.expect("a password");
+        assert_eq!(
+            load_config_at(&path).unwrap().postgres.password,
+            Some(pw.clone())
+        );
+        #[cfg(unix)]
+        assert_eq!(mode(&path), 0o600, "tightened when the password went in");
+        let (again, generated) = ensure_postgres_password_at(&path).unwrap();
+        assert!(!generated);
+        assert_eq!(again.postgres.password, Some(pw));
+    }
+
+    #[test]
+    fn an_operator_password_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[postgres]\nhost = \"db.internal\"\nport = 5432\nuser = \"cfx\"\n\
+             password = \"mine\"\ndb_name = \"crossfyre\"\n\n[container]\n",
+        )
+        .unwrap();
+        let (cfg, generated) = ensure_postgres_password_at(&path).unwrap();
+        assert!(!generated);
+        assert_eq!(cfg.postgres.password.as_deref(), Some("mine"));
     }
 }

@@ -1,25 +1,21 @@
-use std::io::BufRead;
-
 /// The non-empty lines of a wordlist, in file order, without their `\n` or
 /// `\r\n`. A line of spaces is not empty and is kept.
 ///
-/// Read on the blocking pool with std's buffered reader, so the whole file is one
-/// task rather than an await per line. A file that is not UTF-8 is an error, never
-/// a list cut short at the bad byte.
+/// A file that is not UTF-8 is an error, never a list cut short at the bad byte.
+pub fn split_lines(bytes: &[u8]) -> Result<Vec<String>, std::io::Error> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    Ok(text
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+/// [`split_lines`] of a file read by name.
+#[cfg(test)]
 pub async fn read_lines(file_path: &str) -> Result<Vec<String>, std::io::Error> {
-    let path = file_path.to_owned();
-    tokio::task::spawn_blocking(move || {
-        let mut kept = Vec::new();
-        for line in std::io::BufReader::new(std::fs::File::open(path)?).lines() {
-            let line = line?;
-            if !line.is_empty() {
-                kept.push(line);
-            }
-        }
-        Ok(kept)
-    })
-    .await
-    .map_err(std::io::Error::other)?
+    split_lines(&std::fs::read(file_path)?)
 }
 
 #[cfg(test)]

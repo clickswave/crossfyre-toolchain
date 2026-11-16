@@ -90,6 +90,15 @@ jobs:
           test ! -e cortex/src/authz/private.rs
           echo "clean checkout resolves to the open baseline"
 
+      # The release workflow signs provenance, so what it runs is pinned by commit
+      # SHA or digest, and no third-party action shares a job with the signing
+      # permissions. Checked here because a release is too late to find out.
+      - name: The release workflow pins what it runs
+        run: |
+          set -eu
+          python3 -I scripts/test_check_release_workflow.py
+          python3 -I scripts/check_release_workflow.py
+
   build:
     name: build and test
     # The Linux jobs name their image, for the same reason the toolchain below is
@@ -160,7 +169,13 @@ jobs:
             -p ambulo -p voyage -p doorward \
             --features ambulo/tuning,voyage/tuning,doorward/tuning
 
+      # ambulo's unit tests drive the runner's Chrome too, and need what the oracles
+      # job gives it below: Chrome's sandbox does not start on the hosted runners,
+      # and the default launch timeout is marginal there.
       - name: Test
+        env:
+          AMBULO_BROWSER_NO_SANDBOX: '1'
+          AMBULO_BROWSER_LAUNCH_TIMEOUT_SECS: '90'
         run: cargo test --workspace --locked --no-fail-fast
 
   # The build and clippy jobs below, for each target the release workflow publishes
@@ -247,6 +262,13 @@ jobs:
             -p transport -p ambulo -p voyage -p toolmark -p plessor \
             --features transport/impersonate,ambulo/impersonate,voyage/impersonate,toolmark/impersonate,plessor/impersonate \
             -- -D warnings
+
+      # The redirect tests in ambulo and cfx_core listen on 127.0.0.2 as a second
+      # host. Linux and Windows answer on all of 127.0.0.0/8, and macOS only on
+      # the addresses lo0 has.
+      - name: Give lo0 a second address
+        if: runner.os == 'macOS'
+        run: sudo ifconfig lo0 alias 127.0.0.2 up
 
       - name: Test
         env:

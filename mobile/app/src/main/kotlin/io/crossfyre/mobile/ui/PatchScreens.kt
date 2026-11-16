@@ -35,6 +35,8 @@ import io.crossfyre.mobile.patch.PATCH_STAGES
 import io.crossfyre.mobile.patch.PatchJob
 import io.crossfyre.mobile.patch.PatchState
 import io.crossfyre.mobile.patch.PatchStep
+import io.crossfyre.mobile.patch.askToAllow
+import io.crossfyre.mobile.patch.patchedLabel
 import io.crossfyre.mobile.patch.result
 
 /** The note under an app in the scope and patch lists, with its colour. */
@@ -46,7 +48,8 @@ fun appNote(m: AppModel, pkg: String): Pair<String, Tone>? {
     return when {
         f?.shielded == true -> "Shielded: may refuse to run once patched" to Tone.DANGER
         st == PatchState.STALE -> "Patch again: trusts an older certificate" to Tone.WARN
-        st == PatchState.CURRENT -> "Patched with this certificate" to Tone.OK
+        st == PatchState.CURRENT && pkg in m.anyCertPkgs -> patchedLabel(true) to Tone.WARN
+        st == PatchState.CURRENT -> patchedLabel(false) to Tone.OK
         f?.flutter == true -> "Flutter: patch it to read its API" to Tone.NONE
         else -> null
     }
@@ -55,7 +58,7 @@ fun appNote(m: AppModel, pkg: String): Pair<String, Tone>? {
 @Composable
 fun PatchContent(m: AppModel) {
     Text(
-        "Apps that pin their certificate refuse capture. Patching rewrites and re-signs an app on Crossfyre's servers so it trusts this phone's certificate, then installs it back.",
+        "Apps that pin their certificate refuse capture. Patching rewrites and re-signs an app on Crossfyre's servers so it trusts this phone's certificate, then installs it back. A Flutter app may instead be patched to accept any certificate: the result says so when that happens, and such a build is for testing only.",
         style = T.body(),
     )
     val stale = m.staleCount
@@ -110,7 +113,7 @@ fun AppContent(m: AppModel, pkg: String) {
         if (direct) {
             Row {
                 when (st) {
-                    PatchState.CURRENT -> Chip("Patched with this certificate", Tone.OK)
+                    PatchState.CURRENT -> if (pkg in m.anyCertPkgs) Chip(patchedLabel(true), Tone.WARN) else Chip(patchedLabel(false), Tone.OK)
                     PatchState.STALE -> Chip("Patch again", Tone.WARN)
                     PatchState.NONE -> Chip("Not patched")
                 }
@@ -136,7 +139,7 @@ fun AppContent(m: AppModel, pkg: String) {
                 add("Shield signs" to if (f.shieldLibs.isNotEmpty()) "${f.shieldLibs.size} machine-named libraries" else "None found")
                 if (direct) add(
                     "Patched" to when (st) {
-                        PatchState.CURRENT -> "Yes, with this certificate"
+                        PatchState.CURRENT -> if (pkg in m.anyCertPkgs) "Yes, and it accepts any certificate" else "Yes, with this certificate"
                         PatchState.STALE -> "Yes, with an older certificate"
                         PatchState.NONE -> "No"
                     }
@@ -181,6 +184,22 @@ private fun Note(icon: Int, text: String) {
 @Composable
 fun BoxScope.PatchSheets(m: AppModel, job: PatchJob) {
     val c = cfx
+    val ask = job.askToAllow()
+    if (ask != null) {
+        val (title, first, second) = ask
+        Sheet(
+            title = { SheetTitle(title) },
+            onDismiss = null,
+            foot = {
+                CfxButton("Open settings", Kind.PRIMARY, block = true) { m.allowInstalls() }
+                CfxButton("Cancel", Kind.GHOST, block = true) { m.cancelPatch() }
+            },
+        ) {
+            Text(marked(first), style = T.body())
+            Text(second, style = T.body())
+        }
+        return
+    }
     if (job.running) {
         Sheet(
             title = { SheetTitle("Patching ${job.label}") },

@@ -35,6 +35,22 @@ object Patcher {
      */
     class ServerSaid(message: String) : IllegalStateException(message)
 
+    /**
+     * The patched files, and whether the server said the build accepts any
+     * certificate rather than trusting this phone's (see [acceptsAnyCert]).
+     */
+    class Built(val files: List<File>, val acceptsAnyCert: Boolean)
+
+    /**
+     * Whether a finished job's status says the patched build accepts any
+     * certificate. The server sets `flutter_tls_bypassed` when it turned off
+     * certificate checks in a Flutter app's own TLS, which has no trust store
+     * to add this phone's certificate to. A server that does not send the
+     * field has not said so, and that reads as false.
+     */
+    internal fun acceptsAnyCert(status: JSONObject): Boolean =
+        status.opt("flutter_tls_bypassed") == true
+
     /** Delete the scratch directory a patch works in.
      *
      * Called when a patch is cancelled or fails. The APKs staged here are tens
@@ -47,7 +63,8 @@ object Patcher {
     }
 
     /**
-     * Collect [pkg]'s splits, upload them for patching, and return the patched split files (in cache).
+     * Collect [pkg]'s splits, upload them for patching, and return the patched split files (in cache)
+     * with what the server said about them.
      * Throws on any failure (unreadable APK, network, server error). Runs off the main thread.
      */
     suspend fun buildPatched(
@@ -56,9 +73,9 @@ object Patcher {
         apiUrl: String,
         workflowId: String,
         token: String,
-        caPem: File,
+        caPem: String,
         progress: (Step) -> Unit
-    ): List<File> = withContext(Dispatchers.IO) {
+    ): Built = withContext(Dispatchers.IO) {
         progress(Step(PatchStep.READ))
         val ai = ctx.packageManager.getApplicationInfo(pkg, 0)
         val splitPaths = buildList {
@@ -70,17 +87,11 @@ object Patcher {
         // Zip the splits + CA into one upload (base named base.apk so the server picks it as base).
         val work = File(ctx.cacheDir, "patch").apply { deleteRecursively(); mkdirs() }
         val upload = File(work, "in.zip")
-        ZipOutputStream(upload.outputStream().buffered()).use { zos ->
-            splitPaths.forEachIndexed { i, f ->
-                val name = if (f.absolutePath == ai.sourceDir) "base.apk" else "split_$i.apk"
-                zos.putNextEntry(ZipEntry(name))
-                f.inputStream().use { it.copyTo(zos) }
-                zos.closeEntry()
-            }
-            zos.putNextEntry(ZipEntry("ca.pem"))
-            caPem.inputStream().use { it.copyTo(zos) }
-            zos.closeEntry()
-        }
+        writeUpload(
+            upload,
+            splitPaths.mapIndexed { i, f -> (if (f.absolutePath == ai.sourceDir) "base.apk" else "split_$i.apk") to f },
+            caPem,
+        )
 
         val out = File(work, "out.zip")
         val uploadTotal = upload.length()
@@ -158,6 +169,7 @@ object Patcher {
         progress(Step(PatchStep.SERVER))
         var downloadUrl = ""
         var expectedSha = ""
+        var anyCert = false
         val deadline = System.currentTimeMillis() + PATCH_WAIT_MS
         while (System.currentTimeMillis() < deadline) {
             // delay(), not Thread.sleep(): the server phase is the longest part of
@@ -172,6 +184,7 @@ object Patcher {
                 "done" -> {
                     downloadUrl = st.optString("download_url", "")
                     expectedSha = st.optString("sha256", "")
+                    anyCert = acceptsAnyCert(st)
                     break
                 }
                 // The server writes this for the person holding the phone.
@@ -316,7 +329,26 @@ object Patcher {
             // those over nothing, and the original is about to be uninstalled.
             throw IllegalStateException("Patch service returned no installable build of $pkg")
         }
-        patched
+        Built(patched, anyCert)
+    }
+
+    /**
+     * Write the upload: each split under its name, then the certificate as
+     * `ca.pem`. The certificate is written from the text it was handed, not
+     * read back from a file, so nothing can change it while the splits (tens
+     * to hundreds of megabytes) are being zipped.
+     */
+    internal fun writeUpload(upload: File, splits: List<Pair<String, File>>, caPem: String) {
+        ZipOutputStream(upload.outputStream().buffered()).use { zos ->
+            for ((name, f) in splits) {
+                zos.putNextEntry(ZipEntry(name))
+                f.inputStream().use { it.copyTo(zos) }
+                zos.closeEntry()
+            }
+            zos.putNextEntry(ZipEntry("ca.pem"))
+            zos.write(caPem.toByteArray(Charsets.UTF_8))
+            zos.closeEntry()
+        }
     }
 
     /** How long to wait for a rebuild before giving up, and how often to ask. */

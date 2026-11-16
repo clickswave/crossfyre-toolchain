@@ -109,6 +109,15 @@ pub struct InjectParams {
     /// opens raw sockets and looks names up itself.
     #[serde(default)]
     pub resolve: Vec<(String, std::net::SocketAddr)>,
+    /// Check certificates on every connection the pass's HTTP clients make, the
+    /// out-of-band API's included. Absent = false, which is how every pass has run: a
+    /// scan has to reach hosts whose certificates are expired, self-signed or for
+    /// another name. A caller that hands in a session captured where certificates were
+    /// checked sets it, so the session is not sent to whoever answers the handshake for
+    /// that host. The opt-in smuggling probe's raw sends carry no session and are not
+    /// covered.
+    #[serde(default)]
+    pub verify_certs: bool,
     /// Where this op's connections go. Never read from the op's own fields: the
     /// daemon sets it from the egress wrapper the request came in, and a request
     /// without one gets `Inherit`.
@@ -460,6 +469,7 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
             // confirming request times out and every real time-based finding is
             // lost with the false ones.
             min_timeout_ms: SLEEP_SECS * 2 * 1000 + 3000,
+            verify_certs: params.verify_certs,
         },
         redirect,
         params.resolve.clone(),
@@ -487,6 +497,7 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
                     min_timeout_ms: SLEEP_SECS * 2 * 1000 + 3000,
                     block_internal: params.block_internal,
                     egress: &params.egress,
+                    verify_certs: params.verify_certs,
                 },
                 redirect,
                 params.resolve.clone(),
@@ -516,6 +527,7 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
             min_timeout_ms: 0,
             block_internal: params.block_internal,
             egress: &params.egress,
+            verify_certs: params.verify_certs,
         },
         transport::Redirect::None,
         params.resolve.clone(),
@@ -526,6 +538,22 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
         }
         _ => crate::oast::OastClient::from_env(),
     };
+    // Registering, polling and deregistering go through a client of their own, so the
+    // session handed in for the target does not go to the out-of-band API.
+    let oast_http = oast.as_ref().and_then(|_| {
+        probe::oast_client_or_say(
+            probe::oast_client(
+                params.evasive,
+                params.identify.clone(),
+                &params.target,
+                params.timeout_ms,
+                params.block_internal,
+                &params.egress,
+                params.verify_certs,
+            ),
+            &tx,
+        )
+    });
 
     let handed_in = params.endpoints.len();
     // Endpoints that have somewhere to inject go first, because the cap below
@@ -602,9 +630,9 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
     // quietly stops testing a whole class is the worst failure mode there is:
     // the report looks the same as a clean one.
     let mut oob_reg: Option<Arc<crate::oast::OastReg>> = None;
-    if let Some(oc) = oast.as_ref() {
+    if let (Some(oc), Some(http)) = (oast.as_ref(), oast_http.as_ref()) {
         for attempt in 0..3 {
-            if let Some(r) = oc.register(&client).await {
+            if let Some(r) = oc.register(http).await {
                 oob_reg = Some(Arc::new(r));
                 break;
             }
@@ -647,6 +675,7 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
             redirect,
             resolve: params.resolve.clone(),
             egress: params.egress.clone(),
+            verify_certs: params.verify_certs,
         })
     });
     // The operator's authorisation list, parsed once. Anything unparseable is
@@ -915,7 +944,8 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
     // Out-of-band callbacks, collected once. Everything that was going to call
     // back has had the whole pass to do it; this is the grace period for a
     // target that queues its outbound requests, not a per-payload wait.
-    if let (Some(oc), Some(reg)) = (oast.as_ref(), oob_reg.as_ref()) {
+    if let (Some(oc), Some(reg), Some(http)) = (oast.as_ref(), oob_reg.as_ref(), oast_http.as_ref())
+    {
         let pending: Vec<PendingOob> = oob_queue
             .lock()
             .map(|mut v| std::mem::take(&mut *v))
@@ -933,7 +963,7 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
                 if wait > 0 {
                     tokio::time::sleep(Duration::from_millis(wait)).await;
                 }
-                hosts = oc.poll_hosts(&client, reg).await;
+                hosts = oc.poll_hosts(http, reg).await;
                 if !hosts.is_empty() {
                     break;
                 }
@@ -947,7 +977,7 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
                 }
             }
         }
-        oc.deregister(&client, reg).await;
+        oc.deregister(http, reg).await;
     }
 
     // The escalation pass. A file read that discloses a configuration file also
@@ -1275,22 +1305,37 @@ pub(crate) fn keep_in_scope<T>(
         .collect()
 }
 
-fn in_scope(target: &str, url: &str, extra: &crate::scope::Scope) -> bool {
-    let scope = host_of(target);
-    if scope.is_empty() {
+pub(crate) fn in_scope(target: &str, url: &str, extra: &crate::scope::Scope) -> bool {
+    if host_of(target).is_empty() {
         return true;
     }
-    let host = host_of(url);
-    if host.is_empty() || host == scope {
-        return true;
-    }
+    // The host is read the way the clients that send to it read it, with the url
+    // crate. Read as text up to the first '/', `https://a.test:x@b.test/` names
+    // a.test and `https://a.test:443?@b.test/` names b.test, and the request goes
+    // to the other one in both.
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        // A reference with no host of its own is resolved against the target.
+        return host_of(url).is_empty();
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
     // A port difference on the same name is the same service to an operator who
     // named the host; a different name is not.
-    let bare = |h: &str| h.split(':').next().unwrap_or(h).to_string();
-    if bare(&host) == bare(&scope) {
+    if target_host(target).is_some_and(|t| t.eq_ignore_ascii_case(host)) {
         return true;
     }
-    extra.admits(&bare(&host), port_of(url))
+    extra.admits(host, port_of(url))
+}
+
+/// The scan target's host as the url crate reads it. A target written without a
+/// scheme is read as an http URL, which gives the same host.
+fn target_host(target: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(target)
+        .ok()
+        .filter(|u| u.has_host())
+        .or_else(|| reqwest::Url::parse(&format!("http://{target}")).ok())?;
+    parsed.host_str().map(str::to_string)
 }
 
 /// The URL's port: what it says, or what its scheme implies.
@@ -1299,21 +1344,7 @@ fn in_scope(target: &str, url: &str, extra: &crate::scope::Scope) -> bool {
 /// and a rule written `api.example.com:443` has to match `https://api.example.com/`
 /// which does not say a port at all.
 fn port_of(url: &str) -> Option<u16> {
-    let (scheme, rest) = url.split_once("://")?;
-    let host = rest.split('/').next().unwrap_or("");
-    let after = match host.rsplit_once(']') {
-        // [::1]:8080
-        Some((_, tail)) => tail.strip_prefix(':'),
-        None => host.rsplit_once(':').map(|(_, p)| p),
-    };
-    if let Some(p) = after.and_then(|p| p.parse::<u16>().ok()) {
-        return Some(p);
-    }
-    match scheme {
-        "https" => Some(443),
-        "http" => Some(80),
-        _ => None,
-    }
+    reqwest::Url::parse(url).ok()?.port_or_known_default()
 }
 
 /// Everything one endpoint worker needs. Cloned per endpoint; the clients are
@@ -5217,6 +5248,40 @@ mod scope_tests {
         assert_eq!(port_of("http://api.example.com:8080/x"), Some(8080));
         assert_eq!(port_of("http://[::1]:6379/"), Some(6379));
         assert_eq!(port_of("http://[::1]/"), Some(80));
+    }
+
+    #[test]
+    fn the_host_is_read_the_way_the_sender_reads_it() {
+        let target = "https://app.victim.example/";
+        // The text before '@' is a user name, and the request goes to the host after it.
+        assert!(!in_scope(
+            target,
+            "https://app.victim.example:x@third-party.example/x",
+            &none()
+        ));
+        assert!(!in_scope(
+            target,
+            "https://app.victim.example:443@third-party.example/x",
+            &none()
+        ));
+        // These name the target, with what follows in the query or fragment.
+        assert!(in_scope(
+            target,
+            "https://app.victim.example:443?@third-party.example/x",
+            &none()
+        ));
+        assert!(in_scope(
+            target,
+            "https://user@app.victim.example/x",
+            &none()
+        ));
+        // A rule on another host admits by that host, not by text before an '@'.
+        let (s, _) = crate::scope::parse(&["redis.internal:6379".to_string()]);
+        assert!(!in_scope(
+            target,
+            "http://redis.internal:6379@third-party.example:6379/",
+            &s
+        ));
     }
 
     #[test]

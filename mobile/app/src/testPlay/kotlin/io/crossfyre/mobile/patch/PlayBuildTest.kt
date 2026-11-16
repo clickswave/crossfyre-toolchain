@@ -23,6 +23,7 @@ class PlayBuildTest {
         assertEquals(0, f.patchedCount())
         assertTrue(f.stale("anything").isEmpty())
         assertEquals(PatchState.NONE, f.state("com.example", "ca"))
+        assertNull("nothing to allow in a build that cannot install apps", f.allowInstallsIntent())
     }
 
     @Test
