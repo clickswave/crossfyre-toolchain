@@ -91,7 +91,7 @@ enum Commands {
         action: OastAction,
     },
 
-    /// Run a .cfx script locally, no control plane required.
+    /// Run a .cfx script on this machine. No account and no Crossfyre server needed.
     /// Targets are type:value pairs, e.g. `crossfyre run test.cfx domain:example.com`.
     Run {
         script: String,
@@ -103,7 +103,7 @@ enum Commands {
     /// Web Tracer: capture the sites you browse into a `web_trace` session's asset graph.
     /// Runs a local intercepting proxy (default; needs only a browser) and points a launched browser
     /// at it, or use `--method keylog` for SSLKEYLOGFILE + packet capture. Each request is reduced to
-    /// a redacted shape and streamed to the control plane. Create the session in the dashboard
+    /// a redacted shape and streamed to Crossfyre. Create the session in the dashboard
     /// (Command Center -> New Web Tracer) and paste the `--workflow-id`/`--token` it prints.
     Trace {
         /// The web_trace workflow id (from the dashboard session).
@@ -346,7 +346,7 @@ enum NodeAction {
         all: bool,
     },
 
-    /// List your node fleet from the control plane, with live online/offline
+    /// List the nodes on your account, as Crossfyre sees them, with live online/offline
     /// status. (This is the server view; for the local daemons on this host use
     /// `crossfyre node status`.)
     List {

@@ -709,9 +709,10 @@ static CLAIM_MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 
 #[derive(Subcommand, Debug)]
 pub enum DbCommands {
-    /// Start and recreate the database container
+    /// Make a new, empty database container and start it, replacing the one there
+    /// is. The scan state kept in the old one is lost
     Up,
-    /// Stop and remove the database container
+    /// Stop and remove the database container. The scan state kept in it is lost
     Down,
     /// Start the database container
     Start,
