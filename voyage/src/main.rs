@@ -64,8 +64,20 @@ fn load_toolchain_config() -> Result<ToolchainConfig, Box<dyn std::error::Error>
     Ok(config)
 }
 
+// An error is printed as the sentence it is. Returned from `main`, Rust prints it in
+// debug form: in quotes, with a line break shown as a backslash and an n.
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     // -----------------------------------------------------------------------
@@ -183,7 +195,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let daemon_addr = format!("127.0.0.1:{}", cli.port);
     let stream = TcpStream::connect(&daemon_addr).await.map_err(|_| {
         format!(
-            "Voyage daemon is not running on port {}.\nStart it first with: voyage --daemon",
+            "Voyage daemon is not running on port {}.\nStart it with `voyage --daemon`, or with `crossfyre extension start voyage` if crossfyre installed it.",
             cli.port
         )
     })?;
@@ -292,14 +304,14 @@ fn print_all(bytes: &[u8]) -> std::io::Result<()> {
 
 async fn handle_db(args: DbArgs, port: u16) -> Result<(), Box<dyn std::error::Error>> {
     if !args.full_reset {
-        eprintln!("No action specified. Try: voyage db --full-reset");
+        eprintln!("No action given. See `voyage db --help`.");
         std::process::exit(1);
     }
 
     let daemon_addr = format!("127.0.0.1:{port}");
     let stream = TcpStream::connect(&daemon_addr).await.map_err(|_| {
         format!(
-            "Voyage daemon is not running on port {port}.\nStart it first with: voyage --daemon"
+            "Voyage daemon is not running on port {port}.\nStart it with `voyage --daemon`, or with `crossfyre extension start voyage` if crossfyre installed it."
         )
     })?;
 
@@ -401,7 +413,7 @@ async fn handle_enum_exec(args: ExecArgs, port: u16) -> Result<(), Box<dyn std::
     let daemon_addr = format!("127.0.0.1:{port}");
     let stream = TcpStream::connect(&daemon_addr).await.map_err(|_| {
         format!(
-            "Voyage daemon is not running on port {port}.\nStart it first with: voyage --daemon"
+            "Voyage daemon is not running on port {port}.\nStart it with `voyage --daemon`, or with `crossfyre extension start voyage` if crossfyre installed it."
         )
     })?;
     let _ = stream.set_nodelay(true);
@@ -433,7 +445,7 @@ async fn handle_axfr(
     let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
         .await
         .map_err(|_| {
-            format!("Voyage daemon is not running on port {port}. Start it with: voyage --daemon")
+            format!("Voyage daemon is not running on port {port}. Start it with `voyage --daemon`, or with `crossfyre extension start voyage` if crossfyre installed it.")
         })?;
     let request = serde_json::json!({
         "operation": "axfr",
