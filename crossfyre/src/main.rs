@@ -49,7 +49,7 @@ enum Commands {
         #[arg(long)]
         password: Option<String>,
 
-        /// Control-plane origin
+        /// Crossfyre's API address
         #[arg(long, default_value = cfx_core::auth::DEFAULT_API_URL)]
         api_url: String,
 
@@ -114,7 +114,7 @@ enum Commands {
         #[arg(long)]
         token: String,
 
-        /// Control-plane origin.
+        /// Crossfyre's API address.
         #[arg(long, default_value = cfx_core::auth::DEFAULT_API_URL)]
         api_url: String,
 
@@ -271,8 +271,8 @@ enum CloudCommand {
     /// read from a hidden prompt, or from stdin when that is not a terminal; never
     /// from the command line.
     Login {
-        /// Control-plane origin. Defaults to the one `crossfyre login` saved, else
-        /// this build's.
+        /// Crossfyre's API address. Defaults to the one `crossfyre login` saved, and
+        /// otherwise to the build's default.
         #[arg(long)]
         api_url: Option<String>,
         /// Where to save the key. Defaults to `<data-dir>/mcp/cloud.toml`.

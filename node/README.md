@@ -9,7 +9,7 @@ Part of the [Crossfyre toolchain](../).
 
 ## What it does
 
-When you enrol a host, the node registers with the control plane, installs the engines
+When you enrol a host, the node registers with Crossfyre, installs the engines
 that host is meant to run, and keeps their daemons alive. From then on it pulls
 operations (a crawl, a port scan, a vuln scan), hands each to the right engine, and
 relays findings back. Everything is engine-local, so a node with the `ambulo` and
@@ -24,7 +24,7 @@ crossfyre login
 crossfyre node init      # register this host, install its engines, set up the service
 crossfyre node up        # bring it online
 crossfyre node status    # what is running locally
-crossfyre node list      # your fleet, from the control plane
+crossfyre node list      # every node on your account
 ```
 
 `node init` installs a systemd service (on Linux) whose job is to exec this binary's

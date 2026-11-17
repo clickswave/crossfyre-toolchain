@@ -205,7 +205,7 @@ pub async fn run(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 .is_ok();
             let short = &id[..id.len().min(8)];
             let label = format!(
-                "control plane reachable for node {} {}",
+                "Crossfyre reachable for node {} {}",
                 short,
                 dim(&format!("({})", cfg.api_url))
             );

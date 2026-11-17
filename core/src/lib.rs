@@ -3157,7 +3157,7 @@ pub async fn run_daemon(
                             break;
                         }
                         eprintln!(
-                            "Warning: Heartbeat 401 ({consecutive_401}/{EVICT_AFTER_401}) - likely a transient control-plane blip; retrying"
+                            "Warning: Heartbeat 401 ({consecutive_401}/{EVICT_AFTER_401}). Crossfyre may be restarting, so the node will try again."
                         );
                     }
                     Ok(res) => eprintln!("Warning: Heartbeat returned {}", res.status()),

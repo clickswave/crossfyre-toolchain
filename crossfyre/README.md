@@ -28,7 +28,7 @@ crossfyre mcp                   # serve toolmark and plessor to an MCP client (s
 
 ## Running scripts
 
-`crossfyre run` executes a `.cfx` script locally, no control plane involved. Targets
+`crossfyre run` runs a `.cfx` script on this machine and needs no account. Targets
 are passed as `type:value`:
 
 ```sh
