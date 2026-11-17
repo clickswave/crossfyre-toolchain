@@ -11,8 +11,20 @@ mod libs;
 mod services;
 mod signatures;
 
+// An error is printed as the sentence it is. Returned from `main`, Rust prints it in
+// debug form: in quotes, with a line break shown as a backslash and an n.
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     // Toolmark is stateless: no DB, just a fingerprinting TCP service.
@@ -104,7 +116,7 @@ async fn send_stream(
         .await
         .map_err(|_| {
             format!(
-                "Toolmark daemon is not running on port {port}. Start it first with: toolmark --daemon"
+                "Toolmark daemon is not running on port {port}. Start it with `toolmark --daemon`, or with `crossfyre extension start toolmark` if crossfyre installed it."
             )
         })?;
     let (reader, mut writer) = tokio::io::split(stream);

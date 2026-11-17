@@ -136,7 +136,7 @@ pub async fn run(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
         step(&format!(
             "no toolchain config yet {}",
             dim(&format!(
-                "({}) - created on first init",
+                "({}), created on first init",
                 config_path.display()
             ))
         ));
@@ -205,7 +205,7 @@ pub async fn run(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 .is_ok();
             let short = &id[..id.len().min(8)];
             let label = format!(
-                "control plane reachable for node {} {}",
+                "Crossfyre reachable for node {} {}",
                 short,
                 dim(&format!("({})", cfg.api_url))
             );
@@ -225,12 +225,14 @@ pub async fn run(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // -- Legacy OrionChain leftovers ------------------------------------------
-    section("Legacy");
+    // Said only when there is something to say. "No legacy OrionChain leftovers" on
+    // every run named a product most people running this have never heard of.
     let legacy_opt = Path::new("/opt/orionchain").exists();
     let legacy_cfg = super::sudo_user::invoking_user_config_dir()
         .join("orionchain")
         .exists();
     if legacy_opt || legacy_cfg {
+        section("Legacy");
         warn("legacy OrionChain install detected");
         println!(
             "      {}",
@@ -238,8 +240,6 @@ pub async fn run(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 "-> re-run `sudo crossfyre node init` to migrate, or remove /opt/orionchain and ~/.config/orionchain manually"
             )
         );
-    } else {
-        ok("no legacy OrionChain leftovers");
     }
 
     // -- Summary --------------------------------------------------------------

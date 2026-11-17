@@ -709,9 +709,10 @@ static CLAIM_MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 
 #[derive(Subcommand, Debug)]
 pub enum DbCommands {
-    /// Start and recreate the database container
+    /// Make a new, empty database container and start it, replacing the one there
+    /// is. The scan state kept in the old one is lost
     Up,
-    /// Stop and remove the database container
+    /// Stop and remove the database container. The scan state kept in it is lost
     Down,
     /// Start the database container
     Start,
@@ -1086,14 +1087,14 @@ fn scan_nodes(
 ) -> Result<(Vec<String>, Vec<String>), Box<dyn std::error::Error>> {
     if !base.exists() {
         return Err(format!(
-            "config root {base:?} does not exist - run `crossfyre node init` first"
+            "config root {base:?} does not exist. Run `crossfyre node init` first."
         )
         .into());
     }
     let nd = nodes_dir(base);
     if !nd.is_dir() {
         return Err(
-            format!("{nd:?} is missing - run `crossfyre node init` to register a node").into(),
+            format!("{nd:?} is missing. Run `crossfyre node init` to register a node.").into(),
         );
     }
 
@@ -1411,6 +1412,9 @@ pub fn prompt_node_key(no_prompt: bool) -> Result<String, Box<dyn std::error::Er
     }
     use std::io::Write;
     println!("\n  Create a node in the dashboard (Nodes -> create a node) to get its API key.");
+    println!(
+        "  Or stop here and run `crossfyre login` first: signed in, node init asks for no key."
+    );
     print!("  Paste the node API key: ");
     std::io::stdout().flush()?;
     let mut line = String::new();
@@ -1757,7 +1761,7 @@ pub async fn run_init(
         .trim_start_matches("https://")
         .trim_start_matches("http://");
     title("Crossfyre node init", host);
-    field("Control plane", api_url);
+    field("Server", api_url);
     field("Data directory", &data_dir.display().to_string());
     print_privilege_banner(false);
     // Before anything is written: on a host with no node service and no earlier node
@@ -1909,8 +1913,9 @@ pub async fn run_init(
     // Write session file (placeholder empty file for now)
     let session_path = config_dir.join("session");
     if !session_path.exists() {
+        // No line for this: it is an empty placeholder file, and "Session initialized"
+        // read as a sign-in that had not happened.
         toolchain::sudo_user::write_for_invoking_user(&session_path, b"", 0o644)?;
-        step("Session initialized");
     }
 
     // -- Set up the toolchain + selected extensions ------------------------
@@ -2064,7 +2069,7 @@ pub async fn run_init(
 
     end();
     done("Node ready");
-    hint("Run `crossfyre node status` to see the daemons.");
+    hint("Run `crossfyre node status` to see it running.");
     end();
     Ok(())
 }
@@ -2564,7 +2569,7 @@ pub async fn run_daemon(
                     break Err(e);
                 }
                 eprintln!(
-                    "  Control plane not reachable yet ({e}); retrying in {}s",
+                    "  Crossfyre is not reachable yet ({e}); retrying in {}s",
                     backoff.as_secs()
                 );
                 tokio::time::sleep(backoff).await;
@@ -2579,17 +2584,14 @@ pub async fn run_daemon(
                 "\n  Node {} not found on the server (deleted in the dashboard, or its key was revoked).",
                 paths.node_id
             );
-            eprintln!("  Stopping - this node will not be retried.");
+            eprintln!("  Stopping. This node will not be retried.");
             eprintln!("  Clean it up locally with:");
             eprintln!("    crossfyre node remove {}", paths.node_id);
             eprintln!("    crossfyre node remove --inactive   # remove all server-deleted nodes");
             std::process::exit(1);
         }
         eprintln!("\n  Cannot start daemon: {e}");
-        eprintln!(
-            "  crossfyre node daemon {} --force   # take over this node",
-            paths.node_id
-        );
+        eprintln!("  crossfyre node up --force   # take over the nodes on this machine");
         std::process::exit(1);
     }
 
@@ -3157,7 +3159,7 @@ pub async fn run_daemon(
                             break;
                         }
                         eprintln!(
-                            "Warning: Heartbeat 401 ({consecutive_401}/{EVICT_AFTER_401}) - likely a transient control-plane blip; retrying"
+                            "Warning: Heartbeat 401 ({consecutive_401}/{EVICT_AFTER_401}). Crossfyre may be restarting, so the node will try again."
                         );
                     }
                     Ok(res) => eprintln!("Warning: Heartbeat returned {}", res.status()),

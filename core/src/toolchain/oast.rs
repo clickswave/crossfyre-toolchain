@@ -46,7 +46,7 @@ fn require_root() -> Result<(), Box<dyn std::error::Error>> {
         return Err(LINUX_ONLY.into());
     }
     if !crate::os::is_elevated() {
-        return Err("setting up an OAST server needs root - re-run with sudo".into());
+        return Err("setting up an OAST server needs root. Re-run with sudo.".into());
     }
     Ok(())
 }

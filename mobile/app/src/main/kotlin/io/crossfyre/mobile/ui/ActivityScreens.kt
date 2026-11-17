@@ -57,6 +57,7 @@ import io.crossfyre.mobile.approve.countdown
 import io.crossfyre.mobile.channelLabel
 import io.crossfyre.mobile.decidedBy
 import io.crossfyre.mobile.notificationUrl
+import io.crossfyre.mobile.push.PushSetup
 import io.crossfyre.mobile.riskChips
 import io.crossfyre.mobile.shortDate
 import io.crossfyre.mobile.stoppable
@@ -81,7 +82,14 @@ fun ApprovalFacts(m: AppModel) {
             R.drawable.ic_lock_key_open, "An unlock for every approval",
             "Your answer is signed with that key after you unlock the phone, so a CLI or agent key on a computer cannot approve for you. While this phone approves, a yes from the dashboard or from the agent's own client does not count. Either can still deny, and denying needs no unlock.",
         ),
-        Triple(
+        // What reaches the phone with the app closed depends on the build. One made
+        // with Firebase values is pushed, as the README says under "Pushed when it
+        // arrives"; one without only asks while it is open. This fact said there was
+        // no push in every build after push was added.
+        if (PushSetup.available) Triple(
+            R.drawable.ic_bell, "A notification when a request arrives",
+            "While this phone approves, ${m.host} pushes it through Google when a request reaches you, and tapping the notification opens the request. The push carries the kind of notification and ids, never its text. A phone without Google Play services gets no push. While the app is on screen it also asks ${m.host} every few seconds for approvals waiting for you. Pending approvals, recent decisions, your notifications and the activity log are kept in memory while the app is open and are not written to the phone's storage.",
+        ) else Triple(
             R.drawable.ic_clock, "Checked while the app is open",
             "While the app is on screen it asks ${m.host} every few seconds for approvals waiting for you. There is no push notification: with the app closed, requests reach you through the alerts you set up in the dashboard. Pending approvals, recent decisions, your notifications and the activity log are kept in memory while the app is open and are not written to the phone's storage.",
         ),
@@ -399,7 +407,7 @@ private fun ActivityLog(m: AppModel, now: Instant) {
             }
         }
         m.activityStatus == ListStatus.LOADING -> CfxList { repeat(3) { SkelRow(first = it == 0) } }
-        m.activityStatus == ListStatus.EMPTY -> Text("Nothing has happened here yet, or this account cannot read this view.", style = T.hint())
+        m.activityStatus == ListStatus.EMPTY -> Text("Nothing to show yet. If you expected activity here, this account may not be allowed to read it.", style = T.hint())
     }
 }
 

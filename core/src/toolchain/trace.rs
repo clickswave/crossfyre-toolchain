@@ -461,7 +461,7 @@ pub async fn run(cfg: TraceConfig) -> Result<(), BoxErr> {
                                 if let Some(batch) = batcher.push(ev) {
                                     match post_batch(&client, &cfg, &batch, false).await {
                                         Ok(n) => { total += n; print!("\r  captured {total} endpoints"); let _ = std::io::Write::flush(&mut std::io::stdout()); }
-                                        Err(e) => eprintln!("\n  ingest error: {e}"),
+                                        Err(e) => eprintln!("\n  could not send the captured requests to Crossfyre: {e}"),
                                     }
                                 }
                             }
@@ -487,7 +487,7 @@ pub async fn run(cfg: TraceConfig) -> Result<(), BoxErr> {
     // Final flush closes the session.
     let tail = batcher.drain();
     if let Err(e) = post_batch(&client, &cfg, &tail, true).await {
-        eprintln!("  final flush error: {e}");
+        eprintln!("  could not send the last captured requests to Crossfyre: {e}");
     }
     let _ = tshark.start_kill();
     if let Some(mut b) = browser_child {

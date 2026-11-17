@@ -1,5 +1,26 @@
 use std::collections::HashMap;
 
+/// The names `--exclude-passive-source` takes. They live next to the scan that
+/// reads them, so a source added below and the list the CLI validates against
+/// cannot drift apart: the same constant is the provider's exclusion check and
+/// its entry in `SOURCES`.
+pub const CRT_SH: &str = "crt.sh";
+pub const CERTSPOTTER: &str = "certspotter";
+pub const HACKERTARGET: &str = "hackertarget";
+pub const ALIENVAULT: &str = "alienvault";
+pub const URLSCAN: &str = "urlscan";
+pub const SUBDOMAIN_CENTER: &str = "subdomain.center";
+
+/// Every passive source, in the order `execute` runs them.
+pub const SOURCES: [&str; 6] = [
+    CRT_SH,
+    CERTSPOTTER,
+    HACKERTARGET,
+    ALIENVAULT,
+    URLSCAN,
+    SUBDOMAIN_CENTER,
+];
+
 /// Query every passive source and union the results.
 ///
 /// The sources run CONCURRENTLY. They used to run one after another, which made
@@ -39,7 +60,7 @@ pub async fn execute(
     // spawning and no 'static bounds on the borrowed client.
     let (crtsh, certspotter, hackertarget, alienvault, urlscan, subdomain_center) = tokio::join!(
         async {
-            if skipped("crt.sh") {
+            if skipped(CRT_SH) {
                 return vec![];
             }
             match crate::scanners::providers::crt_sh::fetch(&client, domain).await {
@@ -51,7 +72,7 @@ pub async fn execute(
             }
         },
         async {
-            if skipped("certspotter") {
+            if skipped(CERTSPOTTER) {
                 return vec![];
             }
             match crate::scanners::providers::certspotter::fetch(&client, domain).await {
@@ -63,7 +84,7 @@ pub async fn execute(
             }
         },
         async {
-            if skipped("hackertarget") {
+            if skipped(HACKERTARGET) {
                 return vec![];
             }
             match crate::scanners::providers::hackertarget::fetch(&client, domain).await {
@@ -75,7 +96,7 @@ pub async fn execute(
             }
         },
         async {
-            if skipped("alienvault") {
+            if skipped(ALIENVAULT) {
                 return vec![];
             }
             match crate::scanners::providers::alienvault::fetch(&client, domain).await {
@@ -87,7 +108,7 @@ pub async fn execute(
             }
         },
         async {
-            if skipped("urlscan") {
+            if skipped(URLSCAN) {
                 return vec![];
             }
             match crate::scanners::providers::urlscan::fetch(&client, domain).await {
@@ -99,7 +120,7 @@ pub async fn execute(
             }
         },
         async {
-            if skipped("subdomain.center") {
+            if skipped(SUBDOMAIN_CENTER) {
                 return vec![];
             }
             match crate::scanners::providers::subdomain_center::fetch(&client, domain).await {
@@ -119,18 +140,18 @@ pub async fn execute(
     let mut results: HashMap<String, String> = HashMap::new();
     for (prefix, source) in subdomain_center
         .into_iter()
-        .map(|p| (p, "subdomain.center"))
-        .chain(crtsh.into_iter().map(|p| (p, "crt.sh")))
-        .chain(certspotter.into_iter().map(|p| (p, "certspotter")))
-        .chain(hackertarget.into_iter().map(|p| (p, "hackertarget")))
-        .chain(urlscan.into_iter().map(|p| (p, "urlscan")))
+        .map(|p| (p, SUBDOMAIN_CENTER))
+        .chain(crtsh.into_iter().map(|p| (p, CRT_SH)))
+        .chain(certspotter.into_iter().map(|p| (p, CERTSPOTTER)))
+        .chain(hackertarget.into_iter().map(|p| (p, HACKERTARGET)))
+        .chain(urlscan.into_iter().map(|p| (p, URLSCAN)))
     {
         // These return the label prefix; reconstruct the full name.
         results.insert(format!("{prefix}.{domain}"), source.to_string());
     }
     // alienvault returns fully-qualified names already.
     for subdomain in alienvault {
-        results.insert(subdomain, "alienvault".to_string());
+        results.insert(subdomain, ALIENVAULT.to_string());
     }
 
     Ok(results)

@@ -574,9 +574,19 @@ async fn browser_login(
                 let user = user_from_data(&body)?;
                 return Ok((api_key, user));
             }
-            "denied" => return Err("Login was denied in the browser.".into()),
+            "denied" => {
+                return Err(
+                    "The login was denied in the browser. Run `crossfyre login` to try again."
+                        .into(),
+                );
+            }
             "expired" => return Err("Login request expired. Run `crossfyre login` again.".into()),
-            "unknown" => return Err("Login request was not found.".into()),
+            "unknown" => {
+                return Err(
+                    "Crossfyre does not know this login request. Run `crossfyre login` again."
+                        .into(),
+                );
+            }
             // The server says "error" for its own 500. Treated as pending it polls for the
             // full ten minutes against something that is broken and saying so, and the
             // operator watches a spinner rather than reading the reason.
@@ -617,8 +627,20 @@ pub async fn authorize_existing_node(
         .json(&serde_json::json!({ "api_key": node_key, "force": force }))
         .send()
         .await?;
-    if !res.status().is_success() {
-        return Err("Invalid node API key or server error.".into());
+    // Which of the two it was. One sentence for both left a person with a good key
+    // retyping it while the server was the problem.
+    let status = res.status();
+    if status.is_client_error() {
+        return Err(format!(
+            "Crossfyre did not accept this node API key ({status}). Check it, or rotate the node's key in the dashboard and use the new one."
+        )
+        .into());
+    }
+    if !status.is_success() {
+        return Err(format!(
+            "Crossfyre answered {status} while checking the node API key. The key may be fine: try again in a minute."
+        )
+        .into());
     }
     Ok(res.json().await?)
 }
@@ -707,7 +729,10 @@ pub async fn run_login(
     field("file", &account_path(data_dir).display().to_string());
     end();
     done(&format!("Signed in as {who}"));
-    hint("Next: register this host with `crossfyre node init`.");
+    hint(&format!(
+        "Next, enrol this machine: {}",
+        crate::os::elevated("crossfyre node init")
+    ));
     end();
     Ok(())
 }
@@ -733,7 +758,7 @@ pub fn run_logout(data_dir: &Path) {
         done("Signed out");
         hint(&format!("Removed {}.", account_path(data_dir).display()));
     } else {
-        warn("Not logged in.");
+        warn("Not signed in.");
     }
     end();
 }

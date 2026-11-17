@@ -264,7 +264,7 @@ async fn send_stream(
         .await
         .map_err(|_| {
             format!(
-                "Plessor daemon is not running on port {port}. Start it first with: plessor --daemon"
+                "Plessor daemon is not running on port {port}. Start it with `plessor --daemon`, or with `crossfyre extension start plessor` if crossfyre installed it."
             )
         })?;
     let (reader, mut writer) = tokio::io::split(stream);

@@ -783,7 +783,7 @@ mod node {
 
     fn require_root() -> Result<(), Box<dyn std::error::Error>> {
         if unsafe { libc::geteuid() } != 0 {
-            return Err("managing the node service needs root - re-run with sudo".into());
+            return Err("managing the node service needs root. Re-run with sudo.".into());
         }
         Ok(())
     }
@@ -1010,7 +1010,7 @@ mod node {
 
     fn require_root() -> Result<(), Box<dyn std::error::Error>> {
         if !crate::os::is_elevated() {
-            return Err("managing the node service needs root - re-run with sudo".into());
+            return Err("managing the node service needs root. Re-run with sudo.".into());
         }
         Ok(())
     }
@@ -1150,7 +1150,7 @@ mod node {
     fn require_elevated() -> Result<(), Box<dyn std::error::Error>> {
         if !crate::os::is_elevated() {
             return Err(
-                "managing the node service needs an elevated prompt - re-run it as administrator"
+                "managing the node service needs an elevated prompt. Re-run it as administrator."
                     .into(),
             );
         }

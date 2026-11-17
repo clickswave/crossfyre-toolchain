@@ -62,8 +62,20 @@ fn load_toolchain_config() -> Result<ToolchainConfig, Box<dyn std::error::Error>
     Ok(config)
 }
 
+// An error is printed as the sentence it is. Returned from `main`, Rust prints it in
+// debug form: in quotes, with a line break shown as a backslash and an n.
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     // -----------------------------------------------------------------------
@@ -150,7 +162,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let daemon_addr = format!("127.0.0.1:{}", cli.port);
     let stream = TcpStream::connect(&daemon_addr).await.map_err(|_| {
         format!(
-            "Doorward daemon is not running on port {}.\nStart it first with: doorward --daemon",
+            "Doorward daemon is not running on port {}.\nStart it with `doorward --daemon`, or with `crossfyre extension start doorward` if crossfyre installed it.",
             cli.port
         )
     })?;
@@ -248,7 +260,7 @@ fn print_all(bytes: &[u8]) -> std::io::Result<()> {
 
 async fn handle_db(args: DbArgs, port: u16) -> Result<(), Box<dyn std::error::Error>> {
     if !args.full_reset {
-        eprintln!("No action specified. Try: doorward db --full-reset");
+        eprintln!("No action given. See `doorward db --help`.");
         std::process::exit(1);
     }
 
@@ -256,7 +268,7 @@ async fn handle_db(args: DbArgs, port: u16) -> Result<(), Box<dyn std::error::Er
         .await
         .map_err(|_| {
             format!(
-                "Doorward daemon is not running on port {port}. Start it first with: doorward --daemon"
+                "Doorward daemon is not running on port {port}. Start it with `doorward --daemon`, or with `crossfyre extension start doorward` if crossfyre installed it."
             )
         })?;
 
@@ -298,7 +310,7 @@ async fn handle_scan_exec(args: ExecArgs, port: u16) -> Result<(), Box<dyn std::
         .await
         .map_err(|_| {
             format!(
-                "Doorward daemon is not running on port {port}. Start it first with: doorward --daemon"
+                "Doorward daemon is not running on port {port}. Start it with `doorward --daemon`, or with `crossfyre extension start doorward` if crossfyre installed it."
             )
         })?;
     let _ = stream.set_nodelay(true);

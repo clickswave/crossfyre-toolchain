@@ -360,7 +360,7 @@ pub fn cleanup_legacy_orionchain() {
         return;
     }
 
-    println!("[migrate] Legacy OrionChain install detected - cleaning up...");
+    println!("[migrate] Legacy OrionChain install detected. Cleaning up.");
 
     #[cfg(target_os = "linux")]
     for tool in EXTENSIONS {

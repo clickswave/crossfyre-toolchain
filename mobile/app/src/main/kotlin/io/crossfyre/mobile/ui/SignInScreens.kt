@@ -295,7 +295,7 @@ fun WorkspacesScreen(m: AppModel) {
                     if (m.wsBusy) "Pairing…" else "Pair this phone", Kind.PRIMARY, block = true, busy = m.wsBusy,
                     enabled = ready && m.wsSel != null,
                 ) { m.pairSelected() }
-                CfxButton("Use a QR code instead", Kind.TEXT, block = true, icon = R.drawable.ic_qr_code, iconSize = 20.dp) { m.scan() }
+                CfxButton("Pair with a QR code instead", Kind.TEXT, block = true, icon = R.drawable.ic_qr_code, iconSize = 20.dp) { m.scan() }
             }
         },
     ) {

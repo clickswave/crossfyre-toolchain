@@ -7,15 +7,15 @@ use clap::{CommandFactory, Parser, Subcommand};
 #[derive(Parser, Debug)]
 #[command(
     name = "crossfyre",
-    about = "Crossfyre node and toolchain CLI",
+    about = "Install and run the Crossfyre scan engines, and enrol this machine as a node",
     version
 )]
 struct Cli {
-    /// Override the crossfyre config root (the directory that holds
-    /// `nodes.d` and `config.toml`). Defaults to `$XDG_CONFIG_HOME/crossfyre`
-    /// of the *invoking* user (so `sudo` keeps using your home, not `/root`).
-    /// Pass an explicit path to run an isolated set of nodes:
-    /// `--data-dir ~/.config/cfx-htb`.
+    /// Use another config directory, the one that holds `nodes.d` and
+    /// `config.toml`. The default is `$XDG_CONFIG_HOME/crossfyre` of the user who
+    /// ran the command, so `sudo` keeps using your home and not root's. Give a
+    /// path to keep a separate set of nodes, for example
+    /// `--data-dir ~/.config/crossfyre-lab`.
     #[arg(long, global = true, value_name = "PATH")]
     data_dir: Option<std::path::PathBuf>,
 
@@ -25,12 +25,17 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Log in to your Crossfyre account so the CLI can act on your behalf
-    /// (e.g. provision nodes during `node init`). Three methods:
+    /// Sign in to your Crossfyre account.
+    ///
+    /// Signed in, `node init` enrols this machine with no key copied by hand.
+    /// Three ways:
+    ///
+    ///   crossfyre login                                 opens the browser to approve
     ///   crossfyre login --api-key <key>
     ///   crossfyre login --username <u> --password <p>
-    ///   crossfyre login                 (opens the browser to approve)
+    ///
     /// The session is saved to <data-dir>/auth.toml.
+    #[command(verbatim_doc_comment)]
     Login {
         /// Log in with an account API key (from Settings -> CLI Access)
         #[arg(long)]
@@ -44,7 +49,7 @@ enum Commands {
         #[arg(long)]
         password: Option<String>,
 
-        /// Control-plane origin
+        /// Crossfyre's API address
         #[arg(long, default_value = cfx_core::auth::DEFAULT_API_URL)]
         api_url: String,
 
@@ -86,7 +91,7 @@ enum Commands {
         action: OastAction,
     },
 
-    /// Run a .cfx script locally, no control plane required.
+    /// Run a .cfx script on this machine. No account and no Crossfyre server needed.
     /// Targets are type:value pairs, e.g. `crossfyre run test.cfx domain:example.com`.
     Run {
         script: String,
@@ -98,7 +103,7 @@ enum Commands {
     /// Web Tracer: capture the sites you browse into a `web_trace` session's asset graph.
     /// Runs a local intercepting proxy (default; needs only a browser) and points a launched browser
     /// at it, or use `--method keylog` for SSLKEYLOGFILE + packet capture. Each request is reduced to
-    /// a redacted shape and streamed to the control plane. Create the session in the dashboard
+    /// a redacted shape and streamed to Crossfyre. Create the session in the dashboard
     /// (Command Center -> New Web Tracer) and paste the `--workflow-id`/`--token` it prints.
     Trace {
         /// The web_trace workflow id (from the dashboard session).
@@ -109,7 +114,7 @@ enum Commands {
         #[arg(long)]
         token: String,
 
-        /// Control-plane origin.
+        /// Crossfyre's API address.
         #[arg(long, default_value = cfx_core::auth::DEFAULT_API_URL)]
         api_url: String,
 
@@ -139,13 +144,14 @@ enum Commands {
         #[arg(long, default_value = "proxy")]
         method: String,
 
-        /// Local port for the intercepting proxy (Method 2). Default 0 = OS-assigned free port (the
+        /// Local port for the intercepting proxy. Default 0 = OS-assigned free port (the
         /// tool prints the one it picked); set a fixed port if you drive your own browser.
         #[arg(long, default_value_t = 0)]
         proxy_port: u16,
 
         /// Seed the session auth you browse with (cookies, bearer/API-key headers) into the
-        /// Credentials arsenal as encrypted, host-scoped credentials, ready for authenticated scans
+        /// saved credentials (Arsenal, then Credentials in the dashboard) as encrypted, host-scoped
+        /// credentials, ready for authenticated scans
         /// and authz testing. Off by default; only the hosts you actually visit are captured.
         #[arg(long)]
         seed_credentials: bool,
@@ -165,8 +171,7 @@ enum Commands {
     },
 
     /// Show a full overview of the local node daemons, extensions and database.
-    /// (Use `crossfyre node status`, `crossfyre extension list` or
-    /// `crossfyre db status` for a single area.)
+    /// (For one area, use `crossfyre node status` or `crossfyre extension list`.)
     Status,
 
     /// Manage the toolchain Postgres container.
@@ -266,8 +271,8 @@ enum CloudCommand {
     /// read from a hidden prompt, or from stdin when that is not a terminal; never
     /// from the command line.
     Login {
-        /// Control-plane origin. Defaults to the one `crossfyre login` saved, else
-        /// this build's.
+        /// Crossfyre's API address. Defaults to the one `crossfyre login` saved, and
+        /// otherwise to the build's default.
         #[arg(long)]
         api_url: Option<String>,
         /// Where to save the key. Defaults to `<data-dir>/mcp/cloud.toml`.
@@ -291,23 +296,23 @@ enum CloudCommand {
 
 #[derive(Subcommand, Debug)]
 enum NodeAction {
-    /// Register this host as a Crossfyre node using a node API key created in
-    /// the dashboard (Nodes -> create a node). Pass it with `--node-key`, or
-    /// run interactively and you'll be prompted to paste it. Enrolment writes
-    /// `nodes.d/<node-id>.toml`, installs the node's selected extensions,
-    /// provisions the database, and installs the node OS service.
+    /// Enrol this machine as a Crossfyre node. Signed in with `crossfyre login`,
+    /// it takes the oldest node on your account that has not come online yet and
+    /// asks for no key. Without a session it needs that node's API key from the
+    /// dashboard: pass it with `--node-key`, or paste it when asked. Enrolment
+    /// writes `nodes.d/<node-id>.toml`, installs the node's engines, sets up the
+    /// database and installs the node service.
     Init {
         /// Force-disconnect an already-running instance and take over
         #[arg(long)]
         force: bool,
 
-        /// API base URL for the Crossfyre control plane.
-        ///
-        /// Defaults to the control plane this data directory is already signed
-        /// in to, and only then to the build's default. Taking the build default
-        /// first meant `login` and `node init` could disagree: logging in to a
-        /// local instance and then enrolling sent the node key to whatever the
-        /// binary was compiled against, which for a plain build is production.
+        // Why the session comes first: taking the build default first meant `login`
+        // and `node init` could disagree. Logging in to a local instance and then
+        // enrolling sent the node key to whatever the binary was compiled against,
+        // which for a plain build is production.
+        /// Crossfyre's API address. Defaults to the one this data directory is
+        /// signed in to, and otherwise to the build's default.
         #[arg(long)]
         api_url: Option<String>,
 
@@ -315,8 +320,9 @@ enum NodeAction {
         #[arg(long)]
         no_service: bool,
 
-        /// The node API key (from the dashboard). If omitted, you're prompted
-        /// to paste it (unless --no-prompt).
+        /// The node's API key, from the dashboard. Not needed when signed in.
+        /// Without it and without a session, you are asked to paste it (unless
+        /// --no-prompt).
         #[arg(long)]
         node_key: Option<String>,
 
@@ -341,7 +347,7 @@ enum NodeAction {
         all: bool,
     },
 
-    /// List your node fleet from the control plane, with live online/offline
+    /// List the nodes on your account, as Crossfyre sees them, with live online/offline
     /// status. (This is the server view; for the local daemons on this host use
     /// `crossfyre node status`.)
     List {
@@ -376,7 +382,7 @@ enum NodeAction {
 
 #[derive(Subcommand, Debug)]
 enum OastAction {
-    /// Install cf_oast as a systemd service on THIS box for your domain, then obtain
+    /// Install the OAST server as a systemd service (cf-oast) on this machine for your domain, then obtain
     /// a wildcard TLS cert (ACME DNS-01) and print the DNS-delegation records to add.
     /// Re-run after adding the records to finish TLS. Needs root (sudo).
     Setup {
@@ -495,11 +501,21 @@ fn exec_node_supervise(
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tokio::runtime::Builder::new_multi_thread()
+// An error is printed as the sentence it is. Returned from `main`, Rust prints it
+// in debug form: in quotes, with any line break shown as a backslash and an n.
+fn main() -> std::process::ExitCode {
+    let outcome = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(run())
+        .build()
+        .map_err(Box::<dyn std::error::Error>::from)
+        .and_then(|rt| rt.block_on(run()));
+    match outcome {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
