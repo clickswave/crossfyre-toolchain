@@ -10,15 +10,17 @@ pub const HACKERTARGET: &str = "hackertarget";
 pub const ALIENVAULT: &str = "alienvault";
 pub const URLSCAN: &str = "urlscan";
 pub const SUBDOMAIN_CENTER: &str = "subdomain.center";
+pub const ANUBISDB: &str = "anubisdb";
 
 /// Every passive source, in the order `execute` runs them.
-pub const SOURCES: [&str; 6] = [
+pub const SOURCES: [&str; 7] = [
     CRT_SH,
     CERTSPOTTER,
     HACKERTARGET,
     ALIENVAULT,
     URLSCAN,
     SUBDOMAIN_CENTER,
+    ANUBISDB,
 ];
 
 /// Query every passive source and union the results.
@@ -58,7 +60,7 @@ pub async fn execute(
     // Each arm resolves to the source's names, or an empty vec if it was
     // excluded or errored. `join!` polls them on one task, so this needs no
     // spawning and no 'static bounds on the borrowed client.
-    let (crtsh, certspotter, hackertarget, alienvault, urlscan, subdomain_center) = tokio::join!(
+    let (crtsh, certspotter, hackertarget, alienvault, urlscan, subdomain_center, anubisdb) = tokio::join!(
         async {
             if skipped(CRT_SH) {
                 return vec![];
@@ -131,16 +133,30 @@ pub async fn execute(
                 }
             }
         },
+        async {
+            if skipped(ANUBISDB) {
+                return vec![];
+            }
+            match crate::scanners::providers::anubisdb::fetch(&client, domain).await {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("[WARN] anubisdb error: {e}");
+                    vec![]
+                }
+            }
+        },
     );
 
     // Merged in a fixed order so the recorded `source` for a name found by more
     // than one provider is deterministic (last writer wins), regardless of which
-    // request happened to finish first. subdomain.center aggregates the others,
-    // so it goes first and a name keeps the source that found it originally.
+    // request happened to finish first. subdomain.center and anubisdb aggregate
+    // the others, so they go first and a name keeps the source that found it
+    // originally.
     let mut results: HashMap<String, String> = HashMap::new();
     for (prefix, source) in subdomain_center
         .into_iter()
         .map(|p| (p, SUBDOMAIN_CENTER))
+        .chain(anubisdb.into_iter().map(|p| (p, ANUBISDB)))
         .chain(crtsh.into_iter().map(|p| (p, CRT_SH)))
         .chain(certspotter.into_iter().map(|p| (p, CERTSPOTTER)))
         .chain(hackertarget.into_iter().map(|p| (p, HACKERTARGET)))
