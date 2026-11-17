@@ -2,6 +2,18 @@ use crate::scanners::techniques;
 use hickory_resolver::TokioResolver;
 use transport::Client;
 
+/// The names `--exclude-active-technique` takes. They live next to the scan that
+/// reads them, so a technique added below and the list the CLI validates against
+/// cannot drift apart: the same constant is the technique's exclusion check and
+/// its entry in `TECHNIQUES`.
+pub const IPV4_LOOKUP: &str = "ipv4_lookup";
+pub const IPV6_LOOKUP: &str = "ipv6_lookup";
+pub const HTTP_PROBING: &str = "http_probing";
+pub const HTTPS_PROBING: &str = "https_probing";
+
+/// Every active technique, in the order `execute` tries them.
+pub const TECHNIQUES: [&str; 4] = [IPV4_LOOKUP, IPV6_LOOKUP, HTTP_PROBING, HTTPS_PROBING];
+
 pub struct NegativeResult {
     pub level: String,
     pub description: String,
@@ -11,6 +23,11 @@ pub struct ActiveScanResult {
     pub found: bool,
     pub source: String,
     pub negatives: Vec<NegativeResult>,
+}
+
+/// Whether the operator asked for `technique` to be skipped.
+fn excluded(exclude_techniques: &[String], technique: &str) -> bool {
+    exclude_techniques.iter().any(|t| t == technique)
 }
 
 pub async fn execute(
@@ -29,12 +46,12 @@ pub async fn execute(
     };
 
     // ipv4 lookup
-    if !exclude_techniques.contains(&"ipv4_lookup".to_string()) {
+    if !excluded(exclude_techniques, IPV4_LOOKUP) {
         let ipv4_lookup = techniques::ipv4_lookup::execute(resolver, &domain).await;
         match ipv4_lookup {
             Ok(_) => {
                 scan_result.found = true;
-                scan_result.source = "ipv4_lookup".to_string();
+                scan_result.source = IPV4_LOOKUP.to_string();
                 return scan_result;
             }
             Err(e) => scan_result.negatives.push(e),
@@ -42,12 +59,12 @@ pub async fn execute(
     }
 
     // ipv6 lookup
-    if !exclude_techniques.contains(&"ipv6_lookup".to_string()) {
+    if !excluded(exclude_techniques, IPV6_LOOKUP) {
         let ipv6_lookup = techniques::ipv6_lookup::execute(resolver, &domain).await;
         match ipv6_lookup {
             Ok(_) => {
                 scan_result.found = true;
-                scan_result.source = "ipv6_lookup".to_string();
+                scan_result.source = IPV6_LOOKUP.to_string();
                 return scan_result;
             }
             Err(e) => scan_result.negatives.push(e),
@@ -55,13 +72,13 @@ pub async fn execute(
     }
 
     // http probing
-    if !exclude_techniques.contains(&"http_probing".to_string()) {
+    if !excluded(exclude_techniques, HTTP_PROBING) {
         let http_probing =
             techniques::http_probing::execute(reqwest_client, &domain, http_probing_ports).await;
         match http_probing {
             Ok(_) => {
                 scan_result.found = true;
-                scan_result.source = "http_probing".to_string();
+                scan_result.source = HTTP_PROBING.to_string();
                 return scan_result;
             }
             Err(e) => scan_result.negatives.extend(e),
@@ -69,13 +86,13 @@ pub async fn execute(
     }
 
     // https probing
-    if !exclude_techniques.contains(&"https_probing".to_string()) {
+    if !excluded(exclude_techniques, HTTPS_PROBING) {
         let https_probing =
             techniques::https_probing::execute(reqwest_client, &domain, https_probing_ports).await;
         match https_probing {
             Ok(_) => {
                 scan_result.found = true;
-                scan_result.source = "https_probing".to_string();
+                scan_result.source = HTTPS_PROBING.to_string();
                 return scan_result;
             }
             Err(e) => scan_result.negatives.extend(e),

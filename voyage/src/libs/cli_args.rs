@@ -1,3 +1,4 @@
+use crate::scanners::{active_scan, passive_scan};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use dialoguer::{Confirm, Input, theme::ColorfulTheme};
 
@@ -164,12 +165,12 @@ pub struct ScanArgs {
     #[arg(long, default_value_t = false)]
     pub disable_active_enum: bool,
 
-    /// Passive sources to exclude (crt.sh, certspotter, hackertarget, alienvault, urlscan, subdomain.center)
-    #[arg(long)]
+    /// Passive sources to exclude; an unknown name is an error
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(passive_scan::SOURCES))]
     pub exclude_passive_source: Vec<String>,
 
-    /// Active techniques to exclude (ipv4_lookup, ipv6_lookup, http_probing, https_probing)
-    #[arg(long)]
+    /// Active techniques to exclude; an unknown name is an error
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(active_scan::TECHNIQUES))]
     pub exclude_active_technique: Vec<String>,
 
     /// Ports to probe over HTTP
@@ -263,9 +264,10 @@ impl ScanArgs {
 
         // --- Passive enum ---
         self.disable_passive_enum = !Confirm::with_theme(&theme)
-            .with_prompt(
-                "Run passive enumeration? (crt.sh, certspotter, hackertarget, alienvault, urlscan, subdomain.center)",
-            )
+            .with_prompt(format!(
+                "Run passive enumeration? ({})",
+                passive_scan::SOURCES.join(", ")
+            ))
             .default(!self.disable_passive_enum)
             .interact()
             .map_err(|e| e.to_string())?;
@@ -278,5 +280,57 @@ impl ScanArgs {
             .map_err(|e| e.to_string())?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scan_args(argv: &[&str]) -> Result<ScanArgs, clap::Error> {
+        Cli::try_parse_from(argv).map(|cli| match cli.command {
+            Some(Commands::Scan(args)) => args,
+            other => panic!("not a scan: {other:?}"),
+        })
+    }
+
+    #[test]
+    fn the_exclusions_take_the_names_the_scanners_use() {
+        let args = scan_args(&[
+            "voyage",
+            "scan",
+            "--domain",
+            "example.com",
+            "--exclude-passive-source",
+            passive_scan::CRT_SH,
+            "--exclude-active-technique",
+            active_scan::HTTP_PROBING,
+        ])
+        .expect("a known name parses");
+        assert_eq!(args.exclude_passive_source, [passive_scan::CRT_SH]);
+        assert_eq!(args.exclude_active_technique, [active_scan::HTTP_PROBING]);
+    }
+
+    fn refused(flag: &str, typo: &str, valid: &[&str]) {
+        let err = scan_args(&["voyage", "scan", "--domain", "example.com", flag, typo])
+            .expect_err("an unknown name is refused");
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+        let text = err.to_string();
+        assert!(text.contains(typo), "{text}");
+        for name in valid {
+            assert!(text.contains(name), "{name} missing from: {text}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_exclusion_is_refused_and_the_error_names_the_valid_ones() {
+        // A misspelt name used to be accepted and ignored, so the source the
+        // operator meant to switch off ran anyway and nothing said so.
+        refused("--exclude-passive-source", "crtsh", &passive_scan::SOURCES);
+        refused(
+            "--exclude-active-technique",
+            "http_probe",
+            &active_scan::TECHNIQUES,
+        );
     }
 }
