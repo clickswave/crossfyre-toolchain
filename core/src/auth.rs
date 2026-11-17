@@ -574,9 +574,19 @@ async fn browser_login(
                 let user = user_from_data(&body)?;
                 return Ok((api_key, user));
             }
-            "denied" => return Err("The login was denied in the browser. Run `crossfyre login` to try again.".into()),
+            "denied" => {
+                return Err(
+                    "The login was denied in the browser. Run `crossfyre login` to try again."
+                        .into(),
+                );
+            }
             "expired" => return Err("Login request expired. Run `crossfyre login` again.".into()),
-            "unknown" => return Err("Crossfyre does not know this login request. Run `crossfyre login` again.".into()),
+            "unknown" => {
+                return Err(
+                    "Crossfyre does not know this login request. Run `crossfyre login` again."
+                        .into(),
+                );
+            }
             // The server says "error" for its own 500. Treated as pending it polls for the
             // full ten minutes against something that is broken and saying so, and the
             // operator watches a spinner rather than reading the reason.

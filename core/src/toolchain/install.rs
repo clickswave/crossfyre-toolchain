@@ -1607,7 +1607,10 @@ pub fn ensure_self_installed() -> Result<std::path::PathBuf, Box<dyn std::error:
         return Ok(stable);
     }
     place_binary(&exe, &stable)?;
-    super::ui::ok(&format!("Installed the crossfyre binary to {}", stable.display()));
+    super::ui::ok(&format!(
+        "Installed the crossfyre binary to {}",
+        stable.display()
+    ));
     Ok(stable)
 }
 
@@ -1674,7 +1677,10 @@ pub async fn ensure_node_installed() -> Result<(), Box<dyn std::error::Error>> {
     } else if !stable.exists() {
         if let Some(sib) = sibling_of_this_binary("node") {
             place_binary(&sib, &stable)?;
-            super::ui::ok(&format!("Installed the node binary to {}", stable.display()));
+            super::ui::ok(&format!(
+                "Installed the node binary to {}",
+                stable.display()
+            ));
         } else {
             let m = fetch_manifest().await?;
             download_node(&m, false, false).await?;

@@ -1412,7 +1412,9 @@ pub fn prompt_node_key(no_prompt: bool) -> Result<String, Box<dyn std::error::Er
     }
     use std::io::Write;
     println!("\n  Create a node in the dashboard (Nodes -> create a node) to get its API key.");
-    println!("  Or stop here and run `crossfyre login` first: signed in, node init asks for no key.");
+    println!(
+        "  Or stop here and run `crossfyre login` first: signed in, node init asks for no key."
+    );
     print!("  Paste the node API key: ");
     std::io::stdout().flush()?;
     let mut line = String::new();
