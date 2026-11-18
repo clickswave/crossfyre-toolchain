@@ -265,12 +265,6 @@ pub fn install_node_service(
     Ok(())
 }
 
-/// Run first thing by the node supervisor on macOS: see `node::adopt_root_log`.
-#[cfg(target_os = "macos")]
-pub fn adopt_root_node_log() {
-    node::adopt_root_log();
-}
-
 /// The node worker the node unit runs: the one in the bin directory.
 pub fn node_binary() -> std::path::PathBuf {
     super::config::get_bin_dir().join(super::config::ext_file_name("node"))
@@ -578,31 +572,8 @@ pub const NODE_LABEL: &str = "io.crossfyre.node";
 
 /// Where the root node service on macOS logs: a directory only root can change.
 /// launchd opens this path itself, as root, following any link in it, so it cannot be
-/// in the operator's data dir as it once was.
+/// in the operator's data dir.
 pub const NODE_LOG: &str = "/var/log/crossfyre/node.log";
-
-/// `plist`, as [`node_plist`] writes it, with both log entries pointed at `log`; None
-/// when they already are, or when it has no log entries.
-pub fn retarget_log(plist: &str, log: &std::path::Path) -> Option<String> {
-    let want = format!(
-        "<string>{}</string>",
-        plist_string(&log.display().to_string())
-    );
-    let mut out = plist.to_string();
-    let mut found = false;
-    for key in ["StandardOutPath", "StandardErrorPath"] {
-        let head = format!("<key>{key}</key>\n  ");
-        let Some(at) = out.find(&head) else { continue };
-        let start = at + head.len();
-        let Some(len) = out[start..].find("</string>") else {
-            continue;
-        };
-        let end = start + len + "</string>".len();
-        found = true;
-        out.replace_range(start..end, &want);
-    }
-    (found && out != plist).then_some(out)
-}
 
 /// The launchd agent for an engine on macOS: the CLI's `extension host <engine>`, which
 /// starts the engine's daemon (see [`host`]).
@@ -1010,9 +981,6 @@ mod node {
 
     pub fn action(action: &str) -> Result<(), Box<dyn std::error::Error>> {
         require_root()?;
-        if matches!(action, "start" | "restart") {
-            retarget_plist();
-        }
         launchd::act(DOMAIN, super::NODE_LABEL, PLIST, action)?;
         if !super::quiet() {
             super::svc_ok(&format!(
@@ -1042,56 +1010,6 @@ mod node {
         let admin = unsafe { libc::getgrnam(c"admin".as_ptr()) };
         let group = (!admin.is_null()).then(|| unsafe { (*admin).gr_gid });
         super::super::root_fs::open_log(std::path::Path::new(super::NODE_LOG), group)
-    }
-
-    /// Points a daemon plist from an earlier release, which logs to the operator's data
-    /// dir, at [`super::NODE_LOG`]. launchd reads it at the next load: `node restart`,
-    /// the restart `crossfyre update` does, or a reboot.
-    fn retarget_plist() {
-        let Ok(body) = fs::read_to_string(PLIST) else {
-            return;
-        };
-        let Some(new) = super::retarget_log(&body, std::path::Path::new(super::NODE_LOG)) else {
-            return;
-        };
-        // The log has to be there, and root's, before launchd is told to open it.
-        if let Err(e) = open_root_log() {
-            eprintln!("[!] could not prepare {}: {e}", super::NODE_LOG);
-            return;
-        }
-        match super::super::root_fs::replace_file(
-            std::path::Path::new(PLIST),
-            new.as_bytes(),
-            0o644,
-            Some((0, 0)),
-        ) {
-            Ok(()) => println!("[node] the node service now logs to {}", super::NODE_LOG),
-            Err(e) => eprintln!("[!] could not update {PLIST}: {e}"),
-        }
-    }
-
-    /// Run first thing by the node supervisor. Under a plist from an earlier release,
-    /// launchd opened the service's output in the operator's data dir, as root and
-    /// through any link left there. This sends the output to [`super::NODE_LOG`]
-    /// instead, before anything is written, and fixes the plist for the next load.
-    pub fn adopt_root_log() {
-        use std::os::fd::AsRawFd;
-        // Only the service: root, started by launchd. Whatever launchd opened for its
-        // output is replaced, a file or not: a link there could as well have led to a
-        // pipe or a terminal the operator reads.
-        let launched = unsafe { libc::geteuid() == 0 && libc::getppid() == 1 };
-        if !launched {
-            return;
-        }
-        // Without the log, nowhere: never on through the file launchd opened.
-        let out = open_root_log().or_else(|_| fs::OpenOptions::new().write(true).open("/dev/null"));
-        if let Ok(out) = out {
-            unsafe {
-                libc::dup2(out.as_raw_fd(), 1);
-                libc::dup2(out.as_raw_fd(), 2);
-            }
-        }
-        retarget_plist();
     }
 }
 
@@ -1619,25 +1537,6 @@ mod tests {
             "{plist}"
         );
         assert!(!plist.contains(&format!("{data}/logs")), "{plist}");
-    }
-
-    /// A daemon plist written by an earlier release is pointed at the new log, and left
-    /// otherwise as it was.
-    #[test]
-    fn an_old_node_plist_is_pointed_at_the_root_log() {
-        let data = Path::new("/Users/op/Library/Application Support/crossfyre");
-        let old = node_plist(Path::new("/n"), Path::new("/c"), data, Some("op")).replace(
-            NODE_LOG,
-            "/Users/op/Library/Application Support/crossfyre/logs/node.log",
-        );
-        let new = retarget_log(&old, Path::new(NODE_LOG)).expect("rewritten");
-        assert_eq!(
-            new,
-            node_plist(Path::new("/n"), Path::new("/c"), data, Some("op"))
-        );
-        assert_eq!(retarget_log(&new, Path::new(NODE_LOG)), None);
-        // A plist with no log entries at all is left alone.
-        assert_eq!(retarget_log("<plist></plist>", Path::new(NODE_LOG)), None);
     }
 
     #[test]

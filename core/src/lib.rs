@@ -993,44 +993,6 @@ pub fn write_secret_file(path: &std::path::Path, contents: &str) -> std::io::Res
     }
 }
 
-/// Tighten a credential file that an earlier build left world-readable.
-///
-/// Installs created before [`write_secret_file`] existed still have 0644 configs
-/// on disk, and rewriting the file is not part of a normal start. This runs on
-/// load so those installs are repaired without operator action, and says so once
-/// rather than silently, because the secrets in it should be treated as having
-/// been exposed.
-#[cfg(unix)]
-pub fn repair_secret_file_mode(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-    // Through the file's own fd, opened without following a link when root: a chmod by
-    // path would land on whatever a link there names.
-    let file = if toolchain::sudo_user::root_guards() {
-        toolchain::root_fs::open_file(path)
-    } else {
-        fs::File::open(path)
-    };
-    let Ok(file) = file else { return };
-    let Ok(meta) = file.metadata() else { return };
-    let mode = meta.permissions().mode() & 0o777;
-    if mode & 0o077 != 0
-        && file
-            .set_permissions(fs::Permissions::from_mode(0o600))
-            .is_ok()
-    {
-        eprintln!(
-            "[security] {} was mode {:o} (group/other readable) and holds node \
-             credentials; tightened to 600. Rotate this node's key if the host \
-             has other accounts: `crossfyre node revoke`.",
-            path.display(),
-            mode
-        );
-    }
-}
-
-#[cfg(not(unix))]
-pub fn repair_secret_file_mode(_path: &std::path::Path) {}
-
 /// Validate the `~/.config/crossfyre` layout before booting: the config root
 /// must exist and contain a `nodes.d` directory. Returns the list of
 /// registered node-ids (one per `nodes.d/<id>.toml`), sorted for stable
@@ -1206,14 +1168,8 @@ pub async fn run_boot(
     force: bool,
     base: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Before anything is written: on macOS the service's output may still be going to
-    // a file launchd opened in the operator's data dir.
-    #[cfg(target_os = "macos")]
-    toolchain::service::adopt_root_node_log();
     println!("Booting Crossfyre nodes from {base:?}...");
 
-    // Node configs an earlier release handed to the operator become root's, once.
-    toolchain::node_config::take_over_earlier_configs(base);
     // A database container made by 0.1.42 or earlier was published on every
     // interface with no password. Rebuild it on loopback with a password, keeping the
     // engines' rows. Nodes do not use it, so they start meanwhile rather than wait on Docker,
@@ -1401,7 +1357,7 @@ pub fn remove_node_files(base: &std::path::Path, node_id: &str) -> std::io::Resu
     if paths.pid.exists() {
         let _ = toolchain::sudo_user::remove_file(&paths.pid);
     }
-    // Root's network dir, and the one in nodes.d that an earlier release used.
+    // Root's network dir, and the one in nodes.d that a node run without root keeps.
     let operator_net = toolchain::node_config::operator_network_dir(&nodes_dir(base), node_id);
     for dir in [&paths.network_dir, &operator_net] {
         if dir.exists() {
@@ -1716,11 +1672,6 @@ pub async fn run_init(
     field("Server", api_url);
     field("Data directory", &data_dir.display().to_string());
     print_privilege_banner(false);
-    // Before anything is written: on a host with no node service and no earlier node
-    // worker, record that there is nothing from an earlier release to take over, so the
-    // service installed below never hands root a config the operator's account put in
-    // nodes.d.
-    toolchain::node_config::settle_before_init(data_dir)?;
 
     let client = reqwest::Client::new();
 
@@ -2468,11 +2419,6 @@ pub async fn run_daemon(
     }
 
     // Load config
-    // A daemon started on its own, or by the supervisor of an earlier release, takes
-    // over an earlier release's configs as the supervisor does.
-    toolchain::node_config::take_over_earlier_configs(&paths.base);
-    // Repair installs written before the config was mode-restricted.
-    repair_secret_file_mode(&config_path);
     let mut config = load_node_config(&config_path)?;
     // As root, the tunnel config goes to a directory only root can change.
     toolchain::node_config::prepare_network_dir(&nodes_dir(&paths.base), &paths.node_id)?;
@@ -3771,27 +3717,8 @@ mod security_tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Installs written before this existed still have 0644 configs on disk, and
-    /// a normal start does not rewrite the file, so load-time repair is the only
-    /// thing that fixes them.
-    #[cfg(unix)]
-    #[test]
-    fn an_existing_wide_open_config_is_repaired_on_load() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("cfx-sec3-{}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
-        let p = dir.join("node.toml");
-        fs::write(&p, "api_key = \"x\"").unwrap();
-        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
-        repair_secret_file_mode(&p);
-        let mode = fs::metadata(&p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "repair left {mode:o}");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
     /// The node service runs as root over a config root the operator owns. A link the
-    /// operator leaves there must not carry root's reads, writes and chmods to files
-    /// outside it.
+    /// operator leaves there must not carry root's reads and writes to files outside it.
     #[cfg(unix)]
     fn node_root_with_link(name: &str, target: &std::path::Path) -> tempfile::TempDir {
         let t = tempfile::tempdir().expect("tempdir");
@@ -3835,23 +3762,6 @@ mod security_tests {
         );
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn a_root_repair_does_not_chmod_through_a_link() {
-        use std::os::unix::fs::PermissionsExt;
-        let outside = tempfile::tempdir().expect("tempdir");
-        let target = outside.path().join("passwd");
-        fs::write(&target, "x").unwrap();
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
-        let base = node_root_with_link("n.toml", &target);
-
-        let _root = toolchain::sudo_user::act_as_root();
-        repair_secret_file_mode(&base.path().join("nodes.d/n.toml"));
-
-        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o644, "chmodded the link's target");
-    }
-
     /// A hard link is a second name for the same file, and on macOS (or a Linux host
     /// with fs.protected_hardlinks off) the operator can make one to a root file they
     /// cannot read. The scan must not read it, or its parse error quotes the file.
@@ -3890,25 +3800,6 @@ mod security_tests {
         let ids = discover_nodes(base.path()).unwrap();
 
         assert_eq!(ids, vec!["ok".to_string()]);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_root_repair_does_not_chmod_a_hard_linked_file() {
-        use std::os::unix::fs::PermissionsExt;
-        let base = tempfile::tempdir().expect("tempdir");
-        fs::create_dir(base.path().join("nodes.d")).unwrap();
-        let outside = tempfile::tempdir().expect("tempdir");
-        let target = outside.path().join("hosts");
-        fs::write(&target, "127.0.0.1 localhost\n").unwrap();
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
-        fs::hard_link(&target, base.path().join("nodes.d/n.toml")).unwrap();
-
-        let _root = toolchain::sudo_user::act_as_root();
-        repair_secret_file_mode(&base.path().join("nodes.d/n.toml"));
-
-        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o644, "chmodded the other name's file");
     }
 
     #[cfg(unix)]
