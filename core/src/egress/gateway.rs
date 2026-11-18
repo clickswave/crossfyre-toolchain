@@ -135,10 +135,6 @@ impl Gateway {
         Ok(gw)
     }
 
-    pub fn addr(&self) -> SocketAddr {
-        self.addr
-    }
-
     /// A lease for one op: connections presenting it go to `upstream`, under the
     /// policy `block_internal` names. It lasts until the [`Lease`] is dropped.
     pub fn lease(

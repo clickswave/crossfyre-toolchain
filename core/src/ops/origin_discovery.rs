@@ -4,7 +4,6 @@
 //! gathers cert-transparency SANs, resolves them, drops CDN ranges, and validates
 //! the survivors directly. Each confirmed/likely origin is published as a result.
 use super::{OpEnv, Relay};
-use crate::*;
 
 /// Why a proxied node does not run origin discovery.
 pub const PROXIED: &str =

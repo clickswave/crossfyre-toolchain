@@ -43,12 +43,15 @@ base64 = "0.22.1"
 toml = "0.8"
 dirs = "5"
 dialoguer = "0.11"
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
-futures-util = { version = "0.3.34", default-features = false, features = ["sink"] }
 
 [target.'cfg(unix)'.dependencies]
 # Handing the browser its DevTools pipe on fds 3 and 4.
 libc = "0.2"
+
+[target.'cfg(not(unix))'.dependencies]
+# Driving the browser over the DevTools websocket on the port it picks.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["sink"] }
 
 [dev-dependencies]
 # A recording SOCKS5 proxy and counting listeners for the egress tests.

@@ -16,7 +16,6 @@ use crate::toolchain::ui::{hint, ok, step, warn};
 use std::path::Path;
 use std::process::Command;
 
-const OAST_DIR: &str = "/etc/oast";
 const ENV_PATH: &str = "/etc/oast/oast.env";
 const ACME_TXT: &str = "/etc/oast/acme_txt";
 const ACME_HOOK: &str = "/usr/local/bin/oast-acme-hook.sh";

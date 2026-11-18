@@ -116,14 +116,12 @@ pub fn operator_account() -> Result<String, String> {
 /// DBUS_SESSION_BUS_ADDRESS so `systemctl --user` can reach the user's
 /// session bus. Without this it fails with "Failed to connect to user
 /// scope bus via local transport".
+#[cfg(unix)]
 pub fn cmd_as_invoking_user<S: AsRef<std::ffi::OsStr>>(program: S) -> Command {
+    use std::os::unix::process::CommandExt;
     let mut cmd = Command::new(program);
     if let Some((uid, gid, home, name)) = sudo_user_info() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.uid(uid).gid(gid);
-        }
+        cmd.uid(uid).gid(gid);
         cmd.env("HOME", &home);
         cmd.env("USER", &name);
         cmd.env("LOGNAME", &name);
@@ -137,6 +135,12 @@ pub fn cmd_as_invoking_user<S: AsRef<std::ffi::OsStr>>(program: S) -> Command {
         );
     }
     cmd
+}
+
+/// Without sudo there is nobody else to act for: the command runs as this process.
+#[cfg(not(unix))]
+pub fn cmd_as_invoking_user<S: AsRef<std::ffi::OsStr>>(program: S) -> Command {
+    Command::new(program)
 }
 
 /// The outermost of `dir` and its ancestors that does not exist yet, which is the first

@@ -2254,6 +2254,7 @@ exit 127"#;
 
     /// Have this test's thread keep everything but the engine named in it in `dir`, as a
     /// package with that bin_dir would, and own nothing else.
+    #[cfg(unix)]
     fn bin_dir_at(dir: &Path) {
         packaged(&format!(
             r#"{{"manager":"nix","owns":["ambulo"],"bin_dir":"{}"}}"#,

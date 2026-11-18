@@ -17,10 +17,8 @@ pub async fn handle(env: OpEnv) {
         pub_clone,
         status_subj,
         result_subj,
-        http,
-        api_url,
-        api_key,
         egress,
+        ..
     } = env;
 
     // A port scan connects to each port itself, which no proxy can carry, so a node

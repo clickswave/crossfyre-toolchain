@@ -293,7 +293,7 @@ pub async fn build_context(
                 cookies: None,
             })
         }
-        "login_flow" => login_flow(http, cred, egress).await,
+        "login_flow" => login_flow(cred, egress).await,
         // Non-interactive OAuth2 grants (client_credentials / password) are a
         // direct token exchange, done node-side like login_flow. The redirect-based
         // authorization_code grant and interactive SSO need a browser, so they are
@@ -359,7 +359,6 @@ fn attr_after(fragment: &str, attr: &str, quote: char) -> Option<String> {
 /// token. Driven entirely by the credential's `config` (login_url, field names,
 /// success check, token extraction).
 async fn login_flow(
-    http: &reqwest::Client,
     cred: &ResolvedCredential,
     egress: Option<&Lease>,
 ) -> Result<AuthContext, String> {
@@ -386,8 +385,8 @@ async fn login_flow(
         .redirect(secret_body_redirects(&method));
     let client = match egress {
         Some(lease) => target_client(builder, lease)?,
-        // Never `http` in its place: that client follows any redirect, and this
-        // request carries the password.
+        // Never the node's shared client in its place: that client follows any
+        // redirect, and this request carries the password.
         None => builder
             .build()
             .map_err(|e| format!("the login client could not be built: {e}"))?,
@@ -954,7 +953,7 @@ mod redirect_tests {
                     json!({"login_url": format!("http://127.0.0.1:{a}/login"), "method": method}),
                     json!({"username": "alice", "password": "saved-password"}),
                 );
-                let _ = login_flow(&reqwest::Client::new(), &c, None).await;
+                let _ = login_flow(&c, None).await;
                 assert_secret_stayed(&b_seen, "saved-password");
             }
         }
@@ -968,7 +967,7 @@ mod redirect_tests {
                 json!({"login_url": format!("http://127.0.0.1:{a}/login"), "method": method}),
                 json!({"username": "alice", "password": "saved-password"}),
             );
-            let _ = login_flow(&reqwest::Client::new(), &c, None).await;
+            let _ = login_flow(&c, None).await;
             assert_secret_stayed(&b_seen, "saved-password");
         }
     }
@@ -983,7 +982,7 @@ mod redirect_tests {
             json!({"login_url": format!("http://127.0.0.1:{a}/login")}),
             json!({"username": "alice", "password": "saved-password"}),
         );
-        let _ = login_flow(&reqwest::Client::new(), &c, None).await;
+        let _ = login_flow(&c, None).await;
         let seen = b_seen.lock().unwrap();
         assert_eq!(seen.len(), 1, "the 303 was not followed");
         assert!(seen[0].starts_with("GET /home "), "{}", seen[0]);

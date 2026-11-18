@@ -1,4 +1,3 @@
-#![allow(dead_code, unused_imports, unused_variables, unused_mut)]
 use clap::Subcommand;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -33,7 +32,6 @@ use toolchain::sudo_user::chown_to_invoking_user;
 pub struct WorkflowMetrics {
     in_flight: std::sync::atomic::AtomicUsize,
     completed: std::sync::atomic::AtomicUsize,
-    errored: std::sync::atomic::AtomicUsize,
 }
 
 static WORKFLOW_METRICS: OnceLock<
@@ -49,31 +47,23 @@ pub fn workflow_metrics(workflow_id: &str) -> Arc<WorkflowMetrics> {
             Arc::new(WorkflowMetrics {
                 in_flight: 0.into(),
                 completed: 0.into(),
-                errored: 0.into(),
             })
         })
         .clone()
 }
 
-/// RAII guard that bumps `in_flight` while alive and finalises completed/
-/// errored on drop. Lets us track concurrency through the actual permit
-/// lifetime without manual decrement at every return path.
+/// RAII guard that bumps `in_flight` while alive and counts the op as done on
+/// drop. Lets us track concurrency through the actual permit lifetime without
+/// manual decrement at every return path.
 pub struct InFlightGuard {
     metrics: Arc<WorkflowMetrics>,
-    errored: bool,
 }
 impl InFlightGuard {
     fn start(metrics: Arc<WorkflowMetrics>) -> Self {
         metrics
             .in_flight
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Self {
-            metrics,
-            errored: false,
-        }
-    }
-    fn fail(&mut self) {
-        self.errored = true;
+        Self { metrics }
     }
 }
 impl Drop for InFlightGuard {
@@ -81,15 +71,9 @@ impl Drop for InFlightGuard {
         self.metrics
             .in_flight
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        if self.errored {
-            self.metrics
-                .errored
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        } else {
-            self.metrics
-                .completed
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
+        self.metrics
+            .completed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -473,9 +457,8 @@ async fn run_operation(cmd: serde_json::Value, ctx: OpCtx) {
         use std::sync::atomic::Ordering;
         let ifl = m.in_flight.load(Ordering::Relaxed);
         let done = m.completed.load(Ordering::Relaxed);
-        let fail = m.errored.load(Ordering::Relaxed);
         let short = workflow_id.get(..8).unwrap_or(&workflow_id);
-        println!("[scan {short}] claim in_flight={ifl} done={done} failed={fail}");
+        println!("[scan {short}] claim in_flight={ifl} done={done}");
         Some(g)
     } else {
         None

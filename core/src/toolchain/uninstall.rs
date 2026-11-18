@@ -4,13 +4,19 @@
 // --keep-data leaves the container, and --yes skips the question, which is how a
 // package's removal script runs it.
 
-use super::config::{file_name, get_bin_dir, get_toolchain_dir};
-use super::packaging::{Packaging, remove_note};
+#[cfg(any(not(windows), test))]
+use super::config::file_name;
+use super::config::{get_bin_dir, get_toolchain_dir};
+#[cfg(any(not(windows), test))]
+use super::packaging::Packaging;
+#[cfg(not(windows))]
+use super::packaging::remove_note;
 use super::{ENGINES, EXTENSIONS, install, service};
 use std::path::{Path, PathBuf};
 
 /// Where the installer puts everything, and what uninstall removes whole when no package
 /// has files in it.
+#[cfg(any(not(windows), test))]
 const INSTALL_ROOT: &str = "/opt/crossfyre";
 
 /// What `crossfyre uninstall` removes besides the services and binaries.
@@ -283,6 +289,7 @@ fn clear_tree(dir: &Path, later: &mut dyn FnMut(&Path)) -> bool {
 /// Every file name a component may have in the bin directory, with the name of its version
 /// sidecar: the CLI, the node, cfx-script, and each engine under its public name.
 /// cfx-script also has the record of a release that could not start.
+#[cfg(any(not(windows), test))]
 fn component_files(component: &str) -> Vec<String> {
     let mut files = vec![file_name(component), format!("{component}.version")];
     if component == "cfx-script" {
@@ -292,6 +299,7 @@ fn component_files(component: &str) -> Vec<String> {
 }
 
 /// The components uninstall may find in the bin directory, by public name.
+#[cfg(any(not(windows), test))]
 fn components() -> Vec<&'static str> {
     let mut out = vec!["crossfyre", "node", "cfx-script"];
     out.extend(ENGINES.iter().map(|e| e.name));
@@ -300,6 +308,7 @@ fn components() -> Vec<&'static str> {
 
 /// What uninstall removes from `bin_dir` for a packaged install: the files of every
 /// component the package does not own, which the CLI fetched there.
+#[cfg(any(not(windows), test))]
 fn unowned_files(bin_dir: &Path, p: &Packaging) -> Vec<PathBuf> {
     components()
         .into_iter()
@@ -327,6 +336,7 @@ fn fetched_python(bin_dir: &Path) -> Option<PathBuf> {
 
 /// Does the package have a file under `root`: its packaging.json, the CLI at `cli` when
 /// it owns that, or another component it owns in `bin_dir`?
+#[cfg(any(not(windows), test))]
 fn has_files_under(p: &Packaging, bin_dir: &Path, root: &Path, cli: Option<&Path>) -> bool {
     let owned_in_bin = components()
         .into_iter()

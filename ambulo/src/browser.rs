@@ -184,7 +184,7 @@ fn write_profile(profile: &std::path::Path) -> std::io::Result<()> {
 }
 
 /// The websocket endpoint out of the line Chrome prints on stderr.
-#[cfg_attr(unix, allow(dead_code))]
+#[cfg(not(unix))]
 pub fn parse_ws_url(line: &str) -> Option<String> {
     let i = line.find("ws://")?;
     Some(line[i..].trim().to_string())
@@ -374,13 +374,15 @@ pub fn worth_recording(url: &str) -> bool {
 // The Chrome DevTools Protocol, as much of it as this needs
 // ---------------------------------------------------------------------------
 
+#[cfg(not(unix))]
 use futures_util::{SinkExt, StreamExt};
+#[cfg(not(unix))]
 use tokio_tungstenite::tungstenite::Message;
 
 /// What a DevTools connection runs over.
 enum Wire {
     /// A websocket to the port the browser picked.
-    #[cfg_attr(unix, allow(dead_code))]
+    #[cfg(not(unix))]
     Socket(tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>),
     /// The browser's fds 3 and 4: one JSON message per NUL-terminated chunk.
     #[cfg(unix)]
@@ -395,6 +397,7 @@ enum Wire {
 impl Wire {
     async fn send(&mut self, text: String) -> Result<(), String> {
         match self {
+            #[cfg(not(unix))]
             Wire::Socket(ws) => ws
                 .send(Message::Text(text))
                 .await
@@ -413,6 +416,7 @@ impl Wire {
     /// part way, as a timeout does: nothing read so far is lost.
     async fn recv(&mut self) -> Option<String> {
         match self {
+            #[cfg(not(unix))]
             Wire::Socket(ws) => loop {
                 match ws.next().await? {
                     Ok(Message::Text(t)) => return Some(t),
@@ -509,7 +513,7 @@ impl Cdp {
     /// protocol has no use for. And it means the address is resolved HERE,
     /// where it can be refused: a DevTools endpoint is total control over a
     /// browser, and nothing should ever drive one across a network.
-    #[cfg_attr(unix, allow(dead_code))]
+    #[cfg(not(unix))]
     pub async fn connect(ws_url: &str) -> Result<Self, String> {
         let addr = ws_authority(ws_url).ok_or("devtools: unparseable endpoint")?;
         let sock: std::net::SocketAddr = addr
@@ -627,7 +631,7 @@ impl Cdp {
 }
 
 /// `host:port` out of a `ws://host:port/path` endpoint.
-#[cfg_attr(unix, allow(dead_code))]
+#[cfg(not(unix))]
 pub fn ws_authority(ws_url: &str) -> Option<String> {
     let rest = ws_url.strip_prefix("ws://")?;
     let authority = rest.split('/').next()?;
@@ -791,6 +795,7 @@ async fn visit_gated(cdp: &mut Cdp, url: &str) -> Result<Visit, String> {
 mod tests {
     use super::*;
 
+    #[cfg(not(unix))]
     #[test]
     fn the_debugging_endpoint_is_read_off_the_startup_line() {
         let line = "DevTools listening on ws://127.0.0.1:41233/devtools/browser/9f2a-11ee";
@@ -931,6 +936,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(unix))]
     #[test]
     fn a_devtools_endpoint_is_only_ever_driven_on_loopback() {
         assert_eq!(

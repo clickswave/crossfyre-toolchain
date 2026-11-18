@@ -10,8 +10,8 @@
 //! Both implementations expose the same small surface, so `lib.rs` is identical
 //! regardless of which is compiled:
 //!   - [`process_network_config`] ingests a node's network config,
-//!   - [`bring_up`] applies egress and returns a [`TunnelGuard`],
-//!   - [`TunnelGuard`] tears everything down on `Drop`.
+//!   - [`bring_up`] applies egress and returns a `TunnelGuard`,
+//!   - `TunnelGuard` tears everything down on `Drop`.
 //!
 //! Proxies are the other way a node's traffic can leave, and they live here in the
 //! open ([`state`], [`gateway`]). The platform can set a node to send through one
@@ -39,7 +39,7 @@ pub mod state;
 #[cfg(test)]
 pub(crate) mod testkit;
 
-pub use imp::{TunnelGuard, bring_up};
+pub use imp::bring_up;
 
 /// Ingest a node's network config: the tunnel selection the egress impl applies.
 ///

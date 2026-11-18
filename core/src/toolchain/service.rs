@@ -332,6 +332,7 @@ fn quoted_assignment(name: &str, value: &str) -> Result<String, String> {
 }
 
 /// One path on the way to a file a root service runs: its owner, group and mode.
+#[cfg(any(unix, test))]
 pub(crate) struct PathOwner {
     pub path: std::path::PathBuf,
     pub uid: u32,
@@ -344,6 +345,7 @@ pub(crate) struct PathOwner {
 /// writable by nobody else, and so must every directory, except that a directory with its
 /// sticky bit set (the Nix store) does not let anyone replace an entry they do not own.
 /// Write access for the root group counts as root's.
+#[cfg(any(unix, test))]
 pub(crate) fn judge_root_run(chain: &[PathOwner]) -> Result<(), String> {
     for (i, p) in chain.iter().enumerate() {
         let others_write = p.mode & 0o002 != 0 || (p.mode & 0o020 != 0 && p.gid != 0);
@@ -1398,6 +1400,7 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
 
+    #[cfg(unix)]
     fn exec_start(unit: &str) -> &str {
         unit.lines()
             .find(|l| l.starts_with("ExecStart="))

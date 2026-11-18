@@ -801,7 +801,6 @@ fn secure_using(
     let _lock = lock_db(config_path, LOCK_WAIT)?;
     let staged = format!("{name}-new");
     let scratch = format!("{name}-fix");
-    let user = config.postgres.user.clone();
 
     let mut targets = vec![name, staged.as_str()];
     if let Some(id) = config.container.id.as_deref() {

@@ -331,6 +331,7 @@ pub fn discover_from(exe: &Path) -> Found {
 }
 
 /// One path whose owner and mode decide whether a `packaging.json` is believed.
+#[cfg(any(unix, test))]
 struct Checked {
     path: PathBuf,
     uid: u32,
@@ -339,6 +340,7 @@ struct Checked {
 
 /// Can the file described by `checked` be believed for an executable owned by
 /// `exe_owner`? `Ok(true)` when root owns every path checked.
+#[cfg(any(unix, test))]
 fn judge(checked: &[Checked], exe_owner: u32) -> Result<bool, String> {
     let mut root_owned = true;
     for c in checked {

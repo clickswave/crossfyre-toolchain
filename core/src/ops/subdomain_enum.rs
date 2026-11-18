@@ -13,10 +13,8 @@ pub async fn handle(env: OpEnv) {
         pub_clone,
         status_subj,
         result_subj,
-        http,
-        api_url,
-        api_key,
         egress,
+        ..
     } = env;
     let lease = egress.as_deref();
 
