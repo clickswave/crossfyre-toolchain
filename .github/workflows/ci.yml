@@ -57,10 +57,8 @@ jobs:
         run: |
           set -eu
           leaked=0
-          # The authz drop-in sat under cortex/ before 0.1.31; both paths are checked
-          # for one more release.
           for p in adaptive-private .cargo/config.toml core/src/egress/private.rs \
-                   plessor/src/authz/private.rs cortex/src/authz/private.rs; do
+                   plessor/src/authz/private.rs; do
             if git ls-files --error-unmatch "$p" >/dev/null 2>&1; then
               echo "::error file=$p::$p is tracked in git. This is a private \
           drop-in and must never ship in the open repo."
@@ -87,7 +85,6 @@ jobs:
           test ! -e core/src/egress/private.rs
           test -f plessor/src/authz/baseline.rs || { echo "::error::open authz baseline missing"; exit 1; }
           test ! -e plessor/src/authz/private.rs
-          test ! -e cortex/src/authz/private.rs
           echo "clean checkout resolves to the open baseline"
 
       # The release workflow signs provenance, so what it runs is pinned by commit
