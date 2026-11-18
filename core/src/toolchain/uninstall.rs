@@ -93,6 +93,14 @@ pub fn run(scope: Scope, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    #[cfg(target_os = "linux")]
+    match super::linger::undo() {
+        Some(Ok(name)) => ok(&format!(
+            "Lingering turned off for {name}, as crossfyre had turned it on for the engines."
+        )),
+        Some(Err(e)) => warn(&format!("could not turn lingering off: {e}")),
+        None => {}
+    }
     let _ = service::remove_node_service();
 
     // Database container.

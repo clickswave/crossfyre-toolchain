@@ -13,6 +13,8 @@ pub mod config;
 pub mod db;
 pub mod doctor;
 pub mod install;
+#[cfg(target_os = "linux")]
+pub mod linger;
 pub mod node_config;
 pub mod oast;
 pub mod packaging;

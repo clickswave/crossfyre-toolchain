@@ -3,7 +3,8 @@
 // Two kinds of services:
 //
 // 1. Extension daemons (ambulo, voyage, doorward) - long-lived *per-user* daemons:
-//      Linux   -> systemd user units      (~/.config/systemd/user, systemctl --user)
+//      Linux   -> systemd user units      (~/.config/systemd/user, systemctl --user),
+//                 with lingering on for the user so they run outside a login (see `linger`)
 //      macOS   -> launchd user agents     (~/Library/LaunchAgents, launchctl)
 //      Windows -> scheduled tasks run as the operator (see `win::tasks`)
 //
@@ -1135,11 +1136,19 @@ mod imp {
     pub fn create(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
         let dir = unit_dir();
         let svc = service_name(super::super::public_name(ext));
+        let first = !super::ENGINES
+            .iter()
+            .any(|e| dir.join(service_name(e.name)).exists());
         create_dir_all_for_invoking_user(&dir)?;
         // Written into the user's home as root, and handed back to them. Only this one
         // file: the rest of this directory holds the person's own units, and the ones
         // they enabled are links to files their packages own.
         write_for_invoking_user(&dir.join(&svc), unit_body(ext).as_bytes(), 0o644)?;
+        // The user's service manager has to run whether or not they are logged in, or
+        // the engines start only inside a login and stop at its end.
+        if first {
+            super::super::linger::keep_engines_running();
+        }
         let _ = cmd_as_invoking_user("systemctl")
             .args(["--user", "daemon-reload"])
             .status();
