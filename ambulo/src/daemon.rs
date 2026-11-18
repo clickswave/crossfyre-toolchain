@@ -218,13 +218,11 @@ pub async fn run_on(listener: TcpListener, db: AmbuloDb) -> Result<(), Box<dyn s
         // Scans older than this are reclaimed (see AmbuloDb::gc_old_scans). Default
         // 7 days: comfortably longer than any real scan (so a running/paused scan
         // is never touched) while still bounding the table. Tunable per node.
-        let retention_hours: i64 = dguard::env_renamed(
-            "CROSSFYRE_AMBULO_SCAN_RETENTION_HOURS",
-            "CROSSFYRE_MACH_SCAN_RETENTION_HOURS",
-        )
-        .and_then(|v| v.parse::<i64>().ok())
-        .filter(|&h| h > 0)
-        .unwrap_or(168);
+        let retention_hours: i64 = std::env::var("CROSSFYRE_AMBULO_SCAN_RETENTION_HOURS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|&h| h > 0)
+            .unwrap_or(168);
         tokio::spawn(async move {
             let interval = std::time::Duration::from_secs(300);
             loop {

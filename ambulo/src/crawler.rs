@@ -1156,8 +1156,7 @@ async fn run_browser_tier(
         ));
         return;
     };
-    let no_sandbox =
-        dguard::env_renamed("AMBULO_BROWSER_NO_SANDBOX", "MACH_BROWSER_NO_SANDBOX").is_some();
+    let no_sandbox = std::env::var("AMBULO_BROWSER_NO_SANDBOX").is_ok();
     let (browser, mut cdp) = match crate::browser::Browser::launch(&exe, no_sandbox).await {
         Ok(b) => b,
         Err(e) => {

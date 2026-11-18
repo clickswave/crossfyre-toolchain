@@ -461,7 +461,7 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
         let ext_dir = params
             .templates_dir
             .clone()
-            .or_else(|| dguard::env_renamed("PLESSOR_TEMPLATES_DIR", "CORTEX_TEMPLATES_DIR"));
+            .or_else(|| std::env::var("PLESSOR_TEMPLATES_DIR").ok());
         let external = ext_dir
             .as_deref()
             .map(template::load_dir)

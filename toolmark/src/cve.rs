@@ -117,7 +117,7 @@ fn cmp_ver(a: &[u64], b: &[u64]) -> Ordering {
 /// are appended, so a synced feed extends coverage without a rebuild.
 fn ruleset() -> Vec<CveRule> {
     let mut rules: Vec<CveRule> = serde_json::from_str(EMBEDDED_JSON).unwrap_or_default();
-    if let Some(path) = dguard::env_renamed("TOOLMARK_CVE_FILE", "SCOUT_CVE_FILE")
+    if let Ok(path) = std::env::var("TOOLMARK_CVE_FILE")
         && let Ok(text) = std::fs::read_to_string(&path)
         && let Ok(mut ext) = serde_json::from_str::<Vec<CveRule>>(&text)
     {

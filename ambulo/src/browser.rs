@@ -67,14 +67,12 @@ use tokio::process::{Child, Command};
 const LAUNCH_TIMEOUT_DEFAULT_SECS: u64 = 20;
 
 fn launch_timeout() -> Duration {
-    dguard::env_renamed(
-        "AMBULO_BROWSER_LAUNCH_TIMEOUT_SECS",
-        "MACH_BROWSER_LAUNCH_TIMEOUT_SECS",
-    )
-    .and_then(|v| v.parse::<u64>().ok())
-    .filter(|v| *v > 0)
-    .map(Duration::from_secs)
-    .unwrap_or(Duration::from_secs(LAUNCH_TIMEOUT_DEFAULT_SECS))
+    std::env::var("AMBULO_BROWSER_LAUNCH_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(LAUNCH_TIMEOUT_DEFAULT_SECS))
 }
 /// How long one navigation may take before it is abandoned.
 pub const NAV_TIMEOUT: Duration = Duration::from_secs(20);
@@ -100,7 +98,7 @@ const CANDIDATES: &[&str] = &[
 /// Find a browser to drive: `AMBULO_BROWSER` if set, else the first candidate on
 /// PATH.
 pub fn find_browser() -> Option<PathBuf> {
-    if let Some(p) = dguard::env_renamed("AMBULO_BROWSER", "MACH_BROWSER") {
+    if let Ok(p) = std::env::var("AMBULO_BROWSER") {
         let p = PathBuf::from(p);
         return p.is_file().then_some(p);
     }
@@ -895,8 +893,7 @@ mod tests {
             eprintln!("no browser on PATH; skipped");
             return;
         };
-        let no_sandbox =
-            dguard::env_renamed("AMBULO_BROWSER_NO_SANDBOX", "MACH_BROWSER_NO_SANDBOX").is_some();
+        let no_sandbox = std::env::var("AMBULO_BROWSER_NO_SANDBOX").is_ok();
         let (browser, mut cdp) = Browser::launch(&exe, no_sandbox).await.expect("launch");
         let v = visit(
             &mut cdp,
