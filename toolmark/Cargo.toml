@@ -21,11 +21,9 @@ serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.142"
 adaptive = { path = "../adaptive" }
 transport = { path = "../transport" }
-reqwest = { version = "0.12.22", default-features = false, features = ["rustls-tls", "http2", "charset", "cookies", "gzip"] }
 regex = "1"
 base64 = "0.22.1"
 md5 = "0.7"
-uuid = { version = "1.18.0", features = ["v4"] }
 
 [dev-dependencies]
 # A recording SOCKS5 proxy and counting listeners for the egress tests.

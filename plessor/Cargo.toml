@@ -46,7 +46,6 @@ sha2 = "0.10"
 rand = "0.8"
 base64 = "0.22"
 regex = "1"
-uuid = { version = "1.18.0", features = ["v4"] }
 
 [dev-dependencies]
 # A recording SOCKS5 proxy and counting listeners for the egress tests.
