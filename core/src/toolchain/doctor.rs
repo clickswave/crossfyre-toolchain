@@ -1,9 +1,9 @@
 // `crossfyre doctor` - environment checks for the things that actually break
 // in the field: missing docker/unzip, dead daemons, unreachable control
-// plane, leftover OrionChain installs.
+// plane.
 
 use super::packaging::Found;
-use super::ui::{dim, done, error, fail, ok, section, step, title, warn};
+use super::ui::{dim, done, error, fail, ok, section, step, title};
 use super::{ENGINES, config};
 use std::path::Path;
 
@@ -222,24 +222,6 @@ pub async fn run(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
             "no nodes registered yet {}",
             dim("(run `crossfyre node init`)")
         ));
-    }
-
-    // -- Legacy OrionChain leftovers ------------------------------------------
-    // Said only when there is something to say. "No legacy OrionChain leftovers" on
-    // every run named a product most people running this have never heard of.
-    let legacy_opt = Path::new("/opt/orionchain").exists();
-    let legacy_cfg = super::sudo_user::invoking_user_config_dir()
-        .join("orionchain")
-        .exists();
-    if legacy_opt || legacy_cfg {
-        section("Legacy");
-        warn("legacy OrionChain install detected");
-        println!(
-            "      {}",
-            dim(
-                "-> re-run `sudo crossfyre node init` to migrate, or remove /opt/orionchain and ~/.config/orionchain manually"
-            )
-        );
     }
 
     // -- Summary --------------------------------------------------------------

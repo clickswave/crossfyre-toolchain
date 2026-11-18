@@ -1,7 +1,5 @@
 # toolmark
 
-Formerly `scout`, renamed in 0.1.31.
-
 Service enumeration and web fingerprinting. Once you know a host has something
 listening, toolmark works out what it is: the web server, frameworks, libraries, and
 their versions where it can pin them down. When it can tie a version to a known CVE,

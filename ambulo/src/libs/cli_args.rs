@@ -82,9 +82,7 @@ impl std::fmt::Display for OutputFormat {
 /// |                 clickswave.org                  |{n}
 /// |-------------------------------------------------|{n}
 #[derive(Parser, Debug)]
-// `bin_name` is fixed so help names the engine as it is now called, even when it
-// is started through the link its old name left behind.
-#[command(name = "ambulo", bin_name = "ambulo", author, version, about, long_about = None)]
+#[command(name = "ambulo", author, version, about, long_about = None)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,

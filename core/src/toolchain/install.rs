@@ -11,9 +11,7 @@
 // manifest", which conflated the two and read as a stronger guarantee than the
 // code gave.
 
-use super::config::{
-    ext_bin_path, ext_file_name, file_name, get_bin_dir, is_regular_file, legacy_bin_path,
-};
+use super::config::{ext_bin_path, ext_file_name, get_bin_dir};
 use super::packaging::{self, Manager, remove_note, update_note};
 use super::release_http::{Purpose, http_client};
 use super::service;
@@ -54,22 +52,10 @@ fn ext_version_file(ext: &str) -> std::path::PathBuf {
     get_bin_dir().join(format!("{}.version", super::public_name(ext)))
 }
 
-/// The sidecar an engine's binary had under its legacy name, if it was renamed.
-fn legacy_version_file(ext: &str) -> Option<std::path::PathBuf> {
-    let legacy = super::engine(ext)?.legacy?;
-    Some(get_bin_dir().join(format!("{legacy}.version")))
-}
-
 fn installed_ext_version(ext: &str) -> Option<String> {
-    let read = |p: std::path::PathBuf| fs::read_to_string(p).ok().map(|s| s.trim().to_string());
-    if ext_bin_path(ext).exists() {
-        return read(ext_version_file(ext));
-    }
-    // Installed under the legacy name only: the migration has not run here yet.
-    match (legacy_bin_path(ext), legacy_version_file(ext)) {
-        (Some(bin), Some(v)) if is_regular_file(&bin) => read(v),
-        _ => read(ext_version_file(ext)),
-    }
+    fs::read_to_string(ext_version_file(ext))
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 /// The version in `sidecar`, or when there is none, the version the binary at `bin`
@@ -262,37 +248,6 @@ fn cannot_start_note(output: &str) -> String {
     note
 }
 
-/// The manifest keys `component` may be published under, in the order to try them: an
-/// engine's public name first, then its legacy name and its id. A manifest from before
-/// the rename has only the legacy key, and one from after it has both, so the CLI does
-/// not depend on the order in which the manifest gains keys. Any other component is
-/// published under its own name.
-fn manifest_keys(component: &str) -> Vec<&str> {
-    keys_for(super::engine(component), component)
-}
-
-fn keys_for<'a>(engine: Option<&'a super::Engine>, component: &'a str) -> Vec<&'a str> {
-    let Some(e) = engine else {
-        return vec![component];
-    };
-    let mut keys = vec![e.name];
-    for k in e.legacy.into_iter().chain([e.id]) {
-        if !keys.contains(&k) {
-            keys.push(k);
-        }
-    }
-    keys
-}
-
-/// The file inside an unpacked artifact that is `component`'s binary: one named by any
-/// of its manifest keys, public name first. An alias artifact published under the
-/// legacy key carries the binary under the legacy name.
-fn find_member(extract_dir: &Path, keys: &[&str]) -> Option<PathBuf> {
-    keys.iter()
-        .map(|k| extract_dir.join(file_name(k)))
-        .find(|p| p.exists())
-}
-
 /// The version string in `resolve_artifact` for a component, or "" if absent.
 fn manifest_version(manifest: &Manifest, comp: &str) -> String {
     resolve_artifact(manifest, comp)
@@ -392,29 +347,22 @@ async fn fetch_signature(url: &str) -> Result<String, Box<dyn std::error::Error>
         .map_err(|e| format!("could not read the release manifest signature: {e}"))?)
 }
 
+/// The manifest's entry for `component` and its artifact for this platform. An engine
+/// is published under its public name, and any other component under its own.
 fn resolve_artifact<'m>(
     manifest: &'m Manifest,
     component: &str,
 ) -> Result<(&'m Component, &'m Artifact), Box<dyn std::error::Error>> {
-    resolve_keys(manifest, &manifest_keys(component))
-}
-
-/// The first of `keys` the manifest has a component for, and that component's artifact
-/// for this platform. The error names the first key, which is the public name.
-fn resolve_keys<'m>(
-    manifest: &'m Manifest,
-    keys: &[&str],
-) -> Result<(&'m Component, &'m Artifact), Box<dyn std::error::Error>> {
-    let shown = keys.first().copied().unwrap_or("");
-    let comp = keys
-        .iter()
-        .find_map(|k| manifest.components.get(*k))
-        .ok_or_else(|| format!("component '{shown}' not in release manifest"))?;
+    let name = super::public_name(component);
+    let comp = manifest
+        .components
+        .get(name)
+        .ok_or_else(|| format!("component '{name}' not in release manifest"))?;
     let key = platform_key();
     let artifact = comp
         .artifacts
         .get(&key)
-        .ok_or_else(|| format!("no '{shown}' artifact for platform {key} in release manifest"))?;
+        .ok_or_else(|| format!("no '{name}' artifact for platform {key} in release manifest"))?;
     Ok((comp, artifact))
 }
 
@@ -806,9 +754,6 @@ fn report_cfx_script(result: Result<HelperOutcome, Box<dyn std::error::Error>>) 
 /// register the daemon service. The service is created but only started by
 /// `install_and_start` (or an explicit `crossfyre service start`).
 pub async fn install(extension: &str, force: bool) -> Result<(), Box<dyn std::error::Error>> {
-    // Before anything is placed: an engine still installed under its legacy name
-    // would otherwise end up with a second unit on its port.
-    super::migrate::renamed_engines();
     // Fetched only for an engine that is ours to download: one a package installed needs
     // nothing from the release.
     let mut manifest = None;
@@ -880,8 +825,7 @@ async fn install_one(
         return Ok(());
     }
 
-    let keys = manifest_keys(ext);
-    let (comp, artifact) = resolve_keys(manifest, &keys)?;
+    let (comp, artifact) = resolve_artifact(manifest, ext)?;
     if !quiet {
         working(&format!("Downloading {name} {}", dim(&comp.version)));
     }
@@ -897,9 +841,10 @@ async fn install_one(
     let extract_dir = tmp_dir.path().join("extracted");
     extract_zip(&zip_path, &extract_dir)?;
 
-    let Some(extracted_binary) = find_member(&extract_dir, &keys) else {
+    let extracted_binary = extract_dir.join(ext_file_name(ext));
+    if !extracted_binary.exists() {
         return Err(format!("Binary '{}' not found inside zip", ext_file_name(ext)).into());
-    };
+    }
 
     // Stop the running daemon (if any) before replacing the binary - on
     // Windows the file is locked while the task runs. Best-effort, OS-aware.
@@ -954,20 +899,17 @@ fn remove_one(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
     use super::ui::*;
     let bin_path = ext_bin_path(ext);
     let name = super::public_name(ext);
-    // The legacy path, whether it is the binary itself (not migrated yet) or the
-    // link an earlier migration left there.
-    let legacy = legacy_bin_path(ext).filter(|p| fs::symlink_metadata(p).is_ok());
 
     title("Crossfyre extension remove", name);
 
-    if !bin_path.exists() && legacy.is_none() {
+    if !bin_path.exists() {
         warn(&format!("{name} is not installed, nothing to remove"));
         end();
         return Ok(());
     }
 
     step(&format!("Stopping and disabling {name} service"));
-    service::try_stop_and_disable_all(ext);
+    service::try_stop_and_disable(ext);
     service::remove_service_file(ext)?;
 
     if let Some(m) = packaging::owner(ext) {
@@ -979,15 +921,8 @@ fn remove_one(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    if bin_path.exists() {
-        remove_stopped_binary(&bin_path)?;
-    }
-    if let Some(p) = &legacy {
-        remove_stopped_binary(p)?;
-    }
-    for v in std::iter::once(ext_version_file(ext)).chain(legacy_version_file(ext)) {
-        let _ = fs::remove_file(v);
-    }
+    remove_stopped_binary(&bin_path)?;
+    let _ = fs::remove_file(ext_version_file(ext));
     ok(&format!("{name} removed"));
     end();
     Ok(())
@@ -1155,8 +1090,6 @@ pub async fn update(
     current_version: &str,
     force: bool,
 ) -> Result<Updated, Box<dyn std::error::Error>> {
-    // First, so what follows sees every engine under its public name.
-    super::migrate::renamed_engines();
     let manifest = fetch_manifest().await?;
     update_with(&manifest, target, current_version, force).await
 }
@@ -1884,92 +1817,20 @@ mod tests {
     }
 
     #[test]
-    fn an_engine_resolves_under_its_new_key_and_falls_back_to_its_old_one() {
+    fn an_engine_is_looked_up_under_its_public_name() {
         let key = platform_key();
-        let entry = |v: &str| {
-            format!(
-                r#"{{"version":"{v}","artifacts":{{"{key}":{{"file":"f-{v}","sha256":"{HELLO_SHA}"}}}}}}"#
-            )
-        };
-        // The release manifest carries the new key and, for one release, the old one
-        // as an alias. The new key is the one taken.
-        let both = manifest(&format!(
-            r#"{{"components":{{"cortex":{},"plessor":{}}}}}"#,
-            entry("0.0.22"),
-            entry("0.0.23")
+        let m = manifest(&format!(
+            r#"{{"components":{{"plessor":{{"version":"0.0.23","artifacts":{{"{key}":{{"file":"f","sha256":"{HELLO_SHA}"}}}}}}}}}}"#
         ));
-        assert_eq!(manifest_version(&both, "cortex"), "0.0.23");
-        assert_eq!(manifest_version(&both, "plessor"), "0.0.23");
-        // A manifest that has not gained the new key yet still installs the engine.
-        let old = manifest(&format!(
-            r#"{{"components":{{"cortex":{}}}}}"#,
-            entry("0.0.22")
-        ));
-        assert_eq!(manifest_version(&old, "cortex"), "0.0.22");
-        assert_eq!(manifest_version(&old, "plessor"), "0.0.22");
-    }
-
-    /// An engine that was renamed, as the table describes one.
-    const RENAMED: crate::toolchain::Engine = crate::toolchain::Engine {
-        id: "cortex",
-        name: "fresh",
-        legacy: Some("cortex"),
-        port: 4445,
-        about: "",
-    };
-
-    #[test]
-    fn a_renamed_engine_is_looked_up_under_its_public_name_then_its_legacy_one() {
-        assert_eq!(keys_for(Some(&RENAMED), "cortex"), ["fresh", "cortex"]);
-        assert_eq!(keys_for(None, "crossfyre"), ["crossfyre"]);
-        let key = platform_key();
-        let entry = |v: &str| {
-            format!(
-                r#"{{"version":"{v}","artifacts":{{"{key}":{{"file":"f-{v}","sha256":"{HELLO_SHA}"}}}}}}"#
-            )
-        };
-
-        // A manifest from before the rename has only the legacy key.
-        let old = manifest(&format!(
-            r#"{{"components":{{"cortex":{}}}}}"#,
-            entry("0.0.22")
-        ));
-        let (c, _) = resolve_keys(&old, &keys_for(Some(&RENAMED), "cortex")).expect("falls back");
-        assert_eq!(c.version, "0.0.22");
-
-        // One from after it carries both, and the public name is taken.
-        let both = manifest(&format!(
-            r#"{{"components":{{"cortex":{},"fresh":{}}}}}"#,
-            entry("0.0.22"),
-            entry("0.0.23")
-        ));
-        let (c, a) = resolve_keys(&both, &keys_for(Some(&RENAMED), "cortex")).expect("found");
-        assert_eq!(
-            (c.version.as_str(), a.file.as_str()),
-            ("0.0.23", "f-0.0.23")
-        );
-
-        let err = resolve_keys(&manifest(r#"{"components":{}}"#), &["fresh", "cortex"])
-            .expect_err("in neither")
+        // The node names an engine by its id, a person by its public name.
+        assert_eq!(manifest_version(&m, "cortex"), "0.0.23");
+        assert_eq!(manifest_version(&m, "plessor"), "0.0.23");
+        let err = resolve_artifact(&manifest(r#"{"components":{}}"#), "cortex")
+            .expect_err("not in the manifest")
             .to_string();
         assert!(
-            err.contains("'fresh'"),
+            err.contains("'plessor'"),
             "the public name is the one reported: {err}"
-        );
-    }
-
-    #[test]
-    fn the_binary_inside_an_artifact_may_carry_either_name() {
-        let s = Scratch::new("member");
-        let keys = keys_for(Some(&RENAMED), "cortex");
-        assert_eq!(find_member(&s.0, &keys), None);
-        fs::write(s.join(&file_name("cortex")), b"alias").expect("legacy member");
-        assert_eq!(find_member(&s.0, &keys), Some(s.join(&file_name("cortex"))));
-        fs::write(s.join(&file_name("fresh")), b"new").expect("public member");
-        assert_eq!(
-            find_member(&s.0, &keys),
-            Some(s.join(&file_name("fresh"))),
-            "the public name first"
         );
     }
 

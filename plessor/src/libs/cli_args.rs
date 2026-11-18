@@ -1,11 +1,8 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-// `bin_name` is fixed so help names the engine as it is now called, even when it
-// is started through the link its old name left behind.
 #[command(
     name = "plessor",
-    bin_name = "plessor",
     about = "Vulnerability detection engine daemon",
     version
 )]

@@ -1,7 +1,5 @@
 # plessor
 
-Formerly `cortex`, renamed in 0.1.31.
-
 The vulnerability engine. plessor runs template-based checks against a target,
 confirms anything that looks like a hit before reporting it, and can confirm blind
 bugs out of band. It reads nuclei-style templates (a supported subset) plus its own

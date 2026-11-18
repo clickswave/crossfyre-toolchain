@@ -1162,49 +1162,6 @@ pub fn load_node_config(path: &std::path::Path) -> Result<Config, Box<dyn std::e
     Ok(toml::from_str(&text)?)
 }
 
-/// One-time migration for hosts initialized before the `nodes.d` layout:
-/// move a legacy `<base>/config.toml` to `<base>/nodes.d/<node-id>.toml`
-/// (and its `network/` dir to `<node-id>.network/`). Best-effort and silent
-/// when there's nothing to migrate.
-pub fn migrate_legacy_config(base: &std::path::Path) {
-    let legacy = base.join("config.toml");
-    if !legacy.is_file() {
-        return;
-    }
-    let Ok(text) = toolchain::sudo_user::read_to_string(&legacy) else {
-        return;
-    };
-    let Ok(cfg) = toml::from_str::<Config>(&text) else {
-        return;
-    };
-    // The id is the operator's, read from their file, and root makes paths from it.
-    let Ok(paths) = NodePaths::checked(base, &cfg.node_id) else {
-        eprintln!(
-            "[migrate] Not moving {legacy:?}: its node_id {:?} is not a node id",
-            cfg.node_id
-        );
-        return;
-    };
-    if paths.config.exists() {
-        return; // already migrated
-    }
-    if let Err(e) = toolchain::sudo_user::create_dir_all_for_invoking_user(&nodes_dir(base)) {
-        eprintln!("[migrate] Could not create nodes.d: {e}");
-        return;
-    }
-    if toolchain::sudo_user::rename(&legacy, &paths.config).is_ok() {
-        println!("[migrate] Moved legacy config.toml -> {:?}", paths.config);
-        let legacy_net = base.join("network");
-        let net_dir = toolchain::node_config::operator_network_dir(&nodes_dir(base), &cfg.node_id);
-        if legacy_net.is_dir() && !net_dir.exists() {
-            let _ = toolchain::sudo_user::rename(&legacy_net, &net_dir);
-        }
-        // The config itself stays as it is: the tree chown leaves node configs alone,
-        // and taking over an earlier release's configs is node_config's.
-        chown_tree_to_sudo_user(&nodes_dir(base));
-    }
-}
-
 /// How often `up` re-scans `nodes.d` to pick up nodes registered (or
 /// removed) after it started. 2s keeps a freshly `--init`'d node coming
 /// online almost immediately without busy-spinning on the filesystem.
@@ -1255,13 +1212,8 @@ pub async fn run_boot(
     toolchain::service::adopt_root_node_log();
     println!("Booting Crossfyre nodes from {base:?}...");
 
-    // Pull a pre-nodes.d single-node install into the new layout if present.
-    migrate_legacy_config(base);
     // Node configs an earlier release handed to the operator become root's, once.
     toolchain::node_config::take_over_earlier_configs(base);
-    // Engines still installed under the names they had before: carry them over
-    // before any node starts using them.
-    toolchain::migrate::renamed_engines();
     // A database container made by 0.1.42 or earlier was published on every
     // interface with no password. Rebuild it on loopback with a password, keeping the
     // engines' rows. Nodes do not use it, so they start meanwhile rather than wait on Docker,
@@ -1922,10 +1874,6 @@ pub async fn run_init(
     end();
     section("Toolchain");
 
-    // One-time migration: clean up a pre-merge OrionChain install so the old
-    // orion services and binaries don't fight the new ones.
-    toolchain::uninstall::cleanup_legacy_orionchain();
-    toolchain::migrate::renamed_engines();
     // An older installer put the bin directory at the front of PATH, where its `node`
     // hides Node.js.
     toolchain::rcfile::fix_for_invoking_user();
@@ -2595,9 +2543,6 @@ pub async fn run_daemon(
         std::process::exit(1);
     }
 
-    // An older node may have left a proxy in the engines' environment file, where it
-    // would carry a direct node's traffic. The node's proxy is a per-op lease now.
-    egress::cleanup_legacy_env_file();
     let egress_state = Arc::clone(egress::state::global());
 
     // -- Apply isolated egress (if configured) before scanning starts ----
@@ -4042,69 +3987,6 @@ mod security_tests {
         let _ = stage_origin_root_cert(Some(dir.path()));
 
         assert_eq!(fs::read_to_string(&victim).unwrap(), "kept\n");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn the_legacy_migration_does_not_move_a_config_through_a_linked_nodes_dir() {
-        let base = tempfile::tempdir().expect("tempdir");
-        let elsewhere = tempfile::tempdir().expect("tempdir");
-        std::os::unix::fs::symlink(elsewhere.path(), base.path().join("nodes.d")).unwrap();
-        fs::write(base.path().join("config.toml"), A_NODE_CONFIG).unwrap();
-
-        let _root = toolchain::sudo_user::act_as_root();
-        migrate_legacy_config(base.path());
-
-        assert!(
-            !elsewhere.path().join("n.toml").exists(),
-            "moved the config into the link's target"
-        );
-    }
-
-    /// The legacy config.toml is the operator's, and so is the node id in it. Root
-    /// makes paths from that id only when it is one plain name, so nothing of the
-    /// operator's is moved out of their config root.
-    #[cfg(unix)]
-    #[test]
-    fn the_legacy_migration_takes_a_node_id_only_as_one_plain_name() {
-        let base = tempfile::tempdir().expect("tempdir");
-        let elsewhere = tempfile::tempdir().expect("tempdir");
-        let victim = elsewhere.path().join("victim");
-        fs::write(
-            base.path().join("config.toml"),
-            format!(
-                "api_key = \"k\"\nnode_id = \"{}\"\napi_url = \"http://127.0.0.1:9\"\n",
-                victim.display()
-            ),
-        )
-        .unwrap();
-        fs::create_dir(base.path().join("network")).unwrap();
-
-        let _root = toolchain::sudo_user::act_as_root();
-        migrate_legacy_config(base.path());
-
-        let left: Vec<_> = fs::read_dir(elsewhere.path()).unwrap().flatten().collect();
-        assert!(left.is_empty(), "moved {left:?} out of the config root");
-        assert!(base.path().join("config.toml").exists());
-        assert!(base.path().join("network").is_dir());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn the_legacy_migration_moves_a_plain_node_id_s_config() {
-        let base = tempfile::tempdir().expect("tempdir");
-        fs::write(base.path().join("config.toml"), A_NODE_CONFIG).unwrap();
-        fs::create_dir(base.path().join("network")).unwrap();
-
-        let _root = toolchain::sudo_user::act_as_root();
-        migrate_legacy_config(base.path());
-
-        assert_eq!(
-            fs::read_to_string(base.path().join("nodes.d/n.toml")).unwrap(),
-            A_NODE_CONFIG
-        );
-        assert!(base.path().join("nodes.d/n.network").is_dir());
-        assert!(!base.path().join("config.toml").exists());
     }
 
     /// A node id from the command line or the control plane names files only when it

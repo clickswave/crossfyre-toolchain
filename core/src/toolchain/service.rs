@@ -70,25 +70,10 @@ fn resolve_targets(target: &str) -> Result<Vec<&'static str>, Box<dyn std::error
     }
 }
 
-/// The name an engine's service is registered under on this machine: its public name,
-/// unless only a unit under its legacy name exists, which is a machine the rename has
-/// not been carried to yet. Anything that is not an engine is its own key.
-fn unit_key(ext: &str) -> String {
-    match super::engine(ext) {
-        Some(e) => match e.legacy {
-            Some(old) if !imp::exists(e.name) && imp::exists(old) => old.to_string(),
-            _ => e.name.to_string(),
-        },
-        None => ext.to_string(),
-    }
-}
-
-/// Every name a unit for `ext` may be registered under, public name first.
-fn unit_keys(ext: &str) -> Vec<&str> {
-    match super::engine(ext) {
-        Some(e) => std::iter::once(e.name).chain(e.legacy).collect(),
-        None => vec![ext],
-    }
+/// The name an engine's service is registered under: its public name. Anything that
+/// is not an engine is its own key.
+fn unit_key(ext: &str) -> &str {
+    super::public_name(ext)
 }
 
 // ── Public API ────────────────────────────────────────────────────────
@@ -99,38 +84,33 @@ pub fn create_service_file(ext: &str) -> Result<(), Box<dyn std::error::Error>> 
     imp::create(ext)
 }
 
-/// Is a service registered for an extension, under any name it may have?
+/// Is a service registered for an extension?
 pub fn has_service_file(ext: &str) -> bool {
-    unit_keys(ext).into_iter().any(imp::exists)
+    imp::exists(unit_key(ext))
 }
 
-/// Remove the service registration for an extension, under every name it may have.
-/// Called during `remove`.
+/// Remove the service registration for an extension. Called during `remove`.
 pub fn remove_service_file(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
-    for key in unit_keys(ext) {
-        imp::delete(key)?;
-    }
-    Ok(())
+    imp::delete(unit_key(ext))
 }
 
 /// Human-readable run state of an extension's daemon: running | stopped |
 /// failed | disabled | unknown.
 pub fn daemon_status(ext: &str) -> String {
-    imp::status(&unit_key(ext))
+    imp::status(unit_key(ext))
 }
 
 /// Best-effort stop used before replacing a binary on reinstall. Never errors.
 pub fn try_stop(ext: &str) {
-    let _ = imp::action("stop", &unit_key(ext));
+    let _ = imp::action("stop", unit_key(ext));
 }
 
-/// Stop and disable `ext`'s service under every name it may have. Never errors.
-pub fn try_stop_and_disable_all(ext: &str) {
-    for key in unit_keys(ext) {
-        if imp::exists(key) {
-            let _ = imp::action("stop", key);
-            let _ = imp::action("disable", key);
-        }
+/// Stop and disable `ext`'s service, when it has one. Never errors.
+pub fn try_stop_and_disable(ext: &str) {
+    let key = unit_key(ext);
+    if imp::exists(key) {
+        let _ = imp::action("stop", key);
+        let _ = imp::action("disable", key);
     }
 }
 
@@ -147,39 +127,12 @@ pub fn user_unit_dir() -> Option<std::path::PathBuf> {
     }
 }
 
-/// This machine's service manager, as the engine migration drives it.
-pub struct HostUnits;
-
-impl super::migrate::Units for HostUnits {
-    fn exists(&self, key: &str) -> bool {
-        imp::exists(key)
-    }
-    fn stop(&self, key: &str) {
-        let _ = imp::action("stop", key);
-    }
-    fn disable(&self, key: &str) {
-        let _ = imp::action("disable", key);
-    }
-    fn enable(&self, key: &str) {
-        let _ = imp::action("enable", key);
-    }
-    fn start(&self, key: &str) {
-        let _ = imp::action("start", key);
-    }
-    fn remove(&self, key: &str) {
-        let _ = imp::delete(key);
-    }
-    fn create(&self, id: &str) {
-        let _ = imp::create(id);
-    }
-}
-
 pub fn start(target: &str) -> Result<(), Box<dyn std::error::Error>> {
     for t in resolve_targets(target)? {
         if t == NODE_TARGET {
             node::action("start")?;
         } else {
-            imp::action("start", &unit_key(t))?;
+            imp::action("start", unit_key(t))?;
         }
     }
     Ok(())
@@ -190,7 +143,7 @@ pub fn stop(target: &str) -> Result<(), Box<dyn std::error::Error>> {
         if t == NODE_TARGET {
             node::action("stop")?;
         } else {
-            imp::action("stop", &unit_key(t))?;
+            imp::action("stop", unit_key(t))?;
         }
     }
     Ok(())
@@ -201,7 +154,7 @@ pub fn restart(target: &str) -> Result<(), Box<dyn std::error::Error>> {
         if t == NODE_TARGET {
             node::action("restart")?;
         } else {
-            imp::action("restart", &unit_key(t))?;
+            imp::action("restart", unit_key(t))?;
         }
     }
     Ok(())
@@ -212,7 +165,7 @@ pub fn enable(target: &str) -> Result<(), Box<dyn std::error::Error>> {
         if t == NODE_TARGET {
             node::action("enable")?;
         } else {
-            imp::action("enable", &unit_key(t))?;
+            imp::action("enable", unit_key(t))?;
         }
     }
     Ok(())
@@ -223,7 +176,7 @@ pub fn disable(target: &str) -> Result<(), Box<dyn std::error::Error>> {
         if t == NODE_TARGET {
             node::action("disable")?;
         } else {
-            imp::action("disable", &unit_key(t))?;
+            imp::action("disable", unit_key(t))?;
         }
     }
     Ok(())
@@ -266,19 +219,19 @@ pub fn list() -> Result<(), Box<dyn std::error::Error>> {
     for e in ENGINES {
         let installed = is_extension_installed(e.id);
         let key = unit_key(e.id);
-        let has_service = imp::exists(&key);
+        let has_service = imp::exists(key);
 
         let status_str = if !installed {
             "-".to_string()
         } else if !has_service {
             "no service".to_string()
         } else {
-            imp::status(&key)
+            imp::status(key)
         };
 
         let enabled_str = if !installed || !has_service {
             "-".to_string()
-        } else if imp::is_enabled(&key) {
+        } else if imp::is_enabled(key) {
             "yes".to_string()
         } else {
             "no".to_string()
@@ -1216,8 +1169,7 @@ mod imp {
         write_for_invoking_user,
     };
 
-    /// `key` is the name inside the unit name: an engine's public name, or its
-    /// legacy name for a unit registered before the engine took its current one.
+    /// `key` is the name inside the unit name: an engine's public name.
     fn service_name(key: &str) -> String {
         format!("crossfyre-{key}.service")
     }

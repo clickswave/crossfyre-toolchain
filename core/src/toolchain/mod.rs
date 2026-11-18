@@ -1,10 +1,9 @@
 // Built-in package manager and service lifecycle for the Crossfyre toolchain.
 //
-// Formerly the standalone `orion` CLI (OrionChain). Merged into the node
-// binary so `crossfyre node init` can install extensions, provision the Postgres
-// container, and register OS services without piping a remote install script
-// into a shell. Extensions (ambulo, voyage, doorward, toolmark, plessor) remain
-// separate daemon binaries downloaded from bins.crossfyre.io.
+// Built into the CLI and the node, so `crossfyre node init` can install extensions,
+// provision the Postgres container, and register OS services without piping a remote
+// install script into a shell. Extensions (ambulo, voyage, doorward, toolmark, plessor)
+// are separate daemon binaries downloaded from bins.crossfyre.io.
 
 // The traffic-capture core (session CA, per-SNI MITM leaves, egress) is its own crate so the mobile
 // VpnService netstack can reuse it without pulling in the rest of cfx_core. Re-exported here so the
@@ -14,7 +13,6 @@ pub mod config;
 pub mod db;
 pub mod doctor;
 pub mod install;
-pub mod migrate;
 pub mod node_config;
 pub mod oast;
 pub mod packaging;
@@ -42,14 +40,11 @@ pub mod win;
 /// the NATS commands, the ports map pushed to nodes, the heartbeat, `nodes.d` and a
 /// finding's `source` all carry it, and it never changes. `name` is the engine's
 /// public name: its crate, binary, manifest key, service unit and CLI argument, and
-/// every label printed for a person. `legacy` is the binary, unit and manifest key an
-/// engine had before it took its current name, kept for as long as installs that
-/// predate the change can still be found on a machine.
+/// every label printed for a person.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Engine {
     pub id: &'static str,
     pub name: &'static str,
-    pub legacy: Option<&'static str>,
     /// Default daemon port. A fixed protocol constant: the daemons listen on
     /// localhost and the node talks to them over TCP JSON.
     pub port: u16,
@@ -57,9 +52,9 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Does `key` name this engine: its id, its public name, or its legacy name?
+    /// Does `key` name this engine: its id or its public name?
     pub fn answers_to(&self, key: &str) -> bool {
-        key == self.id || key == self.name || self.legacy == Some(key)
+        key == self.id || key == self.name
     }
 }
 
@@ -68,35 +63,30 @@ pub const ENGINES: &[Engine] = &[
     Engine {
         id: "mach",
         name: "ambulo",
-        legacy: Some("mach"),
         port: 4441,
         about: "HTTP fuzzer, content-discovery and web-crawl engine",
     },
     Engine {
         id: "voyage",
         name: "voyage",
-        legacy: None,
         port: 4442,
         about: "Subdomain enumeration engine",
     },
     Engine {
         id: "pulse",
         name: "doorward",
-        legacy: Some("pulse"),
         port: 4443,
         about: "Network host and port-scanning engine",
     },
     Engine {
         id: "scout",
         name: "toolmark",
-        legacy: Some("scout"),
         port: 4444,
         about: "Service enumeration and web fingerprinting engine",
     },
     Engine {
         id: "cortex",
         name: "plessor",
-        legacy: Some("cortex"),
         port: 4445,
         about: "Vulnerability detection engine",
     },
@@ -106,19 +96,19 @@ pub const ENGINES: &[Engine] = &[
 /// these.
 pub const EXTENSIONS: &[&str] = &["mach", "voyage", "pulse", "scout", "cortex"];
 
-/// The engine `key` names in `table`, by id, public name or legacy name.
+/// The engine `key` names in `table`, by id or public name.
 pub fn find_engine<'t>(table: &'t [Engine], key: &str) -> Option<&'t Engine> {
     table.iter().find(|e| e.answers_to(key))
 }
 
-/// The engine `key` names, by id, public name or legacy name.
+/// The engine `key` names, by id or public name.
 pub fn engine(key: &str) -> Option<&'static Engine> {
     find_engine(ENGINES, key)
 }
 
-/// The public name for `key`, which may be an id, a public name or a legacy name.
-/// Anything that is not an engine (`crossfyre`, `node`, `cfx-script`) comes back as
-/// it was, so this is safe on every component name.
+/// The public name for `key`, which may be an id or a public name. Anything that is
+/// not an engine (`crossfyre`, `node`, `cfx-script`) comes back as it was, so this is
+/// safe on every component name.
 pub fn public_name(key: &str) -> &str {
     engine(key).map(|e| e.name).unwrap_or(key)
 }
@@ -179,19 +169,17 @@ pub fn print_extension_usage(verb: &str) {
 mod tests {
     use super::*;
 
-    /// One renamed engine and one that never was.
+    /// One engine whose id and public name differ, and one whose are the same.
     const TABLE: &[Engine] = &[
         Engine {
             id: "cortex",
             name: "fresh",
-            legacy: Some("cortex"),
             port: 4445,
             about: "",
         },
         Engine {
             id: "voyage",
             name: "voyage",
-            legacy: None,
             port: 4442,
             about: "",
         },
@@ -211,9 +199,6 @@ mod tests {
             all.push(e.id);
             if e.name != e.id {
                 all.push(e.name);
-            }
-            if let Some(l) = e.legacy.filter(|l| *l != e.id) {
-                all.push(l);
             }
         }
         let mut dedup = all.clone();
@@ -238,8 +223,8 @@ mod tests {
         assert!(!err.contains("cortex"), "ids are not offered: {err}");
     }
 
-    /// Old name, new name, for every engine that was renamed.
-    const RENAMES: [(&str, &str); 4] = [
+    /// Id and public name, for every engine whose two differ.
+    const ID_AND_NAME: [(&str, &str); 4] = [
         ("mach", "ambulo"),
         ("pulse", "doorward"),
         ("scout", "toolmark"),
@@ -247,33 +232,31 @@ mod tests {
     ];
 
     #[test]
-    fn every_old_cli_argument_still_resolves_to_the_renamed_engine() {
-        // `crossfyre extension install cortex`, and every other command taking an
-        // engine, keeps working, and lands on the same engine as the new name.
-        for (old, new) in RENAMES {
-            assert_eq!(resolve_extensions(old).unwrap(), vec![old], "{old}");
-            assert_eq!(resolve_extensions(new).unwrap(), vec![old], "{new}");
+    fn every_engine_resolves_by_its_id_and_by_its_public_name() {
+        // The node passes ids, a person types public names, and both land on the id.
+        for (id, name) in ID_AND_NAME {
+            assert_eq!(resolve_extensions(id).unwrap(), vec![id], "{id}");
+            assert_eq!(resolve_extensions(name).unwrap(), vec![id], "{name}");
         }
         let err = resolve_extensions("nope").unwrap_err().to_string();
         assert!(
             err.contains("ambulo, voyage, doorward, toolmark, plessor, or all"),
             "{err}"
         );
-        for (old, _) in RENAMES {
-            assert!(!err.contains(old), "an old name is not offered: {err}");
+        for (id, _) in ID_AND_NAME {
+            assert!(!err.contains(id), "an id is not offered: {err}");
         }
     }
 
     #[test]
-    fn an_engine_is_printed_by_its_new_name_and_keeps_its_id() {
-        for (old, new) in RENAMES {
-            let e = engine(old).expect("known by its old name");
-            assert_eq!((e.id, e.name, e.legacy), (old, new, Some(old)));
-            assert_eq!(engine(new), Some(e));
-            assert_eq!(public_name(old), new);
+    fn an_engine_is_printed_by_its_public_name_and_keeps_its_id() {
+        for (id, name) in ID_AND_NAME {
+            let e = engine(id).expect("known by its id");
+            assert_eq!((e.id, e.name), (id, name));
+            assert_eq!(engine(name), Some(e));
+            assert_eq!(public_name(id), name);
         }
         assert_eq!(public_name("voyage"), "voyage");
-        assert_eq!(engine("voyage").unwrap().legacy, None);
     }
 
     #[test]

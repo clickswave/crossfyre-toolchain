@@ -1,7 +1,5 @@
 # ambulo
 
-Formerly `mach`, renamed in 0.1.31.
-
 Content discovery and HTTP fuzzing. Point it at a URL with a `FUZZ` marker and a
 wordlist, and it walks the list looking for paths that exist. There is a live TUI so
 you can watch hits come in, and the run is written to a local database as it goes, so

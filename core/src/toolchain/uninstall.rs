@@ -3,13 +3,9 @@
 // and (with --purge) the config root including registered node configs.
 // --keep-data leaves the container, and --yes skips the question, which is how a
 // package's removal script runs it.
-//
-// Also home of the legacy OrionChain cleanup used by `init` to migrate hosts
-// that were set up before the orion -> crossfyre merge.
 
 use super::config::{file_name, get_bin_dir, get_toolchain_dir};
 use super::packaging::{Packaging, remove_note};
-use super::sudo_user::cmd_as_invoking_user;
 use super::{ENGINES, EXTENSIONS, install, service};
 use std::path::{Path, PathBuf};
 
@@ -80,16 +76,14 @@ pub fn run(scope: Scope, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
             ));
         }
     }
-    // Drop-in directories beside the units, under the public name and the legacy
-    // one. `remove` leaves them, since a person wrote them and a reinstall wants
-    // them back; uninstalling everything is the moment they go too.
+    // Drop-in directories beside the units. `remove` leaves them, since a person
+    // wrote them and a reinstall wants them back; uninstalling everything is the
+    // moment they go too.
     if let Some(dir) = service::user_unit_dir() {
         for e in ENGINES {
-            for key in std::iter::once(e.name).chain(e.legacy) {
-                let d = dir.join(format!("crossfyre-{key}.service.d"));
-                if d.is_dir() && super::sudo_user::remove_dir_all(&d).is_ok() {
-                    ok(&format!("Removed {}", d.display()));
-                }
+            let d = dir.join(format!("crossfyre-{}.service.d", e.name));
+            if d.is_dir() && super::sudo_user::remove_dir_all(&d).is_ok() {
+                ok(&format!("Removed {}", d.display()));
             }
         }
     }
@@ -251,7 +245,7 @@ fn remove_at_restart(path: &Path) {
 /// Where `remove_at_restart` moves a file it cannot remove now: beside it, under a name
 /// no install writes, so the delete queued for the restart can only ever hit this copy.
 /// Same directory, so the rename never crosses a volume.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(any(windows, test))]
 fn aside_name(path: &Path, tag: &str) -> PathBuf {
     let name = path
         .file_name()
@@ -264,7 +258,7 @@ fn aside_name(path: &Path, tag: &str) -> PathBuf {
 /// whatever cannot, deepest first so a directory comes after what is in it. Returns
 /// whether anything was handed over. A file that cannot be removed does not stop the
 /// rest being removed, as it does in `remove_dir_all`, which gives up at the first.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(any(windows, test))]
 fn clear_tree(dir: &Path, later: &mut dyn FnMut(&Path)) -> bool {
     let mut handed = false;
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -287,17 +281,10 @@ fn clear_tree(dir: &Path, later: &mut dyn FnMut(&Path)) -> bool {
 }
 
 /// Every file name a component may have in the bin directory, with the name of its version
-/// sidecar: the CLI, the node, cfx-script, and each engine under its public name and the
-/// name it had before. cfx-script also has the record of a release that could not start.
+/// sidecar: the CLI, the node, cfx-script, and each engine under its public name.
+/// cfx-script also has the record of a release that could not start.
 fn component_files(component: &str) -> Vec<String> {
-    let mut names = vec![component.to_string()];
-    if let Some(old) = super::engine(component).and_then(|e| e.legacy) {
-        names.push(old.to_string());
-    }
-    let mut files: Vec<String> = names
-        .into_iter()
-        .flat_map(|n| [file_name(&n), format!("{n}.version")])
-        .collect();
+    let mut files = vec![file_name(component), format!("{component}.version")];
     if component == "cfx-script" {
         files.push("cfx-script.cannot-start".to_string());
     }
@@ -347,80 +334,6 @@ fn has_files_under(p: &Packaging, bin_dir: &Path, root: &Path, cli: Option<&Path
     p.file.starts_with(root)
         || (p.owns("crossfyre") && cli.is_some_and(|c| c.starts_with(root)))
         || (bin_dir.starts_with(root) && owned_in_bin)
-}
-
-/// Best-effort migration cleanup for hosts initialized before the
-/// orion -> crossfyre merge. Stops and removes the old orion services,
-/// the old install dir, config dir, and the old database container.
-/// Called from `init` when leftovers are detected; every step is optional.
-pub fn cleanup_legacy_orionchain() {
-    let legacy_bin = Path::new("/opt/orionchain");
-    let legacy_cfg = super::sudo_user::invoking_user_config_dir().join("orionchain");
-    if !legacy_bin.exists() && !legacy_cfg.exists() {
-        return;
-    }
-
-    println!("[migrate] Legacy OrionChain install detected. Cleaning up.");
-
-    #[cfg(target_os = "linux")]
-    for tool in EXTENSIONS {
-        let svc = format!("orion-{tool}.service");
-        let _ = cmd_as_invoking_user("systemctl")
-            .args(["--user", "stop", &svc])
-            .output();
-        let _ = cmd_as_invoking_user("systemctl")
-            .args(["--user", "disable", &svc])
-            .output();
-        let unit = super::sudo_user::invoking_user_home()
-            .join(".config/systemd/user")
-            .join(&svc);
-        if unit.exists() {
-            let _ = super::sudo_user::remove_file(&unit);
-            println!("[migrate] Removed old service {svc}");
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let _ = cmd_as_invoking_user("systemctl")
-            .args(["--user", "daemon-reload"])
-            .output();
-    }
-
-    #[cfg(target_os = "macos")]
-    for tool in EXTENSIONS {
-        let plist = super::sudo_user::invoking_user_home()
-            .join("Library/LaunchAgents")
-            .join(format!("com.orionchain.{tool}.plist"));
-        if plist.exists() {
-            let _ = cmd_as_invoking_user("launchctl")
-                .args(["unload", "-w", &plist.to_string_lossy()])
-                .output();
-            let _ = super::sudo_user::remove_file(&plist);
-            println!("[migrate] Removed old launchd agent for {tool}");
-        }
-    }
-
-    // Old database container. Scan state is per-host and disposable; the new
-    // container is provisioned fresh by init.
-    let _ = std::process::Command::new("docker")
-        .args(["rm", "-f", "orion-postgres"])
-        .output();
-
-    if legacy_bin.exists() {
-        match std::fs::remove_dir_all(legacy_bin) {
-            Ok(_) => println!("[migrate] Removed /opt/orionchain"),
-            Err(e) => {
-                eprintln!("[migrate] Could not remove /opt/orionchain: {e} (remove it manually)")
-            }
-        }
-    }
-    if legacy_cfg.exists() {
-        match super::sudo_user::remove_dir_all(&legacy_cfg) {
-            Ok(_) => println!("[migrate] Removed {}", legacy_cfg.display()),
-            Err(e) => eprintln!("[migrate] Could not remove {}: {}", legacy_cfg.display(), e),
-        }
-    }
-    println!("[migrate] Legacy cleanup complete.");
 }
 
 #[cfg(test)]
@@ -542,7 +455,6 @@ mod tests {
             "cfx-script.cannot-start",
             "plessor",
             "plessor.version",
-            "cortex",
         ] {
             assert!(gone.contains(&bin.join(f)), "{f} in {gone:?}");
         }

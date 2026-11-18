@@ -1,7 +1,5 @@
 # doorward
 
-Formerly `pulse`, renamed in 0.1.31.
-
 Host and port scanning. Give it targets (IPs, ranges, CIDRs) and a set of ports, and
 it tells you what is open, with a TCP connect scan, and it can go a step further and
 try to detect the service and OS behind an open port.
