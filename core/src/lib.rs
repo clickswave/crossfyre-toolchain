@@ -10,6 +10,7 @@ pub mod auth;
 pub mod creds;
 mod egress;
 pub mod executor;
+mod init_summary;
 pub mod oast;
 mod ops;
 
@@ -1864,56 +1865,59 @@ pub async fn run_init(
                 .and_then(|()| toolchain::service::start(ext))
             {
                 Ok(()) => ok(&format!("{name} already installed, started")),
-                Err(e) => {
-                    fail(&format!(
-                        "{name} is installed but its service did not start: {e}"
-                    ));
-                    hint(&format!("Run manually: crossfyre extension install {name}"));
-                }
+                Err(e) => fail(&format!(
+                    "{name} is installed but its service did not start: {e}"
+                )),
             }
             continue;
         }
         working(&format!("Installing {name}"));
         match toolchain::install::install_and_start(ext).await {
             Ok(()) => ok(&format!("{name} installed and started")),
-            Err(e) => {
-                fail(&format!("{name} install failed: {e}"));
-                hint(&format!("Run manually: crossfyre extension install {name}"));
-            }
+            Err(e) => fail(&format!("{name} install failed: {e}")),
         }
     }
 
     // Bring up the toolchain database the extensions persist scan state to.
-    if !selected_extensions.is_empty() {
+    let database = if selected_extensions.is_empty() {
+        None
+    } else {
         working("Starting the toolchain database");
-        match toolchain::db::ensure_up() {
-            Ok(()) => ok("Database ready"),
+        Some(match toolchain::db::ensure_up() {
+            Ok(()) => {
+                ok("Database ready");
+                true
+            }
             Err(e) => {
                 fail(&format!("Database start failed: {e}"));
-                hint("Run manually: crossfyre db up");
+                false
             }
-        }
-    }
+        })
+    };
 
     // Register the node supervisor as an OS service so the node survives
-    // reboots and closed terminals (Linux; needs root).
+    // reboots and closed terminals.
     end();
     section("Service");
-    if no_service {
+    let node = if no_service {
         warn("Skipped node service install (--no-service)");
-        hint("Run the node with: crossfyre node up");
+        init_summary::NodeService::Skipped
     } else {
         match toolchain::service::install_node_service(&stable_exe, data_dir) {
-            Ok(()) => ok("Node service installed and started (crossfyre-node)"),
+            Ok(()) if toolchain::service::node_service_running() => {
+                ok("Node service installed and started (crossfyre-node)");
+                init_summary::NodeService::Running
+            }
+            Ok(()) => {
+                warn("the node service is installed and is not running");
+                init_summary::NodeService::Stopped
+            }
             Err(e) => {
                 warn(&format!("could not install the node service: {e}"));
-                hint(&format!(
-                    "Run the node manually with: {}",
-                    os::elevated("crossfyre node up")
-                ));
+                init_summary::NodeService::Stopped
             }
         }
-    }
+    };
 
     // Update node status on the server
     let status_res = client
@@ -1945,11 +1949,42 @@ pub async fn run_init(
     // node configs in it stay root's: the root node service runs what they say.
     chown_tree_to_sudo_user(&config_dir);
 
+    // The true state, last: what runs, and how to start what does not.
+    let mut parts: Vec<init_summary::Part> =
+        selected_extensions.iter().map(|e| engine_part(e)).collect();
+    if let Some(running) = database {
+        parts.push(init_summary::Part {
+            name: "database".to_string(),
+            running,
+            start: "crossfyre db up".to_string(),
+        });
+    }
     end();
-    done("Node ready");
-    hint("Run `crossfyre node status` to see it running.");
-    end();
+    let summary = init_summary::Summary { node, parts };
+    summary.print();
+    if !summary.succeeded() {
+        std::process::exit(1);
+    }
     Ok(())
+}
+
+/// How `node init` left engine `ext`, with the command that starts it when it is not
+/// running: `extension start` for a registered service, and otherwise `extension
+/// install`, which registers one, forced when the binary is already there.
+fn engine_part(ext: &str) -> init_summary::Part {
+    let name = toolchain::public_name(ext);
+    let start = if !toolchain::config::is_extension_installed(ext) {
+        format!("crossfyre extension install {name}")
+    } else if !toolchain::service::has_service_file(ext) {
+        format!("crossfyre extension install --force {name}")
+    } else {
+        format!("crossfyre extension start {name}")
+    };
+    init_summary::Part {
+        name: name.to_string(),
+        running: toolchain::service::daemon_status(ext) == "running",
+        start,
+    }
 }
 
 /// The client the Bench repeater sends with. It does not follow redirects.

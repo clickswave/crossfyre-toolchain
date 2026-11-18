@@ -701,6 +701,21 @@ pub fn node_service_exists() -> bool {
     node::exists()
 }
 
+/// Is the node service running, once its service manager is done starting it? A
+/// service can show as starting for a moment after it was told to start, and longer
+/// while it fails and is restarted, so that is waited out for up to ten seconds.
+pub fn node_service_running() -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let status = node::status();
+        let starting = matches!(status.as_str(), "starting" | "activating");
+        if !starting || std::time::Instant::now() >= deadline {
+            return status == "running";
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod node {
     use std::fs;
