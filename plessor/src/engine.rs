@@ -143,7 +143,6 @@ pub struct OastSpec {
 pub use transport::AuthSpec;
 
 pub(crate) struct BaseResp {
-    #[allow(dead_code)]
     pub(crate) is_https: bool,
     pub(crate) status: u16,
     pub(crate) headers: Vec<(String, String)>,
