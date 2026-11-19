@@ -1,0 +1,19 @@
+# Synthetic: A Flask application behind Gunicorn, which names no framework, known only
+# by the shape of its signed session cookie.
+HTTP/1.1 200 OK
+server: gunicorn
+date: Fri, 20 Nov 2026 06:00:00 GMT
+content-type: text/html; charset=utf-8
+vary: Cookie
+set-cookie: session=eyJfZnJlc2giOmZhbHNlLCJjc3JmX3Rva2VuIjoiZjI3MGM0OTc1YTQ2NmE1NTU2Yzg2MzM2YzVjYzUwMTAzYzQ3MDIyYiJ9.av_h4A.n2nZUWpRsbVDo-vWsG9mGcDQUWw; HttpOnly; Path=/
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Inventory</title>
+</head>
+<body>
+<table class="items"></table>
+</body>
+</html>

@@ -271,6 +271,32 @@
       "version_range": null
     }
   ],
+  "express-cookie-session.http": [
+    {
+      "candidates": [],
+      "category": "Framework",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:openjsf:express:*:*:*:*:*:node.js:*:*",
+      "evidence": [
+        "header x-powered-by: Express"
+      ],
+      "name": "Express",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Express"
+      ],
+      "name": "Node.js",
+      "version": null,
+      "version_range": null
+    }
+  ],
   "express-quiet.http": [
     {
       "candidates": [],
@@ -321,6 +347,44 @@
         "body pattern"
       ],
       "name": "F5 BIG-IP",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "flask-behind-gunicorn.http": [
+    {
+      "candidates": [],
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "",
+      "evidence": [
+        "header server: gunicorn"
+      ],
+      "name": "Gunicorn",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Framework",
+      "confidence": 45,
+      "cpe": "",
+      "evidence": [
+        "cookie session"
+      ],
+      "name": "Flask",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Gunicorn"
+      ],
+      "name": "Python",
       "version": null,
       "version_range": null
     }
@@ -1398,6 +1462,32 @@
     }
   ],
   "lab-xssmaze.http": [],
+  "laravel-named-session.http": [
+    {
+      "candidates": [],
+      "category": "Framework",
+      "confidence": 45,
+      "cpe": "",
+      "evidence": [
+        "cookie XSRF-TOKEN"
+      ],
+      "name": "Laravel",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Laravel"
+      ],
+      "name": "PHP",
+      "version": null,
+      "version_range": null
+    }
+  ],
   "laravel.http": [
     {
       "candidates": [],
@@ -2049,6 +2139,7 @@
       "version_range": null
     }
   ],
+  "spring-xsrf-session.http": [],
   "squarespace.http": [
     {
       "candidates": [],

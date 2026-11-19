@@ -306,14 +306,11 @@ fn leaf(kind: &str, value: Value, version: bool) -> Result<Leaf, String> {
             if version && range.is_none() {
                 return Err("a cookie leaf reads no version".into());
             }
-            refuse(&spec.regex, "regex: it matches the cookie's name")?;
             refuse(&spec.path, "path")?;
             refuse(&spec.src, "src")?;
-            (
-                Source::Cookie,
-                Some(compile(&needs(spec.name, "a name")?)?),
-                45,
-            )
+            let name = compile(&needs(spec.name, "a name")?)?;
+            let value = spec.regex.as_deref().map(compile).transpose()?;
+            (Source::Cookie(name), value, 45)
         }
         Kind::Meta => {
             refuse(&spec.path, "path")?;

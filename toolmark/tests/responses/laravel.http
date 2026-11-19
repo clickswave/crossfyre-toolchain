@@ -3,8 +3,8 @@ HTTP/1.1 200 OK
 content-type: text/html; charset=UTF-8
 cache-control: no-cache, private
 date: Fri, 20 Nov 2026 06:00:00 GMT
-set-cookie: XSRF-TOKEN=
-set-cookie: laravel_session=
+set-cookie: XSRF-TOKEN=eyJpdiI6ImNaV0VZa3U0TnJZamFodnM5V3dpM0E9PSIsInZhbHVlIjoiSUU4MzVYZGUybFFvbGFpTVRCWk1EUjIzV0pQb3lHWmVVR0N3WFY0RHhveVdQVm82Ym40TnVtdGVDNXplaFlaUSIsIm1hYyI6ImQ0N2E3NTdhZmM2MjQ1NjdhMzVlMDBiYzkzYmFmOTc1MDk4NDRlYTlmMDFiMzQ5NDJiYzBkMjEwMjdkZWM5NTQiLCJ0YWciOiIifQ%3D%3D; expires=Fri, 20 Nov 2026 08:00:00 GMT; Max-Age=7200; path=/; samesite=lax
+set-cookie: laravel_session=eyJpdiI6IlNMaFdiU0VHQy83SGYwSUVSckVTTEE9PSIsInZhbHVlIjoidVFQc0ZBL3BSbUE5dmZ2VW4wOE5XNDBOSXVnZTdRaGRBamNxaXdONmlzSGZZcWhNN1lqdTJZQm9qL2U1VTFLViIsIm1hYyI6Ijc2MDkxYWRkOGExOWY5MTA1ZTY1NzJlNDNlYTk1NDI5YzYwZWQ3OWVlMWM0YmY1NDdlYTQ2YjQ5ZTVmZWU0Y2IiLCJ0YWciOiIifQ%3D%3D; expires=Fri, 20 Nov 2026 08:00:00 GMT; Max-Age=7200; path=/; httponly; samesite=lax
 
 <!DOCTYPE html>
 <html>

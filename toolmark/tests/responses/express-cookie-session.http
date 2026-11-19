@@ -1,0 +1,19 @@
+# Synthetic: An Express application with the cookie-session middleware, whose cookie is
+# named session too but holds plain JSON, with its signature in a cookie of its own.
+HTTP/1.1 200 OK
+x-powered-by: Express
+content-type: text/html; charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+set-cookie: session=eyJ2aWV3cyI6IDF9; path=/; httponly
+set-cookie: session.sig=-QxXqEWlene0Xle8kAm1RV-BsPc; path=/; httponly
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Board</title>
+</head>
+<body>
+<main></main>
+</body>
+</html>

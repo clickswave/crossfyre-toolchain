@@ -541,6 +541,41 @@ fn a_script_src_is_read_from_the_landing_page() {
     assert!(found("<script src='/a.js'></script><p>/lib.js</p>").is_empty());
 }
 
+/// A `cookie` leaf is present when the landing page sets a cookie its `name` matches, and
+/// when the leaf has a `regex`, only when that cookie's value, from the first `=` to the
+/// first `;`, matches it too. The evidence names the cookie and never shows its value.
+#[test]
+fn a_cookie_leaf_with_a_regex_reads_the_value_too() {
+    let files = [
+        file(
+            "signed",
+            "{ cookie: { name: '^session$', regex: '^ok\\.' } }",
+        ),
+        file("named", "{ cookie: { name: '^session$' } }"),
+    ];
+    let files: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(f, t)| (f.as_str(), t.as_str()))
+        .collect();
+    let signatures = set(&files);
+    let found = |cookies: &[&str]| {
+        let cookies: Vec<String> = cookies.iter().map(ToString::to_string).collect();
+        Host::new(&signatures, "http://host.test/", &[], &cookies, "", 0)
+            .detections()
+            .into_iter()
+            .map(|d| (d.name, d.evidence))
+            .collect::<Vec<_>>()
+    };
+    let by = |name: &str| (name.to_string(), vec!["cookie session".to_string()]);
+    assert_eq!(
+        found(&["a=ok.1", "session=ok.2=; Path=/; HttpOnly"]),
+        [by("signed"), by("named")]
+    );
+    assert_eq!(found(&["session=no.ok.; Path=/"]), [by("named")]);
+    assert_eq!(found(&["session; Path=/"]), [by("named")]);
+    assert!(found(&["SESSION=ok.1", "other=ok.1"]).is_empty());
+}
+
 /// `script` reads the content of the first script the landing page loads from its own
 /// host whose `src` matches: asked for like a path, absent with no request when the page
 /// loads no such script, and unknown with no request when it comes from another host.

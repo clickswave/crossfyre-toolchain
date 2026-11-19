@@ -124,8 +124,9 @@ enum Answer {
 enum Source {
     /// The value of the first header with this name, which is lower case.
     Header(String),
-    /// The name of each cookie the response sets.
-    Cookie,
+    /// The cookies the response sets: present when one has a name this matches, and a
+    /// value the leaf's pattern matches when it has one.
+    Cookie(Regex),
     /// The content of the first meta tag with this name, anywhere in the body.
     Meta(String),
     /// The first [`HTML_READ`] bytes of the body.
@@ -436,8 +437,8 @@ static SCRIPT_SRC: LazyLock<Regex> = LazyLock::new(|| {
 /// The landing page as the leaves look at it.
 struct Page<'a> {
     headers: &'a [(String, String)],
-    /// The name of each cookie set, in order.
-    cookies: Vec<&'a str>,
+    /// The name and value of each cookie set, in order.
+    cookies: Vec<(&'a str, &'a str)>,
     html: &'a str,
     /// The content of each meta tag a leaf reads, by name.
     metas: BTreeMap<&'a str, Option<String>>,
@@ -457,7 +458,7 @@ impl<'a> Page<'a> {
                 .map(|(_, value)| value.as_str()),
             Source::Meta(name) => self.metas.get(name.as_str()).and_then(|c| c.as_deref()),
             Source::Html => Some(self.html),
-            Source::Cookie
+            Source::Cookie(_)
             | Source::ScriptSrc
             | Source::Path(_)
             | Source::Script(_)
@@ -467,14 +468,16 @@ impl<'a> Page<'a> {
 
     /// The evidence for a passive leaf on this page, when it is there.
     fn found(&self, leaf: &Leaf) -> Option<String> {
-        let regex = leaf.regex.as_ref()?;
-        if let Source::Cookie = leaf.source {
+        if let Source::Cookie(names) = &leaf.source {
             return self
                 .cookies
                 .iter()
-                .find(|name| regex.is_match(name))
-                .map(|name| format!("cookie {name}"));
+                .find(|(name, value)| {
+                    names.is_match(name) && leaf.regex.as_ref().is_none_or(|r| r.is_match(value))
+                })
+                .map(|(name, _)| format!("cookie {name}"));
         }
+        let regex = leaf.regex.as_ref()?;
         if let Source::ScriptSrc = leaf.source {
             return self
                 .scripts
@@ -559,7 +562,11 @@ impl<'a> Host<'a> {
             headers,
             cookies: cookies
                 .iter()
-                .map(|c| c.split(['=', ';']).next().unwrap_or_default().trim())
+                .map(|c| {
+                    let pair = c.split(';').next().unwrap_or_default();
+                    let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+                    (name.trim(), value.trim())
+                })
                 .collect(),
             html: first_n(body, HTML_READ),
             metas: signatures
