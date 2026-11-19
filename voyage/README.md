@@ -34,6 +34,17 @@ not, so piping or redirecting a scan gives you the daemon's newline-delimited
 JSON rather than escape sequences. `--no-tui` forces the JSON path even in a
 terminal.
 
+## How it runs
+
+The enumeration runs in voyage's daemon, on 127.0.0.1:4442, and the commands here are
+its clients. The first command starts the daemon when none is running, and a daemon
+started that way exits after 30 minutes with no client and no scan. `voyage daemon`
+runs one by hand, and `--no-autostart` turns the starting off. It keeps each scan's
+state in PostgreSQL, and the first daemon makes the database, so install PostgreSQL's
+programs before the first scan (`sudo apt install postgresql` on Debian, Ubuntu or
+Kali), or point it at a database you run with `crossfyre db external`. The root
+[README](../#how-the-engines-run) has the details.
+
 ## Handy flags
 
 - `-w, --wordlist-path` list for active brute-forcing

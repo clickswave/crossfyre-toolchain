@@ -9,13 +9,15 @@ Part of the [Crossfyre toolchain](../).
 
 ## How it runs
 
-toolmark is a daemon. Start it, then send it targets:
+The fingerprinting runs in toolmark's daemon, on 127.0.0.1:4444, and the commands
+here are its clients. The first command starts the daemon when none is running, and a
+daemon started that way exits after 30 minutes with no client and no scan. `toolmark
+daemon` runs one by hand, and `--no-autostart` turns the starting off. It keeps no
+state, so it needs no database. The root [README](../#how-the-engines-run) has the
+details.
 
 ```sh
-# start the daemon (default port 4444)
-toolmark daemon
-
-# scan a target through the running daemon
+# scan a target
 toolmark scan https://example.com
 
 # same run, as JSON in the terminal

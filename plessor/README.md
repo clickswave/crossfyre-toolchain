@@ -9,13 +9,14 @@ Part of the [Crossfyre toolchain](../).
 
 ## How it runs
 
-Like toolmark, plessor is a daemon you feed targets:
+The checks run in plessor's daemon, on 127.0.0.1:4445, and the commands here are its
+clients. The first command starts the daemon when none is running, and a daemon
+started that way exits after 30 minutes with no client and no scan. `plessor daemon`
+runs one by hand, and `--no-autostart` turns the starting off. It keeps no state, so
+it needs no database. The root [README](../#how-the-engines-run) has the details.
 
 ```sh
-# start the daemon (default port 4445)
-plessor daemon
-
-# scan a target through it
+# scan a target
 plessor scan https://example.com
 
 # same run, as JSON in the terminal

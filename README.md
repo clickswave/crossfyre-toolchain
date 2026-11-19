@@ -112,6 +112,20 @@ crossfyre node init
 
 The platform is optional. Nothing here needs it.
 
+## How the engines run
+
+Each engine is a daemon and the commands that talk to it. The daemon does the work, on 127.0.0.1 and a port of its own (ambulo 4441, voyage 4442, doorward 4443, toolmark 4444, plessor 4445), and the commands you type are its clients. When a command finds no daemon on its port it starts one: on Linux the engine's systemd user unit, when `crossfyre` registered one for you, and otherwise the engine's own binary, which writes to `logs/<engine>.log` in the toolchain directory (`~/.config/crossfyre` on Linux). The command says `started voyage daemon (pid N)` on stderr, so its JSON on stdout stays clean.
+
+A daemon started from the binary exits once it has had no client and no scan for 30 minutes. For another limit, set `CFX_DAEMON_IDLE_EXIT` to a number of seconds in the environment of the command that starts it. `voyage daemon`, and the same for every engine, runs one by hand, which never exits on its own. `--no-autostart` or `CFX_NO_AUTOSTART=1` turns the starting off. Nothing is started for a command run with sudo, since the daemons and their database belong to your user.
+
+## Where scan state is kept
+
+voyage, doorward and ambulo keep the state of every scan in PostgreSQL, so a stopped scan picks up where it left off. `config.toml` in the toolchain directory names the database they use.
+
+By default it is a local one: a PostgreSQL cluster of your own in the toolchain directory, made with the PostgreSQL programs installed on the machine (on Debian, Ubuntu or Kali, `sudo apt install postgresql`). It runs as you, listens on 127.0.0.1 only, and its generated password is kept in `config.toml`. The first daemon to start makes it, or `crossfyre db up` does ahead of time. `crossfyre db stop` stops it, and `crossfyre db status` says how it is.
+
+To use a PostgreSQL server you run yourself, record it with `crossfyre db external HOST PORT USER`. It asks for the password, or reads it from `CROSSFYRE_DB_PASSWORD`, and records the server only once it lets that user in. Each engine makes its own database there. The local database is stopped and kept with its settings, and `crossfyre db up` goes back to it.
+
 ## Build from source
 
 With a stable [Rust toolchain](https://rustup.rs):
@@ -124,14 +138,7 @@ cargo build --release
 
 Or install one engine with `cargo install --git https://github.com/clickswave/crossfyre-toolchain.git ambulo`.
 
-A source build sets up no services, so before the first scan start the database the engines keep their state in, then the daemon of each engine you use:
-
-```sh
-crossfyre db up
-ambulo daemon &
-```
-
-`crossfyre db up` makes a PostgreSQL cluster of your own in the toolchain directory with the PostgreSQL programs installed on the machine (on Debian, Ubuntu or Kali, `sudo apt install postgresql`), and starts it. It listens on 127.0.0.1 only, with a generated password kept in the toolchain's `config.toml`, which the engines read. To use a database you run yourself instead, record it with `crossfyre db external HOST PORT USER`.
+A source build sets up no services, and needs none: the first command you give an engine starts its daemon, and the first of voyage's, doorward's and ambulo's daemons makes the local database, so install PostgreSQL's programs before the first scan. [How the engines run](#how-the-engines-run) has the rest.
 
 `cfx-script` embeds Python, so building it needs one. On Linux that is your distribution's Python and its development files. On macOS it has to be Python 3.10 or later, and the `python3` that comes with the Xcode command line tools is 3.9, so name another one: `PYO3_PYTHON=/opt/homebrew/bin/python3 cargo build --release`. Windows needs no Python to build it, and Python 3.10 or later to run scripts.
 

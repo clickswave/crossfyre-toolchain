@@ -34,11 +34,16 @@ terminal.
 
 `doorward scan --help` for everything.
 
-## Daemon
+## How it runs
 
-Under the Crossfyre node, doorward runs as a daemon (`doorward daemon`, default port 4443) that
-takes work over a local socket. You do not need that for standalone use; just run
-`doorward scan`.
+The scans run in doorward's daemon, on 127.0.0.1:4443, and the commands here are its
+clients. The first command starts the daemon when none is running, and a daemon
+started that way exits after 30 minutes with no client and no scan. `doorward daemon`
+runs one by hand, and `--no-autostart` turns the starting off. It keeps each scan's
+state in PostgreSQL, and the first daemon makes the database, so install PostgreSQL's
+programs before the first scan (`sudo apt install postgresql` on Debian, Ubuntu or
+Kali), or point it at a database you run with `crossfyre db external`. The root
+[README](../#how-the-engines-run) has the details.
 
 ## Notes
 
