@@ -154,6 +154,10 @@ fn as_json(d: &Detection) -> Value {
         "confidence": d.confidence,
         "evidence": d.evidence,
         "candidates": d.candidates,
+        "version_range": d.version_range.as_ref().map(|r| json!({
+            "since": r.since.as_ref().map(ToString::to_string),
+            "until": r.until.as_ref().map(ToString::to_string),
+        })),
     })
 }
 
@@ -204,8 +208,8 @@ async fn each_saved_response_gives_the_detections_it_gave_before() {
 }
 
 /// Each leaf is exercised by a saved host: every `detect` leaf, under a `none` too, is
-/// present in one, and every `version` leaf reads a version in one its signature is
-/// present in. Every group of a version pattern gives the version in one, through a leaf
+/// present in one, and every `version` leaf reads a version, or for a range is present,
+/// in one its signature is present in. Every group of a version pattern gives the version in one, through a leaf
 /// that carries the pattern.
 #[tokio::test]
 async fn the_saved_responses_exercise_every_leaf() {
@@ -236,6 +240,17 @@ async fn the_saved_responses_exercise_every_leaf() {
             .collect();
         let mut groups: BTreeMap<&str, Vec<bool>> = BTreeMap::new();
         for (n, leaf) in signature.version.iter().enumerate() {
+            // A leaf that gives a range is exercised by being present where its product is.
+            if leaf.range.is_some() {
+                if !found_in.iter().any(|h| h.answer(leaf).0 == Answer::Present) {
+                    missing.push(format!(
+                        "{}: version leaf {} is present on no saved host its product is",
+                        signature.id,
+                        n + 1
+                    ));
+                }
+                continue;
+            }
             let Some(regex) = &leaf.regex else {
                 continue;
             };

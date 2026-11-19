@@ -86,7 +86,10 @@ combine the answers, nested as deep as needed. A product is reported when its `d
 is present. Each leaf that holds it up adds to the confidence, 50, 45, 60, 25, 40, 50,
 50 and 40 by kind unless the leaf sets its own `confidence`, up to 100. The first
 `version` leaf that matches gives the version from its first group, and `vendor` and
-`product` make the CPE.
+`product` make the CPE. A version leaf may give `since` or `until` in place of a group:
+when its evidence is present the version lies from `since` on and before `until`, the
+ranges of all such leaves that are present hold together, and an exact version, when one
+is read, wins.
 
 A `path`, a `script` or a `not_found` is a request the landing page did not need, so it
 is sent from the standard depth tier up, and only when its answer could still change

@@ -703,3 +703,72 @@ fn a_checksum_names_one_exact_file() {
     );
     assert_eq!(answer(status(404, "")), Answer::Absent);
 }
+
+/// A version leaf with `since` or `until` gives where the version lies when its evidence
+/// is present, in place of a captured version. The ranges of all that are present hold
+/// together; an exact version wins over them; and a path that gives a range is asked
+/// for a product found without a version, like any version path.
+#[tokio::test]
+async fn version_ranges_hold_together_and_an_exact_version_wins() {
+    let files = [(
+        "cms.yaml".to_string(),
+        "id: cms\ninfo: { name: CMS, category: Test }\n\
+         detect: { header: { name: x-cms, regex: '.' } }\n\
+         version: [ { header: { name: x-cms, regex: 'cms/([0-9.]+)' } }, \
+                    { html: { regex: 'blocks\\.css', since: '5.0' } }, \
+                    { html: { regex: 'legacy\\.js', until: '6.10' } }, \
+                    { path: { path: /new.js, since: '6.4' } } ]\n"
+            .to_string(),
+    )];
+    let files: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(f, t)| (f.as_str(), t.as_str()))
+        .collect();
+    let signatures = set(&files);
+    let range = |since: Option<&str>, until: Option<&str>| Range {
+        since: since.and_then(Version::parse),
+        until: until.and_then(Version::parse),
+    };
+    let found = |cms: &'static str, body: &'static str, new_js: u16| {
+        let signatures = &signatures;
+        async move {
+            let headers = [("x-cms".to_string(), cms.to_string())];
+            let mut host = Host::new(
+                signatures,
+                "http://host.test/",
+                &headers,
+                &[],
+                body,
+                STANDARD,
+            );
+            let sent = ask(&mut host, |path| {
+                std::future::ready(if path == "/new.js" {
+                    status(new_js, "new")
+                } else {
+                    status(404, "")
+                })
+            })
+            .await;
+            let d = host.detections().remove(0);
+            (d.version, d.version_range, sent)
+        }
+    };
+    // Two ranges from the page, and one from a path, hold together: 6.4 up to 6.10.
+    assert_eq!(
+        found("on", "blocks.css legacy.js", 200).await,
+        (None, Some(range(Some("6.4"), Some("6.10"))), 3)
+    );
+    // The path not there: what the page says alone.
+    assert_eq!(
+        found("on", "blocks.css legacy.js", 404).await,
+        (None, Some(range(Some("5.0"), Some("6.10"))), 3)
+    );
+    // An exact version wins, and nothing is asked for a range.
+    assert_eq!(
+        found("cms/6.5.1", "blocks.css", 200).await,
+        (Some("6.5.1".into()), None, 0)
+    );
+    // Numbers compare as numbers: 6.10 comes after 6.9, so this range allows nothing.
+    let none = range(Some("6.10"), None).and(&range(None, Some("6.9")));
+    assert_eq!(none, None);
+}

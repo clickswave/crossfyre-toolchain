@@ -223,17 +223,18 @@ async fn progress_only_ever_goes_up() {
     );
 }
 
-/// A technology reaches the client with its evidence, which toolmark sends as a list, and
-/// with what it could not be told apart from.
+/// A technology reaches the client with its evidence, which toolmark sends as a list,
+/// with what it could not be told apart from, and with where its version lies when no
+/// exact one was read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_technology_reaches_the_client_with_its_evidence_and_candidates() {
+async fn a_technology_reaches_the_client_with_all_toolmark_says_of_it() {
     let target = listener(Reply::ok("x")).await;
     let mut events = toolmark_events("t", "s");
     events[0] = json!({"type": "finding", "data": {
         "type": "technology", "source": "toolmark", "severity": "info",
         "name": "Framework A", "category": "Test", "version": null, "cpe": "",
         "confidence": 100, "evidence": ["path /a/one.js: 200", "path /a/two.js: 200"],
-        "candidates": ["Framework B"]}});
+        "candidates": ["Framework B"], "version_range": {"since": "2.0", "until": null}}});
     let toolmark = stub_engine(StubOpts {
         events,
         ..Default::default()
@@ -254,6 +255,11 @@ async fn a_technology_reaches_the_client_with_its_evidence_and_candidates() {
     assert_eq!(
         v["technologies"][0]["candidates"],
         json!(["Framework B"]),
+        "{v}"
+    );
+    assert_eq!(
+        v["technologies"][0]["version_range"],
+        json!({"since": "2.0", "until": null}),
         "{v}"
     );
     assert_eq!(

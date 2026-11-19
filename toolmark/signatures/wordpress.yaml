@@ -14,3 +14,4 @@ detect:
 version:
   - meta: { name: generator, regex: '(?i)WordPress ([0-9.]+)' }
   - html: { regex: '(?i)WordPress ([0-9.]+)' }
+  - html: { regex: '/wp-includes/css/dist/block-library/style', since: '5.0' }

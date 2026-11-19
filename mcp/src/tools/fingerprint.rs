@@ -198,6 +198,11 @@ pub(crate) async fn run(
                     "cpe": untrusted::clean(e.get("cpe").and_then(|c| c.as_str()).unwrap_or(""), 200),
                     "confidence": e.get("confidence").filter(|c| c.is_number()).cloned().unwrap_or(Value::Null),
                     "candidates": candidates,
+                    "version_range": untrusted::sanitize_value(
+                        e.get("version_range").unwrap_or(&Value::Null),
+                        200,
+                        2,
+                    ),
                 }));
                 if let Some(v) = e
                     .get("version")

@@ -74,7 +74,10 @@ impl Toolmark {
                 // pick per type rather than showing one field that is empty
                 // for two of the three.
                 let detail = match kind.as_str() {
-                    "technology" => data["version"].as_str().unwrap_or("").to_string(),
+                    "technology" => match data["version"].as_str() {
+                        Some(version) => version.to_string(),
+                        None => range_text(&data["version_range"]),
+                    },
                     "vulnerability" => data["cve"].as_str().unwrap_or("").to_string(),
                     _ => data["server"].as_str().unwrap_or("").to_string(),
                 };
@@ -225,6 +228,18 @@ pub async fn run(rx: mpsc::UnboundedReceiver<Value>, target: String) -> std::io:
     .map_err(|e| std::io::Error::other(e.to_string()))?
 }
 
+/// Where a version lies, as `>= 5.0, < 6.5`, or empty for no range.
+fn range_text(range: &Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(since) = range["since"].as_str() {
+        parts.push(format!(">= {since}"));
+    }
+    if let Some(until) = range["until"].as_str() {
+        parts.push(format!("< {until}"));
+    }
+    parts.join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,5 +264,23 @@ mod tests {
                 "Framework A, possibly Framework B or Framework C"
             ]
         );
+    }
+
+    /// A technology with no exact version shows where its version lies.
+    #[test]
+    fn a_technology_shows_a_version_range_when_it_has_no_version() {
+        let mut view = Toolmark::new("http://example.test/".into());
+        for (version, range) in [
+            (json!("6.4.2"), json!(null)),
+            (json!(null), json!({"since": "5.0", "until": null})),
+            (json!(null), json!({"since": "6.4", "until": "6.5"})),
+        ] {
+            view.apply(json!({"type": "finding", "data": {
+                "type": "technology", "name": "WordPress", "version": version,
+                "version_range": range,
+            }}));
+        }
+        let details: Vec<&str> = view.findings.iter().map(|f| f.detail.as_str()).collect();
+        assert_eq!(details, ["6.4.2", ">= 5.0", ">= 6.4, < 6.5"]);
     }
 }

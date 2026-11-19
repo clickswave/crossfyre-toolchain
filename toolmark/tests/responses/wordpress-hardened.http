@@ -1,0 +1,18 @@
+# Synthetic: A WordPress page with its generator tag and version queries taken out, as
+# hardening plugins do. The block library stylesheet it still loads first shipped in
+# WordPress 5.0.
+HTTP/1.1 200 OK
+content-type: text/html; charset=UTF-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Example</title>
+<link rel='stylesheet' id='wp-block-library-css' href='/wp-includes/css/dist/block-library/style.min.css' media='all' />
+</head>
+<body>
+<div class="wp-site-blocks"></div>
+</body>
+</html>

@@ -9,7 +9,8 @@
         "body pattern"
       ],
       "name": "Angular",
-      "version": "17.0.8"
+      "version": "17.0.8",
+      "version_range": null
     }
   ],
   "apache-behind-balancer.http": [
@@ -22,7 +23,8 @@
         "not-found page: 404"
       ],
       "name": "Apache HTTP Server",
-      "version": "2.4.58"
+      "version": "2.4.58",
+      "version_range": null
     }
   ],
   "apache-php-in-server.http": [
@@ -35,7 +37,8 @@
         "header server: Apache/2.4.41 (Unix) PHP/7.4.3"
       ],
       "name": "Apache HTTP Server",
-      "version": "2.4.41"
+      "version": "2.4.41",
+      "version_range": null
     },
     {
       "candidates": [],
@@ -46,7 +49,8 @@
         "cookie PHPSESSID"
       ],
       "name": "PHP",
-      "version": "7.4.3"
+      "version": "7.4.3",
+      "version_range": null
     }
   ],
   "apache-version-in-error-page.http": [
@@ -59,7 +63,8 @@
         "header server: Apache"
       ],
       "name": "Apache HTTP Server",
-      "version": "2.4.58"
+      "version": "2.4.58",
+      "version_range": null
     }
   ],
   "bootstrap.http": [
@@ -72,7 +77,8 @@
         "body pattern"
       ],
       "name": "Bootstrap",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "cloudflare.http": [
@@ -86,7 +92,8 @@
         "header cf-ray: 8e1f2a3b4c5d6e7f-BOM"
       ],
       "name": "Cloudflare",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "drupal.http": [
@@ -101,7 +108,8 @@
         "body pattern"
       ],
       "name": "Drupal",
-      "version": "10"
+      "version": "10",
+      "version_range": null
     },
     {
       "candidates": [],
@@ -112,7 +120,8 @@
         "implied by Drupal"
       ],
       "name": "PHP",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "express-quiet.http": [
@@ -125,7 +134,8 @@
         "not-found page: 404"
       ],
       "name": "Express",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -136,7 +146,8 @@
         "implied by Express"
       ],
       "name": "Node.js",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "flask-session-cookie.http": [
@@ -149,7 +160,8 @@
         "header server: Werkzeug/3.0.1 Python/3.12.1"
       ],
       "name": "Werkzeug",
-      "version": "3.0.1"
+      "version": "3.0.1",
+      "version_range": null
     },
     {
       "candidates": [],
@@ -161,7 +173,8 @@
         "header server: Werkzeug/3.0.1 Python/3.12.1"
       ],
       "name": "Flask",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -172,7 +185,8 @@
         "implied by Werkzeug"
       ],
       "name": "Python",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "generator-content-first.http": [
@@ -185,7 +199,8 @@
         "meta generator: WordPress 6.5"
       ],
       "name": "WordPress",
-      "version": "6.5"
+      "version": "6.5",
+      "version_range": null
     },
     {
       "candidates": [],
@@ -196,7 +211,8 @@
         "implied by WordPress"
       ],
       "name": "PHP",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -207,7 +223,8 @@
         "implied by WordPress"
       ],
       "name": "MySQL",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "generator-past-60k.http": [
@@ -220,7 +237,8 @@
         "meta generator: Drupal 9 (https://www.drupal.org)"
       ],
       "name": "Drupal",
-      "version": "9"
+      "version": "9",
+      "version_range": null
     },
     {
       "candidates": [],
@@ -231,7 +249,8 @@
         "implied by Drupal"
       ],
       "name": "PHP",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "ghost.http": [
@@ -244,7 +263,8 @@
         "header x-powered-by: Express"
       ],
       "name": "Express",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -256,7 +276,8 @@
         "body pattern"
       ],
       "name": "Ghost",
-      "version": "5.75"
+      "version": "5.75",
+      "version_range": null
     },
     {
       "candidates": [],
@@ -267,7 +288,8 @@
         "implied by Express"
       ],
       "name": "Node.js",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "gunicorn-django.http": [
@@ -280,7 +302,8 @@
         "header server: gunicorn/20.1.0"
       ],
       "name": "Gunicorn",
-      "version": "20.1.0"
+      "version": "20.1.0",
+      "version_range": null
     },
     {
       "candidates": [],
@@ -292,7 +315,8 @@
         "cookie django_language"
       ],
       "name": "Django",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -303,7 +327,8 @@
         "implied by Gunicorn"
       ],
       "name": "Python",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "iis-aspnet.http": [
@@ -316,7 +341,8 @@
         "header server: Microsoft-IIS/10.0"
       ],
       "name": "Microsoft IIS",
-      "version": "10.0"
+      "version": "10.0",
+      "version_range": null
     },
     {
       "candidates": [],
@@ -329,7 +355,8 @@
         "cookie ASP.NET_SessionId"
       ],
       "name": "ASP.NET",
-      "version": "4.0.30319"
+      "version": "4.0.30319",
+      "version_range": null
     }
   ],
   "iis-static.http": [
@@ -342,7 +369,8 @@
         "header server: Microsoft-IIS/10.0"
       ],
       "name": "Microsoft IIS",
-      "version": "10.0"
+      "version": "10.0",
+      "version_range": null
     },
     {
       "candidates": [],
@@ -353,7 +381,8 @@
         "implied by Microsoft IIS"
       ],
       "name": "ASP.NET",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "jetty.http": [
@@ -366,7 +395,8 @@
         "header server: Jetty(9.4.53.v20231009)"
       ],
       "name": "Jetty",
-      "version": "9.4.53"
+      "version": "9.4.53",
+      "version_range": null
     },
     {
       "candidates": [],
@@ -377,7 +407,8 @@
         "implied by Jetty"
       ],
       "name": "Java",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "joomla-1-5.http": [
@@ -391,7 +422,8 @@
         "body pattern"
       ],
       "name": "Joomla",
-      "version": "1.5"
+      "version": "1.5",
+      "version_range": null
     },
     {
       "candidates": [],
@@ -402,7 +434,8 @@
         "implied by Joomla"
       ],
       "name": "PHP",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "joomla.http": [
@@ -416,7 +449,8 @@
         "body pattern"
       ],
       "name": "Joomla",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -427,7 +461,8 @@
         "implied by Joomla"
       ],
       "name": "PHP",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "jquery-banner.http": [
@@ -440,7 +475,8 @@
         "body pattern"
       ],
       "name": "jQuery",
-      "version": "3.7.1"
+      "version": "3.7.1",
+      "version_range": null
     }
   ],
   "jquery-cdnjs.http": [
@@ -453,7 +489,8 @@
         "script src https://cdnjs.cloudflare.com/ajax/libs/jquery/3.4.1/jquery.min.js"
       ],
       "name": "jQuery",
-      "version": "3.4.1"
+      "version": "3.4.1",
+      "version_range": null
     }
   ],
   "jquery-file.http": [
@@ -467,7 +504,8 @@
         "script src /static/js/jquery-3.6.0.min.js"
       ],
       "name": "jQuery",
-      "version": "3.6.0"
+      "version": "3.6.0",
+      "version_range": null
     }
   ],
   "jquery-unversioned.http": [
@@ -480,7 +518,8 @@
         "script src /static/js/jquery.min.js"
       ],
       "name": "jQuery",
-      "version": "3.5.1"
+      "version": "3.5.1",
+      "version_range": null
     }
   ],
   "jquery-wordpress.http": [
@@ -493,7 +532,8 @@
         "body pattern"
       ],
       "name": "WordPress",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -504,7 +544,8 @@
         "script src /wp-includes/js/jquery/jquery.min.js?ver=3.7.1"
       ],
       "name": "jQuery",
-      "version": "3.7.1"
+      "version": "3.7.1",
+      "version_range": null
     },
     {
       "candidates": [],
@@ -515,7 +556,8 @@
         "implied by WordPress"
       ],
       "name": "PHP",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -526,7 +568,8 @@
         "implied by WordPress"
       ],
       "name": "MySQL",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "kestrel.http": [
@@ -539,7 +582,8 @@
         "header server: Kestrel"
       ],
       "name": "Kestrel",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -550,7 +594,8 @@
         "header server: Kestrel"
       ],
       "name": "ASP.NET Core",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "lab-bwapp.http": [
@@ -563,7 +608,8 @@
         "header server: Apache/2.4.7 (Ubuntu)"
       ],
       "name": "Apache HTTP Server",
-      "version": "2.4.7"
+      "version": "2.4.7",
+      "version_range": null
     },
     {
       "candidates": [],
@@ -574,7 +620,8 @@
         "header x-powered-by: PHP/5.5.9-1ubuntu4.14"
       ],
       "name": "PHP",
-      "version": "5.5.9"
+      "version": "5.5.9",
+      "version_range": null
     }
   ],
   "lab-directus.http": [],
@@ -588,7 +635,8 @@
         "script src /static/jquery/jquery.min.js"
       ],
       "name": "jQuery",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -599,7 +647,8 @@
         "body pattern"
       ],
       "name": "Bootstrap",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "lab-dvwa.http": [
@@ -612,7 +661,8 @@
         "header server: Apache/2.4.68 (Debian)"
       ],
       "name": "Apache HTTP Server",
-      "version": "2.4.68"
+      "version": "2.4.68",
+      "version_range": null
     },
     {
       "candidates": [],
@@ -623,7 +673,8 @@
         "header x-powered-by: PHP/8.5.9"
       ],
       "name": "PHP",
-      "version": "8.5.9"
+      "version": "8.5.9",
+      "version_range": null
     }
   ],
   "lab-faultline.http": [
@@ -636,7 +687,8 @@
         "header server: nginx/1.20.2"
       ],
       "name": "Nginx",
-      "version": "1.20.2"
+      "version": "1.20.2",
+      "version_range": null
     }
   ],
   "lab-juice-shop.http": [],
@@ -652,7 +704,8 @@
         "header server: nginx"
       ],
       "name": "Nginx",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "lab-modsec-detectonly.http": [
@@ -665,7 +718,8 @@
         "header server: nginx"
       ],
       "name": "Nginx",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "lab-modsec.http": [
@@ -678,7 +732,8 @@
         "header server: nginx"
       ],
       "name": "Nginx",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "lab-mutillidae.http": [
@@ -691,7 +746,8 @@
         "header server: Apache/2.4.67 (Debian)"
       ],
       "name": "Apache HTTP Server",
-      "version": "2.4.67"
+      "version": "2.4.67",
+      "version_range": null
     },
     {
       "candidates": [],
@@ -703,7 +759,8 @@
         "cookie PHPSESSID"
       ],
       "name": "PHP",
-      "version": "8.5.7"
+      "version": "8.5.7",
+      "version_range": null
     },
     {
       "candidates": [],
@@ -714,7 +771,8 @@
         "script src javascript/jQuery/jquery.js"
       ],
       "name": "jQuery",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "lab-paperless.http": [
@@ -727,7 +785,8 @@
         "cookie csrftoken"
       ],
       "name": "Django",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -738,7 +797,8 @@
         "body pattern"
       ],
       "name": "Bootstrap",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -749,7 +809,8 @@
         "implied by Django"
       ],
       "name": "Python",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "lab-railsgoat.http": [
@@ -762,7 +823,8 @@
         "script src https://cdn.jsdelivr.net/npm/jquery@3.6.0/dist/jquery.min.js"
       ],
       "name": "jQuery",
-      "version": "3.6.0"
+      "version": "3.6.0",
+      "version_range": null
     },
     {
       "candidates": [],
@@ -773,7 +835,8 @@
         "body pattern"
       ],
       "name": "Bootstrap",
-      "version": "5.3.0"
+      "version": "5.3.0",
+      "version_range": null
     }
   ],
   "lab-tandoor.http": [
@@ -786,7 +849,8 @@
         "header server: nginx"
       ],
       "name": "Nginx",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -797,7 +861,8 @@
         "cookie csrftoken"
       ],
       "name": "Django",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -808,7 +873,8 @@
         "script src /static/js/jquery-3.5.1.min.dc5e7f18c8d3.js"
       ],
       "name": "jQuery",
-      "version": "3.5.1"
+      "version": "3.5.1",
+      "version_range": null
     },
     {
       "candidates": [],
@@ -819,7 +885,8 @@
         "implied by Django"
       ],
       "name": "Python",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "lab-vampi.http": [
@@ -832,7 +899,8 @@
         "header server: Werkzeug/2.2.3 Python/3.11.15"
       ],
       "name": "Werkzeug",
-      "version": "2.2.3"
+      "version": "2.2.3",
+      "version_range": null
     },
     {
       "candidates": [],
@@ -843,7 +911,8 @@
         "header server: Werkzeug/2.2.3 Python/3.11.15"
       ],
       "name": "Flask",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -854,7 +923,8 @@
         "implied by Werkzeug"
       ],
       "name": "Python",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "lab-vulnerableapp.http": [
@@ -867,7 +937,8 @@
         "body pattern"
       ],
       "name": "Bootstrap",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "lab-wikijs.http": [
@@ -880,7 +951,8 @@
         "header x-powered-by: Express"
       ],
       "name": "Express",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -891,7 +963,8 @@
         "implied by Express"
       ],
       "name": "Node.js",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "lab-xssmaze.http": [],
@@ -906,7 +979,8 @@
         "cookie XSRF-TOKEN"
       ],
       "name": "Laravel",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -917,7 +991,8 @@
         "implied by Laravel"
       ],
       "name": "PHP",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "litespeed-php.http": [
@@ -930,7 +1005,8 @@
         "header server: LiteSpeed"
       ],
       "name": "LiteSpeed",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -941,7 +1017,8 @@
         "header x-powered-by: PHP/8.2.12"
       ],
       "name": "PHP",
-      "version": "8.2.12"
+      "version": "8.2.12",
+      "version_range": null
     }
   ],
   "long-server-header.http": [
@@ -954,7 +1031,8 @@
         "header server: Apache/2.4.62 (Unix) OpenSSL/3.0.13 mod_perl/2.0.12 Perl/v5.38.2 mod_wsgi/5.0.0 …"
       ],
       "name": "Apache HTTP Server",
-      "version": "2.4.62"
+      "version": "2.4.62",
+      "version_range": null
     }
   ],
   "magento.http": [
@@ -968,7 +1046,8 @@
         "body pattern"
       ],
       "name": "Magento",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -979,7 +1058,8 @@
         "implied by Magento"
       ],
       "name": "PHP",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "nextjs-version-in-page.http": [
@@ -992,7 +1072,8 @@
         "body pattern"
       ],
       "name": "Next.js",
-      "version": "14.0.4"
+      "version": "14.0.4",
+      "version_range": null
     },
     {
       "candidates": [],
@@ -1003,7 +1084,8 @@
         "implied by Next.js"
       ],
       "name": "React",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -1014,7 +1096,8 @@
         "implied by Next.js"
       ],
       "name": "Node.js",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "nextjs.http": [
@@ -1028,7 +1111,8 @@
         "body pattern"
       ],
       "name": "Next.js",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -1039,7 +1123,8 @@
         "implied by Next.js"
       ],
       "name": "React",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -1050,7 +1135,8 @@
         "implied by Next.js"
       ],
       "name": "Node.js",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "nginx-behind-cloudflare.http": [
@@ -1063,7 +1149,8 @@
         "not-found page: 404"
       ],
       "name": "Nginx",
-      "version": "1.24.0"
+      "version": "1.24.0",
+      "version_range": null
     },
     {
       "candidates": [],
@@ -1075,7 +1162,8 @@
         "header cf-ray: 8e1f2a3b4c5d6e7f-BOM"
       ],
       "name": "Cloudflare",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "nginx-version-in-error-page.http": [
@@ -1088,7 +1176,8 @@
         "header server: nginx"
       ],
       "name": "Nginx",
-      "version": "1.24.0"
+      "version": "1.24.0",
+      "version_range": null
     }
   ],
   "nuxt.http": [
@@ -1101,7 +1190,8 @@
         "body pattern"
       ],
       "name": "Nuxt.js",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -1112,7 +1202,8 @@
         "implied by Nuxt.js"
       ],
       "name": "Vue.js",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -1123,7 +1214,8 @@
         "implied by Nuxt.js"
       ],
       "name": "Node.js",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "openresty-error-page.http": [
@@ -1136,7 +1228,8 @@
         "header server: openresty"
       ],
       "name": "OpenResty",
-      "version": "1.21.4.3"
+      "version": "1.21.4.3",
+      "version_range": null
     },
     {
       "candidates": [],
@@ -1147,7 +1240,8 @@
         "implied by OpenResty"
       ],
       "name": "Nginx",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "openresty.http": [
@@ -1160,7 +1254,8 @@
         "header server: openresty/1.21.4.3"
       ],
       "name": "OpenResty",
-      "version": "1.21.4.3"
+      "version": "1.21.4.3",
+      "version_range": null
     },
     {
       "candidates": [],
@@ -1171,7 +1266,8 @@
         "implied by OpenResty"
       ],
       "name": "Nginx",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "rails.http": [
@@ -1185,7 +1281,8 @@
         "body pattern"
       ],
       "name": "Ruby on Rails",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -1196,7 +1293,8 @@
         "implied by Ruby on Rails"
       ],
       "name": "Ruby",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "react.http": [
@@ -1209,7 +1307,8 @@
         "body pattern"
       ],
       "name": "React",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "shopify.http": [
@@ -1224,7 +1323,8 @@
         "body pattern"
       ],
       "name": "Shopify",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "spring-trace.http": [
@@ -1237,7 +1337,8 @@
         "body pattern"
       ],
       "name": "Spring",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -1248,7 +1349,8 @@
         "cookie JSESSIONID"
       ],
       "name": "Java",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "squarespace.http": [
@@ -1262,7 +1364,8 @@
         "body pattern"
       ],
       "name": "Squarespace",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "tomcat-app.http": [
@@ -1275,7 +1378,8 @@
         "not-found page: 404"
       ],
       "name": "Apache Tomcat",
-      "version": "9.0.83"
+      "version": "9.0.83",
+      "version_range": null
     },
     {
       "candidates": [],
@@ -1286,7 +1390,8 @@
         "cookie JSESSIONID"
       ],
       "name": "Java",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "tomcat-coyote.http": [
@@ -1299,7 +1404,8 @@
         "header server: Apache-Coyote/1.1"
       ],
       "name": "Apache Tomcat",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -1310,7 +1416,8 @@
         "cookie JSESSIONID"
       ],
       "name": "Java",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "tomcat-error-page.http": [
@@ -1323,7 +1430,8 @@
         "body pattern"
       ],
       "name": "Apache Tomcat",
-      "version": "9.0.83"
+      "version": "9.0.83",
+      "version_range": null
     },
     {
       "candidates": [],
@@ -1334,7 +1442,8 @@
         "cookie JSESSIONID"
       ],
       "name": "Java",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "varnish.http": [
@@ -1348,7 +1457,8 @@
         "header x-varnish: 32770 3"
       ],
       "name": "Varnish",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "vite-svelte.http": [],
@@ -1362,7 +1472,8 @@
         "body pattern"
       ],
       "name": "Vue.js",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "wix.http": [
@@ -1376,7 +1487,49 @@
         "body pattern"
       ],
       "name": "Wix",
-      "version": null
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "wordpress-hardened.http": [
+    {
+      "candidates": [],
+      "category": "CMS",
+      "confidence": 25,
+      "cpe": "cpe:2.3:a:wordpress:wordpress:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "WordPress",
+      "version": null,
+      "version_range": {
+        "since": "5.0",
+        "until": null
+      }
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by WordPress"
+      ],
+      "name": "PHP",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by WordPress"
+      ],
+      "name": "MySQL",
+      "version": null,
+      "version_range": null
     }
   ],
   "wordpress-login.http": [
@@ -1389,7 +1542,8 @@
         "cookie wordpress_test_cookie"
       ],
       "name": "WordPress",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -1400,7 +1554,8 @@
         "implied by WordPress"
       ],
       "name": "PHP",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -1411,7 +1566,8 @@
         "implied by WordPress"
       ],
       "name": "MySQL",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "wordpress-plugin-generator-first.http": [
@@ -1424,7 +1580,8 @@
         "header server: Apache"
       ],
       "name": "Apache HTTP Server",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -1435,7 +1592,8 @@
         "body pattern"
       ],
       "name": "WordPress",
-      "version": "6.4.2"
+      "version": "6.4.2",
+      "version_range": null
     },
     {
       "candidates": [],
@@ -1446,7 +1604,8 @@
         "implied by WordPress"
       ],
       "name": "PHP",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -1457,7 +1616,8 @@
         "implied by WordPress"
       ],
       "name": "MySQL",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ],
   "wordpress.http": [
@@ -1470,7 +1630,8 @@
         "header server: nginx"
       ],
       "name": "Nginx",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -1482,7 +1643,8 @@
         "body pattern"
       ],
       "name": "WordPress",
-      "version": "6.4.2"
+      "version": "6.4.2",
+      "version_range": null
     },
     {
       "candidates": [],
@@ -1493,7 +1655,8 @@
         "implied by WordPress"
       ],
       "name": "PHP",
-      "version": null
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
@@ -1504,7 +1667,8 @@
         "implied by WordPress"
       ],
       "name": "MySQL",
-      "version": null
+      "version": null,
+      "version_range": null
     }
   ]
 }

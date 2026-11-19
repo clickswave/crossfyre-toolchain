@@ -28,6 +28,79 @@ pub struct Detection {
     /// The products that refine this one and could not be told apart from it, because
     /// the evidence that would decide went unanswered.
     pub candidates: Vec<String>,
+    /// Where the version lies when no exact one was read: what was found shipped from one
+    /// version on, or until one.
+    pub version_range: Option<Range>,
+}
+
+/// A version as a signature writes it, numbers separated by dots, which compare as
+/// numbers: 1.10 comes after 1.9.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Version {
+    parts: Vec<u64>,
+    written: String,
+}
+
+impl Version {
+    /// `text` as a version, when it is numbers separated by dots.
+    fn parse(text: &str) -> Option<Self> {
+        let parts = text
+            .split('.')
+            .map(|p| {
+                (!p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())).then(|| p.parse().ok())?
+            })
+            .collect::<Option<Vec<u64>>>()?;
+        Some(Self {
+            parts,
+            written: text.to_string(),
+        })
+    }
+}
+
+impl PartialOrd for Version {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Version {
+    /// By number, a missing part counting as 0, so 2.0 and 2 are the same version.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let n = self.parts.len().max(other.parts.len());
+        let at = |v: &Self, i: usize| v.parts.get(i).copied().unwrap_or(0);
+        (0..n)
+            .map(|i| at(self, i).cmp(&at(other, i)))
+            .find(|o| o.is_ne())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
+impl std::fmt::Display for Version {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.written)
+    }
+}
+
+/// Versions from `since` on and before `until`, either end open.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct Range {
+    pub since: Option<Version>,
+    pub until: Option<Version>,
+}
+
+impl Range {
+    /// What both this and `other` allow, or none when they allow nothing in common.
+    fn and(&self, other: &Range) -> Option<Range> {
+        let since = self.since.clone().max(other.since.clone());
+        let until = match (&self.until, &other.until) {
+            (Some(a), Some(b)) => Some(a.clone().min(b.clone())),
+            (a, b) => a.clone().or_else(|| b.clone()),
+        };
+        match (&since, &until) {
+            (Some(s), Some(u)) if s >= u => None,
+            _ => Some(Range { since, until }),
+        }
+    }
 }
 
 /// How much of the body an `html` leaf reads.
@@ -100,6 +173,9 @@ struct Leaf {
     regex: Option<Regex>,
     /// The SHA-256 of the exact file a `path` or `script` leaf is.
     sha256: Option<[u8; 32]>,
+    /// For a version leaf, where the version lies when this evidence is present, in place
+    /// of a version it captures.
+    range: Option<Range>,
     /// What it adds to the confidence when it is present.
     confidence: u32,
 }
@@ -752,7 +828,20 @@ impl<'a> Host<'a> {
         signature
             .version
             .iter()
+            .filter(|leaf| leaf.range.is_none())
             .find_map(|leaf| self.version_of(leaf).map(|(_, v)| v))
+    }
+
+    /// Where `signature`'s version lies here, from its range leaves that are present, all
+    /// of them at once. None when none is present, or when they allow no version at all.
+    fn version_range(&self, signature: &Signature) -> Option<Range> {
+        let mut ranges = signature
+            .version
+            .iter()
+            .filter(|leaf| self.answer(leaf).0 == Answer::Present)
+            .filter_map(|leaf| leaf.range.as_ref());
+        let first = ranges.next()?.clone();
+        ranges.try_fold(first, |all, range| all.and(range))
     }
 
     /// Whether a signature present here refines `signature`, directly or through others,
@@ -799,6 +888,10 @@ impl<'a> Host<'a> {
                 continue;
             }
             let version = self.version(signature);
+            let version_range = version
+                .is_none()
+                .then(|| self.version_range(signature))
+                .flatten();
             found.push((
                 signature,
                 Detection {
@@ -809,6 +902,7 @@ impl<'a> Host<'a> {
                     confidence: outcome.confidence.min(100) as u8,
                     evidence: outcome.evidence.clone(),
                     candidates: self.candidates(signature, &outcomes),
+                    version_range,
                 },
             ));
         }
@@ -833,6 +927,7 @@ impl<'a> Host<'a> {
                     confidence: 30,
                     evidence: vec![format!("implied by {}", detection.name)],
                     candidates: Vec::new(),
+                    version_range: None,
                 });
             }
         }

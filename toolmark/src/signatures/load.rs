@@ -1,6 +1,6 @@
 //! Reading signature files: what a file may hold, and why one is left out.
 
-use super::{Leaf, MetaFinder, Node, Signature, Signatures, Source};
+use super::{Leaf, MetaFinder, Node, Range, Signature, Signatures, Source, Version};
 use regex::Regex;
 use serde::Deserialize;
 use serde_yaml::Value;
@@ -42,6 +42,8 @@ struct LeafSpec {
     path: Option<String>,
     src: Option<String>,
     sha256: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
     confidence: Option<u32>,
 }
 
@@ -249,7 +251,36 @@ fn leaf(kind: &str, value: Value, version: bool) -> Result<Leaf, String> {
     if spec.sha256.is_some() && !matches!(known, Kind::Path | Kind::Script) {
         return Err(format!("this {kind} leaf has no sha256"));
     }
-    if spec.sha256.is_some() && version {
+    let range = match (&spec.since, &spec.until) {
+        (None, None) => None,
+        _ if !version => {
+            return Err(format!(
+                "this {kind} leaf has no since or until: only a version leaf does"
+            ));
+        }
+        (since, until) => {
+            let parse = |text: &Option<String>| {
+                text.as_deref()
+                    .map(|v| {
+                        Version::parse(v).ok_or_else(|| {
+                            format!("{v:?} is not a version, numbers separated by dots")
+                        })
+                    })
+                    .transpose()
+            };
+            let range = Range {
+                since: parse(since)?,
+                until: parse(until)?,
+            };
+            if let (Some(s), Some(u)) = (&range.since, &range.until)
+                && s >= u
+            {
+                return Err(format!("since {s} is not before until {u}"));
+            }
+            Some(range)
+        }
+    };
+    if spec.sha256.is_some() && version && range.is_none() {
         return Err("a version leaf reads its version with a regex, not a sha256".into());
     }
     let sha256 = match &spec.sha256 {
@@ -272,7 +303,7 @@ fn leaf(kind: &str, value: Value, version: bool) -> Result<Leaf, String> {
             (Source::Header(name), Some(regex), 50)
         }
         Kind::Cookie => {
-            if version {
+            if version && range.is_none() {
                 return Err("a cookie leaf reads no version".into());
             }
             refuse(&spec.regex, "regex: it matches the cookie's name")?;
@@ -347,7 +378,9 @@ fn leaf(kind: &str, value: Value, version: bool) -> Result<Leaf, String> {
             }
             let regex = match spec.regex {
                 Some(pattern) => Some(compile(&pattern)?),
-                None if version => return Err("a version leaf needs a regex".into()),
+                None if version && range.is_none() && sha256.is_none() => {
+                    return Err("a version leaf needs a regex".into());
+                }
                 None => None,
             };
             (Source::Path(path), regex, 50)
@@ -361,13 +394,17 @@ fn leaf(kind: &str, value: Value, version: bool) -> Result<Leaf, String> {
         Some(c) => c,
         None => confidence,
     };
-    if let Some(regex) = regex.as_ref().filter(|r| version && r.captures_len() < 2) {
+    if let Some(regex) = regex
+        .as_ref()
+        .filter(|r| version && range.is_none() && r.captures_len() < 2)
+    {
         return Err(format!("version pattern {regex} captures nothing"));
     }
     Ok(Leaf {
         source,
         regex,
         sha256,
+        range,
         confidence,
     })
 }
@@ -547,6 +584,27 @@ mod tests {
                 ),
             ),
             (
+                "detect-since.yaml".into(),
+                format!(
+                    "id: detect-since\n{}",
+                    x("detect: { html: { regex: 'x', since: '1.0' } }\n")
+                ),
+            ),
+            (
+                "bad-since.yaml".into(),
+                format!(
+                    "id: bad-since\n{}",
+                    x("version: [ { html: { regex: 'x', since: '1.0-beta' } } ]\n")
+                ),
+            ),
+            (
+                "backwards-range.yaml".into(),
+                format!(
+                    "id: backwards-range\n{}",
+                    x("version: [ { html: { regex: 'x', since: '2.0', until: '1.9' } } ]\n")
+                ),
+            ),
+            (
                 "path-version.yaml".into(),
                 format!(
                     "id: path-version\n{}",
@@ -630,6 +688,9 @@ mod tests {
             ),
             ("header-with-src.yaml", "this header leaf has no src"),
             ("not-found-path.yaml", "this not_found leaf has no path"),
+            ("detect-since.yaml", "only a version leaf does"),
+            ("bad-since.yaml", "is not a version"),
+            ("backwards-range.yaml", "since 2.0 is not before until 1.9"),
             ("short-sha.yaml", "is not 64 hex digits"),
             ("sha-and-regex.yaml", "a regex or a sha256, not both"),
             ("html-sha.yaml", "this html leaf has no sha256"),

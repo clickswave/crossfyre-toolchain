@@ -260,6 +260,10 @@ async fn scan<O: crate::observe::Observer>(
                 "confidence": d.confidence,
                 "evidence": d.evidence,
                 "candidates": d.candidates,
+                "version_range": d.version_range.as_ref().map(|r| json!({
+                    "since": r.since.as_ref().map(ToString::to_string),
+                    "until": r.until.as_ref().map(ToString::to_string),
+                })),
             }
         }));
 
