@@ -3,7 +3,7 @@
 
 use crate::NotReady;
 use crate::account::{Account, Lock};
-use crate::local::{Cluster, Postgres, answers, find_postgres};
+use crate::local::{Cluster, Postgres, answers, find_postgres, port_taken};
 use crate::settings::{Backend, CONFIG_FILE, Settings};
 use std::path::{Path, PathBuf};
 
@@ -125,6 +125,11 @@ impl<'a> Toolchain<'a> {
         }
         let _lock = Lock::hold(self.account, &self.dir)?;
         let cluster = Cluster::in_toolchain(&self.dir);
+        // A cluster made on a port something else holds could not start, so a held port
+        // makes nothing.
+        if !cluster.exists() && answers(settings.port) {
+            return Err(port_taken(settings.port));
+        }
         let pg = self.programs(&cluster)?;
         let made = !cluster.exists();
         if made {
@@ -247,6 +252,24 @@ mod tests {
         assert_eq!(toolchain.status().unwrap(), None);
         assert_eq!(toolchain.stop().unwrap(), Stop::NotMade);
         assert!(!toolchain.dir().exists(), "made something");
+    }
+
+    #[test]
+    fn a_held_port_makes_no_cluster() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            port,
+            password: Some("pw".to_string()),
+            ..Settings::default()
+        };
+        std::fs::write(dir.path().join(CONFIG_FILE), settings.to_file()).unwrap();
+        let account = ThisAccount::new().unwrap();
+        let toolchain = Toolchain::new(dir.path().to_path_buf(), &account);
+        let e = toolchain.up().unwrap_err();
+        assert!(e.problem().contains("something else is listening"), "{e}");
+        assert!(!toolchain.cluster_dir().exists(), "made a cluster");
     }
 
     #[test]

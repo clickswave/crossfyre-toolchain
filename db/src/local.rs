@@ -271,7 +271,7 @@ pub(crate) fn answers(port: u16) -> bool {
 }
 
 /// The message for a port the local database cannot have.
-fn port_taken(port: u16) -> NotReady {
+pub(crate) fn port_taken(port: u16) -> NotReady {
     NotReady::new(
         format!(
             "something else is listening on {LOOPBACK}:{port}, the port config.toml gives the \
