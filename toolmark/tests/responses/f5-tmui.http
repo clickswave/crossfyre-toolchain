@@ -1,0 +1,15 @@
+# Synthetic: What a BIG-IP's management interface answers for /: a page that sends the browser on to its login.
+HTTP/1.1 200 OK
+content-type: text/html;charset=UTF-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>BIG-IP&reg;- Redirect</title>
+</head>
+<body>
+<a href="/tmui/login.jsp">Continue</a>
+</body>
+</html>

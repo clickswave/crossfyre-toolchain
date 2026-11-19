@@ -1,0 +1,8 @@
+# Synthetic: What a FortiGate's SSL VPN answers for /: a script that sends the browser to its login page.
+HTTP/1.1 200 OK
+content-type: text/html
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<html><script type="text/javascript">
+if (window!=top) top.location=window.location;top.location="/remote/login";
+</script></html>

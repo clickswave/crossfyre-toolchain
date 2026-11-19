@@ -1,0 +1,15 @@
+# Synthetic: The WebLogic Server Administration Console's login page, which names its version.
+HTTP/1.1 200 OK
+content-type: text/html;charset=UTF-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Oracle WebLogic Server Administration Console 12c</title>
+</head>
+<body>
+<div id="footer">WebLogic Server Version: 12.2.1.4.0</div>
+</body>
+</html>

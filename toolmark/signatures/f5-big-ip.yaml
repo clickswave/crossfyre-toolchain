@@ -1,0 +1,8 @@
+id: f5-big-ip
+info:
+  name: F5 BIG-IP
+  category: Load Balancer
+detect:
+  any:
+    - cookie: { name: '^BIGipServer' }
+    - html: { regex: '<title>BIG-IP&reg;-' }

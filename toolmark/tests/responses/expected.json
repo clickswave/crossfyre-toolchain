@@ -81,6 +81,21 @@
       "version_range": null
     }
   ],
+  "citrix-gateway.http": [
+    {
+      "candidates": [],
+      "category": "Load Balancer",
+      "confidence": 70,
+      "cpe": "",
+      "evidence": [
+        "cookie NSC_TMAS",
+        "body pattern"
+      ],
+      "name": "Citrix NetScaler",
+      "version": null,
+      "version_range": null
+    }
+  ],
   "cloudflare.http": [
     {
       "candidates": [],
@@ -92,6 +107,33 @@
         "header cf-ray: 8e1f2a3b4c5d6e7f-BOM"
       ],
       "name": "Cloudflare",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "confluence.http": [
+    {
+      "candidates": [],
+      "category": "Wiki",
+      "confidence": 75,
+      "cpe": "cpe:2.3:a:atlassian:confluence_server:7.19.16:*:*:*:*:*:*:*",
+      "evidence": [
+        "header x-confluence-request-time: 1763618400000",
+        "body pattern"
+      ],
+      "name": "Atlassian Confluence",
+      "version": "7.19.16",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Atlassian Confluence"
+      ],
+      "name": "Java",
       "version": null,
       "version_range": null
     }
@@ -190,6 +232,45 @@
       "version_range": null
     }
   ],
+  "exchange.http": [
+    {
+      "candidates": [],
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:microsoft:internet_information_services:10.0:*:*:*:*:*:*:*",
+      "evidence": [
+        "header server: Microsoft-IIS/10.0"
+      ],
+      "name": "Microsoft IIS",
+      "version": "10.0",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Framework",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:microsoft:asp.net:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "header x-powered-by: ASP.NET"
+      ],
+      "name": "ASP.NET",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Mail Server",
+      "confidence": 75,
+      "cpe": "",
+      "evidence": [
+        "header x-owa-version: 15.2.1258.12",
+        "body pattern"
+      ],
+      "name": "Microsoft Exchange Server",
+      "version": "15.2.1258.12",
+      "version_range": null
+    }
+  ],
   "express-quiet.http": [
     {
       "candidates": [],
@@ -212,6 +293,34 @@
         "implied by Express"
       ],
       "name": "Node.js",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "f5-big-ip.http": [
+    {
+      "candidates": [],
+      "category": "Load Balancer",
+      "confidence": 45,
+      "cpe": "",
+      "evidence": [
+        "cookie BIGipServerpool_web"
+      ],
+      "name": "F5 BIG-IP",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "f5-tmui.http": [
+    {
+      "candidates": [],
+      "category": "Load Balancer",
+      "confidence": 25,
+      "cpe": "",
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "F5 BIG-IP",
       "version": null,
       "version_range": null
     }
@@ -251,6 +360,34 @@
         "implied by Werkzeug"
       ],
       "name": "Python",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "fortios-header.http": [
+    {
+      "candidates": [],
+      "category": "Firewall",
+      "confidence": 50,
+      "cpe": "",
+      "evidence": [
+        "header server: xxxxxxxx-xxxxx"
+      ],
+      "name": "Fortinet FortiOS",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "fortios.http": [
+    {
+      "candidates": [],
+      "category": "Firewall",
+      "confidence": 25,
+      "cpe": "",
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "Fortinet FortiOS",
       "version": null,
       "version_range": null
     }
@@ -518,6 +655,21 @@
       "version_range": null
     }
   ],
+  "ivanti-connect-secure.http": [
+    {
+      "candidates": [],
+      "category": "VPN",
+      "confidence": 70,
+      "cpe": "cpe:2.3:a:ivanti:connect_secure:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "body pattern",
+        "cookie DSSignInURL"
+      ],
+      "name": "Ivanti Connect Secure",
+      "version": null,
+      "version_range": null
+    }
+  ],
   "jenkins.http": [
     {
       "candidates": [],
@@ -565,6 +717,32 @@
       "cpe": "",
       "evidence": [
         "implied by Jetty"
+      ],
+      "name": "Java",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "jira.http": [
+    {
+      "candidates": [],
+      "category": "Issue Tracker",
+      "confidence": 60,
+      "cpe": "cpe:2.3:a:atlassian:jira:9.4.14:*:*:*:*:*:*:*",
+      "evidence": [
+        "meta application-name: JIRA"
+      ],
+      "name": "Atlassian Jira",
+      "version": "9.4.14",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Atlassian Jira"
       ],
       "name": "Java",
       "version": null,
@@ -1355,6 +1533,21 @@
       "version_range": null
     }
   ],
+  "moveit-transfer.http": [
+    {
+      "candidates": [],
+      "category": "File Transfer",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:progress:moveit_transfer:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "body pattern",
+        "body pattern"
+      ],
+      "name": "Progress MOVEit Transfer",
+      "version": null,
+      "version_range": null
+    }
+  ],
   "nextjs-version-in-page.http": [
     {
       "candidates": [],
@@ -1669,6 +1862,33 @@
       "version_range": null
     }
   ],
+  "roundcube.http": [
+    {
+      "candidates": [],
+      "category": "Webmail",
+      "confidence": 70,
+      "cpe": "cpe:2.3:a:roundcube:webmail:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "cookie roundcube_sessid",
+        "body pattern"
+      ],
+      "name": "Roundcube Webmail",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Roundcube Webmail"
+      ],
+      "name": "PHP",
+      "version": null,
+      "version_range": null
+    }
+  ],
   "sentry.http": [
     {
       "candidates": [],
@@ -1705,6 +1925,45 @@
       ],
       "name": "Django",
       "version": null,
+      "version_range": null
+    }
+  ],
+  "sharepoint.http": [
+    {
+      "candidates": [],
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:microsoft:internet_information_services:10.0:*:*:*:*:*:*:*",
+      "evidence": [
+        "header server: Microsoft-IIS/10.0"
+      ],
+      "name": "Microsoft IIS",
+      "version": "10.0",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Framework",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:microsoft:asp.net:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "header x-powered-by: ASP.NET"
+      ],
+      "name": "ASP.NET",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "CMS",
+      "confidence": 100,
+      "cpe": "",
+      "evidence": [
+        "header microsoftsharepointteamservices: 16.0.0.10337",
+        "header sprequestguid: 1b2c3d4e-0000-4000-8000-000000000000"
+      ],
+      "name": "Microsoft SharePoint",
+      "version": "16.0.0.10337",
       "version_range": null
     }
   ],
@@ -1980,6 +2239,32 @@
       "version_range": null
     }
   ],
+  "weblogic.http": [
+    {
+      "candidates": [],
+      "category": "Application Server",
+      "confidence": 40,
+      "cpe": "cpe:2.3:a:oracle:weblogic_server:12.2.1.4.0:*:*:*:*:*:*:*",
+      "evidence": [
+        "not-found page: 404"
+      ],
+      "name": "Oracle WebLogic Server",
+      "version": "12.2.1.4.0",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Oracle WebLogic Server"
+      ],
+      "name": "Java",
+      "version": null,
+      "version_range": null
+    }
+  ],
   "wix.http": [
     {
       "candidates": [],
@@ -2236,6 +2521,21 @@
         "implied by Zabbix"
       ],
       "name": "PHP",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "zimbra.http": [
+    {
+      "candidates": [],
+      "category": "Mail Server",
+      "confidence": 70,
+      "cpe": "",
+      "evidence": [
+        "body pattern",
+        "cookie ZM_TEST"
+      ],
+      "name": "Zimbra Collaboration",
       "version": null,
       "version_range": null
     }

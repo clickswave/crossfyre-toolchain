@@ -1,0 +1,8 @@
+id: zimbra
+info:
+  name: Zimbra Collaboration
+  category: Mail Server
+detect:
+  any:
+    - html: { regex: '(?i)<title>\s*Zimbra Web Client Sign In\s*</title>' }
+    - cookie: { name: '^ZM_TEST$' }

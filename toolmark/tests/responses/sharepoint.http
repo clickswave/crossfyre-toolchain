@@ -1,0 +1,19 @@
+# Synthetic: A SharePoint site's sign-in redirect, with the headers SharePoint sends.
+HTTP/1.1 200 OK
+content-type: text/html;charset=UTF-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+server: Microsoft-IIS/10.0
+microsoftsharepointteamservices: 16.0.0.10337
+sprequestguid: 1b2c3d4e-0000-4000-8000-000000000000
+x-powered-by: ASP.NET
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Sign In</title>
+</head>
+<body>
+<form id="aspnetForm"></form>
+</body>
+</html>

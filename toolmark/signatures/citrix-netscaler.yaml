@@ -1,0 +1,8 @@
+id: citrix-netscaler
+info:
+  name: Citrix NetScaler
+  category: Load Balancer
+detect:
+  any:
+    - cookie: { name: '^NSC_' }
+    - html: { regex: '(?i)<title>\s*(?:Citrix|NetScaler) Gateway\s*</title>' }

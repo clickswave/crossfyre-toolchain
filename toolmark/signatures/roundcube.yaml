@@ -1,0 +1,12 @@
+id: roundcube
+info:
+  name: Roundcube Webmail
+  category: Webmail
+  metadata:
+    vendor: roundcube
+    product: webmail
+implies: [php]
+detect:
+  any:
+    - cookie: { name: '^roundcube_sessid$' }
+    - html: { regex: 'rcmail\s*=\s*new rcube_webmail' }

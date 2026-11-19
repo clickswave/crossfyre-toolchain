@@ -1,0 +1,17 @@
+# Synthetic: Ivanti Connect Secure's sign-in page, where the appliance sends anyone not signed in.
+HTTP/1.1 200 OK
+content-type: text/html;charset=UTF-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+set-cookie: DSSignInURL=
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Ivanti Connect Secure</title>
+<link rel="stylesheet" href="/dana-na/css/ds.css">
+</head>
+<body>
+<form name="frmLogin" action="login.cgi" method="POST"></form>
+</body>
+</html>

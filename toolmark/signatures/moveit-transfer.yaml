@@ -1,0 +1,11 @@
+id: moveit-transfer
+info:
+  name: Progress MOVEit Transfer
+  category: File Transfer
+  metadata:
+    vendor: progress
+    product: moveit_transfer
+detect:
+  all:
+    - html: { regex: '<title>[^<]*MOVEit Transfer' }
+    - html: { regex: '(?:action|href|src)="[^"]*human\.aspx' }

@@ -1,0 +1,17 @@
+# Synthetic: Jira's login page, which names the application and its version in meta tags.
+HTTP/1.1 200 OK
+content-type: text/html;charset=UTF-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Log in - Jira</title>
+<meta name="application-name" content="JIRA" data-name="jira" data-version="9.4.14">
+<meta name="ajs-version-number" content="9.4.14">
+</head>
+<body>
+<div id="page"></div>
+</body>
+</html>

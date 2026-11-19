@@ -1,0 +1,13 @@
+id: weblogic
+info:
+  name: Oracle WebLogic Server
+  category: Application Server
+  metadata:
+    vendor: oracle
+    product: weblogic_server
+implies: [java]
+detect:
+  any:
+    - not_found: { regex: '<TITLE>Error 404--Not Found</TITLE>' }
+version:
+  - path: { path: /console/login/LoginForm.jsp, regex: 'WebLogic Server Version: ([0-9]+(?:\.[0-9]+)*)' }
