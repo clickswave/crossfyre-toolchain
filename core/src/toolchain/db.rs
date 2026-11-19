@@ -4,7 +4,7 @@
 // `crossfyre db external`. cfx_db does the work. This is the commands, and the account
 // they act as, which as root is the user crossfyre was run for, never root itself.
 
-use super::config::{get_toolchain_dir, load_config, load_or_create_config, save_config};
+use super::config::{get_toolchain_dir, load_config, load_or_create_config_at, save_config_at};
 use super::sudo_user;
 use cfx_db::{Account, Backend, Settings, Stop, Toolchain, Up};
 
@@ -111,7 +111,7 @@ fn say_up(settings: &Settings, up: Up) {
 
 /// Say whether the database the user runs lets the settings in.
 async fn check_external(settings: &Settings) -> Result<(), Box<dyn std::error::Error>> {
-    cfx_db::check(settings, &super::config::get_config_path()).await?;
+    cfx_db::check(settings, Some(&super::config::get_config_path())).await?;
     super::ui::ok(&format!(
         "It answers on {}, and lets {} in.",
         settings.address(),
@@ -120,27 +120,13 @@ async fn check_external(settings: &Settings) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
-/// `crossfyre db external`: record a database the user runs as the one the engines use.
+/// `crossfyre db external`: record a database the user runs as the one the engines use,
+/// once it lets them in.
 async fn external(host: &str, port: u16, user: &str) -> Result<(), Box<dyn std::error::Error>> {
     use super::ui::{ok, warn};
     let password = external_password(host, user)?;
-    let mut config = load_or_create_config()?;
-    // The local database is not used once another is recorded, so it is not left
-    // running, and its data stays where it is.
-    let stopped = match config.postgres.backend {
-        Backend::Local => with_toolchain(|t| t.stop())?,
-        Backend::External { .. } => Stop::External,
-    };
-    config.postgres = Settings {
-        backend: Backend::External {
-            host: host.to_string(),
-        },
-        port,
-        user: user.to_string(),
-        password: (!password.is_empty()).then_some(password),
-        db_name: config.postgres.db_name,
-    };
-    save_config(&config)?;
+    let stopped = external_in(&get_toolchain_dir(), host, port, user, password).await?;
+    let config = load_config()?;
     ok(&format!(
         "config.toml now names the database you run at {}.",
         config.postgres.address()
@@ -152,7 +138,58 @@ async fn external(host: &str, port: u16, user: &str) -> Result<(), Box<dyn std::
         ));
     }
     restart_engines();
-    check_external(&config.postgres).await
+    ok(&format!(
+        "It answers on {}, and lets {} in.",
+        config.postgres.address(),
+        config.postgres.user
+    ));
+    Ok(())
+}
+
+/// Record the database at `host`:`port` as the one the engines use, in the toolchain
+/// directory `dir`, once it lets `user` in with `password`. Otherwise nothing changes.
+pub(crate) async fn external_in(
+    dir: &std::path::Path,
+    host: &str,
+    port: u16,
+    user: &str,
+    password: String,
+) -> Result<Stop, Box<dyn std::error::Error>> {
+    let settings = Settings {
+        backend: Backend::External {
+            host: host.to_string(),
+        },
+        port,
+        user: user.to_string(),
+        password: (!password.is_empty()).then_some(password),
+        ..Settings::default()
+    };
+    cfx_db::check(&settings, None)
+        .await
+        .map_err(|e| format!("{e}. Nothing was recorded, and config.toml is as it was"))?;
+    record_external_in(dir, settings)
+}
+
+/// config.toml in `dir` names the database `settings` describe, keeping the database name
+/// it had. A local database that runs is stopped, since nothing uses it now.
+fn record_external_in(
+    dir: &std::path::Path,
+    settings: Settings,
+) -> Result<Stop, Box<dyn std::error::Error>> {
+    let path = dir.join("config.toml");
+    let mut config = load_or_create_config_at(&path)?;
+    let account = account()?;
+    let toolchain = Toolchain::new(dir.to_path_buf(), account.as_ref());
+    let stopped = match config.postgres.backend {
+        Backend::Local => toolchain.stop()?,
+        Backend::External { .. } => Stop::External,
+    };
+    config.postgres = Settings {
+        db_name: config.postgres.db_name,
+        ..settings
+    };
+    save_config_at(&path, &config)?;
+    Ok(stopped)
 }
 
 /// The password for `user` at `host`: from [`PASSWORD_ENV`] when it is set, otherwise
@@ -281,6 +318,32 @@ fn lock_file_usable(is_file: bool, links: u64, owner: u32, user: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    const LOCAL: &str = "[postgres]\nbackend = \"local\"\nport = 4440\nuser = \"postgres\"\n\
+                         password = \"local-pw\"\ndb_name = \"crossfyre\"\n";
+
+    #[tokio::test]
+    async fn a_database_that_does_not_answer_is_not_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, LOCAL).unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let e = super::external_in(dir.path(), "127.0.0.1", port, "postgres", "pw".to_string())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            format!(
+                "nothing is listening on 127.0.0.1:{port}. Nothing was recorded, and \
+                 config.toml is as it was"
+            )
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), LOCAL);
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_lock_file_is_handed_to_the_user_only_when_it_is_one_of_its_own() {

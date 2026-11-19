@@ -103,7 +103,7 @@ async fn ready_in(dir: PathBuf, database: &str) -> Result<PgPool, NotReady> {
     })
     .await
     .map_err(|e| NotReady::new(format!("getting the database ready failed: {e}"), None))??;
-    let mut server = connect(&settings, &path, MAINTENANCE_DB).await?;
+    let mut server = connect(&settings, Some(&path), MAINTENANCE_DB).await?;
     let made = make_database(&mut server, database).await;
     let _ = server.close().await;
     made.map_err(|e| {
@@ -118,13 +118,13 @@ async fn ready_in(dir: PathBuf, database: &str) -> Result<PgPool, NotReady> {
     PgPoolOptions::new()
         .connect_with(settings.options(database))
         .await
-        .map_err(|e| not_reached(&settings, &path, e))
+        .map_err(|e| not_reached(&settings, Some(&path), e))
 }
 
-/// Whether the server `settings` names lets them in, as the settings in the config.toml
-/// at `path`.
-pub async fn check(settings: &Settings, path: &Path) -> Result<(), NotReady> {
-    let server = connect(settings, path, MAINTENANCE_DB).await?;
+/// Whether the server `settings` names lets them in. `config` is the config.toml they
+/// were read from, or None for settings given that are in no file yet.
+pub async fn check(settings: &Settings, config: Option<&Path>) -> Result<(), NotReady> {
+    let server = connect(settings, config, MAINTENANCE_DB).await?;
     let _ = server.close().await;
     Ok(())
 }
@@ -133,7 +133,7 @@ pub async fn check(settings: &Settings, path: &Path) -> Result<(), NotReady> {
 /// connection until its time is up and then says only that it timed out.
 async fn connect(
     settings: &Settings,
-    path: &Path,
+    config: Option<&Path>,
     database: &str,
 ) -> Result<PgConnection, NotReady> {
     tokio::time::timeout(
@@ -151,7 +151,7 @@ async fn connect(
             None,
         )
     })?
-    .map_err(|e| not_reached(settings, path, e))
+    .map_err(|e| not_reached(settings, config, e))
 }
 
 /// Make the database called `name` on the server unless it is there.
@@ -170,10 +170,13 @@ async fn make_database(server: &mut PgConnection, name: &str) -> Result<(), sqlx
 }
 
 /// Why the server `settings` names could not be used, from what connecting to it said.
-/// The settings are the ones in the config.toml at `path`.
-fn not_reached(settings: &Settings, path: &Path, e: sqlx::Error) -> NotReady {
+/// `config` is the config.toml the settings were read from, or None for settings given
+/// that are in no file yet.
+fn not_reached(settings: &Settings, config: Option<&Path>, e: sqlx::Error) -> NotReady {
     let at = settings.address();
-    let config = path.display();
+    let Some(config) = config.map(Path::display) else {
+        return not_reached_given(settings, e);
+    };
     // A database the user runs is fixed by recording it again; the local one by
     // `crossfyre db up` where anything fixes it.
     let record = match &settings.backend {
@@ -229,6 +232,33 @@ fn not_reached(settings: &Settings, path: &Path, e: sqlx::Error) -> NotReady {
         },
         _ => NotReady::new(format!("cannot reach the database on {at}: {e}"), None),
     }
+}
+
+/// [`not_reached`] for settings given on the command line, which only other settings fix.
+fn not_reached_given(settings: &Settings, e: sqlx::Error) -> NotReady {
+    let at = settings.address();
+    let problem = match &e {
+        sqlx::Error::Io(io) if io.kind() == std::io::ErrorKind::ConnectionRefused => {
+            format!("nothing is listening on {at}")
+        }
+        sqlx::Error::Database(db) => match db.code().as_deref() {
+            Some("28P01") => format!(
+                "the database on {at} refused the password given for {}",
+                settings.user
+            ),
+            Some("28000") => format!(
+                "the database on {at} refused user {}: {}",
+                settings.user,
+                db.message()
+            ),
+            _ => format!(
+                "the database on {at} refused the connection: {}",
+                db.message()
+            ),
+        },
+        _ => format!("cannot reach the database on {at}: {e}"),
+    };
+    NotReady::new(problem, None)
 }
 
 #[cfg(test)]
@@ -363,10 +393,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_password_given_that_is_refused_is_said_to_be_the_one_given() {
+        let port = refusing_server().await;
+        let e = check(&external_on(port), None).await.unwrap_err();
+        assert_eq!(
+            e.problem(),
+            format!("the database on 127.0.0.1:{port} refused the password given for postgres")
+        );
+        assert_eq!(e.fix(), None);
+    }
+
+    #[tokio::test]
     async fn the_local_database_refusing_its_password_says_config_changed() {
         let port = refusing_server().await;
         let path = Path::new("/t/config.toml");
-        let e = connect(&local_on(port), path, MAINTENANCE_DB)
+        let e = connect(&local_on(port), Some(path), MAINTENANCE_DB)
             .await
             .unwrap_err();
         assert_eq!(
@@ -380,7 +421,7 @@ mod tests {
     #[tokio::test]
     async fn the_local_database_not_listening_says_what_starts_it() {
         let port = closed_port();
-        let e = connect(&local_on(port), Path::new("/t/c"), MAINTENANCE_DB)
+        let e = connect(&local_on(port), Some(Path::new("/t/c")), MAINTENANCE_DB)
             .await
             .unwrap_err();
         assert_eq!(
@@ -499,9 +540,13 @@ mod tests {
             .unwrap();
         pool.close().await;
         let listens: String = {
-            let mut c = connect(&tc.settings().unwrap(), Path::new("c"), MAINTENANCE_DB)
-                .await
-                .unwrap();
+            let mut c = connect(
+                &tc.settings().unwrap(),
+                Some(Path::new("c")),
+                MAINTENANCE_DB,
+            )
+            .await
+            .unwrap();
             sqlx::query_scalar("SHOW listen_addresses")
                 .fetch_one(&mut c)
                 .await
