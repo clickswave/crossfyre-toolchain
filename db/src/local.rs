@@ -20,10 +20,21 @@ const PROGRAMS: [&str; 3] = ["initdb", "pg_ctl", "postgres"];
 /// How long `pg_ctl` waits for the server to start or stop.
 const PG_CTL_WAIT: &str = "60";
 
-/// The transient unit the server runs in where the user's service manager runs. Started
-/// by an engine, it would otherwise run in that engine's unit, and stopping or
-/// restarting the engine would stop it for every engine.
-const SCOPE: &str = "crossfyre-postgres";
+/// The transient unit the server in `data` runs in where the user's service manager
+/// runs. Started by an engine, it would otherwise run in that engine's unit, and
+/// stopping or restarting the engine would stop it for every engine. It is named after
+/// the data directory, so that two clusters of one user never claim the same unit.
+fn scope(data: &std::path::Path) -> String {
+    // FNV-1a over the path: a stable name, not a secret.
+    let hash = data
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .fold(0x811c_9dc5_u32, |h, b| {
+            (h ^ u32::from(*b)).wrapping_mul(0x0100_0193)
+        });
+    format!("crossfyre-postgres-{hash:08x}")
+}
 
 /// PostgreSQL's programs, as found on this machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -416,7 +427,7 @@ impl Cluster {
             Some(systemd_run) => {
                 let mut cmd = account.command(&systemd_run);
                 cmd.args(["--user", "--scope", "--quiet", "--collect"])
-                    .arg(format!("--unit={SCOPE}"))
+                    .arg(format!("--unit={}", scope(&self.data)))
                     .arg("--")
                     .arg(pg.program("pg_ctl"));
                 cmd
@@ -523,6 +534,22 @@ fn last_words(text: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn each_cluster_has_a_scope_of_its_own() {
+        let one = super::scope(std::path::Path::new("/home/a/.config/crossfyre/postgres"));
+        assert_eq!(
+            one,
+            super::scope(std::path::Path::new("/home/a/.config/crossfyre/postgres"))
+        );
+        assert_ne!(
+            one,
+            super::scope(std::path::Path::new("/tmp/t/crossfyre/postgres"))
+        );
+        assert!(
+            one.starts_with("crossfyre-postgres-") && one.len() == "crossfyre-postgres-".len() + 8
+        );
+    }
+
     use super::*;
 
     const DEBIAN: &str = "PRETTY_NAME=\"Debian GNU/Linux 13 (trixie)\"\nID=debian\n";
