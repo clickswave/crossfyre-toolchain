@@ -1,0 +1,15 @@
+id: tomcat
+info:
+  name: Apache Tomcat
+  category: Web Server
+  metadata:
+    vendor: apache
+    product: tomcat
+implies: [java]
+detect:
+  any:
+    - header: { name: server, regex: '(?i)tomcat|coyote' }
+    - cookie: { name: '(?i)^JSESSIONID$' }
+version:
+  - header: { name: server, regex: '(?i)tomcat/([0-9.]+)|coyote/([0-9.]+)' }
+  - html: { regex: '(?i)tomcat/([0-9.]+)|coyote/([0-9.]+)' }

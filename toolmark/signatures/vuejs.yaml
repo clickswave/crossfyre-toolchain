@@ -1,0 +1,7 @@
+id: vuejs
+info:
+  name: Vue.js
+  category: JavaScript Framework
+detect:
+  any:
+    - html: { regex: '(?i)data-v-[0-9a-f]{6,8}|vue(?:\.runtime)?(?:\.min)?\.js|id="app"' }

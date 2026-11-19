@@ -1,0 +1,9 @@
+id: bootstrap
+info:
+  name: Bootstrap
+  category: UI Framework
+detect:
+  any:
+    - html: { regex: '(?i)bootstrap(?:\.min)?\.(?:css|js)|class=.(?:container|navbar)-' }
+version:
+  - html: { regex: '(?i)bootstrap[.-v]*([0-9.]+)(?:\.min)?\.(?:css|js)' }

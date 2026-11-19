@@ -1,14 +1,16 @@
-//! Built-in web technology signatures + WAF/CDN passive detection.
+//! Web technology signatures, and the WAF and CDN tells read passively.
 //!
-//! This is a curated, hand-rolled signature set (no external dataset) so it
-//! carries no third-party data licensing. It is intentionally a superset-ready
-//! shape: a fuller Wappalyzer-compatible dataset can be loaded at runtime later
-//! (see docs/tier1-engines-plan.md section 2). Confidence is additive and capped,
-//! versions are extracted where a source exposes them, and CPEs are emitted as
-//! join keys for downstream CVE matching.
+//! A signature is a file in toolmark/signatures, compiled into the binary: the product it
+//! names, the evidence that shows it, where its version can be read, and the products it
+//! implies. Each is written by hand from public knowledge of the product, so no
+//! third-party dataset is compiled in. Confidence is additive and capped, and a CPE is
+//! built from the vendor and product a file names, as a join key for CVE matching.
+
+mod files;
 
 use regex::Regex;
-use std::collections::HashSet;
+use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
 /// One detected technology.
@@ -21,479 +23,437 @@ pub struct Detection {
     pub evidence: Vec<String>,
 }
 
-enum Pat {
-    /// (header-name-lowercase, value regex)
-    Header(&'static str, Regex),
-    /// cookie-name regex
-    Cookie(Regex),
-    /// meta generator content regex
-    Meta(Regex),
-    /// response-body regex
-    Body(Regex),
+/// How much of the body an `html` leaf reads.
+const HTML_READ: usize = 60_000;
+
+/// What a response shows, for a leaf to look at.
+enum Source {
+    /// The value of the first header with this name, which is lower case.
+    Header(String),
+    /// The name of each cookie the response sets.
+    Cookie,
+    /// The content of the first meta tag with this name, anywhere in the body.
+    Meta(String),
+    /// The first [`HTML_READ`] bytes of the body.
+    Html,
 }
 
-struct Rule {
-    name: &'static str,
-    category: &'static str,
-    /// CPE 2.3 template; "{}" is replaced with the detected version (or "*").
-    cpe: &'static str,
-    patterns: Vec<Pat>,
-    /// Version extractor, run over the concatenated evidence blob.
-    version: Option<Regex>,
-    implies: &'static [&'static str],
+/// One piece of evidence a signature looks for, or reads a version from.
+struct Leaf {
+    source: Source,
+    regex: Regex,
+    /// What it adds to the confidence when it is there.
+    confidence: u32,
 }
 
-fn h(name: &'static str, re: &str) -> Pat {
-    Pat::Header(name, Regex::new(re).unwrap())
-}
-fn ck(re: &str) -> Pat {
-    Pat::Cookie(Regex::new(re).unwrap())
-}
-fn mt(re: &str) -> Pat {
-    Pat::Meta(Regex::new(re).unwrap())
-}
-fn bd(re: &str) -> Pat {
-    Pat::Body(Regex::new(re).unwrap())
-}
-fn ver(re: &str) -> Option<Regex> {
-    Regex::new(re).ok()
-}
-
-static RULES: LazyLock<Vec<Rule>> = LazyLock::new(build_rules);
-
-fn build_rules() -> Vec<Rule> {
-    vec![
-        // --- Web servers ---
-        Rule {
-            name: "Nginx",
-            category: "Web Server",
-            cpe: "cpe:2.3:a:f5:nginx:{}:*:*:*:*:*:*:*",
-            patterns: vec![h("server", r"(?i)nginx")],
-            version: ver(r"(?i)nginx/([0-9.]+)"),
-            implies: &[],
-        },
-        Rule {
-            name: "Apache HTTP Server",
-            category: "Web Server",
-            cpe: "cpe:2.3:a:apache:http_server:{}:*:*:*:*:*:*:*",
-            patterns: vec![h("server", r"(?i)apache")],
-            version: ver(r"(?i)apache/([0-9.]+)"),
-            implies: &[],
-        },
-        Rule {
-            name: "Microsoft IIS",
-            category: "Web Server",
-            cpe: "cpe:2.3:a:microsoft:internet_information_services:{}:*:*:*:*:*:*:*",
-            patterns: vec![h("server", r"(?i)microsoft-iis|(?i)\biis\b")],
-            version: ver(r"(?i)iis/([0-9.]+)"),
-            implies: &["ASP.NET"],
-        },
-        Rule {
-            name: "OpenResty",
-            category: "Web Server",
-            cpe: "cpe:2.3:a:openresty:openresty:{}:*:*:*:*:*:*:*",
-            patterns: vec![h("server", r"(?i)openresty")],
-            version: ver(r"(?i)openresty/([0-9.]+)"),
-            implies: &["Nginx"],
-        },
-        Rule {
-            name: "LiteSpeed",
-            category: "Web Server",
-            cpe: "",
-            patterns: vec![h("server", r"(?i)litespeed")],
-            version: None,
-            implies: &[],
-        },
-        Rule {
-            name: "Apache Tomcat",
-            category: "Web Server",
-            cpe: "cpe:2.3:a:apache:tomcat:{}:*:*:*:*:*:*:*",
-            patterns: vec![h("server", r"(?i)tomcat|coyote"), ck(r"(?i)^JSESSIONID$")],
-            version: ver(r"(?i)tomcat/([0-9.]+)|coyote/([0-9.]+)"),
-            implies: &["Java"],
-        },
-        Rule {
-            name: "Jetty",
-            category: "Web Server",
-            cpe: "",
-            patterns: vec![h("server", r"(?i)jetty")],
-            version: ver(r"(?i)jetty\(?([0-9.]+)"),
-            implies: &["Java"],
-        },
-        Rule {
-            name: "Gunicorn",
-            category: "Web Server",
-            cpe: "",
-            patterns: vec![h("server", r"(?i)gunicorn")],
-            version: ver(r"(?i)gunicorn/([0-9.]+)"),
-            implies: &["Python"],
-        },
-        Rule {
-            name: "Kestrel",
-            category: "Web Server",
-            cpe: "",
-            patterns: vec![h("server", r"(?i)kestrel")],
-            version: None,
-            implies: &["ASP.NET Core"],
-        },
-        Rule {
-            name: "Werkzeug",
-            category: "Web Server",
-            cpe: "",
-            patterns: vec![h("server", r"(?i)werkzeug")],
-            version: ver(r"(?i)werkzeug/([0-9.]+)"),
-            implies: &["Python", "Flask"],
-        },
-        // --- Languages / runtimes ---
-        Rule {
-            name: "PHP",
-            category: "Language",
-            cpe: "cpe:2.3:a:php:php:{}:*:*:*:*:*:*:*",
-            patterns: vec![h("x-powered-by", r"(?i)php"), ck(r"(?i)^PHPSESSID$")],
-            version: ver(r"(?i)php/([0-9.]+)"),
-            implies: &[],
-        },
-        Rule {
-            name: "ASP.NET",
-            category: "Framework",
-            cpe: "cpe:2.3:a:microsoft:asp.net:{}:*:*:*:*:*:*:*",
-            patterns: vec![
-                h("x-powered-by", r"(?i)asp\.net"),
-                h("x-aspnet-version", r".+"),
-                ck(r"(?i)^ASP\.NET_SessionId$"),
-            ],
-            version: ver(r"(?i)x-aspnet-version:?\s*([0-9.]+)"),
-            implies: &[],
-        },
-        Rule {
-            name: "ASP.NET Core",
-            category: "Framework",
-            cpe: "",
-            patterns: vec![
-                h("x-powered-by", r"(?i)asp\.net"),
-                h("server", r"(?i)kestrel"),
-            ],
-            version: None,
-            implies: &[],
-        },
-        // --- Backend frameworks ---
-        Rule {
-            name: "Express",
-            category: "Framework",
-            cpe: "cpe:2.3:a:openjsf:express:{}:*:*:*:*:node.js:*:*",
-            patterns: vec![h("x-powered-by", r"(?i)express")],
-            version: None,
-            implies: &["Node.js"],
-        },
-        Rule {
-            name: "Laravel",
-            category: "Framework",
-            cpe: "",
-            patterns: vec![ck(r"(?i)^laravel_session$"), ck(r"(?i)^XSRF-TOKEN$")],
-            version: None,
-            implies: &["PHP"],
-        },
-        Rule {
-            name: "Django",
-            category: "Framework",
-            cpe: "",
-            patterns: vec![ck(r"(?i)^csrftoken$"), ck(r"(?i)^django")],
-            version: None,
-            implies: &["Python"],
-        },
-        Rule {
-            name: "Flask",
-            category: "Framework",
-            cpe: "",
-            patterns: vec![ck(r"(?i)^session$"), h("server", r"(?i)werkzeug")],
-            version: None,
-            implies: &["Python"],
-        },
-        Rule {
-            name: "Ruby on Rails",
-            category: "Framework",
-            cpe: "",
-            patterns: vec![ck(r"(?i)^_session_id$"), bd(r#"(?i)csrf-param"#)],
-            version: None,
-            implies: &["Ruby"],
-        },
-        Rule {
-            name: "Spring",
-            category: "Framework",
-            cpe: "",
-            patterns: vec![ck(r"(?i)^JSESSIONID$"), bd(r"(?i)org\.springframework")],
-            version: None,
-            implies: &["Java"],
-        },
-        // --- CMS ---
-        Rule {
-            name: "WordPress",
-            category: "CMS",
-            cpe: "cpe:2.3:a:wordpress:wordpress:{}:*:*:*:*:*:*:*",
-            patterns: vec![
-                mt(r"(?i)wordpress"),
-                bd(r"(?i)/wp-content/|/wp-includes/"),
-                ck(r"(?i)^wordpress_|^wp-settings"),
-            ],
-            version: ver(r"(?i)WordPress ([0-9.]+)"),
-            implies: &["PHP", "MySQL"],
-        },
-        Rule {
-            name: "Drupal",
-            category: "CMS",
-            cpe: "cpe:2.3:a:drupal:drupal:{}:*:*:*:*:*:*:*",
-            patterns: vec![
-                mt(r"(?i)drupal"),
-                h("x-generator", r"(?i)drupal"),
-                bd(r"(?i)/sites/all/|/sites/default/files|Drupal\.settings"),
-            ],
-            version: ver(r"(?i)Drupal ([0-9]+)"),
-            implies: &["PHP"],
-        },
-        Rule {
-            name: "Joomla",
-            category: "CMS",
-            cpe: "cpe:2.3:a:joomla:joomla\\!:{}:*:*:*:*:*:*:*",
-            patterns: vec![
-                mt(r"(?i)joomla"),
-                bd(r"(?i)/media/jui/|/media/system/js/|option=com_"),
-            ],
-            version: ver(r"(?i)Joomla!?\s*([0-9.]+)"),
-            implies: &["PHP"],
-        },
-        Rule {
-            name: "Magento",
-            category: "CMS",
-            cpe: "",
-            patterns: vec![
-                ck(r"(?i)^X-Magento"),
-                bd(r"(?i)Mage\.Cookies|/static/version|/mage/"),
-            ],
-            version: None,
-            implies: &["PHP"],
-        },
-        Rule {
-            name: "Ghost",
-            category: "CMS",
-            cpe: "",
-            patterns: vec![mt(r"(?i)ghost"), bd(r"(?i)content=.Ghost")],
-            version: ver(r"(?i)Ghost ([0-9.]+)"),
-            implies: &["Node.js"],
-        },
-        // --- JS frameworks / libraries ---
-        Rule {
-            name: "Next.js",
-            category: "JavaScript Framework",
-            cpe: "",
-            patterns: vec![
-                h("x-powered-by", r"(?i)next\.js"),
-                bd(r"(?i)/_next/|__NEXT_DATA__"),
-            ],
-            version: ver(r"(?i)next\.js\s*([0-9.]+)"),
-            implies: &["React", "Node.js"],
-        },
-        Rule {
-            name: "Nuxt.js",
-            category: "JavaScript Framework",
-            cpe: "",
-            patterns: vec![bd(r"(?i)__NUXT__|/_nuxt/")],
-            version: None,
-            implies: &["Vue.js", "Node.js"],
-        },
-        Rule {
-            name: "React",
-            category: "JavaScript Framework",
-            cpe: "",
-            patterns: vec![bd(
-                r"(?i)data-reactroot|react(?:-dom)?(?:\.production)?\.min\.js|__REACT_DEVTOOLS",
-            )],
-            version: None,
-            implies: &[],
-        },
-        Rule {
-            name: "Vue.js",
-            category: "JavaScript Framework",
-            cpe: "",
-            patterns: vec![bd(
-                r#"(?i)data-v-[0-9a-f]{6,8}|vue(?:\.runtime)?(?:\.min)?\.js|id="app""#,
-            )],
-            version: None,
-            implies: &[],
-        },
-        Rule {
-            name: "Angular",
-            category: "JavaScript Framework",
-            cpe: "",
-            patterns: vec![bd(r"(?i)ng-version|_nghost|angular(?:\.min)?\.js")],
-            version: ver(r#"(?i)ng-version="([0-9.]+)""#),
-            implies: &[],
-        },
-        Rule {
-            name: "jQuery",
-            category: "JavaScript Library",
-            cpe: "cpe:2.3:a:jquery:jquery:{}:*:*:*:*:*:*:*",
-            patterns: vec![bd(r"(?i)jquery[.-]([0-9.]+)(?:\.min)?\.js|jQuery v[0-9.]+")],
-            version: ver(r"(?i)jquery[.-]([0-9.]+)|jQuery v([0-9.]+)"),
-            implies: &[],
-        },
-        Rule {
-            name: "Bootstrap",
-            category: "UI Framework",
-            cpe: "",
-            patterns: vec![bd(
-                r"(?i)bootstrap(?:\.min)?\.(?:css|js)|class=.(?:container|navbar)-",
-            )],
-            version: ver(r"(?i)bootstrap[.-v]*([0-9.]+)(?:\.min)?\.(?:css|js)"),
-            implies: &[],
-        },
-        // --- CDN / edge (also surfaced separately by waf_cdn) ---
-        Rule {
-            name: "Cloudflare",
-            category: "CDN",
-            cpe: "",
-            patterns: vec![h("server", r"(?i)cloudflare"), h("cf-ray", r".+")],
-            version: None,
-            implies: &[],
-        },
-        Rule {
-            name: "Varnish",
-            category: "Caching",
-            cpe: "",
-            patterns: vec![h("via", r"(?i)varnish"), h("x-varnish", r".+")],
-            version: None,
-            implies: &[],
-        },
-        // --- Hosted platforms ---
-        Rule {
-            name: "Shopify",
-            category: "Ecommerce",
-            cpe: "",
-            patterns: vec![
-                h("x-shopify-stage", r".+"),
-                h("x-sorting-hat-shopid", r".+"),
-                bd(r"(?i)cdn\.shopify\.com"),
-            ],
-            version: None,
-            implies: &[],
-        },
-        Rule {
-            name: "Wix",
-            category: "CMS",
-            cpe: "",
-            patterns: vec![
-                h("x-wix-request-id", r".+"),
-                bd(r"(?i)static\.wixstatic\.com"),
-            ],
-            version: None,
-            implies: &[],
-        },
-        Rule {
-            name: "Squarespace",
-            category: "CMS",
-            cpe: "",
-            patterns: vec![
-                h("server", r"(?i)squarespace"),
-                bd(r"(?i)static1\.squarespace\.com"),
-            ],
-            version: None,
-            implies: &[],
-        },
-    ]
+/// One signature file.
+struct Signature {
+    id: String,
+    name: String,
+    category: String,
+    /// Vendor, product and target software, for the CPE.
+    cpe: Option<(String, String, Option<String>)>,
+    /// The ids of the signatures for what this one implies.
+    implies: Vec<String>,
+    /// Any one of these found is the product found.
+    detect: Vec<Leaf>,
+    /// The first of these that reads a version gives it.
+    version: Vec<Leaf>,
 }
 
-/// Run the signature engine over a page's collected signals.
-pub fn detect(headers: &[(String, String)], cookies: &[String], body: &str) -> Vec<Detection> {
-    let server = header_val(headers, "server").unwrap_or_default();
-    let powered = header_val(headers, "x-powered-by").unwrap_or_default();
-    let generator = extract_meta_generator(body).unwrap_or_default();
-    let body_head = first_n(body, 60_000);
+/// Every signature that loaded, in the order of [`files::FILES`].
+static SIGNATURES: LazyLock<Signatures> = LazyLock::new(|| {
+    let (signatures, skipped) = Signatures::load(files::FILES);
+    for why in skipped {
+        eprintln!("[toolmark] a signature file was skipped: {why}");
+    }
+    signatures
+});
 
-    let mut out: Vec<Detection> = Vec::new();
-    for rule in RULES.iter() {
-        let mut conf: u32 = 0;
-        let mut evidence: Vec<String> = Vec::new();
-        for pat in &rule.patterns {
-            match pat {
-                Pat::Header(name, re) => {
-                    if let Some(v) = header_val(headers, name)
-                        && re.is_match(&v)
-                    {
-                        conf += 50;
-                        evidence.push(format!("header {}: {}", name, truncate(&v, 80)));
-                    }
+struct Signatures {
+    list: Vec<Signature>,
+    /// A finder for each meta tag name a leaf reads.
+    metas: BTreeMap<String, MetaFinder>,
+}
+
+/// Finds the content of a meta tag by its name, whichever of the two attributes comes first.
+struct MetaFinder {
+    name_first: Regex,
+    content_first: Regex,
+}
+
+impl MetaFinder {
+    fn new(name: &str) -> Self {
+        let name = regex::escape(name);
+        let re = |pattern: String| Regex::new(&pattern).expect("a meta pattern");
+        Self {
+            name_first: re(format!(
+                r#"(?is)<meta[^>]+name\s*=\s*["']{name}["'][^>]+content\s*=\s*["']([^"']+)["']"#
+            )),
+            content_first: re(format!(
+                r#"(?is)<meta[^>]+content\s*=\s*["']([^"']+)["'][^>]+name\s*=\s*["']{name}["']"#
+            )),
+        }
+    }
+
+    fn content(&self, body: &str) -> Option<String> {
+        self.name_first
+            .captures(body)
+            .or_else(|| self.content_first.captures(body))
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileSpec {
+    id: String,
+    info: InfoSpec,
+    #[serde(default)]
+    implies: Vec<String>,
+    detect: Option<DetectSpec>,
+    #[serde(default)]
+    version: Vec<BTreeMap<String, LeafSpec>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InfoSpec {
+    name: String,
+    category: String,
+    metadata: Option<MetadataSpec>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetadataSpec {
+    vendor: String,
+    product: String,
+    target_sw: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DetectSpec {
+    any: Vec<BTreeMap<String, LeafSpec>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LeafSpec {
+    name: Option<String>,
+    regex: Option<String>,
+    confidence: Option<u32>,
+}
+
+/// A leaf from its one-key map, `{ header: { name: server, regex: ... } }`. A version
+/// leaf has to capture the version, and takes no confidence.
+fn leaf(entry: BTreeMap<String, LeafSpec>, version: bool) -> Result<Leaf, String> {
+    let mut entries = entry.into_iter();
+    let (Some((kind, spec)), None) = (entries.next(), entries.next()) else {
+        return Err("a leaf is a map with one key, its kind".into());
+    };
+    let compile = |pattern: &str| {
+        Regex::new(pattern).map_err(|e| format!("{kind} pattern {pattern:?} does not compile: {e}"))
+    };
+    let needs = |field: Option<String>, what: &str| {
+        field.ok_or_else(|| format!("a {kind} leaf needs {what}"))
+    };
+    let (source, regex, confidence) = match kind.as_str() {
+        "header" => {
+            let name = needs(spec.name, "a name")?.to_ascii_lowercase();
+            let regex = compile(&needs(spec.regex, "a regex")?)?;
+            (Source::Header(name), regex, 50)
+        }
+        "cookie" => {
+            if version {
+                return Err("a cookie leaf reads no version".into());
+            }
+            if spec.regex.is_some() {
+                return Err("a cookie leaf matches its name, and has no regex".into());
+            }
+            (Source::Cookie, compile(&needs(spec.name, "a name")?)?, 45)
+        }
+        "meta" => {
+            let name = needs(spec.name, "a name")?.to_ascii_lowercase();
+            let regex = compile(&needs(spec.regex, "a regex")?)?;
+            (Source::Meta(name), regex, 60)
+        }
+        "html" => {
+            if spec.name.is_some() {
+                return Err("an html leaf has no name".into());
+            }
+            (Source::Html, compile(&needs(spec.regex, "a regex")?)?, 25)
+        }
+        other => return Err(format!("unknown leaf `{other}`")),
+    };
+    let confidence = match spec.confidence {
+        Some(_) if version => return Err("a version leaf has no confidence".into()),
+        Some(c) if !(1..=100).contains(&c) => {
+            return Err(format!("confidence {c} is not between 1 and 100"));
+        }
+        Some(c) => c,
+        None => confidence,
+    };
+    if version && regex.captures_len() < 2 {
+        return Err(format!("version pattern {regex} captures nothing"));
+    }
+    Ok(Leaf {
+        source,
+        regex,
+        confidence,
+    })
+}
+
+impl Signature {
+    /// The signature in file `file`, whose name without `.yaml` is its id.
+    fn parse(file: &str, text: &str) -> Result<Self, String> {
+        let spec: FileSpec = serde_yaml::from_str(text).map_err(|e| e.to_string())?;
+        if Some(spec.id.as_str()) != file.strip_suffix(".yaml") {
+            return Err(format!("its id is {}, not its file's name", spec.id));
+        }
+        if spec.info.name.trim().is_empty() || spec.info.category.trim().is_empty() {
+            return Err("it needs a name and a category".into());
+        }
+        let detect = match spec.detect {
+            Some(d) if d.any.is_empty() => return Err("detect lists nothing".into()),
+            Some(d) => d
+                .any
+                .into_iter()
+                .map(|l| leaf(l, false))
+                .collect::<Result<_, _>>()?,
+            None => Vec::new(),
+        };
+        let version = spec
+            .version
+            .into_iter()
+            .map(|l| leaf(l, true))
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            id: spec.id,
+            name: spec.info.name,
+            category: spec.info.category,
+            cpe: spec
+                .info
+                .metadata
+                .map(|m| (m.vendor, m.product, m.target_sw)),
+            implies: spec.implies,
+            detect,
+            version,
+        })
+    }
+
+    /// The CPE 2.3 name for this product at `version`, or empty when the file names no
+    /// vendor and product.
+    fn cpe(&self, version: Option<&str>) -> String {
+        let Some((vendor, product, target)) = &self.cpe else {
+            return String::new();
+        };
+        format!(
+            "cpe:2.3:a:{}:{}:{}:*:*:*:*:{}:*:*",
+            cpe_value(vendor),
+            cpe_value(product),
+            version.map_or("*".into(), cpe_value),
+            target.as_deref().map_or("*".into(), cpe_value),
+        )
+    }
+}
+
+/// A value as a CPE 2.3 formatted string writes it: anything but a letter, a digit, a
+/// period, a hyphen or an underscore escaped with a backslash.
+fn cpe_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        if !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+impl Signatures {
+    /// The signatures in `files`, in order, and why each file left out was left out: it
+    /// did not parse, a pattern in it did not compile, its id was taken, or it implies a
+    /// signature that is not there.
+    fn load(files: &[(&str, &str)]) -> (Self, Vec<String>) {
+        let mut skipped = Vec::new();
+        let mut list: Vec<Signature> = Vec::new();
+        for (file, text) in files {
+            match Signature::parse(file, text) {
+                Ok(s) if list.iter().any(|o| o.id == s.id) => {
+                    skipped.push(format!("{file}: another file has the id {}", s.id));
                 }
-                Pat::Cookie(re) => {
-                    for c in cookies {
-                        let cn = c.split(&['=', ';'][..]).next().unwrap_or("").trim();
-                        if re.is_match(cn) {
-                            conf += 45;
-                            evidence.push(format!("cookie {cn}"));
-                            break;
-                        }
-                    }
-                }
-                Pat::Meta(re) => {
-                    if !generator.is_empty() && re.is_match(&generator) {
-                        conf += 60;
-                        evidence.push(format!("meta generator: {}", truncate(&generator, 80)));
-                    }
-                }
-                Pat::Body(re) => {
-                    if re.is_match(&body_head) {
-                        conf += 25;
-                        evidence.push("body pattern".to_string());
-                    }
-                }
+                Ok(s) => list.push(s),
+                Err(e) => skipped.push(format!("{file}: {e}")),
             }
         }
-        if conf == 0 {
+        // Leaving one out can leave another implying it, so until none is left out.
+        loop {
+            let ids: Vec<String> = list.iter().map(|s| s.id.clone()).collect();
+            let before = list.len();
+            list.retain(|s| match s.implies.iter().find(|i| !ids.contains(i)) {
+                Some(missing) => {
+                    skipped.push(format!(
+                        "{}.yaml: it implies {missing}, which is not there",
+                        s.id
+                    ));
+                    false
+                }
+                None => true,
+            });
+            if list.len() == before {
+                break;
+            }
+        }
+        let metas = list
+            .iter()
+            .flat_map(|s| s.detect.iter().chain(&s.version))
+            .filter_map(|l| match &l.source {
+                Source::Meta(name) => Some((name.clone(), MetaFinder::new(name))),
+                _ => None,
+            })
+            .collect();
+        (Self { list, metas }, skipped)
+    }
+
+    fn by_id(&self, id: &str) -> Option<&Signature> {
+        self.list.iter().find(|s| s.id == id)
+    }
+}
+
+/// A response as the leaves look at it.
+struct Page<'a> {
+    headers: &'a [(String, String)],
+    /// The name of each cookie set, in order.
+    cookies: Vec<&'a str>,
+    html: &'a str,
+    /// The content of each meta tag a leaf reads, by name.
+    metas: BTreeMap<&'a str, Option<String>>,
+}
+
+impl<'a> Page<'a> {
+    fn new(
+        signatures: &'a Signatures,
+        headers: &'a [(String, String)],
+        cookies: &'a [String],
+        body: &'a str,
+    ) -> Self {
+        Self {
+            headers,
+            cookies: cookies
+                .iter()
+                .map(|c| c.split(['=', ';']).next().unwrap_or_default().trim())
+                .collect(),
+            html: first_n(body, HTML_READ),
+            metas: signatures
+                .metas
+                .iter()
+                .map(|(name, finder)| (name.as_str(), finder.content(body)))
+                .collect(),
+        }
+    }
+
+    /// What a leaf reading `source` matches against, other than a cookie.
+    fn text(&self, source: &Source) -> Option<&str> {
+        match source {
+            Source::Header(name) => self
+                .headers
+                .iter()
+                .find(|(header, _)| header == name)
+                .map(|(_, value)| value.as_str()),
+            Source::Meta(name) => self.metas.get(name.as_str()).and_then(|c| c.as_deref()),
+            Source::Html => Some(self.html),
+            Source::Cookie => None,
+        }
+    }
+}
+
+impl Leaf {
+    /// The evidence for this leaf on `page`, when it is there.
+    fn found(&self, page: &Page) -> Option<String> {
+        if let Source::Cookie = self.source {
+            return page
+                .cookies
+                .iter()
+                .find(|name| self.regex.is_match(name))
+                .map(|name| format!("cookie {name}"));
+        }
+        let text = page.text(&self.source)?;
+        if !self.regex.is_match(text) {
+            return None;
+        }
+        Some(match &self.source {
+            Source::Header(name) => format!("header {name}: {}", truncate(text, 80)),
+            Source::Meta(name) => format!("meta {name}: {}", truncate(text, 80)),
+            _ => "body pattern".to_string(),
+        })
+    }
+
+    /// The version this leaf reads on `page`: the first group of its pattern that
+    /// takes part in the first match.
+    fn version(&self, page: &Page) -> Option<String> {
+        let captures = self.regex.captures(page.text(&self.source)?)?;
+        (1..captures.len())
+            .find_map(|i| captures.get(i))
+            .map(|m| m.as_str().to_string())
+    }
+}
+
+/// Run the signatures over a page's collected signals.
+pub fn detect(headers: &[(String, String)], cookies: &[String], body: &str) -> Vec<Detection> {
+    let signatures = &*SIGNATURES;
+    let page = Page::new(signatures, headers, cookies, body);
+    let mut found: Vec<(&Signature, Detection)> = Vec::new();
+    for signature in &signatures.list {
+        let leaves: Vec<(u32, String)> = signature
+            .detect
+            .iter()
+            .filter_map(|l| l.found(&page).map(|e| (l.confidence, e)))
+            .collect();
+        if leaves.is_empty() {
             continue;
         }
-        let blob = format!("{server} {powered} {generator} {body_head}");
-        let version = rule
-            .version
-            .as_ref()
-            .and_then(|re| re.captures(&blob))
-            .and_then(|c| (1..c.len()).filter_map(|i| c.get(i)).next())
-            .map(|m| m.as_str().to_string());
-        let cpe = if rule.cpe.is_empty() {
-            String::new()
-        } else if rule.cpe.contains("{}") {
-            rule.cpe.replace("{}", version.as_deref().unwrap_or("*"))
-        } else {
-            rule.cpe.to_string()
-        };
-        out.push(Detection {
-            name: rule.name.to_string(),
-            category: rule.category.to_string(),
-            version,
-            cpe,
-            confidence: conf.min(100) as u8,
-            evidence,
-        });
+        let version = signature.version.iter().find_map(|l| l.version(&page));
+        let confidence = leaves.iter().map(|(c, _)| c).sum::<u32>().min(100) as u8;
+        found.push((
+            signature,
+            Detection {
+                name: signature.name.clone(),
+                category: signature.category.clone(),
+                cpe: signature.cpe(version.as_deref()),
+                version,
+                confidence,
+                evidence: leaves.into_iter().map(|(_, e)| e).collect(),
+            },
+        ));
     }
 
-    // One-pass `implies`: add implied techs not already directly detected.
-    let present: HashSet<String> = out.iter().map(|d| d.name.clone()).collect();
+    // What the products found imply, when it was not found itself. One pass: what is
+    // only implied implies nothing further.
     let mut implied: Vec<Detection> = Vec::new();
-    for d in &out {
-        if let Some(rule) = RULES.iter().find(|r| r.name == d.name) {
-            for imp in rule.implies {
-                if !present.contains(*imp) && !implied.iter().any(|x| x.name == *imp) {
-                    implied.push(Detection {
-                        name: (*imp).to_string(),
-                        category: "Implied".to_string(),
-                        version: None,
-                        cpe: String::new(),
-                        confidence: 30,
-                        evidence: vec![format!("implied by {}", d.name)],
-                    });
-                }
+    for (signature, detection) in &found {
+        for id in &signature.implies {
+            let Some(other) = signatures.by_id(id) else {
+                continue;
+            };
+            if found.iter().any(|(s, _)| s.id == other.id)
+                || implied.iter().any(|d| d.name == other.name)
+            {
+                continue;
             }
+            implied.push(Detection {
+                name: other.name.clone(),
+                category: "Implied".to_string(),
+                version: None,
+                cpe: String::new(),
+                confidence: 30,
+                evidence: vec![format!("implied by {}", detection.name)],
+            });
         }
     }
-    out.extend(implied);
-    out
+    found.into_iter().map(|(_, d)| d).chain(implied).collect()
 }
 
 /// Passive WAF/CDN/LB tells from headers and cookies. Returns (waf, cdn) as
@@ -563,23 +523,6 @@ pub fn header_val(headers: &[(String, String)], name: &str) -> Option<String> {
         .map(|(_, v)| v.clone())
 }
 
-static META_GEN_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?is)<meta[^>]+name\s*=\s*["']generator["'][^>]+content\s*=\s*["']([^"']+)["']"#)
-        .unwrap()
-});
-static META_GEN_RE2: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?is)<meta[^>]+content\s*=\s*["']([^"']+)["'][^>]+name\s*=\s*["']generator["']"#)
-        .unwrap()
-});
-
-pub fn extract_meta_generator(body: &str) -> Option<String> {
-    META_GEN_RE
-        .captures(body)
-        .or_else(|| META_GEN_RE2.captures(body))
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().to_string())
-}
-
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
@@ -591,18 +534,141 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{}…", &s[..end])
 }
 
-fn first_n(s: &str, n: usize) -> String {
+/// At most the first `n` bytes of `s`, ending on a character boundary.
+fn first_n(s: &str, n: usize) -> &str {
     if s.len() <= n {
-        s.to_string()
-    } else {
-        // Respect char boundaries.
-        let mut end = n;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        s[..end].to_string()
+        return s;
     }
+    let mut end = n;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 #[cfg(test)]
 mod golden;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_compiled_set_is_the_signatures_folder() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/signatures");
+        let mut on_disk: Vec<String> = std::fs::read_dir(dir)
+            .expect("toolmark/signatures")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        on_disk.sort();
+        let mut listed: Vec<String> = files::FILES.iter().map(|(f, _)| f.to_string()).collect();
+        listed.sort();
+        assert_eq!(
+            on_disk, listed,
+            "toolmark/signatures and src/signatures/files.rs"
+        );
+        let (signatures, skipped) = Signatures::load(files::FILES);
+        assert!(skipped.is_empty(), "{skipped:#?}");
+        assert_eq!(signatures.list.len(), files::FILES.len());
+    }
+
+    /// A file that does not load is left out with the reason, and the rest load. At run
+    /// time the reason is printed; in the test above it fails the build.
+    #[test]
+    fn a_file_that_does_not_load_is_left_out_with_the_reason() {
+        let good = "id: good\ninfo: { name: Good, category: CMS }\n\
+                    detect: { any: [ { html: { regex: 'good' } } ] }\n";
+        let files: &[(&str, &str)] = &[
+            ("good.yaml", good),
+            (
+                "extra-key.yaml",
+                "id: extra-key\ninfo: { name: X, category: CMS }\nrefines: good\n",
+            ),
+            (
+                "unknown-leaf.yaml",
+                "id: unknown-leaf\ninfo: { name: X, category: CMS }\n\
+                 detect: { any: [ { title: { regex: 'x' } } ] }\n",
+            ),
+            (
+                "bad-pattern.yaml",
+                "id: bad-pattern\ninfo: { name: X, category: CMS }\n\
+                 detect: { any: [ { html: { regex: '(' } } ] }\n",
+            ),
+            (
+                "not-its-name.yaml",
+                "id: something-else\ninfo: { name: X, category: CMS }\n",
+            ),
+            ("good.yaml", good),
+            (
+                "no-group.yaml",
+                "id: no-group\ninfo: { name: X, category: CMS }\n\
+                 version: [ { html: { regex: 'x [0-9.]+' } } ]\n",
+            ),
+            (
+                "cookie-version.yaml",
+                "id: cookie-version\ninfo: { name: X, category: CMS }\n\
+                 version: [ { cookie: { name: '(x)' } } ]\n",
+            ),
+            (
+                "version-confidence.yaml",
+                "id: version-confidence\ninfo: { name: X, category: CMS }\n\
+                 version: [ { html: { regex: 'x ([0-9.]+)', confidence: 10 } } ]\n",
+            ),
+            (
+                "zero.yaml",
+                "id: zero\ninfo: { name: X, category: CMS }\n\
+                 detect: { any: [ { html: { regex: 'x', confidence: 0 } } ] }\n",
+            ),
+            (
+                "implies-missing.yaml",
+                "id: implies-missing\ninfo: { name: X, category: CMS }\nimplies: [nowhere]\n",
+            ),
+            (
+                "implies-left-out.yaml",
+                "id: implies-left-out\ninfo: { name: X, category: CMS }\n\
+                 implies: [implies-missing]\n",
+            ),
+        ];
+        let (signatures, skipped) = Signatures::load(files);
+        let ids: Vec<&str> = signatures.list.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["good"]);
+        let why = |file: &str| {
+            skipped
+                .iter()
+                .filter(|s| s.starts_with(&format!("{file}: ")))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for (file, says) in [
+            ("extra-key.yaml", "unknown field `refines`"),
+            ("unknown-leaf.yaml", "unknown leaf `title`"),
+            ("bad-pattern.yaml", "does not compile"),
+            ("not-its-name.yaml", "its id is something-else"),
+            ("good.yaml", "another file has the id good"),
+            ("no-group.yaml", "captures nothing"),
+            ("cookie-version.yaml", "a cookie leaf reads no version"),
+            (
+                "version-confidence.yaml",
+                "a version leaf has no confidence",
+            ),
+            ("zero.yaml", "confidence 0 is not between 1 and 100"),
+            ("implies-missing.yaml", "it implies nowhere"),
+            ("implies-left-out.yaml", "it implies implies-missing"),
+        ] {
+            let reasons = why(file);
+            assert!(
+                reasons.len() == 1 && reasons[0].contains(says),
+                "{file}: {reasons:?}, all: {skipped:#?}"
+            );
+        }
+        assert_eq!(skipped.len(), 11, "{skipped:#?}");
+    }
+
+    #[test]
+    fn a_cpe_escapes_what_its_formatted_string_escapes() {
+        assert_eq!(cpe_value("joomla!"), "joomla\\!");
+        assert_eq!(cpe_value("node.js"), "node.js");
+        assert_eq!(cpe_value("http_server"), "http_server");
+        assert_eq!(cpe_value("1.2+b3:4"), "1.2\\+b3\\:4");
+    }
+}

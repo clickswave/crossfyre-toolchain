@@ -1,0 +1,10 @@
+id: gunicorn
+info:
+  name: Gunicorn
+  category: Web Server
+implies: [python]
+detect:
+  any:
+    - header: { name: server, regex: '(?i)gunicorn' }
+version:
+  - header: { name: server, regex: '(?i)gunicorn/([0-9.]+)' }

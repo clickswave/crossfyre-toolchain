@@ -1,0 +1,8 @@
+id: nuxtjs
+info:
+  name: Nuxt.js
+  category: JavaScript Framework
+implies: [vuejs, nodejs]
+detect:
+  any:
+    - html: { regex: '(?i)__NUXT__|/_nuxt/' }

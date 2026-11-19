@@ -1,0 +1,9 @@
+id: angular
+info:
+  name: Angular
+  category: JavaScript Framework
+detect:
+  any:
+    - html: { regex: '(?i)ng-version|_nghost|angular(?:\.min)?\.js' }
+version:
+  - html: { regex: '(?i)ng-version="([0-9.]+)"' }

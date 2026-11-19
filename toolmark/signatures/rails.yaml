@@ -1,0 +1,9 @@
+id: rails
+info:
+  name: Ruby on Rails
+  category: Framework
+implies: [ruby]
+detect:
+  any:
+    - cookie: { name: '(?i)^_session_id$' }
+    - html: { regex: '(?i)csrf-param' }

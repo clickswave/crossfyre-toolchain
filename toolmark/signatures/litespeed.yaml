@@ -1,0 +1,7 @@
+id: litespeed
+info:
+  name: LiteSpeed
+  category: Web Server
+detect:
+  any:
+    - header: { name: server, regex: '(?i)litespeed' }

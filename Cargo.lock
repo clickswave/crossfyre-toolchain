@@ -5434,6 +5434,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sqlx",
  "tokio",
  "transport",

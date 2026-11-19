@@ -1,0 +1,13 @@
+id: apache-httpd
+info:
+  name: Apache HTTP Server
+  category: Web Server
+  metadata:
+    vendor: apache
+    product: http_server
+detect:
+  any:
+    - header: { name: server, regex: '(?i)apache' }
+version:
+  - header: { name: server, regex: '(?i)apache/([0-9.]+)' }
+  - html: { regex: '(?i)apache/([0-9.]+)' }

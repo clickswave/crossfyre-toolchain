@@ -1,0 +1,9 @@
+id: laravel
+info:
+  name: Laravel
+  category: Framework
+implies: [php]
+detect:
+  any:
+    - cookie: { name: '(?i)^laravel_session$' }
+    - cookie: { name: '(?i)^XSRF-TOKEN$' }

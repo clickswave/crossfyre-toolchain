@@ -48,6 +48,42 @@ Detected technologies and versions for the target, plus any version-based CVE le
 A lead is not a confirmed vulnerability; it is a "this version is known to have had X,
 go look." For actually confirming a bug, hand the target to [`plessor`](../plessor/).
 
+## Signatures
+
+Each product toolmark knows is a file in [`signatures/`](signatures/), compiled into the
+binary. A file says what shows the product, where its version can be read, and what
+else it implies:
+
+```yaml
+id: wordpress
+info:
+  name: WordPress
+  category: CMS
+  metadata:
+    vendor: wordpress
+    product: wordpress
+implies: [php, mysql]
+detect:
+  any:
+    - meta: { name: generator, regex: '(?i)wordpress' }
+    - html: { regex: '(?i)/wp-content/|/wp-includes/' }
+    - cookie: { name: '(?i)^wordpress_|^wp-settings' }
+version:
+  - meta: { name: generator, regex: '(?i)WordPress ([0-9.]+)' }
+  - html: { regex: '(?i)WordPress ([0-9.]+)' }
+```
+
+A leaf reads a response header (`header`), the name of each cookie set (`cookie`), a
+meta tag (`meta`) or the first 60,000 bytes of the body (`html`). Each leaf in `detect`
+that matches adds to the confidence, 50, 45, 60 and 25 by kind unless the leaf sets its
+own `confidence`, up to 100. The first `version` leaf that matches gives the version
+from its first group, and `vendor` and `product` make the CPE.
+
+A new file goes in `src/signatures/files.rs` too, and needs a saved response in
+`tests/responses` for each of its leaves to match. `cargo test -p toolmark` fails when a
+file does not load or a leaf matches none of them, and checks that every saved response
+still gives the detections in `tests/responses/expected.json`.
+
 ## Notes
 
 Fingerprinting is mostly passive (it reads what the server volunteers) but it still

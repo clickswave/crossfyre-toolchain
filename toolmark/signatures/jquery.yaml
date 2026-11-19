@@ -1,0 +1,12 @@
+id: jquery
+info:
+  name: jQuery
+  category: JavaScript Library
+  metadata:
+    vendor: jquery
+    product: jquery
+detect:
+  any:
+    - html: { regex: '(?i)jquery[.-]([0-9.]+)(?:\.min)?\.js|jQuery v[0-9.]+' }
+version:
+  - html: { regex: '(?i)jquery[.-]([0-9.]+)|jQuery v([0-9.]+)' }

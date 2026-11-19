@@ -1,0 +1,12 @@
+id: ghost
+info:
+  name: Ghost
+  category: CMS
+implies: [nodejs]
+detect:
+  any:
+    - meta: { name: generator, regex: '(?i)ghost' }
+    - html: { regex: '(?i)content=.Ghost' }
+version:
+  - meta: { name: generator, regex: '(?i)Ghost ([0-9.]+)' }
+  - html: { regex: '(?i)Ghost ([0-9.]+)' }

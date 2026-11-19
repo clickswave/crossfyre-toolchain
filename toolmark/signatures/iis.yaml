@@ -1,0 +1,13 @@
+id: iis
+info:
+  name: Microsoft IIS
+  category: Web Server
+  metadata:
+    vendor: microsoft
+    product: internet_information_services
+implies: [aspnet]
+detect:
+  any:
+    - header: { name: server, regex: '(?i)microsoft-iis|(?i)\biis\b' }
+version:
+  - header: { name: server, regex: '(?i)iis/([0-9.]+)' }

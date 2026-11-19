@@ -1,0 +1,9 @@
+id: flask
+info:
+  name: Flask
+  category: Framework
+implies: [python]
+detect:
+  any:
+    - cookie: { name: '(?i)^session$' }
+    - header: { name: server, regex: '(?i)werkzeug' }

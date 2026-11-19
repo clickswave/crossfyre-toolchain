@@ -1,0 +1,14 @@
+id: openresty
+info:
+  name: OpenResty
+  category: Web Server
+  metadata:
+    vendor: openresty
+    product: openresty
+implies: [nginx]
+detect:
+  any:
+    - header: { name: server, regex: '(?i)openresty' }
+version:
+  - header: { name: server, regex: '(?i)openresty/([0-9.]+)' }
+  - html: { regex: '(?i)openresty/([0-9.]+)' }

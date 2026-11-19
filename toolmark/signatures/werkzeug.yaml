@@ -1,0 +1,10 @@
+id: werkzeug
+info:
+  name: Werkzeug
+  category: Web Server
+implies: [python, flask]
+detect:
+  any:
+    - header: { name: server, regex: '(?i)werkzeug' }
+version:
+  - header: { name: server, regex: '(?i)werkzeug/([0-9.]+)' }

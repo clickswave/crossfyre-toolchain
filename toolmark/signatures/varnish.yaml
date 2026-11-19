@@ -1,0 +1,8 @@
+id: varnish
+info:
+  name: Varnish
+  category: Caching
+detect:
+  any:
+    - header: { name: via, regex: '(?i)varnish' }
+    - header: { name: x-varnish, regex: '.+' }

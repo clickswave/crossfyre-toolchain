@@ -10,7 +10,7 @@
 //! `TOOLMARK_GOLDEN=write cargo test -p toolmark golden`, and the diff of
 //! `expected.json` is then the change to review.
 
-use super::{Detection, RULES, detect, extract_meta_generator, first_n, header_val};
+use super::{Detection, Leaf, Page, SIGNATURES, detect};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
@@ -129,50 +129,63 @@ fn each_saved_response_gives_the_detections_it_gave_before() {
     );
 }
 
-/// The string a rule's version pattern is run over, as [`detect`] builds it.
-fn version_text(s: &Saved) -> String {
-    let server = header_val(&s.headers, "server").unwrap_or_default();
-    let powered = header_val(&s.headers, "x-powered-by").unwrap_or_default();
-    let generator = extract_meta_generator(&s.body).unwrap_or_default();
-    let head = first_n(&s.body, 60_000);
-    format!("{server} {powered} {generator} {head}")
+/// The group of `leaf`'s pattern that gives the version on `page`, when one does.
+fn version_group(leaf: &Leaf, page: &Page) -> Option<usize> {
+    let captures = leaf.regex.captures(page.text(&leaf.source)?)?;
+    (1..captures.len()).find(|i| captures.get(*i).is_some())
 }
 
-/// Each rule is found by at least one saved response in its own right, not only
-/// implied, and every group of every version pattern gives the version in at least one.
+/// Each leaf is exercised by a saved response: every `detect` leaf is found in one, and
+/// every `version` leaf reads a version in one its signature is found in. Every group of
+/// a version pattern gives the version in one, through a leaf that carries the pattern.
 #[test]
-fn the_saved_responses_exercise_every_rule_and_version_pattern() {
+fn the_saved_responses_exercise_every_leaf() {
+    let signatures = &*SIGNATURES;
     let saved = saved();
-    let found: Vec<(Detection, String)> = saved
+    let pages: Vec<Page> = saved
         .values()
-        .flat_map(|s| {
-            let text = version_text(s);
-            detections(s).into_iter().map(move |d| (d, text.clone()))
-        })
+        .map(|s| Page::new(signatures, &s.headers, &s.cookies, &s.body))
         .collect();
     let mut missing = Vec::new();
-    for rule in RULES.iter() {
-        let direct: Vec<&(Detection, String)> = found
-            .iter()
-            .filter(|(d, _)| d.name == rule.name && d.category != "Implied")
-            .collect();
-        if direct.is_empty() {
-            missing.push(format!("{}: found by no saved response", rule.name));
-            continue;
-        }
-        let Some(re) = &rule.version else { continue };
-        for group in 1..re.captures_len() {
-            let gives = direct.iter().any(|(d, text)| {
-                d.version.is_some()
-                    && re
-                        .captures(text)
-                        .and_then(|c| (1..c.len()).find(|i| c.get(*i).is_some()))
-                        == Some(group)
-            });
-            if !gives {
+    for signature in &signatures.list {
+        for (n, leaf) in signature.detect.iter().enumerate() {
+            if !pages.iter().any(|page| leaf.found(page).is_some()) {
                 missing.push(format!(
-                    "{}: no saved response gives a version through group {group} of {re}",
-                    rule.name
+                    "{}: detect leaf {} is in no saved response",
+                    signature.id,
+                    n + 1
+                ));
+            }
+        }
+        let found_in: Vec<&Page> = pages
+            .iter()
+            .filter(|page| signature.detect.iter().any(|l| l.found(page).is_some()))
+            .collect();
+        let mut groups: BTreeMap<&str, Vec<bool>> = BTreeMap::new();
+        for (n, leaf) in signature.version.iter().enumerate() {
+            let given: Vec<usize> = found_in
+                .iter()
+                .filter_map(|page| version_group(leaf, page))
+                .collect();
+            if given.is_empty() {
+                missing.push(format!(
+                    "{}: version leaf {} reads a version in no saved response",
+                    signature.id,
+                    n + 1
+                ));
+            }
+            let seen = groups
+                .entry(leaf.regex.as_str())
+                .or_insert_with(|| vec![false; leaf.regex.captures_len()]);
+            for group in given {
+                seen[group] = true;
+            }
+        }
+        for (pattern, seen) in groups {
+            for group in (1..seen.len()).filter(|g| !seen[*g]) {
+                missing.push(format!(
+                    "{}: no saved response gives a version through group {group} of {pattern}",
+                    signature.id
                 ));
             }
         }

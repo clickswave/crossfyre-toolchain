@@ -1,0 +1,13 @@
+id: nginx
+info:
+  name: Nginx
+  category: Web Server
+  metadata:
+    vendor: f5
+    product: nginx
+detect:
+  any:
+    - header: { name: server, regex: '(?i)nginx' }
+version:
+  - header: { name: server, regex: '(?i)nginx/([0-9.]+)' }
+  - html: { regex: '(?i)nginx/([0-9.]+)' }
