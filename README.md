@@ -118,6 +118,8 @@ Each engine is a daemon and the commands that talk to it. The daemon does the wo
 
 A daemon started from the binary exits once it has had no client and no scan for 30 minutes. For another limit, set `CFX_DAEMON_IDLE_EXIT` to a number of seconds in the environment of the command that starts it. `voyage daemon`, and the same for every engine, runs one by hand, which never exits on its own. `--no-autostart` or `CFX_NO_AUTOSTART=1` turns the starting off. Nothing is started for a command run with sudo, since the daemons and their database belong to your user.
 
+Where no service manager runs, as on WSL without systemd and in most containers, `crossfyre node up` runs the engines along with the node. It runs them as you, starts one again when it exits and stops them when it stops, and `crossfyre extension start` says so instead of starting one. `node up` runs in the foreground there, so start it where it keeps running, such as a container's command or tmux. On WSL, turning systemd on lets the services run the engines instead.
+
 ## Where scan state is kept
 
 voyage, doorward and ambulo keep the state of every scan in PostgreSQL, so a stopped scan picks up where it left off. `config.toml` in the toolchain directory names the database they use.
