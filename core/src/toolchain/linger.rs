@@ -131,11 +131,6 @@ fn record_path() -> PathBuf {
     super::config::get_toolchain_dir().join(RECORD)
 }
 
-/// Is systemd the service manager here? The test systemd itself documents.
-fn systemd_runs() -> bool {
-    Path::new("/run/systemd/system").is_dir()
-}
-
 /// The account whose service manager runs the engines: the one that ran crossfyre,
 /// under sudo as well. Its uid and name.
 fn engine_account() -> Option<(u32, String)> {
@@ -162,7 +157,7 @@ fn engine_account() -> Option<(u32, String)> {
 /// `systemctl --user` calls after this reach it. One line says when it was turned on,
 /// and one when it could not be, with the command that would.
 pub fn keep_engines_running() {
-    if !systemd_runs() {
+    if !super::service::systemd_runs() {
         return;
     }
     let Some((uid, name)) = engine_account() else {

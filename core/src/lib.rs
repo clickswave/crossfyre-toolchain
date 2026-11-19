@@ -1969,21 +1969,29 @@ pub async fn run_init(
 }
 
 /// How `node init` left engine `ext`, with the command that starts it when it is not
-/// running: `extension start` for a registered service, and otherwise `extension
-/// install`, which registers one, forced when the binary is already there.
+/// running (see [`init_summary::engine_start`]).
 fn engine_part(ext: &str) -> init_summary::Part {
     let name = toolchain::public_name(ext);
-    let start = if !toolchain::config::is_extension_installed(ext) {
-        format!("crossfyre extension install {name}")
-    } else if !toolchain::service::has_service_file(ext) {
-        format!("crossfyre extension install --force {name}")
-    } else {
-        format!("crossfyre extension start {name}")
-    };
+    // Where systemd is not running, the command its unit would run.
+    #[cfg(target_os = "linux")]
+    let daemon = (!toolchain::service::systemd_runs()).then(|| {
+        format!(
+            "{} --daemon --port {}",
+            toolchain::config::ext_bin_path(ext).display(),
+            toolchain::config::engine_port(ext)
+        )
+    });
+    #[cfg(not(target_os = "linux"))]
+    let daemon = None;
     init_summary::Part {
         name: name.to_string(),
         running: toolchain::service::daemon_status(ext) == "running",
-        start,
+        start: init_summary::engine_start(
+            name,
+            toolchain::config::is_extension_installed(ext),
+            toolchain::service::has_service_file(ext),
+            daemon,
+        ),
     }
 }
 

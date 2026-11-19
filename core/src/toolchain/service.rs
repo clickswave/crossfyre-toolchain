@@ -701,6 +701,13 @@ pub fn node_service_exists() -> bool {
     node::exists()
 }
 
+/// Is systemd the service manager here? The test systemd itself documents: it makes
+/// /run/systemd/system as it starts. WSL without systemd and most containers have none.
+#[cfg(target_os = "linux")]
+pub fn systemd_runs() -> bool {
+    std::path::Path::new("/run/systemd/system").is_dir()
+}
+
 /// Is the node service running, once its service manager is done starting it? A
 /// service can show as starting for a moment after it was told to start, and longer
 /// while it fails and is restarted, so that is waited out for up to ten seconds.
@@ -735,6 +742,11 @@ mod node {
         data_dir: &std::path::Path,
     ) -> Result<(), Box<dyn std::error::Error>> {
         require_root()?;
+        // A unit left where nothing runs it would stand in for a service: `node up` would
+        // ask systemctl to start it rather than run the node itself.
+        if !super::systemd_runs() {
+            return Err("systemd is not running here, so the node cannot run as a service".into());
+        }
         let sudo_user = super::super::sudo_user::sudo_user_info().map(|(_, _, _, name)| name);
         // The supervisor is the separate `node` worker binary in the bin directory,
         // and it runs as root, so it has to be a file only root can replace.

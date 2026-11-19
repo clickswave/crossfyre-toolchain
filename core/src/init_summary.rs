@@ -31,6 +31,24 @@ pub(crate) struct Summary {
 /// The command that starts the node when its service is not running.
 const NODE_UP: &str = "crossfyre node up";
 
+/// The command that starts engine `name` when it is not running: `extension install`
+/// when it is not installed, or forced when it is installed without a service; `daemon`,
+/// its own daemon command, where nothing runs services; and otherwise its service,
+/// through `extension start`.
+pub(crate) fn engine_start(
+    name: &str,
+    installed: bool,
+    registered: bool,
+    daemon: Option<String>,
+) -> String {
+    match (installed, daemon) {
+        (false, _) => format!("crossfyre extension install {name}"),
+        (true, Some(daemon)) => daemon,
+        (true, None) if !registered => format!("crossfyre extension install --force {name}"),
+        (true, None) => format!("crossfyre extension start {name}"),
+    }
+}
+
 impl Summary {
     /// Whether `node init` exits zero: the node is running, or `--no-service` left it to
     /// be started by hand.
@@ -159,6 +177,33 @@ mod tests {
         );
         assert_eq!(s.verdict(), "Node not running");
         assert!(!s.succeeded());
+    }
+
+    #[test]
+    fn an_engine_is_started_by_what_will_start_it_here() {
+        let daemon = || Some("/opt/crossfyre/bin/voyage --daemon --port 4442".to_string());
+        assert_eq!(
+            engine_start("voyage", true, true, None),
+            "crossfyre extension start voyage"
+        );
+        assert_eq!(
+            engine_start("voyage", true, false, None),
+            "crossfyre extension install --force voyage"
+        );
+        assert_eq!(
+            engine_start("voyage", false, false, None),
+            "crossfyre extension install voyage"
+        );
+        // Without a service manager its service cannot run, and neither can the command
+        // that would start it: the daemon is started by hand.
+        assert_eq!(
+            engine_start("voyage", true, true, daemon()),
+            "/opt/crossfyre/bin/voyage --daemon --port 4442"
+        );
+        assert_eq!(
+            engine_start("voyage", false, false, daemon()),
+            "crossfyre extension install voyage"
+        );
     }
 
     /// `--no-service` asked for the node to be left to the person, so init has done what
