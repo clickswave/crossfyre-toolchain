@@ -204,10 +204,6 @@ pub(crate) fn load_config_at(
     Ok(config)
 }
 
-pub fn save_config(config: &ToolchainConfig) -> Result<(), Box<dyn std::error::Error>> {
-    save_config_at(&get_config_path(), config)
-}
-
 /// The file holds the database password, so it is written owner-only. The engine
 /// daemons that read it run as the same account the file is handed back to.
 pub(crate) fn save_config_at(
@@ -294,15 +290,9 @@ pub(crate) fn apply_ports_from_json_at(
     Ok(changed)
 }
 
-/// Load the toolchain config, writing the defaults first if none exists.
-/// Defaults are sane for a single-host install; operators can edit
-/// `config.toml` afterwards to point at an external Postgres.
-pub fn load_or_create_config() -> Result<ToolchainConfig, Box<dyn std::error::Error>> {
-    load_or_create_config_at(&get_config_path())
-}
-
-/// A new file is made the way an engine makes one, under the same lock: for the local
-/// database, with a new password, readable by the account the database belongs to.
+/// The toolchain config at `path`, written first when there is none. A new file is made
+/// the way an engine makes one, under the same lock: for the local database, with a new
+/// password, readable by the account the database belongs to.
 pub(crate) fn load_or_create_config_at(
     path: &std::path::Path,
 ) -> Result<ToolchainConfig, Box<dyn std::error::Error>> {
