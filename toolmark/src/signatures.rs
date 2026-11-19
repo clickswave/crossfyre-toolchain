@@ -553,19 +553,38 @@ mod golden;
 mod tests {
     use super::*;
 
+    /// The files in toolmark/signatures are the ones files.rs includes, both ways, so a
+    /// file added to the folder and not to the list fails here rather than never being
+    /// compiled in. Each entry is named after the file it includes, and every file loads.
     #[test]
     fn the_compiled_set_is_the_signatures_folder() {
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/signatures");
-        let mut on_disk: Vec<String> = std::fs::read_dir(dir)
+        use std::collections::BTreeSet;
+        let root = env!("CARGO_MANIFEST_DIR");
+        let on_disk: BTreeSet<String> = std::fs::read_dir(format!("{root}/signatures"))
             .expect("toolmark/signatures")
             .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
             .collect();
-        on_disk.sort();
-        let mut listed: Vec<String> = files::FILES.iter().map(|(f, _)| f.to_string()).collect();
-        listed.sort();
+        let source = std::fs::read_to_string(format!("{root}/src/signatures/files.rs"))
+            .expect("src/signatures/files.rs");
+        let included: Vec<String> =
+            Regex::new(r#"include_str!\(\s*"\.\./\.\./signatures/([^"]+)"\s*\)"#)
+                .expect("pattern")
+                .captures_iter(&source)
+                .map(|c| c[1].to_string())
+                .collect();
+        let listed: BTreeSet<String> = included.iter().cloned().collect();
+        assert_eq!(listed.len(), included.len(), "a file is included twice");
+        let unlisted: Vec<&String> = on_disk.difference(&listed).collect();
+        let gone: Vec<&String> = listed.difference(&on_disk).collect();
+        assert!(
+            unlisted.is_empty() && gone.is_empty(),
+            "in toolmark/signatures and not in files.rs: {unlisted:?}; \
+             in files.rs and not in toolmark/signatures: {gone:?}"
+        );
+        let names: Vec<&str> = files::FILES.iter().map(|(name, _)| *name).collect();
         assert_eq!(
-            on_disk, listed,
-            "toolmark/signatures and src/signatures/files.rs"
+            names, included,
+            "each entry is named after the file it includes"
         );
         let (signatures, skipped) = Signatures::load(files::FILES);
         assert!(skipped.is_empty(), "{skipped:#?}");
