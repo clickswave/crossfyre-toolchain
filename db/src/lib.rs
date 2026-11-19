@@ -17,6 +17,7 @@
 //! `crossfyre db` works on the same [`Toolchain`].
 
 mod account;
+mod held;
 mod local;
 mod migrate;
 mod ready;
@@ -27,6 +28,7 @@ mod toolchain;
 #[cfg(unix)]
 pub use account::lock_file;
 pub use account::{Account, ThisAccount};
+pub use held::{Held, held, purge_all};
 pub use local::{Postgres, find_postgres};
 pub use migrate::{Engine, Migrated};
 pub use ready::{NotReady, check, ensure_ready};

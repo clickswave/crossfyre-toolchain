@@ -112,6 +112,23 @@ struct ScanParams {
     identify: Option<String>,
     #[serde(default)]
     auth: ScanAuth,
+    /// Keep the cookies the target sets, and send them back.
+    #[serde(default)]
+    store_cookies: bool,
+    /// One random User-Agent for the whole scan, or a new one for every request.
+    #[serde(default)]
+    random_user_agent_scan: bool,
+    #[serde(default)]
+    random_user_agent_request: bool,
+    /// Put a `/` at the end of every URL.
+    #[serde(default)]
+    append_slash: bool,
+    /// The User-Agent to send, in place of the one the identity mode picks.
+    #[serde(default)]
+    user_agent: Option<String>,
+    /// The least important lines the scan's log keeps: debug, info, warn or error.
+    #[serde(default)]
+    log_level: Option<String>,
     /// Set by the daemon from the egress wrapper. See `DaemonRequest::egress`.
     #[serde(skip)]
     egress: transport::Egress,
@@ -129,9 +146,17 @@ struct ScanAuth {
     headers: std::collections::HashMap<String, String>,
     #[serde(default)]
     cookies: String,
+    /// `username:password`, sent as basic auth.
+    #[serde(default)]
+    basic_auth: String,
 }
 
 impl ScanAuth {
+    /// Whether the scan authenticates to its target with these.
+    fn carries_credentials(&self) -> bool {
+        !self.headers.is_empty() || !self.cookies.trim().is_empty() || !self.basic_auth.is_empty()
+    }
+
     /// Flatten into the `headers` list the prober consumes ("Key: Value"). The
     /// Cookie header carries the resolved cookie string verbatim rather than
     /// going through the prober's `cookies` list, which reparses `k:v` pairs and
@@ -458,7 +483,7 @@ async fn handle_stream_scan(
         },
         None => ScanWords::Named(&scan_params.wordlist),
     };
-    let (scanner, total, scan_id) = match prepare_scan(&scan_params, &db, words).await {
+    let (scanner, total, running) = match prepare_scan(&scan_params, &db, words).await {
         Ok(v) => v,
         Err(e) => {
             write_json(
@@ -513,7 +538,7 @@ async fn handle_stream_scan(
         let ran = scanner.run_headless_stream(tx).await;
         // Stopped when the caller went away before every request was sent, so that the
         // same scan again takes it up where it was.
-        let _ = db_clone.end_scan(&scan_id, ran.is_err()).await;
+        let _ = db_clone.end_scan(running, ran.is_err()).await;
         if save {
             let (status, result) = match &ran {
                 Ok(_) => (cfx_db::scans::Status::Completed, None),
@@ -677,6 +702,20 @@ async fn dispatch(
                 },
             }
         }
+        "purge" => match cfx_db::scans::purge_operation(db.pool(), &req.params).await {
+            Ok(done) => DaemonResponse {
+                operation_id,
+                status: "completed".to_string(),
+                results: None,
+                message: Some(done),
+            },
+            Err(why) => DaemonResponse {
+                operation_id,
+                status: "error".to_string(),
+                results: None,
+                message: Some(why),
+            },
+        },
         unknown => DaemonResponse {
             operation_id,
             status: "error".to_string(),
@@ -779,7 +818,10 @@ async fn prepare_scan(
     params: &ScanParams,
     db: &Arc<AmbuloDb>,
     words: ScanWords<'_>,
-) -> Result<(Scanner<ScanStore>, usize, String), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<
+    (Scanner<ScanStore>, usize, cfx_db::scans::Running),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     let http_method = parse_method(&params.method);
 
     let mut endpoint = params.endpoint.clone();
@@ -819,40 +861,61 @@ async fn prepare_scan(
     }
     .map_err(|e| format!("Wordlist error: {e}"))?;
 
-    let scan_config = serde_json::json!({
-        "urls": &config.url,
-        "wordlist_hash": &wordlist.hash,
-        "method": &config.http_method.to_string(),
-    });
-    let scan_config_hash =
-        crate::libs::sha::sha512_from_string(serde_json::to_string(&scan_config)?)
-            .await
-            .map_err(|e| format!("Hash: {e}"))?;
+    // A scan that authenticates (headers, cookies, basic auth, or a user, a password or a
+    // token in a URL) is known by its id alone, and keeps nothing derived from them; one
+    // that does not, by what it asks for.
+    let authenticated = params.auth.carries_credentials()
+        || config.url.iter().any(|u| cfx_db::scans::safe_url(u) != *u);
+    let scan_config_hash = if authenticated {
+        None
+    } else {
+        let scan_config = serde_json::json!({
+            "urls": &config.url,
+            "wordlist_hash": &wordlist.hash,
+            "method": &config.http_method.to_string(),
+        });
+        Some(
+            crate::libs::sha::sha512_from_string(serde_json::to_string(&scan_config)?)
+                .await
+                .map_err(|e| format!("Hash: {e}"))?,
+        )
+    };
+    let key = match &scan_config_hash {
+        Some(hash) => cfx_db::scans::Key::Settings(hash),
+        None => cfx_db::scans::Key::Authenticated,
+    };
     let asked = serde_json::to_string(params)?;
-    let scan = cfx_db::scans::start(
+    let running = cfx_db::scans::start(
         db.pool(),
         &config.url.join(", "),
-        &scan_config_hash,
+        key,
         &asked,
         params.fresh_start,
     )
     .await
     .map_err(|e| format!("DB: {e}"))?;
-    if scan.resumed {
-        db.requeue_unfinished(&scan.id)
-            .await
-            .map_err(|e| format!("DB: {e}"))?;
-    } else {
-        db.queue_scan(&scan.id, &config.url, wordlist.id)
-            .await
-            .map_err(|e| format!("DB: {e}"))?;
+    // What fails from here on ends the scan as failed, rather than leaving it running.
+    let queued = async {
+        if running.resumed {
+            db.requeue_unfinished(&running.id).await?;
+        } else {
+            db.queue_scan(&running.id, &config.url, wordlist.id).await?;
+        }
+        db.entries(&running.id).await
     }
-    let total = db.entries(&scan.id).await.map_err(|e| format!("DB: {e}"))?;
+    .await;
+    let total = match queued {
+        Ok(total) => total,
+        Err(e) => {
+            let _ = cfx_db::scans::finish(running, cfx_db::scans::Status::Failed).await;
+            return Err(format!("DB: {e}").into());
+        }
+    };
 
-    let store = db.scan_store(scan.id.clone(), &config);
+    let store = db.scan_store(running.id.clone(), &config);
     let scanner = Scanner::new(config, store);
 
-    Ok((scanner, total as usize, scan.id))
+    Ok((scanner, total as usize, running))
 }
 
 async fn run_scan(
@@ -862,10 +925,10 @@ async fn run_scan(
     if params.wordlist_follows.is_some() {
         return Err("words can follow only a stream scan's request".into());
     }
-    let (scanner, _, scan_id) =
+    let (scanner, _, running) =
         prepare_scan(params, db, ScanWords::Named(&params.wordlist)).await?;
     let ran = scanner.run_headless().await;
-    let _ = db.end_scan(&scan_id, ran.is_err()).await;
+    let _ = db.end_scan(running, ran.is_err()).await;
     ran.map_err(|e| format!("Scan: {e}").into())
 }
 
@@ -892,8 +955,8 @@ fn build_args(params: &ScanParams, endpoint: String, http_method: HttpMethod) ->
         // Authenticated scan: the credential's headers + Cookie land here so the
         // prober sends every probe as the logged-in user. Empty for anonymous.
         headers: params.auth.to_header_lines(),
-        basic_auth: String::new(),
-        store_cookies: false,
+        basic_auth: params.auth.basic_auth.clone(),
+        store_cookies: params.store_cookies,
         success_status_codes: params.success_status_codes.clone(),
         follow_redirects: params.follow_redirects,
         follow_redirects_depth: params.follow_redirects_depth,
@@ -901,14 +964,18 @@ fn build_args(params: &ScanParams, endpoint: String, http_method: HttpMethod) ->
         interval: params.delay,
         tasks: params.tasks,
         fresh_start: params.fresh_start,
-        random_user_agent_scan: false,
-        random_user_agent_request: false,
-        append_slash: false,
-        save_response_headers: true,
-        user_agent: adaptive::identity::resolve(&adaptive::identity::Mode::Evasive, None)
-            .user_agent,
+        random_user_agent_scan: params.random_user_agent_scan,
+        random_user_agent_request: params.random_user_agent_request,
+        append_slash: params.append_slash,
+        user_agent: params.user_agent.clone().unwrap_or_else(|| {
+            adaptive::identity::resolve(&adaptive::identity::Mode::Evasive, None).user_agent
+        }),
         launch_delay: 0,
-        log_level: LogLevel::Info,
+        log_level: params
+            .log_level
+            .as_deref()
+            .and_then(|level| <LogLevel as clap::ValueEnum>::from_str(level, true).ok())
+            .unwrap_or(LogLevel::Info),
         event_poll_timeout: 1000,
         interactive: false,
         adaptive_rate: params.adaptive_rate,
@@ -1510,5 +1577,71 @@ mod probe_redirect_tests {
         });
         let r = probe(&format!("http://127.0.0.1:{a}/"), "get").await;
         assert_eq!(r.results.as_ref().unwrap()["code"], 200, "{:?}", r.results);
+    }
+}
+
+#[cfg(test)]
+mod flag_tests {
+    use super::*;
+    use clap::Parser;
+
+    /// Every flag of `ambulo scan` the scanner can honour, from the command line through
+    /// the request the client sends and the daemon reads, into the scanner's settings.
+    #[test]
+    fn every_scan_flag_reaches_the_scanner() {
+        let cli = crate::libs::cli_args::Cli::try_parse_from([
+            "ambulo",
+            "scan",
+            "https://app.example/::FUZZ::",
+            "-w",
+            "words.txt",
+            "--headers",
+            "X-Team: red",
+            "--cookies",
+            "sid: abc",
+            "--basic-auth",
+            "u:p",
+            "--store-cookies",
+            "-i",
+            "250",
+            "--random-user-agent-scan",
+            "--random-user-agent-request",
+            "--append-slash",
+            "--user-agent",
+            "ua-1",
+            "--identify",
+            "team-7",
+            "--log-level",
+            "warn",
+            "--adaptive-rate",
+            "--adaptive-resilience",
+            "--posture",
+            "gentle",
+        ])
+        .unwrap();
+        let Some(crate::libs::cli_args::Commands::Scan(args)) = cli.command else {
+            panic!("not a scan");
+        };
+        let request = crate::scan_request(&args, &args.url[0]);
+        let params: ScanParams = serde_json::from_value(request).unwrap();
+        let config = build_args(
+            &params,
+            params.endpoint.clone(),
+            parse_method(&params.method),
+        );
+        assert_eq!(config.headers, ["X-Team: red", "Cookie: sid=abc"]);
+        assert_eq!(config.basic_auth, "u:p");
+        assert!(config.store_cookies);
+        assert_eq!(config.interval, 250);
+        assert!(config.random_user_agent_scan);
+        assert!(config.random_user_agent_request);
+        assert!(config.append_slash);
+        assert_eq!(config.user_agent, "ua-1");
+        assert_eq!(config.identify.as_deref(), Some("team-7"));
+        assert!(matches!(config.log_level, LogLevel::Warn));
+        assert!(config.adaptive_rate);
+        assert!(config.adaptive_resilience);
+        assert_eq!(config.posture, "gentle");
+        assert!(params.auth.carries_credentials());
     }
 }

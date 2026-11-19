@@ -11,6 +11,8 @@ repository = "https://github.com/clickswave/crossfyre-toolchain"
 keywords = ["security"]
 
 [dependencies]
+# The `db` subcommand every engine has.
+clap = { version = "4.5.42", features = ["derive"] }
 # The per-user config directory the toolchain directory is found in.
 dirs = "6"
 serde_json = "1"

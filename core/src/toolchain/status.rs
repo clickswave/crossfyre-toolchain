@@ -16,12 +16,12 @@ pub(crate) fn port_open(port: u16) -> bool {
 }
 
 /// `crossfyre status` - everything at a glance.
-pub fn overview(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn overview(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // The same header every other command prints, in place of a ruled line of its own.
     super::ui::title("Crossfyre status", "");
     nodes(base)?;
     extensions()?;
-    db()?;
+    db().await?;
     Ok(())
 }
 
@@ -200,7 +200,7 @@ pub fn extensions() -> Result<(), Box<dyn std::error::Error>> {
 
 /// `crossfyre status db` and `crossfyre db status`: which database the engines use, and
 /// whether it runs.
-pub fn db() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn db() -> Result<(), Box<dyn std::error::Error>> {
     use super::ui::*;
 
     section("Database");
@@ -261,15 +261,58 @@ pub fn db() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
+            if db.running {
+                held(&db.settings).await;
+            }
         }
     }
     end();
     Ok(())
 }
 
+/// A row for each engine that keeps something in the database: its scans, and the space
+/// its tables take.
+async fn held(settings: &cfx_db::Settings) {
+    use super::ui::*;
+    match cfx_db::held(settings).await {
+        Err(e) => println!("{}", row(&cross(), "engines", "", &e.to_string())),
+        Ok(engines) if engines.is_empty() => {
+            println!("{}", row(&dot(), "engines", "", &dim("nothing kept yet")))
+        }
+        Ok(engines) => {
+            for h in engines {
+                let scans = if h.scans == 1 {
+                    "1 scan".to_string()
+                } else {
+                    format!("{} scans", h.scans)
+                };
+                println!("{}", row(&dot(), &h.engine, &scans, &dim(&size(h.bytes))));
+            }
+        }
+    }
+}
+
+/// `bytes` as people read it: 812 kB, 3.4 MB.
+fn size(bytes: i64) -> String {
+    let b = bytes.max(0) as f64;
+    match b {
+        b if b < 1024.0 * 1024.0 => format!("{:.0} kB", b / 1024.0),
+        b if b < 1024.0 * 1024.0 * 1024.0 => format!("{:.1} MB", b / (1024.0 * 1024.0)),
+        b => format!("{:.1} GB", b / (1024.0 * 1024.0 * 1024.0)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_engines_holding_reads_in_the_unit_that_fits_it() {
+        assert_eq!(size(0), "0 kB");
+        assert_eq!(size(812 * 1024), "812 kB");
+        assert_eq!(size(3 * 1024 * 1024 + 400 * 1024), "3.4 MB");
+        assert_eq!(size(5 * 1024 * 1024 * 1024), "5.0 GB");
+    }
     use crate::toolchain::sudo_user::act_as_root;
     use std::fs;
 

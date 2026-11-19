@@ -46,9 +46,47 @@ pub async fn run(command: &crate::DbCommands) -> Result<(), Box<dyn std::error::
                 check_external(&settings).await?;
             }
         }
-        crate::DbCommands::Status => super::status::db()?,
+        crate::DbCommands::Status => super::status::db().await?,
+        crate::DbCommands::Purge(args) => purge(args).await?,
         crate::DbCommands::External { host, port, user } => {
             external(host, *port, user).await?;
+        }
+    }
+    Ok(())
+}
+
+/// `crossfyre db purge`: the scans `args` name, deleted from every engine that keeps
+/// them, without a daemon.
+async fn purge(args: &dguard::PurgeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use super::ui::{error, ok, warn};
+    let which = match (&args.scan, args.older_than) {
+        (Some(id), _) => cfx_db::scans::Purge::Scan(id),
+        (None, Some(days)) => cfx_db::scans::Purge::OlderThanDays(days),
+        (None, None) => return Err("name one scan with --scan, or days with --older-than".into()),
+    };
+    let done = cfx_db::purge_all(&load_config()?.postgres, which).await?;
+    if done.is_empty() {
+        warn("No engine keeps anything in the database yet.");
+        return Ok(());
+    }
+    let deleted: u64 = done.iter().map(|(_, n)| n).sum();
+    match which {
+        cfx_db::scans::Purge::Scan(id) if deleted == 0 => {
+            error(&format!(
+                "There is no scan {id}, or it is running, which a purge leaves alone."
+            ));
+            std::process::exit(1);
+        }
+        cfx_db::scans::Purge::Scan(id) => ok(&format!("Deleted scan {id}.")),
+        cfx_db::scans::Purge::OlderThanDays(days) => {
+            let each = done
+                .iter()
+                .map(|(engine, n)| format!("{engine} {n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            ok(&format!(
+                "Deleted {deleted} scan(s) made more than {days} day(s) ago: {each}."
+            ));
         }
     }
     Ok(())

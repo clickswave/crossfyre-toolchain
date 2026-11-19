@@ -1,4 +1,4 @@
-use crate::libs::cli_args::{Cli, Commands, DbArgs, ExecArgs};
+use crate::libs::cli_args::{Cli, Commands, ExecArgs};
 use crate::scanner::StreamEvent;
 use clap::{CommandFactory, Parser};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -41,7 +41,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let pool = cfx_db::ensure_ready(&libs::doorward_db::ENGINE)
                     .await
                     .map_err(|e| e.to_string())?;
-                cfx_db::scans::stopped_by_exit(&pool)
+                cfx_db::scans::stop_abandoned(&pool)
                     .await
                     .map_err(|e| e.to_string())?;
                 Ok::<_, String>(libs::doorward_db::DoorwardDb::new(pool))
@@ -56,10 +56,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let daemon = dguard::Daemon::new("doorward", cli.port, !cli.no_autostart);
 
     // -----------------------------------------------------------------------
-    // Db subcommand
+    // Db subcommand: sent to the daemon, which keeps the scans
     // -----------------------------------------------------------------------
-    if let Some(Commands::Db(db_args)) = &cli.command {
-        return handle_db(db_args.clone(), &daemon).await;
+    if let Some(Commands::Db { action }) = &cli.command {
+        return dguard::run_db(&daemon, action).await;
     }
 
     // -----------------------------------------------------------------------
@@ -97,17 +97,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let ports = libs::cli_args::resolve_ports(&scan_args.ports);
 
     // Build and send the stream scan request
-    let request = serde_json::json!({
-        "operation": "scan",
-        "response": "stream",
-        "save": true,
-        "targets": scan_args.targets,
-        "ports": ports,
-        "tasks": scan_args.tasks,
-        "timeout": scan_args.timeout,
-        "delay": scan_args.delay,
-        "service_detection": scan_args.service_detection,
-    });
+    let request = scan_request(&scan_args, &ports);
 
     let (reader, mut writer) = tokio::io::split(stream);
     let mut req_str = dguard::encode(&request);
@@ -179,33 +169,21 @@ fn print_all(bytes: &[u8]) -> std::io::Result<()> {
     }
 }
 
-async fn handle_db(
-    args: DbArgs,
-    daemon: &dguard::Daemon,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if !args.full_reset {
-        eprintln!("No action given. See `doorward db --help`.");
-        std::process::exit(1);
-    }
-
-    let stream = daemon.connect().await?;
-
-    let request = serde_json::json!({ "operation": "db_reset", "response": "instant" });
-    let (reader, mut writer) = tokio::io::split(stream);
-    let mut req_str = dguard::encode(&request);
-    req_str.push('\n');
-    writer.write_all(req_str.as_bytes()).await?;
-
-    let mut lines = BufReader::new(reader).lines();
-    if let Some(line) = lines.next_line().await? {
-        let resp: serde_json::Value = serde_json::from_str(&line)?;
-        match resp["status"].as_str().unwrap_or("error") {
-            "completed" => println!("{}", resp["message"].as_str().unwrap_or("Done.")),
-            _ => eprintln!("Error: {}", resp["message"].as_str().unwrap_or("unknown")),
-        }
-    }
-
-    Ok(())
+/// The stream scan request for `ports` of `args`' targets, with every flag of `args` the
+/// daemon honours.
+fn scan_request(args: &libs::cli_args::ScanArgs, ports: &[u16]) -> serde_json::Value {
+    serde_json::json!({
+        "operation": "scan",
+        "response": "stream",
+        "save": true,
+        "targets": args.targets,
+        "ports": ports,
+        "tasks": args.tasks,
+        "timeout": args.timeout,
+        "delay": args.delay,
+        "service_detection": args.service_detection,
+        "fresh_start": args.fresh_start,
+    })
 }
 
 async fn handle_scan_exec(

@@ -272,25 +272,14 @@ impl Prober {
         .to_string();
 
         // headers format --> Name: Value
-        let (headers, headers_length) = match &self.config.save_response_headers {
-            true => {
-                let headers = valid_response
-                    .headers()
-                    .iter()
-                    .map(|(name, value)| {
-                        format!("{}: {}", name.as_str(), value.to_str().unwrap_or(""))
-                    })
-                    .collect::<Vec<String>>();
-                let headers_length = headers.len();
-                (Some(headers), headers_length as i64)
-            }
-            false => {
-                let headers_length = valid_response.headers().len();
-
-                dbg!(headers_length);
-                (None, headers_length as i64)
-            }
-        };
+        // Read for Retry-After on a 429, and counted for the result; never kept.
+        let headers = valid_response
+            .headers()
+            .iter()
+            .map(|(name, value)| format!("{}: {}", name.as_str(), value.to_str().unwrap_or("")))
+            .collect::<Vec<String>>();
+        let headers_length = headers.len() as i64;
+        let headers = Some(headers);
         // The body is not kept, only its length: the declared one when there is one, so
         // the body need not be read for it.
         let body_length = match valid_response.content_length() {

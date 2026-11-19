@@ -1452,6 +1452,7 @@ dependencies = [
 name = "dguard"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "dirs",
  "libc",
  "serde_json",

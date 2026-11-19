@@ -803,7 +803,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Status => {
-            cfx_core::toolchain::status::overview(&base)?;
+            cfx_core::toolchain::status::overview(&base).await?;
         }
         Commands::Db { command } => {
             cfx_core::toolchain::db::run(&command).await?;

@@ -1,4 +1,4 @@
-use crate::libs::cli_args::{Cli, Commands, DbArgs, ExecArgs, OriginArgs, ScanArgs};
+use crate::libs::cli_args::{Cli, Commands, ExecArgs, OriginArgs, ScanArgs};
 use crate::scanner::StreamEvent;
 use clap::{CommandFactory, Parser};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -44,7 +44,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let pool = cfx_db::ensure_ready(&libs::voyage_db::ENGINE)
                     .await
                     .map_err(|e| e.to_string())?;
-                cfx_db::scans::stopped_by_exit(&pool)
+                cfx_db::scans::stop_abandoned(&pool)
                     .await
                     .map_err(|e| e.to_string())?;
                 let db = libs::voyage_db::VoyageDb::new(pool);
@@ -60,10 +60,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let daemon = dguard::Daemon::new("voyage", cli.port, !cli.no_autostart);
 
     // -----------------------------------------------------------------------
-    // Db subcommand - send db_reset to daemon
+    // Db subcommand: sent to the daemon, which keeps the scans
     // -----------------------------------------------------------------------
-    if let Some(Commands::Db(db_args)) = &cli.command {
-        return handle_db(db_args.clone(), &daemon).await;
+    if let Some(Commands::Db { action }) = &cli.command {
+        return dguard::run_db(&daemon, action).await;
     }
 
     if let Some(Commands::Exec(exec_args)) = &cli.command {
@@ -97,7 +97,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut enum_args = match cli.command {
         Some(Commands::Scan(args)) => args,
         Some(Commands::Exec(_))
-        | Some(Commands::Db(_))
+        | Some(Commands::Db { .. })
         | Some(Commands::Origin(_))
         | Some(Commands::Axfr(_))
         | Some(Commands::Completions { .. })
@@ -141,6 +141,46 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// The stream enumeration request for `domain` with every flag of `args` the daemon
+/// honours, the interval between requests as `delay`. `active` says whether words
+/// follow it for the active part.
+fn enum_request(args: &ScanArgs, domain: &str, active: bool) -> serde_json::Value {
+    serde_json::json!({
+        "operation": "enum",
+        "response": "stream",
+        "save": true,
+        "domain": domain,
+        "tasks": args.tasks,
+        "delay": args.interval,
+        "fresh_start": args.fresh_start,
+        "disable_passive": args.disable_passive_enum,
+        "disable_active": !active,
+        "exclude_passive_sources": args.exclude_passive_source,
+        "exclude_active_techniques": args.exclude_active_technique,
+        "http_probing_ports": args.http_probing_port,
+        "https_probing_ports": args.https_probing_port,
+        "active_user_agent": args.active_user_agent,
+        "active_random_user_agent": args.active_random_user_agent,
+        "passive_user_agent": args.passive_user_agent,
+    })
+}
+
+/// Whether event `line` is shown at log level `least`: every event but a log line below
+/// it.
+fn shown(line: &str, least: &libs::cli_args::LogLevel) -> bool {
+    let rank = |level: &str| {
+        ["debug", "info", "warn", "error"]
+            .iter()
+            .position(|l| *l == level)
+    };
+    match serde_json::from_str::<StreamEvent>(line) {
+        Ok(ev) if ev.kind == "log" => {
+            rank(ev.log_level.as_deref().unwrap_or("info")) >= rank(&least.to_string())
+        }
+        _ => true,
+    }
+}
+
 /// One enumeration of `domain` by the daemon, with the words of the file at `wordlist`
 /// when there is one: drawn on the dashboard when `tui`, and otherwise written out as
 /// the daemon's own newline-delimited JSON.
@@ -153,23 +193,7 @@ async fn scan_domain(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let stream = daemon.connect().await?;
 
-    // Build and send the stream enum request
-    let mut request = serde_json::json!({
-        "operation": "enum",
-        "response": "stream",
-        "save": true,
-        "domain": domain,
-        "tasks": enum_args.tasks,
-        "fresh_start": enum_args.fresh_start,
-        "disable_passive": enum_args.disable_passive_enum,
-        "disable_active": wordlist.is_none(),
-        "exclude_passive_sources": enum_args.exclude_passive_source,
-        "exclude_active_techniques": enum_args.exclude_active_technique,
-        "http_probing_ports": enum_args.http_probing_port,
-        "https_probing_ports": enum_args.https_probing_port,
-        "active_user_agent": enum_args.active_user_agent,
-        "passive_user_agent": enum_args.passive_user_agent,
-    });
+    let mut request = enum_request(enum_args, domain, wordlist.is_some());
     if let Some(wordlist) = wordlist {
         request[dguard::WORDS_FOLLOW] = dguard::list_name(wordlist).into();
     }
@@ -208,11 +232,15 @@ async fn scan_domain(
     let operation_id = ack.operation_id.unwrap_or_else(|| "unknown".to_string());
     let total = ack.total.unwrap_or(0);
     let poll_timeout = enum_args.event_poll_timeout;
+    let least = enum_args.log_level.clone();
 
     if tui {
         let (tx, rx) = mpsc::unbounded_channel::<StreamEvent>();
         tokio::spawn(async move {
             while let Ok(Some(line)) = lines.next_line().await {
+                if !shown(&line, &least) {
+                    continue;
+                }
                 if let Ok(ev) = serde_json::from_str::<StreamEvent>(&line) {
                     let done = ev.kind == "done";
                     let _ = tx.send(ev);
@@ -233,7 +261,9 @@ async fn scan_domain(
     // out too rather than being swallowed by the line that read it.
     println!("{ack_line}");
     while let Some(line) = lines.next_line().await? {
-        println!("{line}");
+        if shown(&line, &least) {
+            println!("{line}");
+        }
         if dguard::is_error(&line) {
             std::process::exit(1);
         }
@@ -255,35 +285,6 @@ fn print_all(bytes: &[u8]) -> std::io::Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
         done => done,
     }
-}
-
-async fn handle_db(
-    args: DbArgs,
-    daemon: &dguard::Daemon,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if !args.full_reset {
-        eprintln!("No action given. See `voyage db --help`.");
-        std::process::exit(1);
-    }
-
-    let stream = daemon.connect().await?;
-
-    let request = serde_json::json!({ "operation": "db_reset", "response": "instant" });
-    let (reader, mut writer) = tokio::io::split(stream);
-    let mut req_str = dguard::encode(&request);
-    req_str.push('\n');
-    writer.write_all(req_str.as_bytes()).await?;
-
-    let mut lines = BufReader::new(reader).lines();
-    if let Some(line) = lines.next_line().await? {
-        let resp: serde_json::Value = serde_json::from_str(&line)?;
-        match resp["status"].as_str().unwrap_or("error") {
-            "completed" => println!("{}", resp["message"].as_str().unwrap_or("Done.")),
-            _ => eprintln!("Error: {}", resp["message"].as_str().unwrap_or("unknown")),
-        }
-    }
-
-    Ok(())
 }
 
 async fn handle_origin(args: OriginArgs) -> Result<(), Box<dyn std::error::Error>> {

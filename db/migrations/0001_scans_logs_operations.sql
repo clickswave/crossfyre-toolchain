@@ -2,11 +2,12 @@
 -- the `db` commands read them alike.
 
 -- A scan: what it was pointed at, what it was asked to do, and where it is. A scan
--- with the same config_hash as a stopped one resumes that one.
+-- with the same config_hash as a stopped one resumes that one. A scan that
+-- authenticates to its target has none, and is resumed by its id.
 CREATE TABLE scans (
     id          TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
     target      TEXT NOT NULL,
-    config_hash TEXT NOT NULL,
+    config_hash TEXT,
     params      JSONB NOT NULL DEFAULT '{}',
     status      TEXT NOT NULL DEFAULT 'queued'
                 CHECK (status IN ('queued', 'running', 'stopped', 'completed', 'failed')),

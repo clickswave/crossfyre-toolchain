@@ -93,6 +93,9 @@ struct EnumParams {
     https_probing_ports: Vec<u16>,
     #[serde(default = "default_active_ua")]
     active_user_agent: String,
+    /// A new random User-Agent for every active request.
+    #[serde(default)]
+    active_random_user_agent: bool,
     #[serde(default = "default_passive_ua")]
     passive_user_agent: String,
     /// Explicit DNS server IP to resolve against. Empty = use the node's
@@ -355,7 +358,7 @@ async fn handle_stream_enum(
         .wordlist_follows
         .is_some()
         .then(|| dguard::WordChunks::new(lines, gate));
-    let (scanner, total) = match prepare_enum(&params, &db, following).await {
+    let (scanner, total, running) = match prepare_enum(&params, &db, following).await {
         Ok(v) => v,
         Err(e) => {
             write_json(
@@ -396,11 +399,10 @@ async fn handle_stream_enum(
     let oid = operation_id.clone();
     let save = req.save;
     let db_clone = Arc::clone(&db);
-    let scan_id = scanner.config.scan_id.clone();
 
     dguard::spawn_busy(async move {
         let ran = scanner.run_headless_stream(tx).await;
-        let _ = db_clone.end_scan(&scan_id, ran.is_err()).await;
+        let _ = db_clone.end_scan(running, ran.is_err()).await;
         if save {
             let (status, result) = match &ran {
                 Ok(()) => (cfx_db::scans::Status::Completed, None),
@@ -589,6 +591,20 @@ async fn dispatch(req: DaemonRequest, db: Arc<VoyageDb>) -> DaemonResponse {
                 },
             }
         }
+        "purge" => match cfx_db::scans::purge_operation(db.pool(), &req.params).await {
+            Ok(done) => DaemonResponse {
+                operation_id,
+                status: "completed".to_string(),
+                results: None,
+                message: Some(done),
+            },
+            Err(why) => DaemonResponse {
+                operation_id,
+                status: "error".to_string(),
+                results: None,
+                message: Some(why),
+            },
+        },
         unknown => DaemonResponse {
             operation_id,
             status: "error".to_string(),
@@ -644,7 +660,10 @@ async fn prepare_enum(
     params: &EnumParams,
     db: &Arc<VoyageDb>,
     following: Option<dguard::WordChunks<'_, BufReader<OwnedReadHalf>>>,
-) -> Result<(Scanner<VoyageDb>, usize), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<
+    (Scanner<VoyageDb>, usize, cfx_db::scans::Running),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     let words = match following {
         Some(mut chunks) => {
             if !params.wordlist.is_empty() || params.disable_active {
@@ -675,91 +694,100 @@ async fn prepare_enum(
     };
     let config_hash = scan_key(&params.domain, &params.wordlist, words.as_deref());
     let asked = serde_json::to_string(params).map_err(|e| format!("Invalid params: {e}"))?;
-    let scan_id = db
+    let running = db
         .start_scan(&params.domain, &config_hash, &asked, params.fresh_start)
         .await
         .map_err(|e| format!("DB error: {e}"))?;
+    let scan_id = running.id.clone();
+    // What fails from here on ends the scan as failed, rather than leaving it running.
+    let ready = async {
+        // Passive scan - insert results with status="found"
+        if !params.disable_passive {
+            match crate::scanners::passive_scan::execute(
+                &params.domain,
+                &params.passive_user_agent,
+                &params.exclude_passive_sources,
+                &params.egress,
+            )
+            .await
+            {
+                Ok(results) => {
+                    let entries: Vec<(String, String, String, String)> = results
+                        .iter()
+                        .map(|(subdomain, source)| {
+                            (
+                                subdomain.clone(),
+                                "passive".to_string(),
+                                source.clone(),
+                                "found".to_string(),
+                            )
+                        })
+                        .collect();
+                    let _ = db.insert_entries_batch(&scan_id, &entries).await;
+                }
+                Err(e) => eprintln!("[WARN] Passive scan error: {e}"),
+            }
+        }
 
-    // Passive scan - insert results with status="found"
-    if !params.disable_passive {
-        match crate::scanners::passive_scan::execute(
-            &params.domain,
-            &params.passive_user_agent,
-            &params.exclude_passive_sources,
-            &params.egress,
-        )
-        .await
-        {
-            Ok(results) => {
-                let entries: Vec<(String, String, String, String)> = results
+        // Active wordlist - insert entries with status="queued", a batch at a time, so the
+        // words are never held a second time as entries
+        if let Some(words) = words {
+            for batch in words.chunks(dguard::CHUNK_WORDS) {
+                let entries: Vec<(String, String, String, String)> = batch
                     .iter()
-                    .map(|(subdomain, source)| {
+                    .filter(|w| !w.trim().is_empty())
+                    .map(|word| {
                         (
-                            subdomain.clone(),
-                            "passive".to_string(),
-                            source.clone(),
-                            "found".to_string(),
+                            format!("{}.{}", word.trim(), params.domain),
+                            "active".to_string(),
+                            String::new(),
+                            "queued".to_string(),
                         )
                     })
                     .collect();
-                let _ = db.insert_entries_batch(&scan_id, &entries).await;
+                db.insert_entries_batch(&scan_id, &entries)
+                    .await
+                    .map_err(|e| format!("DB error: {e}"))?;
             }
-            Err(e) => eprintln!("[WARN] Passive scan error: {e}"),
+        }
+
+        db.reset_halted_entries(&scan_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))?;
+
+        let total = db
+            .get_scan_entry_total(&scan_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))? as usize;
+
+        let config = EnumConfig {
+            scan_id,
+            tasks: params.tasks,
+            interval_ms: params.delay,
+            exclude_active_techniques: params.exclude_active_techniques.clone(),
+            block_internal: params.block_internal,
+            http_probing_ports: params.http_probing_ports.clone(),
+            https_probing_ports: params.https_probing_ports.clone(),
+            active_user_agent: params.active_user_agent.clone(),
+            active_random_user_agent: params.active_random_user_agent,
+            dns_server: params.dns_server.clone(),
+            adaptive_rate: params.adaptive_rate,
+            adaptive_resilience: params.adaptive_resilience,
+            posture: params.posture.clone(),
+            evasive: params.evasive,
+            identify: params.identify.clone(),
+            egress: params.egress.clone(),
+        };
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>((config, total))
+    }
+    .await;
+    match ready {
+        Ok((config, total)) => Ok((Scanner::new(config, Arc::clone(db)), total, running)),
+        Err(e) => {
+            let _ = cfx_db::scans::finish(running, cfx_db::scans::Status::Failed).await;
+            Err(e)
         }
     }
-
-    // Active wordlist - insert entries with status="queued", a batch at a time, so the
-    // words are never held a second time as entries
-    if let Some(words) = words {
-        for batch in words.chunks(dguard::CHUNK_WORDS) {
-            let entries: Vec<(String, String, String, String)> = batch
-                .iter()
-                .filter(|w| !w.trim().is_empty())
-                .map(|word| {
-                    (
-                        format!("{}.{}", word.trim(), params.domain),
-                        "active".to_string(),
-                        String::new(),
-                        "queued".to_string(),
-                    )
-                })
-                .collect();
-            db.insert_entries_batch(&scan_id, &entries)
-                .await
-                .map_err(|e| format!("DB error: {e}"))?;
-        }
-    }
-
-    db.reset_halted_entries(&scan_id)
-        .await
-        .map_err(|e| format!("DB error: {e}"))?;
-
-    let total = db
-        .get_scan_entry_total(&scan_id)
-        .await
-        .map_err(|e| format!("DB error: {e}"))? as usize;
-
-    let config = EnumConfig {
-        scan_id,
-        tasks: params.tasks,
-        interval_ms: params.delay,
-        exclude_active_techniques: params.exclude_active_techniques.clone(),
-        block_internal: params.block_internal,
-        http_probing_ports: params.http_probing_ports.clone(),
-        https_probing_ports: params.https_probing_ports.clone(),
-        active_user_agent: params.active_user_agent.clone(),
-        active_random_user_agent: false,
-        dns_server: params.dns_server.clone(),
-        adaptive_rate: params.adaptive_rate,
-        adaptive_resilience: params.adaptive_resilience,
-        posture: params.posture.clone(),
-        evasive: params.evasive,
-        identify: params.identify.clone(),
-        egress: params.egress.clone(),
-    };
-
-    let scanner = Scanner::new(config, Arc::clone(db));
-    Ok((scanner, total))
 }
 
 async fn run_enum_instant(
@@ -769,17 +797,16 @@ async fn run_enum_instant(
     if params.wordlist_follows.is_some() {
         return Err("words can follow only a stream enum's request".into());
     }
-    let (scanner, _) = prepare_enum(params, db, None).await?;
-    let scan_id = scanner.config.scan_id.clone();
+    let (scanner, _, running) = prepare_enum(params, db, None).await?;
+    let scan_id = running.id.clone();
     let db2 = Arc::clone(&scanner.store);
 
     let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
 
     let ending = Arc::clone(&db2);
-    let ended = scan_id.clone();
     dguard::spawn_busy(async move {
         let ran = scanner.run_headless_stream(tx).await;
-        let _ = ending.end_scan(&ended, ran.is_err()).await;
+        let _ = ending.end_scan(running, ran.is_err()).await;
     });
 
     // Drain until channel closes (after "done" is sent)
@@ -1767,5 +1794,44 @@ mod http_request_tests {
             !lines.iter().any(|l| l.contains("capabilities")),
             "read on past the first line: {lines:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod flag_tests {
+    use super::*;
+    use clap::Parser;
+
+    /// Every flag of `voyage scan` the daemon honours, from the command line through the
+    /// request the client sends, into what the daemon reads; and the log level, which
+    /// the client applies to what it shows.
+    #[test]
+    fn every_scan_flag_reaches_the_daemon() {
+        let cli = crate::libs::cli_args::Cli::try_parse_from([
+            "voyage",
+            "scan",
+            "example.com",
+            "--interval",
+            "250",
+            "--active-random-user-agent",
+            "--log-level",
+            "warn",
+        ])
+        .unwrap();
+        let Some(crate::libs::cli_args::Commands::Scan(args)) = cli.command else {
+            panic!("not a scan");
+        };
+        let params: EnumParams =
+            serde_json::from_value(crate::enum_request(&args, "example.com", false)).unwrap();
+        assert_eq!(params.delay, 250);
+        assert!(params.active_random_user_agent);
+        let line = |level: &str| format!(r#"{{"type":"log","log_level":"{level}","message":"m"}}"#);
+        assert!(!crate::shown(&line("info"), &args.log_level));
+        assert!(crate::shown(&line("warn"), &args.log_level));
+        assert!(crate::shown(&line("error"), &args.log_level));
+        assert!(crate::shown(
+            r#"{"type":"result","subdomain":"a.example.com"}"#,
+            &args.log_level
+        ));
     }
 }

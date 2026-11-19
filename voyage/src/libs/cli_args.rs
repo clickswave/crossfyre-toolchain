@@ -80,8 +80,11 @@ pub enum Commands {
     /// Send a JSON op to the daemon and print the reply. `operation` defaults to
     /// `probe`, which checks a single subdomain with no dashboard.
     Exec(ExecArgs),
-    /// Database management
-    Db(DbArgs),
+    /// What this engine keeps: delete one scan, old scans, or everything
+    Db {
+        #[command(subcommand)]
+        action: dguard::DbAction,
+    },
     /// Discover a target's real origin IP behind a CDN/WAF
     Origin(OriginArgs),
     /// Try a DNS zone transfer (AXFR) and print every name the zone gives up
@@ -137,13 +140,6 @@ pub struct OriginArgs {
 pub struct ExecArgs {
     /// JSON payload: {"domain":"sub.example.com","volatility":0}
     pub json: String,
-}
-
-#[derive(ClapArgs, Clone, Debug)]
-pub struct DbArgs {
-    /// Remove all rows from every table (keeps schema intact)
-    #[arg(long, default_value_t = false)]
-    pub full_reset: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -361,9 +357,9 @@ mod tests {
     #[test]
     fn no_autostart_goes_before_or_after_the_command() {
         let parsed = |argv: &[&str]| Cli::try_parse_from(argv).expect("parses").no_autostart;
-        assert!(parsed(&["voyage", "--no-autostart", "db", "--full-reset"]));
-        assert!(parsed(&["voyage", "db", "--full-reset", "--no-autostart"]));
-        assert!(!parsed(&["voyage", "db", "--full-reset"]));
+        assert!(parsed(&["voyage", "--no-autostart", "db", "reset"]));
+        assert!(parsed(&["voyage", "db", "reset", "--no-autostart"]));
+        assert!(!parsed(&["voyage", "db", "reset"]));
     }
 
     #[test]

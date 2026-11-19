@@ -135,8 +135,10 @@ impl AmbuloDb {
     }
 
     /// Request each of `urls` with every word of wordlist `wordlist_id`, as scan
-    /// `scan_id`: the URLs are kept, and an entry made for each URL and word. The
-    /// database makes the entries from the words it holds, so none is read here.
+    /// `scan_id`: the URLs are kept, without a user, a password or a token in them (the
+    /// scan's [`ScanStore`] holds them as given), and an entry made for each URL and
+    /// word. The database makes the entries from the words it holds, so none is read
+    /// here.
     pub async fn queue_scan(
         &self,
         scan_id: &str,
@@ -147,7 +149,7 @@ impl AmbuloDb {
         for url in urls {
             let url_id: i64 =
                 sqlx::query_scalar("INSERT INTO urls (url, scan_id) VALUES ($1, $2) RETURNING id")
-                    .bind(url)
+                    .bind(cfx_db::scans::safe_url(url))
                     .bind(scan_id)
                     .fetch_one(&mut *tx)
                     .await?;
@@ -186,12 +188,16 @@ impl AmbuloDb {
 
     /// End scan `scan_id`: completed when it sent every request, stopped when some were
     /// left unsent, failed when it failed.
-    pub async fn end_scan(&self, scan_id: &str, failed: bool) -> Result<(), sqlx::Error> {
+    pub async fn end_scan(
+        &self,
+        scan: cfx_db::scans::Running,
+        failed: bool,
+    ) -> Result<(), sqlx::Error> {
         let left: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM scan_entries \
              WHERE scan_id = $1 AND status IN ('queued', 'scanning'))",
         )
-        .bind(scan_id)
+        .bind(&scan.id)
         .fetch_one(&self.pool)
         .await?;
         let status = match (failed, left) {
@@ -199,7 +205,7 @@ impl AmbuloDb {
             (false, true) => cfx_db::scans::Status::Stopped,
             (false, false) => cfx_db::scans::Status::Completed,
         };
-        cfx_db::scans::finish(&self.pool, scan_id, status).await
+        cfx_db::scans::finish(scan, status).await
     }
 
     /// Delete the scans made more than `retention_hours` ago, with everything kept for
@@ -221,6 +227,10 @@ const LOG_LEVELS: [&str; 4] = ["debug", "info", "warn", "error"];
 pub struct ScanStore {
     pool: sqlx::PgPool,
     scan_id: String,
+    /// The scan's URLs as the request gave them, by the URL kept for each, which has no
+    /// credential in it. They are held here for the scan's life and given again when it
+    /// is taken up again.
+    urls: std::collections::HashMap<String, String>,
     /// What a request is made from: the scan's URL with the word in place of its marker.
     fuzz_marker: String,
     method: String,
@@ -235,6 +245,11 @@ impl AmbuloDb {
         ScanStore {
             pool: self.pool.clone(),
             scan_id,
+            urls: config
+                .url
+                .iter()
+                .map(|url| (cfx_db::scans::safe_url(url), url.clone()))
+                .collect(),
             fuzz_marker: config.fuzz_marker.clone(),
             method: config.http_method.to_string(),
             min_level: LOG_LEVELS.iter().position(|l| *l == level).unwrap_or(0),
@@ -267,7 +282,7 @@ impl Store for ScanStore {
         .await
         .map_err(|e| e.to_string())?;
         Ok(entry.map(|(entry_id, url, word)| Work {
-            url: url.replace(&self.fuzz_marker, &word),
+            url: self.given(&url).replace(&self.fuzz_marker, &word),
             entry_id,
             method: self.method.clone(),
         }))
@@ -299,9 +314,11 @@ impl Store for ScanStore {
     }
 
     async fn results(&self) -> Result<ScanResults, String> {
-        results(&self.pool, &self.fuzz_marker, &self.scan_id)
-            .await
-            .map_err(|e| e.to_string())
+        results(&self.pool, &self.scan_id, |url, word| {
+            self.given(url).replace(&self.fuzz_marker, word)
+        })
+        .await
+        .map_err(|e| e.to_string())
     }
 
     /// A line that cannot be kept is dropped: a scan does not stop over its log.
@@ -318,11 +335,22 @@ impl Store for ScanStore {
     }
 }
 
-/// What scan `scan_id` found, in the order its entries were made, with its totals.
+impl ScanStore {
+    /// The URL the request gave for `kept`, a URL as the scan keeps it.
+    fn given(&self, kept: &str) -> String {
+        self.urls
+            .get(kept)
+            .cloned()
+            .unwrap_or_else(|| kept.to_string())
+    }
+}
+
+/// What scan `scan_id` found, in the order its entries were made, with its totals, each
+/// entry's URL made by `request` from the URL kept and the word.
 async fn results(
     pool: &sqlx::PgPool,
-    fuzz_marker: &str,
     scan_id: &str,
+    request: impl Fn(&str, &str) -> String,
 ) -> Result<ScanResults, sqlx::Error> {
     let found: Vec<(String, String, i32, i64, i64)> = sqlx::query_as(
         "SELECT u.url, w.word, e.request_status, e.body_length, e.headers_length \
@@ -350,7 +378,7 @@ async fn results(
             .into_iter()
             .map(
                 |(url, word, code, body_length, headers_length)| ScanResult {
-                    url: url.replace(fuzz_marker, &word),
+                    url: request(&url, &word),
                     scan_status: "found".to_string(),
                     request_status: code.to_string(),
                     body_length,

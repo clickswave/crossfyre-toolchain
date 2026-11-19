@@ -40,29 +40,31 @@ impl VoyageDb {
 
     /// Start a scan of `domain` asked for with `params`, whose names are keyed by
     /// `config_hash`: a stopped scan with the same key is taken up again, with the names
-    /// it had tried, unless `fresh` asks for a new one.
+    /// it had tried, unless `fresh` asks for a new one. voyage never authenticates to
+    /// the names it tries: a passive source's API key does not change what they answer.
     pub async fn start_scan(
         &self,
         domain: &str,
         config_hash: &str,
         params: &str,
         fresh: bool,
-    ) -> Result<String, sqlx::Error> {
-        Ok(
-            cfx_db::scans::start(&self.pool, domain, config_hash, params, fresh)
-                .await?
-                .id,
-        )
+    ) -> Result<cfx_db::scans::Running, sqlx::Error> {
+        let key = cfx_db::scans::Key::Settings(config_hash);
+        cfx_db::scans::start(&self.pool, domain, key, params, fresh).await
     }
 
     /// End scan `scan`: completed when it tried every name, stopped when some were left
     /// untried, failed when it failed.
-    pub async fn end_scan(&self, scan: &str, failed: bool) -> Result<(), sqlx::Error> {
+    pub async fn end_scan(
+        &self,
+        scan: cfx_db::scans::Running,
+        failed: bool,
+    ) -> Result<(), sqlx::Error> {
         let left: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM scan_entries \
              WHERE scan_id = $1 AND status IN ('queued', 'scanning'))",
         )
-        .bind(scan)
+        .bind(&scan.id)
         .fetch_one(&self.pool)
         .await?;
         let status = match (failed, left) {
@@ -70,7 +72,7 @@ impl VoyageDb {
             (false, true) => cfx_db::scans::Status::Stopped,
             (false, false) => cfx_db::scans::Status::Completed,
         };
-        cfx_db::scans::finish(&self.pool, scan, status).await
+        cfx_db::scans::finish(scan, status).await
     }
 
     // --- Entries ---

@@ -702,8 +702,11 @@ pub enum DbCommands {
     Stop,
     /// Stop the local database and start it again
     Restart,
-    /// Show which database the engines use, and whether it runs
+    /// Show which database the engines use, whether it runs, and what each engine keeps
     Status,
+    /// Delete one scan with what it found, or every scan made more than a number of days
+    /// ago, from every engine. A running scan is left alone
+    Purge(dguard::PurgeArgs),
     /// Use a database you run yourself, in Docker or anywhere else, in place of the local
     /// one. The password is asked for, or read from CROSSFYRE_DB_PASSWORD
     External {

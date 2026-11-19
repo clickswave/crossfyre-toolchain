@@ -109,8 +109,11 @@ pub enum Commands {
     /// Send a JSON op to the daemon and print the reply. `operation` defaults to
     /// `probe`, which checks a single URL with no wordlist and no dashboard.
     Exec(ExecArgs),
-    /// Database management
-    Db(DbArgs),
+    /// What this engine keeps: delete one scan, old scans, or everything
+    Db {
+        #[command(subcommand)]
+        action: dguard::DbAction,
+    },
     /// Run as this engine's daemon, which the commands here and the node talk to on
     /// --port
     Daemon,
@@ -126,13 +129,6 @@ pub enum Commands {
 pub struct ExecArgs {
     /// JSON payload: {"operation_id":"<uuid>","url":"<url>","success_codes":[200],"method":"get"}
     pub json: String,
-}
-
-#[derive(ClapArgs, Clone, Debug)]
-pub struct DbArgs {
-    /// Remove all rows from every table (keeps schema intact)
-    #[arg(long, default_value_t = false)]
-    pub full_reset: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -210,10 +206,6 @@ pub struct ScanArgs {
     /// Append trailing slash to URLs
     #[arg(long, default_value_t = false)]
     pub append_slash: bool,
-
-    /// Save response headers for each request
-    #[arg(long, default_value_t = true)]
-    pub save_response_headers: bool,
 
     /// User agent string
     #[arg(long, default_value_t = adaptive::identity::resolve(&adaptive::identity::Mode::Evasive, None).user_agent)]
@@ -442,9 +434,9 @@ mod tests {
     #[test]
     fn no_autostart_goes_before_or_after_the_command() {
         let parsed = |argv: &[&str]| Cli::try_parse_from(argv).expect("parses").no_autostart;
-        assert!(parsed(&["ambulo", "--no-autostart", "db", "--full-reset"]));
-        assert!(parsed(&["ambulo", "db", "--full-reset", "--no-autostart"]));
-        assert!(!parsed(&["ambulo", "db", "--full-reset"]));
+        assert!(parsed(&["ambulo", "--no-autostart", "db", "reset"]));
+        assert!(parsed(&["ambulo", "db", "reset", "--no-autostart"]));
+        assert!(!parsed(&["ambulo", "db", "reset"]));
     }
 
     #[test]

@@ -1,8 +1,8 @@
 //! The tables every engine has (`scans`, `logs` and `operations`), written the same way
 //! by each, on a pool [`crate::ensure_ready`] gave it, which looks in the engine's own
-//! schema.
+//! schema. Nothing kept here holds a credential: see [`without_secrets`].
 
-use sqlx::PgPool;
+use sqlx::{Connection, PgPool};
 
 /// Where a scan or an operation is: the same names in every engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,64 +29,134 @@ impl Status {
     }
 }
 
-/// The scan a request runs as.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Started {
-    pub id: String,
-    /// Whether it is a stopped scan taken up again, rather than a new one.
-    pub resumed: bool,
-}
-
-/// Keys whose values are credentials, at any depth of a request's parameters, as
-/// [`secret_key`] spells them.
-const SECRET_KEYS: &[&str] = &[
-    "auth",
-    "authorization",
-    "proxyauthorization",
-    "cookie",
-    "cookies",
-    "setcookie",
+/// Parts of a name that mark what it holds as a credential: a key, a header or a query
+/// parameter whose name, in lower case, contains one of them. A harmless setting whose
+/// name happens to contain one is not kept either.
+const SECRET_PARTS: &[&str] = &[
     "token",
-    "accesstoken",
-    "refreshtoken",
-    "idtoken",
-    "bearer",
-    "password",
-    "passwd",
     "secret",
-    "clientsecret",
+    "passw",
+    "auth",
     "apikey",
-    "xapikey",
-    "credential",
-    "credentials",
+    "api_key",
     "session",
-    "sessionid",
+    "credential",
+    "cookie",
+    "jwt",
+    "csrf",
+    "xsrf",
+    "signature",
 ];
 
-/// Whether `key` names a credential, compared in lower case with `-` and `_` taken out,
-/// so that `X-Api-Key`, `api_key` and `apiKey` are one name.
-fn secret_key(key: &str) -> bool {
-    let key: String = key
-        .chars()
-        .filter(|c| *c != '-' && *c != '_')
-        .flat_map(char::to_lowercase)
-        .collect();
-    SECRET_KEYS.contains(&key.as_str())
+/// Query parameters that carry a credential under a name too short to look for inside
+/// other names.
+const SECRET_PARAMS: &[&str] = &["sig", "key", "code", "pass", "pwd"];
+
+fn secret_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    SECRET_PARTS.iter().any(|part| name.contains(part))
 }
 
-/// Whether `line` is a header (`Name: value`) that carries a credential.
-fn secret_header(line: &str) -> bool {
-    line.split_once(':')
-        .is_some_and(|(name, _)| secret_key(name.trim()))
-}
-
-/// `url` without the user and password it names, when it names them.
-fn without_userinfo(url: &str) -> Option<String> {
-    let (scheme, rest) = url.split_once("://")?;
+/// `url` without a user or password in it, and without the value of any query parameter
+/// that carries a credential. Text that is not a URL comes back as it was.
+pub fn safe_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (authority, tail) = rest.split_at(end);
-    let (_, host) = authority.rsplit_once('@')?;
-    Some(format!("{scheme}://{host}{tail}"))
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let (before, fragment) = match tail.split_once('#') {
+        Some((before, fragment)) => (before, Some(fragment)),
+        None => (tail, None),
+    };
+    let tail = match before.split_once('?') {
+        Some((path, query)) => {
+            let query = query
+                .split('&')
+                .map(|pair| match pair.split_once('=') {
+                    Some((name, _))
+                        if secret_name(name)
+                            || SECRET_PARAMS.contains(&name.to_ascii_lowercase().as_str()) =>
+                    {
+                        format!("{name}=")
+                    }
+                    _ => pair.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join("&");
+            format!("{path}?{query}")
+        }
+        None => before.to_string(),
+    };
+    match fragment {
+        Some(fragment) => format!("{scheme}://{host}{tail}#{fragment}"),
+        None => format!("{scheme}://{host}{tail}"),
+    }
+}
+
+/// Text to keep, such as a log line or a result: every URL in it made safe (see
+/// [`safe_url`]), and the value of a header it echoes that carries a credential left out.
+pub fn safe_text(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            if let Some((name, _)) = line.split_once(':')
+                && !name.trim().contains(' ')
+                && !name.contains("//")
+                && secret_name(name.trim())
+            {
+                return format!("{name}: [not kept]");
+            }
+            line.split(' ')
+                .map(|word| {
+                    if word.contains("://") {
+                        safe_url(word)
+                    } else {
+                        word.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Whether the key `key` holds headers, whose values are never kept.
+fn header_key(key: &str) -> bool {
+    key.to_ascii_lowercase().contains("header")
+}
+
+/// The names of headers in `value`, an object of name to value or a list of
+/// `Name: value` lines, without their values. Says whether there was a value to drop.
+fn header_names(value: &mut serde_json::Value) -> bool {
+    use serde_json::Value;
+    let (names, had_values): (Vec<String>, bool) = match value {
+        Value::Object(map) => (
+            map.keys().cloned().collect(),
+            map.values().any(|v| v.as_str() != Some("")),
+        ),
+        Value::Array(lines) => {
+            let mut had = false;
+            let names = lines
+                .iter()
+                .filter_map(|line| line.as_str())
+                .map(|line| match line.split_once(':') {
+                    Some((name, value)) => {
+                        had |= !value.trim().is_empty();
+                        name.trim().to_string()
+                    }
+                    None => line.trim().to_string(),
+                })
+                .collect();
+            (names, had)
+        }
+        _ => return false,
+    };
+    *value = Value::Array(names.into_iter().map(Value::String).collect());
+    had_values
 }
 
 /// Take every credential out of `value`, and say whether there was one.
@@ -95,38 +165,36 @@ fn strip(value: &mut serde_json::Value) -> bool {
     match value {
         Value::Object(map) => {
             let had = map.len();
-            map.retain(|key, _| !secret_key(key));
+            map.retain(|key, _| !secret_name(key));
             let mut removed = map.len() != had;
-            for v in map.values_mut() {
-                removed |= strip(v);
+            for (key, v) in map.iter_mut() {
+                removed |= if header_key(key) {
+                    header_names(v)
+                } else {
+                    strip(v)
+                };
             }
             removed
         }
-        Value::Array(items) => {
-            let had = items.len();
-            items.retain(|v| !v.as_str().is_some_and(secret_header));
-            let mut removed = items.len() != had;
-            for v in items.iter_mut() {
-                removed |= strip(v);
-            }
-            removed
+        Value::Array(items) => items
+            .iter_mut()
+            .fold(false, |removed, v| strip(v) | removed),
+        Value::String(text) if text.contains("://") => {
+            let safe = safe_url(text);
+            let changed = safe != *text;
+            *text = safe;
+            changed
         }
-        Value::String(text) => match without_userinfo(text) {
-            Some(clean) => {
-                *text = clean;
-                true
-            }
-            None => false,
-        },
         _ => false,
     }
 }
 
-/// The JSON object `params`, as a scan or an operation keeps it: with every credential
-/// taken out (headers that carry one, cookies, tokens, passwords, API keys, and a user
-/// and password in a URL) and, when there was one, `"secrets_removed": true`, so that
-/// whoever takes the scan up again knows to give them again. Parameters that are not a
-/// JSON object are not kept at all.
+/// The JSON object `params`, as a scan or an operation keeps it: with no credential in
+/// it. Keys whose names mark a credential (see [`SECRET_PARTS`]) are left out, headers
+/// keep their names and not their values, and URLs are made safe (see [`safe_url`]).
+/// When anything was taken out, `"secrets_removed": true` says so, so that whoever takes
+/// the scan up again knows to give them again. Parameters that are not a JSON object are
+/// not kept at all.
 pub fn without_secrets(params: &str) -> String {
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(params) else {
         return "{}".to_string();
@@ -142,69 +210,157 @@ pub fn without_secrets(params: &str) -> String {
     }
 }
 
-/// Start a scan of `target` with the settings `params`, a JSON object kept without its
-/// credentials (see [`without_secrets`]), whose hash is `config_hash`. Unless `fresh` is set, the latest scan with the same hash that stopped
-/// before its end is taken up again, and taken so that no other request takes it too; a
-/// scan that is still running is never taken. Otherwise, or when there is none, a new
-/// scan is made. Either way the scan is running when this returns.
+/// What a scan is known by when another request asks for the same scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key<'a> {
+    /// The hash of its settings, none of them a credential: a stopped scan with the same
+    /// hash is taken up again.
+    Settings(&'a str),
+    /// It authenticates to its target, so it is known by its id alone. A credential
+    /// changes what the target answers, so such a scan never takes up another, with or
+    /// without credentials, and is never taken up by one; and nothing derived from a
+    /// credential is kept, a hash included. Resuming one is by its id, with its
+    /// credentials given again. A credential that does not change who the target sees,
+    /// such as a passive source's API key, does not count.
+    Authenticated,
+}
+
+/// A scan this daemon runs. It holds the scan's lock on a connection of its own until
+/// [`finish`] ends it, so that no other daemon on the same database takes the scan up and
+/// another's start-up sweep leaves it running. When the daemon dies, the lock goes with
+/// the connection.
+pub struct Running {
+    pub id: String,
+    /// Whether it is a stopped scan taken up again, rather than a new one.
+    pub resumed: bool,
+    lock: sqlx::PgConnection,
+}
+
+/// The advisory lock a running scan's daemon holds, as SQL on the scan id `$1`.
+const SCAN_LOCK: &str = "hashtextextended($1, 0)";
+
+/// Start a scan of `target` with the settings `params`, a JSON object, known by `key`.
+/// The target and the settings are kept without their credentials (see [`safe_text`] and
+/// [`without_secrets`]). Unless `fresh` is set, a scan with the same [`Key::Settings`]
+/// that stopped before its end is taken up again, the latest first, and so is one still
+/// marked running whose daemon is gone; one whose daemon still runs it is never taken.
+/// Otherwise, or when there is none, a new scan is made. Either way the scan is running
+/// when this returns, and this daemon holds it.
 pub async fn start(
     pool: &PgPool,
     target: &str,
-    config_hash: &str,
+    key: Key<'_>,
     params: &str,
     fresh: bool,
-) -> Result<Started, sqlx::Error> {
-    if !fresh {
-        let stopped: Option<String> = sqlx::query_scalar(
-            "UPDATE scans SET status = 'running', updated_at = now() WHERE id = (
-                SELECT id FROM scans WHERE config_hash = $1 AND status = 'stopped'
-                ORDER BY updated_at DESC LIMIT 1 FOR UPDATE SKIP LOCKED
-            ) RETURNING id",
+) -> Result<Running, sqlx::Error> {
+    let mut lock = pool.acquire().await?.detach();
+    if let (Key::Settings(hash), false) = (key, fresh) {
+        let candidates: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM scans WHERE config_hash = $1 AND status IN ('stopped', 'running') \
+             ORDER BY updated_at DESC",
         )
-        .bind(config_hash)
-        .fetch_optional(pool)
+        .bind(hash)
+        .fetch_all(&mut lock)
         .await?;
-        if let Some(id) = stopped {
-            return Ok(Started { id, resumed: true });
+        for id in candidates {
+            let ours: bool =
+                sqlx::query_scalar(&format!("SELECT pg_try_advisory_lock({SCAN_LOCK})"))
+                    .bind(&id)
+                    .fetch_one(&mut lock)
+                    .await?;
+            if !ours {
+                continue;
+            }
+            let taken = sqlx::query(
+                "UPDATE scans SET status = 'running', updated_at = now() \
+                 WHERE id = $1 AND status IN ('stopped', 'running')",
+            )
+            .bind(&id)
+            .execute(&mut lock)
+            .await?
+            .rows_affected()
+                == 1;
+            if taken {
+                return Ok(Running {
+                    id,
+                    resumed: true,
+                    lock,
+                });
+            }
+            sqlx::query(&format!("SELECT pg_advisory_unlock({SCAN_LOCK})"))
+                .bind(&id)
+                .execute(&mut lock)
+                .await?;
         }
     }
-    let id: String = sqlx::query_scalar(
-        "INSERT INTO scans (target, config_hash, params, status) \
-         VALUES ($1, $2, $3::jsonb, 'running') RETURNING id",
+    // Held before the scan is there to be seen, so no sweep ever finds it unheld.
+    let id: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
+        .fetch_one(&mut lock)
+        .await?;
+    sqlx::query(&format!("SELECT pg_advisory_lock({SCAN_LOCK})"))
+        .bind(&id)
+        .execute(&mut lock)
+        .await?;
+    let hash = match key {
+        Key::Settings(hash) => Some(hash),
+        Key::Authenticated => None,
+    };
+    sqlx::query(
+        "INSERT INTO scans (id, target, config_hash, params, status) \
+         VALUES ($1, $2, $3, $4::jsonb, 'running')",
     )
-    .bind(target)
-    .bind(config_hash)
+    .bind(&id)
+    .bind(safe_text(target))
+    .bind(hash)
     .bind(without_secrets(params))
-    .fetch_one(pool)
+    .execute(&mut lock)
     .await?;
-    Ok(Started { id, resumed: false })
+    Ok(Running {
+        id,
+        resumed: false,
+        lock,
+    })
 }
 
-/// Say where scan `id` ended.
-pub async fn finish(pool: &PgPool, id: &str, status: Status) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE scans SET status = $2, updated_at = now() WHERE id = $1")
-        .bind(id)
+/// Say where scan `running` ended, and let it go.
+pub async fn finish(running: Running, status: Status) -> Result<(), sqlx::Error> {
+    let Running { id, mut lock, .. } = running;
+    let done = sqlx::query("UPDATE scans SET status = $2, updated_at = now() WHERE id = $1")
+        .bind(&id)
         .bind(status.as_str())
-        .execute(pool)
-        .await?;
-    Ok(())
+        .execute(&mut lock)
+        .await;
+    let _ = lock.close().await;
+    done.map(|_| ())
 }
 
-/// Mark what was queued or running when the daemon last exited as stopped, so that it can
-/// be taken up again. A daemon calls this as it starts, before it takes any request.
-pub async fn stopped_by_exit(pool: &PgPool) -> Result<(), sqlx::Error> {
-    for table in ["scans", "operations"] {
-        sqlx::query(&format!(
-            "UPDATE {table} SET status = 'stopped', updated_at = now() \
-             WHERE status IN ('queued', 'running')"
-        ))
-        .execute(pool)
-        .await?;
-    }
-    Ok(())
+/// Mark as stopped what was queued or running when its daemon exited, so that it can be
+/// taken up again: a scan whose lock nobody holds, and the operations it ran. A daemon
+/// calls this as it starts, before it takes any request. A scan another daemon on the same
+/// database is running is left as it is.
+pub async fn stop_abandoned(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let stopped = sqlx::query(&format!(
+        "UPDATE scans SET status = 'stopped', updated_at = now() \
+         WHERE status IN ('queued', 'running') \
+         AND pg_try_advisory_xact_lock({})",
+        SCAN_LOCK.replace("$1", "id")
+    ))
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    sqlx::query(
+        "UPDATE operations o SET status = 'stopped', updated_at = now() FROM scans s \
+         WHERE o.scan_id = s.id AND s.status = 'stopped' AND o.status IN ('queued', 'running')",
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(stopped)
 }
 
-/// A line for scan `scan`'s log, or the daemon's own when `scan` is None.
+/// A line for scan `scan`'s log, or the daemon's own when `scan` is None, kept without
+/// credentials (see [`safe_text`]).
 pub async fn log(
     pool: &PgPool,
     scan: Option<&str>,
@@ -214,7 +370,7 @@ pub async fn log(
     sqlx::query("INSERT INTO logs (scan_id, level, message) VALUES ($1, $2, $3)")
         .bind(scan)
         .bind(level)
-        .bind(message)
+        .bind(safe_text(message))
         .execute(pool)
         .await?;
     Ok(())
@@ -243,13 +399,21 @@ pub async fn record_operation(
     Ok(())
 }
 
-/// Say where operation `id` ended, and what it gave when that is worth keeping.
+/// Say where operation `id` ended, and what it gave when that is worth keeping: a JSON
+/// result kept as [`without_secrets`] keeps settings, other text as [`safe_text`] does.
 pub async fn finish_operation(
     pool: &PgPool,
     id: &str,
     status: Status,
     result: Option<&str>,
 ) -> Result<(), sqlx::Error> {
+    let result = result.map(|r| match serde_json::from_str::<serde_json::Value>(r) {
+        Ok(mut value) => {
+            strip(&mut value);
+            value.to_string()
+        }
+        Err(_) => safe_text(r),
+    });
     sqlx::query("UPDATE operations SET status = $2, result = $3, updated_at = now() WHERE id = $1")
         .bind(id)
         .bind(status.as_str())
@@ -257,6 +421,61 @@ pub async fn finish_operation(
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// Which scans to delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Purge<'a> {
+    /// The scan with this id.
+    Scan(&'a str),
+    /// Every scan made more than this many days ago.
+    OlderThanDays(u32),
+}
+
+/// Delete the scans `which` names, with everything kept for them, on `conn`, which looks
+/// in an engine's schema, and say how many went. A running scan is never deleted.
+pub async fn purge(conn: &mut sqlx::PgConnection, which: Purge<'_>) -> Result<u64, sqlx::Error> {
+    let deleted = match which {
+        Purge::Scan(id) => {
+            sqlx::query("DELETE FROM scans WHERE id = $1 AND status <> 'running'")
+                .bind(id)
+                .execute(&mut *conn)
+                .await?
+        }
+        Purge::OlderThanDays(days) => {
+            sqlx::query(
+                "DELETE FROM scans WHERE status <> 'running' \
+                 AND created_at < now() - make_interval(days => $1)",
+            )
+            .bind(days as i32)
+            .execute(&mut *conn)
+            .await?
+        }
+    };
+    Ok(deleted.rows_affected())
+}
+
+/// A `purge` operation sent to an engine's daemon: `params` name a `scan` by its id, or
+/// `older_than_days`. The reply's message on success, or why it did nothing.
+pub async fn purge_operation(pool: &PgPool, params: &serde_json::Value) -> Result<String, String> {
+    let which = match (params["scan"].as_str(), params["older_than_days"].as_u64()) {
+        (Some(id), None) => Purge::Scan(id),
+        (None, Some(days)) => Purge::OlderThanDays(
+            u32::try_from(days).map_err(|_| format!("{days} days is more than a purge takes"))?,
+        ),
+        _ => return Err("a purge names one scan or a number of days".to_string()),
+    };
+    let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
+    let deleted = purge(&mut conn, which).await.map_err(|e| e.to_string())?;
+    match which {
+        Purge::Scan(id) if deleted == 0 => Err(format!(
+            "there is no scan {id}, or it is running, which a purge leaves alone"
+        )),
+        Purge::Scan(id) => Ok(format!("Deleted scan {id}.")),
+        Purge::OlderThanDays(days) => Ok(format!(
+            "Deleted {deleted} scan(s) made more than {days} day(s) ago."
+        )),
+    }
 }
 
 /// Empty every table in the schema of engine `engine`, keeping the tables.
@@ -291,10 +510,11 @@ mod tests {
     #[test]
     fn credentials_are_taken_out_of_what_is_kept_and_their_place_is_marked() {
         let asked = serde_json::json!({
-            "endpoint": "https://user:hunter2@app.example/login?x=1",
+            "endpoint": "https://user:hunter2@app.example/login?x=1&token=t-1&sig=s-1",
             "auth": {"headers": {"X-Api-Key": "k-123"}, "cookies": "sid=abc"},
-            "headers": ["Accept: text/html", "Authorization: Bearer t-456", "cookie: a=b"],
-            "custom": {"Set-Cookie": "s=1", "keep": "this", "api_key": "k-789"},
+            "headers": ["Accept: text/html", "Authorization: Bearer t-456", "X-Auth-Token: t-2"],
+            "extra_headers": {"Private-Token": "p-2", "X-CSRF-Token": "c-1"},
+            "custom": {"Set-Cookie": "s=1", "keep": "this", "api_key": "k-789", "jwt": "j-1"},
             "list": [{"password": "p-1", "name": "n"}],
             "identify": "team-7",
             "tasks": 4,
@@ -304,8 +524,9 @@ mod tests {
         assert_eq!(
             kept,
             serde_json::json!({
-                "endpoint": "https://app.example/login?x=1",
-                "headers": ["Accept: text/html"],
+                "endpoint": "https://app.example/login?x=1&token=&sig=",
+                "headers": ["Accept", "Authorization", "X-Auth-Token"],
+                "extra_headers": ["Private-Token", "X-CSRF-Token"],
                 "custom": {"keep": "this"},
                 "list": [{"name": "n"}],
                 "identify": "team-7",
@@ -314,7 +535,8 @@ mod tests {
             })
         );
         for secret in [
-            "hunter2", "k-123", "abc", "t-456", "a=b", "s=1", "k-789", "p-1",
+            "hunter2", "t-1", "s-1", "k-123", "abc", "t-456", "t-2", "p-2", "c-1", "s=1", "k-789",
+            "j-1", "p-1",
         ] {
             assert!(!kept.to_string().contains(secret), "{secret} was kept");
         }
@@ -326,6 +548,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_log_line_keeps_no_userinfo_query_token_or_echoed_credential() {
+        assert_eq!(
+            safe_text("[200] FOUND https://u:p@app.example/a?access_token=x1&q=2#f"),
+            "[200] FOUND https://app.example/a?access_token=&q=2#f"
+        );
+        assert_eq!(safe_text("Set-Cookie: sid=abc"), "Set-Cookie: [not kept]");
+        assert_eq!(safe_text("x-session-id: 42"), "x-session-id: [not kept]");
+        assert_eq!(safe_text("Server: nginx"), "Server: nginx");
+        assert_eq!(safe_text("example.com"), "example.com");
+    }
+
     async fn status(pool: &PgPool, id: &str) -> String {
         sqlx::query_scalar("SELECT status FROM scans WHERE id = $1")
             .bind(id)
@@ -334,39 +568,16 @@ mod tests {
             .unwrap()
     }
 
-    #[tokio::test]
-    #[ignore = "needs PostgreSQL's programs"]
-    async fn the_same_scan_twice_at_once_is_two_scans_and_a_stopped_one_is_taken_up_once() {
-        let (_dir, toolchain) = toolchain_with(&local_on(free_port()));
+    /// A local database of a test's own, and a pool on a schema in it.
+    async fn database() -> (tempfile::TempDir, std::path::PathBuf, PgPool) {
+        let (dir, toolchain) = toolchain_with(&local_on(free_port()));
         let pool = ready_in(toolchain.clone(), &engine_at("0.0.1", &[]))
             .await
             .unwrap();
-        let (a, b) = tokio::join!(
-            start(&pool, "example.com", "h", "{}", false),
-            start(&pool, "example.com", "h", "{}", false),
-        );
-        let (a, b) = (a.unwrap(), b.unwrap());
-        assert_ne!(a.id, b.id, "a running scan is never taken");
-        assert!(!a.resumed && !b.resumed);
+        (dir, toolchain, pool)
+    }
 
-        finish(&pool, &a.id, Status::Stopped).await.unwrap();
-        let c = start(&pool, "example.com", "h", "{}", false).await.unwrap();
-        assert_eq!(
-            c,
-            Started {
-                id: a.id.clone(),
-                resumed: true
-            }
-        );
-        assert_eq!(status(&pool, &a.id).await, "running");
-        let d = start(&pool, "example.com", "h", "{}", false).await.unwrap();
-        assert!(!d.resumed && d.id != a.id, "it is taken up once");
-
-        finish(&pool, &d.id, Status::Stopped).await.unwrap();
-        let e = start(&pool, "example.com", "h", "{}", true).await.unwrap();
-        assert!(!e.resumed && e.id != d.id, "a fresh start makes a new scan");
-        assert_eq!(status(&pool, &d.id).await, "stopped");
-
+    async fn done(toolchain: std::path::PathBuf, pool: PgPool) {
         pool.close().await;
         let account = ThisAccount::new().unwrap();
         assert_eq!(
@@ -377,30 +588,185 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "needs PostgreSQL's programs"]
-    async fn what_ran_when_the_daemon_exited_is_stopped_and_a_reset_empties_the_schema() {
-        let (_dir, toolchain) = toolchain_with(&local_on(free_port()));
-        let pool = ready_in(toolchain.clone(), &engine_at("0.0.1", &[]))
-            .await
-            .unwrap();
-        let running = start(&pool, "a", "1", "{}", false).await.unwrap();
-        let done = start(&pool, "b", "2", "{}", false).await.unwrap();
-        finish(&pool, &done.id, Status::Completed).await.unwrap();
-        record_operation(&pool, "op", "scan", Some(&running.id), "{}")
-            .await
-            .unwrap();
-        log(&pool, Some(&running.id), "info", "a line")
-            .await
-            .unwrap();
+    async fn the_same_scan_twice_at_once_is_two_scans_and_a_stopped_one_is_taken_up_once() {
+        let (_dir, toolchain, pool) = database().await;
+        let key = Key::Settings("h");
+        let (a, b) = tokio::join!(
+            start(&pool, "example.com", key, "{}", false),
+            start(&pool, "example.com", key, "{}", false),
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_ne!(a.id, b.id, "a running scan is never taken");
+        assert!(!a.resumed && !b.resumed);
 
-        stopped_by_exit(&pool).await.unwrap();
-        assert_eq!(status(&pool, &running.id).await, "stopped");
-        assert_eq!(status(&pool, &done.id).await, "completed");
-        let op: String = sqlx::query_scalar("SELECT status FROM operations WHERE id = 'op'")
+        let first = a.id.clone();
+        finish(a, Status::Stopped).await.unwrap();
+        let c = start(&pool, "example.com", key, "{}", false).await.unwrap();
+        assert!(c.resumed && c.id == first, "the stopped one is taken up");
+        assert_eq!(status(&pool, &first).await, "running");
+        let d = start(&pool, "example.com", key, "{}", false).await.unwrap();
+        assert!(!d.resumed && d.id != first, "and taken up once");
+
+        let fourth = d.id.clone();
+        finish(d, Status::Stopped).await.unwrap();
+        let e = start(&pool, "example.com", key, "{}", true).await.unwrap();
+        assert!(
+            !e.resumed && e.id != fourth,
+            "a fresh start makes a new scan"
+        );
+        assert_eq!(status(&pool, &fourth).await, "stopped");
+        for running in [b, c, e] {
+            finish(running, Status::Completed).await.unwrap();
+        }
+        done(toolchain, pool).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs PostgreSQL's programs"]
+    async fn a_scan_with_credentials_is_never_taken_up_by_another_and_keeps_no_key() {
+        let (_dir, toolchain, pool) = database().await;
+        // Anonymous, stopped; then the same with credentials: a new scan.
+        let anonymous = start(&pool, "a.example", Key::Settings("a"), "{}", false)
+            .await
+            .unwrap();
+        let anonymous_id = anonymous.id.clone();
+        finish(anonymous, Status::Stopped).await.unwrap();
+        let with = start(&pool, "a.example", Key::Authenticated, "{}", false)
+            .await
+            .unwrap();
+        assert!(!with.resumed && with.id != anonymous_id);
+        let with_id = with.id.clone();
+        finish(with, Status::Stopped).await.unwrap();
+
+        // Authenticated, stopped; then the same anonymously: the anonymous one is taken,
+        // never the authenticated one.
+        let again = start(&pool, "a.example", Key::Settings("a"), "{}", false)
+            .await
+            .unwrap();
+        assert!(again.resumed && again.id == anonymous_id);
+        finish(again, Status::Completed).await.unwrap();
+
+        // Two credentials: each its own scan, and neither takes up the stopped one.
+        let one = start(&pool, "a.example", Key::Authenticated, "{}", false)
+            .await
+            .unwrap();
+        let two = start(&pool, "a.example", Key::Authenticated, "{}", false)
+            .await
+            .unwrap();
+        assert!(!one.resumed && !two.resumed);
+        assert!(one.id != with_id && two.id != with_id && one.id != two.id);
+        let keys: Vec<Option<String>> =
+            sqlx::query_scalar("SELECT config_hash FROM scans WHERE id <> $1 ORDER BY created_at")
+                .bind(&anonymous_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(
+            keys.iter().all(Option::is_none),
+            "nothing derived from a credential is kept"
+        );
+        finish(one, Status::Completed).await.unwrap();
+        finish(two, Status::Completed).await.unwrap();
+        done(toolchain, pool).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs PostgreSQL's programs"]
+    async fn a_daemon_starting_stops_only_the_scans_whose_daemon_is_gone() {
+        let (_dir, toolchain, pool) = database().await;
+        // The first daemon runs a scan; a second one starting leaves it running.
+        let first = start(&pool, "a", Key::Settings("1"), "{}", false)
+            .await
+            .unwrap();
+        let id = first.id.clone();
+        assert_eq!(stop_abandoned(&pool).await.unwrap(), 0);
+        assert_eq!(status(&pool, &id).await, "running");
+        let other = start(&pool, "a", Key::Settings("1"), "{}", false)
+            .await
+            .unwrap();
+        assert!(!other.resumed, "a scan its daemon runs is not taken");
+        finish(other, Status::Completed).await.unwrap();
+
+        // The first daemon is killed: its connection, and the lock, go. The next daemon
+        // to start marks the scan stopped, and a request then takes it up.
+        drop(first);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while stop_abandoned(&pool).await.unwrap() == 0 {
+            assert!(std::time::Instant::now() < deadline, "never let go");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(status(&pool, &id).await, "stopped");
+        let taken = start(&pool, "a", Key::Settings("1"), "{}", false)
+            .await
+            .unwrap();
+        assert!(taken.resumed && taken.id == id);
+        finish(taken, Status::Completed).await.unwrap();
+        done(toolchain, pool).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs PostgreSQL's programs"]
+    async fn a_purge_deletes_the_scan_it_names_or_the_old_ones_and_leaves_the_rest() {
+        let (_dir, toolchain, pool) = database().await;
+        let mut ids = Vec::new();
+        for target in ["a", "b", "c", "d"] {
+            let scan = start(&pool, target, Key::Settings(target), "{}", false)
+                .await
+                .unwrap();
+            ids.push(scan.id.clone());
+            log(&pool, Some(&scan.id), "info", target).await.unwrap();
+            finish(scan, Status::Completed).await.unwrap();
+        }
+        let running = start(&pool, "e", Key::Settings("e"), "{}", false)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE scans SET created_at = now() - interval '40 days' WHERE target IN ('c', 'e')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let targets = |pool: PgPool| async move {
+            sqlx::query_scalar::<_, String>("SELECT target FROM scans ORDER BY target")
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+        };
+        let mut conn = pool.acquire().await.unwrap();
+
+        assert_eq!(purge(&mut conn, Purge::Scan(&ids[1])).await.unwrap(), 1);
+        assert_eq!(targets(pool.clone()).await, ["a", "c", "d", "e"]);
+        let lines: i64 = sqlx::query_scalar("SELECT count(*) FROM logs WHERE scan_id = $1")
+            .bind(&ids[1])
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(op, "stopped");
+        assert_eq!(lines, 0, "its log went with it");
 
+        assert_eq!(purge(&mut conn, Purge::OlderThanDays(30)).await.unwrap(), 1);
+        assert_eq!(
+            targets(pool.clone()).await,
+            ["a", "d", "e"],
+            "c was old; e is old too, but running"
+        );
+        assert_eq!(purge(&mut conn, Purge::Scan(&running.id)).await.unwrap(), 0);
+        drop(conn);
+        finish(running, Status::Completed).await.unwrap();
+        done(toolchain, pool).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs PostgreSQL's programs"]
+    async fn a_reset_empties_the_schema() {
+        let (_dir, toolchain, pool) = database().await;
+        let scan = start(&pool, "a", Key::Settings("1"), "{}", false)
+            .await
+            .unwrap();
+        record_operation(&pool, "op", "scan", Some(&scan.id), "{}")
+            .await
+            .unwrap();
+        log(&pool, Some(&scan.id), "info", "a line").await.unwrap();
+        finish(scan, Status::Completed).await.unwrap();
         reset(&pool, "cfx_db_test").await.unwrap();
         for table in ["scans", "logs", "operations"] {
             let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
@@ -409,11 +775,6 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 0, "{table}");
         }
-        pool.close().await;
-        let account = ThisAccount::new().unwrap();
-        assert_eq!(
-            Toolchain::new(toolchain, &account).stop().unwrap(),
-            Stop::Stopped
-        );
+        done(toolchain, pool).await;
     }
 }

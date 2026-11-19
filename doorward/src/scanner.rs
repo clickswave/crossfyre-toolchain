@@ -181,10 +181,6 @@ pub struct ScanParams {
     /// Ports can be an array of numbers [80, 443] or a string spec "top-1000", "22,80,443"
     #[serde(deserialize_with = "deserialize_ports")]
     pub ports: Vec<u16>,
-    #[serde(default = "default_technique")]
-    // populated but not read yet; kept so the struct still mirrors its config
-    #[allow(dead_code)]
-    pub technique: String,
     #[serde(default = "default_tasks")]
     pub tasks: u32,
     #[serde(default = "default_timeout")]
@@ -196,6 +192,10 @@ pub struct ScanParams {
     pub delay: u64,
     #[serde(default)]
     pub service_detection: bool,
+    /// Run again from the start, rather than taking up the stopped scan with the same
+    /// settings.
+    #[serde(default)]
+    pub fresh_start: bool,
     /// Adaptive rate governor (default on): treat `tasks`/`timeout` as seeds and
     /// let the congestion-control loop tune concurrency/timeout/retries live.
     /// Set false to pin the old fixed-rate behaviour.
@@ -211,9 +211,6 @@ pub struct ScanParams {
     pub posture: Option<String>,
 }
 
-fn default_technique() -> String {
-    "connect".to_string()
-}
 fn default_tasks() -> u32 {
     100
 }
@@ -704,7 +701,6 @@ mod tests {
         let params = ScanParams {
             targets: vec!["127.0.0.1".to_string()],
             ports,
-            technique: "connect".to_string(),
             tasks: 32,
             timeout: 300,
             delay: 0,
@@ -712,6 +708,7 @@ mod tests {
             adaptive: true,
             max_concurrency: Some(128),
             posture: None,
+            fresh_start: false,
         };
 
         let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();

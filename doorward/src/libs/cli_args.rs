@@ -47,8 +47,11 @@ pub enum Commands {
     /// Send a JSON op to the daemon and print the reply. `operation` defaults to
     /// `probe`, which runs a single probe with no dashboard.
     Exec(ExecArgs),
-    /// Database management
-    Db(DbArgs),
+    /// What this engine keeps: delete one scan, old scans, or everything
+    Db {
+        #[command(subcommand)]
+        action: dguard::DbAction,
+    },
     /// Run as this engine's daemon, which the commands here and the node talk to on
     /// --port
     Daemon,
@@ -104,13 +107,6 @@ pub struct ScanArgs {
 pub struct ExecArgs {
     /// Raw JSON payload to send to the daemon
     pub json: String,
-}
-
-#[derive(Parser, Clone)]
-pub struct DbArgs {
-    /// Drop and recreate all tables
-    #[arg(long, default_value_t = false)]
-    pub full_reset: bool,
 }
 
 /// Well-known port lists for convenience.
@@ -254,15 +250,15 @@ mod tests {
             "doorward",
             "--no-autostart",
             "db",
-            "--full-reset"
+            "reset"
         ]));
         assert!(parsed(&[
             "doorward",
             "db",
-            "--full-reset",
+            "reset",
             "--no-autostart"
         ]));
-        assert!(!parsed(&["doorward", "db", "--full-reset"]));
+        assert!(!parsed(&["doorward", "db", "reset"]));
     }
 
     #[test]

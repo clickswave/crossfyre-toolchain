@@ -171,13 +171,15 @@ async fn handle_stream_scan(
         }
     };
 
-    let scan = db.start_scan(&scan_params.targets, &req.params).await;
+    let scan = db
+        .start_scan(&scan_params.targets, &req.params, scan_params.fresh_start)
+        .await;
     if req.save {
         let _ = cfx_db::scans::record_operation(
             &db.pool,
             &operation_id,
             "scan",
-            scan.as_deref(),
+            scan.as_ref().map(|s| s.id.as_str()),
             &req.params.to_string(),
         )
         .await;
@@ -197,7 +199,7 @@ async fn handle_stream_scan(
 
     dguard::spawn_busy(async move {
         scanner::run_connect_scan(&scan_params, tx).await;
-        db_c.finish_scan(scan.as_deref()).await;
+        db_c.finish_scan(scan).await;
         let _ = cfx_db::scans::finish_operation(
             &db_c.pool,
             &oid,
@@ -234,13 +236,15 @@ async fn dispatch(req: DaemonRequest, db: Arc<DoorwardDb>) -> serde_json::Value 
                 }
             };
 
-            let scan = db.start_scan(&scan_params.targets, &req.params).await;
+            let scan = db
+                .start_scan(&scan_params.targets, &req.params, scan_params.fresh_start)
+                .await;
             if req.save {
                 let _ = cfx_db::scans::record_operation(
                     &db.pool,
                     &operation_id,
                     "scan",
-                    scan.as_deref(),
+                    scan.as_ref().map(|s| s.id.as_str()),
                     &req.params.to_string(),
                 )
                 .await;
@@ -261,7 +265,7 @@ async fn dispatch(req: DaemonRequest, db: Arc<DoorwardDb>) -> serde_json::Value 
                         }
                     }
 
-                    db.finish_scan(scan.as_deref()).await;
+                    db.finish_scan(scan).await;
                     let _ = cfx_db::scans::finish_operation(
                         &db.pool,
                         &operation_id,
@@ -283,7 +287,7 @@ async fn dispatch(req: DaemonRequest, db: Arc<DoorwardDb>) -> serde_json::Value 
                     dguard::spawn_busy(async move {
                         let (tx, mut _rx) = mpsc::unbounded_channel::<StreamEvent>();
                         scanner::run_connect_scan(&scan_params, tx).await;
-                        db_c.finish_scan(scan.as_deref()).await;
+                        db_c.finish_scan(scan).await;
                         let _ = cfx_db::scans::finish_operation(
                             &db_c.pool,
                             &oid,
@@ -318,7 +322,6 @@ async fn dispatch(req: DaemonRequest, db: Arc<DoorwardDb>) -> serde_json::Value 
             let params = ScanParams {
                 targets: vec![host],
                 ports: vec![port],
-                technique: "connect".to_string(),
                 tasks: 1,
                 timeout: timeout_ms,
                 delay: 0, // single-port probe path - no pacing needed; daemon-level handles it
@@ -326,6 +329,7 @@ async fn dispatch(req: DaemonRequest, db: Arc<DoorwardDb>) -> serde_json::Value 
                 adaptive: false, // one probe: nothing for the governor to tune
                 max_concurrency: None,
                 posture: None,
+                fresh_start: false,
             };
 
             let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
@@ -363,6 +367,19 @@ async fn dispatch(req: DaemonRequest, db: Arc<DoorwardDb>) -> serde_json::Value 
                 }),
             }
         }
+
+        "purge" => match cfx_db::scans::purge_operation(&db.pool, &req.params).await {
+            Ok(done) => serde_json::json!({
+                "operation_id": operation_id,
+                "status": "completed",
+                "message": done,
+            }),
+            Err(why) => serde_json::json!({
+                "operation_id": operation_id,
+                "status": "error",
+                "message": why,
+            }),
+        },
 
         unknown => serde_json::json!({
             "operation_id": operation_id,
@@ -535,5 +552,46 @@ mod http_request_tests {
             !lines.iter().any(|l| l.contains("capabilities")),
             "read on past the first line: {lines:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod flag_tests {
+    use crate::scanner::ScanParams;
+    use clap::Parser;
+
+    /// Every flag of `doorward scan` the daemon honours, from the command line through
+    /// the request the client sends, into what the daemon reads.
+    #[test]
+    fn every_scan_flag_reaches_the_daemon() {
+        let cli = crate::libs::cli_args::Cli::try_parse_from([
+            "doorward",
+            "scan",
+            "10.0.0.1",
+            "-p",
+            "80",
+            "--tasks",
+            "7",
+            "--timeout",
+            "900",
+            "--delay",
+            "30",
+            "--service-detection",
+            "--fresh-start",
+        ])
+        .unwrap();
+        let Some(crate::libs::cli_args::Commands::Scan(args)) = cli.command else {
+            panic!("not a scan");
+        };
+        let ports = crate::libs::cli_args::resolve_ports(&args.ports);
+        let params: ScanParams =
+            serde_json::from_value(crate::scan_request(&args, &ports)).unwrap();
+        assert_eq!(params.targets, ["10.0.0.1"]);
+        assert_eq!(params.ports, [80]);
+        assert_eq!(params.tasks, 7);
+        assert_eq!(params.timeout, 900);
+        assert_eq!(params.delay, 30);
+        assert!(params.service_detection);
+        assert!(params.fresh_start);
     }
 }
