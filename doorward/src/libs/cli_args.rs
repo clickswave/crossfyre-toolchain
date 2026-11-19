@@ -90,10 +90,6 @@ pub struct ScanArgs {
     #[arg(long, default_value_t = false)]
     pub service_detection: bool,
 
-    /// OS fingerprinting (experimental)
-    #[arg(long, default_value_t = false)]
-    pub os_detection: bool,
-
     /// Start fresh (ignore previous scan state)
     #[arg(long, default_value_t = false)]
     pub fresh_start: bool,
@@ -246,18 +242,8 @@ mod tests {
     #[test]
     fn no_autostart_goes_before_or_after_the_command() {
         let parsed = |argv: &[&str]| Cli::try_parse_from(argv).expect("parses").no_autostart;
-        assert!(parsed(&[
-            "doorward",
-            "--no-autostart",
-            "db",
-            "reset"
-        ]));
-        assert!(parsed(&[
-            "doorward",
-            "db",
-            "reset",
-            "--no-autostart"
-        ]));
+        assert!(parsed(&["doorward", "--no-autostart", "db", "reset"]));
+        assert!(parsed(&["doorward", "db", "reset", "--no-autostart"]));
         assert!(!parsed(&["doorward", "db", "reset"]));
     }
 

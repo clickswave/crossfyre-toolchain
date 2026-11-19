@@ -53,7 +53,7 @@ Kali), or point it at a database you run with `crossfyre db external`. The root
 - `--exclude-active-technique` skip a specific active technique
 - `-t, --tasks` concurrency, `-i, --interval` delay between requests (ms)
 - `--http-probing-port` / `--https-probing-port` where to probe for a live host
-- `--passive-random-user-agent` / `--active-random-user-agent`
+- `--active-random-user-agent`
 
 `voyage scan --help` has the rest.
 

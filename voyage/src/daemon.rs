@@ -1802,17 +1802,37 @@ mod flag_tests {
     use super::*;
     use clap::Parser;
 
-    /// Every flag of `voyage scan` the daemon honours, from the command line through the
-    /// request the client sends, into what the daemon reads; and the log level, which
-    /// the client applies to what it shows.
+    /// Every flag `voyage scan` takes reaches the daemon, from the command line through
+    /// the request the client sends, into what the daemon reads: all but the log level,
+    /// which the client applies to what it shows, and the dashboard's poll timeout and
+    /// --interactive, which are the client's own. The wordlist's words follow the
+    /// request, so it asks for the active part.
     #[test]
     fn every_scan_flag_reaches_the_daemon() {
         let cli = crate::libs::cli_args::Cli::try_parse_from([
             "voyage",
             "scan",
             "example.com",
+            "-w",
+            "words.txt",
+            "--tasks",
+            "9",
             "--interval",
             "250",
+            "--fresh-start",
+            "--disable-passive-enum",
+            "--exclude-passive-source",
+            crate::scanners::passive_scan::SOURCES[0],
+            "--exclude-active-technique",
+            crate::scanners::active_scan::TECHNIQUES[0],
+            "--http-probing-port",
+            "8080",
+            "--https-probing-port",
+            "8443",
+            "--active-user-agent",
+            "ua-active",
+            "--passive-user-agent",
+            "ua-passive",
             "--active-random-user-agent",
             "--log-level",
             "warn",
@@ -1821,9 +1841,26 @@ mod flag_tests {
         let Some(crate::libs::cli_args::Commands::Scan(args)) = cli.command else {
             panic!("not a scan");
         };
-        let params: EnumParams =
-            serde_json::from_value(crate::enum_request(&args, "example.com", false)).unwrap();
+        let request = crate::enum_request(&args, "example.com", !args.wordlist_path.is_empty());
+        let params: EnumParams = serde_json::from_value(request).unwrap();
+        assert_eq!(params.domain, "example.com");
+        assert!(!params.disable_active, "the words follow");
+        assert_eq!(params.tasks, 9);
         assert_eq!(params.delay, 250);
+        assert!(params.fresh_start);
+        assert!(params.disable_passive);
+        assert_eq!(
+            params.exclude_passive_sources,
+            [crate::scanners::passive_scan::SOURCES[0]]
+        );
+        assert_eq!(
+            params.exclude_active_techniques,
+            [crate::scanners::active_scan::TECHNIQUES[0]]
+        );
+        assert_eq!(params.http_probing_ports, [8080]);
+        assert_eq!(params.https_probing_ports, [8443]);
+        assert_eq!(params.active_user_agent, "ua-active");
+        assert_eq!(params.passive_user_agent, "ua-passive");
         assert!(params.active_random_user_agent);
         let line = |level: &str| format!(r#"{{"type":"log","log_level":"{level}","message":"m"}}"#);
         assert!(!crate::shown(&line("info"), &args.log_level));

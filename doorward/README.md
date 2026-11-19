@@ -28,7 +28,6 @@ terminal.
 
 - `-p, --ports` a list (`22,80,443`), a range, or a preset like `top-1000`
 - `--service-detection` fingerprint the service on open ports
-- `--os-detection` guess the host OS
 - `--tasks` concurrency, `--timeout` and `--delay` to pace it
 - `--fresh-start` ignore saved state
 

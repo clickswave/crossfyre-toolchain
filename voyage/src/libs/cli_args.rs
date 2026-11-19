@@ -201,10 +201,6 @@ pub struct ScanArgs {
     #[arg(long, default_value_t = false)]
     pub active_random_user_agent: bool,
 
-    /// Randomize user agent per passive request
-    #[arg(long, default_value_t = false)]
-    pub passive_random_user_agent: bool,
-
     /// Minimum log level
     #[arg(long, value_enum, default_value_t = LogLevel::Info)]
     pub log_level: LogLevel,

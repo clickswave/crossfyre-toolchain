@@ -560,8 +560,9 @@ mod flag_tests {
     use crate::scanner::ScanParams;
     use clap::Parser;
 
-    /// Every flag of `doorward scan` the daemon honours, from the command line through
-    /// the request the client sends, into what the daemon reads.
+    /// Every flag `doorward scan` takes reaches the daemon, from the command line through
+    /// the request the client sends, into what the daemon reads: all but the dashboard's
+    /// poll timeout, which is the client's own.
     #[test]
     fn every_scan_flag_reaches_the_daemon() {
         let cli = crate::libs::cli_args::Cli::try_parse_from([
