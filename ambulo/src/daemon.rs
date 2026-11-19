@@ -748,13 +748,6 @@ async fn run_scan_background(operation_id: String, params: ScanParams, db: Arc<A
 // Shared scan setup → returns (Scanner, total_entries)
 // ---------------------------------------------------------------------------
 
-/// `isolate`: when `Some(op_id)`, the op id is folded into the scan's config
-/// hash so this scan gets its OWN scan record instead of being deduped onto a
-/// shared one by (url, wordlist, method). Stream scans pass their per-connection
-/// operation_id here: without it, two concurrent scans of the same target +
-/// wordlist collapse onto one `scans` row and clobber each other's entries and
-/// results (findings lost / delivered to the wrong connection). `None` keeps the
-/// legacy shared/cached behaviour for one-off (non-stream) scans.
 /// Where the words of a scan come from.
 enum ScanWords<'a> {
     /// The wordlist file at this path.
@@ -766,6 +759,13 @@ enum ScanWords<'a> {
     },
 }
 
+/// `isolate`: when `Some(op_id)`, the op id is folded into the scan's config
+/// hash so this scan gets its OWN scan record instead of being deduped onto a
+/// shared one by (url, wordlist, method). Stream scans pass their per-connection
+/// operation_id here: without it, two concurrent scans of the same target +
+/// wordlist collapse onto one `scans` row and clobber each other's entries and
+/// results (findings lost / delivered to the wrong connection). `None` keeps the
+/// legacy shared/cached behaviour for one-off (non-stream) scans.
 async fn prepare_scan(
     params: &ScanParams,
     db: &Arc<AmbuloDb>,
