@@ -23,6 +23,7 @@ adaptive = { path = "../adaptive" }
 transport = { path = "../transport" }
 regex = "1"
 serde_yaml = "0.9"
+sha2 = "0.10"
 cfx_db = { path = "../db" }
 sqlx = { version = "0.8.6", features = ["postgres"] }
 flate2 = "1.1"

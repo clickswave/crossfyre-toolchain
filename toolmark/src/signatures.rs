@@ -96,8 +96,10 @@ enum Request {
 struct Leaf {
     source: Source,
     /// What the evidence has to match. Only a `path` can do without, when the path being
-    /// there is the evidence.
+    /// there is the evidence, or a `path` or `script` that names its file by checksum.
     regex: Option<Regex>,
+    /// The SHA-256 of the exact file a `path` or `script` leaf is.
+    sha256: Option<[u8; 32]>,
     /// What it adds to the confidence when it is present.
     confidence: u32,
 }
@@ -249,21 +251,37 @@ impl MetaFinder {
 }
 
 /// What one request for a path was answered with.
+#[derive(Clone)]
 pub struct Answered {
     /// None when nothing came back: a timeout, or a connection that failed.
-    pub status: Option<u16>,
+    status: Option<u16>,
     /// The request ended somewhere other than the path, through a redirect.
-    pub moved: bool,
-    pub body: String,
+    moved: bool,
+    body: String,
+    /// The SHA-256 of the body as it came, before it was read as text.
+    sha256: [u8; 32],
 }
 
 impl Answered {
+    /// An answer with `status` and `body`, which ended somewhere other than the path
+    /// asked when `moved`.
+    pub fn new(status: u16, moved: bool, body: &[u8]) -> Self {
+        use sha2::Digest;
+        Self {
+            status: Some(status),
+            moved,
+            body: String::from_utf8_lossy(body).into_owned(),
+            sha256: sha2::Sha256::digest(body).into(),
+        }
+    }
+
     /// No answer at all.
     pub fn none() -> Self {
         Self {
             status: None,
             moved: false,
             body: String::new(),
+            sha256: [0; 32],
         }
     }
 }
@@ -595,6 +613,13 @@ impl<'a> Host<'a> {
                     "path"
                 };
                 let evidence = Some(format!("{kind} {path}: {status}"));
+                if let Some(sha256) = &leaf.sha256 {
+                    return if *sha256 == answered.sha256 {
+                        (Answer::Present, evidence)
+                    } else {
+                        (Answer::Unknown, None)
+                    };
+                }
                 match &leaf.regex {
                     Some(regex) if regex.is_match(&answered.body) => (Answer::Present, evidence),
                     Some(_) => (Answer::Unknown, None),

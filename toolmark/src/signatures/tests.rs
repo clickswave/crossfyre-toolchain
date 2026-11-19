@@ -78,14 +78,7 @@ fn answers(
     let mut host = Host::new(&signatures, "http://host.test/", &headers, &[], "", tier);
     host.not_found = NotFound::Honest;
     for (path, answered) in asked {
-        host.asked.insert(
-            path.to_string(),
-            Answered {
-                status: answered.status,
-                moved: answered.moved,
-                body: answered.body.clone(),
-            },
-        );
+        host.asked.insert(path.to_string(), answered.clone());
     }
     host.outcomes()
         .into_iter()
@@ -94,11 +87,7 @@ fn answers(
 }
 
 fn status(code: u16, body: &str) -> Answered {
-    Answered {
-        status: Some(code),
-        moved: false,
-        body: body.to_string(),
-    }
+    Answered::new(code, false, body.as_bytes())
 }
 
 /// `all`, `any` and `none` over present, absent and unknown, as the plan states them:
@@ -239,30 +228,13 @@ fn a_path_is_absent_only_on_a_404_a_410_or_the_not_found_page() {
         ("forbidden", "/forbidden", status(403, "the marker")),
         ("slow", "/slow", status(429, "")),
         ("broken", "/broken", status(500, "the marker")),
-        (
-            "moved",
-            "/moved",
-            Answered {
-                status: Some(200),
-                moved: true,
-                body: "the marker".into(),
-            },
-        ),
+        ("moved", "/moved", Answered::new(200, true, b"the marker")),
         ("silent", "/silent", Answered::none()),
     ];
     let files: Vec<(String, String)> = paths.iter().map(|(id, path, _)| leaf(id, path)).collect();
     let asked: Vec<(&str, Answered)> = paths
         .iter()
-        .map(|(_, path, a)| {
-            (
-                *path,
-                Answered {
-                    status: a.status,
-                    moved: a.moved,
-                    body: a.body.clone(),
-                },
-            )
-        })
+        .map(|(_, path, a)| (*path, a.clone()))
         .collect();
     let got = answers(&files, "", STANDARD, &asked);
     use Answer::*;
@@ -700,4 +672,34 @@ async fn an_error_page_leaf_reads_the_not_found_page() {
     host.not_found = NotFound::Unusable;
     host.not_found_page = Some(status(403, "Server/2.4"));
     assert_eq!(host.outcomes()[0].1.answer, Answer::Unknown);
+}
+
+/// A `path` or `script` leaf can name its file by checksum: present on exactly those
+/// bytes, binary or not, unknown on any other file there, and absent on a 404.
+#[test]
+fn a_checksum_names_one_exact_file() {
+    use sha2::Digest;
+    let file_bytes: &[u8] = b"\x89PNG\r\n\x1a\n\xff\xfe exact bytes";
+    let hex: String = sha2::Sha256::digest(file_bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let files = [file(
+        "exact",
+        &format!(
+            "{{ path: {{ path: /logo.png, sha256: '{}' }} }}",
+            hex.to_uppercase()
+        ),
+    )];
+    let answer =
+        |answered: Answered| answers(&files, "", STANDARD, &[("/logo.png", answered)])[0].1;
+    assert_eq!(
+        answer(Answered::new(200, false, file_bytes)),
+        Answer::Present
+    );
+    assert_eq!(
+        answer(Answered::new(200, false, b"another file")),
+        Answer::Unknown
+    );
+    assert_eq!(answer(status(404, "")), Answer::Absent);
 }

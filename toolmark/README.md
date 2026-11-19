@@ -76,16 +76,17 @@ version:
 A leaf reads a response header (`header`), the name of each cookie set (`cookie`), a
 meta tag (`meta`), the first 60,000 bytes of the body (`html`) or the `src` of each
 script (`script_src`) on the landing page. Three more each read a request of their own:
-the body the host answers for another path (`path`, which matches its `regex` or, with
-none, only has to be there), the content of a script the landing page loads from the
-host's own origin (`script`, whose `src` picks the script and whose `regex` reads it),
-and the page the host answers for a path it does not have (`not_found`, an error page
-that often names the server and its version). Every leaf answers present, absent or
-unknown, and `all`, `any` and `none` combine the answers, nested as deep as needed. A
-product is reported when its `detect` is present. Each leaf that holds it up adds to the
-confidence, 50, 45, 60, 25, 40, 50, 50 and 40 by kind unless the leaf sets its own
-`confidence`, up to 100. The first `version` leaf that matches gives the version from
-its first group, and `vendor` and `product` make the CPE.
+the body the host answers for another path (`path`, which matches its `regex`, is the
+exact file its `sha256` names, or with neither only has to be there), the content of a
+script the landing page loads from the host's own origin (`script`, whose `src` picks
+the script and whose `regex` or `sha256` reads it), and the page the host answers for a
+path it does not have (`not_found`, an error page that often names the server and its
+version). Every leaf answers present, absent or unknown, and `all`, `any` and `none`
+combine the answers, nested as deep as needed. A product is reported when its `detect`
+is present. Each leaf that holds it up adds to the confidence, 50, 45, 60, 25, 40, 50,
+50 and 40 by kind unless the leaf sets its own `confidence`, up to 100. The first
+`version` leaf that matches gives the version from its first group, and `vendor` and
+`product` make the CPE.
 
 A `path`, a `script` or a `not_found` is a request the landing page did not need, so it
 is sent from the standard depth tier up, and only when its answer could still change

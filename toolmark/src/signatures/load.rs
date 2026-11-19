@@ -41,6 +41,7 @@ struct LeafSpec {
     regex: Option<String>,
     path: Option<String>,
     src: Option<String>,
+    sha256: Option<String>,
     confidence: Option<u32>,
 }
 
@@ -245,6 +246,23 @@ fn leaf(kind: &str, value: Value, version: bool) -> Result<Leaf, String> {
         Some(_) => Err(format!("this {kind} leaf has no {what}")),
         None => Ok(()),
     };
+    if spec.sha256.is_some() && !matches!(known, Kind::Path | Kind::Script) {
+        return Err(format!("this {kind} leaf has no sha256"));
+    }
+    if spec.sha256.is_some() && version {
+        return Err("a version leaf reads its version with a regex, not a sha256".into());
+    }
+    let sha256 = match &spec.sha256 {
+        Some(_) if spec.regex.is_some() => {
+            return Err(format!(
+                "this {kind} leaf has a regex or a sha256, not both"
+            ));
+        }
+        Some(hex) => {
+            Some(sha256_of(hex).ok_or_else(|| format!("sha256 {hex:?} is not 64 hex digits"))?)
+        }
+        None => None,
+    };
     let (source, regex, confidence) = match known {
         Kind::Header => {
             refuse(&spec.path, "path")?;
@@ -297,8 +315,12 @@ fn leaf(kind: &str, value: Value, version: bool) -> Result<Leaf, String> {
             refuse(&spec.name, "name")?;
             refuse(&spec.path, "path")?;
             let src = compile(&needs(spec.src, "a src, which its script's src matches")?)?;
-            let regex = compile(&needs(spec.regex, "a regex")?)?;
-            (Source::Script(src), Some(regex), 50)
+            let regex = match (spec.regex, &sha256) {
+                (Some(pattern), _) => Some(compile(&pattern)?),
+                (None, Some(_)) => None,
+                (None, None) => return Err("this script leaf needs a regex or a sha256".into()),
+            };
+            (Source::Script(src), regex, 50)
         }
         Kind::NotFound => {
             refuse(&spec.name, "name")?;
@@ -345,8 +367,21 @@ fn leaf(kind: &str, value: Value, version: bool) -> Result<Leaf, String> {
     Ok(Leaf {
         source,
         regex,
+        sha256,
         confidence,
     })
+}
+
+/// The 32 bytes 64 hex digits write, in either case.
+fn sha256_of(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 || !hex.is_ascii() {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -475,6 +510,43 @@ mod tests {
                 ),
             ),
             (
+                "short-sha.yaml".into(),
+                format!(
+                    "id: short-sha\n{}",
+                    x("detect: { path: { path: /x, sha256: 'abc' } }\n")
+                ),
+            ),
+            (
+                "sha-and-regex.yaml".into(),
+                format!(
+                    "id: sha-and-regex\n{}",
+                    x(&format!(
+                        "detect: {{ path: {{ path: /x, regex: 'y', sha256: '{}' }} }}\n",
+                        "0".repeat(64)
+                    ))
+                ),
+            ),
+            (
+                "html-sha.yaml".into(),
+                format!(
+                    "id: html-sha\n{}",
+                    x(&format!(
+                        "detect: {{ html: {{ regex: 'y', sha256: '{}' }} }}\n",
+                        "0".repeat(64)
+                    ))
+                ),
+            ),
+            (
+                "version-sha.yaml".into(),
+                format!(
+                    "id: version-sha\n{}",
+                    x(&format!(
+                        "version: [ {{ path: {{ path: /x, sha256: '{}' }} }} ]\n",
+                        "0".repeat(64)
+                    ))
+                ),
+            ),
+            (
                 "path-version.yaml".into(),
                 format!(
                     "id: path-version\n{}",
@@ -558,6 +630,13 @@ mod tests {
             ),
             ("header-with-src.yaml", "this header leaf has no src"),
             ("not-found-path.yaml", "this not_found leaf has no path"),
+            ("short-sha.yaml", "is not 64 hex digits"),
+            ("sha-and-regex.yaml", "a regex or a sha256, not both"),
+            ("html-sha.yaml", "this html leaf has no sha256"),
+            (
+                "version-sha.yaml",
+                "reads its version with a regex, not a sha256",
+            ),
             ("path-version.yaml", "a version leaf needs a regex"),
             ("implies-missing.yaml", "it implies nowhere"),
             ("implies-left-out.yaml", "it implies implies-missing"),

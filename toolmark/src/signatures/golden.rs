@@ -41,16 +41,8 @@ impl Saved {
     /// What this host answers when `path` is asked.
     fn answer(&self, path: &str) -> Answered {
         match self.paths.get(path).or(self.otherwise.as_ref()) {
-            Some(r) => Answered {
-                status: Some(r.status),
-                moved: false,
-                body: r.body.clone(),
-            },
-            None => Answered {
-                status: Some(404),
-                moved: false,
-                body: String::new(),
-            },
+            Some(r) => Answered::new(r.status, false, r.body.as_bytes()),
+            None => Answered::new(404, false, b""),
         }
     }
 

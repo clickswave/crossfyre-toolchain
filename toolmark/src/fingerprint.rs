@@ -233,11 +233,7 @@ async fn scan<O: crate::observe::Observer>(
                     body: &body,
                 })
                 .await;
-            signatures::Answered {
-                status: Some(status),
-                moved,
-                body: String::from_utf8_lossy(&body).into_owned(),
-            }
+            signatures::Answered::new(status, moved, &body)
         }
     })
     .await;
