@@ -14,7 +14,7 @@ pub(crate) const DB_UP: &str = "crossfyre db up";
 
 /// Where the database server is and how to log in to it: the `[postgres]` section of
 /// config.toml. `crossfyre` holds it in the config it writes, and the engines read it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     pub host: String,
     pub port: u16,
@@ -24,6 +24,20 @@ pub struct Settings {
     pub password: Option<String>,
     /// The database `crossfyre` makes the server with.
     pub db_name: String,
+}
+
+/// Printed for a log or an error, the settings say whether there is a password, never
+/// what it is.
+impl std::fmt::Debug for Settings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Settings")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("password", &self.password.as_ref().map(|_| "<hidden>"))
+            .field("db_name", &self.db_name)
+            .finish()
+    }
 }
 
 impl Default for Settings {
@@ -138,6 +152,19 @@ pub fn new_password() -> std::io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Settings end up in errors and logs, and the password must not go with them.
+    #[test]
+    fn printed_settings_never_show_the_password() {
+        let settings = Settings {
+            password: Some("s3cret-pw".to_string()),
+            ..Settings::default()
+        };
+        let printed = format!("{settings:?} {settings:#?}");
+        assert!(!printed.contains("s3cret-pw"), "{printed}");
+        assert!(printed.contains("<hidden>"), "{printed}");
+        assert!(format!("{:?}", Settings::default()).contains("password: None"));
+    }
 
     fn written(text: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
