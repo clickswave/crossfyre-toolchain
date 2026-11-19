@@ -1,6 +1,7 @@
 {
   "angular.http": [
     {
+      "candidates": [],
       "category": "JavaScript Framework",
       "confidence": 25,
       "cpe": "",
@@ -13,6 +14,7 @@
   ],
   "apache-php-in-server.http": [
     {
+      "candidates": [],
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:apache:http_server:2.4.41:*:*:*:*:*:*:*",
@@ -23,6 +25,7 @@
       "version": "2.4.41"
     },
     {
+      "candidates": [],
       "category": "Language",
       "confidence": 45,
       "cpe": "cpe:2.3:a:php:php:7.4.3:*:*:*:*:*:*:*",
@@ -35,6 +38,7 @@
   ],
   "apache-version-in-error-page.http": [
     {
+      "candidates": [],
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:apache:http_server:2.4.58:*:*:*:*:*:*:*",
@@ -47,6 +51,7 @@
   ],
   "aspnet-headers-echoed.http": [
     {
+      "candidates": [],
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:microsoft:internet_information_services:8.5:*:*:*:*:*:*:*",
@@ -57,6 +62,7 @@
       "version": "8.5"
     },
     {
+      "candidates": [],
       "category": "Framework",
       "confidence": 100,
       "cpe": "cpe:2.3:a:microsoft:asp.net:4.0.30319:*:*:*:*:*:*:*",
@@ -68,6 +74,7 @@
       "version": "4.0.30319"
     },
     {
+      "candidates": [],
       "category": "Framework",
       "confidence": 50,
       "cpe": "",
@@ -80,6 +87,7 @@
   ],
   "bootstrap.http": [
     {
+      "candidates": [],
       "category": "UI Framework",
       "confidence": 25,
       "cpe": "",
@@ -92,6 +100,7 @@
   ],
   "cloudflare.http": [
     {
+      "candidates": [],
       "category": "CDN",
       "confidence": 100,
       "cpe": "",
@@ -105,6 +114,7 @@
   ],
   "drupal.http": [
     {
+      "candidates": [],
       "category": "CMS",
       "confidence": 100,
       "cpe": "cpe:2.3:a:drupal:drupal:10:*:*:*:*:*:*:*",
@@ -117,6 +127,7 @@
       "version": "10"
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -129,6 +140,7 @@
   ],
   "flask-session-cookie.http": [
     {
+      "candidates": [],
       "category": "Web Server",
       "confidence": 50,
       "cpe": "",
@@ -139,6 +151,7 @@
       "version": "3.0.1"
     },
     {
+      "candidates": [],
       "category": "Framework",
       "confidence": 95,
       "cpe": "",
@@ -150,6 +163,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -162,6 +176,7 @@
   ],
   "generator-content-first.http": [
     {
+      "candidates": [],
       "category": "CMS",
       "confidence": 60,
       "cpe": "cpe:2.3:a:wordpress:wordpress:6.5:*:*:*:*:*:*:*",
@@ -172,6 +187,7 @@
       "version": "6.5"
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -182,6 +198,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -194,6 +211,7 @@
   ],
   "generator-past-60k.http": [
     {
+      "candidates": [],
       "category": "CMS",
       "confidence": 60,
       "cpe": "cpe:2.3:a:drupal:drupal:9:*:*:*:*:*:*:*",
@@ -204,6 +222,7 @@
       "version": "9"
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -216,6 +235,7 @@
   ],
   "ghost.http": [
     {
+      "candidates": [],
       "category": "Framework",
       "confidence": 50,
       "cpe": "cpe:2.3:a:openjsf:express:*:*:*:*:*:node.js:*:*",
@@ -226,6 +246,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "CMS",
       "confidence": 85,
       "cpe": "",
@@ -237,6 +258,7 @@
       "version": "5.75"
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -249,6 +271,7 @@
   ],
   "gunicorn-django.http": [
     {
+      "candidates": [],
       "category": "Web Server",
       "confidence": 50,
       "cpe": "",
@@ -259,6 +282,7 @@
       "version": "20.1.0"
     },
     {
+      "candidates": [],
       "category": "Framework",
       "confidence": 90,
       "cpe": "",
@@ -270,6 +294,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -282,6 +307,7 @@
   ],
   "iis-aspnet.http": [
     {
+      "candidates": [],
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:microsoft:internet_information_services:10.0:*:*:*:*:*:*:*",
@@ -292,6 +318,7 @@
       "version": "10.0"
     },
     {
+      "candidates": [],
       "category": "Framework",
       "confidence": 100,
       "cpe": "cpe:2.3:a:microsoft:asp.net:*:*:*:*:*:*:*:*",
@@ -304,6 +331,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "Framework",
       "confidence": 50,
       "cpe": "",
@@ -316,6 +344,7 @@
   ],
   "iis-static.http": [
     {
+      "candidates": [],
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:microsoft:internet_information_services:10.0:*:*:*:*:*:*:*",
@@ -326,6 +355,7 @@
       "version": "10.0"
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -338,6 +368,7 @@
   ],
   "jetty.http": [
     {
+      "candidates": [],
       "category": "Web Server",
       "confidence": 50,
       "cpe": "",
@@ -348,6 +379,7 @@
       "version": "9.4.53."
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -360,6 +392,7 @@
   ],
   "joomla-1-5.http": [
     {
+      "candidates": [],
       "category": "CMS",
       "confidence": 85,
       "cpe": "cpe:2.3:a:joomla:joomla\\!:1.5:*:*:*:*:*:*:*",
@@ -371,6 +404,7 @@
       "version": "1.5"
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -383,6 +417,7 @@
   ],
   "joomla.http": [
     {
+      "candidates": [],
       "category": "CMS",
       "confidence": 85,
       "cpe": "cpe:2.3:a:joomla:joomla\\!:*:*:*:*:*:*:*:*",
@@ -394,6 +429,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -406,6 +442,7 @@
   ],
   "jquery-banner.http": [
     {
+      "candidates": [],
       "category": "JavaScript Library",
       "confidence": 25,
       "cpe": "cpe:2.3:a:jquery:jquery:3.7.1:*:*:*:*:*:*:*",
@@ -418,6 +455,7 @@
   ],
   "jquery-file.http": [
     {
+      "candidates": [],
       "category": "JavaScript Library",
       "confidence": 25,
       "cpe": "cpe:2.3:a:jquery:jquery:3.6.0.:*:*:*:*:*:*:*",
@@ -430,6 +468,7 @@
   ],
   "kestrel.http": [
     {
+      "candidates": [],
       "category": "Web Server",
       "confidence": 50,
       "cpe": "",
@@ -440,6 +479,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "Framework",
       "confidence": 50,
       "cpe": "",
@@ -452,6 +492,7 @@
   ],
   "lab-bwapp.http": [
     {
+      "candidates": [],
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:apache:http_server:2.4.7:*:*:*:*:*:*:*",
@@ -462,6 +503,7 @@
       "version": "2.4.7"
     },
     {
+      "candidates": [],
       "category": "Language",
       "confidence": 50,
       "cpe": "cpe:2.3:a:php:php:5.5.9:*:*:*:*:*:*:*",
@@ -475,6 +517,7 @@
   "lab-directus.http": [],
   "lab-dvga.http": [
     {
+      "candidates": [],
       "category": "UI Framework",
       "confidence": 25,
       "cpe": "",
@@ -487,6 +530,7 @@
   ],
   "lab-dvwa.http": [
     {
+      "candidates": [],
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:apache:http_server:2.4.68:*:*:*:*:*:*:*",
@@ -497,6 +541,7 @@
       "version": "2.4.68"
     },
     {
+      "candidates": [],
       "category": "Language",
       "confidence": 50,
       "cpe": "cpe:2.3:a:php:php:8.5.9:*:*:*:*:*:*:*",
@@ -509,6 +554,7 @@
   ],
   "lab-faultline.http": [
     {
+      "candidates": [],
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:f5:nginx:1.20.2:*:*:*:*:*:*:*",
@@ -524,6 +570,7 @@
   "lab-memos.http": [],
   "lab-mirage.http": [
     {
+      "candidates": [],
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:f5:nginx:*:*:*:*:*:*:*:*",
@@ -536,6 +583,7 @@
   ],
   "lab-modsec-detectonly.http": [
     {
+      "candidates": [],
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:f5:nginx:*:*:*:*:*:*:*:*",
@@ -548,6 +596,7 @@
   ],
   "lab-modsec.http": [
     {
+      "candidates": [],
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:f5:nginx:*:*:*:*:*:*:*:*",
@@ -560,6 +609,7 @@
   ],
   "lab-mutillidae.http": [
     {
+      "candidates": [],
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:apache:http_server:2.4.67:*:*:*:*:*:*:*",
@@ -570,6 +620,7 @@
       "version": "2.4.67"
     },
     {
+      "candidates": [],
       "category": "Language",
       "confidence": 95,
       "cpe": "cpe:2.3:a:php:php:8.5.7:*:*:*:*:*:*:*",
@@ -583,6 +634,7 @@
   ],
   "lab-paperless.http": [
     {
+      "candidates": [],
       "category": "Framework",
       "confidence": 45,
       "cpe": "",
@@ -593,6 +645,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "UI Framework",
       "confidence": 25,
       "cpe": "",
@@ -603,6 +656,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -615,6 +669,7 @@
   ],
   "lab-railsgoat.http": [
     {
+      "candidates": [],
       "category": "UI Framework",
       "confidence": 25,
       "cpe": "",
@@ -627,6 +682,7 @@
   ],
   "lab-tandoor.http": [
     {
+      "candidates": [],
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:f5:nginx:*:*:*:*:*:*:*:*",
@@ -637,6 +693,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "Framework",
       "confidence": 45,
       "cpe": "",
@@ -647,6 +704,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -659,6 +717,7 @@
   ],
   "lab-vampi.http": [
     {
+      "candidates": [],
       "category": "Web Server",
       "confidence": 50,
       "cpe": "",
@@ -669,6 +728,7 @@
       "version": "2.2.3"
     },
     {
+      "candidates": [],
       "category": "Framework",
       "confidence": 50,
       "cpe": "",
@@ -679,6 +739,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -691,6 +752,7 @@
   ],
   "lab-vulnerableapp.http": [
     {
+      "candidates": [],
       "category": "UI Framework",
       "confidence": 25,
       "cpe": "",
@@ -703,6 +765,7 @@
   ],
   "lab-wikijs.http": [
     {
+      "candidates": [],
       "category": "Framework",
       "confidence": 50,
       "cpe": "cpe:2.3:a:openjsf:express:*:*:*:*:*:node.js:*:*",
@@ -713,6 +776,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -726,6 +790,7 @@
   "lab-xssmaze.http": [],
   "laravel.http": [
     {
+      "candidates": [],
       "category": "Framework",
       "confidence": 90,
       "cpe": "",
@@ -737,6 +802,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -749,6 +815,7 @@
   ],
   "litespeed-php.http": [
     {
+      "candidates": [],
       "category": "Web Server",
       "confidence": 50,
       "cpe": "",
@@ -759,6 +826,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "Language",
       "confidence": 50,
       "cpe": "cpe:2.3:a:php:php:8.2.12:*:*:*:*:*:*:*",
@@ -771,6 +839,7 @@
   ],
   "long-server-header.http": [
     {
+      "candidates": [],
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:apache:http_server:2.4.62:*:*:*:*:*:*:*",
@@ -783,6 +852,7 @@
   ],
   "magento.http": [
     {
+      "candidates": [],
       "category": "CMS",
       "confidence": 70,
       "cpe": "",
@@ -794,6 +864,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -806,6 +877,7 @@
   ],
   "nextjs-version-in-page.http": [
     {
+      "candidates": [],
       "category": "JavaScript Framework",
       "confidence": 25,
       "cpe": "",
@@ -816,6 +888,7 @@
       "version": "14.0.4"
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -826,6 +899,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -838,6 +912,7 @@
   ],
   "nextjs.http": [
     {
+      "candidates": [],
       "category": "JavaScript Framework",
       "confidence": 75,
       "cpe": "",
@@ -849,6 +924,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -859,6 +935,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -871,6 +948,7 @@
   ],
   "nginx-version-in-error-page.http": [
     {
+      "candidates": [],
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:f5:nginx:1.24.0:*:*:*:*:*:*:*",
@@ -883,6 +961,7 @@
   ],
   "nuxt.http": [
     {
+      "candidates": [],
       "category": "JavaScript Framework",
       "confidence": 25,
       "cpe": "",
@@ -893,6 +972,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -903,6 +983,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -915,6 +996,7 @@
   ],
   "openresty-error-page.http": [
     {
+      "candidates": [],
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:openresty:openresty:1.21.4.3:*:*:*:*:*:*:*",
@@ -925,6 +1007,7 @@
       "version": "1.21.4.3"
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -937,6 +1020,7 @@
   ],
   "openresty.http": [
     {
+      "candidates": [],
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:openresty:openresty:1.21.4.3:*:*:*:*:*:*:*",
@@ -947,6 +1031,7 @@
       "version": "1.21.4.3"
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -959,6 +1044,7 @@
   ],
   "rails.http": [
     {
+      "candidates": [],
       "category": "Framework",
       "confidence": 70,
       "cpe": "",
@@ -970,6 +1056,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -982,6 +1069,7 @@
   ],
   "react.http": [
     {
+      "candidates": [],
       "category": "JavaScript Framework",
       "confidence": 25,
       "cpe": "",
@@ -994,6 +1082,7 @@
   ],
   "shopify.http": [
     {
+      "candidates": [],
       "category": "Ecommerce",
       "confidence": 100,
       "cpe": "",
@@ -1008,6 +1097,7 @@
   ],
   "spring-trace.http": [
     {
+      "candidates": [],
       "category": "Web Server",
       "confidence": 45,
       "cpe": "cpe:2.3:a:apache:tomcat:*:*:*:*:*:*:*:*",
@@ -1018,6 +1108,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "Framework",
       "confidence": 70,
       "cpe": "",
@@ -1029,6 +1120,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -1041,6 +1133,7 @@
   ],
   "squarespace.http": [
     {
+      "candidates": [],
       "category": "CMS",
       "confidence": 75,
       "cpe": "",
@@ -1054,6 +1147,7 @@
   ],
   "tomcat-coyote.http": [
     {
+      "candidates": [],
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:apache:http_server:*:*:*:*:*:*:*:*",
@@ -1064,6 +1158,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "Web Server",
       "confidence": 95,
       "cpe": "cpe:2.3:a:apache:tomcat:1.1:*:*:*:*:*:*:*",
@@ -1075,6 +1170,7 @@
       "version": "1.1"
     },
     {
+      "candidates": [],
       "category": "Framework",
       "confidence": 45,
       "cpe": "",
@@ -1085,6 +1181,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -1097,6 +1194,7 @@
   ],
   "tomcat-error-page.http": [
     {
+      "candidates": [],
       "category": "Web Server",
       "confidence": 45,
       "cpe": "cpe:2.3:a:apache:tomcat:9.0.83:*:*:*:*:*:*:*",
@@ -1107,6 +1205,7 @@
       "version": "9.0.83"
     },
     {
+      "candidates": [],
       "category": "Framework",
       "confidence": 45,
       "cpe": "",
@@ -1117,6 +1216,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -1129,6 +1229,7 @@
   ],
   "varnish.http": [
     {
+      "candidates": [],
       "category": "Caching",
       "confidence": 100,
       "cpe": "",
@@ -1142,6 +1243,7 @@
   ],
   "vue.http": [
     {
+      "candidates": [],
       "category": "JavaScript Framework",
       "confidence": 25,
       "cpe": "",
@@ -1154,6 +1256,7 @@
   ],
   "wix.http": [
     {
+      "candidates": [],
       "category": "CMS",
       "confidence": 75,
       "cpe": "",
@@ -1167,6 +1270,7 @@
   ],
   "wordpress-login.http": [
     {
+      "candidates": [],
       "category": "CMS",
       "confidence": 45,
       "cpe": "cpe:2.3:a:wordpress:wordpress:*:*:*:*:*:*:*:*",
@@ -1177,6 +1281,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -1187,6 +1292,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -1199,6 +1305,7 @@
   ],
   "wordpress-plugin-generator-first.http": [
     {
+      "candidates": [],
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:apache:http_server:*:*:*:*:*:*:*:*",
@@ -1209,6 +1316,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "CMS",
       "confidence": 25,
       "cpe": "cpe:2.3:a:wordpress:wordpress:6.4.2:*:*:*:*:*:*:*",
@@ -1219,6 +1327,7 @@
       "version": "6.4.2"
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -1229,6 +1338,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -1241,6 +1351,7 @@
   ],
   "wordpress.http": [
     {
+      "candidates": [],
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:f5:nginx:*:*:*:*:*:*:*:*",
@@ -1251,6 +1362,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "CMS",
       "confidence": 85,
       "cpe": "cpe:2.3:a:wordpress:wordpress:6.4.2:*:*:*:*:*:*:*",
@@ -1262,6 +1374,7 @@
       "version": "6.4.2"
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -1272,6 +1385,7 @@
       "version": null
     },
     {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",

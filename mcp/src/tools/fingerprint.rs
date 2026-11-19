@@ -180,11 +180,24 @@ pub(crate) async fn run(
         let name = untrusted::clean(e.get("name").and_then(|n| n.as_str()).unwrap_or(""), 200);
         match kind {
             "technology" => {
+                // What refines it and could not be told apart from it.
+                let candidates: Vec<String> = e
+                    .get("candidates")
+                    .and_then(|c| c.as_array())
+                    .map(|c| {
+                        c.iter()
+                            .filter_map(|n| n.as_str())
+                            .take(20)
+                            .map(|n| untrusted::clean(n, 200))
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 technologies.push(json!({
                     "name": name,
                     "category": untrusted::clean(e.get("category").and_then(|c| c.as_str()).unwrap_or(""), 200),
                     "cpe": untrusted::clean(e.get("cpe").and_then(|c| c.as_str()).unwrap_or(""), 200),
                     "confidence": e.get("confidence").filter(|c| c.is_number()).cloned().unwrap_or(Value::Null),
+                    "candidates": candidates,
                 }));
                 if let Some(v) = e
                     .get("version")
@@ -195,13 +208,15 @@ pub(crate) async fn run(
                     truncated |= cut;
                     versions.insert(name.clone(), json!(v));
                 }
-                if let Some(ev) = e
-                    .get("evidence")
-                    .and_then(|v| v.as_str())
-                    .filter(|v| !v.is_empty())
-                    && evidence.len() < 20
-                {
-                    let (ev, cut) = shown(ev, 500);
+                // toolmark sends each piece of evidence as an item of a list.
+                let said: Vec<&str> = match e.get("evidence") {
+                    Some(Value::Array(items)) => items.iter().filter_map(|i| i.as_str()).collect(),
+                    Some(Value::String(s)) => vec![s.as_str()],
+                    _ => Vec::new(),
+                };
+                let said = said.join("; ");
+                if !said.is_empty() && evidence.len() < 20 {
+                    let (ev, cut) = shown(&said, 500);
                     truncated |= cut;
                     evidence.push(json!({"technology": name, "evidence": ev}));
                 }

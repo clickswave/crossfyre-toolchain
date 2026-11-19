@@ -1,29 +1,75 @@
-//! The saved responses in `tests/responses`, each run through [`detect`], give exactly
-//! the detections `tests/responses/expected.json` holds for it: the names, categories,
-//! versions, CPEs, confidence and evidence, in the order they are reported.
+//! The saved responses in `tests/responses`, each run through the shipped signatures at
+//! the standard tier, give exactly the detections `tests/responses/expected.json` holds
+//! for them: the names, categories, versions, CPEs, confidence, evidence and candidates,
+//! in the order they are reported.
 //!
 //! A saved response is an HTTP/1.1 response as text, after any number of lines starting
-//! with `#` that say where it came from. Those named `lab-` are pages the lab's targets
-//! served; the rest are written from what each product is publicly known to send.
+//! with `#` that say where it came from. `name.http` is a host's landing page. What the
+//! same host answers for other paths, when a signature asks, is in `name/`: one file per
+//! path, named after it with each `/` written `%2F` (`feed%2F.http` is `/feed/`), and
+//! `_otherwise.http` for any path not saved there. A host with no `_otherwise.http`
+//! answers a path it does not have with a 404. Those named `lab-` are pages the lab's
+//! targets served; the rest are written from what each product is publicly known to send.
 //!
 //! A change meant to alter what is detected writes the file again with
 //! `TOOLMARK_GOLDEN=write cargo test -p toolmark golden`, and the diff of
 //! `expected.json` is then the change to review.
 
-use super::{Detection, Leaf, Page, SIGNATURES, detect};
+use super::{Answer, Answered, Detection, Host, STANDARD, Signatures, ask};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::path::Path;
 
 const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/responses");
 
-/// A saved response, as a fingerprint hands it to [`detect`].
-struct Saved {
+/// One saved response.
+struct Response {
+    status: u16,
     headers: Vec<(String, String)>,
     cookies: Vec<String>,
     body: String,
 }
 
-fn parse(name: &str, text: &str) -> Saved {
+/// A saved host: its landing page, and what it answers for other paths.
+struct Saved {
+    landing: Response,
+    paths: BTreeMap<String, Response>,
+    otherwise: Option<Response>,
+}
+
+impl Saved {
+    /// What this host answers when `path` is asked.
+    fn answer(&self, path: &str) -> Answered {
+        match self.paths.get(path).or(self.otherwise.as_ref()) {
+            Some(r) => Answered {
+                status: Some(r.status),
+                moved: false,
+                body: r.body.clone(),
+            },
+            None => Answered {
+                status: Some(404),
+                moved: false,
+                body: String::new(),
+            },
+        }
+    }
+
+    /// This host after the shipped signatures have asked it what they need.
+    async fn host(&self) -> Host<'_> {
+        let r = &self.landing;
+        let mut host = Host::new(
+            Signatures::shipped(),
+            &r.headers,
+            &r.cookies,
+            &r.body,
+            STANDARD,
+        );
+        ask(&mut host, |path| std::future::ready(self.answer(&path))).await;
+        host
+    }
+}
+
+fn parse(name: &str, text: &str) -> Response {
     let mut rest = text;
     while rest.starts_with('#') {
         rest = rest.split_once('\n').map_or("", |(_, after)| after);
@@ -32,8 +78,12 @@ fn parse(name: &str, text: &str) -> Saved {
         .split_once("\n\n")
         .unwrap_or_else(|| panic!("{name}: no empty line after the headers"));
     let mut lines = head.lines();
-    let status = lines.next().unwrap_or_default();
-    assert!(status.starts_with("HTTP/1.1 "), "{name}: {status}");
+    let status_line = lines.next().unwrap_or_default();
+    let status = status_line
+        .strip_prefix("HTTP/1.1 ")
+        .and_then(|s| s.split(' ').next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("{name}: {status_line}"));
     let mut headers = Vec::new();
     let mut cookies = Vec::new();
     for line in lines {
@@ -46,14 +96,23 @@ fn parse(name: &str, text: &str) -> Saved {
         }
         headers.push((header, value));
     }
-    Saved {
+    Response {
+        status,
         headers,
         cookies,
         body: body.to_string(),
     }
 }
 
-/// Every saved response, by file name.
+fn read(path: &Path) -> Response {
+    let name = path.display().to_string();
+    parse(
+        &name,
+        &String::from_utf8_lossy(&std::fs::read(path).expect("read")),
+    )
+}
+
+/// Every saved host, by the file name of its landing page.
 fn saved() -> BTreeMap<String, Saved> {
     let mut out = BTreeMap::new();
     for entry in std::fs::read_dir(DIR).expect("tests/responses") {
@@ -66,8 +125,29 @@ fn saved() -> BTreeMap<String, Saved> {
             .and_then(|n| n.to_str())
             .expect("name")
             .to_string();
-        let text = String::from_utf8_lossy(&std::fs::read(&path).expect("read")).into_owned();
-        out.insert(name.clone(), parse(&name, &text));
+        let mut host = Saved {
+            landing: read(&path),
+            paths: BTreeMap::new(),
+            otherwise: None,
+        };
+        let more = path.with_extension("");
+        if more.is_dir() {
+            for entry in std::fs::read_dir(&more).expect("a saved host's paths") {
+                let file = entry.expect("entry").path();
+                let stem = file
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .expect("name")
+                    .to_string();
+                if stem == "_otherwise" {
+                    host.otherwise = Some(read(&file));
+                } else {
+                    host.paths
+                        .insert(format!("/{}", stem.replace("%2F", "/")), read(&file));
+                }
+            }
+        }
+        out.insert(name, host);
     }
     out
 }
@@ -80,22 +160,23 @@ fn as_json(d: &Detection) -> Value {
         "cpe": d.cpe,
         "confidence": d.confidence,
         "evidence": d.evidence,
+        "candidates": d.candidates,
     })
 }
 
-fn detections(s: &Saved) -> Vec<Detection> {
-    detect(&s.headers, &s.cookies, &s.body)
-}
-
-#[test]
-fn each_saved_response_gives_the_detections_it_gave_before() {
-    let got: BTreeMap<String, Value> = saved()
-        .iter()
-        .map(|(name, s)| {
-            let found: Vec<Value> = detections(s).iter().map(as_json).collect();
-            (name.clone(), Value::Array(found))
-        })
-        .collect();
+#[tokio::test]
+async fn each_saved_response_gives_the_detections_it_gave_before() {
+    let mut got: BTreeMap<String, Value> = BTreeMap::new();
+    for (name, saved) in &saved() {
+        let found: Vec<Value> = saved
+            .host()
+            .await
+            .detections()
+            .iter()
+            .map(as_json)
+            .collect();
+        got.insert(name.clone(), Value::Array(found));
+    }
     let path = format!("{DIR}/expected.json");
     if std::env::var("TOOLMARK_GOLDEN").as_deref() == Ok("write") {
         let text = serde_json::to_string_pretty(&got).expect("json");
@@ -129,54 +210,59 @@ fn each_saved_response_gives_the_detections_it_gave_before() {
     );
 }
 
-/// The group of `leaf`'s pattern that gives the version on `page`, when one does.
-fn version_group(leaf: &Leaf, page: &Page) -> Option<usize> {
-    let captures = leaf.regex.captures(page.text(&leaf.source)?)?;
-    (1..captures.len()).find(|i| captures.get(*i).is_some())
-}
-
-/// Each leaf is exercised by a saved response: every `detect` leaf is found in one, and
-/// every `version` leaf reads a version in one its signature is found in. Every group of
-/// a version pattern gives the version in one, through a leaf that carries the pattern.
-#[test]
-fn the_saved_responses_exercise_every_leaf() {
-    let signatures = &*SIGNATURES;
+/// Each leaf is exercised by a saved host: every `detect` leaf, under a `none` too, is
+/// present in one, and every `version` leaf reads a version in one its signature is
+/// present in. Every group of a version pattern gives the version in one, through a leaf
+/// that carries the pattern.
+#[tokio::test]
+async fn the_saved_responses_exercise_every_leaf() {
     let saved = saved();
-    let pages: Vec<Page> = saved
-        .values()
-        .map(|s| Page::new(signatures, &s.headers, &s.cookies, &s.body))
-        .collect();
+    let mut hosts = Vec::new();
+    for s in saved.values() {
+        hosts.push(s.host().await);
+    }
     let mut missing = Vec::new();
-    for signature in &signatures.list {
-        for (n, leaf) in signature.detect.iter().enumerate() {
-            if !pages.iter().any(|page| leaf.found(page).is_some()) {
+    for signature in &Signatures::shipped().list {
+        let Some(detect) = &signature.detect else {
+            continue;
+        };
+        let mut leaves = Vec::new();
+        detect.leaves(&mut leaves);
+        for (n, leaf) in leaves.iter().enumerate() {
+            if !hosts.iter().any(|h| h.answer(leaf).0 == Answer::Present) {
                 missing.push(format!(
-                    "{}: detect leaf {} is in no saved response",
+                    "{}: detect leaf {} is present on no saved host",
                     signature.id,
                     n + 1
                 ));
             }
         }
-        let found_in: Vec<&Page> = pages
+        let found_in: Vec<&Host> = hosts
             .iter()
-            .filter(|page| signature.detect.iter().any(|l| l.found(page).is_some()))
+            .filter(|h| h.eval(detect, None).answer == Answer::Present)
             .collect();
         let mut groups: BTreeMap<&str, Vec<bool>> = BTreeMap::new();
         for (n, leaf) in signature.version.iter().enumerate() {
+            let Some(regex) = &leaf.regex else {
+                continue;
+            };
             let given: Vec<usize> = found_in
                 .iter()
-                .filter_map(|page| version_group(leaf, page))
+                .filter_map(|h| {
+                    let captures = regex.captures(h.text(leaf)?)?;
+                    (1..captures.len()).find(|i| captures.get(*i).is_some())
+                })
                 .collect();
             if given.is_empty() {
                 missing.push(format!(
-                    "{}: version leaf {} reads a version in no saved response",
+                    "{}: version leaf {} reads a version on no saved host",
                     signature.id,
                     n + 1
                 ));
             }
             let seen = groups
-                .entry(leaf.regex.as_str())
-                .or_insert_with(|| vec![false; leaf.regex.captures_len()]);
+                .entry(regex.as_str())
+                .or_insert_with(|| vec![false; regex.captures_len()]);
             for group in given {
                 seen[group] = true;
             }
@@ -184,7 +270,7 @@ fn the_saved_responses_exercise_every_leaf() {
         for (pattern, seen) in groups {
             for group in (1..seen.len()).filter(|g| !seen[*g]) {
                 missing.push(format!(
-                    "{}: no saved response gives a version through group {group} of {pattern}",
+                    "{}: no saved host gives a version through group {group} of {pattern}",
                     signature.id
                 ));
             }

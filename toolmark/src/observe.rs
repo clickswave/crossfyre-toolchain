@@ -3,7 +3,7 @@
 
 use std::future::Future;
 
-/// The landing page a fingerprint fetched.
+/// A page a fingerprint fetched: the landing page, or a path a signature asked for.
 pub struct Observation<'a> {
     pub url: &'a str,
     pub host: &'a str,

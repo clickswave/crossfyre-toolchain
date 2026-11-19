@@ -324,7 +324,8 @@ pub(crate) fn toolmark_events(title: &str, server: &str) -> Vec<Value> {
         json!({"type": "finding", "data": {
             "type": "technology", "source": "toolmark", "severity": "info",
             "name": "nginx", "category": "web-server", "version": "1.18.0",
-            "cpe": "cpe:2.3:a:f5:nginx", "confidence": 90, "evidence": "server header"}}),
+            "cpe": "cpe:2.3:a:f5:nginx", "confidence": 90,
+            "evidence": ["header server: nginx/1.18.0"], "candidates": []}}),
         json!({"type": "finding", "data": {
             "type": "vulnerability", "source": "toolmark-cve", "severity": "HIGH",
             "name": "nginx 1.18.0: CVE-2021-23017", "cve": "CVE-2021-23017", "cvss": 7.7,

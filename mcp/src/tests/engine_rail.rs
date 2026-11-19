@@ -222,3 +222,43 @@ async fn progress_only_ever_goes_up() {
         "progress went sideways: {done:?}"
     );
 }
+
+/// A technology reaches the client with its evidence, which toolmark sends as a list, and
+/// with what it could not be told apart from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_technology_reaches_the_client_with_its_evidence_and_candidates() {
+    let target = listener(Reply::ok("x")).await;
+    let mut events = toolmark_events("t", "s");
+    events[0] = json!({"type": "finding", "data": {
+        "type": "technology", "source": "toolmark", "severity": "info",
+        "name": "Framework A", "category": "Test", "version": null, "cpe": "",
+        "confidence": 100, "evidence": ["path /a/one.js: 200", "path /a/two.js: 200"],
+        "candidates": ["Framework B"]}});
+    let toolmark = stub_engine(StubOpts {
+        events,
+        ..Default::default()
+    })
+    .await;
+    let t = scope(&[format!("127.0.0.1:{}", target.port)], "")
+        .toolmark(toolmark.port)
+        .build();
+    let r = t
+        .call(
+            &FakePeer::new(Elicit::None),
+            "fingerprint",
+            json!({"url": format!("http://127.0.0.1:{}/", target.port)}),
+        )
+        .await;
+    let v = ok(&r);
+    assert_eq!(v["technologies"][0]["name"], "Framework A", "{v}");
+    assert_eq!(
+        v["technologies"][0]["candidates"],
+        json!(["Framework B"]),
+        "{v}"
+    );
+    assert_eq!(
+        v["target_data"]["evidence"],
+        json!([{"technology": "Framework A", "evidence": "path /a/one.js: 200; path /a/two.js: 200"}]),
+        "{v}"
+    );
+}

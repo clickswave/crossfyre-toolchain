@@ -9,10 +9,11 @@ CREATE TABLE hosts (
     UNIQUE (host, port)
 );
 
--- What a scan saw on a host: the landing page's status, its headers in order as
--- [name, value] with no credential's value, and its body, capped as toolmark caps what it
--- reads and gzipped, so that new signatures can be matched against what was seen. A scan
--- with credentials saw the page as the user they belong to, and keeps no body.
+-- What a scan saw on a host: each page it fetched, the landing page and any path a
+-- signature asked for, with its status, its headers in order as [name, value] with no
+-- credential's value, and its body, capped as toolmark caps what it reads and gzipped, so
+-- that new signatures can be matched against what was seen. A scan with credentials saw
+-- the pages as the user they belong to, and keeps no body.
 CREATE TABLE observations (
     id          BIGSERIAL PRIMARY KEY,
     scan_id     TEXT NOT NULL REFERENCES scans (id) ON DELETE CASCADE,

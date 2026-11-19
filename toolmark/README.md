@@ -13,9 +13,9 @@ The fingerprinting runs in toolmark's daemon, on 127.0.0.1:4444, and the command
 here are its clients. The first command starts the daemon when none is running, and a
 daemon started that way exits after 30 minutes with no client and no scan. `toolmark
 daemon` runs one by hand, and `--no-autostart` turns the starting off. It keeps what it
-finds in PostgreSQL: each host it looked at, the landing page it saw there, the products
+finds in PostgreSQL: each host it looked at, the pages it saw there, the products
 and services on it with their versions, and a row each time one appears or changes. A
-scan given credentials saw the page as that user, so it keeps no body. The first daemon
+scan given credentials saw the pages as that user, so it keeps no body. The first daemon
 makes the database, so install PostgreSQL's programs before the first scan (`sudo apt
 install postgresql` on Debian, Ubuntu or Kali), or point it at a database you run with
 `crossfyre db external`. `toolmark scans` lists the scans it keeps, the latest first,
@@ -74,14 +74,31 @@ version:
 ```
 
 A leaf reads a response header (`header`), the name of each cookie set (`cookie`), a
-meta tag (`meta`) or the first 60,000 bytes of the body (`html`). Each leaf in `detect`
-that matches adds to the confidence, 50, 45, 60 and 25 by kind unless the leaf sets its
-own `confidence`, up to 100. The first `version` leaf that matches gives the version
-from its first group, and `vendor` and `product` make the CPE.
+meta tag (`meta`) or the first 60,000 bytes of the body (`html`) on the landing page, or
+the body the host answers for another path (`path`, which matches its `regex` or, with
+none, only has to be there). Every leaf answers present, absent or unknown, and `all`,
+`any` and `none` combine the answers, nested as deep as needed. A product is reported
+when its `detect` is present. Each leaf that holds it up adds to the confidence, 50, 45,
+60, 25 and 50 by kind unless the leaf sets its own `confidence`, up to 100. The first
+`version` leaf that matches gives the version from its first group, and `vendor` and
+`product` make the CPE.
 
-A new file goes in `src/signatures/files.rs` too, and needs a saved response in
-`tests/responses` for each of its leaves to match. `cargo test -p toolmark` fails when a
-file does not load or a leaf matches none of them, and checks that every saved response
+A `path` is a request the landing page did not need, so it is sent from the standard
+depth tier up, and only when its answer could still change what is reported. Each path
+is asked once per host, and a host is asked for 20 at most. Before the first, two random
+paths learn what the host answers for a page it does not have. A path is absent only on
+a 404, a 410 or that same page. A 401, 403, 429, 5xx, redirect or timeout proves nothing,
+and leaves it unknown.
+
+`refines: other-id` makes a signature a more specific form of another. When both are
+present only the refining one is reported. When the evidence that would tell them apart
+is unknown, the other is reported with this one among its `candidates`.
+
+A new file goes in `src/signatures/files.rs` too, and needs saved responses in
+`tests/responses` on which each of its leaves is present: a landing page, and for a
+`path` the page the host answers, in a folder named after the landing page's file
+(`src/signatures/golden.rs` has the layout). `cargo test -p toolmark` fails when a file
+does not load or a leaf is present on none of them, and checks that every saved response
 still gives the detections in `tests/responses/expected.json`.
 
 ## Notes

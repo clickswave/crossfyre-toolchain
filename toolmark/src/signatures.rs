@@ -1,19 +1,23 @@
 //! Web technology signatures, and the WAF and CDN tells read passively.
 //!
 //! A signature is a file in toolmark/signatures, compiled into the binary: the product it
-//! names, the evidence that shows it, where its version can be read, and the products it
-//! implies. Each is written by hand from public knowledge of the product, so no
-//! third-party dataset is compiled in. Confidence is additive and capped, and a CPE is
-//! built from the vendor and product a file names, as a join key for CVE matching.
+//! names, the evidence that shows it, where its version is read, what it implies, and the
+//! signature it refines. Each is written by hand from public knowledge of the product, so
+//! no third-party dataset is compiled in.
+//!
+//! Each piece of evidence, a leaf, answers present, absent or unknown, and `all`, `any`
+//! and `none` combine the answers. What the landing page shows is passive. A `path` leaf
+//! is one more request to the host, made from the standard tier up and only when its
+//! answer could still change one (see [`Host::next_path`] and [`ask`]).
 
 mod files;
+mod load;
 
 use regex::Regex;
-use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::LazyLock;
 
-/// One detected technology.
+/// One technology found.
 pub struct Detection {
     pub name: String,
     pub category: String,
@@ -21,10 +25,27 @@ pub struct Detection {
     pub cpe: String,
     pub confidence: u8,
     pub evidence: Vec<String>,
+    /// The products that refine this one and could not be told apart from it, because
+    /// the evidence that would decide went unanswered.
+    pub candidates: Vec<String>,
 }
 
 /// How much of the body an `html` leaf reads.
 const HTML_READ: usize = 60_000;
+
+/// The depth tier from which a scan asks a host for more than its landing page.
+pub const STANDARD: u8 = 2;
+
+/// The most requests made of one host for its paths in a scan, the two that learn its
+/// not-found page included.
+pub const MAX_PATHS: usize = 20;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Answer {
+    Present,
+    Absent,
+    Unknown,
+}
 
 /// What a response shows, for a leaf to look at.
 enum Source {
@@ -36,14 +57,64 @@ enum Source {
     Meta(String),
     /// The first [`HTML_READ`] bytes of the body.
     Html,
+    /// What the host answers for this path, asked for on its own.
+    Path(String),
+}
+
+impl Source {
+    /// The depth tier a scan needs for this evidence to be looked at.
+    fn tier(&self) -> u8 {
+        match self {
+            Source::Path(_) => STANDARD,
+            _ => 0,
+        }
+    }
 }
 
 /// One piece of evidence a signature looks for, or reads a version from.
 struct Leaf {
     source: Source,
-    regex: Regex,
-    /// What it adds to the confidence when it is there.
+    /// What the evidence has to match. Only a `path` can do without, when the path being
+    /// there is the evidence.
+    regex: Option<Regex>,
+    /// What it adds to the confidence when it is present.
     confidence: u32,
+}
+
+/// How a signature's evidence combines.
+enum Node {
+    Leaf(Leaf),
+    All(Vec<Node>),
+    Any(Vec<Node>),
+    None(Vec<Node>),
+}
+
+impl Node {
+    /// Every leaf under this node, in order.
+    fn leaves<'a>(&'a self, out: &mut Vec<&'a Leaf>) {
+        match self {
+            Node::Leaf(leaf) => out.push(leaf),
+            Node::All(children) | Node::Any(children) | Node::None(children) => {
+                for child in children {
+                    child.leaves(out);
+                }
+            }
+        }
+    }
+
+    /// Every leaf under this node that counts for the product rather than against it,
+    /// which is every one not under a `none`.
+    fn supporting<'a>(&'a self, out: &mut Vec<&'a Leaf>) {
+        match self {
+            Node::Leaf(leaf) => out.push(leaf),
+            Node::All(children) | Node::Any(children) => {
+                for child in children {
+                    child.supporting(out);
+                }
+            }
+            Node::None(_) => {}
+        }
+    }
 }
 
 /// One signature file.
@@ -55,25 +126,76 @@ struct Signature {
     cpe: Option<(String, String, Option<String>)>,
     /// The ids of the signatures for what this one implies.
     implies: Vec<String>,
-    /// Any one of these found is the product found.
-    detect: Vec<Leaf>,
+    /// The id of the signature this one replaces when both are present.
+    refines: Option<String>,
+    /// None for a product known only from what implies it.
+    detect: Option<Node>,
     /// The first of these that reads a version gives it.
     version: Vec<Leaf>,
 }
 
-/// Every signature that loaded, in the order of [`files::FILES`].
-static SIGNATURES: LazyLock<Signatures> = LazyLock::new(|| {
-    let (signatures, skipped) = Signatures::load(files::FILES);
+impl Signature {
+    /// The CPE 2.3 name for this product at `version`, or empty when the file names no
+    /// vendor and product.
+    fn cpe(&self, version: Option<&str>) -> String {
+        let Some((vendor, product, target)) = &self.cpe else {
+            return String::new();
+        };
+        format!(
+            "cpe:2.3:a:{}:{}:{}:*:*:*:*:{}:*:*",
+            cpe_value(vendor),
+            cpe_value(product),
+            version.map_or("*".into(), cpe_value),
+            target.as_deref().map_or("*".into(), cpe_value),
+        )
+    }
+}
+
+/// A value as a CPE 2.3 formatted string writes it: anything but a letter, a digit, a
+/// period, a hyphen or an underscore escaped with a backslash.
+fn cpe_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        if !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// A set of signatures, in the order their detections are reported.
+pub struct Signatures {
+    list: Vec<Signature>,
+    /// A finder for each meta tag name a leaf reads.
+    metas: BTreeMap<String, MetaFinder>,
+}
+
+/// The signatures compiled into toolmark. A file that does not load is left out, and why
+/// is printed.
+static SHIPPED: LazyLock<Signatures> = LazyLock::new(|| {
+    let (signatures, skipped) = load::load(files::FILES);
     for why in skipped {
         eprintln!("[toolmark] a signature file was skipped: {why}");
     }
     signatures
 });
 
-struct Signatures {
-    list: Vec<Signature>,
-    /// A finder for each meta tag name a leaf reads.
-    metas: BTreeMap<String, MetaFinder>,
+impl Signatures {
+    /// The signatures compiled into toolmark.
+    pub fn shipped() -> &'static Self {
+        &SHIPPED
+    }
+
+    fn by_id(&self, id: &str) -> Option<&Signature> {
+        self.list.iter().find(|s| s.id == id)
+    }
+}
+
+/// Signatures from `files`, for a test elsewhere in toolmark, and why any were left out.
+#[cfg(test)]
+pub fn load_for_tests(files: &[(&str, &str)]) -> (Signatures, Vec<String>) {
+    load::load(files)
 }
 
 /// Finds the content of a meta tag by its name, whichever of the two attributes comes first.
@@ -105,225 +227,93 @@ impl MetaFinder {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FileSpec {
-    id: String,
-    info: InfoSpec,
-    #[serde(default)]
-    implies: Vec<String>,
-    detect: Option<DetectSpec>,
-    #[serde(default)]
-    version: Vec<BTreeMap<String, LeafSpec>>,
+/// What one request for a path was answered with.
+pub struct Answered {
+    /// None when nothing came back: a timeout, or a connection that failed.
+    pub status: Option<u16>,
+    /// The request ended somewhere other than the path, through a redirect.
+    pub moved: bool,
+    pub body: String,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct InfoSpec {
-    name: String,
-    category: String,
-    metadata: Option<MetadataSpec>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MetadataSpec {
-    vendor: String,
-    product: String,
-    target_sw: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DetectSpec {
-    any: Vec<BTreeMap<String, LeafSpec>>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LeafSpec {
-    name: Option<String>,
-    regex: Option<String>,
-    confidence: Option<u32>,
-}
-
-/// A leaf from its one-key map, `{ header: { name: server, regex: ... } }`. A version
-/// leaf has to capture the version, and takes no confidence.
-fn leaf(entry: BTreeMap<String, LeafSpec>, version: bool) -> Result<Leaf, String> {
-    let mut entries = entry.into_iter();
-    let (Some((kind, spec)), None) = (entries.next(), entries.next()) else {
-        return Err("a leaf is a map with one key, its kind".into());
-    };
-    let compile = |pattern: &str| {
-        Regex::new(pattern).map_err(|e| format!("{kind} pattern {pattern:?} does not compile: {e}"))
-    };
-    let needs = |field: Option<String>, what: &str| {
-        field.ok_or_else(|| format!("a {kind} leaf needs {what}"))
-    };
-    let (source, regex, confidence) = match kind.as_str() {
-        "header" => {
-            let name = needs(spec.name, "a name")?.to_ascii_lowercase();
-            let regex = compile(&needs(spec.regex, "a regex")?)?;
-            (Source::Header(name), regex, 50)
+impl Answered {
+    /// No answer at all.
+    pub fn none() -> Self {
+        Self {
+            status: None,
+            moved: false,
+            body: String::new(),
         }
-        "cookie" => {
-            if version {
-                return Err("a cookie leaf reads no version".into());
-            }
-            if spec.regex.is_some() {
-                return Err("a cookie leaf matches its name, and has no regex".into());
-            }
-            (Source::Cookie, compile(&needs(spec.name, "a name")?)?, 45)
-        }
-        "meta" => {
-            let name = needs(spec.name, "a name")?.to_ascii_lowercase();
-            let regex = compile(&needs(spec.regex, "a regex")?)?;
-            (Source::Meta(name), regex, 60)
-        }
-        "html" => {
-            if spec.name.is_some() {
-                return Err("an html leaf has no name".into());
-            }
-            (Source::Html, compile(&needs(spec.regex, "a regex")?)?, 25)
-        }
-        other => return Err(format!("unknown leaf `{other}`")),
-    };
-    let confidence = match spec.confidence {
-        Some(_) if version => return Err("a version leaf has no confidence".into()),
-        Some(c) if !(1..=100).contains(&c) => {
-            return Err(format!("confidence {c} is not between 1 and 100"));
-        }
-        Some(c) => c,
-        None => confidence,
-    };
-    if version && regex.captures_len() < 2 {
-        return Err(format!("version pattern {regex} captures nothing"));
-    }
-    Ok(Leaf {
-        source,
-        regex,
-        confidence,
-    })
-}
-
-impl Signature {
-    /// The signature in file `file`, whose name without `.yaml` is its id.
-    fn parse(file: &str, text: &str) -> Result<Self, String> {
-        let spec: FileSpec = serde_yaml::from_str(text).map_err(|e| e.to_string())?;
-        if Some(spec.id.as_str()) != file.strip_suffix(".yaml") {
-            return Err(format!("its id is {}, not its file's name", spec.id));
-        }
-        if spec.info.name.trim().is_empty() || spec.info.category.trim().is_empty() {
-            return Err("it needs a name and a category".into());
-        }
-        let detect = match spec.detect {
-            Some(d) if d.any.is_empty() => return Err("detect lists nothing".into()),
-            Some(d) => d
-                .any
-                .into_iter()
-                .map(|l| leaf(l, false))
-                .collect::<Result<_, _>>()?,
-            None => Vec::new(),
-        };
-        let version = spec
-            .version
-            .into_iter()
-            .map(|l| leaf(l, true))
-            .collect::<Result<_, _>>()?;
-        Ok(Self {
-            id: spec.id,
-            name: spec.info.name,
-            category: spec.info.category,
-            cpe: spec
-                .info
-                .metadata
-                .map(|m| (m.vendor, m.product, m.target_sw)),
-            implies: spec.implies,
-            detect,
-            version,
-        })
-    }
-
-    /// The CPE 2.3 name for this product at `version`, or empty when the file names no
-    /// vendor and product.
-    fn cpe(&self, version: Option<&str>) -> String {
-        let Some((vendor, product, target)) = &self.cpe else {
-            return String::new();
-        };
-        format!(
-            "cpe:2.3:a:{}:{}:{}:*:*:*:*:{}:*:*",
-            cpe_value(vendor),
-            cpe_value(product),
-            version.map_or("*".into(), cpe_value),
-            target.as_deref().map_or("*".into(), cpe_value),
-        )
     }
 }
 
-/// A value as a CPE 2.3 formatted string writes it: anything but a letter, a digit, a
-/// period, a hyphen or an underscore escaped with a backslash.
-fn cpe_value(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for c in value.chars() {
-        if !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')) {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
+/// What a host answers for a path that does not exist, learned from two random paths.
+enum NotFound {
+    /// Not asked yet.
+    Unasked,
+    /// A 404 or a 410.
+    Honest,
+    /// The same page with this status, whatever the path. The body is kept with the
+    /// path taken out of it.
+    Page { status: u16, body: String },
+    /// Answers that differ, so no answer to another path can be shown to be this one.
+    Unusable,
 }
 
-impl Signatures {
-    /// The signatures in `files`, in order, and why each file left out was left out: it
-    /// did not parse, a pattern in it did not compile, its id was taken, or it implies a
-    /// signature that is not there.
-    fn load(files: &[(&str, &str)]) -> (Self, Vec<String>) {
-        let mut skipped = Vec::new();
-        let mut list: Vec<Signature> = Vec::new();
-        for (file, text) in files {
-            match Signature::parse(file, text) {
-                Ok(s) if list.iter().any(|o| o.id == s.id) => {
-                    skipped.push(format!("{file}: another file has the id {}", s.id));
+impl NotFound {
+    fn learn(a: (&str, &Answered), b: (&str, &Answered)) -> Self {
+        let usable = |x: &Answered| !x.moved && x.status.is_some();
+        if !usable(a.1) || !usable(b.1) {
+            return NotFound::Unusable;
+        }
+        match (a.1.status, b.1.status) {
+            (Some(x), Some(y)) if gone(x) && gone(y) => NotFound::Honest,
+            (Some(x), Some(y)) if x == y && (200..300).contains(&x) => {
+                let body = without(&a.1.body, a.0);
+                if body == without(&b.1.body, b.0) {
+                    NotFound::Page { status: x, body }
+                } else {
+                    NotFound::Unusable
                 }
-                Ok(s) => list.push(s),
-                Err(e) => skipped.push(format!("{file}: {e}")),
             }
+            _ => NotFound::Unusable,
         }
-        // Leaving one out can leave another implying it, so until none is left out.
-        loop {
-            let ids: Vec<String> = list.iter().map(|s| s.id.clone()).collect();
-            let before = list.len();
-            list.retain(|s| match s.implies.iter().find(|i| !ids.contains(i)) {
-                Some(missing) => {
-                    skipped.push(format!(
-                        "{}.yaml: it implies {missing}, which is not there",
-                        s.id
-                    ));
-                    false
-                }
-                None => true,
-            });
-            if list.len() == before {
-                break;
-            }
-        }
-        let metas = list
-            .iter()
-            .flat_map(|s| s.detect.iter().chain(&s.version))
-            .filter_map(|l| match &l.source {
-                Source::Meta(name) => Some((name.clone(), MetaFinder::new(name))),
-                _ => None,
-            })
-            .collect();
-        (Self { list, metas }, skipped)
     }
 
-    fn by_id(&self, id: &str) -> Option<&Signature> {
-        self.list.iter().find(|s| s.id == id)
+    /// Whether `answered`, the answer for `path`, is this host's not-found page.
+    fn is(&self, path: &str, status: u16, body: &str) -> bool {
+        matches!(self, NotFound::Page { status: s, body: b } if *s == status && *b == without(body, path))
     }
 }
 
-/// A response as the leaves look at it.
+fn gone(status: u16) -> bool {
+    status == 404 || status == 410
+}
+
+/// `body` with `path` taken out wherever it appears, with and without its leading slash,
+/// as a not-found page that names the path it was asked for does.
+fn without(body: &str, path: &str) -> String {
+    let body = body.replace(path, "");
+    match path.strip_prefix('/').filter(|bare| bare.len() >= 4) {
+        Some(bare) => body.replace(bare, ""),
+        None => body,
+    }
+}
+
+/// A path no host has: sixteen hex digits, different every time.
+fn random_path() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default(),
+    );
+    format!("/{:016x}", hasher.finish())
+}
+
+/// The landing page as the leaves look at it.
 struct Page<'a> {
     headers: &'a [(String, String)],
     /// The name of each cookie set, in order.
@@ -334,13 +324,89 @@ struct Page<'a> {
 }
 
 impl<'a> Page<'a> {
-    fn new(
+    /// What a leaf reading `source` matches against on the landing page, other than a
+    /// cookie or a path.
+    fn text(&self, source: &Source) -> Option<&str> {
+        match source {
+            Source::Header(name) => self
+                .headers
+                .iter()
+                .find(|(header, _)| header == name)
+                .map(|(_, value)| value.as_str()),
+            Source::Meta(name) => self.metas.get(name.as_str()).and_then(|c| c.as_deref()),
+            Source::Html => Some(self.html),
+            Source::Cookie | Source::Path(_) => None,
+        }
+    }
+
+    /// The evidence for a passive leaf on this page, when it is there.
+    fn found(&self, leaf: &Leaf) -> Option<String> {
+        let regex = leaf.regex.as_ref()?;
+        if let Source::Cookie = leaf.source {
+            return self
+                .cookies
+                .iter()
+                .find(|name| regex.is_match(name))
+                .map(|name| format!("cookie {name}"));
+        }
+        let text = self.text(&leaf.source)?;
+        if !regex.is_match(text) {
+            return None;
+        }
+        Some(match &leaf.source {
+            Source::Header(name) => format!("header {name}: {}", truncate(text, 80)),
+            Source::Meta(name) => format!("meta {name}: {}", truncate(text, 80)),
+            _ => "body pattern".to_string(),
+        })
+    }
+}
+
+/// How a node answered, and when present, what its leaves add.
+struct Outcome {
+    answer: Answer,
+    confidence: u32,
+    evidence: Vec<String>,
+}
+
+impl Outcome {
+    fn bare(answer: Answer) -> Self {
+        Self {
+            answer,
+            confidence: 0,
+            evidence: Vec::new(),
+        }
+    }
+
+    fn present(of: Vec<Outcome>) -> Self {
+        Self {
+            answer: Answer::Present,
+            confidence: of.iter().map(|o| o.confidence).sum(),
+            evidence: of.into_iter().flat_map(|o| o.evidence).collect(),
+        }
+    }
+}
+
+/// What one host has shown: its landing page, and its answers for the paths asked of it.
+pub struct Host<'a> {
+    signatures: &'a Signatures,
+    page: Page<'a>,
+    /// The depth tier of the scan.
+    tier: u8,
+    /// How each leaf on the landing page answered, by the leaf's address.
+    passive: HashMap<usize, (Answer, Option<String>)>,
+    not_found: NotFound,
+    asked: BTreeMap<String, Answered>,
+}
+
+impl<'a> Host<'a> {
+    pub fn new(
         signatures: &'a Signatures,
         headers: &'a [(String, String)],
         cookies: &'a [String],
         body: &'a str,
+        tier: u8,
     ) -> Self {
-        Self {
+        let page = Page {
             headers,
             cookies: cookies
                 .iter()
@@ -352,108 +418,360 @@ impl<'a> Page<'a> {
                 .iter()
                 .map(|(name, finder)| (name.as_str(), finder.content(body)))
                 .collect(),
+        };
+        let mut leaves = Vec::new();
+        for signature in &signatures.list {
+            if let Some(detect) = &signature.detect {
+                detect.leaves(&mut leaves);
+            }
+        }
+        let passive = leaves
+            .into_iter()
+            .filter(|l| !matches!(l.source, Source::Path(_)))
+            .map(|l| {
+                let found = page.found(l);
+                let answer = if found.is_some() {
+                    Answer::Present
+                } else {
+                    Answer::Absent
+                };
+                (std::ptr::from_ref(l) as usize, (answer, found))
+            })
+            .collect();
+        Self {
+            signatures,
+            page,
+            tier,
+            passive,
+            not_found: NotFound::Unasked,
+            asked: BTreeMap::new(),
         }
     }
 
-    /// What a leaf reading `source` matches against, other than a cookie.
-    fn text(&self, source: &Source) -> Option<&str> {
-        match source {
-            Source::Header(name) => self
-                .headers
-                .iter()
-                .find(|(header, _)| header == name)
-                .map(|(_, value)| value.as_str()),
-            Source::Meta(name) => self.metas.get(name.as_str()).and_then(|c| c.as_deref()),
-            Source::Html => Some(self.html),
-            Source::Cookie => None,
+    /// How `leaf` answers here, and its evidence when present. A leaf above the scan's
+    /// tier is unknown, as is a path not asked yet.
+    fn answer(&self, leaf: &Leaf) -> (Answer, Option<String>) {
+        if leaf.source.tier() > self.tier {
+            return (Answer::Unknown, None);
+        }
+        let Source::Path(path) = &leaf.source else {
+            return self
+                .passive
+                .get(&(std::ptr::from_ref(leaf) as usize))
+                .cloned()
+                .unwrap_or_else(|| match self.page.found(leaf) {
+                    Some(e) => (Answer::Present, Some(e)),
+                    None => (Answer::Absent, None),
+                });
+        };
+        let Some(answered) = self.asked.get(path) else {
+            return (Answer::Unknown, None);
+        };
+        match answered.status {
+            Some(status) if gone(status) && !answered.moved => (Answer::Absent, None),
+            Some(status) if (200..300).contains(&status) && !answered.moved => {
+                if self.not_found.is(path, status, &answered.body) {
+                    return (Answer::Absent, None);
+                }
+                let evidence = Some(format!("path {path}: {status}"));
+                match &leaf.regex {
+                    Some(regex) if regex.is_match(&answered.body) => (Answer::Present, evidence),
+                    Some(_) => (Answer::Unknown, None),
+                    None if matches!(self.not_found, NotFound::Honest | NotFound::Page { .. }) => {
+                        (Answer::Present, evidence)
+                    }
+                    None => (Answer::Unknown, None),
+                }
+            }
+            _ => (Answer::Unknown, None),
         }
     }
-}
 
-impl Leaf {
-    /// The evidence for this leaf on `page`, when it is there.
-    fn found(&self, page: &Page) -> Option<String> {
-        if let Source::Cookie = self.source {
-            return page
-                .cookies
-                .iter()
-                .find(|name| self.regex.is_match(name))
-                .map(|name| format!("cookie {name}"));
+    /// How `node` answers, with `forced` taken as the answer of that one leaf.
+    fn eval(&self, node: &Node, forced: Option<(&Leaf, Answer)>) -> Outcome {
+        let children =
+            |list: &[Node]| -> Vec<Outcome> { list.iter().map(|c| self.eval(c, forced)).collect() };
+        let has =
+            |outcomes: &[Outcome], answer: Answer| outcomes.iter().any(|o| o.answer == answer);
+        match node {
+            Node::Leaf(leaf) => {
+                if let Some((which, answer)) = forced
+                    && std::ptr::eq(which, leaf)
+                {
+                    return Outcome::bare(answer);
+                }
+                match self.answer(leaf) {
+                    (Answer::Present, evidence) => Outcome {
+                        answer: Answer::Present,
+                        confidence: leaf.confidence,
+                        evidence: evidence.into_iter().collect(),
+                    },
+                    (answer, _) => Outcome::bare(answer),
+                }
+            }
+            Node::All(list) => {
+                let outcomes = children(list);
+                if has(&outcomes, Answer::Absent) {
+                    Outcome::bare(Answer::Absent)
+                } else if has(&outcomes, Answer::Unknown) {
+                    Outcome::bare(Answer::Unknown)
+                } else {
+                    Outcome::present(outcomes)
+                }
+            }
+            Node::Any(list) => {
+                let outcomes = children(list);
+                if has(&outcomes, Answer::Present) {
+                    Outcome::present(
+                        outcomes
+                            .into_iter()
+                            .filter(|o| o.answer == Answer::Present)
+                            .collect(),
+                    )
+                } else if has(&outcomes, Answer::Unknown) {
+                    Outcome::bare(Answer::Unknown)
+                } else {
+                    Outcome::bare(Answer::Absent)
+                }
+            }
+            Node::None(list) => {
+                let outcomes = children(list);
+                if has(&outcomes, Answer::Present) {
+                    Outcome::bare(Answer::Absent)
+                } else if has(&outcomes, Answer::Unknown) {
+                    Outcome::bare(Answer::Unknown)
+                } else {
+                    Outcome::present(Vec::new())
+                }
+            }
         }
-        let text = page.text(&self.source)?;
-        if !self.regex.is_match(text) {
+    }
+
+    /// Every signature with something to detect, and how it answers here.
+    fn outcomes(&self) -> Vec<(&'a Signature, Outcome)> {
+        self.signatures
+            .list
+            .iter()
+            .filter_map(|s| s.detect.as_ref().map(|d| (s, self.eval(d, None))))
+            .collect()
+    }
+
+    /// What `leaf` reads its version from here, when it can be read.
+    fn text(&self, leaf: &Leaf) -> Option<&str> {
+        if leaf.source.tier() > self.tier {
             return None;
         }
-        Some(match &self.source {
-            Source::Header(name) => format!("header {name}: {}", truncate(text, 80)),
-            Source::Meta(name) => format!("meta {name}: {}", truncate(text, 80)),
-            _ => "body pattern".to_string(),
+        let Source::Path(path) = &leaf.source else {
+            return self.page.text(&leaf.source);
+        };
+        let answered = self.asked.get(path)?;
+        let status = answered
+            .status
+            .filter(|s| (200..300).contains(s) && !answered.moved)?;
+        (!self.not_found.is(path, status, &answered.body)).then_some(answered.body.as_str())
+    }
+
+    /// The version `signature` reads here: from the first of its version leaves that
+    /// matches, the first group of the pattern that takes part.
+    fn version(&self, signature: &Signature) -> Option<String> {
+        signature.version.iter().find_map(|leaf| {
+            let captures = leaf.regex.as_ref()?.captures(self.text(leaf)?)?;
+            (1..captures.len())
+                .find_map(|i| captures.get(i))
+                .map(|m| m.as_str().to_string())
         })
     }
 
-    /// The version this leaf reads on `page`: the first group of its pattern that
-    /// takes part in the first match.
-    fn version(&self, page: &Page) -> Option<String> {
-        let captures = self.regex.captures(page.text(&self.source)?)?;
-        (1..captures.len())
-            .find_map(|i| captures.get(i))
-            .map(|m| m.as_str().to_string())
+    /// Whether a signature present here refines `signature`, directly or through others,
+    /// which replaces it.
+    fn refined(&self, signature: &Signature, outcomes: &[(&Signature, Outcome)]) -> bool {
+        outcomes
+            .iter()
+            .filter(|(_, o)| o.answer == Answer::Present)
+            .any(|(other, _)| {
+                let mut base = other.refines.as_deref();
+                while let Some(id) = base {
+                    if id == signature.id {
+                        return true;
+                    }
+                    base = self.signatures.by_id(id).and_then(|s| s.refines.as_deref());
+                }
+                false
+            })
+    }
+
+    /// The signatures refining `base`, directly or through others, that are unknown here,
+    /// so could not be told apart from it.
+    fn candidates(&self, base: &Signature, outcomes: &[(&Signature, Outcome)]) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut bases = VecDeque::from([base.id.as_str()]);
+        while let Some(id) = bases.pop_front() {
+            for (signature, outcome) in outcomes {
+                if signature.refines.as_deref() == Some(id) && outcome.answer == Answer::Unknown {
+                    out.push(signature.name.clone());
+                    bases.push_back(signature.id.as_str());
+                }
+            }
+        }
+        out
+    }
+
+    /// What was found: each signature present and not replaced by one that refines it, in
+    /// the order of the files, then what those imply and were not found themselves.
+    pub fn detections(&self) -> Vec<Detection> {
+        let outcomes = self.outcomes();
+        let mut found: Vec<(&Signature, Detection)> = Vec::new();
+        for (signature, outcome) in &outcomes {
+            if outcome.answer != Answer::Present || self.refined(signature, &outcomes) {
+                continue;
+            }
+            let version = self.version(signature);
+            found.push((
+                signature,
+                Detection {
+                    name: signature.name.clone(),
+                    category: signature.category.clone(),
+                    cpe: signature.cpe(version.as_deref()),
+                    version,
+                    confidence: outcome.confidence.min(100) as u8,
+                    evidence: outcome.evidence.clone(),
+                    candidates: self.candidates(signature, &outcomes),
+                },
+            ));
+        }
+
+        // One pass: what is only implied implies nothing further.
+        let mut implied: Vec<Detection> = Vec::new();
+        for (signature, detection) in &found {
+            for id in &signature.implies {
+                let Some(other) = self.signatures.by_id(id) else {
+                    continue;
+                };
+                if found.iter().any(|(s, _)| s.id == other.id)
+                    || implied.iter().any(|d| d.name == other.name)
+                {
+                    continue;
+                }
+                implied.push(Detection {
+                    name: other.name.clone(),
+                    category: "Implied".to_string(),
+                    version: None,
+                    cpe: String::new(),
+                    confidence: 30,
+                    evidence: vec![format!("implied by {}", detection.name)],
+                    candidates: Vec::new(),
+                });
+            }
+        }
+        found.into_iter().map(|(_, d)| d).chain(implied).collect()
+    }
+
+    /// The next path worth asking, or none: below the standard tier, or once no answer
+    /// left to ask could change what is reported.
+    ///
+    /// A path is worth asking when its answer could decide a signature that is unknown,
+    /// or when it is where a signature that is reported without a version reads one.
+    /// Version paths come first, then the paths of signatures with some evidence present
+    /// already, then the rest, each in the order of the files.
+    pub fn next_path(&self) -> Option<String> {
+        if self.tier < STANDARD {
+            return None;
+        }
+        let outcomes = self.outcomes();
+        let (mut versions, mut supported, mut rest) = (Vec::new(), Vec::new(), Vec::new());
+        for (signature, outcome) in &outcomes {
+            match outcome.answer {
+                Answer::Present => {
+                    if self.refined(signature, &outcomes) || self.version(signature).is_some() {
+                        continue;
+                    }
+                    versions.extend(signature.version.iter().find_map(|l| match &l.source {
+                        Source::Path(path) if !self.asked.contains_key(path) => Some(path),
+                        _ => None,
+                    }));
+                }
+                Answer::Unknown => {
+                    let Some(detect) = &signature.detect else {
+                        continue;
+                    };
+                    let mut leaves = Vec::new();
+                    detect.leaves(&mut leaves);
+                    let deciding = leaves.into_iter().filter_map(|leaf| match &leaf.source {
+                        Source::Path(path)
+                            if !self.asked.contains_key(path)
+                                && [Answer::Present, Answer::Absent].into_iter().any(|a| {
+                                    self.eval(detect, Some((leaf, a))).answer != Answer::Unknown
+                                }) =>
+                        {
+                            Some(path)
+                        }
+                        _ => None,
+                    });
+                    let mut support = Vec::new();
+                    detect.supporting(&mut support);
+                    if support.iter().any(|l| self.answer(l).0 == Answer::Present) {
+                        supported.extend(deciding);
+                    } else {
+                        rest.extend(deciding);
+                    }
+                }
+                Answer::Absent => {}
+            }
+        }
+        versions
+            .into_iter()
+            .chain(supported)
+            .chain(rest)
+            .next()
+            .cloned()
     }
 }
 
-/// Run the signatures over a page's collected signals.
-pub fn detect(headers: &[(String, String)], cookies: &[String], body: &str) -> Vec<Detection> {
-    let signatures = &*SIGNATURES;
-    let page = Page::new(signatures, headers, cookies, body);
-    let mut found: Vec<(&Signature, Detection)> = Vec::new();
-    for signature in &signatures.list {
-        let leaves: Vec<(u32, String)> = signature
-            .detect
-            .iter()
-            .filter_map(|l| l.found(&page).map(|e| (l.confidence, e)))
-            .collect();
-        if leaves.is_empty() {
+/// Ask `host`, through `fetch`, for the paths its signatures still need, until none is
+/// worth asking, [`MAX_PATHS`] requests have been made, the host says to slow down, or it
+/// has failed three times running. The first path asked is preceded by two random ones,
+/// which learn what the host answers for a path it does not have. Returns how many
+/// requests were made.
+pub async fn ask<F, Fut>(host: &mut Host<'_>, mut fetch: F) -> usize
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Answered>,
+{
+    let mut sent = 0;
+    let mut failing = 0;
+    while let Some(path) = host.next_path() {
+        if let NotFound::Unasked = host.not_found {
+            if sent + 3 > MAX_PATHS {
+                break;
+            }
+            let (a, b) = (random_path(), random_path());
+            let first = fetch(a.clone()).await;
+            let second = fetch(b.clone()).await;
+            sent += 2;
+            host.not_found = NotFound::learn((&a, &first), (&b, &second));
+            if [&first, &second].iter().any(|x| x.status == Some(429)) {
+                break;
+            }
+            failing = [&first, &second]
+                .iter()
+                .filter(|x| x.status.is_none_or(|s| s >= 500))
+                .count();
             continue;
         }
-        let version = signature.version.iter().find_map(|l| l.version(&page));
-        let confidence = leaves.iter().map(|(c, _)| c).sum::<u32>().min(100) as u8;
-        found.push((
-            signature,
-            Detection {
-                name: signature.name.clone(),
-                category: signature.category.clone(),
-                cpe: signature.cpe(version.as_deref()),
-                version,
-                confidence,
-                evidence: leaves.into_iter().map(|(_, e)| e).collect(),
-            },
-        ));
-    }
-
-    // What the products found imply, when it was not found itself. One pass: what is
-    // only implied implies nothing further.
-    let mut implied: Vec<Detection> = Vec::new();
-    for (signature, detection) in &found {
-        for id in &signature.implies {
-            let Some(other) = signatures.by_id(id) else {
-                continue;
-            };
-            if found.iter().any(|(s, _)| s.id == other.id)
-                || implied.iter().any(|d| d.name == other.name)
-            {
-                continue;
-            }
-            implied.push(Detection {
-                name: other.name.clone(),
-                category: "Implied".to_string(),
-                version: None,
-                cpe: String::new(),
-                confidence: 30,
-                evidence: vec![format!("implied by {}", detection.name)],
-            });
+        if sent >= MAX_PATHS {
+            break;
+        }
+        let answered = fetch(path.clone()).await;
+        sent += 1;
+        let slow_down = answered.status == Some(429);
+        let failed = answered.status.is_none_or(|s| s >= 500);
+        host.asked.insert(path, answered);
+        failing = if failed { failing + 1 } else { 0 };
+        if slow_down || failing >= 3 {
+            break;
         }
     }
-    found.into_iter().map(|(_, d)| d).chain(implied).collect()
+    sent
 }
 
 /// Passive WAF/CDN/LB tells from headers and cookies. Returns (waf, cdn) as
@@ -550,144 +868,4 @@ fn first_n(s: &str, n: usize) -> &str {
 mod golden;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The files in toolmark/signatures are the ones files.rs includes, both ways, so a
-    /// file added to the folder and not to the list fails here rather than never being
-    /// compiled in. Each entry is named after the file it includes, and every file loads.
-    #[test]
-    fn the_compiled_set_is_the_signatures_folder() {
-        use std::collections::BTreeSet;
-        let root = env!("CARGO_MANIFEST_DIR");
-        let on_disk: BTreeSet<String> = std::fs::read_dir(format!("{root}/signatures"))
-            .expect("toolmark/signatures")
-            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
-            .collect();
-        let source = std::fs::read_to_string(format!("{root}/src/signatures/files.rs"))
-            .expect("src/signatures/files.rs");
-        let included: Vec<String> =
-            Regex::new(r#"include_str!\(\s*"\.\./\.\./signatures/([^"]+)"\s*\)"#)
-                .expect("pattern")
-                .captures_iter(&source)
-                .map(|c| c[1].to_string())
-                .collect();
-        let listed: BTreeSet<String> = included.iter().cloned().collect();
-        assert_eq!(listed.len(), included.len(), "a file is included twice");
-        let unlisted: Vec<&String> = on_disk.difference(&listed).collect();
-        let gone: Vec<&String> = listed.difference(&on_disk).collect();
-        assert!(
-            unlisted.is_empty() && gone.is_empty(),
-            "in toolmark/signatures and not in files.rs: {unlisted:?}; \
-             in files.rs and not in toolmark/signatures: {gone:?}"
-        );
-        let names: Vec<&str> = files::FILES.iter().map(|(name, _)| *name).collect();
-        assert_eq!(
-            names, included,
-            "each entry is named after the file it includes"
-        );
-        let (signatures, skipped) = Signatures::load(files::FILES);
-        assert!(skipped.is_empty(), "{skipped:#?}");
-        assert_eq!(signatures.list.len(), files::FILES.len());
-    }
-
-    /// A file that does not load is left out with the reason, and the rest load. At run
-    /// time the reason is printed; in the test above it fails the build.
-    #[test]
-    fn a_file_that_does_not_load_is_left_out_with_the_reason() {
-        let good = "id: good\ninfo: { name: Good, category: CMS }\n\
-                    detect: { any: [ { html: { regex: 'good' } } ] }\n";
-        let files: &[(&str, &str)] = &[
-            ("good.yaml", good),
-            (
-                "extra-key.yaml",
-                "id: extra-key\ninfo: { name: X, category: CMS }\nrefines: good\n",
-            ),
-            (
-                "unknown-leaf.yaml",
-                "id: unknown-leaf\ninfo: { name: X, category: CMS }\n\
-                 detect: { any: [ { title: { regex: 'x' } } ] }\n",
-            ),
-            (
-                "bad-pattern.yaml",
-                "id: bad-pattern\ninfo: { name: X, category: CMS }\n\
-                 detect: { any: [ { html: { regex: '(' } } ] }\n",
-            ),
-            (
-                "not-its-name.yaml",
-                "id: something-else\ninfo: { name: X, category: CMS }\n",
-            ),
-            ("good.yaml", good),
-            (
-                "no-group.yaml",
-                "id: no-group\ninfo: { name: X, category: CMS }\n\
-                 version: [ { html: { regex: 'x [0-9.]+' } } ]\n",
-            ),
-            (
-                "cookie-version.yaml",
-                "id: cookie-version\ninfo: { name: X, category: CMS }\n\
-                 version: [ { cookie: { name: '(x)' } } ]\n",
-            ),
-            (
-                "version-confidence.yaml",
-                "id: version-confidence\ninfo: { name: X, category: CMS }\n\
-                 version: [ { html: { regex: 'x ([0-9.]+)', confidence: 10 } } ]\n",
-            ),
-            (
-                "zero.yaml",
-                "id: zero\ninfo: { name: X, category: CMS }\n\
-                 detect: { any: [ { html: { regex: 'x', confidence: 0 } } ] }\n",
-            ),
-            (
-                "implies-missing.yaml",
-                "id: implies-missing\ninfo: { name: X, category: CMS }\nimplies: [nowhere]\n",
-            ),
-            (
-                "implies-left-out.yaml",
-                "id: implies-left-out\ninfo: { name: X, category: CMS }\n\
-                 implies: [implies-missing]\n",
-            ),
-        ];
-        let (signatures, skipped) = Signatures::load(files);
-        let ids: Vec<&str> = signatures.list.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, ["good"]);
-        let why = |file: &str| {
-            skipped
-                .iter()
-                .filter(|s| s.starts_with(&format!("{file}: ")))
-                .cloned()
-                .collect::<Vec<_>>()
-        };
-        for (file, says) in [
-            ("extra-key.yaml", "unknown field `refines`"),
-            ("unknown-leaf.yaml", "unknown leaf `title`"),
-            ("bad-pattern.yaml", "does not compile"),
-            ("not-its-name.yaml", "its id is something-else"),
-            ("good.yaml", "another file has the id good"),
-            ("no-group.yaml", "captures nothing"),
-            ("cookie-version.yaml", "a cookie leaf reads no version"),
-            (
-                "version-confidence.yaml",
-                "a version leaf has no confidence",
-            ),
-            ("zero.yaml", "confidence 0 is not between 1 and 100"),
-            ("implies-missing.yaml", "it implies nowhere"),
-            ("implies-left-out.yaml", "it implies implies-missing"),
-        ] {
-            let reasons = why(file);
-            assert!(
-                reasons.len() == 1 && reasons[0].contains(says),
-                "{file}: {reasons:?}, all: {skipped:#?}"
-            );
-        }
-        assert_eq!(skipped.len(), 11, "{skipped:#?}");
-    }
-
-    #[test]
-    fn a_cpe_escapes_what_its_formatted_string_escapes() {
-        assert_eq!(cpe_value("joomla!"), "joomla\\!");
-        assert_eq!(cpe_value("node.js"), "node.js");
-        assert_eq!(cpe_value("http_server"), "http_server");
-        assert_eq!(cpe_value("1.2+b3:4"), "1.2\\+b3\\:4");
-    }
-}
+mod tests;
