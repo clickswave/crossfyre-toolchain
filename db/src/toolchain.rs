@@ -7,6 +7,11 @@ use crate::local::{Cluster, Postgres, answers, find_postgres, port_taken};
 use crate::settings::{Backend, CONFIG_FILE, Settings};
 use std::path::{Path, PathBuf};
 
+/// The file in the local database's own directory that keeps the settings it was used
+/// with, written when config.toml comes to name another database, so that going back to
+/// it finds its password.
+const KEPT: &str = "crossfyre.toml";
+
 /// A toolchain directory, acted on as the account it belongs to.
 pub struct Toolchain<'a> {
     dir: PathBuf,
@@ -141,6 +146,46 @@ impl<'a> Toolchain<'a> {
         Ok((settings, if made { Up::Made } else { Up::Started }))
     }
 
+    /// Keep `settings`, the local database's, in its own directory, readable by the account
+    /// alone, for when config.toml names another database. Nothing is kept when there is
+    /// no local database.
+    pub fn keep_local(&self, settings: &Settings) -> Result<(), NotReady> {
+        let cluster = Cluster::in_toolchain(&self.dir);
+        if !cluster.exists() {
+            return Ok(());
+        }
+        let path = cluster.dir().join(KEPT);
+        self.account
+            .write_private(&path, settings.to_file().as_bytes())
+            .map_err(|e| NotReady::new(format!("cannot write {}: {e}", path.display()), None))
+    }
+
+    /// The settings [`Toolchain::keep_local`] kept for the local database, or None when no
+    /// local database has been made.
+    pub fn kept_local(&self) -> Result<Option<Settings>, NotReady> {
+        let cluster = Cluster::in_toolchain(&self.dir);
+        if !cluster.exists() {
+            return Ok(None);
+        }
+        let path = cluster.dir().join(KEPT);
+        match self.account.read_to_string(&path) {
+            Ok(text) => Settings::parse(&text, &path).map(Some),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(NotReady::new(
+                format!(
+                    "the local database in {} was made with settings that were not kept, so its \
+                     password is not known here. Move it aside, and `crossfyre db up` makes a \
+                     new one",
+                    cluster.dir().display()
+                ),
+                None,
+            )),
+            Err(e) => Err(NotReady::new(
+                format!("cannot read {}: {e}", path.display()),
+                None,
+            )),
+        }
+    }
+
     /// Stop the local database.
     pub fn stop(&self) -> Result<Stop, NotReady> {
         if let Some(Settings {
@@ -268,6 +313,40 @@ mod tests {
         // Made by a PostgreSQL that no machine here has.
         std::fs::write(toolchain.cluster_dir().join("PG_VERSION"), "9\n").unwrap();
         assert_eq!(toolchain.stop().unwrap(), Stop::NotRunning);
+    }
+
+    #[test]
+    fn the_local_settings_are_kept_with_the_database_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let account = ThisAccount::new().unwrap();
+        let toolchain = Toolchain::new(dir.path().to_path_buf(), &account);
+        let local = Settings {
+            password: Some("local-pw".to_string()),
+            ..Settings::default()
+        };
+        toolchain.keep_local(&local).unwrap();
+        assert_eq!(
+            toolchain.kept_local().unwrap(),
+            None,
+            "kept with no database"
+        );
+        assert!(!toolchain.cluster_dir().exists(), "made a directory for it");
+
+        std::fs::create_dir_all(toolchain.cluster_dir()).unwrap();
+        std::fs::write(toolchain.cluster_dir().join("PG_VERSION"), "17\n").unwrap();
+        let e = toolchain.kept_local().unwrap_err();
+        assert!(e.problem().contains("settings that were not kept"), "{e}");
+        toolchain.keep_local(&local).unwrap();
+        assert_eq!(toolchain.kept_local().unwrap(), Some(local));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(toolchain.cluster_dir().join(KEPT))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
     }
 
     #[test]

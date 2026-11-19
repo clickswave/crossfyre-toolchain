@@ -695,8 +695,8 @@ static CLAIM_MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 
 #[derive(Subcommand, Debug)]
 pub enum DbCommands {
-    /// Make the local database if there is none, and start it if it is stopped. What is
-    /// there is never replaced or emptied
+    /// Make the local database if there is none, and start it if it is stopped, going
+    /// back to it from a database you run. What is there is never replaced or emptied
     Up,
     /// Stop the local database
     Stop,

@@ -16,10 +16,18 @@ pub async fn run(command: &crate::DbCommands) -> Result<(), Box<dyn std::error::
     use super::ui::{ok, warn};
     match command {
         crate::DbCommands::Up => {
+            let back = use_local_in(&get_toolchain_dir())?;
+            match back {
+                Back::Already => {}
+                Back::Kept => {
+                    ok("config.toml names the local database again, with the settings it had.")
+                }
+                Back::New => ok("config.toml names the local database now."),
+            }
             let (settings, up) = with_toolchain(|t| t.up())?;
             say_up(&settings, up);
-            if up == Up::External {
-                check_external(&settings).await?;
+            if back != Back::Already {
+                restart_engines();
             }
         }
         crate::DbCommands::Stop => match with_toolchain(|t| t.stop())? {
@@ -133,7 +141,8 @@ async fn external(host: &str, port: u16, user: &str) -> Result<(), Box<dyn std::
     ));
     if matches!(stopped, Stop::Stopped | Stop::NotRunning) {
         warn(&format!(
-            "The local database is not used now, and is stopped. Its data stays in {}.",
+            "The local database is not used now, and is stopped. It stays in {} with its \
+             settings, and `crossfyre db up` goes back to it.",
             get_toolchain_dir().join("postgres").display()
         ));
     }
@@ -180,8 +189,12 @@ fn record_external_in(
     let mut config = load_or_create_config_at(&path)?;
     let account = account()?;
     let toolchain = Toolchain::new(dir.to_path_buf(), account.as_ref());
+    // The local database's settings stay with it, so `crossfyre db up` can go back to it.
     let stopped = match config.postgres.backend {
-        Backend::Local => toolchain.stop()?,
+        Backend::Local => {
+            toolchain.keep_local(&config.postgres)?;
+            toolchain.stop()?
+        }
         Backend::External { .. } => Stop::External,
     };
     config.postgres = Settings {
@@ -190,6 +203,46 @@ fn record_external_in(
     };
     save_config_at(&path, &config)?;
     Ok(stopped)
+}
+
+/// What going back to the local database found.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Back {
+    /// config.toml named it already.
+    Already,
+    /// One had been made, and the settings kept with it are config.toml's again.
+    Kept,
+    /// None had been made, so config.toml names a new one, with a new password.
+    New,
+}
+
+/// config.toml in `dir` names the local database, going back to it from a database the
+/// user runs: the one made before, with the settings kept with it, or a new one.
+pub(crate) fn use_local_in(dir: &std::path::Path) -> Result<Back, Box<dyn std::error::Error>> {
+    let path = dir.join("config.toml");
+    let mut config = load_or_create_config_at(&path)?;
+    if config.postgres.backend == Backend::Local {
+        return Ok(Back::Already);
+    }
+    let account = account()?;
+    let toolchain = Toolchain::new(dir.to_path_buf(), account.as_ref());
+    let back = match toolchain.kept_local()? {
+        Some(kept) => {
+            config.postgres = kept;
+            Back::Kept
+        }
+        None => {
+            let mut local = Settings {
+                db_name: config.postgres.db_name.clone(),
+                ..Settings::default()
+            };
+            local.ensure_password()?;
+            config.postgres = local;
+            Back::New
+        }
+    };
+    save_config_at(&path, &config)?;
+    Ok(back)
 }
 
 /// The password for `user` at `host`: from [`PASSWORD_ENV`] when it is set, otherwise
@@ -320,6 +373,62 @@ fn lock_file_usable(is_file: bool, links: u64, owner: u32, user: u32) -> bool {
 mod tests {
     const LOCAL: &str = "[postgres]\nbackend = \"local\"\nport = 4440\nuser = \"postgres\"\n\
                          password = \"local-pw\"\ndb_name = \"crossfyre\"\n";
+
+    #[test]
+    fn a_database_one_runs_keeps_the_local_one_s_settings_to_go_back_to() {
+        use super::{Backend, Settings};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, LOCAL).unwrap();
+        std::fs::create_dir_all(dir.path().join("postgres")).unwrap();
+        std::fs::write(dir.path().join("postgres/PG_VERSION"), "17\n").unwrap();
+        let theirs = Settings {
+            backend: Backend::External {
+                host: "db.internal".to_string(),
+            },
+            port: 5432,
+            user: "cfx".to_string(),
+            password: Some("their-pw".to_string()),
+            ..Settings::default()
+        };
+        super::record_external_in(dir.path(), theirs).unwrap();
+        let recorded = super::super::config::load_config_at(&path)
+            .unwrap()
+            .postgres;
+        assert_eq!(recorded.address(), "db.internal:5432");
+
+        assert_eq!(super::use_local_in(dir.path()).unwrap(), super::Back::Kept);
+        let back = super::super::config::load_config_at(&path)
+            .unwrap()
+            .postgres;
+        assert_eq!(back.backend, Backend::Local);
+        assert_eq!(back.address(), "127.0.0.1:4440");
+        assert_eq!(back.password.as_deref(), Some("local-pw"));
+        assert_eq!(
+            super::use_local_in(dir.path()).unwrap(),
+            super::Back::Already
+        );
+    }
+
+    #[test]
+    fn going_back_with_no_local_database_made_gives_a_new_password() {
+        use super::Backend;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[postgres]\nbackend = \"external\"\nhost = \"db\"\nport = 5432\nuser = \"u\"\n\
+             password = \"theirs\"\ndb_name = \"scans\"\n",
+        )
+        .unwrap();
+        assert_eq!(super::use_local_in(dir.path()).unwrap(), super::Back::New);
+        let back = super::super::config::load_config_at(&path)
+            .unwrap()
+            .postgres;
+        assert_eq!(back.backend, Backend::Local);
+        assert_eq!(back.db_name, "scans");
+        assert_eq!(back.password.map(|p| p.len()), Some(64));
+    }
 
     #[tokio::test]
     async fn a_database_that_does_not_answer_is_not_recorded() {
