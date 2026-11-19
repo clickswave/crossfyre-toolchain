@@ -470,7 +470,7 @@ fn node_worker() -> Option<std::path::PathBuf> {
             .ok()
             .and_then(|p| {
                 p.parent()
-                    .map(|d| d.join(cfx_core::toolchain::config::ext_file_name("node")))
+                    .map(|d| d.join(cfx_core::toolchain::config::file_name("node")))
             })
             .filter(|p| p.exists())
     };
@@ -819,8 +819,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .iter()
                 .map(|e| cfx_mcp::EngineInfo {
                     name: e.name.to_string(),
-                    port: config::engine_port(e.id),
-                    installed: config::is_extension_installed(e.id),
+                    port: config::engine_port(e.name),
+                    installed: config::is_extension_installed(e.name),
                 })
                 .collect();
             let opts = cfx_mcp::Options {

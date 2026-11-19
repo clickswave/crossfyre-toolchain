@@ -1754,11 +1754,7 @@ pub async fn run_init(
     if selected_extensions.is_empty() {
         field("Extensions", "none assigned");
     } else {
-        let names: Vec<&str> = selected_extensions
-            .iter()
-            .map(|e| toolchain::public_name(e))
-            .collect();
-        field("Extensions", &names.join(", "));
+        field("Extensions", &selected_extensions.join(", "));
     }
 
     // Extract NATS URL from server response (falls back to localhost for dev)
@@ -1851,7 +1847,6 @@ pub async fn run_init(
     // the release manifest, enable and start its daemon. The package manager
     // is built in - no external installer involved.
     for ext in &selected_extensions {
-        let name = toolchain::public_name(ext);
         if toolchain::config::is_extension_installed(ext) {
             // Installed before this node was set up (by an earlier init, by
             // `extension install`, or by a package), which is no promise that its
@@ -1866,17 +1861,17 @@ pub async fn run_init(
                 .and_then(|()| toolchain::service::enable(ext))
                 .and_then(|()| toolchain::service::start(ext))
             {
-                Ok(()) => ok(&format!("{name} already installed, started")),
+                Ok(()) => ok(&format!("{ext} already installed, started")),
                 Err(e) => fail(&format!(
-                    "{name} is installed but its service did not start: {e}"
+                    "{ext} is installed but its service did not start: {e}"
                 )),
             }
             continue;
         }
-        working(&format!("Installing {name}"));
+        working(&format!("Installing {ext}"));
         match toolchain::install::install_and_start(ext).await {
-            Ok(()) => ok(&format!("{name} installed and started")),
-            Err(e) => fail(&format!("{name} install failed: {e}")),
+            Ok(()) => ok(&format!("{ext} installed and started")),
+            Err(e) => fail(&format!("{ext} install failed: {e}")),
         }
     }
 
@@ -1973,7 +1968,6 @@ pub async fn run_init(
 /// How `node init` left engine `ext`, with the command that starts it when it is not
 /// running (see [`init_summary::engine_start`]).
 fn engine_part(ext: &str) -> init_summary::Part {
-    let name = toolchain::public_name(ext);
     // Where systemd is not running, the command its unit would run.
     #[cfg(target_os = "linux")]
     let daemon = (!toolchain::service::systemd_runs()).then(|| {
@@ -1986,10 +1980,10 @@ fn engine_part(ext: &str) -> init_summary::Part {
     #[cfg(not(target_os = "linux"))]
     let daemon = None;
     init_summary::Part {
-        name: name.to_string(),
+        name: ext.to_string(),
         running: toolchain::service::daemon_status(ext) == "running",
         start: init_summary::engine_start(
-            name,
+            ext,
             toolchain::config::is_extension_installed(ext),
             toolchain::service::has_service_file(ext),
             daemon,
@@ -3364,15 +3358,13 @@ pub async fn run_daemon(
                             Some("install_extension") => {
                                 let ext = cmd["extension"].as_str().unwrap_or("").to_string();
                                 engine_egress.remove(&ext);
-                                // Printed by public name; `ext` stays the id the API sent, for the reply.
-                                let name = toolchain::public_name(&ext).to_string();
-                                println!("\n[install] Installing extension: {name}");
+                                println!("\n[install] Installing extension: {ext}");
 
                                 // Built-in package manager: download + verify +
                                 // enable + start in one call.
                                 let msg = match toolchain::install::install_and_start(&ext).await {
                                     Ok(()) => {
-                                        println!("[install] OK {name} installed and started");
+                                        println!("[install] OK {ext} installed and started");
                                         serde_json::json!({
                                             "type": "extension_installed",
                                             "extension": ext,
@@ -3381,7 +3373,7 @@ pub async fn run_daemon(
                                         })
                                     }
                                     Err(e) => {
-                                        eprintln!("[install] FAIL Failed to install {name}: {e}");
+                                        eprintln!("[install] FAIL Failed to install {ext}: {e}");
                                         serde_json::json!({
                                             "type": "extension_install_failed",
                                             "extension": ext,
@@ -3459,13 +3451,11 @@ pub async fn run_daemon(
                             Some("remove_extension") => {
                                 let ext = cmd["extension"].as_str().unwrap_or("").to_string();
                                 engine_egress.remove(&ext);
-                                // Printed by public name; `ext` stays the id the API sent, for the reply.
-                                let name = toolchain::public_name(&ext).to_string();
-                                println!("\n[remove] Removing extension: {name}");
+                                println!("\n[remove] Removing extension: {ext}");
 
                                 let remove_ok = match toolchain::install::remove(&ext) {
-                                    Ok(()) => { println!("[remove] OK {name} removed"); true }
-                                    Err(e) => { eprintln!("[remove] FAIL Failed to remove {name}: {e}"); false }
+                                    Ok(()) => { println!("[remove] OK {ext} removed"); true }
+                                    Err(e) => { eprintln!("[remove] FAIL Failed to remove {ext}: {e}"); false }
                                 };
 
                                 let msg = serde_json::json!({
@@ -3479,13 +3469,11 @@ pub async fn run_daemon(
                             Some("restart_extension") => {
                                 let ext = cmd["extension"].as_str().unwrap_or("").to_string();
                                 engine_egress.remove(&ext);
-                                // Printed by public name; `ext` stays the id the API sent, for the reply.
-                                let name = toolchain::public_name(&ext).to_string();
-                                println!("\n[restart] Restarting extension: {name}");
+                                println!("\n[restart] Restarting extension: {ext}");
 
                                 let msg = match toolchain::service::restart(&ext) {
                                     Ok(()) => {
-                                        println!("[restart] OK {name} restarted");
+                                        println!("[restart] OK {ext} restarted");
                                         serde_json::json!({
                                             "type": "extension_restarted",
                                             "extension": ext,
@@ -3494,7 +3482,7 @@ pub async fn run_daemon(
                                         })
                                     }
                                     Err(e) => {
-                                        eprintln!("[restart] FAIL Failed to restart {name}: {e}");
+                                        eprintln!("[restart] FAIL Failed to restart {ext}: {e}");
                                         serde_json::json!({
                                             "type": "extension_restart_failed",
                                             "extension": ext,
@@ -3508,18 +3496,16 @@ pub async fn run_daemon(
                             Some("reinstall_extension") => {
                                 let ext = cmd["extension"].as_str().unwrap_or("").to_string();
                                 engine_egress.remove(&ext);
-                                // Printed by public name; `ext` stays the id the API sent, for the reply.
-                                let name = toolchain::public_name(&ext).to_string();
-                                println!("\n[reinstall] Reinstalling extension: {name}");
+                                println!("\n[reinstall] Reinstalling extension: {ext}");
 
                                 let success = match toolchain::install::install(&ext, true).await {
                                     Ok(()) => {
-                                        println!("[reinstall] OK {name} reinstalled, starting service...");
+                                        println!("[reinstall] OK {ext} reinstalled, starting service...");
                                         let _ = toolchain::service::start(&ext);
                                         true
                                     }
                                     Err(e) => {
-                                        eprintln!("[reinstall] FAIL Failed to reinstall {name}: {e}");
+                                        eprintln!("[reinstall] FAIL Failed to reinstall {ext}: {e}");
                                         false
                                     }
                                 };
@@ -3535,13 +3521,11 @@ pub async fn run_daemon(
                             Some("stop_extension") => {
                                 let ext = cmd["extension"].as_str().unwrap_or("").to_string();
                                 engine_egress.remove(&ext);
-                                // Printed by public name; `ext` stays the id the API sent, for the reply.
-                                let name = toolchain::public_name(&ext).to_string();
-                                println!("\n[stop] Stopping extension: {name}");
+                                println!("\n[stop] Stopping extension: {ext}");
 
                                 let success = match toolchain::service::stop(&ext) {
-                                    Ok(()) => { println!("[stop] OK {name} stopped"); true }
-                                    Err(e) => { eprintln!("[stop] FAIL Failed to stop {name}: {e}"); false }
+                                    Ok(()) => { println!("[stop] OK {ext} stopped"); true }
+                                    Err(e) => { eprintln!("[stop] FAIL Failed to stop {ext}: {e}"); false }
                                 };
 
                                 let msg = serde_json::json!({

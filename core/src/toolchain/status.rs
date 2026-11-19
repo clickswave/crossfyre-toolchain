@@ -162,7 +162,7 @@ pub fn extensions() -> Result<(), Box<dyn std::error::Error>> {
     );
     section("Extensions");
     for e in ENGINES {
-        let (ext, port) = (e.id, &e.port);
+        let (ext, port) = (e.name, &e.port);
         let installed = is_extension_installed(ext);
         let daemon = if installed {
             service::daemon_status(ext)
@@ -217,7 +217,7 @@ pub fn db() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  container: none recorded. `crossfyre db up` creates one");
             }
             // Extension binaries are useless without the db; nudge if it's down.
-            if !listening && super::EXTENSIONS.iter().any(|e| is_extension_installed(e)) {
+            if !listening && ENGINES.iter().any(|e| is_extension_installed(e.name)) {
                 println!(
                     "  hint: extensions are installed but the database is down. Start it with `crossfyre db start`"
                 );

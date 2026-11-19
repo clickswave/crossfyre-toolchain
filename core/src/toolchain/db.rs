@@ -2211,14 +2211,12 @@ fn remove_all_named(name: &str) -> Vec<String> {
 /// Restart the installed engine daemons, which read the database password only when
 /// they start.
 fn restart_engines() {
-    for ext in super::EXTENSIONS {
+    for ext in super::ENGINES.iter().map(|e| e.name) {
         if super::config::is_extension_installed(ext) && super::service::has_service_file(ext) {
             if let Err(e) = super::service::restart(ext) {
                 eprintln!(
-                    "[db] {} did not restart ({e}); restart it so it uses the database password: \
-                     crossfyre extension restart {}",
-                    super::public_name(ext),
-                    super::public_name(ext)
+                    "[db] {ext} did not restart ({e}); restart it so it uses the database \
+                     password: crossfyre extension restart {ext}"
                 );
             }
         }

@@ -53,9 +53,8 @@ pub(crate) fn engine_addr(ext: &str) -> String {
 /// Why an op failed when engine `ext` could not be reached, worded for whoever reads the
 /// scan as well as for the node's log.
 pub(crate) fn unreachable(ext: &str, e: &std::io::Error) -> String {
-    let name = crate::toolchain::public_name(ext);
     format!(
-        "{name} daemon unreachable on {} ({e}). Is `{name} --daemon` running?",
+        "{ext} daemon unreachable on {} ({e}). Is `{ext} --daemon` running?",
         engine_addr(ext)
     )
 }
@@ -112,9 +111,10 @@ pub(crate) async fn open_engine(
     let mut first = None;
     if egress.is_some() {
         first = rest.next_line().await.ok().flatten();
-        if let Some(note) = first.as_deref().and_then(|l| {
-            crate::egress::state::wrapper_refusal(crate::toolchain::public_name(ext), l)
-        }) {
+        if let Some(note) = first
+            .as_deref()
+            .and_then(|l| crate::egress::state::wrapper_refusal(ext, l))
+        {
             return Err(EngineOpen::Refused(note));
         }
     }

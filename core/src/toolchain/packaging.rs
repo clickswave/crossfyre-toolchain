@@ -111,15 +111,14 @@ pub fn remove_note(manager: Manager) -> String {
     format!("installed by {manager}; remove it with {manager}")
 }
 
-/// The components a package may own, by public name.
+/// The components a package may own besides the engines.
 const COMPONENTS: [&str; 3] = ["crossfyre", "node", "cfx-script"];
 
-/// The public name of a component a package may own, given any of its names.
+/// The component called `name`, when a package may own one by that name.
 fn component(name: &str) -> Option<&'static str> {
-    if let Some(e) = super::engine(name) {
-        return Some(e.name);
-    }
-    COMPONENTS.into_iter().find(|c| *c == name)
+    super::engine(name)
+        .map(|e| e.name)
+        .or_else(|| COMPONENTS.into_iter().find(|c| *c == name))
 }
 
 /// A `packaging.json` that was found and trusted.
@@ -189,12 +188,12 @@ impl Packaging {
         })
     }
 
-    /// Does the package own `component`, given by any of its names?
+    /// Does the package own the component called `component_name`?
     pub fn owns(&self, component_name: &str) -> bool {
         component(component_name).is_some_and(|c| self.owns.contains(&c))
     }
 
-    /// What the package owns, by public name, in the order the file lists them.
+    /// What the package owns, in the order the file lists them.
     pub fn owned(&self) -> &[&'static str] {
         &self.owns
     }
@@ -532,8 +531,6 @@ mod tests {
         for c in ["crossfyre", "node", "cfx-script", "ambulo", "plessor"] {
             assert!(p.owns(c), "{c}");
         }
-        // An engine is owned by every name it answers to.
-        assert!(p.owns("cortex") && p.owns("mach"));
         assert_eq!(
             p.bin_dir(),
             Some(Path::new("/nix/store/x-crossfyre/libexec"))
@@ -542,12 +539,6 @@ mod tests {
             p.cli_path(),
             Some(Path::new("/run/current-system/sw/bin/crossfyre"))
         );
-    }
-
-    #[test]
-    fn an_engine_listed_by_an_old_name_is_kept_under_its_public_one() {
-        let p = parse(r#"{"manager":"container","owns":["cortex","plessor"]}"#).expect("parses");
-        assert_eq!(p.owned(), ["plessor"]);
     }
 
     #[test]

@@ -700,7 +700,7 @@ fn word_filter(name: &str, v: &Option<String>) -> Result<(), Resp> {
     }
 }
 
-/// The engine a launch type runs on, by the public name a node lists it under.
+/// The engine a launch type runs on, by the name a node lists it under.
 fn engine(kind: wire::LaunchType) -> &'static str {
     use wire::LaunchType as T;
     match kind {

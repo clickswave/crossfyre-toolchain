@@ -44,7 +44,7 @@ use std::sync::Arc;
 /// One engine as the CLI knows it.
 #[derive(Debug, Clone)]
 pub struct EngineInfo {
-    /// The public name: `toolmark`, `plessor`, ...
+    /// The engine's name: `toolmark`, `plessor`, ...
     pub name: String,
     /// The daemon's port on 127.0.0.1, from `config.toml`.
     pub port: u16,

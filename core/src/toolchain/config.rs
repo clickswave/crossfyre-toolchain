@@ -32,11 +32,10 @@ pub struct ContainerSection {
     pub id: Option<String>,
 }
 
-/// Per-extension daemon ports, keyed by engine id.
-///
-/// In `config.toml` the `[extensions]` table is keyed by each engine's public name.
-/// A file without the section, or one that leaves an engine out, gets the protocol
-/// default ([`super::Engine::port`]) for it, and any other key is ignored.
+/// Per-extension daemon ports, keyed by engine name, as the `[extensions]` table of
+/// `config.toml` is. A file without the section, or one that leaves an engine out,
+/// gets the protocol default ([`super::Engine::port`]) for it, and any other key is
+/// ignored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionPorts {
     ports: Vec<(&'static str, u16)>,
@@ -45,32 +44,24 @@ pub struct ExtensionPorts {
 impl Default for ExtensionPorts {
     fn default() -> Self {
         Self {
-            ports: super::ENGINES.iter().map(|e| (e.id, e.port)).collect(),
+            ports: super::ENGINES.iter().map(|e| (e.name, e.port)).collect(),
         }
     }
 }
 
-/// The engine whose public name is `key`.
-fn engine_named(key: &str) -> Option<&'static super::Engine> {
-    super::ENGINES.iter().find(|e| e.name == key)
-}
-
 impl ExtensionPorts {
-    /// Configured port for `ext` (an id or a public name), or 0 if it isn't a known
-    /// engine.
+    /// Configured port for engine `ext`, or 0 if it isn't a known engine.
     pub fn get(&self, ext: &str) -> u16 {
-        let id = super::engine(ext).map(|e| e.id).unwrap_or(ext);
         self.ports
             .iter()
-            .find(|(k, _)| *k == id)
+            .find(|(k, _)| *k == ext)
             .map(|(_, p)| *p)
             .unwrap_or(0)
     }
 
     /// Set `ext`'s port; no-op for an unknown engine name.
     pub fn set(&mut self, ext: &str, port: u16) {
-        let id = super::engine(ext).map(|e| e.id).unwrap_or(ext);
-        if let Some(slot) = self.ports.iter_mut().find(|(k, _)| *k == id) {
+        if let Some(slot) = self.ports.iter_mut().find(|(k, _)| *k == ext) {
             slot.1 = port;
         }
     }
@@ -78,11 +69,7 @@ impl ExtensionPorts {
 
 impl Serialize for ExtensionPorts {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_map(
-            self.ports
-                .iter()
-                .map(|(id, port)| (super::public_name(id), *port)),
-        )
+        serializer.collect_map(self.ports.iter().copied())
     }
 }
 
@@ -100,11 +87,11 @@ impl<'de> Deserialize<'de> for ExtensionPorts {
             std::collections::BTreeMap::deserialize(deserializer)?;
         let mut ports = Self::default();
         for (key, value) in &raw {
-            let Some(e) = engine_named(key) else {
+            let Some(e) = super::engine(key) else {
                 continue;
             };
             match value {
-                Entry::Port(p) => ports.set(e.id, *p),
+                Entry::Port(p) => ports.set(e.name, *p),
                 Entry::Other(_) => {
                     return Err(serde::de::Error::custom(format!(
                         "[extensions] {key} must be a port number"
@@ -209,14 +196,9 @@ pub fn get_bin_dir() -> PathBuf {
     }
 }
 
-/// On-disk file name of an extension binary (adds `.exe` on Windows). `ext` may be an
-/// engine id or any other component name; an engine is named by its public name.
-pub fn ext_file_name(ext: &str) -> String {
-    file_name(super::public_name(ext))
-}
-
-/// `name` as a file name on this OS.
-pub(crate) fn file_name(name: &str) -> String {
+/// The file name of the program called `name` on this OS: an engine, `crossfyre`,
+/// `node` or `cfx-script`, with `.exe` on Windows.
+pub fn file_name(name: &str) -> String {
     if cfg!(windows) {
         format!("{name}.exe")
     } else {
@@ -226,11 +208,10 @@ pub(crate) fn file_name(name: &str) -> String {
 
 /// Full path to an installed extension binary, OS-correct extension included.
 pub fn ext_bin_path(ext: &str) -> PathBuf {
-    get_bin_dir().join(ext_file_name(ext))
+    get_bin_dir().join(file_name(ext))
 }
 
-/// An engine counts as installed when its binary is in the bin directory under its
-/// public name.
+/// An engine counts as installed when its binary is in the bin directory.
 pub fn is_extension_installed(ext: &str) -> bool {
     ext_bin_path(ext).exists()
 }
@@ -446,14 +427,14 @@ mod tests {
     fn a_config_without_the_section_gets_every_default() {
         let p = ports("");
         for e in ENGINES {
-            assert_eq!(p.get(e.id), e.port, "{}", e.id);
+            assert_eq!(p.get(e.name), e.port, "{}", e.name);
         }
     }
 
     #[test]
-    fn a_port_is_read_under_an_engine_s_public_name() {
+    fn a_port_is_read_under_the_engine_s_name() {
         let p = ports("[extensions]\nambulo = 5999\n");
-        assert_eq!((p.get("mach"), p.get("ambulo")), (5999, 5999));
+        assert_eq!(p.get("ambulo"), 5999);
         assert_eq!(
             p.get("voyage"),
             4442,
@@ -463,9 +444,8 @@ mod tests {
 
     #[test]
     fn unknown_keys_are_ignored_and_a_bad_engine_port_is_not() {
-        let p = ports("[extensions]\nsomething_else = \"x\"\nvoyage = 5000\nmach = 5002\n");
+        let p = ports("[extensions]\nsomething_else = \"x\"\nvoyage = 5000\n");
         assert_eq!(p.get("voyage"), 5000);
-        assert_eq!(p.get("mach"), 4441, "an id is not a key of the section");
         let bad: Result<ToolchainConfig, _> = toml::from_str(
             "[postgres]\nhost = \"h\"\nport = 1\nuser = \"u\"\ndb_name = \"d\"\n\
              [container]\n[extensions]\nvoyage = \"x\"\n",
@@ -477,7 +457,7 @@ mod tests {
     }
 
     #[test]
-    fn written_back_the_section_uses_public_names_in_table_order() {
+    fn written_back_the_section_is_in_table_order() {
         let text = toml::to_string(&ToolchainConfig::default()).expect("serialises");
         let section = text.split("[extensions]").nth(1).expect("section");
         let keys: Vec<&str> = section
@@ -489,9 +469,9 @@ mod tests {
     }
 
     #[test]
-    fn ports_are_written_back_under_public_names() {
+    fn ports_are_written_back_as_they_were_read() {
         let p = ports("[extensions]\nplessor = 5001\nambulo = 5002\n");
-        assert_eq!((p.get("cortex"), p.get("mach")), (5001, 5002));
+        assert_eq!((p.get("plessor"), p.get("ambulo")), (5001, 5002));
         let cfg = ToolchainConfig {
             extensions: p,
             ..ToolchainConfig::default()
@@ -501,9 +481,6 @@ mod tests {
             text.contains("plessor = 5001") && text.contains("ambulo = 5002"),
             "{text}"
         );
-        for id in ["cortex", "mach", "pulse", "scout"] {
-            assert!(!text.contains(id), "{id} written back: {text}");
-        }
     }
 
     /// The API sends the ports map keyed by engine name, and the node answers with the

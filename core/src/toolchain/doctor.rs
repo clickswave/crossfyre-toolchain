@@ -146,7 +146,7 @@ pub async fn run(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // -- Daemons ------------------------------------------------------------
     section("Daemons");
     for e in ENGINES {
-        if config::is_extension_installed(e.id) {
+        if config::is_extension_installed(e.name) {
             let label = format!("{} daemon listening on {}", e.name, e.port);
             if !check(
                 &label,

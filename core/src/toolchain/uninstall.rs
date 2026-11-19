@@ -11,7 +11,7 @@ use super::config::{get_bin_dir, get_toolchain_dir};
 use super::packaging::Packaging;
 #[cfg(not(windows))]
 use super::packaging::remove_note;
-use super::{ENGINES, EXTENSIONS, install, service};
+use super::{ENGINES, install, service};
 use std::path::{Path, PathBuf};
 
 /// Where the installer puts everything, and what uninstall removes whole when no package
@@ -74,12 +74,9 @@ pub fn run(scope: Scope, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Extensions: stop, disable, deregister, delete binaries. Then the node
     // service (system scope). Each sub-call prints its own per-item lines.
     section("Services");
-    for ext in EXTENSIONS {
-        if let Err(e) = install::remove(ext) {
-            warn(&format!(
-                "could not remove {}: {e}",
-                super::public_name(ext)
-            ));
+    for e in ENGINES {
+        if let Err(err) = install::remove(e.name) {
+            warn(&format!("could not remove {}: {err}", e.name));
         }
     }
     // Drop-in directories beside the units. `remove` leaves them, since a person
@@ -295,7 +292,7 @@ fn clear_tree(dir: &Path, later: &mut dyn FnMut(&Path)) -> bool {
 }
 
 /// Every file name a component may have in the bin directory, with the name of its version
-/// sidecar: the CLI, the node, cfx-script, and each engine under its public name.
+/// sidecar: the CLI, the node, cfx-script and each engine.
 /// cfx-script also has the record of a release that could not start.
 #[cfg(any(not(windows), test))]
 fn component_files(component: &str) -> Vec<String> {
@@ -306,7 +303,7 @@ fn component_files(component: &str) -> Vec<String> {
     files
 }
 
-/// The components uninstall may find in the bin directory, by public name.
+/// The components uninstall may find in the bin directory.
 #[cfg(any(not(windows), test))]
 fn components() -> Vec<&'static str> {
     let mut out = vec!["crossfyre", "node", "cfx-script"];

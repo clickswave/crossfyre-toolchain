@@ -11,7 +11,7 @@
 // manifest", which conflated the two and read as a stronger guarantee than the
 // code gave.
 
-use super::config::{ext_bin_path, ext_file_name, get_bin_dir};
+use super::config::{ext_bin_path, file_name, get_bin_dir};
 use super::packaging::{self, Manager, remove_note, update_note};
 use super::release_http::{Purpose, http_client};
 use super::service;
@@ -47,9 +47,8 @@ fn origin_host() -> &'static str {
 
 /// Sidecar recording an installed extension's version (mirrors node.version),
 /// so `update` can tell "already current" from "needs update" without a reinstall.
-/// Named by the public name, as the binary is.
 fn ext_version_file(ext: &str) -> std::path::PathBuf {
-    get_bin_dir().join(format!("{}.version", super::public_name(ext)))
+    get_bin_dir().join(format!("{ext}.version"))
 }
 
 fn installed_ext_version(ext: &str) -> Option<String> {
@@ -329,22 +328,19 @@ async fn fetch_signature(url: &str) -> Result<String, Box<dyn std::error::Error>
         .map_err(|e| format!("could not read the release manifest signature: {e}"))?)
 }
 
-/// The manifest's entry for `component` and its artifact for this platform. An engine
-/// is published under its public name, and any other component under its own.
+/// The manifest's entry for `component` and its artifact for this platform.
 fn resolve_artifact<'m>(
     manifest: &'m Manifest,
     component: &str,
 ) -> Result<(&'m Component, &'m Artifact), Box<dyn std::error::Error>> {
-    let name = super::public_name(component);
     let comp = manifest
         .components
-        .get(name)
-        .ok_or_else(|| format!("component '{name}' not in release manifest"))?;
+        .get(component)
+        .ok_or_else(|| format!("component '{component}' not in release manifest"))?;
     let key = platform_key();
-    let artifact = comp
-        .artifacts
-        .get(&key)
-        .ok_or_else(|| format!("no '{name}' artifact for platform {key} in release manifest"))?;
+    let artifact = comp.artifacts.get(&key).ok_or_else(|| {
+        format!("no '{component}' artifact for platform {key} in release manifest")
+    })?;
     Ok((comp, artifact))
 }
 
@@ -687,7 +683,7 @@ pub async fn install_cfx_script(
     download_verified(artifact, &zip_path, purpose).await?;
     let extract_dir = tmp_dir.path().join("extracted");
     extract_zip(&zip_path, &extract_dir)?;
-    let extracted = extract_dir.join(ext_file_name(CFX_SCRIPT));
+    let extracted = extract_dir.join(file_name(CFX_SCRIPT));
     if !extracted.exists() {
         return Err("cfx-script binary not found inside its zip".into());
     }
@@ -759,10 +755,9 @@ pub async fn install(extension: &str, force: bool) -> Result<(), Box<dyn std::er
 fn adopt_packaged(ext: &str, m: Manager, quiet: bool) -> Result<(), Box<dyn std::error::Error>> {
     use super::ui::*;
     let bin_path = ext_bin_path(ext);
-    let name = super::public_name(ext);
     if !bin_path.exists() {
         return Err(format!(
-            "{name} is installed by {m}, but {} is missing; reinstall it with {m}",
+            "{ext} is installed by {m}, but {} is missing; reinstall it with {m}",
             bin_path.display()
         )
         .into());
@@ -771,8 +766,8 @@ fn adopt_packaged(ext: &str, m: Manager, quiet: bool) -> Result<(), Box<dyn std:
         service::create_service_file(ext)?;
     }
     if !quiet {
-        title("Crossfyre extension install", name);
-        ok(&format!("{name} is {}", update_note(m)));
+        title("Crossfyre extension install", ext);
+        ok(&format!("{ext} is {}", update_note(m)));
         end();
     }
     Ok(())
@@ -786,20 +781,19 @@ async fn install_one(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use super::ui::*;
     let bin_path = ext_bin_path(ext);
-    let name = super::public_name(ext);
 
     if let Some(m) = packaging::owner(ext) {
         return adopt_packaged(ext, m, quiet);
     }
 
     if !quiet {
-        title("Crossfyre extension install", name);
+        title("Crossfyre extension install", ext);
     }
 
     if super::config::is_extension_installed(ext) && !force {
         if !quiet {
             warn(&format!(
-                "{name} is already installed {}",
+                "{ext} is already installed {}",
                 dim("(use --force to reinstall)")
             ));
             end();
@@ -809,7 +803,7 @@ async fn install_one(
 
     let (comp, artifact) = resolve_artifact(manifest, ext)?;
     if !quiet {
-        working(&format!("Downloading {name} {}", dim(&comp.version)));
+        working(&format!("Downloading {ext} {}", dim(&comp.version)));
     }
 
     let tmp_dir = tempfile::tempdir().map_err(|e| format!("Failed to create temp dir: {e}"))?;
@@ -823,9 +817,9 @@ async fn install_one(
     let extract_dir = tmp_dir.path().join("extracted");
     extract_zip(&zip_path, &extract_dir)?;
 
-    let extracted_binary = extract_dir.join(ext_file_name(ext));
+    let extracted_binary = extract_dir.join(file_name(ext));
     if !extracted_binary.exists() {
-        return Err(format!("Binary '{}' not found inside zip", ext_file_name(ext)).into());
+        return Err(format!("Binary '{}' not found inside zip", file_name(ext)).into());
     }
 
     // Stop the running daemon (if any) before replacing the binary - on
@@ -839,7 +833,7 @@ async fn install_one(
     // node.version). Best-effort: a missing sidecar just triggers one reinstall.
     let _ = fs::write(ext_version_file(ext), &comp.version);
     if !quiet {
-        ok(&format!("{name} {} installed", comp.version));
+        ok(&format!("{ext} {} installed", comp.version));
     }
 
     if let Err(e) = service::create_service_file(ext)
@@ -880,23 +874,22 @@ pub fn remove(extension: &str) -> Result<(), Box<dyn std::error::Error>> {
 fn remove_one(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
     use super::ui::*;
     let bin_path = ext_bin_path(ext);
-    let name = super::public_name(ext);
 
-    title("Crossfyre extension remove", name);
+    title("Crossfyre extension remove", ext);
 
     if !bin_path.exists() {
-        warn(&format!("{name} is not installed, nothing to remove"));
+        warn(&format!("{ext} is not installed, nothing to remove"));
         end();
         return Ok(());
     }
 
-    step(&format!("Stopping and disabling {name} service"));
+    step(&format!("Stopping and disabling {ext} service"));
     service::try_stop_and_disable(ext);
     service::remove_service_file(ext)?;
 
     if let Some(m) = packaging::owner(ext) {
         warn(&format!(
-            "{name}'s service is removed and its binary stays: {}",
+            "{ext}'s service is removed and its binary stays: {}",
             remove_note(m)
         ));
         end();
@@ -905,7 +898,7 @@ fn remove_one(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     remove_stopped_binary(&bin_path)?;
     let _ = fs::remove_file(ext_version_file(ext));
-    ok(&format!("{name} removed"));
+    ok(&format!("{ext} removed"));
     end();
     Ok(())
 }
@@ -1005,7 +998,7 @@ fn cli_dir(bin_dir: &Path) -> PathBuf {
     std::env::current_exe()
         .ok()
         .and_then(|exe| {
-            let stable = bin_dir.join(ext_file_name("crossfyre"));
+            let stable = bin_dir.join(file_name("crossfyre"));
             cli_targets(&exe, &stable).into_iter().next()
         })
         .and_then(|p| p.parent().map(Path::to_path_buf))
@@ -1127,10 +1120,9 @@ async fn update_with(
     // ── Extensions ────────────────────────────────────────────────────
     if !exts.is_empty() {
         println!("  {}", dim("Extensions"));
-        for ext in &exts {
-            let name = super::public_name(ext);
+        for &ext in &exts {
             if let Some(m) = packaging::owner(ext) {
-                println!("{}", row(&check(), name, "", &dim(&update_note(m))));
+                println!("{}", row(&check(), ext, "", &dim(&update_note(m))));
                 out.current += 1;
                 continue;
             }
@@ -1140,35 +1132,30 @@ async fn update_with(
                 && !want.is_empty()
                 && have.as_deref() == Some(want.as_str());
             if up_to_date && !force {
-                println!("{}", row(&check(), name, &ver(&want), &dim("up to date")));
+                println!("{}", row(&check(), ext, &ver(&want), &dim("up to date")));
                 out.current += 1;
                 continue;
             }
             if !writable {
                 println!(
                     "{}",
-                    needs_rights_row(name, &version_change(have.as_deref(), &want))
+                    needs_rights_row(ext, &version_change(have.as_deref(), &want))
                 );
                 out.need_rights += 1;
                 continue;
             }
-            show_progress(name);
+            show_progress(ext);
             match install_one(manifest, ext, true, true).await {
                 Ok(()) => {
                     let _ = service::start(ext);
                     let mid = version_change(have.as_deref(), &want);
-                    show_result(&row(
-                        &check(),
-                        name,
-                        &mid,
-                        &format!("{GREEN}updated{RESET}"),
-                    ));
+                    show_result(&row(&check(), ext, &mid, &format!("{GREEN}updated{RESET}")));
                     out.changed += 1;
                 }
                 Err(e) => {
                     show_result(&row(
                         &bang(),
-                        name,
+                        ext,
                         "",
                         &format!("{YELLOW}failed{RESET} {}", dim(&e.to_string())),
                     ));
@@ -1411,9 +1398,9 @@ async fn update_with(
 }
 
 fn installed_extensions() -> Vec<&'static str> {
-    super::EXTENSIONS
+    super::ENGINES
         .iter()
-        .copied()
+        .map(|e| e.name)
         .filter(|e| super::config::is_extension_installed(e))
         .collect()
 }
@@ -1457,13 +1444,13 @@ pub async fn self_update(
 
     let extract_dir = tmp_dir.path().join("extracted");
     extract_zip(&zip_path, &extract_dir)?;
-    let extracted = extract_dir.join(ext_file_name("crossfyre"));
+    let extracted = extract_dir.join(file_name("crossfyre"));
     if !extracted.exists() {
         return Err("crossfyre binary not found inside update zip".into());
     }
 
     let exe = std::env::current_exe()?;
-    let stable = get_bin_dir().join(ext_file_name("crossfyre"));
+    let stable = get_bin_dir().join(file_name("crossfyre"));
     let mut targets = cli_targets(&exe, &stable).into_iter();
     if let Some(first) = targets.next() {
         place_binary(&extracted, &first)?;
@@ -1511,7 +1498,7 @@ fn cli_targets(exe: &Path, stable: &Path) -> Vec<PathBuf> {
 /// dashboard-triggered self-update).
 pub fn installed_cli_version() -> String {
     let dir = get_bin_dir();
-    let bin = dir.join(ext_file_name("crossfyre"));
+    let bin = dir.join(file_name("crossfyre"));
     recorded_or_reported(
         &dir.join("crossfyre.version"),
         "crossfyre",
@@ -1530,7 +1517,7 @@ pub fn ensure_self_installed() -> Result<std::path::PathBuf, Box<dyn std::error:
     if super::packaging::owner("crossfyre").is_some() {
         return Ok(super::packaging::cli_path_for(&exe));
     }
-    let stable = get_bin_dir().join(ext_file_name("crossfyre"));
+    let stable = get_bin_dir().join(file_name("crossfyre"));
     if exe == stable {
         return Ok(stable);
     }
@@ -1557,7 +1544,7 @@ pub async fn download_node(
         return Err(format!("node is {}", update_note(m)).into());
     }
     let (comp, artifact) = resolve_artifact(manifest, "node")?;
-    let stable = get_bin_dir().join(ext_file_name("node"));
+    let stable = get_bin_dir().join(file_name("node"));
     let ver_file = get_bin_dir().join("node.version");
     if installed_node_version().as_deref() == Some(comp.version.as_str()) && !force {
         return Ok(false); // already current
@@ -1568,7 +1555,7 @@ pub async fn download_node(
     download_verified(artifact, &zip_path, Purpose::replacing(stable.exists())).await?;
     let extract_dir = tmp_dir.path().join("extracted");
     extract_zip(&zip_path, &extract_dir)?;
-    let extracted = extract_dir.join(ext_file_name("node"));
+    let extracted = extract_dir.join(file_name("node"));
     if !extracted.exists() {
         return Err("node binary not found inside the node zip".into());
     }
@@ -1592,7 +1579,7 @@ pub async fn download_node(
 /// service's ExecStart resolves. A helper that cannot be installed is a warning, not an
 /// error, since only .cfx scripts need it.
 pub async fn ensure_node_installed() -> Result<(), Box<dyn std::error::Error>> {
-    let stable = get_bin_dir().join(ext_file_name("node"));
+    let stable = get_bin_dir().join(file_name("node"));
     let mut manifest = None;
     if let Some(m) = packaging::owner("node") {
         if !stable.exists() {
@@ -1662,9 +1649,9 @@ fn sibling_of_this_binary(name: &str) -> Option<PathBuf> {
     if super::packaging::current().is_some() {
         return None;
     }
-    let installed = get_bin_dir().join(ext_file_name(name));
+    let installed = get_bin_dir().join(file_name(name));
     let exe = std::env::current_exe().ok()?;
-    let sib = exe.parent()?.join(ext_file_name(name));
+    let sib = exe.parent()?.join(file_name(name));
     (sib.exists() && sib != installed).then_some(sib)
 }
 
@@ -1812,24 +1799,6 @@ mod tests {
     }
 
     #[test]
-    fn an_engine_is_looked_up_under_its_public_name() {
-        let key = platform_key();
-        let m = manifest(&format!(
-            r#"{{"components":{{"plessor":{{"version":"0.0.23","artifacts":{{"{key}":{{"file":"f","sha256":"{HELLO_SHA}"}}}}}}}}}}"#
-        ));
-        // The node names an engine by its id, a person by its public name.
-        assert_eq!(manifest_version(&m, "cortex"), "0.0.23");
-        assert_eq!(manifest_version(&m, "plessor"), "0.0.23");
-        let err = resolve_artifact(&manifest(r#"{"components":{}}"#), "cortex")
-            .expect_err("not in the manifest")
-            .to_string();
-        assert!(
-            err.contains("'plessor'"),
-            "the public name is the one reported: {err}"
-        );
-    }
-
-    #[test]
     fn the_platform_key_is_one_of_the_shapes_the_manifest_uses() {
         let key = platform_key();
         let (os, arch) = key.split_once('-').expect("os-arch");
@@ -1942,7 +1911,7 @@ mod tests {
         );
         let dir = PathBuf::from("/nix/store/x-crossfyre/libexec");
         assert_eq!(get_bin_dir(), dir);
-        assert_eq!(ext_bin_path("cortex"), dir.join("plessor"));
+        assert_eq!(ext_bin_path("plessor"), dir.join("plessor"));
         assert_eq!(service::node_binary(), dir.join("node"));
     }
 
