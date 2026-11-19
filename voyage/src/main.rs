@@ -10,6 +10,7 @@ mod daemon;
 mod libs;
 mod scanner;
 mod scanners;
+mod store;
 mod takeover;
 
 // An error is printed as the sentence it is. Returned from `main`, Rust prints it in

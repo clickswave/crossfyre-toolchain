@@ -632,7 +632,7 @@ async fn prepare_enum(
     params: &EnumParams,
     db: &Arc<VoyageDb>,
     following: Option<dguard::WordChunks<'_, BufReader<OwnedReadHalf>>>,
-) -> Result<(Scanner, usize), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(Scanner<VoyageDb>, usize), Box<dyn std::error::Error + Send + Sync>> {
     let words = match following {
         Some(mut chunks) => {
             if !params.wordlist.is_empty() || params.disable_active {
@@ -742,16 +742,13 @@ async fn prepare_enum(
 
     let config = EnumConfig {
         scan_id,
-        domain: params.domain.clone(),
         tasks: params.tasks,
         interval_ms: params.delay,
-        exclude_passive_sources: params.exclude_passive_sources.clone(),
         exclude_active_techniques: params.exclude_active_techniques.clone(),
         block_internal: params.block_internal,
         http_probing_ports: params.http_probing_ports.clone(),
         https_probing_ports: params.https_probing_ports.clone(),
         active_user_agent: params.active_user_agent.clone(),
-        passive_user_agent: params.passive_user_agent.clone(),
         active_random_user_agent: false,
         dns_server: params.dns_server.clone(),
         adaptive_rate: params.adaptive_rate,
@@ -775,7 +772,7 @@ async fn run_enum_instant(
     }
     let (scanner, _) = prepare_enum(params, db, None).await?;
     let scan_id = scanner.config.scan_id.clone();
-    let db2 = Arc::clone(&scanner.db);
+    let db2 = Arc::clone(&scanner.store);
 
     let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
 
@@ -1570,15 +1567,12 @@ mod egress_tests {
         let proxy = Recorder::start(to_loopback).await;
         let config = EnumConfig {
             scan_id: "s".into(),
-            domain: "example.test".into(),
             tasks: 1,
             interval_ms: 0,
-            exclude_passive_sources: vec![],
             exclude_active_techniques: vec![],
             http_probing_ports: vec![fx.port],
             https_probing_ports: vec![],
             active_user_agent: "voyage-test".into(),
-            passive_user_agent: "voyage-test".into(),
             active_random_user_agent: false,
             dns_server: local_dns().await,
             adaptive_rate: false,

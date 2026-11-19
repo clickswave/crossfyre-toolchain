@@ -1,5 +1,5 @@
-use crate::libs::voyage_db::{VoyageDb, Work};
 use crate::scanners::active_scan;
+use crate::store::{Store, Work};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -11,18 +11,12 @@ use tokio::time::sleep;
 #[derive(Clone)]
 pub struct EnumConfig {
     pub scan_id: String,
-    #[allow(dead_code)] // populated but not read yet; kept so the struct still mirrors its config
-    pub domain: String,
     pub tasks: usize,
     pub interval_ms: u64,
-    #[allow(dead_code)] // populated but not read yet; kept so the struct still mirrors its config
-    pub exclude_passive_sources: Vec<String>,
     pub exclude_active_techniques: Vec<String>,
     pub http_probing_ports: Vec<u16>,
     pub https_probing_ports: Vec<u16>,
     pub active_user_agent: String,
-    #[allow(dead_code)] // populated but not read yet; kept so the struct still mirrors its config
-    pub passive_user_agent: String,
     pub active_random_user_agent: bool,
     pub dns_server: String,
     /// Adaptive rate limiting for the ACTIVE brute-force: tune concurrency from
@@ -88,16 +82,16 @@ pub struct StreamEvent {
     pub score: Option<f64>,
 }
 
-pub struct Scanner {
+pub struct Scanner<S: Store> {
     pub config: Arc<EnumConfig>,
-    pub db: Arc<VoyageDb>,
+    pub store: Arc<S>,
 }
 
-impl Scanner {
-    pub fn new(config: EnumConfig, db: Arc<VoyageDb>) -> Self {
+impl<S: Store> Scanner<S> {
+    pub fn new(config: EnumConfig, store: Arc<S>) -> Self {
         Scanner {
             config: Arc::new(config),
-            db,
+            store,
         }
     }
 
@@ -105,11 +99,11 @@ impl Scanner {
     pub async fn run_headless_stream(
         &self,
         tx: mpsc::UnboundedSender<StreamEvent>,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<(), String> {
         let arc_tx = Arc::new(tx);
 
         // Emit passive results first (already inserted by prepare_enum)
-        let passive_results = self.db.get_passive_results(&self.config.scan_id).await?;
+        let passive_results = self.store.passive_results(&self.config.scan_id).await?;
         for r in &passive_results {
             let _ = arc_tx.send(StreamEvent {
                 kind: "result".to_string(),
@@ -166,7 +160,7 @@ impl Scanner {
             for i in 0..max_conc {
                 join_set.spawn(adaptive_task_handle(
                     Arc::clone(&self.config),
-                    Arc::clone(&self.db),
+                    Arc::clone(&self.store),
                     Arc::clone(&arc_tx),
                     Arc::clone(&shared),
                     i,
@@ -188,7 +182,7 @@ impl Scanner {
             for _ in 0..self.config.tasks {
                 join_set.spawn(task_handle(
                     Arc::clone(&self.config),
-                    Arc::clone(&self.db),
+                    Arc::clone(&self.store),
                     Arc::clone(&arc_tx),
                 ));
             }
@@ -212,8 +206,8 @@ impl Scanner {
 
         // Get final totals and send "done"
         let (found, not_found) = self
-            .db
-            .get_scan_totals(&self.config.scan_id)
+            .store
+            .totals(&self.config.scan_id)
             .await
             .unwrap_or((0, 0));
 
@@ -236,11 +230,11 @@ impl Scanner {
     }
 }
 
-async fn task_handle(
+async fn task_handle<S: Store>(
     config: Arc<EnumConfig>,
-    db: Arc<VoyageDb>,
+    store: Arc<S>,
     event_tx: Arc<mpsc::UnboundedSender<StreamEvent>>,
-) -> Result<(), sqlx::Error> {
+) {
     let resolver = match crate::libs::dns::create_resolver(Some(config.dns_server.as_str())) {
         Ok(r) => r,
         Err(e) => {
@@ -249,7 +243,7 @@ async fn task_handle(
                 "error",
                 &format!("DNS resolver error: {e}"),
             );
-            return Ok(());
+            return;
         }
     };
 
@@ -267,7 +261,7 @@ async fn task_handle(
                 "error",
                 &format!("HTTP client build error: {e}"),
             );
-            return Ok(());
+            return;
         }
     };
 
@@ -276,23 +270,23 @@ async fn task_handle(
             sleep(Duration::from_millis(config.interval_ms)).await;
         }
 
-        let work: Work = match db.get_work_one(&config.scan_id).await {
-            Ok(w) => w,
-            Err(sqlx::Error::RowNotFound) => {
+        let work: Work = match store.claim(&config.scan_id).await {
+            Ok(Some(w)) => w,
+            Ok(None) => {
                 // No queued work - check if any tasks are still actively scanning
-                match db.is_scanning_active(&config.scan_id).await {
+                match store.trying(&config.scan_id).await {
                     Ok(true) => {
                         sleep(Duration::from_millis(50)).await;
                         continue;
                     }
-                    _ => return Ok(()),
+                    _ => return,
                 }
             }
             Err(e) => {
                 emit_log(
                     &Some(event_tx.clone()),
                     "error",
-                    &format!("get_work_one error: {e}"),
+                    &format!("claiming a name failed: {e}"),
                 );
                 sleep(Duration::from_millis(200)).await;
                 continue;
@@ -321,13 +315,13 @@ async fn task_handle(
         };
         let source = &scan_result.source;
 
-        if let Err(e) = db.update_work_status(work.entry_id, status, source).await {
+        if let Err(e) = store.record(work.entry_id, status, source).await {
             emit_log(
                 &Some(event_tx.clone()),
                 "error",
-                &format!("update_work_status failed: {e}"),
+                &format!("recording a name failed: {e}"),
             );
-            let _ = db.reset_entry_to_queued(work.entry_id).await;
+            let _ = store.release(work.entry_id).await;
             continue;
         }
 
@@ -483,13 +477,13 @@ async fn controller_tick(
     }
 }
 
-async fn adaptive_task_handle(
+async fn adaptive_task_handle<S: Store>(
     config: Arc<EnumConfig>,
-    db: Arc<VoyageDb>,
+    store: Arc<S>,
     event_tx: Arc<mpsc::UnboundedSender<StreamEvent>>,
     shared: Arc<AdaptiveShared>,
     worker_index: u64,
-) -> Result<(), sqlx::Error> {
+) {
     let resolver = match crate::libs::dns::create_resolver(Some(config.dns_server.as_str())) {
         Ok(r) => r,
         Err(e) => {
@@ -498,7 +492,7 @@ async fn adaptive_task_handle(
                 "error",
                 &format!("DNS resolver error: {e}"),
             );
-            return Ok(());
+            return;
         }
     };
     let user_agent = if config.active_random_user_agent {
@@ -514,7 +508,7 @@ async fn adaptive_task_handle(
                 "error",
                 &format!("HTTP client build error: {e}"),
             );
-            return Ok(());
+            return;
         }
     };
 
@@ -523,7 +517,7 @@ async fn adaptive_task_handle(
         if shared.rate_on {
             while worker_index >= shared.target_conc.load(Ordering::Relaxed).max(1) {
                 if shared.drained.load(Ordering::Relaxed) {
-                    return Ok(());
+                    return;
                 }
                 sleep(Duration::from_millis(80)).await;
             }
@@ -537,23 +531,23 @@ async fn adaptive_task_handle(
             sleep(Duration::from_millis(delay)).await;
         }
 
-        let work: Work = match db.get_work_one(&config.scan_id).await {
-            Ok(w) => w,
-            Err(sqlx::Error::RowNotFound) => match db.is_scanning_active(&config.scan_id).await {
+        let work: Work = match store.claim(&config.scan_id).await {
+            Ok(Some(w)) => w,
+            Ok(None) => match store.trying(&config.scan_id).await {
                 Ok(true) => {
                     sleep(Duration::from_millis(50)).await;
                     continue;
                 }
                 _ => {
                     shared.drained.store(true, Ordering::Relaxed);
-                    return Ok(());
+                    return;
                 }
             },
             Err(e) => {
                 emit_log(
                     &Some(event_tx.clone()),
                     "error",
-                    &format!("get_work_one error: {e}"),
+                    &format!("claiming a name failed: {e}"),
                 );
                 sleep(Duration::from_millis(200)).await;
                 continue;
@@ -610,13 +604,13 @@ async fn adaptive_task_handle(
             "not_found"
         };
         let source = &scan_result.source;
-        if let Err(e) = db.update_work_status(work.entry_id, status, source).await {
+        if let Err(e) = store.record(work.entry_id, status, source).await {
             emit_log(
                 &Some(event_tx.clone()),
                 "error",
-                &format!("update_work_status failed: {e}"),
+                &format!("recording a name failed: {e}"),
             );
-            let _ = db.reset_entry_to_queued(work.entry_id).await;
+            let _ = store.release(work.entry_id).await;
             continue;
         }
         if scan_result.found {

@@ -1,22 +1,12 @@
-use sqlx::{FromRow, QueryBuilder};
+use crate::store::{PassiveResult, Store, Work};
+use sqlx::QueryBuilder;
 
 /// The database voyage keeps its tables in.
 pub const DATABASE: &str = "voyage";
 
-pub struct Work {
-    pub entry_id: i64,
-    pub full_subdomain: String,
-}
-
 #[derive(Clone)]
 pub struct VoyageDb {
     pool: sqlx::PgPool,
-}
-
-#[derive(Debug, Clone, FromRow)]
-pub struct PassiveResult {
-    pub full_subdomain: String,
-    pub source: String,
 }
 
 impl VoyageDb {
@@ -228,62 +218,6 @@ impl VoyageDb {
         Ok(())
     }
 
-    /// Atomically claim one queued entry for scanning (FOR UPDATE SKIP LOCKED).
-    pub async fn get_work_one(&self, scan_id: &str) -> Result<Work, sqlx::Error> {
-        #[derive(FromRow)]
-        struct Entry {
-            id: i64,
-            full_subdomain: String,
-        }
-
-        let entry = sqlx::query_as::<_, Entry>(
-            r#"
-            UPDATE scan_entries
-            SET status = 'scanning', updated_at = NOW()::TEXT
-            WHERE id = (
-                SELECT id FROM scan_entries
-                WHERE scan_id = $1 AND status = 'queued'
-                LIMIT 1
-                FOR UPDATE SKIP LOCKED
-            )
-            RETURNING id, full_subdomain
-            "#,
-        )
-        .bind(scan_id)
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(Work {
-            entry_id: entry.id,
-            full_subdomain: entry.full_subdomain,
-        })
-    }
-
-    pub async fn update_work_status(
-        &self,
-        entry_id: i64,
-        status: &str,
-        source: &str,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "UPDATE scan_entries SET status = $1, source = $2, updated_at = NOW()::TEXT WHERE id = $3",
-        )
-        .bind(status)
-        .bind(source)
-        .bind(entry_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn reset_entry_to_queued(&self, entry_id: i64) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE scan_entries SET status = 'queued' WHERE id = $1")
-            .bind(entry_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
     /// Reset any 'scanning' entries back to 'queued' (for crash recovery).
     pub async fn reset_halted_entries(&self, scan_id: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
@@ -295,51 +229,11 @@ impl VoyageDb {
         Ok(())
     }
 
-    pub async fn is_scanning_active(&self, scan_id: &str) -> Result<bool, sqlx::Error> {
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM scan_entries WHERE scan_id = $1 AND status = 'scanning'",
-        )
-        .bind(scan_id)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(count > 0)
-    }
-
     pub async fn get_scan_entry_total(&self, scan_id: &str) -> Result<i64, sqlx::Error> {
         sqlx::query_scalar("SELECT COUNT(*) FROM scan_entries WHERE scan_id = $1")
             .bind(scan_id)
             .fetch_one(&self.pool)
             .await
-    }
-
-    pub async fn get_scan_totals(&self, scan_id: &str) -> Result<(i64, i64), sqlx::Error> {
-        let found: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM scan_entries WHERE scan_id = $1 AND status = 'found'",
-        )
-        .bind(scan_id)
-        .fetch_one(&self.pool)
-        .await?;
-
-        let not_found: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM scan_entries WHERE scan_id = $1 AND status = 'not_found'",
-        )
-        .bind(scan_id)
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok((found, not_found))
-    }
-
-    pub async fn get_passive_results(
-        &self,
-        scan_id: &str,
-    ) -> Result<Vec<PassiveResult>, sqlx::Error> {
-        sqlx::query_as::<_, PassiveResult>(
-            "SELECT full_subdomain, source FROM scan_entries WHERE scan_id = $1 AND method = 'passive' ORDER BY id",
-        )
-        .bind(scan_id)
-        .fetch_all(&self.pool)
-        .await
     }
 
     pub async fn get_found_subdomains(&self, scan_id: &str) -> Result<Vec<String>, sqlx::Error> {
@@ -416,5 +310,96 @@ impl VoyageDb {
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected())
+    }
+}
+
+/// The scanner's view of a scan, kept in voyage's tables.
+impl Store for VoyageDb {
+    async fn passive_results(&self, scan: &str) -> Result<Vec<PassiveResult>, String> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT full_subdomain, source FROM scan_entries \
+             WHERE scan_id = $1 AND method = 'passive' ORDER BY id",
+        )
+        .bind(scan)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(rows
+            .into_iter()
+            .map(|(full_subdomain, source)| PassiveResult {
+                full_subdomain,
+                source,
+            })
+            .collect())
+    }
+
+    /// Taken with FOR UPDATE SKIP LOCKED, so two workers never take the same name.
+    async fn claim(&self, scan: &str) -> Result<Option<Work>, String> {
+        let entry: Option<(i64, String)> = sqlx::query_as(
+            r#"
+            UPDATE scan_entries
+            SET status = 'scanning', updated_at = NOW()::TEXT
+            WHERE id = (
+                SELECT id FROM scan_entries
+                WHERE scan_id = $1 AND status = 'queued'
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING id, full_subdomain
+            "#,
+        )
+        .bind(scan)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(entry.map(|(entry_id, full_subdomain)| Work {
+            entry_id,
+            full_subdomain,
+        }))
+    }
+
+    async fn trying(&self, scan: &str) -> Result<bool, String> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM scan_entries WHERE scan_id = $1 AND status = 'scanning'",
+        )
+        .bind(scan)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(count > 0)
+    }
+
+    async fn record(&self, entry: i64, status: &str, source: &str) -> Result<(), String> {
+        sqlx::query(
+            "UPDATE scan_entries SET status = $1, source = $2, updated_at = NOW()::TEXT \
+             WHERE id = $3",
+        )
+        .bind(status)
+        .bind(source)
+        .bind(entry)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    async fn release(&self, entry: i64) -> Result<(), String> {
+        sqlx::query("UPDATE scan_entries SET status = 'queued' WHERE id = $1")
+            .bind(entry)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    async fn totals(&self, scan: &str) -> Result<(i64, i64), String> {
+        sqlx::query_as(
+            "SELECT COUNT(*) FILTER (WHERE status = 'found'), \
+             COUNT(*) FILTER (WHERE status = 'not_found') FROM scan_entries WHERE scan_id = $1",
+        )
+        .bind(scan)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| e.to_string())
     }
 }
