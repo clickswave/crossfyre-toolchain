@@ -58,7 +58,7 @@ class Engine:
     def __init__(self, binary: Path, env: dict | None = None):
         self.port = free_port()
         self.proc = subprocess.Popen(
-            [str(binary), "--daemon", "--port", str(self.port)],
+            [str(binary), "daemon", "--port", str(self.port)],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             env={**os.environ, **(env or {})},
         )

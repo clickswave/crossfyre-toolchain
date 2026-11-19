@@ -54,7 +54,7 @@ pub(crate) fn engine_addr(ext: &str) -> String {
 /// scan as well as for the node's log.
 pub(crate) fn unreachable(ext: &str, e: &std::io::Error) -> String {
     format!(
-        "{ext} daemon unreachable on {} ({e}). Is `{ext} --daemon` running?",
+        "{ext} daemon unreachable on {} ({e}). Is `{ext} daemon` running?",
         engine_addr(ext)
     )
 }

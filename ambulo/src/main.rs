@@ -35,7 +35,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // -----------------------------------------------------------------------
     // Daemon mode - starts the TCP service and connects directly to postgres
     // -----------------------------------------------------------------------
-    if cli.daemon {
+    if matches!(cli.command, Some(Commands::Daemon)) {
         let dummy_config = libs::cli_args::ScanArgs {
             url: vec![],
             wordlist_path: String::new(),
@@ -193,9 +193,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Exec(_))
         | Some(Commands::Db(_))
         | Some(Commands::Completions { .. })
+        | Some(Commands::Daemon)
         | None => {
             eprintln!(
-                "No command given. Use `ambulo scan`, `ambulo exec`, `ambulo db`, or `ambulo --daemon`. Try --help."
+                "No command given. Use `ambulo scan`, `ambulo exec`, `ambulo db`, or `ambulo daemon`. Try --help."
             );
             std::process::exit(1);
         }

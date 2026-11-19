@@ -13,7 +13,7 @@ Like toolmark, plessor is a daemon you feed targets:
 
 ```sh
 # start the daemon (default port 4445)
-plessor --daemon
+plessor daemon
 
 # scan a target through it
 plessor scan https://example.com

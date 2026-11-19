@@ -27,7 +27,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     // Toolmark is stateless: no DB, just a fingerprinting TCP service.
-    if cli.daemon {
+    if matches!(cli.command, Some(Commands::Daemon)) {
         return daemon::run(cli.port).await;
     }
 
@@ -87,9 +87,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             print_all(&script)?;
             Ok(())
         }
-        None => {
+        Some(Commands::Daemon) | None => {
             eprintln!(
-                "No command given. Use `toolmark scan <target>`, `toolmark services <host:port>...`, `toolmark exec <json>`, or `toolmark --daemon`."
+                "No command given. Use `toolmark scan <target>`, `toolmark services <host:port>...`, `toolmark exec <json>`, or `toolmark daemon`."
             );
             std::process::exit(1);
         }

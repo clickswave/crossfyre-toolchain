@@ -247,7 +247,7 @@ mod tests {
 
     #[test]
     fn an_engine_is_started_by_what_will_start_it_here() {
-        let daemon = || Some("/opt/crossfyre/bin/voyage --daemon --port 4442".to_string());
+        let daemon = || Some("/opt/crossfyre/bin/voyage daemon --port 4442".to_string());
         assert_eq!(
             engine_start("voyage", true, true, None),
             "crossfyre extension start voyage"
@@ -264,7 +264,7 @@ mod tests {
         // that would start it: the daemon is started by hand.
         assert_eq!(
             engine_start("voyage", true, true, daemon()),
-            "/opt/crossfyre/bin/voyage --daemon --port 4442"
+            "/opt/crossfyre/bin/voyage daemon --port 4442"
         );
         assert_eq!(
             engine_start("voyage", false, false, daemon()),

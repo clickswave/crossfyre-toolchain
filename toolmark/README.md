@@ -13,7 +13,7 @@ toolmark is a daemon. Start it, then send it targets:
 
 ```sh
 # start the daemon (default port 4444)
-toolmark --daemon
+toolmark daemon
 
 # scan a target through the running daemon
 toolmark scan https://example.com

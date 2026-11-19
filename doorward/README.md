@@ -40,7 +40,7 @@ terminal, and `--tui` is accepted for symmetry with the other engines.
 
 ## Daemon
 
-Under the Crossfyre node, doorward runs as a daemon (`--daemon`, default port 4443) that
+Under the Crossfyre node, doorward runs as a daemon (`doorward daemon`, default port 4443) that
 takes work over a local socket. You do not need that for standalone use; just run
 `doorward scan`.
 

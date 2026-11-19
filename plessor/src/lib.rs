@@ -68,7 +68,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 /// dispatch can be exercised without spawning a process.
 pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Plessor is stateless: no DB, a vulnerability-detection TCP service.
-    if cli.daemon {
+    if matches!(cli.command, Some(Commands::Daemon)) {
         return daemon::run(cli.port).await;
     }
 
@@ -139,9 +139,9 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             print_all(&script)?;
             Ok(())
         }
-        None => {
+        Some(Commands::Daemon) | None => {
             eprintln!(
-                "No command given. Use `plessor scan <target>`, `plessor inject <url>...`, `plessor exec <json>`, or `plessor --daemon`."
+                "No command given. Use `plessor scan <target>`, `plessor inject <url>...`, `plessor exec <json>`, or `plessor daemon`."
             );
             std::process::exit(1);
         }

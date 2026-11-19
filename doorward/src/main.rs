@@ -29,7 +29,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // -----------------------------------------------------------------------
     // Daemon mode - starts the TCP service and connects to postgres
     // -----------------------------------------------------------------------
-    if cli.daemon {
+    if matches!(cli.command, Some(Commands::Daemon)) {
         // Postgres being briefly unreachable is not a reason to exit: systemd
         // would restart us straight into the same failure, which is how one
         // host logged 2,663 restarts and reported nothing but "down". Wait for
@@ -85,7 +85,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Scan(args)) => args,
         _ => {
             eprintln!(
-                "No command given. Use `doorward scan`, `doorward exec`, `doorward db`, or `doorward --daemon`. Try --help."
+                "No command given. Use `doorward scan`, `doorward exec`, `doorward db`, or `doorward daemon`. Try --help."
             );
             std::process::exit(1);
         }

@@ -128,7 +128,7 @@ A source build sets up no services, so before the first scan start the database 
 
 ```sh
 crossfyre db up
-ambulo --daemon &
+ambulo daemon &
 ```
 
 `crossfyre db up` makes a PostgreSQL cluster of your own in the toolchain directory with the PostgreSQL programs installed on the machine (on Debian, Ubuntu or Kali, `sudo apt install postgresql`), and starts it. It listens on 127.0.0.1 only, with a generated password kept in the toolchain's `config.toml`, which the engines read. To use a database you run yourself instead, record it with `crossfyre db external HOST PORT USER`.
@@ -140,7 +140,7 @@ A source build, like the binaries on the [Releases](../../releases) page, is the
 <details>
 <summary>Running an engine as a daemon on another address</summary>
 
-Every engine can run as a daemon (`--daemon`) that its client talks to over loopback. The protocol is unauthenticated, so the bind address is the security boundary. `CFX_DAEMON_BIND` moves the listener to another IP, and `CFX_DAEMON_TOKEN` makes it require a token, which the clients and the node read from the same variable. If you move the listener, set the token: `ambulo` takes a wordlist path, so an open daemon can be made to read files.
+Every engine can run as a daemon (`<engine> daemon`) that its client talks to over loopback. The protocol is unauthenticated, so the bind address is the security boundary. `CFX_DAEMON_BIND` moves the listener to another IP, and `CFX_DAEMON_TOKEN` makes it require a token, which the clients and the node read from the same variable. If you move the listener, set the token: `ambulo` takes a wordlist path, so an open daemon can be made to read files.
 
 </details>
 

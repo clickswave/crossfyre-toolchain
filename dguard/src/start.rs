@@ -35,6 +35,12 @@ const LAST_LINES: usize = 20;
 /// daemon into a larger one starts it over, and keeps no older copy.
 const LOG_LIMIT: u64 = 10 * 1024 * 1024;
 
+/// The arguments that run an engine's binary as its daemon on `port`, as its unit, its
+/// service on macOS and Windows, `node init` and a client starting one all give them.
+pub fn daemon_args(port: u16) -> [String; 3] {
+    ["daemon".to_string(), "--port".to_string(), port.to_string()]
+}
+
 /// The name of engine `engine`'s systemd user unit, which crossfyre writes to
 /// `~/.config/systemd/user` when it installs the engine.
 pub fn unit_name(engine: &str) -> String {
@@ -44,7 +50,7 @@ pub fn unit_name(engine: &str) -> String {
 /// What a client says when no daemon answers on `port` and none is started for it.
 pub fn not_running(engine: &str, port: u16) -> String {
     format!(
-        "{} daemon is not running on port {port}.\nStart it with `{engine} --daemon`, or with \
+        "{} daemon is not running on port {port}.\nStart it with `{engine} daemon`, or with \
          `crossfyre extension start {engine}` if crossfyre installed it.",
         capitalised(engine)
     )
@@ -381,7 +387,7 @@ fn daemon_command(
 ) -> std::io::Result<std::process::Command> {
     use std::process::Stdio;
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(["--daemon", "--port", &port.to_string()])
+    cmd.args(daemon_args(port))
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
@@ -582,7 +588,7 @@ mod tests {
     fn the_message_without_a_daemon_names_the_two_ways_to_start_one() {
         assert_eq!(
             not_running("ambulo", 4441),
-            "Ambulo daemon is not running on port 4441.\nStart it with `ambulo --daemon`, or \
+            "Ambulo daemon is not running on port 4441.\nStart it with `ambulo daemon`, or \
              with `crossfyre extension start ambulo` if crossfyre installed it."
         );
     }
@@ -604,13 +610,16 @@ mod tests {
 
     #[test]
     fn a_unit_serves_the_port_its_exec_line_names() {
-        let unit = "[Service]\nType=simple\nExecStart=/opt/crossfyre/bin/voyage --daemon --port \
-                    4442\nRestart=on-failure\n";
+        let unit = format!(
+            "[Service]\nType=simple\nExecStart=/opt/crossfyre/bin/voyage {}\nRestart=on-failure\n",
+            daemon_args(4442).join(" ")
+        );
+        let unit = unit.as_str();
         assert!(unit_serves(unit, 4442));
         assert!(!unit_serves(unit, 14442));
         assert!(!unit_serves(unit, 442));
         assert!(unit_serves(
-            "ExecStart=/x/voyage --daemon --port=5000\n",
+            "ExecStart=/x/voyage daemon --port=5000\n",
             5000
         ));
         assert!(!unit_serves("Description=port 4442\n", 4442));
@@ -672,7 +681,7 @@ mod tests {
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(args, ["--daemon", "--port", "4442"]);
+        assert_eq!(args, ["daemon", "--port", "4442"]);
         assert_eq!(idle(&cmd).as_deref(), Some("1800"));
 
         // A client that was given its own limit passes that on with the rest of its

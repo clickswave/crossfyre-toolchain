@@ -1929,9 +1929,9 @@ fn engine_part(ext: &str) -> init_summary::Part {
     #[cfg(target_os = "linux")]
     let daemon = (!toolchain::service::systemd_runs()).then(|| {
         format!(
-            "{} --daemon --port {}",
+            "{} {}",
             toolchain::config::ext_bin_path(ext).display(),
-            toolchain::config::engine_port(ext)
+            dguard::daemon_args(toolchain::config::engine_port(ext)).join(" ")
         )
     });
     #[cfg(not(target_os = "linux"))]
@@ -4732,7 +4732,7 @@ mod op_failure_tests {
             "{op_type}: {done}"
         );
         assert!(
-            why.ends_with(&format!("Is `{engine} --daemon` running?")),
+            why.ends_with(&format!("Is `{engine} daemon` running?")),
             "{op_type}: {done}"
         );
         assert!(

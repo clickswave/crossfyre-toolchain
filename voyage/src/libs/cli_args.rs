@@ -43,12 +43,8 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
 
-    /// Run as a background TCP daemon service
-    #[arg(long, default_value_t = false)]
-    pub daemon: bool,
-
-    /// Port for daemon mode
-    #[arg(long, default_value_t = 4442)]
+    /// The port the daemon listens on, and the one the commands here reach it on
+    #[arg(long, global = true, default_value_t = 4442)]
     pub port: u16,
 
     /// Show the live dashboard instead of streaming JSON. Ignored when stdout is
@@ -80,6 +76,9 @@ pub enum Commands {
     Origin(OriginArgs),
     /// Try a DNS zone transfer (AXFR) and print every name the zone gives up
     Axfr(AxfrArgs),
+    /// Run as this engine's daemon, which the commands here and the node talk to on
+    /// --port
+    Daemon,
     /// Print a shell completion script to stdout, for example:
     ///   voyage completions bash > ~/.local/share/bash-completion/completions/voyage
     Completions {
@@ -345,5 +344,19 @@ mod tests {
         assert!(parsed(&["voyage", "--no-autostart", "db", "--full-reset"]));
         assert!(parsed(&["voyage", "db", "--full-reset", "--no-autostart"]));
         assert!(!parsed(&["voyage", "db", "--full-reset"]));
+    }
+
+    #[test]
+    fn the_daemon_is_a_command_with_its_port_after_it() {
+        let argv: Vec<String> = std::iter::once("voyage".to_string())
+            .chain(dguard::daemon_args(5000))
+            .collect();
+        let cli = Cli::try_parse_from(&argv).expect("parses");
+        assert!(matches!(cli.command, Some(Commands::Daemon)), "{argv:?}");
+        assert_eq!(cli.port, 5000);
+        assert!(
+            Cli::try_parse_from(["voyage", "--daemon"]).is_err(),
+            "the old flag"
+        );
     }
 }

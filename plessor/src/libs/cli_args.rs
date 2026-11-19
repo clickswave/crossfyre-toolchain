@@ -10,12 +10,8 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
 
-    /// Run as a background daemon (TCP server on the given port)
-    #[arg(long, default_value_t = false)]
-    pub daemon: bool,
-
-    /// TCP port to bind (daemon) or connect to (client)
-    #[arg(long, default_value_t = 4445)]
+    /// The port the daemon listens on, and the one the commands here reach it on
+    #[arg(long, global = true, default_value_t = 4445)]
     pub port: u16,
 
     /// Show a live dashboard instead of streaming JSON. Ignored when stdout is
@@ -43,6 +39,9 @@ pub enum Commands {
     /// Send a JSON op to the daemon and print the streamed events. `operation` is
     /// required: this is the raw interface the node uses.
     Exec(ExecArgs),
+    /// Run as this engine's daemon, which the commands here and the node talk to on
+    /// --port
+    Daemon,
     /// Print a shell completion script to stdout, for example:
     ///   plessor completions bash > ~/.local/share/bash-completion/completions/plessor
     Completions {
@@ -110,5 +109,19 @@ mod tests {
             "--no-autostart"
         ]));
         assert!(!parsed(&["plessor", "scan", "example.com"]));
+    }
+
+    #[test]
+    fn the_daemon_is_a_command_with_its_port_after_it() {
+        let argv: Vec<String> = std::iter::once("plessor".to_string())
+            .chain(dguard::daemon_args(5000))
+            .collect();
+        let cli = Cli::try_parse_from(&argv).expect("parses");
+        assert!(matches!(cli.command, Some(Commands::Daemon)), "{argv:?}");
+        assert_eq!(cli.port, 5000);
+        assert!(
+            Cli::try_parse_from(["plessor", "--daemon"]).is_err(),
+            "the old flag"
+        );
     }
 }

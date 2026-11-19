@@ -662,7 +662,7 @@ pub fn host(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
     let bin = super::config::ext_bin_path(e.name);
     let port = super::config::engine_port(e.name);
     let mut cmd = std::process::Command::new(&bin);
-    cmd.args(["--daemon", "--port", &port.to_string()]);
+    cmd.args(dguard::daemon_args(port));
     cmd.env(
         dguard::TOOLCHAIN_DIR_ENV,
         super::config::get_toolchain_dir(),
@@ -1133,7 +1133,7 @@ mod imp {
              [Service]\n\
              Type=simple\n\
              EnvironmentFile=-{egress_env}\n\
-             ExecStart={bin} --daemon --port {port}\n\
+             ExecStart={bin} {daemon}\n\
              Restart=on-failure\n\
              RestartSec=5\n\
              \n\
@@ -1142,7 +1142,7 @@ mod imp {
             ext = ext,
             bin = bin.display(),
             egress_env = egress_env.display(),
-            port = port,
+            daemon = dguard::daemon_args(port).join(" "),
         )
     }
 
@@ -1260,6 +1260,18 @@ mod imp {
 
             assert!(r.is_err(), "removed through a link");
             assert!(victim.join(&unit).exists());
+        }
+
+        #[test]
+        fn an_engine_s_unit_runs_it_as_its_daemon_on_its_port() {
+            let port = super::super::super::config::engine_port("voyage");
+            let exec = format!(
+                "ExecStart={} {}",
+                ext_bin_path("voyage").display(),
+                dguard::daemon_args(port).join(" ")
+            );
+            let unit = unit_body("voyage");
+            assert!(unit.lines().any(|l| l == exec), "{unit}");
         }
 
         #[test]
