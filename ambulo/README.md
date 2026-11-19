@@ -56,7 +56,6 @@ Kali), or point it at a database you run with `crossfyre db external`. The root
 - `--headers` / `--cookies` / `--basic-auth` send auth or custom headers
 - `--follow-redirects` and `--follow-redirects-depth`
 - `--random-user-agent-request` rotate the UA per request
-- `--save-response-body` keep bodies for later inspection
 
 Run `ambulo scan --help` for the full list. `ambulo db --full-reset` deletes every stored run.
 

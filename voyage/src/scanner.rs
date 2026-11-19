@@ -95,7 +95,8 @@ impl<S: Store> Scanner<S> {
         }
     }
 
-    /// Emit passive results already in DB, then run active workers and stream all events.
+    /// Emit the results the passive sources gave, which the daemon stored before the scan
+    /// started, then run the active workers and stream every event.
     pub async fn run_headless_stream(
         &self,
         tx: mpsc::UnboundedSender<StreamEvent>,

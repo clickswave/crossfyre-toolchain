@@ -318,7 +318,7 @@ async fn task_handle<S: Store>(
     // Shared count of requests actually sent (each attempt, incl. 429 retries).
     tested: Arc<AtomicU64>,
     event_tx: Option<Arc<mpsc::UnboundedSender<StreamEvent>>>,
-) -> Result<(), sqlx::Error> {
+) {
     loop {
         let wait_ms = config.interval + throttle.load(Ordering::Relaxed);
         if wait_ms > 0 {
@@ -340,14 +340,14 @@ async fn task_handle<S: Store>(
                     "Result stream consumer disconnected - stopping scan",
                 )
                 .await;
-            return Ok(());
+            return;
         }
 
         let work = match store.claim().await {
             Ok(Some(work)) => work,
             Ok(None) => {
                 store.log("info", "No work available, exiting thread").await;
-                return Ok(());
+                return;
             }
             Err(e) => {
                 let msg = format!("Error fetching work: {e}");
@@ -391,7 +391,7 @@ async fn task_handle<S: Store>(
             if let Some(ref tx) = event_tx
                 && tx.is_closed()
             {
-                return Ok(());
+                return;
             }
             tested.fetch_add(1, Ordering::Relaxed);
             probe = prober
@@ -687,20 +687,20 @@ async fn adaptive_task_handle<S: Store>(
     shared: Arc<AdaptiveShared>,
     worker_index: u64,
     event_tx: Option<Arc<mpsc::UnboundedSender<StreamEvent>>>,
-) -> Result<(), sqlx::Error> {
+) {
     loop {
         // Concurrency gate: park while this worker sits above the current target.
         if shared.rate_on {
             while worker_index >= shared.target_conc.load(Ordering::Relaxed).max(1) {
-                // Exit if the queue drained (another worker hit RowNotFound) or the
-                // consumer disconnected, don't wait for a ramp that may never come.
+                // Exit if the queue drained (another worker found nothing left to claim)
+                // or the consumer disconnected: do not wait for a ramp that may never come.
                 if shared.drained.load(Ordering::Relaxed) {
-                    return Ok(());
+                    return;
                 }
                 if let Some(ref tx) = event_tx
                     && tx.is_closed()
                 {
-                    return Ok(());
+                    return;
                 }
                 sleep(Duration::from_millis(80)).await;
             }
@@ -725,7 +725,7 @@ async fn adaptive_task_handle<S: Store>(
                     "Result stream consumer disconnected - stopping scan",
                 )
                 .await;
-            return Ok(());
+            return;
         }
 
         let work = match store.claim().await {
@@ -734,7 +734,7 @@ async fn adaptive_task_handle<S: Store>(
                 // Queue empty: signal parked workers to stop, then exit.
                 shared.drained.store(true, Ordering::Relaxed);
                 store.log("info", "No work available, exiting thread").await;
-                return Ok(());
+                return;
             }
             Err(e) => {
                 let msg = format!("Error fetching work: {e}");
@@ -794,7 +794,7 @@ async fn adaptive_task_handle<S: Store>(
                     if let Some(ref tx) = event_tx
                         && tx.is_closed()
                     {
-                        return Ok(());
+                        return;
                     }
                     continue;
                 }
