@@ -122,7 +122,7 @@ Where no service manager runs, as on WSL without systemd and in most containers,
 
 ## Where scan state is kept
 
-voyage, doorward and ambulo keep the state of every scan in PostgreSQL, so a stopped scan picks up where it left off. `config.toml` in the toolchain directory names the database they use.
+Every engine keeps its scans in PostgreSQL. voyage, doorward and ambulo keep the state of each one, so a stopped scan picks up where it left off, and so does a plessor template scan. toolmark keeps what it found on each host and when that changed. `config.toml` in the toolchain directory names the database they use.
 
 By default it is a local one: a PostgreSQL cluster of your own in the toolchain directory, made with the PostgreSQL programs installed on the machine (on Debian, Ubuntu or Kali, `sudo apt install postgresql`). It runs as you, listens on 127.0.0.1 only, and its generated password is kept in `config.toml`. The first daemon to start makes it, or `crossfyre db up` does ahead of time. `crossfyre db stop` stops it, and `crossfyre db status` says how it is.
 
@@ -142,7 +142,7 @@ cargo build --release
 
 Or install one engine with `cargo install --git https://github.com/clickswave/crossfyre-toolchain.git ambulo`.
 
-A source build sets up no services, and needs none: the first command you give an engine starts its daemon, and the first of voyage's, doorward's and ambulo's daemons makes the local database, so install PostgreSQL's programs before the first scan. [How the engines run](#how-the-engines-run) has the rest.
+A source build sets up no services, and needs none: the first command you give an engine starts its daemon, and the first engine daemon to start makes the local database, so install PostgreSQL's programs before the first scan. [How the engines run](#how-the-engines-run) has the rest.
 
 `cfx-script` embeds Python, so building it needs one. On Linux that is your distribution's Python and its development files. On macOS it has to be Python 3.10 or later, and the `python3` that comes with the Xcode command line tools is 3.9, so name another one: `PYO3_PYTHON=/opt/homebrew/bin/python3 cargo build --release`. Windows needs no Python to build it, and Python 3.10 or later to run scripts.
 

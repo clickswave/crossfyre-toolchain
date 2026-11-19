@@ -53,9 +53,13 @@ mod graphql;
 #[cfg(feature = "daemon")]
 mod inject;
 #[cfg(feature = "daemon")]
+mod ledger;
+#[cfg(feature = "daemon")]
 pub mod libs;
 #[cfg(feature = "daemon")]
 mod oast;
+#[cfg(feature = "daemon")]
+mod plessor_db;
 #[cfg(feature = "daemon")]
 mod probe;
 #[cfg(feature = "daemon")]
@@ -103,7 +107,6 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 /// dispatch can be exercised without spawning a process.
 #[cfg(feature = "daemon")]
 pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    // Plessor is stateless: no DB, a vulnerability-detection TCP service.
     if matches!(cli.command, Some(Commands::Daemon)) {
         return daemon::run(cli.port).await;
     }
@@ -157,6 +160,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let target = payload["target"].as_str().unwrap_or("").to_string();
             send_stream(&daemon, payload, false, target).await
         }
+        Some(Commands::Db { action }) => dguard::run_db(&daemon, &action).await,
         Some(Commands::Completions { shell }) => {
             let mut script = Vec::new();
             clap_complete::generate(shell, &mut Cli::command(), "plessor", &mut script);

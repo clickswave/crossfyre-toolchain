@@ -12,8 +12,14 @@ Part of the [Crossfyre toolchain](../).
 The fingerprinting runs in toolmark's daemon, on 127.0.0.1:4444, and the commands
 here are its clients. The first command starts the daemon when none is running, and a
 daemon started that way exits after 30 minutes with no client and no scan. `toolmark
-daemon` runs one by hand, and `--no-autostart` turns the starting off. It keeps no
-state, so it needs no database. The root [README](../#how-the-engines-run) has the
+daemon` runs one by hand, and `--no-autostart` turns the starting off. It keeps what it
+finds in PostgreSQL: each host it looked at, the landing page it saw there, the products
+and services on it with their versions, and a row each time one appears or changes. A
+scan given credentials saw the page as that user, so it keeps no body. The first daemon
+makes the database, so install PostgreSQL's programs before the first scan (`sudo apt
+install postgresql` on Debian, Ubuntu or Kali), or point it at a database you run with
+`crossfyre db external`. `toolmark db purge --scan ID` deletes one scan, and `toolmark
+db reset` everything it keeps. The root [README](../#how-the-engines-run) has the
 details.
 
 ```sh

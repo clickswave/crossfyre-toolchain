@@ -1,4 +1,6 @@
 use crate::fingerprint::{self, FpParams};
+use crate::libs::toolmark_db::ToolmarkDb;
+use cfx_db::scans::Status;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -9,17 +11,11 @@ use tokio::sync::mpsc;
 #[derive(Debug, Deserialize)]
 struct DaemonRequest {
     operation: String,
-    #[serde(default = "default_response")]
-    #[allow(dead_code)]
-    response: String,
     #[serde(flatten)]
     params: Value,
     /// From the egress wrapper, never from the request's own fields.
     #[serde(skip)]
     egress: transport::Egress,
-}
-fn default_response() -> String {
-    "stream".to_string()
 }
 
 /// One request line: the operation it asks for, unwrapped, with the egress its
@@ -35,7 +31,7 @@ fn parse_request(line: &str) -> Result<DaemonRequest, String> {
     Ok(req)
 }
 
-pub async fn run(port: u16) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(port: u16, db: ToolmarkDb) -> Result<(), Box<dyn std::error::Error>> {
     // Loopback unless an operator opts out: this channel has no per-request
     // credential of its own, so the bind address is the boundary.
     let addr = dguard::bind_addr(port);
@@ -48,8 +44,9 @@ pub async fn run(port: u16) -> Result<(), Box<dyn std::error::Error>> {
         let (stream, addr) = listener.accept().await?;
         let _ = stream.set_nodelay(true);
         let gate_clone = gate.clone();
+        let db = db.clone();
         dguard::spawn_busy(async move {
-            if let Err(e) = handle_connection(stream, gate_clone).await {
+            if let Err(e) = handle_connection(stream, gate_clone, db).await {
                 eprintln!("Connection error from {addr}: {e}");
             }
         });
@@ -59,6 +56,7 @@ pub async fn run(port: u16) -> Result<(), Box<dyn std::error::Error>> {
 async fn handle_connection(
     stream: TcpStream,
     gate: dguard::Gate,
+    db: ToolmarkDb,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -91,14 +89,30 @@ async fn handle_connection(
 
         match req.operation.as_str() {
             "fingerprint" => {
-                handle_fingerprint(req.params, req.egress, &mut writer).await?;
+                handle_fingerprint(req.params, req.egress, &mut writer, &db).await?;
                 return Ok(());
             }
             // Non-HTTP service identification: what is really listening on a
             // port, and whether it lets anyone in.
             "services" => {
-                handle_services(req.params, req.egress, &mut writer).await?;
+                handle_services(req.params, req.egress, &mut writer, &db).await?;
                 return Ok(());
+            }
+            "db_reset" | "purge" => {
+                let done = match req.operation.as_str() {
+                    "db_reset" => {
+                        cfx_db::scans::reset(db.pool(), crate::libs::toolmark_db::ENGINE.name)
+                            .await
+                            .map(|()| "All tables truncated.".to_string())
+                            .map_err(|e| format!("DB reset failed: {e}"))
+                    }
+                    _ => cfx_db::scans::purge_operation(db.pool(), &req.params).await,
+                };
+                let reply = match done {
+                    Ok(message) => serde_json::json!({"status": "completed", "message": message}),
+                    Err(message) => serde_json::json!({"status": "error", "message": message}),
+                };
+                write_line(&mut writer, &reply).await?;
             }
             // What this daemon honours beyond the original protocol. A caller that
             // must not run on a daemon that would ignore an option asks first, and an
@@ -138,8 +152,9 @@ async fn handle_fingerprint(
     params: Value,
     egress: transport::Egress,
     writer: &mut OwnedWriteHalf,
+    db: &ToolmarkDb,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let fp: FpParams = match serde_json::from_value(params) {
+    let fp: FpParams = match serde_json::from_value(params.clone()) {
         Ok(p) => FpParams { egress, ..p },
         Err(e) => {
             write_line(
@@ -154,12 +169,39 @@ async fn handle_fingerprint(
         }
     };
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
-    dguard::spawn_busy(async move {
-        fingerprint::run(fp, tx).await;
+    let scan = db.start("fingerprint", &fp.target, &params).await;
+    let observer = std::sync::Arc::new(db.observer(scan.as_ref(), &params));
+    let (tx, rx) = mpsc::unbounded_channel::<Value>();
+    let op = dguard::spawn_busy(async move {
+        fingerprint::run(fp, tx, observer).await;
     });
+    forward(op, rx, writer, db, scan).await
+}
 
-    while let Some(ev) = rx.recv().await {
+/// Write the events of scan `op` as they come, and keep what they found. The scan is
+/// kept to its end, after a caller that went away too.
+async fn forward(
+    op: tokio::task::JoinHandle<()>,
+    mut rx: mpsc::UnboundedReceiver<Value>,
+    writer: &mut OwnedWriteHalf,
+    db: &ToolmarkDb,
+    scan: Option<cfx_db::scans::Running>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (out, mut written) = mpsc::unbounded_channel::<Value>();
+    let keeping = db.clone();
+    dguard::spawn_busy(async move {
+        let id = scan.as_ref().map(|s| s.id.clone());
+        while let Some(ev) = rx.recv().await {
+            keeping.event(id.as_deref(), &ev).await;
+            let _ = out.send(ev);
+        }
+        let ended = match op.await {
+            Ok(()) => Status::Completed,
+            Err(_) => Status::Failed,
+        };
+        keeping.finish(scan, ended).await;
+    });
+    while let Some(ev) = written.recv().await {
         write_line(writer, &ev).await?;
     }
     Ok(())
@@ -169,8 +211,9 @@ async fn handle_services(
     params: Value,
     egress: transport::Egress,
     writer: &mut OwnedWriteHalf,
+    db: &ToolmarkDb,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let sp: crate::services::SvcParams = match serde_json::from_value(params) {
+    let sp: crate::services::SvcParams = match serde_json::from_value(params.clone()) {
         Ok(p) => crate::services::SvcParams { egress, ..p },
         Err(e) => {
             write_line(
@@ -185,15 +228,12 @@ async fn handle_services(
         }
     };
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
-    dguard::spawn_busy(async move {
+    let scan = db.start("services", &sp.targets.join(", "), &params).await;
+    let (tx, rx) = mpsc::unbounded_channel::<Value>();
+    let op = dguard::spawn_busy(async move {
         crate::services::run(sp, tx).await;
     });
-
-    while let Some(ev) = rx.recv().await {
-        write_line(writer, &ev).await?;
-    }
-    Ok(())
+    forward(op, rx, writer, db, scan).await
 }
 
 async fn write_line(
@@ -262,7 +302,11 @@ mod tests {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
-                tokio::spawn(handle_connection(stream, dguard::Gate::default()));
+                tokio::spawn(handle_connection(
+                    stream,
+                    dguard::Gate::default(),
+                    ToolmarkDb::unconnected(),
+                ));
             }
         });
         port
@@ -521,7 +565,11 @@ mod http_request_tests {
         let port = listener.local_addr().expect("addr").port();
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                tokio::spawn(handle_connection(stream, dguard::Gate::default()));
+                tokio::spawn(handle_connection(
+                    stream,
+                    dguard::Gate::default(),
+                    ToolmarkDb::unconnected(),
+                ));
             }
         });
         port

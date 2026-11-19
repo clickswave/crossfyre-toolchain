@@ -65,7 +65,11 @@ fn d_tier() -> u8 {
 /// resolving.
 pub use transport::AuthSpec;
 
-pub async fn run(params: FpParams, tx: mpsc::UnboundedSender<Value>) {
+pub async fn run<O: crate::observe::Observer>(
+    params: FpParams,
+    tx: mpsc::UnboundedSender<Value>,
+    observer: std::sync::Arc<O>,
+) {
     let (scheme, host, port, url) = match normalize_target(&params.target) {
         Some(t) => t,
         None => {
@@ -141,6 +145,18 @@ pub async fn run(params: FpParams, tx: mpsc::UnboundedSender<Value>) {
             return;
         }
     };
+
+    observer
+        .observed(crate::observe::Observation {
+            url: &url,
+            host: &host,
+            port,
+            scheme: &scheme,
+            status,
+            headers: &headers,
+            body: body.as_bytes(),
+        })
+        .await;
 
     let title = extract_title(&body);
     let server = signatures::header_val(&headers, "server");
@@ -414,7 +430,26 @@ mod redirect_tests {
     //! pointed, so a 301 on an apex reads as "this sends you to www" rather
     //! than as an empty site.
     use super::*;
+    use crate::observe::{Observation, Observer};
     use std::io::{Read, Write};
+
+    /// What a fingerprint handed on: each page's status, Location header and body length.
+    #[derive(Default)]
+    struct Seen(std::sync::Mutex<Vec<(u16, Option<String>, usize)>>);
+
+    impl Observer for Seen {
+        async fn observed(&self, o: Observation<'_>) {
+            let location = o
+                .headers
+                .iter()
+                .find(|(name, _)| name == "location")
+                .map(|(_, value)| value.clone());
+            self.0
+                .lock()
+                .unwrap()
+                .push((o.status, location, o.body.len()));
+        }
+    }
 
     #[tokio::test]
     async fn the_service_finding_names_a_redirect_it_did_not_follow() {
@@ -439,7 +474,13 @@ mod redirect_tests {
         }))
         .unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        run(params, tx).await;
+        let seen = std::sync::Arc::new(Seen::default());
+        run(params, tx, seen.clone()).await;
+        assert_eq!(
+            *seen.0.lock().unwrap(),
+            [(301, Some("https://www.example.test/".to_string()), 0)],
+            "the page it saw is handed on to be kept"
+        );
         let mut service = None;
         while let Ok(ev) = rx.try_recv() {
             if ev.pointer("/data/type") == Some(&json!("service")) {

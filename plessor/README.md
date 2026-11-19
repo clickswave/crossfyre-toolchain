@@ -12,8 +12,14 @@ Part of the [Crossfyre toolchain](../).
 The checks run in plessor's daemon, on 127.0.0.1:4445, and the commands here are its
 clients. The first command starts the daemon when none is running, and a daemon
 started that way exits after 30 minutes with no client and no scan. `plessor daemon`
-runs one by hand, and `--no-autostart` turns the starting off. It keeps no state, so
-it needs no database. The root [README](../#how-the-engines-run) has the details.
+runs one by hand, and `--no-autostart` turns the starting off. It keeps each scan in
+PostgreSQL with what it found, and for a template scan where each template got to, so a
+scan stopped part way carries on from there when the same scan is asked for again, and
+reports what it had found before. The first daemon makes the database, so install
+PostgreSQL's programs before the first scan (`sudo apt install postgresql` on Debian,
+Ubuntu or Kali), or point it at a database you run with `crossfyre db external`.
+`plessor db purge --scan ID` deletes one scan, and `plessor db reset` everything it
+keeps. The root [README](../#how-the-engines-run) has the details.
 
 ```sh
 # scan a target

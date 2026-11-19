@@ -1,3 +1,5 @@
+use crate::plessor_db::PlessorDb;
+use cfx_db::scans::Status;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -64,6 +66,22 @@ routed!(
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 pub async fn run(port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    // The database being briefly unreachable is not a reason to exit: wait for it,
+    // saying why each time, and start as soon as it answers.
+    let db = dguard::wait_for(
+        "the database",
+        std::time::Duration::from_secs(3600),
+        || async {
+            let pool = cfx_db::ensure_ready(&crate::plessor_db::ENGINE)
+                .await
+                .map_err(|e| e.to_string())?;
+            cfx_db::scans::stop_abandoned(&pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok::<_, String>(PlessorDb::new(pool))
+        },
+    )
+    .await?;
     // Loopback unless an operator opts out: this channel has no per-request
     // credential of its own, so the bind address is the boundary.
     let addr = dguard::bind_addr(port);
@@ -71,26 +89,35 @@ pub async fn run(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
     gate.announce("Plessor", addr);
     dguard::exit_when_idle("plessor");
-    serve(listener, gate).await?;
+    serve(listener, gate, db).await?;
     Ok(())
 }
 
 /// Accept connections on an already bound listener. Split from `run` so the tests can
 /// serve on a port the system picked.
-pub(crate) async fn serve(listener: TcpListener, gate: dguard::Gate) -> std::io::Result<()> {
+pub(crate) async fn serve(
+    listener: TcpListener,
+    gate: dguard::Gate,
+    db: PlessorDb,
+) -> std::io::Result<()> {
     loop {
         let (stream, addr) = listener.accept().await?;
         let _ = stream.set_nodelay(true);
         let gate_clone = gate.clone();
+        let db = db.clone();
         dguard::spawn_busy(async move {
-            if let Err(e) = handle_connection(stream, gate_clone).await {
+            if let Err(e) = handle_connection(stream, gate_clone, db).await {
                 eprintln!("Connection error from {addr}: {e}");
             }
         });
     }
 }
 
-async fn handle_connection(stream: TcpStream, gate: dguard::Gate) -> Result<(), BoxError> {
+async fn handle_connection(
+    stream: TcpStream,
+    gate: dguard::Gate,
+    db: PlessorDb,
+) -> Result<(), BoxError> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
@@ -120,24 +147,55 @@ async fn handle_connection(stream: TcpStream, gate: dguard::Gate) -> Result<(), 
             }
         };
 
-        let (w, l, g) = (&mut writer, &mut lines, &gate);
         let (params, egress) = (req.params, req.egress);
+        // The template scan keeps its plan; every operation keeps its record and findings.
+        let scan = |p, tx, id| crate::engine::run(p, tx, std::sync::Arc::new(db.ledger(id)));
+        macro_rules! op {
+            ($what:literal, $run:expr) => {
+                run_op(
+                    params,
+                    egress,
+                    $what,
+                    $run,
+                    &mut writer,
+                    &mut lines,
+                    &gate,
+                    &db,
+                )
+                .await?
+            };
+        }
         match req.operation.as_str() {
-            "scan" => run_op(params, egress, "scan", crate::engine::run, w, l, g).await?,
-            "authz" => run_op(params, egress, "authz", crate::authz::run, w, l, g).await?,
-            "inject" => run_op(params, egress, "inject", crate::inject::run, w, l, g).await?,
-            "discover" => run_op(params, egress, "discover", crate::discover::run, w, l, g).await?,
-            "fuzz" => run_op(params, egress, "fuzz", crate::fuzz::run, w, l, g).await?,
-            "graphql" => run_op(params, egress, "graphql", crate::graphql::run, w, l, g).await?,
+            "scan" => op!("scan", scan),
+            "authz" => op!("authz", plain(crate::authz::run)),
+            "inject" => op!("inject", plain(crate::inject::run)),
+            "discover" => op!("discover", plain(crate::discover::run)),
+            "fuzz" => op!("fuzz", plain(crate::fuzz::run)),
+            "graphql" => op!("graphql", plain(crate::graphql::run)),
             // Replay a recorded multi-step flow and test its order. See `flow`.
-            "flow" => run_op(params, egress, "flow", crate::flow::run, w, l, g).await?,
+            "flow" => op!("flow", plain(crate::flow::run)),
+            "db_reset" | "purge" => {
+                let done = match req.operation.as_str() {
+                    "db_reset" => cfx_db::scans::reset(db.pool(), crate::plessor_db::ENGINE.name)
+                        .await
+                        .map(|()| "All tables truncated.".to_string())
+                        .map_err(|e| format!("DB reset failed: {e}")),
+                    _ => cfx_db::scans::purge_operation(db.pool(), &params).await,
+                };
+                let reply = match done {
+                    Ok(message) => serde_json::json!({"status": "completed", "message": message}),
+                    Err(message) => serde_json::json!({"status": "error", "message": message}),
+                };
+                write_line(&mut writer, &reply).await?;
+                continue;
+            }
             // What this daemon honours beyond the original protocol. A caller that
             // must not run on a daemon that would ignore an option asks first, and an
             // older daemon answers `Unknown operation` before anything is sent. The
             // connection stays open for the operation that follows.
             "capabilities" => {
                 write_line(
-                    w,
+                    &mut writer,
                     &serde_json::json!({
                         "type": "capabilities",
                         "cancel": true,
@@ -206,12 +264,14 @@ async fn run_op<P, F, Fut>(
     writer: &mut OwnedWriteHalf,
     lines: &mut Lines<BufReader<OwnedReadHalf>>,
     gate: &dguard::Gate,
+    db: &PlessorDb,
 ) -> Result<(), BoxError>
 where
     P: DeserializeOwned + Routed + Send + 'static,
-    F: FnOnce(P, mpsc::UnboundedSender<Value>) -> Fut,
+    F: FnOnce(P, mpsc::UnboundedSender<Value>, Option<String>) -> Fut,
     Fut: Future<Output = ()> + Send + 'static,
 {
+    let asked = params.clone();
     let p: P = match serde_json::from_value(params) {
         Ok(mut p) => {
             P::route(&mut p, egress);
@@ -230,13 +290,16 @@ where
         }
     };
 
+    let scan = db.start(what, &asked).await;
+    let id = scan.as_ref().map(|s| s.id.clone());
     let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
-    let op = dguard::spawn_busy(run(p, tx));
+    let op = dguard::spawn_busy(run(p, tx, id.clone()));
     let mut reading = true;
     loop {
         tokio::select! {
             ev = rx.recv() => match ev {
                 Some(mut ev) => {
+                    db.event(id.as_deref(), &ev).await;
                     if ev.get("type").and_then(|t| t.as_str()) == Some("ack")
                         && let Some(o) = ev.as_object_mut()
                     {
@@ -244,16 +307,25 @@ where
                     }
                     if let Err(e) = write_line(writer, &ev).await {
                         op.abort();
+                        db.finish(scan, Status::Stopped).await;
                         return Err(e);
                     }
                 }
-                None => return Ok(()),
+                None => {
+                    let ended = match op.await {
+                        Ok(()) => Status::Completed,
+                        Err(_) => Status::Failed,
+                    };
+                    db.finish(scan, ended).await;
+                    return Ok(());
+                }
             },
             line = lines.next_line(), if reading => match line {
                 Ok(Some(l)) => {
                     if is_cancel(&l, gate) {
                         op.abort();
                         let _ = op.await;
+                        db.finish(scan, Status::Stopped).await;
                         write_line(
                             writer,
                             &serde_json::json!({"type": "done", "cancelled": true}),
@@ -266,6 +338,14 @@ where
             },
         }
     }
+}
+
+/// An operation that keeps nothing of its own between runs, as [`run_op`] takes one.
+fn plain<P, F, Fut>(run: F) -> impl FnOnce(P, mpsc::UnboundedSender<Value>, Option<String>) -> Fut
+where
+    F: FnOnce(P, mpsc::UnboundedSender<Value>) -> Fut,
+{
+    move |p, tx, _| run(p, tx)
 }
 
 async fn write_line(writer: &mut OwnedWriteHalf, v: &Value) -> Result<(), BoxError> {
@@ -327,7 +407,11 @@ mod tests {
     async fn daemon() -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("addr").port();
-        tokio::spawn(serve(listener, dguard::Gate::default()));
+        tokio::spawn(serve(
+            listener,
+            dguard::Gate::default(),
+            PlessorDb::unconnected(),
+        ));
         port
     }
 
@@ -883,7 +967,11 @@ mod http_request_tests {
     async fn daemon() -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("addr").port();
-        tokio::spawn(serve(listener, dguard::Gate::default()));
+        tokio::spawn(serve(
+            listener,
+            dguard::Gate::default(),
+            PlessorDb::unconnected(),
+        ));
         port
     }
 
@@ -957,7 +1045,11 @@ mod session_tls_tests {
     async fn daemon() -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("addr").port();
-        tokio::spawn(serve(listener, dguard::Gate::default()));
+        tokio::spawn(serve(
+            listener,
+            dguard::Gate::default(),
+            PlessorDb::unconnected(),
+        ));
         port
     }
 

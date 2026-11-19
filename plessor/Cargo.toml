@@ -51,6 +51,8 @@ sha2 = { version = "0.10", optional = true }
 rand = { version = "0.8", optional = true }
 base64 = { version = "0.22", optional = true }
 regex = { version = "1", optional = true }
+cfx_db = { path = "../db", optional = true }
+sqlx = { version = "0.8.6", features = ["postgres"], optional = true }
 
 [dev-dependencies]
 # A recording SOCKS5 proxy and counting listeners for the egress tests.
@@ -67,7 +69,7 @@ default = ["daemon"]
 # gets none of them, and no database.
 daemon = ["dep:dguard", "dep:cfx_finding", "dep:cfx_tui", "dep:ratatui", "dep:clap", "dep:clap_complete",
           "dep:serde", "dep:serde_json", "dep:serde_yaml", "dep:rsa", "dep:aes-gcm", "dep:sha2", "dep:rand",
-          "dep:base64", "dep:regex"]
+          "dep:base64", "dep:regex", "dep:cfx_db", "dep:sqlx"]
 # First-party builds enable this to swap the outward scan client to wreq
 # (BoringSSL) for real browser TLS/HTTP2 fingerprints. Off by default so the open
 # build stays on reqwest (rustls, no C toolchain, no emulation policy shipped).

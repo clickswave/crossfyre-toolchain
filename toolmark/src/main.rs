@@ -7,6 +7,7 @@ mod cve;
 mod daemon;
 mod fingerprint;
 mod libs;
+mod observe;
 mod services;
 mod signatures;
 
@@ -26,9 +27,24 @@ async fn main() -> std::process::ExitCode {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    // Toolmark is stateless: no DB, just a fingerprinting TCP service.
     if matches!(cli.command, Some(Commands::Daemon)) {
-        return daemon::run(cli.port).await;
+        // The database being briefly unreachable is not a reason to exit: wait for it,
+        // saying why each time, and start as soon as it answers.
+        let db = dguard::wait_for(
+            "the database",
+            std::time::Duration::from_secs(3600),
+            || async {
+                let pool = cfx_db::ensure_ready(&libs::toolmark_db::ENGINE)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                cfx_db::scans::stop_abandoned(&pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok::<_, String>(libs::toolmark_db::ToolmarkDb::new(pool))
+            },
+        )
+        .await?;
+        return daemon::run(cli.port, db).await;
     }
 
     // The daemon every command below talks to, started when it is not running.
@@ -69,6 +85,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let target = payload["target"].as_str().unwrap_or("").to_string();
             send_stream(&daemon, payload, false, target).await
         }
+        Some(Commands::Db { action }) => dguard::run_db(&daemon, &action).await,
         Some(Commands::Completions { shell }) => {
             let mut script = Vec::new();
             clap_complete::generate(shell, &mut Cli::command(), "toolmark", &mut script);

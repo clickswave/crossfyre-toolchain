@@ -15,7 +15,7 @@ crossfyre extension start toolmark
 crossfyre extension start plessor
 ```
 
-No database is needed.
+The two daemons keep what they find in PostgreSQL, so install PostgreSQL's programs first (`sudo apt install postgresql` on Debian, Ubuntu or Kali), or point them at a database you run with `crossfyre db external`. [Where scan state is kept](../README.md#where-scan-state-is-kept) has the details.
 
 ## The scope file
 

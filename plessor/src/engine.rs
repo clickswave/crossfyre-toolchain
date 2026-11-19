@@ -182,7 +182,11 @@ fn should_emulate(ua: Option<&str>, mode: &adaptive::identity::Mode) -> bool {
     !announced && !matches!(mode, adaptive::identity::Mode::Fast)
 }
 
-pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
+pub async fn run<L: crate::ledger::Ledger>(
+    params: ScanParams,
+    tx: mpsc::UnboundedSender<Value>,
+    ledger: std::sync::Arc<L>,
+) {
     let base = match normalize_base(&params.target) {
         Some(b) => b,
         None => {
@@ -485,6 +489,56 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
             .count();
         let mut done = 0usize;
 
+        // The plan: every template, with where it starts. A scan taken up again leaves
+        // out what it had run, unless the templates it started with are gone.
+        use crate::ledger::{Planned, State};
+        let planned: Vec<Planned> = template::BUILTIN
+            .iter()
+            .chain(pack.iter().copied())
+            .chain(external.iter())
+            .map(|t| {
+                let sev = if t.info.severity.is_empty() {
+                    "info".to_string()
+                } else {
+                    t.info.severity.to_lowercase()
+                };
+                let (state, reason) = if !allow_id(&t.id) {
+                    (State::Skipped, Some("not one of the templates asked for"))
+                } else if !params.test_writes && template_changes_target(t) {
+                    (State::HeldBack, Some("what it sends changes the target"))
+                } else if !allow(&sev) {
+                    (State::Skipped, Some("below the severities asked for"))
+                } else {
+                    (State::Queued, None)
+                };
+                Planned {
+                    id: t.id.clone(),
+                    state,
+                    reason,
+                }
+            })
+            .collect();
+        let pack_digest = {
+            use sha2::Digest;
+            let mut digest = sha2::Sha256::new();
+            digest.update(env!("CARGO_PKG_VERSION"));
+            for t in &planned {
+                digest.update(b"\n");
+                digest.update(t.id.as_bytes());
+            }
+            format!("{:x}", digest.finalize())
+        };
+        let planning = ledger.plan(&pack_digest, &planned).await;
+        if planning.replanned {
+            let _ = tx.send(json!({"type":"log","message":
+                "the templates this scan started with are gone, so it was planned again and \
+                 starts over"}));
+        }
+        for data in &planning.found {
+            found += 1;
+            let _ = tx.send(json!({"type":"finding","data": data}));
+        }
+
         // OAST client for out-of-band (interactsh) templates; None disables OOB.
         // Per-scan endpoint (node-resolved) wins over the node env fallback.
         let oast = params
@@ -550,6 +604,12 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
             if !allow_id(&tmpl.id) {
                 continue;
             }
+            // Run before this scan was stopped, and taken up again.
+            if planning.done.contains(&tmpl.id) {
+                done += 1;
+                let _ = tx.send(json!({"type":"progress","processed": done, "total": total}));
+                continue;
+            }
             // A template that overwrites or destroys is not a test of whether it
             // could. POST stays, for the reason the injection engine states.
             if !params.test_writes && template_changes_target(tmpl) {
@@ -562,6 +622,8 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
                 tmpl.info.severity.to_lowercase()
             };
             if allow(&sev) {
+                let pending_before = oob_queue.lock().map(|q| q.len()).unwrap_or_default();
+                let mut confirmed = false;
                 for m in template::eval_template(
                     &client,
                     &base,
@@ -575,6 +637,7 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
                 .await
                 {
                     found += 1;
+                    confirmed = true;
                     let _ = tx.send(
                         Finding::new("plessor", &m.class, m.name, m.severity, m.matched_at)
                             .template(m.template_id)
@@ -582,6 +645,15 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
                             .event(),
                     );
                 }
+                let pending = oob_queue.lock().map(|q| q.len()).unwrap_or_default();
+                let state = if confirmed {
+                    State::Confirmed
+                } else if pending > pending_before {
+                    State::Matched
+                } else {
+                    State::Sent
+                };
+                ledger.state(&tmpl.id, state).await;
             }
             done += 1;
             let _ = tx.send(json!({"type":"progress","processed": done, "total": total}));
@@ -618,11 +690,26 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
                         break;
                     }
                 }
+                // Each template waited on: confirmed when one of its callbacks came, and
+                // only sent when none did.
+                let mut waited: std::collections::BTreeMap<String, bool> = Default::default();
                 for p in pending {
-                    if hosts.iter().any(|h| h.contains(&p.marker)) {
+                    let called_back = hosts.iter().any(|h| h.contains(&p.marker));
+                    if let Some(id) = p.finding["template"].as_str() {
+                        *waited.entry(id.to_string()).or_default() |= called_back;
+                    }
+                    if called_back {
                         found += 1;
                         let _ = tx.send(json!({"type":"finding","data": p.finding}));
                     }
+                }
+                for (id, called_back) in waited {
+                    let state = if called_back {
+                        State::Confirmed
+                    } else {
+                        State::Sent
+                    };
+                    ledger.state(&id, state).await;
                 }
             }
             oc.deregister(http, reg).await;
@@ -903,5 +990,144 @@ http:
         let none: Vec<String> = vec![];
         let allow_all = |id: &str| none.is_empty() || none.iter().any(|s| s == &id.to_lowercase());
         assert!(allow_all("anything"));
+    }
+}
+
+#[cfg(test)]
+mod ledger_tests {
+    //! A template scan's plan and the state of each template go to its ledger, and a scan
+    //! taken up again leaves out the templates it had run and reports what they found.
+    use super::*;
+    use crate::ledger::{Ledger, Planned, Planning, State};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// Two of the built-in templates, which a target answering 404 gives nothing.
+    const ASKED: [&str; 2] = ["git-config-exposure", "dotenv-exposure"];
+
+    #[derive(Default)]
+    struct Kept {
+        planned: Mutex<Vec<(String, State, Option<&'static str>)>>,
+        states: Mutex<Vec<(String, State)>>,
+        /// What `plan` answers for a scan taken up again: the templates it had run, and
+        /// what they found.
+        done: Vec<String>,
+        found: Vec<Value>,
+    }
+
+    impl Ledger for Kept {
+        async fn plan(&self, _pack: &str, templates: &[Planned]) -> Planning {
+            *self.planned.lock().unwrap() = templates
+                .iter()
+                .map(|t| (t.id.clone(), t.state, t.reason))
+                .collect();
+            Planning {
+                done: self.done.iter().cloned().collect(),
+                found: self.found.clone(),
+                replanned: false,
+            }
+        }
+        async fn state(&self, id: &str, state: State) {
+            self.states.lock().unwrap().push((id.to_string(), state));
+        }
+    }
+
+    /// A target that answers 404 to everything and counts what it is sent.
+    async fn target() -> (u16, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counted = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let counted = counted.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    while let Ok(n) = s.read(&mut buf).await {
+                        if n == 0 {
+                            return;
+                        }
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        let _ = s
+                            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                            .await;
+                    }
+                });
+            }
+        });
+        (port, hits)
+    }
+
+    /// A scan of the target on `port` for the templates [`ASKED`], and what it said.
+    async fn scan(port: u16, ledger: Arc<Kept>) -> Vec<Value> {
+        let params: ScanParams = serde_json::from_value(json!({
+            "target": format!("http://127.0.0.1:{port}/"),
+            "evasive": false,
+            "timeout_ms": 2000,
+            "only": ASKED,
+        }))
+        .unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        run(params, tx, ledger).await;
+        let mut said = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            said.push(event);
+        }
+        said
+    }
+
+    #[tokio::test]
+    async fn the_plan_and_each_templates_state_are_kept_and_what_ran_is_left_out() {
+        let (port, hits) = target().await;
+        let first = Arc::new(Kept::default());
+        scan(port, first.clone()).await;
+        let planned = first.planned.lock().unwrap().clone();
+        assert_eq!(planned.len(), template::BUILTIN.len());
+        let queued: Vec<&str> = planned
+            .iter()
+            .filter(|(_, state, _)| *state == State::Queued)
+            .map(|(id, _, _)| id.as_str())
+            .collect();
+        assert_eq!(queued, ASKED);
+        for (id, state, reason) in &planned {
+            if !ASKED.contains(&id.as_str()) {
+                assert_eq!(
+                    (*state, *reason),
+                    (State::Skipped, Some("not one of the templates asked for")),
+                    "{id}"
+                );
+            }
+        }
+        assert_eq!(
+            *first.states.lock().unwrap(),
+            ASKED.map(|id| (id.to_string(), State::Sent)),
+            "each template's state is kept as it runs"
+        );
+        let all_of_it = hits.swap(0, Ordering::SeqCst);
+
+        // Taken up again with the first template run, and what it had found.
+        let earlier = json!({"name": "found before the scan stopped", "template": ASKED[0]});
+        let again = Arc::new(Kept {
+            done: vec![ASKED[0].to_string()],
+            found: vec![earlier.clone()],
+            ..Kept::default()
+        });
+        let said = scan(port, again.clone()).await;
+        assert_eq!(
+            *again.states.lock().unwrap(),
+            [(ASKED[1].to_string(), State::Sent)],
+            "only the template not yet run runs"
+        );
+        let resumed = hits.load(Ordering::SeqCst);
+        assert!(
+            resumed < all_of_it,
+            "the template already run was sent again: {resumed} of {all_of_it}"
+        );
+        assert!(
+            said.contains(&json!({"type": "finding", "data": earlier})),
+            "what it had found is reported again: {said:?}"
+        );
+        assert_eq!(said.last(), Some(&json!({"type": "done", "found": 1})));
     }
 }

@@ -52,7 +52,9 @@ const SECRET_PARTS: &[&str] = &[
 /// other names.
 const SECRET_PARAMS: &[&str] = &["sig", "key", "code", "pass", "pwd"];
 
-fn secret_name(name: &str) -> bool {
+/// Whether `name`, a key, a header or a query parameter, names a credential (see
+/// [`SECRET_PARTS`]).
+pub fn secret_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     SECRET_PARTS.iter().any(|part| name.contains(part))
 }
@@ -159,14 +161,30 @@ fn header_names(value: &mut serde_json::Value) -> bool {
     had_values
 }
 
+/// Whether `value`, kept under a credential's name, holds one. A null, an empty value and
+/// a flag hold none.
+fn holds_credential(value: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match value {
+        Value::Null | Value::Bool(_) => false,
+        Value::String(text) => !text.is_empty(),
+        Value::Number(_) => true,
+        Value::Array(items) => items.iter().any(holds_credential),
+        Value::Object(map) => map.values().any(holds_credential),
+    }
+}
+
 /// Take every credential out of `value`, and say whether there was one.
 fn strip(value: &mut serde_json::Value) -> bool {
     use serde_json::Value;
     match value {
         Value::Object(map) => {
-            let had = map.len();
-            map.retain(|key, _| !secret_name(key));
-            let mut removed = map.len() != had;
+            let mut removed = false;
+            map.retain(|key, v| {
+                let secret = secret_name(key);
+                removed |= secret && holds_credential(v);
+                !secret
+            });
             for (key, v) in map.iter_mut() {
                 removed |= if header_key(key) {
                     header_names(v)
@@ -189,10 +207,28 @@ fn strip(value: &mut serde_json::Value) -> bool {
     }
 }
 
+/// `value`, a result such as a finding, with no credential in it: taken out as
+/// [`without_secrets`] takes them out of settings, with no mark where one was.
+pub fn safe_json(value: &serde_json::Value) -> serde_json::Value {
+    let mut value = value.clone();
+    strip(&mut value);
+    value
+}
+
+/// Whether `params`, a JSON object, carries a credential [`without_secrets`] takes out: a
+/// value under a credential's name, a header's value, or a URL's userinfo or secret query
+/// value. A scan asked for with one authenticates to its target, so its key is
+/// [`Key::Authenticated`].
+pub fn carries_credentials(params: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(params)
+        .map(|mut value| strip(&mut value))
+        .unwrap_or(false)
+}
+
 /// The JSON object `params`, as a scan or an operation keeps it: with no credential in
 /// it. Keys whose names mark a credential (see [`SECRET_PARTS`]) are left out, headers
 /// keep their names and not their values, and URLs are made safe (see [`safe_url`]).
-/// When anything was taken out, `"secrets_removed": true` says so, so that whoever takes
+/// When a credential was taken out, `"withheld": true` says so, so that whoever takes
 /// the scan up again knows to give them again. Parameters that are not a JSON object are
 /// not kept at all.
 pub fn without_secrets(params: &str) -> String {
@@ -202,7 +238,7 @@ pub fn without_secrets(params: &str) -> String {
     if strip(&mut value)
         && let serde_json::Value::Object(map) = &mut value
     {
-        map.insert("secrets_removed".to_string(), serde_json::Value::Bool(true));
+        map.insert("withheld".to_string(), serde_json::Value::Bool(true));
     }
     match value {
         serde_json::Value::Object(_) => value.to_string(),
@@ -531,7 +567,7 @@ mod tests {
                 "list": [{"name": "n"}],
                 "identify": "team-7",
                 "tasks": 4,
-                "secrets_removed": true,
+                "withheld": true,
             })
         );
         for secret in [
@@ -540,12 +576,58 @@ mod tests {
         ] {
             assert!(!kept.to_string().contains(secret), "{secret} was kept");
         }
+        assert_eq!(
+            without_secrets(&kept.to_string()),
+            kept.to_string(),
+            "what is kept is kept again as it is, its mark included"
+        );
         let plain = serde_json::json!({"domain": "example.com", "tasks": 4}).to_string();
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&without_secrets(&plain)).unwrap(),
             serde_json::json!({"domain": "example.com", "tasks": 4}),
             "nothing to take out, nothing marked"
         );
+    }
+
+    #[test]
+    fn a_null_an_empty_value_or_a_flag_under_a_credentials_name_is_no_credential() {
+        let none = serde_json::json!({
+            "target": "https://app.example/",
+            "auth": null,
+            "api_key": "",
+            "auth_checks": true,
+            "session": {"cookies": []},
+        });
+        assert!(!carries_credentials(&none.to_string()));
+        assert!(!without_secrets(&none.to_string()).contains("withheld"));
+        for one in [
+            serde_json::json!({"auth": {"headers": {"Authorization": "Bearer t-1"}}}),
+            serde_json::json!({"password": 1234}),
+            serde_json::json!({"target": "https://u:p@app.example/"}),
+            serde_json::json!({"target": "https://app.example/?token=t-1"}),
+            serde_json::json!({"headers": ["X-Forwarded-For: 10.0.0.1"]}),
+        ] {
+            assert!(carries_credentials(&one.to_string()), "{one}");
+        }
+    }
+
+    #[test]
+    fn a_result_is_kept_with_no_credential_and_no_mark_so_keeping_it_again_changes_nothing() {
+        let found = serde_json::json!({
+            "name": "Exposed .git",
+            "matched_at": "https://u:p@app.example/.git/config?token=t-1",
+            "request": {"headers": {"Cookie": "sid=s-1"}, "session": "s-2"},
+        });
+        let kept = safe_json(&found);
+        assert_eq!(
+            kept,
+            serde_json::json!({
+                "name": "Exposed .git",
+                "matched_at": "https://app.example/.git/config?token=",
+                "request": {"headers": ["Cookie"]},
+            })
+        );
+        assert_eq!(safe_json(&kept), kept);
     }
 
     #[test]

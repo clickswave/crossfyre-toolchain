@@ -22,6 +22,9 @@ serde_json = "1.0.142"
 adaptive = { path = "../adaptive" }
 transport = { path = "../transport" }
 regex = "1"
+cfx_db = { path = "../db" }
+sqlx = { version = "0.8.6", features = ["postgres"] }
+flate2 = "1.1"
 base64 = "0.22.1"
 md5 = "0.7"
 

@@ -51,6 +51,11 @@ pub enum Commands {
     /// Identify non-HTTP services on host:port targets, and whether they let
     /// anyone in
     Services(SvcArgs),
+    /// What this engine keeps: delete one scan, old scans, or everything
+    Db {
+        #[command(subcommand)]
+        action: dguard::DbAction,
+    },
     /// Run as this engine's daemon, which the commands here and the node talk to on
     /// --port
     Daemon,
