@@ -299,19 +299,10 @@ async fn handle_origin(args: OriginArgs) -> Result<(), Box<dyn std::error::Error
         scanners::origin::discover(&args.domain, args.timeout, !args.no_evasive, &egress, &log)
             .await;
 
-    if args.json {
-        let arr: Vec<serde_json::Value> = findings
-            .iter()
-            .map(|f| {
-                serde_json::json!({
-                    "ip": f.ip.to_string(),
-                    "host": f.host,
-                    "confidence": f.confidence,
-                    "note": f.note,
-                })
-            })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&arr)?);
+    if args.json || !to_terminal() {
+        for line in origin_json(&findings) {
+            println!("{line}");
+        }
     } else if findings.is_empty() {
         println!(
             "\nNo origin candidates found behind the CDN for {}.",
@@ -328,6 +319,33 @@ async fn handle_origin(args: OriginArgs) -> Result<(), Box<dyn std::error::Error
     }
 
     Ok(())
+}
+
+/// Whether stdout is a terminal, where `origin` and `axfr` write text. Piped or
+/// redirected, they write JSON lines, as every engine's commands do.
+fn to_terminal() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdout().is_terminal()
+}
+
+/// `origin`'s findings as JSON lines: a result for each candidate, and then done.
+fn origin_json(findings: &[scanners::origin::OriginFinding]) -> Vec<String> {
+    findings
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "type": "result",
+                "ip": f.ip.to_string(),
+                "host": f.host,
+                "confidence": f.confidence,
+                "note": f.note,
+            })
+            .to_string()
+        })
+        .chain(std::iter::once(
+            serde_json::json!({"type": "done", "found": findings.len()}).to_string(),
+        ))
+        .collect()
 }
 
 /// The request `exec` sends for the caller's JSON, with the operation, the response
@@ -403,20 +421,110 @@ async fn handle_axfr(
     req_str.push('\n');
     writer.write_all(req_str.as_bytes()).await?;
 
+    let json = !to_terminal();
     let mut lines = BufReader::new(reader).lines();
     while let Some(line) = lines.next_line().await? {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        match v["type"].as_str().unwrap_or("") {
-            "result" => println!("{}", v["subdomain"].as_str().unwrap_or("")),
-            "finding" => eprintln!("[!] {}", v["data"]["name"].as_str().unwrap_or("")),
-            "log" | "error" => eprintln!("[-] {}", v["message"].as_str().unwrap_or("")),
-            "done" => break,
-            _ => {}
+        match axfr_shown(&line, json) {
+            Some(Shown::Out(text)) => println!("{text}"),
+            Some(Shown::Err(text)) => eprintln!("{text}"),
+            None => {}
+        }
+        if serde_json::from_str::<serde_json::Value>(&line).is_ok_and(|v| v["type"] == "done") {
+            break;
         }
     }
     Ok(())
+}
+
+/// What `axfr` shows of a line from the daemon, and where.
+#[derive(Debug, PartialEq, Eq)]
+enum Shown {
+    Out(String),
+    Err(String),
+}
+
+/// A line the daemon sent `axfr`, as it is shown: piped (`json`), the line itself; in a
+/// terminal, a name it found on stdout, and what else happened on stderr.
+fn axfr_shown(line: &str, json: bool) -> Option<Shown> {
+    let v = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if json {
+        return Some(Shown::Out(line.to_string()));
+    }
+    match v["type"].as_str().unwrap_or("") {
+        "result" => Some(Shown::Out(
+            v["subdomain"].as_str().unwrap_or("").to_string(),
+        )),
+        "finding" => Some(Shown::Err(format!(
+            "[!] {}",
+            v["data"]["name"].as_str().unwrap_or("")
+        ))),
+        "log" | "error" => Some(Shown::Err(format!(
+            "[-] {}",
+            v["message"].as_str().unwrap_or("")
+        ))),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod piped_tests {
+    use super::*;
+
+    fn finding(ip: &str) -> scanners::origin::OriginFinding {
+        scanners::origin::OriginFinding {
+            ip: ip.parse().unwrap(),
+            host: "direct.lab.test".to_string(),
+            confidence: "likely",
+            note: "answers for the site".to_string(),
+        }
+    }
+
+    /// Piped, `origin` writes one JSON line per candidate and then one that it is done,
+    /// as every engine's commands do. It wrote a pretty-printed array, a line of which
+    /// was not JSON on its own.
+    #[test]
+    fn origin_writes_json_lines() {
+        let lines = origin_json(&[finding("192.0.2.1"), finding("192.0.2.2")]);
+        let parsed: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|l| serde_json::from_str(l).expect("a line of JSON"))
+            .collect();
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0]["type"], "result");
+        assert_eq!(parsed[0]["ip"], "192.0.2.1");
+        assert_eq!(parsed[1]["host"], "direct.lab.test");
+        assert_eq!(parsed[2], serde_json::json!({"type": "done", "found": 2}));
+        assert_eq!(
+            origin_json(&[]),
+            [serde_json::json!({"type": "done", "found": 0}).to_string()]
+        );
+    }
+
+    /// Piped, `axfr` passes on the daemon's JSON lines; in a terminal it prints the
+    /// names, and what else happened on stderr.
+    #[test]
+    fn axfr_writes_json_lines_when_piped_and_names_in_a_terminal() {
+        let result = r#"{"type":"result","subdomain":"www.lab.test","status":"found"}"#;
+        let log = r#"{"type":"log","message":"ns1.lab.test refused the transfer"}"#;
+        let done = r#"{"type":"done","total":1}"#;
+        assert_eq!(
+            axfr_shown(result, true),
+            Some(Shown::Out(result.to_string()))
+        );
+        assert_eq!(axfr_shown(log, true), Some(Shown::Out(log.to_string())));
+        assert_eq!(axfr_shown(done, true), Some(Shown::Out(done.to_string())));
+        assert_eq!(
+            axfr_shown(result, false),
+            Some(Shown::Out("www.lab.test".to_string()))
+        );
+        assert_eq!(
+            axfr_shown(log, false),
+            Some(Shown::Err(
+                "[-] ns1.lab.test refused the transfer".to_string()
+            ))
+        );
+        assert_eq!(axfr_shown(done, false), None);
+    }
 }
 
 #[cfg(test)]

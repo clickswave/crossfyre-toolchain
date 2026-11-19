@@ -127,7 +127,8 @@ pub struct OriginArgs {
     #[arg(long, default_value_t = false)]
     pub no_evasive: bool,
 
-    /// Emit findings as JSON instead of human-readable text
+    /// Emit findings as JSON lines in a terminal too, as piped or redirected output always
+    /// gets
     #[arg(long, default_value_t = false)]
     pub json: bool,
 }
