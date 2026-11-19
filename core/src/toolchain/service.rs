@@ -275,7 +275,14 @@ pub fn install_node_service(
 ) -> Result<(), Box<dyn std::error::Error>> {
     node::create(cli, data_dir)?;
     node::action("enable")?;
-    node::action("start")?;
+    // One that runs already may run an older node, as after the installer put a new one
+    // in its place, and would run that one until it started again: it is restarted.
+    let how = if node::status() == "running" {
+        "restart"
+    } else {
+        "start"
+    };
+    node::action(how)?;
     Ok(())
 }
 
