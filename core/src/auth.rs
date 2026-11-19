@@ -10,6 +10,7 @@
 //! node-key paste). Flags `--agree-tos` and `--no-prompt` make the flow
 //! scriptable; mismatched/missing flags error rather than silently prompting.
 
+use crate::api::SendApi;
 use serde::{Deserialize, Serialize};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -373,7 +374,7 @@ pub async fn perform_login(
         resolve_method(&mut flags).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     require_tos(&flags).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
-    let client = reqwest::Client::new();
+    let client = crate::api::client();
     let api_url = flags.api_url.trim_end_matches('/').to_string();
 
     let (api_key, user) = match method {
@@ -442,7 +443,7 @@ async fn verify_key(
     let res = client
         .post(format!("{api_url}/api/v1/cli/verify-key"))
         .json(&serde_json::json!({ "api_key": key }))
-        .send()
+        .send_api()
         .await?;
     let ok = res.status().is_success();
     let body: serde_json::Value = res.json().await.unwrap_or(serde_json::json!({}));
@@ -465,7 +466,7 @@ async fn password_login(
             "password": password,
             "key_name": hostname(),
         }))
-        .send()
+        .send_api()
         .await?;
     let ok = res.status().is_success();
     let body: serde_json::Value = res.json().await.unwrap_or(serde_json::json!({}));
@@ -491,7 +492,7 @@ async fn browser_login(
         .json(&serde_json::json!({
             "client_info": client_info(cli_version)
         }))
-        .send()
+        .send_api()
         .await?;
     if !res.status().is_success() {
         let body: serde_json::Value = res.json().await.unwrap_or(serde_json::json!({}));
@@ -540,7 +541,7 @@ async fn browser_login(
         let answer = client
             .post(format!("{api_url}/api/v1/cli/device/poll"))
             .json(&serde_json::json!({ "device_code": device_code }))
-            .send()
+            .send_api()
             .await;
 
         let body = match answer {
@@ -625,7 +626,7 @@ pub async fn authorize_existing_node(
             api_url.trim_end_matches('/')
         ))
         .json(&serde_json::json!({ "api_key": node_key, "force": force }))
-        .send()
+        .send_api()
         .await?;
     // Which of the two it was. One sentence for both left a person with a good key
     // retyping it while the server was the problem.
@@ -666,7 +667,7 @@ pub async fn provision_node(
             "hostname": hostname(),
             "name": name,
         }))
-        .send()
+        .send_api()
         .await?;
     let ok = res.status().is_success();
     let body: serde_json::Value = res.json().await.unwrap_or(serde_json::json!({}));
@@ -688,7 +689,7 @@ pub async fn list_nodes(
             account.api_url.trim_end_matches('/')
         ))
         .json(&serde_json::json!({ "api_key": account.api_key }))
-        .send()
+        .send_api()
         .await?;
     let ok = res.status().is_success();
     let body: serde_json::Value = res.json().await.unwrap_or(serde_json::json!({}));

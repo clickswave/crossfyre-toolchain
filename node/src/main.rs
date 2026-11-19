@@ -49,6 +49,7 @@ enum Cmd {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    cfx_core::api::name_client("crossfyre-node", env!("CARGO_PKG_VERSION"));
     let cli = Cli::parse();
     // The service manager calls back on a thread of its own, which makes its own runtime.
     #[cfg(windows)]

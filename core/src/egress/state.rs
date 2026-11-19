@@ -20,6 +20,7 @@ use cfx_tunnel::{Kind, Upstream};
 use serde_json::{Value, json};
 
 use super::gateway::{Gateway, Lease, Resolver, system_resolver};
+use crate::api::SendApi;
 
 /// The version of the `egress` object this node reads.
 pub const SETTINGS_VERSION: i64 = 1;
@@ -725,7 +726,7 @@ async fn post_settings(f: &Fetch<'_>, mut body: Value) -> Result<Value, String> 
         .post(&url)
         .json(&body)
         .timeout(FETCH_TIMEOUT)
-        .send()
+        .send_api()
         .await
         .map_err(|e| format!("the request failed: {}", e.without_url()))?;
     let code = resp.status();

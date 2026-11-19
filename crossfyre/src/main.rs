@@ -504,6 +504,7 @@ fn exec_node_supervise(
 // An error is printed as the sentence it is. Returned from `main`, Rust prints it
 // in debug form: in quotes, with any line break shown as a backslash and an n.
 fn main() -> std::process::ExitCode {
+    cfx_core::api::name_client("crossfyre", env!("CARGO_PKG_VERSION"));
     let outcome = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

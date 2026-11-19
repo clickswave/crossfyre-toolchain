@@ -19,6 +19,7 @@
 //! browser, which cannot run in CI; it is written to be correct against real tooling and is
 //! exercised manually. `crossfyre doctor` checks for `tshark` on PATH.
 
+use crate::api::SendApi;
 use std::collections::VecDeque;
 use std::error::Error;
 
@@ -304,7 +305,7 @@ pub async fn post_batch(
             "events": events,
             "ended": ended,
         }))
-        .send()
+        .send_api()
         .await?;
     let ok = res.status().is_success();
     let body: serde_json::Value = res.json().await.unwrap_or(serde_json::json!({}));
@@ -336,7 +337,7 @@ pub async fn post_seed_credentials(
             "token": cfg.token,
             "credentials": credentials,
         }))
-        .send()
+        .send_api()
         .await?;
     let ok = res.status().is_success();
     let body: serde_json::Value = res.json().await.unwrap_or(serde_json::json!({}));
@@ -446,7 +447,7 @@ pub async fn run(cfg: TraceConfig) -> Result<(), BoxErr> {
     let stdout = tshark.stdout.take().ok_or("tshark produced no stdout")?;
     let mut lines = BufReader::new(stdout).lines();
 
-    let client = reqwest::Client::new();
+    let client = crate::api::client();
     let mut batcher = Batcher::new(cfg.batch_size);
     let mut total = 0usize;
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(cfg.flush_secs.max(1)));

@@ -27,6 +27,7 @@
 use base64::Engine as _;
 use serde_json::{Value, json};
 
+use crate::api::SendApi;
 use crate::egress::gateway::Lease;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -133,7 +134,7 @@ pub async fn resolve(
             "credential_id": credential_id,
             "host": host,
         }))
-        .send()
+        .send_api()
         .await
         .map_err(|e| format!("resolve request failed: {e}"))?;
 

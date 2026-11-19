@@ -762,7 +762,7 @@ pub async fn run_proxy(cfg: TraceConfig) -> Result<(), BoxErr> {
     println!("  browsing captures into the session; Ctrl-C (or close the browser) to end.");
 
     // Batch + flush loop.
-    let post_client = reqwest::Client::new();
+    let post_client = crate::api::client();
     let mut batcher = Batcher::new(cfg.batch_size);
     let mut total = 0usize;
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(cfg.flush_secs.max(1)));

@@ -6,6 +6,7 @@ use std::sync::{Arc, OnceLock};
 use sysinfo::System;
 use tokio::sync::Semaphore;
 
+pub mod api;
 pub mod auth;
 pub mod creds;
 mod egress;
@@ -25,6 +26,7 @@ pub mod engine_link {
 pub mod os;
 pub mod toolchain;
 
+use api::SendApi;
 use toolchain::sudo_user::chown_to_invoking_user;
 
 /// Per-workflow metrics so we can log a real-time snapshot ("2 in flight,
@@ -480,7 +482,7 @@ async fn run_operation(cmd: serde_json::Value, ctx: OpCtx) {
                 // could claim another tenant's queued operations.
                 "api_key": api_key,
             }))
-            .send()
+            .send_api()
             .await;
 
         // Losing the race and failing to ask are NOT the same thing, and treating
@@ -1370,7 +1372,7 @@ pub async fn run_node_list(
         std::process::exit(1);
     };
 
-    let client = reqwest::Client::new();
+    let client = api::client();
     let nodes = auth::list_nodes(&client, &account).await?;
 
     if as_json {
@@ -1541,7 +1543,7 @@ pub async fn run_node_remove(
     // ── --inactive: only nodes the server no longer knows ───────────────
     if inactive {
         println!("  {}", dim("Nodes"));
-        let client = reqwest::Client::new();
+        let client = api::client();
         let mut removed = 0usize;
         for id in &ids {
             let paths = NodePaths::new(base, id);
@@ -1563,7 +1565,7 @@ pub async fn run_node_remove(
             let res = client
                 .post(format!("{}/api/v1/authorize-node", cfg.api_url))
                 .json(&serde_json::json!({ "api_key": cfg.api_key, "force": false }))
-                .send()
+                .send_api()
                 .await;
             match res {
                 Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => {
@@ -1657,7 +1659,7 @@ pub async fn run_init(
     field("Data directory", &data_dir.display().to_string());
     print_privilege_banner(false);
 
-    let client = reqwest::Client::new();
+    let client = api::client();
 
     // Enrol this host. Two routes, in order of how little the operator has to do:
     //
@@ -1928,7 +1930,7 @@ pub async fn run_init(
             "event": "initialization",
             "message": "Node successfully initialized on CLI"
         }))
-        .send()
+        .send_api()
         .await;
 
     if let Err(e) = status_res {
@@ -2179,11 +2181,11 @@ pub async fn refresh_node_state(
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Refreshing node state from controller...");
-    let client = reqwest::Client::new();
+    let client = api::client();
     let res = client
         .post(format!("{}/api/v1/authorize-node", config.api_url))
         .json(&serde_json::json!({ "api_key": &config.api_key, "force": force }))
-        .send()
+        .send_api()
         .await?;
 
     // 401 = the server doesn't know this api_key (node deleted / key revoked).
@@ -2682,7 +2684,7 @@ pub async fn run_daemon(
 
     // -- Validate API key before going online -------------------------------
     // This blocks the node from ever appearing online with a revoked key.
-    let http_client = reqwest::Client::new();
+    let http_client = api::client();
     let bench_client = bench_client();
     let validate_res = http_client
         .post(format!("{}/api/v1/node-status", config.api_url))
@@ -2707,7 +2709,7 @@ pub async fn run_daemon(
                 "host_seed": host_seed_str.clone()
             })
         }))
-        .send()
+        .send_api()
         .await;
 
     match validate_res {
@@ -2753,7 +2755,7 @@ pub async fn run_daemon(
         let resume_res = http_client
             .post(format!("{api_url}/api/v1/resume-pending"))
             .json(&serde_json::json!({ "api_key": api_key }))
-            .send()
+            .send_api()
             .await;
         match resume_res {
             Ok(r) if r.status().is_success() => {
@@ -3051,7 +3053,7 @@ pub async fn run_daemon(
                         "message": serde_json::Value::Null,
                         "host_status": host_status
                     }))
-                    .send()
+                    .send_api()
                     .await;
 
                 match status_res {

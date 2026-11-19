@@ -5,6 +5,7 @@
 use super::packaging::Found;
 use super::ui::{dim, done, error, fail, ok, section, step, title};
 use super::{ENGINES, config};
+use crate::api::SendApi;
 use std::path::Path;
 
 /// Render one check as a styled status line. Returns true when the check
@@ -197,10 +198,10 @@ pub async fn run(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
             let Ok(cfg) = toml::from_str::<crate::Config>(&text) else {
                 continue;
             };
-            let reachable = reqwest::Client::new()
+            let reachable = crate::api::client()
                 .get(format!("{}/api/v1", cfg.api_url))
                 .timeout(std::time::Duration::from_secs(5))
-                .send()
+                .send_api()
                 .await
                 .is_ok();
             let short = &id[..id.len().min(8)];
