@@ -1,0 +1,20 @@
+# Synthetic: A Drupal 10 page: the X-Generator header, the generator tag, and files under
+# sites/default.
+HTTP/1.1 200 OK
+date: Fri, 20 Nov 2026 06:00:00 GMT
+content-type: text/html; charset=UTF-8
+x-generator: Drupal 10 (https://www.drupal.org)
+x-drupal-cache: MISS
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Welcome</title>
+<meta name="Generator" content="Drupal 10 (https://www.drupal.org)" />
+<link rel="stylesheet" href="/sites/default/files/css/css_aBcD.css" />
+</head>
+<body>
+<script type="application/json" data-drupal-selector="drupal-settings-json">{}</script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+# Lab target log4shell at http://127.0.0.1:7009/, as toolmark kept it on 2026-11-20.
+HTTP/1.1 400 Bad Request
+content-type: text/html;charset=UTF-8
+content-language: en-US
+content-length: 277
+date: Thu, 19 Nov 2026 19:54:54 GMT
+connection: close
+
+<html><body><h1>Whitelabel Error Page</h1><p>This application has no explicit mapping for /error, so you are seeing this as a fallback.</p><div id='created'>Thu Nov 19 19:54:54 GMT 2026</div><div>There was an unexpected error (type=Bad Request, status=400).</div></body></html>

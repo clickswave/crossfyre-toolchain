@@ -1,0 +1,18 @@
+# Synthetic: A page from a Django site whose static files carry a hash of their content in
+# their names, as ManifestStaticFilesStorage writes them, and a Bootstrap layout.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Recipes</title>
+<link rel="stylesheet" href="/static/css/bootstrap.min.0c8a2f1b9d3e.css">
+<script src="/static/js/bootstrap.min.575d3de8fa36.js"></script>
+</head>
+<body>
+<div class="container-fluid"></div>
+</body>
+</html>

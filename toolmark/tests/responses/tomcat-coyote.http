@@ -1,0 +1,18 @@
+# Synthetic: A JSP application on Tomcat with the Coyote connector's Server header, which
+# older Tomcat versions sent by default.
+HTTP/1.1 200 OK
+server: Apache-Coyote/1.1
+set-cookie: JSESSIONID=
+content-type: text/html;charset=UTF-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Login</title>
+</head>
+<body>
+<form action="j_security_check" method="post"><input name="j_username"></form>
+</body>
+</html>

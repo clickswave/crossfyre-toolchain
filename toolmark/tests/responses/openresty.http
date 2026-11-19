@@ -1,0 +1,16 @@
+# Synthetic: An OpenResty front end answering for an application it proxies.
+HTTP/1.1 200 OK
+date: Fri, 20 Nov 2026 06:00:00 GMT
+content-type: text/html; charset=utf-8
+server: openresty/1.21.4.3
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Dashboard</title>
+</head>
+<body>
+<div id="main"></div>
+</body>
+</html>

@@ -1,0 +1,25 @@
+# Lab target dvwa at http://127.0.0.1:7002/, as toolmark kept it on 2026-11-20.
+# The body is cut after </head>.
+HTTP/1.1 200 OK
+date: Thu, 19 Nov 2026 19:54:42 GMT
+server: Apache/2.4.68 (Debian)
+x-powered-by: PHP/8.5.9
+expires: Tue, 23 Jun 2009 12:00:00 GMT
+cache-control: no-cache, must-revalidate
+pragma: no-cache
+vary: Accept-Encoding
+content-type: text/html;charset=utf-8
+
+<!DOCTYPE html>
+
+<html lang="en-GB">
+
+	<head>
+
+		<meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+
+		<title>Login :: Damn Vulnerable Web Application (DVWA)</title>
+
+		<link rel="stylesheet" type="text/css" href="dvwa/css/login.css" />
+
+	</head>

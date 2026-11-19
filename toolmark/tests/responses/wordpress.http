@@ -1,0 +1,20 @@
+# Synthetic: A WordPress front page: the generator tag, and theme and core assets.
+HTTP/1.1 200 OK
+date: Fri, 20 Nov 2026 06:00:00 GMT
+server: nginx
+content-type: text/html; charset=UTF-8
+link: <https://example.test/wp-json/>; rel="https://api.w.org/"
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Example Blog</title>
+<link rel="stylesheet" href="https://example.test/wp-content/themes/twentytwentyfour/style.css?ver=1.0" />
+<meta name="generator" content="WordPress 6.4.2" />
+</head>
+<body>
+<div class="wp-site-blocks"></div>
+<script src="https://example.test/wp-includes/js/wp-embed.min.js?ver=6.4.2"></script>
+</body>
+</html>

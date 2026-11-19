@@ -1,0 +1,16 @@
+# Synthetic: A page with jQuery inlined, which keeps its banner comment.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Portal</title>
+</head>
+<body>
+<script>/*! jQuery v3.7.1 | (c) OpenJS Foundation and other contributors | jquery.org/license */
+!function(e,t){}</script>
+</body>
+</html>

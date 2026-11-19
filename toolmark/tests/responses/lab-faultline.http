@@ -1,0 +1,23 @@
+# Lab target faultline at http://127.0.0.1:8088/, as toolmark kept it on 2026-11-20.
+# The body is cut after the opening body tag, and the line with the site's description
+# and title is left out.
+HTTP/1.1 200 OK
+server: nginx/1.20.2
+date: Thu, 19 Nov 2026 19:54:44 GMT
+content-type: text/html
+content-length: 15705
+connection: keep-alive
+etag: "xl5rqs"
+link: <./_app/immutable/assets/0.DgeAvnG9.css>; rel="preload"; as="style"; nopush, <./_app/immutable/assets/3.DbGZgV7r.css>; rel="preload"; as="style"; nopush, <./_app/immutable/entry/start.B6A-yTGe.js>; rel="modulepreload"; nopush, <./_app/immutable/chunks/D80V9GkY.js>; rel="modulepreload"; nopush, <./_app/immutable/chunks/Cvhc2KUN.js>; rel="modulepreload"; nopush, <./_app/immutable/chunks/BuFlayix.js>; rel="modulepreload"; nopush, <./_app/immutable/entry/app.C5lhTcN7.js>; rel="modulepreload"; nopush, <./_app/immutable/chunks/xihTtKlq.js>; rel="modulepreload"; nopush, <./_app/immutable/nodes/0.D5TVBDo7.js>; rel="modulepreload"; nopush, <./_app/immutable/chunks/BRNCnYSN.js>; rel="modulepreload"; nopush, <./_app/immutable/nodes/3.BCbk2p42.js>; rel="modulepreload"; nopush, <./_app/immutable/chunks/zmd4GuAA.js>; rel="modulepreload"; nopush, <./_app/immutable/chunks/CR_kX207.js>; rel="modulepreload"; nopush
+x-sveltekit-page: true
+
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<meta name="text-scale" content="scale" />
+		<link href="./_app/immutable/assets/0.DgeAvnG9.css" rel="stylesheet">
+		<link href="./_app/immutable/assets/3.DbGZgV7r.css" rel="stylesheet">
+	</head>
+	<body data-sveltekit-preload-data="hover">

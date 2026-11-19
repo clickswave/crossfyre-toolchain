@@ -1,0 +1,29 @@
+# Lab target bwapp at http://127.0.0.1:7007/, as toolmark kept it on 2026-11-20.
+# The body is cut after </head>.
+HTTP/1.1 200 OK
+date: Thu, 19 Nov 2026 19:54:40 GMT
+server: Apache/2.4.7 (Ubuntu)
+x-powered-by: PHP/5.5.9-1ubuntu4.14
+expires: Thu, 19 Nov 1981 08:52:00 GMT
+cache-control: no-store, no-cache, must-revalidate, post-check=0, pre-check=0
+pragma: no-cache
+vary: Accept-Encoding
+content-type: text/html
+
+<!DOCTYPE html>
+<html>
+
+<head>
+
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+
+<!--<link rel="stylesheet" type="text/css" href="https://fonts.googleapis.com/css?family=Architects+Daughter">-->
+<link rel="stylesheet" type="text/css" href="stylesheets/stylesheet.css" media="screen" />
+<link rel="shortcut icon" href="images/favicon.ico" type="image/x-icon" />
+
+<!--<script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>-->
+<script src="js/html5.js"></script>
+
+<title>bWAPP - Login</title>
+
+</head>

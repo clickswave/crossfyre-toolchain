@@ -1,0 +1,14 @@
+# Synthetic: A 404 from nginx behind a proxy that took the version out of Server. nginx's own
+# error page still names it.
+HTTP/1.1 404 Not Found
+server: nginx
+date: Fri, 20 Nov 2026 06:00:00 GMT
+content-type: text/html
+
+<html>
+<head><title>404 Not Found</title></head>
+<body>
+<center><h1>404 Not Found</h1></center>
+<hr><center>nginx/1.24.0</center>
+</body>
+</html>

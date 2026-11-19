@@ -1,0 +1,8 @@
+# Lab target mirage at http://127.0.0.1:7301/, as toolmark kept it on 2026-11-20.
+HTTP/1.1 200 OK
+server: nginx
+date: Thu, 19 Nov 2026 19:54:55 GMT
+content-type: text/html; charset=utf-8
+content-length: 820
+
+<!doctype html><html><head><title>mirage</title></head><body><h1>mirage</h1><ul><li><a href='/.env'>/.env</a></li><li><a href='/admin'>/admin</a></li><li><a href='/api/config'>/api/config</a></li><li><a href='/download'>/download</a></li><li><a href='/echo'>/echo</a></li><li><a href='/fetch'>/fetch</a></li><li><a href='/jsonp'>/jsonp</a></li><li><a href='/login'>/login</a></li><li><a href='/ping'>/ping</a></li><li><a href='/profile'>/profile</a></li><li><a href='/redirect'>/redirect</a></li><li><a href='/render'>/render</a></li><li><a href='/search'>/search</a></li><li><a href='/slow'>/slow</a></li><li><a href='/status'>/status</a></li><li><a href='/xml'>/xml</a></li></ul><hr><p><small>mirage: nothing here is vulnerable. Every finding reported against this target is a false positive.</small></p></body></html>

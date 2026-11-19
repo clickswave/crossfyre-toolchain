@@ -1,0 +1,184 @@
+# Lab target dvga at http://127.0.0.1:7006/, as toolmark kept it on 2026-11-20.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+content-length: 8136
+set-cookie: env=
+date: Thu, 19 Nov 2026 19:55:23 GMT
+
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  
+  <meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+<meta name="description" content="Damn Vulnerable GraphQL Application" />
+<meta name="author" content="Dolev F." />
+<link rel="shortcut icon" href="/static/favicon.ico" />
+<link href="/static/all.css" rel="stylesheet">
+<link rel="stylesheet" href="/static/extra.css" />
+
+<title>Damn Vulnerable GraphQL Application</title>
+
+<link href="/static/bootstrap/css/bootstrap.min.css" rel="stylesheet" />
+<link href="/static/simple-sidebar.css" rel="stylesheet" />
+
+</head>
+
+<body>
+  <div class="d-flex" id="wrapper">
+     <div class="bg-light border-right" id="sidebar-wrapper">
+    <div class="sidebar-heading"><center><img src="/static/images/dvgql_logo.png" width="230px" /></center></div>
+    <div class="list-group list-group-flush">
+    <a href="/" class="list-group-item list-group-item-action bg-light"><i class="fa fa-home"></i> Home</a>
+      <a href="/my_pastes" class="list-group-item list-group-item-action bg-light"><i class="fa fa-clipboard"></i> Private Pastes</a>
+      <a href="/public_pastes" class="list-group-item list-group-item-action bg-light"><i class="fa fa-users"></i> Public Pastes</a>
+      <a href="/create_paste" class="list-group-item list-group-item-action bg-light"><i class="fa fa-plus"></i> Create Paste</a>
+      <a href="/import_paste" class="list-group-item list-group-item-action bg-light"><i class="fa fa-download"></i> Import Paste</a>
+      <a href="/upload_paste" class="list-group-item list-group-item-action bg-light"><i class="fa fa-upload"></i> Upload Paste</a>
+    </div>
+    <hr>
+    <center><span><a href="https://github.com/dolevf/Damn-Vulnerable-GraphQL-Application" class="withlove" target="_blank"><i class="fa fa-star"></i> Star us on GitHub</a></span></center>
+</div>
+    <!-- /#sidebar-wrapper -->
+
+    
+  <!-- Page Content -->
+  <div id="page-content-wrapper">
+    <div>
+  <nav class="navbar navbar-expand-lg navbar-light bg-light border-bottom">
+    <button class="navbar-toggler" type="button" data-toggle="collapse" data-target="#navbarSupportedContent"
+      aria-controls="navbarSupportedContent" aria-expanded="false" aria-label="Toggle navigation">
+      <span class="navbar-toggler-icon"></span>
+    </button>
+
+    <div class="collapse navbar-collapse" id="navbarSupportedContent">
+      <ul class="navbar-nav ml-auto mt-2 mt-lg-0">
+        <li class="nav-item active">
+          <a class="nav-link" href="https://github.com/dolevf/Damn-Vulnerable-GraphQL-Application/issues"
+            target="_blank" id="navbarDropdown" role="button" aria-haspopup="true" aria-expanded="false">
+            <i class="fa fa-bug"></i>
+          </a>
+        </li>
+        <li class="nav-item active">
+          <a class="nav-link" href="mailto:dolev@blackhatgraphql.com,nick@blackhatgraphql.com">
+            <i class="fa fa-envelope"></i>
+          </a>
+        </li>
+        <li class="nav-item active dropdown">
+          <a class="nav-link dropdown-toggle" href="#" id="difficulty" role="button" data-toggle="dropdown"
+            aria-haspopup="true" aria-expanded="false">
+            <i class="fa fa-cubes"></i>
+          </a>
+          <div class="dropdown-menu dropdown-menu-right" aria-labelledby="difficultyDropDown">
+            <a class="dropdown-item" href="/difficulty/easy">Beginner  <i
+                class="fa fa-check"></i> </a>
+            <a class="dropdown-item" href="/difficulty/hard">Expert (Hardened) </a>
+          </div>
+        </li>
+        <li class="nav-item active dropdown">
+          <a class="nav-link dropdown-toggle" href="#" id="helpDropDown" role="button" data-toggle="dropdown"
+            aria-haspopup="true" aria-expanded="false">
+            <i class="fa fa-user"></i>
+          </a>
+          <div class="dropdown-menu dropdown-menu-right" aria-labelledby="helpDropDown">
+            <a class="dropdown-item" href="/audit">Audit</a>
+            <a class="dropdown-item" href="/solutions">Solutions</a>
+            <a class="dropdown-item" href="/about">About</a>
+            <hr />
+            <a class="dropdown-item" href="/start_over" style="color:darkorange">Rollback DVGA</a>
+          </div>
+        </li>
+      </ul>
+    </div>
+  </nav>
+</div>
+    <div class="container-fluid">
+      
+      <h1 class="mt-4">Damn Vulnerable GraphQL Application</h1>
+      <hr />
+      <h4>Welcome!</h4>
+      <p>
+        Damn Vulnerable GraphQL Application, or DVGA, is a vulnerable GraphQL implementation. DVGA allows learning how GraphQL can be exploited as well as defended in a safe environment.
+      </p>
+      <br />
+      <h4>Getting Started</h4>
+      <p>
+        If you aren't yet familiar with GraphQL, see the GraphQL Resources section below. Otherwise, start poking around and find loopholes! There are GraphQL
+        Implementation flaws as well as general application vulnerabilities.
+      </p>
+      <p>You can set a "game mode" in DVGA: A beginner level or expert level by clicking on the top bar menu's cube icon and choosing the level. This is a global setting that will apply to all clients (GUI or CLI)</p>
+      <p>If you are interacting with DVGA programmatically, you can also set the game mode by passing the HTTP Request Header <code>X-DVGA-MODE</code> set to either <code>Beginner</code> or <code>Expert</code> as values.</p>
+      <p>If the Header is not set, DVGA will default to <u>Beginner mode</u> or to whatever you previously set in the user interface.</p>
+      <br />
+      <h4>Difficulty Level Explanation</h4>
+      <h5>Beginner</h5>
+      <p>
+        DVGA's Beginner level is literally the default GraphQL implementation without any restrictions, security controls, or other protections. This is what you would get out of the box in most of the GraphQL implementations without hardening, with the addition of other custom vulnerabilities.
+      </p>
+      <h5>Hard</h5>
+      <p>DVGA's Hard level is a hardened GraphQL implementation which contains a few security controls against malicious queries, such as Cost Based Analysis, Query Depth, Field De-dup checks, etc.</p>
+      <br />
+      <h4>GraphQL Resources</h4>
+      <p>
+        To learn about GraphQL, and common GraphQL weaknesses and attacks, the following
+        resources may be beneficial:
+      </p>
+      <h5><i class="fa fa-play"></i> &nbsp; Videos</h5>
+      <ul>
+        <li>
+          <a href="https://www.youtube.com/watch?v=ZQL7tL2S0oQ" target="_blank">GraphQL in 40 Minutes</a>
+        </li>
+        <li>
+          <a href="https://www.youtube.com/watch?v=OQCgmftU-Og" target="_blank">Hacking GraphQL For Beginners</a>
+        </li>
+        <li>
+          <a href="https://www.youtube.com/watch?v=NPDp7GHmMa0&t=2580" target="_blank">LevelUp 0x05 - REST in Peace</a>
+        </li>
+      </ul>
+
+      <h5><i class="fa fa-newspaper"></i> &nbsp; Articles</h5>
+      <ul>
+        <li>
+          <a href="https://cheatsheetseries.owasp.org/cheatsheets/GraphQL_Cheat_Sheet.html" target="_blank">OWASP GraphQL Defense</a>
+        </li>
+        <li>
+          <a href="https://labs.bishopfox.com/tech-blog/design-considerations-for-secure-graphql-apis" target="_blank">BishopFox Labs - Design Considerations</a>
+        </li>
+      </ul>
+      <br />
+      <h4>Got Stuck?</h4>
+      <p>
+        Head over to the <a href="/solutions">Solutions</a> page to reveal
+        the challenge answers.
+      </p>
+      <br />
+      <h4>Bug Reporting</h4>
+      <p>
+        Found a bug? submit an issue on
+        <a href="https://github.com/dolevf/Damn-Vulnerable-GraphQL-Application/issues">GitHub</a>.
+      </p>
+    </div>
+  </div>
+  <!-- /#page-content-wrapper -->
+
+  </div>
+  <!-- /#wrapper -->
+
+  <!-- Bootstrap core JavaScript -->
+  <script src="/static/jquery/jquery.min.js"></script>
+  <script src="/static/bootstrap/js/bootstrap.bundle.min.js"></script>
+  <script src="/static/jquery/graphql.js"></script>
+
+  
+  <!-- Menu Toggle Script -->
+<script>
+  $("#menu-toggle").click(function (e) {
+    e.preventDefault();
+    $("#wrapper").toggleClass("toggled");
+  });
+</script>
+
+</body>
+
+</html>

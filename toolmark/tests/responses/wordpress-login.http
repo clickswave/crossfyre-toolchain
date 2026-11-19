@@ -1,0 +1,18 @@
+# Synthetic: WordPress's login page, which sets a cookie to check that cookies work.
+HTTP/1.1 200 OK
+date: Fri, 20 Nov 2026 06:00:00 GMT
+content-type: text/html; charset=UTF-8
+set-cookie: wordpress_test_cookie=
+x-frame-options: SAMEORIGIN
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Log In</title>
+<link rel="stylesheet" href="/wp-admin/css/login.min.css?ver=6.4.2" />
+</head>
+<body>
+<form name="loginform" id="loginform" action="/wp-login.php" method="post"></form>
+</body>
+</html>

@@ -1,0 +1,1263 @@
+{
+  "angular.http": [
+    {
+      "category": "JavaScript Framework",
+      "confidence": 25,
+      "cpe": "",
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "Angular",
+      "version": "17.0.8"
+    }
+  ],
+  "apache-php-in-server.http": [
+    {
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:apache:http_server:2.4.41:*:*:*:*:*:*:*",
+      "evidence": [
+        "header server: Apache/2.4.41 (Unix) PHP/7.4.3"
+      ],
+      "name": "Apache HTTP Server",
+      "version": "2.4.41"
+    },
+    {
+      "category": "Language",
+      "confidence": 45,
+      "cpe": "cpe:2.3:a:php:php:7.4.3:*:*:*:*:*:*:*",
+      "evidence": [
+        "cookie PHPSESSID"
+      ],
+      "name": "PHP",
+      "version": "7.4.3"
+    }
+  ],
+  "apache-version-in-error-page.http": [
+    {
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:apache:http_server:2.4.58:*:*:*:*:*:*:*",
+      "evidence": [
+        "header server: Apache"
+      ],
+      "name": "Apache HTTP Server",
+      "version": "2.4.58"
+    }
+  ],
+  "aspnet-headers-echoed.http": [
+    {
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:microsoft:internet_information_services:8.5:*:*:*:*:*:*:*",
+      "evidence": [
+        "header server: Microsoft-IIS/8.5"
+      ],
+      "name": "Microsoft IIS",
+      "version": "8.5"
+    },
+    {
+      "category": "Framework",
+      "confidence": 100,
+      "cpe": "cpe:2.3:a:microsoft:asp.net:4.0.30319:*:*:*:*:*:*:*",
+      "evidence": [
+        "header x-powered-by: ASP.NET",
+        "header x-aspnet-version: 4.0.30319"
+      ],
+      "name": "ASP.NET",
+      "version": "4.0.30319"
+    },
+    {
+      "category": "Framework",
+      "confidence": 50,
+      "cpe": "",
+      "evidence": [
+        "header x-powered-by: ASP.NET"
+      ],
+      "name": "ASP.NET Core",
+      "version": null
+    }
+  ],
+  "bootstrap.http": [
+    {
+      "category": "UI Framework",
+      "confidence": 25,
+      "cpe": "",
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "Bootstrap",
+      "version": "6"
+    }
+  ],
+  "cloudflare.http": [
+    {
+      "category": "CDN",
+      "confidence": 100,
+      "cpe": "",
+      "evidence": [
+        "header server: cloudflare",
+        "header cf-ray: 8e1f2a3b4c5d6e7f-BOM"
+      ],
+      "name": "Cloudflare",
+      "version": null
+    }
+  ],
+  "drupal.http": [
+    {
+      "category": "CMS",
+      "confidence": 100,
+      "cpe": "cpe:2.3:a:drupal:drupal:10:*:*:*:*:*:*:*",
+      "evidence": [
+        "meta generator: Drupal 10 (https://www.drupal.org)",
+        "header x-generator: Drupal 10 (https://www.drupal.org)",
+        "body pattern"
+      ],
+      "name": "Drupal",
+      "version": "10"
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Drupal"
+      ],
+      "name": "PHP",
+      "version": null
+    }
+  ],
+  "flask-session-cookie.http": [
+    {
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "",
+      "evidence": [
+        "header server: Werkzeug/3.0.1 Python/3.12.1"
+      ],
+      "name": "Werkzeug",
+      "version": "3.0.1"
+    },
+    {
+      "category": "Framework",
+      "confidence": 95,
+      "cpe": "",
+      "evidence": [
+        "cookie session",
+        "header server: Werkzeug/3.0.1 Python/3.12.1"
+      ],
+      "name": "Flask",
+      "version": null
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Werkzeug"
+      ],
+      "name": "Python",
+      "version": null
+    }
+  ],
+  "generator-content-first.http": [
+    {
+      "category": "CMS",
+      "confidence": 60,
+      "cpe": "cpe:2.3:a:wordpress:wordpress:6.5:*:*:*:*:*:*:*",
+      "evidence": [
+        "meta generator: WordPress 6.5"
+      ],
+      "name": "WordPress",
+      "version": "6.5"
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by WordPress"
+      ],
+      "name": "PHP",
+      "version": null
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by WordPress"
+      ],
+      "name": "MySQL",
+      "version": null
+    }
+  ],
+  "generator-past-60k.http": [
+    {
+      "category": "CMS",
+      "confidence": 60,
+      "cpe": "cpe:2.3:a:drupal:drupal:9:*:*:*:*:*:*:*",
+      "evidence": [
+        "meta generator: Drupal 9 (https://www.drupal.org)"
+      ],
+      "name": "Drupal",
+      "version": "9"
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Drupal"
+      ],
+      "name": "PHP",
+      "version": null
+    }
+  ],
+  "ghost.http": [
+    {
+      "category": "Framework",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:openjsf:express:*:*:*:*:*:node.js:*:*",
+      "evidence": [
+        "header x-powered-by: Express"
+      ],
+      "name": "Express",
+      "version": null
+    },
+    {
+      "category": "CMS",
+      "confidence": 85,
+      "cpe": "",
+      "evidence": [
+        "meta generator: Ghost 5.75",
+        "body pattern"
+      ],
+      "name": "Ghost",
+      "version": "5.75"
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Express"
+      ],
+      "name": "Node.js",
+      "version": null
+    }
+  ],
+  "gunicorn-django.http": [
+    {
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "",
+      "evidence": [
+        "header server: gunicorn/20.1.0"
+      ],
+      "name": "Gunicorn",
+      "version": "20.1.0"
+    },
+    {
+      "category": "Framework",
+      "confidence": 90,
+      "cpe": "",
+      "evidence": [
+        "cookie csrftoken",
+        "cookie django_language"
+      ],
+      "name": "Django",
+      "version": null
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Gunicorn"
+      ],
+      "name": "Python",
+      "version": null
+    }
+  ],
+  "iis-aspnet.http": [
+    {
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:microsoft:internet_information_services:10.0:*:*:*:*:*:*:*",
+      "evidence": [
+        "header server: Microsoft-IIS/10.0"
+      ],
+      "name": "Microsoft IIS",
+      "version": "10.0"
+    },
+    {
+      "category": "Framework",
+      "confidence": 100,
+      "cpe": "cpe:2.3:a:microsoft:asp.net:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "header x-powered-by: ASP.NET",
+        "header x-aspnet-version: 4.0.30319",
+        "cookie ASP.NET_SessionId"
+      ],
+      "name": "ASP.NET",
+      "version": null
+    },
+    {
+      "category": "Framework",
+      "confidence": 50,
+      "cpe": "",
+      "evidence": [
+        "header x-powered-by: ASP.NET"
+      ],
+      "name": "ASP.NET Core",
+      "version": null
+    }
+  ],
+  "iis-static.http": [
+    {
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:microsoft:internet_information_services:10.0:*:*:*:*:*:*:*",
+      "evidence": [
+        "header server: Microsoft-IIS/10.0"
+      ],
+      "name": "Microsoft IIS",
+      "version": "10.0"
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Microsoft IIS"
+      ],
+      "name": "ASP.NET",
+      "version": null
+    }
+  ],
+  "jetty.http": [
+    {
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "",
+      "evidence": [
+        "header server: Jetty(9.4.53.v20231009)"
+      ],
+      "name": "Jetty",
+      "version": "9.4.53."
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Jetty"
+      ],
+      "name": "Java",
+      "version": null
+    }
+  ],
+  "joomla-1-5.http": [
+    {
+      "category": "CMS",
+      "confidence": 85,
+      "cpe": "cpe:2.3:a:joomla:joomla\\!:1.5:*:*:*:*:*:*:*",
+      "evidence": [
+        "meta generator: Joomla! 1.5 - Open Source Content Management",
+        "body pattern"
+      ],
+      "name": "Joomla",
+      "version": "1.5"
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Joomla"
+      ],
+      "name": "PHP",
+      "version": null
+    }
+  ],
+  "joomla.http": [
+    {
+      "category": "CMS",
+      "confidence": 85,
+      "cpe": "cpe:2.3:a:joomla:joomla\\!:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "meta generator: Joomla! - Open Source Content Management",
+        "body pattern"
+      ],
+      "name": "Joomla",
+      "version": null
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Joomla"
+      ],
+      "name": "PHP",
+      "version": null
+    }
+  ],
+  "jquery-banner.http": [
+    {
+      "category": "JavaScript Library",
+      "confidence": 25,
+      "cpe": "cpe:2.3:a:jquery:jquery:3.7.1:*:*:*:*:*:*:*",
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "jQuery",
+      "version": "3.7.1"
+    }
+  ],
+  "jquery-file.http": [
+    {
+      "category": "JavaScript Library",
+      "confidence": 25,
+      "cpe": "cpe:2.3:a:jquery:jquery:3.6.0.:*:*:*:*:*:*:*",
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "jQuery",
+      "version": "3.6.0."
+    }
+  ],
+  "kestrel.http": [
+    {
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "",
+      "evidence": [
+        "header server: Kestrel"
+      ],
+      "name": "Kestrel",
+      "version": null
+    },
+    {
+      "category": "Framework",
+      "confidence": 50,
+      "cpe": "",
+      "evidence": [
+        "header server: Kestrel"
+      ],
+      "name": "ASP.NET Core",
+      "version": null
+    }
+  ],
+  "lab-bwapp.http": [
+    {
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:apache:http_server:2.4.7:*:*:*:*:*:*:*",
+      "evidence": [
+        "header server: Apache/2.4.7 (Ubuntu)"
+      ],
+      "name": "Apache HTTP Server",
+      "version": "2.4.7"
+    },
+    {
+      "category": "Language",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:php:php:5.5.9:*:*:*:*:*:*:*",
+      "evidence": [
+        "header x-powered-by: PHP/5.5.9-1ubuntu4.14"
+      ],
+      "name": "PHP",
+      "version": "5.5.9"
+    }
+  ],
+  "lab-directus.http": [],
+  "lab-dvga.http": [
+    {
+      "category": "UI Framework",
+      "confidence": 25,
+      "cpe": "",
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "Bootstrap",
+      "version": null
+    }
+  ],
+  "lab-dvwa.http": [
+    {
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:apache:http_server:2.4.68:*:*:*:*:*:*:*",
+      "evidence": [
+        "header server: Apache/2.4.68 (Debian)"
+      ],
+      "name": "Apache HTTP Server",
+      "version": "2.4.68"
+    },
+    {
+      "category": "Language",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:php:php:8.5.9:*:*:*:*:*:*:*",
+      "evidence": [
+        "header x-powered-by: PHP/8.5.9"
+      ],
+      "name": "PHP",
+      "version": "8.5.9"
+    }
+  ],
+  "lab-faultline.http": [
+    {
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:f5:nginx:1.20.2:*:*:*:*:*:*:*",
+      "evidence": [
+        "header server: nginx/1.20.2"
+      ],
+      "name": "Nginx",
+      "version": "1.20.2"
+    }
+  ],
+  "lab-juice-shop.http": [],
+  "lab-log4shell.http": [],
+  "lab-memos.http": [],
+  "lab-mirage.http": [
+    {
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:f5:nginx:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "header server: nginx"
+      ],
+      "name": "Nginx",
+      "version": null
+    }
+  ],
+  "lab-modsec-detectonly.http": [
+    {
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:f5:nginx:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "header server: nginx"
+      ],
+      "name": "Nginx",
+      "version": null
+    }
+  ],
+  "lab-modsec.http": [
+    {
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:f5:nginx:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "header server: nginx"
+      ],
+      "name": "Nginx",
+      "version": null
+    }
+  ],
+  "lab-mutillidae.http": [
+    {
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:apache:http_server:2.4.67:*:*:*:*:*:*:*",
+      "evidence": [
+        "header server: Apache/2.4.67 (Debian)"
+      ],
+      "name": "Apache HTTP Server",
+      "version": "2.4.67"
+    },
+    {
+      "category": "Language",
+      "confidence": 95,
+      "cpe": "cpe:2.3:a:php:php:8.5.7:*:*:*:*:*:*:*",
+      "evidence": [
+        "header x-powered-by: PHP/8.5.7",
+        "cookie PHPSESSID"
+      ],
+      "name": "PHP",
+      "version": "8.5.7"
+    }
+  ],
+  "lab-paperless.http": [
+    {
+      "category": "Framework",
+      "confidence": 45,
+      "cpe": "",
+      "evidence": [
+        "cookie csrftoken"
+      ],
+      "name": "Django",
+      "version": null
+    },
+    {
+      "category": "UI Framework",
+      "confidence": 25,
+      "cpe": "",
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "Bootstrap",
+      "version": null
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Django"
+      ],
+      "name": "Python",
+      "version": null
+    }
+  ],
+  "lab-railsgoat.http": [
+    {
+      "category": "UI Framework",
+      "confidence": 25,
+      "cpe": "",
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "Bootstrap",
+      "version": null
+    }
+  ],
+  "lab-tandoor.http": [
+    {
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:f5:nginx:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "header server: nginx"
+      ],
+      "name": "Nginx",
+      "version": null
+    },
+    {
+      "category": "Framework",
+      "confidence": 45,
+      "cpe": "",
+      "evidence": [
+        "cookie csrftoken"
+      ],
+      "name": "Django",
+      "version": null
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Django"
+      ],
+      "name": "Python",
+      "version": null
+    }
+  ],
+  "lab-vampi.http": [
+    {
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "",
+      "evidence": [
+        "header server: Werkzeug/2.2.3 Python/3.11.15"
+      ],
+      "name": "Werkzeug",
+      "version": "2.2.3"
+    },
+    {
+      "category": "Framework",
+      "confidence": 50,
+      "cpe": "",
+      "evidence": [
+        "header server: Werkzeug/2.2.3 Python/3.11.15"
+      ],
+      "name": "Flask",
+      "version": null
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Werkzeug"
+      ],
+      "name": "Python",
+      "version": null
+    }
+  ],
+  "lab-vulnerableapp.http": [
+    {
+      "category": "UI Framework",
+      "confidence": 25,
+      "cpe": "",
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "Bootstrap",
+      "version": null
+    }
+  ],
+  "lab-wikijs.http": [
+    {
+      "category": "Framework",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:openjsf:express:*:*:*:*:*:node.js:*:*",
+      "evidence": [
+        "header x-powered-by: Express"
+      ],
+      "name": "Express",
+      "version": null
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Express"
+      ],
+      "name": "Node.js",
+      "version": null
+    }
+  ],
+  "lab-xssmaze.http": [],
+  "laravel.http": [
+    {
+      "category": "Framework",
+      "confidence": 90,
+      "cpe": "",
+      "evidence": [
+        "cookie laravel_session",
+        "cookie XSRF-TOKEN"
+      ],
+      "name": "Laravel",
+      "version": null
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Laravel"
+      ],
+      "name": "PHP",
+      "version": null
+    }
+  ],
+  "litespeed-php.http": [
+    {
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "",
+      "evidence": [
+        "header server: LiteSpeed"
+      ],
+      "name": "LiteSpeed",
+      "version": null
+    },
+    {
+      "category": "Language",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:php:php:8.2.12:*:*:*:*:*:*:*",
+      "evidence": [
+        "header x-powered-by: PHP/8.2.12"
+      ],
+      "name": "PHP",
+      "version": "8.2.12"
+    }
+  ],
+  "long-server-header.http": [
+    {
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:apache:http_server:2.4.62:*:*:*:*:*:*:*",
+      "evidence": [
+        "header server: Apache/2.4.62 (Unix) OpenSSL/3.0.13 mod_perl/2.0.12 Perl/v5.38.2 mod_wsgi/5.0.0 …"
+      ],
+      "name": "Apache HTTP Server",
+      "version": "2.4.62"
+    }
+  ],
+  "magento.http": [
+    {
+      "category": "CMS",
+      "confidence": 70,
+      "cpe": "",
+      "evidence": [
+        "cookie X-Magento-Vary",
+        "body pattern"
+      ],
+      "name": "Magento",
+      "version": null
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Magento"
+      ],
+      "name": "PHP",
+      "version": null
+    }
+  ],
+  "nextjs-version-in-page.http": [
+    {
+      "category": "JavaScript Framework",
+      "confidence": 25,
+      "cpe": "",
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "Next.js",
+      "version": "14.0.4"
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Next.js"
+      ],
+      "name": "React",
+      "version": null
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Next.js"
+      ],
+      "name": "Node.js",
+      "version": null
+    }
+  ],
+  "nextjs.http": [
+    {
+      "category": "JavaScript Framework",
+      "confidence": 75,
+      "cpe": "",
+      "evidence": [
+        "header x-powered-by: Next.js",
+        "body pattern"
+      ],
+      "name": "Next.js",
+      "version": null
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Next.js"
+      ],
+      "name": "React",
+      "version": null
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Next.js"
+      ],
+      "name": "Node.js",
+      "version": null
+    }
+  ],
+  "nginx-version-in-error-page.http": [
+    {
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:f5:nginx:1.24.0:*:*:*:*:*:*:*",
+      "evidence": [
+        "header server: nginx"
+      ],
+      "name": "Nginx",
+      "version": "1.24.0"
+    }
+  ],
+  "nuxt.http": [
+    {
+      "category": "JavaScript Framework",
+      "confidence": 25,
+      "cpe": "",
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "Nuxt.js",
+      "version": null
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Nuxt.js"
+      ],
+      "name": "Vue.js",
+      "version": null
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Nuxt.js"
+      ],
+      "name": "Node.js",
+      "version": null
+    }
+  ],
+  "openresty.http": [
+    {
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:openresty:openresty:1.21.4.3:*:*:*:*:*:*:*",
+      "evidence": [
+        "header server: openresty/1.21.4.3"
+      ],
+      "name": "OpenResty",
+      "version": "1.21.4.3"
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by OpenResty"
+      ],
+      "name": "Nginx",
+      "version": null
+    }
+  ],
+  "rails.http": [
+    {
+      "category": "Framework",
+      "confidence": 70,
+      "cpe": "",
+      "evidence": [
+        "cookie _session_id",
+        "body pattern"
+      ],
+      "name": "Ruby on Rails",
+      "version": null
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Ruby on Rails"
+      ],
+      "name": "Ruby",
+      "version": null
+    }
+  ],
+  "react.http": [
+    {
+      "category": "JavaScript Framework",
+      "confidence": 25,
+      "cpe": "",
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "React",
+      "version": null
+    }
+  ],
+  "shopify.http": [
+    {
+      "category": "Ecommerce",
+      "confidence": 100,
+      "cpe": "",
+      "evidence": [
+        "header x-shopify-stage: production",
+        "header x-sorting-hat-shopid: 12345678",
+        "body pattern"
+      ],
+      "name": "Shopify",
+      "version": null
+    }
+  ],
+  "spring-trace.http": [
+    {
+      "category": "Web Server",
+      "confidence": 45,
+      "cpe": "cpe:2.3:a:apache:tomcat:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "cookie JSESSIONID"
+      ],
+      "name": "Apache Tomcat",
+      "version": null
+    },
+    {
+      "category": "Framework",
+      "confidence": 70,
+      "cpe": "",
+      "evidence": [
+        "cookie JSESSIONID",
+        "body pattern"
+      ],
+      "name": "Spring",
+      "version": null
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Apache Tomcat"
+      ],
+      "name": "Java",
+      "version": null
+    }
+  ],
+  "squarespace.http": [
+    {
+      "category": "CMS",
+      "confidence": 75,
+      "cpe": "",
+      "evidence": [
+        "header server: Squarespace",
+        "body pattern"
+      ],
+      "name": "Squarespace",
+      "version": null
+    }
+  ],
+  "tomcat-coyote.http": [
+    {
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:apache:http_server:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "header server: Apache-Coyote/1.1"
+      ],
+      "name": "Apache HTTP Server",
+      "version": null
+    },
+    {
+      "category": "Web Server",
+      "confidence": 95,
+      "cpe": "cpe:2.3:a:apache:tomcat:1.1:*:*:*:*:*:*:*",
+      "evidence": [
+        "header server: Apache-Coyote/1.1",
+        "cookie JSESSIONID"
+      ],
+      "name": "Apache Tomcat",
+      "version": "1.1"
+    },
+    {
+      "category": "Framework",
+      "confidence": 45,
+      "cpe": "",
+      "evidence": [
+        "cookie JSESSIONID"
+      ],
+      "name": "Spring",
+      "version": null
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Apache Tomcat"
+      ],
+      "name": "Java",
+      "version": null
+    }
+  ],
+  "tomcat-error-page.http": [
+    {
+      "category": "Web Server",
+      "confidence": 45,
+      "cpe": "cpe:2.3:a:apache:tomcat:9.0.83:*:*:*:*:*:*:*",
+      "evidence": [
+        "cookie JSESSIONID"
+      ],
+      "name": "Apache Tomcat",
+      "version": "9.0.83"
+    },
+    {
+      "category": "Framework",
+      "confidence": 45,
+      "cpe": "",
+      "evidence": [
+        "cookie JSESSIONID"
+      ],
+      "name": "Spring",
+      "version": null
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Apache Tomcat"
+      ],
+      "name": "Java",
+      "version": null
+    }
+  ],
+  "varnish.http": [
+    {
+      "category": "Caching",
+      "confidence": 100,
+      "cpe": "",
+      "evidence": [
+        "header via: 1.1 varnish (Varnish/7.4)",
+        "header x-varnish: 32770 3"
+      ],
+      "name": "Varnish",
+      "version": null
+    }
+  ],
+  "vue.http": [
+    {
+      "category": "JavaScript Framework",
+      "confidence": 25,
+      "cpe": "",
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "Vue.js",
+      "version": null
+    }
+  ],
+  "wix.http": [
+    {
+      "category": "CMS",
+      "confidence": 75,
+      "cpe": "",
+      "evidence": [
+        "header x-wix-request-id: 1700000000.123456789",
+        "body pattern"
+      ],
+      "name": "Wix",
+      "version": null
+    }
+  ],
+  "wordpress-login.http": [
+    {
+      "category": "CMS",
+      "confidence": 45,
+      "cpe": "cpe:2.3:a:wordpress:wordpress:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "cookie wordpress_test_cookie"
+      ],
+      "name": "WordPress",
+      "version": null
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by WordPress"
+      ],
+      "name": "PHP",
+      "version": null
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by WordPress"
+      ],
+      "name": "MySQL",
+      "version": null
+    }
+  ],
+  "wordpress-plugin-generator-first.http": [
+    {
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:apache:http_server:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "header server: Apache"
+      ],
+      "name": "Apache HTTP Server",
+      "version": null
+    },
+    {
+      "category": "CMS",
+      "confidence": 25,
+      "cpe": "cpe:2.3:a:wordpress:wordpress:6.4.2:*:*:*:*:*:*:*",
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "WordPress",
+      "version": "6.4.2"
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by WordPress"
+      ],
+      "name": "PHP",
+      "version": null
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by WordPress"
+      ],
+      "name": "MySQL",
+      "version": null
+    }
+  ],
+  "wordpress.http": [
+    {
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:f5:nginx:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "header server: nginx"
+      ],
+      "name": "Nginx",
+      "version": null
+    },
+    {
+      "category": "CMS",
+      "confidence": 85,
+      "cpe": "cpe:2.3:a:wordpress:wordpress:6.4.2:*:*:*:*:*:*:*",
+      "evidence": [
+        "meta generator: WordPress 6.4.2",
+        "body pattern"
+      ],
+      "name": "WordPress",
+      "version": "6.4.2"
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by WordPress"
+      ],
+      "name": "PHP",
+      "version": null
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by WordPress"
+      ],
+      "name": "MySQL",
+      "version": null
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+# Synthetic: A diagnostics page that prints the response headers it sent, so X-AspNet-Version
+# is in the body as well as in the headers.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+server: Microsoft-IIS/8.5
+x-aspnet-version: 4.0.30319
+x-powered-by: ASP.NET
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Headers</title>
+</head>
+<body>
+<pre>
+Server: Microsoft-IIS/8.5
+X-AspNet-Version: 4.0.30319
+X-Powered-By: ASP.NET
+</pre>
+</body>
+</html>

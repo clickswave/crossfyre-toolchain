@@ -603,3 +603,6 @@ fn first_n(s: &str, n: usize) -> String {
         s[..end].to_string()
     }
 }
+
+#[cfg(test)]
+mod golden;

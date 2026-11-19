@@ -1,0 +1,44 @@
+# Lab target directus at http://127.0.0.1:19082/, as toolmark kept it on 2026-11-20.
+# The body is cut after </head>.
+HTTP/1.1 200 OK
+content-security-policy: script-src 'self' 'unsafe-eval';worker-src 'self' blob:;child-src 'self' blob:;img-src 'self' data: blob: https://raw.githubusercontent.com https://avatars.githubusercontent.com;media-src 'self';connect-src 'self' https://* wss://*;default-src 'self';base-uri 'self';font-src 'self' https: data:;form-action 'self';frame-ancestors 'self';object-src 'none';script-src-attr 'none';style-src 'self' https: 'unsafe-inline'
+x-powered-by: Directus
+cache-control: no-cache
+vary: Origin, Cache-Control
+content-type: text/html; charset=utf-8
+content-length: 1766
+etag: W/"6e6-TftXKhTKXK+dqEIaF+DDT25C0Mo"
+date: Thu, 19 Nov 2026 19:55:45 GMT
+connection: keep-alive
+keep-alive: timeout=5
+
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<base href="/admin/" />
+		<meta http-equiv="X-UA-Compatible" content="IE=edge" />
+		<meta
+			name="viewport"
+			content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=1, viewport-fit=cover"
+		/>
+		<meta name="format-detection" content="telephone=no,date=no,address=no,email=no,url=no" />
+		<meta name="HandheldFriendly" content="true" />
+		<meta name="MobileOptimized" content="width" />
+		<meta name="color-scheme" content="dark light" />
+		<meta name="mobile-web-app-capable" content="yes" />
+		<meta name="apple-mobile-web-app-capable" content="yes" />
+		<meta name="apple-mobile-web-app-status-bar-style" content="default" />
+		<title>Loading&hellip;</title>
+		<style id="theme"></style>
+		<style id="custom-css"></style>
+		
+		<script type="module" crossorigin src="./assets/index.CkhsPM4d.entry.js"></script>
+		<link rel="modulepreload" crossorigin href="./assets/runtime-core.esm-bundler-zlSgKseS.js">
+		<link rel="modulepreload" crossorigin href="./assets/vue.runtime.esm-bundler-BY4gCD-H.js">
+		<link rel="modulepreload" crossorigin href="./assets/pinia.cgdBTKfv.entry.js">
+		<link rel="modulepreload" crossorigin href="./assets/index-D6e3woEg.js">
+		<link rel="modulepreload" crossorigin href="./assets/vue-i18n.CsbF7Z1r.entry.js">
+		<link rel="modulepreload" crossorigin href="./assets/vue-router.BocT7zdJ.entry.js">
+		<link rel="stylesheet" crossorigin href="./assets/index-wHBrvHE8.css">
+	</head>

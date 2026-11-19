@@ -1,0 +1,16 @@
+# Synthetic: A Server header longer than the 80 characters evidence keeps of it.
+HTTP/1.1 200 OK
+date: Fri, 20 Nov 2026 06:00:00 GMT
+server: Apache/2.4.62 (Unix) OpenSSL/3.0.13 mod_perl/2.0.12 Perl/v5.38.2 mod_wsgi/5.0.0 Python/3.12 PHP/8.3.4
+content-type: text/html
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>It works</title>
+</head>
+<body>
+<h1>It works!</h1>
+</body>
+</html>

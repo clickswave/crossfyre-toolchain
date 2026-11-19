@@ -1,0 +1,9 @@
+# Lab target vampi at http://127.0.0.1:7005/, as toolmark kept it on 2026-11-20.
+HTTP/1.1 200 OK
+server: Werkzeug/2.2.3 Python/3.11.15
+date: Thu, 19 Nov 2026 19:55:19 GMT
+content-type: application/json
+content-length: 271
+connection: close
+
+{ "message": "VAmPI the Vulnerable API", "help": "VAmPI is a vulnerable on purpose API. It was created in order to evaluate the efficiency of third party tools in identifying vulnerabilities in APIs but it can also be used in learning/teaching purposes.", "vulnerable":1}

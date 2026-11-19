@@ -1,0 +1,9 @@
+# Synthetic: Tomcat 9's own 404 page. It sends no Server header, and the version is at the
+# foot of the page.
+HTTP/1.1 404 Not Found
+set-cookie: JSESSIONID=
+content-type: text/html;charset=utf-8
+content-language: en
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!doctype html><html lang="en"><head><title>HTTP Status 404 - Not Found</title></head><body><h1>HTTP Status 404 - Not Found</h1><hr class="line" /><p><b>Type</b> Status Report</p><p><b>Description</b> The origin server did not find a current representation for the target resource.</p><hr class="line" /><h3>Apache Tomcat/9.0.83</h3></body></html>
