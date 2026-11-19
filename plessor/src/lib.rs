@@ -20,52 +20,88 @@
 //!   under the capture core can depend on this crate to get it.
 //! - [`race`], for the check-then-write window, which needs careful ordering and is
 //!   worth exactly nothing reimplemented casually somewhere else.
+//!
+//! The scanner itself, its daemon, the daemon's storage and the command line are behind
+//! the `daemon` feature, which is on by default and which the binary needs. Without it
+//! this library is [`rawhttp`] and [`scope`] alone, which is what a crate that only
+//! sends requests links: it gets no daemon and no database.
 
+#[cfg(feature = "daemon")]
 mod authz;
+#[cfg(feature = "daemon")]
 mod chain;
+#[cfg(feature = "daemon")]
 mod client_tui;
+#[cfg(feature = "daemon")]
 mod daemon;
+#[cfg(feature = "daemon")]
 mod deserial;
+#[cfg(feature = "daemon")]
 mod discover;
+#[cfg(feature = "daemon")]
 mod dsl;
+#[cfg(feature = "daemon")]
 mod engine;
+#[cfg(feature = "daemon")]
 mod exposure;
+#[cfg(feature = "daemon")]
 mod flow;
+#[cfg(feature = "daemon")]
 mod fuzz;
+#[cfg(feature = "daemon")]
 mod graphql;
+#[cfg(feature = "daemon")]
 mod inject;
+#[cfg(feature = "daemon")]
 pub mod libs;
+#[cfg(feature = "daemon")]
 mod oast;
+#[cfg(feature = "daemon")]
 mod probe;
+#[cfg(feature = "daemon")]
 pub mod race;
 pub mod rawhttp;
 pub use cfx_scope as scope;
+#[cfg(feature = "daemon")]
 mod secrets;
+#[cfg(feature = "daemon")]
 mod smuggle;
+#[cfg(feature = "daemon")]
 mod solver;
+#[cfg(feature = "daemon")]
 mod ssrf;
+#[cfg(feature = "daemon")]
 mod tamper;
+#[cfg(feature = "daemon")]
 mod template;
 // Tests for the request guards and the scope fence, counted at a socket like
 // writes_rail below.
 #[cfg(test)]
+#[cfg(feature = "daemon")]
 mod action_rail;
 #[cfg(test)]
+#[cfg(feature = "daemon")]
 mod scope_rail;
 // One test for the rail five engines each had to learn separately. Not a module
 // with anything in it: the test IS the artefact.
 #[cfg(test)]
+#[cfg(feature = "daemon")]
 mod writes_rail;
+#[cfg(feature = "daemon")]
 mod xml;
 
+#[cfg(feature = "daemon")]
 use crate::libs::cli_args::{Cli, Commands};
+#[cfg(feature = "daemon")]
 use clap::CommandFactory;
+#[cfg(feature = "daemon")]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 /// Run a parsed command line.
 ///
 /// Here rather than in `main` so the binary is argument parsing and a call, and so the
 /// dispatch can be exercised without spawning a process.
+#[cfg(feature = "daemon")]
 pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Plessor is stateless: no DB, a vulnerability-detection TCP service.
     if matches!(cli.command, Some(Commands::Daemon)) {
@@ -142,6 +178,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 /// not ask (the node sends its own scans). A templates directory goes as an
 /// absolute path, because the daemon resolves it from its own working directory,
 /// which is wherever its service started it.
+#[cfg(feature = "daemon")]
 fn scan_request(target: &str, templates: Option<&str>) -> Result<serde_json::Value, String> {
     let mut req = serde_json::json!({
         "operation": "scan",
@@ -166,6 +203,7 @@ fn scan_request(target: &str, templates: Option<&str>) -> Result<serde_json::Val
 /// than its target, so URLs from two hosts in one request would test only the
 /// first host's and say nothing about the rest. Origins keep the order their first
 /// URL arrived in.
+#[cfg(feature = "daemon")]
 fn inject_requests(
     urls: &[String],
     cookie: Option<&str>,
@@ -235,6 +273,7 @@ fn inject_requests(
 /// Write `bytes` to stdout. A reader that stops early, as `head` does, closes the pipe,
 /// and that is not an error: the rest was not wanted. clap_complete panics on any failed
 /// write, so what it generates is kept in memory and written from here.
+#[cfg(feature = "daemon")]
 fn print_all(bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut out = std::io::stdout().lock();
@@ -244,6 +283,7 @@ fn print_all(bytes: &[u8]) -> std::io::Result<()> {
     }
 }
 
+#[cfg(feature = "daemon")]
 async fn send_stream(
     daemon: &dguard::Daemon,
     req: serde_json::Value,
@@ -307,6 +347,7 @@ async fn send_stream(
 }
 
 #[cfg(test)]
+#[cfg(feature = "daemon")]
 mod tests {
     use super::{inject_requests, scan_request};
 
