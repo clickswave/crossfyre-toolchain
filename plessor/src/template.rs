@@ -19,6 +19,19 @@ pub struct Template {
     pub info: Info,
     #[serde(default, alias = "requests")]
     pub http: Vec<HttpReq>,
+    /// The text it was read from, so that a scan taken up again can tell a template
+    /// edited under the same id from the one it was planned with.
+    #[serde(skip)]
+    pub source: String,
+}
+
+impl Template {
+    /// The template `text` holds, or None when it is not one this engine reads.
+    fn parse(text: &str) -> Option<Template> {
+        let mut template: Template = serde_yaml::from_str(text).ok()?;
+        template.source = text.to_string();
+        Some(template)
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -993,7 +1006,7 @@ http:
 pub static BUILTIN: LazyLock<Vec<Template>> = LazyLock::new(|| {
     BUILTIN_YAML
         .iter()
-        .filter_map(|y| serde_yaml::from_str::<Template>(y).ok())
+        .filter_map(|y| Template::parse(y))
         .collect()
 });
 
@@ -1006,7 +1019,7 @@ use pack::PACK_YAML;
 pub static PACK: LazyLock<Vec<Template>> = LazyLock::new(|| {
     PACK_YAML
         .iter()
-        .filter_map(|(_, y)| serde_yaml::from_str::<Template>(y).ok())
+        .filter_map(|(_, y)| Template::parse(y))
         .filter(|t| !t.http.is_empty())
         .collect()
 });
@@ -1049,7 +1062,7 @@ fn load_dir_into(dir: &std::path::Path, out: &mut Vec<Template>) {
             continue;
         }
         if let Ok(text) = std::fs::read_to_string(&path)
-            && let Ok(t) = serde_yaml::from_str::<Template>(&text)
+            && let Some(t) = Template::parse(&text)
             && !t.http.is_empty()
         {
             out.push(t);

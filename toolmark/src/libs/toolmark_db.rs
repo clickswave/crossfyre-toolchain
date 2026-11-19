@@ -225,29 +225,34 @@ fn gzipped(body: &[u8]) -> Vec<u8> {
     gz.finish().unwrap_or_default()
 }
 
+/// `headers` as an observation keeps them, each as [name, value] in the order they came:
+/// a Set-Cookie with only the cookie's name, which signatures match, no value for a header
+/// that carries a credential, as an Authorization header does, and every other value with
+/// the URLs in it made safe, as a Location carrying an authorization code needs.
+fn kept_headers(headers: &[(String, String)]) -> Vec<Value> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            let kept = if name == "set-cookie" {
+                let cookie = value.split(['=', ';']).next().unwrap_or_default();
+                Value::String(format!("{}=", cookie.trim()))
+            } else if cfx_db::scans::secret_name(name) {
+                Value::Null
+            } else {
+                Value::String(cfx_db::scans::safe_text(value))
+            };
+            serde_json::json!([name, kept])
+        })
+        .collect()
+}
+
 impl Observer for ScanObserver {
-    /// The headers are kept with no value for one that carries a credential, as an
-    /// Authorization header does, except that a Set-Cookie keeps the cookie's name, which
-    /// signatures match. The body is kept as read, gzipped.
+    /// The headers are kept as [`kept_headers`] keeps them, and the body as read, gzipped.
     async fn observed(&self, o: Observation<'_>) {
         let Some(scan) = &self.scan else {
             return;
         };
-        let headers: Vec<Value> = o
-            .headers
-            .iter()
-            .map(|(name, value)| {
-                let kept = if name == "set-cookie" {
-                    let cookie = value.split(['=', ';']).next().unwrap_or_default();
-                    Value::String(format!("{}=", cookie.trim()))
-                } else if cfx_db::scans::secret_name(name) {
-                    Value::Null
-                } else {
-                    Value::String(value.clone())
-                };
-                serde_json::json!([name, kept])
-            })
-            .collect();
+        let headers = kept_headers(o.headers);
         let body = self.keep_body.then(|| gzipped(o.body));
         let kept = async {
             let mut tx = self.db.pool.begin().await?;
@@ -274,5 +279,36 @@ impl Observer for ScanObserver {
         if let Err(e) = kept {
             eprintln!("[toolmark] could not keep what the scan saw: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_header_keeps_no_credential_and_no_url_that_carried_one() {
+        let seen = [
+            ("location", "https://app.example/callback?code=c-1&state=s"),
+            ("refresh", "0; url=https://app.example/?token=t-1"),
+            ("link", "<https://app.example/next?sig=g-1>; rel=\"next\""),
+            ("content-location", "https://u:p-1@app.example/a"),
+            ("set-cookie", "sid=k-1; Path=/; HttpOnly"),
+            ("authorization", "Bearer b-1"),
+            ("server", "Apache/2.4.49 (Debian)"),
+        ]
+        .map(|(name, value)| (name.to_string(), value.to_string()));
+        assert_eq!(
+            Value::Array(kept_headers(&seen)),
+            serde_json::json!([
+                ["location", "https://app.example/callback?code=&state=s"],
+                ["refresh", "0; url=https://app.example/?token="],
+                ["link", "<https://app.example/next?sig=>; rel=\"next\""],
+                ["content-location", "https://app.example/a"],
+                ["set-cookie", "sid="],
+                ["authorization", null],
+                ["server", "Apache/2.4.49 (Debian)"],
+            ])
+        );
     }
 }

@@ -1,5 +1,6 @@
--- A template scan's plan, and the templates it was made from: a digest of their ids and
--- the version that ran them. A scan taken up again under other templates plans again.
+-- A template scan's plan, and the templates it was made from: a digest of each template
+-- as it was written and of the version that ran them. A scan taken up again under other
+-- templates, or one edited since, plans again.
 CREATE TABLE plans (
     scan_id TEXT PRIMARY KEY REFERENCES scans (id) ON DELETE CASCADE,
     pack    TEXT NOT NULL

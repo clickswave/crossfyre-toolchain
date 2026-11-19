@@ -518,13 +518,22 @@ pub async fn run<L: crate::ledger::Ledger>(
                 }
             })
             .collect();
+        // The templates as they are written: one edited under the same id makes another
+        // pack, and the order a folder happens to be read in does not.
         let pack_digest = {
             use sha2::Digest;
+            let mut templates: Vec<(&str, &str)> = template::BUILTIN
+                .iter()
+                .chain(pack.iter().copied())
+                .chain(external.iter())
+                .map(|t| (t.id.as_str(), t.source.as_str()))
+                .collect();
+            templates.sort_unstable();
             let mut digest = sha2::Sha256::new();
             digest.update(env!("CARGO_PKG_VERSION"));
-            for t in &planned {
-                digest.update(b"\n");
-                digest.update(t.id.as_bytes());
+            for part in templates.into_iter().flat_map(|(id, source)| [id, source]) {
+                digest.update((part.len() as u64).to_le_bytes());
+                digest.update(part);
             }
             format!("{:x}", digest.finalize())
         };
@@ -1007,6 +1016,8 @@ mod ledger_tests {
 
     #[derive(Default)]
     struct Kept {
+        /// The pack the scan was planned under.
+        pack: Mutex<String>,
         planned: Mutex<Vec<(String, State, Option<&'static str>)>>,
         states: Mutex<Vec<(String, State)>>,
         /// What `plan` answers for a scan taken up again: the templates it had run, and
@@ -1016,7 +1027,8 @@ mod ledger_tests {
     }
 
     impl Ledger for Kept {
-        async fn plan(&self, _pack: &str, templates: &[Planned]) -> Planning {
+        async fn plan(&self, pack: &str, templates: &[Planned]) -> Planning {
+            *self.pack.lock().unwrap() = pack.to_string();
             *self.planned.lock().unwrap() = templates
                 .iter()
                 .map(|t| (t.id.clone(), t.state, t.reason))
@@ -1061,13 +1073,20 @@ mod ledger_tests {
 
     /// A scan of the target on `port` for the templates [`ASKED`], and what it said.
     async fn scan(port: u16, ledger: Arc<Kept>) -> Vec<Value> {
-        let params: ScanParams = serde_json::from_value(json!({
+        scan_with(port, json!({ "only": ASKED }), ledger).await
+    }
+
+    /// A scan of the target on `port` with `asked` among its settings, and what it said.
+    async fn scan_with(port: u16, asked: Value, ledger: Arc<Kept>) -> Vec<Value> {
+        let mut params = json!({
             "target": format!("http://127.0.0.1:{port}/"),
             "evasive": false,
             "timeout_ms": 2000,
-            "only": ASKED,
-        }))
-        .unwrap();
+        });
+        if let (Some(params), Value::Object(asked)) = (params.as_object_mut(), asked) {
+            params.extend(asked);
+        }
+        let params: ScanParams = serde_json::from_value(params).unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         run(params, tx, ledger).await;
         let mut said = Vec::new();
@@ -1129,5 +1148,40 @@ mod ledger_tests {
             "what it had found is reported again: {said:?}"
         );
         assert_eq!(said.last(), Some(&json!({"type": "done", "found": 1})));
+    }
+
+    /// A template that looks for `WORD` at /p/t1.
+    const T1: &str = r#"id: t1
+info:
+  name: lab t1
+  severity: low
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/p/t1"
+    matchers:
+      - type: word
+        words:
+          - "WORD"
+"#;
+
+    #[tokio::test]
+    async fn a_template_edited_under_the_same_id_makes_another_pack() {
+        let (port, _) = target().await;
+        let dir = std::env::temp_dir().join(format!("plessor-pack-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let asked = json!({ "templates_dir": dir.to_string_lossy(), "only": ["t1"] });
+        std::fs::write(dir.join("t1.yaml"), T1.replace("WORD", "WRONG-t1")).unwrap();
+        let first = Arc::new(Kept::default());
+        scan_with(port, asked.clone(), first.clone()).await;
+        let again = Arc::new(Kept::default());
+        scan_with(port, asked.clone(), again.clone()).await;
+        let pack = |kept: &Kept| kept.pack.lock().unwrap().clone();
+        assert_eq!(pack(&again), pack(&first), "nothing changed");
+        std::fs::write(dir.join("t1.yaml"), T1.replace("WORD", "FOUND-t1")).unwrap();
+        let edited = Arc::new(Kept::default());
+        scan_with(port, asked, edited.clone()).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_ne!(pack(&edited), pack(&first), "its matcher was edited");
     }
 }
