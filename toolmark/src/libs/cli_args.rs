@@ -11,17 +11,32 @@ pub struct Cli {
     pub command: Option<Commands>,
 
     /// The port the daemon listens on, and the one the commands here reach it on
-    #[arg(long, global = true, default_value_t = 4444)]
+    #[arg(
+        long,
+        global = true,
+        help_heading = "Global options",
+        default_value_t = 4444
+    )]
     pub port: u16,
 
     /// Never draw the dashboard; stream newline-delimited JSON instead, as piped or
     /// redirected output always gets
-    #[arg(long, global = true, default_value_t = false)]
+    #[arg(
+        long,
+        global = true,
+        help_heading = "Global options",
+        default_value_t = false
+    )]
     pub no_tui: bool,
 
     /// Never start the daemon: when it is not running, say so and stop. Setting
     /// CFX_NO_AUTOSTART=1 does the same.
-    #[arg(long, global = true, default_value_t = false)]
+    #[arg(
+        long,
+        global = true,
+        help_heading = "Global options",
+        default_value_t = false
+    )]
     pub no_autostart: bool,
 }
 
