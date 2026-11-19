@@ -313,9 +313,14 @@ impl Cluster {
             .ok()
     }
 
+    /// Whether its server's pid file is there, which a server keeps for as long as it runs.
+    pub(crate) fn has_pid_file(&self) -> bool {
+        self.data.join("postmaster.pid").is_file()
+    }
+
     /// Whether its server says it runs: its pid file is there, and its port answers.
     pub(crate) fn seems_running(&self, port: u16) -> bool {
-        self.data.join("postmaster.pid").is_file() && answers(port)
+        self.has_pid_file() && answers(port)
     }
 
     /// Make the cluster, with `settings`' user as its superuser and their password the

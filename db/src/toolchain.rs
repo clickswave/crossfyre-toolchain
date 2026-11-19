@@ -154,6 +154,11 @@ impl<'a> Toolchain<'a> {
         if !cluster.exists() {
             return Ok(Stop::NotMade);
         }
+        // With no pid file no server runs, and PostgreSQL's programs are not needed to say
+        // so. They may be gone, or be a newer major that cannot run this database.
+        if !cluster.has_pid_file() {
+            return Ok(Stop::NotRunning);
+        }
         let _lock = Lock::hold(self.account, &self.dir)?;
         let pg = self.programs(&cluster)?;
         Ok(if cluster.stop(&pg, self.account)? {
@@ -252,6 +257,17 @@ mod tests {
         assert_eq!(toolchain.status().unwrap(), None);
         assert_eq!(toolchain.stop().unwrap(), Stop::NotMade);
         assert!(!toolchain.dir().exists(), "made something");
+    }
+
+    #[test]
+    fn a_database_no_server_runs_stops_without_postgresql() {
+        let dir = tempfile::tempdir().unwrap();
+        let account = ThisAccount::new().unwrap();
+        let toolchain = Toolchain::new(dir.path().to_path_buf(), &account);
+        std::fs::create_dir_all(toolchain.cluster_dir()).unwrap();
+        // Made by a PostgreSQL that no machine here has.
+        std::fs::write(toolchain.cluster_dir().join("PG_VERSION"), "9\n").unwrap();
+        assert_eq!(toolchain.stop().unwrap(), Stop::NotRunning);
     }
 
     #[test]
