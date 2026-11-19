@@ -1,7 +1,7 @@
 use sqlx::{Pool, Postgres};
 
 /// The database doorward keeps its tables in.
-pub const DATABASE: &str = "pulse";
+pub const DATABASE: &str = "doorward";
 
 pub struct DoorwardDb {
     pub pool: Pool<Postgres>,

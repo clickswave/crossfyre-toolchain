@@ -336,8 +336,8 @@ fn the_toolchain_dir_comes_from_the_environment_even_when_it_is_not_utf8() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("config.toml"),
-        "[postgres]\nhost = \"localhost\"\nport = 4440\nuser = \"postgres\"\n\
-         db_name = \"crossfyre\"\n\n[container]\n\n[extensions]\nambulo = 5999\n",
+        "[postgres]\nbackend = \"local\"\nport = 4440\nuser = \"postgres\"\n\
+         db_name = \"crossfyre\"\n\n[extensions]\nambulo = 5999\n",
     )
     .unwrap();
     let r = run_with_env(

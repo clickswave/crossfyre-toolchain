@@ -4,7 +4,7 @@ use sqlx::{FromRow, QueryBuilder};
 use std::fmt::Display;
 
 /// The database ambulo keeps its tables in.
-pub const DATABASE: &str = "mach";
+pub const DATABASE: &str = "ambulo";
 
 pub struct Work {
     pub url: String,

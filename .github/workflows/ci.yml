@@ -335,12 +335,13 @@ jobs:
         # ambulo, doorward and voyage find their database through this file, and in
         # daemon mode wait, saying why, until it names one they can reach. The CLI
         # that would write it is not in this repo, and standalone terminal use never
-        # reads it, so the file is the whole dependency. Matches the postgres service
-        # above.
+        # reads it, so the file is the whole dependency. It names the postgres service
+        # above as a database the user runs, so the engines make no cluster of their own.
         run: |
           mkdir -p ~/.config/crossfyre
           cat > ~/.config/crossfyre/config.toml <<'TOML'
           [postgres]
+          backend = "external"
           host = "127.0.0.1"
           port = 5432
           user = "crossfyre"

@@ -70,8 +70,8 @@ fn write_config(data: &std::path::Path, toolmark: u16, plessor: u16) {
     std::fs::write(
         data.join("config.toml"),
         format!(
-            "[postgres]\nhost = \"127.0.0.1\"\nport = {}\nuser = \"crossfyre\"\n\
-             db_name = \"crossfyre\"\n\n[container]\n\n[extensions]\ntoolmark = {toolmark}\n\
+            "[postgres]\nbackend = \"external\"\nhost = \"127.0.0.1\"\nport = {}\n\
+             user = \"crossfyre\"\ndb_name = \"crossfyre\"\n\n[extensions]\ntoolmark = {toolmark}\n\
              plessor = {plessor}\n",
             closed_port()
         ),

@@ -174,7 +174,8 @@ enum Commands {
     /// (For one area, use `crossfyre node status` or `crossfyre extension list`.)
     Status,
 
-    /// Manage the toolchain Postgres container.
+    /// The database the engines keep their state in: the local one crossfyre makes and
+    /// runs as you, or one you run yourself.
     Db {
         #[command(subcommand)]
         command: cfx_core::DbCommands,
@@ -183,13 +184,13 @@ enum Commands {
     /// Check the environment for common problems.
     Doctor,
 
-    /// Remove Crossfyre services, extensions, binaries and the database
-    /// container from this host.
+    /// Remove Crossfyre services, extensions, binaries and the local database
+    /// from this host.
     Uninstall {
         /// Also remove the config root (node registrations included)
         #[arg(long, conflicts_with = "keep_data")]
         purge: bool,
-        /// Keep the database container, and the scan state in it
+        /// Keep the local database, and the scan state in it
         #[arg(long)]
         keep_data: bool,
         /// Do not ask first (for scripts, such as a package's removal script)
@@ -542,7 +543,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // No account gate here on purpose. The engines are free, and every command
     // that isn't node enrolment is either local or served from the PUBLIC
     // release manifest (bins.crossfyre.io): `extension` install/manage,
-    // `update`, `status`, `db` (the local container) and `run` (a .cfx script
+    // `update`, `status`, `db` (the local database) and `run` (a .cfx script
     // with no control plane) never touch the account session, so forcing a login
     // to install or use them is friction with nothing behind it.
     //
@@ -783,7 +784,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             cfx_core::toolchain::status::overview(&base)?;
         }
         Commands::Db { command } => {
-            cfx_core::toolchain::db::run(&command)?;
+            cfx_core::toolchain::db::run(&command).await?;
         }
         Commands::Doctor => {
             cfx_core::toolchain::doctor::run(&base).await?;

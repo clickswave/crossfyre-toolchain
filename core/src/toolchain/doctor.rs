@@ -1,5 +1,5 @@
 // `crossfyre doctor` - environment checks for the things that actually break
-// in the field: missing docker/unzip, dead daemons, unreachable control
+// in the field: missing PostgreSQL or unzip, dead daemons, unreachable control
 // plane.
 
 use super::packaging::Found;
@@ -57,12 +57,30 @@ pub async fn run(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
     // -- Host tooling -----------------------------------------------------
     section("Host tooling");
-    if !check(
-        "docker available",
-        has_binary("docker"),
-        "install Docker (the toolchain database runs in a container)",
+    // The local database is made with the PostgreSQL programs installed here; a database
+    // the operator runs needs none of them.
+    let settings = config::load_config().ok().map(|c| c.postgres);
+    if !matches!(
+        settings.as_ref().map(|s| &s.backend),
+        Some(cfx_db::Backend::External { .. })
     ) {
-        failed += 1;
+        let found = super::db::account()
+            .map_err(|e| e.to_string())
+            .and_then(|a| cfx_db::find_postgres(a.as_ref(), None).map_err(|e| e.to_string()));
+        let (label, fix) = match &found {
+            Ok(pg) => (
+                format!(
+                    "PostgreSQL {} available {}",
+                    pg.major,
+                    dim(&format!("({})", pg.dir.display()))
+                ),
+                String::new(),
+            ),
+            Err(e) => ("PostgreSQL available".to_string(), e.clone()),
+        };
+        if !check(&label, found.is_ok(), &fix) {
+            failed += 1;
+        }
     }
     let (unzip_label, unzip_fix) = if cfg!(windows) {
         (
@@ -159,9 +177,18 @@ pub async fn run(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
             step(&format!("{} {}", e.name, dim("not installed")));
         }
     }
-    if let Ok(c) = config::load_config() {
-        let label = format!("postgres listening on {}", c.postgres.port);
-        if !check(&label, port_open(c.postgres.port), "crossfyre db start") {
+    if let Ok(Some(db)) = super::db::status() {
+        let (label, fix) = match db.settings.backend {
+            cfx_db::Backend::Local => (
+                format!("local database running on {}", db.settings.address()),
+                "crossfyre db up",
+            ),
+            cfx_db::Backend::External { .. } => (
+                format!("database answering on {}", db.settings.address()),
+                "start the database you run, or record another with `crossfyre db external`",
+            ),
+        };
+        if !check(&label, db.running, fix) {
             failed += 1;
         }
     }

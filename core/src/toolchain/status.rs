@@ -1,8 +1,8 @@
 // `crossfyre status [nodes|extensions|db]` - the one place to look when
-// something is off. Probes ports, pid files, and the container. The one thing
+// something is off. Probes ports, pid files, and the database. The one thing
 // it changes is a pid file naming a process that is gone, which it removes.
 
-use super::config::{is_extension_installed, load_config};
+use super::config::is_extension_installed;
 use super::{ENGINES, service, sudo_user};
 use std::path::Path;
 
@@ -197,39 +197,72 @@ pub fn extensions() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// `crossfyre status db` - Postgres container state.
+/// `crossfyre status db` and `crossfyre db status`: which database the engines use, and
+/// whether it runs.
 pub fn db() -> Result<(), Box<dyn std::error::Error>> {
-    match load_config() {
-        Ok(config) => {
-            let listening = port_open(config.postgres.port);
+    use super::ui::*;
+
+    section("Database");
+    match super::db::status() {
+        Err(e) => println!("{}", row(&cross(), "database", "", &e.to_string())),
+        Ok(None) => {
             println!(
-                "  postgres: port {} {}",
-                config.postgres.port,
-                if listening {
-                    "(accepting connections)"
-                } else {
-                    "(not reachable)"
-                }
+                "{}",
+                row(&dot(), "database", "", &dim("no config.toml yet"))
             );
-            if let Some(ref id) = config.container.id {
-                println!("  container: {}", &id[..id.len().min(12)]);
-            } else {
-                println!("  container: none recorded. `crossfyre db up` creates one");
-            }
-            // Extension binaries are useless without the db; nudge if it's down.
-            if !listening && ENGINES.iter().any(|e| is_extension_installed(e.name)) {
-                println!(
-                    "  hint: extensions are installed but the database is down. Start it with `crossfyre db start`"
-                );
-            }
+            hint("`crossfyre db up` makes the local database.");
         }
-        Err(_) => {
-            println!(
-                "  postgres: no toolchain config yet. The first `crossfyre node init` or `crossfyre db up` creates it"
-            );
+        Ok(Some(db)) => {
+            let at = db.settings.address();
+            match (&db.settings.backend, &db.cluster) {
+                (cfx_db::Backend::External { .. }, _) if db.running => println!(
+                    "{}",
+                    row(&check(), "external", &at, &format!("{GREEN}answers{RESET}"))
+                ),
+                (cfx_db::Backend::External { .. }, _) => {
+                    println!("{}", row(&cross(), "external", &at, "does not answer"));
+                    hint(
+                        "It is a database you run: start it, or record another with `crossfyre db external`.",
+                    );
+                }
+                (cfx_db::Backend::Local, None) => {
+                    println!("{}", row(&dot(), "local", &at, &dim("not made yet")));
+                    hint("`crossfyre db up` makes it.");
+                }
+                (cfx_db::Backend::Local, Some((dir, major))) => {
+                    let made_by = major
+                        .map(|m| format!(", PostgreSQL {m}"))
+                        .unwrap_or_default();
+                    let mid = format!("{at}  {}", dim(&format!("{}{made_by}", dir.display())));
+                    if db.running {
+                        println!(
+                            "{}",
+                            row(&check(), "local", &mid, &format!("{GREEN}running{RESET}"))
+                        );
+                    } else if db.port_taken {
+                        println!(
+                            "{}",
+                            row(
+                                &bang(),
+                                "local",
+                                &mid,
+                                &format!(
+                                    "{YELLOW}stopped{RESET}, and something else holds its port"
+                                )
+                            )
+                        );
+                        hint(
+                            "If that is the crossfyre-postgres container an earlier version made, `docker rm -f crossfyre-postgres` removes it.",
+                        );
+                    } else {
+                        println!("{}", row(&dot(), "local", &mid, &dim("stopped")));
+                        hint("`crossfyre db up` starts it.");
+                    }
+                }
+            }
         }
     }
-    println!();
+    end();
     Ok(())
 }
 

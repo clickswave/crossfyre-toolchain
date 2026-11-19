@@ -1,9 +1,11 @@
 //! Reaching the database, or saying why it cannot be reached.
 
-use crate::settings::{DB_UP, Settings, config_path};
+use crate::account::ThisAccount;
+use crate::settings::{Backend, CONFIG_FILE, Settings};
+use crate::toolchain::Toolchain;
 use sqlx::Connection;
 use sqlx::postgres::{PgConnection, PgPool, PgPoolOptions};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// How long the server has to answer a connection.
@@ -11,6 +13,9 @@ const ANSWER_WITHIN: Duration = Duration::from_secs(10);
 
 /// The database every Postgres server has, which an engine's own is made from.
 const MAINTENANCE_DB: &str = "postgres";
+
+/// The command that makes the local database, or starts it.
+pub(crate) const DB_UP: &str = "crossfyre db up";
 
 /// Why the database cannot be used, and the one command that fixes it when one does.
 ///
@@ -20,6 +25,7 @@ const MAINTENANCE_DB: &str = "postgres";
 pub struct NotReady {
     problem: String,
     fix: Option<String>,
+    or: Option<String>,
 }
 
 impl NotReady {
@@ -27,7 +33,14 @@ impl NotReady {
         Self {
             problem,
             fix: fix.map(str::to_string),
+            or: None,
         }
+    }
+
+    /// With `instead`, what else would do where the command is not wanted.
+    pub(crate) fn or(mut self, instead: &str) -> Self {
+        self.or = Some(instead.to_string());
+        self
     }
 
     /// What is wrong, and where.
@@ -46,6 +59,9 @@ impl std::fmt::Display for NotReady {
         f.write_str(&self.problem)?;
         if let Some(fix) = &self.fix {
             write!(f, ". Run `{fix}`")?;
+            if let Some(instead) = &self.or {
+                write!(f, ", or {instead}")?;
+            }
         }
         Ok(())
     }
@@ -53,49 +69,89 @@ impl std::fmt::Display for NotReady {
 
 impl std::error::Error for NotReady {}
 
-/// A pool on the database called `database` on the toolchain's database server, made
-/// there first if it is missing.
+/// A pool on the database called `database`, made on the server first if it is missing.
 ///
 /// The server is the one config.toml names, in the toolchain directory
-/// (`dguard::toolchain_dir`). The file is read on every call, so a daemon that waits on
+/// (`dguard::toolchain_dir`). With the local backend this makes the cluster and
+/// config.toml when they are missing, and starts the cluster when it is stopped, as the
+/// user this process runs as. The file is read on every call, so a daemon that waits on
 /// this picks up what `crossfyre` writes while it waits.
 pub async fn ensure_ready(database: &str) -> Result<PgPool, NotReady> {
-    ready_at(&config_path()?, database).await
-}
-
-/// [`ensure_ready`] for the config.toml at `path`.
-async fn ready_at(path: &Path, database: &str) -> Result<PgPool, NotReady> {
-    let settings = Settings::read(path)?;
-    let address = settings.address();
-    // One connection first, because its error says why. A pool retries a refused
-    // connection until its time is up and then says only that it timed out.
-    let mut server = tokio::time::timeout(
-        ANSWER_WITHIN,
-        PgConnection::connect_with(&settings.options(MAINTENANCE_DB)),
-    )
-    .await
-    .map_err(|_| {
+    let dir = dguard::toolchain_dir().ok_or_else(|| {
         NotReady::new(
             format!(
-                "the database on {address} did not answer within {} seconds",
-                ANSWER_WITHIN.as_secs()
+                "there is no home directory to find the toolchain config in. Set {} to the \
+                 directory that holds {CONFIG_FILE}",
+                dguard::TOOLCHAIN_DIR_ENV
             ),
             None,
         )
-    })?
-    .map_err(|e| not_reached(&settings, path, e))?;
+    })?;
+    ready_in(dir, database).await
+}
+
+/// [`ensure_ready`] for the toolchain directory `dir`.
+async fn ready_in(dir: PathBuf, database: &str) -> Result<PgPool, NotReady> {
+    let path = dir.join(CONFIG_FILE);
+    // Making and starting the cluster runs programs and waits on a lock, which the
+    // daemon's other tasks should not wait behind.
+    let settings = tokio::task::spawn_blocking(move || {
+        let account = ThisAccount::new()?;
+        Toolchain::new(dir, &account)
+            .up()
+            .map(|(settings, _)| settings)
+    })
+    .await
+    .map_err(|e| NotReady::new(format!("getting the database ready failed: {e}"), None))??;
+    let mut server = connect(&settings, &path, MAINTENANCE_DB).await?;
     let made = make_database(&mut server, database).await;
     let _ = server.close().await;
     made.map_err(|e| {
         NotReady::new(
-            format!("could not make the {database} database on {address}: {e}"),
+            format!(
+                "could not make the {database} database on {}: {e}",
+                settings.address()
+            ),
             None,
         )
     })?;
     PgPoolOptions::new()
         .connect_with(settings.options(database))
         .await
-        .map_err(|e| not_reached(&settings, path, e))
+        .map_err(|e| not_reached(&settings, &path, e))
+}
+
+/// Whether the server `settings` names lets them in, as the settings in the config.toml
+/// at `path`.
+pub async fn check(settings: &Settings, path: &Path) -> Result<(), NotReady> {
+    let server = connect(settings, path, MAINTENANCE_DB).await?;
+    let _ = server.close().await;
+    Ok(())
+}
+
+/// One connection to `database`, because its error says why. A pool retries a refused
+/// connection until its time is up and then says only that it timed out.
+async fn connect(
+    settings: &Settings,
+    path: &Path,
+    database: &str,
+) -> Result<PgConnection, NotReady> {
+    tokio::time::timeout(
+        ANSWER_WITHIN,
+        PgConnection::connect_with(&settings.options(database)),
+    )
+    .await
+    .map_err(|_| {
+        NotReady::new(
+            format!(
+                "the database on {} did not answer within {} seconds",
+                settings.address(),
+                ANSWER_WITHIN.as_secs()
+            ),
+            None,
+        )
+    })?
+    .map_err(|e| not_reached(settings, path, e))
 }
 
 /// Make the database called `name` on the server unless it is there.
@@ -117,23 +173,42 @@ async fn make_database(server: &mut PgConnection, name: &str) -> Result<(), sqlx
 /// The settings are the ones in the config.toml at `path`.
 fn not_reached(settings: &Settings, path: &Path, e: sqlx::Error) -> NotReady {
     let at = settings.address();
+    let config = path.display();
+    // A database the user runs is fixed by recording it again; the local one by
+    // `crossfyre db up` where anything fixes it.
+    let record = match &settings.backend {
+        Backend::Local => None,
+        Backend::External { host } => Some(format!(
+            "crossfyre db external {host} {} {}",
+            settings.port, settings.user
+        )),
+    };
     match &e {
-        sqlx::Error::Io(io) if io.kind() == std::io::ErrorKind::ConnectionRefused => NotReady::new(
-            format!(
-                "nothing is listening on {at}, where {} puts the database",
-                path.display()
-            ),
-            Some(DB_UP),
-        ),
-        sqlx::Error::Database(db) => match db.code().as_deref() {
-            // invalid_password
-            Some("28P01") => NotReady::new(
-                format!(
-                    "the database on {at} refused the password in {}",
-                    path.display()
-                ),
+        sqlx::Error::Io(io) if io.kind() == std::io::ErrorKind::ConnectionRefused => match record {
+            None => NotReady::new(
+                format!("nothing is listening on {at}, where the local database should be"),
                 Some(DB_UP),
             ),
+            Some(_) => NotReady::new(
+                format!("nothing is listening on {at}, where {config} puts the database you run"),
+                None,
+            ),
+        },
+        sqlx::Error::Database(db) => match db.code().as_deref() {
+            // invalid_password
+            Some("28P01") => match &record {
+                None => NotReady::new(
+                    format!(
+                        "the local database refused the password in {config}, which is not the \
+                         one it was made with"
+                    ),
+                    None,
+                ),
+                Some(record) => NotReady::new(
+                    format!("the database on {at} refused the password in {config}"),
+                    Some(record),
+                ),
+            },
             // invalid_authorization_specification: no such user, or a rule of the
             // server's that turns this one away
             Some("28000") => NotReady::new(
@@ -142,7 +217,7 @@ fn not_reached(settings: &Settings, path: &Path, e: sqlx::Error) -> NotReady {
                     settings.user,
                     db.message()
                 ),
-                Some(DB_UP),
+                record.as_deref(),
             ),
             _ => NotReady::new(
                 format!(
@@ -159,20 +234,35 @@ fn not_reached(settings: &Settings, path: &Path, e: sqlx::Error) -> NotReady {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use crate::toolchain::{Stop, Up};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    fn config_on(dir: &Path, port: u16) -> PathBuf {
-        let path = dir.join("config.toml");
-        std::fs::write(
-            &path,
-            format!(
-                "[postgres]\nhost = \"127.0.0.1\"\nport = {port}\nuser = \"postgres\"\n\
-                 password = \"pw\"\ndb_name = \"crossfyre\"\n"
-            ),
-        )
-        .unwrap();
-        path
+    fn external_on(port: u16) -> Settings {
+        Settings {
+            backend: Backend::External {
+                host: "127.0.0.1".to_string(),
+            },
+            port,
+            password: Some("pw".to_string()),
+            ..Settings::default()
+        }
+    }
+
+    fn local_on(port: u16) -> Settings {
+        Settings {
+            port,
+            password: Some("pw".to_string()),
+            ..Settings::default()
+        }
+    }
+
+    /// A toolchain directory whose config.toml holds `settings`.
+    fn toolchain_with(settings: &Settings) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let toolchain = dir.path().join("crossfyre");
+        std::fs::create_dir_all(&toolchain).unwrap();
+        std::fs::write(toolchain.join(CONFIG_FILE), settings.to_file()).unwrap();
+        (dir, toolchain)
     }
 
     /// A port nothing listens on: one the system just handed out, closed again.
@@ -235,47 +325,69 @@ mod tests {
         );
         let without = NotReady::new("cannot read c".to_string(), None);
         assert_eq!(without.to_string(), "cannot read c");
+        let either = NotReady::new("x is missing".to_string(), Some("get x")).or("use y");
+        assert_eq!(either.to_string(), "x is missing. Run `get x`, or use y");
     }
 
     #[tokio::test]
-    async fn a_closed_port_says_nothing_listens_there_and_what_starts_it() {
-        let dir = tempfile::tempdir().unwrap();
+    async fn a_closed_port_of_a_database_one_runs_says_where_config_puts_it() {
         let port = closed_port();
-        let path = config_on(dir.path(), port);
-        let e = ready_at(&path, "voyage").await.unwrap_err();
+        let (_dir, toolchain) = toolchain_with(&external_on(port));
+        let e = ready_in(toolchain.clone(), "voyage").await.unwrap_err();
         assert_eq!(
             e.problem(),
             format!(
-                "nothing is listening on 127.0.0.1:{port}, where {} puts the database",
-                path.display()
+                "nothing is listening on 127.0.0.1:{port}, where {} puts the database you run",
+                toolchain.join(CONFIG_FILE).display()
             )
         );
-        assert_eq!(e.fix(), Some("crossfyre db up"));
+        assert_eq!(e.fix(), None);
     }
 
     #[tokio::test]
-    async fn a_refused_password_says_whose_it_is() {
-        let dir = tempfile::tempdir().unwrap();
+    async fn a_password_a_database_one_runs_refuses_is_recorded_again() {
         let port = refusing_server().await;
-        let path = config_on(dir.path(), port);
-        let e = ready_at(&path, "voyage").await.unwrap_err();
+        let (_dir, toolchain) = toolchain_with(&external_on(port));
+        let e = ready_in(toolchain.clone(), "voyage").await.unwrap_err();
         assert_eq!(
             e.problem(),
             format!(
                 "the database on 127.0.0.1:{port} refused the password in {}",
-                path.display()
+                toolchain.join(CONFIG_FILE).display()
             )
         );
-        assert_eq!(e.fix(), Some("crossfyre db up"));
+        assert_eq!(
+            e.fix().map(str::to_string),
+            Some(format!("crossfyre db external 127.0.0.1 {port} postgres"))
+        );
     }
 
     #[tokio::test]
-    async fn a_missing_config_is_said_before_anything_is_reached() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        let e = ready_at(&path, "voyage").await.unwrap_err();
+    async fn the_local_database_refusing_its_password_says_config_changed() {
+        let port = refusing_server().await;
+        let path = Path::new("/t/config.toml");
+        let e = connect(&local_on(port), path, MAINTENANCE_DB)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            e.problem(),
+            "the local database refused the password in /t/config.toml, which is not the one \
+             it was made with"
+        );
+        assert_eq!(e.fix(), None);
+    }
+
+    #[tokio::test]
+    async fn the_local_database_not_listening_says_what_starts_it() {
+        let port = closed_port();
+        let e = connect(&local_on(port), Path::new("/t/c"), MAINTENANCE_DB)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            e.problem(),
+            format!("nothing is listening on 127.0.0.1:{port}, where the local database should be")
+        );
         assert_eq!(e.fix(), Some("crossfyre db up"));
-        assert!(e.problem().contains("no toolchain config"), "{e}");
     }
 
     /// A Postgres server in Docker, removed with its data when dropped.
@@ -322,24 +434,27 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    #[ignore = "needs Docker and the postgres:16-alpine image"]
-    async fn a_missing_database_is_made_and_one_that_is_there_is_used() {
-        let server = Server::start("pw");
-        let dir = tempfile::tempdir().unwrap();
-        let path = config_on(dir.path(), server.port);
-        // The server takes a while to take connections, and says so while it does.
+    /// `ready_in`, tried again while the server starts, which takes it a few seconds.
+    async fn ready_soon(toolchain: &Path, database: &str) -> PgPool {
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        let pool = loop {
-            match ready_at(&path, "cfx_db_test").await {
-                Ok(pool) => break pool,
+        loop {
+            match ready_in(toolchain.to_path_buf(), database).await {
+                Ok(pool) => return pool,
                 Err(e) if std::time::Instant::now() < deadline => {
                     eprintln!("not yet: {e}");
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
                 Err(e) => panic!("{e}"),
             }
-        };
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs Docker and the postgres:16-alpine image"]
+    async fn a_missing_database_is_made_on_a_server_one_runs_and_one_there_is_used() {
+        let server = Server::start("pw");
+        let (_dir, toolchain) = toolchain_with(&external_on(server.port));
+        let pool = ready_soon(&toolchain, "cfx_db_test").await;
         let name: String = sqlx::query_scalar("SELECT current_database()")
             .fetch_one(&pool)
             .await
@@ -351,7 +466,7 @@ mod tests {
             .unwrap();
         pool.close().await;
 
-        let again = ready_at(&path, "cfx_db_test").await.unwrap();
+        let again = ready_in(toolchain, "cfx_db_test").await.unwrap();
         let tables: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM information_schema.tables WHERE table_name = 'kept'",
         )
@@ -359,5 +474,90 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(tables, 1, "the database was made again, empty");
+    }
+
+    /// A free port for a local database of a test's own.
+    fn free_port() -> u16 {
+        closed_port()
+    }
+
+    #[tokio::test]
+    #[ignore = "needs PostgreSQL's programs"]
+    async fn the_local_database_is_made_started_stopped_and_kept() {
+        let (_dir, toolchain) = toolchain_with(&local_on(free_port()));
+        let account = ThisAccount::new().unwrap();
+        let tc = Toolchain::new(toolchain.clone(), &account);
+
+        let pool = ready_in(toolchain.clone(), "cfx_db_test").await.unwrap();
+        sqlx::query("CREATE TABLE kept (n int)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO kept VALUES (7)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        let listens: String = {
+            let mut c = connect(&tc.settings().unwrap(), Path::new("c"), MAINTENANCE_DB)
+                .await
+                .unwrap();
+            sqlx::query_scalar("SHOW listen_addresses")
+                .fetch_one(&mut c)
+                .await
+                .unwrap()
+        };
+        assert_eq!(listens, "127.0.0.1");
+        assert_eq!(tc.up().unwrap().1, Up::Running);
+
+        assert_eq!(tc.stop().unwrap(), Stop::Stopped);
+        assert_eq!(tc.stop().unwrap(), Stop::NotRunning);
+        assert!(!tc.status().unwrap().unwrap().running);
+
+        let again = ready_in(toolchain.clone(), "cfx_db_test").await.unwrap();
+        let n: i32 = sqlx::query_scalar("SELECT n FROM kept")
+            .fetch_one(&again)
+            .await
+            .unwrap();
+        assert_eq!(n, 7, "the data did not survive a stop and a start");
+        again.close().await;
+        assert!(tc.status().unwrap().unwrap().running);
+        assert_eq!(tc.stop().unwrap(), Stop::Stopped);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs PostgreSQL's programs"]
+    async fn engines_starting_at_once_make_one_database() {
+        let (_dir, toolchain) = toolchain_with(&local_on(free_port()));
+        let names = ["voyage", "doorward", "ambulo"];
+        let pools = futures_join(names.map(|name| {
+            let toolchain = toolchain.clone();
+            tokio::spawn(async move { ready_in(toolchain, name).await })
+        }))
+        .await;
+        for (name, pool) in names.iter().zip(pools) {
+            let pool = pool.unwrap().unwrap_or_else(|e| panic!("{name}: {e}"));
+            let here: String = sqlx::query_scalar("SELECT current_database()")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(&here, name);
+            pool.close().await;
+        }
+        let account = ThisAccount::new().unwrap();
+        let tc = Toolchain::new(toolchain, &account);
+        assert!(tc.cluster_dir().join("PG_VERSION").is_file());
+        assert_eq!(tc.stop().unwrap(), Stop::Stopped);
+    }
+
+    /// Every handle's result, in order.
+    async fn futures_join<T>(
+        handles: [tokio::task::JoinHandle<T>; 3],
+    ) -> Vec<Result<T, tokio::task::JoinError>> {
+        let mut out = Vec::new();
+        for h in handles {
+            out.push(h.await);
+        }
+        out
     }
 }

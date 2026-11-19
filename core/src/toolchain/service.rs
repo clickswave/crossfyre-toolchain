@@ -289,7 +289,7 @@ pub fn node_unit(
     Ok(format!(
         "[Unit]\n\
          Description=Crossfyre node supervisor\n\
-         After=network-online.target docker.service\n\
+         After=network-online.target\n\
          Wants=network-online.target\n\
          \n\
          [Service]\n\

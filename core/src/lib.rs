@@ -695,17 +695,25 @@ static CLAIM_MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 
 #[derive(Subcommand, Debug)]
 pub enum DbCommands {
-    /// Make a new, empty database container and start it, replacing the one there
-    /// is. The scan state kept in the old one is lost
+    /// Make the local database if there is none, and start it if it is stopped. What is
+    /// there is never replaced or emptied
     Up,
-    /// Stop and remove the database container. The scan state kept in it is lost
-    Down,
-    /// Start the database container
-    Start,
-    /// Stop the database container
+    /// Stop the local database
     Stop,
-    /// Restart the database container
+    /// Stop the local database and start it again
     Restart,
+    /// Show which database the engines use, and whether it runs
+    Status,
+    /// Use a database you run yourself, in Docker or anywhere else, in place of the local
+    /// one. The password is asked for, or read from CROSSFYRE_DB_PASSWORD
+    External {
+        /// The server's host name or address
+        host: String,
+        /// The port it listens on
+        port: u16,
+        /// The user to log in as, which may make databases
+        user: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -1116,29 +1124,12 @@ pub async fn run_boot(
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Booting Crossfyre nodes from {base:?}...");
 
-    // A database container made by 0.1.42 or earlier was published on every
-    // interface with no password. Rebuild it on loopback with a password, keeping the
-    // engines' rows. Nodes do not use it, so they start meanwhile rather than wait on Docker,
-    // which may be slow to answer or not running yet.
-    let securing = std::thread::spawn(|| {
-        if let Err(e) = toolchain::db::secure_existing() {
-            eprintln!(
-                "[db] FAIL could not secure the toolchain database container: {e}. If \
-                 Docker could not be asked, it may still accept connections from the \
-                 network without a password. Run `crossfyre db restart` from the account \
-                 that runs Docker to secure it, or stop it with `crossfyre db stop`."
-            );
-        }
-    });
-
     let node_ids = discover_nodes(base)?;
     if node_ids.is_empty() {
         eprintln!(
             "No nodes registered under {:?}.\nRegister one with: crossfyre node init",
             nodes_dir(base)
         );
-        // Not cut short halfway through a move.
-        let _ = securing.join();
         std::process::exit(1);
     }
 
@@ -1835,14 +1826,20 @@ pub async fn run_init(
         }
     }
 
-    // Bring up the toolchain database the extensions persist scan state to.
+    // Bring up the toolchain database the extensions persist scan state to: the local
+    // one, made and started as the user the engines run as, or the one config.toml names.
     let database = if selected_extensions.is_empty() {
         None
     } else {
         working("Starting the toolchain database");
-        Some(match toolchain::db::ensure_up() {
-            Ok(()) => {
-                ok("Database ready");
+        Some(match toolchain::db::up() {
+            Ok(up) => {
+                ok(match up {
+                    cfx_db::Up::Made => "Database made and started",
+                    cfx_db::Up::Started => "Database started",
+                    cfx_db::Up::Running => "Database running",
+                    cfx_db::Up::External => "Database is the one config.toml names",
+                });
                 true
             }
             Err(e) => {
@@ -2226,11 +2223,13 @@ fn reconcile_ports(ports_json: &serde_json::Value) -> Vec<String> {
     if changed.is_empty() {
         return changed;
     }
-    // Postgres port moved: re-provision the container on the new port.
-    if changed.iter().any(|c| c == "postgres")
-        && let Err(e) = toolchain::db::up()
-    {
-        eprintln!("[ports] FAIL re-provision the database: {e}");
+    // Postgres port moved: start the local database again on its new port, and then
+    // the engines, whose connections are to the old one.
+    if changed.iter().any(|c| c == "postgres") {
+        match toolchain::db::restart() {
+            Ok(_) => toolchain::db::restart_engines(),
+            Err(e) => eprintln!("[ports] FAIL restart the database on its new port: {e}"),
+        }
     }
     // Engine port moved: rewrite its unit (ExecStart reads config.toml) + restart.
     for ext in changed.iter().filter(|c| c.as_str() != "postgres") {
@@ -2945,16 +2944,14 @@ pub async fn run_daemon(
                     serde_json::Value::Object(map)
                 };
 
-                // Toolchain health: the node's own version, and Postgres
-                // probed on its configured TCP port.
+                // Toolchain health: the node's own version, and the database config.toml
+                // names, probed on its port: 127.0.0.1 for the local one, or the host of
+                // one the operator runs.
                 let toolchain_status: serde_json::Value = {
-                    let pg_port = crate::toolchain::config::load_config()
-                        .map(|c| c.postgres.port)
-                        .unwrap_or(4440);
-                    let pg_running = std::net::TcpStream::connect_timeout(
-                        &std::net::SocketAddr::from(([127, 0, 0, 1], pg_port)),
-                        std::time::Duration::from_millis(200),
-                    ).is_ok();
+                    let (pg_port, pg_running) = match crate::toolchain::config::load_config() {
+                        Ok(c) => (c.postgres.port, c.postgres.answers()),
+                        Err(_) => (cfx_db::Settings::default().port, false),
+                    };
                     toolchain_health(
                         node_version,
                         pg_port,
@@ -3346,14 +3343,13 @@ pub async fn run_daemon(
                             }
                             Some("start_postgres") => {
                                 println!("\n[toolchain] Starting PostgreSQL...");
-                                // Blocking, and slow when a container from an earlier release
-                                // has to be secured first.
+                                // Blocking: making the local database runs initdb.
                                 let started = tokio::task::spawn_blocking(|| {
-                                    toolchain::db::ensure_up().map_err(|e| e.to_string())
+                                    toolchain::db::up().map_err(|e| e.to_string())
                                 })
                                 .await;
                                 let success = match started {
-                                    Ok(Ok(())) => { println!("[toolchain] OK PostgreSQL started"); true }
+                                    Ok(Ok(_)) => { println!("[toolchain] OK PostgreSQL started"); true }
                                     Ok(Err(e)) => { eprintln!("[toolchain] FAIL PostgreSQL failed to start: {e}"); false }
                                     Err(e) => { eprintln!("[toolchain] FAIL PostgreSQL failed to start: {e}"); false }
                                 };

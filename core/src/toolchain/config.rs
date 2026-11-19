@@ -1,27 +1,21 @@
-// Toolchain configuration: where extension binaries live, and how the
-// extensions reach the shared Postgres instance. Lives in the same
-// `~/.config/crossfyre` root as the node configs (`nodes.d/`), in a
-// `config.toml` the extension daemons also read.
+// Toolchain configuration: where extension binaries live, which database the
+// extensions keep their state in, and the ports they listen on. Lives in the same
+// `~/.config/crossfyre` root as the node configs (`nodes.d/`), in a `config.toml`
+// the extension daemons also read.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ToolchainConfig {
-    /// Where the engines' database is, in the shape the engines read it.
+    /// Which database the engines use, in the shape the engines read it.
     pub postgres: cfx_db::Settings,
-    pub container: ContainerSection,
     // Local TCP ports the extension daemons listen on. Host-level (all nodes on
     // this machine share one set of engine daemons + one Postgres), overridable
     // per install so an operator can dodge a port clash. Defaulted via serde, so
     // a file without the section gets the protocol defaults.
     #[serde(default)]
     pub extensions: ExtensionPorts,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ContainerSection {
-    pub id: Option<String>,
 }
 
 /// Per-extension daemon ports, keyed by engine name, as the `[extensions]` table of
@@ -92,16 +86,6 @@ impl<'de> Deserialize<'de> for ExtensionPorts {
             }
         }
         Ok(ports)
-    }
-}
-
-impl Default for ToolchainConfig {
-    fn default() -> Self {
-        Self {
-            postgres: cfx_db::Settings::default(),
-            container: ContainerSection { id: None },
-            extensions: ExtensionPorts::default(),
-        }
     }
 }
 
@@ -317,15 +301,15 @@ pub fn load_or_create_config() -> Result<ToolchainConfig, Box<dyn std::error::Er
     load_or_create_config_at(&get_config_path())
 }
 
-/// A new file gets a generated database password, so the container `crossfyre db up`
-/// makes from it, and the engines that read it, never run without one.
+/// A new file is made the way an engine makes one, under the same lock: for the local
+/// database, with a new password, readable by the account the database belongs to.
 pub(crate) fn load_or_create_config_at(
     path: &std::path::Path,
 ) -> Result<ToolchainConfig, Box<dyn std::error::Error>> {
     if !path.exists() {
-        let mut config = ToolchainConfig::default();
-        config.postgres.ensure_password()?;
-        save_config_at(path, &config)?;
+        let dir = path.parent().ok_or("config.toml has no directory")?;
+        let account = super::db::account()?;
+        cfx_db::Toolchain::new(dir.to_path_buf(), account.as_ref()).settings()?;
         println!(
             "[config] Wrote default toolchain config: {}",
             path.display()
@@ -338,8 +322,8 @@ pub(crate) fn load_or_create_config_at(
 mod root_link_tests {
     use super::*;
 
-    const A_CONFIG: &str = "[postgres]\nhost = \"localhost\"\nport = 4440\nuser = \"postgres\"\n\
-                            db_name = \"crossfyre\"\n\n[container]\n";
+    const A_CONFIG: &str = "[postgres]\nbackend = \"local\"\nport = 4440\nuser = \"postgres\"\n\
+                            db_name = \"crossfyre\"\n";
 
     /// The node service reads the toolchain config as root from the operator's home.
     #[test]
@@ -379,8 +363,8 @@ mod tests {
 
     fn ports(text: &str) -> ExtensionPorts {
         let cfg: ToolchainConfig = toml::from_str(&format!(
-            "[postgres]\nhost = \"localhost\"\nport = 4440\nuser = \"postgres\"\n\
-             db_name = \"crossfyre\"\n\n[container]\n\n{text}"
+            "[postgres]\nbackend = \"local\"\nport = 4440\nuser = \"postgres\"\n\
+             db_name = \"crossfyre\"\n\n{text}"
         ))
         .expect("config parses");
         cfg.extensions
@@ -410,8 +394,8 @@ mod tests {
         let p = ports("[extensions]\nsomething_else = \"x\"\nvoyage = 5000\n");
         assert_eq!(p.get("voyage"), 5000);
         let bad: Result<ToolchainConfig, _> = toml::from_str(
-            "[postgres]\nhost = \"h\"\nport = 1\nuser = \"u\"\ndb_name = \"d\"\n\
-             [container]\n[extensions]\nvoyage = \"x\"\n",
+            "[postgres]\nbackend = \"local\"\nport = 1\nuser = \"u\"\ndb_name = \"d\"\n\
+             [extensions]\nvoyage = \"x\"\n",
         );
         assert!(
             bad.is_err(),

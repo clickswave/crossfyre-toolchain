@@ -1,8 +1,8 @@
 // `crossfyre uninstall` - remove everything the toolchain put on this host:
-// extension daemons + binaries, the node service, the Postgres container,
+// extension daemons + binaries, the node service, the local database,
 // and (with --purge) the config root including registered node configs.
-// --keep-data leaves the container, and --yes skips the question, which is how a
-// package's removal script runs it.
+// --keep-data leaves the local database, and --yes skips the question, which is how
+// a package's removal script runs it.
 
 #[cfg(any(not(windows), test))]
 use super::config::file_name;
@@ -24,7 +24,7 @@ const INSTALL_ROOT: &str = "/opt/crossfyre";
 pub struct Scope {
     /// The config root too, node registrations included.
     pub purge: bool,
-    /// Leave the database container, and the scan state in it, in place.
+    /// Leave the local database, and the scan state in it, in place.
     pub keep_data: bool,
 }
 
@@ -32,13 +32,13 @@ impl Scope {
     fn question(self) -> &'static str {
         match (self.purge, self.keep_data) {
             (true, _) => {
-                "Remove all Crossfyre services, binaries, the database container AND all config/node registrations?"
+                "Remove all Crossfyre services, binaries, the local database AND all config/node registrations?"
             }
             (false, true) => {
-                "Remove all Crossfyre services and binaries? (the database container and config root are kept)"
+                "Remove all Crossfyre services and binaries? (the local database and config root are kept)"
             }
             (false, false) => {
-                "Remove all Crossfyre services, binaries and the database container? (config root is kept)"
+                "Remove all Crossfyre services, binaries and the local database? (config root is kept)"
             }
         }
     }
@@ -100,17 +100,19 @@ pub fn run(scope: Scope, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
     }
     let _ = service::remove_node_service();
 
-    // Database container.
+    // The local database, stopped and then removed with its data. A database the
+    // operator runs is theirs, and nothing here touches it.
     section("Database");
     if scope.keep_data {
-        warn("Database container kept (--keep-data).");
+        warn("Local database kept (--keep-data).");
     } else {
-        let removed = super::db::remove_all();
-        if removed.is_empty() {
-            ok("No database container to remove.");
-        }
-        for name in removed {
-            ok(&format!("Removed database container {name} and its data."));
+        match super::db::remove_local() {
+            Ok(Some(dir)) => ok(&format!(
+                "Removed the local database in {} and its data.",
+                dir.display()
+            )),
+            Ok(None) => ok("No local database to remove."),
+            Err(e) => warn(&format!("Kept the local database: {e}")),
         }
     }
 
@@ -445,7 +447,7 @@ mod tests {
         assert!(!keep.what().contains("database"), "{}", keep.what());
         assert!(
             keep.question()
-                .contains("database container and config root are kept")
+                .contains("local database and config root are kept")
         );
     }
 

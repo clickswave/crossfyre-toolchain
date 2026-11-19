@@ -124,14 +124,14 @@ cargo build --release
 
 Or install one engine with `cargo install --git https://github.com/clickswave/crossfyre-toolchain.git ambulo`.
 
-A source build sets up no services, so before the first scan start the Postgres container the engines keep their state in (this needs Docker), then the daemon of each engine you use:
+A source build sets up no services, so before the first scan start the database the engines keep their state in, then the daemon of each engine you use:
 
 ```sh
 crossfyre db up
 ambulo --daemon &
 ```
 
-The container is published on 127.0.0.1 only, with a generated password kept in the toolchain's `config.toml`, which the engines read when they start.
+`crossfyre db up` makes a PostgreSQL cluster of your own in the toolchain directory with the PostgreSQL programs installed on the machine (on Debian, Ubuntu or Kali, `sudo apt install postgresql`), and starts it. It listens on 127.0.0.1 only, with a generated password kept in the toolchain's `config.toml`, which the engines read. To use a database you run yourself instead, record it with `crossfyre db external HOST PORT USER`.
 
 `cfx-script` embeds Python, so building it needs one. On Linux that is your distribution's Python and its development files. On macOS it has to be Python 3.10 or later, and the `python3` that comes with the Xcode command line tools is 3.9, so name another one: `PYO3_PYTHON=/opt/homebrew/bin/python3 cargo build --release`. Windows needs no Python to build it, and Python 3.10 or later to run scripts.
 
