@@ -62,7 +62,7 @@ pub async fn handle(env: OpEnv) {
         // see whether ambulo took the wrapper, so the bound covers that too.
         let bound = std::time::Duration::from_secs(30);
         let answer = tokio::time::timeout(bound, async {
-            let (mut lines, _writer) = super::open_engine("mach", &ambulo_req, lease).await?;
+            let (mut lines, _writer) = super::open_engine("ambulo", &ambulo_req, lease).await?;
             Ok::<_, super::EngineOpen>(lines.next_line().await)
         })
         .await;
@@ -117,7 +117,7 @@ pub async fn handle(env: OpEnv) {
             Ok(Err(super::EngineOpen::Unreachable(e))) => {
                 // ambulo was never asked, so this is not a path that is missing. Reported
                 // as done with nothing found, it read exactly like one.
-                let why = super::unreachable("mach", &e);
+                let why = super::unreachable("ambulo", &e);
                 eprintln!("[op] FAIL {why}");
                 super::publish_failed(
                     &pub_clone,
@@ -460,7 +460,7 @@ pub async fn handle(env: OpEnv) {
             obj.insert("auth".into(), auth.clone());
         }
 
-        match super::open_engine("mach", &ambulo_req, lease).await {
+        match super::open_engine("ambulo", &ambulo_req, lease).await {
             Ok((mut lines, writer)) => {
                 while let Ok(Some(line)) = lines.next_line().await {
                     // Honor pause / halt / delete promptly (checked per probe event).
@@ -632,7 +632,7 @@ pub async fn handle(env: OpEnv) {
                 return;
             }
             Err(super::EngineOpen::Unreachable(e)) => {
-                let why = super::unreachable("mach", &e);
+                let why = super::unreachable("ambulo", &e);
                 eprintln!("[op] FAIL {why}");
                 super::publish_failed(
                     &pub_clone,

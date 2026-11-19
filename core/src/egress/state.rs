@@ -832,7 +832,7 @@ pub async fn engine_reads_egress(addr: &str) -> Option<bool> {
 pub const ENGINE_ASK_EVERY: Duration = Duration::from_secs(30);
 
 /// What each running engine answered when asked whether it reads the egress wrapper,
-/// and when, by engine id. The heartbeat reports it per engine.
+/// and when, by engine name. The heartbeat reports it per engine.
 #[derive(Default)]
 pub struct EngineEgress {
     answers: std::collections::HashMap<String, (bool, Instant)>,

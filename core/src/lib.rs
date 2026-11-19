@@ -719,8 +719,8 @@ pub struct Config {
     nats_url: String,
     nats_nkey_seed: Option<String>,
     nats_user_jwt: Option<String>,
-    /// Extensions installed on this node, as engine ids (e.g. ["mach", "voyage"]),
-    /// which is what the API sends and what never changes.
+    /// Extensions installed on this node, by engine name (e.g. ["ambulo", "voyage"]),
+    /// as the API sends them.
     #[serde(default)]
     extensions: Vec<String>,
     /// Deploy-time network identity (tunnel selection + OPSEC toggles).
@@ -2332,7 +2332,7 @@ fn toolchain_health(
     status
 }
 
-/// The engines a heartbeat reports, by id, in [`toolchain::ENGINES`] order, each with
+/// The engines a heartbeat reports, by name, in [`toolchain::ENGINES`] order, each with
 /// whether it is installed on this host: every engine `installed` says the host has,
 /// and any other that the node's own list (`listed`) names.
 ///
@@ -2348,13 +2348,8 @@ fn heartbeat_engines(
 ) -> Vec<(&'static str, bool)> {
     toolchain::ENGINES
         .iter()
-        .map(|e| (e.id, installed(e.id)))
-        .filter(|(id, here)| {
-            *here
-                || listed
-                    .iter()
-                    .any(|l| toolchain::engine(l).is_some_and(|e| e.id == *id))
-        })
+        .map(|e| (e.name, installed(e.name)))
+        .filter(|(name, here)| *here || listed.iter().any(|l| l == name))
         .collect()
 }
 
@@ -2922,7 +2917,7 @@ pub async fn run_daemon(
     const EVICT_AFTER_401: u32 = 4; // ~20s of sustained auth failure at the 5s interval
 
     // Whether each running engine sends a wrapped op through the proxy it names, by
-    // engine id. Asked once an engine is seen running, again after it is installed,
+    // engine name. Asked once an engine is seen running, again after it is installed,
     // restarted or stopped, and every half minute besides, so the heartbeat can say
     // which engines a proxied op can use.
     let mut engine_egress = egress::state::EngineEgress::default();
@@ -4091,21 +4086,21 @@ mod heartbeat_tests {
     /// was not installed on it: the heartbeat reported only the node's own list.
     #[test]
     fn the_heartbeat_reports_every_engine_installed_on_the_host() {
-        let on_host = |id: &str| id == "pulse" || id == "cortex";
+        let on_host = |name: &str| name == "doorward" || name == "plessor";
         assert_eq!(
             heartbeat_engines(&[], on_host),
-            vec![("pulse", true), ("cortex", true)]
+            vec![("doorward", true), ("plessor", true)]
         );
-        // The node's own list still counts, installed or not, under any of an
-        // engine's names, and nothing is reported twice.
+        // The node's own list still counts, installed or not, and nothing is reported
+        // twice.
         let listed = [
-            "mach".to_string(),
+            "ambulo".to_string(),
             "doorward".to_string(),
             "postgres".to_string(),
         ];
         assert_eq!(
             heartbeat_engines(&listed, on_host),
-            vec![("mach", false), ("pulse", true), ("cortex", true)]
+            vec![("ambulo", false), ("doorward", true), ("plessor", true)]
         );
         assert!(heartbeat_engines(&[], |_| false).is_empty());
     }
@@ -4261,7 +4256,7 @@ mod egress_tests {
         run(
             op("op9", "vuln-scan-1", data),
             c,
-            &[("cortex", plessor.port)],
+            &[("plessor", plessor.port)],
             &nats,
         )
         .await;
@@ -4303,7 +4298,7 @@ mod egress_tests {
         run(
             op("op10", "vuln-scan-1", data),
             c,
-            &[("cortex", plessor.port)],
+            &[("plessor", plessor.port)],
             &nats,
         )
         .await;
@@ -4343,7 +4338,7 @@ mod egress_tests {
         run(
             op("op10b", "vuln-scan-1", data),
             c,
-            &[("cortex", plessor.port)],
+            &[("plessor", plessor.port)],
             &nats,
         )
         .await;
@@ -4387,7 +4382,7 @@ mod egress_tests {
         run(
             op("op-ps", "network-scan-ds", data),
             c,
-            &[("pulse", doorward.port)],
+            &[("doorward", doorward.port)],
             &nats,
         )
         .await;
@@ -4574,7 +4569,7 @@ mod egress_tests {
             "target": "http://app.example.test/",
             "egress_expect": {NODE: {"mode": "direct", "proxy_id": null, "rev": 5}},
         });
-        let engines = [("cortex", port)];
+        let engines = [("plessor", port)];
         let run =
             ops::test_engines::with(&engines, run_operation(op("op-sw", "vuln-scan-1", data), c));
         let switch = async {
@@ -4780,9 +4775,9 @@ mod op_failure_tests {
         (done, subject, nats.types(), port)
     }
 
-    async fn assert_failed_with_reason(op_type: &str, ext: &str, engine: &str, data: Value) {
+    async fn assert_failed_with_reason(op_type: &str, engine: &str, data: Value) {
         let op_id = format!("op-{op_type}-{}", data.as_object().map_or(0, |m| m.len()));
-        let (done, subject, types, port) = run_unreachable(&op_id, op_type, ext, data).await;
+        let (done, subject, types, port) = run_unreachable(&op_id, op_type, engine, data).await;
         assert_eq!(subject, format!("cfx.results.{NODE}"), "{op_type}");
         assert_eq!(done["code"], 1, "{op_type}: {done}");
         assert_eq!(done["job_id"], format!("{WF}-{op_id}"), "{op_type}: {done}");
@@ -4816,28 +4811,28 @@ mod op_failure_tests {
         let cases = [
             (
                 "vuln-scan-1",
-                "cortex",
+                "plessor",
                 json!({"target": hostile, "credential_id": "c1"}),
             ),
             (
                 "vuln-scan-1",
-                "cortex",
+                "plessor",
                 json!({"target": hostile, "mode": "authz",
                        "identities": [{"role": "admin", "credential_id": "c2"}]}),
             ),
             (
                 "service-enum-1",
-                "scout",
+                "toolmark",
                 json!({"target": hostile, "credential_id": "c3"}),
             ),
             (
                 "web-crawl-1",
-                "mach",
+                "ambulo",
                 json!({"seed": hostile, "credential_id": "c4"}),
             ),
             (
                 "content-discovery-db",
-                "mach",
+                "ambulo",
                 json!({"url": hostile, "wordlist_url": "", "credential_id": "c5"}),
             ),
         ];
@@ -4858,49 +4853,49 @@ mod op_failure_tests {
     #[tokio::test]
     async fn a_vuln_scan_with_plessor_down_says_so() {
         let data = json!({"target": "http://127.0.0.1:9/"});
-        assert_failed_with_reason("vuln-scan-1", "cortex", "plessor", data).await;
+        assert_failed_with_reason("vuln-scan-1", "plessor", data).await;
     }
 
     #[tokio::test]
     async fn a_service_scan_with_toolmark_down_says_so() {
         let data = json!({"target": "http://127.0.0.1:9/"});
-        assert_failed_with_reason("service-enum-1", "scout", "toolmark", data).await;
+        assert_failed_with_reason("service-enum-1", "toolmark", data).await;
     }
 
     #[tokio::test]
     async fn a_crawl_with_ambulo_down_says_so() {
         let data = json!({"seed": "http://127.0.0.1:9/"});
-        assert_failed_with_reason("web-crawl-1", "mach", "ambulo", data).await;
+        assert_failed_with_reason("web-crawl-1", "ambulo", data).await;
     }
 
     #[tokio::test]
     async fn a_takeover_check_with_voyage_down_says_so() {
         let data = json!({"domain": "example.test"});
-        assert_failed_with_reason("takeover-1", "voyage", "voyage", data).await;
+        assert_failed_with_reason("takeover-1", "voyage", data).await;
     }
 
     #[tokio::test]
     async fn origin_discovery_with_voyage_down_says_so() {
         let data = json!({"domain": "example.test"});
-        assert_failed_with_reason("origin-discovery-1", "voyage", "voyage", data).await;
+        assert_failed_with_reason("origin-discovery-1", "voyage", data).await;
     }
 
     #[tokio::test]
     async fn subdomain_enumeration_with_voyage_down_says_so() {
         let data = json!({"domain": "example.test", "disable_active": true});
-        assert_failed_with_reason("subdomain-enum-ds", "voyage", "voyage", data).await;
+        assert_failed_with_reason("subdomain-enum-ds", "voyage", data).await;
     }
 
     #[tokio::test]
     async fn a_port_probe_with_doorward_down_says_so() {
         let data = json!({"host": "127.0.0.1", "port": 22});
-        assert_failed_with_reason("network-scan-ds", "pulse", "doorward", data).await;
+        assert_failed_with_reason("network-scan-ds", "doorward", data).await;
     }
 
     #[tokio::test]
     async fn a_port_batch_with_doorward_down_says_so() {
         let data = json!({"targets": ["127.0.0.1"], "ports": "22", "tasks": 1});
-        assert_failed_with_reason("network-scan-db", "pulse", "doorward", data).await;
+        assert_failed_with_reason("network-scan-db", "doorward", data).await;
     }
 
     /// A probe that could not reach ambulo used to be reported as done with nothing
@@ -4908,13 +4903,13 @@ mod op_failure_tests {
     #[tokio::test]
     async fn a_content_probe_with_ambulo_down_says_so() {
         let data = json!({"mode": "probe", "probe_url": "http://127.0.0.1:9/x"});
-        assert_failed_with_reason("content-discovery-ds", "mach", "ambulo", data).await;
+        assert_failed_with_reason("content-discovery-ds", "ambulo", data).await;
     }
 
     #[tokio::test]
     async fn a_content_scan_with_ambulo_down_says_so() {
         let data = json!({"url": "http://127.0.0.1:9/", "wordlist_url": ""});
-        assert_failed_with_reason("content-discovery-db", "mach", "ambulo", data).await;
+        assert_failed_with_reason("content-discovery-db", "ambulo", data).await;
     }
 
     /// A downloaded wordlist used to be written to a fixed name in /tmp, following
@@ -4929,7 +4924,6 @@ mod op_failure_tests {
             (
                 "subdomain-enum-ds",
                 "voyage",
-                "voyage",
                 format!("op-planted-sub-wl-{pid}"),
                 format!("cfx-wl-sub-{wl}.txt"),
                 json!({"domain": "example.test", "wordlists": [{"id": wl, "url": ""}]}),
@@ -4937,14 +4931,12 @@ mod op_failure_tests {
             (
                 "subdomain-enum-ds",
                 "voyage",
-                "voyage",
                 format!("op-planted-sub-url-{pid}"),
                 format!("cfx-wl-sub-op-planted-sub-url-{pid}.txt"),
                 json!({"domain": "example.test", "wordlist_url": ""}),
             ),
             (
                 "content-discovery-db",
-                "mach",
                 "ambulo",
                 format!("op-planted-cd-wl-{pid}"),
                 format!("cfx-wl-{wl}.txt"),
@@ -4952,7 +4944,6 @@ mod op_failure_tests {
             ),
             (
                 "content-discovery-db",
-                "mach",
                 "ambulo",
                 format!("op-planted-cd-url-{pid}"),
                 format!("cfx-wl-chunk-op-planted-cd-url-{pid}.txt"),
@@ -4960,7 +4951,6 @@ mod op_failure_tests {
             ),
             (
                 "content-discovery-db",
-                "mach",
                 "ambulo",
                 format!("op-planted-cd-rec-{pid}"),
                 format!("cfx-wl-recurse-op-planted-cd-rec-{pid}.txt"),
@@ -4973,14 +4963,14 @@ mod op_failure_tests {
                 }),
             ),
         ];
-        for (op_type, ext, engine, op_id, name, data) in cases {
+        for (op_type, engine, op_id, name, data) in cases {
             let scratch = tempfile::tempdir().unwrap();
             let victim = scratch.path().join("victim");
             std::fs::write(&victim, "kept\n").unwrap();
             let planted = std::path::PathBuf::from("/tmp").join(&name);
             let _ = std::fs::remove_file(&planted);
             std::os::unix::fs::symlink(&victim, &planted).unwrap();
-            let (done, ..) = run_unreachable(&op_id, op_type, ext, data).await;
+            let (done, ..) = run_unreachable(&op_id, op_type, engine, data).await;
             let _ = std::fs::remove_file(&planted);
             assert_eq!(
                 std::fs::read_to_string(&victim).unwrap(),
@@ -5010,7 +5000,7 @@ mod op_failure_tests {
             "recurse_wordlist_url": "",
         });
         let (done, _, types, _) =
-            run_unreachable(&op_id, "content-discovery-db", "mach", data).await;
+            run_unreachable(&op_id, "content-discovery-db", "ambulo", data).await;
         let _ = std::fs::remove_file(format!("/tmp/cfx-wl-recurse-{op_id}.txt"));
         assert_eq!(done["code"], 1, "{done}");
         let why = done["error"].as_str().unwrap_or_default();
@@ -5140,17 +5130,17 @@ mod impostor_engine_tests {
         let cases = [
             (
                 "vuln-scan-1",
-                "cortex",
+                "plessor",
                 json!({"target": "http://127.0.0.1:9/"}),
             ),
             (
                 "service-enum-1",
-                "scout",
+                "toolmark",
                 json!({"target": "http://127.0.0.1:9/"}),
             ),
             (
                 "web-crawl-1",
-                "mach",
+                "ambulo",
                 json!({"seed": "http://127.0.0.1:9/"}),
             ),
             ("takeover-1", "voyage", json!({"domain": "example.test"})),
@@ -5166,22 +5156,22 @@ mod impostor_engine_tests {
             ),
             (
                 "network-scan-ds",
-                "pulse",
+                "doorward",
                 json!({"host": "127.0.0.1", "port": 22}),
             ),
             (
                 "network-scan-db",
-                "pulse",
+                "doorward",
                 json!({"targets": ["127.0.0.1"], "ports": "22", "tasks": 1}),
             ),
             (
                 "content-discovery-ds",
-                "mach",
+                "ambulo",
                 json!({"mode": "probe", "probe_url": "http://127.0.0.1:9/x"}),
             ),
             (
                 "content-discovery-db",
-                "mach",
+                "ambulo",
                 json!({"url": "http://127.0.0.1:9/", "wordlist_url": ""}),
             ),
         ];
@@ -5330,7 +5320,7 @@ mod credential_scope_tests {
             }
             let (req, notes) = engine_request(
                 "vuln-scan-1",
-                "cortex",
+                "plessor",
                 &format!("op-cs-{mode}"),
                 data,
                 json!(["app.victim.test"]),
@@ -5370,7 +5360,7 @@ mod credential_scope_tests {
             "scope": ["m.attacker.test"], "credential_id": "cs-unscoped",
         });
         let (req, notes) =
-            engine_request("vuln-scan-1", "cortex", "op-cs-unscoped", data, json!([])).await;
+            engine_request("vuln-scan-1", "plessor", "op-cs-unscoped", data, json!([])).await;
         assert_eq!(
             req["auth"]["headers"]["Authorization"],
             "Bearer saved-token"
@@ -5398,7 +5388,7 @@ mod credential_scope_tests {
             });
             let (req, notes) = engine_request(
                 "vuln-scan-1",
-                "cortex",
+                "plessor",
                 &format!("op-cs-gql-{n}"),
                 data,
                 json!(["app.victim.test"]),
@@ -5434,7 +5424,7 @@ mod credential_scope_tests {
         });
         let (req, notes) = engine_request(
             "web-crawl-1",
-            "mach",
+            "ambulo",
             "op-cs-crawl",
             data,
             json!(["app.victim.test", "*.api.victim.test"]),
@@ -5457,7 +5447,7 @@ mod credential_scope_tests {
             "seed": TARGET, "follow_external": true, "scope_hosts": ["m.attacker.test"],
         });
         let (req, _) =
-            engine_request("web-crawl-1", "mach", "op-cs-crawl-anon", data, json!([])).await;
+            engine_request("web-crawl-1", "ambulo", "op-cs-crawl-anon", data, json!([])).await;
         assert_eq!(req["follow_external"], true);
         assert_eq!(req["scope_hosts"], json!(["m.attacker.test"]));
     }

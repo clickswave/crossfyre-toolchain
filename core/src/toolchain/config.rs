@@ -318,17 +318,24 @@ pub fn engine_addr(ext: &str) -> String {
 }
 
 /// Merge server-provided port overrides into the host `config.toml`. The JSON
-/// is a flat map of service name to port, keyed by engine id (the ids are the
-/// engines' original names), e.g.
-/// `{ "postgres": 4440, "mach": 4441, "pulse": 4443 }` - "postgres" targets the
-/// database, every other key an engine daemon. A public name is accepted in place
-/// of an id. Missing/unknown keys keep their current value. Ensures `config.toml` exists first, and only writes when
-/// something actually changed. Returns the list of services whose port moved
-/// (so a live re-apply can restart exactly those), postgres included.
+/// is a flat map of service name to port, e.g.
+/// `{ "postgres": 4440, "ambulo": 4441, "doorward": 4443 }`: "postgres" targets the
+/// database, every other key an engine daemon by its name. Missing or unknown keys
+/// keep their current value. Ensures `config.toml` exists first, and only writes when
+/// something actually changed. Returns the services whose port moved (so a live
+/// re-apply can restart exactly those), postgres included.
 pub fn apply_ports_from_json(
     ports: &serde_json::Value,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let mut config = load_or_create_config()?;
+    apply_ports_from_json_at(&get_config_path(), ports)
+}
+
+/// [`apply_ports_from_json`] for the config at `path`.
+pub(crate) fn apply_ports_from_json_at(
+    path: &std::path::Path,
+    ports: &serde_json::Value,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut config = load_or_create_config_at(path)?;
     let obj = match ports.as_object() {
         Some(o) => o,
         None => return Ok(Vec::new()),
@@ -343,18 +350,17 @@ pub fn apply_ports_from_json(
         }
     }
     for e in super::ENGINES {
-        let given = obj.get(e.id).or_else(|| obj.get(e.name));
-        if let Some(p) = given.and_then(|v| v.as_u64()) {
+        if let Some(p) = obj.get(e.name).and_then(|v| v.as_u64()) {
             let p = p as u16;
-            if p != 0 && config.extensions.get(e.id) != p {
-                config.extensions.set(e.id, p);
-                changed.push(e.id.to_string());
+            if p != 0 && config.extensions.get(e.name) != p {
+                config.extensions.set(e.name, p);
+                changed.push(e.name.to_string());
             }
         }
     }
 
     if !changed.is_empty() {
-        save_config(&config)?;
+        save_config_at(path, &config)?;
     }
     Ok(changed)
 }
@@ -498,6 +504,31 @@ mod tests {
         for id in ["cortex", "mach", "pulse", "scout"] {
             assert!(!text.contains(id), "{id} written back: {text}");
         }
+    }
+
+    /// The API sends the ports map keyed by engine name, and the node answers with the
+    /// names of what moved.
+    #[test]
+    fn a_ports_map_moves_each_engine_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let ports = serde_json::json!({"postgres": 4999, "plessor": 5001, "voyage": 0, "nope": 7});
+        assert_eq!(
+            apply_ports_from_json_at(&path, &ports).unwrap(),
+            ["postgres", "plessor"]
+        );
+        let cfg = load_config_at(&path).unwrap();
+        assert_eq!(cfg.postgres.port, 4999);
+        assert_eq!(cfg.extensions.get("plessor"), 5001);
+        assert_eq!(
+            cfg.extensions.get("voyage"),
+            4442,
+            "a port of 0 moves nothing"
+        );
+        assert!(
+            apply_ports_from_json_at(&path, &ports).unwrap().is_empty(),
+            "the same map again moves nothing"
+        );
     }
 
     #[cfg(unix)]

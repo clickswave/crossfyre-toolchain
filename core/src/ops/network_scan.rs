@@ -79,7 +79,7 @@ pub async fn handle(env: OpEnv) {
         // can grep for known-open ones (53, 80, 5432, etc).
         let log_sample = true;
         let mut found_count = 0;
-        let conn = super::listener::connect(&super::engine_addr("pulse")).await;
+        let conn = super::listener::connect(&super::engine_addr("doorward")).await;
         match conn {
             Ok(stream) => {
                 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -244,7 +244,7 @@ pub async fn handle(env: OpEnv) {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_secs();
-                let why = super::unreachable("pulse", &e);
+                let why = super::unreachable("doorward", &e);
                 if now_secs.saturating_sub(LAST_LOG.load(Ordering::Relaxed)) >= 60 {
                     LAST_LOG.store(now_secs, Ordering::Relaxed);
                     eprintln!("[op] FAIL {why} (suppressing further messages for 60s)");
@@ -313,7 +313,7 @@ pub async fn handle(env: OpEnv) {
         doorward_req["max_concurrency"] = serde_json::json!(mc);
     }
 
-    let conn = super::listener::connect(&super::engine_addr("pulse")).await;
+    let conn = super::listener::connect(&super::engine_addr("doorward")).await;
     match conn {
         Ok(stream) => {
             use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -428,7 +428,7 @@ pub async fn handle(env: OpEnv) {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs();
-            let why = super::unreachable("pulse", &e);
+            let why = super::unreachable("doorward", &e);
             if now_secs.saturating_sub(LAST_LOG.load(Ordering::Relaxed)) >= 60 {
                 LAST_LOG.store(now_secs, Ordering::Relaxed);
                 eprintln!("[op] FAIL {why} (suppressing further messages for 60s)");

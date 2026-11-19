@@ -175,7 +175,7 @@ async fn run_toolmark(
     };
 
     let mut found_count: i64 = 0;
-    match super::open_engine("scout", &req, lease).await {
+    match super::open_engine("toolmark", &req, lease).await {
         Ok((mut lines, writer)) => {
             while let Ok(Some(line)) = lines.next_line().await {
                 if !workflow_id.is_empty() && is_workflow_cancelled(workflow_id) {
@@ -247,7 +247,7 @@ async fn run_toolmark(
             return;
         }
         Err(super::EngineOpen::Unreachable(e)) => {
-            relay.fail(&super::unreachable("scout", &e)).await;
+            relay.fail(&super::unreachable("toolmark", &e)).await;
             return;
         }
     }

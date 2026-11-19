@@ -98,7 +98,7 @@ pub async fn handle(env: OpEnv) {
     let mut total: i64 = 0;
     let mut last_prog = std::time::Instant::now();
 
-    match super::open_engine("mach", &crawl_req, lease).await {
+    match super::open_engine("ambulo", &crawl_req, lease).await {
         Ok((mut lines, writer)) => {
             while let Ok(Some(line)) = lines.next_line().await {
                 if !workflow_id.is_empty() && is_workflow_cancelled(&workflow_id) {
@@ -204,7 +204,7 @@ pub async fn handle(env: OpEnv) {
             return;
         }
         Err(super::EngineOpen::Unreachable(e)) => {
-            relay.fail(&super::unreachable("mach", &e)).await;
+            relay.fail(&super::unreachable("ambulo", &e)).await;
             return;
         }
     }

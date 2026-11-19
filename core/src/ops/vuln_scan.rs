@@ -257,7 +257,7 @@ pub async fn handle(env: OpEnv) {
     let mut processed: i64 = 0;
     let mut total: i64 = 0;
     let mut last_prog = std::time::Instant::now();
-    match super::open_engine("cortex", &plessor_req, lease).await {
+    match super::open_engine("plessor", &plessor_req, lease).await {
         Ok((mut lines, writer)) => {
             while let Ok(Some(line)) = lines.next_line().await {
                 if !workflow_id.is_empty() && is_workflow_cancelled(&workflow_id) {
@@ -337,7 +337,7 @@ pub async fn handle(env: OpEnv) {
             return;
         }
         Err(super::EngineOpen::Unreachable(e)) => {
-            relay.fail(&super::unreachable("cortex", &e)).await;
+            relay.fail(&super::unreachable("plessor", &e)).await;
             return;
         }
     }
