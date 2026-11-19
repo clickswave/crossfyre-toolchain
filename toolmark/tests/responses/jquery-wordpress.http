@@ -1,0 +1,18 @@
+# Synthetic: A WordPress page, which loads jQuery from its own copy with the version in
+# the query string.
+HTTP/1.1 200 OK
+content-type: text/html; charset=UTF-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Example</title>
+<script src="/wp-includes/js/jquery/jquery.min.js?ver=3.7.1" id="jquery-core-js"></script>
+<script src="/wp-includes/js/jquery/jquery-migrate.min.js?ver=3.4.1" id="jquery-migrate-js"></script>
+</head>
+<body>
+<div class="site"></div>
+</body>
+</html>

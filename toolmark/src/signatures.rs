@@ -57,18 +57,36 @@ enum Source {
     Meta(String),
     /// The first [`HTML_READ`] bytes of the body.
     Html,
+    /// The `src` of each script the landing page loads, as it is written there.
+    ScriptSrc,
     /// What the host answers for this path, asked for on its own.
     Path(String),
+    /// The content of the first script the landing page loads from its own host whose
+    /// `src` matches this, asked for on its own.
+    Script(Regex),
 }
 
 impl Source {
     /// The depth tier a scan needs for this evidence to be looked at.
     fn tier(&self) -> u8 {
         match self {
-            Source::Path(_) => STANDARD,
+            Source::Path(_) | Source::Script(_) => STANDARD,
             _ => 0,
         }
     }
+
+    /// Whether this evidence is read from a request of its own rather than from the
+    /// landing page.
+    fn asks(&self) -> bool {
+        matches!(self, Source::Path(_) | Source::Script(_))
+    }
+}
+
+/// What a leaf that reads a request of its own needs: a path to ask, or an answer that
+/// needs no request.
+enum Request {
+    Ask(String),
+    Decided(Answer),
 }
 
 /// One piece of evidence a signature looks for, or reads a version from.
@@ -313,6 +331,11 @@ fn random_path() -> String {
     format!("/{:016x}", hasher.finish())
 }
 
+/// Finds the `src` of each script element.
+static SCRIPT_SRC: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?is)<script\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']"#).expect("a script pattern")
+});
+
 /// The landing page as the leaves look at it.
 struct Page<'a> {
     headers: &'a [(String, String)],
@@ -321,6 +344,8 @@ struct Page<'a> {
     html: &'a str,
     /// The content of each meta tag a leaf reads, by name.
     metas: BTreeMap<&'a str, Option<String>>,
+    /// The `src` of each script, in the order the page loads them.
+    scripts: Vec<&'a str>,
 }
 
 impl<'a> Page<'a> {
@@ -335,7 +360,7 @@ impl<'a> Page<'a> {
                 .map(|(_, value)| value.as_str()),
             Source::Meta(name) => self.metas.get(name.as_str()).and_then(|c| c.as_deref()),
             Source::Html => Some(self.html),
-            Source::Cookie | Source::Path(_) => None,
+            Source::Cookie | Source::ScriptSrc | Source::Path(_) | Source::Script(_) => None,
         }
     }
 
@@ -348,6 +373,13 @@ impl<'a> Page<'a> {
                 .iter()
                 .find(|name| regex.is_match(name))
                 .map(|name| format!("cookie {name}"));
+        }
+        if let Source::ScriptSrc = leaf.source {
+            return self
+                .scripts
+                .iter()
+                .find(|src| regex.is_match(src))
+                .map(|src| format!("script src {}", truncate(src, 120)));
         }
         let text = self.text(&leaf.source)?;
         if !regex.is_match(text) {
@@ -390,6 +422,8 @@ impl Outcome {
 pub struct Host<'a> {
     signatures: &'a Signatures,
     page: Page<'a>,
+    /// Where the landing page came from, which a script's `src` is read against.
+    base: Option<transport::Url>,
     /// The depth tier of the scan.
     tier: u8,
     /// How each leaf on the landing page answered, by the leaf's address.
@@ -399,8 +433,11 @@ pub struct Host<'a> {
 }
 
 impl<'a> Host<'a> {
+    /// The host whose landing page, at `url`, answered with `headers`, `cookies` and
+    /// `body`, scanned at depth tier `tier`.
     pub fn new(
         signatures: &'a Signatures,
+        url: &str,
         headers: &'a [(String, String)],
         cookies: &'a [String],
         body: &'a str,
@@ -418,6 +455,11 @@ impl<'a> Host<'a> {
                 .iter()
                 .map(|(name, finder)| (name.as_str(), finder.content(body)))
                 .collect(),
+            scripts: SCRIPT_SRC
+                .captures_iter(body)
+                .filter_map(|c| c.get(1))
+                .map(|m| m.as_str())
+                .collect(),
         };
         let mut leaves = Vec::new();
         for signature in &signatures.list {
@@ -427,7 +469,7 @@ impl<'a> Host<'a> {
         }
         let passive = leaves
             .into_iter()
-            .filter(|l| !matches!(l.source, Source::Path(_)))
+            .filter(|l| !l.source.asks())
             .map(|l| {
                 let found = page.found(l);
                 let answer = if found.is_some() {
@@ -441,6 +483,7 @@ impl<'a> Host<'a> {
         Self {
             signatures,
             page,
+            base: transport::Url::parse(url).ok(),
             tier,
             passive,
             not_found: NotFound::Unasked,
@@ -448,32 +491,69 @@ impl<'a> Host<'a> {
         }
     }
 
+    /// What `leaf`, when it reads a request of its own, needs here. A `script` leaf whose
+    /// script the landing page does not load is absent with no request, and one whose
+    /// script comes from another host is unknown, as that host is not the one scanned.
+    fn request(&self, leaf: &Leaf) -> Option<Request> {
+        match &leaf.source {
+            Source::Path(path) => Some(Request::Ask(path.clone())),
+            Source::Script(src) => {
+                let Some(written) = self.page.scripts.iter().find(|s| src.is_match(s)) else {
+                    return Some(Request::Decided(Answer::Absent));
+                };
+                let base = self.base.as_ref()?;
+                let url = base.join(written).ok()?;
+                let same = url.scheme() == base.scheme()
+                    && url.host_str() == base.host_str()
+                    && url.port_or_known_default() == base.port_or_known_default();
+                if !same {
+                    return Some(Request::Decided(Answer::Unknown));
+                }
+                Some(Request::Ask(match url.query() {
+                    Some(query) => format!("{}?{query}", url.path()),
+                    None => url.path().to_string(),
+                }))
+            }
+            _ => None,
+        }
+    }
+
     /// How `leaf` answers here, and its evidence when present. A leaf above the scan's
-    /// tier is unknown, as is a path not asked yet.
+    /// tier is unknown, as is a request not made yet.
     fn answer(&self, leaf: &Leaf) -> (Answer, Option<String>) {
         if leaf.source.tier() > self.tier {
             return (Answer::Unknown, None);
         }
-        let Source::Path(path) = &leaf.source else {
-            return self
-                .passive
-                .get(&(std::ptr::from_ref(leaf) as usize))
-                .cloned()
-                .unwrap_or_else(|| match self.page.found(leaf) {
-                    Some(e) => (Answer::Present, Some(e)),
-                    None => (Answer::Absent, None),
-                });
+        let path = match self.request(leaf) {
+            None if !leaf.source.asks() => {
+                return self
+                    .passive
+                    .get(&(std::ptr::from_ref(leaf) as usize))
+                    .cloned()
+                    .unwrap_or_else(|| match self.page.found(leaf) {
+                        Some(e) => (Answer::Present, Some(e)),
+                        None => (Answer::Absent, None),
+                    });
+            }
+            None => return (Answer::Unknown, None),
+            Some(Request::Decided(answer)) => return (answer, None),
+            Some(Request::Ask(path)) => path,
         };
-        let Some(answered) = self.asked.get(path) else {
+        let Some(answered) = self.asked.get(&path) else {
             return (Answer::Unknown, None);
         };
         match answered.status {
             Some(status) if gone(status) && !answered.moved => (Answer::Absent, None),
             Some(status) if (200..300).contains(&status) && !answered.moved => {
-                if self.not_found.is(path, status, &answered.body) {
+                if self.not_found.is(&path, status, &answered.body) {
                     return (Answer::Absent, None);
                 }
-                let evidence = Some(format!("path {path}: {status}"));
+                let kind = if let Source::Script(_) = leaf.source {
+                    "script"
+                } else {
+                    "path"
+                };
+                let evidence = Some(format!("{kind} {path}: {status}"));
                 match &leaf.regex {
                     Some(regex) if regex.is_match(&answered.body) => (Answer::Present, evidence),
                     Some(_) => (Answer::Unknown, None),
@@ -556,30 +636,50 @@ impl<'a> Host<'a> {
             .collect()
     }
 
-    /// What `leaf` reads its version from here, when it can be read.
-    fn text(&self, leaf: &Leaf) -> Option<&str> {
+    /// What `leaf` reads its version from here, when it can be read: one text, or for a
+    /// `script_src` leaf the `src` of each script.
+    fn texts(&self, leaf: &Leaf) -> Vec<&str> {
         if leaf.source.tier() > self.tier {
-            return None;
+            return Vec::new();
         }
-        let Source::Path(path) = &leaf.source else {
-            return self.page.text(&leaf.source);
+        if let Source::ScriptSrc = leaf.source {
+            return self.page.scripts.clone();
+        }
+        let Some(Request::Ask(path)) = self.request(leaf) else {
+            return self.page.text(&leaf.source).into_iter().collect();
         };
-        let answered = self.asked.get(path)?;
-        let status = answered
-            .status
-            .filter(|s| (200..300).contains(s) && !answered.moved)?;
-        (!self.not_found.is(path, status, &answered.body)).then_some(answered.body.as_str())
+        let Some(answered) = self.asked.get(&path) else {
+            return Vec::new();
+        };
+        match answered.status {
+            Some(s) if (200..300).contains(&s) && !answered.moved => {
+                if self.not_found.is(&path, s, &answered.body) {
+                    Vec::new()
+                } else {
+                    vec![answered.body.as_str()]
+                }
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// The group of `leaf`'s pattern that reads a version here, and what it reads: the
+    /// first group that takes part in the first match.
+    fn version_of(&self, leaf: &Leaf) -> Option<(usize, String)> {
+        let regex = leaf.regex.as_ref()?;
+        self.texts(leaf).into_iter().find_map(|text| {
+            let captures = regex.captures(text)?;
+            (1..captures.len()).find_map(|i| captures.get(i).map(|m| (i, m.as_str().to_string())))
+        })
     }
 
     /// The version `signature` reads here: from the first of its version leaves that
-    /// matches, the first group of the pattern that takes part.
+    /// reads one.
     fn version(&self, signature: &Signature) -> Option<String> {
-        signature.version.iter().find_map(|leaf| {
-            let captures = leaf.regex.as_ref()?.captures(self.text(leaf)?)?;
-            (1..captures.len())
-                .find_map(|i| captures.get(i))
-                .map(|m| m.as_str().to_string())
-        })
+        signature
+            .version
+            .iter()
+            .find_map(|leaf| self.version_of(leaf).map(|(_, v)| v))
     }
 
     /// Whether a signature present here refines `signature`, directly or through others,
@@ -685,9 +785,13 @@ impl<'a> Host<'a> {
                     if self.refined(signature, &outcomes) || self.version(signature).is_some() {
                         continue;
                     }
-                    versions.extend(signature.version.iter().find_map(|l| match &l.source {
-                        Source::Path(path) if !self.asked.contains_key(path) => Some(path),
-                        _ => None,
+                    versions.extend(signature.version.iter().find_map(|l| {
+                        match self.request(l).filter(|_| l.source.tier() <= self.tier) {
+                            Some(Request::Ask(path)) if !self.asked.contains_key(&path) => {
+                                Some(path)
+                            }
+                            _ => None,
+                        }
                     }));
                 }
                 Answer::Unknown => {
@@ -696,16 +800,14 @@ impl<'a> Host<'a> {
                     };
                     let mut leaves = Vec::new();
                     detect.leaves(&mut leaves);
-                    let deciding = leaves.into_iter().filter_map(|leaf| match &leaf.source {
-                        Source::Path(path)
-                            if !self.asked.contains_key(path)
-                                && [Answer::Present, Answer::Absent].into_iter().any(|a| {
-                                    self.eval(detect, Some((leaf, a))).answer != Answer::Unknown
-                                }) =>
-                        {
-                            Some(path)
-                        }
-                        _ => None,
+                    let deciding = leaves.into_iter().filter_map(|leaf| {
+                        let Some(Request::Ask(path)) = self.request(leaf) else {
+                            return None;
+                        };
+                        let decides = [Answer::Present, Answer::Absent]
+                            .into_iter()
+                            .any(|a| self.eval(detect, Some((leaf, a))).answer != Answer::Unknown);
+                        (!self.asked.contains_key(&path) && decides).then_some(path)
                     });
                     let mut support = Vec::new();
                     detect.supporting(&mut support);
@@ -718,12 +820,7 @@ impl<'a> Host<'a> {
                 Answer::Absent => {}
             }
         }
-        versions
-            .into_iter()
-            .chain(supported)
-            .chain(rest)
-            .next()
-            .cloned()
+        versions.into_iter().chain(supported).chain(rest).next()
     }
 }
 

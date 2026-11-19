@@ -59,6 +59,7 @@ impl Saved {
         let r = &self.landing;
         let mut host = Host::new(
             Signatures::shipped(),
+            "http://saved.test/",
             &r.headers,
             &r.cookies,
             &r.body,
@@ -248,10 +249,7 @@ async fn the_saved_responses_exercise_every_leaf() {
             };
             let given: Vec<usize> = found_in
                 .iter()
-                .filter_map(|h| {
-                    let captures = regex.captures(h.text(leaf)?)?;
-                    (1..captures.len()).find(|i| captures.get(*i).is_some())
-                })
+                .filter_map(|h| h.version_of(leaf).map(|(group, _)| group))
                 .collect();
             if given.is_empty() {
                 missing.push(format!(

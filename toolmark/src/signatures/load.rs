@@ -40,6 +40,7 @@ struct LeafSpec {
     name: Option<String>,
     regex: Option<String>,
     path: Option<String>,
+    src: Option<String>,
     confidence: Option<u32>,
 }
 
@@ -217,14 +218,18 @@ fn leaf(kind: &str, value: Value, version: bool) -> Result<Leaf, String> {
         Cookie,
         Meta,
         Html,
+        ScriptSrc,
         Path,
+        Script,
     }
     let known = match kind {
         "header" => Kind::Header,
         "cookie" => Kind::Cookie,
         "meta" => Kind::Meta,
         "html" => Kind::Html,
+        "script_src" => Kind::ScriptSrc,
         "path" => Kind::Path,
+        "script" => Kind::Script,
         other => return Err(format!("unknown leaf `{other}`")),
     };
     let spec: LeafSpec = serde_yaml::from_value(value).map_err(|e| format!("{kind}: {e}"))?;
@@ -232,15 +237,16 @@ fn leaf(kind: &str, value: Value, version: bool) -> Result<Leaf, String> {
         Regex::new(pattern).map_err(|e| format!("{kind} pattern {pattern:?} does not compile: {e}"))
     };
     let needs = |field: Option<String>, what: &str| {
-        field.ok_or_else(|| format!("a {kind} leaf needs {what}"))
+        field.ok_or_else(|| format!("this {kind} leaf needs {what}"))
     };
     let refuse = |field: &Option<String>, what: &str| match field {
-        Some(_) => Err(format!("a {kind} leaf has no {what}")),
+        Some(_) => Err(format!("this {kind} leaf has no {what}")),
         None => Ok(()),
     };
     let (source, regex, confidence) = match known {
         Kind::Header => {
             refuse(&spec.path, "path")?;
+            refuse(&spec.src, "src")?;
             let name = needs(spec.name, "a name")?.to_ascii_lowercase();
             let regex = compile(&needs(spec.regex, "a regex")?)?;
             (Source::Header(name), Some(regex), 50)
@@ -251,6 +257,7 @@ fn leaf(kind: &str, value: Value, version: bool) -> Result<Leaf, String> {
             }
             refuse(&spec.regex, "regex: it matches the cookie's name")?;
             refuse(&spec.path, "path")?;
+            refuse(&spec.src, "src")?;
             (
                 Source::Cookie,
                 Some(compile(&needs(spec.name, "a name")?)?),
@@ -259,6 +266,7 @@ fn leaf(kind: &str, value: Value, version: bool) -> Result<Leaf, String> {
         }
         Kind::Meta => {
             refuse(&spec.path, "path")?;
+            refuse(&spec.src, "src")?;
             let name = needs(spec.name, "a name")?.to_ascii_lowercase();
             let regex = compile(&needs(spec.regex, "a regex")?)?;
             (Source::Meta(name), Some(regex), 60)
@@ -266,14 +274,33 @@ fn leaf(kind: &str, value: Value, version: bool) -> Result<Leaf, String> {
         Kind::Html => {
             refuse(&spec.name, "name")?;
             refuse(&spec.path, "path")?;
+            refuse(&spec.src, "src")?;
             (
                 Source::Html,
                 Some(compile(&needs(spec.regex, "a regex")?)?),
                 25,
             )
         }
+        Kind::ScriptSrc => {
+            refuse(&spec.name, "name")?;
+            refuse(&spec.path, "path")?;
+            refuse(&spec.src, "src: its regex matches the src")?;
+            (
+                Source::ScriptSrc,
+                Some(compile(&needs(spec.regex, "a regex")?)?),
+                40,
+            )
+        }
+        Kind::Script => {
+            refuse(&spec.name, "name")?;
+            refuse(&spec.path, "path")?;
+            let src = compile(&needs(spec.src, "a src, which its script's src matches")?)?;
+            let regex = compile(&needs(spec.regex, "a regex")?)?;
+            (Source::Script(src), Some(regex), 50)
+        }
         Kind::Path => {
             refuse(&spec.name, "name")?;
+            refuse(&spec.src, "src")?;
             let path = needs(spec.path, "a path")?;
             let lawful = path.starts_with('/')
                 && !path.starts_with("//")
@@ -408,6 +435,27 @@ mod tests {
                 ),
             ),
             (
+                "script-without-src.yaml".into(),
+                format!(
+                    "id: script-without-src\n{}",
+                    x("detect: { script: { regex: 'x' } }\n")
+                ),
+            ),
+            (
+                "script-src-with-src.yaml".into(),
+                format!(
+                    "id: script-src-with-src\n{}",
+                    x("detect: { script_src: { regex: 'x', src: 'y' } }\n")
+                ),
+            ),
+            (
+                "header-with-src.yaml".into(),
+                format!(
+                    "id: header-with-src\n{}",
+                    x("detect: { header: { name: server, regex: 'x', src: 'y' } }\n")
+                ),
+            ),
+            (
                 "path-version.yaml".into(),
                 format!(
                     "id: path-version\n{}",
@@ -483,7 +531,13 @@ mod tests {
             ("only-none.yaml", "could hold with no evidence found"),
             ("empty-all.yaml", "`all` lists nothing"),
             ("off-host.yaml", "is not one on the host"),
-            ("path-name.yaml", "a path leaf has no name"),
+            ("path-name.yaml", "this path leaf has no name"),
+            ("script-without-src.yaml", "this script leaf needs a src"),
+            (
+                "script-src-with-src.yaml",
+                "this script_src leaf has no src",
+            ),
+            ("header-with-src.yaml", "this header leaf has no src"),
             ("path-version.yaml", "a version leaf needs a regex"),
             ("implies-missing.yaml", "it implies nowhere"),
             ("implies-left-out.yaml", "it implies implies-missing"),

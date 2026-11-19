@@ -189,7 +189,14 @@ async fn scan<O: crate::observe::Observer>(
 
     // What the landing page leaves undecided, from the paths worth asking. Each one asked
     // is kept as what the scan saw, as the landing page is.
-    let mut found = signatures::Host::new(signatures, &headers, &cookies, &body, params.depth_tier);
+    let mut found = signatures::Host::new(
+        signatures,
+        &url,
+        &headers,
+        &cookies,
+        &body,
+        params.depth_tier,
+    );
     let base = transport::Url::parse(&url).ok();
     signatures::ask(&mut found, |path| {
         let target = base.as_ref().and_then(|b| b.join(&path).ok());

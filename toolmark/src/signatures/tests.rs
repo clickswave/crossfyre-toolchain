@@ -75,7 +75,7 @@ fn answers(
         .collect();
     let signatures = set(&files);
     let headers = [("server".to_string(), server.to_string())];
-    let mut host = Host::new(&signatures, &headers, &[], "", tier);
+    let mut host = Host::new(&signatures, "http://host.test/", &headers, &[], "", tier);
     host.not_found = NotFound::Honest;
     for (path, answered) in asked {
         host.asked.insert(
@@ -205,7 +205,14 @@ fn only_the_leaves_that_hold_a_detection_count_for_it() {
         .collect();
     let signatures = set(&files);
     let headers = [("server".to_string(), "nginx/1.24.0".to_string())];
-    let host = Host::new(&signatures, &headers, &[], "", STANDARD);
+    let host = Host::new(
+        &signatures,
+        "http://host.test/",
+        &headers,
+        &[],
+        "",
+        STANDARD,
+    );
     let found = host.detections();
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].confidence, 40);
@@ -291,7 +298,7 @@ fn the_not_found_page_decides_a_path_that_has_no_pattern() {
         .collect();
     let signatures = set(&files);
     let answer = |not_found: NotFound, body: &str| {
-        let mut host = Host::new(&signatures, &[], &[], "", STANDARD);
+        let mut host = Host::new(&signatures, "http://host.test/", &[], &[], "", STANDARD);
         host.not_found = not_found;
         host.asked.insert("/admin/".into(), status(200, body));
         host.outcomes()[0].1.answer
@@ -353,7 +360,14 @@ fn a_refining_signature_replaces_its_base_or_is_named_as_a_candidate() {
     let signatures = set(&files);
     let headers = [("server".to_string(), "frame".to_string())];
     let reported = |asked: &[(&str, u16)]| {
-        let mut host = Host::new(&signatures, &headers, &[], "", STANDARD);
+        let mut host = Host::new(
+            &signatures,
+            "http://host.test/",
+            &headers,
+            &[],
+            "",
+            STANDARD,
+        );
         host.not_found = NotFound::Honest;
         for (path, code) in asked {
             host.asked.insert(path.to_string(), status(*code, "page"));
@@ -407,7 +421,14 @@ fn only_a_path_that_could_change_an_answer_is_worth_asking() {
         .collect();
     let signatures = set(&files);
     let headers = [("server".to_string(), "frame".to_string())];
-    let mut host = Host::new(&signatures, &headers, &[], "", STANDARD);
+    let mut host = Host::new(
+        &signatures,
+        "http://host.test/",
+        &headers,
+        &[],
+        "",
+        STANDARD,
+    );
     host.not_found = NotFound::Honest;
     let mut order = Vec::new();
     while let Some(path) = host.next_path() {
@@ -424,11 +445,18 @@ fn only_a_path_that_could_change_an_answer_is_worth_asking() {
 
     // With the version in the Server header, the version path is not worth asking.
     let headers = [("server".to_string(), "frame/3.0".to_string())];
-    let host = Host::new(&signatures, &headers, &[], "", STANDARD);
+    let host = Host::new(
+        &signatures,
+        "http://host.test/",
+        &headers,
+        &[],
+        "",
+        STANDARD,
+    );
     assert_eq!(host.next_path().as_deref(), Some("/supported"));
 
     // Below the standard tier nothing is asked.
-    let host = Host::new(&signatures, &headers, &[], "", 1);
+    let host = Host::new(&signatures, "http://host.test/", &headers, &[], "", 1);
     assert_eq!(host.next_path(), None);
 }
 
@@ -444,7 +472,7 @@ async fn asking_learns_the_not_found_page_first_and_stops_where_it_should() {
     let run = |answer: fn(&str) -> Answered| {
         let signatures = &signatures;
         async move {
-            let mut host = Host::new(signatures, &[], &[], "", STANDARD);
+            let mut host = Host::new(signatures, "http://host.test/", &[], &[], "", STANDARD);
             let mut seen = Vec::new();
             let sent = ask(&mut host, |path| {
                 seen.push(path.clone());
@@ -500,4 +528,99 @@ async fn asking_learns_the_not_found_page_first_and_stops_where_it_should() {
     assert_eq!(sent, 5);
     let (sent, _) = run(|_| status(503, "")).await;
     assert_eq!(sent, 3);
+}
+
+/// `script_src` reads the `src` of each script the landing page loads: present when one
+/// matches, absent when none does, and a version from the first that captures one.
+#[test]
+fn a_script_src_is_read_from_the_landing_page() {
+    let files = [(
+        "lib.yaml".to_string(),
+        "id: lib\ninfo: { name: Lib, category: Test }\n\
+         detect: { script_src: { regex: '/lib(?:\\.min)?\\.js' } }\n\
+         version: [ { script_src: { regex: '/lib(?:\\.min)?\\.js\\?ver=([0-9.]+)' } } ]\n"
+            .to_string(),
+    )];
+    let files: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(f, t)| (f.as_str(), t.as_str()))
+        .collect();
+    let signatures = set(&files);
+    let found = |body: &str| {
+        Host::new(&signatures, "http://host.test/", &[], &[], body, 0)
+            .detections()
+            .into_iter()
+            .map(|d| (d.name, d.version, d.evidence))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        found(
+            "<script src='/a.js'></script><SCRIPT defer SRC=\"/static/lib.min.js?ver=2.1\"></SCRIPT>"
+        ),
+        [(
+            "Lib".to_string(),
+            Some("2.1".to_string()),
+            vec!["script src /static/lib.min.js?ver=2.1".to_string()]
+        )]
+    );
+    assert!(found("<script src='/a.js'></script><p>/lib.js</p>").is_empty());
+}
+
+/// `script` reads the content of the first script the landing page loads from its own
+/// host whose `src` matches: asked for like a path, absent with no request when the page
+/// loads no such script, and unknown with no request when it comes from another host.
+#[test]
+fn a_script_is_asked_for_only_when_the_page_loads_it_from_its_own_host() {
+    let files = [(
+        "lib.yaml".to_string(),
+        "id: lib\ninfo: { name: Lib, category: Test }\n\
+         detect: { script: { src: 'lib\\.js', regex: 'lib-marker' } }\n\
+         version: [ { script: { src: 'lib\\.js', regex: 'Lib v([0-9.]+)' } } ]\n"
+            .to_string(),
+    )];
+    let files: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(f, t)| (f.as_str(), t.as_str()))
+        .collect();
+    let signatures = set(&files);
+    let host = |body: &'static str| {
+        let mut host = Host::new(
+            &signatures,
+            "http://host.test/app/",
+            &[],
+            &[],
+            body,
+            STANDARD,
+        );
+        host.not_found = NotFound::Honest;
+        host
+    };
+
+    // From its own host, by a relative src: the path is asked, query and all.
+    let mut own = host("<script src='js/lib.js?v=7'></script>");
+    assert_eq!(own.next_path().as_deref(), Some("/app/js/lib.js?v=7"));
+    own.asked.insert(
+        "/app/js/lib.js?v=7".into(),
+        status(200, "/* lib-marker Lib v1.4.2 */"),
+    );
+    let found = own.detections();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].version.as_deref(), Some("1.4.2"));
+    assert_eq!(found[0].evidence, ["script /app/js/lib.js?v=7: 200"]);
+    assert_eq!(own.next_path(), None);
+
+    // A 404 for it is the script not being there.
+    let mut gone = host("<script src='/js/lib.js'></script>");
+    gone.asked.insert("/js/lib.js".into(), status(404, ""));
+    assert_eq!(gone.outcomes()[0].1.answer, Answer::Absent);
+
+    // From another host: nothing is asked, and it stays unknown.
+    let elsewhere = host("<script src='https://cdn.test/lib.js'></script>");
+    assert_eq!(elsewhere.next_path(), None);
+    assert_eq!(elsewhere.outcomes()[0].1.answer, Answer::Unknown);
+
+    // Not loaded at all: absent, and nothing is asked.
+    let none = host("<script src='/other.js'></script>");
+    assert_eq!(none.next_path(), None);
+    assert_eq!(none.outcomes()[0].1.answer, Answer::Absent);
 }
