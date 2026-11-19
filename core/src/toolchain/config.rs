@@ -200,7 +200,8 @@ pub(crate) fn load_config_at(
 ) -> Result<ToolchainConfig, Box<dyn std::error::Error>> {
     // The node service reads this as root from the operator's home.
     let contents = super::sudo_user::read_to_string(path)?;
-    let config: ToolchainConfig = toml::from_str(&contents)?;
+    let config: ToolchainConfig =
+        toml::from_str(&contents).map_err(|e| cfx_db::config_unreadable(&contents, path, &e))?;
     Ok(config)
 }
 

@@ -66,6 +66,51 @@ impl Default for Settings {
     }
 }
 
+/// What a config.toml from before the local database says, with `{path}` its path: one
+/// that a crossfyre older than 0.1.45 wrote, whose database ran in Docker, and that this
+/// one does not read.
+pub const FROM_DOCKER_DAYS: &str = "{path} was written by a crossfyre older than this one, \
+    whose database ran in Docker, and this one cannot read it. To reinstall, run `crossfyre \
+    uninstall`, delete {path}, run `docker rm -f crossfyre-postgres`, and then run the install \
+    command again";
+
+/// What reading the config.toml at `path`, holding `text`, failed with `e` says: for one
+/// from before the local database, how to reinstall (see [`FROM_DOCKER_DAYS`]), and for
+/// any other the file, the line and the key.
+pub fn config_unreadable(text: &str, path: &Path, e: &toml::de::Error) -> NotReady {
+    if from_docker_days(text) {
+        let path = path.display().to_string();
+        return NotReady::new(FROM_DOCKER_DAYS.replace("{path}", &path), None);
+    }
+    let line = e
+        .span()
+        .and_then(|span| text.get(..span.start))
+        .map(|before| before.matches('\n').count() + 1);
+    let at = line.map(|n| format!(" (line {n})")).unwrap_or_default();
+    NotReady::new(
+        format!(
+            "{} is not a valid toolchain config: {}{at}",
+            path.display(),
+            e.message()
+        ),
+        None,
+    )
+}
+
+/// Whether `text` is a config.toml from before the local database: its [postgres]
+/// section names the container's host and no backend, since the container was the only
+/// one there was.
+fn from_docker_days(text: &str) -> bool {
+    toml::from_str::<toml::Table>(text)
+        .ok()
+        .and_then(|file| {
+            file.get("postgres")?
+                .as_table()
+                .map(|pg| pg.contains_key("host") && !pg.contains_key("backend"))
+        })
+        .unwrap_or(false)
+}
+
 impl Settings {
     /// Give the settings a new password when they have none, and say whether they got
     /// one. An empty password counts as none.
@@ -116,21 +161,7 @@ impl Settings {
         }
         toml::from_str::<File>(text)
             .map(|file| file.postgres)
-            .map_err(|e| {
-                let line = e
-                    .span()
-                    .and_then(|span| text.get(..span.start))
-                    .map(|before| before.matches('\n').count() + 1);
-                let at = line.map(|n| format!(" (line {n})")).unwrap_or_default();
-                NotReady::new(
-                    format!(
-                        "{} is not a valid toolchain config: {}{at}",
-                        path.display(),
-                        e.message()
-                    ),
-                    None,
-                )
-            })
+            .map_err(|e| config_unreadable(text, path, &e))
     }
 
     /// config.toml holding these settings and nothing else, as it is made when missing.
@@ -284,6 +315,24 @@ mod tests {
             "{}",
             e.problem()
         );
+    }
+
+    /// What an install of crossfyre older than 0.1.45 left, whose database ran in Docker.
+    /// It is not read, and says how to reinstall, in a sentence rather than the parser's
+    /// picture of line 1.
+    #[test]
+    fn a_config_from_before_the_local_database_says_to_reinstall() {
+        let e = parsed(
+            "[postgres]\nhost = \"localhost\"\nport = 4440\nuser = \"postgres\"\n\
+             password = \"pw\"\ndb_name = \"crossfyre\"\n\n[extensions]\nvoyage = 4442\n",
+        )
+        .unwrap_err();
+        assert_eq!(
+            e.problem(),
+            FROM_DOCKER_DAYS.replace("{path}", "/t/config.toml")
+        );
+        assert_eq!(e.fix(), None);
+        assert!(!e.problem().contains('\n'), "{}", e.problem());
     }
 
     #[test]

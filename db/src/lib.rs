@@ -24,5 +24,5 @@ pub use account::lock_file;
 pub use account::{Account, ThisAccount};
 pub use local::{Postgres, find_postgres};
 pub use ready::{NotReady, check, ensure_ready};
-pub use settings::{Backend, Settings, new_password};
+pub use settings::{Backend, FROM_DOCKER_DAYS, Settings, config_unreadable, new_password};
 pub use toolchain::{Status, Stop, Toolchain, Up};
