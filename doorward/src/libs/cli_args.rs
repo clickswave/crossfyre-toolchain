@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
@@ -35,7 +35,6 @@ pub enum Commands {
     Scan(ScanArgs),
     /// Send a JSON op to the daemon and print the reply. `operation` defaults to
     /// `probe`, which runs a single probe with no dashboard.
-    #[command(alias = "scan-exec")]
     Exec(ExecArgs),
     /// Database management
     Db(DbArgs),
@@ -52,18 +51,13 @@ pub enum Commands {
 
 #[derive(Parser, Clone)]
 pub struct ScanArgs {
-    /// Target hosts/CIDRs (e.g. 192.168.1.0/24, example.com)
-    #[arg(short = 't', long, num_args = 1..)]
+    /// The hosts, addresses and CIDR ranges to scan (e.g. 192.168.1.0/24 example.com)
+    #[arg(value_name = "TARGET", required = true)]
     pub targets: Vec<String>,
 
     /// Ports to scan (e.g. "1-1024", "80,443,8080", "top-100", "top-1000")
     #[arg(short = 'p', long, default_value = "top-1000")]
     pub ports: String,
-
-    /// Scan technique. Only connect scanning is implemented; `syn` is accepted
-    /// so existing commands keep working, and runs a connect scan.
-    #[arg(long, default_value = "connect")]
-    pub technique: ScanTechnique,
 
     /// Number of concurrent tasks
     #[arg(long, default_value_t = 100)]
@@ -106,41 +100,6 @@ pub struct DbArgs {
     /// Drop and recreate all tables
     #[arg(long, default_value_t = false)]
     pub full_reset: bool,
-}
-
-#[derive(Clone, Debug, ValueEnum)]
-pub enum ScanTechnique {
-    /// TCP connect scan (full handshake)
-    Connect,
-    /// Accepted for compatibility. No SYN scan is implemented yet, so it runs
-    /// a connect scan and says so.
-    Syn,
-}
-
-impl ScanTechnique {
-    /// The technique the scan actually runs with.
-    pub fn runs(&self) -> &'static str {
-        "connect"
-    }
-
-    /// What to tell the user before the scan starts, if anything.
-    pub fn notice(&self) -> Option<&'static str> {
-        match self {
-            ScanTechnique::Connect => None,
-            ScanTechnique::Syn => Some(
-                "doorward: SYN scanning is not implemented yet, so this is a TCP connect scan.",
-            ),
-        }
-    }
-}
-
-impl std::fmt::Display for ScanTechnique {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ScanTechnique::Connect => write!(f, "connect"),
-            ScanTechnique::Syn => write!(f, "syn"),
-        }
-    }
 }
 
 /// Well-known port lists for convenience.
@@ -274,32 +233,6 @@ mod resolve_ports_tests {
 }
 
 #[cfg(test)]
-mod technique_tests {
-    use super::*;
-
-    fn scan(argv: &[&str]) -> ScanArgs {
-        match Cli::try_parse_from(argv).expect("arguments parse").command {
-            Some(Commands::Scan(args)) => args,
-            _ => panic!("not a scan"),
-        }
-    }
-
-    #[test]
-    fn the_default_is_the_scan_that_runs() {
-        let args = scan(&["doorward", "scan", "-t", "10.0.0.5"]);
-        assert_eq!(args.technique.to_string(), "connect");
-    }
-
-    #[test]
-    fn asking_for_syn_still_parses_and_says_it_is_a_connect_scan() {
-        let args = scan(&["doorward", "scan", "-t", "10.0.0.5", "--technique", "syn"]);
-        assert_eq!(args.technique.runs(), "connect");
-        assert!(args.technique.notice().is_some());
-        assert!(ScanTechnique::Connect.notice().is_none());
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -333,5 +266,24 @@ mod tests {
             Cli::try_parse_from(["doorward", "--daemon"]).is_err(),
             "the old flag"
         );
+    }
+
+    #[test]
+    fn the_targets_follow_scan_and_the_old_names_are_gone() {
+        let cli = Cli::try_parse_from(["doorward", "scan", "10.0.0.5", "example.com", "-p", "80"])
+            .expect("parses");
+        let Some(Commands::Scan(args)) = cli.command else {
+            panic!("not a scan")
+        };
+        assert_eq!(args.targets, ["10.0.0.5", "example.com"]);
+        for old in [
+            &["doorward", "scan"][..],
+            &["doorward", "scan", "-t", "10.0.0.5"],
+            &["doorward", "scan", "--targets", "10.0.0.5"],
+            &["doorward", "scan", "10.0.0.5", "--technique", "syn"],
+            &["doorward", "scan-exec", "{}"],
+        ] {
+            assert!(Cli::try_parse_from(old).is_err(), "{old:?}");
+        }
     }
 }

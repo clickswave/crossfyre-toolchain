@@ -116,7 +116,6 @@ pub enum Commands {
     Scan(ScanArgs),
     /// Send a JSON op to the daemon and print the reply. `operation` defaults to
     /// `probe`, which checks a single URL with no wordlist and no dashboard.
-    #[command(alias = "scan-exec")]
     Exec(ExecArgs),
     /// Database management
     Db(DbArgs),
@@ -150,8 +149,9 @@ pub struct DbArgs {
 
 #[derive(ClapArgs, Clone, Debug)]
 pub struct ScanArgs {
-    /// Specify the URL(s) to target
-    #[arg(short, long)]
+    /// The URLs to scan, one after another. ::FUZZ:: marks where each word goes, and
+    /// without it each word goes at the end of the path
+    #[arg(value_name = "URL", required_unless_present = "interactive")]
     pub url: Vec<String>,
 
     /// Specify the wordlist path
@@ -433,7 +433,7 @@ impl ScanArgs {
 /// Scan arguments as the command line gives them by default, for tests.
 #[cfg(test)]
 pub(crate) fn defaults_for_tests() -> ScanArgs {
-    match Cli::try_parse_from(["ambulo", "scan", "--url", "http://h/::FUZZ::"])
+    match Cli::try_parse_from(["ambulo", "scan", "http://h/::FUZZ::"])
         .unwrap()
         .command
     {
@@ -458,20 +458,14 @@ mod tests {
         // `index.php/` is a different resource from `index.php`, and on most
         // servers a missing one. The slash was on by default with no way to
         // turn it off, so every file in a wordlist was requested as a directory.
-        let mut args = scan_args(&["ambulo", "scan", "--url", "http://h/::FUZZ::"]);
+        let mut args = scan_args(&["ambulo", "scan", "http://h/::FUZZ::"]);
         args.validate_urls().unwrap();
         assert_eq!(args.url, ["http://h/::FUZZ::"]);
     }
 
     #[test]
     fn append_slash_asks_for_directories() {
-        let mut args = scan_args(&[
-            "ambulo",
-            "scan",
-            "--url",
-            "http://h/::FUZZ::",
-            "--append-slash",
-        ]);
+        let mut args = scan_args(&["ambulo", "scan", "http://h/::FUZZ::", "--append-slash"]);
         args.validate_urls().unwrap();
         assert_eq!(args.url, ["http://h/::FUZZ::/"]);
     }
@@ -496,5 +490,23 @@ mod tests {
             Cli::try_parse_from(["ambulo", "--daemon"]).is_err(),
             "the old flag"
         );
+    }
+
+    #[test]
+    fn the_urls_follow_scan_and_the_old_names_are_gone() {
+        let args = scan_args(&["ambulo", "scan", "http://a/::FUZZ::", "http://b/"]);
+        assert_eq!(args.url, ["http://a/::FUZZ::", "http://b/"]);
+        assert!(
+            Cli::try_parse_from(["ambulo", "scan", "--interactive"]).is_ok(),
+            "asked for"
+        );
+        for old in [
+            &["ambulo", "scan"][..],
+            &["ambulo", "scan", "-u", "http://a/"],
+            &["ambulo", "scan", "--url", "http://a/"],
+            &["ambulo", "scan-exec", "{}"],
+        ] {
+            assert!(Cli::try_parse_from(old).is_err(), "{old:?}");
+        }
     }
 }

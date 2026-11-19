@@ -33,7 +33,6 @@ pub struct Cli {
 pub enum Commands {
     /// Scan a single target through the running daemon: fingerprint its web
     /// stack and report what it is running
-    #[command(alias = "fingerprint")]
     Scan(ScanArgs),
     /// Send a JSON op to the daemon and print the streamed events. `operation` is
     /// required: this is the raw interface the node uses.
@@ -113,5 +112,11 @@ mod tests {
             Cli::try_parse_from(["toolmark", "--daemon"]).is_err(),
             "the old flag"
         );
+    }
+
+    #[test]
+    fn fingerprint_is_no_longer_a_name_for_scan() {
+        assert!(Cli::try_parse_from(["toolmark", "scan", "example.com"]).is_ok());
+        assert!(Cli::try_parse_from(["toolmark", "fingerprint", "example.com"]).is_err());
     }
 }

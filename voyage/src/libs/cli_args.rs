@@ -68,7 +68,6 @@ pub enum Commands {
     Scan(ScanArgs),
     /// Send a JSON op to the daemon and print the reply. `operation` defaults to
     /// `probe`, which checks a single subdomain with no dashboard.
-    #[command(alias = "scan-exec")]
     Exec(ExecArgs),
     /// Database management
     Db(DbArgs),
@@ -141,11 +140,12 @@ pub struct DbArgs {
 
 #[derive(ClapArgs, Clone, Debug)]
 pub struct ScanArgs {
-    /// Target domain(s) to enumerate
-    #[arg(short, long)]
+    /// The domains to enumerate, one after another
+    #[arg(value_name = "DOMAIN", required_unless_present = "interactive")]
     pub domain: Vec<String>,
 
-    /// Wordlist path for active enumeration
+    /// A wordlist of names to try under each domain. Without one, only passive sources
+    /// run
     #[arg(short, long, default_value_t = String::new())]
     pub wordlist_path: String,
 
@@ -164,10 +164,6 @@ pub struct ScanArgs {
     /// Disable passive subdomain enumeration
     #[arg(long, default_value_t = false)]
     pub disable_passive_enum: bool,
-
-    /// Disable active subdomain enumeration (wordlist-based)
-    #[arg(long, default_value_t = false)]
-    pub disable_active_enum: bool,
 
     /// Passive sources to exclude; an unknown name is an error
     #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(passive_scan::SOURCES))]
@@ -242,13 +238,9 @@ impl ScanArgs {
             .interact_text()
             .map_err(|e| e.to_string())?;
 
-        if wordlist_input.trim().is_empty() {
-            self.disable_active_enum = true;
-        } else {
-            if !std::path::Path::new(wordlist_input.trim()).exists() {
-                return Err(format!("Wordlist not found: {}", wordlist_input.trim()));
-            }
-            self.wordlist_path = wordlist_input.trim().to_string();
+        self.wordlist_path = wordlist_input.trim().to_string();
+        if !self.wordlist_path.is_empty() && !std::path::Path::new(&self.wordlist_path).exists() {
+            return Err(format!("Wordlist not found: {}", self.wordlist_path));
         }
 
         // --- Tasks ---
@@ -285,6 +277,23 @@ impl ScanArgs {
 
         Ok(())
     }
+
+    /// What runs without a wordlist: the line that says only the passive sources do,
+    /// or why nothing would. None with a wordlist, when both halves run.
+    pub fn passive_only(&self) -> Result<Option<&'static str>, &'static str> {
+        if !self.wordlist_path.is_empty() {
+            return Ok(None);
+        }
+        if self.disable_passive_enum {
+            return Err(
+                "there is nothing to run: the passive sources are off, and active \
+                 enumeration needs -w <wordlist>",
+            );
+        }
+        Ok(Some(
+            "voyage: active enumeration needs -w <wordlist>, so only passive sources run",
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -303,7 +312,6 @@ mod tests {
         let args = scan_args(&[
             "voyage",
             "scan",
-            "--domain",
             "example.com",
             "--exclude-passive-source",
             passive_scan::CRT_SH,
@@ -316,7 +324,7 @@ mod tests {
     }
 
     fn refused(flag: &str, typo: &str, valid: &[&str]) {
-        let err = scan_args(&["voyage", "scan", "--domain", "example.com", flag, typo])
+        let err = scan_args(&["voyage", "scan", "example.com", flag, typo])
             .expect_err("an unknown name is refused");
         assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
         let text = err.to_string();
@@ -358,5 +366,39 @@ mod tests {
             Cli::try_parse_from(["voyage", "--daemon"]).is_err(),
             "the old flag"
         );
+    }
+
+    #[test]
+    fn the_domains_follow_scan_and_the_old_names_are_gone() {
+        let args = scan_args(&["voyage", "scan", "example.com", "example.org"]).expect("parses");
+        assert_eq!(args.domain, ["example.com", "example.org"]);
+        assert!(
+            scan_args(&["voyage", "scan", "--interactive"]).is_ok(),
+            "asked for"
+        );
+        for old in [
+            &["voyage", "scan"][..],
+            &["voyage", "scan", "-d", "example.com"],
+            &["voyage", "scan", "--domain", "example.com"],
+            &["voyage", "scan", "example.com", "--disable-active-enum"],
+            &["voyage", "scan-exec", "{}"],
+        ] {
+            assert!(Cli::try_parse_from(old).is_err(), "{old:?}");
+        }
+    }
+
+    #[test]
+    fn without_a_wordlist_only_the_passive_sources_run() {
+        let args = scan_args(&["voyage", "scan", "example.com"]).unwrap();
+        assert_eq!(
+            args.passive_only(),
+            Ok(Some(
+                "voyage: active enumeration needs -w <wordlist>, so only passive sources run"
+            ))
+        );
+        let args = scan_args(&["voyage", "scan", "example.com", "-w", "subs.txt"]).unwrap();
+        assert_eq!(args.passive_only(), Ok(None));
+        let args = scan_args(&["voyage", "scan", "example.com", "--disable-passive-enum"]).unwrap();
+        assert!(args.passive_only().is_err());
     }
 }

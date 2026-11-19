@@ -85,25 +85,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Scan(args)) => args,
         _ => {
             eprintln!(
-                "No command given. Use `doorward scan`, `doorward exec`, `doorward db`, or `doorward daemon`. Try --help."
+                "No command given. Use `doorward scan <target>...`, `doorward exec <json>`, `doorward db`, or `doorward daemon`. Try --help."
             );
             std::process::exit(1);
         }
     };
 
-    if scan_args.targets.is_empty() {
-        eprintln!("Error: --targets is required");
-        std::process::exit(1);
-    }
-
     let stream = daemon.connect().await?;
 
     let ports = libs::cli_args::resolve_ports(&scan_args.ports);
-
-    // On stderr, so a piped scan's JSON on stdout stays clean.
-    if let Some(notice) = scan_args.technique.notice() {
-        eprintln!("{notice}");
-    }
 
     // Build and send the stream scan request
     let request = serde_json::json!({
@@ -112,7 +102,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "save": true,
         "targets": scan_args.targets,
         "ports": ports,
-        "technique": scan_args.technique.runs(),
         "tasks": scan_args.tasks,
         "timeout": scan_args.timeout,
         "delay": scan_args.delay,

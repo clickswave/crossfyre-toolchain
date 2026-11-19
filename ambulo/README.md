@@ -11,13 +11,13 @@ Part of the [Crossfyre toolchain](../). Works on its own; no account needed.
 
 ```sh
 # fuzz a path. ::FUZZ:: is where each wordlist entry gets substituted
-ambulo scan --url https://example.com/::FUZZ:: --wordlist-path ./words.txt
+ambulo scan https://example.com/::FUZZ:: --wordlist-path ./words.txt
 
 # tune concurrency and pacing
-ambulo scan -u https://example.com/::FUZZ:: -w ./words.txt --tasks 40 --interval 20
+ambulo scan https://example.com/::FUZZ:: -w ./words.txt --tasks 40 --interval 20
 
 # only treat these as hits
-ambulo scan -u https://example.com/::FUZZ:: -w ./words.txt --success-status-codes 200,204,301,403
+ambulo scan https://example.com/::FUZZ:: -w ./words.txt --success-status-codes 200,204,301,403
 ```
 
 A stopped scan resumes by default. Use `--fresh-start` if you want to ignore prior

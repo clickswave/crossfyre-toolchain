@@ -11,13 +11,13 @@ Part of the [Crossfyre toolchain](../). Standalone, no account.
 
 ```sh
 # passive sources only
-voyage scan --domain example.com
+voyage scan example.com
 
 # add active brute-forcing with a wordlist
-voyage scan --domain example.com --wordlist-path ./subdomains.txt
+voyage scan example.com --wordlist-path ./subdomains.txt
 
 # passive off, active only
-voyage scan -d example.com -w ./subdomains.txt --disable-passive-enum
+voyage scan example.com -w ./subdomains.txt --disable-passive-enum
 ```
 
 Resumes by default; pass `--fresh-start` to run clean.
@@ -37,7 +37,7 @@ terminal, and `--tui` is accepted for symmetry with the other engines.
 ## Handy flags
 
 - `-w, --wordlist-path` list for active brute-forcing
-- `--disable-passive-enum` / `--disable-active-enum` turn either half off
+- `--disable-passive-enum` turn the passive sources off; without `-w` there is no active half
 - `--exclude-passive-source` skip a specific source
 - `--exclude-active-technique` skip a specific active technique
 - `-t, --tasks` concurrency, `-i, --interval` delay between requests (ms)

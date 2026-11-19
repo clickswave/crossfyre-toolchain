@@ -84,13 +84,13 @@ When the CLI fetches from bins.crossfyre.io, the request's User-Agent carries it
 
 ```sh
 # Subdomains of a domain
-voyage scan --domain example.com --wordlist-path /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt
+voyage scan example.com --wordlist-path /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt
 
 # Ports and services across a range
-doorward scan --targets 10.0.0.0/24 --ports top-1000 --service-detection
+doorward scan 10.0.0.0/24 --ports top-1000 --service-detection
 
 # Content discovery, fuzzing the path at ::FUZZ::
-ambulo scan --url https://example.com/::FUZZ:: --wordlist-path /usr/share/seclists/Discovery/Web-Content/common.txt
+ambulo scan https://example.com/::FUZZ:: --wordlist-path /usr/share/seclists/Discovery/Web-Content/common.txt
 ```
 
 Wordlists are read only from a few directories, since the daemon would otherwise read any file a request names: `/usr/share/wordlists` and `/usr/share/seclists` on Linux, and Homebrew's seclists on macOS. The temp directory is read only for the lists the node hands over. Add your own directories with `CFX_WORDLIST_ROOTS`, separated like `PATH`.

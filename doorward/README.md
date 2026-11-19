@@ -10,14 +10,11 @@ Part of the [Crossfyre toolchain](../). Runs standalone.
 
 ```sh
 # scan a range for the top ports, with service detection
-doorward scan --targets 10.0.0.0/24 --ports top-1000 --service-detection
+doorward scan 10.0.0.0/24 --ports top-1000 --service-detection
 
 # specific hosts and ports
-doorward scan -t 10.0.0.5 10.0.0.6 -p 22,80,443,8080
+doorward scan 10.0.0.5 10.0.0.6 -p 22,80,443,8080
 ```
-
-`--technique syn` is accepted so older commands keep working, but no SYN scan is
-implemented yet: it runs a connect scan and says so.
 
 For scripted single probes, `exec` takes a JSON payload and runs it through the
 daemon.
@@ -29,7 +26,6 @@ terminal, and `--tui` is accepted for symmetry with the other engines.
 
 ## Handy flags
 
-- `-t, --targets` one or more hosts, ranges or CIDRs
 - `-p, --ports` a list (`22,80,443`), a range, or a preset like `top-1000`
 - `--service-detection` fingerprint the service on open ports
 - `--os-detection` guess the host OS

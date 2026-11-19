@@ -1,4 +1,4 @@
-use crate::libs::cli_args::{Cli, Commands, DbArgs, ExecArgs};
+use crate::libs::cli_args::{Cli, Commands, DbArgs, ExecArgs, ScanArgs};
 use crate::scanner::StreamEvent;
 use clap::{CommandFactory, Parser};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -196,7 +196,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         | Some(Commands::Daemon)
         | None => {
             eprintln!(
-                "No command given. Use `ambulo scan`, `ambulo exec`, `ambulo db`, or `ambulo daemon`. Try --help."
+                "No command given. Use `ambulo scan <url>...`, `ambulo exec <json>`, `ambulo db`, or `ambulo daemon`. Try --help."
             );
             std::process::exit(1);
         }
@@ -208,12 +208,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     }
 
-    if fuzz_args.url.is_empty() {
-        eprintln!("Error: --url is required (or use --interactive)");
-        std::process::exit(1);
-    }
     if fuzz_args.wordlist_path.is_empty() {
-        eprintln!("Error: --wordlist-path is required (or use --interactive)");
+        eprintln!("Error: a wordlist is needed: -w <wordlist> (or use --interactive)");
         std::process::exit(1);
     }
 
@@ -227,20 +223,37 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .validate_urls()
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
-    let stream = daemon.connect().await?;
-
     // Resolve wordlist to absolute path (daemon runs from a different cwd)
     let wordlist_abs = std::fs::canonicalize(&fuzz_args.wordlist_path)
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| fuzz_args.wordlist_path.clone());
+
+    let tui = cfx_tui::wanted(cli.tui, cli.no_tui, true);
+    for url in &fuzz_args.url {
+        scan_url(&daemon, &fuzz_args, url, &wordlist_abs, tui).await?;
+    }
+    Ok(())
+}
+
+/// One scan of `url` by the daemon with the wordlist at `wordlist`: drawn on the
+/// dashboard when `tui`, and otherwise written out as the daemon's own newline-delimited
+/// JSON.
+async fn scan_url(
+    daemon: &dguard::Daemon,
+    fuzz_args: &ScanArgs,
+    url: &str,
+    wordlist: &str,
+    tui: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stream = daemon.connect().await?;
 
     // Build and send the stream scan request
     let request = serde_json::json!({
         "operation": "scan",
         "response": "stream",
         "save": true,
-        "endpoint": fuzz_args.url[0],
-        "wordlist": wordlist_abs,
+        "endpoint": url,
+        "wordlist": wordlist,
         "method": fuzz_args.http_method.to_string(),
         "tasks": fuzz_args.tasks,
         "follow_redirects": fuzz_args.follow_redirects,
@@ -272,7 +285,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let total = ack.total.unwrap_or(0);
     let poll_timeout = fuzz_args.event_poll_timeout;
 
-    if cfx_tui::wanted(cli.tui, cli.no_tui, true) {
+    if tui {
         let (tx, rx) = mpsc::unbounded_channel::<StreamEvent>();
         tokio::spawn(async move {
             while let Ok(Some(line)) = lines.next_line().await {

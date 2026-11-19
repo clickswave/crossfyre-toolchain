@@ -1,4 +1,4 @@
-use crate::libs::cli_args::{Cli, Commands, DbArgs, ExecArgs, OriginArgs};
+use crate::libs::cli_args::{Cli, Commands, DbArgs, ExecArgs, OriginArgs, ScanArgs};
 use crate::scanner::StreamEvent;
 use clap::{CommandFactory, Parser};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -101,7 +101,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         | Some(Commands::Daemon)
         | None => {
             eprintln!(
-                "No command given. Use `voyage scan`, `voyage exec`, `voyage db`, or `voyage daemon`. Try --help."
+                "No command given. Use `voyage scan <domain>...`, `voyage exec <json>`, `voyage db`, or `voyage daemon`. Try --help."
             );
             std::process::exit(1);
         }
@@ -113,24 +113,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     }
 
-    if enum_args.domain.is_empty() {
-        eprintln!("Error: --domain is required (or use --interactive)");
-        std::process::exit(1);
+    // Without a wordlist only the passive sources run, and with those off as well there
+    // is nothing to run.
+    match enum_args.passive_only() {
+        Ok(note) => {
+            if let Some(note) = note {
+                eprintln!("{note}");
+            }
+        }
+        Err(why) => {
+            eprintln!("Error: {why}");
+            std::process::exit(1);
+        }
     }
-
-    if enum_args.disable_passive_enum && enum_args.disable_active_enum {
-        eprintln!("Error: cannot disable both passive and active enumeration");
-        std::process::exit(1);
-    }
-
-    if !enum_args.disable_active_enum && enum_args.wordlist_path.is_empty() {
-        eprintln!(
-            "Error: --wordlist-path is required for active enumeration (or use --disable-active-enum / --interactive)"
-        );
-        std::process::exit(1);
-    }
-
-    let stream = daemon.connect().await?;
 
     // Resolve wordlist to absolute path (daemon runs from a different cwd), as ambulo
     // does. An empty path stays empty: no active enumeration.
@@ -142,17 +137,36 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|_| enum_args.wordlist_path.clone())
     };
 
+    let tui = cfx_tui::wanted(cli.tui, cli.no_tui, true);
+    for domain in &enum_args.domain {
+        scan_domain(&daemon, &enum_args, domain, &wordlist_abs, tui).await?;
+    }
+    Ok(())
+}
+
+/// One enumeration of `domain` by the daemon, with the wordlist at `wordlist` when there
+/// is one: drawn on the dashboard when `tui`, and otherwise written out as the daemon's
+/// own newline-delimited JSON.
+async fn scan_domain(
+    daemon: &dguard::Daemon,
+    enum_args: &ScanArgs,
+    domain: &str,
+    wordlist: &str,
+    tui: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stream = daemon.connect().await?;
+
     // Build and send the stream enum request
     let request = serde_json::json!({
         "operation": "enum",
         "response": "stream",
         "save": true,
-        "domain": enum_args.domain[0],
-        "wordlist": wordlist_abs,
+        "domain": domain,
+        "wordlist": wordlist,
         "tasks": enum_args.tasks,
         "fresh_start": enum_args.fresh_start,
         "disable_passive": enum_args.disable_passive_enum,
-        "disable_active": enum_args.disable_active_enum,
+        "disable_active": wordlist.is_empty(),
         "exclude_passive_sources": enum_args.exclude_passive_source,
         "exclude_active_techniques": enum_args.exclude_active_technique,
         "http_probing_ports": enum_args.http_probing_port,
@@ -186,7 +200,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let total = ack.total.unwrap_or(0);
     let poll_timeout = enum_args.event_poll_timeout;
 
-    if cfx_tui::wanted(cli.tui, cli.no_tui, true) {
+    if tui {
         let (tx, rx) = mpsc::unbounded_channel::<StreamEvent>();
         tokio::spawn(async move {
             while let Ok(Some(line)) = lines.next_line().await {
