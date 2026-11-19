@@ -558,12 +558,13 @@ mod tests {
         }
     }
 
-    fn closed_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
+    /// A port nothing listens on, which stays this test's while the socket that comes
+    /// with it is held: bound and not listening, so no test running meanwhile is given
+    /// it by the system and answers on it.
+    fn closed_port() -> (u16, tokio::net::TcpSocket) {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        (socket.local_addr().unwrap().port(), socket)
     }
 
     /// A daemon on a port of its own that answers every line with `reply`.
@@ -600,7 +601,7 @@ mod tests {
 
     #[tokio::test]
     async fn with_starting_off_a_client_says_the_daemon_is_not_running() {
-        let port = closed_port();
+        let (port, _held) = closed_port();
         let e = Daemon::new("voyage", port, false)
             .connect()
             .await
@@ -750,7 +751,8 @@ mod tests {
         let log = dir.path().join("voyage.log");
         std::fs::write(&log, "a line from an earlier run\n").unwrap();
         let start = spawned("echo 'the database is not there'; exit 3", &log);
-        let daemon = Daemon::new("voyage", closed_port(), true);
+        let (port, _held) = closed_port();
+        let daemon = Daemon::new("voyage", port, true);
         let e = daemon
             .wait(start, Duration::from_secs(10))
             .await
@@ -771,7 +773,8 @@ mod tests {
                     (attempt 1, retrying in 1s)\n[dguard] waiting for the database: \
                     PostgreSQL is not installed here (attempt 2, retrying in 2s)";
         let start = spawned(&format!("printf '%s\\n' '{said}'; exec sleep 30"), &log);
-        let daemon = Daemon::new("voyage", closed_port(), true);
+        let (port, _held) = closed_port();
+        let daemon = Daemon::new("voyage", port, true);
         let begun = Instant::now();
         let e = daemon
             .wait(start, Duration::from_secs(20))
@@ -801,7 +804,8 @@ mod tests {
              (attempt 1, retrying in 1s)'; exec sleep 30",
             &log,
         );
-        let daemon = Daemon::new("doorward", closed_port(), true);
+        let (port, _held) = closed_port();
+        let daemon = Daemon::new("doorward", port, true);
         let e = daemon
             .wait(start, Duration::from_secs(2))
             .await
@@ -846,7 +850,8 @@ mod tests {
             unreachable!()
         };
         let pid = child.id() as libc::pid_t;
-        let daemon = Daemon::new("doorward", closed_port(), true);
+        let (port, _held) = closed_port();
+        let daemon = Daemon::new("doorward", port, true);
         let begun = Instant::now();
         let e = daemon
             .wait(start, Duration::from_secs(1))

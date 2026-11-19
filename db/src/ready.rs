@@ -295,10 +295,15 @@ mod tests {
         (dir, toolchain)
     }
 
-    /// A port nothing listens on: one the system just handed out, closed again.
-    fn closed_port() -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().port()
+    /// A port nothing listens on, which stays this test's while the socket that comes
+    /// with it is held: bound and not listening, so no test running meanwhile is given
+    /// it by the system and answers on it.
+    fn closed_port() -> (u16, tokio::net::TcpSocket) {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket
+            .bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
+            .unwrap();
+        (socket.local_addr().unwrap().port(), socket)
     }
 
     /// A server that turns every connection away as Postgres does a wrong password: with
@@ -361,7 +366,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_closed_port_of_a_database_one_runs_says_where_config_puts_it() {
-        let port = closed_port();
+        let (port, _held) = closed_port();
         let (_dir, toolchain) = toolchain_with(&external_on(port));
         let e = ready_in(toolchain.clone(), "voyage").await.unwrap_err();
         assert_eq!(
@@ -420,7 +425,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_local_database_not_listening_says_what_starts_it() {
-        let port = closed_port();
+        let (port, _held) = closed_port();
         let e = connect(&local_on(port), Some(Path::new("/t/c")), MAINTENANCE_DB)
             .await
             .unwrap_err();
@@ -517,9 +522,9 @@ mod tests {
         assert_eq!(tables, 1, "the database was made again, empty");
     }
 
-    /// A free port for a local database of a test's own.
+    /// A free port for a local database of a test's own, which its server binds.
     fn free_port() -> u16 {
-        closed_port()
+        closed_port().0
     }
 
     #[tokio::test]
