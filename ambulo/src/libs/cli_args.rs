@@ -103,6 +103,11 @@ pub struct Cli {
     /// Never draw the dashboard; stream newline-delimited JSON instead.
     #[arg(long, default_value_t = false)]
     pub no_tui: bool,
+
+    /// Never start the daemon: when it is not running, say so and stop. Setting
+    /// CFX_NO_AUTOSTART=1 does the same.
+    #[arg(long, global = true, default_value_t = false)]
+    pub no_autostart: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -470,5 +475,13 @@ mod tests {
         ]);
         args.validate_urls().unwrap();
         assert_eq!(args.url, ["http://h/::FUZZ::/"]);
+    }
+
+    #[test]
+    fn no_autostart_goes_before_or_after_the_command() {
+        let parsed = |argv: &[&str]| Cli::try_parse_from(argv).expect("parses").no_autostart;
+        assert!(parsed(&["ambulo", "--no-autostart", "db", "--full-reset"]));
+        assert!(parsed(&["ambulo", "db", "--full-reset", "--no-autostart"]));
+        assert!(!parsed(&["ambulo", "db", "--full-reset"]));
     }
 }

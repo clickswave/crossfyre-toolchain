@@ -2,7 +2,6 @@ use crate::libs::cli_args::{Cli, Commands, DbArgs, ExecArgs, OriginArgs};
 use crate::scanner::StreamEvent;
 use clap::{CommandFactory, Parser};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 mod axfr;
@@ -54,15 +53,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return daemon::run(cli.port, voyage_db).await;
     }
 
+    // The daemon every command below talks to, started when it is not running.
+    let daemon = dguard::Daemon::new("voyage", cli.port, !cli.no_autostart);
+
     // -----------------------------------------------------------------------
     // Db subcommand - send db_reset to daemon
     // -----------------------------------------------------------------------
     if let Some(Commands::Db(db_args)) = &cli.command {
-        return handle_db(db_args.clone(), cli.port).await;
+        return handle_db(db_args.clone(), &daemon).await;
     }
 
     if let Some(Commands::Exec(exec_args)) = &cli.command {
-        return handle_enum_exec(exec_args.clone(), cli.port).await;
+        return handle_enum_exec(exec_args.clone(), &daemon).await;
     }
 
     // -----------------------------------------------------------------------
@@ -73,7 +75,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some(Commands::Axfr(args)) = &cli.command {
-        return handle_axfr(args.clone(), cli.port).await;
+        return handle_axfr(args.clone(), &daemon).await;
     }
 
     // -----------------------------------------------------------------------
@@ -127,14 +129,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    // Connect to the daemon
-    let daemon_addr = format!("127.0.0.1:{}", cli.port);
-    let stream = TcpStream::connect(&daemon_addr).await.map_err(|_| {
-        format!(
-            "Voyage daemon is not running on port {}.\nStart it with `voyage --daemon`, or with `crossfyre extension start voyage` if crossfyre installed it.",
-            cli.port
-        )
-    })?;
+    let stream = daemon.connect().await?;
 
     // Resolve wordlist to absolute path (daemon runs from a different cwd), as ambulo
     // does. An empty path stays empty: no active enumeration.
@@ -238,18 +233,16 @@ fn print_all(bytes: &[u8]) -> std::io::Result<()> {
     }
 }
 
-async fn handle_db(args: DbArgs, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+async fn handle_db(
+    args: DbArgs,
+    daemon: &dguard::Daemon,
+) -> Result<(), Box<dyn std::error::Error>> {
     if !args.full_reset {
         eprintln!("No action given. See `voyage db --help`.");
         std::process::exit(1);
     }
 
-    let daemon_addr = format!("127.0.0.1:{port}");
-    let stream = TcpStream::connect(&daemon_addr).await.map_err(|_| {
-        format!(
-            "Voyage daemon is not running on port {port}.\nStart it with `voyage --daemon`, or with `crossfyre extension start voyage` if crossfyre installed it."
-        )
-    })?;
+    let stream = daemon.connect().await?;
 
     let request = serde_json::json!({ "operation": "db_reset", "response": "instant" });
     let (reader, mut writer) = tokio::io::split(stream);
@@ -342,16 +335,14 @@ fn exec_request(json: &str) -> Result<serde_json::Value, String> {
     Ok(payload)
 }
 
-async fn handle_enum_exec(args: ExecArgs, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+async fn handle_enum_exec(
+    args: ExecArgs,
+    daemon: &dguard::Daemon,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Parse the caller's JSON and fill in the operation if they did not name one.
     let payload = exec_request(&args.json)?;
 
-    let daemon_addr = format!("127.0.0.1:{port}");
-    let stream = TcpStream::connect(&daemon_addr).await.map_err(|_| {
-        format!(
-            "Voyage daemon is not running on port {port}.\nStart it with `voyage --daemon`, or with `crossfyre extension start voyage` if crossfyre installed it."
-        )
-    })?;
+    let stream = daemon.connect().await?;
     let _ = stream.set_nodelay(true);
 
     let (reader, mut writer) = tokio::io::split(stream);
@@ -376,13 +367,9 @@ async fn handle_enum_exec(args: ExecArgs, port: u16) -> Result<(), Box<dyn std::
 /// `voyage axfr`: ask the daemon for a zone transfer and print what comes back.
 async fn handle_axfr(
     args: crate::libs::cli_args::AxfrArgs,
-    port: u16,
+    daemon: &dguard::Daemon,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
-        .await
-        .map_err(|_| {
-            format!("Voyage daemon is not running on port {port}. Start it with `voyage --daemon`, or with `crossfyre extension start voyage` if crossfyre installed it.")
-        })?;
+    let stream = daemon.connect().await?;
     let request = serde_json::json!({
         "operation": "axfr",
         "response": "stream",

@@ -37,12 +37,6 @@ const PATTERNS: &[&str] = &[
 /// (file, pattern, how many, why it is not target traffic or not an op's egress)
 const ALLOWED: &[(&str, &str, usize, &str)] = &[
     (
-        "plessor/src/lib.rs",
-        "TcpStream::connect(",
-        1,
-        "the command line talking to its own daemon on loopback",
-    ),
-    (
         "plessor/src/solver.rs",
         "reqwest::Client::builder(",
         1,
@@ -53,12 +47,6 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
         "Egress::Inherit",
         1,
         "the solver is told the environment's proxy only for an op that inherits it",
-    ),
-    (
-        "ambulo/src/main.rs",
-        "TcpStream::connect(",
-        3,
-        "the command line talking to its own daemon on loopback",
     ),
     (
         "ambulo/src/main.rs",
@@ -80,27 +68,9 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "voyage/src/main.rs",
-        "TcpStream::connect(",
-        4,
-        "the command line talking to its own daemon on loopback",
-    ),
-    (
-        "voyage/src/main.rs",
         "Egress::Inherit",
         1,
         "origin discovery run from the command line, which inherits",
-    ),
-    (
-        "toolmark/src/main.rs",
-        "TcpStream::connect(",
-        1,
-        "the command line talking to its own daemon on loopback",
-    ),
-    (
-        "doorward/src/main.rs",
-        "TcpStream::connect(",
-        3,
-        "the command line talking to its own daemon on loopback",
     ),
     (
         "doorward/src/scanner.rs",

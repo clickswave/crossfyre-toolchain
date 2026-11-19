@@ -70,6 +70,7 @@ pub async fn run(port: u16, db: DoorwardDb) -> Result<(), Box<dyn std::error::Er
     let gate = dguard::Gate::from_env();
     let listener = TcpListener::bind(addr).await?;
     gate.announce("Doorward", addr);
+    dguard::exit_when_idle("doorward");
 
     let db = Arc::new(db);
 
@@ -93,7 +94,7 @@ pub async fn run(port: u16, db: DoorwardDb) -> Result<(), Box<dyn std::error::Er
         let _ = stream.set_nodelay(true);
         let gate_clone = gate.clone();
         let db_clone = Arc::clone(&db);
-        tokio::spawn(async move {
+        dguard::spawn_busy(async move {
             if let Err(e) = handle_connection(stream, gate_clone, db_clone).await {
                 eprintln!("Connection error from {addr}: {e}");
             }
@@ -137,6 +138,20 @@ async fn handle_connection(
                 continue;
             }
         };
+
+        // What this daemon honours beyond the original protocol, and which process it
+        // is, asked before an operation is sent and by a client waiting for the daemon
+        // it started. It reads the egress wrapper only to refuse a proxy, so it names no
+        // egress version, and a node sends it nothing through one. The connection stays
+        // open for the operation that follows.
+        if req.operation == "capabilities" {
+            write_json(
+                &mut writer,
+                &serde_json::json!({"type": "capabilities", "pid": std::process::id()}),
+            )
+            .await?;
+            continue;
+        }
 
         // Streaming mode takes over the connection
         if req.response == "stream" {
@@ -190,7 +205,7 @@ async fn handle_stream_scan(
     let oid = operation_id.clone();
     let db_c = Arc::clone(&db);
 
-    tokio::spawn(async move {
+    dguard::spawn_busy(async move {
         scanner::run_connect_scan(&scan_params, tx).await;
         let _ = db_c.update_operation_status(&oid, "completed", None).await;
     });
@@ -258,7 +273,7 @@ async fn dispatch(req: DaemonRequest, db: Arc<DoorwardDb>) -> serde_json::Value 
                     // Queue mode
                     let oid = operation_id.clone();
                     let db_c = Arc::clone(&db);
-                    tokio::spawn(async move {
+                    dguard::spawn_busy(async move {
                         let (tx, mut _rx) = mpsc::unbounded_channel::<StreamEvent>();
                         scanner::run_connect_scan(&scan_params, tx).await;
                         let _ = db_c.update_operation_status(&oid, "completed", None).await;
@@ -470,6 +485,29 @@ mod http_request_tests {
             !lines.iter().any(|l| l.contains("capabilities")),
             "read the body as a request: {lines:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn capabilities_say_which_process_answers_and_name_no_egress_version() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let port = daemon().await;
+        let s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let (r, mut w) = s.into_split();
+        w.write_all(b"{\"operation\":\"capabilities\"}\n")
+            .await
+            .unwrap();
+        let mut lines = BufReader::new(r).lines();
+        let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("an answer in time")
+            .unwrap()
+            .expect("a line");
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["type"], "capabilities", "{v}");
+        assert_eq!(v["pid"], std::process::id(), "{v}");
+        // A node that read an egress version here would send doorward ops through a
+        // proxy, which it refuses.
+        assert!(v.get("egress").is_none(), "{v}");
     }
 
     #[tokio::test]

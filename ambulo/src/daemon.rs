@@ -203,6 +203,7 @@ pub async fn run_on(listener: TcpListener, db: AmbuloDb) -> Result<(), Box<dyn s
     let addr = listener.local_addr()?;
     let gate = dguard::Gate::from_env();
     gate.announce("Ambulo", addr);
+    dguard::exit_when_idle("ambulo");
 
     let db = Arc::new(db);
     // Shared by every probe that comes without an egress wrapper. A wrapped probe
@@ -252,7 +253,7 @@ pub async fn run_on(listener: TcpListener, db: AmbuloDb) -> Result<(), Box<dyn s
         let db_clone = Arc::clone(&db);
         let client_clone = Arc::clone(&probe_client);
         let client_noredir_clone = Arc::clone(&probe_client_noredirect);
-        tokio::spawn(async move {
+        dguard::spawn_busy(async move {
             if let Err(e) = handle_connection(
                 stream,
                 gate_clone,
@@ -356,6 +357,8 @@ async fn handle_connection(
                     "type": "capabilities",
                     // The version of the egress wrapper this daemon reads.
                     "egress": transport::WIRE_VERSION,
+                    // Which process answers, for the client that started it.
+                    "pid": std::process::id(),
                 }),
             )
             .await?;
@@ -490,7 +493,7 @@ async fn handle_stream_scan(
     let save = req.save;
     let db_clone = Arc::clone(&db);
 
-    tokio::spawn(async move {
+    dguard::spawn_busy(async move {
         match scanner.run_headless_stream(tx).await {
             Ok(_) => {
                 if save {
@@ -548,7 +551,7 @@ async fn handle_stream_crawl(
     };
 
     let (tx, mut rx) = mpsc::unbounded_channel::<crate::crawler::CrawlEvent>();
-    tokio::spawn(async move {
+    dguard::spawn_busy(async move {
         crate::crawler::run_stream(params, tx).await;
     });
 
@@ -602,7 +605,7 @@ async fn dispatch(
                 "instant" => run_scan_instant(operation_id, scan_params, db, req.save).await,
                 _ => {
                     let oid = operation_id.clone();
-                    tokio::spawn(async move {
+                    dguard::spawn_busy(async move {
                         run_scan_background(oid, scan_params, db).await;
                     });
                     DaemonResponse {
@@ -1242,6 +1245,7 @@ mod egress_tests {
         .await;
         assert_eq!(events[0]["type"], "capabilities", "{events:?}");
         assert_eq!(events[0]["egress"], 1, "{events:?}");
+        assert_eq!(events[0]["pid"], std::process::id(), "{events:?}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

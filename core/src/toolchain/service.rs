@@ -1109,11 +1109,6 @@ mod imp {
         write_for_invoking_user,
     };
 
-    /// `key` is the name inside the unit name: an engine's name.
-    fn service_name(key: &str) -> String {
-        format!("crossfyre-{key}.service")
-    }
-
     fn unit_dir() -> std::path::PathBuf {
         // Honor SUDO_USER so units land in the real user's
         // ~/.config/systemd/user, not /root's where they'd be invisible.
@@ -1153,10 +1148,10 @@ mod imp {
 
     pub fn create(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
         let dir = unit_dir();
-        let svc = service_name(ext);
+        let svc = dguard::unit_name(ext);
         let first = !super::ENGINES
             .iter()
-            .any(|e| dir.join(service_name(e.name)).exists());
+            .any(|e| dir.join(dguard::unit_name(e.name)).exists());
         create_dir_all_for_invoking_user(&dir)?;
         // Written into the user's home as root, and handed back to them. Only this one
         // file: the rest of this directory holds the person's own units, and the ones
@@ -1181,7 +1176,7 @@ mod imp {
             let _ = cmd_as_invoking_user("systemctl")
                 .args(["--user", "daemon-reload"])
                 .status();
-            super::svc_ok(&format!("{} removed", service_name(ext)));
+            super::svc_ok(&format!("{} removed", dguard::unit_name(ext)));
         }
         Ok(())
     }
@@ -1189,7 +1184,7 @@ mod imp {
     /// Removes `ext`'s unit from `dir` when it is there, and says whether it was. `dir` is
     /// in the operator's home, so as root no link on the way there is followed.
     fn remove_unit(dir: &std::path::Path, ext: &str) -> std::io::Result<bool> {
-        let path = dir.join(service_name(ext));
+        let path = dir.join(dguard::unit_name(ext));
         if !path.exists() {
             return Ok(false);
         }
@@ -1198,7 +1193,7 @@ mod imp {
     }
 
     pub fn action(action: &str, ext: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let svc = service_name(ext);
+        let svc = dguard::unit_name(ext);
         let status = cmd_as_invoking_user("systemctl")
             .args(["--user", action, &svc])
             .status()
@@ -1213,7 +1208,7 @@ mod imp {
     }
 
     pub fn status(ext: &str) -> String {
-        let svc = service_name(ext);
+        let svc = dguard::unit_name(ext);
         match cmd_as_invoking_user("systemctl")
             .args(["--user", "is-active", &svc])
             .output()
@@ -1229,7 +1224,7 @@ mod imp {
     }
 
     pub fn is_enabled(ext: &str) -> bool {
-        let svc = service_name(ext);
+        let svc = dguard::unit_name(ext);
         cmd_as_invoking_user("systemctl")
             .args(["--user", "is-enabled", &svc])
             .output()
@@ -1238,7 +1233,7 @@ mod imp {
     }
 
     pub fn exists(ext: &str) -> bool {
-        unit_dir().join(service_name(ext)).exists()
+        unit_dir().join(dguard::unit_name(ext)).exists()
     }
 
     #[cfg(test)]
@@ -1254,7 +1249,7 @@ mod imp {
             let t = tempfile::tempdir().expect("tempdir");
             let victim = t.path().join("victim");
             fs::create_dir(&victim).expect("victim");
-            let unit = service_name("x");
+            let unit = dguard::unit_name("x");
             fs::write(victim.join(&unit), "root's file\n").expect("victim file");
             let systemd = t.path().join("home/.config/systemd");
             fs::create_dir_all(&systemd).expect("systemd");
@@ -1270,7 +1265,7 @@ mod imp {
         #[test]
         fn removing_a_unit_as_root_removes_it() {
             let t = tempfile::tempdir().expect("tempdir");
-            fs::write(t.path().join(service_name("x")), "x").expect("unit");
+            fs::write(t.path().join(dguard::unit_name("x")), "x").expect("unit");
             let _root = act_as_root();
             assert!(remove_unit(t.path(), "x").expect("remove"));
             assert!(!remove_unit(t.path(), "x").expect("again"));

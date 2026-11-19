@@ -20,8 +20,18 @@
 //! Binding off loopback without a token is permitted (an operator may have put
 //! the port behind a firewall or a private network) but it is announced on every
 //! start, because it is the configuration that used to be the silent default.
+//!
+//! It is also where an engine's client starts the engine's daemon when none runs
+//! ([`Daemon`]), and where a daemon started that way exits once nothing uses it
+//! ([`exit_when_idle`]).
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+mod idle;
+mod start;
+
+pub use idle::{IDLE_EXIT_ENV, exit_when_idle, spawn_busy};
+pub use start::{Daemon, NO_AUTOSTART_ENV, not_running, unit_name};
 
 /// Moves a daemon listener off loopback. Value is an IP, not a host name.
 pub const BIND_ENV: &str = "CFX_DAEMON_BIND";
@@ -1614,6 +1624,10 @@ mod toolchain_dir_tests {
 // Startup dependencies
 // ---------------------------------------------------------------------------
 
+/// How [`wait_for`] begins each line that says what a daemon waits for. A client that
+/// started the daemon reads it in the daemon's log, and stops waiting itself.
+pub(crate) const WAITING: &str = "[dguard] waiting for ";
+
 /// Wait for a dependency the daemon cannot start without, instead of dying.
 ///
 /// ambulo, doorward and voyage open Postgres at startup. When the database went away
@@ -1664,7 +1678,7 @@ where
                     return Err(e);
                 }
                 eprintln!(
-                    "[dguard] waiting for {what}: {e} (attempt {tries}, retrying in {}s)",
+                    "{WAITING}{what}: {e} (attempt {tries}, retrying in {}s)",
                     wait.as_secs()
                 );
                 tokio::time::sleep(wait).await;

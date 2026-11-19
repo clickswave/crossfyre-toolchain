@@ -61,7 +61,6 @@ mod xml;
 use crate::libs::cli_args::{Cli, Commands};
 use clap::CommandFactory;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
 
 /// Run a parsed command line.
 ///
@@ -73,11 +72,14 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         return daemon::run(cli.port).await;
     }
 
+    // The daemon every command below talks to, started when it is not running.
+    let daemon = dguard::Daemon::new("plessor", cli.port, !cli.no_autostart);
+
     match cli.command {
         Some(Commands::Scan(args)) => {
             let req = scan_request(&args.target, args.templates.as_deref())?;
             send_stream(
-                cli.port,
+                &daemon,
                 req,
                 cfx_tui::wanted(cli.tui, cli.no_tui, false),
                 args.target.clone(),
@@ -107,7 +109,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             )?;
             for (origin, req) in batches {
                 send_stream(
-                    cli.port,
+                    &daemon,
                     req,
                     cfx_tui::wanted(cli.tui, cli.no_tui, false),
                     origin,
@@ -124,7 +126,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             let target = payload["target"].as_str().unwrap_or("").to_string();
             send_stream(
-                cli.port,
+                &daemon,
                 payload,
                 cfx_tui::wanted(cli.tui, cli.no_tui, false),
                 target,
@@ -255,18 +257,12 @@ fn print_all(bytes: &[u8]) -> std::io::Result<()> {
 }
 
 async fn send_stream(
-    port: u16,
+    daemon: &dguard::Daemon,
     req: serde_json::Value,
     tui: bool,
     target: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
-        .await
-        .map_err(|_| {
-            format!(
-                "Plessor daemon is not running on port {port}. Start it with `plessor --daemon`, or with `crossfyre extension start plessor` if crossfyre installed it."
-            )
-        })?;
+    let stream = daemon.connect().await?;
     let (reader, mut writer) = tokio::io::split(stream);
     let mut s = dguard::encode(&req);
     s.push('\n');

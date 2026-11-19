@@ -1,7 +1,6 @@
 use crate::libs::cli_args::{Cli, Commands};
 use clap::{CommandFactory, Parser};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
 
 mod client_tui;
 mod cve;
@@ -32,6 +31,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return daemon::run(cli.port).await;
     }
 
+    // The daemon every command below talks to, started when it is not running.
+    let daemon = dguard::Daemon::new("toolmark", cli.port, !cli.no_autostart);
+
     match cli.command {
         Some(Commands::Scan(args)) => {
             let req = serde_json::json!({
@@ -40,7 +42,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "target": args.target,
             });
             send_stream(
-                cli.port,
+                &daemon,
                 req,
                 cfx_tui::wanted(cli.tui, cli.no_tui, false),
                 args.target.clone(),
@@ -57,7 +59,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             });
             let label = args.targets.join(", ");
             send_stream(
-                cli.port,
+                &daemon,
                 req,
                 cfx_tui::wanted(cli.tui, cli.no_tui, false),
                 label,
@@ -72,7 +74,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             let target = payload["target"].as_str().unwrap_or("").to_string();
             send_stream(
-                cli.port,
+                &daemon,
                 payload,
                 cfx_tui::wanted(cli.tui, cli.no_tui, false),
                 target,
@@ -107,18 +109,12 @@ fn print_all(bytes: &[u8]) -> std::io::Result<()> {
 }
 
 async fn send_stream(
-    port: u16,
+    daemon: &dguard::Daemon,
     req: serde_json::Value,
     tui: bool,
     target: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
-        .await
-        .map_err(|_| {
-            format!(
-                "Toolmark daemon is not running on port {port}. Start it with `toolmark --daemon`, or with `crossfyre extension start toolmark` if crossfyre installed it."
-            )
-        })?;
+    let stream = daemon.connect().await?;
     let (reader, mut writer) = tokio::io::split(stream);
     let mut s = dguard::encode(&req);
     s.push('\n');

@@ -173,6 +173,7 @@ pub async fn run(port: u16, db: VoyageDb) -> Result<(), Box<dyn std::error::Erro
     let gate = dguard::Gate::from_env();
     let listener = TcpListener::bind(addr).await?;
     gate.announce("Voyage", addr);
+    dguard::exit_when_idle("voyage");
 
     let db = Arc::new(db);
 
@@ -197,7 +198,7 @@ pub async fn run(port: u16, db: VoyageDb) -> Result<(), Box<dyn std::error::Erro
         let _ = stream.set_nodelay(true);
         let gate_clone = gate.clone();
         let db_clone = Arc::clone(&db);
-        tokio::spawn(async move {
+        dguard::spawn_busy(async move {
             if let Err(e) = handle_connection(stream, gate_clone, db_clone).await {
                 eprintln!("Connection error from {addr}: {e}");
             }
@@ -258,6 +259,8 @@ async fn handle_connection(
                     "type": "capabilities",
                     // The version of the egress wrapper this daemon reads.
                     "egress": transport::WIRE_VERSION,
+                    // Which process answers, for the client that started it.
+                    "pid": std::process::id(),
                 }),
             )
             .await?;
@@ -378,7 +381,7 @@ async fn handle_stream_enum(
     let save = req.save;
     let db_clone = Arc::clone(&db);
 
-    tokio::spawn(async move {
+    dguard::spawn_busy(async move {
         match scanner.run_headless_stream(tx).await {
             Ok(_) => {
                 if save {
@@ -474,7 +477,7 @@ async fn dispatch(req: DaemonRequest, db: Arc<VoyageDb>) -> DaemonResponse {
                 _ => {
                     let oid = operation_id.clone();
                     let db2 = Arc::clone(&db);
-                    tokio::spawn(async move {
+                    dguard::spawn_busy(async move {
                         let _ = run_enum_instant(&params, &db2).await;
                         let _ = db2.update_operation_status(&oid, "completed", None).await;
                     });
@@ -731,7 +734,7 @@ async fn run_enum_instant(
 
     let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
 
-    tokio::spawn(async move {
+    dguard::spawn_busy(async move {
         let _ = scanner.run_headless_stream(tx).await;
     });
 
@@ -1642,6 +1645,7 @@ mod egress_tests {
         .await;
         assert_eq!(events[0]["type"], "capabilities", "{events:?}");
         assert_eq!(events[0]["egress"], 1, "{events:?}");
+        assert_eq!(events[0]["pid"], std::process::id(), "{events:?}");
     }
 }
 

@@ -84,7 +84,7 @@ pub fn run(scope: Scope, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
     // moment they go too.
     if let Some(dir) = service::user_unit_dir() {
         for e in ENGINES {
-            let d = dir.join(format!("crossfyre-{}.service.d", e.name));
+            let d = dir.join(format!("{}.d", dguard::unit_name(e.name)));
             if d.is_dir() && super::sudo_user::remove_dir_all(&d).is_ok() {
                 ok(&format!("Removed {}", d.display()));
             }

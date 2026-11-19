@@ -70,6 +70,7 @@ pub async fn run(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let gate = dguard::Gate::from_env();
     let listener = TcpListener::bind(addr).await?;
     gate.announce("Plessor", addr);
+    dguard::exit_when_idle("plessor");
     serve(listener, gate).await?;
     Ok(())
 }
@@ -81,7 +82,7 @@ pub(crate) async fn serve(listener: TcpListener, gate: dguard::Gate) -> std::io:
         let (stream, addr) = listener.accept().await?;
         let _ = stream.set_nodelay(true);
         let gate_clone = gate.clone();
-        tokio::spawn(async move {
+        dguard::spawn_busy(async move {
             if let Err(e) = handle_connection(stream, gate_clone).await {
                 eprintln!("Connection error from {addr}: {e}");
             }
@@ -143,6 +144,8 @@ async fn handle_connection(stream: TcpStream, gate: dguard::Gate) -> Result<(), 
                         "inject": ["follow_redirects", "resolve", "verify_certs"],
                         // The version of the egress wrapper this daemon reads.
                         "egress": transport::WIRE_VERSION,
+                        // Which process answers, for the client that started it.
+                        "pid": std::process::id(),
                     }),
                 )
                 .await?;
@@ -228,7 +231,7 @@ where
     };
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
-    let op = tokio::spawn(run(p, tx));
+    let op = dguard::spawn_busy(run(p, tx));
     let mut reading = true;
     loop {
         tokio::select! {
@@ -841,6 +844,7 @@ mod tests {
         .await;
         assert_eq!(answer["type"], "capabilities", "{answer}");
         assert_eq!(answer["egress"], 1, "{answer}");
+        assert_eq!(answer["pid"], std::process::id(), "{answer}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

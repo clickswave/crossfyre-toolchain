@@ -42,12 +42,13 @@ pub async fn run(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let gate = dguard::Gate::from_env();
     let listener = TcpListener::bind(addr).await?;
     gate.announce("Toolmark", addr);
+    dguard::exit_when_idle("toolmark");
 
     loop {
         let (stream, addr) = listener.accept().await?;
         let _ = stream.set_nodelay(true);
         let gate_clone = gate.clone();
-        tokio::spawn(async move {
+        dguard::spawn_busy(async move {
             if let Err(e) = handle_connection(stream, gate_clone).await {
                 eprintln!("Connection error from {addr}: {e}");
             }
@@ -111,6 +112,8 @@ async fn handle_connection(
                         "fingerprint": ["resolve", "block_internal"],
                         // The version of the egress wrapper this daemon reads.
                         "egress": transport::WIRE_VERSION,
+                        // Which process answers, for the client that started it.
+                        "pid": std::process::id(),
                     }),
                 )
                 .await?;
@@ -152,7 +155,7 @@ async fn handle_fingerprint(
     };
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
-    tokio::spawn(async move {
+    dguard::spawn_busy(async move {
         fingerprint::run(fp, tx).await;
     });
 
@@ -183,7 +186,7 @@ async fn handle_services(
     };
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
-    tokio::spawn(async move {
+    dguard::spawn_busy(async move {
         crate::services::run(sp, tx).await;
     });
 
@@ -499,6 +502,7 @@ mod tests {
         .await;
         assert_eq!(events[0]["type"], "capabilities", "{events:?}");
         assert_eq!(events[0]["egress"], 1, "{events:?}");
+        assert_eq!(events[0]["pid"], std::process::id(), "{events:?}");
     }
 }
 

@@ -2,7 +2,6 @@ use crate::libs::cli_args::{Cli, Commands, DbArgs, ExecArgs};
 use crate::scanner::StreamEvent;
 use clap::{CommandFactory, Parser};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 mod browser;
@@ -162,15 +161,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return daemon::run_on(listener, ambulo_db).await;
     }
 
+    // The daemon every command below talks to, started when it is not running.
+    let daemon = dguard::Daemon::new("ambulo", cli.port, !cli.no_autostart);
+
     // -----------------------------------------------------------------------
     // Db subcommand - database management (connects directly to postgres)
     // -----------------------------------------------------------------------
     if let Some(Commands::Db(db_args)) = &cli.command {
-        return handle_db(db_args.clone(), cli.port).await;
+        return handle_db(db_args.clone(), &daemon).await;
     }
 
     if let Some(Commands::Exec(exec_args)) = &cli.command {
-        return handle_fuzz_exec(exec_args.clone(), cli.port).await;
+        return handle_fuzz_exec(exec_args.clone(), &daemon).await;
     }
 
     // -----------------------------------------------------------------------
@@ -224,14 +226,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .validate_urls()
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
-    // Connect to the daemon
-    let daemon_addr = format!("127.0.0.1:{}", cli.port);
-    let stream = TcpStream::connect(&daemon_addr).await.map_err(|_| {
-        format!(
-            "Ambulo daemon is not running on port {}.\nStart it with `ambulo --daemon`, or with `crossfyre extension start ambulo` if crossfyre installed it.",
-            cli.port
-        )
-    })?;
+    let stream = daemon.connect().await?;
 
     // Resolve wordlist to absolute path (daemon runs from a different cwd)
     let wordlist_abs = std::fs::canonicalize(&fuzz_args.wordlist_path)
@@ -324,18 +319,16 @@ fn print_all(bytes: &[u8]) -> std::io::Result<()> {
     }
 }
 
-async fn handle_db(args: DbArgs, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+async fn handle_db(
+    args: DbArgs,
+    daemon: &dguard::Daemon,
+) -> Result<(), Box<dyn std::error::Error>> {
     if !args.full_reset {
         eprintln!("No action given. See `ambulo db --help`.");
         std::process::exit(1);
     }
 
-    let daemon_addr = format!("127.0.0.1:{port}");
-    let stream = TcpStream::connect(&daemon_addr).await.map_err(|_| {
-        format!(
-            "Ambulo daemon is not running on port {port}.\nStart it with `ambulo --daemon`, or with `crossfyre extension start ambulo` if crossfyre installed it."
-        )
-    })?;
+    let stream = daemon.connect().await?;
 
     let request = serde_json::json!({ "operation": "db_reset", "response": "instant" });
     let (reader, mut writer) = tokio::io::split(stream);
@@ -381,16 +374,14 @@ fn exec_request(json: &str) -> Result<serde_json::Value, String> {
     Ok(payload)
 }
 
-async fn handle_fuzz_exec(args: ExecArgs, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+async fn handle_fuzz_exec(
+    args: ExecArgs,
+    daemon: &dguard::Daemon,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Parse the caller's JSON and fill in the operation if they did not name one.
     let payload = exec_request(&args.json)?;
 
-    let daemon_addr = format!("127.0.0.1:{port}");
-    let stream = TcpStream::connect(&daemon_addr).await.map_err(|_| {
-        format!(
-            "Ambulo daemon is not running on port {port}.\nStart it with `ambulo --daemon`, or with `crossfyre extension start ambulo` if crossfyre installed it."
-        )
-    })?;
+    let stream = daemon.connect().await?;
     let _ = stream.set_nodelay(true);
 
     let (reader, mut writer) = tokio::io::split(stream);
