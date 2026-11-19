@@ -12,6 +12,7 @@
 //! Nothing here depends on any engine crate. It takes numbers and strings, so
 //! it cannot become a path for internals to reach the screen by accident.
 
+pub mod scans;
 pub mod theme;
 pub mod widgets;
 

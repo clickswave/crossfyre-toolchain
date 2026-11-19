@@ -57,7 +57,7 @@ Kali), or point it at a database you run with `crossfyre db external`. The root
 - `--follow-redirects` and `--follow-redirects-depth`
 - `--random-user-agent-request` rotate the UA per request
 
-Run `ambulo scan --help` for the full list. `ambulo db reset` deletes every stored run, and `ambulo db purge --scan ID` one of them.
+Run `ambulo scan --help` for the full list. `ambulo scans` lists the scans it keeps, the latest first, and Enter on a stopped one takes it up again. A scan given credentials keeps none of them, so it is taken up by asking for it as it was first asked for, with `--resume ID`. `ambulo db reset` deletes every stored run, and `ambulo db purge --scan ID` one of them.
 
 ## Notes
 

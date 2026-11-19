@@ -50,6 +50,9 @@ pub enum Commands {
     /// Send a JSON op to the daemon and print the streamed events. `operation` is
     /// required: this is the raw interface the node uses.
     Exec(ExecArgs),
+    /// The scans this engine keeps, the latest first, and a stopped template scan to take
+    /// up again
+    Scans,
     /// What this engine keeps: delete one scan, old scans, or everything
     Db {
         #[command(subcommand)]

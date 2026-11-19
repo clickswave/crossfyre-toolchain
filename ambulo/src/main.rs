@@ -1,4 +1,4 @@
-use crate::libs::cli_args::{Cli, Commands, ExecArgs, ScanArgs};
+use crate::libs::cli_args::{Cli, Commands, EVENT_POLL_TIMEOUT_MS, ExecArgs, ScanArgs};
 use crate::scanner::StreamEvent;
 use clap::{CommandFactory, Parser};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -128,6 +128,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // -----------------------------------------------------------------------
+    // Scans subcommand: what the daemon keeps, and a stopped one taken up again
+    // -----------------------------------------------------------------------
+    if let Some(Commands::Scans) = &cli.command {
+        let scans = dguard::list_scans(&daemon).await?;
+        let tui = cfx_tui::wanted(cli.no_tui);
+        let chosen =
+            tokio::task::spawn_blocking(move || cfx_tui::scans::show("AMBULO", &scans, tui))
+                .await??;
+        if let Some(scan) = chosen {
+            let request = dguard::resume_request(scan["id"].as_str().unwrap_or_default());
+            stream_scan(&daemon, &request, None, tui, EVENT_POLL_TIMEOUT_MS).await?;
+        }
+        return Ok(());
+    }
+
+    // -----------------------------------------------------------------------
     // Completions subcommand - print a shell completion script (no daemon needed)
     // -----------------------------------------------------------------------
     if let Some(Commands::Completions { shell }) = &cli.command {
@@ -143,6 +159,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut fuzz_args = match cli.command {
         Some(Commands::Scan(args)) => args,
         Some(Commands::Exec(_))
+        | Some(Commands::Scans)
         | Some(Commands::Db { .. })
         | Some(Commands::Completions { .. })
         | Some(Commands::Daemon)
@@ -174,6 +191,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     fuzz_args
         .validate_urls()
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    if fuzz_args.resume.is_some() && fuzz_args.url.len() > 1 {
+        eprintln!("Error: --resume takes up one scan: give the one URL it was asked for with");
+        std::process::exit(1);
+    }
 
     // The wordlist is read here and its words sent after the request, so the daemon
     // opens no path for this scan and any file this user can read will do.
@@ -216,6 +237,7 @@ fn scan_request(args: &ScanArgs, url: &str) -> serde_json::Value {
         "follow_redirects": args.follow_redirects,
         "follow_redirects_depth": args.follow_redirects_depth,
         "fresh_start": args.fresh_start,
+        "resume": args.resume,
         "fuzz_marker": args.fuzz_marker,
         "success_status_codes": args.success_status_codes,
         "auth": {"headers": headers, "cookies": cookies, "basic_auth": args.basic_auth},
@@ -243,16 +265,38 @@ async fn scan_url(
     wordlist: &std::path::Path,
     tui: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stream = daemon.connect().await?;
-
     let mut request = scan_request(fuzz_args, url);
     request[dguard::WORDS_FOLLOW] = dguard::list_name(wordlist).into();
+    stream_scan(
+        daemon,
+        &request,
+        Some(wordlist),
+        tui,
+        fuzz_args.event_poll_timeout,
+    )
+    .await
+}
 
+/// Send `request` to the daemon, with the words of the file at `wordlist` after it when
+/// there is one, and show the scan it starts: drawn on the dashboard when `tui`, polling
+/// for events every `poll_timeout` ms, and otherwise written out as the daemon's own
+/// newline-delimited JSON.
+async fn stream_scan(
+    daemon: &dguard::Daemon,
+    request: &serde_json::Value,
+    wordlist: Option<&std::path::Path>,
+    tui: bool,
+    poll_timeout: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stream = daemon.connect().await?;
     let (reader, mut writer) = tokio::io::split(stream);
-    let mut req_str = dguard::encode(&request);
+    let mut req_str = dguard::encode(request);
     req_str.push('\n');
     writer.write_all(req_str.as_bytes()).await?;
-    let sent = dguard::send_words(&mut writer, wordlist).await;
+    let sent = match wordlist {
+        Some(wordlist) => dguard::send_words(&mut writer, wordlist).await,
+        None => Ok(()),
+    };
     // Read the "ack" event to get operation_id and total. A daemon that refused the
     // scan says why here, which is more use than a write it stopped reading.
     let mut lines = BufReader::new(reader).lines();
@@ -275,7 +319,6 @@ async fn scan_url(
 
     let operation_id = ack.operation_id.unwrap_or_else(|| "unknown".to_string());
     let total = ack.total.unwrap_or(0);
-    let poll_timeout = fuzz_args.event_poll_timeout;
 
     if tui {
         let (tx, rx) = mpsc::unbounded_channel::<StreamEvent>();

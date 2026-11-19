@@ -2,6 +2,10 @@ use crate::scanners::{active_scan, passive_scan};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use dialoguer::{Confirm, Input, theme::ColorfulTheme};
 
+/// How long the dashboard waits for an event before it draws again, unless
+/// `--event-poll-timeout` says otherwise.
+pub const EVENT_POLL_TIMEOUT_MS: u64 = 1000;
+
 #[derive(Clone, Debug, ValueEnum)]
 pub enum LogLevel {
     Debug,
@@ -80,6 +84,9 @@ pub enum Commands {
     /// Send a JSON op to the daemon and print the reply. `operation` defaults to
     /// `probe`, which checks a single subdomain with no dashboard.
     Exec(ExecArgs),
+    /// The enumerations this engine keeps, the latest first, and a stopped one to take up
+    /// again
+    Scans,
     /// What this engine keeps: delete one scan, old scans, or everything
     Db {
         #[command(subcommand)]
@@ -206,7 +213,7 @@ pub struct ScanArgs {
     pub log_level: LogLevel,
 
     /// TUI event polling timeout in ms
-    #[arg(long, default_value_t = 1000)]
+    #[arg(long, default_value_t = EVENT_POLL_TIMEOUT_MS)]
     pub event_poll_timeout: u64,
 
     /// Interactive mode - prompts for required options

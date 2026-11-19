@@ -129,6 +129,11 @@ struct ScanParams {
     /// The least important lines the scan's log keeps: debug, info, warn or error.
     #[serde(default)]
     log_level: Option<String>,
+    /// The id of a stopped scan this request takes up again, asking for it with its
+    /// settings, credentials included: how one given credentials, which are not kept, is
+    /// taken up. Not one of the scan's settings.
+    #[serde(default, skip_serializing)]
+    resume: Option<String>,
     /// Set by the daemon from the egress wrapper. See `DaemonRequest::egress`.
     #[serde(skip)]
     egress: transport::Egress,
@@ -395,7 +400,15 @@ async fn handle_connection(
             continue;
         }
 
-        // Stream mode takes over the connection for the duration of the operation.
+        // The scans this daemon keeps, the latest first.
+        if req.operation == "scans" {
+            let answer = cfx_db::scans::answer_scans(db.pool(), cfx_db::scans::Listed::why_not);
+            write_json(&mut writer, &answer.await).await?;
+            continue;
+        }
+
+        // Stream mode takes over the connection for the duration of the operation. A
+        // stopped scan taken up again streams as the scan did.
         if req.response == "stream" {
             match req.operation.as_str() {
                 "crawl" => handle_stream_crawl(req, writer).await?,
@@ -444,18 +457,31 @@ async fn handle_stream_scan(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let operation_id = Uuid::new_v4().to_string();
 
-    let scan_params: ScanParams = match serde_json::from_value(req.params.clone()) {
-        Ok(p) => ScanParams {
-            egress: req.egress.clone(),
-            ..p
-        },
-        Err(e) => {
+    // The scan as asked for, or a stopped one taken up again with the settings it was
+    // kept with.
+    let asked = match req.operation.as_str() {
+        "resume" => taken_up(&req, &db)
+            .await
+            .map(|(p, running)| (p, Some(running))),
+        _ => serde_json::from_value::<ScanParams>(req.params.clone())
+            .map(|p| (p, None))
+            .map_err(|e| format!("Invalid scan params: {e}")),
+    };
+    let (scan_params, taken) = match asked {
+        Ok((p, taken)) => (
+            ScanParams {
+                egress: req.egress.clone(),
+                ..p
+            },
+            taken,
+        ),
+        Err(message) => {
             write_json(
                 &mut writer,
                 &serde_json::json!({
                     "type": "error",
                     "operation_id": operation_id,
-                    "message": format!("Invalid scan params: {}", e),
+                    "message": message,
                 }),
             )
             .await?;
@@ -474,16 +500,17 @@ async fn handle_stream_scan(
         .await;
     }
 
-    // Set up the scan: its wordlist, and its entries, or those of the stopped scan with
-    // the same settings, which it takes up again.
-    let words = match &scan_params.wordlist_follows {
-        Some(name) => ScanWords::Following {
+    // Set up the scan: its wordlist, and its entries, or those of the stopped scan it
+    // takes up again.
+    let begin = match (taken, &scan_params.wordlist_follows) {
+        (Some(running), _) => Begin::TakenUp(running),
+        (None, Some(name)) => Begin::Asked(ScanWords::Following {
             name,
             chunks: dguard::WordChunks::new(lines, gate),
-        },
-        None => ScanWords::Named(&scan_params.wordlist),
+        }),
+        (None, None) => Begin::Asked(ScanWords::Named(&scan_params.wordlist)),
     };
-    let (scanner, total, running) = match prepare_scan(&scan_params, &db, words).await {
+    let (scanner, total, running) = match prepare_scan(&scan_params, &db, begin).await {
         Ok(v) => v,
         Err(e) => {
             write_json(
@@ -810,14 +837,47 @@ enum ScanWords<'a> {
     },
 }
 
-/// Set up a scan of `params`: its wordlist, kept once, and the scan itself. A stopped
-/// scan with the same URLs, words and method is taken up again with the requests it had
-/// not sent, unless the request asks for a fresh start; otherwise every request is
-/// queued for a new scan. Two of the same scan at once are two scans.
+/// How a scan begins.
+enum Begin<'a> {
+    /// As its request asks, with its words.
+    Asked(ScanWords<'a>),
+    /// A stopped scan taken up again with the settings it was kept with, its requests
+    /// queued already.
+    TakenUp(cfx_db::scans::Running),
+}
+
+/// The stopped scan a `resume` request names, taken up again, with the settings it was
+/// kept with: or why it cannot be.
+async fn taken_up(
+    req: &DaemonRequest,
+    db: &AmbuloDb,
+) -> Result<(ScanParams, cfx_db::scans::Running), String> {
+    let id = req.params["scan"]
+        .as_str()
+        .ok_or("a resume names the scan to take up again")?;
+    let (running, settings) = cfx_db::scans::take_up(db.pool(), id, None)
+        .await
+        .map_err(|e| e.to_string())?;
+    match serde_json::from_value(settings) {
+        Ok(params) => Ok((params, running)),
+        Err(e) => {
+            let _ = cfx_db::scans::finish(running, cfx_db::scans::Status::Stopped).await;
+            Err(format!(
+                "scan {id} was kept with settings this ambulo cannot read: {e}"
+            ))
+        }
+    }
+}
+
+/// Set up a scan of `params` as it begins: its wordlist, kept once, and the scan
+/// itself. A stopped scan with the same URLs, words and method, or the one the request
+/// names to take up, is taken up again with the requests it had not sent, unless the
+/// request asks for a fresh start; otherwise every request is queued for a new scan.
+/// Two of the same scan at once are two scans.
 async fn prepare_scan(
     params: &ScanParams,
     db: &Arc<AmbuloDb>,
-    words: ScanWords<'_>,
+    begin: Begin<'_>,
 ) -> Result<
     (Scanner<ScanStore>, usize, cfx_db::scans::Running),
     Box<dyn std::error::Error + Send + Sync>,
@@ -837,6 +897,10 @@ async fn prepare_scan(
     }
 
     let config = build_args(params, endpoint, http_method);
+    let words = match begin {
+        Begin::TakenUp(running) => return scan_on(params, db, config, running, None).await,
+        Begin::Asked(words) => words,
+    };
 
     // Every scan path reaches here, so this is the one place a wordlist file has to
     // be contained. `wordlist` is a filesystem path from the request and the
@@ -863,9 +927,12 @@ async fn prepare_scan(
 
     // A scan that authenticates (headers, cookies, basic auth, or a user, a password or a
     // token in a URL) is known by its id alone, and keeps nothing derived from them; one
-    // that does not, by what it asks for.
+    // that does not, by what it asks for. Its own marker is no credential.
     let authenticated = params.auth.carries_credentials()
-        || config.url.iter().any(|u| cfx_db::scans::safe_url(u) != *u);
+        || config
+            .url
+            .iter()
+            .any(|u| cfx_db::scans::safe_url_keeping(u, &params.fuzz_marker) != *u);
     let scan_config_hash = if authenticated {
         None
     } else {
@@ -884,22 +951,44 @@ async fn prepare_scan(
         Some(hash) => cfx_db::scans::Key::Settings(hash),
         None => cfx_db::scans::Key::Authenticated,
     };
-    let asked = serde_json::to_string(params)?;
-    let running = cfx_db::scans::start(
-        db.pool(),
-        &config.url.join(", "),
-        key,
-        &asked,
-        params.fresh_start,
-    )
-    .await
-    .map_err(|e| format!("DB: {e}"))?;
+    let settings = serde_json::to_string(params)?;
+    let target = config.url.join(", ");
+    let asked = cfx_db::scans::Asked::new(&target, &settings).keeping(&params.fuzz_marker);
+    let running = match &params.resume {
+        Some(id) => {
+            cfx_db::scans::take_up(db.pool(), id, Some(asked))
+                .await
+                .map_err(|e| e.to_string())?
+                .0
+        }
+        None => cfx_db::scans::start(db.pool(), asked, key, params.fresh_start)
+            .await
+            .map_err(|e| format!("DB: {e}"))?,
+    };
+    scan_on(params, db, config, running, Some(wordlist.id)).await
+}
+
+/// The scanner of `running`, a scan of `params` with `config`: a new one's requests,
+/// one for each word of wordlist `words`, queued, or those a scan taken up again had
+/// not sent queued again.
+async fn scan_on(
+    params: &ScanParams,
+    db: &Arc<AmbuloDb>,
+    config: crate::libs::cli_args::Args,
+    running: cfx_db::scans::Running,
+    words: Option<i64>,
+) -> Result<
+    (Scanner<ScanStore>, usize, cfx_db::scans::Running),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     // What fails from here on ends the scan as failed, rather than leaving it running.
     let queued = async {
-        if running.resumed {
-            db.requeue_unfinished(&running.id).await?;
-        } else {
-            db.queue_scan(&running.id, &config.url, wordlist.id).await?;
+        match (running.resumed, words) {
+            (false, Some(words)) => {
+                db.queue_scan(&running.id, &config.url, words, &params.fuzz_marker)
+                    .await?
+            }
+            _ => db.requeue_unfinished(&running.id).await?,
         }
         db.entries(&running.id).await
     }
@@ -926,7 +1015,7 @@ async fn run_scan(
         return Err("words can follow only a stream scan's request".into());
     }
     let (scanner, _, running) =
-        prepare_scan(params, db, ScanWords::Named(&params.wordlist)).await?;
+        prepare_scan(params, db, Begin::Asked(ScanWords::Named(&params.wordlist))).await?;
     let ran = scanner.run_headless().await;
     let _ = db.end_scan(running, ran.is_err()).await;
     ran.map_err(|e| format!("Scan: {e}").into())
@@ -964,6 +1053,7 @@ fn build_args(params: &ScanParams, endpoint: String, http_method: HttpMethod) ->
         interval: params.delay,
         tasks: params.tasks,
         fresh_start: params.fresh_start,
+        resume: params.resume.clone(),
         random_user_agent_scan: params.random_user_agent_scan,
         random_user_agent_request: params.random_user_agent_request,
         append_slash: params.append_slash,
@@ -976,7 +1066,7 @@ fn build_args(params: &ScanParams, endpoint: String, http_method: HttpMethod) ->
             .as_deref()
             .and_then(|level| <LogLevel as clap::ValueEnum>::from_str(level, true).ok())
             .unwrap_or(LogLevel::Info),
-        event_poll_timeout: 1000,
+        event_poll_timeout: crate::libs::cli_args::EVENT_POLL_TIMEOUT_MS,
         interactive: false,
         adaptive_rate: params.adaptive_rate,
         adaptive_resilience: params.adaptive_resilience,
@@ -1585,6 +1675,26 @@ mod flag_tests {
     use super::*;
     use clap::Parser;
 
+    /// A scan taken up again from what was kept runs with the settings it was asked for.
+    #[test]
+    fn what_is_kept_of_a_scans_settings_reads_back_as_them() {
+        let params: ScanParams = serde_json::from_value(serde_json::json!({
+            "endpoint": "https://app.example/api?key=::FUZZ::",
+            "wordlist_follows": "words.txt",
+            "auth": {"headers": {}, "cookies": "", "basic_auth": ""},
+            "store_cookies": true,
+        }))
+        .unwrap();
+        let kept = cfx_db::scans::Asked::new("", &serde_json::to_string(&params).unwrap())
+            .keeping(&params.fuzz_marker)
+            .kept_params();
+        let back: ScanParams = serde_json::from_str(&kept).unwrap();
+        assert_eq!(
+            serde_json::to_value(&back).unwrap(),
+            serde_json::to_value(&params).unwrap()
+        );
+    }
+
     /// Every flag of `ambulo scan` the scanner can honour, from the command line through
     /// the request the client sends and the daemon reads, into the scanner's settings.
     #[test]
@@ -1617,6 +1727,8 @@ mod flag_tests {
             "--adaptive-resilience",
             "--posture",
             "gentle",
+            "--resume",
+            "s-1",
         ])
         .unwrap();
         let Some(crate::libs::cli_args::Commands::Scan(args)) = cli.command else {
@@ -1643,5 +1755,10 @@ mod flag_tests {
         assert!(config.adaptive_resilience);
         assert_eq!(config.posture, "gentle");
         assert!(params.auth.carries_credentials());
+        assert_eq!(params.resume.as_deref(), Some("s-1"));
+        assert!(
+            !serde_json::to_string(&params).unwrap().contains("s-1"),
+            "the scan to take up is not one of its settings"
+        );
     }
 }

@@ -34,8 +34,8 @@ impl DoorwardDb {
 
     /// Start keeping a scan of `targets`, asked for with `params`: a stopped one with the
     /// same settings is run again from the start, as a port scan keeps nothing to resume
-    /// from, unless `fresh` asks for a new record. The settings, without credentials, are the key. A scan runs whether or not
-    /// it could be kept, so a failure is only said.
+    /// from, unless `fresh` asks for a new record. The settings, without credentials, are
+    /// the key. A scan runs whether or not it could be kept, so a failure is only said.
     pub async fn start_scan(
         &self,
         targets: &[String],
@@ -44,7 +44,9 @@ impl DoorwardDb {
     ) -> Option<cfx_db::scans::Running> {
         let params = cfx_db::scans::without_secrets(&params.to_string());
         let key = cfx_db::scans::Key::Settings(&params);
-        match cfx_db::scans::start(&self.pool, &targets.join(", "), key, &params, fresh).await {
+        let target = targets.join(", ");
+        let asked = cfx_db::scans::Asked::new(&target, &params);
+        match cfx_db::scans::start(&self.pool, asked, key, fresh).await {
             Ok(scan) => Some(scan),
             Err(e) => {
                 eprintln!("[doorward] could not keep a record of the scan: {e}");

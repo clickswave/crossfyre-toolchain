@@ -51,6 +51,9 @@ pub enum Commands {
     /// Identify non-HTTP services on host:port targets, and whether they let
     /// anyone in
     Services(SvcArgs),
+    /// The scans this engine keeps, the latest first. toolmark keeps nothing a stopped
+    /// scan could carry on from, so a scan is run again rather than taken up
+    Scans,
     /// What this engine keeps: delete one scan, old scans, or everything
     Db {
         #[command(subcommand)]

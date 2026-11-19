@@ -18,8 +18,8 @@ and services on it with their versions, and a row each time one appears or chang
 scan given credentials saw the page as that user, so it keeps no body. The first daemon
 makes the database, so install PostgreSQL's programs before the first scan (`sudo apt
 install postgresql` on Debian, Ubuntu or Kali), or point it at a database you run with
-`crossfyre db external`. `toolmark db purge --scan ID` deletes one scan, and `toolmark
-db reset` everything it keeps. The root [README](../#how-the-engines-run) has the
+`crossfyre db external`. `toolmark scans` lists the scans it keeps, the latest first,
+`toolmark db purge --scan ID` deletes one, and `toolmark db reset` everything it keeps. The root [README](../#how-the-engines-run) has the
 details.
 
 ```sh

@@ -138,7 +138,15 @@ async fn handle_connection(
             continue;
         }
 
-        // Streaming mode takes over the connection
+        // The scans this daemon keeps, the latest first.
+        if req.operation == "scans" {
+            let answer = cfx_db::scans::answer_scans(&db.pool, cfx_db::scans::Listed::why_not);
+            write_json(&mut writer, &answer.await).await?;
+            continue;
+        }
+
+        // Streaming mode takes over the connection. A stopped scan taken up again streams
+        // as the scan did.
         if req.response == "stream" {
             handle_stream_scan(req, writer, Arc::clone(&db)).await?;
             return Ok(());
@@ -159,21 +167,29 @@ async fn handle_stream_scan(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let operation_id = uuid::Uuid::new_v4().to_string();
 
-    let scan_params: ScanParams = match serde_json::from_value(req.params.clone()) {
-        Ok(p) => p,
-        Err(e) => {
-            write_json(
-                &mut writer,
-                &StreamEvent::error(&format!("Invalid scan params: {e}")),
-            )
-            .await?;
+    // The scan as asked for, or a stopped one taken up again with the settings it was
+    // kept with.
+    let begun = match req.operation.as_str() {
+        "resume" => taken_up(&req, &db)
+            .await
+            .map(|(params, running)| (params, Some(running))),
+        _ => match serde_json::from_value::<ScanParams>(req.params.clone()) {
+            Ok(params) => {
+                let scan = db
+                    .start_scan(&params.targets, &req.params, params.fresh_start)
+                    .await;
+                Ok((params, scan))
+            }
+            Err(e) => Err(format!("Invalid scan params: {e}")),
+        },
+    };
+    let (scan_params, scan) = match begun {
+        Ok(begun) => begun,
+        Err(message) => {
+            write_json(&mut writer, &StreamEvent::error(&message)).await?;
             return Ok(());
         }
     };
-
-    let scan = db
-        .start_scan(&scan_params.targets, &req.params, scan_params.fresh_start)
-        .await;
     if req.save {
         let _ = cfx_db::scans::record_operation(
             &db.pool,
@@ -218,6 +234,30 @@ async fn handle_stream_scan(
     }
 
     Ok(())
+}
+
+/// The stopped scan a `resume` request names, taken up again with the settings it was kept
+/// with: or why it cannot be. A port scan keeps nothing to carry on from, so it runs again
+/// from the start, under its own record.
+async fn taken_up(
+    req: &DaemonRequest,
+    db: &DoorwardDb,
+) -> Result<(ScanParams, cfx_db::scans::Running), String> {
+    let id = req.params["scan"]
+        .as_str()
+        .ok_or("a resume names the scan to take up again")?;
+    let (running, settings) = cfx_db::scans::take_up(&db.pool, id, None)
+        .await
+        .map_err(|e| e.to_string())?;
+    match serde_json::from_value(settings) {
+        Ok(params) => Ok((params, running)),
+        Err(e) => {
+            let _ = cfx_db::scans::finish(running, cfx_db::scans::Status::Stopped).await;
+            Err(format!(
+                "scan {id} was kept with settings this doorward cannot read: {e}"
+            ))
+        }
+    }
 }
 
 async fn dispatch(req: DaemonRequest, db: Arc<DoorwardDb>) -> serde_json::Value {

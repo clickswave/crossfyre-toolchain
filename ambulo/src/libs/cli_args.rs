@@ -98,6 +98,10 @@ pub struct Cli {
     pub no_autostart: bool,
 }
 
+/// How long the dashboard waits for an event before it draws again, unless
+/// `--event-poll-timeout` says otherwise.
+pub const EVENT_POLL_TIMEOUT_MS: u64 = 1000;
+
 #[derive(Subcommand, Debug)]
 // clap subcommand enum: the large variant is the fully-populated scan config,
 // constructed once per process. Boxing it would only move an allocation that
@@ -109,6 +113,8 @@ pub enum Commands {
     /// Send a JSON op to the daemon and print the reply. `operation` defaults to
     /// `probe`, which checks a single URL with no wordlist and no dashboard.
     Exec(ExecArgs),
+    /// The scans this engine keeps, the latest first, and a stopped one to take up again
+    Scans,
     /// What this engine keeps: delete one scan, old scans, or everything
     Db {
         #[command(subcommand)]
@@ -195,6 +201,11 @@ pub struct ScanArgs {
     #[arg(long, default_value_t = false)]
     pub fresh_start: bool,
 
+    /// Take up stopped scan ID again, asked for as it was first asked for: how one given
+    /// credentials, which are not kept, is taken up. `ambulo scans` lists the scans
+    #[arg(long, value_name = "ID", conflicts_with = "fresh_start")]
+    pub resume: Option<String>,
+
     /// Use a random user agent for the whole scan
     #[arg(long, default_value_t = false)]
     pub random_user_agent_scan: bool,
@@ -228,7 +239,7 @@ pub struct ScanArgs {
     pub log_level: LogLevel,
 
     /// TUI event polling timeout in ms
-    #[arg(long, default_value_t = 1000)]
+    #[arg(long, default_value_t = EVENT_POLL_TIMEOUT_MS)]
     pub event_poll_timeout: u64,
 
     /// Interactive mode - prompts for required options

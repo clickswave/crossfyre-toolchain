@@ -161,12 +161,46 @@ async fn handle_connection(
                     &mut lines,
                     &gate,
                     &db,
+                    None,
                 )
                 .await?
             };
         }
         match req.operation.as_str() {
             "scan" => op!("scan", scan),
+            // A stopped template scan, taken up again with the request it was kept with.
+            "resume" => match db
+                .taken_up(params["scan"].as_str().unwrap_or_default())
+                .await
+            {
+                Ok((kept, taken)) => {
+                    run_op(
+                        kept,
+                        egress,
+                        "scan",
+                        scan,
+                        &mut writer,
+                        &mut lines,
+                        &gate,
+                        &db,
+                        Some(taken),
+                    )
+                    .await?
+                }
+                Err(message) => {
+                    write_line(
+                        &mut writer,
+                        &serde_json::json!({"type": "error", "message": message}),
+                    )
+                    .await?;
+                    continue;
+                }
+            },
+            // The scans this daemon keeps, the latest first.
+            "scans" => {
+                write_line(&mut writer, &db.scans().await).await?;
+                continue;
+            }
             "authz" => op!("authz", plain(crate::authz::run)),
             "inject" => op!("inject", plain(crate::inject::run)),
             "discover" => op!("discover", plain(crate::discover::run)),
@@ -255,6 +289,9 @@ fn is_cancel(line: &str, gate: &dguard::Gate) -> bool {
 ///
 /// The `ack` says `"cancellable": true`, so a client can tell this daemon from one
 /// that cannot be stopped and say so rather than claim it stopped.
+///
+/// The operation is kept as a scan of its own, or as `taken`, a stopped one taken up
+/// again, which it hands back as stopped when its settings no longer parse.
 #[allow(clippy::too_many_arguments)]
 async fn run_op<P, F, Fut>(
     params: Value,
@@ -265,6 +302,7 @@ async fn run_op<P, F, Fut>(
     lines: &mut Lines<BufReader<OwnedReadHalf>>,
     gate: &dguard::Gate,
     db: &PlessorDb,
+    taken: Option<cfx_db::scans::Running>,
 ) -> Result<(), BoxError>
 where
     P: DeserializeOwned + Routed + Send + 'static,
@@ -278,6 +316,7 @@ where
             p
         }
         Err(e) => {
+            db.finish(taken, Status::Stopped).await;
             write_line(
                 writer,
                 &serde_json::json!({
@@ -290,7 +329,10 @@ where
         }
     };
 
-    let scan = db.start(what, &asked).await;
+    let scan = match taken {
+        Some(taken) => Some(taken),
+        None => db.start(what, &asked).await,
+    };
     let id = scan.as_ref().map(|s| s.id.clone());
     let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
     let op = dguard::spawn_busy(run(p, tx, id.clone()));

@@ -1,4 +1,4 @@
-use crate::libs::cli_args::{Cli, Commands, ExecArgs};
+use crate::libs::cli_args::{Cli, Commands, EVENT_POLL_TIMEOUT_MS, ExecArgs};
 use crate::scanner::StreamEvent;
 use clap::{CommandFactory, Parser};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -70,6 +70,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // -----------------------------------------------------------------------
+    // Scans subcommand: what the daemon keeps, and a stopped one taken up again
+    // -----------------------------------------------------------------------
+    if let Some(Commands::Scans) = &cli.command {
+        let scans = dguard::list_scans(&daemon).await?;
+        let tui = cfx_tui::wanted(cli.no_tui);
+        let chosen =
+            tokio::task::spawn_blocking(move || cfx_tui::scans::show("DOORWARD", &scans, tui))
+                .await??;
+        if let Some(scan) = chosen {
+            let request = dguard::resume_request(scan["id"].as_str().unwrap_or_default());
+            stream_scan(&daemon, &request, tui, EVENT_POLL_TIMEOUT_MS).await?;
+        }
+        return Ok(());
+    }
+
+    // -----------------------------------------------------------------------
     // Completions subcommand - print a shell completion script (no daemon needed)
     // -----------------------------------------------------------------------
     if let Some(Commands::Completions { shell }) = &cli.command {
@@ -92,15 +108,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let stream = daemon.connect().await?;
-
     let ports = libs::cli_args::resolve_ports(&scan_args.ports);
-
-    // Build and send the stream scan request
     let request = scan_request(&scan_args, &ports);
+    let tui = cfx_tui::wanted(cli.no_tui);
+    stream_scan(&daemon, &request, tui, scan_args.event_poll_timeout).await
+}
 
+/// Send `request` to the daemon and show the scan it starts: drawn on the dashboard when
+/// `tui`, polling for events every `poll_timeout` ms, and otherwise written out as the
+/// daemon's own newline-delimited JSON.
+async fn stream_scan(
+    daemon: &dguard::Daemon,
+    request: &serde_json::Value,
+    tui: bool,
+    poll_timeout: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stream = daemon.connect().await?;
     let (reader, mut writer) = tokio::io::split(stream);
-    let mut req_str = dguard::encode(&request);
+    let mut req_str = dguard::encode(request);
     req_str.push('\n');
     writer.write_all(req_str.as_bytes()).await?;
 
@@ -119,9 +144,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let operation_id = ack.operation_id.unwrap_or_else(|| "unknown".to_string());
     let total = ack.total.unwrap_or(0);
-    let poll_timeout = scan_args.event_poll_timeout;
 
-    if cfx_tui::wanted(cli.no_tui) {
+    if tui {
         let (tx, rx) = mpsc::unbounded_channel::<StreamEvent>();
         tokio::spawn(async move {
             while let Ok(Some(line)) = lines.next_line().await {

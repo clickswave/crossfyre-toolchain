@@ -276,9 +276,17 @@ async fn handle_connection(
             continue;
         }
 
+        // The enumerations this daemon keeps, the latest first.
+        if req.operation == "scans" {
+            let answer = cfx_db::scans::answer_scans(db.pool(), cfx_db::scans::Listed::why_not);
+            write_json(&mut writer, &answer.await).await?;
+            continue;
+        }
+
         // Stream mode takes over the connection for the duration of the scan.
         // Routed by operation first: each stream handler parses its own params,
-        // so takeover requests must not reach the enum parser.
+        // so takeover requests must not reach the enum parser. A stopped enumeration
+        // taken up again streams as it did.
         if req.response == "stream" {
             match req.operation.as_str() {
                 "takeover" => handle_stream_takeover(req, writer).await?,
@@ -324,18 +332,31 @@ async fn handle_stream_enum(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let operation_id = Uuid::new_v4().to_string();
 
-    let params: EnumParams = match serde_json::from_value(req.params.clone()) {
-        Ok(p) => EnumParams {
-            egress: req.egress.clone(),
-            ..p
-        },
-        Err(e) => {
+    // The enumeration as asked for, or a stopped one taken up again with the settings it
+    // was kept with.
+    let asked = match req.operation.as_str() {
+        "resume" => taken_up(&req, &db)
+            .await
+            .map(|(p, running)| (p, Some(running))),
+        _ => serde_json::from_value::<EnumParams>(req.params.clone())
+            .map(|p| (p, None))
+            .map_err(|e| format!("Invalid enum params: {e}")),
+    };
+    let (params, taken) = match asked {
+        Ok((p, taken)) => (
+            EnumParams {
+                egress: req.egress.clone(),
+                ..p
+            },
+            taken,
+        ),
+        Err(message) => {
             write_json(
                 &mut writer,
                 &serde_json::json!({
                     "type": "error",
                     "operation_id": operation_id,
-                    "message": format!("Invalid enum params: {}", e),
+                    "message": message,
                 }),
             )
             .await?;
@@ -358,7 +379,7 @@ async fn handle_stream_enum(
         .wordlist_follows
         .is_some()
         .then(|| dguard::WordChunks::new(lines, gate));
-    let (scanner, total, running) = match prepare_enum(&params, &db, following).await {
+    let (scanner, total, running) = match prepare_enum(&params, &db, following, taken).await {
         Ok(v) => v,
         Err(e) => {
             write_json(
@@ -653,13 +674,44 @@ fn scan_key(domain: &str, wordlist: &str, words: Option<&[String]>) -> String {
     crate::libs::sha::sha512(config.to_string())
 }
 
-/// Set up an enumeration of `params.domain`. Its words are those of the wordlist file
-/// the request names, or, when `following` is given, the chunks that follow the request
-/// on the connection. They are held once, and made into entries a batch at a time.
+/// The stopped enumeration a `resume` request names, taken up again with the settings it
+/// was kept with: or why it cannot be. Its names are queued already, so no words follow.
+async fn taken_up(
+    req: &DaemonRequest,
+    db: &VoyageDb,
+) -> Result<(EnumParams, cfx_db::scans::Running), String> {
+    let id = req.params["scan"]
+        .as_str()
+        .ok_or("a resume names the enumeration to take up again")?;
+    let (running, settings) = cfx_db::scans::take_up(db.pool(), id, None)
+        .await
+        .map_err(|e| e.to_string())?;
+    match serde_json::from_value::<EnumParams>(settings) {
+        Ok(params) => Ok((
+            EnumParams {
+                wordlist_follows: None,
+                ..params
+            },
+            running,
+        )),
+        Err(e) => {
+            let _ = cfx_db::scans::finish(running, cfx_db::scans::Status::Stopped).await;
+            Err(format!(
+                "scan {id} was kept with settings this voyage cannot read: {e}"
+            ))
+        }
+    }
+}
+
+/// Set up an enumeration of `params.domain`, or `taken`, a stopped one taken up again by
+/// its id. Its words are those of the wordlist file the request names, or, when
+/// `following` is given, the chunks that follow the request on the connection. They are
+/// held once, and made into entries a batch at a time.
 async fn prepare_enum(
     params: &EnumParams,
     db: &Arc<VoyageDb>,
     following: Option<dguard::WordChunks<'_, BufReader<OwnedReadHalf>>>,
+    taken: Option<cfx_db::scans::Running>,
 ) -> Result<
     (Scanner<VoyageDb>, usize, cfx_db::scans::Running),
     Box<dyn std::error::Error + Send + Sync>,
@@ -692,12 +744,17 @@ async fn prepare_enum(
             None => None,
         },
     };
-    let config_hash = scan_key(&params.domain, &params.wordlist, words.as_deref());
-    let asked = serde_json::to_string(params).map_err(|e| format!("Invalid params: {e}"))?;
-    let running = db
-        .start_scan(&params.domain, &config_hash, &asked, params.fresh_start)
-        .await
-        .map_err(|e| format!("DB error: {e}"))?;
+    let running = match taken {
+        Some(running) => running,
+        None => {
+            let config_hash = scan_key(&params.domain, &params.wordlist, words.as_deref());
+            let asked =
+                serde_json::to_string(params).map_err(|e| format!("Invalid params: {e}"))?;
+            db.start_scan(&params.domain, &config_hash, &asked, params.fresh_start)
+                .await
+                .map_err(|e| format!("DB error: {e}"))?
+        }
+    };
     let scan_id = running.id.clone();
     // What fails from here on ends the scan as failed, rather than leaving it running.
     let ready = async {
@@ -797,7 +854,7 @@ async fn run_enum_instant(
     if params.wordlist_follows.is_some() {
         return Err("words can follow only a stream enum's request".into());
     }
-    let (scanner, _, running) = prepare_enum(params, db, None).await?;
+    let (scanner, _, running) = prepare_enum(params, db, None, None).await?;
     let scan_id = running.id.clone();
     let db2 = Arc::clone(&scanner.store);
 

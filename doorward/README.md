@@ -41,8 +41,9 @@ started that way exits after 30 minutes with no client and no scan. `doorward da
 runs one by hand, and `--no-autostart` turns the starting off. It keeps each scan's
 state in PostgreSQL, and the first daemon makes the database, so install PostgreSQL's
 programs before the first scan (`sudo apt install postgresql` on Debian, Ubuntu or
-Kali), or point it at a database you run with `crossfyre db external`. The root
-[README](../#how-the-engines-run) has the details.
+Kali), or point it at a database you run with `crossfyre db external`. `doorward scans`
+lists the scans it keeps, the latest first, and Enter on a stopped one runs it again
+under its own record. The root [README](../#how-the-engines-run) has the details.
 
 ## Notes
 

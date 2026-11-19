@@ -160,6 +160,21 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let target = payload["target"].as_str().unwrap_or("").to_string();
             send_stream(&daemon, payload, false, target).await
         }
+        Some(Commands::Scans) => {
+            let scans = dguard::list_scans(&daemon).await?;
+            let tui = cfx_tui::wanted(cli.no_tui);
+            let chosen =
+                tokio::task::spawn_blocking(move || cfx_tui::scans::show("PLESSOR", &scans, tui))
+                    .await??;
+            match chosen {
+                Some(scan) => {
+                    let id = scan["id"].as_str().unwrap_or_default();
+                    let target = scan["target"].as_str().unwrap_or_default().to_string();
+                    send_stream(&daemon, dguard::resume_request(id), tui, target).await
+                }
+                None => Ok(()),
+            }
+        }
         Some(Commands::Db { action }) => dguard::run_db(&daemon, &action).await,
         Some(Commands::Completions { shell }) => {
             let mut script = Vec::new();

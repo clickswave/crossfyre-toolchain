@@ -98,6 +98,18 @@ async fn handle_connection(
                 handle_services(req.params, req.egress, &mut writer, &db).await?;
                 return Ok(());
             }
+            // The scans this daemon keeps, the latest first.
+            "scans" => write_line(&mut writer, &db.scans().await).await?,
+            "resume" => {
+                write_line(
+                    &mut writer,
+                    &serde_json::json!({
+                        "type": "error",
+                        "message": crate::libs::toolmark_db::NOTHING_TO_TAKE_UP,
+                    }),
+                )
+                .await?;
+            }
             "db_reset" | "purge" => {
                 let done = match req.operation.as_str() {
                     "db_reset" => {

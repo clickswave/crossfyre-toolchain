@@ -18,8 +18,9 @@ scan stopped part way carries on from there when the same scan is asked for agai
 reports what it had found before. The first daemon makes the database, so install
 PostgreSQL's programs before the first scan (`sudo apt install postgresql` on Debian,
 Ubuntu or Kali), or point it at a database you run with `crossfyre db external`.
-`plessor db purge --scan ID` deletes one scan, and `plessor db reset` everything it
-keeps. The root [README](../#how-the-engines-run) has the details.
+`plessor scans` lists the scans it keeps, the latest first, and Enter on a stopped
+template scan takes it up again. `plessor db purge --scan ID` deletes one scan, and
+`plessor db reset` everything it keeps. The root [README](../#how-the-engines-run) has the details.
 
 ```sh
 # scan a target

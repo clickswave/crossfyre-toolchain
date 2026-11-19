@@ -120,7 +120,7 @@ mod tests {
     use super::*;
     use crate::ready::ready_in;
     use crate::ready::tests::{free_port, local_on, toolchain_with};
-    use crate::scans::{Key, Status, finish, start};
+    use crate::scans::{Asked, Key, Status, finish, start};
     use crate::{Engine, Stop, ThisAccount, Toolchain};
 
     #[tokio::test]
@@ -145,9 +145,14 @@ mod tests {
             .await
             .unwrap();
             for target in ["a", "b"] {
-                let scan = start(&pool, target, Key::Settings(target), "{}", false)
-                    .await
-                    .unwrap();
+                let scan = start(
+                    &pool,
+                    Asked::new(target, "{}"),
+                    Key::Settings(target),
+                    false,
+                )
+                .await
+                .unwrap();
                 finish(scan, Status::Completed).await.unwrap();
             }
             pool.close().await;

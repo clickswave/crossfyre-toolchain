@@ -7,6 +7,10 @@ use cfx_db::scans::{Key, Running, Status};
 use serde_json::Value;
 use std::io::Write;
 
+/// Why no toolmark scan is taken up again.
+pub const NOTHING_TO_TAKE_UP: &str =
+    "toolmark keeps nothing to carry on from, so a scan is run again rather than taken up";
+
 /// toolmark's part of the database: its schema, and the files that make its tables.
 pub const ENGINE: cfx_db::Engine = cfx_db::Engine {
     name: "toolmark",
@@ -58,7 +62,8 @@ impl ToolmarkDb {
         } else {
             Key::Settings(&hash)
         };
-        match cfx_db::scans::start(&self.pool, target, key, &asked, true).await {
+        let asked = cfx_db::scans::Asked::new(target, &asked);
+        match cfx_db::scans::start(&self.pool, asked, key, true).await {
             Ok(scan) => Some(scan),
             Err(e) => {
                 eprintln!("[toolmark] could not keep a record of the scan: {e}");
@@ -197,6 +202,12 @@ impl ToolmarkDb {
         .execute(&mut *tx)
         .await?;
         tx.commit().await
+    }
+
+    /// What this daemon answers a `scans` request with: its scans, none of which can be
+    /// taken up again.
+    pub async fn scans(&self) -> Value {
+        cfx_db::scans::answer_scans(&self.pool, |_| Some(NOTHING_TO_TAKE_UP.to_string())).await
     }
 
     /// What scan `scan`, asked for with `params`, sees, kept as it is seen.

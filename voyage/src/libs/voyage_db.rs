@@ -50,7 +50,13 @@ impl VoyageDb {
         fresh: bool,
     ) -> Result<cfx_db::scans::Running, sqlx::Error> {
         let key = cfx_db::scans::Key::Settings(config_hash);
-        cfx_db::scans::start(&self.pool, domain, key, params, fresh).await
+        cfx_db::scans::start(
+            &self.pool,
+            cfx_db::scans::Asked::new(domain, params),
+            key,
+            fresh,
+        )
+        .await
     }
 
     /// End scan `scan`: completed when it tried every name, stopped when some were left

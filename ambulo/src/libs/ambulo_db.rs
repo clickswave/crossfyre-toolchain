@@ -137,21 +137,22 @@ impl AmbuloDb {
     }
 
     /// Request each of `urls` with every word of wordlist `wordlist_id`, as scan
-    /// `scan_id`: the URLs are kept, without a user, a password or a token in them (the
-    /// scan's [`ScanStore`] holds them as given), and an entry made for each URL and
-    /// word. The database makes the entries from the words it holds, so none is read
+    /// `scan_id`: the URLs are kept without a user, a password or a token in them, with
+    /// `fuzz_marker` kept where it stands in place of one (the scan's [`ScanStore`] holds
+    /// them as given), and an entry made for each URL and word. The database makes the entries from the words it holds, so none is read
     /// here.
     pub async fn queue_scan(
         &self,
         scan_id: &str,
         urls: &[String],
         wordlist_id: i64,
+        fuzz_marker: &str,
     ) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         for url in urls {
             let url_id: i64 =
                 sqlx::query_scalar("INSERT INTO urls (url, scan_id) VALUES ($1, $2) RETURNING id")
-                    .bind(cfx_db::scans::safe_url(url))
+                    .bind(cfx_db::scans::safe_url_keeping(url, fuzz_marker))
                     .bind(scan_id)
                     .fetch_one(&mut *tx)
                     .await?;
@@ -250,7 +251,10 @@ impl AmbuloDb {
             urls: config
                 .url
                 .iter()
-                .map(|url| (cfx_db::scans::safe_url(url), url.clone()))
+                .map(|url| {
+                    let kept = cfx_db::scans::safe_url_keeping(url, &config.fuzz_marker);
+                    (kept, url.clone())
+                })
                 .collect(),
             fuzz_marker: config.fuzz_marker.clone(),
             method: config.http_method.to_string(),

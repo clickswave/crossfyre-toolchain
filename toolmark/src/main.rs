@@ -85,6 +85,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let target = payload["target"].as_str().unwrap_or("").to_string();
             send_stream(&daemon, payload, false, target).await
         }
+        Some(Commands::Scans) => {
+            let scans = dguard::list_scans(&daemon).await?;
+            let tui = cfx_tui::wanted(cli.no_tui);
+            tokio::task::spawn_blocking(move || cfx_tui::scans::show("TOOLMARK", &scans, tui))
+                .await??;
+            Ok(())
+        }
         Some(Commands::Db { action }) => dguard::run_db(&daemon, &action).await,
         Some(Commands::Completions { shell }) => {
             let mut script = Vec::new();

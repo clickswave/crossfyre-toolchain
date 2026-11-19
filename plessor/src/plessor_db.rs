@@ -5,6 +5,10 @@ use crate::ledger::{Ledger, Planned, Planning, State};
 use cfx_db::scans::{Key, Running, Status};
 use serde_json::Value;
 
+/// Why a scan other than a template scan is not taken up again.
+const NOT_A_TEMPLATE_SCAN: &str =
+    "keeps nothing to carry on from, as only a template scan does: run it again";
+
 /// plessor's part of the database: its schema, and the files that make its tables.
 pub const ENGINE: cfx_db::Engine = cfx_db::Engine {
     name: "plessor",
@@ -44,15 +48,22 @@ impl PlessorDb {
         &self.pool
     }
 
-    /// Start keeping an `operation` asked for with `params`. One with credentials is known
-    /// by its id alone; one without, by its settings. A template scan with the same
-    /// settings as a stopped one takes it up again and carries on with what it had not
-    /// run. Any other operation keeps nothing it could carry on from, so it is a new scan
-    /// every time. An operation runs whether or not it could be kept, so a failure is
-    /// only said.
+    /// Start keeping an `operation` asked for with `params`, kept as its settings with the
+    /// operation in them. One with credentials is known by its id alone; one without, by
+    /// its settings. A template scan with the same settings as a stopped one takes it up
+    /// again and carries on with what it had not run, and so does one that names a
+    /// stopped scan to take up in `resume`, giving its settings again, credentials
+    /// included. Any other operation keeps nothing it could carry on from, so it is a new
+    /// scan every time. An operation runs whether or not it could be kept, so a failure is
+    /// only said, and so is a scan to take up that cannot be.
     pub async fn start(&self, operation: &str, params: &Value) -> Option<Running> {
-        let asked = params.to_string();
-        let hash = format!("{operation} {}", cfx_db::scans::without_secrets(&asked));
+        let mut settings = params.clone();
+        let resume = settings.as_object_mut().and_then(|s| {
+            s.insert("operation".to_string(), operation.into());
+            s.remove("resume")
+        });
+        let asked = settings.to_string();
+        let hash = cfx_db::scans::without_secrets(&asked);
         let key = if cfx_db::scans::carries_credentials(&asked) {
             Key::Authenticated
         } else {
@@ -70,14 +81,49 @@ impl PlessorDb {
                 })
             })
             .unwrap_or_else(|| operation.to_string());
+        let asked = cfx_db::scans::Asked::new(&target, &asked);
+        if let Some(id) = resume.as_ref().and_then(Value::as_str) {
+            return match cfx_db::scans::take_up(&self.pool, id, Some(asked)).await {
+                Ok((scan, _)) => Some(scan),
+                Err(e) => {
+                    eprintln!("[plessor] could not take up the scan asked for: {e}");
+                    None
+                }
+            };
+        }
         let fresh = operation != "scan";
-        match cfx_db::scans::start(&self.pool, &target, key, &asked, fresh).await {
+        match cfx_db::scans::start(&self.pool, asked, key, fresh).await {
             Ok(scan) => Some(scan),
             Err(e) => {
                 eprintln!("[plessor] could not keep a record of the {operation}: {e}");
                 None
             }
         }
+    }
+
+    /// Stopped template scan `id` taken up again, and the request it was kept with: or
+    /// why it cannot be. Only a template scan is taken up again.
+    pub async fn taken_up(&self, id: &str) -> Result<(Value, Running), String> {
+        let (scan, settings) = cfx_db::scans::take_up(&self.pool, id, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        if settings["operation"] != "scan" {
+            self.finish(Some(scan), Status::Stopped).await;
+            return Err(format!("scan {id} {NOT_A_TEMPLATE_SCAN}"));
+        }
+        Ok((settings, scan))
+    }
+
+    /// What this daemon answers a `scans` request with.
+    pub async fn scans(&self) -> Value {
+        cfx_db::scans::answer_scans(&self.pool, |scan| {
+            if scan.settings["operation"] != "scan" {
+                Some(NOT_A_TEMPLATE_SCAN.to_string())
+            } else {
+                scan.why_not()
+            }
+        })
+        .await
     }
 
     /// Say where scan `scan`, if it was kept, ended.

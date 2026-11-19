@@ -8,6 +8,8 @@ publish.workspace = true
 [dependencies]
 ratatui = { version = "0.30.0-alpha.5", features = ["crossterm"] }
 crossterm = "0.29.0"
+# The scans a daemon lists, as it lists them.
+serde_json = "1"
 
 [features]
 default = []

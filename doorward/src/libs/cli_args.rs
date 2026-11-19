@@ -40,6 +40,10 @@ pub struct Cli {
     pub no_autostart: bool,
 }
 
+/// How long the dashboard waits for an event before it draws again, unless
+/// `--event-poll-timeout` says otherwise.
+pub const EVENT_POLL_TIMEOUT_MS: u64 = 500;
+
 #[derive(Subcommand, Clone)]
 pub enum Commands {
     /// Run a network scan
@@ -47,6 +51,8 @@ pub enum Commands {
     /// Send a JSON op to the daemon and print the reply. `operation` defaults to
     /// `probe`, which runs a single probe with no dashboard.
     Exec(ExecArgs),
+    /// The scans this engine keeps, the latest first, and a stopped one to take up again
+    Scans,
     /// What this engine keeps: delete one scan, old scans, or everything
     Db {
         #[command(subcommand)]
@@ -95,7 +101,7 @@ pub struct ScanArgs {
     pub fresh_start: bool,
 
     /// TUI event poll timeout in ms
-    #[arg(long, default_value_t = 500)]
+    #[arg(long, default_value_t = EVENT_POLL_TIMEOUT_MS)]
     pub event_poll_timeout: u64,
 }
 
