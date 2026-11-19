@@ -2420,44 +2420,14 @@ pub async fn run_daemon(
     // controller on every daemon start. The server enforces "one running
     // node per api_key" - so if it returns valid=false we abort instead of
     // falling through to a cached config (which would let two daemons race
-    // for the same NATS subjects).
-    // Retry a control plane that is not up YET, rather than treating it as fatal.
-    //
-    // WHY: on a reboot the node service and the control plane start together, and
-    // the node usually wins the race. It used to call exit(1) on the resulting
-    // connection error; the supervisor then parked it as dead and "held until its
-    // config changes", i.e. forever. systemd never intervened either, because
-    // Restart=on-failure watches the SUPERVISOR, which stayed perfectly healthy
-    // holding a corpse. Net effect: every reboot silently killed the fleet until a
-    // human ran `systemctl restart` by hand, and the dashboard just said 0 nodes
-    // online without saying why.
-    //
-    // Only genuinely transient failures are retried. A deleted node, a revoked key
-    // or another daemon holding the same api_key are permanent and still exit
-    // immediately: retrying those would spin forever hiding a real problem.
-    const AUTH_RETRY_WINDOW_SECS: u64 = 600;
-    let auth_started = std::time::Instant::now();
-    let mut backoff = std::time::Duration::from_secs(2);
-    let refresh_result = loop {
-        match refresh_node_state(&mut config, &config_path, &paths.network_dir, force).await {
-            Ok(()) => break Ok(()),
-            Err(e) => {
-                let transient = e
-                    .downcast_ref::<reqwest::Error>()
-                    .map(|re| re.is_connect() || re.is_timeout() || re.is_request())
-                    .unwrap_or(false);
-                if !transient || auth_started.elapsed().as_secs() >= AUTH_RETRY_WINDOW_SECS {
-                    break Err(e);
-                }
-                eprintln!(
-                    "  Crossfyre is not reachable yet ({e}); retrying in {}s",
-                    backoff.as_secs()
-                );
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
-            }
-        }
-    };
+    // for the same NATS subjects). A controller that is not up yet is waited
+    // for (see START_RETRY_WINDOW).
+    let refresh_result = until_reachable(
+        "Crossfyre",
+        async || refresh_node_state(&mut config, &config_path, &paths.network_dir, force).await,
+        |e| controller_unreachable(&**e),
+    )
+    .await;
 
     if let Err(e) = refresh_result {
         if e.downcast_ref::<NodeDeleted>().is_some() {
@@ -2523,27 +2493,6 @@ pub async fn run_daemon(
     // settings are fetched again, ops ask for them first, and the fetch is made as soon
     // as the connection is back.
     let reconnected = Arc::new(tokio::sync::Notify::new());
-    let on_event = {
-        let egress_state = Arc::clone(&egress_state);
-        let reconnected = Arc::clone(&reconnected);
-        move |event: async_nats::Event| {
-            match event {
-                async_nats::Event::Disconnected => egress_state.connection_lost(),
-                async_nats::Event::Connected => reconnected.notify_one(),
-                _ => {}
-            }
-            std::future::ready(())
-        }
-    };
-    let opts = async_nats::ConnectOptions::with_jwt(jwt_str, move |nonce: Vec<u8>| {
-        let kp = key_pair.clone();
-        async move { kp.sign(&nonce).map_err(async_nats::AuthError::new) }
-    })
-    // Increase the subscriber buffer so large bursts (e.g. a 65k-op scan)
-    // don't overflow and drop messages as "slow consumer".
-    .subscription_capacity(1_000_000)
-    .event_callback(on_event);
-    let opts = with_node_inbox(opts, &config.node_id);
 
     // TLS to the control plane.
     //
@@ -2562,9 +2511,9 @@ pub async fn run_daemon(
     // downgraded or tampered NATS_PUBLIC_URL (say `nats://`) would silently
     // reconnect in cleartext, which is precisely the failure this is meant to
     // prevent.
-    let opts = if nats_url.starts_with("tls://") {
+    let root_certificate = if nats_url.starts_with("tls://") {
         match write_origin_root_cert() {
-            Ok(ca_path) => opts.add_root_certificates(ca_path).require_tls(true),
+            Ok(ca_path) => Some(ca_path),
             Err(e) => {
                 eprintln!("ERROR: could not stage the NATS root certificate: {e}");
                 return Err(e.into());
@@ -2575,13 +2524,57 @@ pub async fn run_daemon(
             "WARNING: NATS_PUBLIC_URL is not tls:// - this connection is UNENCRYPTED. \
              Scan targets and findings will cross the network in cleartext."
         );
-        opts
+        None
     };
 
-    let nats_client = opts.connect(nats_url).await.map_err(|e| {
-        eprintln!("ERROR: Failed to connect to NATS: {e}");
-        e
-    })?;
+    // A connection attempt uses its options up, so each one is given its own.
+    let options = || {
+        let on_event = {
+            let egress_state = Arc::clone(&egress_state);
+            let reconnected = Arc::clone(&reconnected);
+            move |event: async_nats::Event| {
+                match event {
+                    async_nats::Event::Disconnected => egress_state.connection_lost(),
+                    async_nats::Event::Connected => reconnected.notify_one(),
+                    _ => {}
+                }
+                std::future::ready(())
+            }
+        };
+        let key_pair = Arc::clone(&key_pair);
+        let opts = async_nats::ConnectOptions::with_jwt(jwt_str.clone(), move |nonce: Vec<u8>| {
+            let kp = key_pair.clone();
+            async move { kp.sign(&nonce).map_err(async_nats::AuthError::new) }
+        })
+        // Increase the subscriber buffer so large bursts (e.g. a 65k-op scan)
+        // don't overflow and drop messages as "slow consumer".
+        .subscription_capacity(1_000_000)
+        .event_callback(on_event);
+        let opts = with_node_inbox(opts, &config.node_id);
+        match &root_certificate {
+            Some(ca_path) => opts
+                .add_root_certificates(ca_path.clone())
+                .require_tls(true),
+            None => opts,
+        }
+    };
+
+    // NATS that is not up yet is waited for, as the controller is (see
+    // START_RETRY_WINDOW). Not with async-nats' retry_on_initial_connect: that retries
+    // for good in the background while the node looks connected.
+    let nats_client = match until_reachable(
+        &format!("NATS at {nats_url}"),
+        async || options().connect(nats_url).await,
+        nats_unreachable,
+    )
+    .await
+    {
+        Ok(client) => client,
+        Err(e) => {
+            eprintln!("ERROR: Failed to connect to NATS: {e}");
+            return Err(e.into());
+        }
+    };
 
     // Subscribe to the job/control channel for this node
     let job_subject = format!("cfx.jobs.{}", config.node_id);
@@ -3636,6 +3629,155 @@ fn stage_origin_root_cert(dir: Option<&std::path::Path>) -> std::io::Result<std:
     std::fs::create_dir_all(dir)?;
     std::fs::write(&path, ORIGIN_ROOT)?;
     Ok(path)
+}
+
+/// How long a starting node keeps trying a control plane that is not up yet: the
+/// controller it refreshes its state from, and then NATS.
+///
+/// WHY: on a reboot the node service and the control plane start together, and the
+/// node usually wins the race. It used to call exit(1) on the resulting connection
+/// error; the supervisor then parked it as dead and "held until its config changes",
+/// i.e. forever. systemd never intervened either, because Restart=on-failure watches
+/// the SUPERVISOR, which stayed perfectly healthy holding a corpse. Net effect: every
+/// reboot silently killed the fleet until a human ran `systemctl restart` by hand, and
+/// the dashboard just said 0 nodes online without saying why.
+///
+/// Only genuinely transient failures are retried. A deleted node, a revoked key, another
+/// daemon holding the same api_key or a refused NATS login are permanent and still exit
+/// immediately: retrying those would spin forever hiding a real problem.
+const START_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Try `attempt` until it succeeds, until it fails in a way `transient` says waiting
+/// will not mend, or until [`START_RETRY_WINDOW`] has passed since the first try. The
+/// wait after a failure is 2 seconds and then twice the one before, up to 30, and each
+/// one is announced with `what`, the part of the control plane that did not answer.
+async fn until_reachable<T, E: std::fmt::Display>(
+    what: &str,
+    mut attempt: impl AsyncFnMut() -> Result<T, E>,
+    transient: impl Fn(&E) -> bool,
+) -> Result<T, E> {
+    let started = tokio::time::Instant::now();
+    let mut wait = std::time::Duration::from_secs(2);
+    loop {
+        let e = match attempt().await {
+            Ok(done) => return Ok(done),
+            Err(e) => e,
+        };
+        if !transient(&e) || started.elapsed() >= START_RETRY_WINDOW {
+            return Err(e);
+        }
+        eprintln!(
+            "  {what} is not reachable yet ({e}); retrying in {}s",
+            wait.as_secs()
+        );
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(std::time::Duration::from_secs(30));
+    }
+}
+
+/// Whether a refresh that failed may succeed if tried again: the controller did not
+/// answer, as while it starts. An answer it gave is final.
+fn controller_unreachable(e: &(dyn std::error::Error + 'static)) -> bool {
+    e.downcast_ref::<reqwest::Error>()
+        .is_some_and(|re| re.is_connect() || re.is_timeout() || re.is_request())
+}
+
+/// Whether a first connection to NATS that failed may succeed if tried again: nothing
+/// listened yet, nothing answered in time, or the name did not resolve yet. A refused
+/// login, a TLS failure and an address that does not parse are not mended by waiting.
+fn nats_unreachable(e: &async_nats::ConnectError) -> bool {
+    use async_nats::ConnectErrorKind::{Dns, Io, TimedOut};
+    matches!(e.kind(), Io | TimedOut | Dns)
+}
+
+#[cfg(test)]
+mod start_retry_tests {
+    use super::*;
+    use async_nats::{ConnectError, ConnectErrorKind};
+    use std::time::Duration;
+
+    fn refused() -> ConnectError {
+        ConnectError::with_source(
+            ConnectErrorKind::Io,
+            std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+        )
+    }
+
+    /// NATS that is still starting, as on a reboot, is waited for: the node used to exit
+    /// at the first refusal and stay down.
+    #[tokio::test(start_paused = true)]
+    async fn a_node_waits_for_nats_that_is_still_starting() {
+        let started = tokio::time::Instant::now();
+        let mut tries = 0;
+        let got = until_reachable(
+            "NATS",
+            async || {
+                tries += 1;
+                if tries < 4 { Err(refused()) } else { Ok(tries) }
+            },
+            nats_unreachable,
+        )
+        .await;
+        assert_eq!(got.ok(), Some(4));
+        // 2, 4 and 8 seconds between the four tries.
+        assert_eq!(started.elapsed(), Duration::from_secs(14));
+    }
+
+    /// A refusal that waiting will not mend ends the start at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_login_is_not_tried_again() {
+        let mut tries = 0;
+        let got = until_reachable(
+            "NATS",
+            async || {
+                tries += 1;
+                Err::<(), _>(ConnectError::new(ConnectErrorKind::AuthorizationViolation))
+            },
+            nats_unreachable,
+        )
+        .await;
+        assert_eq!(
+            got.map_err(|e| e.kind()),
+            Err(ConnectErrorKind::AuthorizationViolation)
+        );
+        assert_eq!(tries, 1);
+    }
+
+    /// Nor does a start wait for good: NATS that has not answered in ten minutes is a
+    /// problem to show.
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_ends_after_ten_minutes() {
+        let started = tokio::time::Instant::now();
+        let got = until_reachable("NATS", async || Err::<(), _>(refused()), nats_unreachable).await;
+        assert!(got.is_err());
+        assert!(
+            started.elapsed() >= START_RETRY_WINDOW,
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() <= START_RETRY_WINDOW + Duration::from_secs(30),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn only_what_waiting_can_mend_is_tried_again() {
+        use ConnectErrorKind::*;
+        for kind in [Io, TimedOut, Dns] {
+            assert!(nats_unreachable(&ConnectError::new(kind)), "{kind:?}");
+        }
+        for kind in [
+            AuthorizationViolation,
+            Authentication,
+            Tls,
+            ServerParse,
+            MaxReconnects,
+        ] {
+            assert!(!nats_unreachable(&ConnectError::new(kind)), "{kind:?}");
+        }
+    }
 }
 
 #[cfg(test)]

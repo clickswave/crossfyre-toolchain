@@ -72,6 +72,8 @@ cfx_tunnel = { path = "../tunnel", features = ["recorder"] }
 rcgen = "0.13"
 # The shape of the release client's User-Agent.
 regex = "1"
+# Time that stands still until a test's tasks wait, for the node's start retries.
+tokio = { version = "1.49.0", features = ["test-util"] }
 
 # Windows: the node supervisor runs as a service (windows-service), the engines as
 # scheduled tasks registered through the Task Scheduler's COM interface (the `windows`
