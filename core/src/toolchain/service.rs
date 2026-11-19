@@ -941,24 +941,6 @@ mod launchd {
         format!("{domain}/{label}")
     }
 
-    /// Load the job from `plist`. A job that was booted out a moment ago may still be
-    /// on its way out, and launchd refuses to load it again until it is gone, so a
-    /// refusal is tried again for a few seconds.
-    fn bootstrap(domain: &str, label: &str, plist: &str) -> Result<(), String> {
-        let mut last = String::new();
-        for _ in 0..20 {
-            match run(&["bootstrap", domain, plist]) {
-                Ok(()) => return Ok(()),
-                Err(e) => last = e,
-            }
-            if loaded(domain, label) {
-                return Ok(());
-            }
-            std::thread::sleep(std::time::Duration::from_millis(250));
-        }
-        Err(last)
-    }
-
     /// Is the job loaded in `domain`?
     pub fn loaded(domain: &str, label: &str) -> bool {
         launchctl(&["print", &target(domain, label)]).is_ok_and(|o| o.status.success())
@@ -979,16 +961,13 @@ mod launchd {
         let t = target(domain, label);
         match action {
             "start" if loaded(domain, label) => run(&["kickstart", &t]),
-            "start" => bootstrap(domain, label, plist),
-            "stop" if loaded(domain, label) => run(&["bootout", &t]),
-            "stop" => Ok(()),
+            "start" => run(&["bootstrap", domain, plist]),
+            "stop" => bootout(domain, label),
             // Booted out and in again, so a plist rewritten since it was loaded (a new
             // port, say) is the one that runs, as a restart after daemon-reload does.
             "restart" => {
-                if loaded(domain, label) {
-                    run(&["bootout", &t])?;
-                }
-                bootstrap(domain, label, plist)
+                bootout(domain, label)?;
+                run(&["bootstrap", domain, plist])
             }
             "enable" => run(&["enable", &t]),
             "disable" => run(&["disable", &t]),
@@ -1018,8 +997,25 @@ mod launchd {
         })
     }
 
-    pub fn bootout(domain: &str, label: &str) {
-        let _ = launchctl(&["bootout", &target(domain, label)]);
+    /// Unload the job if it is loaded, and wait until it is gone. `bootout` returns once
+    /// launchd has sent the job SIGTERM, and the job stays loaded, as `SIGTERMed`, until
+    /// its process exits: about two seconds for the node. Until then launchd refuses to
+    /// load it again, and `kickstart` starts nothing. launchd kills the process
+    /// ExitTimeOut seconds after the SIGTERM, 20 unless the plist sets it, so that is
+    /// waited out with a few seconds to spare.
+    pub fn bootout(domain: &str, label: &str) -> Result<(), String> {
+        if !loaded(domain, label) {
+            return Ok(());
+        }
+        run(&["bootout", &target(domain, label)])?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+        while loaded(domain, label) {
+            if std::time::Instant::now() >= deadline {
+                return Err(format!("{label} was stopped and has not exited"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        Ok(())
     }
 
     pub fn disable(domain: &str, label: &str) {
@@ -1102,7 +1098,7 @@ mod node {
     pub fn delete() -> Result<(), Box<dyn std::error::Error>> {
         if exists() {
             require_root()?;
-            launchd::bootout(DOMAIN, super::NODE_LABEL);
+            launchd::bootout(DOMAIN, super::NODE_LABEL)?;
             fs::remove_file(PLIST)?;
             super::svc_ok(&format!("{} removed", super::NODE_LABEL));
         }
@@ -1513,7 +1509,7 @@ mod imp {
     pub fn delete(key: &str) -> Result<(), Box<dyn std::error::Error>> {
         let path = plist_path(key);
         if path.exists() {
-            launchd::bootout(&domain(), &label(key));
+            launchd::bootout(&domain(), &label(key))?;
             // In the operator's home: as root, no link on the way there is followed.
             super::super::sudo_user::remove_file(&path)?;
             super::svc_ok(&format!("{} removed", label(key)));
