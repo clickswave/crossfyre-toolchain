@@ -1,6 +1,7 @@
 //! Reaching the database, or saying why it cannot be reached.
 
 use crate::account::ThisAccount;
+use crate::migrate::{Engine, Migrated, cleared, migrate};
 use crate::settings::{Backend, CONFIG_FILE, Settings};
 use crate::toolchain::Toolchain;
 use sqlx::Connection;
@@ -11,8 +12,12 @@ use std::time::Duration;
 /// How long the server has to answer a connection.
 const ANSWER_WITHIN: Duration = Duration::from_secs(10);
 
-/// The database every Postgres server has, which an engine's own is made from.
+/// The database every Postgres server has, which the engines' is made from.
 const MAINTENANCE_DB: &str = "postgres";
+
+/// Held while the engines' database is looked for and made, so that engines starting at
+/// once make it once.
+const MAKING: i64 = 0x6366_785f_6d6b_6462;
 
 /// The command that makes the local database, or starts it.
 pub(crate) const DB_UP: &str = "crossfyre db up";
@@ -69,14 +74,16 @@ impl std::fmt::Display for NotReady {
 
 impl std::error::Error for NotReady {}
 
-/// A pool on the database called `database`, made on the server first if it is missing.
+/// A pool on `engine`'s schema of the engines' database, which config.toml names
+/// (`db_name`), with the database made first if it is missing and the schema brought up
+/// to date (see [`crate::Engine`]).
 ///
 /// The server is the one config.toml names, in the toolchain directory
 /// (`dguard::toolchain_dir`). With the local backend this makes the cluster and
 /// config.toml when they are missing, and starts the cluster when it is stopped, as the
 /// user this process runs as. The file is read on every call, so a daemon that waits on
 /// this picks up what `crossfyre` writes while it waits.
-pub async fn ensure_ready(database: &str) -> Result<PgPool, NotReady> {
+pub async fn ensure_ready(engine: &Engine) -> Result<PgPool, NotReady> {
     let dir = dguard::toolchain_dir().ok_or_else(|| {
         NotReady::new(
             format!(
@@ -87,11 +94,11 @@ pub async fn ensure_ready(database: &str) -> Result<PgPool, NotReady> {
             None,
         )
     })?;
-    ready_in(dir, database).await
+    ready_in(dir, engine).await
 }
 
 /// [`ensure_ready`] for the toolchain directory `dir`.
-async fn ready_in(dir: PathBuf, database: &str) -> Result<PgPool, NotReady> {
+pub(crate) async fn ready_in(dir: PathBuf, engine: &Engine) -> Result<PgPool, NotReady> {
     let path = dir.join(CONFIG_FILE);
     // Making and starting the cluster runs programs and waits on a lock, which the
     // daemon's other tasks should not wait behind.
@@ -103,6 +110,7 @@ async fn ready_in(dir: PathBuf, database: &str) -> Result<PgPool, NotReady> {
     })
     .await
     .map_err(|e| NotReady::new(format!("getting the database ready failed: {e}"), None))??;
+    let database = settings.db_name.as_str();
     let mut server = connect(&settings, Some(&path), MAINTENANCE_DB).await?;
     let made = make_database(&mut server, database).await;
     let _ = server.close().await;
@@ -115,8 +123,18 @@ async fn ready_in(dir: PathBuf, database: &str) -> Result<PgPool, NotReady> {
             None,
         )
     })?;
+    let mut conn = connect(&settings, Some(&path), database).await?;
+    let migrated = migrate(&mut conn, engine).await;
+    let _ = conn.close().await;
+    if migrated? == Migrated::Remade {
+        eprintln!("[{}] {}", engine.name, cleared(engine.name));
+    }
     PgPoolOptions::new()
-        .connect_with(settings.options(database))
+        .connect_with(
+            settings
+                .options(database)
+                .options([("search_path", engine.name)]),
+        )
         .await
         .map_err(|e| not_reached(&settings, Some(&path), e))
 }
@@ -156,6 +174,20 @@ async fn connect(
 
 /// Make the database called `name` on the server unless it is there.
 async fn make_database(server: &mut PgConnection, name: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(MAKING)
+        .execute(&mut *server)
+        .await?;
+    let made = make_if_missing(&mut *server, name).await;
+    // The lock goes with the connection too, which is closed straight after this.
+    let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(MAKING)
+        .execute(&mut *server)
+        .await;
+    made
+}
+
+async fn make_if_missing(server: &mut PgConnection, name: &str) -> Result<(), sqlx::Error> {
     let exists: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)")
             .bind(name)
@@ -262,7 +294,7 @@ fn not_reached_given(settings: &Settings, e: sqlx::Error) -> NotReady {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::toolchain::{Stop, Up};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -278,7 +310,7 @@ mod tests {
         }
     }
 
-    fn local_on(port: u16) -> Settings {
+    pub(crate) fn local_on(port: u16) -> Settings {
         Settings {
             port,
             password: Some("pw".to_string()),
@@ -286,8 +318,17 @@ mod tests {
         }
     }
 
+    /// An engine called `name` at version 0.0.1, with no tables but the shared ones.
+    fn engine(name: &'static str) -> Engine {
+        Engine {
+            name,
+            version: "0.0.1",
+            migrations: &[],
+        }
+    }
+
     /// A toolchain directory whose config.toml holds `settings`.
-    fn toolchain_with(settings: &Settings) -> (tempfile::TempDir, PathBuf) {
+    pub(crate) fn toolchain_with(settings: &Settings) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let toolchain = dir.path().join("crossfyre");
         std::fs::create_dir_all(&toolchain).unwrap();
@@ -368,7 +409,9 @@ mod tests {
     async fn a_closed_port_of_a_database_one_runs_says_where_config_puts_it() {
         let (port, _held) = closed_port();
         let (_dir, toolchain) = toolchain_with(&external_on(port));
-        let e = ready_in(toolchain.clone(), "voyage").await.unwrap_err();
+        let e = ready_in(toolchain.clone(), &engine("voyage"))
+            .await
+            .unwrap_err();
         assert_eq!(
             e.problem(),
             format!(
@@ -383,7 +426,9 @@ mod tests {
     async fn a_password_a_database_one_runs_refuses_is_recorded_again() {
         let port = refusing_server().await;
         let (_dir, toolchain) = toolchain_with(&external_on(port));
-        let e = ready_in(toolchain.clone(), "voyage").await.unwrap_err();
+        let e = ready_in(toolchain.clone(), &engine("voyage"))
+            .await
+            .unwrap_err();
         assert_eq!(
             e.problem(),
             format!(
@@ -481,10 +526,10 @@ mod tests {
     }
 
     /// `ready_in`, tried again while the server starts, which takes it a few seconds.
-    async fn ready_soon(toolchain: &Path, database: &str) -> PgPool {
+    async fn ready_soon(toolchain: &Path, engine: &Engine) -> PgPool {
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         loop {
-            match ready_in(toolchain.to_path_buf(), database).await {
+            match ready_in(toolchain.to_path_buf(), engine).await {
                 Ok(pool) => return pool,
                 Err(e) if std::time::Instant::now() < deadline => {
                     eprintln!("not yet: {e}");
@@ -500,19 +545,19 @@ mod tests {
     async fn a_missing_database_is_made_on_a_server_one_runs_and_one_there_is_used() {
         let server = Server::start("pw");
         let (_dir, toolchain) = toolchain_with(&external_on(server.port));
-        let pool = ready_soon(&toolchain, "cfx_db_test").await;
+        let pool = ready_soon(&toolchain, &engine("cfx_db_test")).await;
         let name: String = sqlx::query_scalar("SELECT current_database()")
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(name, "cfx_db_test");
+        assert_eq!(name, Settings::default().db_name);
         sqlx::query("CREATE TABLE kept (n int)")
             .execute(&pool)
             .await
             .unwrap();
         pool.close().await;
 
-        let again = ready_in(toolchain, "cfx_db_test").await.unwrap();
+        let again = ready_in(toolchain, &engine("cfx_db_test")).await.unwrap();
         let tables: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM information_schema.tables WHERE table_name = 'kept'",
         )
@@ -523,7 +568,7 @@ mod tests {
     }
 
     /// A free port for a local database of a test's own, which its server binds.
-    fn free_port() -> u16 {
+    pub(crate) fn free_port() -> u16 {
         closed_port().0
     }
 
@@ -534,7 +579,9 @@ mod tests {
         let account = ThisAccount::new().unwrap();
         let tc = Toolchain::new(toolchain.clone(), &account);
 
-        let pool = ready_in(toolchain.clone(), "cfx_db_test").await.unwrap();
+        let pool = ready_in(toolchain.clone(), &engine("cfx_db_test"))
+            .await
+            .unwrap();
         sqlx::query("CREATE TABLE kept (n int)")
             .execute(&pool)
             .await
@@ -564,7 +611,9 @@ mod tests {
         assert_eq!(tc.stop().unwrap(), Stop::NotRunning);
         assert!(!tc.status().unwrap().unwrap().running);
 
-        let again = ready_in(toolchain.clone(), "cfx_db_test").await.unwrap();
+        let again = ready_in(toolchain.clone(), &engine("cfx_db_test"))
+            .await
+            .unwrap();
         let n: i32 = sqlx::query_scalar("SELECT n FROM kept")
             .fetch_one(&again)
             .await
@@ -577,27 +626,223 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "needs PostgreSQL's programs"]
-    async fn engines_starting_at_once_make_one_database() {
+    async fn engines_starting_at_once_make_one_database_with_a_schema_each() {
         let (_dir, toolchain) = toolchain_with(&local_on(free_port()));
         let names = ["voyage", "doorward", "ambulo"];
         let pools = futures_join(names.map(|name| {
             let toolchain = toolchain.clone();
-            tokio::spawn(async move { ready_in(toolchain, name).await })
+            tokio::spawn(async move { ready_in(toolchain, &engine(name)).await })
         }))
         .await;
         for (name, pool) in names.iter().zip(pools) {
             let pool = pool.unwrap().unwrap_or_else(|e| panic!("{name}: {e}"));
-            let here: String = sqlx::query_scalar("SELECT current_database()")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-            assert_eq!(&here, name);
+            let (database, schema): (String, String) =
+                sqlx::query_as("SELECT current_database(), current_schema()")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(database, Settings::default().db_name);
+            assert_eq!(&schema, name);
             pool.close().await;
         }
         let account = ThisAccount::new().unwrap();
         let tc = Toolchain::new(toolchain, &account);
         assert!(tc.cluster_dir().join("PG_VERSION").is_file());
         assert_eq!(tc.stop().unwrap(), Stop::Stopped);
+    }
+
+    /// A test engine's first file, the same file rewritten, and a second file.
+    const KEPT: &str = "CREATE TABLE kept (n int);";
+    const KEPT_REWRITTEN: &str = "CREATE TABLE kept (n bigint);";
+    const MORE: &str = "CREATE TABLE more (m int);";
+
+    pub(crate) fn engine_at(version: &'static str, migrations: &'static [&'static str]) -> Engine {
+        Engine {
+            name: "cfx_db_test",
+            version,
+            migrations,
+        }
+    }
+
+    /// The tables in `pool`'s schema, by name.
+    async fn tables(pool: &PgPool) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT tablename::text FROM pg_tables WHERE schemaname = current_schema() \
+             ORDER BY tablename",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn kept(pool: &PgPool) -> Vec<i64> {
+        sqlx::query_scalar("SELECT n::bigint FROM kept")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "needs PostgreSQL's programs"]
+    async fn an_engines_schema_is_made_kept_added_to_and_refused_to_an_older_engine() {
+        let (_dir, toolchain) = toolchain_with(&local_on(free_port()));
+        let made = ready_in(toolchain.clone(), &engine_at("0.0.2", &[KEPT]))
+            .await
+            .unwrap();
+        let schema: String = sqlx::query_scalar("SELECT current_schema()")
+            .fetch_one(&made)
+            .await
+            .unwrap();
+        assert_eq!(schema, "cfx_db_test");
+        assert_eq!(tables(&made).await, ["kept", "logs", "operations", "scans"]);
+        sqlx::query("INSERT INTO kept VALUES (7)")
+            .execute(&made)
+            .await
+            .unwrap();
+        made.close().await;
+
+        // At its version already: nothing is applied, and the data stays.
+        let same = ready_in(toolchain.clone(), &engine_at("0.0.2", &[KEPT]))
+            .await
+            .unwrap();
+        assert_eq!(kept(&same).await, [7]);
+        same.close().await;
+
+        // A newer engine with a file more: the file is applied, and the data stays.
+        let newer = ready_in(toolchain.clone(), &engine_at("0.0.3", &[KEPT, MORE]))
+            .await
+            .unwrap();
+        assert_eq!(
+            tables(&newer).await,
+            ["kept", "logs", "more", "operations", "scans"]
+        );
+        assert_eq!(kept(&newer).await, [7]);
+
+        // The older engine again: refused, and nothing is changed.
+        let e = ready_in(toolchain.clone(), &engine_at("0.0.2", &[KEPT]))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "this database was upgraded by a newer cfx_db_test. Run `crossfyre update`"
+        );
+        assert_eq!(
+            tables(&newer).await,
+            ["kept", "logs", "more", "operations", "scans"]
+        );
+        assert_eq!(kept(&newer).await, [7]);
+        newer.close().await;
+        let account = ThisAccount::new().unwrap();
+        assert_eq!(
+            Toolchain::new(toolchain, &account).stop().unwrap(),
+            Stop::Stopped
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs PostgreSQL's programs"]
+    async fn a_file_rewritten_after_it_was_applied_makes_the_schema_again_empty() {
+        let (_dir, toolchain) = toolchain_with(&local_on(free_port()));
+        let first = ready_in(toolchain.clone(), &engine_at("0.0.2", &[KEPT]))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO kept VALUES (7)")
+            .execute(&first)
+            .await
+            .unwrap();
+        first.close().await;
+
+        let again = ready_in(toolchain.clone(), &engine_at("0.0.2", &[KEPT_REWRITTEN]))
+            .await
+            .unwrap();
+        let column: String = sqlx::query_scalar(
+            "SELECT data_type::text FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name = 'kept'",
+        )
+        .fetch_one(&again)
+        .await
+        .unwrap();
+        assert_eq!(column, "bigint", "the rewritten file made the table");
+        assert!(kept(&again).await.is_empty(), "made again, empty");
+        let said: Vec<String> = sqlx::query_scalar("SELECT message FROM logs")
+            .fetch_all(&again)
+            .await
+            .unwrap();
+        assert_eq!(
+            said,
+            ["cfx_db_test's stored scans were cleared because this version keeps them differently"]
+        );
+        again.close().await;
+        let account = ThisAccount::new().unwrap();
+        assert_eq!(
+            Toolchain::new(toolchain, &account).stop().unwrap(),
+            Stop::Stopped
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs PostgreSQL's programs"]
+    async fn files_a_newer_engine_rewrote_are_refused_by_an_older_one_not_remade() {
+        let (_dir, toolchain) = toolchain_with(&local_on(free_port()));
+        let newer = ready_in(toolchain.clone(), &engine_at("0.0.3", &[KEPT_REWRITTEN]))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO kept VALUES (7)")
+            .execute(&newer)
+            .await
+            .unwrap();
+
+        let e = ready_in(toolchain.clone(), &engine_at("0.0.2", &[KEPT]))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "this database was upgraded by a newer cfx_db_test. Run `crossfyre update`"
+        );
+        assert_eq!(kept(&newer).await, [7], "left as it was");
+        let recorded: String =
+            sqlx::query_scalar("SELECT version FROM meta.migrations WHERE source = 'cfx_db_test'")
+                .fetch_one(&newer)
+                .await
+                .unwrap();
+        assert_eq!(recorded, "0.0.3");
+        newer.close().await;
+        let account = ThisAccount::new().unwrap();
+        assert_eq!(
+            Toolchain::new(toolchain, &account).stop().unwrap(),
+            Stop::Stopped
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs PostgreSQL's programs"]
+    async fn daemons_of_one_engine_starting_at_once_make_its_tables_once() {
+        let (_dir, toolchain) = toolchain_with(&local_on(free_port()));
+        let pools = futures_join([(); 3].map(|()| {
+            let toolchain = toolchain.clone();
+            tokio::spawn(async move { ready_in(toolchain, &engine_at("0.0.1", &[KEPT])).await })
+        }))
+        .await;
+        let mut pools = pools
+            .into_iter()
+            .map(|p| p.unwrap().unwrap_or_else(|e| panic!("{e}")));
+        let pool = pools.next().unwrap();
+        let files: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM meta.migrations WHERE schema_name = $1")
+                .bind("cfx_db_test")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(files, 2, "the shared file and the engine's, once each");
+        pool.close().await;
+        for p in pools {
+            p.close().await;
+        }
+        let account = ThisAccount::new().unwrap();
+        assert_eq!(
+            Toolchain::new(toolchain, &account).stop().unwrap(),
+            Stop::Stopped
+        );
     }
 
     /// Every handle's result, in order.

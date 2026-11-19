@@ -61,7 +61,7 @@ struct DaemonResponse {
 }
 
 /// Scan-specific parameters.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct ScanParams {
     endpoint: String,
     /// A wordlist file, which is read only inside the permitted directories.
@@ -123,7 +123,7 @@ fn default_evasive() -> bool {
 
 /// Auth applied to every probe in an authenticated content-discovery scan. Same
 /// shape the crawler receives (`AuthContext::to_json` on the node side).
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 struct ScanAuth {
     #[serde(default)]
     headers: std::collections::HashMap<String, String>,
@@ -223,7 +223,7 @@ pub async fn run_on(listener: TcpListener, db: AmbuloDb) -> Result<(), Box<dyn s
     // Background task: delete expired probe_results + GC old scans every 5 min.
     {
         let db_cleanup = Arc::clone(&db);
-        // Scans older than this are reclaimed (see AmbuloDb::gc_old_scans). Default
+        // Scans older than this are deleted (see AmbuloDb::delete_old_scans). Default
         // 7 days: comfortably longer than any real scan (so a running/paused scan
         // is never touched) while still bounding the table. Tunable per node.
         let retention_hours: i64 = std::env::var("CROSSFYRE_AMBULO_SCAN_RETENTION_HOURS")
@@ -240,11 +240,9 @@ pub async fn run_on(listener: TcpListener, db: AmbuloDb) -> Result<(), Box<dyn s
                 {
                     println!("Cleaned up {n} expired probe result(s)");
                 }
-                match db_cleanup.gc_old_scans(retention_hours).await {
+                match db_cleanup.delete_old_scans(retention_hours).await {
                     Ok(n) if n > 0 => {
-                        println!(
-                            "GC: reclaimed {n} scan_entries from scans older than {retention_hours}h"
-                        )
+                        println!("GC: deleted {n} scan(s) older than {retention_hours}h")
                     }
                     Err(e) => eprintln!("GC: scan sweep failed: {e}"),
                     _ => {}
@@ -441,15 +439,18 @@ async fn handle_stream_scan(
     };
 
     if req.save {
-        let params_str = serde_json::to_string(&req.params).unwrap_or_default();
-        let _ = db
-            .create_operation(&operation_id, "scan", &params_str)
-            .await;
+        let _ = cfx_db::scans::record_operation(
+            db.pool(),
+            &operation_id,
+            "scan",
+            None,
+            &req.params.to_string(),
+        )
+        .await;
     }
 
-    // Set up the scan (wordlist, DB entries, etc.). Pass operation_id so this
-    // stream scan gets its OWN isolated scan record - concurrent scans of the
-    // same target/wordlist no longer share a row and clobber each other.
+    // Set up the scan: its wordlist, and its entries, or those of the stopped scan with
+    // the same settings, which it takes up again.
     let words = match &scan_params.wordlist_follows {
         Some(name) => ScanWords::Following {
             name,
@@ -457,22 +458,21 @@ async fn handle_stream_scan(
         },
         None => ScanWords::Named(&scan_params.wordlist),
     };
-    let (scanner, total, scan_id) =
-        match prepare_scan(&scan_params, &db, Some(&operation_id), words).await {
-            Ok(v) => v,
-            Err(e) => {
-                write_json(
-                    &mut writer,
-                    &serde_json::json!({
-                        "type": "error",
-                        "operation_id": operation_id,
-                        "message": e.to_string(),
-                    }),
-                )
-                .await?;
-                return Ok(());
-            }
-        };
+    let (scanner, total, scan_id) = match prepare_scan(&scan_params, &db, words).await {
+        Ok(v) => v,
+        Err(e) => {
+            write_json(
+                &mut writer,
+                &serde_json::json!({
+                    "type": "error",
+                    "operation_id": operation_id,
+                    "message": e.to_string(),
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
 
     // Send "ack" with operation_id and total entry count
     write_json(
@@ -510,26 +510,17 @@ async fn handle_stream_scan(
     let db_clone = Arc::clone(&db);
 
     dguard::spawn_busy(async move {
-        match scanner.run_headless_stream(tx).await {
-            Ok(_) => {
-                if save {
-                    let _ = db_clone
-                        .update_operation_status(&oid, "completed", None)
-                        .await;
-                }
-            }
-            Err(e) => {
-                if save {
-                    let _ = db_clone
-                        .update_operation_status(&oid, "error", Some(&e.to_string()))
-                        .await;
-                }
-            }
+        let ran = scanner.run_headless_stream(tx).await;
+        // Stopped when the caller went away before every request was sent, so that the
+        // same scan again takes it up where it was.
+        let _ = db_clone.end_scan(&scan_id, ran.is_err()).await;
+        if save {
+            let (status, result) = match &ran {
+                Ok(_) => (cfx_db::scans::Status::Completed, None),
+                Err(e) => (cfx_db::scans::Status::Failed, Some(e.as_str())),
+            };
+            let _ = cfx_db::scans::finish_operation(db_clone.pool(), &oid, status, result).await;
         }
-        // Isolated per-connection scan: drop its now-unreferenced rows so the
-        // isolation doesn't grow the ambulo DB unbounded. Runs after the scanner
-        // finishes, even if the client disconnected mid-stream.
-        let _ = db_clone.delete_scan(scan_id).await;
     });
 
     // Forward all events to the TCP stream
@@ -607,14 +598,17 @@ async fn dispatch(
                 }
             };
 
-            if req.save {
-                let params_str = serde_json::to_string(&req.params).unwrap_or_default();
-                if let Err(e) = db
-                    .create_operation(&operation_id, "scan", &params_str)
-                    .await
-                {
-                    eprintln!("Failed to save operation: {e}");
-                }
+            if req.save
+                && let Err(e) = cfx_db::scans::record_operation(
+                    db.pool(),
+                    &operation_id,
+                    "scan",
+                    None,
+                    &req.params.to_string(),
+                )
+                .await
+            {
+                eprintln!("Failed to save operation: {e}");
             }
 
             match req.response.as_str() {
@@ -667,20 +661,22 @@ async fn dispatch(
             };
             run_probe(probe_params, client, db).await
         }
-        "db_reset" => match db.truncate_tables().await {
-            Ok(_) => DaemonResponse {
-                operation_id,
-                status: "completed".to_string(),
-                results: None,
-                message: Some("All tables truncated.".to_string()),
-            },
-            Err(e) => DaemonResponse {
-                operation_id,
-                status: "error".to_string(),
-                results: None,
-                message: Some(format!("DB reset failed: {e}")),
-            },
-        },
+        "db_reset" => {
+            match cfx_db::scans::reset(db.pool(), crate::libs::ambulo_db::ENGINE.name).await {
+                Ok(_) => DaemonResponse {
+                    operation_id,
+                    status: "completed".to_string(),
+                    results: None,
+                    message: Some("All tables truncated.".to_string()),
+                },
+                Err(e) => DaemonResponse {
+                    operation_id,
+                    status: "error".to_string(),
+                    results: None,
+                    message: Some(format!("DB reset failed: {e}")),
+                },
+            }
+        }
         unknown => DaemonResponse {
             operation_id,
             status: "error".to_string(),
@@ -701,9 +697,13 @@ async fn run_scan_instant(
             let result_json = serde_json::to_value(&results.found).unwrap_or(Value::Null);
             if save {
                 let s = serde_json::to_string(&result_json).unwrap_or_default();
-                let _ = db
-                    .update_operation_status(&operation_id, "completed", Some(&s))
-                    .await;
+                let _ = cfx_db::scans::finish_operation(
+                    db.pool(),
+                    &operation_id,
+                    cfx_db::scans::Status::Completed,
+                    Some(&s),
+                )
+                .await;
             }
             DaemonResponse {
                 operation_id,
@@ -714,9 +714,13 @@ async fn run_scan_instant(
         }
         Err(e) => {
             if save {
-                let _ = db
-                    .update_operation_status(&operation_id, "error", Some(&e.to_string()))
-                    .await;
+                let _ = cfx_db::scans::finish_operation(
+                    db.pool(),
+                    &operation_id,
+                    cfx_db::scans::Status::Failed,
+                    Some(&e.to_string()),
+                )
+                .await;
             }
             DaemonResponse {
                 operation_id,
@@ -732,14 +736,22 @@ async fn run_scan_background(operation_id: String, params: ScanParams, db: Arc<A
     match run_scan(&params, &db).await {
         Ok(results) => {
             let s = serde_json::to_string(&results.found).unwrap_or_default();
-            let _ = db
-                .update_operation_status(&operation_id, "completed", Some(&s))
-                .await;
+            let _ = cfx_db::scans::finish_operation(
+                db.pool(),
+                &operation_id,
+                cfx_db::scans::Status::Completed,
+                Some(&s),
+            )
+            .await;
         }
         Err(e) => {
-            let _ = db
-                .update_operation_status(&operation_id, "error", Some(&e.to_string()))
-                .await;
+            let _ = cfx_db::scans::finish_operation(
+                db.pool(),
+                &operation_id,
+                cfx_db::scans::Status::Failed,
+                Some(&e.to_string()),
+            )
+            .await;
         }
     }
 }
@@ -759,20 +771,15 @@ enum ScanWords<'a> {
     },
 }
 
-/// `isolate`: when `Some(op_id)`, the op id is folded into the scan's config
-/// hash so this scan gets its OWN scan record instead of being deduped onto a
-/// shared one by (url, wordlist, method). Stream scans pass their per-connection
-/// operation_id here: without it, two concurrent scans of the same target +
-/// wordlist collapse onto one `scans` row and clobber each other's entries and
-/// results (findings lost / delivered to the wrong connection). `None`, which a
-/// one-off (non-stream) scan passes, leaves it out, so the scan shares the record of an
-/// earlier one with the same url, wordlist and method, and the results saved there.
+/// Set up a scan of `params`: its wordlist, kept once, and the scan itself. A stopped
+/// scan with the same URLs, words and method is taken up again with the requests it had
+/// not sent, unless the request asks for a fresh start; otherwise every request is
+/// queued for a new scan. Two of the same scan at once are two scans.
 async fn prepare_scan(
     params: &ScanParams,
     db: &Arc<AmbuloDb>,
-    isolate: Option<&str>,
     words: ScanWords<'_>,
-) -> Result<(Scanner<ScanStore>, usize, i64), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(Scanner<ScanStore>, usize, String), Box<dyn std::error::Error + Send + Sync>> {
     let http_method = parse_method(&params.method);
 
     let mut endpoint = params.endpoint.clone();
@@ -812,71 +819,40 @@ async fn prepare_scan(
     }
     .map_err(|e| format!("Wordlist error: {e}"))?;
 
-    let mut scan_config = serde_json::json!({
+    let scan_config = serde_json::json!({
         "urls": &config.url,
         "wordlist_hash": &wordlist.hash,
         "method": &config.http_method.to_string(),
     });
-    // Per-connection isolation (stream scans): make the hash unique so concurrent
-    // scans never share a `scans` row. Omitted when None so one-off scans keep
-    // the exact same hash and can still reuse a cached scan.
-    if let Some(iso) = isolate {
-        scan_config["isolate"] = serde_json::json!(iso);
-    }
-    let scan_config_json = serde_json::to_string(&scan_config)?;
-    let scan_config_hash = crate::libs::sha::sha512_from_string(scan_config_json)
-        .await
-        .map_err(|e| format!("Hash: {e}"))?;
-
-    let mut scan = match db.find_scan(&scan_config_hash).await {
-        Ok(s) if params.fresh_start => db
-            .fresh_start_scan(&s.id)
+    let scan_config_hash =
+        crate::libs::sha::sha512_from_string(serde_json::to_string(&scan_config)?)
             .await
-            .map_err(|e| format!("DB: {e}"))?,
-        Ok(s) => s,
-        Err(sqlx::Error::RowNotFound) => db
-            .create_scan(
-                &scan_config_hash,
-                &wordlist.id,
-                &config.http_method.to_string(),
-            )
-            .await
-            .map_err(|e| format!("DB: {e}"))?,
-        Err(e) => return Err(format!("DB: {e}").into()),
-    };
-
-    let urls = match db.find_urls(&scan.id).await {
-        Ok(u) => u,
-        Err(sqlx::Error::RowNotFound) => db
-            .create_urls(&scan.id, &config.url)
-            .await
-            .map_err(|e| format!("DB: {e}"))?,
-        Err(e) => return Err(format!("DB: {e}").into()),
-    };
-
-    if scan.status == "created" {
-        db.create_scan_entries(&urls, &scan, wordlist.id)
+            .map_err(|e| format!("Hash: {e}"))?;
+    let asked = serde_json::to_string(params)?;
+    let scan = cfx_db::scans::start(
+        db.pool(),
+        &config.url.join(", "),
+        &scan_config_hash,
+        &asked,
+        params.fresh_start,
+    )
+    .await
+    .map_err(|e| format!("DB: {e}"))?;
+    if scan.resumed {
+        db.requeue_unfinished(&scan.id)
             .await
             .map_err(|e| format!("DB: {e}"))?;
-        scan.status = db
-            .set_scan_status(&scan.id, "populated")
+    } else {
+        db.queue_scan(&scan.id, &config.url, wordlist.id)
             .await
             .map_err(|e| format!("DB: {e}"))?;
     }
+    let total = db.entries(&scan.id).await.map_err(|e| format!("DB: {e}"))?;
 
-    db.reset_halted_scan_entries(&scan.id)
-        .await
-        .map_err(|e| format!("DB: {e}"))?;
-
-    let (_, _, _, total) = db
-        .fetch_total_scan_entries(scan.id)
-        .await
-        .map_err(|e| format!("DB: {e}"))?;
-
-    let store = db.scan_store(scan.id, &config);
+    let store = db.scan_store(scan.id.clone(), &config);
     let scanner = Scanner::new(config, store);
 
-    Ok((scanner, total, scan.id))
+    Ok((scanner, total as usize, scan.id))
 }
 
 async fn run_scan(
@@ -886,12 +862,11 @@ async fn run_scan(
     if params.wordlist_follows.is_some() {
         return Err("words can follow only a stream scan's request".into());
     }
-    let (scanner, _, _) =
-        prepare_scan(params, db, None, ScanWords::Named(&params.wordlist)).await?;
-    scanner
-        .run_headless()
-        .await
-        .map_err(|e| format!("Scan: {e}").into())
+    let (scanner, _, scan_id) =
+        prepare_scan(params, db, ScanWords::Named(&params.wordlist)).await?;
+    let ran = scanner.run_headless().await;
+    let _ = db.end_scan(&scan_id, ran.is_err()).await;
+    ran.map_err(|e| format!("Scan: {e}").into())
 }
 
 // ---------------------------------------------------------------------------

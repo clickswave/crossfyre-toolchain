@@ -126,7 +126,7 @@ voyage, doorward and ambulo keep the state of every scan in PostgreSQL, so a sto
 
 By default it is a local one: a PostgreSQL cluster of your own in the toolchain directory, made with the PostgreSQL programs installed on the machine (on Debian, Ubuntu or Kali, `sudo apt install postgresql`). It runs as you, listens on 127.0.0.1 only, and its generated password is kept in `config.toml`. The first daemon to start makes it, or `crossfyre db up` does ahead of time. `crossfyre db stop` stops it, and `crossfyre db status` says how it is.
 
-To use a PostgreSQL server you run yourself, record it with `crossfyre db external HOST PORT USER`. It asks for the password, or reads it from `CROSSFYRE_DB_PASSWORD`, and records the server only once it lets that user in. Each engine makes its own database there. The local database is stopped and kept with its settings, and `crossfyre db up` goes back to it.
+To use a PostgreSQL server you run yourself, record it with `crossfyre db external HOST PORT USER`. It asks for the password, or reads it from `CROSSFYRE_DB_PASSWORD`, and records the server only once it lets that user in. The engines keep their tables in one database there, `crossfyre` unless `db_name` in config.toml names another, with a schema each. The local database is stopped and kept with its settings, and `crossfyre db up` goes back to it.
 
 ## Build from source
 

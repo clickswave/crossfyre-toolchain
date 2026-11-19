@@ -59,11 +59,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             std::time::Duration::from_secs(3600),
             || async {
                 let ready = async {
-                    let pool = cfx_db::ensure_ready(libs::ambulo_db::DATABASE)
+                    let pool = cfx_db::ensure_ready(&libs::ambulo_db::ENGINE)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    cfx_db::scans::stopped_by_exit(&pool)
                         .await
                         .map_err(|e| e.to_string())?;
                     let db = libs::ambulo_db::AmbuloDb::new(pool);
-                    db.create_tables().await.map_err(|e| e.to_string())?;
                     Ok::<_, String>(db)
                 }
                 .await;

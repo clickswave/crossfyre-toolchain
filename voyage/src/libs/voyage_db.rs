@@ -1,8 +1,12 @@
 use crate::store::{PassiveResult, Store, Work};
 use sqlx::QueryBuilder;
 
-/// The database voyage keeps its tables in.
-pub const DATABASE: &str = "voyage";
+/// voyage's part of the database: its schema, and the files that make its tables.
+pub const ENGINE: cfx_db::Engine = cfx_db::Engine {
+    name: "voyage",
+    version: env!("CARGO_PKG_VERSION"),
+    migrations: &[include_str!("../../migrations/0001_entries.sql")],
+};
 
 #[derive(Clone)]
 pub struct VoyageDb {
@@ -10,7 +14,7 @@ pub struct VoyageDb {
 }
 
 impl VoyageDb {
-    /// voyage's tables on `pool`, a pool on [`DATABASE`].
+    /// voyage's tables on `pool`, a pool [`cfx_db::ensure_ready`] gave for [`ENGINE`].
     pub fn new(pool: sqlx::PgPool) -> Self {
         Self { pool }
     }
@@ -23,165 +27,50 @@ impl VoyageDb {
             .host("127.0.0.1")
             .port(1)
             .username("none")
-            .database(DATABASE);
+            .database("none");
         Self {
             pool: sqlx::PgPool::connect_lazy_with(opts),
         }
     }
 
-    pub async fn create_tables(&self) -> Result<(), sqlx::Error> {
-        // scans table
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS scans (
-                id TEXT PRIMARY KEY,
-                config_hash TEXT NOT NULL UNIQUE,
-                domain TEXT NOT NULL,
-                wordlist_path TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL DEFAULT 'created',
-                created_at TEXT NOT NULL DEFAULT NOW()::TEXT,
-                updated_at TEXT NOT NULL DEFAULT NOW()::TEXT
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // scan_entries table
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS scan_entries (
-                id BIGSERIAL PRIMARY KEY,
-                scan_id TEXT NOT NULL REFERENCES scans(id),
-                full_subdomain TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'queued',
-                method TEXT NOT NULL DEFAULT 'active',
-                source TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL DEFAULT NOW()::TEXT,
-                updated_at TEXT NOT NULL DEFAULT NOW()::TEXT,
-                UNIQUE (scan_id, full_subdomain)
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // logs table
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS logs (
-                id BIGSERIAL PRIMARY KEY,
-                scan_id TEXT,
-                level TEXT NOT NULL DEFAULT 'info',
-                message TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT NOW()::TEXT
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // operations table
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS operations (
-                id TEXT PRIMARY KEY,
-                operation TEXT NOT NULL,
-                params TEXT NOT NULL DEFAULT '{}',
-                status TEXT NOT NULL DEFAULT 'queued',
-                result TEXT,
-                created_at TEXT NOT NULL DEFAULT NOW()::TEXT,
-                updated_at TEXT NOT NULL DEFAULT NOW()::TEXT
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // probe_results table (for enum-exec with volatility > 0)
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS probe_results (
-                id BIGSERIAL PRIMARY KEY,
-                operation_id TEXT NOT NULL,
-                domain TEXT NOT NULL,
-                found BOOLEAN NOT NULL DEFAULT false,
-                technique TEXT NOT NULL DEFAULT '',
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                delete_after TIMESTAMPTZ NOT NULL
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
+    /// The pool, for the tables every engine has.
+    pub fn pool(&self) -> &sqlx::PgPool {
+        &self.pool
     }
 
-    pub async fn truncate_tables(&self) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "TRUNCATE TABLE probe_results, operations, logs, scan_entries, scans RESTART IDENTITY CASCADE",
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    // --- Scan lifecycle ---
-
-    pub async fn get_or_create_scan(
+    /// Start a scan of `domain` asked for with `params`, whose names are keyed by
+    /// `config_hash`: a stopped scan with the same key is taken up again, with the names
+    /// it had tried, unless `fresh` asks for a new one.
+    pub async fn start_scan(
         &self,
-        config_hash: &str,
         domain: &str,
-        wordlist_path: &str,
+        config_hash: &str,
+        params: &str,
+        fresh: bool,
     ) -> Result<String, sqlx::Error> {
-        let existing: Option<String> =
-            sqlx::query_scalar("SELECT id FROM scans WHERE config_hash = $1")
-                .bind(config_hash)
-                .fetch_optional(&self.pool)
-                .await?;
-
-        if let Some(id) = existing {
-            return Ok(id);
-        }
-
-        let new_id = uuid::Uuid::new_v4().to_string();
-        sqlx::query(
-            "INSERT INTO scans (id, config_hash, domain, wordlist_path, status) VALUES ($1, $2, $3, $4, 'created')",
+        Ok(
+            cfx_db::scans::start(&self.pool, domain, config_hash, params, fresh)
+                .await?
+                .id,
         )
-        .bind(&new_id)
-        .bind(config_hash)
-        .bind(domain)
-        .bind(wordlist_path)
-        .execute(&self.pool)
+    }
+
+    /// End scan `scan`: completed when it tried every name, stopped when some were left
+    /// untried, failed when it failed.
+    pub async fn end_scan(&self, scan: &str, failed: bool) -> Result<(), sqlx::Error> {
+        let left: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM scan_entries \
+             WHERE scan_id = $1 AND status IN ('queued', 'scanning'))",
+        )
+        .bind(scan)
+        .fetch_one(&self.pool)
         .await?;
-
-        Ok(new_id)
-    }
-
-    pub async fn fresh_start_scan(&self, scan_id: &str) -> Result<(), sqlx::Error> {
-        sqlx::query("DELETE FROM scan_entries WHERE scan_id = $1")
-            .bind(scan_id)
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("DELETE FROM logs WHERE scan_id = $1")
-            .bind(scan_id)
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("UPDATE scans SET status = 'created' WHERE id = $1")
-            .bind(scan_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    pub async fn set_scan_status(&self, scan_id: &str, status: &str) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE scans SET status = $1 WHERE id = $2")
-            .bind(status)
-            .bind(scan_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+        let status = match (failed, left) {
+            (true, _) => cfx_db::scans::Status::Failed,
+            (false, true) => cfx_db::scans::Status::Stopped,
+            (false, false) => cfx_db::scans::Status::Completed,
+        };
+        cfx_db::scans::finish(&self.pool, scan, status).await
     }
 
     // --- Entries ---
@@ -245,42 +134,6 @@ impl VoyageDb {
         .await
     }
 
-    // --- Operations ---
-
-    pub async fn create_operation(
-        &self,
-        id: &str,
-        operation: &str,
-        params: &str,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "INSERT INTO operations (id, operation, params, status) VALUES ($1, $2, $3, 'queued')",
-        )
-        .bind(id)
-        .bind(operation)
-        .bind(params)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn update_operation_status(
-        &self,
-        id: &str,
-        status: &str,
-        result: Option<&str>,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "UPDATE operations SET status = $1, result = $2, updated_at = NOW()::TEXT WHERE id = $3",
-        )
-        .bind(status)
-        .bind(result)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
     // --- Probe results ---
 
     pub async fn save_probe_result(
@@ -338,7 +191,7 @@ impl Store for VoyageDb {
         let entry: Option<(i64, String)> = sqlx::query_as(
             r#"
             UPDATE scan_entries
-            SET status = 'scanning', updated_at = NOW()::TEXT
+            SET status = 'scanning', updated_at = now()
             WHERE id = (
                 SELECT id FROM scan_entries
                 WHERE scan_id = $1 AND status = 'queued'
@@ -371,7 +224,7 @@ impl Store for VoyageDb {
 
     async fn record(&self, entry: i64, status: &str, source: &str) -> Result<(), String> {
         sqlx::query(
-            "UPDATE scan_entries SET status = $1, source = $2, updated_at = NOW()::TEXT \
+            "UPDATE scan_entries SET status = $1, source = $2, updated_at = now() \
              WHERE id = $3",
         )
         .bind(status)

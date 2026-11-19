@@ -28,7 +28,7 @@ clap_complete = "4.6.9"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { version = "1.0.142", features = [] }
 # Its runtime and TLS come with cfx_db, which makes every connection.
-sqlx = { version = "0.8.6", features = ["postgres", "chrono"] }
+sqlx = { version = "0.8.6", features = ["postgres"] }
 uuid = { version = "1.18.0", features = ["v4"] }
 cfx_tui = { path = "../tui" }
 ratatui = { version = "0.30.0-alpha.5", features = ["crossterm"] }

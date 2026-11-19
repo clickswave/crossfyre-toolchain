@@ -41,11 +41,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "the database",
             std::time::Duration::from_secs(3600),
             || async {
-                let pool = cfx_db::ensure_ready(libs::voyage_db::DATABASE)
+                let pool = cfx_db::ensure_ready(&libs::voyage_db::ENGINE)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                cfx_db::scans::stopped_by_exit(&pool)
                     .await
                     .map_err(|e| e.to_string())?;
                 let db = libs::voyage_db::VoyageDb::new(pool);
-                db.create_tables().await.map_err(|e| e.to_string())?;
                 Ok::<_, String>(db)
             },
         )

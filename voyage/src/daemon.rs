@@ -54,7 +54,7 @@ struct DaemonResponse {
     message: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct EnumParams {
     domain: String,
     /// Evasiveness posture: present as a real browser (default) vs neutral.
@@ -341,10 +341,14 @@ async fn handle_stream_enum(
     };
 
     if req.save {
-        let params_str = serde_json::to_string(&req.params).unwrap_or_default();
-        let _ = db
-            .create_operation(&operation_id, "enum", &params_str)
-            .await;
+        let _ = cfx_db::scans::record_operation(
+            db.pool(),
+            &operation_id,
+            "enum",
+            None,
+            &req.params.to_string(),
+        )
+        .await;
     }
 
     let following = params
@@ -392,23 +396,17 @@ async fn handle_stream_enum(
     let oid = operation_id.clone();
     let save = req.save;
     let db_clone = Arc::clone(&db);
+    let scan_id = scanner.config.scan_id.clone();
 
     dguard::spawn_busy(async move {
-        match scanner.run_headless_stream(tx).await {
-            Ok(_) => {
-                if save {
-                    let _ = db_clone
-                        .update_operation_status(&oid, "completed", None)
-                        .await;
-                }
-            }
-            Err(e) => {
-                if save {
-                    let _ = db_clone
-                        .update_operation_status(&oid, "error", Some(&e.to_string()))
-                        .await;
-                }
-            }
+        let ran = scanner.run_headless_stream(tx).await;
+        let _ = db_clone.end_scan(&scan_id, ran.is_err()).await;
+        if save {
+            let (status, result) = match &ran {
+                Ok(()) => (cfx_db::scans::Status::Completed, None),
+                Err(e) => (cfx_db::scans::Status::Failed, Some(e.as_str())),
+            };
+            let _ = cfx_db::scans::finish_operation(db_clone.pool(), &oid, status, result).await;
         }
     });
 
@@ -445,10 +443,14 @@ async fn dispatch(req: DaemonRequest, db: Arc<VoyageDb>) -> DaemonResponse {
             };
 
             if req.save {
-                let params_str = serde_json::to_string(&req.params).unwrap_or_default();
-                let _ = db
-                    .create_operation(&operation_id, "enum", &params_str)
-                    .await;
+                let _ = cfx_db::scans::record_operation(
+                    db.pool(),
+                    &operation_id,
+                    "enum",
+                    None,
+                    &req.params.to_string(),
+                )
+                .await;
             }
 
             match req.response.as_str() {
@@ -457,9 +459,13 @@ async fn dispatch(req: DaemonRequest, db: Arc<VoyageDb>) -> DaemonResponse {
                         let result_json = serde_json::to_value(&found).unwrap_or(Value::Null);
                         if req.save {
                             let s = serde_json::to_string(&result_json).unwrap_or_default();
-                            let _ = db
-                                .update_operation_status(&operation_id, "completed", Some(&s))
-                                .await;
+                            let _ = cfx_db::scans::finish_operation(
+                                db.pool(),
+                                &operation_id,
+                                cfx_db::scans::Status::Completed,
+                                Some(&s),
+                            )
+                            .await;
                         }
                         DaemonResponse {
                             operation_id,
@@ -470,13 +476,13 @@ async fn dispatch(req: DaemonRequest, db: Arc<VoyageDb>) -> DaemonResponse {
                     }
                     Err(e) => {
                         if req.save {
-                            let _ = db
-                                .update_operation_status(
-                                    &operation_id,
-                                    "error",
-                                    Some(&e.to_string()),
-                                )
-                                .await;
+                            let _ = cfx_db::scans::finish_operation(
+                                db.pool(),
+                                &operation_id,
+                                cfx_db::scans::Status::Failed,
+                                Some(&e.to_string()),
+                            )
+                            .await;
                         }
                         DaemonResponse {
                             operation_id,
@@ -490,8 +496,12 @@ async fn dispatch(req: DaemonRequest, db: Arc<VoyageDb>) -> DaemonResponse {
                     let oid = operation_id.clone();
                     let db2 = Arc::clone(&db);
                     dguard::spawn_busy(async move {
-                        let _ = run_enum_instant(&params, &db2).await;
-                        let _ = db2.update_operation_status(&oid, "completed", None).await;
+                        let status = match run_enum_instant(&params, &db2).await {
+                            Ok(_) => cfx_db::scans::Status::Completed,
+                            Err(_) => cfx_db::scans::Status::Failed,
+                        };
+                        let _ =
+                            cfx_db::scans::finish_operation(db2.pool(), &oid, status, None).await;
                     });
                     DaemonResponse {
                         operation_id,
@@ -563,20 +573,22 @@ async fn dispatch(req: DaemonRequest, db: Arc<VoyageDb>) -> DaemonResponse {
                 message: None,
             }
         }
-        "db_reset" => match db.truncate_tables().await {
-            Ok(_) => DaemonResponse {
-                operation_id,
-                status: "completed".to_string(),
-                results: None,
-                message: Some("All tables truncated.".to_string()),
-            },
-            Err(e) => DaemonResponse {
-                operation_id,
-                status: "error".to_string(),
-                results: None,
-                message: Some(format!("DB reset failed: {e}")),
-            },
-        },
+        "db_reset" => {
+            match cfx_db::scans::reset(db.pool(), crate::libs::voyage_db::ENGINE.name).await {
+                Ok(_) => DaemonResponse {
+                    operation_id,
+                    status: "completed".to_string(),
+                    results: None,
+                    message: Some("All tables truncated.".to_string()),
+                },
+                Err(e) => DaemonResponse {
+                    operation_id,
+                    status: "error".to_string(),
+                    results: None,
+                    message: Some(format!("DB reset failed: {e}")),
+                },
+            }
+        }
         unknown => DaemonResponse {
             operation_id,
             status: "error".to_string(),
@@ -662,21 +674,11 @@ async fn prepare_enum(
         },
     };
     let config_hash = scan_key(&params.domain, &params.wordlist, words.as_deref());
-    let wordlist = params
-        .wordlist_follows
-        .as_deref()
-        .unwrap_or(&params.wordlist);
-
+    let asked = serde_json::to_string(params).map_err(|e| format!("Invalid params: {e}"))?;
     let scan_id = db
-        .get_or_create_scan(&config_hash, &params.domain, wordlist)
+        .start_scan(&params.domain, &config_hash, &asked, params.fresh_start)
         .await
         .map_err(|e| format!("DB error: {e}"))?;
-
-    if params.fresh_start {
-        db.fresh_start_scan(&scan_id)
-            .await
-            .map_err(|e| format!("DB error: {e}"))?;
-    }
 
     // Passive scan - insert results with status="found"
     if !params.disable_passive {
@@ -728,9 +730,6 @@ async fn prepare_enum(
         }
     }
 
-    db.set_scan_status(&scan_id, "populated")
-        .await
-        .map_err(|e| format!("DB error: {e}"))?;
     db.reset_halted_entries(&scan_id)
         .await
         .map_err(|e| format!("DB error: {e}"))?;
@@ -776,8 +775,11 @@ async fn run_enum_instant(
 
     let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
 
+    let ending = Arc::clone(&db2);
+    let ended = scan_id.clone();
     dguard::spawn_busy(async move {
-        let _ = scanner.run_headless_stream(tx).await;
+        let ran = scanner.run_headless_stream(tx).await;
+        let _ = ending.end_scan(&ended, ran.is_err()).await;
     });
 
     // Drain until channel closes (after "done" is sent)

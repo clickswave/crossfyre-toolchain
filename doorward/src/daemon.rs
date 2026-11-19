@@ -74,21 +74,6 @@ pub async fn run(port: u16, db: DoorwardDb) -> Result<(), Box<dyn std::error::Er
 
     let db = Arc::new(db);
 
-    // Background: clean up expired probe results every 5 minutes
-    {
-        let db_c = Arc::clone(&db);
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-                if let Ok(n) = db_c.delete_expired_probe_results().await
-                    && n > 0
-                {
-                    println!("Cleaned {n} expired probe result(s)");
-                }
-            }
-        });
-    }
-
     loop {
         let (stream, addr) = listener.accept().await?;
         let _ = stream.set_nodelay(true);
@@ -186,11 +171,16 @@ async fn handle_stream_scan(
         }
     };
 
+    let scan = db.start_scan(&scan_params.targets, &req.params).await;
     if req.save {
-        let params_str = serde_json::to_string(&req.params).unwrap_or_default();
-        let _ = db
-            .create_operation(&operation_id, "scan", &params_str)
-            .await;
+        let _ = cfx_db::scans::record_operation(
+            &db.pool,
+            &operation_id,
+            "scan",
+            scan.as_deref(),
+            &req.params.to_string(),
+        )
+        .await;
     }
 
     // Resolve hosts and compute total probes
@@ -207,7 +197,14 @@ async fn handle_stream_scan(
 
     dguard::spawn_busy(async move {
         scanner::run_connect_scan(&scan_params, tx).await;
-        let _ = db_c.update_operation_status(&oid, "completed", None).await;
+        db_c.finish_scan(scan.as_deref()).await;
+        let _ = cfx_db::scans::finish_operation(
+            &db_c.pool,
+            &oid,
+            cfx_db::scans::Status::Completed,
+            None,
+        )
+        .await;
     });
 
     while let Some(ev) = rx.recv().await {
@@ -237,11 +234,16 @@ async fn dispatch(req: DaemonRequest, db: Arc<DoorwardDb>) -> serde_json::Value 
                 }
             };
 
+            let scan = db.start_scan(&scan_params.targets, &req.params).await;
             if req.save {
-                let params_str = serde_json::to_string(&req.params).unwrap_or_default();
-                let _ = db
-                    .create_operation(&operation_id, "scan", &params_str)
-                    .await;
+                let _ = cfx_db::scans::record_operation(
+                    &db.pool,
+                    &operation_id,
+                    "scan",
+                    scan.as_deref(),
+                    &req.params.to_string(),
+                )
+                .await;
             }
 
             match req.response.as_str() {
@@ -259,9 +261,14 @@ async fn dispatch(req: DaemonRequest, db: Arc<DoorwardDb>) -> serde_json::Value 
                         }
                     }
 
-                    let _ = db
-                        .update_operation_status(&operation_id, "completed", None)
-                        .await;
+                    db.finish_scan(scan.as_deref()).await;
+                    let _ = cfx_db::scans::finish_operation(
+                        &db.pool,
+                        &operation_id,
+                        cfx_db::scans::Status::Completed,
+                        None,
+                    )
+                    .await;
 
                     serde_json::json!({
                         "operation_id": operation_id,
@@ -276,7 +283,14 @@ async fn dispatch(req: DaemonRequest, db: Arc<DoorwardDb>) -> serde_json::Value 
                     dguard::spawn_busy(async move {
                         let (tx, mut _rx) = mpsc::unbounded_channel::<StreamEvent>();
                         scanner::run_connect_scan(&scan_params, tx).await;
-                        let _ = db_c.update_operation_status(&oid, "completed", None).await;
+                        db_c.finish_scan(scan.as_deref()).await;
+                        let _ = cfx_db::scans::finish_operation(
+                            &db_c.pool,
+                            &oid,
+                            cfx_db::scans::Status::Completed,
+                            None,
+                        )
+                        .await;
                     });
 
                     serde_json::json!({
@@ -335,18 +349,20 @@ async fn dispatch(req: DaemonRequest, db: Arc<DoorwardDb>) -> serde_json::Value 
             })
         }
 
-        "db_reset" => match db.truncate_tables().await {
-            Ok(_) => serde_json::json!({
-                "operation_id": operation_id,
-                "status": "completed",
-                "message": "All tables truncated.",
-            }),
-            Err(e) => serde_json::json!({
-                "operation_id": operation_id,
-                "status": "error",
-                "message": format!("DB reset failed: {}", e),
-            }),
-        },
+        "db_reset" => {
+            match cfx_db::scans::reset(&db.pool, super::libs::doorward_db::ENGINE.name).await {
+                Ok(_) => serde_json::json!({
+                    "operation_id": operation_id,
+                    "status": "completed",
+                    "message": "All tables truncated.",
+                }),
+                Err(e) => serde_json::json!({
+                    "operation_id": operation_id,
+                    "status": "error",
+                    "message": format!("DB reset failed: {}", e),
+                }),
+            }
+        }
 
         unknown => serde_json::json!({
             "operation_id": operation_id,
