@@ -31,6 +31,10 @@ const SAY_AFTER: Duration = Duration::from_secs(1);
 /// How many of the last lines a daemon wrote are shown when it does not answer.
 const LAST_LINES: usize = 20;
 
+/// How large a daemon's log may grow. It is only ever appended to, so a client starting a
+/// daemon into a larger one starts it over, and keeps no older copy.
+const LOG_LIMIT: u64 = 10 * 1024 * 1024;
+
 /// The name of engine `engine`'s systemd user unit, which crossfyre writes to
 /// `~/.config/systemd/user` when it installs the engine.
 pub fn unit_name(engine: &str) -> String {
@@ -348,7 +352,8 @@ fn answer_to(line: &str) -> Answer {
     }
 }
 
-/// Open the daemon log at `log` in `dir` to append to, readable by the user alone.
+/// Open the daemon log at `log` in `dir` to append to, readable by the user alone, and
+/// empty once it has grown past [`LOG_LIMIT`].
 fn open_log(dir: &Path, log: &Path) -> std::io::Result<std::fs::File> {
     std::fs::create_dir_all(dir)?;
     let mut options = std::fs::OpenOptions::new();
@@ -358,7 +363,11 @@ fn open_log(dir: &Path, log: &Path) -> std::io::Result<std::fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    options.open(log)
+    let file = options.open(log)?;
+    if file.metadata()?.len() > LOG_LIMIT {
+        file.set_len(0)?;
+    }
+    Ok(file)
 }
 
 /// The command that runs `exe` as a daemon on `port`, writing to `log`. It is told when
@@ -605,6 +614,45 @@ mod tests {
             5000
         ));
         assert!(!unit_serves("Description=port 4442\n", 4442));
+    }
+
+    #[test]
+    fn a_log_past_its_limit_is_started_over_and_one_within_it_is_kept() {
+        let dir = Scratch::new("log-limit");
+        let logs = dir.path().join("logs");
+        let log = logs.join("voyage.log");
+        open_log(&logs, &log).unwrap();
+
+        std::fs::write(&log, "an earlier run\n").unwrap();
+        std::fs::File::options()
+            .append(true)
+            .open(&log)
+            .unwrap()
+            .set_len(LOG_LIMIT)
+            .unwrap();
+        let file = open_log(&logs, &log).unwrap();
+        assert_eq!(
+            file.metadata().unwrap().len(),
+            LOG_LIMIT,
+            "within the limit"
+        );
+
+        std::fs::File::options()
+            .append(true)
+            .open(&log)
+            .unwrap()
+            .set_len(LOG_LIMIT + 1)
+            .unwrap();
+        let mut file = open_log(&logs, &log).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 0, "past the limit");
+        use std::io::Write;
+        writeln!(file, "this run").unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "this run\n");
+        assert_eq!(
+            std::fs::read_dir(&logs).unwrap().count(),
+            1,
+            "an older copy was kept"
+        );
     }
 
     #[test]
