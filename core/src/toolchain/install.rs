@@ -1160,6 +1160,23 @@ async fn update_with(
         Some(ext) => (false, super::resolve_extensions(ext)?),
     };
 
+    // Only a CLI of the release being installed updates the rest, since it writes what
+    // they run from, an engine's unit above all. One of another release replaces itself
+    // first, which an update of one engine does not do.
+    let release_cli = Some(manifest_version(manifest, "crossfyre"))
+        .filter(|want| !want.is_empty() && want != current_version);
+    if !do_self && let Some(want) = &release_cli {
+        let first = match packaging::owner("crossfyre") {
+            Some(m) => format!("update it with {m}"),
+            None => "run `crossfyre update`".to_string(),
+        };
+        return Err(format!(
+            "this crossfyre is {current_version}, and the release's is {want}: {first} first, \
+             so the CLI is replaced before it writes an engine's unit"
+        )
+        .into());
+    }
+
     use super::ui::*;
     if !handed_over {
         println!();
@@ -1246,13 +1263,10 @@ async fn update_with(
             }
         }
 
-        // Only a CLI of the release being installed updates the rest, since it writes
-        // what they run from, an engine's unit above all. One that is behind and was not
-        // replaced here, because a package manager keeps it or replacing it failed,
-        // leaves them for a run that is.
+        // A CLI of another release that was not replaced here, because a package manager
+        // keeps it or replacing it failed, leaves the rest for a run of one that is.
         hold = !handed_over
-            && !want.is_empty()
-            && want != current_version
+            && release_cli.is_some()
             && (ext_bin_path("node").exists()
                 || ext_bin_path(CFX_SCRIPT).exists()
                 || !exts.is_empty());
@@ -2469,6 +2483,43 @@ exit 127"#;
         assert_eq!(
             out.summary(),
             "Nothing was updated: 1 already current, 1 skipped."
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_engine_is_updated_only_by_a_cli_of_the_release() {
+        // The engine is current here, so nothing but the CLI's release stops the update.
+        let s = Scratch::new("ext-cli-behind");
+        bin_dir_at(&s.0);
+        fs::write(s.join("voyage"), "").expect("voyage");
+        fs::write(s.join("voyage.version"), "9.9.9").expect("its version");
+        let manifest = full_manifest("9.9.9");
+        let refused = || update_with(&manifest, Some("voyage"), "9.9.8", false, false);
+        assert_eq!(
+            refused().await.expect_err("refused").to_string(),
+            "this crossfyre is 9.9.8, and the release's is 9.9.9: run `crossfyre update` \
+             first, so the CLI is replaced before it writes an engine's unit"
+        );
+        packaged(&format!(
+            r#"{{"manager":"brew","owns":["crossfyre"],"bin_dir":"{}"}}"#,
+            s.0.display()
+        ));
+        assert_eq!(
+            refused().await.expect_err("refused").to_string(),
+            "this crossfyre is 9.9.8, and the release's is 9.9.9: update it with brew first, \
+             so the CLI is replaced before it writes an engine's unit"
+        );
+        // A CLI of the release updates it.
+        let out = update_with(&manifest, Some("voyage"), "9.9.9", false, false)
+            .await
+            .expect("runs");
+        assert_eq!(
+            out,
+            Updated {
+                current: 1,
+                ..Updated::default()
+            }
         );
     }
 
