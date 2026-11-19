@@ -5,5 +5,4 @@ pub(crate) mod rng;
 pub(crate) mod scan_config;
 pub(crate) mod sha;
 pub(crate) mod sqlite;
-pub(crate) mod utils;
-pub(crate) mod wordlist_config;
+pub(crate) mod wordlist_source;

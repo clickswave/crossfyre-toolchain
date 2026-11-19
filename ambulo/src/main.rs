@@ -223,37 +223,34 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .validate_urls()
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
-    // Resolve wordlist to absolute path (daemon runs from a different cwd)
-    let wordlist_abs = std::fs::canonicalize(&fuzz_args.wordlist_path)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| fuzz_args.wordlist_path.clone());
-
+    // The wordlist is read here and its words sent after the request, so the daemon
+    // opens no path for this scan and any file this user can read will do.
+    let wordlist = std::path::Path::new(&fuzz_args.wordlist_path);
     let tui = cfx_tui::wanted(cli.no_tui);
     for url in &fuzz_args.url {
-        scan_url(&daemon, &fuzz_args, url, &wordlist_abs, tui).await?;
+        scan_url(&daemon, &fuzz_args, url, wordlist, tui).await?;
     }
     Ok(())
 }
 
-/// One scan of `url` by the daemon with the wordlist at `wordlist`: drawn on the
-/// dashboard when `tui`, and otherwise written out as the daemon's own newline-delimited
-/// JSON.
+/// One scan of `url` by the daemon with the words of the file at `wordlist`: drawn on
+/// the dashboard when `tui`, and otherwise written out as the daemon's own
+/// newline-delimited JSON.
 async fn scan_url(
     daemon: &dguard::Daemon,
     fuzz_args: &ScanArgs,
     url: &str,
-    wordlist: &str,
+    wordlist: &std::path::Path,
     tui: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let stream = daemon.connect().await?;
 
     // Build and send the stream scan request
-    let request = serde_json::json!({
+    let mut request = serde_json::json!({
         "operation": "scan",
         "response": "stream",
         "save": true,
         "endpoint": url,
-        "wordlist": wordlist,
         "method": fuzz_args.http_method.to_string(),
         "tasks": fuzz_args.tasks,
         "follow_redirects": fuzz_args.follow_redirects,
@@ -262,24 +259,32 @@ async fn scan_url(
         "fuzz_marker": fuzz_args.fuzz_marker,
         "success_status_codes": fuzz_args.success_status_codes,
     });
+    request[dguard::WORDS_FOLLOW] = dguard::list_name(wordlist).into();
 
     let (reader, mut writer) = tokio::io::split(stream);
     let mut req_str = dguard::encode(&request);
     req_str.push('\n');
     writer.write_all(req_str.as_bytes()).await?;
-
-    // Read the "ack" event to get operation_id and total
+    let sent = dguard::send_words(&mut writer, wordlist).await;
+    // Read the "ack" event to get operation_id and total. A daemon that refused the
+    // scan says why here, which is more use than a write it stopped reading.
     let mut lines = BufReader::new(reader).lines();
-    let ack_line = lines
-        .next_line()
-        .await?
-        .ok_or("Daemon closed connection before ack")?;
+    let ack_line = match lines.next_line().await? {
+        Some(line) => line,
+        None => {
+            return Err(sent
+                .err()
+                .unwrap_or_else(|| "Daemon closed connection before ack".to_string())
+                .into());
+        }
+    };
     let ack: StreamEvent = serde_json::from_str(&ack_line)?;
 
     if ack.kind == "error" {
         eprintln!("Error: {}", ack.message.as_deref().unwrap_or("unknown"));
         std::process::exit(1);
     }
+    sent?;
 
     let operation_id = ack.operation_id.unwrap_or_else(|| "unknown".to_string());
     let total = ack.total.unwrap_or(0);

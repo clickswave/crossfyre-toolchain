@@ -29,9 +29,11 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 mod idle;
 mod start;
+mod words;
 
 pub use idle::{IDLE_EXIT_ENV, exit_when_idle, spawn_busy};
 pub use start::{Daemon, NO_AUTOSTART_ENV, daemon_args, not_running, unit_name};
+pub use words::{CHUNK_WORDS, WORDS_FOLLOW, WordChunks, list_name, send_words};
 
 /// Moves a daemon listener off loopback. Value is an IP, not a host name.
 pub const BIND_ENV: &str = "CFX_DAEMON_BIND";

@@ -127,46 +127,39 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Resolve wordlist to absolute path (daemon runs from a different cwd), as ambulo
-    // does. An empty path stays empty: no active enumeration.
-    let wordlist_abs = if enum_args.wordlist_path.is_empty() {
-        String::new()
-    } else {
-        std::fs::canonicalize(&enum_args.wordlist_path)
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| enum_args.wordlist_path.clone())
-    };
-
+    // A wordlist is read here and its words sent after the request, so the daemon
+    // opens no path for this scan and any file this user can read will do.
+    let wordlist = (!enum_args.wordlist_path.is_empty())
+        .then(|| std::path::Path::new(&enum_args.wordlist_path));
     let tui = cfx_tui::wanted(cli.no_tui);
     for domain in &enum_args.domain {
-        scan_domain(&daemon, &enum_args, domain, &wordlist_abs, tui).await?;
+        scan_domain(&daemon, &enum_args, domain, wordlist, tui).await?;
     }
     Ok(())
 }
 
-/// One enumeration of `domain` by the daemon, with the wordlist at `wordlist` when there
-/// is one: drawn on the dashboard when `tui`, and otherwise written out as the daemon's
-/// own newline-delimited JSON.
+/// One enumeration of `domain` by the daemon, with the words of the file at `wordlist`
+/// when there is one: drawn on the dashboard when `tui`, and otherwise written out as
+/// the daemon's own newline-delimited JSON.
 async fn scan_domain(
     daemon: &dguard::Daemon,
     enum_args: &ScanArgs,
     domain: &str,
-    wordlist: &str,
+    wordlist: Option<&std::path::Path>,
     tui: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let stream = daemon.connect().await?;
 
     // Build and send the stream enum request
-    let request = serde_json::json!({
+    let mut request = serde_json::json!({
         "operation": "enum",
         "response": "stream",
         "save": true,
         "domain": domain,
-        "wordlist": wordlist,
         "tasks": enum_args.tasks,
         "fresh_start": enum_args.fresh_start,
         "disable_passive": enum_args.disable_passive_enum,
-        "disable_active": wordlist.is_empty(),
+        "disable_active": wordlist.is_none(),
         "exclude_passive_sources": enum_args.exclude_passive_source,
         "exclude_active_techniques": enum_args.exclude_active_technique,
         "http_probing_ports": enum_args.http_probing_port,
@@ -174,18 +167,30 @@ async fn scan_domain(
         "active_user_agent": enum_args.active_user_agent,
         "passive_user_agent": enum_args.passive_user_agent,
     });
+    if let Some(wordlist) = wordlist {
+        request[dguard::WORDS_FOLLOW] = dguard::list_name(wordlist).into();
+    }
 
     let (reader, mut writer) = tokio::io::split(stream);
     let mut req_str = dguard::encode(&request);
     req_str.push('\n');
     writer.write_all(req_str.as_bytes()).await?;
-
-    // Read the "ack" event to get operation_id and total
+    let sent = match wordlist {
+        Some(wordlist) => dguard::send_words(&mut writer, wordlist).await,
+        None => Ok(()),
+    };
+    // Read the "ack" event to get operation_id and total. A daemon that refused the
+    // scan says why here, which is more use than a write it stopped reading.
     let mut lines = BufReader::new(reader).lines();
-    let ack_line = lines
-        .next_line()
-        .await?
-        .ok_or("Daemon closed connection before ack")?;
+    let ack_line = match lines.next_line().await? {
+        Some(line) => line,
+        None => {
+            return Err(sent
+                .err()
+                .unwrap_or_else(|| "Daemon closed connection before ack".to_string())
+                .into());
+        }
+    };
     let ack: StreamEvent = serde_json::from_str(&ack_line)?;
 
     if ack.kind == "error" {
@@ -195,6 +200,7 @@ async fn scan_domain(
         );
         std::process::exit(1);
     }
+    sent?;
 
     let operation_id = ack.operation_id.unwrap_or_else(|| "unknown".to_string());
     let total = ack.total.unwrap_or(0);

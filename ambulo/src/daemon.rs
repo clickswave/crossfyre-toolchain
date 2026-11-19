@@ -4,8 +4,9 @@ use crate::scanner::{Scanner, StreamEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
+use tokio::io::Lines;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream, tcp::OwnedWriteHalf};
+use tokio::net::{TcpListener, TcpStream, tcp::OwnedReadHalf, tcp::OwnedWriteHalf};
 use tokio::sync::mpsc;
 use transport::Client;
 use uuid::Uuid;
@@ -63,7 +64,13 @@ struct DaemonResponse {
 #[derive(Debug, Deserialize, Clone)]
 struct ScanParams {
     endpoint: String,
+    /// A wordlist file, which is read only inside the permitted directories.
+    #[serde(default)]
     wordlist: String,
+    /// In place of `wordlist`: the name of a list whose words follow the request on
+    /// the connection (see [`dguard::WordChunks`]). Only a stream scan takes them.
+    #[serde(default)]
+    wordlist_follows: Option<String>,
     #[serde(default = "default_method")]
     method: String,
     #[serde(default = "default_tasks")]
@@ -369,7 +376,7 @@ async fn handle_connection(
         if req.response == "stream" {
             match req.operation.as_str() {
                 "crawl" => handle_stream_crawl(req, writer).await?,
-                _ => handle_stream_scan(req, writer, Arc::clone(&db)).await?,
+                _ => handle_stream_scan(req, writer, &mut lines, &gate, Arc::clone(&db)).await?,
             }
             return Ok(());
         }
@@ -408,6 +415,8 @@ where
 async fn handle_stream_scan(
     req: DaemonRequest,
     mut writer: OwnedWriteHalf,
+    lines: &mut Lines<BufReader<OwnedReadHalf>>,
+    gate: &dguard::Gate,
     db: Arc<AmbuloDb>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let operation_id = Uuid::new_v4().to_string();
@@ -441,22 +450,29 @@ async fn handle_stream_scan(
     // Set up the scan (wordlist, DB entries, etc.). Pass operation_id so this
     // stream scan gets its OWN isolated scan record - concurrent scans of the
     // same target/wordlist no longer share a row and clobber each other.
-    let (scanner, total, scan_id) = match prepare_scan(&scan_params, &db, Some(&operation_id)).await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            write_json(
-                &mut writer,
-                &serde_json::json!({
-                    "type": "error",
-                    "operation_id": operation_id,
-                    "message": e.to_string(),
-                }),
-            )
-            .await?;
-            return Ok(());
-        }
+    let words = match &scan_params.wordlist_follows {
+        Some(name) => ScanWords::Following {
+            name,
+            chunks: dguard::WordChunks::new(lines, gate),
+        },
+        None => ScanWords::Named(&scan_params.wordlist),
     };
+    let (scanner, total, scan_id) =
+        match prepare_scan(&scan_params, &db, Some(&operation_id), words).await {
+            Ok(v) => v,
+            Err(e) => {
+                write_json(
+                    &mut writer,
+                    &serde_json::json!({
+                        "type": "error",
+                        "operation_id": operation_id,
+                        "message": e.to_string(),
+                    }),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
 
     // Send "ack" with operation_id and total entry count
     write_json(
@@ -739,10 +755,22 @@ async fn run_scan_background(operation_id: String, params: ScanParams, db: Arc<A
 /// wordlist collapse onto one `scans` row and clobber each other's entries and
 /// results (findings lost / delivered to the wrong connection). `None` keeps the
 /// legacy shared/cached behaviour for one-off (non-stream) scans.
+/// Where the words of a scan come from.
+enum ScanWords<'a> {
+    /// The wordlist file at this path.
+    Named(&'a str),
+    /// The connection, after the request: the list `name`, chunk by chunk.
+    Following {
+        name: &'a str,
+        chunks: dguard::WordChunks<'a, BufReader<OwnedReadHalf>>,
+    },
+}
+
 async fn prepare_scan(
     params: &ScanParams,
     db: &Arc<AmbuloDb>,
     isolate: Option<&str>,
+    words: ScanWords<'_>,
 ) -> Result<(Scanner, usize, i64), Box<dyn std::error::Error + Send + Sync>> {
     let http_method = parse_method(&params.method);
 
@@ -760,33 +788,32 @@ async fn prepare_scan(
 
     let config = build_args(params, endpoint, http_method);
 
-    // Every scan path reaches here, so this is the one place the wordlist has to
+    // Every scan path reaches here, so this is the one place a wordlist file has to
     // be contained. `wordlist` is a filesystem path from the request and the
     // scanner emits one request per line to a target the same request names,
     // which made an arbitrary file readable one line at a time by anyone who
-    // could reach this daemon. WordlistConfig opens it once, inside the
-    // permitted directories, and reads only through that handle.
-    let wordlist_config = crate::libs::wordlist_config::WordlistConfig::new(&params.wordlist)
-        .await
-        .map_err(|e| format!("Wordlist error: {e}"))?;
-
-    let wordlist = match db.find_wordlist(&wordlist_config.hash).await {
-        Ok(w) => w,
-        Err(sqlx::Error::RowNotFound) => db
-            .create_wordlist(&wordlist_config)
-            .await
-            .map_err(|e| format!("DB: {e}"))?,
-        Err(e) => return Err(format!("DB: {e}").into()),
-    };
-
-    let words = db
-        .fetch_words(&wordlist.id)
-        .await
-        .map_err(|e| format!("DB: {e}"))?;
+    // could reach this daemon. FileWords opens it once, inside the permitted
+    // directories, and reads only through that handle. Words that follow the
+    // request come from the client, which read a file it may read itself.
+    let wordlist = match words {
+        ScanWords::Named(path) => {
+            let mut file = crate::libs::wordlist_source::FileWords::open(path)
+                .map_err(|e| format!("Wordlist error: {e}"))?;
+            let name = file.name.clone();
+            db.store_wordlist(&name, &mut file).await
+        }
+        ScanWords::Following { name, mut chunks } => {
+            if !params.wordlist.is_empty() {
+                return Err("a scan names a wordlist or sends its words, not both".into());
+            }
+            db.store_wordlist(name, &mut chunks).await
+        }
+    }
+    .map_err(|e| format!("Wordlist error: {e}"))?;
 
     let mut scan_config = serde_json::json!({
         "urls": &config.url,
-        "wordlist_hash": &wordlist_config.hash,
+        "wordlist_hash": &wordlist.hash,
         "method": &config.http_method.to_string(),
     });
     // Per-connection isolation (stream scans): make the hash unique so concurrent
@@ -832,7 +859,7 @@ async fn prepare_scan(
     };
 
     if scan.status == "created" {
-        db.create_scan_entries(&urls, &scan, &words)
+        db.create_scan_entries(&urls, &scan, wordlist.id)
             .await
             .map_err(|e| format!("DB: {e}"))?;
         scan.status = db
@@ -860,7 +887,11 @@ async fn run_scan(
     params: &ScanParams,
     db: &Arc<AmbuloDb>,
 ) -> Result<crate::scanner::ScanResults, Box<dyn std::error::Error + Send + Sync>> {
-    let (scanner, _, _) = prepare_scan(params, db, None).await?;
+    if params.wordlist_follows.is_some() {
+        return Err("words can follow only a stream scan's request".into());
+    }
+    let (scanner, _, _) =
+        prepare_scan(params, db, None, ScanWords::Named(&params.wordlist)).await?;
     scanner
         .run_headless()
         .await

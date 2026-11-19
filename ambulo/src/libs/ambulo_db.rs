@@ -1,4 +1,4 @@
-use crate::libs::wordlist_config::WordlistConfig;
+use crate::libs::wordlist_source::{ListDigest, WordSource};
 use crate::scanner::{LogTotals, Logs, ScanResult, ScanResults};
 use sqlx::{FromRow, QueryBuilder};
 use std::fmt::Display;
@@ -73,14 +73,6 @@ pub struct Url {
     pub id: i64,
     pub url: String,
     pub scan_id: i64,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, FromRow)]
-pub struct Word {
-    pub id: i64,
-    pub word: String,
-    pub wordlist_id: i64,
 }
 
 #[allow(dead_code)]
@@ -387,57 +379,59 @@ impl AmbuloDb {
         Ok(())
     }
 
-    pub async fn find_wordlist(&self, wordlist_hash: &str) -> Result<Wordlist, sqlx::Error> {
-        sqlx::query_as::<_, Wordlist>("SELECT * FROM wordlists WHERE hash = $1")
-            .bind(wordlist_hash)
-            .fetch_one(&self.pool)
-            .await
-    }
-
-    pub async fn create_words(
+    /// Store the words `source` gives as the wordlist `name`, and say which wordlist
+    /// holds them. A list is known by its [`ListDigest`], so one stored before is used
+    /// again rather than stored twice. The words go in a chunk at a time inside one
+    /// transaction, which is undone when the source fails or the list was already
+    /// here, and only one chunk is ever held in memory.
+    pub(crate) async fn store_wordlist(
         &self,
-        wordlist_id: &i64,
-        words: &[String],
-    ) -> Result<Vec<Word>, sqlx::Error> {
-        const BATCH_SIZE: usize = 1000;
-        for chunk in words.chunks(BATCH_SIZE) {
+        name: &str,
+        source: &mut impl WordSource,
+    ) -> Result<Wordlist, String> {
+        let db = |e: sqlx::Error| format!("DB: {e}");
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let id: i64 =
+            sqlx::query_scalar("INSERT INTO wordlists (name, hash) VALUES ($1, $2) RETURNING id")
+                .bind(name)
+                .bind(format!("pending {}", uuid::Uuid::new_v4()))
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(db)?;
+        let mut digest = ListDigest::default();
+        while let Some(chunk) = source.next_chunk().await? {
+            digest.update(&chunk);
             let mut qb: QueryBuilder<sqlx::Postgres> =
                 QueryBuilder::new("INSERT INTO words (word, wordlist_id) ");
             qb.push_values(chunk.iter(), |mut b, word| {
-                b.push_bind(word.clone()).push_bind(*wordlist_id);
+                b.push_bind(word).push_bind(id);
             });
-            qb.build().execute(&self.pool).await?;
+            qb.build().execute(&mut *tx).await.map_err(db)?;
         }
-
-        sqlx::query_as::<_, Word>("SELECT * FROM words WHERE wordlist_id = $1")
-            .bind(wordlist_id)
-            .fetch_all(&self.pool)
-            .await
-    }
-
-    pub async fn create_wordlist(
-        &self,
-        wordlist_config: &WordlistConfig,
-    ) -> Result<Wordlist, sqlx::Error> {
-        let wordlist = sqlx::query_as::<_, Wordlist>(
-            "INSERT INTO wordlists (name, hash) VALUES ($1, $2) RETURNING *",
-        )
-        .bind(&wordlist_config.name)
-        .bind(&wordlist_config.hash)
-        .fetch_one(&self.pool)
-        .await?;
-
-        let words = wordlist_config.lines().await?;
-        self.create_words(&wordlist.id, &words).await?;
-
-        Ok(wordlist)
-    }
-
-    pub async fn fetch_words(&self, wordlist_id: &i64) -> Result<Vec<Word>, sqlx::Error> {
-        sqlx::query_as::<_, Word>("SELECT * FROM words WHERE wordlist_id = $1")
-            .bind(wordlist_id)
-            .fetch_all(&self.pool)
-            .await
+        let hash = digest.finish();
+        let stored = sqlx::query("UPDATE wordlists SET hash = $1 WHERE id = $2")
+            .bind(&hash)
+            .bind(id)
+            .execute(&mut *tx)
+            .await;
+        match stored {
+            Ok(_) => tx.commit().await.map_err(db)?,
+            // Stored before, or by another scan meanwhile: that copy is the one used.
+            Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => {
+                tx.rollback().await.map_err(db)?;
+                return sqlx::query_as::<_, Wordlist>("SELECT * FROM wordlists WHERE hash = $1")
+                    .bind(&hash)
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(db);
+            }
+            Err(e) => return Err(db(e)),
+        }
+        Ok(Wordlist {
+            id,
+            name: name.to_string(),
+            hash,
+        })
     }
 
     pub async fn find_scan(&self, scan_hash: &str) -> Result<Scan, sqlx::Error> {
@@ -883,33 +877,25 @@ impl AmbuloDb {
         Ok(reclaimed)
     }
 
+    /// Queue every word of wordlist `wordlist_id` against each of `urls` in `scan`. The
+    /// database makes the entries from the words it holds, so none is read here.
     pub async fn create_scan_entries(
         &self,
-        urls: &Vec<Url>,
+        urls: &[Url],
         scan: &Scan,
-        words: &[Word],
+        wordlist_id: i64,
     ) -> Result<(), sqlx::Error> {
-        const BATCH_SIZE: usize = 1000;
         for url in urls {
-            for chunk in words.chunks(BATCH_SIZE) {
-                let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
-                    "INSERT INTO scan_entries (word_id, scan_id, url_id, status, headers_length, body_length, headers, body) ",
-                );
-                qb.push_values(chunk.iter(), |mut b, word| {
-                    b.push_bind(word.id)
-                        .push_bind(scan.id)
-                        .push_bind(url.id)
-                        .push_bind("queued")
-                        .push_bind(0i64)
-                        .push_bind(0i64)
-                        .push_bind(Option::<String>::None)
-                        .push_bind(Option::<Vec<u8>>::None);
-                });
-                if let Err(e) = qb.build().execute(&self.pool).await {
-                    eprintln!("Error inserting scan entries: {e:?}");
-                    return Err(e);
-                }
-            }
+            sqlx::query(
+                "INSERT INTO scan_entries (word_id, scan_id, url_id, status, headers_length, \
+                 body_length, headers, body) SELECT id, $1, $2, 'queued', 0, 0, NULL, NULL \
+                 FROM words WHERE wordlist_id = $3 ORDER BY id",
+            )
+            .bind(scan.id)
+            .bind(url.id)
+            .bind(wordlist_id)
+            .execute(&self.pool)
+            .await?;
         }
         Ok(())
     }

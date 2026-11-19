@@ -3,8 +3,9 @@ use crate::scanner::{EnumConfig, Scanner, StreamEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
+use tokio::io::Lines;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream, tcp::OwnedWriteHalf};
+use tokio::net::{TcpListener, TcpStream, tcp::OwnedReadHalf, tcp::OwnedWriteHalf};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -62,8 +63,13 @@ struct EnumParams {
     /// Attribution token for authorized programs (sent as X-Bug-Bounty).
     #[serde(default)]
     identify: Option<String>,
+    /// A wordlist file, which is read only inside the permitted directories.
     #[serde(default)]
     wordlist: String,
+    /// In place of `wordlist`: the name of a list whose words follow the request on
+    /// the connection (see [`dguard::WordChunks`]). Only a stream enum takes them.
+    #[serde(default)]
+    wordlist_follows: Option<String>,
     #[serde(default = "default_tasks")]
     tasks: usize,
     /// Per-task wait between requests in ms. Same semantic as doorward's
@@ -276,7 +282,7 @@ async fn handle_connection(
                 // Zone transfer: when a nameserver answers it, the zone lists
                 // every name it holds and the brute-force phase is redundant.
                 "axfr" => handle_stream_axfr(req, writer).await?,
-                _ => handle_stream_enum(req, writer, Arc::clone(&db)).await?,
+                _ => handle_stream_enum(req, writer, &mut lines, &gate, Arc::clone(&db)).await?,
             }
             return Ok(());
         }
@@ -309,6 +315,8 @@ where
 async fn handle_stream_enum(
     req: DaemonRequest,
     mut writer: OwnedWriteHalf,
+    lines: &mut Lines<BufReader<OwnedReadHalf>>,
+    gate: &dguard::Gate,
     db: Arc<VoyageDb>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let operation_id = Uuid::new_v4().to_string();
@@ -339,7 +347,11 @@ async fn handle_stream_enum(
             .await;
     }
 
-    let (scanner, total) = match prepare_enum(&params, &db).await {
+    let following = params
+        .wordlist_follows
+        .is_some()
+        .then(|| dguard::WordChunks::new(lines, gate));
+    let (scanner, total) = match prepare_enum(&params, &db, following).await {
         Ok(v) => v,
         Err(e) => {
             write_json(
@@ -613,22 +625,50 @@ fn scan_key(domain: &str, wordlist: &str, words: Option<&[String]>) -> String {
     crate::libs::sha::sha512(config.to_string())
 }
 
+/// Set up an enumeration of `params.domain`. Its words are those of the wordlist file
+/// the request names, or, when `following` is given, the chunks that follow the request
+/// on the connection. They are held once, and made into entries a batch at a time.
 async fn prepare_enum(
     params: &EnumParams,
     db: &Arc<VoyageDb>,
+    following: Option<dguard::WordChunks<'_, BufReader<OwnedReadHalf>>>,
 ) -> Result<(Scanner, usize), Box<dyn std::error::Error + Send + Sync>> {
-    let words = match active_wordlist(params)? {
-        Some(file) => Some(
-            crate::libs::wordlist::read_lines_from(file)
+    let words = match following {
+        Some(mut chunks) => {
+            if !params.wordlist.is_empty() || params.disable_active {
+                return Err(
+                    "an enum that sends its words names no wordlist file, and has \
+                            active enumeration on"
+                        .into(),
+                );
+            }
+            let mut words = Vec::new();
+            while let Some(chunk) = chunks
+                .next()
                 .await
-                .map_err(|e| format!("Wordlist error: {e}"))?,
-        ),
-        None => None,
+                .map_err(|e| format!("Wordlist error: {e}"))?
+            {
+                words.extend(chunk);
+            }
+            Some(words)
+        }
+        None => match active_wordlist(params)? {
+            Some(file) => Some(
+                crate::libs::wordlist::read_lines_from(file)
+                    .await
+                    .map_err(|e| format!("Wordlist error: {e}"))?,
+            ),
+            None => None,
+        },
     };
     let config_hash = scan_key(&params.domain, &params.wordlist, words.as_deref());
+    let wordlist = params
+        .wordlist_follows
+        .as_deref()
+        .unwrap_or(&params.wordlist);
 
     let scan_id = db
-        .get_or_create_scan(&config_hash, &params.domain, &params.wordlist)
+        .get_or_create_scan(&config_hash, &params.domain, wordlist)
         .await
         .map_err(|e| format!("DB error: {e}"))?;
 
@@ -666,24 +706,26 @@ async fn prepare_enum(
         }
     }
 
-    // Active wordlist - insert entries with status="queued"
+    // Active wordlist - insert entries with status="queued", a batch at a time, so the
+    // words are never held a second time as entries
     if let Some(words) = words {
-        let entries: Vec<(String, String, String, String)> = words
-            .iter()
-            .filter(|w| !w.trim().is_empty())
-            .map(|word| {
-                (
-                    format!("{}.{}", word.trim(), params.domain),
-                    "active".to_string(),
-                    String::new(),
-                    "queued".to_string(),
-                )
-            })
-            .collect();
-
-        db.insert_entries_batch(&scan_id, &entries)
-            .await
-            .map_err(|e| format!("DB error: {e}"))?;
+        for batch in words.chunks(dguard::CHUNK_WORDS) {
+            let entries: Vec<(String, String, String, String)> = batch
+                .iter()
+                .filter(|w| !w.trim().is_empty())
+                .map(|word| {
+                    (
+                        format!("{}.{}", word.trim(), params.domain),
+                        "active".to_string(),
+                        String::new(),
+                        "queued".to_string(),
+                    )
+                })
+                .collect();
+            db.insert_entries_batch(&scan_id, &entries)
+                .await
+                .map_err(|e| format!("DB error: {e}"))?;
+        }
     }
 
     db.set_scan_status(&scan_id, "populated")
@@ -728,7 +770,10 @@ async fn run_enum_instant(
     params: &EnumParams,
     db: &Arc<VoyageDb>,
 ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-    let (scanner, _) = prepare_enum(params, db).await?;
+    if params.wordlist_follows.is_some() {
+        return Err("words can follow only a stream enum's request".into());
+    }
+    let (scanner, _) = prepare_enum(params, db, None).await?;
     let scan_id = scanner.config.scan_id.clone();
     let db2 = Arc::clone(&scanner.db);
 
