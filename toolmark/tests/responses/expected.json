@@ -913,6 +913,28 @@
       "version": null
     }
   ],
+  "openresty-error-page.http": [
+    {
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:openresty:openresty:1.21.4.3:*:*:*:*:*:*:*",
+      "evidence": [
+        "header server: openresty"
+      ],
+      "name": "OpenResty",
+      "version": "1.21.4.3"
+    },
+    {
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by OpenResty"
+      ],
+      "name": "Nginx",
+      "version": null
+    }
+  ],
   "openresty.http": [
     {
       "category": "Web Server",
