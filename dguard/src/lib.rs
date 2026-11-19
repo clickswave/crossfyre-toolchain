@@ -593,14 +593,8 @@ fn default_roots() -> Vec<std::path::PathBuf> {
 fn handoff_roots() -> Vec<std::path::PathBuf> {
     #[cfg(windows)]
     {
-        use std::path::PathBuf;
         let mut roots = vec![std::env::temp_dir()];
-        // The engine host names the toolchain directory; without it, the default one.
-        let toolchain = std::env::var_os("CROSSFYRE_TOOLCHAIN_DIR")
-            .filter(|d| !d.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("crossfyre")));
-        if let Some(dir) = toolchain {
+        if let Some(dir) = toolchain_dir() {
             roots.push(dir.join("tmp"));
         }
         roots
@@ -1547,6 +1541,72 @@ mod wordlist_tests {
         let _ = std::fs::remove_file(p);
         let want = if cfg!(windows) { "semicolon" } else { "colon" };
         assert!(err.contains(&format!("({want}-separated)")), "{err}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The toolchain directory
+// ---------------------------------------------------------------------------
+
+/// The variable that names the toolchain directory, which holds `config.toml`. The
+/// engine host sets it for the engines it starts on macOS and Windows.
+pub const TOOLCHAIN_DIR_ENV: &str = "CROSSFYRE_TOOLCHAIN_DIR";
+
+/// The toolchain directory: the one [`TOOLCHAIN_DIR_ENV`] names, else
+/// `~/.config/crossfyre` on Linux and `crossfyre` in the per-user config directory
+/// elsewhere (`~/Library/Application Support` on macOS, `%APPDATA%` on Windows), which
+/// is where the CLI writes it. None when there is no home directory to look in.
+pub fn toolchain_dir() -> Option<std::path::PathBuf> {
+    toolchain_dir_from(std::env::var_os(TOOLCHAIN_DIR_ENV))
+}
+
+/// [`toolchain_dir`] given the variable's value, so it is tested without changing the
+/// environment. An empty value names nothing.
+fn toolchain_dir_from(named: Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
+    if let Some(dir) = named.filter(|d| !d.is_empty()) {
+        return Some(dir.into());
+    }
+    let root = if cfg!(target_os = "linux") {
+        dirs::home_dir()?.join(".config")
+    } else {
+        dirs::config_dir()?
+    };
+    Some(root.join("crossfyre"))
+}
+
+#[cfg(test)]
+mod toolchain_dir_tests {
+    use super::toolchain_dir_from;
+    use std::path::PathBuf;
+
+    #[test]
+    fn the_directory_the_variable_names_is_the_one_used() {
+        assert_eq!(
+            toolchain_dir_from(Some("/srv/cfx".into())),
+            Some(PathBuf::from("/srv/cfx"))
+        );
+    }
+
+    #[test]
+    fn an_empty_variable_names_nothing() {
+        assert_eq!(
+            toolchain_dir_from(Some("".into())),
+            toolchain_dir_from(None)
+        );
+    }
+
+    /// ~/.config on Linux whatever XDG_CONFIG_HOME says, as under sudo the CLI finds the
+    /// invoking user's, and the platform's config directory elsewhere.
+    #[test]
+    fn without_the_variable_it_is_in_the_user_s_config_directory() {
+        let home = dirs::home_dir().expect("a home directory");
+        let dir = toolchain_dir_from(None).expect("a toolchain directory");
+        if cfg!(target_os = "linux") {
+            assert_eq!(dir, home.join(".config").join("crossfyre"));
+        } else {
+            assert_eq!(dir, dirs::config_dir().unwrap().join("crossfyre"));
+            assert!(dir.starts_with(&home), "{}", dir.display());
+        }
     }
 }
 

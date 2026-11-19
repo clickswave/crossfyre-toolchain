@@ -149,11 +149,6 @@ pub fn get_config_path() -> PathBuf {
     get_toolchain_dir().join("config.toml")
 }
 
-/// The variable that tells an engine daemon where the toolchain directory, and so its
-/// `config.toml`, is. The engine host sets it on macOS and Windows; an engine without
-/// it looks in the per-user default, as it always has on Linux.
-pub const TOOLCHAIN_DIR_ENV: &str = "CROSSFYRE_TOOLCHAIN_DIR";
-
 /// The file holding the egress-proxy variables the engine daemons start with. Linux
 /// keeps the path its systemd units have always named; elsewhere it is in the
 /// toolchain directory, which is where that path leads on Linux too unless

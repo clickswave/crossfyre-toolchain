@@ -1459,6 +1459,7 @@ dependencies = [
 name = "dguard"
 version = "0.1.0"
 dependencies = [
+ "dirs 6.0.0",
  "libc",
  "serde_json",
  "tokio",

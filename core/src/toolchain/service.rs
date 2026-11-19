@@ -664,7 +664,7 @@ pub fn host(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut cmd = std::process::Command::new(&bin);
     cmd.args(["--daemon", "--port", &port.to_string()]);
     cmd.env(
-        super::config::TOOLCHAIN_DIR_ENV,
+        dguard::TOOLCHAIN_DIR_ENV,
         super::config::get_toolchain_dir(),
     );
     if let Ok(text) = std::fs::read_to_string(super::config::egress_env_path()) {
