@@ -762,9 +762,7 @@ fn adopt_packaged(ext: &str, m: Manager, quiet: bool) -> Result<(), Box<dyn std:
         )
         .into());
     }
-    if !service::has_service_file(ext) {
-        service::create_service_file(ext)?;
-    }
+    service::refresh_service_file(ext)?;
     if !quiet {
         title("Crossfyre extension install", ext);
         ok(&format!("{ext} is {}", update_note(m)));
@@ -796,8 +794,19 @@ async fn install_one(
                 "{ext} is already installed {}",
                 dim("(use --force to reinstall)")
             ));
+        }
+        // Its unit may be one another release wrote.
+        let refreshed = service::refresh_service_file(ext);
+        if !quiet {
+            if let Err(e) = &refreshed {
+                fail(&format!(
+                    "Failed to make its service this release's: {}",
+                    dim(&e.to_string())
+                ));
+            }
             end();
         }
+        refreshed?;
         return Ok(());
     }
 

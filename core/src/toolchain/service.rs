@@ -84,6 +84,27 @@ pub fn has_service_file(ext: &str) -> bool {
     imp::exists(ext)
 }
 
+/// What [`refresh_service_file`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refreshed {
+    /// It was what this build writes already.
+    Current,
+    /// It was missing, or another release wrote it, and it is this build's now.
+    Written,
+    /// As `Written`, and the engine, which was running, was restarted from it.
+    Restarted,
+}
+
+/// Make engine `ext`'s service what this build writes. A unit is a file crossfyre
+/// generates, so one that is missing or that another release wrote, such as one naming
+/// a command line that release had, is written again, and an engine that was running
+/// is restarted to run from it. `node init` and `extension install` do this for an
+/// engine that is installed already, and the node service for every engine when it
+/// starts, which is what carries an upgrade by a package manager or by the dashboard.
+pub fn refresh_service_file(ext: &str) -> Result<Refreshed, Box<dyn std::error::Error>> {
+    imp::refresh(ext)
+}
+
 /// Remove the service registration for an extension. Called during `remove`.
 pub fn remove_service_file(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
     imp::delete(ext)
@@ -1236,11 +1257,65 @@ mod imp {
         unit_dir().join(dguard::unit_name(ext)).exists()
     }
 
+    pub fn refresh(ext: &str) -> Result<super::Refreshed, Box<dyn std::error::Error>> {
+        use super::Refreshed;
+        let path = unit_dir().join(dguard::unit_name(ext));
+        if !path.exists() {
+            create(ext)?;
+            return Ok(Refreshed::Written);
+        }
+        // Asked before the unit changes: a unit another release wrote may be failing over
+        // and over, which systemd shows as activating.
+        let was = status(ext);
+        if !write_if_differs(&path, &unit_body(ext))? {
+            return Ok(Refreshed::Current);
+        }
+        let _ = cmd_as_invoking_user("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status();
+        if !super::quiet() {
+            super::svc_ok(&format!("{} rewritten", dguard::unit_name(ext)));
+        }
+        if matches!(was.as_str(), "running" | "activating") {
+            action("restart", ext)?;
+            return Ok(Refreshed::Restarted);
+        }
+        Ok(Refreshed::Written)
+    }
+
+    /// Write `body` to the unit file at `path` unless it holds `body` already, and say
+    /// whether it was written.
+    fn write_if_differs(path: &std::path::Path, body: &str) -> std::io::Result<bool> {
+        if super::super::sudo_user::read_to_string(path).is_ok_and(|now| now == body) {
+            return Ok(false);
+        }
+        write_for_invoking_user(path, body.as_bytes(), 0o644)?;
+        Ok(true)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
         use crate::toolchain::sudo_user::act_as_root;
         use std::fs;
+
+        #[test]
+        fn a_unit_another_release_wrote_is_written_again_and_one_this_build_wrote_is_not() {
+            let t = tempfile::tempdir().expect("tempdir");
+            let path = t.path().join(dguard::unit_name("voyage"));
+            let body = unit_body("voyage");
+            fs::write(
+                &path,
+                "[Service]\nExecStart=/opt/crossfyre/bin/voyage --daemon --port 4442\n",
+            )
+            .expect("an older unit");
+            assert!(write_if_differs(&path, &body).expect("written"));
+            assert_eq!(fs::read_to_string(&path).expect("read"), body);
+            assert!(
+                !write_if_differs(&path, &body).expect("left"),
+                "written again"
+            );
+        }
 
         /// `sudo crossfyre uninstall` removes the units it made in the operator's
         /// ~/.config/systemd/user, a directory the operator can swap for a link.
@@ -1372,6 +1447,16 @@ mod imp {
     pub fn exists(key: &str) -> bool {
         plist_path(key).exists()
     }
+
+    /// The agent names `crossfyre extension host <engine>`, which builds the engine's
+    /// command line each time it starts it, so no release's command line is kept in it.
+    pub fn refresh(key: &str) -> Result<super::Refreshed, Box<dyn std::error::Error>> {
+        if !exists(key) {
+            create(key)?;
+            return Ok(super::Refreshed::Written);
+        }
+        Ok(super::Refreshed::Current)
+    }
 }
 
 // ── Windows: scheduled tasks (extensions) ─────────────────────────────
@@ -1424,6 +1509,16 @@ mod imp {
 
     pub fn exists(key: &str) -> bool {
         tasks::exists(key)
+    }
+
+    /// The task names `crossfyre extension host <engine>`, which builds the engine's
+    /// command line each time it starts it, so no release's command line is kept in it.
+    pub fn refresh(key: &str) -> Result<super::Refreshed, Box<dyn std::error::Error>> {
+        if !exists(key) {
+            create(key)?;
+            return Ok(super::Refreshed::Written);
+        }
+        Ok(super::Refreshed::Current)
     }
 }
 

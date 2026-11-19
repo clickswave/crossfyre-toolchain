@@ -1124,6 +1124,21 @@ pub async fn run_boot(
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Booting Crossfyre nodes from {base:?}...");
 
+    // An engine's unit is a file crossfyre generates, and an upgrade by a package
+    // manager or by the dashboard leaves the ones another release wrote, so each
+    // installed engine's is made this build's before the nodes start.
+    for e in toolchain::ENGINES {
+        if !toolchain::config::is_extension_installed(e.name) {
+            continue;
+        }
+        if let Err(err) = toolchain::service::refresh_service_file(e.name) {
+            eprintln!(
+                "[boot] {}'s service could not be made this release's: {err}",
+                e.name
+            );
+        }
+    }
+
     let node_ids = discover_nodes(base)?;
     if node_ids.is_empty() {
         eprintln!(
