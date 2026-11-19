@@ -3462,12 +3462,16 @@ pub async fn run_daemon(
                                             "node_id": &node_id
                                         })
                                     }
+                                    // Why it did not, which the dashboard shows: where no
+                                    // service manager runs, that `crossfyre node up` runs the
+                                    // engines.
                                     Err(e) => {
                                         eprintln!("[restart] FAIL Failed to restart {ext}: {e}");
                                         serde_json::json!({
                                             "type": "extension_restart_failed",
                                             "extension": ext,
                                             "success": false,
+                                            "error": e.to_string(),
                                             "node_id": &node_id
                                         })
                                     }
