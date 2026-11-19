@@ -10,13 +10,15 @@ The folder is read recursively, so the subdirectories below are just categories.
 
 | Folder | What it holds |
 |---|---|
-| `technologies/` | Passive fingerprints for web tech, frameworks, servers, and CDNs (WordPress, Django, Laravel, Spring Boot, Jenkins, GitLab, Grafana, nginx, IIS, and so on). |
 | `exposures/` | Sensitive files left web-readable (.git/HEAD, .npmrc, .htpasswd, Dockerfile, docker-compose, Spring actuator env and heapdump, backups). |
 | `misconfigurations/` | Insecure defaults and exposed services (CORS reflection, open redirect, unauthenticated Elasticsearch, Docker registry, Kubernetes, Prometheus). |
 | `panels/` | Reachable admin and login consoles (Tomcat Manager, Adminer, Swagger UI, Keycloak, Portainer). |
 | `default-logins/` | Well-known default credentials being accepted (Tomcat Manager, Grafana admin/admin). |
 | `vulnerabilities/` | Active probes for injection and logic flaws (SQLi, XXE, SSRF, command injection, reflected XSS, SSTI, CRLF, cloud-metadata SSRF, mass assignment, JWT alg:none). |
 | `cves/` | Specific known CVEs, detected without running a destructive payload. |
+
+Naming the technology a host runs is toolmark's job, from its own signatures in
+[`toolmark/signatures`](../../toolmark/signatures/), so there is no category for it here.
 
 ## Adding a template
 

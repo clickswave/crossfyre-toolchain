@@ -1025,7 +1025,7 @@ pub static PACK: LazyLock<Vec<Template>> = LazyLock::new(|| {
 });
 
 /// Load external nuclei templates (*.yaml / *.yml) from a directory, recursing
-/// into subdirectories so a categorized pack (technologies/, exposures/, cves/,
+/// into subdirectories so a categorized pack (exposures/, cves/, panels/,
 /// ...) loads as one set. Templates that fail to parse against the supported
 /// subset, or carry no runnable request, are skipped rather than aborting the
 /// load. A hidden directory (leading dot) is skipped so stray editor/VCS state
