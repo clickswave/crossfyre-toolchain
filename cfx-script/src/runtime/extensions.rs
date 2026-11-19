@@ -20,15 +20,10 @@ pub fn inject_defaults() {
     let mut map = HashMap::new();
 
     // Crossfyre extension daemons (TCP JSON protocol). Ports come from the
-    // host config.toml so a custom port applies to cfx scripts too. Each is
-    // reachable by its public name and by its engine id. The id stays for good:
-    // scripts saved in workflows and on disk ask for it, and it never changes.
-    for id in ["mach", "voyage"] {
-        let port = cfx_core::toolchain::config::engine_port(id);
-        let name = cfx_core::toolchain::public_name(id);
-        for key in [name, id] {
-            map.insert(key.to_string(), ExtensionKind::Daemon { port });
-        }
+    // host config.toml so a custom port applies to cfx scripts too.
+    for name in ["ambulo", "voyage"] {
+        let port = cfx_core::toolchain::config::engine_port(name);
+        map.insert(name.to_string(), ExtensionKind::Daemon { port });
     }
 
     // Common CLI recon tools (shell out to binary)
@@ -504,7 +499,7 @@ mod tests {
         for (how, call) in ask {
             let (port, seen) = impostor();
             let ext = DaemonExtension {
-                name: "mach".into(),
+                name: "ambulo".into(),
                 port,
             };
             TRUSTED.with(|t| *t.borrow_mut() = Some(others()));
@@ -527,7 +522,7 @@ mod tests {
     fn a_script_reaches_an_engine_this_account_runs() {
         let (port, seen) = impostor();
         let ext = DaemonExtension {
-            name: "mach".into(),
+            name: "ambulo".into(),
             port,
         };
         let answer = Python::attach(|py| {
