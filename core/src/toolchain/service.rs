@@ -996,7 +996,7 @@ mod launchd {
         }
     }
 
-    /// running | stopped | failed.
+    /// running | starting | stopped | failed (see [`super::launchd_state`]).
     pub fn status(domain: &str, label: &str) -> String {
         let Ok(out) = launchctl(&["print", &target(domain, label)]) else {
             return "unknown".to_string();
@@ -1004,20 +1004,7 @@ mod launchd {
         if !out.status.success() {
             return "stopped".to_string();
         }
-        let text = String::from_utf8_lossy(&out.stdout);
-        if text.lines().any(|l| l.trim() == "state = running") {
-            return "running".to_string();
-        }
-        // `last exit code = 1: Operation not permitted`, or `(never exited)`.
-        let failed = text
-            .lines()
-            .filter_map(|l| l.trim().strip_prefix("last exit code = "))
-            .any(|code| {
-                code.chars()
-                    .next()
-                    .is_some_and(|c| c.is_ascii_digit() && c != '0')
-            });
-        if failed { "failed" } else { "stopped" }.to_string()
+        super::launchd_state(&String::from_utf8_lossy(&out.stdout)).to_string()
     }
 
     /// Has `disable` been set for the job? `print-disabled` lists a job switched off as
@@ -1038,6 +1025,32 @@ mod launchd {
     pub fn disable(domain: &str, label: &str) {
         let _ = launchctl(&["disable", &target(domain, label)]);
     }
+}
+
+/// A launchd job's state from what `launchctl print` says of it: running; starting while
+/// launchd is still bringing its process up (`xpcproxy`, `spawn scheduled`), as just after
+/// it is loaded; failed when its last exit was a failure; and otherwise stopped.
+#[cfg(any(target_os = "macos", test))]
+fn launchd_state(print: &str) -> &'static str {
+    let state = print
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("state = "))
+        .unwrap_or("");
+    match state {
+        "running" => return "running",
+        "xpcproxy" | "spawn scheduled" => return "starting",
+        _ => {}
+    }
+    // `last exit code = 1: Operation not permitted`, or `(never exited)`.
+    let failed = print
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("last exit code = "))
+        .any(|code| {
+            code.chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit() && c != '0')
+        });
+    if failed { "failed" } else { "stopped" }
 }
 
 // ── macOS: the node supervisor as a launchd daemon ───────────────────
@@ -1785,6 +1798,40 @@ mod tests {
             ),
             "{plist}"
         );
+    }
+
+    /// What `launchctl print` says of a job, as the node's status. Just loaded, a job is
+    /// in launchd's hands until its process runs, and node init, which asks at once, read
+    /// that as stopped and said the node it had just started was not running.
+    #[test]
+    fn a_job_launchd_is_still_starting_is_starting() {
+        let print = |state: &str, exit: &str| {
+            format!(
+                "system/io.crossfyre.node = {{\n\tactive count = 1\n\tstate = {state}\n\t\
+                 program = /opt/crossfyre/bin/node\n\tlast exit code = {exit}\n}}\n"
+            )
+        };
+        assert_eq!(
+            launchd_state(&print("running", "(never exited)")),
+            "running"
+        );
+        assert_eq!(
+            launchd_state(&print("xpcproxy", "(never exited)")),
+            "starting"
+        );
+        assert_eq!(
+            launchd_state(&print("spawn scheduled", "(never exited)")),
+            "starting"
+        );
+        assert_eq!(
+            launchd_state(&print("not running", "(never exited)")),
+            "stopped"
+        );
+        assert_eq!(
+            launchd_state(&print("not running", "1: Operation not permitted")),
+            "failed"
+        );
+        assert_eq!(launchd_state(&print("not running", "0")), "stopped");
     }
 
     #[test]
