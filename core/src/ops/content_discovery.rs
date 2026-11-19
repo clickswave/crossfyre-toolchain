@@ -86,7 +86,7 @@ pub async fn handle(env: OpEnv) {
                                 "type": "endpoint",
                                 "status_code": code,
                                 "body_length": body_len,
-                                "source": "mach",
+                                "source": "ambulo",
                                 "operation_id": op_id,
                                 "word": data["word"].as_str().unwrap_or(""),
                             }
@@ -530,7 +530,7 @@ pub async fn handle(env: OpEnv) {
                                         "status_code": event["code"],
                                         "body_length": event["body_length"],
                                         "final_url": final_url,
-                                        "source": "mach",
+                                        "source": "ambulo",
                                         "operation_id": op_id,
                                     }
                                 });

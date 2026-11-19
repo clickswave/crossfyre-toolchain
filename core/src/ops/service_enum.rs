@@ -202,7 +202,7 @@ async fn run_toolmark(
                             if let Some(o) = v.as_object_mut() {
                                 o.remove("type");
                                 o.insert("type".into(), serde_json::json!("service"));
-                                o.insert("source".into(), serde_json::json!("scout-services"));
+                                o.insert("source".into(), serde_json::json!("toolmark-services"));
                             }
                             v
                         } else {

@@ -203,7 +203,7 @@ pub async fn eval_template(
                 };
                 // Built now, released only if this template's marker calls back.
                 let finding = cfx_finding::Finding::new(
-                    "cortex",
+                    "plessor",
                     &class_from_tags(&tmpl.info.tags, &tmpl.id, &tmpl.info.metadata.category),
                     if tmpl.info.name.is_empty() {
                         tmpl.id.clone()

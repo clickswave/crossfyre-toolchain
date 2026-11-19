@@ -450,7 +450,7 @@ pub async fn probe(recipe: &Recipe, ep: &InjEndpoint) -> Outcome {
     }
 
     let finding = Finding::new(
-        "cortex-race",
+        "plessor-race",
         "race",
         "Race condition: a single-use limit that concurrency walks past",
         "high",

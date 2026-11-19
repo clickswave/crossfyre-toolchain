@@ -2460,7 +2460,7 @@ fn finding(
     method: &str,
     detail: &str,
 ) -> Finding {
-    Finding::new("cortex-graphql", class, name, severity, url)
+    Finding::new("plessor-graphql", class, name, severity, url)
         .method(method)
         .location("graphql")
         .describe(detail)

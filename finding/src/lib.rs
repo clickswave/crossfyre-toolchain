@@ -174,7 +174,7 @@ mod tests {
     #[test]
     fn every_finding_carries_the_same_locators() {
         let v = Finding::new(
-            "cortex-inject",
+            "plessor-inject",
             "SQLi",
             "SQL injection",
             "high",
@@ -195,7 +195,7 @@ mod tests {
 
     #[test]
     fn unknown_fields_are_absent_not_empty() {
-        let v = Finding::new("cortex", "exposure", "n", "info", "http://h/").build();
+        let v = Finding::new("plessor", "exposure", "n", "info", "http://h/").build();
         assert!(v.get("param").is_none());
         assert!(v.get("location").is_none());
         assert!(v.get("template").is_none());

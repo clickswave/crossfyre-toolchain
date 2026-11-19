@@ -62,7 +62,7 @@ async fn a_hostile_finding_arrives_as_labelled_clean_capped_data() {
         events: vec![json!({"type": "finding", "data": {
             "type": "vulnerability", "vuln_class": "sqli", "name": format!("SQL injection {HOSTILE}"),
             "severity": "HIGH", "confidence": "confirmed", "description": HOSTILE,
-            "source": "cortex-inject", "url": format!("http://127.0.0.1:{}/?q=1", target.port),
+            "source": "plessor-inject", "url": format!("http://127.0.0.1:{}/?q=1", target.port),
             "method": "GET", "param": "q", "location": "query", "evidence": evidence,
             "payload_echo": HOSTILE,
         }})],

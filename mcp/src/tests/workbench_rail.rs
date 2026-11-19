@@ -3489,7 +3489,7 @@ mod injection {
         let plessor = stub_engine(StubOpts {
             events: vec![json!({"type": "finding", "data": {
                 "type": "vulnerability", "vuln_class": "sqli", "name": "SQL injection",
-                "severity": "HIGH", "confidence": "confirmed", "source": "cortex-inject",
+                "severity": "HIGH", "confidence": "confirmed", "source": "plessor-inject",
                 "url": "http://app.example.test/api/items?id=2&token=S6-tok",
                 "method": "GET", "param": "id", "location": "query",
                 "evidence": "GET /api/items?id=2'&token=S6-tok HTTP/1.1\r\nCookie: sid=S1-ck\r\n\

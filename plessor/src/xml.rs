@@ -110,7 +110,7 @@ pub async fn probe(
                 speaks_xml = true;
                 out.push(
                     Finding::new(
-                        "cortex-xml",
+                        "plessor-xml",
                         "exposure",
                         "SOAP service contract (WSDL) publicly readable",
                         "low",
@@ -179,7 +179,7 @@ pub async fn probe(
             }
             out.push(
                 Finding::new(
-                    "cortex-xml",
+                    "plessor-xml",
                     "xxe",
                     "XML external entity (XXE) - local file disclosure",
                     "high",
@@ -222,7 +222,7 @@ pub async fn probe(
                     marker,
                     finding: (
                         Finding::new(
-                        "cortex-xml",
+                        "plessor-xml",
                         "xxe",
                         "XML external entity (XXE, blind - out-of-band confirmed)",
                         "high",

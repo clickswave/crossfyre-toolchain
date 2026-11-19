@@ -206,7 +206,7 @@ pub async fn probe(url: &str, route: &crate::rawhttp::Route) -> Option<Value> {
 
         Some(
             Finding::new(
-                "cortex-smuggle",
+                "plessor-smuggle",
                 "smuggling",
                 format!("HTTP request smuggling ({} desync)", variant.label()),
                 "critical",

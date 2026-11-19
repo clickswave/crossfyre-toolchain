@@ -293,7 +293,7 @@ fn printable(b: &[u8]) -> String {
 }
 
 fn open_finding(service: &str, target: &str, severity: &str, name: &str, detail: String) -> Value {
-    Finding::new("scout-services", "misconfig", name, severity, target)
+    Finding::new("toolmark-services", "misconfig", name, severity, target)
         .location("service")
         .describe(detail)
         .with("service", json!(service))
@@ -301,11 +301,17 @@ fn open_finding(service: &str, target: &str, severity: &str, name: &str, detail:
 }
 
 fn creds_finding(service: &str, target: &str, name: &str, detail: String) -> Value {
-    Finding::new("scout-services", "default_creds", name, "critical", target)
-        .location("service")
-        .describe(detail)
-        .with("service", json!(service))
-        .build()
+    Finding::new(
+        "toolmark-services",
+        "default_creds",
+        name,
+        "critical",
+        target,
+    )
+    .location("service")
+    .describe(detail)
+    .with("service", json!(service))
+    .build()
 }
 
 // ---------------------------------------------------------------------------

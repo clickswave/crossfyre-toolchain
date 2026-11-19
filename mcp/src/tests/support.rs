@@ -322,19 +322,19 @@ pub(crate) async fn stub_engine(opts: StubOpts) -> Stub {
 pub(crate) fn toolmark_events(title: &str, server: &str) -> Vec<Value> {
     vec![
         json!({"type": "finding", "data": {
-            "type": "technology", "source": "scout", "severity": "info",
+            "type": "technology", "source": "toolmark", "severity": "info",
             "name": "nginx", "category": "web-server", "version": "1.18.0",
             "cpe": "cpe:2.3:a:f5:nginx", "confidence": 90, "evidence": "server header"}}),
         json!({"type": "finding", "data": {
-            "type": "vulnerability", "source": "scout-cve", "severity": "HIGH",
+            "type": "vulnerability", "source": "toolmark-cve", "severity": "HIGH",
             "name": "nginx 1.18.0: CVE-2021-23017", "cve": "CVE-2021-23017", "cvss": 7.7,
             "product": "nginx", "version": "1.18.0", "confidence": "version-inferred",
             "reference": "https://nvd.nist.gov/vuln/detail/CVE-2021-23017",
             "description": "resolver off-by-one"}}),
         json!({"type": "finding", "data": {
-            "type": "service", "source": "scout", "severity": "info", "status_code": 200,
+            "type": "service", "source": "toolmark", "severity": "info", "status_code": 200,
             "title": title, "server": server, "favicon": null, "waf": null, "cdn": null}}),
-        json!({"type": "finding", "data": {"type": "environment", "source": "scout"}}),
+        json!({"type": "finding", "data": {"type": "environment", "source": "toolmark"}}),
     ]
 }
 

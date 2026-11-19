@@ -267,7 +267,7 @@ pub async fn probe(
         names.dedup();
         return Some(
             Finding::new(
-                "cortex-exposure",
+                "plessor-exposure",
                 "excessive_exposure",
                 "Credentials returned to an unauthenticated request",
                 "critical",
@@ -336,7 +336,7 @@ pub async fn probe(
                 fields.sort();
                 return Some(
                     Finding::new(
-                        "cortex-exposure",
+                        "plessor-exposure",
                         "excessive_exposure",
                         "Personal records readable without authentication, by identifier",
                         "high",
@@ -412,7 +412,7 @@ pub async fn probe(
             fields.sort();
             return Some(
                 Finding::new(
-                    "cortex-exposure",
+                    "plessor-exposure",
                     "excessive_exposure",
                     "Personal records readable without authentication, by identifier",
                     "high",

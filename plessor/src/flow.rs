@@ -871,7 +871,7 @@ pub async fn run(p: FlowParams, tx: mpsc::UnboundedSender<Value>) {
             continue;
         }
         let f = Finding::new(
-            "cortex-flow",
+            "plessor-flow",
             "workflow",
             "Business logic: a required step in a flow can be skipped",
             "high",
@@ -909,7 +909,7 @@ pub async fn run(p: FlowParams, tx: mpsc::UnboundedSender<Value>) {
         && class(twice.1) == 2
     {
         let f = Finding::new(
-            "cortex-flow",
+            "plessor-flow",
             "workflow",
             "Business logic: a flow's final step is accepted twice",
             "medium",
@@ -1057,7 +1057,7 @@ async fn cross_identity(p: &FlowParams, label: &str, tx: &mpsc::UnboundedSender<
         };
 
         let f = Finding::new(
-            "cortex-flow",
+            "plessor-flow",
             "bola",
             "Broken object authorization inside a flow",
             "critical",

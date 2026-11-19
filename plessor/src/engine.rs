@@ -404,14 +404,14 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
     if blocked {
         let _ = tx.send(
             Finding::new(
-                "cortex",
+                "plessor",
                 "waf",
                 format!("Target behind WAF/anti-bot ({block_label})"),
                 "info",
                 &base,
             )
             .kind("waf")
-            .template("cortex:waf-challenge")
+            .template("plessor:waf-challenge")
             .describe("The base URL returned a WAF/anti-bot challenge that could not be cleared, so active vulnerability templates were skipped. Consider origin discovery, an attribution/allowlist header, or a challenge-solving session.")
             .event(),
         );
@@ -440,7 +440,7 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
             if allow(severity) && allow_id(template) {
                 found += 1;
                 let _ = tx.send(
-                    Finding::new("cortex", "misconfig", name, severity, &base)
+                    Finding::new("plessor", "misconfig", name, severity, &base)
                         .template(template)
                         // These are read off the base response's headers, so the
                         // location is not a guess.
@@ -576,7 +576,7 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
                 {
                     found += 1;
                     let _ = tx.send(
-                        Finding::new("cortex", &m.class, m.name, m.severity, m.matched_at)
+                        Finding::new("plessor", &m.class, m.name, m.severity, m.matched_at)
                             .template(m.template_id)
                             .describe(m.description)
                             .event(),

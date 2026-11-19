@@ -146,10 +146,10 @@ fn toolmark() -> (u16, Arc<Mutex<Vec<Value>>>) {
             }
             for ev in [
                 json!({"type": "ack", "target": t}),
-                json!({"type": "finding", "data": {"type": "technology", "source": "scout",
+                json!({"type": "finding", "data": {"type": "technology", "source": "toolmark",
                     "severity": "info", "name": "nginx", "category": "web-server",
                     "version": "1.25.3", "cpe": "", "confidence": 100, "evidence": "server"}}),
-                json!({"type": "finding", "data": {"type": "service", "source": "scout",
+                json!({"type": "finding", "data": {"type": "service", "source": "toolmark",
                     "severity": "info", "status_code": 200, "title": "t", "server": "nginx"}}),
                 json!({"type": "done"}),
             ] {
