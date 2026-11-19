@@ -57,6 +57,9 @@ pub enum Commands {
     /// What toolmark knows runs where: each host and port it scanned, and the products
     /// and versions it found there
     Inventory,
+    /// Run the signatures toolmark has now over the pages it kept from earlier scans, and
+    /// report only what is new. Nothing is sent to any host
+    Rematch,
     /// What this engine keeps: delete one scan, old scans, or everything
     Db {
         #[command(subcommand)]

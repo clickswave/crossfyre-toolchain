@@ -449,7 +449,7 @@ async fn asking_learns_the_not_found_page_first_and_stops_where_it_should() {
         async move {
             let mut host = Host::new(signatures, "http://host.test/", &[], &[], "", STANDARD);
             let mut seen = Vec::new();
-            let sent = ask(&mut host, |path| {
+            let sent = ask(&mut host, |path, _| {
                 seen.push(path.clone());
                 std::future::ready(answer(&path))
             })
@@ -624,7 +624,7 @@ async fn an_error_page_leaf_reads_the_not_found_page() {
         async move {
             let headers = [("server".to_string(), server.to_string())];
             let mut host = Host::new(signatures, "http://host.test/", &headers, &[], "", STANDARD);
-            let sent = ask(&mut host, |_| std::future::ready(answer())).await;
+            let sent = ask(&mut host, |_, _| std::future::ready(answer())).await;
             let found: Vec<(String, Option<String>, Vec<String>)> = host
                 .detections()
                 .into_iter()
@@ -741,7 +741,7 @@ async fn version_ranges_hold_together_and_an_exact_version_wins() {
                 body,
                 STANDARD,
             );
-            let sent = ask(&mut host, |path| {
+            let sent = ask(&mut host, |path, _| {
                 std::future::ready(if path == "/new.js" {
                     status(new_js, "new")
                 } else {

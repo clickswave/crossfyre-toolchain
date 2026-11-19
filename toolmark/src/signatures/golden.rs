@@ -57,7 +57,7 @@ impl Saved {
             &r.body,
             STANDARD,
         );
-        ask(&mut host, |path| std::future::ready(self.answer(&path))).await;
+        ask(&mut host, |path, _| std::future::ready(self.answer(&path))).await;
         host
     }
 }

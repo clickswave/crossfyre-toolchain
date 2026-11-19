@@ -159,6 +159,7 @@ async fn scan<O: crate::observe::Observer>(
 
     observer
         .observed(crate::observe::Observation {
+            asked: crate::observe::Asked::Landing,
             url: &url,
             host: &host,
             port,
@@ -166,6 +167,7 @@ async fn scan<O: crate::observe::Observer>(
             status,
             headers: &headers,
             body: body.as_bytes(),
+            moved: false,
         })
         .await;
 
@@ -198,7 +200,7 @@ async fn scan<O: crate::observe::Observer>(
         params.depth_tier,
     );
     let base = transport::Url::parse(&url).ok();
-    signatures::ask(&mut found, |path| {
+    signatures::ask(&mut found, |path, asked| {
         let target = base.as_ref().and_then(|b| b.join(&path).ok());
         let (client, observer) = (client.clone(), observer.clone());
         let (host, scheme) = (host.clone(), scheme.clone());
@@ -224,6 +226,7 @@ async fn scan<O: crate::observe::Observer>(
             let body = read_bytes_capped(r, MAX_PATH_BYTES).await;
             observer
                 .observed(crate::observe::Observation {
+                    asked,
                     url: target.as_str(),
                     host: &host,
                     port,
@@ -231,6 +234,7 @@ async fn scan<O: crate::observe::Observer>(
                     status,
                     headers: &headers,
                     body: &body,
+                    moved,
                 })
                 .await;
             signatures::Answered::new(status, moved, &body)
@@ -245,27 +249,7 @@ async fn scan<O: crate::observe::Observer>(
         if !d.cpe.is_empty() {
             cpes.push(d.cpe.clone());
         }
-        let _ = tx.send(json!({
-            "type": "finding",
-            "data": {
-                "target": url,
-                "host": host, "port": port, "scheme": scheme,
-                "type": "technology",
-                "source": "toolmark",
-                "severity": "info",
-                "name": d.name,
-                "category": d.category,
-                "version": d.version,
-                "cpe": d.cpe,
-                "confidence": d.confidence,
-                "evidence": d.evidence,
-                "candidates": d.candidates,
-                "version_range": d.version_range.as_ref().map(|r| json!({
-                    "since": r.since.as_ref().map(ToString::to_string),
-                    "until": r.until.as_ref().map(ToString::to_string),
-                })),
-            }
-        }));
+        let _ = tx.send(technology(d, &url, &host, port, &scheme));
 
         // Version-based CVE matches for this technology. Emitted as
         // "version-inferred" (a backported fix could make it a false positive).
@@ -343,6 +327,37 @@ async fn scan<O: crate::observe::Observer>(
     }));
 
     let _ = tx.send(json!({"type":"done"}));
+}
+
+/// The finding for technology `d`, found at `url` on `host`:`port`.
+pub fn technology(
+    d: &signatures::Detection,
+    url: &str,
+    host: &str,
+    port: u16,
+    scheme: &str,
+) -> Value {
+    json!({
+        "type": "finding",
+        "data": {
+            "target": url,
+            "host": host, "port": port, "scheme": scheme,
+            "type": "technology",
+            "source": "toolmark",
+            "severity": "info",
+            "name": d.name,
+            "category": d.category,
+            "version": d.version,
+            "cpe": d.cpe,
+            "confidence": d.confidence,
+            "evidence": d.evidence,
+            "candidates": d.candidates,
+            "version_range": d.version_range.as_ref().map(|r| json!({
+                "since": r.since.as_ref().map(ToString::to_string),
+                "until": r.until.as_ref().map(ToString::to_string),
+            })),
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------

@@ -604,6 +604,25 @@ impl<'a> Host<'a> {
         }
     }
 
+    /// Pages kept from an earlier scan of this host, given to it as its answers: what it
+    /// said for the random paths that learn its not-found page, and for the paths asked by
+    /// signatures, each with the path it was asked at. Nothing is asked of the host.
+    pub fn remember(&mut self, not_found: Vec<(String, Answered)>, paths: Vec<(String, Answered)>) {
+        let mut pages = not_found.into_iter();
+        match (pages.next(), pages.next()) {
+            (Some(a), Some(b)) => {
+                self.not_found = NotFound::learn((&a.0, &a.1), (&b.0, &b.1));
+                self.not_found_page = Some(a.1);
+            }
+            (Some(a), None) => {
+                self.not_found = NotFound::Unusable;
+                self.not_found_page = Some(a.1);
+            }
+            _ => {}
+        }
+        self.asked.extend(paths);
+    }
+
     /// What `leaf`, when it reads a request of its own, needs here. A `script` leaf whose
     /// script the landing page does not load is absent with no request, and one whose
     /// script comes from another host is unknown, as that host is not the one scanned.
@@ -1011,7 +1030,7 @@ impl<'a> Host<'a> {
 /// Returns how many requests were made.
 pub async fn ask<F, Fut>(host: &mut Host<'_>, mut fetch: F) -> usize
 where
-    F: FnMut(String) -> Fut,
+    F: FnMut(String, crate::observe::Asked) -> Fut,
     Fut: std::future::Future<Output = Answered>,
 {
     let mut sent = 0;
@@ -1023,8 +1042,8 @@ where
                     break;
                 }
                 let (a, b) = (random_path(), random_path());
-                let first = fetch(a.clone()).await;
-                let second = fetch(b.clone()).await;
+                let first = fetch(a.clone(), crate::observe::Asked::NotFound).await;
+                let second = fetch(b.clone(), crate::observe::Asked::NotFound).await;
                 sent += 2;
                 host.not_found = NotFound::learn((&a, &first), (&b, &second));
                 let refused = [&first, &second].iter().any(|x| x.status == Some(429));
@@ -1043,7 +1062,7 @@ where
         if sent >= MAX_PATHS {
             break;
         }
-        let answered = fetch(path.clone()).await;
+        let answered = fetch(path.clone(), crate::observe::Asked::Path).await;
         sent += 1;
         let slow_down = answered.status == Some(429);
         let failed = answered.status.is_none_or(|s| s >= 500);

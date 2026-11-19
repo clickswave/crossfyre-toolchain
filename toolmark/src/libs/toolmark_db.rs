@@ -2,7 +2,7 @@
 //! services it found there, and when they changed. Other engines read it through the
 //! `inventory` view.
 
-use crate::observe::{Observation, Observer};
+use crate::observe::{Asked, Observation, Observer};
 use cfx_db::scans::{Key, Running, Status};
 use serde_json::Value;
 use std::io::Write;
@@ -234,6 +234,62 @@ impl ToolmarkDb {
         }
     }
 
+    /// What toolmark kept of each host it has fetched a landing page of: the pages of the
+    /// latest scan that did, and what it has found there.
+    pub async fn kept(&self) -> Result<Vec<KeptHost>, sqlx::Error> {
+        let latest: Vec<(i64, String, String, i32, String)> = sqlx::query_as(
+            "SELECT DISTINCT ON (o.host_id) o.host_id, o.scan_id, h.host, h.port, h.scheme \
+             FROM observations o JOIN hosts h ON h.id = o.host_id WHERE o.asked = 'landing' \
+             ORDER BY o.host_id, o.observed_at DESC, o.id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::new();
+        for (host_id, scan, host, port, scheme) in latest {
+            let rows: Vec<KeptRow> = sqlx::query_as(
+                "SELECT asked, url, status, moved, headers::text, body FROM observations \
+                 WHERE scan_id = $1 AND host_id = $2 ORDER BY id",
+            )
+            .bind(&scan)
+            .bind(host_id)
+            .fetch_all(&self.pool)
+            .await?;
+            let pages = rows
+                .into_iter()
+                .filter_map(|(asked, url, status, moved, headers, body)| {
+                    let headers: Vec<(String, Option<String>)> =
+                        serde_json::from_str(&headers).unwrap_or_default();
+                    Some(Kept {
+                        asked: Asked::from_str(&asked)?,
+                        url,
+                        status: u16::try_from(status).ok()?,
+                        moved,
+                        headers: headers
+                            .into_iter()
+                            .filter_map(|(name, value)| Some((name, value?)))
+                            .collect(),
+                        body: body.as_deref().map(gunzipped).unwrap_or_default(),
+                    })
+                })
+                .collect();
+            let found =
+                sqlx::query_as("SELECT product, version FROM fingerprints WHERE host_id = $1")
+                    .bind(host_id)
+                    .fetch_all(&self.pool)
+                    .await?
+                    .into_iter()
+                    .collect();
+            out.push(KeptHost {
+                host,
+                port: u16::try_from(port).unwrap_or_default(),
+                scheme,
+                pages,
+                found,
+            });
+        }
+        Ok(out)
+    }
+
     /// What this daemon answers a `scans` request with: its scans, none of which can be
     /// taken up again.
     pub async fn scans(&self) -> Value {
@@ -248,6 +304,40 @@ impl ToolmarkDb {
             keep_body: !cfx_db::scans::carries_credentials(&params.to_string()),
         }
     }
+}
+
+/// A page a scan kept: what it was asked for, where, and what came back.
+pub struct Kept {
+    pub asked: Asked,
+    pub url: String,
+    pub status: u16,
+    pub moved: bool,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+/// What toolmark kept of one host: the pages of the latest scan that fetched its landing
+/// page, and the version of each product it has found there, empty for none.
+pub struct KeptHost {
+    pub host: String,
+    pub port: u16,
+    pub scheme: String,
+    pub pages: Vec<Kept>,
+    pub found: std::collections::BTreeMap<String, String>,
+}
+
+/// One kept page as the observations table holds it: what it was asked for, its URL,
+/// status, whether it moved, its headers as JSON text, and its gzipped body.
+type KeptRow = (String, String, i32, bool, String, Option<Vec<u8>>);
+
+/// `body` as it was before it was gzipped, read no further than a fingerprint reads.
+fn gunzipped(body: &[u8]) -> Vec<u8> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    let _ = flate2::read::GzDecoder::new(body)
+        .take(8 * 1024 * 1024)
+        .read_to_end(&mut out);
+    out
 }
 
 /// One row of the inventory view: host, port, vendor, product, version, CPE and when it
@@ -306,13 +396,16 @@ impl Observer for ScanObserver {
                 .host(&mut tx, o.host, i64::from(o.port), o.scheme)
                 .await?;
             sqlx::query(
-                "INSERT INTO observations (scan_id, host_id, url, status, headers, body, body_length) \
-                 VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)",
+                "INSERT INTO observations \
+                 (scan_id, host_id, asked, url, status, moved, headers, body, body_length) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9)",
             )
             .bind(scan)
             .bind(host)
+            .bind(o.asked.as_str())
             .bind(cfx_db::scans::safe_url(o.url))
             .bind(i32::from(o.status))
+            .bind(o.moved)
             .bind(Value::Array(headers).to_string())
             .bind(body)
             .bind(o.body.len() as i64)

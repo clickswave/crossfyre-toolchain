@@ -9,6 +9,7 @@ mod fingerprint;
 mod inventory;
 mod libs;
 mod observe;
+mod rematch;
 mod services;
 mod signatures;
 
@@ -92,6 +93,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             tokio::task::spawn_blocking(move || cfx_tui::scans::show("TOOLMARK", &scans, tui))
                 .await??;
             Ok(())
+        }
+        Some(Commands::Rematch) => {
+            let req = serde_json::json!({"operation": "rematch", "response": "stream"});
+            let label = "the pages toolmark kept".to_string();
+            send_stream(&daemon, req, cfx_tui::wanted(cli.no_tui), label).await
         }
         Some(Commands::Inventory) => {
             let answer = dguard::answer(&daemon, "inventory").await?;

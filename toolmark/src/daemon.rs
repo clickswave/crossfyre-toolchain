@@ -102,6 +102,11 @@ async fn handle_connection(
             "scans" => write_line(&mut writer, &db.scans().await).await?,
             // What it knows runs where.
             "inventory" => write_line(&mut writer, &db.inventory().await).await?,
+            // The signatures it has now, over the pages it kept, and nothing sent.
+            "rematch" => {
+                handle_rematch(&mut writer, &db).await?;
+                return Ok(());
+            }
             "resume" => {
                 write_line(
                     &mut writer,
@@ -188,6 +193,23 @@ async fn handle_fingerprint(
     let (tx, rx) = mpsc::unbounded_channel::<Value>();
     let op = dguard::spawn_busy(async move {
         fingerprint::run(fp, tx, observer).await;
+    });
+    forward(op, rx, writer, db, scan).await
+}
+
+/// Run the signatures toolmark has now over the pages it kept, and keep what is new as
+/// a fingerprint's findings are kept.
+async fn handle_rematch(
+    writer: &mut OwnedWriteHalf,
+    db: &ToolmarkDb,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let scan = db
+        .start("rematch", "the pages toolmark kept", &serde_json::json!({}))
+        .await;
+    let (tx, rx) = mpsc::unbounded_channel::<Value>();
+    let kept = db.clone();
+    let op = dguard::spawn_busy(async move {
+        crate::rematch::run(&kept, crate::signatures::Signatures::shipped(), tx).await;
     });
     forward(op, rx, writer, db, scan).await
 }
