@@ -46,6 +46,8 @@ impl AmbuloDb {
         &self.pool
     }
 
+    /// What probe `operation_id` of `url` found, kept for `volatility_hours`, with no
+    /// credential in the URL.
     // Column-for-column mirror of the table it writes; splitting it into a struct
     // would add a type whose only job is to be destructured immediately.
     #[allow(clippy::too_many_arguments)]
@@ -64,7 +66,7 @@ impl AmbuloDb {
              VALUES ($1, $2, $3, $4, $5, $6, NOW() + ($7 || ' hours')::INTERVAL)",
         )
         .bind(operation_id)
-        .bind(url)
+        .bind(cfx_db::scans::safe_url(url))
         .bind(status)
         .bind(code)
         .bind(body_length)
@@ -326,12 +328,7 @@ impl Store for ScanStore {
         if LOG_LEVELS.iter().position(|l| *l == level).unwrap_or(0) < self.min_level {
             return;
         }
-        let _ = sqlx::query("INSERT INTO logs (scan_id, level, message) VALUES ($1, $2, $3)")
-            .bind(&self.scan_id)
-            .bind(level)
-            .bind(message)
-            .execute(&self.pool)
-            .await;
+        let _ = cfx_db::scans::log(&self.pool, Some(&self.scan_id), level, message).await;
     }
 }
 

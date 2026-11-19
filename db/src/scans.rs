@@ -114,7 +114,9 @@ pub fn safe_text(text: &str) -> String {
             line.split(' ')
                 .map(|word| {
                     if word.contains("://") {
-                        safe_url(word)
+                        // Punctuation after a URL, as in "(url)" or "url,", is not part of it.
+                        let url = word.trim_end_matches([')', ']', '>', ',', '.', ';', '"', '\'']);
+                        format!("{}{}", safe_url(url), &word[url.len()..])
                     } else {
                         word.to_string()
                     }
@@ -635,6 +637,10 @@ mod tests {
         assert_eq!(
             safe_text("[200] FOUND https://u:p@app.example/a?access_token=x1&q=2#f"),
             "[200] FOUND https://app.example/a?access_token=&q=2#f"
+        );
+        assert_eq!(
+            safe_text("error sending request for url (http://app.example/a?token=x1)"),
+            "error sending request for url (http://app.example/a?token=)"
         );
         assert_eq!(safe_text("Set-Cookie: sid=abc"), "Set-Cookie: [not kept]");
         assert_eq!(safe_text("x-session-id: 42"), "x-session-id: [not kept]");
