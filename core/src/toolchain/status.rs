@@ -6,7 +6,8 @@ use super::config::is_extension_installed;
 use super::{ENGINES, service, sudo_user};
 use std::path::Path;
 
-fn port_open(port: u16) -> bool {
+/// Whether something answers on 127.0.0.1:`port`.
+pub(crate) fn port_open(port: u16) -> bool {
     std::net::TcpStream::connect_timeout(
         &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
         std::time::Duration::from_millis(300),

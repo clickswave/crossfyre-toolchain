@@ -552,6 +552,36 @@ pub fn open_lock(path: &Path, mode: u32) -> io::Result<File> {
     Ok(File::from(fd))
 }
 
+/// Opens `path` to append to, creating it with `mode` if it is missing, without following
+/// a link on the way there or at `path` itself, and hands it to `owner`. Anything but a
+/// regular file is refused, as is a file with a second name or one that belongs to an
+/// account other than root and `owner`.
+pub fn open_append(path: &Path, mode: u32, owner: (u32, u32)) -> io::Result<File> {
+    let (dirs, name) = split(path)?;
+    let dir = open_dir(&dirs, false, None)?;
+    // O_NONBLOCK so a FIFO at that name cannot hang the open.
+    let fd = openat(
+        dir.as_raw_fd(),
+        &name,
+        libc::O_WRONLY
+            | libc::O_APPEND
+            | libc::O_CREAT
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
+            | libc::O_NOCTTY,
+        mode & 0o7777,
+    )
+    .map_err(|e| refused_link(e, dir.as_raw_fd(), &name, path))?;
+    let st = fstat(fd.as_raw_fd())?;
+    if !is_file(&st) || st.st_nlink > 1 || (st.st_uid != 0 && st.st_uid != owner.0) {
+        return Err(invalid(
+            "it is not a file of its own that belongs to its account",
+        ));
+    }
+    check(unsafe { libc::fchown(fd.as_raw_fd(), owner.0, owner.1) })?;
+    Ok(File::from(fd))
+}
+
 /// Opens the log a root service writes, appending, for a directory of its own that
 /// only this account may change: the directory is made if missing and then set to
 /// 0755 and this account's, and the file to 0640 and `group` (when given) so that

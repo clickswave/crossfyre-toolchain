@@ -730,7 +730,8 @@ fn report_cfx_script(result: Result<HelperOutcome, Box<dyn std::error::Error>>) 
 
 /// Install one or more extensions ("ambulo" | "all"). Download + verify +
 /// register the daemon service. The service is created but only started by
-/// `install_and_start` (or an explicit `crossfyre service start`).
+/// `install_and_start` (or an explicit `crossfyre extension start`). Where no service
+/// manager runs, no service is made, and `crossfyre node up` runs the engines.
 pub async fn install(extension: &str, force: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Fetched only for an engine that is ours to download: one a package installed needs
     // nothing from the release.
@@ -762,9 +763,15 @@ fn adopt_packaged(ext: &str, m: Manager, quiet: bool) -> Result<(), Box<dyn std:
         )
         .into());
     }
-    service::refresh_service_file(ext)?;
     if !quiet {
         title("Crossfyre extension install", ext);
+    }
+    if service::user_manager_started() {
+        service::refresh_service_file(ext)?;
+    } else {
+        service::say_node_up_runs_engines();
+    }
+    if !quiet {
         ok(&format!("{ext} is {}", update_note(m)));
         end();
     }
@@ -796,7 +803,12 @@ async fn install_one(
             ));
         }
         // Its unit may be one another release wrote.
-        let refreshed = service::refresh_service_file(ext);
+        let refreshed = if service::user_manager_started() {
+            service::refresh_service_file(ext).map(|_| ())
+        } else {
+            service::say_node_up_runs_engines();
+            Ok(())
+        };
         if !quiet {
             if let Err(e) = &refreshed {
                 fail(&format!(
@@ -845,7 +857,9 @@ async fn install_one(
         ok(&format!("{ext} {} installed", comp.version));
     }
 
-    if let Err(e) = service::create_service_file(ext)
+    if !service::user_manager_started() {
+        service::say_node_up_runs_engines();
+    } else if let Err(e) = service::create_service_file(ext)
         && !quiet
     {
         fail(&format!(
@@ -861,15 +875,20 @@ async fn install_one(
     Ok(())
 }
 
-/// One-step install used by `crossfyre install`, `init`, and the dashboard's
-/// install-extension path: download + verify + enable + start.
-pub async fn install_and_start(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
-    install(ext, false).await?;
+/// One-step install used by `crossfyre extension install`, `node init`, and the
+/// dashboard's install-extension path: download, verify, and enable and start its
+/// service. Whether it was started: where no service manager runs, it is left for
+/// `crossfyre node up` to run.
+pub async fn install_and_start(ext: &str, force: bool) -> Result<bool, Box<dyn std::error::Error>> {
+    install(ext, force).await?;
+    if !service::user_manager_started() {
+        return Ok(false);
+    }
     for e in super::resolve_extensions(ext)? {
         service::enable(e)?;
         service::start(e)?;
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Remove one or more extensions: stop + disable + deregister + delete binary.

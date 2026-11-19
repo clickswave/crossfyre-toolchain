@@ -286,6 +286,30 @@ pub fn write_for_invoking_user(
     }
 }
 
+/// Open `path` to append to, made with `mode` if it is missing, owned by the invoking
+/// user. As root no link is followed on the way there or at `path`, and a file of another
+/// account's, or with a second name, is refused (see [`super::root_fs::open_append`]).
+pub fn append_for_invoking_user(
+    path: &std::path::Path,
+    mode: u32,
+) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    if root_guards() {
+        let owner = sudo_user_info().map_or((0, 0), |(uid, gid, _, _)| (uid, gid));
+        return super::root_fs::open_append(path, mode, owner);
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(mode);
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    options.open(path)
+}
+
 /// Rename `from` to `to`. As root, a link below a directory another account can change
 /// is not followed on the way to either.
 pub fn rename(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {

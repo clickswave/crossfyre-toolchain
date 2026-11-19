@@ -272,8 +272,12 @@ fn external_password(host: &str, user: &str) -> Result<String, Box<dyn std::erro
 }
 
 /// Restart the installed engine daemons, whose open connections are to the database
-/// config.toml named when they started.
+/// config.toml named when they started. Where no service manager runs them, `crossfyre
+/// node up` does, and starts each again itself once config.toml names another database.
 pub fn restart_engines() {
+    if !super::service::user_manager_runs() {
+        return;
+    }
     for ext in super::ENGINES.iter().map(|e| e.name) {
         if super::config::is_extension_installed(ext) && super::service::has_service_file(ext) {
             if let Err(e) = super::service::restart(ext) {

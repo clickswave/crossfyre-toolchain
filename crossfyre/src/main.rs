@@ -644,15 +644,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             ExtensionAction::List => cfx_core::toolchain::status::extensions()?,
             ExtensionAction::Install { name, force } => match name.as_deref() {
                 Some(ext) => {
-                    if force {
-                        cfx_core::toolchain::install::install(ext, true).await?;
-                        for e in cfx_core::toolchain::resolve_extensions(ext)? {
-                            cfx_core::toolchain::service::enable(e)?;
-                            cfx_core::toolchain::service::start(e)?;
-                        }
-                    } else {
-                        cfx_core::toolchain::install::install_and_start(ext).await?;
-                    }
+                    cfx_core::toolchain::install::install_and_start(ext, force).await?;
                 }
                 None => cfx_core::toolchain::print_extension_usage("install"),
             },

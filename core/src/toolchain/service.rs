@@ -670,39 +670,51 @@ fn host_cli() -> std::path::PathBuf {
         .unwrap_or(stable)
 }
 
-/// Start engine `ext`'s daemon the way its service on macOS or Windows wants it: on its
-/// configured port, told where the toolchain directory is, and with the egress-proxy
-/// variables of the file a systemd unit would have read. Run by the CLI's hidden
-/// `extension host <engine>`, which the launchd agent and the scheduled task name.
+/// Engine `ext`'s daemon as its service runs it: on its configured port, told where the
+/// toolchain directory is, and with the egress-proxy variables of the file a systemd unit
+/// reads. The engine host on macOS and Windows runs it, and so does the node supervisor
+/// where no service manager runs the engines (see `node_engines`).
+pub fn engine_command(ext: &str) -> Result<std::process::Command, String> {
+    let e = super::engine(ext).ok_or_else(|| format!("{ext} is not an engine"))?;
+    let mut cmd = std::process::Command::new(super::config::ext_bin_path(e.name));
+    cmd.args(dguard::daemon_args(super::config::engine_port(e.name)));
+    cmd.env(
+        dguard::TOOLCHAIN_DIR_ENV,
+        super::config::get_toolchain_dir(),
+    );
+    if let Ok(text) = super::sudo_user::read_to_string(&super::config::egress_env_path()) {
+        for (key, value) in env_assignments(&text) {
+            cmd.env(key, value);
+        }
+    }
+    Ok(cmd)
+}
+
+/// Start engine `ext`'s daemon the way its service on macOS or Windows wants it (see
+/// [`engine_command`]). Run by the CLI's hidden `extension host <engine>`, which the
+/// launchd agent and the scheduled task name.
 ///
 /// On macOS this becomes the engine (exec), so launchd supervises the daemon itself. On
 /// Windows it stays to restart the engine when it fails (see `win::host`).
 #[cfg(not(target_os = "linux"))]
 pub fn host(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let e = super::engine(ext).ok_or_else(|| format!("{ext} is not an engine"))?;
-    let bin = super::config::ext_bin_path(e.name);
-    let port = super::config::engine_port(e.name);
-    let mut cmd = std::process::Command::new(&bin);
-    cmd.args(dguard::daemon_args(port));
-    cmd.env(
-        dguard::TOOLCHAIN_DIR_ENV,
-        super::config::get_toolchain_dir(),
-    );
-    if let Ok(text) = std::fs::read_to_string(super::config::egress_env_path()) {
-        for (key, value) in env_assignments(&text) {
-            cmd.env(key, value);
-        }
-    }
+    let cmd = engine_command(ext)?;
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
+        let mut cmd = cmd;
         let err = cmd.exec();
-        Err(format!("could not start {}: {err}", bin.display()).into())
+        Err(format!(
+            "could not start {}: {err}",
+            std::path::Path::new(cmd.get_program()).display()
+        )
+        .into())
     }
     #[cfg(windows)]
     {
-        let log = super::config::logs_dir().join(format!("{}.log", e.name));
-        super::win::host(e.name, cmd, &log)
+        let name = super::engine(ext).map_or(ext, |e| e.name);
+        let log = super::config::logs_dir().join(format!("{name}.log"));
+        super::win::host(name, cmd, &log)
     }
 }
 
@@ -719,6 +731,61 @@ pub fn node_service_exists() -> bool {
 #[cfg(target_os = "linux")]
 pub fn systemd_runs() -> bool {
     std::path::Path::new("/run/systemd/system").is_dir()
+}
+
+/// What an action on an engine's service says where no service manager runs one.
+pub const NODE_UP_RUNS_ENGINES: &str =
+    "no service manager runs here, so `crossfyre node up` runs the engines";
+
+/// Whether the user's service manager runs, to run the engines' units: it answers on a
+/// bus in their runtime directory, which is what an engine's client looks for before it
+/// starts a unit too. WSL without systemd and most containers run none, systemctl binary
+/// or not, and there `crossfyre node up` runs the engines (see `node_engines`). macOS and
+/// Windows always run theirs.
+pub fn user_manager_runs() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        super::linger::user_bus().is_some_and(|bus| bus.exists())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
+/// [`user_manager_runs`], once what starts the user's service manager has had its chance,
+/// for a command about to give the installed engines their units. Where systemd is the
+/// service manager and no engine has a unit yet, lingering is turned on for the user, so
+/// theirs runs whether or not they are logged in and the engines do not stop at their
+/// logout; and where theirs does not answer, it is waited for for a few seconds, as it
+/// may still be starting, as at boot. Asked once in a process.
+pub fn user_manager_started() -> bool {
+    static STARTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *STARTED.get_or_init(|| {
+        #[cfg(target_os = "linux")]
+        if systemd_runs() && ENGINES.iter().any(|e| is_extension_installed(e.name)) {
+            if !ENGINES.iter().any(|e| imp::exists(e.name)) {
+                super::linger::keep_engines_running();
+            } else if !user_manager_runs() {
+                super::linger::wait_for_manager();
+            }
+        }
+        user_manager_runs()
+    })
+}
+
+/// Say, once in a process, that no service manager runs here, so `crossfyre node up` runs
+/// the engines: what an engine's install says where it makes no unit. Not in a command
+/// that renders its own summary (see [`set_quiet`]).
+pub fn say_node_up_runs_engines() {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    if !quiet() {
+        SAID.call_once(|| {
+            super::ui::step(
+                "No service manager runs here, so `crossfyre node up` runs the engines",
+            );
+        });
+    }
 }
 
 /// Is the node service running, once its service manager is done starting it? A
@@ -1167,22 +1234,17 @@ mod imp {
         )
     }
 
+    /// Write engine `ext`'s unit. The user's service manager that runs it was started first
+    /// where it has to be (see `user_manager_started`), lingering included, so the engines
+    /// run whether or not the user is logged in.
     pub fn create(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
         let dir = unit_dir();
         let svc = dguard::unit_name(ext);
-        let first = !super::ENGINES
-            .iter()
-            .any(|e| dir.join(dguard::unit_name(e.name)).exists());
         create_dir_all_for_invoking_user(&dir)?;
         // Written into the user's home as root, and handed back to them. Only this one
         // file: the rest of this directory holds the person's own units, and the ones
         // they enabled are links to files their packages own.
         write_for_invoking_user(&dir.join(&svc), unit_body(ext).as_bytes(), 0o644)?;
-        // The user's service manager has to run whether or not they are logged in, or
-        // the engines start only inside a login and stop at its end.
-        if first {
-            super::super::linger::keep_engines_running();
-        }
         let _ = cmd_as_invoking_user("systemctl")
             .args(["--user", "daemon-reload"])
             .status();
@@ -1194,9 +1256,11 @@ mod imp {
 
     pub fn delete(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
         if remove_unit(&unit_dir(), ext)? {
-            let _ = cmd_as_invoking_user("systemctl")
-                .args(["--user", "daemon-reload"])
-                .status();
+            if super::user_manager_runs() {
+                let _ = cmd_as_invoking_user("systemctl")
+                    .args(["--user", "daemon-reload"])
+                    .status();
+            }
             super::svc_ok(&format!("{} removed", dguard::unit_name(ext)));
         }
         Ok(())
@@ -1214,6 +1278,9 @@ mod imp {
     }
 
     pub fn action(action: &str, ext: &str) -> Result<(), Box<dyn std::error::Error>> {
+        if !super::user_manager_runs() {
+            return Err(super::NODE_UP_RUNS_ENGINES.into());
+        }
         let svc = dguard::unit_name(ext);
         let status = cmd_as_invoking_user("systemctl")
             .args(["--user", action, &svc])
@@ -1228,7 +1295,14 @@ mod imp {
         Ok(())
     }
 
+    /// Where no service manager runs, `crossfyre node up` runs the engine, and it is running
+    /// when it answers on its port.
     pub fn status(ext: &str) -> String {
+        if !super::user_manager_runs() {
+            let port = super::super::config::engine_port(ext);
+            let answers = super::super::status::port_open(port);
+            return if answers { "running" } else { "stopped" }.to_string();
+        }
         let svc = dguard::unit_name(ext);
         match cmd_as_invoking_user("systemctl")
             .args(["--user", "is-active", &svc])

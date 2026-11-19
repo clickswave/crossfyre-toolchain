@@ -1124,11 +1124,15 @@ pub async fn run_boot(
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Booting Crossfyre nodes from {base:?}...");
 
+    // The engines run as units of the user's service manager, or where none runs, as
+    // this supervisor's children (see toolchain::node_engines).
+    let units = toolchain::service::user_manager_started();
+
     // An engine's unit is a file crossfyre generates, and an upgrade by a package
     // manager or by the dashboard leaves the ones another release wrote, so each
     // installed engine's is made this build's before the nodes start.
     for e in toolchain::ENGINES {
-        if !toolchain::config::is_extension_installed(e.name) {
+        if !units || !toolchain::config::is_extension_installed(e.name) {
             continue;
         }
         if let Err(err) = toolchain::service::refresh_service_file(e.name) {
@@ -1171,6 +1175,8 @@ pub async fn run_boot(
         return Err("no node daemons could be started".into());
     }
 
+    let mut engines = toolchain::node_engines::NodeEngines::start();
+
     let mut sigterm = os::StopSignal::new().expect("failed to install SIGTERM handler");
     let mut rescan = tokio::time::interval(BOOT_RESCAN_INTERVAL);
     rescan.tick().await; // consume the immediate first tick
@@ -1185,9 +1191,14 @@ pub async fn run_boot(
     // tick until a shutdown signal arrives.
     loop {
         tokio::select! {
+            // A stop first: the Ctrl+C that ends this ends the engines it runs as well,
+            // which are not to be started again.
+            biased;
             _ = tokio::signal::ctrl_c() => { println!("\n[boot] Ctrl+C received - stopping all nodes..."); break; }
             _ = sigterm.recv() => { println!("\n[boot] {} received - stopping all nodes...", os::STOP_SIGNAL_NAME); break; }
             _ = rescan.tick() => {
+                engines.tend();
+
                 // 1. Reap children that exited on their own; park them in
                 //    `dead` so we don't respawn a flapping node every tick.
                 let exited: Vec<String> = children.iter_mut()
@@ -1260,6 +1271,7 @@ pub async fn run_boot(
         let _ = child.wait();
         println!("[boot] Node {id} stopped.");
     }
+    engines.stop();
 
     Ok(())
 }
@@ -1814,6 +1826,12 @@ pub async fn run_init(
     // is built in - no external installer involved.
     for ext in &selected_extensions {
         if toolchain::config::is_extension_installed(ext) {
+            // Where no service manager runs, `crossfyre node up` runs it.
+            if !toolchain::service::user_manager_started() {
+                toolchain::service::say_node_up_runs_engines();
+                ok(&format!("{ext} already installed"));
+                continue;
+            }
             // Installed before this node was set up (by an earlier init, by
             // `extension install`, or by a package), which is no promise that its
             // service exists: register it if it does not, then enable and start it,
@@ -1835,8 +1853,9 @@ pub async fn run_init(
             continue;
         }
         working(&format!("Installing {ext}"));
-        match toolchain::install::install_and_start(ext).await {
-            Ok(()) => ok(&format!("{ext} installed and started")),
+        match toolchain::install::install_and_start(ext, false).await {
+            Ok(true) => ok(&format!("{ext} installed and started")),
+            Ok(false) => ok(&format!("{ext} installed")),
             Err(e) => fail(&format!("{ext} install failed: {e}")),
         }
     }
@@ -1940,17 +1959,6 @@ pub async fn run_init(
 /// How `node init` left engine `ext`, with the command that starts it when it is not
 /// running (see [`init_summary::engine_start`]).
 fn engine_part(ext: &str) -> init_summary::Part {
-    // Where systemd is not running, the command its unit would run.
-    #[cfg(target_os = "linux")]
-    let daemon = (!toolchain::service::systemd_runs()).then(|| {
-        format!(
-            "{} {}",
-            toolchain::config::ext_bin_path(ext).display(),
-            dguard::daemon_args(toolchain::config::engine_port(ext)).join(" ")
-        )
-    });
-    #[cfg(not(target_os = "linux"))]
-    let daemon = None;
     init_summary::Part {
         name: ext.to_string(),
         running: toolchain::service::daemon_status(ext) == "running",
@@ -1958,7 +1966,7 @@ fn engine_part(ext: &str) -> init_summary::Part {
             ext,
             toolchain::config::is_extension_installed(ext),
             toolchain::service::has_service_file(ext),
-            daemon,
+            !toolchain::service::user_manager_runs(),
         ),
     }
 }
@@ -2246,9 +2254,11 @@ fn reconcile_ports(ports_json: &serde_json::Value) -> Vec<String> {
             Err(e) => eprintln!("[ports] FAIL restart the database on its new port: {e}"),
         }
     }
-    // Engine port moved: rewrite its unit (ExecStart reads config.toml) + restart.
+    // Engine port moved: rewrite its unit (ExecStart reads config.toml) + restart. Where
+    // no service manager runs, `crossfyre node up` starts the engine again on its new port.
     for ext in changed.iter().filter(|c| c.as_str() != "postgres") {
-        if toolchain::config::is_extension_installed(ext) {
+        if toolchain::config::is_extension_installed(ext) && toolchain::service::user_manager_runs()
+        {
             let _ = toolchain::service::create_service_file(ext);
             let _ = toolchain::service::restart(ext);
         }
@@ -3326,14 +3336,16 @@ pub async fn run_daemon(
                                 println!("\n[install] Installing extension: {ext}");
 
                                 // Built-in package manager: download + verify +
-                                // enable + start in one call.
-                                let msg = match toolchain::install::install_and_start(&ext).await {
-                                    Ok(()) => {
-                                        println!("[install] OK {ext} installed and started");
+                                // enable + start in one call. Where no service manager
+                                // runs, `crossfyre node up` starts it within seconds.
+                                let msg = match toolchain::install::install_and_start(&ext, false).await {
+                                    Ok(started) => {
+                                        let and = if started { " and started" } else { "" };
+                                        println!("[install] OK {ext} installed{and}");
                                         serde_json::json!({
                                             "type": "extension_installed",
                                             "extension": ext,
-                                            "started": true,
+                                            "started": started,
                                             "node_id": &node_id
                                         })
                                     }

@@ -32,20 +32,15 @@ pub(crate) struct Summary {
 const NODE_UP: &str = "crossfyre node up";
 
 /// The command that starts engine `name` when it is not running: `extension install`
-/// when it is not installed, or forced when it is installed without a service; `daemon`,
-/// its own daemon command, where nothing runs services; and otherwise its service,
-/// through `extension start`.
-pub(crate) fn engine_start(
-    name: &str,
-    installed: bool,
-    registered: bool,
-    daemon: Option<String>,
-) -> String {
-    match (installed, daemon) {
+/// when it is not installed, or forced when it is installed without a service;
+/// `crossfyre node up` where no service manager runs services (`node_up`), since the node
+/// supervisor runs the engines there; and otherwise its service, through `extension start`.
+pub(crate) fn engine_start(name: &str, installed: bool, registered: bool, node_up: bool) -> String {
+    match (installed, node_up) {
         (false, _) => format!("crossfyre extension install {name}"),
-        (true, Some(daemon)) => daemon,
-        (true, None) if !registered => format!("crossfyre extension install --force {name}"),
-        (true, None) => format!("crossfyre extension start {name}"),
+        (true, true) => NODE_UP.to_string(),
+        (true, false) if !registered => format!("crossfyre extension install --force {name}"),
+        (true, false) => format!("crossfyre extension start {name}"),
     }
 }
 
@@ -247,27 +242,24 @@ mod tests {
 
     #[test]
     fn an_engine_is_started_by_what_will_start_it_here() {
-        let daemon = || Some("/opt/crossfyre/bin/voyage daemon --port 4442".to_string());
         assert_eq!(
-            engine_start("voyage", true, true, None),
+            engine_start("voyage", true, true, false),
             "crossfyre extension start voyage"
         );
         assert_eq!(
-            engine_start("voyage", true, false, None),
+            engine_start("voyage", true, false, false),
             "crossfyre extension install --force voyage"
         );
         assert_eq!(
-            engine_start("voyage", false, false, None),
+            engine_start("voyage", false, false, false),
             "crossfyre extension install voyage"
         );
-        // Without a service manager its service cannot run, and neither can the command
-        // that would start it: the daemon is started by hand.
+        // Where no service manager runs, `crossfyre node up` runs the engines, with or
+        // without a unit an earlier install left.
+        assert_eq!(engine_start("voyage", true, true, true), NODE_UP);
+        assert_eq!(engine_start("voyage", true, false, true), NODE_UP);
         assert_eq!(
-            engine_start("voyage", true, true, daemon()),
-            "/opt/crossfyre/bin/voyage daemon --port 4442"
-        );
-        assert_eq!(
-            engine_start("voyage", false, false, daemon()),
+            engine_start("voyage", false, false, true),
             "crossfyre extension install voyage"
         );
     }

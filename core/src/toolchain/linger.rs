@@ -160,7 +160,7 @@ pub fn keep_engines_running() {
     if !super::service::systemd_runs() {
         return;
     }
-    let Some((uid, name)) = engine_account() else {
+    let Some((_, name)) = engine_account() else {
         return;
     };
     match turn_on(&Loginctl, &name, &record_path()) {
@@ -181,7 +181,19 @@ pub fn keep_engines_running() {
             return;
         }
     }
-    wait_for(Path::new(&format!("/run/user/{uid}/bus")), BUS_WAIT);
+    wait_for_manager();
+}
+
+/// Where the engine account's service manager listens when it runs: on a bus in its
+/// runtime directory.
+pub fn user_bus() -> Option<PathBuf> {
+    engine_account().map(|(uid, _)| PathBuf::from(format!("/run/user/{uid}/bus")))
+}
+
+/// Wait a few seconds for the engine account's service manager to answer on its bus, as
+/// it does once lingering is turned on, or at boot once it has started. Whether it does.
+pub fn wait_for_manager() -> bool {
+    user_bus().is_some_and(|bus| wait_for(&bus, BUS_WAIT))
 }
 
 /// For `crossfyre uninstall`: turn lingering off for the invoking user when crossfyre

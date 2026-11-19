@@ -16,6 +16,7 @@ pub mod install;
 #[cfg(target_os = "linux")]
 pub mod linger;
 pub mod node_config;
+pub mod node_engines;
 pub mod oast;
 pub mod packaging;
 pub mod release_http;

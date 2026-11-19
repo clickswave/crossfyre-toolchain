@@ -31,9 +31,10 @@ const SAY_AFTER: Duration = Duration::from_secs(1);
 /// How many of the last lines a daemon wrote are shown when it does not answer.
 const LAST_LINES: usize = 20;
 
-/// How large a daemon's log may grow. It is only ever appended to, so a client starting a
-/// daemon into a larger one starts it over, and keeps no older copy.
-const LOG_LIMIT: u64 = 10 * 1024 * 1024;
+/// How large a daemon's log may grow. It is only ever appended to, so whoever starts a
+/// daemon into a larger one, its client or the node supervisor, starts it over, and keeps
+/// no older copy.
+pub const LOG_LIMIT: u64 = 10 * 1024 * 1024;
 
 /// The arguments that run an engine's binary as its daemon on `port`, as its unit, its
 /// service on macOS and Windows, `node init` and a client starting one all give them.
