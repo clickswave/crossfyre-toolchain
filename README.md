@@ -97,7 +97,7 @@ A wordlist can be any file you can read: the command line reads it and sends its
 
 In a terminal every engine's `scan` draws a live dashboard, and so do `toolmark services` and `plessor inject`. `--no-tui` prints JSON instead, and `exec` always does. Piped or redirected, every engine writes newline-delimited JSON, one event per line, and exits non-zero if the run ends in an error. `voyage`, `doorward` and `ambulo` save findings as they go, so a stopped scan resumes where it left off. Add `--help` to any command for the rest.
 
-From 0.1.38, `crossfyre completions <shell>` prints a completion script for bash, zsh, fish, powershell or elvish: `crossfyre completions bash > ~/.local/share/bash-completion/completions/crossfyre`. Each engine takes the same command, as in `voyage completions zsh`.
+From 0.1.38, `crossfyre completions <shell>` prints a completion script for bash, zsh, fish, powershell or elvish: `mkdir -p ~/.local/share/bash-completion/completions && crossfyre completions bash > ~/.local/share/bash-completion/completions/crossfyre`. Each engine takes the same command, as in `voyage completions zsh`.
 
 From 0.1.38, `crossfyre mcp` serves `toolmark` and `plessor` to an MCP client over stdio, so an agent can fingerprint a service, test endpoints for injection and replay single requests, and refuses any destination that a scope file you write does not list. See [crossfyre/MCP.md](crossfyre/MCP.md).
 

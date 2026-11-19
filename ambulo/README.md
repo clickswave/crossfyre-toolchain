@@ -58,7 +58,7 @@ Kali), or point it at a database you run with `crossfyre db external`. The root
 - `--random-user-agent-request` rotate the UA per request
 - `--save-response-body` keep bodies for later inspection
 
-Run `ambulo scan --help` for the full list. Stored runs live under `ambulo db`.
+Run `ambulo scan --help` for the full list. `ambulo db --full-reset` deletes every stored run.
 
 ## Notes
 
