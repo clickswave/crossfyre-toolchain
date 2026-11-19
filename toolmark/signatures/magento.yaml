@@ -7,3 +7,6 @@ detect:
   any:
     - cookie: { name: '(?i)^X-Magento' }
     - html: { regex: '(?i)Mage\.Cookies|/static/version|/mage/' }
+    - all:
+        - html: { regex: '/static/frontend/' }
+        - html: { regex: 'Magento_' }

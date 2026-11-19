@@ -11,6 +11,8 @@ detect:
     - header: { name: server, regex: '(?i)tomcat|coyote' }
     - html: { regex: '(?i)Apache Tomcat/[0-9]' }
     - not_found: { regex: '(?i)Apache Tomcat/[0-9]' }
+    - path: { path: /docs/, regex: '(?i)<title>Apache Tomcat [0-9]' }
 version:
   - html: { regex: '(?i)Apache Tomcat/([0-9]+(?:\.[0-9]+)*)' }
   - not_found: { regex: '(?i)Apache Tomcat/([0-9]+(?:\.[0-9]+)*)' }
+  - path: { path: /docs/, regex: '(?i)<title>Apache Tomcat [0-9]+ \(([0-9]+(?:\.[0-9]+)*)\)' }

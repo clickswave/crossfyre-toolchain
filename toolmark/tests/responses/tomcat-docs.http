@@ -1,0 +1,16 @@
+# Synthetic: A Java application on Tomcat with a 404 page of its own and no Server header. Tomcat's
+# documentation, left installed, is in tomcat-docs/.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Payroll</title>
+</head>
+<body>
+<div id="app-shell"></div>
+</body>
+</html>

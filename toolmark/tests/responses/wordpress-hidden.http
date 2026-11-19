@@ -1,0 +1,16 @@
+# Synthetic: A WordPress site whose landing page, served from a static cache, names nothing of
+# WordPress. Its login page, in wordpress-hidden/, does.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Studio</title>
+</head>
+<body>
+<div class="studio"></div>
+</body>
+</html>

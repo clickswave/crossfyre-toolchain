@@ -1,0 +1,8 @@
+# Synthetic: The start of Drupal's core script.
+HTTP/1.1 200 OK
+content-type: application/javascript
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+(function (Drupal, drupalSettings, drupalTranslations, console, Proxy, Reflect) {
+  Drupal.behaviors = {};
+})(Drupal, window.drupalSettings);

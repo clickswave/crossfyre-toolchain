@@ -1,0 +1,10 @@
+# Synthetic: The start of Joomla 4.4's core manifest, which anyone can read.
+HTTP/1.1 200 OK
+content-type: text/xml
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<?xml version="1.0" encoding="UTF-8"?>
+<extension type="file" method="upgrade">
+<name>files_joomla</name>
+<version>4.4.0</version>
+</extension>

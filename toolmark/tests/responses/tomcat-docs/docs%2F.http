@@ -1,0 +1,15 @@
+# Synthetic: The index of the documentation Tomcat 9 installs.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Apache Tomcat 9 (9.0.83) - Documentation Index</title>
+</head>
+<body>
+<div id="content"><h2>Documentation Index</h2></div>
+</body>
+</html>

@@ -6,4 +6,6 @@ implies: [ruby]
 detect:
   any:
     - cookie: { name: '(?i)^_session_id$' }
+    - cookie: { name: '^_[A-Za-z0-9_]+_session$' }
+    - header: { name: x-runtime, regex: '^[0-9]+\.[0-9]+$' }
     - html: { regex: '(?i)csrf-param' }

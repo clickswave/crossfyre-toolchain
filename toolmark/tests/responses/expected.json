@@ -110,6 +110,58 @@
       "version_range": null
     }
   ],
+  "django-admin.http": [
+    {
+      "candidates": [],
+      "category": "Framework",
+      "confidence": 50,
+      "cpe": "",
+      "evidence": [
+        "path /admin/login/: 200"
+      ],
+      "name": "Django",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Django"
+      ],
+      "name": "Python",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "drupal-quiet.http": [
+    {
+      "candidates": [],
+      "category": "CMS",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:drupal:drupal:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "path /core/misc/drupal.js: 200"
+      ],
+      "name": "Drupal",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Drupal"
+      ],
+      "name": "PHP",
+      "version": null,
+      "version_range": null
+    }
+  ],
   "drupal.http": [
     {
       "candidates": [],
@@ -309,6 +361,18 @@
   "gitlab.http": [
     {
       "candidates": [],
+      "category": "Framework",
+      "confidence": 45,
+      "cpe": "",
+      "evidence": [
+        "cookie _gitlab_session"
+      ],
+      "name": "Ruby on Rails",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
       "category": "DevOps",
       "confidence": 70,
       "cpe": "cpe:2.3:a:gitlab:gitlab:*:*:*:*:*:*:*:*",
@@ -326,21 +390,9 @@
       "confidence": 30,
       "cpe": "",
       "evidence": [
-        "implied by GitLab"
+        "implied by Ruby on Rails"
       ],
       "name": "Ruby",
-      "version": null,
-      "version_range": null
-    },
-    {
-      "candidates": [],
-      "category": "Implied",
-      "confidence": 30,
-      "cpe": "",
-      "evidence": [
-        "implied by GitLab"
-      ],
-      "name": "Ruby on Rails",
       "version": null,
       "version_range": null
     }
@@ -531,6 +583,32 @@
       ],
       "name": "Joomla",
       "version": "1.5",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Joomla"
+      ],
+      "name": "PHP",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "joomla-quiet.http": [
+    {
+      "candidates": [],
+      "category": "CMS",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:joomla:joomla\\!:4.4.0:*:*:*:*:*:*:*",
+      "evidence": [
+        "path /administrator/manifests/files/joomla.xml: 200"
+      ],
+      "name": "Joomla",
+      "version": "4.4.0",
       "version_range": null
     },
     {
@@ -965,6 +1043,19 @@
   "lab-railsgoat.http": [
     {
       "candidates": [],
+      "category": "Framework",
+      "confidence": 95,
+      "cpe": "",
+      "evidence": [
+        "cookie _railsgoat_session",
+        "header x-runtime: 0.010763"
+      ],
+      "name": "Ruby on Rails",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
       "category": "JavaScript Library",
       "confidence": 40,
       "cpe": "cpe:2.3:a:jquery:jquery:3.6.0:*:*:*:*:*:*:*",
@@ -985,6 +1076,18 @@
       ],
       "name": "Bootstrap",
       "version": "5.3.0",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Ruby on Rails"
+      ],
+      "name": "Ruby",
+      "version": null,
       "version_range": null
     }
   ],
@@ -1181,6 +1284,33 @@
       ],
       "name": "Apache HTTP Server",
       "version": "2.4.62",
+      "version_range": null
+    }
+  ],
+  "magento-luma.http": [
+    {
+      "candidates": [],
+      "category": "CMS",
+      "confidence": 50,
+      "cpe": "",
+      "evidence": [
+        "body pattern",
+        "body pattern"
+      ],
+      "name": "Magento",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Magento"
+      ],
+      "name": "PHP",
+      "version": null,
       "version_range": null
     }
   ],
@@ -1501,10 +1631,11 @@
     {
       "candidates": [],
       "category": "Framework",
-      "confidence": 70,
+      "confidence": 100,
       "cpe": "",
       "evidence": [
         "cookie _session_id",
+        "header x-runtime: 0.012000",
         "body pattern"
       ],
       "name": "Ruby on Rails",
@@ -1753,6 +1884,32 @@
       "version_range": null
     }
   ],
+  "tomcat-docs.http": [
+    {
+      "candidates": [],
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:apache:tomcat:9.0.83:*:*:*:*:*:*:*",
+      "evidence": [
+        "path /docs/: 200"
+      ],
+      "name": "Apache Tomcat",
+      "version": "9.0.83",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Apache Tomcat"
+      ],
+      "name": "Java",
+      "version": null,
+      "version_range": null
+    }
+  ],
   "tomcat-error-page.http": [
     {
       "candidates": [],
@@ -1853,6 +2010,44 @@
         "since": "5.0",
         "until": null
       }
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by WordPress"
+      ],
+      "name": "PHP",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by WordPress"
+      ],
+      "name": "MySQL",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "wordpress-hidden.http": [
+    {
+      "candidates": [],
+      "category": "CMS",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:wordpress:wordpress:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "path /wp-login.php: 200"
+      ],
+      "name": "WordPress",
+      "version": null,
+      "version_range": null
     },
     {
       "candidates": [],
