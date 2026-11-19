@@ -44,7 +44,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             send_stream(
                 &daemon,
                 req,
-                cfx_tui::wanted(cli.tui, cli.no_tui, false),
+                cfx_tui::wanted(cli.no_tui),
                 args.target.clone(),
             )
             .await
@@ -58,13 +58,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "timeout_ms": args.timeout_ms,
             });
             let label = args.targets.join(", ");
-            send_stream(
-                &daemon,
-                req,
-                cfx_tui::wanted(cli.tui, cli.no_tui, false),
-                label,
-            )
-            .await
+            send_stream(&daemon, req, cfx_tui::wanted(cli.no_tui), label).await
         }
         Some(Commands::Exec(args)) => {
             let mut payload: serde_json::Value =
@@ -73,13 +67,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 payload["response"] = serde_json::json!("stream");
             }
             let target = payload["target"].as_str().unwrap_or("").to_string();
-            send_stream(
-                &daemon,
-                payload,
-                cfx_tui::wanted(cli.tui, cli.no_tui, false),
-                target,
-            )
-            .await
+            send_stream(&daemon, payload, false, target).await
         }
         Some(Commands::Completions { shell }) => {
             let mut script = Vec::new();

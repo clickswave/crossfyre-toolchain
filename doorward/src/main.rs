@@ -130,7 +130,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let total = ack.total.unwrap_or(0);
     let poll_timeout = scan_args.event_poll_timeout;
 
-    if cfx_tui::wanted(cli.tui, cli.no_tui, true) {
+    if cfx_tui::wanted(cli.no_tui) {
         let (tx, rx) = mpsc::unbounded_channel::<StreamEvent>();
         tokio::spawn(async move {
             while let Ok(Some(line)) = lines.next_line().await {

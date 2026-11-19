@@ -22,7 +22,7 @@ daemon.
 The dashboard is on by default when stdout is a terminal, and off when it is
 not, so piping or redirecting a scan gives you the daemon's newline-delimited
 JSON rather than escape sequences. `--no-tui` forces the JSON path even in a
-terminal, and `--tui` is accepted for symmetry with the other engines.
+terminal.
 
 ## Handy flags
 

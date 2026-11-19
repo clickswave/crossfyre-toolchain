@@ -18,16 +18,14 @@ plessor daemon
 # scan a target through it
 plessor scan https://example.com
 
-# same run, with the live dashboard
-plessor --tui scan https://example.com
+# same run, as JSON in the terminal
+plessor scan https://example.com --no-tui
 ```
 
-`--no-tui` is accepted for symmetry with the other engines; here JSON is
-already the default.
-
-`--tui` brings up the shared toolchain dashboard, with findings ordered by
-severity so a critical sits at the top the moment it is confirmed. It is
-ignored when output is piped, so the node and any scripts still get JSON.
+In a terminal, `scan` and `inject` bring up the shared toolchain dashboard, with
+findings ordered by severity so a critical sits at the top the moment it is
+confirmed. `--no-tui` prints the events as JSON instead, which is what piped or
+redirected output always gets, so the node and any scripts still get JSON.
 
 Every finding streams back as a JSON event. plessor only emits a finding after it
 re-issues the request and gets the same result twice, so what you get out is the set

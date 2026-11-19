@@ -47,13 +47,9 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = 4442)]
     pub port: u16,
 
-    /// Show the live dashboard instead of streaming JSON. Ignored when stdout is
-    /// not a terminal, so piping still produces parseable output.
-    #[arg(long, default_value_t = false)]
-    pub tui: bool,
-
-    /// Never draw the dashboard; stream newline-delimited JSON instead.
-    #[arg(long, default_value_t = false)]
+    /// Never draw the dashboard; stream newline-delimited JSON instead, as piped or
+    /// redirected output always gets
+    #[arg(long, global = true, default_value_t = false)]
     pub no_tui: bool,
 
     /// Never start the daemon: when it is not running, say so and stop. Setting
@@ -400,5 +396,14 @@ mod tests {
         assert_eq!(args.passive_only(), Ok(None));
         let args = scan_args(&["voyage", "scan", "example.com", "--disable-passive-enum"]).unwrap();
         assert!(args.passive_only().is_err());
+    }
+
+    #[test]
+    fn no_tui_goes_before_or_after_the_command_and_tui_is_gone() {
+        let parsed = |argv: &[&str]| Cli::try_parse_from(argv).expect("parses").no_tui;
+        assert!(parsed(&["voyage", "--no-tui", "scan", "example.com"]));
+        assert!(parsed(&["voyage", "scan", "example.com", "--no-tui"]));
+        assert!(!parsed(&["voyage", "scan", "example.com"]));
+        assert!(Cli::try_parse_from(["voyage", "--tui", "scan", "example.com"]).is_err());
     }
 }

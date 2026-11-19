@@ -228,7 +228,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| fuzz_args.wordlist_path.clone());
 
-    let tui = cfx_tui::wanted(cli.tui, cli.no_tui, true);
+    let tui = cfx_tui::wanted(cli.no_tui);
     for url in &fuzz_args.url {
         scan_url(&daemon, &fuzz_args, url, &wordlist_abs, tui).await?;
     }

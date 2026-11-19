@@ -14,13 +14,9 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = 4445)]
     pub port: u16,
 
-    /// Show a live dashboard instead of streaming JSON. Ignored when stdout is
-    /// not a terminal, so piping still produces parseable output.
-    #[arg(long, default_value_t = false)]
-    pub tui: bool,
-
-    /// Never draw the dashboard; stream newline-delimited JSON instead.
-    #[arg(long, default_value_t = false)]
+    /// Never draw the dashboard; stream newline-delimited JSON instead, as piped or
+    /// redirected output always gets
+    #[arg(long, global = true, default_value_t = false)]
     pub no_tui: bool,
 
     /// Never start the daemon: when it is not running, say so and stop. Setting
@@ -123,5 +119,14 @@ mod tests {
             Cli::try_parse_from(["plessor", "--daemon"]).is_err(),
             "the old flag"
         );
+    }
+
+    #[test]
+    fn no_tui_goes_before_or_after_the_command_and_tui_is_gone() {
+        let parsed = |argv: &[&str]| Cli::try_parse_from(argv).expect("parses").no_tui;
+        assert!(parsed(&["plessor", "--no-tui", "scan", "example.com"]));
+        assert!(parsed(&["plessor", "scan", "example.com", "--no-tui"]));
+        assert!(!parsed(&["plessor", "scan", "example.com"]));
+        assert!(Cli::try_parse_from(["plessor", "--tui", "scan", "example.com"]).is_err());
     }
 }

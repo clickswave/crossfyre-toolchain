@@ -18,16 +18,14 @@ toolmark daemon
 # scan a target through the running daemon
 toolmark scan https://example.com
 
-# same run, with the live dashboard instead of JSON
-toolmark --tui scan https://example.com
+# same run, as JSON in the terminal
+toolmark scan https://example.com --no-tui
 ```
 
-`--no-tui` is accepted for symmetry with the other engines; here JSON is
-already the default.
-
-`--tui` brings up the shared toolchain dashboard: findings sorted into
-technologies, services and CVE leads as they arrive. It is ignored when output
-is piped, so scripts still get clean JSON.
+In a terminal, `scan` and `services` bring up the shared toolchain dashboard:
+findings sorted into technologies, services and CVE leads as they arrive.
+`--no-tui` prints the events as JSON instead, which is what piped or redirected
+output always gets, so scripts still get clean JSON.
 
 `exec` sends a raw JSON op to the daemon and streams the events back, which is what
 the node uses under the hood:

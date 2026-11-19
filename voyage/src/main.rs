@@ -137,7 +137,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|_| enum_args.wordlist_path.clone())
     };
 
-    let tui = cfx_tui::wanted(cli.tui, cli.no_tui, true);
+    let tui = cfx_tui::wanted(cli.no_tui);
     for domain in &enum_args.domain {
         scan_domain(&daemon, &enum_args, domain, &wordlist_abs, tui).await?;
     }
