@@ -1,0 +1,17 @@
+# Synthetic: Express's own 404 for a GET it has no route for.
+HTTP/1.1 404 Not Found
+content-security-policy: default-src 'none'
+x-content-type-options: nosniff
+content-type: text/html; charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Error</title>
+</head>
+<body>
+<pre>Cannot GET /missing</pre>
+</body>
+</html>

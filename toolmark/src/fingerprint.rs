@@ -532,11 +532,13 @@ mod redirect_tests {
                 );
             }
         });
+        // A quiet scan, so the landing page is the only page asked for.
         let params: FpParams = serde_json::from_value(json!({
             "target": format!("http://127.0.0.1:{port}/"),
             "evasive": false,
             "favicon": false,
             "timeout_ms": 3000,
+            "depth_tier": 1,
         }))
         .unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();

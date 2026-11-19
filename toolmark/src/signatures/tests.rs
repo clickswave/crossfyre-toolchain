@@ -431,7 +431,7 @@ fn only_a_path_that_could_change_an_answer_is_worth_asking() {
     );
     host.not_found = NotFound::Honest;
     let mut order = Vec::new();
-    while let Some(path) = host.next_path() {
+    while let Some(Next::Path(path)) = host.next() {
         order.push(path.clone());
         host.asked.insert(path, status(200, "v2.1"));
     }
@@ -453,11 +453,14 @@ fn only_a_path_that_could_change_an_answer_is_worth_asking() {
         "",
         STANDARD,
     );
-    assert_eq!(host.next_path().as_deref(), Some("/supported"));
+    assert_eq!(host.next(), Some(Next::NotFound));
+    let mut host = host;
+    host.not_found = NotFound::Honest;
+    assert_eq!(host.next(), Some(Next::Path("/supported".into())));
 
     // Below the standard tier nothing is asked.
     let host = Host::new(&signatures, "http://host.test/", &headers, &[], "", 1);
-    assert_eq!(host.next_path(), None);
+    assert_eq!(host.next(), None);
 }
 
 /// [`ask`] learns the not-found page first, asks each path once, and stops at the cap,
@@ -598,7 +601,7 @@ fn a_script_is_asked_for_only_when_the_page_loads_it_from_its_own_host() {
 
     // From its own host, by a relative src: the path is asked, query and all.
     let mut own = host("<script src='js/lib.js?v=7'></script>");
-    assert_eq!(own.next_path().as_deref(), Some("/app/js/lib.js?v=7"));
+    assert_eq!(own.next(), Some(Next::Path("/app/js/lib.js?v=7".into())));
     own.asked.insert(
         "/app/js/lib.js?v=7".into(),
         status(200, "/* lib-marker Lib v1.4.2 */"),
@@ -607,7 +610,7 @@ fn a_script_is_asked_for_only_when_the_page_loads_it_from_its_own_host() {
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].version.as_deref(), Some("1.4.2"));
     assert_eq!(found[0].evidence, ["script /app/js/lib.js?v=7: 200"]);
-    assert_eq!(own.next_path(), None);
+    assert_eq!(own.next(), None);
 
     // A 404 for it is the script not being there.
     let mut gone = host("<script src='/js/lib.js'></script>");
@@ -616,11 +619,85 @@ fn a_script_is_asked_for_only_when_the_page_loads_it_from_its_own_host() {
 
     // From another host: nothing is asked, and it stays unknown.
     let elsewhere = host("<script src='https://cdn.test/lib.js'></script>");
-    assert_eq!(elsewhere.next_path(), None);
+    assert_eq!(elsewhere.next(), None);
     assert_eq!(elsewhere.outcomes()[0].1.answer, Answer::Unknown);
 
     // Not loaded at all: absent, and nothing is asked.
     let none = host("<script src='/other.js'></script>");
-    assert_eq!(none.next_path(), None);
+    assert_eq!(none.next(), None);
     assert_eq!(none.outcomes()[0].1.answer, Answer::Absent);
+}
+
+/// `not_found` reads what the host answered for the first random path. Nothing else asks
+/// for it, yet the two random paths are asked for it alone, and only when its answer
+/// could change one. A 403 or a 5xx for a random path is the host refusing or failing,
+/// and proves nothing.
+#[tokio::test]
+async fn an_error_page_leaf_reads_the_not_found_page() {
+    let files = [(
+        "server.yaml".to_string(),
+        "id: server\ninfo: { name: Server, category: Test }\n\
+         detect: { any: [ { header: { name: server, regex: 'server' } }, \
+                          { not_found: { regex: 'Server/[0-9]' } } ] }\n\
+         version: [ { not_found: { regex: 'Server/([0-9.]+)' } } ]\n"
+            .to_string(),
+    )];
+    let files: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(f, t)| (f.as_str(), t.as_str()))
+        .collect();
+    let signatures = set(&files);
+    let scan = |server: &'static str, answer: fn() -> Answered| {
+        let signatures = &signatures;
+        async move {
+            let headers = [("server".to_string(), server.to_string())];
+            let mut host = Host::new(signatures, "http://host.test/", &headers, &[], "", STANDARD);
+            let sent = ask(&mut host, |_| std::future::ready(answer())).await;
+            let found: Vec<(String, Option<String>, Vec<String>)> = host
+                .detections()
+                .into_iter()
+                .map(|d| (d.name, d.version, d.evidence))
+                .collect();
+            (sent, found)
+        }
+    };
+    let page = || status(404, "<hr><address>Server/2.4 at host.test</address>");
+
+    // Nothing on the landing page: the not-found page decides, and gives the version.
+    assert_eq!(
+        scan("other", page).await,
+        (
+            2,
+            vec![(
+                "Server".into(),
+                Some("2.4".into()),
+                vec!["not-found page: 404".into()]
+            )]
+        )
+    );
+    // Found from its header without a version: asked for the version, and once asked the
+    // not-found page is evidence too.
+    assert_eq!(
+        scan("server", page).await,
+        (
+            2,
+            vec![(
+                "Server".into(),
+                Some("2.4".into()),
+                vec!["header server: server".into(), "not-found page: 404".into()]
+            )]
+        )
+    );
+    // Another server's not-found page: absent.
+    assert_eq!(
+        scan("other", || status(404, "<h1>Not Found</h1>")).await,
+        (2, vec![])
+    );
+    // Refused: nothing is proved either way.
+    let (_, found) = scan("other", || status(403, "Server/2.4")).await;
+    assert!(found.is_empty(), "{found:?}");
+    let mut host = Host::new(&signatures, "http://host.test/", &[], &[], "", STANDARD);
+    host.not_found = NotFound::Unusable;
+    host.not_found_page = Some(status(403, "Server/2.4"));
+    assert_eq!(host.outcomes()[0].1.answer, Answer::Unknown);
 }

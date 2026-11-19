@@ -221,6 +221,7 @@ fn leaf(kind: &str, value: Value, version: bool) -> Result<Leaf, String> {
         ScriptSrc,
         Path,
         Script,
+        NotFound,
     }
     let known = match kind {
         "header" => Kind::Header,
@@ -230,6 +231,7 @@ fn leaf(kind: &str, value: Value, version: bool) -> Result<Leaf, String> {
         "script_src" => Kind::ScriptSrc,
         "path" => Kind::Path,
         "script" => Kind::Script,
+        "not_found" => Kind::NotFound,
         other => return Err(format!("unknown leaf `{other}`")),
     };
     let spec: LeafSpec = serde_yaml::from_value(value).map_err(|e| format!("{kind}: {e}"))?;
@@ -297,6 +299,16 @@ fn leaf(kind: &str, value: Value, version: bool) -> Result<Leaf, String> {
             let src = compile(&needs(spec.src, "a src, which its script's src matches")?)?;
             let regex = compile(&needs(spec.regex, "a regex")?)?;
             (Source::Script(src), Some(regex), 50)
+        }
+        Kind::NotFound => {
+            refuse(&spec.name, "name")?;
+            refuse(&spec.path, "path")?;
+            refuse(&spec.src, "src")?;
+            (
+                Source::NotFound,
+                Some(compile(&needs(spec.regex, "a regex")?)?),
+                40,
+            )
         }
         Kind::Path => {
             refuse(&spec.name, "name")?;
@@ -456,6 +468,13 @@ mod tests {
                 ),
             ),
             (
+                "not-found-path.yaml".into(),
+                format!(
+                    "id: not-found-path\n{}",
+                    x("detect: { not_found: { regex: 'x', path: /y } }\n")
+                ),
+            ),
+            (
                 "path-version.yaml".into(),
                 format!(
                     "id: path-version\n{}",
@@ -538,6 +557,7 @@ mod tests {
                 "this script_src leaf has no src",
             ),
             ("header-with-src.yaml", "this header leaf has no src"),
+            ("not-found-path.yaml", "this not_found leaf has no path"),
             ("path-version.yaml", "a version leaf needs a regex"),
             ("implies-missing.yaml", "it implies nowhere"),
             ("implies-left-out.yaml", "it implies implies-missing"),

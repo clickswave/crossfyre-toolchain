@@ -1,0 +1,14 @@
+# Synthetic: nginx 1.24's own 404 page, passed through Cloudflare.
+HTTP/1.1 404 Not Found
+date: Fri, 20 Nov 2026 06:00:00 GMT
+content-type: text/html
+server: cloudflare
+cf-ray: 8e1f2a3b4c5d6e80-BOM
+
+<html>
+<head><title>404 Not Found</title></head>
+<body>
+<center><h1>404 Not Found</h1></center>
+<hr><center>nginx/1.24.0</center>
+</body>
+</html>

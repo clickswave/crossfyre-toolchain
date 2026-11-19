@@ -1,0 +1,11 @@
+# Synthetic: A Node.js application on Express with X-Powered-By turned off. The 404 for
+# a path it does not have, in express-quiet/, is Express's own.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Board</title></head>
+<body><div id="board"></div></body>
+</html>

@@ -12,6 +12,19 @@
       "version": "17.0.8"
     }
   ],
+  "apache-behind-balancer.http": [
+    {
+      "candidates": [],
+      "category": "Web Server",
+      "confidence": 40,
+      "cpe": "cpe:2.3:a:apache:http_server:2.4.58:*:*:*:*:*:*:*",
+      "evidence": [
+        "not-found page: 404"
+      ],
+      "name": "Apache HTTP Server",
+      "version": "2.4.58"
+    }
+  ],
   "apache-php-in-server.http": [
     {
       "candidates": [],
@@ -99,6 +112,30 @@
         "implied by Drupal"
       ],
       "name": "PHP",
+      "version": null
+    }
+  ],
+  "express-quiet.http": [
+    {
+      "candidates": [],
+      "category": "Framework",
+      "confidence": 40,
+      "cpe": "cpe:2.3:a:openjsf:express:*:*:*:*:*:node.js:*:*",
+      "evidence": [
+        "not-found page: 404"
+      ],
+      "name": "Express",
+      "version": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Express"
+      ],
+      "name": "Node.js",
       "version": null
     }
   ],
@@ -1016,6 +1053,31 @@
       "version": null
     }
   ],
+  "nginx-behind-cloudflare.http": [
+    {
+      "candidates": [],
+      "category": "Web Server",
+      "confidence": 40,
+      "cpe": "cpe:2.3:a:f5:nginx:1.24.0:*:*:*:*:*:*:*",
+      "evidence": [
+        "not-found page: 404"
+      ],
+      "name": "Nginx",
+      "version": "1.24.0"
+    },
+    {
+      "candidates": [],
+      "category": "CDN",
+      "confidence": 100,
+      "cpe": "",
+      "evidence": [
+        "header server: cloudflare",
+        "header cf-ray: 8e1f2a3b4c5d6e7f-BOM"
+      ],
+      "name": "Cloudflare",
+      "version": null
+    }
+  ],
   "nginx-version-in-error-page.http": [
     {
       "candidates": [],
@@ -1200,6 +1262,30 @@
         "body pattern"
       ],
       "name": "Squarespace",
+      "version": null
+    }
+  ],
+  "tomcat-app.http": [
+    {
+      "candidates": [],
+      "category": "Web Server",
+      "confidence": 40,
+      "cpe": "cpe:2.3:a:apache:tomcat:9.0.83:*:*:*:*:*:*:*",
+      "evidence": [
+        "not-found page: 404"
+      ],
+      "name": "Apache Tomcat",
+      "version": "9.0.83"
+    },
+    {
+      "candidates": [],
+      "category": "Language",
+      "confidence": 45,
+      "cpe": "",
+      "evidence": [
+        "cookie JSESSIONID"
+      ],
+      "name": "Java",
       "version": null
     }
   ],

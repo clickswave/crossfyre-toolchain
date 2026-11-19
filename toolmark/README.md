@@ -75,23 +75,26 @@ version:
 
 A leaf reads a response header (`header`), the name of each cookie set (`cookie`), a
 meta tag (`meta`), the first 60,000 bytes of the body (`html`) or the `src` of each
-script (`script_src`) on the landing page. Two more each read a request of their own:
+script (`script_src`) on the landing page. Three more each read a request of their own:
 the body the host answers for another path (`path`, which matches its `regex` or, with
-none, only has to be there), and the content of a script the landing page loads from the
-host's own origin (`script`, whose `src` picks the script and whose `regex` reads it).
-Every leaf answers present, absent or unknown, and `all`, `any` and `none` combine the
-answers, nested as deep as needed. A product is reported when its `detect` is present.
-Each leaf that holds it up adds to the confidence, 50, 45, 60, 25, 40, 50 and 50 by kind
-unless the leaf sets its own `confidence`, up to 100. The first `version` leaf that
-matches gives the version from its first group, and `vendor` and `product` make the CPE.
+none, only has to be there), the content of a script the landing page loads from the
+host's own origin (`script`, whose `src` picks the script and whose `regex` reads it),
+and the page the host answers for a path it does not have (`not_found`, an error page
+that often names the server and its version). Every leaf answers present, absent or
+unknown, and `all`, `any` and `none` combine the answers, nested as deep as needed. A
+product is reported when its `detect` is present. Each leaf that holds it up adds to the
+confidence, 50, 45, 60, 25, 40, 50, 50 and 40 by kind unless the leaf sets its own
+`confidence`, up to 100. The first `version` leaf that matches gives the version from
+its first group, and `vendor` and `product` make the CPE.
 
-A `path` or a `script` is a request the landing page did not need, so it is sent from
-the standard depth tier up, and only when its answer could still change what is
-reported. A script from another host is never fetched, and leaves its leaf unknown. Each
-path is asked once per host, and a host is asked for 20 at most. Before the first, two
-random paths learn what the host answers for a page it does not have. A path is absent
-only on a 404, a 410 or that same page. A 401, 403, 429, 5xx, redirect or timeout proves
-nothing, and leaves it unknown.
+A `path`, a `script` or a `not_found` is a request the landing page did not need, so it
+is sent from the standard depth tier up, and only when its answer could still change
+what is reported. A script from another host is never fetched, and leaves its leaf
+unknown. An error page answered with a 401, 403, 429 or 5xx proves nothing either way.
+Each path is asked once per host, and a host is asked for 20 at most. Before the first,
+two random paths learn what the host answers for a page it does not have. A path is
+absent only on a 404, a 410 or that same page. A 401, 403, 429, 5xx, redirect or timeout
+proves nothing, and leaves it unknown.
 
 `refines: other-id` makes a signature a more specific form of another. When both are
 present only the refining one is reported. When the evidence that would tell them apart

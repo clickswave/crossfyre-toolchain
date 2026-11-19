@@ -6,10 +6,13 @@ info:
     vendor: apache
     product: http_server
 detect:
-  all:
-    - header: { name: server, regex: '(?i)apache' }
-    - none:
-        - header: { name: server, regex: '(?i)coyote' }
+  any:
+    - all:
+        - header: { name: server, regex: '(?i)apache' }
+        - none:
+            - header: { name: server, regex: '(?i)coyote' }
+    - not_found: { regex: '<address>Apache(?:/[0-9.]+)?(?: \([^)]*\))? Server at ' }
 version:
   - header: { name: server, regex: '(?i)apache/([0-9.]+)' }
   - html: { regex: '(?i)apache/([0-9.]+)' }
+  - not_found: { regex: '<address>Apache/([0-9]+(?:\.[0-9]+)*)' }

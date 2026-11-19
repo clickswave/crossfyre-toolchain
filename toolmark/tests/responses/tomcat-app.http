@@ -1,0 +1,12 @@
+# Synthetic: A Java application on Tomcat 9, which sends no Server header. Its own
+# pages do not name Tomcat; the 404 for a path it does not have, in tomcat-app/, does.
+HTTP/1.1 200 OK
+set-cookie: JSESSIONID=
+content-type: text/html;charset=UTF-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Claims</title></head>
+<body><form action="login" method="post"><input name="user"></form></body>
+</html>

@@ -8,7 +8,7 @@
 //! Each piece of evidence, a leaf, answers present, absent or unknown, and `all`, `any`
 //! and `none` combine the answers. What the landing page shows is passive. A `path` leaf
 //! is one more request to the host, made from the standard tier up and only when its
-//! answer could still change one (see [`Host::next_path`] and [`ask`]).
+//! answer could still change one (see [`Host::next`] and [`ask`]).
 
 mod files;
 mod load;
@@ -64,13 +64,16 @@ enum Source {
     /// The content of the first script the landing page loads from its own host whose
     /// `src` matches this, asked for on its own.
     Script(Regex),
+    /// What the host answers for a path it does not have: the first of the two random
+    /// paths that learn its not-found page.
+    NotFound,
 }
 
 impl Source {
     /// The depth tier a scan needs for this evidence to be looked at.
     fn tier(&self) -> u8 {
         match self {
-            Source::Path(_) | Source::Script(_) => STANDARD,
+            Source::Path(_) | Source::Script(_) | Source::NotFound => STANDARD,
             _ => 0,
         }
     }
@@ -78,7 +81,7 @@ impl Source {
     /// Whether this evidence is read from a request of its own rather than from the
     /// landing page.
     fn asks(&self) -> bool {
-        matches!(self, Source::Path(_) | Source::Script(_))
+        matches!(self, Source::Path(_) | Source::Script(_) | Source::NotFound)
     }
 }
 
@@ -360,7 +363,11 @@ impl<'a> Page<'a> {
                 .map(|(_, value)| value.as_str()),
             Source::Meta(name) => self.metas.get(name.as_str()).and_then(|c| c.as_deref()),
             Source::Html => Some(self.html),
-            Source::Cookie | Source::ScriptSrc | Source::Path(_) | Source::Script(_) => None,
+            Source::Cookie
+            | Source::ScriptSrc
+            | Source::Path(_)
+            | Source::Script(_)
+            | Source::NotFound => None,
         }
     }
 
@@ -429,7 +436,18 @@ pub struct Host<'a> {
     /// How each leaf on the landing page answered, by the leaf's address.
     passive: HashMap<usize, (Answer, Option<String>)>,
     not_found: NotFound,
+    /// What the host answered for the first random path, once asked.
+    not_found_page: Option<Answered>,
     asked: BTreeMap<String, Answered>,
+}
+
+/// What a host is asked next.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Next {
+    /// The two random paths that learn its not-found page.
+    NotFound,
+    /// This path.
+    Path(String),
 }
 
 impl<'a> Host<'a> {
@@ -487,6 +505,7 @@ impl<'a> Host<'a> {
             tier,
             passive,
             not_found: NotFound::Unasked,
+            not_found_page: None,
             asked: BTreeMap::new(),
         }
     }
@@ -518,11 +537,33 @@ impl<'a> Host<'a> {
         }
     }
 
+    /// The host's not-found page and its status, when it can be read: a 404, a 410 or a
+    /// 2xx, not moved. A 401, 403, 429 or 5xx for a random path is the host refusing or
+    /// failing, not its not-found page, and proves nothing.
+    fn not_found_page(&self) -> Option<(u16, &str)> {
+        let page = self.not_found_page.as_ref()?;
+        let status = page
+            .status
+            .filter(|s| !page.moved && (gone(*s) || (200..300).contains(s)))?;
+        Some((status, page.body.as_str()))
+    }
+
     /// How `leaf` answers here, and its evidence when present. A leaf above the scan's
     /// tier is unknown, as is a request not made yet.
     fn answer(&self, leaf: &Leaf) -> (Answer, Option<String>) {
         if leaf.source.tier() > self.tier {
             return (Answer::Unknown, None);
+        }
+        if let Source::NotFound = leaf.source {
+            let Some((status, body)) = self.not_found_page() else {
+                return (Answer::Unknown, None);
+            };
+            return match &leaf.regex {
+                Some(regex) if regex.is_match(body) => {
+                    (Answer::Present, Some(format!("not-found page: {status}")))
+                }
+                _ => (Answer::Absent, None),
+            };
         }
         let path = match self.request(leaf) {
             None if !leaf.source.asks() => {
@@ -645,6 +686,13 @@ impl<'a> Host<'a> {
         if let Source::ScriptSrc = leaf.source {
             return self.page.scripts.clone();
         }
+        if let Source::NotFound = leaf.source {
+            return self
+                .not_found_page()
+                .map(|(_, body)| body)
+                .into_iter()
+                .collect();
+        }
         let Some(Request::Ask(path)) = self.request(leaf) else {
             return self.page.text(&leaf.source).into_iter().collect();
         };
@@ -766,14 +814,30 @@ impl<'a> Host<'a> {
         found.into_iter().map(|(_, d)| d).chain(implied).collect()
     }
 
-    /// The next path worth asking, or none: below the standard tier, or once no answer
-    /// left to ask could change what is reported.
+    /// What `leaf` would need asked here before it could answer: the not-found page, a
+    /// path, or nothing, because it has its answer or no request could give one.
+    fn pending(&self, leaf: &Leaf) -> Option<Next> {
+        if leaf.source.tier() > self.tier {
+            return None;
+        }
+        if let Source::NotFound = leaf.source {
+            return matches!(self.not_found, NotFound::Unasked).then_some(Next::NotFound);
+        }
+        match self.request(leaf) {
+            Some(Request::Ask(path)) if !self.asked.contains_key(&path) => Some(Next::Path(path)),
+            _ => None,
+        }
+    }
+
+    /// What to ask next, or nothing: below the standard tier, or once no answer left to
+    /// ask could change what is reported.
     ///
-    /// A path is worth asking when its answer could decide a signature that is unknown,
-    /// or when it is where a signature that is reported without a version reads one.
-    /// Version paths come first, then the paths of signatures with some evidence present
-    /// already, then the rest, each in the order of the files.
-    pub fn next_path(&self) -> Option<String> {
+    /// A request is worth making when its answer could decide a signature that is
+    /// unknown, or when it is where a signature reported without a version reads one.
+    /// The not-found page comes before any path. Version paths come first, then the
+    /// paths of signatures with some evidence present already, then the rest, each in the
+    /// order of the files.
+    pub fn next(&self) -> Option<Next> {
         if self.tier < STANDARD {
             return None;
         }
@@ -785,14 +849,7 @@ impl<'a> Host<'a> {
                     if self.refined(signature, &outcomes) || self.version(signature).is_some() {
                         continue;
                     }
-                    versions.extend(signature.version.iter().find_map(|l| {
-                        match self.request(l).filter(|_| l.source.tier() <= self.tier) {
-                            Some(Request::Ask(path)) if !self.asked.contains_key(&path) => {
-                                Some(path)
-                            }
-                            _ => None,
-                        }
-                    }));
+                    versions.extend(signature.version.iter().find_map(|l| self.pending(l)));
                 }
                 Answer::Unknown => {
                     let Some(detect) = &signature.detect else {
@@ -801,13 +858,11 @@ impl<'a> Host<'a> {
                     let mut leaves = Vec::new();
                     detect.leaves(&mut leaves);
                     let deciding = leaves.into_iter().filter_map(|leaf| {
-                        let Some(Request::Ask(path)) = self.request(leaf) else {
-                            return None;
-                        };
-                        let decides = [Answer::Present, Answer::Absent]
+                        let next = self.pending(leaf)?;
+                        [Answer::Present, Answer::Absent]
                             .into_iter()
-                            .any(|a| self.eval(detect, Some((leaf, a))).answer != Answer::Unknown);
-                        (!self.asked.contains_key(&path) && decides).then_some(path)
+                            .any(|a| self.eval(detect, Some((leaf, a))).answer != Answer::Unknown)
+                            .then_some(next)
                     });
                     let mut support = Vec::new();
                     detect.supporting(&mut support);
@@ -820,15 +875,20 @@ impl<'a> Host<'a> {
                 Answer::Absent => {}
             }
         }
-        versions.into_iter().chain(supported).chain(rest).next()
+        let mut wanted = versions.into_iter().chain(supported).chain(rest).peekable();
+        match (&self.not_found, wanted.peek()) {
+            (_, None) => None,
+            (NotFound::Unasked, Some(_)) => Some(Next::NotFound),
+            _ => wanted.find(|n| matches!(n, Next::Path(_))),
+        }
     }
 }
 
-/// Ask `host`, through `fetch`, for the paths its signatures still need, until none is
+/// Ask `host`, through `fetch`, for what its signatures still need, until nothing is
 /// worth asking, [`MAX_PATHS`] requests have been made, the host says to slow down, or it
-/// has failed three times running. The first path asked is preceded by two random ones,
-/// which learn what the host answers for a path it does not have. Returns how many
-/// requests were made.
+/// has failed three times running. Before any path, two random ones learn what the host
+/// answers for a path it does not have, which is also all an error-page leaf needs.
+/// Returns how many requests were made.
 pub async fn ask<F, Fut>(host: &mut Host<'_>, mut fetch: F) -> usize
 where
     F: FnMut(String) -> Fut,
@@ -836,25 +896,30 @@ where
 {
     let mut sent = 0;
     let mut failing = 0;
-    while let Some(path) = host.next_path() {
-        if let NotFound::Unasked = host.not_found {
-            if sent + 3 > MAX_PATHS {
-                break;
+    while let Some(next) = host.next() {
+        let path = match next {
+            Next::NotFound => {
+                if sent + 2 > MAX_PATHS {
+                    break;
+                }
+                let (a, b) = (random_path(), random_path());
+                let first = fetch(a.clone()).await;
+                let second = fetch(b.clone()).await;
+                sent += 2;
+                host.not_found = NotFound::learn((&a, &first), (&b, &second));
+                let refused = [&first, &second].iter().any(|x| x.status == Some(429));
+                failing = [&first, &second]
+                    .iter()
+                    .filter(|x| x.status.is_none_or(|s| s >= 500))
+                    .count();
+                host.not_found_page = Some(first);
+                if refused {
+                    break;
+                }
+                continue;
             }
-            let (a, b) = (random_path(), random_path());
-            let first = fetch(a.clone()).await;
-            let second = fetch(b.clone()).await;
-            sent += 2;
-            host.not_found = NotFound::learn((&a, &first), (&b, &second));
-            if [&first, &second].iter().any(|x| x.status == Some(429)) {
-                break;
-            }
-            failing = [&first, &second]
-                .iter()
-                .filter(|x| x.status.is_none_or(|s| s >= 500))
-                .count();
-            continue;
-        }
+            Next::Path(path) => path,
+        };
         if sent >= MAX_PATHS {
             break;
         }
