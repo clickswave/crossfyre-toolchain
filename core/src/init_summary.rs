@@ -50,10 +50,19 @@ pub(crate) fn engine_start(
 }
 
 impl Summary {
-    /// Whether `node init` exits zero: the node is running, or `--no-service` left it to
-    /// be started by hand.
+    /// Whether `node init` exits zero: everything it started is running, and the node is
+    /// too, unless `--no-service` left it to be started by hand.
     pub fn succeeded(&self) -> bool {
-        self.node != NodeService::Stopped
+        self.node != NodeService::Stopped && self.down().is_empty()
+    }
+
+    /// The parts that are not running, by name.
+    fn down(&self) -> Vec<&str> {
+        self.parts
+            .iter()
+            .filter(|p| !p.running)
+            .map(|p| p.name.as_str())
+            .collect()
     }
 
     /// One row for the node and one for each part: running, or not running and the
@@ -83,11 +92,21 @@ impl Summary {
     }
 
     /// The line under the rows.
-    pub fn verdict(&self) -> &'static str {
-        match self.node {
-            NodeService::Running => "Node ready",
-            NodeService::Stopped => "Node not running",
-            NodeService::Skipped => "Node not started (--no-service)",
+    pub fn verdict(&self) -> String {
+        let down = self.down();
+        let (rest, verb) = match down.as_slice() {
+            [] => (String::new(), ""),
+            [one] => (one.to_string(), "is"),
+            [first @ .., last] => (format!("{} and {last}", first.join(", ")), "are"),
+        };
+        match (self.node, down.is_empty()) {
+            (NodeService::Stopped, _) => "Node not running".to_string(),
+            (NodeService::Running, true) => "Node ready".to_string(),
+            (NodeService::Running, false) => format!("Node running, but {rest} {verb} not"),
+            (NodeService::Skipped, true) => "Node not started (--no-service)".to_string(),
+            (NodeService::Skipped, false) => {
+                format!("Node not started (--no-service), and {rest} {verb} not running")
+            }
         }
     }
 
@@ -97,13 +116,14 @@ impl Summary {
             println!("{line}");
         }
         end();
-        match self.node {
-            NodeService::Running => {
-                done(self.verdict());
-                hint("Run `crossfyre node status` to see it running.");
-            }
-            NodeService::Stopped => error(self.verdict()),
-            NodeService::Skipped => hint(self.verdict()),
+        let verdict = self.verdict();
+        if !self.succeeded() {
+            error(&verdict);
+        } else if self.node == NodeService::Running {
+            done(&verdict);
+            hint("Run `crossfyre node status` to see it running.");
+        } else {
+            hint(&verdict);
         }
         end();
     }
@@ -140,7 +160,22 @@ mod tests {
     }
 
     #[test]
-    fn a_running_node_is_ready_and_whatever_did_not_start_is_named_with_its_command() {
+    fn a_running_node_with_everything_up_is_ready() {
+        let s = Summary {
+            node: NodeService::Running,
+            parts: vec![
+                part("voyage", true, "crossfyre extension start voyage"),
+                part("database", true, "crossfyre db up"),
+            ],
+        };
+        assert_eq!(s.verdict(), "Node ready");
+        assert!(s.succeeded());
+    }
+
+    /// The node is online, but it cannot do the work it was given, so init fails and
+    /// says what is down.
+    #[test]
+    fn whatever_did_not_start_is_named_with_its_command_and_init_fails() {
         let s = Summary {
             node: NodeService::Running,
             parts: vec![
@@ -158,8 +193,39 @@ mod tests {
                 "    \u{2717} database   not running   \u{203a} crossfyre db up",
             ]
         );
-        assert_eq!(s.verdict(), "Node ready");
-        assert!(s.succeeded());
+        assert_eq!(
+            s.verdict(),
+            "Node running, but doorward and database are not"
+        );
+        assert!(!s.succeeded());
+
+        let one = Summary {
+            node: NodeService::Running,
+            parts: vec![part("database", false, "crossfyre db up")],
+        };
+        assert_eq!(one.verdict(), "Node running, but database is not");
+        assert!(!one.succeeded());
+    }
+
+    /// --no-service leaves the node to be started by hand, which is no failure, but
+    /// what init did start still has to run.
+    #[test]
+    fn without_the_node_service_init_fails_only_on_what_it_started() {
+        let skipped = |running| Summary {
+            node: NodeService::Skipped,
+            parts: vec![
+                part("voyage", running, "crossfyre extension start voyage"),
+                part("toolmark", running, "crossfyre extension start toolmark"),
+                part("database", running, "crossfyre db up"),
+            ],
+        };
+        assert_eq!(skipped(true).verdict(), "Node not started (--no-service)");
+        assert!(skipped(true).succeeded());
+        assert_eq!(
+            skipped(false).verdict(),
+            "Node not started (--no-service), and voyage, toolmark and database are not running"
+        );
+        assert!(!skipped(false).succeeded());
     }
 
     #[test]
