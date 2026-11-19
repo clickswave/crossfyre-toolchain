@@ -1011,6 +1011,79 @@ async fn run_probe(params: ProbeParams, client: Arc<Client>, db: Arc<AmbuloDb>) 
     }
 }
 
+/// Answer a caller while the database is not ready: one error line saying `why`, and
+/// then the end of the connection. What the caller sent is read meanwhile, until it hangs
+/// up or a few seconds pass: a connection closed with any of it unread is reset, and
+/// Windows then gives the caller the reset in place of the line.
+pub(crate) async fn answer_not_ready(sock: TcpStream, why: String) {
+    use tokio::io::AsyncReadExt;
+    let (mut reader, mut writer) = sock.into_split();
+    let msg = serde_json::json!({
+        "type": "error",
+        "message": format!("ambulo is not ready, waiting for its database: {why}"),
+    });
+    let _ = writer.write_all(format!("{msg}\n").as_bytes()).await;
+    let _ = writer.shutdown().await;
+    let mut sent = [0u8; 8192];
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while matches!(reader.read(&mut sent).await, Ok(n) if n > 0) {}
+    })
+    .await;
+}
+
+#[cfg(test)]
+mod not_ready_tests {
+    use super::*;
+
+    /// A caller that sends its request, and words after it as a scan with a wordlist
+    /// does, reads why the daemon cannot serve it yet. Closed with the request unread, the
+    /// connection was reset, and on Windows the caller saw only that.
+    #[tokio::test]
+    async fn a_caller_while_the_database_is_not_ready_reads_why() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            answer_not_ready(sock, "PostgreSQL is not installed here".to_string()).await;
+        });
+        let client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let (reader, mut writer) = client.into_split();
+        writer
+            .write_all(b"{\"operation\":\"scan\",\"wordlist_follows\":true}\n")
+            .await
+            .unwrap();
+        let words = tokio::spawn(async move {
+            let chunk = format!("{{\"words\":[{}]}}\n", vec!["\"word\""; 512].join(","));
+            for _ in 0..64 {
+                if writer.write_all(chunk.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .await
+            .expect("the line saying why");
+        assert!(
+            line.contains(
+                "ambulo is not ready, waiting for its database: PostgreSQL is not installed here"
+            ),
+            "{line}"
+        );
+        // And then the end of the connection, not a reset, which Windows reports in place
+        // of the line it discards.
+        let mut rest = String::new();
+        assert_eq!(
+            reader.read_line(&mut rest).await.map_err(|e| e.kind()),
+            Ok(0)
+        );
+        words.await.unwrap();
+        server.await.unwrap();
+    }
+}
+
 #[cfg(test)]
 mod egress_tests {
     //! The egress wrapper. A fixture that counts its connections sits behind a

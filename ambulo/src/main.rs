@@ -139,19 +139,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 tokio::select! {
                     res = &mut db_fut => break res?,
                     accepted = listener.accept() => {
-                        if let Ok((mut sock, _)) = accepted {
+                        if let Ok((sock, _)) = accepted {
                             let why = not_ready.lock().map(|w| w.clone()).unwrap_or_default();
-                            tokio::spawn(async move {
-                                use tokio::io::AsyncWriteExt;
-                                let msg = serde_json::json!({
-                                    "type": "error",
-                                    "message": format!(
-                                        "ambulo is not ready, waiting for its database: {why}"
-                                    ),
-                                });
-                                let _ = sock.write_all(format!("{msg}\n").as_bytes()).await;
-                                let _ = sock.flush().await;
-                            });
+                            tokio::spawn(daemon::answer_not_ready(sock, why));
                         }
                     }
                 }
