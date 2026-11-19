@@ -1619,6 +1619,8 @@ pub async fn run_node_remove(
     std::process::exit(1);
 }
 
+/// `crossfyre node init`, run by the CLI at `cli_version`, which installs the node's
+/// engines only when it is the release's (see [`toolchain::install::Writer`]).
 pub async fn run_init(
     force: bool,
     api_url: &str,
@@ -1626,6 +1628,7 @@ pub async fn run_init(
     no_service: bool,
     node_key: Option<String>,
     no_prompt: bool,
+    cli_version: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::toolchain::ui::*;
 
@@ -1824,6 +1827,7 @@ pub async fn run_init(
     // Install each extension assigned to this node: download, verify against
     // the release manifest, enable and start its daemon. The package manager
     // is built in - no external installer involved.
+    let writer = toolchain::install::Writer::cli(cli_version);
     for ext in &selected_extensions {
         if toolchain::config::is_extension_installed(ext) {
             // Where no service manager runs, `crossfyre node up` runs it.
@@ -1853,7 +1857,7 @@ pub async fn run_init(
             continue;
         }
         working(&format!("Installing {ext}"));
-        match toolchain::install::install_and_start(ext, false).await {
+        match toolchain::install::install_and_start(ext, false, writer).await {
             Ok(true) => ok(&format!("{ext} installed and started")),
             Ok(false) => ok(&format!("{ext} installed")),
             Err(e) => fail(&format!("{ext} install failed: {e}")),
@@ -3338,7 +3342,8 @@ pub async fn run_daemon(
                                 // Built-in package manager: download + verify +
                                 // enable + start in one call. Where no service manager
                                 // runs, `crossfyre node up` starts it within seconds.
-                                let msg = match toolchain::install::install_and_start(&ext, false).await {
+                                let writer = toolchain::install::Writer::node(node_version);
+                                let msg = match toolchain::install::install_and_start(&ext, false, writer).await {
                                     Ok(started) => {
                                         let and = if started { " and started" } else { "" };
                                         println!("[install] OK {ext} installed{and}");
@@ -3474,7 +3479,8 @@ pub async fn run_daemon(
                                 engine_egress.remove(&ext);
                                 println!("\n[reinstall] Reinstalling extension: {ext}");
 
-                                let success = match toolchain::install::install(&ext, true).await {
+                                let writer = toolchain::install::Writer::node(node_version);
+                                let success = match toolchain::install::install(&ext, true, writer).await {
                                     Ok(()) => {
                                         println!("[reinstall] OK {ext} reinstalled, starting service...");
                                         let _ = toolchain::service::start(&ext);

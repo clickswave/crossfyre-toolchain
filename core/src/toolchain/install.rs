@@ -732,7 +732,14 @@ fn report_cfx_script(result: Result<HelperOutcome, Box<dyn std::error::Error>>) 
 /// register the daemon service. The service is created but only started by
 /// `install_and_start` (or an explicit `crossfyre extension start`). Where no service
 /// manager runs, no service is made, and `crossfyre node up` runs the engines.
-pub async fn install(extension: &str, force: bool) -> Result<(), Box<dyn std::error::Error>> {
+///
+/// `writer` is the CLI or node doing it, which refuses when it is not of the release (see
+/// [`Writer`]).
+pub async fn install(
+    extension: &str,
+    force: bool,
+    writer: Writer<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Fetched only for an engine that is ours to download: one a package installed needs
     // nothing from the release.
     let mut manifest = None;
@@ -742,7 +749,11 @@ pub async fn install(extension: &str, force: bool) -> Result<(), Box<dyn std::er
             continue;
         }
         if manifest.is_none() {
-            manifest = Some(fetch_manifest().await?);
+            let release = fetch_manifest().await?;
+            if let Some(why) = writer.refusal(&release) {
+                return Err(why.into());
+            }
+            manifest = Some(release);
         }
         if let Some(manifest) = &manifest {
             install_one(manifest, ext, force, false).await?;
@@ -877,10 +888,14 @@ async fn install_one(
 
 /// One-step install used by `crossfyre extension install`, `node init`, and the
 /// dashboard's install-extension path: download, verify, and enable and start its
-/// service. Whether it was started: where no service manager runs, it is left for
-/// `crossfyre node up` to run.
-pub async fn install_and_start(ext: &str, force: bool) -> Result<bool, Box<dyn std::error::Error>> {
-    install(ext, force).await?;
+/// service, as `writer` (see [`install`]). Whether it was started: where no service
+/// manager runs, it is left for `crossfyre node up` to run.
+pub async fn install_and_start(
+    ext: &str,
+    force: bool,
+    writer: Writer<'_>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    install(ext, force, writer).await?;
     if !service::user_manager_started() {
         return Ok(false);
     }
@@ -1114,6 +1129,57 @@ fn needs_rights_row(name: &str, mid: &str) -> String {
     )
 }
 
+/// The binary that writes what an engine runs from, its unit above all: the CLI or the
+/// node worker, at the version it is. Only one of the release being installed may write
+/// them, since one of another release writes what its own release runs.
+#[derive(Debug, Clone, Copy)]
+pub struct Writer<'a> {
+    component: &'static str,
+    version: &'a str,
+}
+
+impl<'a> Writer<'a> {
+    /// The crossfyre CLI at `version`.
+    pub fn cli(version: &'a str) -> Self {
+        Self {
+            component: "crossfyre",
+            version,
+        }
+    }
+
+    /// The node worker at `version`.
+    pub fn node(version: &'a str) -> Self {
+        Self {
+            component: "node",
+            version,
+        }
+    }
+
+    /// Why it may not install or update an engine of `manifest`'s release: it is of
+    /// another release, and what replaces it first. None when it is of this one, or the
+    /// release does not name it.
+    fn refusal(&self, manifest: &Manifest) -> Option<String> {
+        let want = manifest_version(manifest, self.component);
+        if want.is_empty() || want == self.version {
+            return None;
+        }
+        let first = match packaging::owner(self.component) {
+            Some(m) => format!("update it with {m}"),
+            None => "run `crossfyre update`".to_string(),
+        };
+        let replaced = if self.component == "node" {
+            "node"
+        } else {
+            "CLI"
+        };
+        Some(format!(
+            "this {} is {}, and the release's is {want}: {first} first, so the {replaced} is \
+             replaced before it writes an engine's unit",
+            self.component, self.version
+        ))
+    }
+}
+
 /// `crossfyre update [self|<ext>|all]`. With no target: update self plus
 /// every installed extension.
 pub async fn update(
@@ -1179,21 +1245,11 @@ async fn update_with(
         Some(ext) => (false, super::resolve_extensions(ext)?),
     };
 
-    // Only a CLI of the release being installed updates the rest, since it writes what
-    // they run from, an engine's unit above all. One of another release replaces itself
-    // first, which an update of one engine does not do.
-    let release_cli = Some(manifest_version(manifest, "crossfyre"))
-        .filter(|want| !want.is_empty() && want != current_version);
-    if !do_self && let Some(want) = &release_cli {
-        let first = match packaging::owner("crossfyre") {
-            Some(m) => format!("update it with {m}"),
-            None => "run `crossfyre update`".to_string(),
-        };
-        return Err(format!(
-            "this crossfyre is {current_version}, and the release's is {want}: {first} first, \
-             so the CLI is replaced before it writes an engine's unit"
-        )
-        .into());
+    // Only a CLI of the release being installed updates the rest (see `Writer`). One of
+    // another release replaces itself first, which an update of one engine does not do.
+    let refusal = Writer::cli(current_version).refusal(manifest);
+    if !do_self && let Some(why) = &refusal {
+        return Err(why.clone().into());
     }
 
     use super::ui::*;
@@ -1285,7 +1341,7 @@ async fn update_with(
         // A CLI of another release that was not replaced here, because a package manager
         // keeps it or replacing it failed, leaves the rest for a run of one that is.
         hold = !handed_over
-            && release_cli.is_some()
+            && refusal.is_some()
             && (ext_bin_path("node").exists()
                 || ext_bin_path(CFX_SCRIPT).exists()
                 || !exts.is_empty());
@@ -2502,6 +2558,30 @@ exit 127"#;
         assert_eq!(
             out.summary(),
             "Nothing was updated: 1 already current, 1 skipped."
+        );
+    }
+
+    /// The dashboard's one command installs the release's CLI with install.sh just before
+    /// `node init`, so node init's engine installs go ahead. A CLI or a node of another
+    /// release refuses them, since it would write the unit its own release writes.
+    #[test]
+    fn only_a_cli_or_node_of_the_release_installs_an_engine() {
+        let m = full_manifest("9.9.9");
+        assert_eq!(Writer::cli("9.9.9").refusal(&m), None);
+        assert_eq!(Writer::node("9.9.9").refusal(&m), None);
+        assert_eq!(
+            Writer::cli("9.9.8").refusal(&m).as_deref(),
+            Some(
+                "this crossfyre is 9.9.8, and the release's is 9.9.9: run `crossfyre update` \
+                 first, so the CLI is replaced before it writes an engine's unit"
+            )
+        );
+        assert_eq!(
+            Writer::node("9.9.8").refusal(&m).as_deref(),
+            Some(
+                "this node is 9.9.8, and the release's is 9.9.9: run `crossfyre update` \
+                 first, so the node is replaced before it writes an engine's unit"
+            )
         );
     }
 

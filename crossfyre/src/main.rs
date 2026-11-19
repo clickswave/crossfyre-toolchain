@@ -592,7 +592,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let api_url = api_url
                     .or_else(|| cfx_core::auth::load_account(&base).map(|a| a.api_url))
                     .unwrap_or_else(|| cfx_core::auth::DEFAULT_API_URL.to_string());
-                cfx_core::run_init(force, &api_url, &base, no_service, node_key, no_prompt).await?;
+                cfx_core::run_init(
+                    force,
+                    &api_url,
+                    &base,
+                    no_service,
+                    node_key,
+                    no_prompt,
+                    env!("CARGO_PKG_VERSION"),
+                )
+                .await?;
             }
             NodeAction::Remove {
                 node_id,
@@ -644,7 +653,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             ExtensionAction::List => cfx_core::toolchain::status::extensions()?,
             ExtensionAction::Install { name, force } => match name.as_deref() {
                 Some(ext) => {
-                    cfx_core::toolchain::install::install_and_start(ext, force).await?;
+                    let writer =
+                        cfx_core::toolchain::install::Writer::cli(env!("CARGO_PKG_VERSION"));
+                    cfx_core::toolchain::install::install_and_start(ext, force, writer).await?;
                 }
                 None => cfx_core::toolchain::print_extension_usage("install"),
             },
