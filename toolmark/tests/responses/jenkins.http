@@ -1,0 +1,18 @@
+# Synthetic: Jenkins refusing an anonymous visitor, with the headers it sends on every answer.
+HTTP/1.1 403 Forbidden
+content-type: text/html; charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+x-jenkins: 2.426.1
+x-jenkins-session: 8f3c2a1b
+x-hudson: 1.395
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Sign in [Jenkins]</title>
+</head>
+<body>
+<form name="login"></form>
+</body>
+</html>

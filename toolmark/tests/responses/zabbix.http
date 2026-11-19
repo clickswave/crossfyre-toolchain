@@ -1,0 +1,15 @@
+# Synthetic: Zabbix's login page.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Zabbix</title>
+</head>
+<body>
+<form method="post"><input type="text" name="name"><input type="password" name="password"></form>
+</body>
+</html>

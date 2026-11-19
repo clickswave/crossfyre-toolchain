@@ -1,0 +1,6 @@
+# Synthetic: What a Consul agent's API says about itself, with no ACL in the way.
+HTTP/1.1 200 OK
+content-type: application/json
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+{"Config":{"Datacenter":"dc1","NodeName":"node-1","Server":true,"Version":"1.16.2"},"Member":{"Name":"node-1","Port":8301}}

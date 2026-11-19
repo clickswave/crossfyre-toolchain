@@ -1,0 +1,17 @@
+# Synthetic: A Symfony application left in debug mode, which sends its profiler's token.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+x-debug-token: a1b2c3
+x-debug-token-link: http://saved.test/_profiler/a1b2c3
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Welcome</title>
+</head>
+<body>
+<div class="sf-toolbar"></div>
+</body>
+</html>

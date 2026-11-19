@@ -1,0 +1,17 @@
+# Synthetic: Kibana's login page, with the headers Kibana sends on every answer.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+kbn-name: kibana
+kbn-version: 8.11.1
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Elastic</title>
+</head>
+<body>
+<div id="kibana-body"></div>
+</body>
+</html>

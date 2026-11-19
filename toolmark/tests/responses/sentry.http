@@ -1,0 +1,15 @@
+# Synthetic: Sentry's login page, where a self-hosted Sentry sends anyone not signed in.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Login | Sentry</title>
+</head>
+<body>
+<form method="post"><input type="hidden" name="csrfmiddlewaretoken" value=""></form>
+</body>
+</html>

@@ -1,0 +1,15 @@
+id: phpmyadmin
+info:
+  name: phpMyAdmin
+  category: Database Admin
+  metadata:
+    vendor: phpmyadmin
+    product: phpmyadmin
+implies: [php]
+detect:
+  any:
+    - html: { regex: 'name="pma_username"' }
+    - path: { path: /phpmyadmin/index.php, regex: 'name="pma_username"' }
+version:
+  - path: { path: /phpmyadmin/index.php, regex: '[?&]v=([0-9]+(?:\.[0-9]+)+)' }
+  - html: { regex: '[?&]v=([0-9]+(?:\.[0-9]+)+)' }

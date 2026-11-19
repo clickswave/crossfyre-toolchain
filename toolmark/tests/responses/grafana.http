@@ -1,0 +1,16 @@
+# Synthetic: Grafana's login page, with its boot data and build information.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Grafana</title>
+</head>
+<body>
+<div id="reactRoot"></div>
+<script>window.grafanaBootData = {"settings":{"appSubUrl":"","buildInfo":{"hideVersion":false,"version":"10.2.3","commit":"1e84fede54"}}};</script>
+</body>
+</html>

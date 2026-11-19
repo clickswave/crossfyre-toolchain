@@ -96,6 +96,38 @@ pub(super) static FILES: &[(&str, &str)] = &[
         "squarespace.yaml",
         include_str!("../../signatures/squarespace.yaml"),
     ),
+    (
+        "spring-boot.yaml",
+        include_str!("../../signatures/spring-boot.yaml"),
+    ),
+    (
+        "symfony.yaml",
+        include_str!("../../signatures/symfony.yaml"),
+    ),
+    (
+        "jenkins.yaml",
+        include_str!("../../signatures/jenkins.yaml"),
+    ),
+    ("gitlab.yaml", include_str!("../../signatures/gitlab.yaml")),
+    (
+        "sonarqube.yaml",
+        include_str!("../../signatures/sonarqube.yaml"),
+    ),
+    ("harbor.yaml", include_str!("../../signatures/harbor.yaml")),
+    (
+        "grafana.yaml",
+        include_str!("../../signatures/grafana.yaml"),
+    ),
+    ("kibana.yaml", include_str!("../../signatures/kibana.yaml")),
+    ("zabbix.yaml", include_str!("../../signatures/zabbix.yaml")),
+    ("sentry.yaml", include_str!("../../signatures/sentry.yaml")),
+    (
+        "phpmyadmin.yaml",
+        include_str!("../../signatures/phpmyadmin.yaml"),
+    ),
+    ("consul.yaml", include_str!("../../signatures/consul.yaml")),
+    ("vault.yaml", include_str!("../../signatures/vault.yaml")),
+    ("minio.yaml", include_str!("../../signatures/minio.yaml")),
     ("java.yaml", include_str!("../../signatures/java.yaml")),
     ("python.yaml", include_str!("../../signatures/python.yaml")),
     ("nodejs.yaml", include_str!("../../signatures/nodejs.yaml")),

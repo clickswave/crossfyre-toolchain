@@ -1,0 +1,9 @@
+id: symfony
+info:
+  name: Symfony
+  category: Framework
+implies: [php]
+detect:
+  any:
+    - header: { name: x-debug-token, regex: '.' }
+    - header: { name: x-debug-token-link, regex: '.' }

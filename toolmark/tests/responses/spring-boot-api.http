@@ -1,0 +1,6 @@
+# Synthetic: The root of a Spring Boot service that answers JSON, which has nothing at /.
+HTTP/1.1 200 OK
+content-type: application/json
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+{"service":"orders","status":"ok"}

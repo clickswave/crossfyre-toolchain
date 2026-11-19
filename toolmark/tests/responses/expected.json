@@ -96,6 +96,20 @@
       "version_range": null
     }
   ],
+  "consul.http": [
+    {
+      "candidates": [],
+      "category": "Service Discovery",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:hashicorp:consul:1.16.2:*:*:*:*:*:*:*",
+      "evidence": [
+        "path /v1/agent/self: 200"
+      ],
+      "name": "HashiCorp Consul",
+      "version": "1.16.2",
+      "version_range": null
+    }
+  ],
   "drupal.http": [
     {
       "candidates": [],
@@ -292,6 +306,59 @@
       "version_range": null
     }
   ],
+  "gitlab.http": [
+    {
+      "candidates": [],
+      "category": "DevOps",
+      "confidence": 70,
+      "cpe": "cpe:2.3:a:gitlab:gitlab:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "cookie _gitlab_session",
+        "body pattern"
+      ],
+      "name": "GitLab",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by GitLab"
+      ],
+      "name": "Ruby",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by GitLab"
+      ],
+      "name": "Ruby on Rails",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "grafana.http": [
+    {
+      "candidates": [],
+      "category": "Monitoring",
+      "confidence": 25,
+      "cpe": "cpe:2.3:a:grafana:grafana:10.2.3:*:*:*:*:*:*:*",
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "Grafana",
+      "version": "10.2.3",
+      "version_range": null
+    }
+  ],
   "gunicorn-django.http": [
     {
       "candidates": [],
@@ -328,6 +395,20 @@
       ],
       "name": "Python",
       "version": null,
+      "version_range": null
+    }
+  ],
+  "harbor.http": [
+    {
+      "candidates": [],
+      "category": "DevOps",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:linuxfoundation:harbor:2.9.1:*:*:*:*:*:*:*",
+      "evidence": [
+        "path /api/v2.0/systeminfo: 200"
+      ],
+      "name": "Harbor",
+      "version": "2.9.1",
       "version_range": null
     }
   ],
@@ -381,6 +462,33 @@
         "implied by Microsoft IIS"
       ],
       "name": "ASP.NET",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "jenkins.http": [
+    {
+      "candidates": [],
+      "category": "DevOps",
+      "confidence": 100,
+      "cpe": "cpe:2.3:a:jenkins:jenkins:2.426.1:*:*:*:*:*:*:*",
+      "evidence": [
+        "header x-jenkins: 2.426.1",
+        "header x-jenkins-session: 8f3c2a1b"
+      ],
+      "name": "Jenkins",
+      "version": "2.426.1",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Jenkins"
+      ],
+      "name": "Java",
       "version": null,
       "version_range": null
     }
@@ -598,6 +706,21 @@
       "version_range": null
     }
   ],
+  "kibana.http": [
+    {
+      "candidates": [],
+      "category": "Monitoring",
+      "confidence": 100,
+      "cpe": "cpe:2.3:a:elastic:kibana:8.11.1:*:*:*:*:*:*:*",
+      "evidence": [
+        "header kbn-name: kibana",
+        "header kbn-version: 8.11.1"
+      ],
+      "name": "Kibana",
+      "version": "8.11.1",
+      "version_range": null
+    }
+  ],
   "lab-bwapp.http": [
     {
       "candidates": [],
@@ -692,7 +815,33 @@
     }
   ],
   "lab-juice-shop.http": [],
-  "lab-log4shell.http": [],
+  "lab-log4shell.http": [
+    {
+      "candidates": [],
+      "category": "Framework",
+      "confidence": 65,
+      "cpe": "cpe:2.3:a:vmware:spring_boot:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "body pattern",
+        "not-found page: 404"
+      ],
+      "name": "Spring Boot",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Spring Boot"
+      ],
+      "name": "Java",
+      "version": null,
+      "version_range": null
+    }
+  ],
   "lab-memos.http": [],
   "lab-mirage.http": [
     {
@@ -1062,6 +1211,20 @@
       "version_range": null
     }
   ],
+  "minio.http": [
+    {
+      "candidates": [],
+      "category": "Object Storage",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:minio:minio:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "header server: MinIO"
+      ],
+      "name": "MinIO",
+      "version": null,
+      "version_range": null
+    }
+  ],
   "nextjs-version-in-page.http": [
     {
       "candidates": [],
@@ -1270,6 +1433,70 @@
       "version_range": null
     }
   ],
+  "phpmyadmin-alias.http": [
+    {
+      "candidates": [],
+      "category": "Database Admin",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:phpmyadmin:phpmyadmin:5.2.1:*:*:*:*:*:*:*",
+      "evidence": [
+        "path /phpmyadmin/index.php: 200"
+      ],
+      "name": "phpMyAdmin",
+      "version": "5.2.1",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by phpMyAdmin"
+      ],
+      "name": "PHP",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "phpmyadmin.http": [
+    {
+      "candidates": [],
+      "category": "JavaScript Library",
+      "confidence": 40,
+      "cpe": "cpe:2.3:a:jquery:jquery:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "script src js/vendor/jquery/jquery.min.js?v=5.2.1"
+      ],
+      "name": "jQuery",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Database Admin",
+      "confidence": 25,
+      "cpe": "cpe:2.3:a:phpmyadmin:phpmyadmin:5.2.1:*:*:*:*:*:*:*",
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "phpMyAdmin",
+      "version": "5.2.1",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by phpMyAdmin"
+      ],
+      "name": "PHP",
+      "version": null,
+      "version_range": null
+    }
+  ],
   "rails.http": [
     {
       "candidates": [],
@@ -1311,6 +1538,45 @@
       "version_range": null
     }
   ],
+  "sentry.http": [
+    {
+      "candidates": [],
+      "category": "Monitoring",
+      "confidence": 50,
+      "cpe": "",
+      "evidence": [
+        "body pattern",
+        "body pattern"
+      ],
+      "name": "Sentry",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Sentry"
+      ],
+      "name": "Python",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Sentry"
+      ],
+      "name": "Django",
+      "version": null,
+      "version_range": null
+    }
+  ],
   "shopify.http": [
     {
       "candidates": [],
@@ -1323,6 +1589,46 @@
         "body pattern"
       ],
       "name": "Shopify",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "sonarqube.http": [
+    {
+      "candidates": [],
+      "category": "DevOps",
+      "confidence": 25,
+      "cpe": "cpe:2.3:a:sonarsource:sonarqube:10.3.0.82913:*:*:*:*:*:*:*",
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "SonarQube",
+      "version": "10.3.0.82913",
+      "version_range": null
+    }
+  ],
+  "spring-boot-api.http": [
+    {
+      "candidates": [],
+      "category": "Framework",
+      "confidence": 40,
+      "cpe": "cpe:2.3:a:vmware:spring_boot:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "not-found page: 404"
+      ],
+      "name": "Spring Boot",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Spring Boot"
+      ],
+      "name": "Java",
       "version": null,
       "version_range": null
     }
@@ -1364,6 +1670,33 @@
         "body pattern"
       ],
       "name": "Squarespace",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "symfony.http": [
+    {
+      "candidates": [],
+      "category": "Framework",
+      "confidence": 100,
+      "cpe": "",
+      "evidence": [
+        "header x-debug-token: a1b2c3",
+        "header x-debug-token-link: http://saved.test/_profiler/a1b2c3"
+      ],
+      "name": "Symfony",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Symfony"
+      ],
+      "name": "PHP",
       "version": null,
       "version_range": null
     }
@@ -1458,6 +1791,20 @@
       ],
       "name": "Varnish",
       "version": null,
+      "version_range": null
+    }
+  ],
+  "vault.http": [
+    {
+      "candidates": [],
+      "category": "Secrets",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:hashicorp:vault:1.15.2:*:*:*:*:*:*:*",
+      "evidence": [
+        "path /v1/sys/health: 200"
+      ],
+      "name": "HashiCorp Vault",
+      "version": "1.15.2",
       "version_range": null
     }
   ],
@@ -1667,6 +2014,33 @@
         "implied by WordPress"
       ],
       "name": "MySQL",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "zabbix.http": [
+    {
+      "candidates": [],
+      "category": "Monitoring",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:zabbix:zabbix:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "body pattern",
+        "body pattern"
+      ],
+      "name": "Zabbix",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Zabbix"
+      ],
+      "name": "PHP",
       "version": null,
       "version_range": null
     }

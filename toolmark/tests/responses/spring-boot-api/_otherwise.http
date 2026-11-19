@@ -1,0 +1,6 @@
+# Synthetic: Spring Boot's default answer, as JSON, for a path the service does not have.
+HTTP/1.1 404 Not Found
+content-type: application/json
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+{"timestamp":"2026-11-20T06:00:00.000+00:00","status":404,"error":"Not Found","path":"/missing"}

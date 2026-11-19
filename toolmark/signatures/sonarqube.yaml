@@ -1,0 +1,12 @@
+id: sonarqube
+info:
+  name: SonarQube
+  category: DevOps
+  metadata:
+    vendor: sonarsource
+    product: sonarqube
+detect:
+  any:
+    - html: { regex: '(?i)<title>\s*SonarQube' }
+version:
+  - path: { path: /api/server/version, regex: '^([0-9]+(?:\.[0-9]+)+)' }

@@ -1,0 +1,11 @@
+# Lab target log4shell at http://127.0.0.1:7009/, answering a path it does not have, as
+# a browser asks for it, on 2026-11-20.
+HTTP/1.1 404 Not Found
+vary: Origin
+vary: Access-Control-Request-Method
+vary: Access-Control-Request-Headers
+content-type: text/html;charset=UTF-8
+content-language: en-US
+date: Thu, 19 Nov 2026 21:50:17 GMT
+
+<html><body><h1>Whitelabel Error Page</h1><p>This application has no explicit mapping for /error, so you are seeing this as a fallback.</p><div id='created'>Thu Nov 19 21:50:17 GMT 2026</div><div>There was an unexpected error (type=Not Found, status=404).</div></body></html>

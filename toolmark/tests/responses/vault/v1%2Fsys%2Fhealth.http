@@ -1,0 +1,6 @@
+# Synthetic: What Vault's health endpoint tells anyone about an unsealed, active node.
+HTTP/1.1 200 OK
+content-type: application/json
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+{"initialized":true,"sealed":false,"standby":false,"performance_standby":false,"replication_performance_mode":"disabled","replication_dr_mode":"disabled","server_time_utc":1763618400,"version":"1.15.2","cluster_name":"vault-cluster-1"}

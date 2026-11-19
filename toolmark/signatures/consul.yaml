@@ -1,0 +1,12 @@
+id: consul
+info:
+  name: HashiCorp Consul
+  category: Service Discovery
+  metadata:
+    vendor: hashicorp
+    product: consul
+detect:
+  any:
+    - path: { path: /v1/agent/self, regex: '(?s)"Config"\s*:\s*\{.*"Member"\s*:' }
+version:
+  - path: { path: /v1/agent/self, regex: '"Version"\s*:\s*"([0-9]+(?:\.[0-9]+)*)' }

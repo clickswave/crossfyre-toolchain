@@ -1,0 +1,14 @@
+id: spring-boot
+info:
+  name: Spring Boot
+  category: Framework
+  metadata:
+    vendor: vmware
+    product: spring_boot
+implies: [java]
+refines: spring
+detect:
+  any:
+    - html: { regex: '<h1>Whitelabel Error Page</h1>' }
+    - not_found: { regex: '<h1>Whitelabel Error Page</h1>' }
+    - not_found: { regex: '"timestamp":[^,]+,"status":404,"error":"Not Found"' }
