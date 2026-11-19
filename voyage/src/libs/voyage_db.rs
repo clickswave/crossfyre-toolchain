@@ -1,5 +1,7 @@
-use sqlx::postgres::PgConnectOptions;
 use sqlx::{FromRow, QueryBuilder};
+
+/// The database voyage keeps its tables in.
+pub const DATABASE: &str = "voyage";
 
 pub struct Work {
     pub entry_id: i64,
@@ -18,60 +20,20 @@ pub struct PassiveResult {
 }
 
 impl VoyageDb {
-    /// Bootstrap: connect to `postgres` maintenance DB, create `voyage` DB if missing,
-    /// then return a pool connected to `voyage`.
-    pub async fn init(
-        host: &str,
-        port: u16,
-        user: &str,
-        password: Option<&str>,
-    ) -> Result<Self, sqlx::Error> {
-        let mut admin_opts = PgConnectOptions::new()
-            .host(host)
-            .port(port)
-            .username(user)
-            .database("postgres");
-        if let Some(pwd) = password {
-            admin_opts = admin_opts.password(pwd);
-        }
-
-        let admin_pool = sqlx::PgPool::connect_with(admin_opts).await?;
-
-        let db_exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = 'voyage')")
-                .fetch_one(&admin_pool)
-                .await?;
-
-        if !db_exists {
-            sqlx::query("CREATE DATABASE voyage")
-                .execute(&admin_pool)
-                .await?;
-        }
-        drop(admin_pool);
-
-        let mut voyage_opts = PgConnectOptions::new()
-            .host(host)
-            .port(port)
-            .username(user)
-            .database("voyage");
-        if let Some(pwd) = password {
-            voyage_opts = voyage_opts.password(pwd);
-        }
-
-        let pool = sqlx::PgPool::connect_with(voyage_opts).await?;
-
-        Ok(Self { pool })
+    /// voyage's tables on `pool`, a pool on [`DATABASE`].
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self { pool }
     }
 
     /// A handle that has never connected and connects only if it is used, for tests
     /// of daemon paths that do not touch the database.
     #[cfg(test)]
     pub fn unconnected() -> Self {
-        let opts = PgConnectOptions::new()
+        let opts = sqlx::postgres::PgConnectOptions::new()
             .host("127.0.0.1")
             .port(1)
             .username("none")
-            .database("voyage");
+            .database(DATABASE);
         Self {
             pool: sqlx::PgPool::connect_lazy_with(opts),
         }

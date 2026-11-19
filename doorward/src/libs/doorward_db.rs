@@ -1,56 +1,16 @@
-use sqlx::postgres::PgPoolOptions;
 use sqlx::{Pool, Postgres};
+
+/// The database doorward keeps its tables in.
+pub const DATABASE: &str = "pulse";
 
 pub struct DoorwardDb {
     pub pool: Pool<Postgres>,
 }
 
 impl DoorwardDb {
-    pub async fn init(
-        host: &str,
-        port: u16,
-        user: &str,
-        password: Option<&str>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let admin_url = match password {
-            Some(pw) => format!("postgresql://{user}:{pw}@{host}:{port}/postgres"),
-            None => format!("postgresql://{user}@{host}:{port}/postgres"),
-        };
-
-        let admin_pool = PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&admin_url)
-            .await?;
-
-        // Create the `pulse` database if it doesn't exist. It keeps the engine's
-        // original name: it holds resumable scan state, and renaming it would drop
-        // every run an operator could still resume.
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = 'pulse')")
-                .fetch_one(&admin_pool)
-                .await?;
-
-        if !exists {
-            sqlx::query("CREATE DATABASE pulse")
-                .execute(&admin_pool)
-                .await?;
-            println!("Created database: pulse");
-        }
-
-        admin_pool.close().await;
-
-        // Connect to the `pulse` database
-        let db_url = match password {
-            Some(pw) => format!("postgresql://{user}:{pw}@{host}:{port}/pulse"),
-            None => format!("postgresql://{user}@{host}:{port}/pulse"),
-        };
-
-        let pool = PgPoolOptions::new()
-            .max_connections(5)
-            .connect(&db_url)
-            .await?;
-
-        Ok(Self { pool })
+    /// doorward's tables on `pool`, a pool on [`DATABASE`].
+    pub fn new(pool: Pool<Postgres>) -> Self {
+        Self { pool }
     }
 
     /// A handle that has never connected and connects only if it is used, for tests
@@ -61,7 +21,7 @@ impl DoorwardDb {
             .host("127.0.0.1")
             .port(1)
             .username("none")
-            .database("pulse");
+            .database(DATABASE);
         Self {
             pool: sqlx::PgPool::connect_lazy_with(opts),
         }

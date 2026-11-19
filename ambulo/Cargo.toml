@@ -23,13 +23,15 @@ impersonate = ["transport/impersonate"]
 
 [dependencies]
 dguard = { path = "../dguard" }
+cfx_db = { path = "../db" }
 adaptive = { path = "../adaptive" }
 transport = { path = "../transport" }
 tokio = { version = "1.47.1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "process", "time"] }
 clap = { version = "4.5.42", features = ["derive"] }
 clap_complete = "4.6.9"
 serde = { version = "1.0.219", features = ["derive"] }
-sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "chrono"] }
+# Its runtime and TLS come with cfx_db, which makes every connection.
+sqlx = { version = "0.8.6", features = ["postgres", "chrono"] }
 sha2 = "0.10.9"
 serde_json = { version = "1.0.142", features = [] }
 reqwest = { version = "0.12.22", default-features = false, features = ["rustls-tls", "http2", "charset", "cookies"] }
@@ -40,8 +42,6 @@ csv = { version = "1.3.1"}
 regex = "1"
 uuid = { version = "1.18.0", features = ["v4"] }
 base64 = "0.22.1"
-toml = "0.8"
-dirs = "5"
 dialoguer = "0.11"
 
 [target.'cfg(unix)'.dependencies]

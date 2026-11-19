@@ -20,18 +20,18 @@ tuning = ["cfx_tui/tuning"]
 
 [dependencies]
 dguard = { path = "../dguard" }
+cfx_db = { path = "../db" }
 adaptive = { path = "../adaptive" }
 tokio = { version = "1.47.1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "time"] }
 clap = { version = "4.5.42", features = ["derive"] }
 clap_complete = "4.6.9"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { version = "1.0.142", features = [] }
-sqlx = { version = "0.8.6", features = ["runtime-tokio-native-tls", "postgres", "chrono"] }
+# Its runtime and TLS come with cfx_db, which makes every connection.
+sqlx = { version = "0.8.6", features = ["postgres", "chrono"] }
 uuid = { version = "1.18.0", features = ["v4"] }
 cfx_tui = { path = "../tui" }
 ratatui = { version = "0.30.0-alpha.5", features = ["crossterm"] }
-toml = "0.8"
-dirs = "5"
 
 [dev-dependencies]
 # A recording SOCKS5 proxy and counting listeners for the egress tests.

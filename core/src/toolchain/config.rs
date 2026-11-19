@@ -8,7 +8,8 @@ use std::path::PathBuf;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ToolchainConfig {
-    pub postgres: PostgresSection,
+    /// Where the engines' database is, in the shape the engines read it.
+    pub postgres: cfx_db::Settings,
     pub container: ContainerSection,
     // Local TCP ports the extension daemons listen on. Host-level (all nodes on
     // this machine share one set of engine daemons + one Postgres), overridable
@@ -16,15 +17,6 @@ pub struct ToolchainConfig {
     // a file without the section gets the protocol defaults.
     #[serde(default)]
     pub extensions: ExtensionPorts,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PostgresSection {
-    pub host: String,
-    pub port: u16,
-    pub user: String,
-    pub password: Option<String>,
-    pub db_name: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -106,13 +98,7 @@ impl<'de> Deserialize<'de> for ExtensionPorts {
 impl Default for ToolchainConfig {
     fn default() -> Self {
         Self {
-            postgres: PostgresSection {
-                host: "localhost".to_string(),
-                port: 4440,
-                user: "postgres".to_string(),
-                password: None,
-                db_name: "crossfyre".to_string(),
-            },
+            postgres: cfx_db::Settings::default(),
             container: ContainerSection { id: None },
             extensions: ExtensionPorts::default(),
         }
@@ -243,33 +229,6 @@ pub(crate) fn save_config_at(
     Ok(())
 }
 
-/// A new random password for the toolchain database: 32 bytes as hex.
-pub fn new_postgres_password() -> Result<String, Box<dyn std::error::Error>> {
-    let mut b = [0u8; 32];
-    getrandom::fill(&mut b).map_err(|e| format!("no randomness for a database password: {e}"))?;
-    Ok(b.iter().map(|x| format!("{x:02x}")).collect())
-}
-
-/// The config at `path` with a database password, generating and saving one if the
-/// file has none. The flag says whether one was generated, which means anything
-/// that read the file earlier (the engine daemons) still holds the old settings.
-pub(crate) fn ensure_postgres_password_at(
-    path: &std::path::Path,
-) -> Result<(ToolchainConfig, bool), Box<dyn std::error::Error>> {
-    let mut config = load_config_at(path)?;
-    if config
-        .postgres
-        .password
-        .as_deref()
-        .is_some_and(|p| !p.is_empty())
-    {
-        return Ok((config, false));
-    }
-    config.postgres.password = Some(new_postgres_password()?);
-    save_config_at(path, &config)?;
-    Ok((config, true))
-}
-
 /// Resolve an extension daemon's port from `config.toml`, falling back to the
 /// protocol default if the file is missing/unreadable or the engine is unknown.
 /// This is the single lookup every op-client and the service installer use, so
@@ -355,7 +314,7 @@ pub(crate) fn load_or_create_config_at(
 ) -> Result<ToolchainConfig, Box<dyn std::error::Error>> {
     if !path.exists() {
         let mut config = ToolchainConfig::default();
-        config.postgres.password = Some(new_postgres_password()?);
+        config.postgres.ensure_password()?;
         save_config_at(path, &config)?;
         println!(
             "[config] Wrote default toolchain config: {}",
@@ -407,7 +366,6 @@ mod root_link_tests {
 mod tests {
     use super::*;
     use crate::toolchain::ENGINES;
-    use std::fs;
 
     fn ports(text: &str) -> ExtensionPorts {
         let cfg: ToolchainConfig = toml::from_str(&format!(
@@ -506,7 +464,7 @@ mod tests {
     #[cfg(unix)]
     fn mode(path: &std::path::Path) -> u32 {
         use std::os::unix::fs::PermissionsExt;
-        fs::metadata(path).unwrap().permissions().mode() & 0o777
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
     #[test]
@@ -524,49 +482,5 @@ mod tests {
             load_or_create_config_at(&path).unwrap().postgres.password,
             Some(pw)
         );
-    }
-
-    #[test]
-    fn a_config_without_a_password_gets_one_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        fs::write(
-            &path,
-            "[postgres]\nhost = \"localhost\"\nport = 4440\nuser = \"postgres\"\n\
-             db_name = \"crossfyre\"\n\n[container]\n",
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        }
-        let (cfg, generated) = ensure_postgres_password_at(&path).unwrap();
-        assert!(generated);
-        let pw = cfg.postgres.password.expect("a password");
-        assert_eq!(
-            load_config_at(&path).unwrap().postgres.password,
-            Some(pw.clone())
-        );
-        #[cfg(unix)]
-        assert_eq!(mode(&path), 0o600, "tightened when the password went in");
-        let (again, generated) = ensure_postgres_password_at(&path).unwrap();
-        assert!(!generated);
-        assert_eq!(again.postgres.password, Some(pw));
-    }
-
-    #[test]
-    fn an_operator_password_is_kept() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        fs::write(
-            &path,
-            "[postgres]\nhost = \"db.internal\"\nport = 5432\nuser = \"cfx\"\n\
-             password = \"mine\"\ndb_name = \"crossfyre\"\n\n[container]\n",
-        )
-        .unwrap();
-        let (cfg, generated) = ensure_postgres_password_at(&path).unwrap();
-        assert!(!generated);
-        assert_eq!(cfg.postgres.password.as_deref(), Some("mine"));
     }
 }

@@ -332,10 +332,11 @@ jobs:
         run: cargo build --locked -p plessor -p ambulo
 
       - name: Write the toolchain config
-        # ambulo, doorward and voyage refuse to start in daemon mode without this and
-        # tell you to run `crossfyre init`. The CLI that would write it is not
-        # in this repo, and standalone terminal use never reads it, so the file
-        # is the whole dependency. Matches the postgres service above.
+        # ambulo, doorward and voyage find their database through this file, and in
+        # daemon mode wait, saying why, until it names one they can reach. The CLI
+        # that would write it is not in this repo, and standalone terminal use never
+        # reads it, so the file is the whole dependency. Matches the postgres service
+        # above.
         run: |
           mkdir -p ~/.config/crossfyre
           cat > ~/.config/crossfyre/config.toml <<'TOML'

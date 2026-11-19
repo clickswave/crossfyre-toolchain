@@ -114,6 +114,7 @@ version = "0.0.24"
 dependencies = [
  "adaptive",
  "base64 0.22.1",
+ "cfx_db",
  "cfx_tui",
  "cfx_tunnel",
  "clap",
@@ -122,7 +123,6 @@ dependencies = [
  "csv",
  "dguard",
  "dialoguer 0.11.0",
- "dirs 5.0.1",
  "futures-util",
  "libc",
  "ratatui",
@@ -134,7 +134,6 @@ dependencies = [
  "sqlx",
  "tokio",
  "tokio-tungstenite",
- "toml 0.8.23",
  "transport",
  "uuid",
 ]
@@ -741,12 +740,13 @@ dependencies = [
  "async-nats",
  "base64 0.21.7",
  "cfx_capture",
+ "cfx_db",
  "cfx_scope",
  "cfx_tunnel",
  "clap",
  "dguard",
  "dialoguer 0.12.0",
- "dirs 6.0.0",
+ "dirs",
  "ed25519-dalek",
  "flate2",
  "futures-util",
@@ -767,10 +767,23 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls",
- "toml 1.1.3+spec-1.1.0",
+ "toml",
  "windows",
  "windows-service",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "cfx_db"
+version = "0.1.0"
+dependencies = [
+ "dguard",
+ "getrandom 0.3.4",
+ "serde",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "toml",
 ]
 
 [[package]]
@@ -798,7 +811,7 @@ dependencies = [
  "sha2 0.10.9",
  "tokio",
  "tokio-util",
- "toml 1.1.3+spec-1.1.0",
+ "toml",
  "transport",
  "uuid",
 ]
@@ -1246,7 +1259,7 @@ dependencies = [
  "clap_complete",
  "clap_mangen",
  "dialoguer 0.12.0",
- "dirs 6.0.0",
+ "dirs",
  "oast",
  "serde_json",
  "sha2 0.10.9",
@@ -1459,7 +1472,7 @@ dependencies = [
 name = "dguard"
 version = "0.1.0"
 dependencies = [
- "dirs 6.0.0",
+ "dirs",
  "libc",
  "serde_json",
  "tokio",
@@ -1515,32 +1528,11 @@ dependencies = [
 
 [[package]]
 name = "dirs"
-version = "5.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44c45a9d03d6676652bcb5e724c7e988de1acad23a711b5217ab9cbecbec2225"
-dependencies = [
- "dirs-sys 0.4.1",
-]
-
-[[package]]
-name = "dirs"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
 dependencies = [
- "dirs-sys 0.5.0",
-]
-
-[[package]]
-name = "dirs-sys"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "520f05a5cbd335fae5a99ff7a6ab8627577660ee5cfd6a94a6a929b52ff0321c"
-dependencies = [
- "libc",
- "option-ext",
- "redox_users 0.4.6",
- "windows-sys 0.48.0",
+ "dirs-sys",
 ]
 
 [[package]]
@@ -1551,7 +1543,7 @@ checksum = "e01a3366d27ee9890022452ee61b2b63a67e6f13f58900b651ff5665f0bb1fab"
 dependencies = [
  "libc",
  "option-ext",
- "redox_users 0.5.2",
+ "redox_users",
  "windows-sys 0.61.2",
 ]
 
@@ -1580,18 +1572,17 @@ name = "doorward"
 version = "0.0.17"
 dependencies = [
  "adaptive",
+ "cfx_db",
  "cfx_tui",
  "cfx_tunnel",
  "clap",
  "clap_complete",
  "dguard",
- "dirs 5.0.1",
  "ratatui",
  "serde",
  "serde_json",
  "sqlx",
  "tokio",
- "toml 0.8.23",
  "uuid",
 ]
 
@@ -3978,17 +3969,6 @@ dependencies = [
 
 [[package]]
 name = "redox_users"
-version = "0.4.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba009ff324d1fc1b900bd1fdb31564febe58a8ccc8a6fdbb93b543d33b13ca43"
-dependencies = [
- "getrandom 0.2.17",
- "libredox",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "redox_users"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4e608c6638b9c18977b00b475ac1f28d14e84b27d8d42f70e0bf1e3dec127ac"
@@ -4505,15 +4485,6 @@ dependencies = [
 
 [[package]]
 name = "serde_spanned"
-version = "0.6.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "serde_spanned"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6662b5879511e06e8999a8a235d848113e942c9124f211511b16466ee2995f26"
@@ -4776,7 +4747,6 @@ dependencies = [
  "indexmap",
  "log",
  "memchr",
- "native-tls",
  "once_cell",
  "percent-encoding",
  "rustls",
@@ -5428,38 +5398,17 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "0.8.23"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc1beb996b9d83529a9e75c17a1686767d148d70663143c7854d8b4a09ced362"
-dependencies = [
- "serde",
- "serde_spanned 0.6.9",
- "toml_datetime 0.6.11",
- "toml_edit",
-]
-
-[[package]]
-name = "toml"
 version = "1.1.3+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "53c96ecdfa941c8fc4fcaed14f99ada8ebed502eef533015095a07e3301d4c3c"
 dependencies = [
  "indexmap",
  "serde_core",
- "serde_spanned 1.1.1",
- "toml_datetime 1.1.1+spec-1.1.0",
+ "serde_spanned",
+ "toml_datetime",
  "toml_parser",
  "toml_writer",
- "winnow 1.0.4",
-]
-
-[[package]]
-name = "toml_datetime"
-version = "0.6.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22cddaf88f4fbc13c51aebbf5f8eceb5c7c5a9da2ac40a13519eb5b0a0e8f11c"
-dependencies = [
- "serde",
+ "winnow",
 ]
 
 [[package]]
@@ -5472,33 +5421,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "toml_edit"
-version = "0.22.27"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41fe8c660ae4257887cf66394862d21dbca4a6ddd26f04a3560410406a2f819a"
-dependencies = [
- "indexmap",
- "serde",
- "serde_spanned 0.6.9",
- "toml_datetime 0.6.11",
- "toml_write",
- "winnow 0.7.15",
-]
-
-[[package]]
 name = "toml_parser"
 version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2abe9b86193656635d2411dc43050282ca48aa31c2451210f4202550afb7526"
 dependencies = [
- "winnow 1.0.4",
+ "winnow",
 ]
-
-[[package]]
-name = "toml_write"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "toml_writer"
@@ -5855,13 +5784,13 @@ name = "voyage"
 version = "0.0.17"
 dependencies = [
  "adaptive",
+ "cfx_db",
  "cfx_tui",
  "cfx_tunnel",
  "clap",
  "clap_complete",
  "dguard",
  "dialoguer 0.11.0",
- "dirs 5.0.1",
  "hickory-proto",
  "hickory-resolver",
  "ipnet",
@@ -5871,7 +5800,6 @@ dependencies = [
  "sha2 0.10.9",
  "sqlx",
  "tokio",
- "toml 0.8.23",
  "transport",
  "uuid",
 ]
@@ -6546,15 +6474,6 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
-
-[[package]]
-name = "winnow"
-version = "0.7.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
-dependencies = [
- "memchr",
-]
 
 [[package]]
 name = "winnow"

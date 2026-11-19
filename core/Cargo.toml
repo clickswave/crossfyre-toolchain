@@ -14,6 +14,8 @@ path = "src/lib.rs"
 
 [dependencies]
 dguard = { path = "../dguard" }
+# The engines' database settings in config.toml, and the password they get.
+cfx_db = { path = "../db" }
 adaptive = { path = "../adaptive" }
 async-nats = "0.50.0"
 # Direct handle so run_daemon can install a rustls CryptoProvider before the

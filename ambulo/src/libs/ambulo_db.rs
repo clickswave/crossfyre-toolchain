@@ -1,8 +1,10 @@
 use crate::libs::wordlist_config::WordlistConfig;
 use crate::scanner::{LogTotals, Logs, ScanResult, ScanResults};
-use sqlx::postgres::PgConnectOptions;
 use sqlx::{FromRow, QueryBuilder};
 use std::fmt::Display;
+
+/// The database ambulo keeps its tables in.
+pub const DATABASE: &str = "mach";
 
 pub struct Work {
     pub url: String,
@@ -152,71 +154,23 @@ impl Logger {
 }
 
 impl AmbuloDb {
-    /// Bootstrap: connect to the `postgres` maintenance DB, create the `mach` DB if
-    /// missing, then return a pool connected to it.
-    ///
-    /// The database keeps the engine's original name, `mach`. It holds resumable scan
-    /// state, and renaming it would drop every run an operator could still resume.
-    pub async fn init(
-        host: &str,
-        port: u16,
-        user: &str,
-        password: Option<&str>,
-        config: &crate::libs::cli_args::Args,
-    ) -> Result<Self, sqlx::Error> {
-        // Build admin connection options (connect to postgres maintenance DB)
-        let mut admin_opts = PgConnectOptions::new()
-            .host(host)
-            .port(port)
-            .username(user)
-            .database("postgres");
-        if let Some(pwd) = password {
-            admin_opts = admin_opts.password(pwd);
-        }
-
-        let admin_pool = sqlx::PgPool::connect_with(admin_opts).await?;
-
-        // Create the `mach` database if it doesn't exist
-        let db_exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = 'mach')")
-                .fetch_one(&admin_pool)
-                .await?;
-
-        if !db_exists {
-            // CREATE DATABASE cannot run inside a transaction
-            sqlx::query("CREATE DATABASE mach")
-                .execute(&admin_pool)
-                .await?;
-        }
-        drop(admin_pool);
-
-        // Connect to the `mach` database
-        let mut ambulo_opts = PgConnectOptions::new()
-            .host(host)
-            .port(port)
-            .username(user)
-            .database("mach");
-        if let Some(pwd) = password {
-            ambulo_opts = ambulo_opts.password(pwd);
-        }
-
-        let pool = sqlx::PgPool::connect_with(ambulo_opts).await?;
-
-        Ok(Self {
+    /// ambulo's tables on `pool`, a pool on [`DATABASE`].
+    pub fn new(pool: sqlx::PgPool, config: &crate::libs::cli_args::Args) -> Self {
+        Self {
             pool,
             config: config.clone(),
-        })
+        }
     }
 
     /// A handle that has never connected and connects only if it is used, for tests
     /// of daemon paths that do not touch the database.
     #[cfg(test)]
     pub fn unconnected(config: &crate::libs::cli_args::Args) -> Self {
-        let opts = PgConnectOptions::new()
+        let opts = sqlx::postgres::PgConnectOptions::new()
             .host("127.0.0.1")
             .port(1)
             .username("none")
-            .database("mach");
+            .database(DATABASE);
         Self {
             pool: sqlx::PgPool::connect_lazy_with(opts),
             config: config.clone(),

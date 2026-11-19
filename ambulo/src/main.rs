@@ -1,7 +1,6 @@
 use crate::libs::cli_args::{Cli, Commands, DbArgs, ExecArgs};
 use crate::scanner::StreamEvent;
 use clap::{CommandFactory, Parser};
-use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -17,56 +16,6 @@ mod routetable;
 mod scanner;
 mod spa;
 mod tui;
-
-/// Mirrors the toolchain config at ~/.config/crossfyre/config.toml (see `toolchain_dir`)
-#[derive(Debug, Deserialize)]
-struct ToolchainConfig {
-    postgres: PostgresConfig,
-}
-
-#[derive(Debug, Deserialize)]
-struct PostgresConfig {
-    host: String,
-    port: u16,
-    user: String,
-    password: Option<String>,
-    #[allow(dead_code)]
-    db_name: String,
-}
-
-/// The toolchain directory: `CROSSFYRE_TOOLCHAIN_DIR` when the service that started this
-/// daemon names one, as the engine host does on macOS and Windows, else
-/// `~/.config/crossfyre` on Linux and the per-user config directory elsewhere
-/// (`~/Library/Application Support` on macOS, `%APPDATA%` on Windows), which is where
-/// the CLI writes it.
-fn toolchain_dir() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
-    if let Some(dir) = std::env::var_os("CROSSFYRE_TOOLCHAIN_DIR").filter(|d| !d.is_empty()) {
-        return Ok(dir.into());
-    }
-    let root = if cfg!(target_os = "linux") {
-        dirs::home_dir()
-            .ok_or("Could not find home directory")?
-            .join(".config")
-    } else {
-        dirs::config_dir().ok_or("Could not find the config directory")?
-    };
-    Ok(root.join("crossfyre"))
-}
-
-fn load_toolchain_config() -> Result<ToolchainConfig, Box<dyn std::error::Error>> {
-    let config_path = toolchain_dir()?.join("config.toml");
-
-    let contents = std::fs::read_to_string(&config_path).map_err(|e| {
-        format!(
-            "Cannot read toolchain config at {}: {}. Run 'crossfyre db up' first.",
-            config_path.display(),
-            e
-        )
-    })?;
-
-    let config: ToolchainConfig = toml::from_str(&contents)?;
-    Ok(config)
-}
 
 // An error is printed as the sentence it is. Returned from `main`, Rust prints it in
 // debug form: in quotes, with a line break shown as a backslash and an n.
@@ -88,8 +37,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Daemon mode - starts the TCP service and connects directly to postgres
     // -----------------------------------------------------------------------
     if cli.daemon {
-        let toolchain_cfg = load_toolchain_config()?;
-
         let dummy_config = libs::cli_args::ScanArgs {
             url: vec![],
             wordlist_path: String::new(),
@@ -132,7 +79,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         // Postgres being briefly unreachable is not a reason to exit: systemd
         // would restart us straight into the same failure, which is how one
         // host logged 2,663 restarts and reported nothing but "down". Wait for
-        // it, saying so each time, and start as soon as it answers.
+        // it, saying why each time, and start as soon as it answers.
         // Bind before the database is reachable, and answer while waiting.
         //
         // Binding after the database meant a database problem looked exactly
@@ -146,27 +93,29 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         eprintln!("Ambulo daemon listening on {addr} (waiting for database)");
 
-        // Name the endpoint and the fix. "pool timed out while waiting for an
-        // open connection" is true and useless: it does not say which host,
-        // which port, or that the container may simply not have been created on
-        // this machine yet.
-        let db_label = format!(
-            "postgres at {}:{} (create it with `crossfyre db up`)",
-            toolchain_cfg.postgres.host, toolchain_cfg.postgres.port
+        // Why the last try failed, for whoever connects before one succeeds.
+        let not_ready = std::sync::Mutex::new(String::from("no answer yet"));
+        let db_fut = dguard::wait_for(
+            "the database",
+            std::time::Duration::from_secs(3600),
+            || async {
+                let ready = async {
+                    let pool = cfx_db::ensure_ready(libs::ambulo_db::DATABASE)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let db = libs::ambulo_db::AmbuloDb::new(pool, &dummy_config);
+                    db.create_tables().await.map_err(|e| e.to_string())?;
+                    Ok::<_, String>(db)
+                }
+                .await;
+                if let Err(why) = &ready
+                    && let Ok(mut last) = not_ready.lock()
+                {
+                    last.clone_from(why);
+                }
+                ready
+            },
         );
-        let db_fut = dguard::wait_for(&db_label, std::time::Duration::from_secs(3600), || async {
-            let db = libs::ambulo_db::AmbuloDb::init(
-                &toolchain_cfg.postgres.host,
-                toolchain_cfg.postgres.port,
-                &toolchain_cfg.postgres.user,
-                toolchain_cfg.postgres.password.as_deref(),
-                &dummy_config,
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-            db.create_tables().await.map_err(|e| e.to_string())?;
-            Ok::<_, String>(db)
-        });
         tokio::pin!(db_fut);
 
         // Do not answer yet. An ordinary start reaches the database in well
@@ -192,12 +141,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     res = &mut db_fut => break res?,
                     accepted = listener.accept() => {
                         if let Ok((mut sock, _)) = accepted {
+                            let why = not_ready.lock().map(|w| w.clone()).unwrap_or_default();
                             tokio::spawn(async move {
                                 use tokio::io::AsyncWriteExt;
                                 let msg = serde_json::json!({
                                     "type": "error",
-                                    "message": "ambulo is not ready: waiting for its \
-                                                database. Create it with `crossfyre db up`.",
+                                    "message": format!(
+                                        "ambulo is not ready, waiting for its database: {why}"
+                                    ),
                                 });
                                 let _ = sock.write_all(format!("{msg}\n").as_bytes()).await;
                                 let _ = sock.flush().await;

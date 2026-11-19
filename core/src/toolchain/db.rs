@@ -3,12 +3,13 @@
 // container named `crossfyre-postgres`, published on loopback port 4440 and
 // protected by the password in config.toml.
 
-use super::config::{PostgresSection, ToolchainConfig};
+use super::config::ToolchainConfig;
 use super::config::{
-    ensure_postgres_password_at, get_config_path, load_config, load_config_at,
-    load_or_create_config, new_postgres_password, save_config, save_config_at,
+    get_config_path, load_config, load_config_at, load_or_create_config, save_config,
+    save_config_at,
 };
 use super::sudo_user;
+use cfx_db::Settings;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -196,12 +197,7 @@ fn publish_arg(port: u16) -> String {
 
 /// `docker run` arguments for the database container. The password is named but not
 /// given here; see [`PASSWORD_ENV`].
-fn run_args(
-    name: &str,
-    pg: &PostgresSection,
-    image: &str,
-    volumes_from: Option<&str>,
-) -> Vec<String> {
+fn run_args(name: &str, pg: &Settings, image: &str, volumes_from: Option<&str>) -> Vec<String> {
     let mut args = vec![
         "run".to_string(),
         "-d".to_string(),
@@ -733,16 +729,17 @@ const LOCK_WAIT: Duration = Duration::from_secs(600);
 fn up_password(
     config_path: &Path,
 ) -> Result<(ToolchainConfig, String, bool), Box<dyn std::error::Error>> {
-    let config = load_config_at(config_path)?;
+    let mut config = load_config_at(config_path)?;
     if !is_local_host(&config.postgres.host) {
         // The engines use another database, whose config this password must not reach.
-        let password = match config.postgres.password.clone() {
-            Some(p) if !p.is_empty() => p,
-            _ => new_postgres_password()?,
-        };
-        return Ok((config, password, false));
+        let mut container = config.postgres.clone();
+        container.ensure_password()?;
+        return Ok((config, container.password.unwrap_or_default(), false));
     }
-    let (config, generated) = ensure_postgres_password_at(config_path)?;
+    let generated = config.postgres.ensure_password()?;
+    if generated {
+        save_config_at(config_path, &config)?;
+    }
     let password = config.postgres.password.clone().unwrap_or_default();
     Ok((config, password, generated))
 }
@@ -921,13 +918,16 @@ fn secure_using(
     );
     let local = is_local_host(&config.postgres.host);
     let (config, password) = if local {
-        let (config, _) = ensure_postgres_password_at(config_path)?;
+        let mut config = load_config_at(config_path)?;
+        if config.postgres.ensure_password()? {
+            save_config_at(config_path, &config)?;
+        }
         let password = config.postgres.password.clone().unwrap_or_default();
         (config, password)
     } else {
         // config.toml points the engines at another database, which this password
         // must not reach. The container gets one of its own that is not kept.
-        (config, new_postgres_password()?)
+        (config, cfx_db::new_password()?)
     };
 
     let new_id = if exposure.trust {
@@ -1045,7 +1045,7 @@ fn made_with_user(info: &serde_json::Value) -> String {
 /// made `how` and the extra arguments `more` given before the image.
 fn labelled_run_args(
     name: &str,
-    pg: &PostgresSection,
+    pg: &Settings,
     image: &str,
     volumes_from: Option<&str>,
     how: &str,
@@ -1196,7 +1196,7 @@ fn rebuild(
     scratch: &str,
     staged: &str,
     name: &str,
-    pg: &PostgresSection,
+    pg: &Settings,
     password: &str,
     was_running: bool,
 ) -> Result<String, String> {
@@ -1219,7 +1219,7 @@ fn rebuild(
     // The new container is published on the database port, which the stopped one no
     // longer holds. Until the rows are in, it has a password nobody knows, so no engine
     // starts on a half filled database.
-    let loading = new_postgres_password().map_err(|e| e.to_string())?;
+    let loading = cfx_db::new_password().map_err(|e| e.to_string())?;
     let out = docker()
         .args(labelled_run_args(staged, pg, image, None, REBUILT, &initdb))
         .env(PASSWORD_ENV, &loading)
@@ -2143,7 +2143,7 @@ fn replace(
     old: &str,
     staged: &str,
     name: &str,
-    pg: &PostgresSection,
+    pg: &Settings,
     password: &str,
     was_running: bool,
 ) -> Result<String, String> {
@@ -2272,13 +2272,10 @@ fn stop(config: &ToolchainConfig) -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
 
-    fn pg() -> PostgresSection {
-        PostgresSection {
-            host: "localhost".to_string(),
-            port: 4440,
-            user: "postgres".to_string(),
+    fn pg() -> Settings {
+        Settings {
             password: Some("s3cret-value".to_string()),
-            db_name: "crossfyre".to_string(),
+            ..Settings::default()
         }
     }
 
@@ -2552,6 +2549,45 @@ mod tests {
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_default()
+    }
+
+    /// The container here is made with config.toml's password, which is generated and
+    /// saved owner-only when the file has none, and kept after that.
+    #[test]
+    fn a_new_container_here_gets_a_password_saved_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(
+            &cfg,
+            "[postgres]\nhost = \"localhost\"\nport = 4440\nuser = \"postgres\"\n\
+             db_name = \"crossfyre\"\n\n[container]\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        let mode = || {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(&cfg).unwrap().permissions().mode() & 0o777
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let (_, password, generated) = up_password(&cfg).unwrap();
+        assert!(
+            generated,
+            "the engines hold the old settings until they restart"
+        );
+        assert_eq!(password.len(), 64);
+        assert_eq!(
+            load_config_at(&cfg).unwrap().postgres.password,
+            Some(password.clone())
+        );
+        #[cfg(unix)]
+        assert_eq!(mode(), 0o600, "tightened when the password went in");
+        let (_, again, generated) = up_password(&cfg).unwrap();
+        assert!(!generated);
+        assert_eq!(again, password);
     }
 
     #[test]
@@ -3376,8 +3412,7 @@ mod tests {
             let old_id = open_0_1_42(&name, port);
             write_config(&cfg, port, Some(&old_id));
             seed_mach(&name);
-            let (config, _) = ensure_postgres_password_at(&cfg).unwrap();
-            let password = config.postgres.password.clone().unwrap();
+            let (config, password, _) = up_password(&cfg).unwrap();
             // The run stopped the old container, which was running, and made a copy
             // whose rows were not all in when it was cut short.
             docker_ok(&["stop", &old_id]).unwrap();
@@ -3759,8 +3794,7 @@ mod tests {
             let port = free_port();
             let old_id = open_0_1_42(&name, port);
             write_config(&cfg, port, Some(&old_id));
-            let (config, _) = ensure_postgres_password_at(&cfg).unwrap();
-            let password = config.postgres.password.clone().unwrap();
+            let (config, password, _) = up_password(&cfg).unwrap();
             docker_ok(&["stop", &old_id]).unwrap();
             let staged_id = rebuilt_copy(&name, &config, &image_of(&old_id), &password, true);
             // The run had already handed the old data to a container that keeps it.
@@ -3796,8 +3830,7 @@ mod tests {
             let port = free_port();
             let old_id = open_0_1_42(&name, port);
             write_config(&cfg, port, Some(&old_id));
-            let (config, _) = ensure_postgres_password_at(&cfg).unwrap();
-            let password = config.postgres.password.clone().unwrap();
+            let (config, password, _) = up_password(&cfg).unwrap();
             set_password(&name, "postgres", &password).unwrap();
             sh_as_postgres(
                 &name,
