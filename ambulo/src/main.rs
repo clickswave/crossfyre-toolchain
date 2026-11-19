@@ -8,13 +8,12 @@ mod browser;
 mod client_tui;
 mod crawler;
 mod daemon;
-mod exporter;
 mod libs;
 mod prober;
 mod routetable;
 mod scanner;
 mod spa;
-mod tui;
+mod store;
 
 // An error is printed as the sentence it is. Returned from `main`, Rust prints it in
 // debug form: in quotes, with a line break shown as a backslash and an n.
@@ -36,45 +35,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Daemon mode - starts the TCP service and connects directly to postgres
     // -----------------------------------------------------------------------
     if matches!(cli.command, Some(Commands::Daemon)) {
-        let dummy_config = libs::cli_args::ScanArgs {
-            url: vec![],
-            wordlist_path: String::new(),
-            fuzz_marker: "::FUZZ::".to_string(),
-            cookies: vec![],
-            headers: vec![],
-            basic_auth: String::new(),
-            store_cookies: false,
-            success_status_codes: vec![200],
-            follow_redirects: true,
-            follow_redirects_depth: 5,
-            http_method: libs::cli_args::HttpMethod::Get,
-            interval: 0,
-            tasks: 1,
-            fresh_start: false,
-            random_user_agent_scan: false,
-            random_user_agent_request: false,
-            append_slash: false,
-            save_response_body: false,
-            save_response_headers: false,
-            user_agent: adaptive::identity::resolve(&adaptive::identity::Mode::Evasive, None)
-                .user_agent,
-            evasive: true,
-            identify: None,
-            no_exit_banner: true,
-            recreate_db: false,
-            launch_delay: 0,
-            log_level: libs::cli_args::LogLevel::Info,
-            output_format: libs::cli_args::OutputFormat::Text,
-            output_path: String::new(),
-            event_poll_timeout: 1000,
-            enable_offset_pagination: false,
-            interactive: false,
-            adaptive_rate: false,
-            adaptive_resilience: false,
-            posture: "balanced".to_string(),
-            egress: transport::Egress::Inherit,
-        };
-
         // Postgres being briefly unreachable is not a reason to exit: systemd
         // would restart us straight into the same failure, which is how one
         // host logged 2,663 restarts and reported nothing but "down". Wait for
@@ -102,7 +62,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let pool = cfx_db::ensure_ready(libs::ambulo_db::DATABASE)
                         .await
                         .map_err(|e| e.to_string())?;
-                    let db = libs::ambulo_db::AmbuloDb::new(pool, &dummy_config);
+                    let db = libs::ambulo_db::AmbuloDb::new(pool);
                     db.create_tables().await.map_err(|e| e.to_string())?;
                     Ok::<_, String>(db)
                 }

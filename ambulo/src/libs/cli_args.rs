@@ -50,25 +50,6 @@ impl std::fmt::Display for LogLevel {
     }
 }
 
-#[derive(Clone, Debug, ValueEnum)]
-pub enum OutputFormat {
-    Text,
-    Csv,
-}
-
-impl std::fmt::Display for OutputFormat {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                OutputFormat::Text => "text",
-                OutputFormat::Csv => "csv",
-            }
-        )
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Top-level CLI
 // ---------------------------------------------------------------------------
@@ -230,10 +211,6 @@ pub struct ScanArgs {
     #[arg(long, default_value_t = false)]
     pub append_slash: bool,
 
-    /// Save response body for each request
-    #[arg(long, default_value_t = false)]
-    pub save_response_body: bool,
-
     /// Save response headers for each request
     #[arg(long, default_value_t = true)]
     pub save_response_headers: bool,
@@ -250,14 +227,6 @@ pub struct ScanArgs {
     #[arg(long)]
     pub identify: Option<String>,
 
-    /// Suppress exit banner
-    #[arg(long, default_value_t = false)]
-    pub no_exit_banner: bool,
-
-    /// Drop and recreate the database before scanning
-    #[arg(long, default_value_t = false)]
-    pub recreate_db: bool,
-
     /// Delay in seconds before starting
     #[arg(long, default_value_t = 0)]
     pub launch_delay: i64,
@@ -266,21 +235,9 @@ pub struct ScanArgs {
     #[arg(long, value_enum, default_value_t = LogLevel::Info)]
     pub log_level: LogLevel,
 
-    /// Output format
-    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
-    pub output_format: OutputFormat,
-
-    /// Output file path
-    #[arg(short, long, default_value_t = format!(""))]
-    pub output_path: String,
-
     /// TUI event polling timeout in ms
     #[arg(long, default_value_t = 1000)]
     pub event_poll_timeout: u64,
-
-    /// [UNSTABLE] Enable TUI offset pagination
-    #[arg(long, default_value_t = false)]
-    pub enable_offset_pagination: bool,
 
     /// Interactive mode - prompts for required options
     #[arg(long, default_value_t = false)]

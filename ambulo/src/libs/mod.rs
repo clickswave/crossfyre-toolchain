@@ -1,5 +1,4 @@
 pub(crate) mod ambulo_db;
-pub(crate) mod banner;
 pub(crate) mod cli_args;
 pub(crate) mod rng;
 pub(crate) mod scan_config;

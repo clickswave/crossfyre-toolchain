@@ -49,12 +49,6 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
         "the solver is told the environment's proxy only for an op that inherits it",
     ),
     (
-        "ambulo/src/main.rs",
-        "Egress::Inherit",
-        1,
-        "the daemon's default scan settings; each op sets its own egress",
-    ),
-    (
         "ambulo/src/daemon.rs",
         "Egress::Inherit",
         3,

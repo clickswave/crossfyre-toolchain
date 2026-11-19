@@ -1,8 +1,6 @@
-use crate::libs::ambulo_db::{AmbuloDb, Logger};
 use crate::libs::cli_args;
-use crate::tui::Tui;
+use crate::store::{Outcome, Store, Work};
 use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -26,34 +24,12 @@ pub struct ScanResultTotals {
     pub entries: usize,
 }
 
+/// What a scan found, and how many of its requests found something, found nothing and
+/// failed.
 #[derive(Debug)]
 pub struct ScanResults {
     pub found: Vec<ScanResult>,
-    pub not_found: Vec<ScanResult>,
-    pub error: Vec<ScanResult>,
     pub totals: ScanResultTotals,
-}
-
-#[derive(Debug, Clone, FromRow)]
-pub struct Log {
-    pub level: String,
-    pub description: String,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct LogTotals {
-    pub debug: usize,
-    pub info: usize,
-    pub warn: usize,
-    pub error: usize,
-    pub entries: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct Logs {
-    pub logs: Vec<Log>,
-    pub totals: LogTotals,
 }
 
 /// Events streamed from the daemon to the fuzz client over TCP.
@@ -112,73 +88,24 @@ pub struct StreamEvent {
     pub final_url: Option<String>,
 }
 
-pub struct Scanner {
+pub struct Scanner<S: Store> {
     config: cli_args::Args,
-    db: AmbuloDb,
-    logger: Logger,
-    scan_id: i64,
+    store: Arc<S>,
 }
-/// Async callback invoked when an [`ObservableValue`] changes.
-type ChangeHook =
-    Box<dyn Fn(usize) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
-
-pub struct ObservableValue {
-    pub(crate) value: usize,
-    on_change: Vec<ChangeHook>,
-}
-
-// A reactive value that can notify subscribers when it changes;
-impl ObservableValue {
-    pub fn new(initial: usize) -> Self {
-        Self {
-            value: initial,
-            on_change: Vec::new(),
-        }
-    }
-
-    pub fn set(&mut self, new_value: usize) {
-        if self.value != new_value {
-            self.value = new_value;
-            for cb in &self.on_change {
-                let fut = cb(new_value);
-                tokio::spawn(fut);
-            }
-        }
-    }
-
-    pub fn subscribe<F, Fut>(&mut self, f: F)
-    where
-        F: Fn(usize) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
-    {
-        self.on_change.push(Box::new(move |val| Box::pin(f(val))));
-    }
-}
-
-// Type aliases for clarity
-pub type Limit = ObservableValue;
-pub type Offset = ObservableValue;
-
-impl Scanner {
-    pub fn new(config: cli_args::Args, db: AmbuloDb, logger: Logger, scan_id: i64) -> Self {
+impl<S: Store> Scanner<S> {
+    pub fn new(config: cli_args::Args, store: S) -> Self {
         Scanner {
             config,
-            db,
-            logger,
-            scan_id,
+            store: Arc::new(store),
         }
     }
 
     /// Run scan headlessly (no TUI) - used by daemon mode.
     /// Blocks until all work is exhausted, then returns the final results.
-    pub async fn run_headless(&self) -> Result<ScanResults, sqlx::Error> {
+    pub async fn run_headless(&self) -> Result<ScanResults, String> {
         let mut join_set = tokio::task::JoinSet::new();
 
         let arc_config = Arc::new(self.config.clone());
-        let arc_db = Arc::new(self.db.clone());
-        let arc_logger = Arc::new(self.logger.clone());
-        let arc_scan_id = Arc::new(self.scan_id);
-        let pause_notifier = Arc::new(AtomicBool::new(false));
         let arc_throttle = Arc::new(AtomicU64::new(0));
         let arc_tested = Arc::new(AtomicU64::new(0));
 
@@ -189,21 +116,17 @@ impl Scanner {
             }
             Err(e) => {
                 eprintln!("Failed to create prober: {e:?}");
-                self.logger
-                    .error(&format!("Failed to create prober: {e:?}"))
-                    .await?;
-                return Err(sqlx::Error::BeginFailed);
+                let why = format!("Failed to create prober: {e:?}");
+                self.store.log("error", &why).await;
+                return Err(why);
             }
         };
 
         for _ in 0..self.config.tasks {
             join_set.spawn(task_handle(
                 Arc::clone(&arc_config),
-                Arc::clone(&arc_db),
-                Arc::clone(&arc_logger),
-                Arc::clone(&arc_scan_id),
+                Arc::clone(&self.store),
                 Arc::clone(&arc_prober),
-                Arc::clone(&pause_notifier),
                 Arc::clone(&arc_throttle),
                 Arc::clone(&arc_tested),
                 None,
@@ -213,11 +136,13 @@ impl Scanner {
         while let Some(result) = join_set.join_next().await {
             if let Err(e) = result {
                 eprintln!("Task failed: {e:?}");
-                self.logger.error(&format!("Task failed: {e:?}")).await?;
+                self.store
+                    .log("error", &format!("Task failed: {e:?}"))
+                    .await;
             }
         }
 
-        self.db.get_scan_results(self.scan_id, 0, 0).await
+        self.store.results().await
     }
 
     /// Run scan headlessly, streaming per-result events through `tx`.
@@ -225,14 +150,10 @@ impl Scanner {
     pub async fn run_headless_stream(
         &self,
         tx: mpsc::UnboundedSender<StreamEvent>,
-    ) -> Result<ScanResults, sqlx::Error> {
+    ) -> Result<ScanResults, String> {
         let mut join_set = tokio::task::JoinSet::new();
 
         let arc_config = Arc::new(self.config.clone());
-        let arc_db = Arc::new(self.db.clone());
-        let arc_logger = Arc::new(self.logger.clone());
-        let arc_scan_id = Arc::new(self.scan_id);
-        let pause_notifier = Arc::new(AtomicBool::new(false));
         let arc_throttle = Arc::new(AtomicU64::new(0));
         let arc_tested = Arc::new(AtomicU64::new(0));
         let arc_tx = Arc::new(tx);
@@ -245,10 +166,9 @@ impl Scanner {
                 Arc::new(prober)
             }
             Err(e) => {
-                self.logger
-                    .error(&format!("Failed to create prober: {e:?}"))
-                    .await?;
-                return Err(sqlx::Error::BeginFailed);
+                let why = format!("Failed to create prober: {e:?}");
+                self.store.log("error", &why).await;
+                return Err(why);
             }
         };
 
@@ -292,11 +212,8 @@ impl Scanner {
             for i in 0..max_conc {
                 join_set.spawn(adaptive_task_handle(
                     Arc::clone(&arc_config),
-                    Arc::clone(&arc_db),
-                    Arc::clone(&arc_logger),
-                    Arc::clone(&arc_scan_id),
+                    Arc::clone(&self.store),
                     Arc::clone(&arc_prober),
-                    Arc::clone(&pause_notifier),
                     Arc::clone(&arc_tested),
                     Arc::clone(&shared),
                     i,
@@ -311,17 +228,14 @@ impl Scanner {
                 max_conc
             );
             eprintln!("[ambulo] {msg}");
-            let _ = self.logger.info(&msg).await;
+            self.store.log("info", &msg).await;
             Some((ticker, stop))
         } else {
             for _ in 0..self.config.tasks {
                 join_set.spawn(task_handle(
                     Arc::clone(&arc_config),
-                    Arc::clone(&arc_db),
-                    Arc::clone(&arc_logger),
-                    Arc::clone(&arc_scan_id),
+                    Arc::clone(&self.store),
                     Arc::clone(&arc_prober),
-                    Arc::clone(&pause_notifier),
                     Arc::clone(&arc_throttle),
                     Arc::clone(&arc_tested),
                     Some(Arc::clone(&arc_tx)),
@@ -332,7 +246,9 @@ impl Scanner {
 
         while let Some(result) = join_set.join_next().await {
             if let Err(e) = result {
-                self.logger.error(&format!("Task failed: {e:?}")).await?;
+                self.store
+                    .log("error", &format!("Task failed: {e:?}"))
+                    .await;
             }
         }
 
@@ -342,7 +258,7 @@ impl Scanner {
             ticker.abort();
         }
 
-        let results = self.db.get_scan_results(self.scan_id, 0, 0).await?;
+        let results = self.store.results().await?;
 
         let _ = arc_tx.send(StreamEvent {
             kind: "done".to_string(),
@@ -369,230 +285,6 @@ impl Scanner {
 
         Ok(results)
     }
-
-    #[allow(dead_code)]
-    pub async fn spawn_tasks(&self) -> Result<(), sqlx::Error> {
-        let mut join_set = tokio::task::JoinSet::new();
-
-        let arc_config = Arc::new(self.config.clone());
-        let arc_db = Arc::new(self.db.clone());
-        let arc_logger = Arc::new(self.logger.clone());
-        let arc_scan_id = Arc::new(self.scan_id);
-
-        let arc_prober = match crate::prober::Prober::new(&self.config).await {
-            Ok(mut prober) => {
-                prober.calibrate().await;
-                Arc::new(prober)
-            }
-            Err(e) => {
-                eprintln!("Failed to create prober: {e:?}");
-                self.logger
-                    .error(&format!("Failed to create prober: {e:?}"))
-                    .await?;
-                return Err(sqlx::Error::BeginFailed);
-            }
-        };
-
-        let terminal = ratatui::init();
-        let rows_limit = match self.config.enable_offset_pagination {
-            true => terminal.size()?.height as usize,
-            false => 0,
-        };
-
-        let scan_results_arc = Arc::new(Mutex::new(
-            self.db
-                .get_scan_results(self.scan_id, rows_limit, 0)
-                .await?,
-        ));
-
-        let scan_results_offset = Arc::new(Mutex::new(Offset::new(0)));
-        let scan_results_limit = Arc::new(Mutex::new(Limit::new(rows_limit)));
-
-        let logs_arc = Arc::new(Mutex::new(
-            self.db.get_logs(&self.scan_id, rows_limit, 0).await?,
-        ));
-
-        let logs_offset = Arc::new(Mutex::new(Offset::new(0)));
-        let logs_limit = Arc::new(Mutex::new(Limit::new(rows_limit)));
-
-        let pause_notifier = Arc::new(AtomicBool::new(false));
-        let arc_throttle = Arc::new(AtomicU64::new(0));
-        let arc_tested = Arc::new(AtomicU64::new(0));
-
-        // ADD SUBSCRIBERS IF PAGINATION IS ENABLED
-        if self.config.enable_offset_pagination {
-            // ATOMIC SUBSCRIBERS
-            {
-                let db = Arc::clone(&arc_db);
-                let scan_id = Arc::clone(&arc_scan_id);
-                let limit = Arc::clone(&scan_results_limit);
-                let offset = Arc::clone(&scan_results_offset);
-                let results = Arc::clone(&scan_results_arc);
-
-                let update_results = move |_| {
-                    let db = Arc::clone(&db);
-                    let scan_id = Arc::clone(&scan_id);
-                    let limit = Arc::clone(&limit);
-                    let offset = Arc::clone(&offset);
-                    let results = Arc::clone(&results);
-
-                    async move {
-                        let limit_val = limit.lock().unwrap().value;
-                        let offset_val = offset.lock().unwrap().value;
-                        match db.get_scan_results(*scan_id, limit_val, offset_val).await {
-                            Ok(new_results) => *results.lock().unwrap() = new_results,
-                            Err(e) => eprintln!("{e}"),
-                        }
-                    }
-                };
-
-                scan_results_offset
-                    .lock()
-                    .unwrap()
-                    .subscribe(update_results.clone());
-                scan_results_limit.lock().unwrap().subscribe(update_results);
-            }
-            {
-                let db = Arc::clone(&arc_db);
-                let scan_id = Arc::clone(&arc_scan_id);
-                let limit = Arc::clone(&logs_limit);
-                let offset = Arc::clone(&logs_offset);
-                let logs_data = Arc::clone(&logs_arc);
-
-                let update_logs = move |_| {
-                    let db = Arc::clone(&db);
-                    let scan_id = Arc::clone(&scan_id);
-                    let limit = Arc::clone(&limit);
-                    let offset = Arc::clone(&offset);
-                    let logs_data = Arc::clone(&logs_data);
-
-                    async move {
-                        let (limit_val, offset_val) =
-                            { (limit.lock().unwrap().value, offset.lock().unwrap().value) };
-                        match db.get_logs(&scan_id, limit_val, offset_val).await {
-                            Ok(new_logs) => *logs_data.lock().unwrap() = new_logs,
-                            Err(e) => eprintln!("Error fetching logs: {e:?}"),
-                        }
-                    }
-                };
-
-                logs_offset.lock().unwrap().subscribe(update_logs.clone());
-                logs_limit.lock().unwrap().subscribe(update_logs);
-            }
-        }
-
-        let mut tui = Tui::new(
-            Arc::clone(&arc_config),
-            Arc::clone(&scan_results_arc),
-            Arc::clone(&pause_notifier),
-            Arc::clone(&scan_results_limit),
-            Arc::clone(&scan_results_offset),
-            Arc::clone(&logs_arc),
-            Arc::clone(&logs_limit),
-            Arc::clone(&logs_offset),
-            self.scan_id,
-            self.db.clone(),
-        );
-
-        for _ in 0..self.config.tasks {
-            join_set.spawn(task_handle(
-                Arc::clone(&arc_config),
-                Arc::clone(&arc_db),
-                Arc::clone(&arc_logger),
-                Arc::clone(&arc_scan_id),
-                Arc::clone(&arc_prober),
-                Arc::clone(&pause_notifier),
-                Arc::clone(&arc_throttle),
-                Arc::clone(&arc_tested),
-                None,
-            ));
-        }
-
-        join_set.spawn(update_results_handle(
-            Arc::clone(&arc_db),
-            Arc::clone(&arc_scan_id),
-            Arc::clone(&scan_results_arc),
-            Arc::clone(&scan_results_limit),
-            Arc::clone(&scan_results_offset),
-        ));
-
-        join_set.spawn(update_logs_handle(
-            Arc::clone(&arc_db),
-            Arc::clone(&arc_scan_id),
-            Arc::clone(&logs_arc),
-            Arc::clone(&logs_limit),
-            Arc::clone(&logs_offset),
-        ));
-
-        if let Err(e) = tui.run(terminal).await {
-            eprintln!("Failed to run TUI: {e:?}");
-            self.logger
-                .error(&format!("Failed to run TUI: {e:?}"))
-                .await?;
-            return Err(sqlx::Error::BeginFailed);
-        }
-
-        while let Some(result) = join_set.join_next().await {
-            if let Err(e) = result {
-                eprintln!("Task failed: {e:?}");
-                self.logger.error(&format!("Task failed: {e:?}")).await?;
-            }
-        }
-
-        Ok(())
-    }
-}
-
-#[allow(dead_code)]
-async fn update_logs_handle(
-    db: Arc<AmbuloDb>,
-    scan_id: Arc<i64>,
-    logs: Arc<Mutex<Logs>>,
-    limit: Arc<Mutex<Limit>>,
-    offset: Arc<Mutex<Offset>>,
-) -> Result<(), sqlx::Error> {
-    loop {
-        // Wait for the specified interval before updating logs
-        sleep(Duration::from_secs(1)).await;
-        let (limit_val, offset_val) =
-            { (limit.lock().unwrap().value, offset.lock().unwrap().value) };
-
-        let new_logs = match db.get_logs(&scan_id, limit_val, offset_val).await {
-            Ok(logs) => logs,
-            Err(e) => {
-                eprintln!("Error fetching logs: {e:?}");
-                continue; // Retry on error
-            }
-        };
-        let mut logs_lock = logs.lock().unwrap();
-        *logs_lock = new_logs;
-    }
-}
-
-#[allow(dead_code)]
-async fn update_results_handle(
-    db: Arc<AmbuloDb>,
-    scan_id: Arc<i64>,
-    results: Arc<Mutex<ScanResults>>,
-    limit: Arc<Mutex<Limit>>,
-    offset: Arc<Mutex<Offset>>,
-) -> Result<(), sqlx::Error> {
-    loop {
-        // Wait for the specified interval before updating results
-        sleep(Duration::from_secs(1)).await;
-        let (limit_val, offset_val) =
-            { (limit.lock().unwrap().value, offset.lock().unwrap().value) };
-
-        let new_results = match db.get_scan_results(*scan_id, limit_val, offset_val).await {
-            Ok(results) => results,
-            Err(e) => {
-                eprintln!("Error fetching scan results: {e:?}");
-                continue; // Retry on error
-            }
-        };
-        let mut results_lock = results.lock().unwrap();
-        *results_lock = new_results;
-    }
 }
 
 // Adaptive rate-limit control (shared across all workers of one scan).
@@ -616,13 +308,10 @@ fn parse_retry_after(headers: &Option<Vec<String>>) -> Option<u64> {
 // Worker entry point: every argument is a distinct channel, budget or shared
 // handle. Bundling them hides which parts a task actually touches.
 #[allow(clippy::too_many_arguments)]
-async fn task_handle(
+async fn task_handle<S: Store>(
     config: Arc<cli_args::Args>,
-    db: Arc<AmbuloDb>,
-    logger: Arc<Logger>,
-    scan_id: Arc<i64>,
+    store: Arc<S>,
     prober: Arc<crate::prober::Prober>,
-    pause_notifier: Arc<AtomicBool>,
     // Shared adaptive throttle (ms) added between probes; grows on 429s so the
     // whole scan backs off the target and stops losing findings to rate limits.
     throttle: Arc<AtomicU64>,
@@ -636,12 +325,6 @@ async fn task_handle(
             sleep(Duration::from_millis(wait_ms)).await;
         }
 
-        if pause_notifier.load(core::sync::atomic::Ordering::Relaxed) {
-            let _ = logger.debug("Scanner paused, waiting...").await;
-            sleep(Duration::from_secs(1)).await;
-            continue;
-        }
-
         // If the result-stream consumer (the node) has disconnected, stop:
         // nobody is listening, so continuing would just keep hammering the
         // target after a pause/halt/delete. The node closes this stream when
@@ -651,21 +334,24 @@ async fn task_handle(
         if let Some(ref tx) = event_tx
             && tx.is_closed()
         {
-            let _ = logger
-                .info("Result stream consumer disconnected - stopping scan")
+            store
+                .log(
+                    "info",
+                    "Result stream consumer disconnected - stopping scan",
+                )
                 .await;
             return Ok(());
         }
 
-        let work = match db.get_work_one(&scan_id).await {
-            Ok(work) => work,
-            Err(sqlx::Error::RowNotFound) => {
-                let _ = logger.info("No work available, exiting thread").await;
+        let work = match store.claim().await {
+            Ok(Some(work)) => work,
+            Ok(None) => {
+                store.log("info", "No work available, exiting thread").await;
                 return Ok(());
             }
             Err(e) => {
-                let msg = format!("Error fetching work: {e:?}");
-                let _ = logger.error(&msg).await;
+                let msg = format!("Error fetching work: {e}");
+                store.log("error", &msg).await;
                 emit_log(&event_tx, "error", &msg);
                 sleep(Duration::from_millis(200)).await;
                 continue;
@@ -718,7 +404,7 @@ async fn task_handle(
             let cur = throttle.load(Ordering::Relaxed);
             throttle.store(cur.saturating_sub(RL_STEP_MS), Ordering::Relaxed);
         }
-        record_outcome(&db, &logger, &event_tx, &tested, &work, probe, rl_attempt).await?;
+        record_outcome(&*store, &event_tx, &tested, &work, probe, rl_attempt).await;
     }
 }
 
@@ -726,33 +412,27 @@ async fn task_handle(
 /// fixed-pool `task_handle` and the adaptive `adaptive_task_handle` so both
 /// record results identically.
 async fn record_outcome(
-    db: &AmbuloDb,
-    logger: &Logger,
+    store: &impl Store,
     event_tx: &Option<Arc<mpsc::UnboundedSender<StreamEvent>>>,
     tested: &AtomicU64,
-    work: &crate::libs::ambulo_db::Work,
+    work: &Work,
     probe: Result<crate::prober::ProbeResult, crate::prober::ProbeError>,
     retries: u32,
-) -> Result<(), sqlx::Error> {
+) {
     match probe {
         Ok(result) => {
-            if let Err(e) = db
-                .update_work_status(
-                    work.entry_id,
-                    &result.status,
-                    result.response.status.to_string().as_str(),
-                    result.response.body,
-                    result.response.headers,
-                    result.response.headers_length,
-                    result.response.body_length,
-                )
-                .await
-            {
-                let msg = format!("Failed to update work status: {e:?}");
-                let _ = logger.error(&msg).await;
+            let outcome = Outcome {
+                status: &result.status,
+                code: &result.response.status.to_string(),
+                body_length: result.response.body_length,
+                headers_length: result.response.headers_length,
+            };
+            if let Err(e) = store.record(work.entry_id, outcome).await {
+                let msg = format!("Failed to update work status: {e}");
+                store.log("error", &msg).await;
                 emit_log(event_tx, "error", &msg);
-                let _ = db.reset_entry_to_queued(work.entry_id).await;
-                return Ok(());
+                let _ = store.release(work.entry_id).await;
+                return;
             }
 
             emit_log(
@@ -800,7 +480,7 @@ async fn record_outcome(
         }
         Err(e) => {
             let err_msg = e.to_string();
-            let _ = logger.error(&err_msg).await;
+            store.log("error", &err_msg).await;
             let (entry_status, code) = match &e {
                 crate::prober::ProbeError::UnsupportedMethod(_) => ("error", "EXCEPT"),
                 crate::prober::ProbeError::RequestFailed(_) => ("error", "0"),
@@ -810,14 +490,17 @@ async fn record_outcome(
                 "error",
                 &format!("[{}] {} {}", code, work.url, err_msg),
             );
-            if let Err(db_err) = db
-                .update_work_status(work.entry_id, entry_status, code, None, None, 0, 0)
-                .await
-            {
-                let msg = format!("Failed to update error status: {db_err:?}");
-                let _ = logger.error(&msg).await;
+            let outcome = Outcome {
+                status: entry_status,
+                code,
+                body_length: 0,
+                headers_length: 0,
+            };
+            if let Err(e) = store.record(work.entry_id, outcome).await {
+                let msg = format!("Failed to update error status: {e}");
+                store.log("error", &msg).await;
                 emit_log(event_tx, "error", &msg);
-                let _ = db.reset_entry_to_queued(work.entry_id).await;
+                let _ = store.release(work.entry_id).await;
             }
             if let Some(tx) = event_tx {
                 let _ = tx.send(StreamEvent {
@@ -845,7 +528,6 @@ async fn record_outcome(
             }
         }
     }
-    Ok(())
 }
 
 fn emit_log(event_tx: &Option<Arc<mpsc::UnboundedSender<StreamEvent>>>, level: &str, msg: &str) {
@@ -997,13 +679,10 @@ async fn controller_tick(
 // Worker entry point: every argument is a distinct channel, budget or shared
 // handle. Bundling them hides which parts a task actually touches.
 #[allow(clippy::too_many_arguments)]
-async fn adaptive_task_handle(
+async fn adaptive_task_handle<S: Store>(
     config: Arc<cli_args::Args>,
-    db: Arc<AmbuloDb>,
-    logger: Arc<Logger>,
-    scan_id: Arc<i64>,
+    store: Arc<S>,
     prober: Arc<crate::prober::Prober>,
-    pause_notifier: Arc<AtomicBool>,
     tested: Arc<AtomicU64>,
     shared: Arc<AdaptiveShared>,
     worker_index: u64,
@@ -1037,32 +716,29 @@ async fn adaptive_task_handle(
             sleep(Duration::from_millis(delay)).await;
         }
 
-        if pause_notifier.load(Ordering::Relaxed) {
-            let _ = logger.debug("Scanner paused, waiting...").await;
-            sleep(Duration::from_secs(1)).await;
-            continue;
-        }
-
         if let Some(ref tx) = event_tx
             && tx.is_closed()
         {
-            let _ = logger
-                .info("Result stream consumer disconnected - stopping scan")
+            store
+                .log(
+                    "info",
+                    "Result stream consumer disconnected - stopping scan",
+                )
                 .await;
             return Ok(());
         }
 
-        let work = match db.get_work_one(&scan_id).await {
-            Ok(work) => work,
-            Err(sqlx::Error::RowNotFound) => {
+        let work = match store.claim().await {
+            Ok(Some(work)) => work,
+            Ok(None) => {
                 // Queue empty: signal parked workers to stop, then exit.
                 shared.drained.store(true, Ordering::Relaxed);
-                let _ = logger.info("No work available, exiting thread").await;
+                store.log("info", "No work available, exiting thread").await;
                 return Ok(());
             }
             Err(e) => {
-                let msg = format!("Error fetching work: {e:?}");
-                let _ = logger.error(&msg).await;
+                let msg = format!("Error fetching work: {e}");
+                store.log("error", &msg).await;
                 emit_log(&event_tx, "error", &msg);
                 sleep(Duration::from_millis(200)).await;
                 continue;
@@ -1126,15 +802,6 @@ async fn adaptive_task_handle(
             break probe;
         };
 
-        record_outcome(
-            &db,
-            &logger,
-            &event_tx,
-            &tested,
-            &work,
-            final_probe,
-            attempt,
-        )
-        .await?;
+        record_outcome(&*store, &event_tx, &tested, &work, final_probe, attempt).await;
     }
 }

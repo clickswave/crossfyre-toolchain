@@ -1,5 +1,5 @@
-use crate::libs::ambulo_db::AmbuloDb;
-use crate::libs::cli_args::{Args, HttpMethod, LogLevel, OutputFormat};
+use crate::libs::ambulo_db::{AmbuloDb, ScanStore};
+use crate::libs::cli_args::{Args, HttpMethod, LogLevel};
 use crate::scanner::{Scanner, StreamEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -772,7 +772,7 @@ async fn prepare_scan(
     db: &Arc<AmbuloDb>,
     isolate: Option<&str>,
     words: ScanWords<'_>,
-) -> Result<(Scanner, usize, i64), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(Scanner<ScanStore>, usize, i64), Box<dyn std::error::Error + Send + Sync>> {
     let http_method = parse_method(&params.method);
 
     let mut endpoint = params.endpoint.clone();
@@ -845,11 +845,6 @@ async fn prepare_scan(
         Err(e) => return Err(format!("DB: {e}").into()),
     };
 
-    let logger = db
-        .spawn_logger(&scan.id, &config.log_level.to_string())
-        .await
-        .map_err(|e| format!("DB: {e}"))?;
-
     let urls = match db.find_urls(&scan.id).await {
         Ok(u) => u,
         Err(sqlx::Error::RowNotFound) => db
@@ -878,8 +873,8 @@ async fn prepare_scan(
         .await
         .map_err(|e| format!("DB: {e}"))?;
 
-    let scan_db = db.clone_with_config(config.clone());
-    let scanner = Scanner::new(config, scan_db, logger, scan.id);
+    let store = db.scan_store(scan.id, &config);
+    let scanner = Scanner::new(config, store);
 
     Ok((scanner, total, scan.id))
 }
@@ -934,18 +929,12 @@ fn build_args(params: &ScanParams, endpoint: String, http_method: HttpMethod) ->
         random_user_agent_scan: false,
         random_user_agent_request: false,
         append_slash: false,
-        save_response_body: false,
         save_response_headers: true,
         user_agent: adaptive::identity::resolve(&adaptive::identity::Mode::Evasive, None)
             .user_agent,
-        no_exit_banner: true,
-        recreate_db: false,
         launch_delay: 0,
         log_level: LogLevel::Info,
-        output_format: OutputFormat::Text,
-        output_path: String::new(),
         event_poll_timeout: 1000,
-        enable_offset_pagination: false,
         interactive: false,
         adaptive_rate: params.adaptive_rate,
         adaptive_resilience: params.adaptive_resilience,
@@ -1101,9 +1090,7 @@ mod egress_tests {
     async fn daemon() -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("addr").port();
-        let db = Arc::new(AmbuloDb::unconnected(
-            &crate::libs::cli_args::defaults_for_tests(),
-        ));
+        let db = Arc::new(AmbuloDb::unconnected());
         let follow = Arc::new(build_probe_client(true, &transport::Egress::Inherit).unwrap());
         let stay = Arc::new(build_probe_client(false, &transport::Egress::Inherit).unwrap());
         tokio::spawn(async move {
@@ -1372,7 +1359,7 @@ mod egress_tests {
         };
         let args = build_args(&params, params.endpoint.clone(), HttpMethod::Get);
         let prober = crate::prober::Prober::new(&args).await.unwrap();
-        let work = crate::libs::ambulo_db::Work {
+        let work = crate::store::Work {
             url: format!("{}/admin", fx.base()),
             entry_id: 1,
             method: "get".into(),
@@ -1397,9 +1384,7 @@ mod http_request_tests {
     async fn daemon() -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("addr").port();
-        let db = Arc::new(AmbuloDb::unconnected(
-            &crate::libs::cli_args::defaults_for_tests(),
-        ));
+        let db = Arc::new(AmbuloDb::unconnected());
         let follow = Arc::new(build_probe_client(true, &transport::Egress::Inherit).unwrap());
         let stay = Arc::new(build_probe_client(false, &transport::Egress::Inherit).unwrap());
         tokio::spawn(async move {
@@ -1503,9 +1488,7 @@ mod probe_redirect_tests {
         }))
         .unwrap();
         let client = Arc::new(build_probe_client(true, &transport::Egress::Inherit).unwrap());
-        let db = Arc::new(AmbuloDb::unconnected(
-            &crate::libs::cli_args::defaults_for_tests(),
-        ));
+        let db = Arc::new(AmbuloDb::unconnected());
         run_probe(params, client, db).await
     }
 

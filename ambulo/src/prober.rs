@@ -1,5 +1,5 @@
-use crate::libs::ambulo_db::Work;
 use crate::libs::cli_args;
+use crate::store::Work;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use reqwest::header::{AUTHORIZATION, COOKIE, HeaderMap, HeaderName, HeaderValue};
@@ -29,7 +29,6 @@ pub struct Response {
     pub status: u16,
     pub headers: Option<Vec<String>>,
     pub headers_length: i64,
-    pub body: Option<Vec<u8>>,
     pub body_length: i64,
     /// Where the request actually landed. Equal to the requested URL for a direct
     /// hit; when redirects were followed it is the final destination, so the node
@@ -292,30 +291,14 @@ impl Prober {
                 (None, headers_length as i64)
             }
         };
-        // if save_response_body is true, we need to get body as bytes anyway but,
-        // if its false, check for content length first
-        // if content length is present, we can skip reading the body
-        let (body, body_length) = match self.config.save_response_body {
-            true => {
-                let valid_body = valid_response.bytes().await;
-                match valid_body {
-                    Ok(bytes) => (Some(bytes.to_vec()), bytes.len() as i64),
-                    Err(_) => (None, 0),
-                }
-            }
-            false => {
-                let content_length = valid_response.content_length();
-                match content_length {
-                    Some(len) => (None, len as i64),
-                    None => {
-                        let valid_body = valid_response.bytes().await;
-                        match valid_body {
-                            Ok(bytes) => (None, bytes.len() as i64),
-                            Err(_) => (None, 0),
-                        }
-                    }
-                }
-            }
+        // The body is not kept, only its length: the declared one when there is one, so
+        // the body need not be read for it.
+        let body_length = match valid_response.content_length() {
+            Some(len) => len as i64,
+            None => match valid_response.bytes().await {
+                Ok(bytes) => bytes.len() as i64,
+                Err(_) => 0,
+            },
         };
 
         // Demote a "found" that matches the learned soft-404 wildcard (same success status and a
@@ -337,7 +320,6 @@ impl Prober {
                 status: response_status,
                 headers,
                 headers_length,
-                body,
                 body_length,
                 final_url,
             },
