@@ -384,7 +384,7 @@ enum NodeAction {
 enum OastAction {
     /// Install the OAST server as a systemd service (cf-oast) on this machine for your domain, then obtain
     /// a wildcard TLS cert (ACME DNS-01) and print the DNS-delegation records to add.
-    /// Re-run after adding the records to finish TLS. Needs root (sudo).
+    /// Re-run after adding the records to finish TLS. Needs root, which it asks sudo for.
     Setup {
         /// The delegated zone callbacks arrive on, e.g. oob.example.com
         #[arg(long)]
@@ -520,6 +520,16 @@ fn main() -> std::process::ExitCode {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    // Run by a user, a command that needs root runs again through sudo.
+    #[cfg(unix)]
+    if !cfx_core::os::is_elevated()
+        && let Some(command) = needs_root(
+            &cli.command,
+            &cfx_core::toolchain::install::may_replace_binaries,
+        )
+    {
+        cfx_core::os::rerun_as_root(command);
+    }
     let base = cfx_core::resolve_data_dir(cli.data_dir.as_deref())?;
     // Make --data-dir mean what it says: config.toml lives under the same root
     // as nodes.d and auth.toml, so an isolated node set gets its own database
@@ -854,6 +864,48 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// The command as a person names it, as `node init`, when it needs root on Linux and
+/// macOS, where it then runs itself again through sudo. The node service, the node's
+/// configs (which only root may change, and which `node remove` reads and deletes),
+/// uninstall and the OAST service always need it. `update` and the commands that install
+/// or remove an engine need it when this user may not replace what is in the bin
+/// directory, as in the installer's /opt/crossfyre/bin: `binaries_writable` says.
+#[cfg(unix)]
+fn needs_root(command: &Commands, binaries_writable: &dyn Fn() -> bool) -> Option<&'static str> {
+    match command {
+        Commands::Node { action } => match action {
+            NodeAction::Init { .. } => Some("node init"),
+            NodeAction::Up { .. } => Some("node up"),
+            NodeAction::Down => Some("node down"),
+            NodeAction::Restart => Some("node restart"),
+            NodeAction::Enable => Some("node enable"),
+            NodeAction::Disable => Some("node disable"),
+            NodeAction::Remove {
+                node_id,
+                inactive,
+                all,
+            } if node_id.is_some() || *inactive || *all => Some("node remove"),
+            NodeAction::Remove { .. } | NodeAction::List { .. } | NodeAction::Status => None,
+        },
+        Commands::Uninstall { .. } => Some("uninstall"),
+        Commands::Oast {
+            action: OastAction::Setup { .. },
+        } if cfg!(target_os = "linux") => Some("oast setup"),
+        Commands::Update { .. } if !binaries_writable() => Some("update"),
+        Commands::Extension { action } => match action {
+            ExtensionAction::Install { name: Some(_), .. } if !binaries_writable() => {
+                Some("extension install")
+            }
+            ExtensionAction::Remove { name: Some(_) } if !binaries_writable() => {
+                Some("extension remove")
+            }
+            ExtensionAction::Update { .. } if !binaries_writable() => Some("extension update"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Write `bytes` to stdout. A reader that stops early, as `head` does, closes the pipe,
 /// and that is not an error: the rest was not wanted. clap_complete panics on any failed
 /// write, so what it generates is kept in memory and written from here.
@@ -916,6 +968,99 @@ async fn mcp_cloud(base: &std::path::Path, cmd: CloudCommand) {
         Err(e) => {
             eprintln!("crossfyre mcp cloud: {e}");
             std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    fn root_for(args: &[&str], binaries_writable: bool) -> Option<&'static str> {
+        let cli = Cli::try_parse_from(std::iter::once("crossfyre").chain(args.iter().copied()))
+            .expect("parses");
+        needs_root(&cli.command, &|| binaries_writable)
+    }
+
+    #[test]
+    fn the_node_s_service_and_configs_and_uninstall_always_need_root() {
+        for (args, name) in [
+            (&["node", "init"][..], "node init"),
+            (
+                &["node", "init", "--no-service", "--node-key", "k"],
+                "node init",
+            ),
+            (&["node", "up"], "node up"),
+            (&["node", "up", "--force"], "node up"),
+            (&["node", "down"], "node down"),
+            (&["node", "restart"], "node restart"),
+            (&["node", "enable"], "node enable"),
+            (&["node", "disable"], "node disable"),
+            (&["node", "remove", "0b7f5d0e"], "node remove"),
+            (&["node", "remove", "--inactive"], "node remove"),
+            (&["node", "remove", "--all"], "node remove"),
+            (&["uninstall", "--yes"], "uninstall"),
+            (&["uninstall", "--purge"], "uninstall"),
+        ] {
+            for writable in [false, true] {
+                assert_eq!(root_for(args, writable), Some(name), "{args:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn replacing_binaries_needs_root_only_where_this_user_may_not_write_them() {
+        for (args, name) in [
+            (&["update"][..], "update"),
+            (&["update", "self"], "update"),
+            (&["update", "voyage", "--force"], "update"),
+            (&["extension", "install", "voyage"], "extension install"),
+            (&["extension", "remove", "voyage"], "extension remove"),
+            (&["extension", "update"], "extension update"),
+            (&["extension", "update", "voyage"], "extension update"),
+        ] {
+            assert_eq!(root_for(args, false), Some(name), "{args:?}");
+            assert_eq!(root_for(args, true), None, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn the_oast_service_needs_root_where_it_can_be_set_up() {
+        let args = ["oast", "setup", "--domain", "oob.example.com"];
+        let want = cfg!(target_os = "linux").then_some("oast setup");
+        assert_eq!(root_for(&args, true), want);
+    }
+
+    /// Engines are the user's own services, and the rest reads or talks to the
+    /// account, so none of it asks for root.
+    #[test]
+    fn everything_else_runs_as_the_user() {
+        for args in [
+            &["login"][..],
+            &["logout"],
+            &["status"],
+            &["doctor"],
+            &["node", "status"],
+            &["node", "list"],
+            &["node", "remove"],
+            &["extension", "list"],
+            &["extension", "install"],
+            &["extension", "remove"],
+            &["extension", "start", "voyage"],
+            &["extension", "stop", "voyage"],
+            &["extension", "restart", "voyage"],
+            &["extension", "enable", "voyage"],
+            &["extension", "disable", "voyage"],
+            &["oast", "status"],
+            &["oast", "serve", "--domain", "oob.example.com"],
+            &["db", "up"],
+            &["mcp"],
+            &["run", "x.cfx", "domain:example.com"],
+            &["completions", "bash"],
+        ] {
+            for writable in [false, true] {
+                assert_eq!(root_for(args, writable), None, "{args:?}");
+            }
         }
     }
 }

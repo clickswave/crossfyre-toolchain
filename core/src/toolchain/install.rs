@@ -1000,6 +1000,27 @@ const RIGHTS: &str = if cfg!(windows) {
     "root"
 };
 
+/// The directory `update` writes the CLI to first (see `cli_targets`).
+fn cli_dir(bin_dir: &Path) -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            let stable = bin_dir.join(ext_file_name("crossfyre"));
+            cli_targets(&exe, &stable).into_iter().next()
+        })
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| bin_dir.to_path_buf())
+}
+
+/// May this user replace what `update` and the engine commands replace: what is in the
+/// bin directory, and the CLI unless a package keeps it? On Linux and macOS a command
+/// that may not runs itself again through sudo.
+pub fn may_replace_binaries() -> bool {
+    let bin_dir = get_bin_dir();
+    can_write_in(&bin_dir)
+        && (packaging::owner("crossfyre").is_some() || can_write_in(&cli_dir(&bin_dir)))
+}
+
 /// Can this process create files in `dir`, or create `dir` itself? Asked before anything
 /// is downloaded, so that an update run by a user who may not write the bin directory
 /// says what it needs at once. Without it, each component was downloaded and then failed
@@ -1163,15 +1184,7 @@ async fn update_with(
         println!("  {}", dim("Core"));
 
         let want = manifest_version(manifest, "crossfyre");
-        // Where the update writes the CLI first (see `cli_targets`).
-        let cli_dir = std::env::current_exe()
-            .ok()
-            .and_then(|exe| {
-                let stable = bin_dir.join(ext_file_name("crossfyre"));
-                cli_targets(&exe, &stable).into_iter().next()
-            })
-            .and_then(|p| p.parent().map(Path::to_path_buf))
-            .unwrap_or_else(|| bin_dir.clone());
+        let cli_dir = cli_dir(&bin_dir);
         if let Some(m) = packaging::owner("crossfyre") {
             println!(
                 "{}",

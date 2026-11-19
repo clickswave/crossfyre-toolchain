@@ -40,7 +40,7 @@ crossfyre run recon.cfx domain:example.com
 `crossfyre oast` stands up your own out-of-band server (see [`oast`](../oast/)):
 
 ```sh
-sudo crossfyre oast setup --domain oob.yourdomain.com --email you@yourdomain.com
+crossfyre oast setup --domain oob.yourdomain.com --email you@yourdomain.com
 crossfyre oast status
 ```
 

@@ -127,7 +127,7 @@ pub fn purge_root_network_dirs() -> io::Result<Option<PathBuf>> {
     if !privileged() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            format!("{} belongs to root: run this with sudo", dir.display()),
+            format!("{} belongs to root", dir.display()),
         ));
     }
     super::root_fs::remove_dir_all(&dir)?;

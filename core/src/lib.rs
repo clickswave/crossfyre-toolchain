@@ -869,15 +869,15 @@ pub fn print_privilege_banner(needs_root: bool) {
         .filter(|s| !s.is_empty() && s != "root");
     if elevated && sudo_user.is_none() && cfg!(unix) {
         eprintln!(
-            "[security] WARNING: launched as plain root. Re-run with `sudo crossfyre ...` from your user shell."
+            "[security] WARNING: launched as plain root, so the config and the engines go to root's account. Run crossfyre from your own account: it uses sudo where it needs root."
         );
     } else if !elevated && needs_root {
         if cfg!(windows) {
             eprintln!("Please re-run from an elevated prompt (Run as administrator):");
             eprintln!("  crossfyre node up");
         } else {
-            eprintln!("Please re-run with sudo:");
-            eprintln!("  sudo crossfyre node up");
+            eprintln!("The node needs root. Start it with:");
+            eprintln!("  crossfyre node up");
         }
         std::process::exit(1);
     }

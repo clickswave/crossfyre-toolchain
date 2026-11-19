@@ -22,7 +22,7 @@ If you have the `crossfyre` CLI on a public box, one command sets everything up,
 including wildcard TLS and the DNS records you need to add:
 
 ```sh
-sudo crossfyre oast setup --domain oob.yourdomain.com --email you@yourdomain.com
+crossfyre oast setup --domain oob.yourdomain.com --email you@yourdomain.com
 ```
 
 See the [self-host guide](https://github.com/clickswave/crossfyre-toolchain) for the

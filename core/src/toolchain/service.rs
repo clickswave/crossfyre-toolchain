@@ -725,7 +725,7 @@ mod node {
 
     fn require_root() -> Result<(), Box<dyn std::error::Error>> {
         if unsafe { libc::geteuid() } != 0 {
-            return Err("managing the node service needs root. Re-run with sudo.".into());
+            return Err("managing the node service needs root".into());
         }
         Ok(())
     }
@@ -952,7 +952,7 @@ mod node {
 
     fn require_root() -> Result<(), Box<dyn std::error::Error>> {
         if !crate::os::is_elevated() {
-            return Err("managing the node service needs root. Re-run with sudo.".into());
+            return Err("managing the node service needs root".into());
         }
         Ok(())
     }
