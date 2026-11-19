@@ -285,7 +285,7 @@ async fn handle_db(
 
 async fn handle_origin(args: OriginArgs) -> Result<(), Box<dyn std::error::Error>> {
     if args.domain.trim().is_empty() {
-        eprintln!("Error: --domain is required");
+        eprintln!("Error: the domain is empty");
         std::process::exit(1);
     }
 

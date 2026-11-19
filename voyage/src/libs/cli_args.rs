@@ -84,8 +84,8 @@ pub enum Commands {
 
 #[derive(ClapArgs, Clone, Debug)]
 pub struct AxfrArgs {
-    /// Zone to request (e.g. example.com)
-    #[arg(short, long)]
+    /// The zone to request (e.g. example.com)
+    #[arg(value_name = "DOMAIN")]
     pub domain: String,
 
     /// Nameserver to ask, as `ip` or `ip:port`. Omit to ask the zone's own
@@ -100,8 +100,8 @@ pub struct AxfrArgs {
 
 #[derive(ClapArgs, Clone, Debug)]
 pub struct OriginArgs {
-    /// Target apex domain (e.g. example.com)
-    #[arg(short, long)]
+    /// The apex domain to look behind (e.g. example.com)
+    #[arg(value_name = "DOMAIN")]
     pub domain: String,
 
     /// Per-request timeout in ms
@@ -405,5 +405,29 @@ mod tests {
         assert!(parsed(&["voyage", "scan", "example.com", "--no-tui"]));
         assert!(!parsed(&["voyage", "scan", "example.com"]));
         assert!(Cli::try_parse_from(["voyage", "--tui", "scan", "example.com"]).is_err());
+    }
+    #[test]
+    fn origin_and_axfr_take_the_domain_as_scan_does() {
+        let cli = Cli::try_parse_from(["voyage", "origin", "example.com"]).expect("parses");
+        let Some(Commands::Origin(args)) = cli.command else {
+            panic!("not origin")
+        };
+        assert_eq!(args.domain, "example.com");
+        let cli =
+            Cli::try_parse_from(["voyage", "axfr", "example.com", "--dns-server", "10.0.0.53"])
+                .expect("parses");
+        let Some(Commands::Axfr(args)) = cli.command else {
+            panic!("not axfr")
+        };
+        assert_eq!(args.domain, "example.com");
+        for old in [
+            &["voyage", "origin"][..],
+            &["voyage", "origin", "-d", "example.com"],
+            &["voyage", "origin", "--domain", "example.com"],
+            &["voyage", "axfr", "-d", "example.com"],
+            &["voyage", "axfr", "--domain", "example.com"],
+        ] {
+            assert!(Cli::try_parse_from(old).is_err(), "{old:?}");
+        }
     }
 }
