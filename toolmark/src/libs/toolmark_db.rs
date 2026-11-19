@@ -331,6 +331,78 @@ impl Observer for ScanObserver {
 mod tests {
     use super::*;
 
+    /// A product toolmark found on `host`, as a fingerprint reports it.
+    fn found(host: &str, product: &str, version: &str, cpe: &str) -> Value {
+        serde_json::json!({"type": "finding", "data": {
+            "type": "technology", "host": host, "port": 443, "scheme": "https",
+            "name": product, "category": "Web Server", "version": version, "cpe": cpe,
+            "confidence": 50, "evidence": ["header server: x"],
+        }})
+    }
+
+    /// A host whose version of a product changed between two scans is in the inventory
+    /// once, at the newer version, seen at the second scan.
+    #[tokio::test]
+    #[ignore = "needs PostgreSQL's programs"]
+    async fn the_inventory_holds_each_product_once_at_its_newest_version() {
+        let scratch = cfx_db::testing::Scratch::new(&ENGINE).await;
+        let db = ToolmarkDb::new(scratch.pool.clone());
+        let mut seen = Vec::new();
+        for (version, cpe) in [
+            ("1.24.0", "cpe:2.3:a:f5:nginx:1.24.0:*:*:*:*:*:*:*"),
+            ("1.25.3", "cpe:2.3:a:f5:nginx:1.25.3:*:*:*:*:*:*:*"),
+        ] {
+            let params = serde_json::json!({"target": "https://app.test/"});
+            let scan = db.start("fingerprint", "https://app.test/", &params).await;
+            db.event(
+                scan.as_ref().map(|s| s.id.as_str()),
+                &found("app.test", "Nginx", version, cpe),
+            )
+            .await;
+            db.finish(scan, Status::Completed).await;
+            seen.push(database_now(&db).await);
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        }
+        let inventory = db.inventory().await;
+        assert_eq!(inventory["status"], "completed", "{inventory}");
+        let rows = inventory["inventory"].as_array().expect("rows");
+        assert_eq!(rows.len(), 1, "{inventory}");
+        let row = &rows[0];
+        assert_eq!(
+            (
+                &row["host"],
+                &row["port"],
+                &row["product"],
+                &row["vendor"],
+                &row["version"]
+            ),
+            (
+                &serde_json::json!("app.test"),
+                &serde_json::json!(443),
+                &serde_json::json!("Nginx"),
+                &serde_json::json!("f5"),
+                &serde_json::json!("1.25.3")
+            ),
+            "{inventory}"
+        );
+        let last_seen = row["last_seen"].as_str().expect("last seen");
+        assert!(
+            seen[0].as_str() < last_seen && last_seen <= seen[1].as_str(),
+            "seen at the second scan: {last_seen}, scans at {seen:?}"
+        );
+        scratch.done().await;
+    }
+
+    /// The database's clock now, as the inventory writes a time.
+    async fn database_now(db: &ToolmarkDb) -> String {
+        sqlx::query_scalar(
+            "SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("now")
+    }
+
     #[test]
     fn a_header_keeps_no_credential_and_no_url_that_carried_one() {
         let seen = [

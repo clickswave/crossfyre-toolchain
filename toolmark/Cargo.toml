@@ -33,6 +33,8 @@ md5 = "0.7"
 [dev-dependencies]
 # A recording SOCKS5 proxy and counting listeners for the egress tests.
 cfx_tunnel = { path = "../tunnel", features = ["recorder"] }
+# A database of a test's own, for the tests of what toolmark keeps.
+cfx_db = { path = "../db", features = ["testing"] }
 
 [features]
 # First-party builds enable this to swap the scan client to wreq (BoringSSL) for

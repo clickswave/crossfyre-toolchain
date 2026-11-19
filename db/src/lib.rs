@@ -23,6 +23,8 @@ mod migrate;
 mod ready;
 pub mod scans;
 mod settings;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 mod toolchain;
 
 #[cfg(unix)]

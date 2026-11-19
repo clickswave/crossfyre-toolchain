@@ -119,8 +119,8 @@ pub async fn purge_all(
 mod tests {
     use super::*;
     use crate::ready::ready_in;
-    use crate::ready::tests::{free_port, local_on, toolchain_with};
     use crate::scans::{Asked, Key, Status, finish, start};
+    use crate::testing::{free_port, local_on, toolchain_with};
     use crate::{Engine, Stop, ThisAccount, Toolchain};
 
     #[tokio::test]

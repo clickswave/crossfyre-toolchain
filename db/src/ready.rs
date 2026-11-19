@@ -296,6 +296,7 @@ fn not_reached_given(settings: &Settings, e: sqlx::Error) -> NotReady {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::testing::{closed_port, free_port, local_on, toolchain_with};
     use crate::toolchain::{Stop, Up};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -310,14 +311,6 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn local_on(port: u16) -> Settings {
-        Settings {
-            port,
-            password: Some("pw".to_string()),
-            ..Settings::default()
-        }
-    }
-
     /// An engine called `name` at version 0.0.1, with no tables but the shared ones.
     fn engine(name: &'static str) -> Engine {
         Engine {
@@ -325,26 +318,6 @@ pub(crate) mod tests {
             version: "0.0.1",
             migrations: &[],
         }
-    }
-
-    /// A toolchain directory whose config.toml holds `settings`.
-    pub(crate) fn toolchain_with(settings: &Settings) -> (tempfile::TempDir, PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        let toolchain = dir.path().join("crossfyre");
-        std::fs::create_dir_all(&toolchain).unwrap();
-        std::fs::write(toolchain.join(CONFIG_FILE), settings.to_file()).unwrap();
-        (dir, toolchain)
-    }
-
-    /// A port nothing listens on, which stays this test's while the socket that comes
-    /// with it is held: bound and not listening, so no test running meanwhile is given
-    /// it by the system and answers on it.
-    fn closed_port() -> (u16, tokio::net::TcpSocket) {
-        let socket = tokio::net::TcpSocket::new_v4().unwrap();
-        socket
-            .bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
-            .unwrap();
-        (socket.local_addr().unwrap().port(), socket)
     }
 
     /// A server that turns every connection away as Postgres does a wrong password: with
@@ -565,11 +538,6 @@ pub(crate) mod tests {
         .await
         .unwrap();
         assert_eq!(tables, 1, "the database was made again, empty");
-    }
-
-    /// A free port for a local database of a test's own, which its server binds.
-    pub(crate) fn free_port() -> u16 {
-        closed_port().0
     }
 
     #[tokio::test]

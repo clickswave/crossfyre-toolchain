@@ -821,9 +821,8 @@ pub async fn reset(pool: &PgPool, engine: &str) -> Result<(), sqlx::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ready::ready_in;
-    use crate::ready::tests::{engine_at, free_port, local_on, toolchain_with};
-    use crate::{Stop, ThisAccount, Toolchain};
+    use crate::ready::tests::engine_at;
+    use crate::testing::Scratch;
 
     #[test]
     fn credentials_are_taken_out_of_what_is_kept_and_their_place_is_marked() {
@@ -1007,28 +1006,17 @@ mod tests {
             .unwrap()
     }
 
-    /// A local database of a test's own, and a pool on a schema in it.
-    async fn database() -> (tempfile::TempDir, std::path::PathBuf, PgPool) {
-        let (dir, toolchain) = toolchain_with(&local_on(free_port()));
-        let pool = ready_in(toolchain.clone(), &engine_at("0.0.1", &[]))
-            .await
-            .unwrap();
-        (dir, toolchain, pool)
-    }
-
-    async fn done(toolchain: std::path::PathBuf, pool: PgPool) {
-        pool.close().await;
-        let account = ThisAccount::new().unwrap();
-        assert_eq!(
-            Toolchain::new(toolchain, &account).stop().unwrap(),
-            Stop::Stopped
-        );
+    /// A local database of a test's own, with a schema in it for an engine with no
+    /// tables but the shared ones.
+    async fn database() -> Scratch {
+        Scratch::new(&engine_at("0.0.1", &[])).await
     }
 
     #[tokio::test]
     #[ignore = "needs PostgreSQL's programs"]
     async fn the_same_scan_twice_at_once_is_two_scans_and_a_stopped_one_is_taken_up_once() {
-        let (_dir, toolchain, pool) = database().await;
+        let db = database().await;
+        let pool = db.pool.clone();
         let key = Key::Settings("h");
         let (a, b) = tokio::join!(
             start(&pool, Asked::new("example.com", "{}"), key, false),
@@ -1063,13 +1051,14 @@ mod tests {
         for running in [b, c, e] {
             finish(running, Status::Completed).await.unwrap();
         }
-        done(toolchain, pool).await;
+        db.done().await;
     }
 
     #[tokio::test]
     #[ignore = "needs PostgreSQL's programs"]
     async fn a_scan_with_credentials_is_never_taken_up_by_another_and_keeps_no_key() {
-        let (_dir, toolchain, pool) = database().await;
+        let db = database().await;
+        let pool = db.pool.clone();
         // Anonymous, stopped; then the same with credentials: a new scan.
         let anonymous = start(
             &pool,
@@ -1137,13 +1126,14 @@ mod tests {
         );
         finish(one, Status::Completed).await.unwrap();
         finish(two, Status::Completed).await.unwrap();
-        done(toolchain, pool).await;
+        db.done().await;
     }
 
     #[tokio::test]
     #[ignore = "needs PostgreSQL's programs"]
     async fn a_stopped_scan_is_taken_up_by_its_id_and_only_with_its_own_settings() {
-        let (_dir, toolchain, pool) = database().await;
+        let db = database().await;
+        let pool = db.pool.clone();
         let plain = Asked::new("a.example", r#"{"tasks": 4}"#);
         let scan = start(&pool, plain, Key::Settings("k"), false)
             .await
@@ -1195,13 +1185,14 @@ mod tests {
             .await
             .unwrap();
         finish(taken, Status::Completed).await.unwrap();
-        done(toolchain, pool).await;
+        db.done().await;
     }
 
     #[tokio::test]
     #[ignore = "needs PostgreSQL's programs"]
     async fn settings_of_any_length_key_a_scan() {
-        let (_dir, toolchain, pool) = database().await;
+        let db = database().await;
+        let pool = db.pool.clone();
         let ports = (1..=4000)
             .map(|p| p.to_string())
             .collect::<Vec<_>>()
@@ -1217,13 +1208,14 @@ mod tests {
             .unwrap();
         assert_eq!((again.id.as_str(), again.resumed), (id.as_str(), true));
         finish(again, Status::Completed).await.unwrap();
-        done(toolchain, pool).await;
+        db.done().await;
     }
 
     #[tokio::test]
     #[ignore = "needs PostgreSQL's programs"]
     async fn the_scans_are_listed_the_latest_first() {
-        let (_dir, toolchain, pool) = database().await;
+        let db = database().await;
+        let pool = db.pool.clone();
         for target in ["first.example", "second.example", "third.example"] {
             let scan = start(
                 &pool,
@@ -1246,13 +1238,14 @@ mod tests {
             "{stamp}"
         );
         assert_eq!(listed[0].status, "stopped");
-        done(toolchain, pool).await;
+        db.done().await;
     }
 
     #[tokio::test]
     #[ignore = "needs PostgreSQL's programs"]
     async fn an_operation_that_ran_no_scan_is_stopped_once_a_day_has_gone_without_it() {
-        let (_dir, toolchain, pool) = database().await;
+        let db = database().await;
+        let pool = db.pool.clone();
         sqlx::query(
             "INSERT INTO operations (id, operation, status, updated_at) VALUES \
              ('old', 'enum', 'running', now() - interval '25 hours'), \
@@ -1274,13 +1267,14 @@ mod tests {
                 ("old".to_string(), "stopped".to_string())
             ]
         );
-        done(toolchain, pool).await;
+        db.done().await;
     }
 
     #[tokio::test]
     #[ignore = "needs PostgreSQL's programs"]
     async fn a_daemon_starting_stops_only_the_scans_whose_daemon_is_gone() {
-        let (_dir, toolchain, pool) = database().await;
+        let db = database().await;
+        let pool = db.pool.clone();
         // The first daemon runs a scan; a second one starting leaves it running.
         let first = start(&pool, Asked::new("a", "{}"), Key::Settings("1"), false)
             .await
@@ -1308,13 +1302,14 @@ mod tests {
             .unwrap();
         assert!(taken.resumed && taken.id == id);
         finish(taken, Status::Completed).await.unwrap();
-        done(toolchain, pool).await;
+        db.done().await;
     }
 
     #[tokio::test]
     #[ignore = "needs PostgreSQL's programs"]
     async fn a_purge_deletes_the_scan_it_names_or_the_old_ones_and_leaves_the_rest() {
-        let (_dir, toolchain, pool) = database().await;
+        let db = database().await;
+        let pool = db.pool.clone();
         let mut ids = Vec::new();
         for target in ["a", "b", "c", "d"] {
             let scan = start(
@@ -1364,13 +1359,14 @@ mod tests {
         assert_eq!(purge(&mut conn, Purge::Scan(&running.id)).await.unwrap(), 0);
         drop(conn);
         finish(running, Status::Completed).await.unwrap();
-        done(toolchain, pool).await;
+        db.done().await;
     }
 
     #[tokio::test]
     #[ignore = "needs PostgreSQL's programs"]
     async fn a_reset_empties_the_schema() {
-        let (_dir, toolchain, pool) = database().await;
+        let db = database().await;
+        let pool = db.pool.clone();
         let scan = start(&pool, Asked::new("a", "{}"), Key::Settings("1"), false)
             .await
             .unwrap();
@@ -1387,6 +1383,6 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 0, "{table}");
         }
-        done(toolchain, pool).await;
+        db.done().await;
     }
 }

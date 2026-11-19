@@ -22,10 +22,15 @@ serde_json = "1"
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
 tokio = { version = "1", features = ["rt", "time"] }
 toml = "1.0.3"
+tempfile = { version = "3", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 # The lock around making and starting the local database, and telling root apart.
 libc = "0.2"
+
+[features]
+# testing::Scratch, a database of a test's own, for other crates' tests.
+testing = ["dep:tempfile", "tokio/net"]
 
 [dev-dependencies]
 tempfile = "3"
