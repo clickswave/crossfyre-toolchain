@@ -2526,13 +2526,10 @@ pub async fn run_daemon(
     // reconnect in cleartext, which is precisely the failure this is meant to
     // prevent.
     let root_certificate = if nats_url.starts_with("tls://") {
-        match write_origin_root_cert() {
-            Ok(ca_path) => Some(ca_path),
-            Err(e) => {
-                eprintln!("ERROR: could not stage the NATS root certificate: {e}");
-                return Err(e.into());
-            }
-        }
+        Some(
+            write_origin_root_cert()
+                .map_err(|e| format!("could not stage the NATS root certificate: {e}"))?,
+        )
     } else {
         eprintln!(
             "WARNING: NATS_PUBLIC_URL is not tls:// - this connection is UNENCRYPTED. \
@@ -2576,29 +2573,20 @@ pub async fn run_daemon(
     // NATS that is not up yet is waited for, as the controller is (see
     // START_RETRY_WINDOW). Not with async-nats' retry_on_initial_connect: that retries
     // for good in the background while the node looks connected.
-    let nats_client = match until_reachable(
+    let nats_client = until_reachable(
         &format!("NATS at {nats_url}"),
         async || options().connect(nats_url).await,
         nats_unreachable,
     )
     .await
-    {
-        Ok(client) => client,
-        Err(e) => {
-            eprintln!("ERROR: Failed to connect to NATS: {e}");
-            return Err(e.into());
-        }
-    };
+    .map_err(|e| format!("could not connect to NATS at {nats_url}: {e}"))?;
 
     // Subscribe to the job/control channel for this node
     let job_subject = format!("cfx.jobs.{}", config.node_id);
     let mut job_sub = nats_client
         .subscribe(job_subject.clone())
         .await
-        .map_err(|e| {
-            eprintln!("ERROR: Failed to subscribe to {job_subject}: {e}");
-            e
-        })?;
+        .map_err(|e| format!("could not subscribe to {job_subject}: {e}"))?;
 
     // Keep a clone for publishing status updates (nats_client is cheap to clone)
     let publisher = nats_client.clone();

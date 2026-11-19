@@ -48,9 +48,20 @@ enum Cmd {
     },
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+// An error is printed once, as the sentence it is. Returned from `main`, Rust printed it
+// a second time, in debug form, after the line that had said it already.
+fn main() -> std::process::ExitCode {
     cfx_core::api::name_client("crossfyre-node", env!("CARGO_PKG_VERSION"));
-    let cli = Cli::parse();
+    match start(Cli::parse()) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn start(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // The service manager calls back on a thread of its own, which makes its own runtime.
     #[cfg(windows)]
     if let Cmd::Service {
