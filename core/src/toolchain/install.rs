@@ -1004,14 +1004,21 @@ const RIGHTS: &str = if cfg!(windows) {
 
 /// The directory `update` writes the CLI to first (see `cli_targets`).
 fn cli_dir(bin_dir: &Path) -> PathBuf {
+    cli_path(bin_dir)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| bin_dir.to_path_buf())
+}
+
+/// The CLI `update` writes first (see `cli_targets`), which is the one it hands the rest
+/// of the update to. Asked before the running CLI is replaced: after that, the running
+/// binary's path names a file that is gone.
+fn cli_path(bin_dir: &Path) -> PathBuf {
+    let stable = bin_dir.join(file_name("crossfyre"));
     std::env::current_exe()
         .ok()
-        .and_then(|exe| {
-            let stable = bin_dir.join(file_name("crossfyre"));
-            cli_targets(&exe, &stable).into_iter().next()
-        })
-        .and_then(|p| p.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| bin_dir.to_path_buf())
+        .and_then(|exe| cli_targets(&exe, &stable).into_iter().next())
+        .unwrap_or(stable)
 }
 
 /// May this user replace what `update` and the engine commands replace: what is in the
@@ -1096,15 +1103,56 @@ pub async fn update(
     force: bool,
 ) -> Result<Updated, Box<dyn std::error::Error>> {
     let manifest = fetch_manifest().await?;
-    update_with(&manifest, target, current_version, force).await
+    let handed_over = std::env::var_os(UPDATED_FROM_ENV).is_some();
+    update_with(&manifest, target, current_version, force, handed_over).await
 }
 
-/// `update` against a manifest already fetched.
+/// Set by a CLI that replaced itself during `update` on the new CLI it hands the rest of
+/// the update to, holding the version it was. The new CLI counts the CLI as updated and
+/// does not replace itself again.
+pub const UPDATED_FROM_ENV: &str = "CROSSFYRE_UPDATED_FROM";
+
+/// Hand the rest of an update to the CLI at `cli`, which has just replaced this one,
+/// version `from`: run it with this process's arguments and [`UPDATED_FROM_ENV`]. On
+/// Unix it takes this process's place. On Windows this one waits for it, and exits as
+/// it does. Returns only when the new CLI could not be started, with why.
+fn hand_over(cli: &Path, from: &str) -> Box<dyn std::error::Error> {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let mut cmd = Command::new(cli);
+    cmd.args(std::env::args_os().skip(1))
+        .env(UPDATED_FROM_ENV, from);
+    let not_run = |e: std::io::Error| {
+        format!(
+            "the new crossfyre at {} did not start to finish the update: {e}. Run \
+             `crossfyre update` again",
+            cli.display()
+        )
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        not_run(cmd.exec()).into()
+    }
+    #[cfg(not(unix))]
+    {
+        match cmd.status() {
+            Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+            Err(e) => not_run(e).into(),
+        }
+    }
+}
+
+/// `update` against a manifest already fetched. The CLI goes first, and when it is
+/// replaced, the new CLI runs the rest, so what an update writes, an engine's unit above
+/// all, is the release's own. `handed_over` says this CLI is that new one: the one
+/// before it replaced itself with this one and printed the heading and its own row.
 async fn update_with(
     manifest: &Manifest,
     target: Option<&str>,
     current_version: &str,
     force: bool,
+    handed_over: bool,
 ) -> Result<Updated, Box<dyn std::error::Error>> {
     let (do_self, exts): (bool, Vec<&str>) = match target {
         Some("self") => (true, vec![]),
@@ -1113,9 +1161,11 @@ async fn update_with(
     };
 
     use super::ui::*;
-    println!();
-    println!("  {BOLD}Crossfyre update{RESET}   {}", dim(origin_host()));
-    println!();
+    if !handed_over {
+        println!();
+        println!("  {BOLD}Crossfyre update{RESET}   {}", dim(origin_host()));
+        println!();
+    }
 
     let mut out = Updated::default();
     let bin_dir = get_bin_dir();
@@ -1126,62 +1176,17 @@ async fn update_with(
     // it is always restored before returning.
     service::set_quiet(true);
 
-    // ── Extensions ────────────────────────────────────────────────────
-    if !exts.is_empty() {
-        println!("  {}", dim("Extensions"));
-        for &ext in &exts {
-            if let Some(m) = packaging::owner(ext) {
-                println!("{}", row(&check(), ext, "", &dim(&update_note(m))));
-                out.current += 1;
-                continue;
-            }
-            let want = manifest_version(manifest, ext);
-            let have = installed_ext_version(ext);
-            let up_to_date = ext_bin_path(ext).exists()
-                && !want.is_empty()
-                && have.as_deref() == Some(want.as_str());
-            if up_to_date && !force {
-                println!("{}", row(&check(), ext, &ver(&want), &dim("up to date")));
-                out.current += 1;
-                continue;
-            }
-            if !writable {
-                println!(
-                    "{}",
-                    needs_rights_row(ext, &version_change(have.as_deref(), &want))
-                );
-                out.need_rights += 1;
-                continue;
-            }
-            show_progress(ext);
-            match install_one(manifest, ext, true, true).await {
-                Ok(()) => {
-                    let _ = service::start(ext);
-                    let mid = version_change(have.as_deref(), &want);
-                    show_result(&row(&check(), ext, &mid, &format!("{GREEN}updated{RESET}")));
-                    out.changed += 1;
-                }
-                Err(e) => {
-                    show_result(&row(
-                        &bang(),
-                        ext,
-                        "",
-                        &format!("{YELLOW}failed{RESET} {}", dim(&e.to_string())),
-                    ));
-                    out.failed += 1;
-                }
-            }
-        }
-        println!();
-    }
-
-    // ── Core: crossfyre CLI + node worker ─────────────────────────────
+    // ── Core: the crossfyre CLI first, then the node worker ──────────
     if do_self {
-        println!("  {}", dim("Core"));
-
         let want = manifest_version(manifest, "crossfyre");
+        let cli = cli_path(&bin_dir);
         let cli_dir = cli_dir(&bin_dir);
-        if let Some(m) = packaging::owner("crossfyre") {
+        if handed_over {
+            // The CLI this one replaced printed its row.
+            out.restart = true;
+            out.changed += 1;
+        } else if let Some(m) = packaging::owner("crossfyre") {
+            println!("  {}", dim("Core"));
             println!(
                 "{}",
                 row(
@@ -1193,18 +1198,21 @@ async fn update_with(
             );
             out.current += 1;
         } else if !want.is_empty() && want == current_version && !force {
+            println!("  {}", dim("Core"));
             println!(
                 "{}",
                 row(&check(), "crossfyre", &ver(&want), &dim("up to date"))
             );
             out.current += 1;
         } else if !can_write_in(&cli_dir) {
+            println!("  {}", dim("Core"));
             println!(
                 "{}",
                 needs_rights_row("crossfyre", &version_change(Some(current_version), &want))
             );
             out.need_rights += 1;
         } else {
+            println!("  {}", dim("Core"));
             show_progress("crossfyre");
             match self_update(manifest, current_version, true, force).await {
                 Ok(true) => {
@@ -1215,8 +1223,9 @@ async fn update_with(
                         &mid,
                         &format!("{GREEN}updated{RESET}"),
                     ));
-                    out.restart = true;
-                    out.changed += 1;
+                    // The new CLI does the rest, writing what its release writes.
+                    service::set_quiet(false);
+                    return Err(hand_over(&cli, current_version));
                 }
                 Ok(false) => {
                     show_result(&row(&check(), "crossfyre", &ver(&want), &dim("up to date")));
@@ -1371,6 +1380,55 @@ async fn update_with(
                         ));
                         out.failed += 1;
                     }
+                }
+            }
+        }
+        println!();
+    }
+
+    // ── Extensions ────────────────────────────────────────────────────
+    if !exts.is_empty() {
+        println!("  {}", dim("Extensions"));
+        for &ext in &exts {
+            if let Some(m) = packaging::owner(ext) {
+                println!("{}", row(&check(), ext, "", &dim(&update_note(m))));
+                out.current += 1;
+                continue;
+            }
+            let want = manifest_version(manifest, ext);
+            let have = installed_ext_version(ext);
+            let up_to_date = ext_bin_path(ext).exists()
+                && !want.is_empty()
+                && have.as_deref() == Some(want.as_str());
+            if up_to_date && !force {
+                println!("{}", row(&check(), ext, &ver(&want), &dim("up to date")));
+                out.current += 1;
+                continue;
+            }
+            if !writable {
+                println!(
+                    "{}",
+                    needs_rights_row(ext, &version_change(have.as_deref(), &want))
+                );
+                out.need_rights += 1;
+                continue;
+            }
+            show_progress(ext);
+            match install_one(manifest, ext, true, true).await {
+                Ok(()) => {
+                    let _ = service::start(ext);
+                    let mid = version_change(have.as_deref(), &want);
+                    show_result(&row(&check(), ext, &mid, &format!("{GREEN}updated{RESET}")));
+                    out.changed += 1;
+                }
+                Err(e) => {
+                    show_result(&row(
+                        &bang(),
+                        ext,
+                        "",
+                        &format!("{YELLOW}failed{RESET} {}", dim(&e.to_string())),
+                    ));
+                    out.failed += 1;
                 }
             }
         }
@@ -2310,7 +2368,7 @@ exit 127"#;
         reports(&s.0, "crossfyre", "9.9.9");
         reports(&s.0, "node", "9.9.9");
         reports(&s.0, CFX_SCRIPT, "9.9.9");
-        let out = update_with(&full_manifest("9.9.9"), Some("self"), "9.9.9", false)
+        let out = update_with(&full_manifest("9.9.9"), Some("self"), "9.9.9", false, false)
             .await
             .expect("runs");
         assert_eq!(
@@ -2322,6 +2380,29 @@ exit 127"#;
         );
         assert_eq!(out.summary(), "Everything is up to date.");
         assert_eq!(installed_cli_version(), "9.9.9");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_cli_an_update_was_handed_to_counts_itself_updated_and_has_the_node_restarted() {
+        let s = Scratch::new("handed-over");
+        bin_dir_at(&s.0);
+        reports(&s.0, "crossfyre", "9.9.9");
+        reports(&s.0, "node", "9.9.9");
+        reports(&s.0, CFX_SCRIPT, "9.9.9");
+        let out = update_with(&full_manifest("9.9.9"), Some("self"), "9.9.9", false, true)
+            .await
+            .expect("runs");
+        assert_eq!(
+            out,
+            Updated {
+                restart: true,
+                changed: 1,
+                current: 2,
+                ..Updated::default()
+            }
+        );
+        assert_eq!(out.summary(), "Updated 1 component, 2 already current.");
     }
 
     #[cfg(unix)]
@@ -2363,7 +2444,7 @@ exit 127"#;
         reports(&s.0, "node", "0.0.1");
         reports(&s.0, CFX_SCRIPT, "9.9.9");
         fs::set_permissions(&s.0, fs::Permissions::from_mode(0o555)).expect("lock");
-        let out = update_with(&full_manifest("9.9.9"), Some("self"), "9.9.9", false).await;
+        let out = update_with(&full_manifest("9.9.9"), Some("self"), "9.9.9", false, false).await;
         fs::set_permissions(&s.0, fs::Permissions::from_mode(0o755)).expect("unlock");
         let out = out.expect("runs");
         // Said before anything is downloaded, rather than a Permission denied after.
@@ -2393,7 +2474,7 @@ exit 127"#;
             r#"{{"manager":"brew","owns":["crossfyre"],"bin_dir":"{}"}}"#,
             s.join("bin").display()
         ));
-        let out = update_with(&full_manifest("9.9.9"), None, "9.9.8", false)
+        let out = update_with(&full_manifest("9.9.9"), None, "9.9.8", false, false)
             .await
             .expect("runs");
         assert_eq!(
@@ -2429,7 +2510,7 @@ exit 127"#;
         assert_eq!(version, "9.9.9");
         assert_eq!(output, missing);
 
-        let out = update_with(&full_manifest("9.9.9"), Some("self"), "9.9.9", false)
+        let out = update_with(&full_manifest("9.9.9"), Some("self"), "9.9.9", false, false)
             .await
             .expect("runs");
         assert_eq!(
