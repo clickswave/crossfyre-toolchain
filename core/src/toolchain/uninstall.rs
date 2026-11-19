@@ -1,8 +1,8 @@
 // `crossfyre uninstall` - remove everything the toolchain put on this host:
 // extension daemons + binaries, the node service, the local database,
 // and (with --purge) the config root including registered node configs.
-// --keep-data leaves the local database, and --yes skips the question, which is how
-// a package's removal script runs it.
+// --keep-data stops the local database and leaves it with its data, and --yes skips the
+// question, which is how a package's removal script runs it.
 
 #[cfg(any(not(windows), test))]
 use super::config::file_name;
@@ -24,7 +24,7 @@ const INSTALL_ROOT: &str = "/opt/crossfyre";
 pub struct Scope {
     /// The config root too, node registrations included.
     pub purge: bool,
-    /// Leave the local database, and the scan state in it, in place.
+    /// Stop the local database and leave it, with the scan state in it, in place.
     pub keep_data: bool,
 }
 
@@ -49,6 +49,44 @@ impl Scope {
             (false, true) => "services, binaries",
             (false, false) => "services, binaries, database",
         }
+    }
+}
+
+/// What becomes of the local database, in one line: with `keep_data` it is stopped with
+/// `stop` and kept with its data, otherwise stopped and removed with `remove`. A line that
+/// is a warning comes as the error.
+fn local_database(
+    keep_data: bool,
+    stop: impl FnOnce() -> Result<(cfx_db::Stop, PathBuf), Box<dyn std::error::Error>>,
+    remove: impl FnOnce() -> Result<Option<PathBuf>, Box<dyn std::error::Error>>,
+) -> Result<String, String> {
+    use cfx_db::Stop;
+    if keep_data {
+        return match stop() {
+            Ok((Stop::Stopped, dir)) => Ok(format!(
+                "Stopped the local database. It stays in {} with its data.",
+                dir.display()
+            )),
+            Ok((Stop::NotRunning, dir)) => Ok(format!(
+                "The local database was not running. It stays in {} with its data.",
+                dir.display()
+            )),
+            Ok((Stop::NotMade, _)) => Ok("No local database to keep.".to_string()),
+            Ok((Stop::External, _)) => {
+                Ok("config.toml names a database you run, which is left as it is.".to_string())
+            }
+            Err(e) => Err(format!(
+                "Could not stop the local database, which is kept as it is: {e}"
+            )),
+        };
+    }
+    match remove() {
+        Ok(Some(dir)) => Ok(format!(
+            "Removed the local database in {} and its data.",
+            dir.display()
+        )),
+        Ok(None) => Ok("No local database to remove.".to_string()),
+        Err(e) => Err(format!("Kept the local database: {e}")),
     }
 }
 
@@ -100,20 +138,17 @@ pub fn run(scope: Scope, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
     }
     let _ = service::remove_node_service();
 
-    // The local database, stopped and then removed with its data. A database the
-    // operator runs is theirs, and nothing here touches it.
+    // The local database is stopped, since nothing is left to use it, and then removed
+    // with its data, or kept with it. A database the operator runs is theirs, and nothing
+    // here touches it.
     section("Database");
-    if scope.keep_data {
-        warn("Local database kept (--keep-data).");
-    } else {
-        match super::db::remove_local() {
-            Ok(Some(dir)) => ok(&format!(
-                "Removed the local database in {} and its data.",
-                dir.display()
-            )),
-            Ok(None) => ok("No local database to remove."),
-            Err(e) => warn(&format!("Kept the local database: {e}")),
-        }
+    match local_database(
+        scope.keep_data,
+        super::db::stop_local,
+        super::db::remove_local,
+    ) {
+        Ok(line) => ok(&line),
+        Err(line) => warn(&line),
     }
 
     // The install dir (binaries are already gone; this removes the tree,
@@ -430,6 +465,41 @@ mod tests {
             "a file nothing holds goes now"
         );
         assert!(!clear_tree(&root, &mut |_| panic!("nothing is left")));
+    }
+
+    #[test]
+    fn keeping_the_data_stops_the_local_database_and_removes_nothing() {
+        let dir = PathBuf::from("/home/op/.config/crossfyre/postgres");
+        let stopped = std::cell::Cell::new(false);
+        let line = local_database(
+            true,
+            || {
+                stopped.set(true);
+                Ok((cfx_db::Stop::Stopped, dir.clone()))
+            },
+            || panic!("removed with --keep-data"),
+        );
+        assert!(stopped.get(), "not stopped");
+        assert_eq!(
+            line,
+            Ok(
+                "Stopped the local database. It stays in /home/op/.config/crossfyre/postgres \
+                 with its data."
+                    .to_string()
+            )
+        );
+        let line = local_database(
+            false,
+            || panic!("stopped and kept without --keep-data"),
+            || Ok(Some(dir.clone())),
+        );
+        assert_eq!(
+            line,
+            Ok(
+                "Removed the local database in /home/op/.config/crossfyre/postgres and its data."
+                    .to_string()
+            )
+        );
     }
 
     #[test]

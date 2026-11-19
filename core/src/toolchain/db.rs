@@ -30,7 +30,7 @@ pub async fn run(command: &crate::DbCommands) -> Result<(), Box<dyn std::error::
                 restart_engines();
             }
         }
-        crate::DbCommands::Stop => match with_toolchain(|t| t.stop())? {
+        crate::DbCommands::Stop => match stop_local()?.0 {
             Stop::Stopped => ok("Stopped the local database."),
             Stop::NotRunning => warn("The local database was not running."),
             Stop::NotMade => warn("There is no local database yet. `crossfyre db up` makes one."),
@@ -72,6 +72,14 @@ pub fn restart() -> Result<(Settings, Up), Box<dyn std::error::Error>> {
 /// `doctor`. None without a config.toml.
 pub fn status() -> Result<Option<cfx_db::Status>, Box<dyn std::error::Error>> {
     with_toolchain(|t| t.status())
+}
+
+/// Stop the local database and keep it with its data, as `crossfyre db stop` and
+/// `crossfyre uninstall --keep-data` do. Says what it did, and where the database is.
+pub fn stop_local() -> Result<(Stop, std::path::PathBuf), Box<dyn std::error::Error>> {
+    let account = account()?;
+    let toolchain = Toolchain::new(get_toolchain_dir(), account.as_ref());
+    Ok((toolchain.stop()?, toolchain.cluster_dir()))
 }
 
 /// Stop the local database and remove it with its data, for `crossfyre uninstall`. Says

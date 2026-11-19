@@ -190,7 +190,7 @@ enum Commands {
         /// Also remove the config root (node registrations included)
         #[arg(long, conflicts_with = "keep_data")]
         purge: bool,
-        /// Keep the local database, and the scan state in it
+        /// Stop the local database and keep it, with the scan state in it
         #[arg(long)]
         keep_data: bool,
         /// Do not ask first (for scripts, such as a package's removal script)
