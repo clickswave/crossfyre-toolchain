@@ -1176,6 +1176,9 @@ async fn update_with(
     // it is always restored before returning.
     service::set_quiet(true);
 
+    // Set when the rest has to wait for the CLI (see below).
+    let mut hold = false;
+
     // ── Core: the crossfyre CLI first, then the node worker ──────────
     if do_self {
         let want = manifest_version(manifest, "crossfyre");
@@ -1243,142 +1246,177 @@ async fn update_with(
             }
         }
 
-        // The node worker. One that is not here is not installed by an update: `node
-        // init` sets a node up, and a CLI that Homebrew or apt installed runs without one.
-        let nwant = manifest_version(manifest, "node");
-        let node_installed = ext_bin_path("node").exists();
-        if let Some(m) = packaging::owner("node") {
-            println!("{}", row(&check(), "node", "", &dim(&update_note(m))));
-            out.current += 1;
-        } else if !node_installed {
-            println!("{}", row(&dot(), "node", "", &dim("not installed")));
-        } else {
-            let nhave = installed_node_version();
-            if !nwant.is_empty() && nhave.as_deref() == Some(nwant.as_str()) && !force {
-                println!(
-                    "{}",
-                    row(&check(), "node", &ver(&nwant), &dim("up to date"))
-                );
+        // Only a CLI of the release being installed updates the rest, since it writes
+        // what they run from, an engine's unit above all. One that is behind and was not
+        // replaced here, because a package manager keeps it or replacing it failed,
+        // leaves them for a run that is.
+        hold = !handed_over
+            && !want.is_empty()
+            && want != current_version
+            && (ext_bin_path("node").exists()
+                || ext_bin_path(CFX_SCRIPT).exists()
+                || !exts.is_empty());
+        if hold {
+            println!(
+                "{}",
+                row(
+                    &dot(),
+                    "the rest",
+                    "",
+                    &dim(&format!(
+                        "waits for crossfyre {want}, whose release writes what it runs from"
+                    ))
+                )
+            );
+            out.skipped += 1;
+        }
+
+        if !hold {
+            // The node worker. One that is not here is not installed by an update: `node
+            // init` sets a node up, and a CLI that Homebrew or apt installed runs without one.
+            let nwant = manifest_version(manifest, "node");
+            let node_installed = ext_bin_path("node").exists();
+            if let Some(m) = packaging::owner("node") {
+                println!("{}", row(&check(), "node", "", &dim(&update_note(m))));
                 out.current += 1;
-            } else if !writable {
-                println!(
-                    "{}",
-                    needs_rights_row("node", &version_change(nhave.as_deref(), &nwant))
-                );
-                out.need_rights += 1;
+            } else if !node_installed {
+                println!("{}", row(&dot(), "node", "", &dim("not installed")));
             } else {
-                show_progress("node");
-                match download_node(manifest, true, force).await {
-                    Ok(true) => {
-                        let mid = version_change(nhave.as_deref(), &nwant);
-                        show_result(&row(
-                            &check(),
-                            "node",
-                            &mid,
-                            &format!("{GREEN}updated{RESET}"),
-                        ));
-                        out.restart = true;
-                        out.changed += 1;
-                    }
-                    Ok(false) => {
-                        show_result(&row(&check(), "node", &ver(&nwant), &dim("up to date")));
-                        out.current += 1;
-                    }
-                    Err(e) => {
-                        show_result(&row(
-                            &bang(),
-                            "node",
-                            "",
-                            &format!("{YELLOW}failed{RESET} {}", dim(&e.to_string())),
-                        ));
-                        out.failed += 1;
+                let nhave = installed_node_version();
+                if !nwant.is_empty() && nhave.as_deref() == Some(nwant.as_str()) && !force {
+                    println!(
+                        "{}",
+                        row(&check(), "node", &ver(&nwant), &dim("up to date"))
+                    );
+                    out.current += 1;
+                } else if !writable {
+                    println!(
+                        "{}",
+                        needs_rights_row("node", &version_change(nhave.as_deref(), &nwant))
+                    );
+                    out.need_rights += 1;
+                } else {
+                    show_progress("node");
+                    match download_node(manifest, true, force).await {
+                        Ok(true) => {
+                            let mid = version_change(nhave.as_deref(), &nwant);
+                            show_result(&row(
+                                &check(),
+                                "node",
+                                &mid,
+                                &format!("{GREEN}updated{RESET}"),
+                            ));
+                            out.restart = true;
+                            out.changed += 1;
+                        }
+                        Ok(false) => {
+                            show_result(&row(&check(), "node", &ver(&nwant), &dim("up to date")));
+                            out.current += 1;
+                        }
+                        Err(e) => {
+                            show_result(&row(
+                                &bang(),
+                                "node",
+                                "",
+                                &format!("{YELLOW}failed{RESET} {}", dim(&e.to_string())),
+                            ));
+                            out.failed += 1;
+                        }
                     }
                 }
             }
-        }
 
-        // The cfx-script helper beside node. Optional, as in the installer, and a release
-        // without one is passed over in silence. A new one needs no restart: every job
-        // starts it afresh.
-        let hwant = manifest_version(manifest, CFX_SCRIPT);
-        let helper_installed = ext_bin_path(CFX_SCRIPT).exists();
-        // The row and the note for a cfx-script this host cannot start.
-        let skipped_row = row(
-            &bang(),
-            CFX_SCRIPT,
-            &ver(&hwant),
-            &format!(
-                "{YELLOW}skipped{RESET} {}",
-                dim("cannot start on this host")
-            ),
-        );
-        let skipped_note = |output: &str| {
-            format!(
-                "{} Until it can, {}.",
-                cannot_start_note(output),
-                without_new_helper()
-            )
-        };
-        if let Some(m) = packaging::owner(CFX_SCRIPT) {
-            println!("{}", row(&check(), CFX_SCRIPT, "", &dim(&update_note(m))));
-            out.current += 1;
-        } else if !hwant.is_empty() && !helper_installed && !node_installed {
-            println!("{}", row(&dot(), CFX_SCRIPT, "", &dim("not installed")));
-        } else if !hwant.is_empty() {
-            let hhave = installed_helper_version();
-            if hhave.as_deref() == Some(hwant.as_str()) && !force {
-                println!(
-                    "{}",
-                    row(&check(), CFX_SCRIPT, &ver(&hwant), &dim("up to date"))
-                );
+            // The cfx-script helper beside node. Optional, as in the installer, and a release
+            // without one is passed over in silence. A new one needs no restart: every job
+            // starts it afresh.
+            let hwant = manifest_version(manifest, CFX_SCRIPT);
+            let helper_installed = ext_bin_path(CFX_SCRIPT).exists();
+            // The row and the note for a cfx-script this host cannot start.
+            let skipped_row = row(
+                &bang(),
+                CFX_SCRIPT,
+                &ver(&hwant),
+                &format!(
+                    "{YELLOW}skipped{RESET} {}",
+                    dim("cannot start on this host")
+                ),
+            );
+            let skipped_note = |output: &str| {
+                format!(
+                    "{} Until it can, {}.",
+                    cannot_start_note(output),
+                    without_new_helper()
+                )
+            };
+            if let Some(m) = packaging::owner(CFX_SCRIPT) {
+                println!("{}", row(&check(), CFX_SCRIPT, "", &dim(&update_note(m))));
                 out.current += 1;
-            } else if let Some(output) = still_cannot_start(&hwant).filter(|_| !force) {
-                println!("{skipped_row}");
-                show_detail(&skipped_note(&output));
-                out.skipped += 1;
-            } else if !writable {
-                println!(
-                    "{}",
-                    needs_rights_row(CFX_SCRIPT, &version_change(hhave.as_deref(), &hwant))
-                );
-                out.need_rights += 1;
-            } else {
-                show_progress(CFX_SCRIPT);
-                match install_cfx_script(manifest, force).await {
-                    Ok(HelperOutcome::Installed { version, replaced }) => {
-                        let mid = version_change(replaced.as_deref(), &version);
-                        show_result(&row(
-                            &check(),
-                            CFX_SCRIPT,
-                            &mid,
-                            &format!("{GREEN}updated{RESET}"),
-                        ));
-                        out.changed += 1;
-                    }
-                    Ok(HelperOutcome::Current { .. } | HelperOutcome::NotInRelease) => {
-                        show_result(&row(&check(), CFX_SCRIPT, &ver(&hwant), &dim("up to date")));
-                        out.current += 1;
-                    }
-                    Ok(HelperOutcome::Owned(m)) => {
-                        show_result(&row(&check(), CFX_SCRIPT, "", &dim(&update_note(m))));
-                        out.current += 1;
-                    }
-                    Ok(HelperOutcome::CannotStart { output, .. }) => {
-                        show_result(&skipped_row);
-                        show_detail(&skipped_note(&output));
-                        out.skipped += 1;
-                    }
-                    Err(e) => {
-                        show_result(&row(
-                            &bang(),
-                            CFX_SCRIPT,
-                            "",
-                            &format!(
-                                "{YELLOW}failed{RESET} {}",
-                                dim(&format!("{e}. Until it installs, {}", without_new_helper()))
-                            ),
-                        ));
-                        out.failed += 1;
+            } else if !hwant.is_empty() && !helper_installed && !node_installed {
+                println!("{}", row(&dot(), CFX_SCRIPT, "", &dim("not installed")));
+            } else if !hwant.is_empty() {
+                let hhave = installed_helper_version();
+                if hhave.as_deref() == Some(hwant.as_str()) && !force {
+                    println!(
+                        "{}",
+                        row(&check(), CFX_SCRIPT, &ver(&hwant), &dim("up to date"))
+                    );
+                    out.current += 1;
+                } else if let Some(output) = still_cannot_start(&hwant).filter(|_| !force) {
+                    println!("{skipped_row}");
+                    show_detail(&skipped_note(&output));
+                    out.skipped += 1;
+                } else if !writable {
+                    println!(
+                        "{}",
+                        needs_rights_row(CFX_SCRIPT, &version_change(hhave.as_deref(), &hwant))
+                    );
+                    out.need_rights += 1;
+                } else {
+                    show_progress(CFX_SCRIPT);
+                    match install_cfx_script(manifest, force).await {
+                        Ok(HelperOutcome::Installed { version, replaced }) => {
+                            let mid = version_change(replaced.as_deref(), &version);
+                            show_result(&row(
+                                &check(),
+                                CFX_SCRIPT,
+                                &mid,
+                                &format!("{GREEN}updated{RESET}"),
+                            ));
+                            out.changed += 1;
+                        }
+                        Ok(HelperOutcome::Current { .. } | HelperOutcome::NotInRelease) => {
+                            show_result(&row(
+                                &check(),
+                                CFX_SCRIPT,
+                                &ver(&hwant),
+                                &dim("up to date"),
+                            ));
+                            out.current += 1;
+                        }
+                        Ok(HelperOutcome::Owned(m)) => {
+                            show_result(&row(&check(), CFX_SCRIPT, "", &dim(&update_note(m))));
+                            out.current += 1;
+                        }
+                        Ok(HelperOutcome::CannotStart { output, .. }) => {
+                            show_result(&skipped_row);
+                            show_detail(&skipped_note(&output));
+                            out.skipped += 1;
+                        }
+                        Err(e) => {
+                            show_result(&row(
+                                &bang(),
+                                CFX_SCRIPT,
+                                "",
+                                &format!(
+                                    "{YELLOW}failed{RESET} {}",
+                                    dim(&format!(
+                                        "{e}. Until it installs, {}",
+                                        without_new_helper()
+                                    ))
+                                ),
+                            ));
+                            out.failed += 1;
+                        }
                     }
                 }
             }
@@ -1387,7 +1425,7 @@ async fn update_with(
     }
 
     // ── Extensions ────────────────────────────────────────────────────
-    if !exts.is_empty() {
+    if !hold && !exts.is_empty() {
         println!("  {}", dim("Extensions"));
         for &ext in &exts {
             if let Some(m) = packaging::owner(ext) {
@@ -2403,6 +2441,35 @@ exit 127"#;
             }
         );
         assert_eq!(out.summary(), "Updated 1 component, 2 already current.");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cli_that_stays_behind_leaves_the_rest_for_one_of_the_release() {
+        // A package manager keeps this CLI, a release behind. What it updated would run
+        // from what its own release writes, an engine's unit above all.
+        let s = Scratch::new("cli-behind");
+        packaged(&format!(
+            r#"{{"manager":"brew","owns":["crossfyre"],"bin_dir":"{}"}}"#,
+            s.join("bin").display()
+        ));
+        fs::create_dir_all(s.join("bin")).expect("bin");
+        reports(&s.join("bin"), "node", "9.9.9");
+        let out = update_with(&full_manifest("9.9.9"), Some("self"), "9.9.8", false, false)
+            .await
+            .expect("runs");
+        assert_eq!(
+            out,
+            Updated {
+                current: 1,
+                skipped: 1,
+                ..Updated::default()
+            }
+        );
+        assert_eq!(
+            out.summary(),
+            "Nothing was updated: 1 already current, 1 skipped."
+        );
     }
 
     #[cfg(unix)]
