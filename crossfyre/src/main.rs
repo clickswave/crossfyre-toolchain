@@ -12,9 +12,9 @@ use clap::{CommandFactory, Parser, Subcommand};
 )]
 struct Cli {
     /// Use another config directory, the one that holds `nodes.d` and
-    /// `config.toml`. The default is `$XDG_CONFIG_HOME/crossfyre` of the user who
-    /// ran the command, so `sudo` keeps using your home and not root's. Give a
-    /// path to keep a separate set of nodes, for example
+    /// `config.toml`. The default is the one the engines read, `~/.config/crossfyre`
+    /// on Linux, of the user who ran the command, so `sudo` keeps using your home and
+    /// not root's. Give a path to keep a separate set of nodes, for example
     /// `--data-dir ~/.config/crossfyre-lab`.
     #[arg(long, global = true, value_name = "PATH")]
     data_dir: Option<std::path::PathBuf>,

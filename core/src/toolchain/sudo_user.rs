@@ -57,16 +57,6 @@ pub fn invoking_user_home() -> PathBuf {
     }
 }
 
-/// Config root of the invoking user. Under sudo this is `$SUDO_USER`'s
-/// config root (see [`config_root_in`]); otherwise the platform config dir.
-pub fn invoking_user_config_dir() -> PathBuf {
-    if let Some((_, _, home, _)) = sudo_user_info() {
-        config_root_in(&home)
-    } else {
-        dirs::config_dir().expect("Could not resolve config directory")
-    }
-}
-
 /// The per-user config root under the home directory `home`, where `dirs::config_dir()`
 /// puts it for that user: `~/.config` on Linux (and any other Unix), and
 /// `~/Library/Application Support` on macOS. Used where the user is not the one running

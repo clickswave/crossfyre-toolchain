@@ -105,8 +105,6 @@ impl Default for ToolchainConfig {
     }
 }
 
-/// `~/.config/crossfyre` of the *invoking* user (honors SUDO_USER), the same
-/// root that holds `nodes.d/`.
 /// Process-wide override for the toolchain directory, set once from `--data-dir`.
 ///
 /// `--data-dir` is documented as "the directory that holds `nodes.d` and
@@ -128,7 +126,19 @@ pub fn get_toolchain_dir() -> PathBuf {
     if let Some(dir) = TOOLCHAIN_DIR_OVERRIDE.get() {
         return dir.clone();
     }
-    super::sudo_user::invoking_user_config_dir().join("crossfyre")
+    default_toolchain_dir().expect("Could not find the toolchain directory")
+}
+
+/// The toolchain directory, the same root that holds `nodes.d/`, when `--data-dir`
+/// names none. As root it is the one of the user crossfyre was run for through sudo.
+/// Otherwise it is the one the engines find (`dguard::toolchain_dir`), so the CLI and
+/// the engines read one config.toml: `~/.config/crossfyre` on Linux whatever
+/// XDG_CONFIG_HOME says.
+pub fn default_toolchain_dir() -> Option<PathBuf> {
+    if let Some((_, _, home, _)) = super::sudo_user::sudo_user_info() {
+        return Some(super::sudo_user::config_root_in(&home).join("crossfyre"));
+    }
+    dguard::toolchain_dir()
 }
 
 pub fn get_config_path() -> PathBuf {
@@ -465,6 +475,40 @@ mod tests {
     fn mode(path: &std::path::Path) -> u32 {
         use std::os::unix::fs::PermissionsExt;
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// With XDG_CONFIG_HOME pointing elsewhere, the CLI still finds the directory the
+    /// engines read, which follows HOME on Linux. Run again in a child process, which
+    /// has the environment this needs and prints what it found.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_cli_finds_the_directory_the_engines_read_whatever_xdg_config_home_says() {
+        const NAME: &str = "toolchain::config::tests::the_cli_finds_the_directory_the_engines_read_whatever_xdg_config_home_says";
+        const CHILD: &str = "CFX_TEST_PRINT_TOOLCHAIN_DIR";
+        if std::env::var_os(CHILD).is_some() {
+            println!("dir={}", crate::resolve_data_dir(None).unwrap().display());
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join("elsewhere"))
+            .env_remove(dguard::TOOLCHAIN_DIR_ENV)
+            .env_remove("SUDO_USER")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        // libtest prints the test's name on the line the child's output starts.
+        let dir = text
+            .lines()
+            .find_map(|l| l.split_once("dir=").map(|(_, d)| d.trim()))
+            .unwrap_or_else(|| panic!("the child said: {text}"));
+        assert_eq!(
+            std::path::Path::new(dir),
+            home.path().join(".config").join("crossfyre")
+        );
     }
 
     #[test]

@@ -787,57 +787,17 @@ pub fn default_nats_url() -> String {
     "nats://localhost:4222".to_string()
 }
 
-/// Resolve the data directory for this invocation. Order of preference:
-///   1. `--data-dir <PATH>` (if provided)
-///   2. `$SUDO_USER`'s config root + `crossfyre` (`~/.config` on Linux,
-///      `~/Library/Application Support` on macOS) - keeps the user's data
-///      visible when they `sudo crossfyre node up`
-///   3. `dirs::config_dir()/crossfyre`
+/// Resolve the data directory for this invocation: `--data-dir <PATH>` when given,
+/// otherwise the toolchain directory (see [`toolchain::config::default_toolchain_dir`]),
+/// which under sudo is the invoking user's, so their data stays theirs when they
+/// `sudo crossfyre node up`.
 pub fn resolve_data_dir(
     cli_arg: Option<&std::path::Path>,
 ) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
     if let Some(p) = cli_arg {
         return Ok(p.to_path_buf());
     }
-    if let Ok(sudo_user) = std::env::var("SUDO_USER")
-        && !sudo_user.is_empty()
-        && sudo_user != "root"
-    {
-        // Best effort - fall back to dirs::config_dir() if the home directory
-        // can't be resolved (e.g. unusual NSS setup).
-        if let Some(home) = home_for_user(&sudo_user) {
-            let mut p = toolchain::sudo_user::config_root_in(&home);
-            p.push("crossfyre");
-            return Ok(p);
-        }
-    }
-    let mut p = dirs::config_dir().ok_or("Could not resolve config directory")?;
-    p.push("crossfyre");
-    Ok(p)
-}
-
-#[cfg(unix)]
-pub fn home_for_user(name: &str) -> Option<std::path::PathBuf> {
-    use std::ffi::CString;
-    let c = CString::new(name).ok()?;
-    unsafe {
-        let pwd = libc::getpwnam(c.as_ptr());
-        if pwd.is_null() {
-            return None;
-        }
-        let dir_ptr = (*pwd).pw_dir;
-        if dir_ptr.is_null() {
-            return None;
-        }
-        let cstr = std::ffi::CStr::from_ptr(dir_ptr);
-        Some(std::path::PathBuf::from(
-            cstr.to_string_lossy().into_owned(),
-        ))
-    }
-}
-#[cfg(not(unix))]
-pub fn home_for_user(_name: &str) -> Option<std::path::PathBuf> {
-    None
+    Ok(toolchain::config::default_toolchain_dir().ok_or("Could not resolve config directory")?)
 }
 
 /// When running under `sudo`, `chown` files we just wrote back to the
