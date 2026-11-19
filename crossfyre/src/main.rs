@@ -479,7 +479,7 @@ fn node_worker() -> Option<std::path::PathBuf> {
 }
 
 /// Run the `node` worker's supervisor in the foreground (fallback for hosts
-/// with no OS service).
+/// with no OS service). On Unix it takes this process's place.
 fn exec_node_supervise(
     base: &std::path::Path,
     force: bool,
@@ -491,15 +491,34 @@ fn exec_node_supervise(
             cfx_core::os::elevated("crossfyre node init")
         )
     })?;
-    let mut cmd = std::process::Command::new(node);
+    let mut cmd = std::process::Command::new(&node);
     cmd.arg("supervise").arg("--data-dir").arg(base);
     if force {
         cmd.arg("--force");
     }
-    if !cmd.status()?.success() {
-        return Err("node supervise exited with an error".into());
+    // On Unix the supervisor takes this process's place, so it is the command sudo runs
+    // and a Ctrl+C reaches it to stop the node and the engines in order. Waited on, this
+    // CLI died of the Ctrl+C at once, sudo closed the terminal behind it, and the
+    // supervisor died of that halfway through.
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::process::CommandExt;
+        let _ = std::io::stdout().flush();
+        let err = cmd.exec();
+        Err(format!(
+            "could not run the node supervisor {}: {err}",
+            node.display()
+        )
+        .into())
     }
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        if !cmd.status()?.success() {
+            return Err("node supervise exited with an error".into());
+        }
+        Ok(())
+    }
 }
 
 // An error is printed as the sentence it is. Returned from `main`, Rust prints it
