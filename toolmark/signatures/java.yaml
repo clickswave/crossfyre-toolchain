@@ -2,3 +2,6 @@ id: java
 info:
   name: Java
   category: Language
+detect:
+  any:
+    - cookie: { name: '(?i)^JSESSIONID$' }

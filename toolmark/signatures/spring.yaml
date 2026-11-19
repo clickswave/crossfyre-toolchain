@@ -5,5 +5,4 @@ info:
 implies: [java]
 detect:
   any:
-    - cookie: { name: '(?i)^JSESSIONID$' }
     - html: { regex: '(?i)org\.springframework' }

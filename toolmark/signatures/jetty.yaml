@@ -7,4 +7,4 @@ detect:
   any:
     - header: { name: server, regex: '(?i)jetty' }
 version:
-  - header: { name: server, regex: '(?i)jetty\(?([0-9.]+)' }
+  - header: { name: server, regex: '(?i)jetty\(?([0-9]+(?:\.[0-9]+)*)' }

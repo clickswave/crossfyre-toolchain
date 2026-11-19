@@ -49,42 +49,6 @@
       "version": "2.4.58"
     }
   ],
-  "aspnet-headers-echoed.http": [
-    {
-      "candidates": [],
-      "category": "Web Server",
-      "confidence": 50,
-      "cpe": "cpe:2.3:a:microsoft:internet_information_services:8.5:*:*:*:*:*:*:*",
-      "evidence": [
-        "header server: Microsoft-IIS/8.5"
-      ],
-      "name": "Microsoft IIS",
-      "version": "8.5"
-    },
-    {
-      "candidates": [],
-      "category": "Framework",
-      "confidence": 100,
-      "cpe": "cpe:2.3:a:microsoft:asp.net:4.0.30319:*:*:*:*:*:*:*",
-      "evidence": [
-        "header x-powered-by: ASP.NET",
-        "header x-aspnet-version: 4.0.30319"
-      ],
-      "name": "ASP.NET",
-      "version": "4.0.30319"
-    },
-    {
-      "candidates": [],
-      "category": "Framework",
-      "confidence": 50,
-      "cpe": "",
-      "evidence": [
-        "header x-powered-by: ASP.NET"
-      ],
-      "name": "ASP.NET Core",
-      "version": null
-    }
-  ],
   "bootstrap.http": [
     {
       "candidates": [],
@@ -95,7 +59,7 @@
         "body pattern"
       ],
       "name": "Bootstrap",
-      "version": "6"
+      "version": null
     }
   ],
   "cloudflare.http": [
@@ -321,25 +285,14 @@
       "candidates": [],
       "category": "Framework",
       "confidence": 100,
-      "cpe": "cpe:2.3:a:microsoft:asp.net:*:*:*:*:*:*:*:*",
+      "cpe": "cpe:2.3:a:microsoft:asp.net:4.0.30319:*:*:*:*:*:*:*",
       "evidence": [
         "header x-powered-by: ASP.NET",
         "header x-aspnet-version: 4.0.30319",
         "cookie ASP.NET_SessionId"
       ],
       "name": "ASP.NET",
-      "version": null
-    },
-    {
-      "candidates": [],
-      "category": "Framework",
-      "confidence": 50,
-      "cpe": "",
-      "evidence": [
-        "header x-powered-by: ASP.NET"
-      ],
-      "name": "ASP.NET Core",
-      "version": null
+      "version": "4.0.30319"
     }
   ],
   "iis-static.http": [
@@ -376,7 +329,7 @@
         "header server: Jetty(9.4.53.v20231009)"
       ],
       "name": "Jetty",
-      "version": "9.4.53."
+      "version": "9.4.53"
     },
     {
       "candidates": [],
@@ -458,12 +411,12 @@
       "candidates": [],
       "category": "JavaScript Library",
       "confidence": 25,
-      "cpe": "cpe:2.3:a:jquery:jquery:3.6.0.:*:*:*:*:*:*:*",
+      "cpe": "cpe:2.3:a:jquery:jquery:3.6.0:*:*:*:*:*:*:*",
       "evidence": [
         "body pattern"
       ],
       "name": "jQuery",
-      "version": "3.6.0."
+      "version": "3.6.0"
     }
   ],
   "kestrel.http": [
@@ -677,7 +630,7 @@
         "body pattern"
       ],
       "name": "Bootstrap",
-      "version": null
+      "version": "5.3.0"
     }
   ],
   "lab-tandoor.http": [
@@ -1098,22 +1051,10 @@
   "spring-trace.http": [
     {
       "candidates": [],
-      "category": "Web Server",
-      "confidence": 45,
-      "cpe": "cpe:2.3:a:apache:tomcat:*:*:*:*:*:*:*:*",
-      "evidence": [
-        "cookie JSESSIONID"
-      ],
-      "name": "Apache Tomcat",
-      "version": null
-    },
-    {
-      "candidates": [],
       "category": "Framework",
-      "confidence": 70,
+      "confidence": 25,
       "cpe": "",
       "evidence": [
-        "cookie JSESSIONID",
         "body pattern"
       ],
       "name": "Spring",
@@ -1121,11 +1062,11 @@
     },
     {
       "candidates": [],
-      "category": "Implied",
-      "confidence": 30,
+      "category": "Language",
+      "confidence": 45,
       "cpe": "",
       "evidence": [
-        "implied by Apache Tomcat"
+        "cookie JSESSIONID"
       ],
       "name": "Java",
       "version": null
@@ -1150,43 +1091,20 @@
       "candidates": [],
       "category": "Web Server",
       "confidence": 50,
-      "cpe": "cpe:2.3:a:apache:http_server:*:*:*:*:*:*:*:*",
+      "cpe": "cpe:2.3:a:apache:tomcat:*:*:*:*:*:*:*:*",
       "evidence": [
         "header server: Apache-Coyote/1.1"
       ],
-      "name": "Apache HTTP Server",
+      "name": "Apache Tomcat",
       "version": null
     },
     {
       "candidates": [],
-      "category": "Web Server",
-      "confidence": 95,
-      "cpe": "cpe:2.3:a:apache:tomcat:1.1:*:*:*:*:*:*:*",
-      "evidence": [
-        "header server: Apache-Coyote/1.1",
-        "cookie JSESSIONID"
-      ],
-      "name": "Apache Tomcat",
-      "version": "1.1"
-    },
-    {
-      "candidates": [],
-      "category": "Framework",
+      "category": "Language",
       "confidence": 45,
       "cpe": "",
       "evidence": [
         "cookie JSESSIONID"
-      ],
-      "name": "Spring",
-      "version": null
-    },
-    {
-      "candidates": [],
-      "category": "Implied",
-      "confidence": 30,
-      "cpe": "",
-      "evidence": [
-        "implied by Apache Tomcat"
       ],
       "name": "Java",
       "version": null
@@ -1196,32 +1114,21 @@
     {
       "candidates": [],
       "category": "Web Server",
-      "confidence": 45,
+      "confidence": 25,
       "cpe": "cpe:2.3:a:apache:tomcat:9.0.83:*:*:*:*:*:*:*",
       "evidence": [
-        "cookie JSESSIONID"
+        "body pattern"
       ],
       "name": "Apache Tomcat",
       "version": "9.0.83"
     },
     {
       "candidates": [],
-      "category": "Framework",
+      "category": "Language",
       "confidence": 45,
       "cpe": "",
       "evidence": [
         "cookie JSESSIONID"
-      ],
-      "name": "Spring",
-      "version": null
-    },
-    {
-      "candidates": [],
-      "category": "Implied",
-      "confidence": 30,
-      "cpe": "",
-      "evidence": [
-        "implied by Apache Tomcat"
       ],
       "name": "Java",
       "version": null
@@ -1241,6 +1148,7 @@
       "version": null
     }
   ],
+  "vite-svelte.http": [],
   "vue.http": [
     {
       "candidates": [],

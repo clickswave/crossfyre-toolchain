@@ -6,4 +6,4 @@ detect:
   any:
     - html: { regex: '(?i)bootstrap(?:\.min)?\.(?:css|js)|class=.(?:container|navbar)-' }
 version:
-  - html: { regex: '(?i)bootstrap[.-v]*([0-9.]+)(?:\.min)?\.(?:css|js)' }
+  - html: { regex: '(?i)bootstrap[@/-]([0-9]+\.[0-9]+(?:\.[0-9]+)?)' }

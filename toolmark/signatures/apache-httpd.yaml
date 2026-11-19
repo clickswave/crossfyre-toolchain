@@ -6,8 +6,10 @@ info:
     vendor: apache
     product: http_server
 detect:
-  any:
+  all:
     - header: { name: server, regex: '(?i)apache' }
+    - none:
+        - header: { name: server, regex: '(?i)coyote' }
 version:
   - header: { name: server, regex: '(?i)apache/([0-9.]+)' }
   - html: { regex: '(?i)apache/([0-9.]+)' }
