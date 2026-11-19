@@ -9,18 +9,20 @@ Part of the [Crossfyre toolchain](../).
 
 ## How it runs
 
-The fingerprinting runs in toolmark's daemon, on 127.0.0.1:4444, and the commands
-here are its clients. The first command starts the daemon when none is running, and a
-daemon started that way exits after 30 minutes with no client and no scan. `toolmark
-daemon` runs one by hand, and `--no-autostart` turns the starting off. It keeps what it
-finds in PostgreSQL: each host it looked at, the pages it saw there, the products
-and services on it with their versions, and a row each time one appears or changes. A
-scan given credentials saw the pages as that user, so it keeps no body. The first daemon
-makes the database, so install PostgreSQL's programs before the first scan (`sudo apt
-install postgresql` on Debian, Ubuntu or Kali), or point it at a database you run with
-`crossfyre db external`. `toolmark scans` lists the scans it keeps, the latest first,
-`toolmark db purge --scan ID` deletes one, and `toolmark db reset` everything it keeps. The root [README](../#how-the-engines-run) has the
-details.
+The fingerprinting runs in toolmark's daemon, on 127.0.0.1:4444, and the commands here
+are its clients. The first command starts the daemon when none is running, and a daemon
+started that way exits after 30 minutes with no client and no scan. `toolmark daemon`
+runs one by hand, and `--no-autostart` turns the starting off. It keeps what it finds in
+PostgreSQL: each host it looked at, the pages it saw there, the products and services on
+it with their versions, and a row each time one appears or changes. A scan given
+credentials saw the pages as that user, so it keeps no body. The first daemon makes the
+database, so install PostgreSQL's programs before the first scan (`sudo apt install
+postgresql` on Debian, Ubuntu or Kali), or point it at a database you run with
+`crossfyre db external`. `toolmark inventory` shows what it knows runs where: each host
+and port it scanned, and the products and versions it found there. `toolmark scans`
+lists the scans it keeps, the latest first, `toolmark db purge --scan ID` deletes one,
+and `toolmark db reset` everything it keeps. The root [README](../#how-the-engines-run)
+has the details.
 
 ```sh
 # scan a target

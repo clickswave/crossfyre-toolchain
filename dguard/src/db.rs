@@ -61,11 +61,7 @@ pub async fn run_db(daemon: &Daemon, action: &DbAction) -> Result<(), Box<dyn st
 pub async fn list_scans(
     daemon: &Daemon,
 ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
-    let answer = ask(
-        daemon,
-        &json!({ "operation": "scans", "response": "instant" }),
-    )
-    .await?;
+    let answer = answer(daemon, "scans").await?;
     match answer["scans"].as_array() {
         Some(scans) => Ok(scans.clone()),
         None => Err("the daemon listed no scans".into()),
@@ -76,6 +72,19 @@ pub async fn list_scans(
 /// Its events come as the scan's own did.
 pub fn resume_request(id: &str) -> serde_json::Value {
     json!({ "operation": "resume", "response": "stream", "scan": id })
+}
+
+/// Ask the engine's daemon `operation`, one that answers at once, and give the answer. An
+/// answer other than completed is an error, in the daemon's words.
+pub async fn answer(
+    daemon: &Daemon,
+    operation: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    ask(
+        daemon,
+        &json!({ "operation": operation, "response": "instant" }),
+    )
+    .await
 }
 
 /// Send `request` to the engine's daemon, and give its answer when it is done. An answer

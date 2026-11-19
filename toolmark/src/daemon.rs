@@ -100,6 +100,8 @@ async fn handle_connection(
             }
             // The scans this daemon keeps, the latest first.
             "scans" => write_line(&mut writer, &db.scans().await).await?,
+            // What it knows runs where.
+            "inventory" => write_line(&mut writer, &db.inventory().await).await?,
             "resume" => {
                 write_line(
                     &mut writer,

@@ -204,6 +204,36 @@ impl ToolmarkDb {
         tx.commit().await
     }
 
+    /// What this daemon answers an `inventory` request with: each product toolmark found,
+    /// on its host and port, with its version, by host.
+    pub async fn inventory(&self) -> Value {
+        let rows: Result<Vec<InventoryRow>, _> = sqlx::query_as(
+            "SELECT host, port, vendor, product, version, cpe, \
+                 to_char(last_seen AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \
+                 FROM inventory ORDER BY host, port, product",
+        )
+        .fetch_all(&self.pool)
+        .await;
+        match rows {
+            Ok(rows) => serde_json::json!({
+                "status": "completed",
+                "inventory": rows
+                    .into_iter()
+                    .map(|(host, port, vendor, product, version, cpe, last_seen)| {
+                        serde_json::json!({
+                            "host": host, "port": port, "vendor": vendor, "product": product,
+                            "version": version, "cpe": cpe, "last_seen": last_seen,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            }),
+            Err(e) => serde_json::json!({
+                "status": "error",
+                "message": format!("could not read the inventory: {e}"),
+            }),
+        }
+    }
+
     /// What this daemon answers a `scans` request with: its scans, none of which can be
     /// taken up again.
     pub async fn scans(&self) -> Value {
@@ -219,6 +249,10 @@ impl ToolmarkDb {
         }
     }
 }
+
+/// One row of the inventory view: host, port, vendor, product, version, CPE and when it
+/// was last seen.
+type InventoryRow = (String, i32, String, String, String, String, String);
 
 /// One scan's [`Observer`], which keeps what it saw in toolmark's tables.
 pub struct ScanObserver {

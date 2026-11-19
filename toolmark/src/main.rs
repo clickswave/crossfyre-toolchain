@@ -6,6 +6,7 @@ mod client_tui;
 mod cve;
 mod daemon;
 mod fingerprint;
+mod inventory;
 mod libs;
 mod observe;
 mod services;
@@ -90,6 +91,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let tui = cfx_tui::wanted(cli.no_tui);
             tokio::task::spawn_blocking(move || cfx_tui::scans::show("TOOLMARK", &scans, tui))
                 .await??;
+            Ok(())
+        }
+        Some(Commands::Inventory) => {
+            let answer = dguard::answer(&daemon, "inventory").await?;
+            let rows = answer["inventory"].as_array().cloned().unwrap_or_default();
+            let tui = cfx_tui::wanted(cli.no_tui);
+            tokio::task::spawn_blocking(move || inventory::show(&rows, tui)).await??;
             Ok(())
         }
         Some(Commands::Db { action }) => dguard::run_db(&daemon, &action).await,

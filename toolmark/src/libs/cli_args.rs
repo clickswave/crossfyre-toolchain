@@ -54,6 +54,9 @@ pub enum Commands {
     /// The scans this engine keeps, the latest first. toolmark keeps nothing a stopped
     /// scan could carry on from, so a scan is run again rather than taken up
     Scans,
+    /// What toolmark knows runs where: each host and port it scanned, and the products
+    /// and versions it found there
+    Inventory,
     /// What this engine keeps: delete one scan, old scans, or everything
     Db {
         #[command(subcommand)]
