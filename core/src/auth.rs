@@ -612,8 +612,8 @@ async fn browser_login(
 
 // ---- node provisioning (used by `init`) --------------------------------
 
-/// Authenticate an existing dashboard-created node by its `cfx_...` key
-/// (legacy `crossfyre node init --node-key` path). Returns the authorize-node body.
+/// Authenticate an existing dashboard-created node by its `cfxn_...` key
+/// (the `crossfyre node init --node-key` path). Returns the authorize-node body.
 pub async fn authorize_existing_node(
     client: &reqwest::Client,
     api_url: &str,

@@ -764,8 +764,9 @@ enum ScanWords<'a> {
 /// shared one by (url, wordlist, method). Stream scans pass their per-connection
 /// operation_id here: without it, two concurrent scans of the same target +
 /// wordlist collapse onto one `scans` row and clobber each other's entries and
-/// results (findings lost / delivered to the wrong connection). `None` keeps the
-/// legacy shared/cached behaviour for one-off (non-stream) scans.
+/// results (findings lost / delivered to the wrong connection). `None`, which a
+/// one-off (non-stream) scan passes, leaves it out, so the scan shares the record of an
+/// earlier one with the same url, wordlist and method, and the results saved there.
 async fn prepare_scan(
     params: &ScanParams,
     db: &Arc<AmbuloDb>,
