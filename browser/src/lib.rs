@@ -1,6 +1,7 @@
-//! The headless tier: run the application, and record what it actually asks for.
+//! The headless tier of ambulo's crawler: run the application, and record what it
+//! actually asks for.
 //!
-//! Everything else in this crawler reads files the server hands over. That
+//! Everything else in that crawler reads files the server hands over. That
 //! reaches a great deal - `spa` recovers source maps, lazily-loaded chunks and
 //! route tables without a browser - but it cannot reach two things, and they are
 //! the two that matter most on a modern application:

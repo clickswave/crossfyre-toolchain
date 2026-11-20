@@ -1,0 +1,25 @@
+[package]
+name = "cfx_browser"
+version = "0.0.1"
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+homepage = "https://clickswave.org"
+repository = "https://github.com/clickswave/crossfyre-toolchain"
+keywords = ["headless", "browser", "devtools", "security"]
+description = "Drive a headless browser over the DevTools protocol, held to the hosts its caller allows, and record what a page asks for."
+authors = ["Clickswave <team@clickswave.org>"]
+
+[dependencies]
+serde_json = "1"
+uuid = { version = "1.18.0", features = ["v4"] }
+tokio = { version = "1.47.1", features = ["rt", "macros", "io-util", "process", "time"] }
+
+[target.'cfg(unix)'.dependencies]
+# Handing the browser its DevTools pipe on fds 3 and 4.
+libc = "0.2"
+
+[target.'cfg(not(unix))'.dependencies]
+# Driving the browser over the DevTools websocket on the port it picks.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["sink"] }

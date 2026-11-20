@@ -1139,7 +1139,7 @@ async fn run_browser_tier(
         let _ = tx.send(CrawlEvent::note(HEADLESS_SKIPPED.to_string()));
         return;
     }
-    let Some(exe) = crate::browser::find_browser() else {
+    let Some(exe) = cfx_browser::find_browser() else {
         let _ = tx.send(CrawlEvent::note(
             "the headless tier was requested but no browser was found. Set AMBULO_BROWSER to a \
              Chrome or Chromium binary. Endpoints that only exist once the application is running \
@@ -1149,7 +1149,7 @@ async fn run_browser_tier(
         return;
     };
     let no_sandbox = std::env::var("AMBULO_BROWSER_NO_SANDBOX").is_ok();
-    let (browser, mut cdp) = match crate::browser::Browser::launch(&exe, no_sandbox).await {
+    let (browser, mut cdp) = match cfx_browser::Browser::launch(&exe, no_sandbox).await {
         Ok(b) => b,
         Err(e) => {
             let _ = tx.send(CrawlEvent::note(format!(
@@ -1177,7 +1177,7 @@ async fn run_browser_tier(
     // redirect, a script navigation or a frame pointing anywhere else is failed
     // before it is sent, so a hostile page cannot use the browser to reach a host
     // the operator never listed.
-    let gate: crate::browser::Gate = {
+    let gate: cfx_browser::Gate = {
         let (base, scope, host) = (seed.clone(), params.clone(), seed_host.to_string());
         std::sync::Arc::new(move |u: &str| resolve_and_scope(u, &base, &scope, &host).is_some())
     };
@@ -1186,7 +1186,7 @@ async fn run_browser_tier(
     let mut visited = 0usize;
     let mut refused: Vec<String> = Vec::new();
     for url in &plan {
-        let Ok(v) = crate::browser::visit(&mut cdp, url.as_str(), gate.clone()).await else {
+        let Ok(v) = cfx_browser::visit(&mut cdp, url.as_str(), gate.clone()).await else {
             continue;
         };
         for r in v.refused {
@@ -2444,7 +2444,7 @@ mod redirect_tests {
     /// A crawl with the headless tier on, or `None` when this machine has no
     /// browser to drive.
     async fn browser_crawl(seed: &str, scope_hosts: &[&str]) -> Option<Vec<CrawlEvent>> {
-        crate::browser::find_browser()?;
+        cfx_browser::find_browser()?;
         Some(
             run(serde_json::json!({
                 "seed": seed,

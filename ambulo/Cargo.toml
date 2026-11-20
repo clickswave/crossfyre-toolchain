@@ -26,6 +26,7 @@ dguard = { path = "../dguard" }
 cfx_db = { path = "../db" }
 adaptive = { path = "../adaptive" }
 transport = { path = "../transport" }
+cfx_browser = { path = "../browser" }
 tokio = { version = "1.47.1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "process", "time"] }
 clap = { version = "4.5.42", features = ["derive"] }
 clap_complete = "4.6.9"
@@ -43,15 +44,10 @@ uuid = { version = "1.18.0", features = ["v4"] }
 base64 = "0.22.1"
 dialoguer = "0.11"
 
-[target.'cfg(unix)'.dependencies]
-# Handing the browser its DevTools pipe on fds 3 and 4.
-libc = "0.2"
-
-[target.'cfg(not(unix))'.dependencies]
-# Driving the browser over the DevTools websocket on the port it picks.
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
-futures-util = { version = "0.3.34", default-features = false, features = ["sink"] }
-
 [dev-dependencies]
 # A recording SOCKS5 proxy and counting listeners for the egress tests.
 cfx_tunnel = { path = "../tunnel", features = ["recorder"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+# The wordlist tests make a FIFO.
+libc = "0.2"

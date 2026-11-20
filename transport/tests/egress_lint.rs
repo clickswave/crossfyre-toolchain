@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 const ENGINES: &[&str] = &[
     "plessor/src",
     "ambulo/src",
+    "browser/src",
     "voyage/src",
     "toolmark/src",
     "doorward/src",
@@ -55,7 +56,7 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
         "the shared probe clients serve only requests that came without a wrapper",
     ),
     (
-        "ambulo/src/browser.rs",
+        "browser/src/lib.rs",
         "TcpStream::connect(",
         1,
         "the DevTools socket of the browser this process started, on loopback",
