@@ -12,7 +12,8 @@ CREATE TABLE hosts (
 -- What a scan saw on a host: each page it fetched, the landing page, the two random paths
 -- that learn its not-found page and any path a signature asked for, with what it was
 -- asked for, its status, its headers in order as [name, value] with no credential's
--- value, and its body, capped as toolmark caps what it reads and gzipped, so that new
+-- value, its body, capped as toolmark caps what it reads and gzipped, and for a landing
+-- page that came over TLS the certificate its server presented, DER encoded, so that new
 -- signatures can be matched against what was seen. A scan with credentials saw the pages
 -- as the user they belong to, and keeps no body.
 CREATE TABLE observations (
@@ -26,6 +27,7 @@ CREATE TABLE observations (
     headers     JSONB NOT NULL DEFAULT '[]',
     body        BYTEA,
     body_length BIGINT NOT NULL DEFAULT 0,
+    certificate BYTEA,
     observed_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX observations_host_id ON observations (host_id, observed_at);

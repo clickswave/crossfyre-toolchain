@@ -247,8 +247,8 @@ impl ToolmarkDb {
         let mut out = Vec::new();
         for (host_id, scan, host, port, scheme) in latest {
             let rows: Vec<KeptRow> = sqlx::query_as(
-                "SELECT asked, url, status, moved, headers::text, body FROM observations \
-                 WHERE scan_id = $1 AND host_id = $2 ORDER BY id",
+                "SELECT asked, url, status, moved, headers::text, body, certificate \
+                 FROM observations WHERE scan_id = $1 AND host_id = $2 ORDER BY id",
             )
             .bind(&scan)
             .bind(host_id)
@@ -256,7 +256,7 @@ impl ToolmarkDb {
             .await?;
             let pages = rows
                 .into_iter()
-                .filter_map(|(asked, url, status, moved, headers, body)| {
+                .filter_map(|(asked, url, status, moved, headers, body, certificate)| {
                     let headers: Vec<(String, Option<String>)> =
                         serde_json::from_str(&headers).unwrap_or_default();
                     Some(Kept {
@@ -269,6 +269,7 @@ impl ToolmarkDb {
                             .filter_map(|(name, value)| Some((name, value?)))
                             .collect(),
                         body: body.as_deref().map(gunzipped).unwrap_or_default(),
+                        certificate,
                     })
                 })
                 .collect();
@@ -314,6 +315,8 @@ pub struct Kept {
     pub moved: bool,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// The certificate a landing page came with, when it came over TLS.
+    pub certificate: Option<Vec<u8>>,
 }
 
 /// What toolmark kept of one host: the pages of the latest scan that fetched its landing
@@ -327,8 +330,17 @@ pub struct KeptHost {
 }
 
 /// One kept page as the observations table holds it: what it was asked for, its URL,
-/// status, whether it moved, its headers as JSON text, and its gzipped body.
-type KeptRow = (String, String, i32, bool, String, Option<Vec<u8>>);
+/// status, whether it moved, its headers as JSON text, its gzipped body, and the
+/// certificate it came with.
+type KeptRow = (
+    String,
+    String,
+    i32,
+    bool,
+    String,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+);
 
 /// `body` as it was before it was gzipped, read no further than a fingerprint reads.
 fn gunzipped(body: &[u8]) -> Vec<u8> {
@@ -397,8 +409,8 @@ impl Observer for ScanObserver {
                 .await?;
             sqlx::query(
                 "INSERT INTO observations \
-                 (scan_id, host_id, asked, url, status, moved, headers, body, body_length) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9)",
+                 (scan_id, host_id, asked, url, status, moved, headers, body, body_length, \
+                 certificate) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10)",
             )
             .bind(scan)
             .bind(host)
@@ -409,6 +421,7 @@ impl Observer for ScanObserver {
             .bind(Value::Array(headers).to_string())
             .bind(body)
             .bind(o.body.len() as i64)
+            .bind(o.certificate)
             .execute(&mut *tx)
             .await?;
             tx.commit().await

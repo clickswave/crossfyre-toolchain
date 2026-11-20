@@ -68,6 +68,13 @@ fn new_on(kept: &KeptHost, signatures: &Signatures) -> Vec<(String, Detection)> 
             })
             .collect()
     };
+    // The certificate the landing page came with; one kept from a TLS page without it is
+    // not known.
+    match &landing.certificate {
+        Some(der) => host.certificate(der),
+        None if !landing.url.starts_with("https:") => host.no_tls(),
+        None => {}
+    }
     host.remember(pages(Asked::NotFound), pages(Asked::Path));
     host.detections()
         .into_iter()
@@ -90,8 +97,8 @@ mod tests {
     type KeptPage<'a> = (Asked, &'a str, u16, &'a [(&'a str, &'a str)], &'a str);
 
     /// Keep, as one scan of `url`'s host, `pages` it saw: what each was asked for, its
-    /// path, status, headers and body.
-    async fn keep(db: &ToolmarkDb, url: &str, pages: &[KeptPage<'_>]) {
+    /// path, status, headers and body, and the certificate the landing page came with.
+    async fn keep(db: &ToolmarkDb, url: &str, pages: &[KeptPage<'_>], certificate: Option<&[u8]>) {
         let params = json!({"target": url});
         let scan = db.start("fingerprint", url, &params).await;
         let observer = db.observer(scan.as_ref(), &params);
@@ -112,6 +119,7 @@ mod tests {
                     headers: &headers,
                     body: body.as_bytes(),
                     moved: false,
+                    certificate: certificate.filter(|_| *asked == Asked::Landing),
                 })
                 .await;
         }
@@ -155,6 +163,7 @@ mod tests {
             &db,
             &url,
             &[(Asked::Landing, "/", 403, &[("x-jenkins", "2.426.1")], "")],
+            None,
         )
         .await;
         assert_eq!(
@@ -166,6 +175,30 @@ mod tests {
         );
         assert_eq!(rematch(&db).await, []);
         assert!(listener.accept().is_err(), "a connection reached the host");
+        scratch.done().await;
+    }
+
+    /// The certificate a landing page came with is kept with it, so a signature that reads
+    /// the certificate finds on the kept page what the scan could have found.
+    #[tokio::test]
+    #[ignore = "needs PostgreSQL's programs"]
+    async fn a_kept_certificate_is_read_again() {
+        let scratch = cfx_db::testing::Scratch::new(&ENGINE).await;
+        let db = ToolmarkDb::new(scratch.pool.clone());
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "TRAEFIK DEFAULT CERT");
+        let key = rcgen::KeyPair::generate().unwrap();
+        let der = params.self_signed(&key).unwrap().der().to_vec();
+        keep(
+            &db,
+            "https://127.0.0.1:8443/",
+            &[(Asked::Landing, "/", 404, &[], "404 page not found")],
+            Some(&der),
+        )
+        .await;
+        assert_eq!(rematch(&db).await, [("Traefik".to_string(), None)]);
         scratch.done().await;
     }
 
@@ -186,6 +219,7 @@ mod tests {
                 &[("server", "nginx/1.24.0"), ("x-powered-by", "PHP/8.2.12")],
                 "",
             )],
+            None,
         )
         .await;
         assert_eq!(
@@ -205,6 +239,7 @@ mod tests {
                 &[("server", "nginx/1.25.3"), ("x-powered-by", "PHP/8.2.12")],
                 "",
             )],
+            None,
         )
         .await;
         assert_eq!(
@@ -237,6 +272,7 @@ mod tests {
                     r#"{"initialized":true,"sealed":false,"version":"1.15.2"}"#,
                 ),
             ],
+            None,
         )
         .await;
         let found = rematch(&db).await;

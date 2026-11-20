@@ -50,6 +50,9 @@ pub struct Observation<'a> {
     pub body: &'a [u8],
     /// The request ended somewhere other than where it was sent, through a redirect.
     pub moved: bool,
+    /// The certificate its server presented, DER encoded, for a landing page that came
+    /// over TLS.
+    pub certificate: Option<&'a [u8]>,
 }
 
 /// Where what a fingerprint saw goes.

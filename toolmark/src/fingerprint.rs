@@ -171,6 +171,7 @@ async fn scan<O: crate::observe::Observer>(
             headers: &headers,
             body: body.as_bytes(),
             moved: false,
+            certificate: tls.as_ref().and_then(|c| c.as_deref()),
         })
         .await;
 
@@ -243,6 +244,7 @@ async fn scan<O: crate::observe::Observer>(
                     headers: &headers,
                     body: &body,
                     moved,
+                    certificate: None,
                 })
                 .await;
             signatures::Answered::new(status, moved, &body)
