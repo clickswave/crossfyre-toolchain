@@ -7,22 +7,31 @@
 //!   "format": 1,
 //!   "sequence": 42,
 //!   "made": "2026-11-20T03:00:00Z",
-//!   "cves": {
-//!     "CVE-2021-41773": {"severity": "high", "score": 7.5, "kev": true, "epss": 0.944}
-//!   },
 //!   "products": [
 //!     {"part": "a", "vendor": "apache", "product": "http_server", "affected": [
 //!       {"cve": "CVE-2021-41773", "ranges": [{"eq": "2.4.49"}]}
+//!     ]},
+//!     {"part": "npm", "vendor": "", "product": "jquery", "affected": [
+//!       {"cve": "CVE-2020-11022", "ranges": [{"ge": "1.2.0", "lt": "3.5.0"}]}
 //!     ]}
-//!   ]
+//!   ],
+//!   "cves": {
+//!     "CVE-2021-41773": {"severity": "high", "score": 7.5, "kev": true, "epss": 0.944},
+//!     "CVE-2020-11022": {"severity": "medium", "score": 6.1, "epss": 0.992}
+//!   }
 //! }
 //! ```
 //!
-//! `cves` holds what is known of each CVE: its CVSS severity and score, whether it is on
-//! CISA's known-exploited list, and its EPSS score. `products` holds, for each CPE part,
-//! vendor and product, the CVEs that affect it and at which versions. A range has any of
-//! `eq`, `ge`, `gt`, `le` and `lt`, and a version is in it when it meets each bound it
-//! has. A CVE affects a version in any of its ranges.
+//! `products` holds, for each CPE part, vendor and product, the CVEs that affect it and at
+//! which versions. A package from an ecosystem's registry is named with the ecosystem as
+//! its part and no vendor. A range has any of `eq`, `ge`, `gt`, `le` and `lt`, and a
+//! version is in it when it meets each bound it has. A CVE affects a version in any of its
+//! ranges. `cves` holds what is known of each CVE: its CVSS severity and score, whether
+//! it is on CISA's known-exploited list, and its EPSS score.
+//!
+//! The whole dataset is large: millions of ranges. A caller that asks about a known set
+//! of products loads only those ([`Dataset::from_bytes_for`]), and as the products come
+//! before the CVEs, keeps only the CVEs they name as it reads.
 //!
 //! A version matched here makes a lead, never a confirmed finding: a version can be read
 //! wrong, and a distribution's build may carry a fix its version does not show.
@@ -32,9 +41,9 @@ mod version;
 pub use version::Version;
 
 use serde::Deserialize;
-use std::collections::{BTreeMap, HashMap};
+use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
-use std::io::Read;
 
 /// The dataset format this crate reads.
 pub const FORMAT: u32 = 1;
@@ -145,52 +154,73 @@ impl Range {
 }
 
 #[derive(Deserialize)]
-struct File {
-    format: u32,
-    sequence: u64,
-    made: String,
-    cves: HashMap<String, Known>,
-    products: Vec<ProductFile>,
-}
-
-#[derive(Deserialize)]
-struct ProductFile {
-    part: String,
-    vendor: String,
-    product: String,
-    affected: Vec<AffectedFile>,
-}
-
-#[derive(Deserialize)]
 struct AffectedFile {
     cve: String,
     ranges: Vec<BTreeMap<String, String>>,
 }
 
+/// Which products a load keeps.
+type Keep<'a> = &'a dyn Fn(&Cpe) -> bool;
+
+/// The file as read: the products a load keeps, and the CVEs, only those the kept
+/// products name when the products come first.
+#[derive(Default)]
+struct Read {
+    format: Option<u32>,
+    sequence: Option<u64>,
+    made: Option<String>,
+    cves: HashMap<String, Known>,
+    products: Vec<(Cpe, Vec<AffectedFile>)>,
+}
+
 impl Dataset {
     /// The dataset in `bytes`, gzipped as it is published or as plain JSON.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        let json = if bytes.starts_with(&[0x1f, 0x8b]) {
-            let mut out = Vec::new();
-            flate2::read::GzDecoder::new(bytes)
-                .read_to_end(&mut out)
-                .map_err(|e| Error(format!("the dataset does not unzip: {e}")))?;
-            out
+        Self::load(bytes, &|_| true)
+    }
+
+    /// The dataset in `bytes`, with only the products `names` name: all a caller that
+    /// asks about a known set of products needs, in a small part of the memory.
+    pub fn from_bytes_for(bytes: &[u8], names: &HashSet<Cpe>) -> Result<Self, Error> {
+        Self::load(bytes, &|cpe| names.contains(cpe))
+    }
+
+    fn load(bytes: &[u8], keep: Keep) -> Result<Self, Error> {
+        let unreadable =
+            |e: serde_json::Error| Error(format!("the dataset is not one this reads: {e}"));
+        let mut file = if bytes.starts_with(&[0x1f, 0x8b]) {
+            let gz = std::io::BufReader::new(flate2::read::GzDecoder::new(bytes));
+            let mut json = serde_json::Deserializer::from_reader(gz);
+            let file = FileSeed(keep).deserialize(&mut json).map_err(unreadable)?;
+            json.end().map_err(unreadable)?;
+            file
         } else {
-            bytes.to_vec()
+            let mut json = serde_json::Deserializer::from_slice(bytes);
+            let file = FileSeed(keep).deserialize(&mut json).map_err(unreadable)?;
+            json.end().map_err(unreadable)?;
+            file
         };
-        let file: File = serde_json::from_slice(&json)
-            .map_err(|e| Error(format!("the dataset is not one this reads: {e}")))?;
-        if file.format != FORMAT {
+        let (Some(format), Some(sequence), Some(made)) =
+            (file.format, file.sequence, file.made.take())
+        else {
+            return Err(Error(
+                "the dataset has no format, sequence or time it was made".to_string(),
+            ));
+        };
+        if format != FORMAT {
             return Err(Error(format!(
-                "the dataset is in format {}, and this reads format {FORMAT}",
-                file.format
+                "the dataset is in format {format}, and this reads format {FORMAT}"
             )));
         }
+        let named: HashSet<&str> = file
+            .products
+            .iter()
+            .flat_map(|(_, affected)| affected.iter().map(|a| a.cve.as_str()))
+            .collect();
+        file.cves.retain(|id, _| named.contains(id.as_str()));
         let mut products: HashMap<Cpe, Vec<Affected>> = HashMap::new();
-        for p in file.products {
-            let cpe = Cpe::new(&p.part, &p.vendor, &p.product);
-            for a in p.affected {
+        for (cpe, affected) in file.products {
+            for a in affected {
                 if !file.cves.contains_key(&a.cve) {
                     return Err(Error(format!(
                         "{cpe} names {}, which it does not hold",
@@ -209,11 +239,16 @@ impl Dataset {
             }
         }
         Ok(Self {
-            sequence: file.sequence,
-            made: file.made,
+            sequence,
+            made,
             cves: file.cves,
             products,
         })
+    }
+
+    /// What the dataset knows of `cve`, when a product it holds names it.
+    pub fn known(&self, cve: &str) -> Option<&Known> {
+        self.cves.get(cve)
     }
 
     /// Which of the datasets made it is: each is numbered one more than the last.
@@ -300,6 +335,158 @@ fn range(bounds: &BTreeMap<String, String>) -> Result<Range, String> {
         return Err("a range with no bound".to_string());
     }
     Ok(range)
+}
+
+/// Reads the file, keeping what a load wants of it.
+struct FileSeed<'a>(Keep<'a>);
+
+impl<'de> DeserializeSeed<'de> for FileSeed<'_> {
+    type Value = Read;
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<Read, D::Error> {
+        d.deserialize_map(self)
+    }
+}
+
+impl<'de> Visitor<'de> for FileSeed<'_> {
+    type Value = Read;
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a CVE dataset")
+    }
+    fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Read, M::Error> {
+        let mut out = Read::default();
+        let mut named: Option<HashSet<String>> = None;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "format" => out.format = Some(map.next_value()?),
+                "sequence" => out.sequence = Some(map.next_value()?),
+                "made" => out.made = Some(map.next_value()?),
+                "products" => {
+                    out.products = map.next_value_seed(ProductsSeed(self.0))?;
+                    named = Some(
+                        out.products
+                            .iter()
+                            .flat_map(|(_, affected)| affected.iter().map(|a| a.cve.clone()))
+                            .collect(),
+                    );
+                }
+                "cves" => out.cves = map.next_value_seed(CvesSeed(named.as_ref()))?,
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Reads the products, keeping those a load wants.
+struct ProductsSeed<'a>(Keep<'a>);
+
+impl<'de> DeserializeSeed<'de> for ProductsSeed<'_> {
+    type Value = Vec<(Cpe, Vec<AffectedFile>)>;
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        d.deserialize_seq(self)
+    }
+}
+
+impl<'de> Visitor<'de> for ProductsSeed<'_> {
+    type Value = Vec<(Cpe, Vec<AffectedFile>)>;
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a list of products")
+    }
+    fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> Result<Self::Value, S::Error> {
+        let mut out = Vec::new();
+        while let Some(product) = seq.next_element_seed(ProductSeed(self.0))? {
+            out.extend(product);
+        }
+        Ok(out)
+    }
+}
+
+/// Reads one product, skipping what it affects unread when a load does not want it.
+struct ProductSeed<'a>(Keep<'a>);
+
+impl<'de> DeserializeSeed<'de> for ProductSeed<'_> {
+    type Value = Option<(Cpe, Vec<AffectedFile>)>;
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        d.deserialize_map(self)
+    }
+}
+
+impl<'de> Visitor<'de> for ProductSeed<'_> {
+    type Value = Option<(Cpe, Vec<AffectedFile>)>;
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a product")
+    }
+    fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+        let (mut part, mut vendor, mut product) = (None::<String>, None::<String>, None::<String>);
+        let mut affected = None;
+        let mut skipped = false;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "part" => part = Some(map.next_value()?),
+                "vendor" => vendor = Some(map.next_value()?),
+                "product" => product = Some(map.next_value()?),
+                "affected" => {
+                    // Its name comes first as the dataset is written; when it does not,
+                    // what it affects is read, and dropped once the name says so.
+                    let wanted = match (&part, &vendor, &product) {
+                        (Some(p), Some(v), Some(name)) => (self.0)(&Cpe::new(p, v, name)),
+                        _ => true,
+                    };
+                    if wanted {
+                        affected = Some(map.next_value::<Vec<AffectedFile>>()?);
+                    } else {
+                        map.next_value::<IgnoredAny>()?;
+                        skipped = true;
+                    }
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        let (Some(part), Some(vendor), Some(product)) = (part, vendor, product) else {
+            return Err(de::Error::custom(
+                "a product without its part, vendor or product",
+            ));
+        };
+        let cpe = Cpe::new(&part, &vendor, &product);
+        if skipped || !(self.0)(&cpe) {
+            return Ok(None);
+        }
+        let affected = affected.ok_or_else(|| de::Error::missing_field("affected"))?;
+        Ok(Some((cpe, affected)))
+    }
+}
+
+/// Reads the CVEs: those the kept products name when the products came first, else all.
+struct CvesSeed<'a>(Option<&'a HashSet<String>>);
+
+impl<'de> DeserializeSeed<'de> for CvesSeed<'_> {
+    type Value = HashMap<String, Known>;
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        d.deserialize_map(self)
+    }
+}
+
+impl<'de> Visitor<'de> for CvesSeed<'_> {
+    type Value = HashMap<String, Known>;
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("the CVEs")
+    }
+    fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+        let mut out = HashMap::new();
+        while let Some(id) = map.next_key::<String>()? {
+            if self.0.is_none_or(|named| named.contains(&id)) {
+                let known = map.next_value::<Known>()?;
+                out.insert(id, known);
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -428,9 +615,43 @@ mod tests {
     fn the_published_file_is_read_gzipped() {
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         gz.write_all(SMALL.as_bytes()).unwrap();
-        let d = Dataset::from_bytes(&gz.finish().unwrap()).unwrap();
+        let gz = gz.finish().unwrap();
+        let d = Dataset::from_bytes(&gz).unwrap();
         assert_eq!((d.sequence(), d.made()), (7, "2026-11-20T03:00:00Z"));
         assert_eq!(d.leads(&apache(), "2.4.49", None).len(), 2);
+        let some = Dataset::from_bytes_for(&gz, &apache().into_iter().collect()).unwrap();
+        assert_eq!(some.leads(&apache(), "2.4.49", None).len(), 2);
+    }
+
+    /// Products before CVEs, as the job writes them, and one product whose name comes
+    /// after what it affects.
+    const ORDERED: &str = r#"{"format": 1, "sequence": 2, "made": "x",
+        "products": [
+          {"part": "a", "vendor": "v", "product": "p",
+           "affected": [{"cve": "CVE-1", "ranges": [{"lt": "2.0"}]}]},
+          {"affected": [{"cve": "CVE-2", "ranges": [{"lt": "2.0"}]}],
+           "part": "a", "vendor": "v", "product": "q"}
+        ],
+        "cves": {"CVE-1": {"kev": true}, "CVE-2": {}}}"#;
+
+    #[test]
+    fn a_load_for_some_products_keeps_only_those_and_their_cves() {
+        let p = Cpe::new("a", "v", "p");
+        let q = Cpe::new("a", "v", "q");
+        let only_p = Dataset::from_bytes_for(ORDERED.as_bytes(), &[p.clone()].into()).unwrap();
+        assert_eq!(ids(&only_p.leads(&[p.clone()], "1.0", None)), ["CVE-1"]);
+        assert!(only_p.leads(&[q.clone()], "1.0", None).is_empty());
+        assert!(only_p.known("CVE-1").is_some_and(|k| k.kev));
+        assert!(only_p.known("CVE-2").is_none());
+        let only_q = Dataset::from_bytes_for(ORDERED.as_bytes(), &[q.clone()].into()).unwrap();
+        assert_eq!(ids(&only_q.leads(&[q], "1.0", None)), ["CVE-2"]);
+        assert!(only_q.known("CVE-1").is_none());
+        // CVEs before products, as in the small dataset, are kept for the products wanted.
+        let apache_only =
+            Dataset::from_bytes_for(SMALL.as_bytes(), &apache().into_iter().collect()).unwrap();
+        assert_eq!(apache_only.leads(&apache(), "2.4.49", None).len(), 2);
+        assert!(apache_only.known("CVE-2024-6387").is_none());
+        assert!(apache_only.known("CVE-2021-41773").is_some());
     }
 
     #[test]
