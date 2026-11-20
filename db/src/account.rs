@@ -235,12 +235,17 @@ mod tests {
             "taken a second time while held"
         );
         drop(held);
-        assert!(
-            account
-                .try_lock(&dir.path().join(LOCK_FILE))
-                .unwrap()
-                .is_some()
-        );
+        // A child another thread is starting holds a copy of the lock file until it runs
+        // its program, so the lock is free soon after the drop rather than at once.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while account
+            .try_lock(&dir.path().join(LOCK_FILE))
+            .unwrap()
+            .is_none()
+        {
+            assert!(Instant::now() < deadline, "still held after it was dropped");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[cfg(unix)]
