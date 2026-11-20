@@ -1,0 +1,5 @@
+# Synthetic: Solr's system information, which names the version.
+HTTP/1.1 200 OK
+content-type: application/json;charset=utf-8
+
+{"responseHeader": {"status": 0, "QTime": 10}, "mode": "std", "solr_home": "/var/solr/data", "lucene": {"solr-spec-version": "8.11.2", "solr-impl-version": "8.11.2", "lucene-spec-version": "8.11.2"}}

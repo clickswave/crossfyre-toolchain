@@ -1,0 +1,16 @@
+# Synthetic: An Apache OFBiz application, with the visitor cookie OFBiz sets.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+set-cookie: OFBiz.Visitor=10000; Max-Age=31536000; Path=/; Secure; HttpOnly
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>OFBiz: Web Tools: Login</title>
+</head>
+<body>
+<form method="post" action="/webtools/control/login"></form>
+</body>
+</html>

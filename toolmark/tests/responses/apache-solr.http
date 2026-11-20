@@ -1,0 +1,16 @@
+# Synthetic: Solr's admin page, where Solr sends anyone who opens its root, and its
+# system information in apache-solr/.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Solr Admin</title>
+</head>
+<body>
+<div id="wrapper"></div>
+</body>
+</html>

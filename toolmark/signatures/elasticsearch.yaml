@@ -1,0 +1,14 @@
+id: elasticsearch
+info:
+  name: Elasticsearch
+  category: Search Engine
+  metadata:
+    vendor: elastic
+    product: elasticsearch
+implies: [java]
+detect:
+  any:
+    - header: { name: x-elastic-product, regex: '^Elasticsearch$' }
+    - html: { regex: '"tagline"\s*:\s*"You Know, for Search"' }
+version:
+  - html: { regex: '"number"\s*:\s*"([0-9]+(?:\.[0-9]+)*)"' }

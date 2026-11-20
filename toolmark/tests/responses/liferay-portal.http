@@ -1,0 +1,17 @@
+# Synthetic: A Liferay Portal Community Edition, which names itself and its version in a
+# header of its own.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+liferay-portal: Liferay Community Edition Portal 7.2.0 CE GA1 (Mueller / Build 7200 / June 4, 2019)
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Welcome - Liferay</title>
+</head>
+<body>
+<div id="wrapper"></div>
+</body>
+</html>

@@ -1,0 +1,12 @@
+id: craft-cms
+info:
+  name: Craft CMS
+  category: CMS
+  metadata:
+    vendor: craftcms
+    product: craft_cms
+implies: [php]
+detect:
+  any:
+    - header: { name: x-powered-by, regex: '^Craft CMS' }
+    - cookie: { name: '^CraftSessionId$' }

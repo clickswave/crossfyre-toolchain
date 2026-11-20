@@ -235,6 +235,34 @@ pub(super) static FILES: &[(&str, &str)] = &[
         "usermin.yaml",
         include_str!("../../signatures/usermin.yaml"),
     ),
+    (
+        "telerik-ui-aspnet-ajax.yaml",
+        include_str!("../../signatures/telerik-ui-aspnet-ajax.yaml"),
+    ),
+    (
+        "craft-cms.yaml",
+        include_str!("../../signatures/craft-cms.yaml"),
+    ),
+    (
+        "elasticsearch.yaml",
+        include_str!("../../signatures/elasticsearch.yaml"),
+    ),
+    (
+        "apache-ofbiz.yaml",
+        include_str!("../../signatures/apache-ofbiz.yaml"),
+    ),
+    (
+        "apache-solr.yaml",
+        include_str!("../../signatures/apache-solr.yaml"),
+    ),
+    (
+        "liferay.yaml",
+        include_str!("../../signatures/liferay.yaml"),
+    ),
+    (
+        "liferay-portal.yaml",
+        include_str!("../../signatures/liferay-portal.yaml"),
+    ),
     ("java.yaml", include_str!("../../signatures/java.yaml")),
     ("python.yaml", include_str!("../../signatures/python.yaml")),
     ("nodejs.yaml", include_str!("../../signatures/nodejs.yaml")),

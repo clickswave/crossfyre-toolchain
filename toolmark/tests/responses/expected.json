@@ -27,6 +27,32 @@
       "version_range": null
     }
   ],
+  "apache-ofbiz.http": [
+    {
+      "candidates": [],
+      "category": "ERP",
+      "confidence": 45,
+      "cpe": "cpe:2.3:a:apache:ofbiz:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "cookie OFBiz.Visitor"
+      ],
+      "name": "Apache OFBiz",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Apache OFBiz"
+      ],
+      "name": "Java",
+      "version": null,
+      "version_range": null
+    }
+  ],
   "apache-php-in-server.http": [
     {
       "candidates": [],
@@ -50,6 +76,32 @@
       ],
       "name": "PHP",
       "version": "7.4.3",
+      "version_range": null
+    }
+  ],
+  "apache-solr.http": [
+    {
+      "candidates": [],
+      "category": "Search Engine",
+      "confidence": 25,
+      "cpe": "cpe:2.3:a:apache:solr:8.11.2:*:*:*:*:*:*:*",
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "Apache Solr",
+      "version": "8.11.2",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Apache Solr"
+      ],
+      "name": "Java",
+      "version": null,
       "version_range": null
     }
   ],
@@ -173,6 +225,33 @@
       "version_range": null
     }
   ],
+  "craft-cms.http": [
+    {
+      "candidates": [],
+      "category": "CMS",
+      "confidence": 95,
+      "cpe": "cpe:2.3:a:craftcms:craft_cms:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "header x-powered-by: Craft CMS",
+        "cookie CraftSessionId"
+      ],
+      "name": "Craft CMS",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Craft CMS"
+      ],
+      "name": "PHP",
+      "version": null,
+      "version_range": null
+    }
+  ],
   "crushftp.http": [
     {
       "candidates": [],
@@ -263,6 +342,58 @@
         "implied by Drupal"
       ],
       "name": "PHP",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "elasticsearch-secured.http": [
+    {
+      "candidates": [],
+      "category": "Search Engine",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:elastic:elasticsearch:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "header x-elastic-product: Elasticsearch"
+      ],
+      "name": "Elasticsearch",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Elasticsearch"
+      ],
+      "name": "Java",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "elasticsearch.http": [
+    {
+      "candidates": [],
+      "category": "Search Engine",
+      "confidence": 25,
+      "cpe": "cpe:2.3:a:elastic:elasticsearch:7.10.2:*:*:*:*:*:*:*",
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "Elasticsearch",
+      "version": "7.10.2",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Elasticsearch"
+      ],
+      "name": "Java",
       "version": null,
       "version_range": null
     }
@@ -1573,6 +1704,58 @@
       "version_range": null
     }
   ],
+  "liferay-dxp.http": [
+    {
+      "candidates": [],
+      "category": "CMS",
+      "confidence": 50,
+      "cpe": "",
+      "evidence": [
+        "header liferay-portal: Liferay Digital Experience Platform 7.4"
+      ],
+      "name": "Liferay",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Liferay"
+      ],
+      "name": "Java",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "liferay-portal.http": [
+    {
+      "candidates": [],
+      "category": "CMS",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:liferay:liferay_portal:7.2.0:*:*:*:*:*:*:*",
+      "evidence": [
+        "header liferay-portal: Liferay Community Edition Portal 7.2.0 CE GA1 (Mueller / Build 7200 / June 4, 20…"
+      ],
+      "name": "Liferay Portal",
+      "version": "7.2.0",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Liferay Portal"
+      ],
+      "name": "Java",
+      "version": null,
+      "version_range": null
+    }
+  ],
   "litespeed-php.http": [
     {
       "candidates": [],
@@ -2268,6 +2451,45 @@
       ],
       "name": "PHP",
       "version": null,
+      "version_range": null
+    }
+  ],
+  "telerik-ui-aspnet-ajax.http": [
+    {
+      "candidates": [],
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:microsoft:internet_information_services:10.0:*:*:*:*:*:*:*",
+      "evidence": [
+        "header server: Microsoft-IIS/10.0"
+      ],
+      "name": "Microsoft IIS",
+      "version": "10.0",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Framework",
+      "confidence": 100,
+      "cpe": "cpe:2.3:a:microsoft:asp.net:4.0.30319:*:*:*:*:*:*:*",
+      "evidence": [
+        "header x-powered-by: ASP.NET",
+        "header x-aspnet-version: 4.0.30319"
+      ],
+      "name": "ASP.NET",
+      "version": "4.0.30319",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "UI Framework",
+      "confidence": 40,
+      "cpe": "cpe:2.3:a:telerik:ui_for_asp.net_ajax:2019.3.1023:*:*:*:*:*:*:*",
+      "evidence": [
+        "script src /Telerik.Web.UI.WebResource.axd?_TSM_HiddenField_=RadScriptManager1_TSM&amp;compress=1&amp;_TSM_CombinedScripts_=%3b%3bS…"
+      ],
+      "name": "Telerik UI for ASP.NET AJAX",
+      "version": "2019.3.1023",
       "version_range": null
     }
   ],

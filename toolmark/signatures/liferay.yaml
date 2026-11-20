@@ -1,0 +1,8 @@
+id: liferay
+info:
+  name: Liferay
+  category: CMS
+implies: [java]
+detect:
+  any:
+    - header: { name: liferay-portal, regex: '.' }

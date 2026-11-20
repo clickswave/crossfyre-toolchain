@@ -1,0 +1,17 @@
+# Synthetic: A Liferay DXP, whose header names no Community Edition, so only Liferay is
+# reported.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+liferay-portal: Liferay Digital Experience Platform 7.4
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Home - Liferay DXP</title>
+</head>
+<body>
+<div id="wrapper"></div>
+</body>
+</html>

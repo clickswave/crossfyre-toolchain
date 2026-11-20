@@ -1,0 +1,11 @@
+id: apache-ofbiz
+info:
+  name: Apache OFBiz
+  category: ERP
+  metadata:
+    vendor: apache
+    product: ofbiz
+implies: [java]
+detect:
+  any:
+    - cookie: { name: '^OFBiz\.Visitor$' }

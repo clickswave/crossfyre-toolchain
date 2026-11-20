@@ -1,0 +1,18 @@
+# Synthetic: What an Elasticsearch node answers at its root with no security turned on.
+HTTP/1.1 200 OK
+content-type: application/json; charset=UTF-8
+
+{
+  "name": "node-1",
+  "cluster_name": "search",
+  "cluster_uuid": "AAAAAAAAAAAAAAAAAAAAAA",
+  "version": {
+    "number": "7.10.2",
+    "build_flavor": "default",
+    "build_type": "docker",
+    "lucene_version": "8.7.0",
+    "minimum_wire_compatibility_version": "6.8.0",
+    "minimum_index_compatibility_version": "6.0.0-beta1"
+  },
+  "tagline": "You Know, for Search"
+}
