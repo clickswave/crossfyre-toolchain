@@ -168,8 +168,8 @@ def describe(f: dict) -> str:
 
 
 def have_browser() -> bool:
-    if os.environ.get("AMBULO_BROWSER"):
-        return Path(os.environ["AMBULO_BROWSER"]).is_file()
+    if os.environ.get("CFX_BROWSER"):
+        return Path(os.environ["CFX_BROWSER"]).is_file()
     for name in ("chromium", "chromium-browser", "google-chrome",
                  "google-chrome-stable", "chrome"):
         for d in os.environ.get("PATH", "").split(os.pathsep):
@@ -255,7 +255,7 @@ def main() -> int:
             # Named, never silent. A case that quietly does not run is the exact
             # failure mode this suite exists to catch.
             print(f"SKIP {name:22}   -.-s  {case.get('what','')}  "
-                  f"(no browser; set AMBULO_BROWSER)", flush=True)
+                  f"(no browser; set CFX_BROWSER)", flush=True)
             skipped += 1
             continue
         t0 = time.time()
