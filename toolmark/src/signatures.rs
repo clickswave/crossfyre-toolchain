@@ -23,6 +23,8 @@ pub struct Detection {
     pub category: String,
     pub version: Option<String>,
     pub cpe: String,
+    /// The product as its CPE names it, which its CVE leads are looked up by.
+    pub cpe_name: Option<cfx_cve::Cpe>,
     pub confidence: u8,
     pub evidence: Vec<String>,
     /// The products that refine this one and could not be told apart from it: the
@@ -286,6 +288,14 @@ impl Signature {
     }
 }
 
+impl Signature {
+    /// The product as its CPE names it, when the file names its vendor and product.
+    fn cpe_name(&self) -> Option<cfx_cve::Cpe> {
+        let (vendor, product, _) = self.cpe.as_ref()?;
+        Some(cfx_cve::Cpe::new("a", vendor, product))
+    }
+}
+
 /// A value as a CPE 2.3 formatted string writes it: anything but a letter, a digit, a
 /// period, a hyphen or an underscore escaped with a backslash.
 fn cpe_value(value: &str) -> String {
@@ -324,6 +334,11 @@ impl Signatures {
 
     fn by_id(&self, id: &str) -> Option<&Signature> {
         self.list.iter().find(|s| s.id == id)
+    }
+
+    /// The products these signatures name by CPE: what CVE leads are looked up for.
+    pub fn cpes(&self) -> std::collections::HashSet<cfx_cve::Cpe> {
+        self.list.iter().filter_map(Signature::cpe_name).collect()
     }
 }
 
@@ -1076,6 +1091,7 @@ impl<'a> Host<'a> {
                     name: signature.name.clone(),
                     category: signature.category.clone(),
                     cpe: signature.cpe(version.as_deref()),
+                    cpe_name: signature.cpe_name(),
                     version,
                     confidence: outcome.confidence.min(100) as u8,
                     evidence: outcome.evidence.clone(),
@@ -1103,6 +1119,7 @@ impl<'a> Host<'a> {
                     category: "Implied".to_string(),
                     version: None,
                     cpe: String::new(),
+                    cpe_name: None,
                     confidence: 30,
                     evidence: vec![format!("implied by {}", detection.name)],
                     candidates: Vec::new(),

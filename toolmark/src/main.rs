@@ -46,7 +46,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             },
         )
         .await?;
-        return daemon::run(cli.port, db).await;
+        // CVE leads come from the dataset in toolmark's data folder, or with none there,
+        // the known-exploited snapshot compiled in.
+        let folder = dguard::toolchain_dir().map(|d| d.join("toolmark"));
+        let names = signatures::Signatures::shipped().cpes();
+        let cves = std::sync::Arc::new(cve::Cves::load(folder.as_deref(), &names));
+        return daemon::run(cli.port, db, cves).await;
     }
 
     // The daemon every command below talks to, started when it is not running.

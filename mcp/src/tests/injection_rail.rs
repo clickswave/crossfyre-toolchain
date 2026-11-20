@@ -160,6 +160,12 @@ async fn a_hostile_page_title_stays_under_target_data() {
     );
     assert_eq!(v["cve_leads"][0]["severity"], "high");
     assert_eq!(v["cve_leads"][0]["confidence"], "version-inferred");
+    // Each lead says which data it came from, and what may make it wrong.
+    assert_eq!(
+        v["cve_leads"][0]["cve_data"],
+        "built-in known-exploited snapshot"
+    );
+    assert_eq!(v["cve_leads"][0]["backport"], true);
 }
 
 #[tokio::test]

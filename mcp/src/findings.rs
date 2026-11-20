@@ -182,7 +182,18 @@ pub(crate) fn from_toolmark(data: &Value, st: Stamp<'_>) -> Option<Value> {
             let sev = severity(data.get("severity").and_then(|s| s.as_str()).unwrap_or(""));
             o.insert("severity".into(), json!(sev));
             o.insert("confidence".into(), json!("version-inferred"));
-            for k in ["cve", "cvss", "product", "version", "reference"] {
+            for k in [
+                "cve",
+                "cvss",
+                "kev",
+                "epss",
+                "product",
+                "version",
+                "possible",
+                "backport",
+                "cve_data",
+                "reference",
+            ] {
                 if let Some(v) = data.get(k) {
                     extra.insert(k.into(), v.clone());
                 }

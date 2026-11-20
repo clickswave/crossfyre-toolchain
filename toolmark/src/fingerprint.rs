@@ -116,12 +116,15 @@ async fn render(params: &FpParams, url: &str) -> Result<String, String> {
 /// resolving.
 pub use transport::AuthSpec;
 
+/// Fingerprint the target, sending what is found on `tx`, the pages seen to `observer`,
+/// and the CVE leads of each technology from `cves`.
 pub async fn run<O: crate::observe::Observer>(
     params: FpParams,
     tx: mpsc::UnboundedSender<Value>,
     observer: std::sync::Arc<O>,
+    cves: std::sync::Arc<crate::cve::Cves>,
 ) {
-    scan(Signatures::shipped(), params, tx, observer).await
+    scan(Signatures::shipped(), params, tx, observer, &cves).await
 }
 
 /// [`run`] with `signatures` in place of the shipped ones.
@@ -130,6 +133,7 @@ async fn scan<O: crate::observe::Observer>(
     params: FpParams,
     tx: mpsc::UnboundedSender<Value>,
     observer: std::sync::Arc<O>,
+    cves: &crate::cve::Cves,
 ) {
     let (scheme, host, port, url) = match normalize_target(&params.target) {
         Some(t) => t,
@@ -339,38 +343,7 @@ async fn scan<O: crate::observe::Observer>(
         }
         let _ = tx.send(technology(d, &url, &host, port, &scheme));
 
-        // Version-based CVE matches for this technology. Emitted as
-        // "version-inferred" (a backported fix could make it a false positive).
-        if let Some(ver) = d.version.as_deref().filter(|v| !v.is_empty()) {
-            for rule in crate::cve::match_cves(&d.name, ver) {
-                let headline = if rule.title.is_empty() {
-                    rule.cve.clone()
-                } else {
-                    rule.title.clone()
-                };
-                let _ = tx.send(json!({
-                    "type": "finding",
-                    "data": {
-                        "target": url,
-                        "host": host, "port": port, "scheme": scheme,
-                        "type": "vulnerability",
-                        "source": "toolmark-cve",
-                        "severity": rule.severity,
-                        "name": format!("{} {}: {}", d.name, ver, rule.cve),
-                        "cve": rule.cve,
-                        "cvss": rule.cvss,
-                        "product": d.name,
-                        "version": ver,
-                        "confidence": "version-inferred",
-                        "reference": rule.reference,
-                        "description": format!(
-                            "{}. Version-based match ({} {}); a backported patch could make this a false positive, so verify the exact build.",
-                            headline, d.name, ver
-                        ),
-                    }
-                }));
-            }
-        }
+        send_leads(&tx, cves, d, &url, &host, port, &scheme);
     }
 
     // Service summary finding.
@@ -462,6 +435,84 @@ fn extract_title(body: &str) -> Option<String> {
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Send the CVE leads for `d` at its version from `cves`, each saying which data it came
+/// from. A lead is a version match, never confirmed.
+pub(crate) fn send_leads(
+    tx: &mpsc::UnboundedSender<Value>,
+    cves: &crate::cve::Cves,
+    d: &signatures::Detection,
+    url: &str,
+    host: &str,
+    port: u16,
+    scheme: &str,
+) {
+    let (Some(version), Some(name)) = (d.version.as_deref().filter(|v| !v.is_empty()), &d.cpe_name)
+    else {
+        return;
+    };
+    let (leads, from) = cves.leads(name, version, d.distro.as_deref());
+    for lead in &leads {
+        let _ = tx.send(cve_lead(lead, &from, d, url, host, port, scheme));
+    }
+}
+
+/// One CVE lead as a finding: `d`, at its version, is in a range `lead` affects, by the
+/// data `from` names.
+fn cve_lead(
+    lead: &cfx_cve::Lead,
+    from: &str,
+    d: &signatures::Detection,
+    url: &str,
+    host: &str,
+    port: u16,
+    scheme: &str,
+) -> Value {
+    let version = d.version.as_deref().unwrap_or_default();
+    let reference = if lead.cve.starts_with("GHSA-") {
+        format!("https://github.com/advisories/{}", lead.cve)
+    } else {
+        format!("https://nvd.nist.gov/vuln/detail/{}", lead.cve)
+    };
+    let exploited = if lead.known.kev {
+        ", and it is on CISA's known-exploited list"
+    } else {
+        ""
+    };
+    let backport = if lead.backport {
+        " The distribution that built it may have backported the fix."
+    } else {
+        ""
+    };
+    json!({
+        "type": "finding",
+        "data": {
+            "target": url,
+            "host": host, "port": port, "scheme": scheme,
+            "type": "vulnerability",
+            "source": "toolmark-cve",
+            "severity": lead.known.severity.as_deref().unwrap_or("medium"),
+            "name": format!("{} {version}: {}", d.name, lead.cve),
+            "cve": lead.cve,
+            "cvss": lead.known.score,
+            "kev": lead.known.kev,
+            "epss": lead.known.epss,
+            "product": d.name,
+            "version": version,
+            "cpe": d.cpe_name.as_ref().map(ToString::to_string),
+            "confidence": "version-inferred",
+            "possible": lead.possible,
+            "backport": lead.backport,
+            "cve_data": from,
+            "reference": reference,
+            "description": format!(
+                "{} {version} is in a version range {} affects{exploited}. A version match, not \
+                 a confirmed finding: check the exact build.{backport}",
+                d.name, lead.cve
+            ),
+        }
+    })
 }
 
 /// Cap on how much of a decoded response we buffer. reqwest's gzip feature
@@ -657,7 +708,7 @@ mod redirect_tests {
         .unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let seen = std::sync::Arc::new(Seen::default());
-        run(params, tx, seen.clone()).await;
+        run(params, tx, seen.clone(), crate::cve::snapshot_for_tests()).await;
         assert_eq!(
             *seen.0.lock().unwrap(),
             [(301, Some("https://www.example.test/".to_string()), 0)],
@@ -784,7 +835,14 @@ mod path_tests {
         }))
         .unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        scan(Signatures::shipped(), params, tx, Arc::new(Nowhere)).await;
+        scan(
+            Signatures::shipped(),
+            params,
+            tx,
+            Arc::new(Nowhere),
+            &crate::cve::snapshot_for_tests(),
+        )
+        .await;
         let mut named = Vec::new();
         while let Ok(event) = rx.try_recv() {
             if event.pointer("/data/type") == Some(&json!("technology")) {
@@ -859,7 +917,14 @@ mod path_tests {
         .unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
         let kept = Arc::new(Kept::default());
-        scan(&signatures, params, tx, kept.clone()).await;
+        scan(
+            &signatures,
+            params,
+            tx,
+            kept.clone(),
+            &crate::cve::snapshot_for_tests(),
+        )
+        .await;
         let rendered: Vec<String> = kept
             .0
             .lock()
@@ -966,7 +1031,14 @@ mod path_tests {
         }))
         .unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        scan(signatures, params, tx, Arc::new(Nowhere)).await;
+        scan(
+            signatures,
+            params,
+            tx,
+            Arc::new(Nowhere),
+            &crate::cve::snapshot_for_tests(),
+        )
+        .await;
         let mut found = Vec::new();
         while let Ok(event) = rx.try_recv() {
             if event.pointer("/data/type") == Some(&json!("technology")) {
@@ -1076,4 +1148,119 @@ mod path_tests {
     }
 
     const STANDARD_TIER: u8 = signatures::STANDARD;
+}
+
+#[cfg(test)]
+mod cve_lead_tests {
+    //! The CVE leads a fingerprint sends for what it found, from the snapshot or from a
+    //! dataset in the data folder.
+    use super::*;
+    use crate::observe::{Observation, Observer};
+    use std::io::{Read, Write};
+
+    struct Nowhere;
+
+    impl Observer for Nowhere {
+        async fn observed(&self, _: Observation<'_>) {}
+    }
+
+    /// A server whose every answer says it is `server`.
+    fn server(server: &'static str) -> u16 {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nServer: {server}\r\nContent-Length: 0\r\n\
+                         Connection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        port
+    }
+
+    /// The leads a quiet fingerprint of the server on `port` sends, with `cves`.
+    async fn leads(port: u16, cves: &crate::cve::Cves) -> Vec<Value> {
+        let params: FpParams = serde_json::from_value(json!({
+            "target": format!("http://127.0.0.1:{port}/"),
+            "evasive": false,
+            "favicon": false,
+            "timeout_ms": 3000,
+            "depth_tier": 1,
+        }))
+        .unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        scan(
+            Signatures::shipped(),
+            params,
+            tx,
+            std::sync::Arc::new(Nowhere),
+            cves,
+        )
+        .await;
+        let mut out = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if event.pointer("/data/type") == Some(&json!("vulnerability")) {
+                out.push(event["data"].clone());
+            }
+        }
+        out
+    }
+
+    fn named(leads: &[Value], cve: &str) -> bool {
+        leads.iter().any(|l| l["cve"] == cve)
+    }
+
+    /// With no dataset, Apache 2.4.49 gives both of its path traversals from the
+    /// snapshot, each a lead that says where it came from, and 2.4.51 gives neither.
+    #[tokio::test]
+    async fn apache_2_4_49_gives_its_path_traversals_from_the_snapshot() {
+        let cves = crate::cve::snapshot_for_tests();
+        let found = leads(server("Apache/2.4.49 (Unix)"), &cves).await;
+        assert!(
+            named(&found, "CVE-2021-41773") && named(&found, "CVE-2021-42013"),
+            "{found:?}"
+        );
+        let lead = found.iter().find(|l| l["cve"] == "CVE-2021-41773").unwrap();
+        assert_eq!(lead["cve_data"], crate::cve::SNAPSHOT_LABEL);
+        assert_eq!(lead["confidence"], "version-inferred");
+        assert_eq!(lead["cpe"], "a:apache:http_server");
+        assert_eq!(lead["version"], "2.4.49");
+        assert_eq!(
+            (lead["kev"].as_bool(), lead["backport"].as_bool()),
+            (Some(true), Some(false))
+        );
+        let later = leads(server("Apache/2.4.51 (Unix)"), &cves).await;
+        assert!(!named(&later, "CVE-2021-41773") && !named(&later, "CVE-2021-42013"));
+    }
+
+    /// A dataset in the data folder answers in place of the snapshot, and its leads name
+    /// it.
+    #[tokio::test]
+    async fn a_dataset_in_the_data_folder_gives_the_leads_and_is_named() {
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(
+            folder.path().join(crate::cve::DATASET_FILE),
+            r#"{"format": 1, "sequence": 4, "made": "2026-11-22T15:00:00Z",
+                "products": [{"part": "a", "vendor": "apache", "product": "http_server",
+                  "affected": [{"cve": "CVE-2099-0049", "ranges": [{"eq": "2.4.49"}]}]}],
+                "cves": {"CVE-2099-0049": {"severity": "high", "score": 7.5}}}"#,
+        )
+        .unwrap();
+        let cves = crate::cve::Cves::load(Some(folder.path()), &Signatures::shipped().cpes());
+        let found = leads(server("Apache/2.4.49 (Unix)"), &cves).await;
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0]["cve"], "CVE-2099-0049");
+        assert_eq!(found[0]["cve_data"], "CVE dataset 4 of 2026-11-22");
+        assert_eq!(
+            (found[0]["severity"].as_str(), found[0]["cvss"].as_f64()),
+            (Some("high"), Some(7.5))
+        );
+    }
 }

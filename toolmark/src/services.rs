@@ -84,7 +84,13 @@ impl Svc {
     }
 }
 
-pub async fn run(params: SvcParams, tx: mpsc::UnboundedSender<Value>) {
+/// Identify the service on each target, sending what is found on `tx`, with the CVE leads
+/// of each product named from `cves`.
+pub async fn run(
+    params: SvcParams,
+    tx: mpsc::UnboundedSender<Value>,
+    cves: std::sync::Arc<crate::cve::Cves>,
+) {
     let _ = tx.send(json!({"type":"ack","targets": params.targets.len()}));
     let to = Duration::from_millis(params.timeout_ms.clamp(500, 30_000));
     let tasks = params.tasks.clamp(1, 64);
@@ -145,6 +151,7 @@ pub async fn run(params: SvcParams, tx: mpsc::UnboundedSender<Value>) {
                     port,
                     &svc.service,
                 ));
+                crate::fingerprint::send_leads(&tx, &cves, &d, &target, &host, port, &svc.service);
             }
         }
         let _ = tx.send(json!({"type":"progress","processed":done,"total":total}));
@@ -938,6 +945,53 @@ mod tests {
         assert_eq!(i32::from_le_bytes([m[12], m[13], m[14], m[15]]), 2013);
     }
 
+    /// A product a probe names gets its CVE leads, and one a distribution built says the
+    /// build may carry a backported fix.
+    #[tokio::test]
+    async fn a_service_s_product_gets_its_cve_leads() {
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(
+            folder.path().join(crate::cve::DATASET_FILE),
+            r#"{"format": 1, "sequence": 5, "made": "2026-11-22T15:00:00Z",
+                "products": [{"part": "a", "vendor": "openbsd", "product": "openssh",
+                  "affected": [{"cve": "CVE-2099-0089", "ranges": [{"ge": "8.5p1", "lt": "9.8p1"}]}]}],
+                "cves": {"CVE-2099-0089": {"severity": "high", "score": 8.1}}}"#,
+        )
+        .unwrap();
+        let cves = std::sync::Arc::new(crate::cve::Cves::load(
+            Some(folder.path()),
+            &Signatures::shipped().cpes(),
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let _ = stream
+                    .write_all(b"SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6\r\n")
+                    .await;
+            }
+        });
+        let params: SvcParams = serde_json::from_value(json!({
+            "targets": [format!("127.0.0.1:{port}")],
+            "timeout_ms": 1000,
+            "auth_checks": false,
+        }))
+        .unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        run(params, tx, cves).await;
+        let mut leads = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if event["type"] == "finding" && event["data"]["type"] == "vulnerability" {
+                leads.push(event["data"].clone());
+            }
+        }
+        assert_eq!(leads.len(), 1, "{leads:?}");
+        assert_eq!(leads[0]["cve"], "CVE-2099-0089");
+        assert_eq!(leads[0]["cve_data"], "CVE dataset 5 of 2026-11-22");
+        assert_eq!(leads[0]["backport"], true);
+        assert_eq!(leads[0]["product"], "OpenSSH");
+    }
+
     /// A service is named by the signatures from what its probe read: the product, its
     /// version and the distribution that built it, as a technology on the service's own
     /// host and port, from the text the probe keeps of each protocol's greeting.
@@ -990,7 +1044,7 @@ mod tests {
             }))
             .unwrap();
             let (tx, mut rx) = mpsc::unbounded_channel();
-            run(params, tx).await;
+            run(params, tx, crate::cve::snapshot_for_tests()).await;
             let mut named = Vec::new();
             while let Ok(event) = rx.try_recv() {
                 if event["type"] == "finding" && event["data"]["type"] == "technology" {

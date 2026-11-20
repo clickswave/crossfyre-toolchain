@@ -54,6 +54,13 @@ Detected technologies and versions for the target, plus any version-based CVE le
 A lead is not a confirmed vulnerability; it is a "this version is known to have had X,
 go look." For actually confirming a bug, hand the target to [`plessor`](../plessor/).
 
+Leads come from Clickswave's CVE dataset, built each day from the CVE list, NVD, CISA's
+known-exploited list, EPSS and GitHub's advisories, when toolmark has it in its data
+folder (`cve-dataset.json.gz` in the `toolmark` folder of the toolchain directory). With
+none there, they come from the known-exploited CVEs built into toolmark. Each lead says
+which data it came from, and one for a build a distribution made says the fix may have
+been backported.
+
 ## Signatures
 
 Each product toolmark knows is a file in [`signatures/`](signatures/), compiled into the

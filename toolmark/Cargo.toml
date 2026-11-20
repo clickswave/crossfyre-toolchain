@@ -11,6 +11,8 @@ authors = ["Clickswave <team@clickswave.org>"]
 
 [dependencies]
 dguard = { path = "../dguard" }
+# Which CVEs may affect a technology found, from the CVE dataset.
+cfx_cve = { path = "../cve" }
 cfx_finding = { path = "../finding" }
 cfx_tui = { path = "../tui" }
 ratatui = { version = "0.30.0-alpha.5", features = ["crossterm"] }
@@ -42,6 +44,8 @@ cfx_db = { path = "../db", features = ["testing"] }
 # Certificates for the `tls` leaf's tests, and a server that presents one.
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# A data folder of a test's own.
+tempfile = "3"
 
 [features]
 # First-party builds enable this to swap the scan client to wreq (BoringSSL) for

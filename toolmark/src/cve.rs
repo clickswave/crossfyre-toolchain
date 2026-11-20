@@ -1,218 +1,164 @@
-//! Version-based CVE matching.
-//!
-//! Given a detected product + version (from fingerprinting), match it against a
-//! ruleset of version-ranged CVEs. This is the same embedded-starter + external-
-//! file pattern plessor uses for templates, so the ruleset extends to a full feed
-//! (NVD/CPE export) by dropping a JSON file at `TOOLMARK_CVE_FILE` without a rebuild.
-//!
-//! Version-based matching is inherently lower-confidence than active detection:
-//! a distro may backport a fix without bumping the version string, and fingerprint
-//! versions are sometimes imprecise. Findings are therefore emitted as
-//! `confidence: "version-inferred"`, never "confirmed".
+//! CVE leads: the CVEs that may affect a technology toolmark found, from the CVE dataset
+//! in toolmark's data folder or, with none there it can read, the known-exploited
+//! snapshot compiled in. A lead is a version match, never a confirmed finding: a version
+//! can be read wrong, and a build may carry a fix its version does not show.
 
-use serde::Deserialize;
-use std::cmp::Ordering;
+use cfx_cve::{Cpe, Dataset, Lead};
+use std::collections::HashSet;
+use std::path::Path;
+use std::sync::RwLock;
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct CveRule {
-    /// Product name to match against the detected technology name (case-insensitive).
-    pub product: String,
-    pub cve: String,
-    #[serde(default)]
-    pub title: String,
-    #[serde(default = "d_sev")]
-    pub severity: String,
-    #[serde(default)]
-    pub cvss: f32,
-    /// Inclusive lower bound: the vuln affects versions >= this.
-    #[serde(default)]
-    pub version_min: Option<String>,
-    /// Exclusive upper bound ("fixed in"): affects versions < this.
-    #[serde(default)]
-    pub version_max_excl: Option<String>,
-    /// Inclusive upper bound: affects versions <= this.
-    #[serde(default)]
-    pub version_max_incl: Option<String>,
-    #[serde(default)]
-    pub reference: String,
+/// The known-exploited CVEs of the dataset, cut at the last release (toolmark/data).
+const SNAPSHOT: &[u8] = include_bytes!("../data/cve-known-exploited.json.gz");
+
+/// The dataset's file in toolmark's data folder.
+pub const DATASET_FILE: &str = "cve-dataset.json.gz";
+
+/// What a lead from the snapshot says of where it came from.
+pub const SNAPSHOT_LABEL: &str = "built-in known-exploited snapshot";
+
+/// Where leads come from, and what each says of it.
+pub struct Cves {
+    data: RwLock<(Dataset, String)>,
 }
 
-fn d_sev() -> String {
-    "medium".to_string()
-}
-
-/// Match a detected product+version against the ruleset (embedded + external).
-pub fn match_cves(product: &str, version: &str) -> Vec<CveRule> {
-    let v = parse_ver(version);
-    if v.is_empty() {
-        return Vec::new(); // no usable version -> no version-based match (avoids FPs)
-    }
-    ruleset()
-        .iter()
-        .filter(|r| r.product.eq_ignore_ascii_case(product))
-        .filter(|r| version_in_range(&v, r))
-        .cloned()
-        .collect()
-}
-
-fn version_in_range(v: &[u64], r: &CveRule) -> bool {
-    if let Some(min) = &r.version_min
-        && cmp_ver(v, &parse_ver(min)) == Ordering::Less
-    {
-        return false;
-    }
-    if let Some(max) = &r.version_max_excl
-        && cmp_ver(v, &parse_ver(max)) != Ordering::Less
-    {
-        return false;
-    }
-    if let Some(max) = &r.version_max_incl
-        && cmp_ver(v, &parse_ver(max)) == Ordering::Greater
-    {
-        return false;
-    }
-    // A rule with no bounds at all would match every version; reject it so a
-    // malformed rule can't blanket-flag a product.
-    r.version_min.is_some() || r.version_max_excl.is_some() || r.version_max_incl.is_some()
-}
-
-/// Parse a dotted version into numeric components, stopping at the first
-/// non-numeric segment ("1.21.0" -> [1,21,0], "2.4.49" -> [2,4,49]).
-fn parse_ver(s: &str) -> Vec<u64> {
-    let mut out = Vec::new();
-    for part in s
-        .trim()
-        .trim_start_matches('v')
-        .split(['.', '-', '+', '_', ' '])
-    {
-        if part.is_empty() {
-            continue;
-        }
-        // Take the leading digit run of each segment ("49p1" -> 49).
-        let digits: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if digits.is_empty() {
-            break;
-        }
-        match digits.parse::<u64>() {
-            Ok(n) => out.push(n),
-            Err(_) => break,
+impl Cves {
+    /// The dataset in `folder` when there is one this reads, else the snapshot, with only
+    /// the products `names` name.
+    pub fn load(folder: Option<&Path>, names: &HashSet<Cpe>) -> Self {
+        let data = folder
+            .and_then(|f| read(&f.join(DATASET_FILE), names))
+            .unwrap_or_else(|| snapshot(names));
+        Self {
+            data: RwLock::new(data),
         }
     }
-    out
+
+    /// The leads for `name` at `version`, built by the distribution `distro` names when
+    /// one is known, and the data they come from.
+    pub fn leads(&self, name: &Cpe, version: &str, distro: Option<&str>) -> (Vec<Lead>, String) {
+        let data = self.data.read().unwrap_or_else(|e| e.into_inner());
+        let leads = data.0.leads(std::slice::from_ref(name), version, distro);
+        (leads, data.1.clone())
+    }
 }
 
-fn cmp_ver(a: &[u64], b: &[u64]) -> Ordering {
-    for i in 0..a.len().max(b.len()) {
-        let x = a.get(i).copied().unwrap_or(0);
-        let y = b.get(i).copied().unwrap_or(0);
-        match x.cmp(&y) {
-            Ordering::Equal => continue,
-            o => return o,
+/// The dataset at `path` and what its leads say of it, or none when there is no file or
+/// it does not read, which is said.
+fn read(path: &Path, names: &HashSet<Cpe>) -> Option<(Dataset, String)> {
+    let bytes = std::fs::read(path).ok()?;
+    match Dataset::from_bytes_for(&bytes, names) {
+        Ok(d) => {
+            let made = d.made().get(..10).unwrap_or(d.made());
+            let label = format!("CVE dataset {} of {made}", d.sequence());
+            Some((d, label))
+        }
+        Err(e) => {
+            eprintln!(
+                "[toolmark] the CVE dataset in {} is not used: {e}",
+                path.display()
+            );
+            None
         }
     }
-    Ordering::Equal
 }
 
-/// Embedded + external ruleset. External rules (a JSON array at `TOOLMARK_CVE_FILE`)
-/// are appended, so a synced feed extends coverage without a rebuild.
-fn ruleset() -> Vec<CveRule> {
-    let mut rules: Vec<CveRule> = serde_json::from_str(EMBEDDED_JSON).unwrap_or_default();
-    if let Ok(path) = std::env::var("TOOLMARK_CVE_FILE")
-        && let Ok(text) = std::fs::read_to_string(&path)
-        && let Ok(mut ext) = serde_json::from_str::<Vec<CveRule>>(&text)
-    {
-        rules.append(&mut ext);
-    }
-    rules
+fn snapshot(names: &HashSet<Cpe>) -> (Dataset, String) {
+    let d = Dataset::from_bytes_for(SNAPSHOT, names)
+        .expect("the snapshot compiled into toolmark reads, as its test shows");
+    (d, SNAPSHOT_LABEL.to_string())
 }
 
-/// A small, high-confidence starter set of version-pinned CVEs for products the
-/// fingerprinter commonly detects. Extend via TOOLMARK_CVE_FILE (a full feed export).
-const EMBEDDED_JSON: &str = r#"[
-  {
-    "product": "Nginx",
-    "cve": "CVE-2021-23017",
-    "title": "nginx resolver off-by-one heap write",
-    "severity": "high", "cvss": 7.7,
-    "version_max_excl": "1.21.0",
-    "reference": "https://nvd.nist.gov/vuln/detail/CVE-2021-23017"
-  },
-  {
-    "product": "Apache HTTP Server",
-    "cve": "CVE-2021-41773",
-    "title": "Path traversal and file disclosure/RCE in Apache 2.4.49",
-    "severity": "critical", "cvss": 9.8,
-    "version_min": "2.4.49", "version_max_incl": "2.4.49",
-    "reference": "https://nvd.nist.gov/vuln/detail/CVE-2021-41773"
-  },
-  {
-    "product": "Apache HTTP Server",
-    "cve": "CVE-2021-42013",
-    "title": "Path traversal and RCE in Apache 2.4.49/2.4.50",
-    "severity": "critical", "cvss": 9.8,
-    "version_min": "2.4.49", "version_max_incl": "2.4.50",
-    "reference": "https://nvd.nist.gov/vuln/detail/CVE-2021-42013"
-  },
-  {
-    "product": "OpenSSL",
-    "cve": "CVE-2022-3602",
-    "title": "X.509 email address 4-byte buffer overflow (punycode)",
-    "severity": "high", "cvss": 7.5,
-    "version_min": "3.0.0", "version_max_excl": "3.0.7",
-    "reference": "https://nvd.nist.gov/vuln/detail/CVE-2022-3602"
-  },
-  {
-    "product": "jQuery",
-    "cve": "CVE-2020-11022",
-    "title": "Cross-site scripting via jQuery HTML manipulation",
-    "severity": "medium", "cvss": 6.1,
-    "version_min": "1.2.0", "version_max_excl": "3.5.0",
-    "reference": "https://nvd.nist.gov/vuln/detail/CVE-2020-11022"
-  },
-  {
-    "product": "Bootstrap",
-    "cve": "CVE-2019-8331",
-    "title": "Cross-site scripting in Bootstrap tooltip/popover data-template",
-    "severity": "medium", "cvss": 6.1,
-    "version_min": "3.0.0", "version_max_excl": "3.4.1",
-    "reference": "https://nvd.nist.gov/vuln/detail/CVE-2019-8331"
-  },
-  {
-    "product": "Lodash",
-    "cve": "CVE-2020-8203",
-    "title": "Prototype pollution in lodash",
-    "severity": "high", "cvss": 7.4,
-    "version_max_excl": "4.17.19",
-    "reference": "https://nvd.nist.gov/vuln/detail/CVE-2020-8203"
-  }
-]"#;
+/// The snapshot alone with every shipped signature's product, as a daemon with no dataset
+/// answers: for the tests that fingerprint.
+#[cfg(test)]
+pub fn snapshot_for_tests() -> std::sync::Arc<Cves> {
+    static ONE: std::sync::LazyLock<std::sync::Arc<Cves>> = std::sync::LazyLock::new(|| {
+        let names = crate::signatures::Signatures::shipped().cpes();
+        std::sync::Arc::new(Cves::load(None, &names))
+    });
+    ONE.clone()
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
-    #[test]
-    fn version_parse_and_compare() {
-        assert_eq!(parse_ver("1.21.0"), vec![1, 21, 0]);
-        assert_eq!(parse_ver("v2.4.49p1"), vec![2, 4, 49]);
-        assert_eq!(cmp_ver(&[1, 20, 2], &[1, 21, 0]), Ordering::Less);
-        assert_eq!(cmp_ver(&[2, 4, 49], &[2, 4, 49]), Ordering::Equal);
-        assert_eq!(cmp_ver(&[3, 0, 7], &[3, 0, 0]), Ordering::Greater);
+    fn apache() -> Cpe {
+        Cpe::new("a", "apache", "http_server")
     }
 
+    fn ids(leads: &[Lead]) -> Vec<&str> {
+        leads.iter().map(|l| l.cve.as_str()).collect()
+    }
+
+    /// A dataset of one CVE on Apache 2.4.49, numbered `sequence`.
+    fn dataset(sequence: u64) -> Vec<u8> {
+        let json = format!(
+            r#"{{"format": 1, "sequence": {sequence}, "made": "2026-11-21T15:00:00Z",
+            "products": [{{"part": "a", "vendor": "apache", "product": "http_server",
+              "affected": [{{"cve": "CVE-2099-0049", "ranges": [{{"eq": "2.4.49"}}]}}]}}],
+            "cves": {{"CVE-2099-0049": {{"severity": "high", "score": 7.5}}}}}}"#
+        );
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(json.as_bytes()).unwrap();
+        gz.finish().unwrap()
+    }
+
+    /// With no dataset, the snapshot answers with the known-exploited CVEs, and says so.
     #[test]
-    fn matches_known_cves() {
-        // nginx 1.20.2 is < 1.21.0 -> vulnerable to CVE-2021-23017.
-        let m = match_cves("Nginx", "1.20.2");
-        assert!(m.iter().any(|r| r.cve == "CVE-2021-23017"));
-        // nginx 1.21.6 is patched.
-        assert!(match_cves("Nginx", "1.21.6").is_empty());
-        // Apache 2.4.49 -> both path-traversal CVEs.
-        let a = match_cves("Apache HTTP Server", "2.4.49");
-        assert!(a.iter().any(|r| r.cve == "CVE-2021-41773"));
-        // No version -> no match (avoids false positives).
-        assert!(match_cves("Nginx", "").is_empty());
-        // Unknown product -> no match.
-        assert!(match_cves("Caddy", "2.0.0").is_empty());
+    fn with_no_dataset_the_snapshot_answers() {
+        let folder = tempfile::tempdir().unwrap();
+        let names: HashSet<Cpe> = [apache()].into();
+        for cves in [
+            Cves::load(None, &names),
+            Cves::load(Some(folder.path()), &names),
+        ] {
+            let (leads, from) = cves.leads(&apache(), "2.4.49", None);
+            assert_eq!(from, SNAPSHOT_LABEL);
+            for cve in ["CVE-2021-41773", "CVE-2021-42013"] {
+                assert!(ids(&leads).contains(&cve), "{cve} in {:?}", ids(&leads));
+            }
+            assert!(leads.iter().all(|l| l.known.kev));
+            let (later, _) = cves.leads(&apache(), "2.4.51", None);
+            assert!(
+                !ids(&later)
+                    .iter()
+                    .any(|c| *c == "CVE-2021-41773" || *c == "CVE-2021-42013")
+            );
+        }
+    }
+
+    /// The dataset in the data folder answers in place of the snapshot, and its leads say
+    /// which dataset they come from.
+    #[test]
+    fn the_dataset_in_the_data_folder_answers_and_is_named() {
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(folder.path().join(DATASET_FILE), dataset(9)).unwrap();
+        let cves = Cves::load(Some(folder.path()), &[apache()].into());
+        let (leads, from) = cves.leads(&apache(), "2.4.49", Some("Ubuntu"));
+        assert_eq!(from, "CVE dataset 9 of 2026-11-21");
+        assert_eq!(ids(&leads), ["CVE-2099-0049"]);
+        assert!(leads[0].backport);
+    }
+
+    /// A file there that does not read leaves the snapshot answering.
+    #[test]
+    fn a_dataset_that_does_not_read_leaves_the_snapshot() {
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(folder.path().join(DATASET_FILE), b"not a dataset").unwrap();
+        let cves = Cves::load(Some(folder.path()), &[apache()].into());
+        assert_eq!(cves.leads(&apache(), "2.4.49", None).1, SNAPSHOT_LABEL);
+    }
+
+    /// Every product a shipped signature names by CPE is one the snapshot can be asked
+    /// about, and the snapshot reads.
+    #[test]
+    fn the_snapshot_reads_with_every_shipped_product() {
+        let names = crate::signatures::Signatures::shipped().cpes();
+        assert!(names.contains(&apache()), "{} products", names.len());
+        let cves = Cves::load(None, &names);
+        assert!(!cves.leads(&apache(), "2.4.49", None).0.is_empty());
     }
 }

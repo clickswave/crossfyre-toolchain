@@ -240,12 +240,18 @@ pub(crate) async fn run(
                 let s = |k: &str| {
                     untrusted::clean(e.get(k).and_then(|v| v.as_str()).unwrap_or(""), 200)
                 };
+                let flag = |k: &str| e.get(k).and_then(Value::as_bool).unwrap_or(false);
                 cve_leads.push(json!({
                     "cve": s("cve"),
                     "severity": findings::severity(&s("severity")),
                     "cvss": num("cvss"),
+                    "kev": flag("kev"),
+                    "epss": num("epss"),
                     "product": s("product"),
                     "confidence": "version-inferred",
+                    "possible": flag("possible"),
+                    "backport": flag("backport"),
+                    "cve_data": s("cve_data"),
                     "reference": s("reference"),
                 }));
             }

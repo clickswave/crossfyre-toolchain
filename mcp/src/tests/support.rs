@@ -331,6 +331,8 @@ pub(crate) fn toolmark_events(title: &str, server: &str) -> Vec<Value> {
             "type": "vulnerability", "source": "toolmark-cve", "severity": "HIGH",
             "name": "nginx 1.18.0: CVE-2021-23017", "cve": "CVE-2021-23017", "cvss": 7.7,
             "product": "nginx", "version": "1.18.0", "confidence": "version-inferred",
+            "kev": false, "epss": 0.5, "possible": false, "backport": true,
+            "cve_data": "built-in known-exploited snapshot",
             "reference": "https://nvd.nist.gov/vuln/detail/CVE-2021-23017",
             "description": "resolver off-by-one"}}),
         json!({"type": "finding", "data": {

@@ -31,7 +31,11 @@ fn parse_request(line: &str) -> Result<DaemonRequest, String> {
     Ok(req)
 }
 
-pub async fn run(port: u16, db: ToolmarkDb) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(
+    port: u16,
+    db: ToolmarkDb,
+    cves: std::sync::Arc<crate::cve::Cves>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Loopback unless an operator opts out: this channel has no per-request
     // credential of its own, so the bind address is the boundary.
     let addr = dguard::bind_addr(port);
@@ -45,8 +49,9 @@ pub async fn run(port: u16, db: ToolmarkDb) -> Result<(), Box<dyn std::error::Er
         let _ = stream.set_nodelay(true);
         let gate_clone = gate.clone();
         let db = db.clone();
+        let cves = cves.clone();
         dguard::spawn_busy(async move {
-            if let Err(e) = handle_connection(stream, gate_clone, db).await {
+            if let Err(e) = handle_connection(stream, gate_clone, db, cves).await {
                 eprintln!("Connection error from {addr}: {e}");
             }
         });
@@ -57,6 +62,7 @@ async fn handle_connection(
     stream: TcpStream,
     gate: dguard::Gate,
     db: ToolmarkDb,
+    cves: std::sync::Arc<crate::cve::Cves>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -89,13 +95,13 @@ async fn handle_connection(
 
         match req.operation.as_str() {
             "fingerprint" => {
-                handle_fingerprint(req.params, req.egress, &mut writer, &db).await?;
+                handle_fingerprint(req.params, req.egress, &mut writer, &db, cves).await?;
                 return Ok(());
             }
             // Non-HTTP service identification: what is really listening on a
             // port, and whether it lets anyone in.
             "services" => {
-                handle_services(req.params, req.egress, &mut writer, &db).await?;
+                handle_services(req.params, req.egress, &mut writer, &db, cves).await?;
                 return Ok(());
             }
             // The scans this daemon keeps, the latest first.
@@ -172,6 +178,7 @@ async fn handle_fingerprint(
     egress: transport::Egress,
     writer: &mut OwnedWriteHalf,
     db: &ToolmarkDb,
+    cves: std::sync::Arc<crate::cve::Cves>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let fp: FpParams = match serde_json::from_value(params.clone()) {
         Ok(p) => FpParams { egress, ..p },
@@ -192,7 +199,7 @@ async fn handle_fingerprint(
     let observer = std::sync::Arc::new(db.observer(scan.as_ref(), &params));
     let (tx, rx) = mpsc::unbounded_channel::<Value>();
     let op = dguard::spawn_busy(async move {
-        fingerprint::run(fp, tx, observer).await;
+        fingerprint::run(fp, tx, observer, cves).await;
     });
     forward(op, rx, writer, db, scan).await
 }
@@ -248,6 +255,7 @@ async fn handle_services(
     egress: transport::Egress,
     writer: &mut OwnedWriteHalf,
     db: &ToolmarkDb,
+    cves: std::sync::Arc<crate::cve::Cves>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let sp: crate::services::SvcParams = match serde_json::from_value(params.clone()) {
         Ok(p) => crate::services::SvcParams { egress, ..p },
@@ -267,7 +275,7 @@ async fn handle_services(
     let scan = db.start("services", &sp.targets.join(", "), &params).await;
     let (tx, rx) = mpsc::unbounded_channel::<Value>();
     let op = dguard::spawn_busy(async move {
-        crate::services::run(sp, tx).await;
+        crate::services::run(sp, tx, cves).await;
     });
     forward(op, rx, writer, db, scan).await
 }
@@ -342,6 +350,7 @@ mod tests {
                     stream,
                     dguard::Gate::default(),
                     ToolmarkDb::unconnected(),
+                    crate::cve::snapshot_for_tests(),
                 ));
             }
         });
@@ -605,6 +614,7 @@ mod http_request_tests {
                     stream,
                     dguard::Gate::default(),
                     ToolmarkDb::unconnected(),
+                    crate::cve::snapshot_for_tests(),
                 ));
             }
         });
