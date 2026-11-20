@@ -511,8 +511,7 @@ pub async fn take_up(
             ))
         }
         (why, _) => {
-            // The lock, when this took it, goes with the connection.
-            let _ = lock.close().await;
+            let _ = let_go(lock, ours.then_some(id)).await;
             Err(why.unwrap_or_else(|| NotTaken::Unknown(id.to_string())))
         }
     }
@@ -640,8 +639,24 @@ pub async fn finish(running: Running, status: Status) -> Result<(), sqlx::Error>
         .bind(status.as_str())
         .execute(&mut lock)
         .await;
+    let released = let_go(lock, Some(&id)).await;
+    done.map(|_| ()).and(released)
+}
+
+/// Close `lock`, first letting go of scan `held`'s lock when it holds it. On a closed
+/// connection the server frees the lock only once it has read the close, which can be
+/// after a daemon asking for the scan straight after has found it still held.
+async fn let_go(mut lock: sqlx::PgConnection, held: Option<&str>) -> Result<(), sqlx::Error> {
+    let released = match held {
+        Some(id) => sqlx::query(&format!("SELECT pg_advisory_unlock({SCAN_LOCK})"))
+            .bind(id)
+            .execute(&mut lock)
+            .await
+            .map(|_| ()),
+        None => Ok(()),
+    };
     let _ = lock.close().await;
-    done.map(|_| ())
+    released
 }
 
 /// Mark as stopped what was queued or running when its daemon exited, so that it can be
@@ -1010,6 +1025,60 @@ mod tests {
     /// tables but the shared ones.
     async fn database() -> Scratch {
         Scratch::new(&engine_at("0.0.1", &[])).await
+    }
+
+    /// Whether scan `id`'s lock is free: taken on `conn`, and let go at once.
+    async fn free(conn: &mut sqlx::PgConnection, id: &str) -> bool {
+        let free: bool = sqlx::query_scalar(&format!("SELECT pg_try_advisory_lock({SCAN_LOCK})"))
+            .bind(id)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        if free {
+            sqlx::query(&format!("SELECT pg_advisory_unlock({SCAN_LOCK})"))
+                .bind(id)
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+        }
+        free
+    }
+
+    /// A scan is let go before finish returns, and before a take-up that refused it
+    /// returns, so a daemon asking for it straight after finds it free. Closing the
+    /// connection alone frees it only once the server has read the close: with every
+    /// core busy, after the next request had asked, about one time in three.
+    #[tokio::test]
+    #[ignore = "needs PostgreSQL's programs"]
+    async fn a_scan_is_let_go_before_finish_or_a_refused_take_up_returns() {
+        let db = database().await;
+        let pool = db.pool.clone();
+        let mut probe = pool.acquire().await.unwrap();
+        for i in 0..100 {
+            let key = format!("k{i}");
+            let scan = start(
+                &pool,
+                Asked::new("example.com", "{}"),
+                Key::Settings(&key),
+                true,
+            )
+            .await
+            .unwrap();
+            let id = scan.id.clone();
+            finish(scan, Status::Stopped).await.unwrap();
+            assert!(free(&mut probe, &id).await, "held after finish, at {i}");
+            let other = Asked::new("example.com", r#"{"tasks": 2}"#);
+            assert!(matches!(
+                take_up(&pool, &id, Some(other)).await,
+                Err(NotTaken::OtherSettings(_))
+            ));
+            assert!(
+                free(&mut probe, &id).await,
+                "held after a refused take-up, at {i}"
+            );
+        }
+        drop(probe);
+        db.done().await;
     }
 
     #[tokio::test]
