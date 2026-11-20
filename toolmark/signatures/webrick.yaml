@@ -1,0 +1,12 @@
+id: webrick
+info:
+  name: WEBrick
+  category: Web Server
+  metadata:
+    vendor: ruby-lang
+    product: webrick
+detect:
+  any:
+    - header: { name: server, regex: '^WEBrick' }
+version:
+  - header: { name: server, regex: '^WEBrick/([0-9]+(?:\.[0-9]+)*)' }

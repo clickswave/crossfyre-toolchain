@@ -1,0 +1,7 @@
+id: cowboy
+info:
+  name: Cowboy
+  category: Web Server
+detect:
+  any:
+    - header: { name: server, regex: '^Cowboy$' }

@@ -1,0 +1,12 @@
+id: resin
+info:
+  name: Resin
+  category: Web Server
+  metadata:
+    vendor: caucho
+    product: resin
+detect:
+  any:
+    - header: { name: server, regex: '^Resin' }
+version:
+  - header: { name: server, regex: '^Resin/([0-9]+(?:\.[0-9]+)*)' }

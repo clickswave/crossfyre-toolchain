@@ -1,0 +1,10 @@
+id: uvicorn
+info:
+  name: Uvicorn
+  category: Web Server
+  metadata:
+    vendor: encode
+    product: uvicorn
+detect:
+  any:
+    - header: { name: server, regex: '^uvicorn$' }

@@ -1,0 +1,12 @@
+id: apache-traffic-server
+info:
+  name: Apache Traffic Server
+  category: Web Server
+  metadata:
+    vendor: apache
+    product: traffic_server
+detect:
+  any:
+    - header: { name: server, regex: '^ATS/' }
+version:
+  - header: { name: server, regex: '^ATS/([0-9]+(?:\.[0-9]+)*)' }

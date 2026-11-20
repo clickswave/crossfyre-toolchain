@@ -1,0 +1,9 @@
+id: http-sys
+info:
+  name: Microsoft HTTP Server API
+  category: Web Server
+detect:
+  any:
+    - header: { name: server, regex: '^Microsoft-HTTPAPI/' }
+version:
+  - header: { name: server, regex: '^Microsoft-HTTPAPI/([0-9]+(?:\.[0-9]+)*)' }

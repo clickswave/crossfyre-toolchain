@@ -1,0 +1,12 @@
+id: lighttpd
+info:
+  name: lighttpd
+  category: Web Server
+  metadata:
+    vendor: lighttpd
+    product: lighttpd
+detect:
+  any:
+    - header: { name: server, regex: '^lighttpd' }
+version:
+  - header: { name: server, regex: '^lighttpd/([0-9]+(?:\.[0-9]+)*)' }

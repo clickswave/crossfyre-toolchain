@@ -1,0 +1,15 @@
+# Synthetic: A page mini_httpd serves, which names it as the server.
+HTTP/1.1 200 OK
+server: mini_httpd/1.30 26Oct2018
+content-type: text/html
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<title>Index</title>
+</head>
+<body>
+<p>It works.</p>
+</body>
+</html>

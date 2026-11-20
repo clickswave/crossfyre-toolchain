@@ -3333,6 +3333,216 @@
       "version_range": null
     }
   ],
+  "server-apache-traffic-server.http": [
+    {
+      "candidates": [],
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:apache:traffic_server:9.2.3:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "header server: ATS/9.2.3"
+      ],
+      "name": "Apache Traffic Server",
+      "version": "9.2.3",
+      "version_range": null
+    }
+  ],
+  "server-boa.http": [
+    {
+      "candidates": [],
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:boa:boa:0.94.14rc21:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "header server: Boa/0.94.14rc21"
+      ],
+      "name": "Boa",
+      "version": "0.94.14rc21",
+      "version_range": null
+    }
+  ],
+  "server-cowboy.http": [
+    {
+      "candidates": [],
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "",
+      "distro": null,
+      "evidence": [
+        "header server: Cowboy"
+      ],
+      "name": "Cowboy",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "server-goahead.http": [
+    {
+      "candidates": [],
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:embedthis:goahead:*:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "header server: GoAhead-Webs"
+      ],
+      "name": "GoAhead",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "server-http-sys.http": [
+    {
+      "candidates": [],
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "",
+      "distro": null,
+      "evidence": [
+        "header server: Microsoft-HTTPAPI/2.0"
+      ],
+      "name": "Microsoft HTTP Server API",
+      "version": "2.0",
+      "version_range": null
+    }
+  ],
+  "server-ibm-http-server.http": [
+    {
+      "candidates": [],
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:ibm:http_server:*:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "header server: IBM_HTTP_Server"
+      ],
+      "name": "IBM HTTP Server",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "server-lighttpd.http": [
+    {
+      "candidates": [],
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:lighttpd:lighttpd:1.4.69:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "header server: lighttpd/1.4.69"
+      ],
+      "name": "lighttpd",
+      "version": "1.4.69",
+      "version_range": null
+    }
+  ],
+  "server-mini-httpd.http": [
+    {
+      "candidates": [],
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:acme:mini_httpd:1.30:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "header server: mini_httpd/1.30 26Oct2018"
+      ],
+      "name": "mini_httpd",
+      "version": "1.30",
+      "version_range": null
+    }
+  ],
+  "server-resin.http": [
+    {
+      "candidates": [],
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:caucho:resin:4.0.66:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "header server: Resin/4.0.66"
+      ],
+      "name": "Resin",
+      "version": "4.0.66",
+      "version_range": null
+    }
+  ],
+  "server-squid.http": [
+    {
+      "candidates": [],
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:squid-cache:squid:5.7:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "header server: squid/5.7"
+      ],
+      "name": "Squid",
+      "version": "5.7",
+      "version_range": null
+    }
+  ],
+  "server-thttpd.http": [
+    {
+      "candidates": [],
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:acme:thttpd:2.29:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "header server: thttpd/2.29 23May2018"
+      ],
+      "name": "thttpd",
+      "version": "2.29",
+      "version_range": null
+    }
+  ],
+  "server-tornado.http": [
+    {
+      "candidates": [],
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:tornadoweb:tornado:6.3.3:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "header server: TornadoServer/6.3.3"
+      ],
+      "name": "Tornado",
+      "version": "6.3.3",
+      "version_range": null
+    }
+  ],
+  "server-uvicorn.http": [
+    {
+      "candidates": [],
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:encode:uvicorn:*:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "header server: uvicorn"
+      ],
+      "name": "Uvicorn",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "server-webrick.http": [
+    {
+      "candidates": [],
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:ruby-lang:webrick:1.7.0:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "header server: WEBrick/1.7.0 (Ruby/3.2.2/2023-03-30)"
+      ],
+      "name": "WEBrick",
+      "version": "1.7.0",
+      "version_range": null
+    }
+  ],
   "sharepoint.http": [
     {
       "candidates": [],

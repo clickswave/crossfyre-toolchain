@@ -415,6 +415,47 @@ pub(super) static FILES: &[(&str, &str)] = &[
         include_str!("../../signatures/chartjs.yaml"),
     ),
     ("d3.yaml", include_str!("../../signatures/d3.yaml")),
+    (
+        "apache-traffic-server.yaml",
+        include_str!("../../signatures/apache-traffic-server.yaml"),
+    ),
+    (
+        "uvicorn.yaml",
+        include_str!("../../signatures/uvicorn.yaml"),
+    ),
+    (
+        "tornado.yaml",
+        include_str!("../../signatures/tornado.yaml"),
+    ),
+    ("cowboy.yaml", include_str!("../../signatures/cowboy.yaml")),
+    ("squid.yaml", include_str!("../../signatures/squid.yaml")),
+    (
+        "lighttpd.yaml",
+        include_str!("../../signatures/lighttpd.yaml"),
+    ),
+    (
+        "http-sys.yaml",
+        include_str!("../../signatures/http-sys.yaml"),
+    ),
+    (
+        "webrick.yaml",
+        include_str!("../../signatures/webrick.yaml"),
+    ),
+    ("thttpd.yaml", include_str!("../../signatures/thttpd.yaml")),
+    ("boa.yaml", include_str!("../../signatures/boa.yaml")),
+    (
+        "goahead.yaml",
+        include_str!("../../signatures/goahead.yaml"),
+    ),
+    (
+        "mini-httpd.yaml",
+        include_str!("../../signatures/mini-httpd.yaml"),
+    ),
+    ("resin.yaml", include_str!("../../signatures/resin.yaml")),
+    (
+        "ibm-http-server.yaml",
+        include_str!("../../signatures/ibm-http-server.yaml"),
+    ),
     ("java.yaml", include_str!("../../signatures/java.yaml")),
     ("python.yaml", include_str!("../../signatures/python.yaml")),
     ("nodejs.yaml", include_str!("../../signatures/nodejs.yaml")),
