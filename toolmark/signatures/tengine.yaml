@@ -1,0 +1,9 @@
+id: tengine
+info:
+  name: Tengine
+  category: Web Server
+detect:
+  any:
+    - header: { name: server, regex: '^Tengine' }
+version:
+  - header: { name: server, regex: '^Tengine/([0-9]+(?:\.[0-9]+)*)' }

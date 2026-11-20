@@ -1,0 +1,13 @@
+id: typo3
+info:
+  name: TYPO3
+  category: CMS
+  metadata:
+    vendor: typo3
+    product: typo3
+implies: [php]
+detect:
+  any:
+    - meta: { name: generator, regex: '^TYPO3 ' }
+version:
+  - meta: { name: generator, regex: '^TYPO3 ([0-9]+\.[0-9]+) CMS' }

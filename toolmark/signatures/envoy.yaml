@@ -1,0 +1,10 @@
+id: envoy
+info:
+  name: Envoy
+  category: Reverse Proxy
+  metadata:
+    vendor: envoyproxy
+    product: envoy
+detect:
+  any:
+    - header: { name: server, regex: '^envoy$' }

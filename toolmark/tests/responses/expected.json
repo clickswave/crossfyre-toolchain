@@ -1,4 +1,32 @@
 {
+  "adobe-experience-manager.http": [
+    {
+      "candidates": [],
+      "category": "CMS",
+      "confidence": 25,
+      "cpe": "cpe:2.3:a:adobe:experience_manager:*:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "Adobe Experience Manager",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "distro": null,
+      "evidence": [
+        "implied by Adobe Experience Manager"
+      ],
+      "name": "Java",
+      "version": null,
+      "version_range": null
+    }
+  ],
   "angular.http": [
     {
       "candidates": [],
@@ -184,6 +212,50 @@
       "version_range": null
     }
   ],
+  "bitrix.http": [
+    {
+      "candidates": [],
+      "category": "CMS",
+      "confidence": 95,
+      "cpe": "",
+      "distro": null,
+      "evidence": [
+        "header x-powered-cms: Bitrix Site Manager (0000000000000000000000000000000)",
+        "cookie BITRIX_SM_GUEST_ID"
+      ],
+      "name": "1C-Bitrix Site Manager",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "distro": null,
+      "evidence": [
+        "implied by 1C-Bitrix Site Manager"
+      ],
+      "name": "PHP",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "blogger.http": [
+    {
+      "candidates": [],
+      "category": "Blog",
+      "confidence": 60,
+      "cpe": "",
+      "distro": null,
+      "evidence": [
+        "meta generator: blogger"
+      ],
+      "name": "Blogger",
+      "version": null,
+      "version_range": null
+    }
+  ],
   "bootstrap.http": [
     {
       "candidates": [],
@@ -223,6 +295,21 @@
         "implied by Cacti"
       ],
       "name": "PHP",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "caddy.http": [
+    {
+      "candidates": [],
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:caddyserver:caddy:*:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "header server: Caddy"
+      ],
+      "name": "Caddy",
       "version": null,
       "version_range": null
     }
@@ -522,6 +609,21 @@
         "implied by Elasticsearch"
       ],
       "name": "Java",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "envoy.http": [
+    {
+      "candidates": [],
+      "category": "Reverse Proxy",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:envoyproxy:envoy:*:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "header server: envoy"
+      ],
+      "name": "Envoy",
       "version": null,
       "version_range": null
     }
@@ -1853,6 +1955,19 @@
     },
     {
       "candidates": [],
+      "category": "JavaScript Library",
+      "confidence": 40,
+      "cpe": "cpe:2.3:a:momentjs:moment:2.29.4:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "script src https://cdn.jsdelivr.net/npm/moment@2.29.4/moment.min.js"
+      ],
+      "name": "Moment.js",
+      "version": "2.29.4",
+      "version_range": null
+    },
+    {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
@@ -2160,6 +2275,21 @@
       "version_range": null
     }
   ],
+  "lodash-cdn.http": [
+    {
+      "candidates": [],
+      "category": "JavaScript Library",
+      "confidence": 40,
+      "cpe": "cpe:2.3:a:lodash:lodash:4.17.21:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "script src https://cdnjs.cloudflare.com/ajax/libs/lodash.js/4.17.21/lodash.min.js"
+      ],
+      "name": "Lodash",
+      "version": "4.17.21",
+      "version_range": null
+    }
+  ],
   "long-server-header.http": [
     {
       "candidates": [],
@@ -2349,6 +2479,21 @@
       ],
       "name": "MiniServ",
       "version": "2.105",
+      "version_range": null
+    }
+  ],
+  "moment-cdn.http": [
+    {
+      "candidates": [],
+      "category": "JavaScript Library",
+      "confidence": 40,
+      "cpe": "cpe:2.3:a:momentjs:moment:2.29.4:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "script src https://cdn.jsdelivr.net/npm/moment@2.29.4/moment.min.js"
+      ],
+      "name": "Moment.js",
+      "version": "2.29.4",
       "version_range": null
     }
   ],
@@ -2822,6 +2967,34 @@
       "version_range": null
     }
   ],
+  "prestashop.http": [
+    {
+      "candidates": [],
+      "category": "Ecommerce",
+      "confidence": 45,
+      "cpe": "cpe:2.3:a:prestashop:prestashop:*:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "cookie PrestaShop-0123456789abcdef0123456789abcdef"
+      ],
+      "name": "PrestaShop",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "distro": null,
+      "evidence": [
+        "implied by PrestaShop"
+      ],
+      "name": "PHP",
+      "version": null,
+      "version_range": null
+    }
+  ],
   "proftpd-debian.banner": [
     {
       "candidates": [],
@@ -3246,6 +3419,36 @@
       "version_range": null
     }
   ],
+  "tengine.http": [
+    {
+      "candidates": [],
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "",
+      "distro": null,
+      "evidence": [
+        "header server: Tengine/2.3.3"
+      ],
+      "name": "Tengine",
+      "version": "2.3.3",
+      "version_range": null
+    }
+  ],
+  "tilda.http": [
+    {
+      "candidates": [],
+      "category": "CMS",
+      "confidence": 25,
+      "cpe": "",
+      "distro": null,
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "Tilda",
+      "version": null,
+      "version_range": null
+    }
+  ],
   "tomcat-app.http": [
     {
       "candidates": [],
@@ -3373,6 +3576,62 @@
       "version_range": null
     }
   ],
+  "typo3-4.http": [
+    {
+      "candidates": [],
+      "category": "CMS",
+      "confidence": 60,
+      "cpe": "cpe:2.3:a:typo3:typo3:4.5:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "meta generator: TYPO3 4.5 CMS"
+      ],
+      "name": "TYPO3",
+      "version": "4.5",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "distro": null,
+      "evidence": [
+        "implied by TYPO3"
+      ],
+      "name": "PHP",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "typo3.http": [
+    {
+      "candidates": [],
+      "category": "CMS",
+      "confidence": 60,
+      "cpe": "cpe:2.3:a:typo3:typo3:*:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "meta generator: TYPO3 CMS"
+      ],
+      "name": "TYPO3",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "distro": null,
+      "evidence": [
+        "implied by TYPO3"
+      ],
+      "name": "PHP",
+      "version": null,
+      "version_range": null
+    }
+  ],
   "usermin-banner.http": [
     {
       "candidates": [],
@@ -3492,6 +3751,22 @@
         "body pattern"
       ],
       "name": "Vue.js",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "webflow.http": [
+    {
+      "candidates": [],
+      "category": "CMS",
+      "confidence": 50,
+      "cpe": "",
+      "distro": null,
+      "evidence": [
+        "body pattern",
+        "body pattern"
+      ],
+      "name": "Webflow",
       "version": null,
       "version_range": null
     }

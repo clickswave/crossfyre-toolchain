@@ -1,0 +1,18 @@
+# Synthetic: A site on 1C-Bitrix, which says so in a header of its own and sets its
+# cookies.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+x-powered-cms: Bitrix Site Manager (0000000000000000000000000000000)
+set-cookie: BITRIX_SM_GUEST_ID=1; path=/
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Home</title>
+</head>
+<body>
+<p>Hello</p>
+</body>
+</html>

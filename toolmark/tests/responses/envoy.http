@@ -1,0 +1,8 @@
+# Synthetic: A service behind Envoy, which names itself as the server.
+HTTP/1.1 200 OK
+content-type: application/json
+date: Fri, 20 Nov 2026 06:00:00 GMT
+server: envoy
+x-envoy-upstream-service-time: 3
+
+{"ok":true}

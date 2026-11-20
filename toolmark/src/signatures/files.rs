@@ -360,6 +360,33 @@ pub(super) static FILES: &[(&str, &str)] = &[
         "manageengine-adselfservice-plus.yaml",
         include_str!("../../signatures/manageengine-adselfservice-plus.yaml"),
     ),
+    ("caddy.yaml", include_str!("../../signatures/caddy.yaml")),
+    ("envoy.yaml", include_str!("../../signatures/envoy.yaml")),
+    (
+        "tengine.yaml",
+        include_str!("../../signatures/tengine.yaml"),
+    ),
+    (
+        "webflow.yaml",
+        include_str!("../../signatures/webflow.yaml"),
+    ),
+    ("typo3.yaml", include_str!("../../signatures/typo3.yaml")),
+    (
+        "prestashop.yaml",
+        include_str!("../../signatures/prestashop.yaml"),
+    ),
+    ("bitrix.yaml", include_str!("../../signatures/bitrix.yaml")),
+    ("tilda.yaml", include_str!("../../signatures/tilda.yaml")),
+    (
+        "adobe-experience-manager.yaml",
+        include_str!("../../signatures/adobe-experience-manager.yaml"),
+    ),
+    (
+        "blogger.yaml",
+        include_str!("../../signatures/blogger.yaml"),
+    ),
+    ("lodash.yaml", include_str!("../../signatures/lodash.yaml")),
+    ("moment.yaml", include_str!("../../signatures/moment.yaml")),
     ("java.yaml", include_str!("../../signatures/java.yaml")),
     ("python.yaml", include_str!("../../signatures/python.yaml")),
     ("nodejs.yaml", include_str!("../../signatures/nodejs.yaml")),
