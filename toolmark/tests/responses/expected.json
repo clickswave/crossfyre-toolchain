@@ -81,6 +81,21 @@
       "version_range": null
     }
   ],
+  "cisco-asa.http": [
+    {
+      "candidates": [],
+      "category": "Firewall",
+      "confidence": 70,
+      "cpe": "",
+      "evidence": [
+        "body pattern",
+        "cookie webvpnlogin"
+      ],
+      "name": "Cisco ASA",
+      "version": null,
+      "version_range": null
+    }
+  ],
   "citrix-gateway.http": [
     {
       "candidates": [],
@@ -149,6 +164,20 @@
       ],
       "name": "HashiCorp Consul",
       "version": "1.16.2",
+      "version_range": null
+    }
+  ],
+  "crushftp.http": [
+    {
+      "candidates": [],
+      "category": "File Transfer",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:crushftp:crushftp:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "header server: CrushFTP HTTP Server"
+      ],
+      "name": "CrushFTP",
+      "version": null,
       "version_range": null
     }
   ],
@@ -594,6 +623,20 @@
         "implied by Ruby on Rails"
       ],
       "name": "Ruby",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "globalprotect.http": [
+    {
+      "candidates": [],
+      "category": "VPN",
+      "confidence": 25,
+      "cpe": "",
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "Palo Alto Networks GlobalProtect",
       "version": null,
       "version_range": null
     }
@@ -1979,6 +2022,20 @@
       "version_range": null
     }
   ],
+  "screenconnect.http": [
+    {
+      "candidates": [],
+      "category": "Remote Access",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:connectwise:screenconnect:23.9.7.8804:*:*:*:*:*:*:*",
+      "evidence": [
+        "header server: ScreenConnect/23.9.7.8804-2862393838 Microsoft-HTTPAPI/2.0"
+      ],
+      "name": "ConnectWise ScreenConnect",
+      "version": "23.9.7.8804",
+      "version_range": null
+    }
+  ],
   "sentry.http": [
     {
       "candidates": [],
@@ -2316,6 +2373,34 @@
     }
   ],
   "vite-svelte.http": [],
+  "vmware-esxi.http": [
+    {
+      "candidates": [],
+      "category": "Virtualization",
+      "confidence": 25,
+      "cpe": "",
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "VMware ESXi",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "vmware-vcenter.http": [
+    {
+      "candidates": [],
+      "category": "Virtualization",
+      "confidence": 25,
+      "cpe": "cpe:2.3:a:vmware:vcenter_server:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "VMware vCenter Server",
+      "version": null,
+      "version_range": null
+    }
+  ],
   "vue.http": [
     {
       "candidates": [],
@@ -2353,6 +2438,20 @@
       ],
       "name": "Java",
       "version": null,
+      "version_range": null
+    }
+  ],
+  "webmin.http": [
+    {
+      "candidates": [],
+      "category": "Control Panel",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:webmin:webmin:1.890:*:*:*:*:*:*:*",
+      "evidence": [
+        "header server: MiniServ/1.890"
+      ],
+      "name": "Webmin",
+      "version": "1.890",
       "version_range": null
     }
   ],

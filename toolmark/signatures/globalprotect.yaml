@@ -1,0 +1,7 @@
+id: globalprotect
+info:
+  name: Palo Alto Networks GlobalProtect
+  category: VPN
+detect:
+  any:
+    - html: { regex: '(?:src|href|action)="/global-protect/' }

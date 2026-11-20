@@ -170,6 +170,31 @@ pub(super) static FILES: &[(&str, &str)] = &[
         "moveit-transfer.yaml",
         include_str!("../../signatures/moveit-transfer.yaml"),
     ),
+    (
+        "globalprotect.yaml",
+        include_str!("../../signatures/globalprotect.yaml"),
+    ),
+    (
+        "cisco-asa.yaml",
+        include_str!("../../signatures/cisco-asa.yaml"),
+    ),
+    (
+        "vmware-vcenter.yaml",
+        include_str!("../../signatures/vmware-vcenter.yaml"),
+    ),
+    (
+        "vmware-esxi.yaml",
+        include_str!("../../signatures/vmware-esxi.yaml"),
+    ),
+    (
+        "screenconnect.yaml",
+        include_str!("../../signatures/screenconnect.yaml"),
+    ),
+    (
+        "crushftp.yaml",
+        include_str!("../../signatures/crushftp.yaml"),
+    ),
+    ("webmin.yaml", include_str!("../../signatures/webmin.yaml")),
     ("java.yaml", include_str!("../../signatures/java.yaml")),
     ("python.yaml", include_str!("../../signatures/python.yaml")),
     ("nodejs.yaml", include_str!("../../signatures/nodejs.yaml")),

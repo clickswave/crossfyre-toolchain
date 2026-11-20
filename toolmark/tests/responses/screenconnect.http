@@ -1,0 +1,16 @@
+# Synthetic: ScreenConnect's web page, whose server names the version.
+HTTP/1.1 200 OK
+content-type: text/html; charset=UTF-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+server: ScreenConnect/23.9.7.8804-2862393838 Microsoft-HTTPAPI/2.0
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ScreenConnect Remote Support Software</title>
+</head>
+<body>
+<div id="Content"></div>
+</body>
+</html>

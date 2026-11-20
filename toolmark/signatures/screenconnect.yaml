@@ -1,0 +1,12 @@
+id: screenconnect
+info:
+  name: ConnectWise ScreenConnect
+  category: Remote Access
+  metadata:
+    vendor: connectwise
+    product: screenconnect
+detect:
+  any:
+    - header: { name: server, regex: '^ScreenConnect/' }
+version:
+  - header: { name: server, regex: '^ScreenConnect/([0-9]+(?:\.[0-9]+)*)' }

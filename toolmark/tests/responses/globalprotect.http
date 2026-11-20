@@ -1,0 +1,17 @@
+# Synthetic: The GlobalProtect portal's login page, where a PAN-OS firewall's portal
+# sends anyone not signed in.
+HTTP/1.1 200 OK
+content-type: text/html; charset=UTF-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>GlobalProtect Portal</title>
+<link rel="stylesheet" type="text/css" href="/global-protect/portal/css/login.css">
+</head>
+<body>
+<form name="login" method="POST" action="login.esp"></form>
+</body>
+</html>

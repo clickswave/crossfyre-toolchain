@@ -1,0 +1,10 @@
+id: crushftp
+info:
+  name: CrushFTP
+  category: File Transfer
+  metadata:
+    vendor: crushftp
+    product: crushftp
+detect:
+  any:
+    - header: { name: server, regex: '^CrushFTP HTTP Server' }

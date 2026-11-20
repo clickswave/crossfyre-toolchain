@@ -1,0 +1,7 @@
+id: vmware-esxi
+info:
+  name: VMware ESXi
+  category: Virtualization
+detect:
+  any:
+    - html: { regex: '<title>\s*ID_EESX_Welcome\s*</title>' }

@@ -1,0 +1,15 @@
+# Synthetic: vCenter Server's landing page, whose title is a string the page fills in.
+HTTP/1.1 200 OK
+content-type: text/html; charset=UTF-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ID_VC_Welcome</title>
+</head>
+<body>
+<div id="welcome"></div>
+</body>
+</html>
