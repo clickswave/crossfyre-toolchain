@@ -347,7 +347,21 @@ pub fn build_client(cfg: ClientConfig, egress: &Egress) -> Result<Client, BuildE
         }
     }
 
+    // The certificate a server presents travels with each response it sends, for
+    // `peer_certificate` to read.
+    b = b.tls_info(true);
+
     Ok(b.build()?)
+}
+
+/// The certificate the server presented on the connection `response` came over, DER
+/// encoded, or None when that connection was not TLS.
+pub fn peer_certificate(response: &Response) -> Option<&[u8]> {
+    #[cfg(not(feature = "impersonate"))]
+    use reqwest::tls::TlsInfo;
+    #[cfg(feature = "impersonate")]
+    use wreq::tls::TlsInfo;
+    response.extensions().get::<TlsInfo>()?.peer_certificate()
 }
 
 /// True when a redirect from `from` to `to` stays where `from`'s credentials
