@@ -105,7 +105,10 @@ proves nothing, and leaves it unknown.
 
 `refines: other-id` makes a signature a more specific form of another. When both are
 present only the refining one is reported. When the evidence that would tell them apart
-is unknown, the other is reported with this one among its `candidates`.
+is unknown, the other is reported with this one among its `candidates`. A refining
+signature with no `detect` is a product that nothing seen tells from the other, as when
+two products serve the same pages: it is never reported itself, and the other always
+names it among its `candidates`.
 
 A new file goes in `src/signatures/files.rs` too, and needs saved responses in
 `tests/responses` on which each of its leaves is present: a landing page, and for a

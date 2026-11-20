@@ -2,9 +2,6 @@ id: confluence
 info:
   name: Atlassian Confluence
   category: Wiki
-  metadata:
-    vendor: atlassian
-    product: confluence_server
 implies: [java]
 detect:
   any:

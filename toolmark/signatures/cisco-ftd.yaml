@@ -1,0 +1,5 @@
+id: cisco-ftd
+info:
+  name: Cisco Firepower Threat Defense
+  category: Firewall
+refines: cisco-webvpn

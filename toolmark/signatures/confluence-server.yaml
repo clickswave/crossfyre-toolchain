@@ -1,0 +1,5 @@
+id: confluence-server
+info:
+  name: Atlassian Confluence Server
+  category: Wiki
+refines: confluence

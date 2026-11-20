@@ -1,4 +1,5 @@
-# Synthetic: Ivanti Connect Secure's sign-in page, where the appliance sends anyone not signed in.
+# Synthetic: The sign-in page of an Ivanti gateway, where it sends anyone not signed in.
+# Connect Secure and Policy Secure serve the same one.
 HTTP/1.1 200 OK
 content-type: text/html;charset=UTF-8
 date: Fri, 20 Nov 2026 06:00:00 GMT

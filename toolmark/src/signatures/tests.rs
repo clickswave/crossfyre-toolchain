@@ -362,6 +362,60 @@ fn a_refining_signature_replaces_its_base_or_is_named_as_a_candidate() {
     assert_eq!(reported(&[("/b", 200), ("/c", 403)]), [named("b", &["c"])]);
 }
 
+/// A signature that refines another and has nothing to detect is a product nothing seen
+/// can tell from the one it refines: it is never reported, and wherever the other is
+/// reported, it is among the candidates.
+#[test]
+fn a_refining_signature_with_nothing_to_detect_is_always_a_candidate() {
+    let files = [
+        file("a", "{ header: { name: server, regex: 'frame' } }"),
+        (
+            "b.yaml".to_string(),
+            "id: b\ninfo: { name: b, category: Test }\nrefines: a\n".to_string(),
+        ),
+        (
+            "c.yaml".to_string(),
+            "id: c\ninfo: { name: c, category: Test }\nrefines: a\n\
+             detect: { all: [ { header: { name: server, regex: 'frame' } }, { path: { path: /c } } ] }\n"
+                .to_string(),
+        ),
+    ];
+    let files: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(f, t)| (f.as_str(), t.as_str()))
+        .collect();
+    let signatures = set(&files);
+    let reported = |server: &str, asked: &[(&str, u16)]| {
+        let headers = [("server".to_string(), server.to_string())];
+        let mut host = Host::new(
+            &signatures,
+            "http://host.test/",
+            &headers,
+            &[],
+            "",
+            STANDARD,
+        );
+        host.not_found = NotFound::Honest;
+        for (path, code) in asked {
+            host.asked.insert(path.to_string(), status(*code, "page"));
+        }
+        host.detections()
+            .into_iter()
+            .map(|d| (d.name, d.candidates))
+            .collect::<Vec<_>>()
+    };
+    let named = |name: &str, candidates: &[&str]| {
+        (
+            name.to_string(),
+            candidates.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(reported("frame", &[("/c", 404)]), [named("a", &["b"])]);
+    assert_eq!(reported("frame", &[("/c", 403)]), [named("a", &["b", "c"])]);
+    assert_eq!(reported("frame", &[("/c", 200)]), [named("c", &[])]);
+    assert!(reported("other", &[]).is_empty());
+}
+
 /// Only paths that can still change an answer are asked: none for a signature whose
 /// passive evidence decided it, the deciding one for a signature that is unknown, and a
 /// version path for one reported without a version. Version paths first, then those of

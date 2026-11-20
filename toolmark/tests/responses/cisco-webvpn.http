@@ -1,5 +1,5 @@
-# Synthetic: The clientless SSL VPN login page of a Cisco ASA, with the cookies it sets
-# there.
+# Synthetic: The SSL VPN login page of a Cisco firewall, with the cookies it sets there.
+# The ASA and Firepower Threat Defense serve the same one.
 HTTP/1.1 200 OK
 content-type: text/html; charset=UTF-8
 date: Fri, 20 Nov 2026 06:00:00 GMT

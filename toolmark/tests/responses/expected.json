@@ -81,17 +81,20 @@
       "version_range": null
     }
   ],
-  "cisco-asa.http": [
+  "cisco-webvpn.http": [
     {
-      "candidates": [],
-      "category": "Firewall",
+      "candidates": [
+        "Cisco ASA",
+        "Cisco Firepower Threat Defense"
+      ],
+      "category": "VPN",
       "confidence": 70,
       "cpe": "",
       "evidence": [
         "body pattern",
         "cookie webvpnlogin"
       ],
-      "name": "Cisco ASA",
+      "name": "Cisco WebVPN portal",
       "version": null,
       "version_range": null
     }
@@ -128,10 +131,13 @@
   ],
   "confluence.http": [
     {
-      "candidates": [],
+      "candidates": [
+        "Atlassian Confluence Server",
+        "Atlassian Confluence Data Center"
+      ],
       "category": "Wiki",
       "confidence": 75,
-      "cpe": "cpe:2.3:a:atlassian:confluence_server:7.19.16:*:*:*:*:*:*:*",
+      "cpe": "",
       "evidence": [
         "header x-confluence-request-time: 1763618400000",
         "body pattern"
@@ -457,30 +463,36 @@
       "version_range": null
     }
   ],
-  "fortios-header.http": [
+  "fortinet-ssl-vpn.http": [
     {
-      "candidates": [],
-      "category": "Firewall",
-      "confidence": 50,
-      "cpe": "",
-      "evidence": [
-        "header server: xxxxxxxx-xxxxx"
+      "candidates": [
+        "Fortinet FortiOS",
+        "Fortinet FortiProxy"
       ],
-      "name": "Fortinet FortiOS",
-      "version": null,
-      "version_range": null
-    }
-  ],
-  "fortios.http": [
-    {
-      "candidates": [],
       "category": "Firewall",
       "confidence": 25,
       "cpe": "",
       "evidence": [
         "body pattern"
       ],
-      "name": "Fortinet FortiOS",
+      "name": "Fortinet appliance",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "fortinet.http": [
+    {
+      "candidates": [
+        "Fortinet FortiOS",
+        "Fortinet FortiProxy"
+      ],
+      "category": "Firewall",
+      "confidence": 50,
+      "cpe": "",
+      "evidence": [
+        "header server: xxxxxxxx-xxxxx"
+      ],
+      "name": "Fortinet appliance",
       "version": null,
       "version_range": null
     }
@@ -762,17 +774,20 @@
       "version_range": null
     }
   ],
-  "ivanti-connect-secure.http": [
+  "ivanti-gateway.http": [
     {
-      "candidates": [],
+      "candidates": [
+        "Ivanti Connect Secure",
+        "Ivanti Policy Secure"
+      ],
       "category": "VPN",
       "confidence": 70,
-      "cpe": "cpe:2.3:a:ivanti:connect_secure:*:*:*:*:*:*:*:*",
+      "cpe": "",
       "evidence": [
         "body pattern",
         "cookie DSSignInURL"
       ],
-      "name": "Ivanti Connect Secure",
+      "name": "Ivanti gateway",
       "version": null,
       "version_range": null
     }
@@ -1666,6 +1681,23 @@
       "version_range": null
     }
   ],
+  "miniserv-basic-auth.http": [
+    {
+      "candidates": [
+        "Webmin",
+        "Usermin"
+      ],
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "",
+      "evidence": [
+        "header server: MiniServ/2.105"
+      ],
+      "name": "MiniServ",
+      "version": "2.105",
+      "version_range": null
+    }
+  ],
   "moveit-transfer.http": [
     {
       "candidates": [],
@@ -2343,6 +2375,35 @@
       "version_range": null
     }
   ],
+  "usermin-banner.http": [
+    {
+      "candidates": [],
+      "category": "Control Panel",
+      "confidence": 100,
+      "cpe": "cpe:2.3:a:webmin:usermin:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "header server: MiniServ/2.102",
+        "path /session_login.cgi: 200"
+      ],
+      "name": "Usermin",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "usermin.http": [
+    {
+      "candidates": [],
+      "category": "Control Panel",
+      "confidence": 25,
+      "cpe": "cpe:2.3:a:webmin:usermin:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "Usermin",
+      "version": null,
+      "version_range": null
+    }
+  ],
   "varnish.http": [
     {
       "candidates": [],
@@ -2441,14 +2502,29 @@
       "version_range": null
     }
   ],
+  "webmin-banner.http": [
+    {
+      "candidates": [],
+      "category": "Control Panel",
+      "confidence": 100,
+      "cpe": "cpe:2.3:a:webmin:webmin:2.105:*:*:*:*:*:*:*",
+      "evidence": [
+        "header server: MiniServ/2.105",
+        "path /session_login.cgi: 200"
+      ],
+      "name": "Webmin",
+      "version": "2.105",
+      "version_range": null
+    }
+  ],
   "webmin.http": [
     {
       "candidates": [],
       "category": "Control Panel",
-      "confidence": 50,
+      "confidence": 25,
       "cpe": "cpe:2.3:a:webmin:webmin:1.890:*:*:*:*:*:*:*",
       "evidence": [
-        "header server: MiniServ/1.890"
+        "body pattern"
       ],
       "name": "Webmin",
       "version": "1.890",

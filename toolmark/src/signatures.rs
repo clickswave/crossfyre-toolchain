@@ -228,7 +228,8 @@ struct Signature {
     implies: Vec<String>,
     /// The id of the signature this one replaces when both are present.
     refines: Option<String>,
-    /// None for a product known only from what implies it.
+    /// None for a product known only from what implies it, or for one that refines another
+    /// and that nothing seen tells from it.
     detect: Option<Node>,
     /// The first of these that reads a version gives it.
     version: Vec<Leaf>,
@@ -888,14 +889,22 @@ impl<'a> Host<'a> {
             })
     }
 
-    /// The signatures refining `base`, directly or through others, that are unknown here,
-    /// so could not be told apart from it.
+    /// The signatures refining `base`, directly or through others, that could not be told
+    /// apart from it: those unknown here, and those with nothing to detect, which nothing
+    /// seen ever tells apart.
     fn candidates(&self, base: &Signature, outcomes: &[(&Signature, Outcome)]) -> Vec<String> {
         let mut out = Vec::new();
         let mut bases = VecDeque::from([base.id.as_str()]);
         while let Some(id) = bases.pop_front() {
-            for (signature, outcome) in outcomes {
-                if signature.refines.as_deref() == Some(id) && outcome.answer == Answer::Unknown {
+            for signature in &self.signatures.list {
+                if signature.refines.as_deref() != Some(id) {
+                    continue;
+                }
+                let unknown = signature.detect.is_none()
+                    || outcomes
+                        .iter()
+                        .any(|(s, o)| s.id == signature.id && o.answer == Answer::Unknown);
+                if unknown {
                     out.push(signature.name.clone());
                     bases.push_back(signature.id.as_str());
                 }

@@ -1,0 +1,9 @@
+id: miniserv
+info:
+  name: MiniServ
+  category: Web Server
+detect:
+  any:
+    - header: { name: server, regex: '^MiniServ/' }
+version:
+  - header: { name: server, regex: '^MiniServ/([0-9]+(?:\.[0-9]+)*)' }

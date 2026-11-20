@@ -1,0 +1,8 @@
+id: ivanti-gateway
+info:
+  name: Ivanti gateway
+  category: VPN
+detect:
+  any:
+    - html: { regex: '(?:src|href|action)="/dana-na/' }
+    - cookie: { name: '^DSSignInURL$' }

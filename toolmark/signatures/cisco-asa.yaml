@@ -2,7 +2,4 @@ id: cisco-asa
 info:
   name: Cisco ASA
   category: Firewall
-detect:
-  any:
-    - html: { regex: '(?:src|href|action)="/\+(?:CSCOE|webvpn)\+/' }
-    - cookie: { name: '^webvpn(?:login|Lang)?$' }
+refines: cisco-webvpn

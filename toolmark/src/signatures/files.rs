@@ -132,6 +132,14 @@ pub(super) static FILES: &[(&str, &str)] = &[
         "confluence.yaml",
         include_str!("../../signatures/confluence.yaml"),
     ),
+    (
+        "confluence-server.yaml",
+        include_str!("../../signatures/confluence-server.yaml"),
+    ),
+    (
+        "confluence-data-center.yaml",
+        include_str!("../../signatures/confluence-data-center.yaml"),
+    ),
     ("jira.yaml", include_str!("../../signatures/jira.yaml")),
     (
         "exchange.yaml",
@@ -150,12 +158,28 @@ pub(super) static FILES: &[(&str, &str)] = &[
         include_str!("../../signatures/f5-big-ip.yaml"),
     ),
     (
+        "fortinet.yaml",
+        include_str!("../../signatures/fortinet.yaml"),
+    ),
+    (
         "fortios.yaml",
         include_str!("../../signatures/fortios.yaml"),
     ),
     (
+        "fortiproxy.yaml",
+        include_str!("../../signatures/fortiproxy.yaml"),
+    ),
+    (
+        "ivanti-gateway.yaml",
+        include_str!("../../signatures/ivanti-gateway.yaml"),
+    ),
+    (
         "ivanti-connect-secure.yaml",
         include_str!("../../signatures/ivanti-connect-secure.yaml"),
+    ),
+    (
+        "ivanti-policy-secure.yaml",
+        include_str!("../../signatures/ivanti-policy-secure.yaml"),
     ),
     (
         "weblogic.yaml",
@@ -175,8 +199,16 @@ pub(super) static FILES: &[(&str, &str)] = &[
         include_str!("../../signatures/globalprotect.yaml"),
     ),
     (
+        "cisco-webvpn.yaml",
+        include_str!("../../signatures/cisco-webvpn.yaml"),
+    ),
+    (
         "cisco-asa.yaml",
         include_str!("../../signatures/cisco-asa.yaml"),
+    ),
+    (
+        "cisco-ftd.yaml",
+        include_str!("../../signatures/cisco-ftd.yaml"),
     ),
     (
         "vmware-vcenter.yaml",
@@ -194,7 +226,15 @@ pub(super) static FILES: &[(&str, &str)] = &[
         "crushftp.yaml",
         include_str!("../../signatures/crushftp.yaml"),
     ),
+    (
+        "miniserv.yaml",
+        include_str!("../../signatures/miniserv.yaml"),
+    ),
     ("webmin.yaml", include_str!("../../signatures/webmin.yaml")),
+    (
+        "usermin.yaml",
+        include_str!("../../signatures/usermin.yaml"),
+    ),
     ("java.yaml", include_str!("../../signatures/java.yaml")),
     ("python.yaml", include_str!("../../signatures/python.yaml")),
     ("nodejs.yaml", include_str!("../../signatures/nodejs.yaml")),

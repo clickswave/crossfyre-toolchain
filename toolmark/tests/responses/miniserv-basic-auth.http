@@ -1,0 +1,18 @@
+# Synthetic: A MiniServ set to ask for HTTP authentication, under a realm its admin
+# named, so nothing on it says whether it serves Webmin or Usermin.
+HTTP/1.1 401 Unauthorized
+server: MiniServ/2.105
+date: Fri, 20 Nov 2026 06:00:00 GMT
+www-authenticate: Basic realm="Admin"
+content-type: text/html; charset=UTF-8
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>401 Unauthorized</title>
+</head>
+<body>
+<h1>Unauthorized</h1>
+</body>
+</html>

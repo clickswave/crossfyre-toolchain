@@ -143,9 +143,6 @@ fn parse(file: &str, text: &str) -> Result<Signature, String> {
     if detect.as_ref().is_some_and(|d| !positive(d)) {
         return Err("detect could hold with no evidence found, as a `none` alone does".into());
     }
-    if spec.refines.is_some() && detect.is_none() {
-        return Err("it refines another, and has nothing to detect".into());
-    }
     let version = spec
         .version
         .into_iter()
@@ -640,10 +637,6 @@ mod tests {
                     x("refines: loop-a\ndetect: { html: { regex: 'b' } }\n")
                 ),
             ),
-            (
-                "refines-blind.yaml".into(),
-                format!("id: refines-blind\n{}", x("refines: good\n")),
-            ),
         ];
         let files: Vec<(&str, &str)> = files
             .iter()
@@ -701,7 +694,6 @@ mod tests {
             ("refines-missing.yaml", "it refines nowhere"),
             ("loop-a.yaml", "comes back round to it"),
             ("loop-b.yaml", "comes back round to it"),
-            ("refines-blind.yaml", "has nothing to detect"),
         ];
         for (file, says) in expected {
             let reasons = why(file);

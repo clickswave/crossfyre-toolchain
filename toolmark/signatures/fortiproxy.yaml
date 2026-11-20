@@ -1,0 +1,5 @@
+id: fortiproxy
+info:
+  name: Fortinet FortiProxy
+  category: Proxy
+refines: fortinet
