@@ -1,0 +1,12 @@
+id: rejetto-hfs
+info:
+  name: Rejetto HTTP File Server
+  category: File Transfer
+  metadata:
+    vendor: rejetto
+    product: http_file_server
+detect:
+  any:
+    - header: { name: server, regex: '^HFS ' }
+version:
+  - header: { name: server, regex: '^HFS ([0-9]+\.[0-9]+[a-z]?)' }

@@ -1,0 +1,10 @@
+id: jboss
+info:
+  name: JBoss
+  category: Application Server
+implies: [java]
+detect:
+  any:
+    - header: { name: x-powered-by, regex: 'JBoss' }
+version:
+  - header: { name: x-powered-by, regex: 'JBoss(?:AS)?-([0-9]+(?:\.[0-9]+)*)' }

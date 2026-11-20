@@ -1,0 +1,11 @@
+id: goanywhere-mft
+info:
+  name: Fortra GoAnywhere MFT
+  category: File Transfer
+  metadata:
+    vendor: fortra
+    product: goanywhere_managed_file_transfer
+implies: [java]
+detect:
+  any:
+    - html: { regex: '(?:src|href|action)="/goanywhere/' }

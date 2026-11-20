@@ -986,6 +986,34 @@
       "version_range": null
     }
   ],
+  "goanywhere-mft.http": [
+    {
+      "candidates": [],
+      "category": "File Transfer",
+      "confidence": 25,
+      "cpe": "cpe:2.3:a:fortra:goanywhere_managed_file_transfer:*:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "Fortra GoAnywhere MFT",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "distro": null,
+      "evidence": [
+        "implied by Fortra GoAnywhere MFT"
+      ],
+      "name": "Java",
+      "version": null,
+      "version_range": null
+    }
+  ],
   "grafana.http": [
     {
       "candidates": [],
@@ -1146,6 +1174,34 @@
         "cookie DSSignInURL"
       ],
       "name": "Ivanti gateway",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "jboss.http": [
+    {
+      "candidates": [],
+      "category": "Application Server",
+      "confidence": 50,
+      "cpe": "",
+      "distro": null,
+      "evidence": [
+        "header x-powered-by: Servlet 2.5; JBoss-5.0/JBossWeb-2.1"
+      ],
+      "name": "JBoss",
+      "version": "5.0",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "distro": null,
+      "evidence": [
+        "implied by JBoss"
+      ],
+      "name": "Java",
       "version": null,
       "version_range": null
     }
@@ -2177,6 +2233,62 @@
       "version_range": null
     }
   ],
+  "manageengine-adselfservice-plus.http": [
+    {
+      "candidates": [],
+      "category": "Identity",
+      "confidence": 25,
+      "cpe": "cpe:2.3:a:zohocorp:manageengine_adselfservice_plus:*:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "ManageEngine ADSelfService Plus",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "distro": null,
+      "evidence": [
+        "implied by ManageEngine ADSelfService Plus"
+      ],
+      "name": "Java",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "manageengine-servicedesk-plus.http": [
+    {
+      "candidates": [],
+      "category": "Issue Tracker",
+      "confidence": 25,
+      "cpe": "cpe:2.3:a:zohocorp:manageengine_servicedesk_plus:*:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "ManageEngine ServiceDesk Plus",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "distro": null,
+      "evidence": [
+        "implied by ManageEngine ServiceDesk Plus"
+      ],
+      "name": "Java",
+      "version": null,
+      "version_range": null
+    }
+  ],
   "mariadb-ubuntu.banner": [
     {
       "candidates": [],
@@ -2380,6 +2492,21 @@
       ],
       "name": "Nginx",
       "version": "1.24.0",
+      "version_range": null
+    }
+  ],
+  "nostromo.http": [
+    {
+      "candidates": [],
+      "category": "Web Server",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:nazgul:nostromo_nhttpd:1.9.6:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "header server: nostromo 1.9.6"
+      ],
+      "name": "nostromo nhttpd",
+      "version": "1.9.6",
       "version_range": null
     }
   ],
@@ -2767,6 +2894,21 @@
       ],
       "name": "React",
       "version": null,
+      "version_range": null
+    }
+  ],
+  "rejetto-hfs.http": [
+    {
+      "candidates": [],
+      "category": "File Transfer",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:rejetto:http_file_server:2.3m:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "header server: HFS 2.3m"
+      ],
+      "name": "Rejetto HTTP File Server",
+      "version": "2.3m",
       "version_range": null
     }
   ],

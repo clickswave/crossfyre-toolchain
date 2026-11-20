@@ -339,6 +339,27 @@ pub(super) static FILES: &[(&str, &str)] = &[
         "traefik.yaml",
         include_str!("../../signatures/traefik.yaml"),
     ),
+    (
+        "nostromo.yaml",
+        include_str!("../../signatures/nostromo.yaml"),
+    ),
+    (
+        "rejetto-hfs.yaml",
+        include_str!("../../signatures/rejetto-hfs.yaml"),
+    ),
+    ("jboss.yaml", include_str!("../../signatures/jboss.yaml")),
+    (
+        "goanywhere-mft.yaml",
+        include_str!("../../signatures/goanywhere-mft.yaml"),
+    ),
+    (
+        "manageengine-servicedesk-plus.yaml",
+        include_str!("../../signatures/manageengine-servicedesk-plus.yaml"),
+    ),
+    (
+        "manageengine-adselfservice-plus.yaml",
+        include_str!("../../signatures/manageengine-adselfservice-plus.yaml"),
+    ),
     ("java.yaml", include_str!("../../signatures/java.yaml")),
     ("python.yaml", include_str!("../../signatures/python.yaml")),
     ("nodejs.yaml", include_str!("../../signatures/nodejs.yaml")),

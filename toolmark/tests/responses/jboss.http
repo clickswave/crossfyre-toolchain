@@ -1,0 +1,16 @@
+# Synthetic: An application on JBoss, which names itself in X-Powered-By.
+HTTP/1.1 200 OK
+content-type: text/html
+date: Fri, 20 Nov 2026 06:00:00 GMT
+x-powered-by: Servlet 2.5; JBoss-5.0/JBossWeb-2.1
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Welcome to JBoss</title>
+</head>
+<body>
+<h1>Welcome</h1>
+</body>
+</html>

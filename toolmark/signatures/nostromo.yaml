@@ -1,0 +1,12 @@
+id: nostromo
+info:
+  name: nostromo nhttpd
+  category: Web Server
+  metadata:
+    vendor: nazgul
+    product: nostromo_nhttpd
+detect:
+  any:
+    - header: { name: server, regex: '^nostromo ' }
+version:
+  - header: { name: server, regex: '^nostromo ([0-9]+(?:\.[0-9]+)*)' }
