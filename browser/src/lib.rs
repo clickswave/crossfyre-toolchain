@@ -63,12 +63,12 @@ use tokio::process::{Child, Command};
 /// run and took longer than 20s on another running concurrently, which reads as
 /// a detection regression rather than as a slow machine.
 ///
-/// `AMBULO_BROWSER_LAUNCH_TIMEOUT_SECS` raises it where that is the known cost,
+/// `CFX_BROWSER_LAUNCH_TIMEOUT_SECS` raises it where that is the known cost,
 /// rather than making every user wait longer for a browser that is broken.
 const LAUNCH_TIMEOUT_DEFAULT_SECS: u64 = 20;
 
 fn launch_timeout() -> Duration {
-    std::env::var("AMBULO_BROWSER_LAUNCH_TIMEOUT_SECS")
+    std::env::var("CFX_BROWSER_LAUNCH_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|v| *v > 0)
@@ -96,10 +96,9 @@ const CANDIDATES: &[&str] = &[
     "msedge",
 ];
 
-/// Find a browser to drive: `AMBULO_BROWSER` if set, else the first candidate on
-/// PATH.
+/// Find a browser to drive: `CFX_BROWSER` if set, else the first candidate on PATH.
 pub fn find_browser() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("AMBULO_BROWSER") {
+    if let Ok(p) = std::env::var("CFX_BROWSER") {
         let p = PathBuf::from(p);
         return p.is_file().then_some(p);
     }
@@ -199,13 +198,19 @@ pub struct Browser {
 
 /// The note for a browser that died before it could be driven.
 const EXITED_EARLY: &str = "the browser exited before it was ready. On a container this \
-     usually means it needs --no-sandbox; set AMBULO_BROWSER_NO_SANDBOX=1 to allow that, \
+     usually means it needs --no-sandbox; set CFX_BROWSER_NO_SANDBOX=1 to allow that, \
      knowing it removes renderer isolation.";
+
+/// Whether the browser may be started without its sandbox: `CFX_BROWSER_NO_SANDBOX` is
+/// set, as a container whose sandbox does not start needs.
+pub fn no_sandbox() -> bool {
+    std::env::var("CFX_BROWSER_NO_SANDBOX").is_ok()
+}
 
 impl Browser {
     /// Start a browser and connect to it.
     pub async fn launch(exe: &PathBuf, no_sandbox: bool) -> Result<(Self, Cdp), String> {
-        let profile = std::env::temp_dir().join(format!("ambulo-browser-{}", uuid::Uuid::new_v4()));
+        let profile = std::env::temp_dir().join(format!("cfx-browser-{}", uuid::Uuid::new_v4()));
         write_profile(&profile).map_err(|e| format!("profile dir: {e}"))?;
         let args = launch_args(&profile.to_string_lossy(), no_sandbox);
         let mut cmd = Command::new(exe);
@@ -809,10 +814,10 @@ mod tests {
 
     #[test]
     fn the_profile_is_never_the_operators_own() {
-        let a = launch_args("/tmp/ambulo-browser-abc", false);
+        let a = launch_args("/tmp/cfx-browser-abc", false);
         assert!(
             a.iter()
-                .any(|f| f == "--user-data-dir=/tmp/ambulo-browser-abc")
+                .any(|f| f == "--user-data-dir=/tmp/cfx-browser-abc")
         );
         // Without this the browser opens the real profile, with the operator's
         // cookies, and points it at somebody else's application.
@@ -823,7 +828,7 @@ mod tests {
     fn the_profile_starts_with_network_prediction_off() {
         // 2 is "never". Without it the browser connects to where a page is
         // about to send it before the gate has been asked.
-        let dir = std::env::temp_dir().join(format!("ambulo-prefs-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("cfx-browser-prefs-{}", uuid::Uuid::new_v4()));
         write_profile(&dir).unwrap();
         let prefs: Value = serde_json::from_str(
             &std::fs::read_to_string(dir.join("Default/Preferences")).unwrap(),
@@ -899,8 +904,7 @@ mod tests {
             eprintln!("no browser on PATH; skipped");
             return;
         };
-        let no_sandbox = std::env::var("AMBULO_BROWSER_NO_SANDBOX").is_ok();
-        let (browser, mut cdp) = Browser::launch(&exe, no_sandbox).await.expect("launch");
+        let (browser, mut cdp) = Browser::launch(&exe, no_sandbox()).await.expect("launch");
         let v = visit(
             &mut cdp,
             "data:text/html,<a href=/x>x</a>",

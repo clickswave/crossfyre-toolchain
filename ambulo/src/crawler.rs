@@ -1141,24 +1141,24 @@ async fn run_browser_tier(
     }
     let Some(exe) = cfx_browser::find_browser() else {
         let _ = tx.send(CrawlEvent::note(
-            "the headless tier was requested but no browser was found. Set AMBULO_BROWSER to a \
+            "the headless tier was requested but no browser was found. Set CFX_BROWSER to a \
              Chrome or Chromium binary. Endpoints that only exist once the application is running \
              were NOT looked for in this crawl."
                 .to_string(),
         ));
         return;
     };
-    let no_sandbox = std::env::var("AMBULO_BROWSER_NO_SANDBOX").is_ok();
-    let (browser, mut cdp) = match cfx_browser::Browser::launch(&exe, no_sandbox).await {
-        Ok(b) => b,
-        Err(e) => {
-            let _ = tx.send(CrawlEvent::note(format!(
-                "the headless tier could not start a browser ({e}). Endpoints that only exist \
+    let (browser, mut cdp) =
+        match cfx_browser::Browser::launch(&exe, cfx_browser::no_sandbox()).await {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = tx.send(CrawlEvent::note(format!(
+                    "the headless tier could not start a browser ({e}). Endpoints that only exist \
                  once the application is running were NOT looked for in this crawl."
-            )));
-            return;
-        }
-    };
+                )));
+                return;
+            }
+        };
     // The seed first, then the routes the static tiers recovered. Those routes
     // are the lazily-loaded sections - the admin area, the reports section - and
     // loading one makes the application fetch its own data, which is the whole
