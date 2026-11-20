@@ -305,7 +305,25 @@ async fn scan<O: crate::observe::Observer>(
     // At the rendered tier, the landing page as a browser builds it.
     if params.depth_tier >= signatures::RENDERED {
         match render(&params, &url).await {
-            Ok(dom) => found.rendered(dom),
+            Ok(dom) => {
+                // Read, and kept for rematch, no longer than a fetched page's body.
+                let dom = capped(dom, MAX_BODY_BYTES);
+                observer
+                    .observed(crate::observe::Observation {
+                        asked: crate::observe::Asked::Rendered,
+                        url: &url,
+                        host: &host,
+                        port,
+                        scheme: &scheme,
+                        status,
+                        headers: &[],
+                        body: dom.as_bytes(),
+                        moved: false,
+                        certificate: None,
+                    })
+                    .await;
+                found.rendered(dom);
+            }
             Err(why) => {
                 let _ = tx.send(json!({"type": "log", "message": why}));
             }
@@ -471,6 +489,16 @@ async fn read_bytes_capped(mut resp: transport::Response, cap: usize) -> Vec<u8>
         }
     }
     buf
+}
+
+/// `text` cut to at most `cap` bytes, where a character ends.
+fn capped(mut text: String, cap: usize) -> String {
+    let mut end = text.len().min(cap);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text
 }
 
 fn normalize_target(t: &str) -> Option<(String, String, u16, String)> {
@@ -797,6 +825,64 @@ mod path_tests {
         let (aggressive, _) = fingerprint(&signatures, port, 3, &asked).await;
         assert_eq!(rendered, [("Spa".to_string(), vec![])]);
         assert_eq!(aggressive, []);
+    }
+
+    /// What a scan handed on to be kept: what each page was asked for, and its body.
+    #[derive(Default)]
+    struct Kept(Mutex<Vec<(crate::observe::Asked, String)>>);
+
+    impl Observer for Kept {
+        async fn observed(&self, o: Observation<'_>) {
+            let body = String::from_utf8_lossy(o.body).into_owned();
+            self.0.lock().unwrap().push((o.asked, body));
+        }
+    }
+
+    /// The page the browser built is handed on with the pages fetched, for rematch to
+    /// read again. Skipped where no browser is found.
+    #[tokio::test]
+    async fn the_rendered_page_is_handed_on_to_be_kept() {
+        if cfx_browser::find_browser().is_none() {
+            eprintln!("no browser on PATH; skipped");
+            return;
+        }
+        let page = "<html><body><div id=\"app\"></div><script>document.getElementById('app')\
+                    .innerHTML = '<p id=\"made-by-script\">hi</p>';</script></body></html>";
+        let (port, _) = serve(move |_, _| (200, page.to_string()));
+        let (signatures, _) = signatures::load_for_tests(&[]);
+        let params: FpParams = serde_json::from_value(json!({
+            "target": format!("http://127.0.0.1:{port}/"),
+            "evasive": false,
+            "timeout_ms": 3000,
+            "depth_tier": signatures::RENDERED,
+        }))
+        .unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let kept = Arc::new(Kept::default());
+        scan(&signatures, params, tx, kept.clone()).await;
+        let rendered: Vec<String> = kept
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(asked, _)| *asked == crate::observe::Asked::Rendered)
+            .map(|(_, body)| body.clone())
+            .collect();
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        assert!(
+            rendered[0].contains("id=\"made-by-script\""),
+            "{}",
+            rendered[0]
+        );
+    }
+
+    /// A rendered page is read and kept no longer than a fetched body, cut where a
+    /// character ends.
+    #[test]
+    fn a_rendered_page_is_cut_at_the_cap_where_a_character_ends() {
+        assert_eq!(capped("abcdef".into(), 4), "abcd");
+        assert_eq!(capped("ab\u{e9}".into(), 3), "ab");
+        assert_eq!(capped("abc".into(), 8), "abc");
     }
 
     /// The browser loads documents only from the target's origin, and no internal

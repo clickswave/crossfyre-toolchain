@@ -3,7 +3,7 @@
 
 use crate::libs::toolmark_db::{KeptHost, ToolmarkDb};
 use crate::observe::Asked;
-use crate::signatures::{Answered, Detection, Host, STANDARD, Signatures};
+use crate::signatures::{Answered, Detection, Host, RENDERED, Signatures};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
@@ -52,7 +52,7 @@ fn new_on(kept: &KeptHost, signatures: &Signatures) -> Vec<(String, Detection)> 
         &landing.headers,
         &cookies,
         &body,
-        STANDARD,
+        RENDERED,
     );
     let pages = |asked: Asked| -> Vec<(String, Answered)> {
         kept.pages
@@ -74,6 +74,15 @@ fn new_on(kept: &KeptHost, signatures: &Signatures) -> Vec<(String, Detection)> 
         Some(der) => host.certificate(der),
         None if !landing.url.starts_with("https:") => host.no_tls(),
         None => {}
+    }
+    // The landing page as a browser built it, when the scan rendered it and kept what it
+    // saw; without it the `rendered` leaves are unknown.
+    if let Some(built) = kept
+        .pages
+        .iter()
+        .find(|p| p.asked == Asked::Rendered && !p.body.is_empty())
+    {
+        host.rendered(String::from_utf8_lossy(&built.body).into_owned());
     }
     host.remember(pages(Asked::NotFound), pages(Asked::Path));
     host.detections()
@@ -199,6 +208,33 @@ mod tests {
         )
         .await;
         assert_eq!(rematch(&db).await, [("Traefik".to_string(), None)]);
+        scratch.done().await;
+    }
+
+    /// The landing page a browser built is kept with what the scan saw, so a signature
+    /// that reads the rendered page finds there what the rendered tier could have.
+    #[tokio::test]
+    #[ignore = "needs PostgreSQL's programs"]
+    async fn a_kept_rendered_page_is_read_again() {
+        let scratch = cfx_db::testing::Scratch::new(&ENGINE).await;
+        let db = ToolmarkDb::new(scratch.pool.clone());
+        let shell = "<html><body><app-root></app-root></body></html>";
+        let built =
+            "<html><body><app-root ng-version=\"17.3.0\"><h1>Console</h1></app-root></body></html>";
+        keep(
+            &db,
+            "http://127.0.0.1:8081/",
+            &[
+                (Asked::Landing, "/", 200, &[], shell),
+                (Asked::Rendered, "/", 200, &[], built),
+            ],
+            None,
+        )
+        .await;
+        assert_eq!(
+            rematch(&db).await,
+            [("Angular".to_string(), Some("17.3.0".to_string()))]
+        );
         scratch.done().await;
     }
 

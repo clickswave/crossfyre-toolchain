@@ -10,7 +10,8 @@ CREATE TABLE hosts (
 );
 
 -- What a scan saw on a host: each page it fetched, the landing page, the two random paths
--- that learn its not-found page and any path a signature asked for, with what it was
+-- that learn its not-found page, any path a signature asked for and, at the rendered
+-- tier, the landing page as a browser built it, with what it was
 -- asked for, its status, its headers in order as [name, value] with no credential's
 -- value, its body, capped as toolmark caps what it reads and gzipped, and for a landing
 -- page that came over TLS the certificate its server presented, DER encoded, so that new
@@ -20,7 +21,7 @@ CREATE TABLE observations (
     id          BIGSERIAL PRIMARY KEY,
     scan_id     TEXT NOT NULL REFERENCES scans (id) ON DELETE CASCADE,
     host_id     BIGINT NOT NULL REFERENCES hosts (id) ON DELETE CASCADE,
-    asked       TEXT NOT NULL CHECK (asked IN ('landing', 'not_found', 'path')),
+    asked       TEXT NOT NULL CHECK (asked IN ('landing', 'not_found', 'path', 'rendered')),
     url         TEXT NOT NULL,
     status      INTEGER NOT NULL,
     moved       BOOLEAN NOT NULL,

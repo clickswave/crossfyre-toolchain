@@ -12,6 +12,8 @@ pub enum Asked {
     NotFound,
     /// A path a signature asked for.
     Path,
+    /// The landing page as a browser built it, at the rendered tier.
+    Rendered,
 }
 
 impl Asked {
@@ -21,6 +23,7 @@ impl Asked {
             Asked::Landing => "landing",
             Asked::NotFound => "not_found",
             Asked::Path => "path",
+            Asked::Rendered => "rendered",
         }
     }
 
@@ -30,12 +33,14 @@ impl Asked {
             "landing" => Asked::Landing,
             "not_found" => Asked::NotFound,
             "path" => Asked::Path,
+            "rendered" => Asked::Rendered,
             _ => return None,
         })
     }
 }
 
-/// A page a fingerprint fetched: the landing page, or a path a signature asked for.
+/// A page a fingerprint saw: the landing page, a path a signature asked for, or the
+/// landing page as a browser built it.
 pub struct Observation<'a> {
     /// What it was fetched for.
     pub asked: Asked,

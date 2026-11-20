@@ -499,6 +499,57 @@ mod tests {
         scratch.done().await;
     }
 
+    /// The page a browser built is kept as a fetched body is: gzipped, and not at all for
+    /// a scan that carried a credential.
+    #[tokio::test]
+    #[ignore = "needs PostgreSQL's programs"]
+    async fn a_rendered_page_is_kept_as_a_body_is() {
+        let scratch = cfx_db::testing::Scratch::new(&ENGINE).await;
+        let db = ToolmarkDb::new(scratch.pool.clone());
+        let built = b"<html><body><app-root ng-version=\"17.3.0\"></app-root></body></html>";
+        for params in [
+            serde_json::json!({"target": "https://app.test/"}),
+            serde_json::json!({"target": "https://app.test/",
+                "headers": {"Authorization": "Bearer not-kept"}}),
+        ] {
+            let scan = db.start("fingerprint", "https://app.test/", &params).await;
+            db.observer(scan.as_ref(), &params)
+                .observed(Observation {
+                    asked: Asked::Rendered,
+                    url: "https://app.test/",
+                    host: "app.test",
+                    port: 443,
+                    scheme: "https",
+                    status: 200,
+                    headers: &[],
+                    body: built,
+                    moved: false,
+                    certificate: None,
+                })
+                .await;
+            db.finish(scan, Status::Completed).await;
+        }
+        let kept: Vec<(Option<Vec<u8>>, i64)> = sqlx::query_as(
+            "SELECT body, body_length FROM observations WHERE asked = 'rendered' ORDER BY id",
+        )
+        .fetch_all(db.pool())
+        .await
+        .expect("kept");
+        let length = built.len() as i64;
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert_eq!(
+            kept[0].0.as_deref().map(gunzipped).as_deref(),
+            Some(&built[..])
+        );
+        assert_eq!(kept[0].1, length);
+        assert_eq!(
+            kept[1],
+            (None, length),
+            "a scan with a credential keeps no body"
+        );
+        scratch.done().await;
+    }
+
     /// The database's clock now, as the inventory writes a time.
     async fn database_now(db: &ToolmarkDb) -> String {
         sqlx::query_scalar(
