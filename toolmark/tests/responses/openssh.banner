@@ -1,0 +1,3 @@
+# Synthetic: OpenSSH built from its own source, which says nothing after the version.
+ssh
+2.0-OpenSSH_9.6

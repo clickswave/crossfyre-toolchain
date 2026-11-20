@@ -1,0 +1,9 @@
+id: openssh-windows
+info:
+  name: OpenSSH for Windows
+  category: SSH Server
+detect:
+  any:
+    - banner: { name: ssh, regex: 'OpenSSH_for_Windows_' }
+version:
+  - banner: { name: ssh, regex: 'OpenSSH_for_Windows_([0-9]+\.[0-9]+(?:p[0-9]+)?)' }

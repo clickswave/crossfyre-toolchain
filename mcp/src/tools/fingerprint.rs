@@ -203,6 +203,10 @@ pub(crate) async fn run(
                         200,
                         2,
                     ),
+                    "distro": e
+                        .get("distro")
+                        .and_then(|d| d.as_str())
+                        .map(|d| untrusted::clean(d, 200)),
                 }));
                 if let Some(v) = e
                     .get("version")

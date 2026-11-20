@@ -1,0 +1,12 @@
+id: libssh
+info:
+  name: libssh
+  category: SSH Server
+  metadata:
+    vendor: libssh
+    product: libssh
+detect:
+  any:
+    - banner: { name: ssh, regex: '-libssh[_-][0-9]' }
+version:
+  - banner: { name: ssh, regex: '-libssh[_-]([0-9]+(?:\.[0-9]+)*)' }

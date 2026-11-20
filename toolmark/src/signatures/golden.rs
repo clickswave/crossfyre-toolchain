@@ -11,6 +11,9 @@
 //! answers a path it does not have with a 404. Those named `lab-` are pages the lab's
 //! targets served; the rest are written from what each product is publicly known to send.
 //!
+//! A `name.banner` is a service rather than a page: after its `#` lines, the name a probe
+//! identified it by on one line, and what the probe read from it on the next.
+//!
 //! A change meant to alter what is detected writes the file again with
 //! `TOOLMARK_GOLDEN=write cargo test -p toolmark golden`, and the diff of
 //! `expected.json` is then the change to review.
@@ -30,14 +33,14 @@ struct Response {
     body: String,
 }
 
-/// A saved host: its landing page, and what it answers for other paths.
-struct Saved {
+/// A saved page: the landing page, and what its host answers for other paths.
+struct Page {
     landing: Response,
     paths: BTreeMap<String, Response>,
     otherwise: Option<Response>,
 }
 
-impl Saved {
+impl Page {
     /// What this host answers when `path` is asked.
     fn answer(&self, path: &str) -> Answered {
         match self.paths.get(path).or(self.otherwise.as_ref()) {
@@ -45,10 +48,24 @@ impl Saved {
             None => Answered::new(404, false, b""),
         }
     }
+}
 
+/// A saved host: a page, or a service and what its probe read from it.
+enum Saved {
+    Page(Page),
+    Service { name: String, text: String },
+}
+
+impl Saved {
     /// This host after the shipped signatures have asked it what they need.
     async fn host(&self) -> Host<'_> {
-        let r = &self.landing;
+        let page = match self {
+            Saved::Page(page) => page,
+            Saved::Service { name, text } => {
+                return Host::service(Signatures::shipped(), name, text);
+            }
+        };
+        let r = &page.landing;
         let mut host = Host::new(
             Signatures::shipped(),
             "http://saved.test/",
@@ -57,7 +74,7 @@ impl Saved {
             &r.body,
             STANDARD,
         );
-        ask(&mut host, |path, _| std::future::ready(self.answer(&path))).await;
+        ask(&mut host, |path, _| std::future::ready(page.answer(&path))).await;
         host
     }
 }
@@ -105,20 +122,41 @@ fn read(path: &Path) -> Response {
     )
 }
 
+/// A saved service: the name it was identified by, and what was read from it.
+fn service(path: &Path) -> Saved {
+    let text = std::fs::read_to_string(path).expect("read");
+    let mut lines = text.lines().filter(|line| !line.starts_with('#'));
+    let mut next = || {
+        lines
+            .next()
+            .unwrap_or_else(|| panic!("{}: a name and a line read", path.display()))
+            .to_string()
+    };
+    Saved::Service {
+        name: next(),
+        text: next(),
+    }
+}
+
 /// Every saved host, by the file name of its landing page.
 fn saved() -> BTreeMap<String, Saved> {
     let mut out = BTreeMap::new();
     for entry in std::fs::read_dir(DIR).expect("tests/responses") {
         let path = entry.expect("entry").path();
-        if path.extension().and_then(|e| e.to_str()) != Some("http") {
-            continue;
-        }
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
             .expect("name")
             .to_string();
-        let mut host = Saved {
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("http") => {}
+            Some("banner") => {
+                out.insert(name, service(&path));
+                continue;
+            }
+            _ => continue,
+        }
+        let mut host = Page {
             landing: read(&path),
             paths: BTreeMap::new(),
             otherwise: None,
@@ -140,7 +178,7 @@ fn saved() -> BTreeMap<String, Saved> {
                 }
             }
         }
-        out.insert(name, host);
+        out.insert(name, Saved::Page(host));
     }
     out
 }
@@ -158,6 +196,7 @@ fn as_json(d: &Detection) -> Value {
             "since": r.since.as_ref().map(ToString::to_string),
             "until": r.until.as_ref().map(ToString::to_string),
         })),
+        "distro": d.distro,
     })
 }
 
@@ -208,9 +247,9 @@ async fn each_saved_response_gives_the_detections_it_gave_before() {
 }
 
 /// Each leaf is exercised by a saved host: every `detect` leaf, under a `none` too, is
-/// present in one, and every `version` leaf reads a version, or for a range is present,
-/// in one its signature is present in. Every group of a version pattern gives the version in one, through a leaf
-/// that carries the pattern.
+/// present in one, every `version` leaf reads a version, or for a range is present, and
+/// every `distro` leaf reads a tag, in one its signature is present in. Every group of a
+/// version pattern gives the version in one, through a leaf that carries the pattern.
 #[tokio::test]
 async fn the_saved_responses_exercise_every_leaf() {
     let saved = saved();
@@ -270,6 +309,15 @@ async fn the_saved_responses_exercise_every_leaf() {
                 .or_insert_with(|| vec![false; regex.captures_len()]);
             for group in given {
                 seen[group] = true;
+            }
+        }
+        for (n, leaf) in signature.distro.iter().enumerate() {
+            if !found_in.iter().any(|h| h.version_of(leaf).is_some()) {
+                missing.push(format!(
+                    "{}: distro leaf {} reads a tag on no saved host its product is",
+                    signature.id,
+                    n + 1
+                ));
             }
         }
         for (pattern, seen) in groups {

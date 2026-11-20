@@ -159,7 +159,14 @@ pub(crate) fn from_toolmark(data: &Value, st: Stamp<'_>) -> Option<Value> {
             o.insert("name".into(), top(data.get("name")));
             o.insert("severity".into(), json!("info"));
             o.insert("confidence".into(), top(data.get("confidence")));
-            for k in ["category", "version", "cpe", "candidates", "version_range"] {
+            for k in [
+                "category",
+                "version",
+                "cpe",
+                "candidates",
+                "version_range",
+                "distro",
+            ] {
                 if let Some(v) = data.get(k) {
                     extra.insert(k.into(), v.clone());
                 }

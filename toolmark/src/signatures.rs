@@ -25,12 +25,15 @@ pub struct Detection {
     pub cpe: String,
     pub confidence: u8,
     pub evidence: Vec<String>,
-    /// The products that refine this one and could not be told apart from it, because
-    /// the evidence that would decide went unanswered.
+    /// The products that refine this one and could not be told apart from it: the
+    /// evidence that would decide went unanswered, or there is none to be had.
     pub candidates: Vec<String>,
     /// Where the version lies when no exact one was read: what was found shipped from one
     /// version on, or until one.
     pub version_range: Option<Range>,
+    /// The tag of the distribution that built this copy, as its banner gives it, which
+    /// says it may carry fixes its version does not.
+    pub distro: Option<String>,
 }
 
 /// A version as a signature writes it, numbers separated by dots, which compare as
@@ -141,6 +144,9 @@ enum Source {
     /// What the host answers for a path it does not have: the first of the two random
     /// paths that learn its not-found page.
     NotFound,
+    /// What a service probe read from a service of this name: the version it gave, or
+    /// its greeting where it gives none apart.
+    Banner(String),
 }
 
 impl Source {
@@ -233,6 +239,8 @@ struct Signature {
     detect: Option<Node>,
     /// The first of these that reads a version gives it.
     version: Vec<Leaf>,
+    /// The first of these that reads a tag gives the distribution that built it.
+    distro: Vec<Leaf>,
 }
 
 impl Signature {
@@ -445,6 +453,8 @@ struct Page<'a> {
     metas: BTreeMap<&'a str, Option<String>>,
     /// The `src` of each script, in the order the page loads them.
     scripts: Vec<&'a str>,
+    /// For a service rather than a page: its name, and what its probe read from it.
+    banner: Option<(&'a str, &'a str)>,
 }
 
 impl<'a> Page<'a> {
@@ -459,6 +469,10 @@ impl<'a> Page<'a> {
                 .map(|(_, value)| value.as_str()),
             Source::Meta(name) => self.metas.get(name.as_str()).and_then(|c| c.as_deref()),
             Source::Html => Some(self.html),
+            Source::Banner(name) => self
+                .banner
+                .filter(|(service, _)| *service == name.as_str())
+                .map(|(_, text)| text),
             Source::Cookie(_)
             | Source::ScriptSrc
             | Source::Path(_)
@@ -493,6 +507,7 @@ impl<'a> Page<'a> {
         Some(match &leaf.source {
             Source::Header(name) => format!("header {name}: {}", truncate(text, 80)),
             Source::Meta(name) => format!("meta {name}: {}", truncate(text, 80)),
+            Source::Banner(name) => format!("{name} banner: {}", truncate(text, 80)),
             _ => "body pattern".to_string(),
         })
     }
@@ -580,7 +595,27 @@ impl<'a> Host<'a> {
                 .filter_map(|c| c.get(1))
                 .map(|m| m.as_str())
                 .collect(),
+            banner: None,
         };
+        Self::of(signatures, page, url, tier)
+    }
+
+    /// A service a probe identified as `service`, which `text` is what it read from: the
+    /// version the service gave, or its greeting. It has no page, and nothing is asked
+    /// of it.
+    pub fn service(signatures: &'a Signatures, service: &'a str, text: &'a str) -> Self {
+        let page = Page {
+            headers: &[],
+            cookies: Vec::new(),
+            html: "",
+            metas: BTreeMap::new(),
+            scripts: Vec::new(),
+            banner: Some((service, text)),
+        };
+        Self::of(signatures, page, "", 0)
+    }
+
+    fn of(signatures: &'a Signatures, page: Page<'a>, url: &str, tier: u8) -> Self {
         let mut leaves = Vec::new();
         for signature in &signatures.list {
             if let Some(detect) = &signature.detect {
@@ -859,6 +894,15 @@ impl<'a> Host<'a> {
             .find_map(|leaf| self.version_of(leaf).map(|(_, v)| v))
     }
 
+    /// The distribution `signature` was built by here: from the first of its distro leaves
+    /// that reads a tag.
+    fn distro(&self, signature: &Signature) -> Option<String> {
+        signature
+            .distro
+            .iter()
+            .find_map(|leaf| self.version_of(leaf).map(|(_, tag)| tag))
+    }
+
     /// Where `signature`'s version lies here, from its range leaves that are present, all
     /// of them at once. None when none is present, or when they allow no version at all.
     fn version_range(&self, signature: &Signature) -> Option<Range> {
@@ -938,6 +982,7 @@ impl<'a> Host<'a> {
                     evidence: outcome.evidence.clone(),
                     candidates: self.candidates(signature, &outcomes),
                     version_range,
+                    distro: self.distro(signature),
                 },
             ));
         }
@@ -963,6 +1008,7 @@ impl<'a> Host<'a> {
                     evidence: vec![format!("implied by {}", detection.name)],
                     candidates: Vec::new(),
                     version_range: None,
+                    distro: None,
                 });
             }
         }

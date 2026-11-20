@@ -630,6 +630,51 @@ fn a_cookie_leaf_with_a_regex_reads_the_value_too() {
     assert!(found(&["SESSION=ok.1", "other=ok.1"]).is_empty());
 }
 
+/// A `banner` leaf reads what a probe read from a service of its name, and nothing else:
+/// not another service's, and not a page that says the same. `distro` leaves read the tag
+/// of the build beside the version.
+#[test]
+fn a_banner_leaf_reads_only_a_service_of_its_name() {
+    let files = [(
+        "srv.yaml".to_string(),
+        "id: srv\ninfo: { name: Srv, category: Test }\n\
+         detect: { banner: { name: ssh, regex: '^2\\.0-Srv_' } }\n\
+         version: [ { banner: { name: ssh, regex: 'Srv_([0-9.]+)' } } ]\n\
+         distro: [ { banner: { name: ssh, regex: 'Srv_\\S+ (\\S+)' } } ]\n"
+            .to_string(),
+    )];
+    let files: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(f, t)| (f.as_str(), t.as_str()))
+        .collect();
+    let signatures = set(&files);
+    let found = |service: &str, text: &str| {
+        Host::service(&signatures, service, text)
+            .detections()
+            .into_iter()
+            .map(|d| (d.version, d.distro, d.evidence))
+            .collect::<Vec<_>>()
+    };
+    let srv = |version: &str, distro: Option<&str>, banner: &str| {
+        (
+            Some(version.to_string()),
+            distro.map(ToString::to_string),
+            vec![format!("ssh banner: {banner}")],
+        )
+    };
+    assert_eq!(
+        found("ssh", "2.0-Srv_1.2 Distro-3"),
+        [srv("1.2", Some("Distro-3"), "2.0-Srv_1.2 Distro-3")]
+    );
+    assert_eq!(
+        found("ssh", "2.0-Srv_1.2"),
+        [srv("1.2", None, "2.0-Srv_1.2")]
+    );
+    assert!(found("ftp", "2.0-Srv_1.2").is_empty());
+    let page = Host::new(&signatures, "http://host.test/", &[], &[], "2.0-Srv_1.2", 0);
+    assert!(page.detections().is_empty());
+}
+
 /// `script` reads the content of the first script the landing page loads from its own
 /// host whose `src` matches: asked for like a path, absent with no request when the page
 /// loads no such script, and unknown with no request when it comes from another host.

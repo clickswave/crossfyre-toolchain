@@ -74,9 +74,10 @@ impl Toolmark {
                 // pick per type rather than showing one field that is empty
                 // for two of the three.
                 let detail = match kind.as_str() {
-                    "technology" => match data["version"].as_str() {
-                        Some(version) => version.to_string(),
-                        None => range_text(&data["version_range"]),
+                    "technology" => match (data["version"].as_str(), data["distro"].as_str()) {
+                        (Some(version), Some(distro)) => format!("{version} ({distro})"),
+                        (Some(version), None) => version.to_string(),
+                        (None, _) => range_text(&data["version_range"]),
                     },
                     "vulnerability" => data["cve"].as_str().unwrap_or("").to_string(),
                     _ => data["server"].as_str().unwrap_or("").to_string(),
@@ -282,5 +283,20 @@ mod tests {
         }
         let details: Vec<&str> = view.findings.iter().map(|f| f.detail.as_str()).collect();
         assert_eq!(details, ["6.4.2", ">= 5.0", ">= 6.4, < 6.5"]);
+    }
+
+    /// A technology whose banner named the distribution that built it says so beside the
+    /// version.
+    #[test]
+    fn a_technology_shows_the_distro_that_built_it() {
+        let mut view = Toolmark::new("10.0.0.1:22".into());
+        for distro in [json!("Ubuntu-3ubuntu0.6"), json!(null)] {
+            view.apply(json!({"type": "finding", "data": {
+                "type": "technology", "name": "OpenSSH", "version": "8.9p1",
+                "distro": distro,
+            }}));
+        }
+        let details: Vec<&str> = view.findings.iter().map(|f| f.detail.as_str()).collect();
+        assert_eq!(details, ["8.9p1 (Ubuntu-3ubuntu0.6)", "8.9p1"]);
     }
 }

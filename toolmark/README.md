@@ -84,15 +84,20 @@ Three more each read a request of their own: the body the host answers for anoth
 neither only has to be there), the content of a script the landing page loads from the
 host's own origin (`script`, whose `src` picks the script and whose `regex` or `sha256`
 reads it), and the page the host answers for a path it does not have (`not_found`, an
-error page that often names the server and its version). Every leaf answers present,
+error page that often names the server and its version). A `banner` leaf reads what
+toolmark's service probes read from a service its `name` names, `ssh` say: the version
+the service gave, or its greeting where it gave none apart. Every leaf answers present,
 absent or unknown, and `all`, `any` and `none` combine the answers, nested as deep as
 needed. A product is reported when its `detect` is present. Each leaf that holds it up
-adds to the confidence, 50, 45, 60, 25, 40, 50, 50 and 40 by kind unless the leaf sets
-its own `confidence`, up to 100. The first `version` leaf that matches gives the version
-from its first group, and `vendor` and `product` make the CPE. A version leaf may give
-`since` or `until` in place of a group: when its evidence is present the version lies
-from `since` on and before `until`, the ranges of all such leaves that are present hold
-together, and an exact version, when one is read, wins.
+adds to the confidence, 50, 45, 60, 25, 40, 50, 50, 40 and 60 by kind unless the leaf
+sets its own `confidence`, up to 100. The first `version` leaf that matches gives the
+version from its first group, and `vendor` and `product` make the CPE. A version leaf
+may give `since` or `until` in place of a group: when its evidence is present the
+version lies from `since` on and before `until`, the ranges of all such leaves that are
+present hold together, and an exact version, when one is read, wins. A `distro` list,
+the same shape as `version`, reads the tag of the distribution that built the product,
+as OpenSSH's banner gives it after the version, which says the build may carry fixes its
+version does not.
 
 A `path`, a `script` or a `not_found` is a request the landing page did not need, so it
 is sent from the standard depth tier up, and only when its answer could still change
@@ -112,7 +117,8 @@ names it among its `candidates`.
 
 A new file goes in `src/signatures/files.rs` too, and needs saved responses in
 `tests/responses` on which each of its leaves is present: a landing page, and for a
-`path` the page the host answers, in a folder named after the landing page's file
+`path` the page the host answers, in a folder named after the landing page's file, and
+for a `banner` a `.banner` file holding the service's name and what its probe read
 (`src/signatures/golden.rs` has the layout). `cargo test -p toolmark` fails when a file
 does not load or a leaf is present on none of them, and checks that every saved response
 still gives the detections in `tests/responses/expected.json`.

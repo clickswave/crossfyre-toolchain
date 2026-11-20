@@ -16,6 +16,8 @@ struct FileSpec {
     detect: Option<Value>,
     #[serde(default)]
     version: Vec<Value>,
+    #[serde(default)]
+    distro: Vec<Value>,
 }
 
 #[derive(Deserialize)]
@@ -151,6 +153,18 @@ fn parse(file: &str, text: &str) -> Result<Signature, String> {
             leaf(&kind, value, true)
         })
         .collect::<Result<_, String>>()?;
+    let distro = spec
+        .distro
+        .into_iter()
+        .map(|v| {
+            let (kind, value) = one_key(v)?;
+            let tag = leaf(&kind, value, true)?;
+            match tag.range {
+                Some(_) => Err("a distro leaf reads a tag, and gives no since or until".into()),
+                None => Ok(tag),
+            }
+        })
+        .collect::<Result<_, String>>()?;
     Ok(Signature {
         id: spec.id,
         name: spec.info.name,
@@ -163,6 +177,7 @@ fn parse(file: &str, text: &str) -> Result<Signature, String> {
         refines: spec.refines,
         detect,
         version,
+        distro,
     })
 }
 
@@ -222,6 +237,7 @@ fn leaf(kind: &str, value: Value, version: bool) -> Result<Leaf, String> {
         Path,
         Script,
         NotFound,
+        Banner,
     }
     let known = match kind {
         "header" => Kind::Header,
@@ -232,6 +248,7 @@ fn leaf(kind: &str, value: Value, version: bool) -> Result<Leaf, String> {
         "path" => Kind::Path,
         "script" => Kind::Script,
         "not_found" => Kind::NotFound,
+        "banner" => Kind::Banner,
         other => return Err(format!("unknown leaf `{other}`")),
     };
     let spec: LeafSpec = serde_yaml::from_value(value).map_err(|e| format!("{kind}: {e}"))?;
@@ -308,6 +325,13 @@ fn leaf(kind: &str, value: Value, version: bool) -> Result<Leaf, String> {
             let name = compile(&needs(spec.name, "a name")?)?;
             let value = spec.regex.as_deref().map(compile).transpose()?;
             (Source::Cookie(name), value, 45)
+        }
+        Kind::Banner => {
+            refuse(&spec.path, "path")?;
+            refuse(&spec.src, "src")?;
+            let name = needs(spec.name, "a name")?.to_ascii_lowercase();
+            let regex = compile(&needs(spec.regex, "a regex")?)?;
+            (Source::Banner(name), Some(regex), 60)
         }
         Kind::Meta => {
             refuse(&spec.path, "path")?;
@@ -430,7 +454,7 @@ mod tests {
             ("good.yaml".into(), good.into()),
             (
                 "extra-key.yaml".into(),
-                format!("id: extra-key\n{}", x("distro: []\n")),
+                format!("id: extra-key\n{}", x("tags: []\n")),
             ),
             (
                 "unknown-leaf.yaml".into(),
@@ -624,6 +648,21 @@ mod tests {
                 ),
             ),
             (
+                "banner-nameless.yaml".into(),
+                format!(
+                    "id: banner-nameless\n{}",
+                    x("detect: { banner: { regex: 'x' } }\n")
+                ),
+            ),
+            (
+                "distro-range.yaml".into(),
+                format!(
+                    "id: distro-range\n{}",
+                    x("detect: { html: { regex: 'x' } }\n\
+                       distro: [ { html: { regex: 'x', since: '1.0' } } ]\n")
+                ),
+            ),
+            (
                 "loop-a.yaml".into(),
                 format!(
                     "id: loop-a\n{}",
@@ -653,7 +692,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let expected = [
-            ("extra-key.yaml", "unknown field `distro`"),
+            ("extra-key.yaml", "unknown field `tags`"),
             ("unknown-leaf.yaml", "unknown leaf `title`"),
             ("unknown-group.yaml", "unknown leaf `either`"),
             ("bad-pattern.yaml", "does not compile"),
@@ -692,6 +731,8 @@ mod tests {
             ("implies-missing.yaml", "it implies nowhere"),
             ("implies-left-out.yaml", "it implies implies-missing"),
             ("refines-missing.yaml", "it refines nowhere"),
+            ("banner-nameless.yaml", "this banner leaf needs a name"),
+            ("distro-range.yaml", "a distro leaf reads a tag"),
             ("loop-a.yaml", "comes back round to it"),
             ("loop-b.yaml", "comes back round to it"),
         ];

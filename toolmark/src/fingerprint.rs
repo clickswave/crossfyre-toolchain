@@ -356,6 +356,7 @@ pub fn technology(
                 "since": r.since.as_ref().map(ToString::to_string),
                 "until": r.until.as_ref().map(ToString::to_string),
             })),
+            "distro": d.distro,
         }
     })
 }

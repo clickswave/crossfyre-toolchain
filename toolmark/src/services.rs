@@ -23,6 +23,7 @@
 //!     protocol leaves the stream in a state the next probe would misread.
 //!   * The port is a hint for ordering, never the answer.
 
+use crate::signatures::{Host, Signatures};
 use cfx_finding::Finding;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -128,6 +129,22 @@ pub async fn run(params: SvcParams, tx: mpsc::UnboundedSender<Value>) {
             }));
             for f in svc.findings {
                 let _ = tx.send(json!({"type":"finding","data": f}));
+            }
+            // What the probe read names the product, through the signatures a page is read
+            // with: the version the service gave, or its greeting where it gave none apart.
+            let text = if svc.version.is_empty() {
+                &svc.banner
+            } else {
+                &svc.version
+            };
+            for d in Host::service(Signatures::shipped(), &svc.service, text).detections() {
+                let _ = tx.send(crate::fingerprint::technology(
+                    &d,
+                    &target,
+                    &host,
+                    port,
+                    &svc.service,
+                ));
             }
         }
         let _ = tx.send(json!({"type":"progress","processed":done,"total":total}));
@@ -335,7 +352,12 @@ async fn banner_service(egress: &Egress, target: &str, to: Duration) -> Option<S
 
     if low.starts_with("ssh-") {
         svc.service = "ssh".into();
-        svc.version = text.trim_start_matches("SSH-").to_string();
+        // The identification string is the first line, which the protocol ends with CR LF.
+        let line = b
+            .split(|c| *c == b'\r' || *c == b'\n')
+            .next()
+            .unwrap_or_default();
+        svc.version = printable(line).trim_start_matches("SSH-").to_string();
     } else if low.starts_with("220") && low.contains("ftp") {
         svc.service = "ftp".into();
         svc.version = text.clone();
@@ -914,6 +936,45 @@ mod tests {
         let len = i32::from_le_bytes([m[0], m[1], m[2], m[3]]) as usize;
         assert_eq!(len, m.len());
         assert_eq!(i32::from_le_bytes([m[12], m[13], m[14], m[15]]), 2013);
+    }
+
+    /// A service is named by the signatures from what its probe read: an SSH server's
+    /// banner gives the product, its version and the distribution that built it, as a
+    /// technology on the service's own host and port.
+    #[tokio::test]
+    async fn a_service_is_named_from_its_banner() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let _ = stream
+                    .write_all(b"SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6\r\n")
+                    .await;
+            }
+        });
+        let target = format!("127.0.0.1:{port}");
+        let params: SvcParams = serde_json::from_value(json!({
+            "targets": [target],
+            "timeout_ms": 1000,
+            "auth_checks": false,
+        }))
+        .unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        run(params, tx).await;
+        let mut named = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if event["type"] == "finding" && event["data"]["type"] == "technology" {
+                named.push(event["data"].clone());
+            }
+        }
+        assert_eq!(named.len(), 1, "{named:?}");
+        let found = &named[0];
+        assert_eq!(found["name"], "OpenSSH", "{found}");
+        assert_eq!(found["version"], "8.9p1", "{found}");
+        assert_eq!(found["distro"], "Ubuntu-3ubuntu0.6", "{found}");
+        assert_eq!(found["target"], target.as_str(), "{found}");
+        assert_eq!(found["port"], port, "{found}");
+        assert_eq!(found["scheme"], "ssh", "{found}");
     }
 
     #[test]

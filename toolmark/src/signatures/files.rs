@@ -284,6 +284,23 @@ pub(super) static FILES: &[(&str, &str)] = &[
         "openfire.yaml",
         include_str!("../../signatures/openfire.yaml"),
     ),
+    (
+        "openssh.yaml",
+        include_str!("../../signatures/openssh.yaml"),
+    ),
+    (
+        "openssh-windows.yaml",
+        include_str!("../../signatures/openssh-windows.yaml"),
+    ),
+    (
+        "dropbear.yaml",
+        include_str!("../../signatures/dropbear.yaml"),
+    ),
+    (
+        "erlang-otp-ssh.yaml",
+        include_str!("../../signatures/erlang-otp-ssh.yaml"),
+    ),
+    ("libssh.yaml", include_str!("../../signatures/libssh.yaml")),
     ("java.yaml", include_str!("../../signatures/java.yaml")),
     ("python.yaml", include_str!("../../signatures/python.yaml")),
     ("nodejs.yaml", include_str!("../../signatures/nodejs.yaml")),
