@@ -31,6 +31,9 @@ toolmark scan https://example.com
 
 # same run, as JSON in the terminal
 toolmark scan https://example.com --no-tui
+
+# as far as it goes, the landing page built in a browser too (needs Chrome or Chromium)
+toolmark scan https://example.com --depth rendered
 ```
 
 In a terminal, `scan` and `services` bring up the shared toolchain dashboard:

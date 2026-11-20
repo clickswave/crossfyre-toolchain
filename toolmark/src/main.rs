@@ -54,11 +54,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Some(Commands::Scan(args)) => {
-            let req = serde_json::json!({
-                "operation": "fingerprint",
-                "response": "stream",
-                "target": args.target,
-            });
+            let req = args.request();
             send_stream(
                 &daemon,
                 req,

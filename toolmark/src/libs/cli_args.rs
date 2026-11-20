@@ -80,6 +80,37 @@ pub enum Commands {
 pub struct ScanArgs {
     /// Target URL or host[:port] (e.g. https://example.com, example.com:8443)
     pub target: String,
+
+    /// How far the scan goes: passive (the landing page only), quiet (and the
+    /// favicon), standard (and the paths signatures ask for), aggressive, or rendered
+    /// (and the landing page built in a browser, which needs Chrome or Chromium). 0 to 4
+    /// work too
+    #[arg(long, default_value = "standard", value_parser = depth)]
+    pub depth: u8,
+}
+
+impl ScanArgs {
+    /// The operation the daemon is sent for this scan.
+    pub fn request(&self) -> serde_json::Value {
+        serde_json::json!({
+            "operation": "fingerprint",
+            "response": "stream",
+            "target": self.target,
+            "depth_tier": self.depth,
+        })
+    }
+}
+
+/// A depth tier, by its number or its name.
+fn depth(given: &str) -> Result<u8, String> {
+    match given.to_ascii_lowercase().as_str() {
+        "0" | "passive" => Ok(0),
+        "1" | "quiet" => Ok(1),
+        "2" | "standard" => Ok(2),
+        "3" | "aggressive" => Ok(3),
+        "4" | "rendered" => Ok(4),
+        _ => Err("a depth is passive, quiet, standard, aggressive or rendered, or 0 to 4".into()),
+    }
 }
 
 #[derive(Parser, Clone)]
@@ -137,6 +168,33 @@ mod tests {
             Cli::try_parse_from(["toolmark", "--daemon"]).is_err(),
             "the old flag"
         );
+    }
+
+    #[test]
+    fn a_scan_takes_its_depth_by_number_or_name() {
+        let depth = |args: &[&str]| match Cli::try_parse_from(args).ok()?.command? {
+            Commands::Scan(scan) => Some(scan.depth),
+            _ => None,
+        };
+        let scan = ["toolmark", "scan", "example.com"];
+        assert_eq!(depth(&scan), Some(2));
+        for (given, tier) in [("rendered", 4), ("4", 4), ("passive", 0), ("Aggressive", 3)] {
+            assert_eq!(
+                depth(&[&scan[..], &["--depth", given]].concat()),
+                Some(tier)
+            );
+        }
+        for wrong in ["5", "loud", "-1"] {
+            assert!(Cli::try_parse_from([&scan[..], &["--depth", wrong]].concat()).is_err());
+        }
+        let Some(Commands::Scan(args)) =
+            Cli::try_parse_from([&scan[..], &["--depth", "rendered"]].concat())
+                .unwrap()
+                .command
+        else {
+            panic!("not a scan");
+        };
+        assert_eq!(args.request()["depth_tier"], 4);
     }
 
     #[test]
