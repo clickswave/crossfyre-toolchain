@@ -1,0 +1,33 @@
+The known-exploited snapshot in cve-known-exploited.json.gz, the CVEs on CISA's list cut
+from the CVE dataset 2 made 2026-11-20T07:42:16Z, is compiled by Clickswave from the
+sources below, each used under its own terms. Version ranges are normalised into the
+dataset's own format.
+
+CVE
+  Copyright (c) 1999-2026, The MITRE Corporation. CVE and the CVE logo are registered
+  trademarks of The MITRE Corporation. https://www.cve.org
+
+  CVE Usage: MITRE hereby grants you a perpetual, worldwide, non-exclusive, no-charge,
+  royalty-free, irrevocable copyright license to reproduce, prepare derivative works of,
+  publicly display, publicly perform, sublicense, and distribute Common Vulnerabilities and
+  Exposures (CVE). Any copy you make for such purposes is authorized provided that you
+  reproduce MITRE's copyright designation and this license in any such copy.
+
+NVD
+  This product uses data from the NVD API but is not endorsed or certified by the NVD.
+  https://nvd.nist.gov
+
+CISA Known Exploited Vulnerabilities Catalog
+  https://www.cisa.gov/known-exploited-vulnerabilities-catalog, distributed under the
+  Creative Commons 0 1.0 licence.
+
+EPSS
+  Exploit Prediction Scoring System scores from FIRST, https://www.first.org/epss/
+  Jacobs, J., Romanosky, S., Edwards, B., Roytman, M., Adjerid, I. (2021). Exploit
+  Prediction Scoring System (EPSS). Digital Threats: Research and Practice, 2(3).
+
+GitHub Advisory Database
+  Advisories from the GitHub Advisory Database, https://github.com/github/advisory-database,
+  as published by OSV, https://osv.dev, licensed under Creative Commons Attribution 4.0
+  International, https://creativecommons.org/licenses/by/4.0/. Changed: version ranges
+  are normalised into this dataset's format.
