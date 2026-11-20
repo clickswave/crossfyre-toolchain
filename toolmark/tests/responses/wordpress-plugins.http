@@ -1,0 +1,22 @@
+# Synthetic: A WordPress shop with the plugins most sites run, each loading its assets
+# with its own version, and Yoast SEO naming its version in a comment.
+HTTP/1.1 200 OK
+content-type: text/html; charset=UTF-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+<meta charset="UTF-8">
+<title>Acme Store</title>
+<!-- This site is optimized with the Yoast SEO plugin v21.5 - https://yoast.com/wordpress/plugins/seo/ -->
+<link rel="stylesheet" href="https://shop.example.test/wp-content/plugins/woocommerce/assets/css/woocommerce.css?ver=8.2.1" media="all">
+<link rel="stylesheet" href="https://shop.example.test/wp-content/plugins/elementor/assets/css/frontend.min.css?ver=3.17.2" media="all">
+<link rel="stylesheet" href="https://shop.example.test/wp-content/plugins/contact-form-7/includes/css/styles.css?ver=5.8.2" media="all">
+<link rel="stylesheet" href="https://shop.example.test/wp-content/plugins/jetpack/css/jetpack.css?ver=12.8" media="all">
+<!-- / Yoast SEO plugin. -->
+</head>
+<body class="home woocommerce-js">
+<main id="main"></main>
+</body>
+</html>

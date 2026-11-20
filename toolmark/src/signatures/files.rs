@@ -456,6 +456,26 @@ pub(super) static FILES: &[(&str, &str)] = &[
         "ibm-http-server.yaml",
         include_str!("../../signatures/ibm-http-server.yaml"),
     ),
+    (
+        "woocommerce.yaml",
+        include_str!("../../signatures/woocommerce.yaml"),
+    ),
+    (
+        "elementor.yaml",
+        include_str!("../../signatures/elementor.yaml"),
+    ),
+    (
+        "contact-form-7.yaml",
+        include_str!("../../signatures/contact-form-7.yaml"),
+    ),
+    (
+        "jetpack.yaml",
+        include_str!("../../signatures/jetpack.yaml"),
+    ),
+    (
+        "yoast-seo.yaml",
+        include_str!("../../signatures/yoast-seo.yaml"),
+    ),
     ("java.yaml", include_str!("../../signatures/java.yaml")),
     ("python.yaml", include_str!("../../signatures/python.yaml")),
     ("nodejs.yaml", include_str!("../../signatures/nodejs.yaml")),

@@ -1,0 +1,14 @@
+id: woocommerce
+info:
+  name: WooCommerce
+  category: WordPress Plugin
+  metadata:
+    vendor: woocommerce
+    product: woocommerce
+    target_sw: wordpress
+implies: [wordpress]
+detect:
+  any:
+    - html: { regex: '(?:src|href)="[^"]*/wp-content/plugins/woocommerce/' }
+version:
+  - html: { regex: '/wp-content/plugins/woocommerce/[^"]*\?ver=([0-9]+\.[0-9]+(?:\.[0-9]+)?)"' }

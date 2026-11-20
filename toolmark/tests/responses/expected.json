@@ -4373,6 +4373,126 @@
     },
     {
       "candidates": [],
+      "category": "WordPress Plugin",
+      "confidence": 85,
+      "cpe": "cpe:2.3:a:elementor:website_builder:3.18.3:*:*:*:*:wordpress:*:*",
+      "distro": null,
+      "evidence": [
+        "body pattern",
+        "meta generator: Elementor 3.18.3; features: e_dom_optimization; settings: css_print_method-exter…"
+      ],
+      "name": "Elementor",
+      "version": "3.18.3",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "distro": null,
+      "evidence": [
+        "implied by WordPress"
+      ],
+      "name": "PHP",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "distro": null,
+      "evidence": [
+        "implied by WordPress"
+      ],
+      "name": "MySQL",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "wordpress-plugins.http": [
+    {
+      "candidates": [],
+      "category": "CMS",
+      "confidence": 25,
+      "cpe": "cpe:2.3:a:wordpress:wordpress:*:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "WordPress",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "WordPress Plugin",
+      "confidence": 25,
+      "cpe": "cpe:2.3:a:woocommerce:woocommerce:8.2.1:*:*:*:*:wordpress:*:*",
+      "distro": null,
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "WooCommerce",
+      "version": "8.2.1",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "WordPress Plugin",
+      "confidence": 25,
+      "cpe": "cpe:2.3:a:elementor:website_builder:3.17.2:*:*:*:*:wordpress:*:*",
+      "distro": null,
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "Elementor",
+      "version": "3.17.2",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "WordPress Plugin",
+      "confidence": 25,
+      "cpe": "cpe:2.3:a:rocklobster:contact_form_7:5.8.2:*:*:*:*:wordpress:*:*",
+      "distro": null,
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "Contact Form 7",
+      "version": "5.8.2",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "WordPress Plugin",
+      "confidence": 25,
+      "cpe": "cpe:2.3:a:automattic:jetpack:12.8:*:*:*:*:wordpress:*:*",
+      "distro": null,
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "Jetpack",
+      "version": "12.8",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "WordPress Plugin",
+      "confidence": 25,
+      "cpe": "cpe:2.3:a:yoast:yoast_seo:21.5:*:*:*:*:wordpress:*:*",
+      "distro": null,
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "Yoast SEO",
+      "version": "21.5",
+      "version_range": null
+    },
+    {
+      "candidates": [],
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
