@@ -123,7 +123,8 @@ names it among its `candidates`.
 A new file goes in `src/signatures/files.rs` too, and needs saved responses in
 `tests/responses` on which each of its leaves is present: a landing page, and for a
 `path` the page the host answers, in a folder named after the landing page's file, and
-for a `tls` leaf the certificate in a `.pem` file beside it, and for a `banner` a
+for a `tls` leaf the certificate in a `.pem` file beside it, for a `rendered` leaf the
+page as a browser built it in a `.rendered.html` file beside it, and for a `banner` a
 `.banner` file holding the service's name and what its probe read
 (`src/signatures/golden.rs` has the layout). `cargo test -p toolmark` fails when a file
 does not load or a leaf is present on none of them, and checks that every saved response

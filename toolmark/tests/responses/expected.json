@@ -27,6 +27,21 @@
       "version_range": null
     }
   ],
+  "angular-rendered.http": [
+    {
+      "candidates": [],
+      "category": "JavaScript Framework",
+      "confidence": 50,
+      "cpe": "",
+      "distro": null,
+      "evidence": [
+        "rendered page pattern"
+      ],
+      "name": "Angular",
+      "version": "17.3.0",
+      "version_range": null
+    }
+  ],
   "angular.http": [
     {
       "candidates": [],
@@ -4079,6 +4094,21 @@
       ],
       "name": "vsftpd",
       "version": "3.0.3",
+      "version_range": null
+    }
+  ],
+  "vue-rendered.http": [
+    {
+      "candidates": [],
+      "category": "JavaScript Framework",
+      "confidence": 50,
+      "cpe": "",
+      "distro": null,
+      "evidence": [
+        "rendered page pattern"
+      ],
+      "name": "Vue.js",
+      "version": null,
       "version_range": null
     }
   ],

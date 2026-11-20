@@ -1,5 +1,5 @@
 //! The saved responses in `tests/responses`, each run through the shipped signatures at
-//! the standard tier, give exactly the detections `tests/responses/expected.json` holds
+//! the rendered tier, give exactly the detections `tests/responses/expected.json` holds
 //! for them: the names, categories, versions, CPEs, confidence, evidence and candidates,
 //! in the order they are reported.
 //!
@@ -12,7 +12,9 @@
 //! targets served; the rest are written from what each product is publicly known to send.
 //!
 //! A `name.pem` beside `name.http` is the certificate the landing page came with, which
-//! makes it a page that came over TLS; without one it came over plain HTTP.
+//! makes it a page that came over TLS; without one it came over plain HTTP. A
+//! `name.rendered.html` is the page as a browser built it; a page without one was not
+//! rendered, and answers as it would at the standard tier.
 //!
 //! A `name.banner` is a service rather than a page: after its `#` lines, the name a probe
 //! identified it by on one line, and what the probe read from it on the next.
@@ -21,7 +23,7 @@
 //! `TOOLMARK_GOLDEN=write cargo test -p toolmark golden`, and the diff of
 //! `expected.json` is then the change to review.
 
-use super::{Answer, Answered, Detection, Host, STANDARD, Signatures, ask};
+use super::{Answer, Answered, Detection, Host, RENDERED, Signatures, ask};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -43,6 +45,7 @@ struct Page {
     paths: BTreeMap<String, Response>,
     otherwise: Option<Response>,
     certificate: Option<Vec<u8>>,
+    rendered: Option<String>,
 }
 
 impl Page {
@@ -77,11 +80,14 @@ impl Saved {
             &r.headers,
             &r.cookies,
             &r.body,
-            STANDARD,
+            RENDERED,
         );
         match &page.certificate {
             Some(der) => host.certificate(der),
             None => host.no_tls(),
+        }
+        if let Some(dom) = &page.rendered {
+            host.rendered(dom.clone());
         }
         ask(&mut host, |path, _| std::future::ready(page.answer(&path))).await;
         host
@@ -166,6 +172,7 @@ fn saved() -> BTreeMap<String, Saved> {
             _ => continue,
         }
         let pem = path.with_extension("pem");
+        let rendered = path.with_extension("rendered.html");
         let mut host = Page {
             landing: read(&path),
             paths: BTreeMap::new(),
@@ -177,6 +184,9 @@ fn saved() -> BTreeMap<String, Saved> {
                     .and_then(|c| c.to_der())
                     .unwrap_or_else(|e| panic!("{}: {e}", pem.display()))
             }),
+            rendered: rendered
+                .exists()
+                .then(|| std::fs::read_to_string(&rendered).expect("read")),
         };
         let more = path.with_extension("");
         if more.is_dir() {
