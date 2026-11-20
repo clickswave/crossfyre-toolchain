@@ -1,0 +1,12 @@
+id: underscore
+info:
+  name: Underscore.js
+  category: JavaScript Library
+  metadata:
+    vendor: underscorejs
+    product: underscore
+detect:
+  any:
+    - script_src: { regex: '/underscore(?:-min|\.min)?\.js' }
+version:
+  - script_src: { regex: '(?:underscore\.js/|underscore@)([0-9]+\.[0-9]+\.[0-9]+)' }

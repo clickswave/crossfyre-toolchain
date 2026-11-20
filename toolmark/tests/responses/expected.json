@@ -1594,6 +1594,138 @@
       "version_range": null
     }
   ],
+  "js-libraries-cdn.http": [
+    {
+      "candidates": [],
+      "category": "JavaScript Library",
+      "confidence": 40,
+      "cpe": "cpe:2.3:a:underscorejs:underscore:1.13.6:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "script src https://cdnjs.cloudflare.com/ajax/libs/underscore.js/1.13.6/underscore-min.js"
+      ],
+      "name": "Underscore.js",
+      "version": "1.13.6",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "JavaScript Library",
+      "confidence": 40,
+      "cpe": "cpe:2.3:a:handlebarsjs:handlebars:4.7.8:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "script src https://cdn.jsdelivr.net/npm/handlebars@4.7.8/dist/handlebars.min.js"
+      ],
+      "name": "Handlebars",
+      "version": "4.7.8",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "JavaScript Library",
+      "confidence": 40,
+      "cpe": "",
+      "distro": null,
+      "evidence": [
+        "script src https://cdnjs.cloudflare.com/ajax/libs/backbone.js/1.5.0/backbone-min.js"
+      ],
+      "name": "Backbone.js",
+      "version": "1.5.0",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "JavaScript Library",
+      "confidence": 40,
+      "cpe": "",
+      "distro": null,
+      "evidence": [
+        "script src https://cdn.jsdelivr.net/npm/@popperjs/core@2.11.8/dist/umd/popper.min.js"
+      ],
+      "name": "Popper",
+      "version": "2.11.8",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "JavaScript Library",
+      "confidence": 40,
+      "cpe": "",
+      "distro": null,
+      "evidence": [
+        "script src https://cdnjs.cloudflare.com/ajax/libs/modernizr/2.8.3/modernizr.min.js"
+      ],
+      "name": "Modernizr",
+      "version": "2.8.3",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "JavaScript Library",
+      "confidence": 40,
+      "cpe": "",
+      "distro": null,
+      "evidence": [
+        "script src https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js"
+      ],
+      "name": "GSAP",
+      "version": "3.12.5",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "JavaScript Library",
+      "confidence": 40,
+      "cpe": "",
+      "distro": null,
+      "evidence": [
+        "script src https://cdn.jsdelivr.net/npm/swiper@11.0.5/swiper-bundle.min.js"
+      ],
+      "name": "Swiper",
+      "version": "11.0.5",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "JavaScript Library",
+      "confidence": 40,
+      "cpe": "",
+      "distro": null,
+      "evidence": [
+        "script src https://cdn.jsdelivr.net/npm/alpinejs@3.13.3/dist/cdn.min.js"
+      ],
+      "name": "Alpine.js",
+      "version": "3.13.3",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "JavaScript Library",
+      "confidence": 40,
+      "cpe": "cpe:2.3:a:chartjs:chart.js:4.4.0:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "script src https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"
+      ],
+      "name": "Chart.js",
+      "version": "4.4.0",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "JavaScript Library",
+      "confidence": 40,
+      "cpe": "",
+      "distro": null,
+      "evidence": [
+        "script src https://cdn.jsdelivr.net/npm/d3@7.8.5/dist/d3.min.js"
+      ],
+      "name": "D3",
+      "version": "7.8.5",
+      "version_range": null
+    }
+  ],
   "juniper-jweb.http": [
     {
       "candidates": [],

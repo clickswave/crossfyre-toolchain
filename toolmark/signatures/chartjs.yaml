@@ -1,0 +1,12 @@
+id: chartjs
+info:
+  name: Chart.js
+  category: JavaScript Library
+  metadata:
+    vendor: chartjs
+    product: chart.js
+detect:
+  any:
+    - script_src: { regex: '(?i)/chart(?:\.umd)?(?:\.min)?\.js' }
+version:
+  - script_src: { regex: '(?:Chart\.js/|chart\.js@)([0-9]+\.[0-9]+\.[0-9]+)' }

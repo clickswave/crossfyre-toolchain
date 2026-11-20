@@ -1,0 +1,12 @@
+id: handlebars
+info:
+  name: Handlebars
+  category: JavaScript Library
+  metadata:
+    vendor: handlebarsjs
+    product: handlebars
+detect:
+  any:
+    - script_src: { regex: '/handlebars(?:\.runtime)?(?:\.min)?\.js' }
+version:
+  - script_src: { regex: '(?:handlebars\.js/|handlebars@)([0-9]+\.[0-9]+\.[0-9]+)' }

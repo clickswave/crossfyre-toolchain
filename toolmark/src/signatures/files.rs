@@ -387,6 +387,34 @@ pub(super) static FILES: &[(&str, &str)] = &[
     ),
     ("lodash.yaml", include_str!("../../signatures/lodash.yaml")),
     ("moment.yaml", include_str!("../../signatures/moment.yaml")),
+    (
+        "underscore.yaml",
+        include_str!("../../signatures/underscore.yaml"),
+    ),
+    (
+        "handlebars.yaml",
+        include_str!("../../signatures/handlebars.yaml"),
+    ),
+    (
+        "backbone.yaml",
+        include_str!("../../signatures/backbone.yaml"),
+    ),
+    ("popper.yaml", include_str!("../../signatures/popper.yaml")),
+    (
+        "modernizr.yaml",
+        include_str!("../../signatures/modernizr.yaml"),
+    ),
+    ("gsap.yaml", include_str!("../../signatures/gsap.yaml")),
+    ("swiper.yaml", include_str!("../../signatures/swiper.yaml")),
+    (
+        "alpinejs.yaml",
+        include_str!("../../signatures/alpinejs.yaml"),
+    ),
+    (
+        "chartjs.yaml",
+        include_str!("../../signatures/chartjs.yaml"),
+    ),
+    ("d3.yaml", include_str!("../../signatures/d3.yaml")),
     ("java.yaml", include_str!("../../signatures/java.yaml")),
     ("python.yaml", include_str!("../../signatures/python.yaml")),
     ("nodejs.yaml", include_str!("../../signatures/nodejs.yaml")),
