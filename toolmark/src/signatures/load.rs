@@ -239,6 +239,7 @@ fn leaf(kind: &str, value: Value, version: bool) -> Result<Leaf, String> {
         NotFound,
         Banner,
         Tls,
+        Rendered,
     }
     let known = match kind {
         "header" => Kind::Header,
@@ -251,6 +252,7 @@ fn leaf(kind: &str, value: Value, version: bool) -> Result<Leaf, String> {
         "not_found" => Kind::NotFound,
         "banner" => Kind::Banner,
         "tls" => Kind::Tls,
+        "rendered" => Kind::Rendered,
         other => return Err(format!("unknown leaf `{other}`")),
     };
     let spec: LeafSpec = serde_yaml::from_value(value).map_err(|e| format!("{kind}: {e}"))?;
@@ -327,6 +329,16 @@ fn leaf(kind: &str, value: Value, version: bool) -> Result<Leaf, String> {
             let name = compile(&needs(spec.name, "a name")?)?;
             let value = spec.regex.as_deref().map(compile).transpose()?;
             (Source::Cookie(name), value, 45)
+        }
+        Kind::Rendered => {
+            refuse(&spec.name, "name")?;
+            refuse(&spec.path, "path")?;
+            refuse(&spec.src, "src")?;
+            (
+                Source::Rendered,
+                Some(compile(&needs(spec.regex, "a regex")?)?),
+                50,
+            )
         }
         Kind::Tls => {
             refuse(&spec.path, "path")?;
@@ -672,6 +684,13 @@ mod tests {
                 ),
             ),
             (
+                "rendered-name.yaml".into(),
+                format!(
+                    "id: rendered-name\n{}",
+                    x("detect: { rendered: { regex: 'x', name: y } }\n")
+                ),
+            ),
+            (
                 "tls-part.yaml".into(),
                 format!(
                     "id: tls-part\n{}",
@@ -760,6 +779,7 @@ mod tests {
                 "tls-part.yaml",
                 "reads the certificate's subject or issuer, not serial",
             ),
+            ("rendered-name.yaml", "this rendered leaf has no name"),
             ("distro-range.yaml", "a distro leaf reads a tag"),
             ("loop-a.yaml", "comes back round to it"),
             ("loop-b.yaml", "comes back round to it"),

@@ -675,6 +675,39 @@ fn a_banner_leaf_reads_only_a_service_of_its_name() {
     assert!(page.detections().is_empty());
 }
 
+/// A `rendered` leaf reads the landing page as a browser built it: unknown below the
+/// rendered tier, and at it until a browser has rendered the page.
+#[test]
+fn a_rendered_leaf_reads_the_page_a_browser_built() {
+    let files = [file(
+        "spa",
+        "{ rendered: { regex: 'id=\"made-by-script\"' } }",
+    )];
+    let files: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(f, t)| (f.as_str(), t.as_str()))
+        .collect();
+    let signatures = set(&files);
+    let built = "<p id=\"made-by-script\">hi</p>".to_string();
+    let answer = |host: &Host| {
+        let outcomes = host.outcomes();
+        (outcomes[0].1.answer, outcomes[0].1.evidence.clone())
+    };
+    let mut below = Host::new(&signatures, "http://host.test/", &[], &[], "", STANDARD);
+    below.rendered(built.clone());
+    assert_eq!(answer(&below).0, Answer::Unknown);
+    let mut host = Host::new(&signatures, "http://host.test/", &[], &[], "", RENDERED);
+    assert_eq!(answer(&host).0, Answer::Unknown);
+    host.rendered(built);
+    assert_eq!(
+        answer(&host),
+        (Answer::Present, vec!["rendered page pattern".to_string()])
+    );
+    let mut plain = Host::new(&signatures, "http://host.test/", &[], &[], "", RENDERED);
+    plain.rendered("<p>hi</p>".to_string());
+    assert_eq!(answer(&plain).0, Answer::Absent);
+}
+
 /// A `tls` leaf reads the subject or the issuer of the certificate the landing page's
 /// server presented. It is unknown where no certificate was read, and absent over plain
 /// HTTP.

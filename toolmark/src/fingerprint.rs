@@ -28,7 +28,8 @@ pub struct FpParams {
     pub follow_redirects: bool,
     #[serde(default = "d_true")]
     pub favicon: bool,
-    /// OPSEC depth tier: 0 passive, 1 quiet (favicon), 2 standard, 3 aggressive.
+    /// OPSEC depth tier: 0 passive, 1 quiet (favicon), 2 standard, 3 aggressive, 4
+    /// rendered (the landing page built in a browser).
     #[serde(default = "d_tier")]
     pub depth_tier: u8,
     /// Optional request auth (headers + cookie) resolved from a credential by the
@@ -58,6 +59,56 @@ fn d_true() -> bool {
 }
 fn d_tier() -> u8 {
     2
+}
+
+/// Why the rendered tier cannot run for an op with this egress, when it cannot. The
+/// browser starts with no proxy of its own and cannot authenticate to the node's
+/// SOCKS gateway, so through one it would load the page from this machine's address.
+fn rendering_refused(egress: &transport::Egress) -> Option<&'static str> {
+    egress.is_proxied().then_some(
+        "the rendered tier did not run: the browser cannot go through the op's proxy, so it \
+         would have loaded the page from this machine's own address",
+    )
+}
+
+/// The documents the browser may load while rendering `target`: those of its origin,
+/// and none at an internal address when `block_internal` is set.
+fn rendering_gate(target: &transport::Url, block_internal: bool) -> cfx_browser::Gate {
+    let origin = target.origin();
+    std::sync::Arc::new(move |u: &str| {
+        transport::Url::parse(u).is_ok_and(|u| {
+            u.origin() == origin
+                && !(block_internal
+                    && u.host_str()
+                        .is_some_and(transport::guard::is_internal_literal))
+        })
+    })
+}
+
+/// The landing page at `url` as a browser builds it, or why it was not built.
+async fn render(params: &FpParams, url: &str) -> Result<String, String> {
+    if let Some(why) = rendering_refused(&params.egress) {
+        return Err(why.to_string());
+    }
+    let Some(exe) = cfx_browser::find_browser() else {
+        return Err(
+            "the rendered tier did not run: no browser was found. Set CFX_BROWSER to \
+                    a Chrome or Chromium binary."
+                .to_string(),
+        );
+    };
+    let target = transport::Url::parse(url).map_err(|e| format!("the rendered tier: {e}"))?;
+    let (browser, mut cdp) = cfx_browser::Browser::launch(&exe, cfx_browser::no_sandbox())
+        .await
+        .map_err(|e| format!("the rendered tier could not start a browser ({e})"))?;
+    let gate = rendering_gate(&target, params.block_internal);
+    let visit = cfx_browser::visit(&mut cdp, url, gate, params.block_internal).await;
+    browser.shutdown().await;
+    match visit {
+        Ok(v) if v.final_url.is_some() => Ok(v.dom),
+        Ok(_) => Err("the rendered tier could not load the page in the browser".to_string()),
+        Err(e) => Err(format!("the rendered tier could not render the page ({e})")),
+    }
 }
 
 /// Request auth resolved from a credential. Shared across all engines via
@@ -251,6 +302,15 @@ async fn scan<O: crate::observe::Observer>(
         }
     })
     .await;
+    // At the rendered tier, the landing page as a browser builds it.
+    if params.depth_tier >= signatures::RENDERED {
+        match render(&params, &url).await {
+            Ok(dom) => found.rendered(dom),
+            Err(why) => {
+                let _ = tx.send(json!({"type": "log", "message": why}));
+            }
+        }
+    }
     let detections = found.detections();
 
     // One finding per detected technology.
@@ -713,6 +773,54 @@ mod path_tests {
                 json!(["certificate subject: CN=TRAEFIK DEFAULT CERT"])
             )]
         );
+    }
+
+    /// At the rendered tier a browser builds the landing page, and a `rendered` leaf
+    /// reads what its script made; below the tier nothing is rendered. Skipped where no
+    /// browser is found.
+    #[tokio::test]
+    async fn the_rendered_tier_reads_what_the_pages_script_built() {
+        if cfx_browser::find_browser().is_none() {
+            eprintln!("no browser on PATH; skipped");
+            return;
+        }
+        let page = "<html><body><div id=\"app\"></div><script>document.getElementById('app')\
+                    .innerHTML = '<p id=\"made-by-script\">hi</p>';</script></body></html>";
+        let (port, asked) = serve(move |_, _| (200, page.to_string()));
+        let (signatures, skipped) = signatures::load_for_tests(&[(
+            "spa.yaml",
+            "id: spa\ninfo: { name: Spa, category: Test }\n\
+             detect: { rendered: { regex: 'id=\"made-by-script\"' } }\n",
+        )]);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let (rendered, _) = fingerprint(&signatures, port, signatures::RENDERED, &asked).await;
+        let (aggressive, _) = fingerprint(&signatures, port, 3, &asked).await;
+        assert_eq!(rendered, [("Spa".to_string(), vec![])]);
+        assert_eq!(aggressive, []);
+    }
+
+    /// The browser loads documents only from the target's origin, and no internal
+    /// address when the op refuses them.
+    #[test]
+    fn the_browser_renders_only_the_targets_origin() {
+        let target = transport::Url::parse("http://app.example.test:8080/").unwrap();
+        let gate = rendering_gate(&target, false);
+        assert!(gate("http://app.example.test:8080/dashboard"));
+        assert!(!gate("http://app.example.test/"));
+        assert!(!gate("https://app.example.test:8080/"));
+        assert!(!gate("http://elsewhere.test:8080/"));
+        let inside = transport::Url::parse("http://10.0.0.5/").unwrap();
+        assert!(rendering_gate(&inside, false)("http://10.0.0.5/login"));
+        assert!(!rendering_gate(&inside, true)("http://10.0.0.5/login"));
+    }
+
+    /// Through a proxy the browser would load the page from this machine's own
+    /// address, so the rendered tier does not run, and says why.
+    #[test]
+    fn a_proxied_op_renders_nothing() {
+        assert!(rendering_refused(&transport::Egress::Direct).is_none());
+        let proxied = transport::Egress::Proxy("socks5h://127.0.0.1:1080".into());
+        assert!(rendering_refused(&proxied).is_some_and(|why| why.contains("proxy")));
     }
 
     /// Framework A is three files. Framework B refines it: the same three and a fourth.

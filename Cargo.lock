@@ -5473,6 +5473,7 @@ version = "0.0.16"
 dependencies = [
  "adaptive",
  "base64 0.22.1",
+ "cfx_browser",
  "cfx_db",
  "cfx_finding",
  "cfx_tui",

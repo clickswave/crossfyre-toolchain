@@ -112,6 +112,10 @@ const HTML_READ: usize = 60_000;
 /// The depth tier from which a scan asks a host for more than its landing page.
 pub const STANDARD: u8 = 2;
 
+/// The depth tier at which a scan renders the landing page in a browser, above
+/// aggressive (3), for the `rendered` leaves.
+pub const RENDERED: u8 = 4;
+
 /// The most requests made of one host for its paths in a scan, the two that learn its
 /// not-found page included.
 pub const MAX_PATHS: usize = 20;
@@ -149,6 +153,8 @@ enum Source {
     Banner(String),
     /// A part of the certificate the landing page's connection presented.
     Tls(CertPart),
+    /// The landing page as a browser built it, its script run.
+    Rendered,
 }
 
 /// The part of a certificate a `tls` leaf reads, as RFC 4514 writes a name.
@@ -173,6 +179,7 @@ impl Source {
     fn tier(&self) -> u8 {
         match self {
             Source::Path(_) | Source::Script(_) | Source::NotFound => STANDARD,
+            Source::Rendered => RENDERED,
             _ => 0,
         }
     }
@@ -488,7 +495,7 @@ impl<'a> Page<'a> {
                 .map(|(_, value)| value.as_str()),
             Source::Meta(name) => self.metas.get(name.as_str()).and_then(|c| c.as_deref()),
             Source::Html => Some(self.html),
-            Source::Tls(_) => None,
+            Source::Tls(_) | Source::Rendered => None,
             Source::Banner(name) => self
                 .banner
                 .filter(|(service, _)| *service == name.as_str())
@@ -573,6 +580,8 @@ pub struct Host<'a> {
     not_found_page: Option<Answered>,
     asked: BTreeMap<String, Answered>,
     certificate: Certificate,
+    /// The landing page as a browser built it, once one has.
+    rendered: Option<String>,
 }
 
 /// What a host is asked next.
@@ -645,7 +654,7 @@ impl<'a> Host<'a> {
         }
         let passive = leaves
             .into_iter()
-            .filter(|l| !l.source.asks() && !matches!(l.source, Source::Tls(_)))
+            .filter(|l| !l.source.asks() && !matches!(l.source, Source::Tls(_) | Source::Rendered))
             .map(|l| {
                 let found = page.found(l);
                 let answer = if found.is_some() {
@@ -666,6 +675,7 @@ impl<'a> Host<'a> {
             not_found_page: None,
             asked: BTreeMap::new(),
             certificate: Certificate::Unread,
+            rendered: None,
         }
     }
 
@@ -679,6 +689,12 @@ impl<'a> Host<'a> {
                 issuer: cert.tbs_certificate.issuer.to_string(),
             };
         }
+    }
+
+    /// The landing page as a browser built it, its script run, for the `rendered`
+    /// leaves. Until a browser has rendered it, they are unknown.
+    pub fn rendered(&mut self, dom: String) {
+        self.rendered = Some(dom);
     }
 
     /// The landing page came over plain HTTP, so there was no certificate.
@@ -757,6 +773,17 @@ impl<'a> Host<'a> {
     fn answer(&self, leaf: &Leaf) -> (Answer, Option<String>) {
         if leaf.source.tier() > self.tier {
             return (Answer::Unknown, None);
+        }
+        if let Source::Rendered = leaf.source {
+            let Some(dom) = &self.rendered else {
+                return (Answer::Unknown, None);
+            };
+            return match &leaf.regex {
+                Some(regex) if regex.is_match(dom) => {
+                    (Answer::Present, Some("rendered page pattern".to_string()))
+                }
+                _ => (Answer::Absent, None),
+            };
         }
         if let Source::Tls(part) = leaf.source {
             if let Certificate::Unread = self.certificate {
@@ -917,6 +944,9 @@ impl<'a> Host<'a> {
         }
         if let Source::Tls(part) = leaf.source {
             return self.certificate_part(part).into_iter().collect();
+        }
+        if let Source::Rendered = leaf.source {
+            return self.rendered.as_deref().into_iter().collect();
         }
         if let Source::NotFound = leaf.source {
             return self

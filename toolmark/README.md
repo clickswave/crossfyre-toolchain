@@ -87,19 +87,22 @@ reads it), and the page the host answers for a path it does not have (`not_found
 error page that often names the server and its version). A `tls` leaf reads the
 `subject` or the `issuer` its `name` gives of the certificate the landing page's server
 presented, as RFC 4514 writes a name: unknown when none was read, and absent over plain
-HTTP. A `banner` leaf reads what toolmark's service probes read from a service its
-`name` names, `ssh` say: the version the service gave, or its greeting where it gave
-none apart. Every leaf answers present, absent or unknown, and `all`, `any` and `none`
-combine the answers, nested as deep as needed. A product is reported when its `detect`
-is present. Each leaf that holds it up adds to the confidence, 50, 45, 60, 25, 40, 50,
-50, 40, 60 and 60 by kind unless the leaf sets its own `confidence`, up to 100. The
-first `version` leaf that matches gives the version from its first group, and `vendor`
-and `product` make the CPE. A version leaf may give `since` or `until` in place of a
-group: when its evidence is present the version lies from `since` on and before `until`,
-the ranges of all such leaves that are present hold together, and an exact version, when
-one is read, wins. A `distro` list, the same shape as `version`, reads the tag of the
-distribution that built the product, as OpenSSH's banner gives it after the version,
-which says the build may carry fixes its version does not.
+HTTP. A `rendered` leaf reads the landing page as a browser built it, its script run,
+from depth tier 4, the rendered tier, up: unknown below it, and where no browser was
+found or the op goes through a proxy, which the browser cannot use. A `banner` leaf
+reads what toolmark's service probes read from a service its `name` names, `ssh` say:
+the version the service gave, or its greeting where it gave none apart. Every leaf
+answers present, absent or unknown, and `all`, `any` and `none` combine the answers,
+nested as deep as needed. A product is reported when its `detect` is present. Each leaf
+that holds it up adds to the confidence, 50, 45, 60, 25, 40, 50, 50, 40, 60, 60 and 50
+by kind unless the leaf sets its own `confidence`, up to 100. The first `version` leaf
+that matches gives the version from its first group, and `vendor` and `product` make the
+CPE. A version leaf may give `since` or `until` in place of a group: when its evidence
+is present the version lies from `since` on and before `until`, the ranges of all such
+leaves that are present hold together, and an exact version, when one is read, wins. A
+`distro` list, the same shape as `version`, reads the tag of the distribution that built
+the product, as OpenSSH's banner gives it after the version, which says the build may
+carry fixes its version does not.
 
 A `path`, a `script` or a `not_found` is a request the landing page did not need, so it
 is sent from the standard depth tier up, and only when its answer could still change
