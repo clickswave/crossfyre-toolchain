@@ -1,0 +1,36 @@
+{
+  "format": 1,
+  "sequence": 7,
+  "made": "2026-11-20T03:00:00Z",
+  "cves": {
+    "CVE-2021-41773": {"severity": "high", "score": 7.5, "kev": true, "epss": 0.944},
+    "CVE-2021-42013": {"severity": "critical", "score": 9.8, "kev": true, "epss": 0.943},
+    "CVE-2024-6387": {"severity": "high", "score": 8.1, "kev": false, "epss": 0.4},
+    "CVE-2099-0001": {"severity": "critical", "score": 9.8, "kev": true},
+    "CVE-2099-0002": {"severity": "high", "score": 7.5},
+    "CVE-2099-0011": {"severity": "medium", "score": 5.3, "kev": true},
+    "CVE-2099-0012": {"severity": "medium", "score": 6.5},
+    "CVE-2099-0013": {"severity": "critical", "score": 9.1}
+  },
+  "products": [
+    {"part": "a", "vendor": "apache", "product": "http_server", "affected": [
+      {"cve": "CVE-2021-41773", "ranges": [{"eq": "2.4.49"}]},
+      {"cve": "CVE-2021-42013", "ranges": [{"ge": "2.4.49", "le": "2.4.50"}]}
+    ]},
+    {"part": "a", "vendor": "openbsd", "product": "openssh", "affected": [
+      {"cve": "CVE-2024-6387", "ranges": [{"lt": "4.4p1"}, {"ge": "8.5p1", "lt": "9.8p1"}]}
+    ]},
+    {"part": "a", "vendor": "example", "product": "appliance_gateway", "affected": [
+      {"cve": "CVE-2099-0001", "ranges": [{"ge": "13.1", "lt": "13.1-49.13"}]},
+      {"cve": "CVE-2099-0002", "ranges": [{"ge": "13.1", "lt": "13.1-49.13"}]}
+    ]},
+    {"part": "a", "vendor": "example", "product": "appliance_controller", "affected": [
+      {"cve": "CVE-2099-0001", "ranges": [{"ge": "13.1", "lt": "13.1-49.13"}]}
+    ]},
+    {"part": "o", "vendor": "example", "product": "firewall_os", "affected": [
+      {"cve": "CVE-2099-0011", "ranges": [{"gt": "7.0", "lt": "7.4"}]},
+      {"cve": "CVE-2099-0012", "ranges": [{"eq": "7.2.4"}]},
+      {"cve": "CVE-2099-0013", "ranges": [{"ge": "7.2.0", "le": "7.2.4"}]}
+    ]}
+  ]
+}

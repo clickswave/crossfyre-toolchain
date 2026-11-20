@@ -785,6 +785,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cfx_cve"
+version = "0.0.1"
+dependencies = [
+ "flate2",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cfx_db"
 version = "0.1.0"
 dependencies = [
