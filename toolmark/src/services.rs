@@ -938,43 +938,74 @@ mod tests {
         assert_eq!(i32::from_le_bytes([m[12], m[13], m[14], m[15]]), 2013);
     }
 
-    /// A service is named by the signatures from what its probe read: an SSH server's
-    /// banner gives the product, its version and the distribution that built it, as a
-    /// technology on the service's own host and port.
+    /// A service is named by the signatures from what its probe read: the product, its
+    /// version and the distribution that built it, as a technology on the service's own
+    /// host and port, from the text the probe keeps of each protocol's greeting.
     #[tokio::test]
     async fn a_service_is_named_from_its_banner() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                let _ = stream
-                    .write_all(b"SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6\r\n")
-                    .await;
+        // What the service sends, the service it is, and the name, version and distro read.
+        type Case = (
+            &'static [u8],
+            &'static str,
+            &'static str,
+            Option<&'static str>,
+            Option<&'static str>,
+        );
+        let cases: [Case; 3] = [
+            (
+                b"SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6\r\n",
+                "ssh",
+                "OpenSSH",
+                Some("8.9p1"),
+                Some("Ubuntu-3ubuntu0.6"),
+            ),
+            (
+                b"220 ProFTPD 1.3.5e Server (Debian) [::ffff:127.0.0.1]\r\n",
+                "ftp",
+                "ProFTPD",
+                Some("1.3.5e"),
+                Some("Debian"),
+            ),
+            (
+                b"220 mail.example.test ESMTP Postfix (Ubuntu)\r\n",
+                "smtp",
+                "Postfix",
+                None,
+                Some("Ubuntu"),
+            ),
+        ];
+        for (greeting, service, name, version, distro) in cases {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let _ = stream.write_all(greeting).await;
+                }
+            });
+            let target = format!("127.0.0.1:{port}");
+            let params: SvcParams = serde_json::from_value(json!({
+                "targets": [target],
+                "timeout_ms": 1000,
+                "auth_checks": false,
+            }))
+            .unwrap();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            run(params, tx).await;
+            let mut named = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                if event["type"] == "finding" && event["data"]["type"] == "technology" {
+                    named.push(event["data"].clone());
+                }
             }
-        });
-        let target = format!("127.0.0.1:{port}");
-        let params: SvcParams = serde_json::from_value(json!({
-            "targets": [target],
-            "timeout_ms": 1000,
-            "auth_checks": false,
-        }))
-        .unwrap();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        run(params, tx).await;
-        let mut named = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            if event["type"] == "finding" && event["data"]["type"] == "technology" {
-                named.push(event["data"].clone());
-            }
+            assert_eq!(named.len(), 1, "{service}: {named:?}");
+            let found = &named[0];
+            assert_eq!(found["name"], name, "{found}");
+            assert_eq!(found["version"].as_str(), version, "{found}");
+            assert_eq!(found["distro"].as_str(), distro, "{found}");
+            assert_eq!(found["target"], target.as_str(), "{found}");
+            assert_eq!(found["port"], port, "{found}");
+            assert_eq!(found["scheme"], service, "{found}");
         }
-        assert_eq!(named.len(), 1, "{named:?}");
-        let found = &named[0];
-        assert_eq!(found["name"], "OpenSSH", "{found}");
-        assert_eq!(found["version"], "8.9p1", "{found}");
-        assert_eq!(found["distro"], "Ubuntu-3ubuntu0.6", "{found}");
-        assert_eq!(found["target"], target.as_str(), "{found}");
-        assert_eq!(found["port"], port, "{found}");
-        assert_eq!(found["scheme"], "ssh", "{found}");
     }
 
     #[test]

@@ -1,0 +1,3 @@
+# Synthetic: vsftpd's greeting, as the FTP probe keeps it.
+ftp
+vsFTPd 3.0.3

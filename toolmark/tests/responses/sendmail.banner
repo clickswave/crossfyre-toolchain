@@ -1,0 +1,3 @@
+# Synthetic: Sendmail's greeting, which names the version of the program and its configuration.
+smtp
+mail.example.test ESMTP Sendmail 8.15.2/8.15.2; Fri, 20 Nov 2026 06:00:00 GMT

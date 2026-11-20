@@ -1,0 +1,3 @@
+# Synthetic: Pure-FTPd's greeting, which runs over several lines and names no version.
+ftp
+Welcome to Pure-FTPd [privsep] [TLS] ----------..220-You are user number 1 of 50 allowed

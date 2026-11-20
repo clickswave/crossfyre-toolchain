@@ -1,0 +1,12 @@
+id: vsftpd
+info:
+  name: vsftpd
+  category: FTP Server
+  metadata:
+    vendor: vsftpd_project
+    product: vsftpd
+detect:
+  any:
+    - banner: { name: ftp, regex: 'vsFTPd' }
+version:
+  - banner: { name: ftp, regex: 'vsFTPd ([0-9]+\.[0-9]+\.[0-9]+)' }

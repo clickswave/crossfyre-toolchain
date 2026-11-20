@@ -301,6 +301,36 @@ pub(super) static FILES: &[(&str, &str)] = &[
         include_str!("../../signatures/erlang-otp-ssh.yaml"),
     ),
     ("libssh.yaml", include_str!("../../signatures/libssh.yaml")),
+    ("vsftpd.yaml", include_str!("../../signatures/vsftpd.yaml")),
+    (
+        "proftpd.yaml",
+        include_str!("../../signatures/proftpd.yaml"),
+    ),
+    (
+        "pure-ftpd.yaml",
+        include_str!("../../signatures/pure-ftpd.yaml"),
+    ),
+    (
+        "filezilla-server.yaml",
+        include_str!("../../signatures/filezilla-server.yaml"),
+    ),
+    (
+        "postfix.yaml",
+        include_str!("../../signatures/postfix.yaml"),
+    ),
+    ("exim.yaml", include_str!("../../signatures/exim.yaml")),
+    (
+        "sendmail.yaml",
+        include_str!("../../signatures/sendmail.yaml"),
+    ),
+    (
+        "opensmtpd.yaml",
+        include_str!("../../signatures/opensmtpd.yaml"),
+    ),
+    (
+        "mariadb.yaml",
+        include_str!("../../signatures/mariadb.yaml"),
+    ),
     ("java.yaml", include_str!("../../signatures/java.yaml")),
     ("python.yaml", include_str!("../../signatures/python.yaml")),
     ("nodejs.yaml", include_str!("../../signatures/nodejs.yaml")),

@@ -583,6 +583,21 @@
       "version_range": null
     }
   ],
+  "exim.banner": [
+    {
+      "candidates": [],
+      "category": "Mail Server",
+      "confidence": 60,
+      "cpe": "cpe:2.3:a:exim:exim:4.96:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "smtp banner: mail.example.test ESMTP Exim 4.96 Fri, 20 Nov 2026 06:00:00 +0000"
+      ],
+      "name": "Exim",
+      "version": "4.96",
+      "version_range": null
+    }
+  ],
   "express-cookie-session.http": [
     {
       "candidates": [],
@@ -666,6 +681,21 @@
       ],
       "name": "F5 BIG-IP",
       "version": null,
+      "version_range": null
+    }
+  ],
+  "filezilla-server.banner": [
+    {
+      "candidates": [],
+      "category": "FTP Server",
+      "confidence": 60,
+      "cpe": "cpe:2.3:a:filezilla-project:filezilla_server:1.7.0:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "ftp banner: FileZilla Server 1.7.0..220 Please visit https://filezilla-project.org"
+      ],
+      "name": "FileZilla Server",
+      "version": "1.7.0",
       "version_range": null
     }
   ],
@@ -2132,6 +2162,36 @@
       "version_range": null
     }
   ],
+  "mariadb-ubuntu.banner": [
+    {
+      "candidates": [],
+      "category": "Database",
+      "confidence": 60,
+      "cpe": "cpe:2.3:a:mariadb:mariadb:10.6.12:*:*:*:*:*:*:*",
+      "distro": "0ubuntu0.22.04.1",
+      "evidence": [
+        "mysql banner: 5.5.5-10.6.12-MariaDB-0ubuntu0.22.04.1"
+      ],
+      "name": "MariaDB",
+      "version": "10.6.12",
+      "version_range": null
+    }
+  ],
+  "mariadb.banner": [
+    {
+      "candidates": [],
+      "category": "Database",
+      "confidence": 60,
+      "cpe": "cpe:2.3:a:mariadb:mariadb:11.4.2:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "mysql banner: 11.4.2-MariaDB"
+      ],
+      "name": "MariaDB",
+      "version": "11.4.2",
+      "version_range": null
+    }
+  ],
   "minio.http": [
     {
       "candidates": [],
@@ -2433,6 +2493,21 @@
       "version_range": null
     }
   ],
+  "opensmtpd.banner": [
+    {
+      "candidates": [],
+      "category": "Mail Server",
+      "confidence": 60,
+      "cpe": "cpe:2.3:a:openbsd:opensmtpd:*:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "smtp banner: mail.example.test ESMTP OpenSMTPD"
+      ],
+      "name": "OpenSMTPD",
+      "version": null,
+      "version_range": null
+    }
+  ],
   "openssh-debian.banner": [
     {
       "candidates": [],
@@ -2590,6 +2665,51 @@
       "version_range": null
     }
   ],
+  "postfix-ubuntu.banner": [
+    {
+      "candidates": [],
+      "category": "Mail Server",
+      "confidence": 60,
+      "cpe": "cpe:2.3:a:postfix:postfix:*:*:*:*:*:*:*:*",
+      "distro": "Ubuntu",
+      "evidence": [
+        "smtp banner: mail.example.test ESMTP Postfix (Ubuntu"
+      ],
+      "name": "Postfix",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "proftpd-debian.banner": [
+    {
+      "candidates": [],
+      "category": "FTP Server",
+      "confidence": 60,
+      "cpe": "cpe:2.3:a:proftpd:proftpd:1.3.5e:*:*:*:*:*:*:*",
+      "distro": "Debian",
+      "evidence": [
+        "ftp banner: ProFTPD 1.3.5e Server (Debian) [::ffff:10.0.0.5"
+      ],
+      "name": "ProFTPD",
+      "version": "1.3.5e",
+      "version_range": null
+    }
+  ],
+  "pure-ftpd.banner": [
+    {
+      "candidates": [],
+      "category": "FTP Server",
+      "confidence": 60,
+      "cpe": "cpe:2.3:a:pureftpd:pure-ftpd:*:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "ftp banner: Welcome to Pure-FTPd [privsep] [TLS] ----------..220-You are user number 1 of 50…"
+      ],
+      "name": "Pure-FTPd",
+      "version": null,
+      "version_range": null
+    }
+  ],
   "rails.http": [
     {
       "candidates": [],
@@ -2691,6 +2811,21 @@
       ],
       "name": "ConnectWise ScreenConnect",
       "version": "23.9.7.8804",
+      "version_range": null
+    }
+  ],
+  "sendmail.banner": [
+    {
+      "candidates": [],
+      "category": "Mail Server",
+      "confidence": 60,
+      "cpe": "cpe:2.3:a:sendmail:sendmail:8.15.2:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "smtp banner: mail.example.test ESMTP Sendmail 8.15.2/8.15.2; Fri, 20 Nov 2026 06:00:00 GMT"
+      ],
+      "name": "Sendmail",
+      "version": "8.15.2",
       "version_range": null
     }
   ],
@@ -3156,6 +3291,21 @@
       ],
       "name": "VMware vCenter Server",
       "version": null,
+      "version_range": null
+    }
+  ],
+  "vsftpd.banner": [
+    {
+      "candidates": [],
+      "category": "FTP Server",
+      "confidence": 60,
+      "cpe": "cpe:2.3:a:vsftpd_project:vsftpd:3.0.3:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "ftp banner: vsFTPd 3.0.3"
+      ],
+      "name": "vsftpd",
+      "version": "3.0.3",
       "version_range": null
     }
   ],

@@ -1,0 +1,12 @@
+id: postfix
+info:
+  name: Postfix
+  category: Mail Server
+  metadata:
+    vendor: postfix
+    product: postfix
+detect:
+  any:
+    - banner: { name: smtp, regex: 'ESMTP Postfix' }
+distro:
+  - banner: { name: smtp, regex: 'ESMTP Postfix \((Ubuntu|Debian/GNU)' }

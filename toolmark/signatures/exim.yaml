@@ -1,0 +1,12 @@
+id: exim
+info:
+  name: Exim
+  category: Mail Server
+  metadata:
+    vendor: exim
+    product: exim
+detect:
+  any:
+    - banner: { name: smtp, regex: 'ESMTP Exim' }
+version:
+  - banner: { name: smtp, regex: 'ESMTP Exim ([0-9]+\.[0-9]+(?:\.[0-9]+)?)' }

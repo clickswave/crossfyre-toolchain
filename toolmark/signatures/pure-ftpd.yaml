@@ -1,0 +1,10 @@
+id: pure-ftpd
+info:
+  name: Pure-FTPd
+  category: FTP Server
+  metadata:
+    vendor: pureftpd
+    product: pure-ftpd
+detect:
+  any:
+    - banner: { name: ftp, regex: 'Pure-FTPd' }

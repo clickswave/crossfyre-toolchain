@@ -1,0 +1,10 @@
+id: opensmtpd
+info:
+  name: OpenSMTPD
+  category: Mail Server
+  metadata:
+    vendor: openbsd
+    product: opensmtpd
+detect:
+  any:
+    - banner: { name: smtp, regex: 'ESMTP OpenSMTPD' }

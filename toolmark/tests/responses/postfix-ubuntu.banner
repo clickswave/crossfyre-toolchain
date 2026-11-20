@@ -1,0 +1,3 @@
+# Synthetic: Postfix as Ubuntu configures it, which names Ubuntu after the product.
+smtp
+mail.example.test ESMTP Postfix (Ubuntu
