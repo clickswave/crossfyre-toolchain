@@ -621,8 +621,28 @@ mod tests {
                 )
                 .unwrap();
                 std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+                runs(&script);
             }
             dir
+        }
+
+        /// Wait until `program` runs. A child another test's thread was starting while it
+        /// was written holds a copy of the handle that wrote it until that child runs its
+        /// own program, and until then running this one fails as busy (ETXTBSY).
+        fn runs(program: &Path) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                match std::process::Command::new(program).output() {
+                    Ok(_) => return,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("{} does not run: {e}", program.display()),
+                }
+            }
         }
 
         fn found_on(path: &[&Path], major: Option<u32>) -> Result<Postgres, Vec<u32>> {
