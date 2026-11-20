@@ -44,6 +44,20 @@ pub async fn run(
     gate.announce("Toolmark", addr);
     dguard::exit_when_idle("toolmark");
 
+    // The CVE dataset is fetched when the copy in the data folder is a day old: now, and
+    // once a day while the daemon runs. It keeps no connection open, so the daemon still
+    // stops when it has nothing else to do.
+    let keeping = cves.clone();
+    tokio::spawn(async move {
+        loop {
+            match keeping.refresh(false).await {
+                Ok(from) => eprintln!("[toolmark] CVE leads come from {from}"),
+                Err(why) => eprintln!("[toolmark] {why}. CVE leads come from {}", keeping.from()),
+            }
+            tokio::time::sleep(crate::cve::FRESH_FOR).await;
+        }
+    });
+
     loop {
         let (stream, addr) = listener.accept().await?;
         let _ = stream.set_nodelay(true);
@@ -108,6 +122,17 @@ async fn handle_connection(
             "scans" => write_line(&mut writer, &db.scans().await).await?,
             // What it knows runs where.
             "inventory" => write_line(&mut writer, &db.inventory().await).await?,
+            // Fetch the CVE dataset now, whatever the age of the copy kept.
+            "cve_update" => {
+                let reply = match cves.refresh(true).await {
+                    Ok(from) => serde_json::json!({
+                        "status": "completed",
+                        "message": format!("CVE leads come from {from}"),
+                    }),
+                    Err(why) => serde_json::json!({"status": "error", "message": why}),
+                };
+                write_line(&mut writer, &reply).await?;
+            }
             // The signatures it has now, over the pages it kept, and nothing sent.
             "rematch" => {
                 handle_rematch(&mut writer, &db).await?;
@@ -300,6 +325,31 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, Lines};
     use tokio::net::tcp::OwnedReadHalf;
+
+    /// `toolmark cve update` asks the daemon to fetch the CVE dataset now, and is told what
+    /// happened: here, with no data folder to keep one in, why nothing was fetched.
+    #[tokio::test]
+    async fn cve_update_is_answered_with_what_happened() {
+        let dport = daemon().await;
+        let stream = TcpStream::connect(("127.0.0.1", dport))
+            .await
+            .expect("connect");
+        let (reader, mut writer) = stream.into_split();
+        writer
+            .write_all(b"{\"operation\":\"cve_update\"}\n")
+            .await
+            .expect("send");
+        let mut lines = BufReader::new(reader).lines();
+        let line = lines.next_line().await.expect("read").expect("an answer");
+        let answer: Value = serde_json::from_str(&line).expect("json");
+        assert_eq!(answer["status"], "error", "{answer}");
+        assert!(
+            answer["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("no data folder")),
+            "{answer}"
+        );
+    }
 
     /// A page that answers every request and counts them.
     async fn target() -> (u16, Arc<AtomicUsize>) {

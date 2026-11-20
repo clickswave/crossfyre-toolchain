@@ -961,6 +961,7 @@ mod tests {
         let cves = std::sync::Arc::new(crate::cve::Cves::load(
             Some(folder.path()),
             &Signatures::shipped().cpes(),
+            crate::cve::DATASET_URL,
         ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();

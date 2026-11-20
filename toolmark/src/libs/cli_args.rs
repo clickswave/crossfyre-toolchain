@@ -60,6 +60,12 @@ pub enum Commands {
     /// Run the signatures toolmark has now over the pages it kept from earlier scans, and
     /// report only what is new. Nothing is sent to any host
     Rematch,
+    /// The CVE dataset toolmark's leads come from. The daemon fetches it when its copy is
+    /// a day old
+    Cve {
+        #[command(subcommand)]
+        action: CveAction,
+    },
     /// What this engine keeps: delete one scan, old scans, or everything
     Db {
         #[command(subcommand)]
@@ -74,6 +80,13 @@ pub enum Commands {
         /// The shell to generate completions for
         shell: clap_complete::Shell,
     },
+}
+
+#[derive(Subcommand, Clone)]
+pub enum CveAction {
+    /// Fetch the CVE dataset now, whatever the age of the copy toolmark keeps, and say
+    /// what CVE leads come from
+    Update,
 }
 
 #[derive(Parser, Clone)]

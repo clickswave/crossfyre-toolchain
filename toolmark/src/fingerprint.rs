@@ -524,7 +524,7 @@ const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// The same cap for a path a signature asks for, which is held until the scan ends.
 const MAX_PATH_BYTES: usize = 1024 * 1024;
 
-async fn read_bytes_capped(mut resp: transport::Response, cap: usize) -> Vec<u8> {
+pub(crate) async fn read_bytes_capped(mut resp: transport::Response, cap: usize) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::new();
     while buf.len() < cap {
         match resp.chunk().await {
@@ -1253,7 +1253,11 @@ mod cve_lead_tests {
                 "cves": {"CVE-2099-0049": {"severity": "high", "score": 7.5}}}"#,
         )
         .unwrap();
-        let cves = crate::cve::Cves::load(Some(folder.path()), &Signatures::shipped().cpes());
+        let cves = crate::cve::Cves::load(
+            Some(folder.path()),
+            &Signatures::shipped().cpes(),
+            crate::cve::DATASET_URL,
+        );
         let found = leads(server("Apache/2.4.49 (Unix)"), &cves).await;
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0]["cve"], "CVE-2099-0049");

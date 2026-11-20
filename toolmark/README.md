@@ -56,7 +56,9 @@ go look." For actually confirming a bug, hand the target to [`plessor`](../pless
 
 Leads come from Clickswave's CVE dataset, built each day from the CVE list, NVD, CISA's
 known-exploited list, EPSS and GitHub's advisories, when toolmark has it in its data
-folder (`cve-dataset.json.gz` in the `toolmark` folder of the toolchain directory). With
+folder (`cve-dataset.json.gz` in the `toolmark` folder of the toolchain directory). The
+daemon fetches it from bins.crossfyre.io when its copy is more than a day old, as it
+starts and once a day while it runs, and `toolmark cve update` fetches it at once. With
 none there, they come from the known-exploited CVEs built into toolmark. Each lead says
 which data it came from, and one for a build a distribution made says the fix may have
 been backported.

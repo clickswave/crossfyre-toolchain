@@ -1,4 +1,4 @@
-use crate::libs::cli_args::{Cli, Commands};
+use crate::libs::cli_args::{Cli, Commands, CveAction};
 use clap::{CommandFactory, Parser};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -50,7 +50,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         // the known-exploited snapshot compiled in.
         let folder = dguard::toolchain_dir().map(|d| d.join("toolmark"));
         let names = signatures::Signatures::shipped().cpes();
-        let cves = std::sync::Arc::new(cve::Cves::load(folder.as_deref(), &names));
+        let cves =
+            std::sync::Arc::new(cve::Cves::load(folder.as_deref(), &names, cve::DATASET_URL));
         return daemon::run(cli.port, db, cves).await;
     }
 
@@ -105,6 +106,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let rows = answer["inventory"].as_array().cloned().unwrap_or_default();
             let tui = cfx_tui::wanted(cli.no_tui);
             tokio::task::spawn_blocking(move || inventory::show(&rows, tui)).await??;
+            Ok(())
+        }
+        Some(Commands::Cve {
+            action: CveAction::Update,
+        }) => {
+            let answer = dguard::answer(&daemon, "cve_update").await?;
+            println!("{}", answer["message"].as_str().unwrap_or_default());
             Ok(())
         }
         Some(Commands::Db { action }) => dguard::run_db(&daemon, &action).await,

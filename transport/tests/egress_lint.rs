@@ -73,6 +73,12 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
         1,
         "a connect scan is the measurement; the daemon refuses a proxied op",
     ),
+    (
+        "toolmark/src/cve.rs",
+        "Egress::Inherit",
+        1,
+        "the CVE dataset from bins, which is not target traffic and belongs to no op",
+    ),
 ];
 
 fn workspace() -> PathBuf {
