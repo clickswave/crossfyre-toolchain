@@ -707,6 +707,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-tungstenite",
+ "transport",
  "uuid",
 ]
 

@@ -12,6 +12,9 @@ authors = ["Clickswave <team@clickswave.org>"]
 
 [dependencies]
 serde_json = "1"
+# Whether an address a page asks for is internal, by the rules every engine's client
+# keeps.
+transport = { path = "../transport" }
 uuid = { version = "1.18.0", features = ["v4"] }
 tokio = { version = "1.47.1", features = ["rt", "macros", "io-util", "net", "process", "time"] }
 

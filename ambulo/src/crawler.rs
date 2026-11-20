@@ -1186,7 +1186,7 @@ async fn run_browser_tier(
     let mut visited = 0usize;
     let mut refused: Vec<String> = Vec::new();
     for url in &plan {
-        let Ok(v) = cfx_browser::visit(&mut cdp, url.as_str(), gate.clone()).await else {
+        let Ok(v) = cfx_browser::visit(&mut cdp, url.as_str(), gate.clone(), false).await else {
             continue;
         };
         for r in v.refused {

@@ -368,6 +368,22 @@ pub struct Visit {
 /// page's own script starts, and every frame.
 pub type Gate = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
+/// Whether a request a page makes itself is failed whatever the scope says: one that
+/// is not http or https, or names an internal address outright. A page's own data and
+/// blob URLs never leave the browser, so they are let be.
+fn refused_outright(url: &str) -> bool {
+    let Ok(u) = transport::Url::parse(url) else {
+        return true;
+    };
+    match u.scheme() {
+        "data" | "blob" => false,
+        "http" | "https" => u
+            .host_str()
+            .is_none_or(transport::guard::is_internal_literal),
+        _ => true,
+    }
+}
+
 /// Is this a request worth recording?
 ///
 /// Data and blob URLs are the page talking to itself, and the browser's own
@@ -459,8 +475,14 @@ pub struct Cdp {
     /// request waits for an answer, so it is answered the moment it is read,
     /// whichever wait reads it.
     gate: Option<Gate>,
-    /// Documents the gate refused during the current visit.
+    /// Documents the gate refused during the current visit, and requests the page made
+    /// itself that were failed.
     refused: Vec<String>,
+    /// Whether a request the page makes itself is failed when its host's name resolves
+    /// to an internal address, during the current visit.
+    block_internal: bool,
+    /// What each name a page asked for resolved to, internal or not, in this visit.
+    resolved: std::collections::HashMap<String, bool>,
 }
 
 impl Cdp {
@@ -471,11 +493,45 @@ impl Cdp {
             pending: Vec::new(),
             gate: None,
             refused: Vec::new(),
+            block_internal: false,
+            resolved: std::collections::HashMap::new(),
         }
     }
 
-    /// Answer a paused request if `v` is one: let it through or fail it, as the
-    /// gate says. Returns whether `v` was a paused request.
+    /// Whether a request the page makes itself may go out of the scope: it is http or
+    /// https to no internal address, and with `block_internal` its host's name does not
+    /// resolve to one. A name that does not resolve is refused then too.
+    async fn may_leave_scope(&mut self, url: &str) -> bool {
+        if refused_outright(url) {
+            return false;
+        }
+        if !self.block_internal {
+            return true;
+        }
+        let Some(host) = transport::Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+        else {
+            return false;
+        };
+        if let Some(internal) = self.resolved.get(&host) {
+            return !internal;
+        }
+        let internal = match tokio::net::lookup_host((host.as_str(), 0)).await {
+            Ok(addrs) => {
+                let addrs: Vec<_> = addrs.collect();
+                addrs.is_empty() || addrs.iter().any(|a| transport::guard::is_internal(&a.ip()))
+            }
+            Err(_) => true,
+        };
+        self.resolved.insert(host, internal);
+        !internal
+    }
+
+    /// Answer a paused request if `v` is one: let it through or fail it. A document goes
+    /// only where the gate says. Anything else the page asks for goes where the gate says
+    /// too, or out of the scope when [`Cdp::may_leave_scope`] lets it: a site's own CDN
+    /// loads, an internal address does not. Returns whether `v` was a paused request.
     ///
     /// The answer is sent without waiting for its reply. Nothing is waiting on
     /// that id, so the reply is read and dropped like any other stray.
@@ -491,7 +547,12 @@ impl Cdp {
             .and_then(|x| x.as_str())
             .unwrap_or("");
         // No gate means nothing was asked to be stopped.
-        let allowed = self.gate.as_ref().is_none_or(|g| g(url));
+        let in_scope = self.gate.as_ref().is_none_or(|g| g(url));
+        let document =
+            v.pointer("/params/resourceType").and_then(|x| x.as_str()) == Some("Document");
+        let url = url.to_string();
+        let allowed = in_scope || (!document && self.may_leave_scope(&url).await);
+        let url = url.as_str();
         let (method, params) = if allowed {
             ("Fetch.continueRequest", json!({"requestId": request_id}))
         } else {
@@ -681,10 +742,20 @@ pub fn requests_from(events: &[Value]) -> Vec<(String, String)> {
 ///
 /// Every document the page would load, `url` itself, each redirect hop and any
 /// frame or script navigation, is held until `gate` answers for it, and one it
-/// refuses is never requested. Requests for scripts, images and data are not
-/// gated: they are what the page itself asks for, and they are recorded.
-pub async fn visit(cdp: &mut Cdp, url: &str, gate: Gate) -> Result<Visit, String> {
+/// refuses is never requested. Everything else the page asks for itself, its
+/// scripts, images and data, goes where `gate` allows, or out of it over http or
+/// https to an address that is not internal, as a browser loading the site would
+/// load its CDNs; with `block_internal`, a name that resolves to an internal address
+/// is refused as well. All of it is recorded, and what was refused is listed.
+pub async fn visit(
+    cdp: &mut Cdp,
+    url: &str,
+    gate: Gate,
+    block_internal: bool,
+) -> Result<Visit, String> {
     cdp.gate = Some(gate);
+    cdp.block_internal = block_internal;
+    cdp.resolved.clear();
     cdp.refused.clear();
     let out = visit_gated(cdp, url).await;
     cdp.gate = None;
@@ -727,12 +798,13 @@ async fn visit_gated(cdp: &mut Cdp, url: &str) -> Result<Visit, String> {
 
     let _ = cdp.call("Network.enable", json!({}), s, NAV_TIMEOUT).await;
     let _ = cdp.call("Page.enable", json!({}), s, NAV_TIMEOUT).await;
-    // Hold every document request until the gate has answered for it. Without
-    // this the browser follows a redirect wherever it points, as a browser does.
+    // Hold every request until it has been answered for. Without this the browser
+    // follows a redirect wherever it points, and a page's own script, images and
+    // frames reach whatever address it names, the node's own network included.
     let gated = cdp
         .call(
             "Fetch.enable",
-            json!({"patterns": [{"urlPattern": "*", "resourceType": "Document", "requestStage": "Request"}]}),
+            json!({"patterns": [{"urlPattern": "*", "requestStage": "Request"}]}),
             s,
             NAV_TIMEOUT,
         )
@@ -909,6 +981,7 @@ mod tests {
             &mut cdp,
             "data:text/html,<a href=/x>x</a>",
             std::sync::Arc::new(|_: &str| true),
+            false,
         )
         .await;
         let port_file = browser.profile.join("DevToolsActivePort");
@@ -917,6 +990,126 @@ mod tests {
         let v = v.expect("visit");
         assert!(v.dom.contains("href=\"/x\""), "{}", v.dom);
         assert!(!opened_a_port, "the browser listened on a DevTools port");
+    }
+
+    /// A listener on loopback that answers every request, and counts the connections
+    /// that reach it.
+    #[cfg(unix)]
+    fn counting_listener() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = count.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { return };
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\
+                      Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        (port, count)
+    }
+
+    /// A listener on loopback that answers every request with `page`.
+    #[cfg(unix)]
+    fn page_server(page: String) -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { return };
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+                         Connection: close\r\n\r\n{page}",
+                        page.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        port
+    }
+
+    /// What a rendered page fetches itself, a script's fetch or an image, reaches no
+    /// internal address outside the scope: it is failed before it is sent, and listed
+    /// as refused. With the scope allowing them, the same page does reach them, so the
+    /// listeners are seen to count a request.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_page_reaches_no_internal_address_outside_the_scope() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let Some(exe) = find_browser() else {
+            eprintln!("no browser on PATH; skipped");
+            return;
+        };
+        let (fetched_port, fetched) = counting_listener();
+        let (image_port, imaged) = counting_listener();
+        let page = format!(
+            "<html><body><img src=\"http://127.0.0.1:{image_port}/pixel.png\">\
+             <script>fetch('http://127.0.0.1:{fetched_port}/data').catch(() => {{}});</script>\
+             </body></html>"
+        );
+        let page_url = format!("http://127.0.0.1:{}/", page_server(page));
+        let origin = page_url.clone();
+        let (browser, mut cdp) = Browser::launch(&exe, no_sandbox()).await.expect("launch");
+        let scoped: Gate = std::sync::Arc::new(move |u: &str| u.starts_with(&origin));
+        let guarded = visit(&mut cdp, &page_url, scoped, false).await;
+        let after_guarded = (fetched.load(SeqCst), imaged.load(SeqCst));
+        let open: Gate = std::sync::Arc::new(|_: &str| true);
+        let opened = visit(&mut cdp, &page_url, open, false).await;
+        let after_open = (fetched.load(SeqCst), imaged.load(SeqCst));
+        browser.shutdown().await;
+        let guarded = guarded.expect("the guarded visit");
+        opened.expect("the open visit");
+        assert_eq!(after_guarded, (0, 0), "refused: {:?}", guarded.refused);
+        for port in [fetched_port, image_port] {
+            let at = format!("127.0.0.1:{port}/");
+            assert!(
+                guarded.refused.iter().any(|u| u.contains(&at)),
+                "{at} not refused: {:?}",
+                guarded.refused
+            );
+        }
+        assert!(
+            after_open.0 > 0 && after_open.1 > 0,
+            "the open page reached the listeners {after_open:?} times, so the test cannot \
+             see a request"
+        );
+    }
+
+    /// A request a page makes itself is failed outright when it is not http or https,
+    /// or names an internal address; a page's own data and blob URLs never leave the
+    /// browser.
+    #[test]
+    fn a_subresource_is_refused_by_its_scheme_or_an_internal_address() {
+        for refused in [
+            "http://127.0.0.1:8080/data",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]/",
+            "https://10.0.0.5/app.js",
+            "ftp://cdn.example.test/file",
+            "file:///etc/passwd",
+        ] {
+            assert!(refused_outright(refused), "{refused}");
+        }
+        for allowed in [
+            "https://cdn.example.test/app.js",
+            "http://fonts.example.test/font.woff2",
+            "data:image/png;base64,AAAA",
+            "blob:https://app.example.test/0000",
+        ] {
+            assert!(!refused_outright(allowed), "{allowed}");
+        }
     }
 
     // A browser that dies at once closes its end of the pipe, which has to read as
