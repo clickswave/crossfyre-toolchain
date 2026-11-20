@@ -1,0 +1,13 @@
+id: openfire
+info:
+  name: Openfire
+  category: Messaging
+  metadata:
+    vendor: igniterealtime
+    product: openfire
+implies: [java]
+detect:
+  any:
+    - html: { regex: '<title>\s*Openfire Admin Console' }
+version:
+  - html: { regex: 'Openfire, Version: ([0-9]+(?:\.[0-9]+)*)' }

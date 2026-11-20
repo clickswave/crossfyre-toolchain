@@ -1,0 +1,16 @@
+# Synthetic: The welcome page ActiveMQ's web console serves at its root.
+HTTP/1.1 200 OK
+content-type: text/html; charset=UTF-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Apache ActiveMQ</title>
+</head>
+<body>
+<h2>Welcome to the Apache ActiveMQ!</h2>
+<a href="/admin/">Manage ActiveMQ broker</a>
+</body>
+</html>

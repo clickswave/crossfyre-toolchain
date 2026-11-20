@@ -1,0 +1,13 @@
+id: cacti
+info:
+  name: Cacti
+  category: Monitoring
+  metadata:
+    vendor: cacti
+    product: cacti
+implies: [php]
+detect:
+  any:
+    - html: { regex: '<title>\s*Login to Cacti\s*</title>' }
+version:
+  - html: { regex: 'class=.versionInfo.>Version ([0-9]+(?:\.[0-9]+)*)' }

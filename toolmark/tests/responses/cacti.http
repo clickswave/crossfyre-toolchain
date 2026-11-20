@@ -1,0 +1,16 @@
+# Synthetic: Cacti's login page, which names the version under the form.
+HTTP/1.1 200 OK
+content-type: text/html; charset=UTF-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Login to Cacti</title>
+</head>
+<body>
+<form method='post' action='index.php'></form>
+<div class='versionInfo'>Version 1.2.22 | (c) 2004-2022 - The Cacti Group</div>
+</body>
+</html>

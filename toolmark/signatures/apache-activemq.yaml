@@ -1,0 +1,12 @@
+id: apache-activemq
+info:
+  name: Apache ActiveMQ
+  category: Message Broker
+  metadata:
+    vendor: apache
+    product: activemq
+implies: [java]
+detect:
+  any:
+    - header: { name: www-authenticate, regex: 'realm="ActiveMQRealm"' }
+    - html: { regex: 'Welcome to the Apache ActiveMQ!' }

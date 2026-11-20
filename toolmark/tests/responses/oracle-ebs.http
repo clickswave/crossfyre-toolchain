@@ -1,0 +1,16 @@
+# Synthetic: Oracle E-Business Suite's login page, whose pages all come from /OA_HTML/.
+HTTP/1.1 200 OK
+content-type: text/html; charset=UTF-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Login</title>
+<link rel="stylesheet" href="/OA_HTML/cabo/styles/blaf.css">
+</head>
+<body>
+<form method="post" action="/OA_HTML/AppsLocalLogin.jsp"></form>
+</body>
+</html>

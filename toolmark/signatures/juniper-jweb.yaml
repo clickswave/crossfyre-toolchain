@@ -1,0 +1,7 @@
+id: juniper-jweb
+info:
+  name: Juniper J-Web
+  category: Network Device
+detect:
+  any:
+    - html: { regex: '<title>\s*Log In - Juniper Web Device Manager\s*</title>' }

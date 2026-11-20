@@ -1,0 +1,16 @@
+# Synthetic: The login page of Openfire's admin console, which names the version.
+HTTP/1.1 200 OK
+content-type: text/html; charset=UTF-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Openfire Admin Console</title>
+</head>
+<body>
+<form action="login.jsp" method="post"></form>
+<div id="jive-loginVersion">Openfire, Version: 4.7.4</div>
+</body>
+</html>

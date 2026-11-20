@@ -263,6 +263,27 @@ pub(super) static FILES: &[(&str, &str)] = &[
         "liferay-portal.yaml",
         include_str!("../../signatures/liferay-portal.yaml"),
     ),
+    (
+        "apache-activemq.yaml",
+        include_str!("../../signatures/apache-activemq.yaml"),
+    ),
+    (
+        "oracle-ebs.yaml",
+        include_str!("../../signatures/oracle-ebs.yaml"),
+    ),
+    (
+        "sap-netweaver.yaml",
+        include_str!("../../signatures/sap-netweaver.yaml"),
+    ),
+    (
+        "juniper-jweb.yaml",
+        include_str!("../../signatures/juniper-jweb.yaml"),
+    ),
+    ("cacti.yaml", include_str!("../../signatures/cacti.yaml")),
+    (
+        "openfire.yaml",
+        include_str!("../../signatures/openfire.yaml"),
+    ),
     ("java.yaml", include_str!("../../signatures/java.yaml")),
     ("python.yaml", include_str!("../../signatures/python.yaml")),
     ("nodejs.yaml", include_str!("../../signatures/nodejs.yaml")),

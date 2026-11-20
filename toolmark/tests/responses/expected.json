@@ -13,6 +13,58 @@
       "version_range": null
     }
   ],
+  "apache-activemq-admin.http": [
+    {
+      "candidates": [],
+      "category": "Message Broker",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:apache:activemq:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "header www-authenticate: basic realm=\"ActiveMQRealm\""
+      ],
+      "name": "Apache ActiveMQ",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Apache ActiveMQ"
+      ],
+      "name": "Java",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "apache-activemq.http": [
+    {
+      "candidates": [],
+      "category": "Message Broker",
+      "confidence": 25,
+      "cpe": "cpe:2.3:a:apache:activemq:*:*:*:*:*:*:*:*",
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "Apache ActiveMQ",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Apache ActiveMQ"
+      ],
+      "name": "Java",
+      "version": null,
+      "version_range": null
+    }
+  ],
   "apache-behind-balancer.http": [
     {
       "candidates": [],
@@ -129,6 +181,32 @@
         "body pattern"
       ],
       "name": "Bootstrap",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "cacti.http": [
+    {
+      "candidates": [],
+      "category": "Monitoring",
+      "confidence": 25,
+      "cpe": "cpe:2.3:a:cacti:cacti:1.2.22:*:*:*:*:*:*:*",
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "Cacti",
+      "version": "1.2.22",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Cacti"
+      ],
+      "name": "PHP",
       "version": null,
       "version_range": null
     }
@@ -1189,6 +1267,20 @@
       "version_range": null
     }
   ],
+  "juniper-jweb.http": [
+    {
+      "candidates": [],
+      "category": "Network Device",
+      "confidence": 25,
+      "cpe": "",
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "Juniper J-Web",
+      "version": null,
+      "version_range": null
+    }
+  ],
   "kestrel.http": [
     {
       "candidates": [],
@@ -2052,6 +2144,32 @@
       "version_range": null
     }
   ],
+  "openfire.http": [
+    {
+      "candidates": [],
+      "category": "Messaging",
+      "confidence": 25,
+      "cpe": "cpe:2.3:a:igniterealtime:openfire:4.7.4:*:*:*:*:*:*:*",
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "Openfire",
+      "version": "4.7.4",
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Openfire"
+      ],
+      "name": "Java",
+      "version": null,
+      "version_range": null
+    }
+  ],
   "openresty-error-page.http": [
     {
       "candidates": [],
@@ -2100,6 +2218,32 @@
         "implied by OpenResty"
       ],
       "name": "Nginx",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "oracle-ebs.http": [
+    {
+      "candidates": [],
+      "category": "ERP",
+      "confidence": 25,
+      "cpe": "",
+      "evidence": [
+        "body pattern"
+      ],
+      "name": "Oracle E-Business Suite",
+      "version": null,
+      "version_range": null
+    },
+    {
+      "candidates": [],
+      "category": "Implied",
+      "confidence": 30,
+      "cpe": "",
+      "evidence": [
+        "implied by Oracle E-Business Suite"
+      ],
+      "name": "Java",
       "version": null,
       "version_range": null
     }
@@ -2234,6 +2378,20 @@
       ],
       "name": "PHP",
       "version": null,
+      "version_range": null
+    }
+  ],
+  "sap-netweaver.http": [
+    {
+      "candidates": [],
+      "category": "Application Server",
+      "confidence": 50,
+      "cpe": "",
+      "evidence": [
+        "header server: SAP NetWeaver Application Server 7.50 / AS Java 7.50"
+      ],
+      "name": "SAP NetWeaver Application Server",
+      "version": "7.50",
       "version_range": null
     }
   ],

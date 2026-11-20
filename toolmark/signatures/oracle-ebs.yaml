@@ -1,0 +1,8 @@
+id: oracle-ebs
+info:
+  name: Oracle E-Business Suite
+  category: ERP
+implies: [java]
+detect:
+  any:
+    - html: { regex: '(?:src|href|action)="/OA_HTML/' }

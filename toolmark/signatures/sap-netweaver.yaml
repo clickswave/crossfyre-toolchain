@@ -1,0 +1,9 @@
+id: sap-netweaver
+info:
+  name: SAP NetWeaver Application Server
+  category: Application Server
+detect:
+  any:
+    - header: { name: server, regex: '^SAP NetWeaver Application Server' }
+version:
+  - header: { name: server, regex: '^SAP NetWeaver Application Server ([0-9]+\.[0-9]+)' }
