@@ -675,6 +675,68 @@ fn a_banner_leaf_reads_only_a_service_of_its_name() {
     assert!(page.detections().is_empty());
 }
 
+/// A `tls` leaf reads the subject or the issuer of the certificate the landing page's
+/// server presented. It is unknown where no certificate was read, and absent over plain
+/// HTTP.
+#[test]
+fn a_tls_leaf_reads_the_certificate_the_server_presented() {
+    let files = [
+        file(
+            "fake",
+            "{ tls: { name: subject, regex: 'CN=Fake Certificate' } }",
+        ),
+        file("ca", "{ tls: { name: issuer, regex: 'O=Some CA' } }"),
+    ];
+    let files: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(f, t)| (f.as_str(), t.as_str()))
+        .collect();
+    let signatures = set(&files);
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Fake Certificate");
+    params
+        .distinguished_name
+        .push(rcgen::DnType::OrganizationName, "Some CA");
+    let key = rcgen::KeyPair::generate().unwrap();
+    let der = params.self_signed(&key).unwrap().der().to_vec();
+    let answers = |host: &Host| {
+        host.outcomes()
+            .into_iter()
+            .map(|(s, o)| (s.id.clone(), o.answer, o.evidence))
+            .collect::<Vec<_>>()
+    };
+    let mut host = Host::new(&signatures, "https://host.test/", &[], &[], "", 0);
+    let unread = answers(&host);
+    assert!(
+        unread.iter().all(|(_, a, _)| *a == Answer::Unknown),
+        "{}",
+        unread.len()
+    );
+    host.certificate(&der);
+    let read = answers(&host);
+    assert_eq!(read[0].1, Answer::Present);
+    assert!(
+        read[0].2[0].starts_with("certificate subject: "),
+        "{:?}",
+        read[0].2
+    );
+    assert!(
+        read[0].2[0].contains("CN=Fake Certificate"),
+        "{:?}",
+        read[0].2
+    );
+    assert_eq!(read[1].1, Answer::Present);
+    assert!(
+        read[1].2[0].starts_with("certificate issuer: "),
+        "{:?}",
+        read[1].2
+    );
+    host.no_tls();
+    assert!(answers(&host).iter().all(|(_, a, _)| *a == Answer::Absent));
+}
+
 /// `script` reads the content of the first script the landing page loads from its own
 /// host whose `src` matches: asked for like a path, absent with no request when the page
 /// loads no such script, and unknown with no request when it comes from another host.

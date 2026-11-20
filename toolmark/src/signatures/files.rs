@@ -331,6 +331,14 @@ pub(super) static FILES: &[(&str, &str)] = &[
         "mariadb.yaml",
         include_str!("../../signatures/mariadb.yaml"),
     ),
+    (
+        "ingress-nginx.yaml",
+        include_str!("../../signatures/ingress-nginx.yaml"),
+    ),
+    (
+        "traefik.yaml",
+        include_str!("../../signatures/traefik.yaml"),
+    ),
     ("java.yaml", include_str!("../../signatures/java.yaml")),
     ("python.yaml", include_str!("../../signatures/python.yaml")),
     ("nodejs.yaml", include_str!("../../signatures/nodejs.yaml")),

@@ -147,6 +147,25 @@ enum Source {
     /// What a service probe read from a service of this name: the version it gave, or
     /// its greeting where it gives none apart.
     Banner(String),
+    /// A part of the certificate the landing page's connection presented.
+    Tls(CertPart),
+}
+
+/// The part of a certificate a `tls` leaf reads, as RFC 4514 writes a name.
+#[derive(Clone, Copy)]
+pub(crate) enum CertPart {
+    Subject,
+    Issuer,
+}
+
+/// What a host's landing page showed of a certificate.
+enum Certificate {
+    /// Not known, as for a page kept without it.
+    Unread,
+    /// The page came over plain HTTP.
+    None,
+    /// The subject and issuer of the certificate the server presented.
+    Read { subject: String, issuer: String },
 }
 
 impl Source {
@@ -469,6 +488,7 @@ impl<'a> Page<'a> {
                 .map(|(_, value)| value.as_str()),
             Source::Meta(name) => self.metas.get(name.as_str()).and_then(|c| c.as_deref()),
             Source::Html => Some(self.html),
+            Source::Tls(_) => None,
             Source::Banner(name) => self
                 .banner
                 .filter(|(service, _)| *service == name.as_str())
@@ -552,6 +572,7 @@ pub struct Host<'a> {
     /// What the host answered for the first random path, once asked.
     not_found_page: Option<Answered>,
     asked: BTreeMap<String, Answered>,
+    certificate: Certificate,
 }
 
 /// What a host is asked next.
@@ -624,7 +645,7 @@ impl<'a> Host<'a> {
         }
         let passive = leaves
             .into_iter()
-            .filter(|l| !l.source.asks())
+            .filter(|l| !l.source.asks() && !matches!(l.source, Source::Tls(_)))
             .map(|l| {
                 let found = page.found(l);
                 let answer = if found.is_some() {
@@ -644,6 +665,33 @@ impl<'a> Host<'a> {
             not_found: NotFound::Unasked,
             not_found_page: None,
             asked: BTreeMap::new(),
+            certificate: Certificate::Unread,
+        }
+    }
+
+    /// The certificate the landing page's server presented, DER encoded. One that does
+    /// not parse leaves the certificate unknown.
+    pub fn certificate(&mut self, der: &[u8]) {
+        use x509_cert::der::Decode;
+        if let Ok(cert) = x509_cert::Certificate::from_der(der) {
+            self.certificate = Certificate::Read {
+                subject: cert.tbs_certificate.subject.to_string(),
+                issuer: cert.tbs_certificate.issuer.to_string(),
+            };
+        }
+    }
+
+    /// The landing page came over plain HTTP, so there was no certificate.
+    pub fn no_tls(&mut self) {
+        self.certificate = Certificate::None;
+    }
+
+    /// The part of the certificate `part` names, when one was read.
+    fn certificate_part(&self, part: CertPart) -> Option<&str> {
+        match (&self.certificate, part) {
+            (Certificate::Read { subject, .. }, CertPart::Subject) => Some(subject),
+            (Certificate::Read { issuer, .. }, CertPart::Issuer) => Some(issuer),
+            _ => None,
         }
     }
 
@@ -709,6 +757,24 @@ impl<'a> Host<'a> {
     fn answer(&self, leaf: &Leaf) -> (Answer, Option<String>) {
         if leaf.source.tier() > self.tier {
             return (Answer::Unknown, None);
+        }
+        if let Source::Tls(part) = leaf.source {
+            if let Certificate::Unread = self.certificate {
+                return (Answer::Unknown, None);
+            }
+            return match (self.certificate_part(part), &leaf.regex) {
+                (Some(text), Some(regex)) if regex.is_match(text) => {
+                    let name = match part {
+                        CertPart::Subject => "subject",
+                        CertPart::Issuer => "issuer",
+                    };
+                    (
+                        Answer::Present,
+                        Some(format!("certificate {name}: {}", truncate(text, 80))),
+                    )
+                }
+                _ => (Answer::Absent, None),
+            };
         }
         if let Source::NotFound = leaf.source {
             let Some((status, body)) = self.not_found_page() else {
@@ -848,6 +914,9 @@ impl<'a> Host<'a> {
         }
         if let Source::ScriptSrc = leaf.source {
             return self.page.scripts.clone();
+        }
+        if let Source::Tls(part) = leaf.source {
+            return self.certificate_part(part).into_iter().collect();
         }
         if let Source::NotFound = leaf.source {
             return self

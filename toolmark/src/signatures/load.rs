@@ -1,6 +1,6 @@
 //! Reading signature files: what a file may hold, and why one is left out.
 
-use super::{Leaf, MetaFinder, Node, Range, Signature, Signatures, Source, Version};
+use super::{CertPart, Leaf, MetaFinder, Node, Range, Signature, Signatures, Source, Version};
 use regex::Regex;
 use serde::Deserialize;
 use serde_yaml::Value;
@@ -238,6 +238,7 @@ fn leaf(kind: &str, value: Value, version: bool) -> Result<Leaf, String> {
         Script,
         NotFound,
         Banner,
+        Tls,
     }
     let known = match kind {
         "header" => Kind::Header,
@@ -249,6 +250,7 @@ fn leaf(kind: &str, value: Value, version: bool) -> Result<Leaf, String> {
         "script" => Kind::Script,
         "not_found" => Kind::NotFound,
         "banner" => Kind::Banner,
+        "tls" => Kind::Tls,
         other => return Err(format!("unknown leaf `{other}`")),
     };
     let spec: LeafSpec = serde_yaml::from_value(value).map_err(|e| format!("{kind}: {e}"))?;
@@ -325,6 +327,21 @@ fn leaf(kind: &str, value: Value, version: bool) -> Result<Leaf, String> {
             let name = compile(&needs(spec.name, "a name")?)?;
             let value = spec.regex.as_deref().map(compile).transpose()?;
             (Source::Cookie(name), value, 45)
+        }
+        Kind::Tls => {
+            refuse(&spec.path, "path")?;
+            refuse(&spec.src, "src")?;
+            let part = match needs(spec.name, "a name")?.as_str() {
+                "subject" => CertPart::Subject,
+                "issuer" => CertPart::Issuer,
+                other => {
+                    return Err(format!(
+                        "a tls leaf reads the certificate's subject or issuer, not {other}"
+                    ));
+                }
+            };
+            let regex = compile(&needs(spec.regex, "a regex")?)?;
+            (Source::Tls(part), Some(regex), 60)
         }
         Kind::Banner => {
             refuse(&spec.path, "path")?;
@@ -655,6 +672,13 @@ mod tests {
                 ),
             ),
             (
+                "tls-part.yaml".into(),
+                format!(
+                    "id: tls-part\n{}",
+                    x("detect: { tls: { name: serial, regex: 'x' } }\n")
+                ),
+            ),
+            (
                 "distro-range.yaml".into(),
                 format!(
                     "id: distro-range\n{}",
@@ -732,6 +756,10 @@ mod tests {
             ("implies-left-out.yaml", "it implies implies-missing"),
             ("refines-missing.yaml", "it refines nowhere"),
             ("banner-nameless.yaml", "this banner leaf needs a name"),
+            (
+                "tls-part.yaml",
+                "reads the certificate's subject or issuer, not serial",
+            ),
             ("distro-range.yaml", "a distro leaf reads a tag"),
             ("loop-a.yaml", "comes back round to it"),
             ("loop-b.yaml", "comes back round to it"),

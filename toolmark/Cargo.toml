@@ -24,6 +24,8 @@ transport = { path = "../transport" }
 regex = "1"
 serde_yaml = "0.9"
 sha2 = "0.10"
+# Reads the subject and issuer of the certificate a server presents, for `tls` leaves.
+x509-cert = "0.2"
 cfx_db = { path = "../db" }
 sqlx = { version = "0.8.6", features = ["postgres"] }
 flate2 = "1.1"
@@ -35,6 +37,9 @@ md5 = "0.7"
 cfx_tunnel = { path = "../tunnel", features = ["recorder"] }
 # A database of a test's own, for the tests of what toolmark keeps.
 cfx_db = { path = "../db", features = ["testing"] }
+# Certificates for the `tls` leaf's tests, and a server that presents one.
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 [features]
 # First-party builds enable this to swap the scan client to wreq (BoringSSL) for

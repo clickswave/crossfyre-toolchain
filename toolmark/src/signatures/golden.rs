@@ -11,6 +11,9 @@
 //! answers a path it does not have with a 404. Those named `lab-` are pages the lab's
 //! targets served; the rest are written from what each product is publicly known to send.
 //!
+//! A `name.pem` beside `name.http` is the certificate the landing page came with, which
+//! makes it a page that came over TLS; without one it came over plain HTTP.
+//!
 //! A `name.banner` is a service rather than a page: after its `#` lines, the name a probe
 //! identified it by on one line, and what the probe read from it on the next.
 //!
@@ -33,11 +36,13 @@ struct Response {
     body: String,
 }
 
-/// A saved page: the landing page, and what its host answers for other paths.
+/// A saved page: the landing page, what its host answers for other paths, and the
+/// certificate it came with, DER encoded, when it came over TLS.
 struct Page {
     landing: Response,
     paths: BTreeMap<String, Response>,
     otherwise: Option<Response>,
+    certificate: Option<Vec<u8>>,
 }
 
 impl Page {
@@ -74,6 +79,10 @@ impl Saved {
             &r.body,
             STANDARD,
         );
+        match &page.certificate {
+            Some(der) => host.certificate(der),
+            None => host.no_tls(),
+        }
         ask(&mut host, |path, _| std::future::ready(page.answer(&path))).await;
         host
     }
@@ -156,10 +165,18 @@ fn saved() -> BTreeMap<String, Saved> {
             }
             _ => continue,
         }
+        let pem = path.with_extension("pem");
         let mut host = Page {
             landing: read(&path),
             paths: BTreeMap::new(),
             otherwise: None,
+            certificate: pem.exists().then(|| {
+                use x509_cert::der::{DecodePem, Encode};
+                let text = std::fs::read_to_string(&pem).expect("read");
+                x509_cert::Certificate::from_pem(text.as_bytes())
+                    .and_then(|c| c.to_der())
+                    .unwrap_or_else(|e| panic!("{}: {e}", pem.display()))
+            }),
         };
         let more = path.with_extension("");
         if more.is_dir() {

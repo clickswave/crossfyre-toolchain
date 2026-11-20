@@ -1116,6 +1116,21 @@
       "version_range": null
     }
   ],
+  "ingress-nginx.http": [
+    {
+      "candidates": [],
+      "category": "Reverse Proxy",
+      "confidence": 60,
+      "cpe": "cpe:2.3:a:kubernetes:ingress-nginx:*:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "certificate subject: CN=Kubernetes Ingress Controller Fake Certificate,O=Acme Co"
+      ],
+      "name": "Ingress-NGINX Controller",
+      "version": null,
+      "version_range": null
+    }
+  ],
   "ivanti-gateway.http": [
     {
       "candidates": [
@@ -3197,6 +3212,21 @@
         "cookie JSESSIONID"
       ],
       "name": "Java",
+      "version": null,
+      "version_range": null
+    }
+  ],
+  "traefik.http": [
+    {
+      "candidates": [],
+      "category": "Reverse Proxy",
+      "confidence": 60,
+      "cpe": "cpe:2.3:a:traefik:traefik:*:*:*:*:*:*:*:*",
+      "distro": null,
+      "evidence": [
+        "certificate subject: CN=TRAEFIK DEFAULT CERT"
+      ],
+      "name": "Traefik",
       "version": null,
       "version_range": null
     }

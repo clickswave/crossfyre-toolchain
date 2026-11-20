@@ -1,0 +1,8 @@
+# Synthetic: What Traefik answers for a route it does not have, under the certificate it
+# makes up when it has none for the name, in traefik.pem.
+HTTP/1.1 404 Not Found
+content-type: text/plain; charset=utf-8
+x-content-type-options: nosniff
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+404 page not found

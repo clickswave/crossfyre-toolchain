@@ -133,9 +133,12 @@ async fn scan<O: crate::observe::Observer>(
     let _ = tx.send(json!({"type":"ack","target": url}));
 
     // Fetch the landing page.
-    let (status, headers, body, cookies) = match client.get(&url).send().await {
+    let (status, headers, body, cookies, tls) = match client.get(&url).send().await {
         Ok(r) => {
             let status = r.status().as_u16();
+            // The certificate its server presented, or none when it came over plain HTTP.
+            let tls = (r.url().scheme() == "https")
+                .then(|| transport::peer_certificate(&r).map(<[u8]>::to_vec));
             let mut hdrs: Vec<(String, String)> = Vec::new();
             let mut cookies: Vec<String> = Vec::new();
             for (k, v) in r.headers().iter() {
@@ -148,7 +151,7 @@ async fn scan<O: crate::observe::Observer>(
             }
             let body =
                 String::from_utf8_lossy(&read_bytes_capped(r, MAX_BODY_BYTES).await).into_owned();
-            (status, hdrs, body, cookies)
+            (status, hdrs, body, cookies, tls)
         }
         Err(e) => {
             let _ = tx.send(json!({"type":"error","message":format!("fetch failed: {e}")}));
@@ -199,6 +202,11 @@ async fn scan<O: crate::observe::Observer>(
         &body,
         params.depth_tier,
     );
+    match &tls {
+        None => found.no_tls(),
+        Some(Some(der)) => found.certificate(der),
+        Some(None) => {}
+    }
     let base = transport::Url::parse(&url).ok();
     signatures::ask(&mut found, |path, asked| {
         let target = base.as_ref().and_then(|b| b.join(&path).ok());
@@ -635,6 +643,74 @@ mod path_tests {
             }
         });
         (port, asked)
+    }
+
+    /// The certificate the landing page's server presented reaches the signatures: a
+    /// Traefik with no certificate for the name it was asked for shows its own.
+    #[tokio::test]
+    async fn the_landing_pages_certificate_is_read() {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "TRAEFIK DEFAULT CERT");
+        let key = rcgen::KeyPair::generate().unwrap();
+        let der = params.self_signed(&key).unwrap().der().to_vec();
+        let cfg = Arc::new(
+            rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![rustls::pki_types::CertificateDer::from(der)],
+                rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+            )
+            .unwrap(),
+        );
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { return };
+                let mut conn = rustls::ServerConnection::new(Arc::clone(&cfg)).unwrap();
+                let mut tls = rustls::Stream::new(&mut conn, &mut s);
+                let mut buf = [0u8; 4096];
+                if matches!(tls.read(&mut buf), Ok(n) if n > 0) {
+                    let _ = tls.write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 18\r\n\
+                          Connection: close\r\n\r\n404 page not found",
+                    );
+                    let _ = tls.flush();
+                }
+            }
+        });
+        let params: FpParams = serde_json::from_value(json!({
+            "target": format!("https://127.0.0.1:{port}/"),
+            "evasive": false,
+            "timeout_ms": 3000,
+            "depth_tier": 0,
+            "favicon": false,
+        }))
+        .unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        scan(Signatures::shipped(), params, tx, Arc::new(Nowhere)).await;
+        let mut named = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if event.pointer("/data/type") == Some(&json!("technology")) {
+                named.push((
+                    event["data"]["name"].clone(),
+                    event["data"]["evidence"].clone(),
+                ));
+            }
+        }
+        assert_eq!(
+            named,
+            [(
+                json!("Traefik"),
+                json!(["certificate subject: CN=TRAEFIK DEFAULT CERT"])
+            )]
+        );
     }
 
     /// Framework A is three files. Framework B refines it: the same three and a fourth.
