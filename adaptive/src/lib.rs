@@ -44,7 +44,7 @@ pub mod wire;
 
 pub use challenge::{Challenge, Reaction};
 pub use congestion::{
-    Decision, Estimator, Limits, Outcome, Sample, WINDOW_MS, Window, decide as congestion_decide,
+    Decision, Estimator, Limits, Outcome, Sample, Window, decide as congestion_decide,
 };
 pub use health::{HealthStats, HealthWindow, ProbeClass};
 pub use rate::{Caps, Directive, Posture, PostureParams, RateController, score};

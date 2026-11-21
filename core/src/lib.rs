@@ -216,7 +216,7 @@ impl TargetPace {
             w.record(class, 0);
         }
         let n = self.since_tick.fetch_add(1, Ordering::Relaxed) + 1;
-        if n >= adaptive::coord::TICK_EVERY {
+        if n >= adaptive::coord::tick_every() {
             self.since_tick.store(0, Ordering::Relaxed);
             let stats = { self.window.lock().unwrap().stats() };
             let dir = { self.controller.lock().unwrap().tick(&stats) };

@@ -8,6 +8,7 @@
 
 use crate::health::HealthStats;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 
 /// How aggressive the controller is allowed to be. In this baseline the postures
 /// share one profile; the private build resolves each to its own tuning.
@@ -36,33 +37,98 @@ impl Posture {
 
     /// The controller constants this posture resolves to. Baseline: one generic,
     /// conservative profile of round placeholder values for all postures (the
-    /// tuned per-posture tables live in the private drop-in).
+    /// tuned per-posture tables live in the private drop-in). A module's are held
+    /// to bounds that keep the controller backing off under stress.
     pub fn params(self) -> PostureParams {
-        PostureParams {
-            healthy_wm: 0.75,
-            stressed_wm: 0.50,
-            inc: 1.0,
-            dec: 0.5,
-            ss_growth: 1.5,
-            ss_exit_frac: 0.5,
-            delay_step_ms: 100,
-            delay_relief_ms: 50,
-            w_rl: 0.25,
-            w_se: 0.25,
-            w_to: 0.25,
-            w_lat: 0.25,
-            rl_ref: 0.10,
-            se_ref: 0.10,
-            to_ref: 0.10,
-            lat_ref: 2.0,
-            max_retries: 3,
+        #[derive(Serialize)]
+        struct Ask {
+            posture: Posture,
         }
+        static KEPT: [OnceLock<Option<PostureParams>>; 3] = [
+            const { OnceLock::new() },
+            const { OnceLock::new() },
+            const { OnceLock::new() },
+        ];
+        let kept = match self {
+            Posture::Stealth => &KEPT[0],
+            Posture::Balanced => &KEPT[1],
+            Posture::Throughput => &KEPT[2],
+        };
+        crate::backend::ask_once(kept, "rate.params", &Ask { posture: self }, held).unwrap_or(
+            PostureParams {
+                healthy_wm: 0.75,
+                stressed_wm: 0.50,
+                inc: 1.0,
+                dec: 0.5,
+                ss_growth: 1.5,
+                ss_exit_frac: 0.5,
+                delay_step_ms: 100,
+                delay_relief_ms: 50,
+                w_rl: 0.25,
+                w_se: 0.25,
+                w_to: 0.25,
+                w_lat: 0.25,
+                rl_ref: 0.10,
+                se_ref: 0.10,
+                to_ref: 0.10,
+                lat_ref: 2.0,
+                max_retries: 3,
+            },
+        )
     }
+}
+
+/// A module's constants, held to bounds: every number finite, the watermarks in
+/// order, a decrease that always decreases and a delay step that always slows, the
+/// weights and references in range, and at most ten retries. None when a number is
+/// not finite.
+fn held(a: PostureParams) -> Option<PostureParams> {
+    let reals = [
+        a.healthy_wm,
+        a.stressed_wm,
+        a.inc,
+        a.dec,
+        a.ss_growth,
+        a.ss_exit_frac,
+        a.w_rl,
+        a.w_se,
+        a.w_to,
+        a.w_lat,
+        a.rl_ref,
+        a.se_ref,
+        a.to_ref,
+        a.lat_ref,
+    ];
+    if !reals.iter().all(|x| x.is_finite()) {
+        return None;
+    }
+    let healthy_wm = a.healthy_wm.clamp(0.0, 1.0);
+    let weight = |w: f64| w.clamp(0.0, 1.0);
+    let reference = |r: f64| r.clamp(0.001, 100.0);
+    Some(PostureParams {
+        healthy_wm,
+        stressed_wm: a.stressed_wm.clamp(0.0, healthy_wm),
+        inc: a.inc.clamp(0.0, 16.0),
+        dec: a.dec.clamp(0.1, 0.9),
+        ss_growth: a.ss_growth.clamp(1.0, 4.0),
+        ss_exit_frac: a.ss_exit_frac.clamp(0.0, 1.0),
+        delay_step_ms: a.delay_step_ms.clamp(1, 10_000),
+        delay_relief_ms: a.delay_relief_ms.min(10_000),
+        w_rl: weight(a.w_rl),
+        w_se: weight(a.w_se),
+        w_to: weight(a.w_to),
+        w_lat: weight(a.w_lat),
+        rl_ref: reference(a.rl_ref),
+        se_ref: reference(a.se_ref),
+        to_ref: reference(a.to_ref),
+        lat_ref: reference(a.lat_ref),
+        max_retries: a.max_retries.min(10),
+    })
 }
 
 /// The controller constants a [`Posture`] resolves to. `*_ref` values are the
 /// rate/ratio at which that penalty term is considered "fully bad".
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct PostureParams {
     pub healthy_wm: f64,
     pub stressed_wm: f64,

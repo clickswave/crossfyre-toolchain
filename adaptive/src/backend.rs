@@ -59,10 +59,44 @@ pub fn pacing() -> Pacing {
     }
 }
 
+/// Whether a module is installed.
+pub(crate) fn installed() -> bool {
+    BACKEND.get().is_some()
+}
+
 /// The installed module's answer to `op` for `input`, read as `O`, or None.
 pub(crate) fn ask<I: Serialize, O: DeserializeOwned>(op: &str, input: &I) -> Option<O> {
     let backend = BACKEND.get()?;
     let asked = serde_json::to_vec(input).ok()?;
     let answer = backend.call(op, &asked)?;
     serde_json::from_slice(&answer).ok()
+}
+
+/// The answer to a call whose answer cannot change within a process, as `held` keeps
+/// it: asked once a module is installed, then kept, the refusal included. Without a
+/// module nothing is asked or kept, so one installed later is still asked.
+pub(crate) fn ask_once<I: Serialize, A: DeserializeOwned, O: Clone>(
+    kept: &OnceLock<Option<O>>,
+    op: &str,
+    input: &I,
+    held: impl FnOnce(A) -> Option<O>,
+) -> Option<O> {
+    if !installed() {
+        return None;
+    }
+    kept.get_or_init(|| ask(op, input).and_then(held)).clone()
+}
+
+/// A header name a module may give: an HTTP token of at most 64 characters.
+pub(crate) fn is_header_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
+/// A header value a module may give: printable ASCII, spaces and tabs, no line
+/// breaks, at most 1024 bytes.
+pub(crate) fn is_header_value(s: &str) -> bool {
+    s.len() <= 1024 && s.bytes().all(|b| b == b'\t' || (b' '..=b'~').contains(&b))
 }

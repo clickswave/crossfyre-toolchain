@@ -52,9 +52,22 @@ impl Default for Limits {
     }
 }
 
+/// The control window length, in milliseconds.
+const WINDOW_MS: u64 = 500;
+
 /// The control window length, in milliseconds. The engine ticks the loop on this
-/// cadence.
-pub const WINDOW_MS: u64 = 500;
+/// cadence. A module's is held to 100 ms to 5 s.
+pub fn window_ms() -> u64 {
+    #[derive(serde::Deserialize)]
+    struct Answer {
+        window_ms: u64,
+    }
+    static KEPT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    crate::backend::ask_once(&KEPT, "congestion.params", &(), |a: Answer| {
+        Some(a.window_ms.clamp(100, 5_000))
+    })
+    .unwrap_or(WINDOW_MS)
+}
 
 /// One window's raw counts, filled by the engine from its accumulators.
 pub struct Window {
