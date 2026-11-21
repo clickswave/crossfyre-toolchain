@@ -1,4 +1,5 @@
 use crate::fingerprint::{self, FpParams};
+use crate::knowledge::{Knowledge, Known};
 use crate::libs::toolmark_db::ToolmarkDb;
 use cfx_db::scans::Status;
 use serde::Deserialize;
@@ -34,7 +35,7 @@ fn parse_request(line: &str) -> Result<DaemonRequest, String> {
 pub async fn run(
     port: u16,
     db: ToolmarkDb,
-    cves: std::sync::Arc<crate::cve::Cves>,
+    knowledge: std::sync::Arc<Knowledge>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Loopback unless an operator opts out: this channel has no per-request
     // credential of its own, so the bind address is the boundary.
@@ -44,28 +45,16 @@ pub async fn run(
     gate.announce("Toolmark", addr);
     dguard::exit_when_idle("toolmark");
 
-    // The CVE dataset is fetched when the copy in the data folder is a day old: now, and
-    // once a day while the daemon runs. It keeps no connection open, so the daemon still
-    // stops when it has nothing else to do.
-    let keeping = cves.clone();
-    tokio::spawn(async move {
-        loop {
-            match keeping.refresh(false).await {
-                Ok(from) => eprintln!("[toolmark] CVE leads come from {from}"),
-                Err(why) => eprintln!("[toolmark] {why}. CVE leads come from {}", keeping.from()),
-            }
-            tokio::time::sleep(crate::cve::FRESH_FOR).await;
-        }
-    });
+    eprintln!("[toolmark] {}", knowledge.now().said());
 
     loop {
         let (stream, addr) = listener.accept().await?;
         let _ = stream.set_nodelay(true);
         let gate_clone = gate.clone();
         let db = db.clone();
-        let cves = cves.clone();
+        let knowledge = knowledge.clone();
         dguard::spawn_busy(async move {
-            if let Err(e) = handle_connection(stream, gate_clone, db, cves).await {
+            if let Err(e) = handle_connection(stream, gate_clone, db, knowledge).await {
                 eprintln!("Connection error from {addr}: {e}");
             }
         });
@@ -76,7 +65,7 @@ async fn handle_connection(
     stream: TcpStream,
     gate: dguard::Gate,
     db: ToolmarkDb,
-    cves: std::sync::Arc<crate::cve::Cves>,
+    knowledge: std::sync::Arc<Knowledge>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -109,29 +98,30 @@ async fn handle_connection(
 
         match req.operation.as_str() {
             "fingerprint" => {
-                handle_fingerprint(req.params, req.egress, &mut writer, &db, cves).await?;
+                let known = knowledge.now();
+                handle_fingerprint(req.params, req.egress, &mut writer, &db, known).await?;
                 return Ok(());
             }
             // Non-HTTP service identification: what is really listening on a
             // port, and whether it lets anyone in.
             "services" => {
-                handle_services(req.params, req.egress, &mut writer, &db, cves).await?;
+                let known = knowledge.now();
+                handle_services(req.params, req.egress, &mut writer, &db, known).await?;
                 return Ok(());
             }
             // The scans this daemon keeps, the latest first.
             "scans" => write_line(&mut writer, &db.scans().await).await?,
             // What it knows runs where.
             "inventory" => {
-                let answer = crate::inventory::with_leads(db.inventory().await, &cves);
+                let answer = crate::inventory::with_leads(db.inventory().await, &knowledge.now());
                 write_line(&mut writer, &answer).await?
             }
-            // Fetch the CVE dataset now, whatever the age of the copy kept.
-            "cve_update" => {
-                let reply = match cves.refresh(true).await {
-                    Ok(from) => serde_json::json!({
-                        "status": "completed",
-                        "message": format!("CVE leads come from {from}"),
-                    }),
+            // Read the pack and the CVE dataset in the toolchain directory again, as
+            // `crossfyre update` asks after it writes new ones. A scan running goes on
+            // with what it started with.
+            "reload" => {
+                let reply = match knowledge.reload().await {
+                    Ok(said) => serde_json::json!({"status": "completed", "message": said}),
                     Err(why) => serde_json::json!({"status": "error", "message": why}),
                 };
                 write_line(&mut writer, &reply).await?;
@@ -139,7 +129,7 @@ async fn handle_connection(
             // The signatures and CVE data it has now, over the pages and products it
             // kept, and nothing sent.
             "rematch" => {
-                handle_rematch(&mut writer, &db, cves).await?;
+                handle_rematch(&mut writer, &db, knowledge.now()).await?;
                 return Ok(());
             }
             "resume" => {
@@ -207,7 +197,7 @@ async fn handle_fingerprint(
     egress: transport::Egress,
     writer: &mut OwnedWriteHalf,
     db: &ToolmarkDb,
-    cves: std::sync::Arc<crate::cve::Cves>,
+    known: std::sync::Arc<Known>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let fp: FpParams = match serde_json::from_value(params.clone()) {
         Ok(p) => FpParams { egress, ..p },
@@ -228,7 +218,7 @@ async fn handle_fingerprint(
     let observer = std::sync::Arc::new(db.observer(scan.as_ref(), &params));
     let (tx, rx) = mpsc::unbounded_channel::<Value>();
     let op = dguard::spawn_busy(async move {
-        fingerprint::run(fp, tx, observer, cves).await;
+        fingerprint::run(fp, tx, observer, known).await;
     });
     forward(op, rx, writer, db, scan).await
 }
@@ -238,7 +228,7 @@ async fn handle_fingerprint(
 async fn handle_rematch(
     writer: &mut OwnedWriteHalf,
     db: &ToolmarkDb,
-    cves: std::sync::Arc<crate::cve::Cves>,
+    known: std::sync::Arc<Known>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let scan = db
         .start("rematch", "the pages toolmark kept", &serde_json::json!({}))
@@ -246,7 +236,7 @@ async fn handle_rematch(
     let (tx, rx) = mpsc::unbounded_channel::<Value>();
     let kept = db.clone();
     let op = dguard::spawn_busy(async move {
-        crate::rematch::run(&kept, crate::signatures::Signatures::shipped(), tx, &cves).await;
+        crate::rematch::run(&kept, &known, tx).await;
     });
     forward(op, rx, writer, db, scan).await
 }
@@ -285,7 +275,7 @@ async fn handle_services(
     egress: transport::Egress,
     writer: &mut OwnedWriteHalf,
     db: &ToolmarkDb,
-    cves: std::sync::Arc<crate::cve::Cves>,
+    known: std::sync::Arc<Known>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let sp: crate::services::SvcParams = match serde_json::from_value(params.clone()) {
         Ok(p) => crate::services::SvcParams { egress, ..p },
@@ -305,7 +295,7 @@ async fn handle_services(
     let scan = db.start("services", &sp.targets.join(", "), &params).await;
     let (tx, rx) = mpsc::unbounded_channel::<Value>();
     let op = dguard::spawn_busy(async move {
-        crate::services::run(sp, tx, cves).await;
+        crate::services::run(sp, tx, known).await;
     });
     forward(op, rx, writer, db, scan).await
 }
@@ -331,27 +321,26 @@ mod tests {
     use tokio::io::{AsyncReadExt, Lines};
     use tokio::net::tcp::OwnedReadHalf;
 
-    /// `toolmark cve update` asks the daemon to fetch the CVE dataset now, and is told what
-    /// happened: here, with no data folder to keep one in, why nothing was fetched.
+    /// `reload`, as `crossfyre update` sends it after it writes new data, reads the
+    /// toolchain directory again and says what toolmark knows now.
     #[tokio::test]
-    async fn cve_update_is_answered_with_what_happened() {
+    async fn reload_is_answered_with_what_is_known_now() {
         let dport = daemon().await;
         let stream = TcpStream::connect(("127.0.0.1", dport))
             .await
             .expect("connect");
         let (reader, mut writer) = stream.into_split();
         writer
-            .write_all(b"{\"operation\":\"cve_update\"}\n")
+            .write_all(b"{\"operation\":\"reload\"}\n")
             .await
             .expect("send");
         let mut lines = BufReader::new(reader).lines();
         let line = lines.next_line().await.expect("read").expect("an answer");
         let answer: Value = serde_json::from_str(&line).expect("json");
-        assert_eq!(answer["status"], "error", "{answer}");
-        assert!(
-            answer["message"]
-                .as_str()
-                .is_some_and(|m| m.contains("no data folder")),
+        assert_eq!(answer["status"], "completed", "{answer}");
+        assert_eq!(
+            answer["message"],
+            Knowledge::load(None).now().said(),
             "{answer}"
         );
     }
@@ -405,7 +394,7 @@ mod tests {
                     stream,
                     dguard::Gate::default(),
                     ToolmarkDb::unconnected(),
-                    crate::cve::snapshot_for_tests(),
+                    std::sync::Arc::new(Knowledge::load(None)),
                 ));
             }
         });
@@ -669,7 +658,7 @@ mod http_request_tests {
                     stream,
                     dguard::Gate::default(),
                     ToolmarkDb::unconnected(),
-                    crate::cve::snapshot_for_tests(),
+                    std::sync::Arc::new(Knowledge::load(None)),
                 ));
             }
         });

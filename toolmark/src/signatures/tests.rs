@@ -33,7 +33,7 @@ fn the_compiled_set_is_the_signatures_folder() {
         names, included,
         "each entry is named after the file it includes"
     );
-    let (signatures, skipped) = load::load(files::FILES);
+    let (signatures, skipped) = load::load(files::FILES, &crate::knowledge::compiled_stamps());
     assert!(skipped.is_empty(), "{skipped:#?}");
     assert_eq!(signatures.list.len(), files::FILES.len());
 }
@@ -60,22 +60,6 @@ fn a_stamp_table_line_that_is_not_one_says_why() {
     );
 }
 
-/// A folder's .yaml files load as the compiled set does, and a file that does not is
-/// named with why.
-#[test]
-fn a_folder_of_signatures_loads_and_names_what_it_left_out() {
-    let dir = tempfile::tempdir().unwrap();
-    let (good, text) = file("acme", "{ header: { name: server, regex: acme } }");
-    std::fs::write(dir.path().join(good), text).unwrap();
-    std::fs::write(dir.path().join("broken.yaml"), "id: [").unwrap();
-    std::fs::write(dir.path().join("notes.txt"), "id: [").unwrap();
-    let (signatures, skipped) = load_dir(dir.path()).unwrap();
-    assert_eq!(signatures.list.len(), 1);
-    assert_eq!(signatures.list[0].id, "acme");
-    assert_eq!(skipped.len(), 1, "{skipped:?}");
-    assert!(skipped[0].starts_with("broken.yaml: "), "{skipped:?}");
-}
-
 #[test]
 fn a_cpe_escapes_what_its_formatted_string_escapes() {
     assert_eq!(cpe_value("joomla!"), "joomla\\!");
@@ -86,7 +70,7 @@ fn a_cpe_escapes_what_its_formatted_string_escapes() {
 
 /// Signatures from `files`, which must all load.
 fn set(files: &[(&str, &str)]) -> Signatures {
-    let (signatures, skipped) = load::load(files);
+    let (signatures, skipped) = load::load(files, &crate::knowledge::compiled_stamps());
     assert!(skipped.is_empty(), "{skipped:#?}");
     signatures
 }
@@ -215,7 +199,7 @@ fn only_the_leaves_that_hold_a_detection_count_for_it() {
         .iter()
         .map(|(f, t)| (f.as_str(), t.as_str()))
         .collect();
-    let (_, skipped) = load::load(&files);
+    let (_, skipped) = load::load(&files, &crate::knowledge::compiled_stamps());
     // A confidence goes inside the leaf's own map.
     assert!(skipped[0].contains("map with one key"), "{skipped:?}");
 

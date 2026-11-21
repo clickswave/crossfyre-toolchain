@@ -23,7 +23,7 @@
 //! `TOOLMARK_GOLDEN=write cargo test -p toolmark golden`, and the diff of
 //! `expected.json` is then the change to review.
 
-use super::{Answer, Answered, Detection, Host, RENDERED, Signatures, ask};
+use super::{Answer, Answered, Detection, Host, RENDERED, ask};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -70,12 +70,16 @@ impl Saved {
         let page = match self {
             Saved::Page(page) => page,
             Saved::Service { name, text } => {
-                return Host::service(Signatures::shipped(), name, text);
+                return Host::service(
+                    crate::knowledge::compiled_signatures_for_tests(),
+                    name,
+                    text,
+                );
             }
         };
         let r = &page.landing;
         let mut host = Host::new(
-            Signatures::shipped(),
+            crate::knowledge::compiled_signatures_for_tests(),
             "http://saved.test/",
             &r.headers,
             &r.cookies,
@@ -286,7 +290,7 @@ async fn the_saved_responses_exercise_every_leaf() {
         hosts.push(s.host().await);
     }
     let mut missing = Vec::new();
-    for signature in &Signatures::shipped().list {
+    for signature in &crate::knowledge::compiled_signatures_for_tests().list {
         let Some(detect) = &signature.detect else {
             continue;
         };

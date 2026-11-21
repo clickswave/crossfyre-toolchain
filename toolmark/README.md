@@ -58,18 +58,20 @@ go look." For actually confirming a bug, hand the target to [`plessor`](../pless
 
 Leads come from Clickswave's CVE dataset, built each day from the CVE list, NVD, CISA's
 known-exploited list, EPSS and GitHub's advisories, when toolmark has it in its data
-folder (`cve-dataset.json.gz` in the `toolmark` folder of the toolchain directory). The
-daemon fetches it from bins.crossfyre.io when its copy is more than a day old, as it
-starts and once a day while it runs, and `toolmark cve update` fetches it at once. With
-none there, they come from the known-exploited CVEs built into toolmark. Each lead says
-which data it came from, and one for a build a distribution made says the fix may have
-been backported.
+folder (`cve-dataset.json.gz` in the `toolmark` folder of the toolchain directory), where
+`crossfyre update` puts it. With none there, they come from the known-exploited CVEs
+built into toolmark. toolmark fetches nothing itself: the daemon reads what is there as
+it starts, and again when `crossfyre update` tells it to. Each lead says which data it
+came from, and one for a build a distribution made says the fix may have been
+backported.
 
 ## Signatures
 
 Each product toolmark knows is a file in [`signatures/`](signatures/), compiled into the
-binary. A file says what shows the product, where its version can be read, and what
-else it implies:
+binary, a copy of crossfyre-templates' `toolmark/` folder. A later pack of that repo,
+which `crossfyre update` puts in the toolchain directory, takes the copy's place once
+every file in it loads. A file says what shows the product, where its version can be
+read, and what else it implies:
 
 ```yaml
 id: wordpress

@@ -1021,16 +1021,136 @@ pub static BUILTIN: LazyLock<Vec<Template>> = LazyLock::new(|| {
 mod pack;
 use pack::PACK_YAML;
 
-/// The starter pack in templates/, compiled in. Parsed with the same rules as
-/// `load_dir`, so a file that does not parse, or carries no request, is skipped
-/// here exactly as it would be from disk.
-pub static PACK: LazyLock<Vec<Template>> = LazyLock::new(|| {
-    PACK_YAML
-        .iter()
-        .filter_map(|(_, y)| Template::parse(y))
-        .filter(|t| !t.http.is_empty())
-        .collect()
-});
+/// The pack's templates plessor runs beside its built-in checks, crossfyre-templates'
+/// plessor folder, and where they come from. A release compiles in a copy (templates/),
+/// and the pack `crossfyre update` puts in the toolchain directory takes its place when it
+/// is later and every template in it reads.
+pub struct Pack {
+    pub templates: Vec<Template>,
+    pub from: String,
+}
+
+/// The templates in `files`, by path and text, or each one that plessor would not run:
+/// all of them read, or none is used.
+fn read_pack(files: &[(&str, &str)]) -> Result<Vec<Template>, Vec<String>> {
+    let mut problems = Vec::new();
+    let mut templates = Vec::new();
+    for (path, text) in files {
+        match Template::parse(text) {
+            Some(t) if !t.http.is_empty() => templates.push(t),
+            Some(_) => problems.push(format!("{path}: it has no request")),
+            None => problems.push(format!("{path}: it is not a template plessor reads")),
+        }
+    }
+    if problems.is_empty() {
+        Ok(templates)
+    } else {
+        Err(problems)
+    }
+}
+
+/// The first seven characters of a commit, as it is named in a log.
+fn short(commit: &str) -> &str {
+    commit.get(..7).unwrap_or(commit)
+}
+
+impl Pack {
+    /// The pack in the toolchain directory `dir` when there is one to use, else the copy
+    /// compiled in. One there that is not used says why.
+    pub fn load(dir: Option<&std::path::Path>) -> Self {
+        dir.and_then(Self::from_dir).unwrap_or_else(Self::compiled)
+    }
+
+    /// The copy compiled in.
+    pub fn compiled() -> Self {
+        let templates = read_pack(PACK_YAML).unwrap_or_else(|problems| {
+            panic!("the templates compiled into plessor read, as their test shows: {problems:?}")
+        });
+        let from = format!(
+            "crossfyre-templates {} ({}), compiled in",
+            cfx_pack::COMPILED.sequence,
+            short(cfx_pack::COMPILED.commit)
+        );
+        Self { templates, from }
+    }
+
+    fn from_dir(dir: &std::path::Path) -> Option<Self> {
+        let path = cfx_pack::path_in(dir);
+        let pack = match cfx_pack::installed(dir) {
+            Ok(Some(pack)) => pack,
+            Ok(None) => return None,
+            Err(e) => {
+                eprintln!("[plessor] the pack at {} is not used: {e}", path.display());
+                return None;
+            }
+        };
+        if !pack.replaces_compiled() {
+            eprintln!(
+                "[plessor] the pack at {} is {} {}, which is no later than the copy compiled in, {}",
+                path.display(),
+                pack.name(),
+                pack.sequence(),
+                cfx_pack::COMPILED.sequence
+            );
+            return None;
+        }
+        let files: Vec<(&str, &str)> = pack.files_in("plessor").collect();
+        match read_pack(&files) {
+            Ok(templates) => Some(Self {
+                templates,
+                from: format!(
+                    "crossfyre-templates {} ({}), from {}",
+                    pack.sequence(),
+                    short(pack.commit()),
+                    path.display()
+                ),
+            }),
+            Err(problems) => {
+                eprintln!(
+                    "[plessor] the pack at {} is not used, as not all of it reads:",
+                    path.display()
+                );
+                for problem in problems {
+                    eprintln!("[plessor]   {problem}");
+                }
+                None
+            }
+        }
+    }
+}
+
+/// The pack the daemon runs now, and where it reads it again from.
+pub struct Packs {
+    dir: Option<std::path::PathBuf>,
+    now: std::sync::RwLock<std::sync::Arc<Pack>>,
+}
+
+impl Packs {
+    /// What is in the toolchain directory `dir`, or compiled in.
+    pub fn load(dir: Option<&std::path::Path>) -> Self {
+        Self {
+            dir: dir.map(std::path::Path::to_path_buf),
+            now: std::sync::RwLock::new(std::sync::Arc::new(Pack::load(dir))),
+        }
+    }
+
+    /// The pack now. A scan takes it once, as it starts.
+    pub fn now(&self) -> std::sync::Arc<Pack> {
+        self.now.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Read the toolchain directory again, and say where the templates come from now.
+    /// What a scan already took stays as it was.
+    pub async fn reload(&self) -> Result<String, String> {
+        let dir = self.dir.clone();
+        let pack = tokio::task::spawn_blocking(move || Pack::load(dir.as_deref()))
+            .await
+            .map_err(|e| format!("nothing was read again: {e}"))?;
+        let said = format!("templates from {}", pack.from);
+        *self.now.write().unwrap_or_else(|e| e.into_inner()) = std::sync::Arc::new(pack);
+        Ok(said)
+    }
+}
 
 /// Load external nuclei templates (*.yaml / *.yml) from a directory, recursing
 /// into subdirectories so a categorized pack (exposures/, cves/, panels/,
@@ -1259,7 +1379,7 @@ pub fn class_from_tags(tags: &str, template_id: &str, category: &str) -> String 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #[test]
     fn template_class_comes_from_tags() {
         use super::class_from_tags;
@@ -1330,11 +1450,12 @@ mod tests {
         );
         assert_eq!(super::PACK_YAML.len(), walk_yaml(std::path::Path::new(dir)));
         let mut on_disk: Vec<String> = super::load_dir(dir).into_iter().map(|t| t.id).collect();
-        let mut compiled: Vec<String> = super::PACK.iter().map(|t| t.id.clone()).collect();
+        let pack = super::Pack::compiled();
+        let mut compiled: Vec<String> = pack.templates.iter().map(|t| t.id.clone()).collect();
         on_disk.sort();
         compiled.sort();
         assert_eq!(compiled, on_disk);
-        for t in super::PACK.iter() {
+        for t in &pack.templates {
             assert!(
                 !super::BUILTIN.iter().any(|b| b.id == t.id),
                 "pack template {} has a built-in check's id",
@@ -1525,7 +1646,9 @@ mod tests {
         // A client carrying a credential or an attribution token gets a redirect
         // to another host back unfollowed, so the template has to read the
         // redirect itself as well as the page it lands on.
-        let t = super::PACK
+        let pack = super::Pack::compiled();
+        let t = pack
+            .templates
             .iter()
             .find(|t| t.id == "open-redirect-param")
             .expect("open-redirect template in the pack");
@@ -1642,6 +1765,75 @@ mod tests {
         assert!(problems[2].starts_with("misc/f.yaml: it names a vendor or a product alone"));
         // Without the names, only the templates themselves are checked.
         assert_eq!(super::check_dir(&dir, None).len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A template that fires on any page that says ok, for the pack tests.
+    pub(crate) const ACME_PROBE: (&str, &str) = (
+        "plessor/misconfigurations/acme-probe.yaml",
+        "id: acme-probe\ninfo:\n  name: Acme probe\n  severity: info\n  metadata:\n    \
+         category: misconfigurations\nhttp:\n  - method: GET\n    path:\n      - \
+         \"{{BaseURL}}/acme-probe\"\n    matchers-condition: and\n    matchers:\n      - \
+         type: word\n        words:\n          - ok\n      - type: status\n        status:\n          \
+         - 200\n",
+    );
+
+    /// A pack numbered `sequence` of the templates compiled in, with `extra` added, put
+    /// where `crossfyre update` keeps it in the toolchain directory `dir`.
+    pub(crate) fn install_pack(dir: &std::path::Path, sequence: u64, extra: &[(&str, &str)]) {
+        let mut files = serde_json::Map::new();
+        for (path, text) in super::PACK_YAML.iter().chain(extra) {
+            let path = path.strip_prefix("plessor/").unwrap_or(path);
+            files.insert(format!("plessor/{path}"), serde_json::json!(text));
+        }
+        let pack = serde_json::json!({"format": 1, "name": cfx_pack::NAME, "sequence": sequence,
+            "made": "2026-11-21T07:00:00Z", "commit": "abcdef0123456789", "files": files});
+        let path = cfx_pack::path_in(dir);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, pack.to_string()).unwrap();
+    }
+
+    fn ids(pack: &super::Pack) -> Vec<&str> {
+        pack.templates.iter().map(|t| t.id.as_str()).collect()
+    }
+
+    /// A later pack in the toolchain directory takes the place of the copy compiled in,
+    /// and says which it is. One no later, of another name, that does not read, or with a
+    /// template plessor would not run, is not used.
+    #[test]
+    fn a_later_pack_takes_the_place_of_the_compiled_copy_when_all_of_it_reads() {
+        let later = cfx_pack::COMPILED.sequence + 1;
+        let dir = std::env::temp_dir().join(format!("plessor-packs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(super::Pack::load(Some(&dir)).from.ends_with("compiled in"));
+        install_pack(&dir, later, &[ACME_PROBE]);
+        let pack = super::Pack::load(Some(&dir));
+        assert!(ids(&pack).contains(&"acme-probe"));
+        assert_eq!(
+            pack.templates.len(),
+            super::Pack::compiled().templates.len() + 1
+        );
+        assert_eq!(
+            pack.from,
+            format!(
+                "crossfyre-templates {later} (abcdef0), from {}",
+                cfx_pack::path_in(&dir).display()
+            )
+        );
+        let no_request = ("plessor/x/none.yaml", "id: none\ninfo:\n  name: none\n");
+        let broken = ("plessor/x/broken.yaml", "id: [");
+        for (sequence, extra) in [
+            (cfx_pack::COMPILED.sequence, &[ACME_PROBE][..]),
+            (later, &[ACME_PROBE, no_request][..]),
+            (later, &[ACME_PROBE, broken][..]),
+        ] {
+            install_pack(&dir, sequence, extra);
+            let pack = super::Pack::load(Some(&dir));
+            assert!(pack.from.ends_with("compiled in"), "{sequence} {extra:?}");
+            assert!(!ids(&pack).contains(&"acme-probe"));
+        }
+        std::fs::write(cfx_pack::path_in(&dir), b"not a pack").unwrap();
+        assert!(super::Pack::load(Some(&dir)).from.ends_with("compiled in"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

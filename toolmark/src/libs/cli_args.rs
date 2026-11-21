@@ -61,12 +61,6 @@ pub enum Commands {
     /// its CVE data over the products it holds, and report only what is new: products,
     /// versions and CVE leads. Nothing is sent to any host
     Rematch,
-    /// The CVE dataset toolmark's leads come from. The daemon fetches it when its copy is
-    /// a day old
-    Cve {
-        #[command(subcommand)]
-        action: CveAction,
-    },
     /// Check a folder of signatures, and the mappings beside them, as toolmark reads them,
     /// and write the products they name for plessor's check of its templates
     Check(CheckArgs),
@@ -84,13 +78,6 @@ pub enum Commands {
         /// The shell to generate completions for
         shell: clap_complete::Shell,
     },
-}
-
-#[derive(Subcommand, Clone)]
-pub enum CveAction {
-    /// Fetch the CVE dataset now, whatever the age of the copy toolmark keeps, and say
-    /// what CVE leads come from
-    Update,
 }
 
 #[derive(Parser, Clone)]
@@ -234,9 +221,10 @@ mod tests {
 pub struct CheckArgs {
     /// The folder of signatures
     pub dir: std::path::PathBuf,
-    /// The folder of mappings: aliases.yaml, versions.yaml and netscaler-stamps.csv
+    /// The folder of mappings: aliases.yaml, versions.yaml and each table a stamp leaf
+    /// names, <name>-stamps.csv
     #[arg(long)]
-    pub mappings: Option<std::path::PathBuf>,
+    pub mappings: std::path::PathBuf,
     /// Write the products the signatures name, and their aliases, one vendor:product a
     /// line, to this file
     #[arg(long)]

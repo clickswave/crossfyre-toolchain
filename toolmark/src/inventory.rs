@@ -3,9 +3,9 @@
 use serde_json::{Value, json};
 use std::io;
 
-/// The inventory `answer` with the CVE leads `cves` gives each product at its version,
+/// The inventory `answer` with the CVE leads `known` gives each product at its version,
 /// and the data they come from.
-pub fn with_leads(mut answer: Value, cves: &crate::cve::Cves) -> Value {
+pub fn with_leads(mut answer: Value, known: &crate::knowledge::Known) -> Value {
     let Some(rows) = answer["inventory"].as_array_mut() else {
         return answer;
     };
@@ -24,7 +24,7 @@ pub fn with_leads(mut answer: Value, cves: &crate::cve::Cves) -> Value {
         let leads = if names.is_empty() || version.is_empty() {
             Vec::new()
         } else {
-            cves.leads(&names, &version, distro.as_deref()).0
+            known.leads(&names, &version, distro.as_deref()).0
         };
         row["leads"] = leads
             .iter()
@@ -37,7 +37,7 @@ pub fn with_leads(mut answer: Value, cves: &crate::cve::Cves) -> Value {
             })
             .collect();
     }
-    let from = cves.from();
+    let from = known.cves_from().to_string();
     for row in rows.iter_mut() {
         row["cve_data"] = json!(from);
     }
@@ -166,21 +166,12 @@ mod tests {
     /// the table with those known to be exploited, and the answer says which data.
     #[test]
     fn each_product_gets_its_cve_leads() {
-        let folder = tempfile::tempdir().unwrap();
-        std::fs::write(
-            folder.path().join(crate::cve::DATASET_FILE),
+        let cves = crate::knowledge::with_dataset_for_tests(
             r#"{"format": 1, "sequence": 6, "made": "2026-11-23T15:00:00Z", "products": [
               {"part": "a", "vendor": "f5", "product": "nginx", "affected": [
                 {"cve": "CVE-2099-0050", "ranges": [{"lt": "1.25.0"}]},
                 {"cve": "CVE-2099-0051", "ranges": [{"lt": "1.25.0"}]}]}],
              "cves": {"CVE-2099-0050": {"kev": true, "severity": "high"}, "CVE-2099-0051": {}}}"#,
-        )
-        .unwrap();
-        let nginx = cfx_cve::Cpe::new("a", "f5", "nginx");
-        let cves = crate::cve::Cves::load(
-            Some(folder.path()),
-            &[nginx].into(),
-            crate::cve::DATASET_URL,
         );
         let answer = json!({"status": "completed", "inventory": [
             {"host": "app.test", "port": 443, "product": "Nginx", "version": "1.24.0",

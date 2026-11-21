@@ -117,14 +117,14 @@ async fn render(params: &FpParams, url: &str) -> Result<String, String> {
 pub use transport::AuthSpec;
 
 /// Fingerprint the target, sending what is found on `tx`, the pages seen to `observer`,
-/// and the CVE leads of each technology from `cves`.
+/// and the CVE leads of each technology, with what toolmark knows when it starts.
 pub async fn run<O: crate::observe::Observer>(
     params: FpParams,
     tx: mpsc::UnboundedSender<Value>,
     observer: std::sync::Arc<O>,
-    cves: std::sync::Arc<crate::cve::Cves>,
+    known: std::sync::Arc<crate::knowledge::Known>,
 ) {
-    scan(Signatures::shipped(), params, tx, observer, &cves).await
+    scan(&known.signatures, params, tx, observer, &known).await
 }
 
 /// [`run`] with `signatures` in place of the shipped ones.
@@ -133,7 +133,7 @@ async fn scan<O: crate::observe::Observer>(
     params: FpParams,
     tx: mpsc::UnboundedSender<Value>,
     observer: std::sync::Arc<O>,
-    cves: &crate::cve::Cves,
+    known: &crate::knowledge::Known,
 ) {
     let (scheme, host, port, url) = match normalize_target(&params.target) {
         Some(t) => t,
@@ -343,7 +343,7 @@ async fn scan<O: crate::observe::Observer>(
         }
         let _ = tx.send(technology(d, &url, &host, port, &scheme));
 
-        send_leads(&tx, cves, d, &url, &host, port, &scheme);
+        send_leads(&tx, known, d, &url, &host, port, &scheme);
     }
 
     // Service summary finding.
@@ -452,11 +452,11 @@ pub(crate) struct Subject<'a> {
     pub scheme: &'a str,
 }
 
-/// Send the CVE leads for `d` at its version from `cves`, each saying which data it came
+/// Send the CVE leads for `d` at its version from `known`, each saying which data it came
 /// from. A lead is a version match, never confirmed.
 pub(crate) fn send_leads(
     tx: &mpsc::UnboundedSender<Value>,
-    cves: &crate::cve::Cves,
+    known: &crate::knowledge::Known,
     d: &signatures::Detection,
     url: &str,
     host: &str,
@@ -476,17 +476,17 @@ pub(crate) fn send_leads(
         port,
         scheme,
     };
-    for (_, lead) in leads_for(cves, &subject) {
+    for (_, lead) in leads_for(known, &subject) {
         let _ = tx.send(lead);
     }
 }
 
-/// The CVE leads for `s` from `cves`, each with its CVE, as findings.
-pub(crate) fn leads_for(cves: &crate::cve::Cves, s: &Subject) -> Vec<(String, Value)> {
+/// The CVE leads for `s` from `known`, each with its CVE, as findings.
+pub(crate) fn leads_for(known: &crate::knowledge::Known, s: &Subject) -> Vec<(String, Value)> {
     if s.cpes.is_empty() {
         return Vec::new();
     }
-    let (leads, from) = cves.leads(s.cpes, s.version, s.distro);
+    let (leads, from) = known.leads(s.cpes, s.version, s.distro);
     leads
         .iter()
         .map(|lead| (lead.cve.clone(), cve_lead(lead, &from, s)))
@@ -733,7 +733,13 @@ mod redirect_tests {
         .unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let seen = std::sync::Arc::new(Seen::default());
-        run(params, tx, seen.clone(), crate::cve::snapshot_for_tests()).await;
+        run(
+            params,
+            tx,
+            seen.clone(),
+            crate::knowledge::compiled_for_tests(),
+        )
+        .await;
         assert_eq!(
             *seen.0.lock().unwrap(),
             [(301, Some("https://www.example.test/".to_string()), 0)],
@@ -861,11 +867,11 @@ mod path_tests {
         .unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         scan(
-            Signatures::shipped(),
+            crate::knowledge::compiled_signatures_for_tests(),
             params,
             tx,
             Arc::new(Nowhere),
-            &crate::cve::snapshot_for_tests(),
+            &crate::knowledge::compiled_for_tests(),
         )
         .await;
         let mut named = Vec::new();
@@ -947,7 +953,7 @@ mod path_tests {
             params,
             tx,
             kept.clone(),
-            &crate::cve::snapshot_for_tests(),
+            &crate::knowledge::compiled_for_tests(),
         )
         .await;
         let rendered: Vec<String> = kept
@@ -1061,7 +1067,7 @@ mod path_tests {
             params,
             tx,
             Arc::new(Nowhere),
-            &crate::cve::snapshot_for_tests(),
+            &crate::knowledge::compiled_for_tests(),
         )
         .await;
         let mut found = Vec::new();
@@ -1148,7 +1154,13 @@ mod path_tests {
         let changing = |_: &str, n: usize| (200, format!("<html>request {n}</html>"));
 
         let (port, asked) = serve(changing);
-        let (_, paths) = fingerprint(Signatures::shipped(), port, 3, &asked).await;
+        let (_, paths) = fingerprint(
+            crate::knowledge::compiled_signatures_for_tests(),
+            port,
+            3,
+            &asked,
+        )
+        .await;
         assert!(paths.len() <= cap, "{} requests: {paths:?}", paths.len());
 
         let many: Vec<(String, String)> = (0..60)
@@ -1211,7 +1223,7 @@ mod cve_lead_tests {
     }
 
     /// The leads a quiet fingerprint of the server on `port` sends, with `cves`.
-    async fn leads(port: u16, cves: &crate::cve::Cves) -> Vec<Value> {
+    async fn leads(port: u16, cves: &crate::knowledge::Known) -> Vec<Value> {
         let params: FpParams = serde_json::from_value(json!({
             "target": format!("http://127.0.0.1:{port}/"),
             "evasive": false,
@@ -1222,7 +1234,7 @@ mod cve_lead_tests {
         .unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         scan(
-            Signatures::shipped(),
+            crate::knowledge::compiled_signatures_for_tests(),
             params,
             tx,
             std::sync::Arc::new(Nowhere),
@@ -1246,7 +1258,7 @@ mod cve_lead_tests {
     /// snapshot, each a lead that says where it came from, and 2.4.51 gives neither.
     #[tokio::test]
     async fn apache_2_4_49_gives_its_path_traversals_from_the_snapshot() {
-        let cves = crate::cve::snapshot_for_tests();
+        let cves = crate::knowledge::compiled_for_tests();
         let found = leads(server("Apache/2.4.49 (Unix)"), &cves).await;
         assert!(
             named(&found, "CVE-2021-41773") && named(&found, "CVE-2021-42013"),
@@ -1282,7 +1294,7 @@ mod cve_lead_tests {
                 );
             }
         });
-        let found = leads(port, &crate::cve::snapshot_for_tests()).await;
+        let found = leads(port, &crate::knowledge::compiled_for_tests()).await;
         assert!(
             found
                 .iter()
@@ -1295,19 +1307,11 @@ mod cve_lead_tests {
     /// it.
     #[tokio::test]
     async fn a_dataset_in_the_data_folder_gives_the_leads_and_is_named() {
-        let folder = tempfile::tempdir().unwrap();
-        std::fs::write(
-            folder.path().join(crate::cve::DATASET_FILE),
+        let cves = crate::knowledge::with_dataset_for_tests(
             r#"{"format": 1, "sequence": 4, "made": "2026-11-22T15:00:00Z",
                 "products": [{"part": "a", "vendor": "apache", "product": "http_server",
                   "affected": [{"cve": "CVE-2099-0049", "ranges": [{"eq": "2.4.49"}]}]}],
                 "cves": {"CVE-2099-0049": {"severity": "high", "score": 7.5}}}"#,
-        )
-        .unwrap();
-        let cves = crate::cve::Cves::load(
-            Some(folder.path()),
-            &Signatures::shipped().cpes(),
-            crate::cve::DATASET_URL,
         );
         let found = leads(server("Apache/2.4.49 (Unix)"), &cves).await;
         assert_eq!(found.len(), 1, "{found:?}");
@@ -1385,11 +1389,11 @@ mod stamp_tests {
         .unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         scan(
-            Signatures::shipped(),
+            crate::knowledge::compiled_signatures_for_tests(),
             params,
             tx,
             Arc::new(Nowhere),
-            &crate::cve::snapshot_for_tests(),
+            &crate::knowledge::compiled_for_tests(),
         )
         .await;
         let mut out = Vec::new();
@@ -1431,11 +1435,11 @@ mod stamp_tests {
         .unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         scan(
-            Signatures::shipped(),
+            crate::knowledge::compiled_signatures_for_tests(),
             params,
             tx,
             Arc::new(Nowhere),
-            &crate::cve::snapshot_for_tests(),
+            &crate::knowledge::compiled_for_tests(),
         )
         .await;
         let mut out = Vec::new();

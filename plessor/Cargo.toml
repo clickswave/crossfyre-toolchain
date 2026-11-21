@@ -17,6 +17,8 @@ required-features = ["daemon"]
 [dependencies]
 dguard = { path = "../dguard", optional = true }
 cfx_finding = { path = "../finding", optional = true }
+# The crossfyre-templates pack `crossfyre update` puts in the toolchain directory.
+cfx_pack = { path = "../pack", optional = true }
 cfx_scope = { path = "../scope" }
 cfx_tui = { path = "../tui", optional = true }
 ratatui = { version = "0.30.0-alpha.5", features = ["crossterm"], optional = true }
@@ -67,7 +69,7 @@ default = ["daemon"]
 # line, with what only they use. The binary needs it. A crate that links this library for
 # its sender and nothing else, as the Workbench does, turns the default features off and
 # gets none of them, and no database.
-daemon = ["dep:dguard", "dep:cfx_finding", "dep:cfx_tui", "dep:ratatui", "dep:clap", "dep:clap_complete",
+daemon = ["dep:dguard", "dep:cfx_finding", "dep:cfx_pack", "dep:cfx_tui", "dep:ratatui", "dep:clap", "dep:clap_complete",
           "dep:serde", "dep:serde_json", "dep:serde_yaml", "dep:rsa", "dep:aes-gcm", "dep:sha2", "dep:rand",
           "dep:base64", "dep:regex", "dep:cfx_db", "dep:sqlx"]
 # First-party builds enable this to swap the outward scan client to wreq

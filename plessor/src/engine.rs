@@ -182,10 +182,13 @@ fn should_emulate(ua: Option<&str>, mode: &adaptive::identity::Mode) -> bool {
     !announced && !matches!(mode, adaptive::identity::Mode::Fast)
 }
 
+/// Scan `params.target`, sending what is found on `tx`, keeping the plan in `ledger`, and
+/// with `pack`'s templates when the request asks for the pack.
 pub async fn run<L: crate::ledger::Ledger>(
     params: ScanParams,
     tx: mpsc::UnboundedSender<Value>,
     ledger: std::sync::Arc<L>,
+    pack: std::sync::Arc<template::Pack>,
 ) {
     let base = match normalize_base(&params.target) {
         Some(b) => b,
@@ -472,7 +475,7 @@ pub async fn run<L: crate::ledger::Ledger>(
         // A directory template with a pack template's id replaces it, so a copy
         // of the pack pointed at with --templates runs each check once.
         let pack: Vec<&template::Template> = if params.pack {
-            template::PACK
+            pack.templates
                 .iter()
                 .filter(|p| !external.iter().any(|e| e.id == p.id))
                 .collect()
@@ -1088,7 +1091,13 @@ mod ledger_tests {
         }
         let params: ScanParams = serde_json::from_value(params).unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        run(params, tx, ledger).await;
+        run(
+            params,
+            tx,
+            ledger,
+            std::sync::Arc::new(template::Pack::compiled()),
+        )
+        .await;
         let mut said = Vec::new();
         while let Ok(event) = rx.try_recv() {
             said.push(event);

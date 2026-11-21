@@ -24,7 +24,8 @@
 //!
 //! Each release compiles in a copy of the same files, from the commit [`COMPILED`] names,
 //! and a pack is used in its place only when it is later
-//! ([`Pack::replaces_compiled`]). Engines never fetch a pack.
+//! ([`Pack::replaces_compiled`]). Engines never fetch a pack: they read the one in the
+//! toolchain directory ([`installed`]).
 
 mod compiled;
 
@@ -32,6 +33,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Read;
+use std::path::{Path, PathBuf};
 
 /// The pack format this crate reads.
 pub const FORMAT: u32 = 1;
@@ -44,6 +46,22 @@ pub const MAX_BYTES: u64 = 32 << 20;
 
 /// The folders a pack's files are in.
 pub const FOLDERS: &[&str] = &["plessor", "toolmark", "mappings"];
+
+/// Where the pack is kept in the toolchain directory `dir`.
+pub fn path_in(dir: &Path) -> PathBuf {
+    dir.join("packs").join(format!("{NAME}.json.gz"))
+}
+
+/// The pack kept in the toolchain directory `dir`: none when there is no file, and why
+/// when there is one that cannot be read.
+pub fn installed(dir: &Path) -> Result<Option<Pack>, Error> {
+    let path = path_in(dir);
+    match std::fs::read(&path) {
+        Ok(bytes) => Pack::from_bytes(&bytes).map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Error(format!("{}: {e}", path.display()))),
+    }
+}
 
 /// The pack the copies compiled into this build come from.
 pub struct Compiled {
@@ -309,6 +327,25 @@ mod tests {
         let big = "a".repeat(MAX_BYTES as usize);
         let err = Pack::from_bytes(&gzip(&pack_json(&[("plessor/a.yaml", &big)]))).unwrap_err();
         assert_eq!(err.0, "the pack holds more than 32 MB unpacked");
+    }
+
+    #[test]
+    fn the_pack_in_a_toolchain_directory_is_read_from_its_packs_folder() {
+        let dir = std::env::temp_dir().join(format!("cfx-pack-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(installed(&dir).unwrap().is_none(), "no file is no pack");
+        let path = path_in(&dir);
+        assert_eq!(path, dir.join("packs").join("crossfyre-templates.json.gz"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, gzip(&pack_json(&[("toolmark/a.yaml", "id: a\n")]))).unwrap();
+        let pack = installed(&dir).unwrap().unwrap();
+        assert_eq!(pack.files_in("toolmark").count(), 1);
+        std::fs::write(&path, b"not a pack").unwrap();
+        assert!(
+            installed(&dir).is_err(),
+            "a file that does not read says why"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

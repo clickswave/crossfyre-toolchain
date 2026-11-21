@@ -1,4 +1,4 @@
-use crate::libs::cli_args::{Cli, Commands, CveAction};
+use crate::libs::cli_args::{Cli, Commands};
 use clap::{CommandFactory, Parser};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -7,6 +7,7 @@ mod cve;
 mod daemon;
 mod fingerprint;
 mod inventory;
+mod knowledge;
 mod libs;
 mod observe;
 mod rematch;
@@ -46,13 +47,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             },
         )
         .await?;
-        // CVE leads come from the dataset in toolmark's data folder, or with none there,
-        // the known-exploited snapshot compiled in.
-        let folder = dguard::toolchain_dir().map(|d| d.join("toolmark"));
-        let names = signatures::Signatures::shipped().cpes();
-        let cves =
-            std::sync::Arc::new(cve::Cves::load(folder.as_deref(), &names, cve::DATASET_URL));
-        return daemon::run(cli.port, db, cves).await;
+        // What `crossfyre update` put in the toolchain directory, or what is compiled in.
+        let dir = dguard::toolchain_dir();
+        let knowledge = std::sync::Arc::new(knowledge::Knowledge::load(dir.as_deref()));
+        return daemon::run(cli.port, db, knowledge).await;
     }
 
     // The daemon every command below talks to, started when it is not running.
@@ -108,13 +106,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             tokio::task::spawn_blocking(move || inventory::show(&rows, tui)).await??;
             Ok(())
         }
-        Some(Commands::Cve {
-            action: CveAction::Update,
-        }) => {
-            let answer = dguard::answer(&daemon, "cve_update").await?;
-            println!("{}", answer["message"].as_str().unwrap_or_default());
-            Ok(())
-        }
         Some(Commands::Db { action }) => dguard::run_db(&daemon, &action).await,
         Some(Commands::Completions { shell }) => {
             let mut script = Vec::new();
@@ -132,49 +123,64 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// `toolmark check`: the signatures in a folder, and the mappings when given, read as
-/// toolmark reads them, each problem printed; and the products they name written out.
+/// `toolmark check`: the signatures in a folder and the mappings in another, read as
+/// toolmark reads a pack, each problem printed; and, when all of it loads, the products
+/// the signatures name, with their aliases, written out.
 fn check(args: &libs::cli_args::CheckArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let (signatures, mut problems) =
-        signatures::load_dir(&args.dir).map_err(|e| format!("{}: {e}", args.dir.display()))?;
-    let mut aliases = std::collections::HashMap::new();
-    if let Some(dir) = &args.mappings {
-        let read = |name: &str| std::fs::read_to_string(dir.join(name)).map_err(|e| e.to_string());
-        match read("aliases.yaml").and_then(|t| cve::read_aliases(&t)) {
-            Ok(read) => aliases = read,
-            Err(why) => problems.push(format!("aliases.yaml: {why}")),
+    let signatures = files_in(&args.dir, |name| name.ends_with(".yaml"))?;
+    let mappings = files_in(&args.mappings, knowledge::is_mapping)?;
+    let (signatures, mappings) = match knowledge::read(&pairs(&signatures), &pairs(&mappings)) {
+        Ok(read) => read,
+        Err(problems) => {
+            for problem in &problems {
+                println!("{problem}");
+            }
+            return Err(format!("{} problem(s) in {}", problems.len(), args.dir.display()).into());
         }
-        if let Err(why) = read("versions.yaml").and_then(|t| cve::read_versions(&t).map(|_| ())) {
-            problems.push(format!("versions.yaml: {why}"));
-        }
-        if let Err(why) =
-            read("netscaler-stamps.csv").and_then(|t| signatures::read_stamps(&t).map(|_| ()))
-        {
-            problems.push(format!("netscaler-stamps.csv: {why}"));
-        }
-    }
+    };
     if let Some(path) = &args.names {
         let mut names: Vec<String> = signatures
             .cpes()
-            .into_iter()
-            .flat_map(|cpe| {
-                let also = aliases.get(&cpe).cloned().unwrap_or_default();
-                std::iter::once(cpe).chain(also)
-            })
+            .iter()
+            .flat_map(|cpe| mappings.with_aliases(cpe))
             .map(|c| format!("{}:{}", c.vendor, c.product))
             .collect();
         names.sort();
         names.dedup();
         std::fs::write(path, names.join("\n") + "\n")?;
     }
-    for problem in &problems {
-        println!("{problem}");
+    Ok(())
+}
+
+/// `files` as names and texts.
+fn pairs(files: &[(String, String)]) -> Vec<(&str, &str)> {
+    files
+        .iter()
+        .map(|(n, t)| (n.as_str(), t.as_str()))
+        .collect()
+}
+
+/// The files directly in `dir` whose names `wanted` takes, by name and text, in order.
+fn files_in(
+    dir: &std::path::Path,
+    wanted: impl Fn(&str) -> bool,
+) -> Result<Vec<(String, String)>, String> {
+    let fail = |e: std::io::Error| format!("{}: {e}", dir.display());
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(fail)? {
+        let path = entry.map_err(fail)?.path();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if path.is_file() && wanted(name) {
+            let text =
+                std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            files.push((name.to_string(), text));
+        }
     }
-    if problems.is_empty() {
-        Ok(())
-    } else {
-        Err(format!("{} problem(s) in {}", problems.len(), args.dir.display()).into())
-    }
+    files.sort();
+    Ok(files)
 }
 
 /// Write `bytes` to stdout. A reader that stops early, as `head` does, closes the pipe,
@@ -265,7 +271,7 @@ mod tests {
         let names = out.path().join("names.txt");
         let args = |mappings: &std::path::Path| super::libs::cli_args::CheckArgs {
             dir: format!("{root}/signatures").into(),
-            mappings: Some(mappings.to_path_buf()),
+            mappings: mappings.to_path_buf(),
             names: Some(names.clone()),
         };
         super::check(&args(std::path::Path::new(&format!("{root}/data")))).unwrap();
@@ -278,8 +284,33 @@ mod tests {
         );
         assert!(lines.windows(2).all(|w| w[0] < w[1]), "sorted, once each");
 
+        // No mappings: neither file, nor the stamp table NetScaler's signature names.
         let empty = tempfile::tempdir().unwrap();
         let err = super::check(&args(empty.path())).unwrap_err();
         assert!(err.to_string().starts_with("3 problem(s)"), "{err}");
+    }
+
+    /// A folder's .yaml files are read as a pack's are, a file that does not load is a
+    /// problem that names it, and what is not a .yaml file is not read.
+    #[test]
+    fn a_signature_that_does_not_load_is_named_and_other_files_are_not_read() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("acme.yaml"),
+            "id: acme\ninfo: { name: Acme, category: Test }\ndetect: { header: { name: server, regex: acme } }\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("broken.yaml"), "id: [").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "id: [").unwrap();
+        let args = super::libs::cli_args::CheckArgs {
+            dir: dir.path().to_path_buf(),
+            mappings: format!("{root}/data").into(),
+            names: None,
+        };
+        let err = super::check(&args).unwrap_err();
+        assert!(err.to_string().starts_with("1 problem(s)"), "{err}");
+        std::fs::remove_file(dir.path().join("broken.yaml")).unwrap();
+        super::check(&args).unwrap();
     }
 }

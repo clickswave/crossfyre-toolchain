@@ -9,16 +9,16 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use tokio::sync::mpsc;
 
-/// Run `signatures` over every host's kept pages and send, as a fingerprint would, a
-/// finding for each product that is new there, or whose version is new. Then send each
-/// CVE lead `cves` gives a product toolmark holds, or has just found, that was not reported
-/// for it before.
+/// Run the signatures `known` holds over every host's kept pages and send, as a
+/// fingerprint would, a finding for each product that is new there, or whose version is
+/// new. Then send each CVE lead `known` gives a product toolmark holds, or has just found,
+/// that was not reported for it before.
 pub async fn run(
     db: &ToolmarkDb,
-    signatures: &Signatures,
+    known: &crate::knowledge::Known,
     tx: mpsc::UnboundedSender<Value>,
-    cves: &crate::cve::Cves,
 ) {
+    let signatures = &known.signatures;
     let _ = tx.send(json!({"type": "ack", "target": "the pages toolmark kept"}));
     let hosts = match db.kept().await {
         Ok(hosts) => hosts,
@@ -103,7 +103,7 @@ pub async fn run(
             port: h.port,
             scheme: &h.scheme,
         };
-        for (cve, lead) in crate::fingerprint::leads_for(cves, &subject) {
+        for (cve, lead) in crate::fingerprint::leads_for(known, &subject) {
             if !h.reported.contains(&cve) {
                 let _ = tx.send(lead);
             }
@@ -232,13 +232,7 @@ mod tests {
         let params = json!({});
         let scan = db.start("rematch", "kept", &params).await;
         let (tx, mut rx) = mpsc::unbounded_channel();
-        run(
-            db,
-            Signatures::shipped(),
-            tx,
-            &crate::cve::snapshot_for_tests(),
-        )
-        .await;
+        run(db, &crate::knowledge::compiled_for_tests(), tx).await;
         let mut found = Vec::new();
         while let Ok(event) = rx.try_recv() {
             db.event(scan.as_ref().map(|s| s.id.as_str()), &event).await;
@@ -254,10 +248,10 @@ mod tests {
     }
 
     /// The leads a re-match with `cves` sends, kept as the daemon keeps them.
-    async fn rematch_leads(db: &ToolmarkDb, cves: &crate::cve::Cves) -> Vec<Value> {
+    async fn rematch_leads(db: &ToolmarkDb, cves: &crate::knowledge::Known) -> Vec<Value> {
         let scan = db.start("rematch", "kept", &json!({})).await;
         let (tx, mut rx) = mpsc::unbounded_channel();
-        run(db, Signatures::shipped(), tx, cves).await;
+        run(db, cves, tx).await;
         let mut leads = Vec::new();
         while let Ok(event) = rx.try_recv() {
             db.event(scan.as_ref().map(|s| s.id.as_str()), &event).await;
@@ -269,8 +263,9 @@ mod tests {
         leads
     }
 
-    /// A dataset numbered `sequence` in `folder`, with `cves` on Apache 2.4.49.
-    fn apache_dataset(folder: &std::path::Path, sequence: u64, cves: &[&str]) {
+    /// A dataset numbered `sequence` in the data folder of the toolchain directory `dir`,
+    /// with `cves` on Apache 2.4.49.
+    fn apache_dataset(dir: &std::path::Path, sequence: u64, cves: &[&str]) {
         let affected: Vec<Value> = cves
             .iter()
             .map(|c| json!({"cve": c, "ranges": [{"eq": "2.4.49"}]}))
@@ -285,6 +280,8 @@ mod tests {
                           "affected": affected}],
             "cves": known,
         });
+        let folder = dir.join("toolmark");
+        std::fs::create_dir_all(&folder).unwrap();
         std::fs::write(folder.join(crate::cve::DATASET_FILE), dataset.to_string()).unwrap();
     }
 
@@ -330,8 +327,7 @@ mod tests {
 
         let folder = tempfile::tempdir().unwrap();
         apache_dataset(folder.path(), 2, &["CVE-2099-0001", "CVE-2099-0002"]);
-        let names = Signatures::shipped().cpes();
-        let cves = crate::cve::Cves::load(Some(folder.path()), &names, crate::cve::DATASET_URL);
+        let cves = crate::knowledge::Known::load(Some(folder.path()));
         let leads = rematch_leads(&db, &cves).await;
         assert_eq!(leads.len(), 1, "{leads:?}");
         assert_eq!(leads[0]["cve"], "CVE-2099-0002");

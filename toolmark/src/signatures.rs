@@ -15,7 +15,7 @@ mod load;
 
 use regex::Regex;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 /// One technology found.
 pub struct Detection {
@@ -217,12 +217,15 @@ struct Leaf {
     confidence: u32,
     /// For a version leaf on a path that is a gzip file, the table that names the build
     /// its header's time belongs to.
-    stamp: Option<&'static Stamps>,
+    stamp: Option<Arc<Stamps>>,
 }
 
 /// A table of builds by the time a gzip file shipped with them carries: a time not in
 /// it gives no version.
 pub(crate) struct Stamps(std::collections::HashMap<u32, String>);
+
+/// The stamp tables signatures can name, by name: `netscaler` for netscaler-stamps.csv.
+pub(crate) type StampTables = HashMap<String, Arc<Stamps>>;
 
 /// The table `text` gives, stamp,version a line under its header and comments, or the
 /// first line that is not one.
@@ -240,40 +243,6 @@ pub(crate) fn read_stamps(text: &str) -> Result<Stamps, String> {
         })
         .collect::<Result<_, String>>()
         .map(Stamps)
-}
-
-/// The signatures in `dir`, its .yaml files, and why each left out was left out.
-pub(crate) fn load_dir(dir: &std::path::Path) -> std::io::Result<(Signatures, Vec<String>)> {
-    let mut texts = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("yaml") {
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default()
-                .to_string();
-            texts.push((name, std::fs::read_to_string(&path)?));
-        }
-    }
-    texts.sort();
-    let files: Vec<(&str, &str)> = texts
-        .iter()
-        .map(|(n, t)| (n.as_str(), t.as_str()))
-        .collect();
-    Ok(load::load(&files))
-}
-
-/// Each table a `stamp` names, from toolmark/data.
-pub(crate) fn stamps(name: &str) -> Option<&'static Stamps> {
-    static NETSCALER: LazyLock<Stamps> = LazyLock::new(|| {
-        read_stamps(include_str!("../data/netscaler-stamps.csv"))
-            .expect("toolmark/data/netscaler-stamps.csv")
-    });
-    match name {
-        "netscaler" => Some(&NETSCALER),
-        _ => None,
-    }
 }
 
 /// How a signature's evidence combines.
@@ -391,20 +360,15 @@ pub struct Signatures {
     metas: BTreeMap<String, MetaFinder>,
 }
 
-/// The signatures compiled into toolmark. A file that does not load is left out, and why
-/// is printed.
-static SHIPPED: LazyLock<Signatures> = LazyLock::new(|| {
-    let (signatures, skipped) = load::load(files::FILES);
-    for why in skipped {
-        eprintln!("[toolmark] a signature file was skipped: {why}");
-    }
-    signatures
-});
+/// The signature files compiled into toolmark, by name: toolmark/signatures, copied from
+/// crossfyre-templates.
+pub(crate) const COMPILED: &[(&str, &str)] = files::FILES;
 
 impl Signatures {
-    /// The signatures compiled into toolmark.
-    pub fn shipped() -> &'static Self {
-        &SHIPPED
+    /// The signatures in `files`, by file name, in order, with the stamp tables `tables`
+    /// gives, and why each file left out was left out.
+    pub(crate) fn load(files: &[(&str, &str)], tables: &StampTables) -> (Self, Vec<String>) {
+        load::load(files, tables)
     }
 
     fn by_id(&self, id: &str) -> Option<&Signature> {
@@ -417,10 +381,11 @@ impl Signatures {
     }
 }
 
-/// Signatures from `files`, for a test elsewhere in toolmark, and why any were left out.
+/// Signatures from `files`, with the stamp tables compiled in, for a test elsewhere in
+/// toolmark, and why any were left out.
 #[cfg(test)]
 pub fn load_for_tests(files: &[(&str, &str)]) -> (Signatures, Vec<String>) {
-    load::load(files)
+    load::load(files, &crate::knowledge::compiled_stamps())
 }
 
 /// Finds the content of a meta tag by its name, whichever of the two attributes comes first.
@@ -1081,7 +1046,7 @@ impl<'a> Host<'a> {
     /// The group of `leaf`'s pattern that reads a version here, and what it reads: the
     /// first group that takes part in the first match.
     fn version_of(&self, leaf: &Leaf) -> Option<(usize, String)> {
-        if let Some(table) = leaf.stamp {
+        if let Some(table) = &leaf.stamp {
             let stamp = self.answered(leaf)?.gzip_stamp?;
             return table.0.get(&stamp).map(|build| (1, build.clone()));
         }

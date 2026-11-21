@@ -66,11 +66,14 @@ struct LeafSpec {
 /// The signatures in `files`, in order, and why each file left out was left out: it did
 /// not parse, a pattern in it did not compile, its id was taken, or it implies or refines
 /// a signature that is not there.
-pub(super) fn load(files: &[(&str, &str)]) -> (Signatures, Vec<String>) {
+pub(super) fn load(
+    files: &[(&str, &str)],
+    tables: &super::StampTables,
+) -> (Signatures, Vec<String>) {
     let mut skipped = Vec::new();
     let mut list: Vec<Signature> = Vec::new();
     for (file, text) in files {
-        match parse(file, text) {
+        match parse(file, text, tables) {
             Ok(s) if list.iter().any(|o| o.id == s.id) => {
                 skipped.push(format!("{file}: another file has the id {}", s.id));
             }
@@ -143,7 +146,7 @@ fn refines_itself(signature: &Signature, list: &[Signature]) -> bool {
 }
 
 /// The signature in file `file`, whose name without `.yaml` is its id.
-fn parse(file: &str, text: &str) -> Result<Signature, String> {
+fn parse(file: &str, text: &str, tables: &super::StampTables) -> Result<Signature, String> {
     let spec: FileSpec = serde_yaml::from_str(text).map_err(|e| e.to_string())?;
     if Some(spec.id.as_str()) != file.strip_suffix(".yaml") {
         return Err(format!("its id is {}, not its file's name", spec.id));
@@ -155,7 +158,7 @@ fn parse(file: &str, text: &str) -> Result<Signature, String> {
     if spec.info.name.trim().is_empty() || spec.info.category.trim().is_empty() {
         return Err("it needs a name and a category".into());
     }
-    let detect = spec.detect.map(node).transpose()?;
+    let detect = spec.detect.map(|d| node(d, tables)).transpose()?;
     if detect.as_ref().is_some_and(|d| !positive(d)) {
         return Err("detect could hold with no evidence found, as a `none` alone does".into());
     }
@@ -164,7 +167,7 @@ fn parse(file: &str, text: &str) -> Result<Signature, String> {
         .into_iter()
         .map(|v| {
             let (kind, value) = one_key(v)?;
-            leaf(&kind, value, true)
+            leaf(&kind, value, true, tables)
         })
         .collect::<Result<_, String>>()?;
     let distro = spec
@@ -172,7 +175,7 @@ fn parse(file: &str, text: &str) -> Result<Signature, String> {
         .into_iter()
         .map(|v| {
             let (kind, value) = one_key(v)?;
-            let tag = leaf(&kind, value, true)?;
+            let tag = leaf(&kind, value, true, tables)?;
             match tag.range {
                 Some(_) => Err("a distro leaf reads a tag, and gives no since or until".into()),
                 None => Ok(tag),
@@ -225,10 +228,10 @@ fn one_key(value: Value) -> Result<(String, Value), String> {
 }
 
 /// A group, `{ any: [...] }`, or a leaf, `{ html: { regex: ... } }`.
-fn node(value: Value) -> Result<Node, String> {
+fn node(value: Value, tables: &super::StampTables) -> Result<Node, String> {
     let (kind, value) = one_key(value)?;
     if !matches!(kind.as_str(), "all" | "any" | "none") {
-        return leaf(&kind, value, false).map(Node::Leaf);
+        return leaf(&kind, value, false, tables).map(Node::Leaf);
     }
     let Value::Sequence(items) = value else {
         return Err(format!("`{kind}` is a list"));
@@ -236,7 +239,10 @@ fn node(value: Value) -> Result<Node, String> {
     if items.is_empty() {
         return Err(format!("`{kind}` lists nothing"));
     }
-    let children = items.into_iter().map(node).collect::<Result<Vec<_>, _>>()?;
+    let children = items
+        .into_iter()
+        .map(|i| node(i, tables))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(match kind.as_str() {
         "all" => Node::All(children),
         "any" => Node::Any(children),
@@ -246,7 +252,12 @@ fn node(value: Value) -> Result<Node, String> {
 
 /// A leaf of kind `kind`. A version leaf has to capture the version, and takes no
 /// confidence.
-fn leaf(kind: &str, value: Value, version: bool) -> Result<Leaf, String> {
+fn leaf(
+    kind: &str,
+    value: Value,
+    version: bool,
+    tables: &super::StampTables,
+) -> Result<Leaf, String> {
     enum Kind {
         Header,
         Cookie,
@@ -296,9 +307,12 @@ fn leaf(kind: &str, value: Value, version: bool) -> Result<Leaf, String> {
         Some(_) if spec.regex.is_some() || spec.sha256.is_some() => {
             return Err("a stamp leaf reads its version from its table, with no regex".into());
         }
-        Some(name) => {
-            Some(super::stamps(name).ok_or_else(|| format!("there is no stamp table {name:?}"))?)
-        }
+        Some(name) => Some(
+            tables
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("there is no stamp table {name:?}"))?,
+        ),
     };
     let range = match (&spec.since, &spec.until) {
         (None, None) => None,
@@ -787,7 +801,7 @@ mod tests {
             .iter()
             .map(|(f, t)| (f.as_str(), t.as_str()))
             .collect();
-        let (signatures, skipped) = load(&files);
+        let (signatures, skipped) = load(&files, &crate::knowledge::compiled_stamps());
         let ids: Vec<&str> = signatures.list.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, ["good"]);
         let why = |file: &str| {

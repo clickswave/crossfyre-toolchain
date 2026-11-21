@@ -1,4 +1,5 @@
 use crate::plessor_db::PlessorDb;
+use crate::template::Packs;
 use cfx_db::scans::Status;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -89,7 +90,10 @@ pub async fn run(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
     gate.announce("Plessor", addr);
     dguard::exit_when_idle("plessor");
-    serve(listener, gate, db).await?;
+    // What `crossfyre update` put in the toolchain directory, or what is compiled in.
+    let packs = std::sync::Arc::new(Packs::load(dguard::toolchain_dir().as_deref()));
+    eprintln!("[plessor] templates from {}", packs.now().from);
+    serve(listener, gate, db, packs).await?;
     Ok(())
 }
 
@@ -99,14 +103,16 @@ pub(crate) async fn serve(
     listener: TcpListener,
     gate: dguard::Gate,
     db: PlessorDb,
+    packs: std::sync::Arc<Packs>,
 ) -> std::io::Result<()> {
     loop {
         let (stream, addr) = listener.accept().await?;
         let _ = stream.set_nodelay(true);
         let gate_clone = gate.clone();
         let db = db.clone();
+        let packs = packs.clone();
         dguard::spawn_busy(async move {
-            if let Err(e) = handle_connection(stream, gate_clone, db).await {
+            if let Err(e) = handle_connection(stream, gate_clone, db, packs).await {
                 eprintln!("Connection error from {addr}: {e}");
             }
         });
@@ -117,6 +123,7 @@ async fn handle_connection(
     stream: TcpStream,
     gate: dguard::Gate,
     db: PlessorDb,
+    packs: std::sync::Arc<Packs>,
 ) -> Result<(), BoxError> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -149,7 +156,8 @@ async fn handle_connection(
 
         let (params, egress) = (req.params, req.egress);
         // The template scan keeps its plan; every operation keeps its record and findings.
-        let scan = |p, tx, id| crate::engine::run(p, tx, std::sync::Arc::new(db.ledger(id)));
+        let scan =
+            |p, tx, id| crate::engine::run(p, tx, std::sync::Arc::new(db.ledger(id)), packs.now());
         macro_rules! op {
             ($what:literal, $run:expr) => {
                 run_op(
@@ -199,6 +207,16 @@ async fn handle_connection(
             // The scans this daemon keeps, the latest first.
             "scans" => {
                 write_line(&mut writer, &db.scans().await).await?;
+                continue;
+            }
+            // Read the pack in the toolchain directory again, as `crossfyre update` asks
+            // after it writes a new one. A scan running goes on with what it started with.
+            "reload" => {
+                let reply = match packs.reload().await {
+                    Ok(said) => serde_json::json!({"status": "completed", "message": said}),
+                    Err(why) => serde_json::json!({"status": "error", "message": why}),
+                };
+                write_line(&mut writer, &reply).await?;
                 continue;
             }
             "authz" => op!("authz", plain(crate::authz::run)),
@@ -453,6 +471,7 @@ mod tests {
             listener,
             dguard::Gate::default(),
             PlessorDb::unconnected(),
+            std::sync::Arc::new(Packs::load(None)),
         ));
         port
     }
@@ -721,6 +740,66 @@ mod tests {
             0,
             "a template request followed a redirect off the target"
         );
+    }
+
+    /// `reload`, as `crossfyre update` sends it after it writes a new pack, has the next
+    /// scan run the pack's templates: one that was not there before runs after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_reload_has_the_next_scan_run_the_new_pack() {
+        let (tport, _) = target(Duration::ZERO).await;
+        let dir = std::env::temp_dir().join(format!("plessor-reload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let dport = listener.local_addr().expect("addr").port();
+        tokio::spawn(serve(
+            listener,
+            dguard::Gate::default(),
+            PlessorDb::unconnected(),
+            Arc::new(Packs::load(Some(&dir))),
+        ));
+        let op = serde_json::json!({
+            "operation": "scan",
+            "response": "stream",
+            "target": format!("http://127.0.0.1:{tport}"),
+            "pack": true,
+            "only": ["acme-probe"],
+            "evasive": false,
+            "timeout_ms": 5000,
+        });
+        let found = |events: &[Value]| {
+            events
+                .iter()
+                .any(|e| e["type"] == "finding" && e["data"]["template"] == "acme-probe")
+        };
+        assert!(
+            !found(&run_to_done(dport, &op).await),
+            "not in the compiled pack"
+        );
+        crate::template::tests::install_pack(
+            &dir,
+            cfx_pack::COMPILED.sequence + 1,
+            &[crate::template::tests::ACME_PROBE],
+        );
+        assert!(
+            !found(&run_to_done(dport, &op).await),
+            "not read until told"
+        );
+        let stream = TcpStream::connect(("127.0.0.1", dport)).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut lines = BufReader::new(r).lines();
+        w.write_all(b"{\"operation\":\"reload\"}\n").await.unwrap();
+        let answer = next_event(&mut lines, Duration::from_secs(30))
+            .await
+            .expect("an answer");
+        assert_eq!(answer["status"], "completed", "{answer}");
+        assert!(
+            answer["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("templates from crossfyre-templates ")),
+            "{answer}"
+        );
+        assert!(found(&run_to_done(dport, &op).await), "the new pack runs");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1013,6 +1092,7 @@ mod http_request_tests {
             listener,
             dguard::Gate::default(),
             PlessorDb::unconnected(),
+            std::sync::Arc::new(Packs::load(None)),
         ));
         port
     }
@@ -1091,6 +1171,7 @@ mod session_tls_tests {
             listener,
             dguard::Gate::default(),
             PlessorDb::unconnected(),
+            std::sync::Arc::new(Packs::load(None)),
         ));
         port
     }

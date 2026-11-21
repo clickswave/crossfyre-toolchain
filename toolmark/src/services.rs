@@ -23,7 +23,7 @@
 //!     protocol leaves the stream in a state the next probe would misread.
 //!   * The port is a hint for ordering, never the answer.
 
-use crate::signatures::{Host, Signatures};
+use crate::signatures::Host;
 use cfx_finding::Finding;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -89,7 +89,7 @@ impl Svc {
 pub async fn run(
     params: SvcParams,
     tx: mpsc::UnboundedSender<Value>,
-    cves: std::sync::Arc<crate::cve::Cves>,
+    known: std::sync::Arc<crate::knowledge::Known>,
 ) {
     let _ = tx.send(json!({"type":"ack","targets": params.targets.len()}));
     let to = Duration::from_millis(params.timeout_ms.clamp(500, 30_000));
@@ -143,7 +143,7 @@ pub async fn run(
             } else {
                 &svc.version
             };
-            for d in Host::service(Signatures::shipped(), &svc.service, text).detections() {
+            for d in Host::service(&known.signatures, &svc.service, text).detections() {
                 let _ = tx.send(crate::fingerprint::technology(
                     &d,
                     &target,
@@ -151,7 +151,7 @@ pub async fn run(
                     port,
                     &svc.service,
                 ));
-                crate::fingerprint::send_leads(&tx, &cves, &d, &target, &host, port, &svc.service);
+                crate::fingerprint::send_leads(&tx, &known, &d, &target, &host, port, &svc.service);
             }
         }
         let _ = tx.send(json!({"type":"progress","processed":done,"total":total}));
@@ -949,20 +949,12 @@ mod tests {
     /// build may carry a backported fix.
     #[tokio::test]
     async fn a_service_s_product_gets_its_cve_leads() {
-        let folder = tempfile::tempdir().unwrap();
-        std::fs::write(
-            folder.path().join(crate::cve::DATASET_FILE),
+        let cves = crate::knowledge::with_dataset_for_tests(
             r#"{"format": 1, "sequence": 5, "made": "2026-11-22T15:00:00Z",
                 "products": [{"part": "a", "vendor": "openbsd", "product": "openssh",
                   "affected": [{"cve": "CVE-2099-0089", "ranges": [{"ge": "8.5p1", "lt": "9.8p1"}]}]}],
                 "cves": {"CVE-2099-0089": {"severity": "high", "score": 8.1}}}"#,
-        )
-        .unwrap();
-        let cves = std::sync::Arc::new(crate::cve::Cves::load(
-            Some(folder.path()),
-            &Signatures::shipped().cpes(),
-            crate::cve::DATASET_URL,
-        ));
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
@@ -1045,7 +1037,7 @@ mod tests {
             }))
             .unwrap();
             let (tx, mut rx) = mpsc::unbounded_channel();
-            run(params, tx, crate::cve::snapshot_for_tests()).await;
+            run(params, tx, crate::knowledge::compiled_for_tests()).await;
             let mut named = Vec::new();
             while let Ok(event) = rx.try_recv() {
                 if event["type"] == "finding" && event["data"]["type"] == "technology" {

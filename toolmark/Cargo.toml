@@ -13,6 +13,8 @@ authors = ["Clickswave <team@clickswave.org>"]
 dguard = { path = "../dguard" }
 # Which CVEs may affect a technology found, from the CVE dataset.
 cfx_cve = { path = "../cve" }
+# The crossfyre-templates pack `crossfyre update` puts in the toolchain directory.
+cfx_pack = { path = "../pack" }
 cfx_finding = { path = "../finding" }
 cfx_tui = { path = "../tui" }
 ratatui = { version = "0.30.0-alpha.5", features = ["crossterm"] }
