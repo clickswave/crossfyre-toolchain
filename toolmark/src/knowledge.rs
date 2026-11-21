@@ -171,7 +171,7 @@ impl Known {
             .flat_map(|cpe| mappings.with_aliases(cpe))
             .collect();
         let (dataset, cves_from) = dir
-            .and_then(|d| cve::read(&d.join("toolmark").join(cve::DATASET_FILE), &names))
+            .and_then(|d| cve::read(&cfx_cve::path_in(d), &names))
             .unwrap_or_else(|| cve::snapshot(&names));
         Self {
             signatures,
@@ -271,15 +271,16 @@ pub fn compiled_signatures_for_tests() -> &'static Signatures {
 #[cfg(test)]
 pub fn with_dataset_for_tests(json: &str) -> Arc<Known> {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(dir.path().join("toolmark")).unwrap();
-    std::fs::write(dir.path().join("toolmark").join(cve::DATASET_FILE), json).unwrap();
+    let path = cfx_cve::path_in(dir.path());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, json).unwrap();
     Arc::new(Known::load(Some(dir.path())))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cve::{DATASET_FILE, SNAPSHOT_LABEL};
+    use crate::cve::SNAPSHOT_LABEL;
     use serde_json::json;
 
     fn apache() -> Cpe {
@@ -423,7 +424,7 @@ mod tests {
         );
         std::fs::create_dir_all(dir.path().join("toolmark")).unwrap();
         std::fs::write(
-            dir.path().join("toolmark").join(DATASET_FILE),
+            cfx_cve::path_in(dir.path()),
             r#"{"format": 1, "sequence": 9, "made": "2026-11-21T15:00:00Z",
             "products": [{"part": "a", "vendor": "acme", "product": "widget",
               "affected": [{"cve": "CVE-2099-0060", "ranges": [{"lt": "2.0"}]}]}],

@@ -286,6 +286,59 @@ pub fn write_for_invoking_user(
     }
 }
 
+/// Put `contents` at `path`, and the folders on the way, owned by the invoking user, for
+/// a reader that may read it at any moment: it is written under a temporary name in the
+/// same folder and renamed into place, so the reader finds the old file or the new one,
+/// never part of either.
+///
+/// As root it goes through [`super::root_fs`], which follows no link and hands each folder
+/// it makes, and the file, to the user crossfyre was run for through sudo; elevated on
+/// Windows, through `admin_fs`, which follows no link either.
+pub fn replace_for_invoking_user(
+    path: &std::path::Path,
+    contents: &[u8],
+    mode: u32,
+) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other(format!("{} is in no folder", path.display())))?;
+    #[cfg(unix)]
+    if root_guards() {
+        let owner = sudo_user_info().map(|(uid, gid, _, _)| (uid, gid));
+        super::root_fs::create_dir_all(parent, owner)?;
+        return super::root_fs::replace_file(path, contents, mode, owner);
+    }
+    #[cfg(windows)]
+    if root_guards() {
+        let _ = mode;
+        super::win::admin_fs::create_dir_all(parent)?;
+        return super::win::admin_fs::replace_file(path, contents, false);
+    }
+    std::fs::create_dir_all(parent)?;
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let tmp = parent.join(format!(".{name}.{}.tmp", std::process::id()));
+    let written = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(mode);
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        use std::io::Write;
+        let mut f = options.open(&tmp)?;
+        f.write_all(contents)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
 /// Open `path` to append to, made with `mode` if it is missing, owned by the invoking
 /// user. As root no link is followed on the way there or at `path`, and a file of another
 /// account's, or with a second name, is refused (see [`super::root_fs::open_append`]).
@@ -761,5 +814,54 @@ mod elevated_link_tests {
         let r = crate::write_secret_file(&data.join("nodes.d").join("config.toml"), "x");
         assert!(r.is_err(), "wrote through a junction");
         assert!(!victim.join("config.toml").exists());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod replace_tests {
+    use super::{act_as_root, replace_for_invoking_user};
+    use std::os::unix::fs::PermissionsExt;
+
+    /// The file goes in whole, with the folders on the way, by its mode, and leaves no
+    /// temporary file beside it, as root and not.
+    #[test]
+    fn a_file_is_put_in_place_with_its_folders_and_no_temporary_left() {
+        for root in [false, true] {
+            let base = tempfile::tempdir().unwrap();
+            let path = base
+                .path()
+                .join("packs")
+                .join("crossfyre-templates.json.gz");
+            let _root = root.then(act_as_root);
+            replace_for_invoking_user(&path, b"one", 0o644).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"one", "root {root}");
+            replace_for_invoking_user(&path, b"two", 0o644).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"two", "root {root}");
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o644, "root {root}");
+            let names: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(names.len(), 1, "root {root}: {names:?}");
+        }
+    }
+
+    /// A link where the file goes is replaced, never written through, as root and not.
+    #[test]
+    fn a_link_where_the_file_goes_is_replaced_and_not_written_through() {
+        for root in [false, true] {
+            let base = tempfile::tempdir().unwrap();
+            let elsewhere = base.path().join("elsewhere");
+            std::fs::write(&elsewhere, b"kept").unwrap();
+            let path = base.path().join("toolmark").join("cve-dataset.json.gz");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+            let _root = root.then(act_as_root);
+            replace_for_invoking_user(&path, b"new", 0o644).unwrap();
+            assert_eq!(std::fs::read(&elsewhere).unwrap(), b"kept", "root {root}");
+            assert!(!path.symlink_metadata().unwrap().file_type().is_symlink());
+            assert_eq!(std::fs::read(&path).unwrap(), b"new", "root {root}");
+        }
     }
 }

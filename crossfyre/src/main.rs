@@ -158,8 +158,10 @@ enum Commands {
     },
 
     /// Update from the release manifest: `self`, an extension name, or `all`
-    /// (default: self + every installed extension). For a single extension you
-    /// can also use `crossfyre extension update <name>`.
+    /// (default: self + every installed extension, and the data the engines read).
+    /// `data` takes only that data: the template and signature pack and the CVE
+    /// dataset. For a single extension you can also use `crossfyre extension update
+    /// <name>`.
     Update {
         target: Option<String>,
         /// Re-download and reinstall even when the installed version already
@@ -915,7 +917,14 @@ fn needs_root(command: &Commands, binaries_writable: &dyn Fn() -> bool) -> Optio
         Commands::Oast {
             action: OastAction::Setup { .. },
         } if cfg!(target_os = "linux") => Some("oast setup"),
-        Commands::Update { .. } if !binaries_writable() => Some("update"),
+        // The data goes in the toolchain directory, which needs no rights the bin
+        // directory does.
+        Commands::Update { target, .. }
+            if target.as_deref() != Some(cfx_core::toolchain::install::DATA)
+                && !binaries_writable() =>
+        {
+            Some("update")
+        }
         Commands::Extension { action } => match action {
             ExtensionAction::Install { name: Some(_), .. } if !binaries_writable() => {
                 Some("extension install")
@@ -1045,6 +1054,15 @@ mod tests {
         ] {
             assert_eq!(root_for(args, false), Some(name), "{args:?}");
             assert_eq!(root_for(args, true), None, "{args:?}");
+        }
+    }
+
+    /// The data goes in the toolchain directory, so taking it alone asks for no rights,
+    /// whoever may write the bin directory.
+    #[test]
+    fn updating_the_data_alone_needs_no_root() {
+        for writable in [false, true] {
+            assert_eq!(root_for(&["update", "data"], writable), None);
         }
     }
 

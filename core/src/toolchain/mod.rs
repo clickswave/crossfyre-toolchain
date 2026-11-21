@@ -11,6 +11,7 @@
 pub use cfx_capture as capture;
 pub mod config;
 pub mod data_manifest;
+pub mod data_update;
 pub mod db;
 pub mod doctor;
 pub mod install;

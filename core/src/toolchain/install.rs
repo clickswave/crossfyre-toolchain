@@ -1187,9 +1187,153 @@ pub async fn update(
     current_version: &str,
     force: bool,
 ) -> Result<Updated, Box<dyn std::error::Error>> {
+    if target == Some(DATA) {
+        print_heading();
+        let mut out = Updated::default();
+        update_data(&mut out).await;
+        print_summary(&out, target, force);
+        return Ok(out);
+    }
     let manifest = fetch_manifest().await?;
     let handed_over = std::env::var_os(UPDATED_FROM_ENV).is_some();
     update_with(&manifest, target, current_version, force, handed_over).await
+}
+
+/// The target of `update` that takes the data the engines read and nothing else.
+pub const DATA: &str = "data";
+
+/// The line `update` opens with.
+fn print_heading() {
+    use super::ui::*;
+    println!();
+    println!("  {BOLD}Crossfyre update{RESET}   {}", dim(origin_host()));
+    println!();
+}
+
+/// The data the engines read: the crossfyre-templates pack and the CVE dataset, from the
+/// data manifest on the bins origin (`data_update`), and the engines told to read them
+/// again. Its rows go under their own heading, and count in `out`.
+async fn update_data(out: &mut Updated) {
+    use super::data_update::Outcome;
+    use super::ui::*;
+    println!("  {}", dim("Data"));
+    let dir = super::config::get_toolchain_dir();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let fetched = super::data_update::fetch(
+        BASE_URL,
+        &dir,
+        super::release_sig::data_required(),
+        &super::release_sig::verify_data,
+        now,
+    )
+    .await;
+    let report = match fetched {
+        Ok(report) if !report.published => {
+            println!("{}", row(&check(), "data", "", &dim("none published yet")));
+            println!();
+            return;
+        }
+        Ok(report) => report,
+        Err(why) => {
+            println!(
+                "{}",
+                row(
+                    &bang(),
+                    "data",
+                    "",
+                    &format!("{YELLOW}failed{RESET} {}", dim(&why))
+                )
+            );
+            out.failed += 1;
+            println!();
+            return;
+        }
+    };
+    for (name, outcome) in [("templates", &report.pack), ("dataset", &report.dataset)] {
+        let line = match outcome {
+            None => continue,
+            Some(Outcome::Updated { from, to }) => {
+                out.changed += 1;
+                let mid = version_change(from.map(|f| f.to_string()).as_deref(), &to.to_string());
+                row(&check(), name, &mid, &format!("{GREEN}updated{RESET}"))
+            }
+            Some(Outcome::Current(at)) => {
+                out.current += 1;
+                row(&check(), name, &ver(&at.to_string()), &dim("up to date"))
+            }
+            Some(Outcome::Refused { offered, accepted }) => {
+                out.failed += 1;
+                let why = format!(
+                    "{offered} is published, older than the {accepted} accepted here, so it \
+                     is not used"
+                );
+                row(
+                    &bang(),
+                    name,
+                    &ver(&accepted.to_string()),
+                    &format!("{YELLOW}refused{RESET} {}", dim(&why)),
+                )
+            }
+            Some(Outcome::Failed(why)) => {
+                out.failed += 1;
+                row(
+                    &bang(),
+                    name,
+                    "",
+                    &format!("{YELLOW}failed{RESET} {}", dim(why)),
+                )
+            }
+        };
+        println!("{line}");
+    }
+    if let Some(days) = report.stale_days {
+        println!(
+            "    {YELLOW}!{RESET} {}",
+            dim(&format!(
+                "the data on {} was made {days} days ago, and nothing newer has been published",
+                origin_host()
+            ))
+        );
+    }
+    for (engine, said) in super::data_update::reload_engines(&report).await {
+        let status = match said {
+            Some(Ok(_)) => dim("read it again"),
+            Some(Err(why)) => format!("{YELLOW}did not read it again{RESET} {}", dim(&why)),
+            None => dim("not running: reads it when it starts"),
+        };
+        println!("{}", row(&check(), engine, "", &status));
+    }
+    println!();
+}
+
+/// The lines `update` closes with: the summary, and the command that finishes what this
+/// one could not.
+fn print_summary(out: &Updated, target: Option<&str>, force: bool) {
+    use super::ui::*;
+    let colour = if out.succeeded() && out.skipped == 0 {
+        GREEN
+    } else {
+        YELLOW
+    };
+    println!("  {BOLD}{colour}{}{RESET}", out.summary());
+    if out.need_rights > 0 {
+        let mut again = String::from("crossfyre update");
+        if let Some(t) = target {
+            again.push(' ');
+            again.push_str(t);
+        }
+        if force {
+            again.push_str(" --force");
+        }
+        let them = if out.need_rights == 1 { "it" } else { "them" };
+        println!(
+            "  Run {} to update {them}.",
+            bold(&crate::os::elevated(&again))
+        );
+    }
+    println!();
 }
 
 /// Set by a CLI that replaced itself during `update` on the new CLI it hands the rest of
@@ -1254,9 +1398,7 @@ async fn update_with(
 
     use super::ui::*;
     if !handed_over {
-        println!();
-        println!("  {BOLD}Crossfyre update{RESET}   {}", dim(origin_host()));
-        println!();
+        print_heading();
     }
 
     let mut out = Updated::default();
@@ -1564,30 +1706,12 @@ async fn update_with(
 
     service::set_quiet(false);
 
-    // ── Summary ───────────────────────────────────────────────────────
-    let colour = if out.succeeded() && out.skipped == 0 {
-        GREEN
-    } else {
-        YELLOW
-    };
-    println!("  {BOLD}{colour}{}{RESET}", out.summary());
-    if out.need_rights > 0 {
-        let mut again = String::from("crossfyre update");
-        if let Some(t) = target {
-            again.push(' ');
-            again.push_str(t);
-        }
-        if force {
-            again.push_str(" --force");
-        }
-        let them = if out.need_rights == 1 { "it" } else { "them" };
-        println!(
-            "  Run {} to update {them}.",
-            bold(&crate::os::elevated(&again))
-        );
+    // ── Data: the pack and the CVE dataset, with everything else ──────
+    if !hold && matches!(target, Some("all") | None) {
+        update_data(&mut out).await;
     }
-    println!();
 
+    print_summary(&out, target, force);
     Ok(out)
 }
 

@@ -13,9 +13,6 @@ use std::path::Path;
 /// The known-exploited CVEs of the dataset, cut at the last release (toolmark/data).
 const SNAPSHOT: &[u8] = include_bytes!("../data/cve-known-exploited.json.gz");
 
-/// The dataset's file in toolmark's data folder.
-pub const DATASET_FILE: &str = "cve-dataset.json.gz";
-
 /// What a lead from the snapshot says of where it came from.
 pub const SNAPSHOT_LABEL: &str = "built-in known-exploited snapshot";
 

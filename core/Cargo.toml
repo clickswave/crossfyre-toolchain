@@ -14,6 +14,10 @@ path = "src/lib.rs"
 
 [dependencies]
 dguard = { path = "../dguard" }
+# What `crossfyre update` brings the engines: the crossfyre-templates pack and the CVE
+# dataset, and where each goes in the toolchain directory.
+cfx_pack = { path = "../pack" }
+cfx_cve = { path = "../cve" }
 # The engines' database settings in config.toml, and the password they get.
 cfx_db = { path = "../db" }
 adaptive = { path = "../adaptive" }

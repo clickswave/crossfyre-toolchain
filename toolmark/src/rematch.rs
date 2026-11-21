@@ -280,9 +280,9 @@ mod tests {
                           "affected": affected}],
             "cves": known,
         });
-        let folder = dir.join("toolmark");
-        std::fs::create_dir_all(&folder).unwrap();
-        std::fs::write(folder.join(crate::cve::DATASET_FILE), dataset.to_string()).unwrap();
+        let path = cfx_cve::path_in(dir);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, dataset.to_string()).unwrap();
     }
 
     /// A dataset a day newer, holding one more CVE for a product toolmark holds, gives

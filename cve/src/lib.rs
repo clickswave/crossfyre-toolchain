@@ -48,6 +48,12 @@ use std::fmt;
 /// The dataset format this crate reads.
 pub const FORMAT: u32 = 1;
 
+/// Where the dataset is kept in the toolchain directory `dir`: `crossfyre update` puts it
+/// there and toolmark reads it from there.
+pub fn path_in(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("toolmark").join("cve-dataset.json.gz")
+}
+
 /// A product as a CPE names it: its part (`a` for an application, `o` for an operating
 /// system), vendor and product.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]

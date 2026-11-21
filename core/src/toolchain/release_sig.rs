@@ -192,6 +192,23 @@ fn verify_against(keys: &[&str], what: &str, manifest: &[u8], sig_b64: &str) -> 
     ))
 }
 
+/// [`verify_data`] against `keys`, for a test elsewhere, which cannot set the keys
+/// compiled in.
+#[cfg(test)]
+pub(crate) fn verify_data_with(
+    keys: &[&str],
+    manifest: &[u8],
+    sig_b64: &str,
+) -> Result<(), String> {
+    verify_against(keys, "data manifest", manifest, sig_b64)
+}
+
+/// Base64 as the keys and signatures here are written, for a test elsewhere.
+#[cfg(test)]
+pub(crate) fn b64_for_tests(data: &[u8]) -> String {
+    tests::b64_encode(data)
+}
+
 /// Verify against an explicitly given public key.
 ///
 /// `verify` is the one callers use, and it reads the key compiled into the binary, which
@@ -284,7 +301,7 @@ mod tests {
         b64_encode(sk.verifying_key().as_bytes())
     }
 
-    fn b64_encode(data: &[u8]) -> String {
+    pub(super) fn b64_encode(data: &[u8]) -> String {
         const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut out = String::new();
         for chunk in data.chunks(3) {
