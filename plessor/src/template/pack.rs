@@ -55,10 +55,6 @@ pub(super) static PACK_YAML: &[(&str, &str)] = &[
         include_str!("../../templates/cves/CVE-2021-44228-log4shell.yaml"),
     ),
     (
-        "cves/CVE-2023-38646-metabase-token.yaml",
-        include_str!("../../templates/cves/CVE-2023-38646-metabase-token.yaml"),
-    ),
-    (
         "cves/langflow-instance-exposed.yaml",
         include_str!("../../templates/cves/langflow-instance-exposed.yaml"),
     ),
@@ -173,6 +169,10 @@ pub(super) static PACK_YAML: &[(&str, &str)] = &[
     (
         "misconfigurations/kubernetes-api-anonymous.yaml",
         include_str!("../../templates/misconfigurations/kubernetes-api-anonymous.yaml"),
+    ),
+    (
+        "misconfigurations/metabase-setup-open.yaml",
+        include_str!("../../templates/misconfigurations/metabase-setup-open.yaml"),
     ),
     (
         "misconfigurations/nginx-default-page.yaml",
