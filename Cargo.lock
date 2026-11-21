@@ -5854,6 +5854,7 @@ version = "0.0.17"
 dependencies = [
  "adaptive",
  "cfx_db",
+ "cfx_scope",
  "cfx_tui",
  "cfx_tunnel",
  "clap",

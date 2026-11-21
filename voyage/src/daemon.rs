@@ -116,6 +116,13 @@ struct EnumParams {
     /// authorised enum gets.
     #[serde(default)]
     block_internal: bool,
+    /// Scope entries, in cfx_scope's syntax, that an HTTP or HTTPS probe of a name found
+    /// has to be admitted by. Empty probes every name.
+    #[serde(default)]
+    scope: Vec<String>,
+    /// Follow a probe's redirects. Absent = true, as an enum always has.
+    #[serde(default = "default_true")]
+    follow_redirects: bool,
     /// Set by the daemon from the egress wrapper. See `DaemonRequest::egress`.
     #[serde(skip)]
     egress: transport::Egress,
@@ -266,6 +273,7 @@ async fn handle_connection(
                 &mut writer,
                 &serde_json::json!({
                     "type": "capabilities",
+                    "enum": ["scope", "follow_redirects", "block_internal"],
                     // The version of the egress wrapper this daemon reads.
                     "egress": transport::WIRE_VERSION,
                     // Which process answers, for the client that started it.
@@ -680,6 +688,22 @@ async fn dispatch(req: DaemonRequest, db: Arc<VoyageDb>) -> DaemonResponse {
 // Shared enum setup → returns (Scanner, total_entries)
 // ---------------------------------------------------------------------------
 
+/// The scope an enum's probes keep to: None for no entries, or the entries parsed, all
+/// of them or the enum is refused, as one misread entry would probe names nobody listed.
+fn probe_scope(entries: &[String]) -> Result<Option<cfx_scope::Scope>, String> {
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let (scope, refused) = cfx_scope::parse(entries);
+    if !refused.is_empty() {
+        return Err(format!(
+            "scope entries that do not parse: {}",
+            refused.join(", ")
+        ));
+    }
+    Ok(Some(scope))
+}
+
 /// The wordlist an enum reads, if it reads one, contained as ambulo contains its own.
 /// `wordlist` is a path from the request, and the enum sends one DNS query per line for
 /// a domain the same request names, so without the check any file the daemon can read
@@ -757,6 +781,8 @@ async fn prepare_enum(
     (Scanner<VoyageDb>, usize, cfx_db::scans::Running),
     Box<dyn std::error::Error + Send + Sync>,
 > {
+    // Before anything is sent, so an entry misread never reaches the sources or a probe.
+    let scope = probe_scope(&params.scope)?;
     let words = match following {
         Some(mut chunks) => {
             if !params.wordlist.is_empty() || params.disable_active {
@@ -864,6 +890,8 @@ async fn prepare_enum(
             interval_ms: params.delay,
             exclude_active_techniques: params.exclude_active_techniques.clone(),
             block_internal: params.block_internal,
+            scope,
+            follow_redirects: params.follow_redirects,
             http_probing_ports: params.http_probing_ports.clone(),
             https_probing_ports: params.https_probing_ports.clone(),
             active_user_agent: params.active_user_agent.clone(),
@@ -1627,6 +1655,14 @@ mod wordlist_tests {
             Ok(None)
         ));
         assert!(matches!(active_wordlist(&enum_params("", false)), Ok(None)));
+        // An enum's probe scope is all of its entries or nothing sent.
+        assert!(matches!(probe_scope(&[]), Ok(None)));
+        let scope = probe_scope(&["*.example.com".to_string()])
+            .unwrap()
+            .unwrap();
+        assert!(scope.admits("www.example.com", Some(80)));
+        let refused = probe_scope(&["*.example.com".to_string(), "*.0.0.1".to_string()]);
+        assert!(refused.is_err_and(|e| e.contains("*.0.0.1")));
     }
 
     // The enum reads its words after the passive sources have run, long after the
@@ -1826,6 +1862,8 @@ mod egress_tests {
             evasive: false,
             identify: None,
             block_internal: false,
+            scope: None,
+            follow_redirects: true,
             egress: proxied(&proxy),
         };
         let client = crate::scanner::probe_client(&config, "voyage-test").unwrap();
@@ -1928,6 +1966,11 @@ mod egress_tests {
         )
         .await;
         assert_eq!(events[0]["type"], "capabilities", "{events:?}");
+        assert_eq!(
+            events[0]["enum"],
+            serde_json::json!(["scope", "follow_redirects", "block_internal"]),
+            "{events:?}"
+        );
         assert_eq!(events[0]["egress"], 1, "{events:?}");
         assert_eq!(events[0]["pid"], std::process::id(), "{events:?}");
     }

@@ -22,6 +22,8 @@ tuning = ["cfx_tui/tuning"]
 impersonate = ["transport/impersonate"]
 
 [dependencies]
+# The scope entries an enum's probes keep to, read as every client reads them.
+cfx_scope = { path = "../scope" }
 dguard = { path = "../dguard" }
 cfx_db = { path = "../db" }
 adaptive = { path = "../adaptive" }

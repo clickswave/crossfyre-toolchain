@@ -38,6 +38,13 @@ pub struct EnumConfig {
     /// who registers a domain with records pointing inward can otherwise aim
     /// those probes at our own network.
     pub block_internal: bool,
+    /// The names and ports an HTTP or HTTPS probe may go to. A name outside it is still
+    /// looked up, as that goes to the resolvers, and is not probed. None probes every
+    /// name, as an enum always has.
+    pub scope: Option<cfx_scope::Scope>,
+    /// Follow a probe's redirects. A caller that checks each destination itself sets it
+    /// false, as a hop followed here is one that caller never sees.
+    pub follow_redirects: bool,
     /// Where the enum's HTTP probing and passive lookups go. DNS queries are not
     /// HTTP and go to the configured or public resolvers from this machine.
     pub egress: transport::Egress,
@@ -294,15 +301,8 @@ async fn task_handle<S: Store>(
             }
         };
 
-        let scan_result = active_scan::execute(
-            &resolver,
-            &client,
-            &config.exclude_active_techniques,
-            &config.http_probing_ports,
-            &config.https_probing_ports,
-            &work.full_subdomain,
-        )
-        .await;
+        let scan_result =
+            active_scan::execute(&resolver, &client, &config, &work.full_subdomain).await;
 
         // Log negative results (debug/info level only)
         for neg in &scan_result.negatives {
@@ -365,6 +365,11 @@ pub(crate) fn probe_client(
     transport::build_client(
         transport::ClientConfig {
             block_internal: config.block_internal,
+            redirect: if config.follow_redirects {
+                transport::Redirect::Limited(5)
+            } else {
+                transport::Redirect::None
+            },
             timeout: Some(Duration::from_secs(10)),
             user_agent: Some(user_agent.to_string()),
             emulate: config.evasive,
@@ -559,15 +564,7 @@ async fn adaptive_task_handle<S: Store>(
         // subdomain (lossy UDP) is retried instead of being lost.
         let mut attempt = 0u32;
         let scan_result = loop {
-            let res = active_scan::execute(
-                &resolver,
-                &client,
-                &config.exclude_active_techniques,
-                &config.http_probing_ports,
-                &config.https_probing_ports,
-                &work.full_subdomain,
-            )
-            .await;
+            let res = active_scan::execute(&resolver, &client, &config, &work.full_subdomain).await;
             let class = classify(&res);
             {
                 shared.window.lock().unwrap().record(class, 0);
