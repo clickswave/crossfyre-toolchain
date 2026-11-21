@@ -53,6 +53,8 @@ mod graphql;
 #[cfg(feature = "daemon")]
 mod inject;
 #[cfg(feature = "daemon")]
+mod leads;
+#[cfg(feature = "daemon")]
 mod ledger;
 #[cfg(feature = "daemon")]
 pub mod libs;

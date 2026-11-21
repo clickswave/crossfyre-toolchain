@@ -32,6 +32,21 @@ impl Template {
         template.source = text.to_string();
         Some(template)
     }
+
+    /// Whether it checks `cve`, as its `info.classification.cve-id` names one or a list.
+    pub fn checks_cve(&self, cve: &str) -> bool {
+        let named = |v: &serde_yaml::Value| v.as_str().is_some_and(|c| c.eq_ignore_ascii_case(cve));
+        match &self.info.classification.cve_id {
+            Some(serde_yaml::Value::Sequence(list)) => list.iter().any(named),
+            Some(one) => named(one),
+            None => false,
+        }
+    }
+
+    /// Some of what it checks is confirmed only by an out-of-band callback.
+    pub fn needs_oob(&self) -> bool {
+        self.http.iter().any(references_oob)
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -49,6 +64,16 @@ pub struct Info {
     pub tags: String,
     #[serde(default)]
     pub metadata: Meta,
+    #[serde(default)]
+    pub classification: Classification,
+}
+
+/// What the template is a check for, by public identifiers. Read loosely, as nuclei
+/// writes `cve-id` as one or a list, so that neither keeps a template from loading.
+#[derive(Debug, Deserialize, Default)]
+pub struct Classification {
+    #[serde(default, rename = "cve-id")]
+    pub cve_id: Option<serde_yaml::Value>,
 }
 
 #[derive(Debug, Deserialize, Default)]

@@ -3544,6 +3544,7 @@ dependencies = [
  "aes-gcm",
  "base64 0.22.1",
  "boring2",
+ "cfx_cve",
  "cfx_db",
  "cfx_finding",
  "cfx_pack",

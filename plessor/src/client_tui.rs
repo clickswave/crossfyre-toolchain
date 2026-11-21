@@ -3,23 +3,26 @@
 //! Chrome, keys and logs come from `cfx_tui`. What stays here is the part that
 //! is about vulnerability scanning: tracking template progress, listing
 //! matches worst-first, since a critical three screens down is a critical
-//! nobody saw, and listing the templates the scan held back, so a shorter run
-//! is not taken for a clean one.
+//! nobody saw, listing the templates the scan held back, so a shorter run is
+//! not taken for a clean one, and toolmark's CVE leads for the target beside
+//! the findings, with what the templates said of each.
 
 use cfx_tui::{Dashboard, Level, Logs, Stat, View, widgets};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::Style,
-    widgets::{Block, Borders, Cell, Row, Table, TableState},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
 };
 use serde_json::Value;
 use tokio::sync::mpsc;
 
 const FINDINGS: char = 'f';
+const LEADS: char = 'c';
 const HELD_BACK: char = 'h';
 const VIEWS: &[View] = &[
     View::new(FINDINGS, "Findings"),
+    View::new(LEADS, "CVE leads"),
     View::new(HELD_BACK, "Held back"),
 ];
 
@@ -29,6 +32,18 @@ struct Finding {
     matched_at: String,
     /// Rank for sorting: lower is worse, so criticals float to the top.
     rank: u8,
+}
+
+/// A CVE lead toolmark gave the scan, and what its templates said of it once they ran.
+struct Lead {
+    cve: String,
+    product: String,
+    severity: String,
+    kev: bool,
+    /// Empty until the scan answers.
+    answer: String,
+    /// The template that answered, or why none did.
+    by: String,
 }
 
 /// A template the scan did not run, and why.
@@ -46,6 +61,11 @@ struct Plessor {
     high: usize,
     findings: Vec<Finding>,
     table: TableState,
+    leads: Vec<Lead>,
+    leads_from: String,
+    /// The line said with a lead checked and not found: that it is no proof.
+    not_proof: Option<String>,
+    leads_table: TableState,
     held: Vec<HeldBack>,
     held_table: TableState,
     logs: Logs,
@@ -63,6 +83,10 @@ impl Plessor {
             high: 0,
             findings: Vec::new(),
             table: TableState::default(),
+            leads: Vec::new(),
+            leads_from: String::new(),
+            not_proof: None,
+            leads_table: TableState::default(),
             held: Vec::new(),
             held_table: TableState::default(),
             logs: Logs::new(),
@@ -110,6 +134,42 @@ impl Plessor {
             "log" => {
                 if let Some(m) = event["message"].as_str() {
                     self.logs.push(Level::Warn, m);
+                }
+            }
+            "leads" => {
+                self.leads_from = event["from"].as_str().unwrap_or_default().to_string();
+                let text = |v: &Value| v.as_str().unwrap_or_default().to_string();
+                self.leads = event["leads"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|l| Lead {
+                        cve: text(&l["cve"]),
+                        product: text(&l["product"]),
+                        severity: text(&l["severity"]),
+                        kev: l["kev"].as_bool().unwrap_or(false),
+                        answer: String::new(),
+                        by: String::new(),
+                    })
+                    .collect();
+            }
+            "lead_answers" => {
+                for a in event["answers"].as_array().into_iter().flatten() {
+                    let (cve, product) = (a["cve"].as_str(), a["product"].as_str());
+                    if let Some(lead) = self.leads.iter_mut().find(|l| {
+                        Some(l.cve.as_str()) == cve && Some(l.product.as_str()) == product
+                    }) {
+                        lead.answer = a["answer"].as_str().unwrap_or_default().to_string();
+                        lead.by = a["reason"]
+                            .as_str()
+                            .or(a["template"].as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                    }
+                }
+                self.not_proof = event["not_proof"].as_str().map(str::to_string);
+                if let Some(m) = event["message"].as_str() {
+                    self.logs.info(m);
                 }
             }
             "templates_held_back" => {
@@ -165,6 +225,13 @@ impl Plessor {
                 Stat::bad("Critical", self.critical),
                 Stat::new("High", self.high),
                 Stat::new("Total", self.found),
+                Stat::new(
+                    "Leads confirmed",
+                    self.leads
+                        .iter()
+                        .filter(|l| l.answer == "confirmed")
+                        .count(),
+                ),
                 Stat::new("Held back", self.held.len()),
             ],
         );
@@ -197,6 +264,71 @@ impl Plessor {
             rows[2],
             &mut self.table,
         );
+    }
+
+    fn render_leads(&mut self, frame: &mut Frame, area: Rect) {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(2)])
+            .split(area);
+        let header = Row::new(
+            [
+                "CVE",
+                "Product",
+                "Severity",
+                "KEV",
+                "Answer",
+                "By, or why not",
+            ]
+            .iter()
+            .map(|h| Cell::from(*h).style(cfx_tui::theme::title())),
+        )
+        .height(1);
+        let body: Vec<Row> = self
+            .leads
+            .iter()
+            .map(|l| {
+                let answer = if l.answer.is_empty() {
+                    "waiting"
+                } else {
+                    l.answer.as_str()
+                };
+                let colour = match answer {
+                    "confirmed" => cfx_tui::theme::BAD,
+                    "waiting" => cfx_tui::theme::MUTED,
+                    _ => cfx_tui::theme::TEXT,
+                };
+                Row::new(vec![
+                    Cell::from(l.cve.clone()),
+                    Cell::from(l.product.clone()),
+                    Cell::from(l.severity.clone())
+                        .style(Style::default().fg(severity_colour(&l.severity))),
+                    Cell::from(if l.kev { "yes" } else { "" }),
+                    Cell::from(answer.to_string()).style(Style::default().fg(colour)),
+                    Cell::from(l.by.clone()).style(cfx_tui::theme::label()),
+                ])
+            })
+            .collect();
+        let title = if self.leads_from.is_empty() {
+            "CVE leads".to_string()
+        } else {
+            format!("CVE leads from {}", self.leads_from)
+        };
+        frame.render_stateful_widget(
+            Table::new(body, widgets::table_constraints(&[16, 22, 9, 4, 20]))
+                .header(header)
+                .block(Block::default().borders(Borders::ALL).title(title))
+                .row_highlight_style(cfx_tui::theme::selected()),
+            rows[0],
+            &mut self.leads_table,
+        );
+        // A lead checked and not found is no proof, said under the table wherever one is.
+        if let Some(line) = &self.not_proof {
+            frame.render_widget(
+                Paragraph::new(line.as_str()).style(Style::default().fg(cfx_tui::theme::WARN)),
+                rows[1],
+            );
+        }
     }
 
     fn render_held_back(&mut self, frame: &mut Frame, area: Rect) {
@@ -271,6 +403,7 @@ impl Dashboard for Plessor {
     fn render(&mut self, key: char, frame: &mut Frame, area: Rect) {
         match key {
             FINDINGS => self.render_findings(frame, area),
+            LEADS => self.render_leads(frame, area),
             HELD_BACK => self.render_held_back(frame, area),
             _ => {}
         }
@@ -334,6 +467,47 @@ mod tests {
             ]
         );
         assert_eq!(view.logs.len(), 2);
+    }
+
+    /// The leads a scan was given are listed as it starts, each answered when the scan
+    /// says, with the template that answered or why none did, and the line that a lead
+    /// checked and not found is no proof.
+    #[test]
+    fn the_leads_are_listed_and_answered() {
+        let mut view = Plessor::new("http://app.test".into());
+        view.apply(json!({"type": "leads", "from": "toolmark's inventory of app.test:80",
+            "leads": [
+                {"cve": "CVE-2021-41773", "product": "Apache HTTP Server", "severity": "high", "kev": true},
+                {"cve": "CVE-2021-42013", "product": "Apache HTTP Server", "severity": "critical"},
+                {"cve": "CVE-2099-0001", "product": "Apache HTTP Server", "severity": "low"},
+            ]}));
+        assert!(view.leads.iter().all(|l| l.answer.is_empty()));
+        view.apply(json!({"type": "lead_answers", "answers": [
+                {"cve": "CVE-2021-41773", "product": "Apache HTTP Server", "answer": "confirmed",
+                 "template": "CVE-2021-41773"},
+                {"cve": "CVE-2021-42013", "product": "Apache HTTP Server",
+                 "answer": "checked, not found", "template": "CVE-2021-42013"},
+                {"cve": "CVE-2099-0001", "product": "Apache HTTP Server", "answer": "not checked",
+                 "reason": "no template checks it"},
+            ], "not_proof": "not proof the host is safe", "message": "3 CVE leads"}));
+        let shown: Vec<(&str, &str)> = view
+            .leads
+            .iter()
+            .map(|l| (l.answer.as_str(), l.by.as_str()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("confirmed", "CVE-2021-41773"),
+                ("checked, not found", "CVE-2021-42013"),
+                ("not checked", "no template checks it"),
+            ]
+        );
+        assert_eq!(
+            view.not_proof.as_deref(),
+            Some("not proof the host is safe")
+        );
+        assert!(view.leads[0].kev);
     }
 
     /// A log line from the scan, such as out-of-band callbacks being unavailable, is shown.

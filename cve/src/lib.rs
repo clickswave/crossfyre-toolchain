@@ -36,8 +36,11 @@
 //! A version matched here makes a lead, never a confirmed finding: a version can be read
 //! wrong, and a distribution's build may carry a fix its version does not show.
 
+pub mod inventory;
+mod utc;
 mod version;
 
+pub use utc::unix_time;
 pub use version::Version;
 
 use serde::Deserialize;

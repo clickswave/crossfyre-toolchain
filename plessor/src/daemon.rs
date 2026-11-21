@@ -845,8 +845,70 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A template in the --templates folder with a pack template's id runs in its place,
-    /// once: the folder's is the one that finds, and the scan counts one template.
+    /// The leads a scan is given come back answered: confirmed where the template for the
+    /// CVE found it, checked and not found, with the line that this is no proof, where it
+    /// ran and found nothing, and not checked where no template checks the CVE.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_scan_answers_the_leads_it_was_given() {
+        let (tport, _) = target(Duration::ZERO).await;
+        let dport = daemon().await;
+        let dir = std::env::temp_dir().join(format!("plessor-leads-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cve = |id: &str, word: &str| {
+            format!(
+                "id: {id}\ninfo:\n  name: {id}\n  severity: high\n  classification:\n    \
+                 cve-id: {id}\nhttp:\n  - method: GET\n    path:\n      - \"{{{{BaseURL}}}}/{id}\"\n    \
+                 matchers:\n      - type: word\n        words:\n          - {word}\n"
+            )
+        };
+        std::fs::write(dir.join("hit.yaml"), cve("CVE-2099-0001", "ok")).unwrap();
+        std::fs::write(dir.join("miss.yaml"), cve("CVE-2099-0002", "absent-marker")).unwrap();
+        let lead =
+            |cve: &str| serde_json::json!({"cve": cve, "product": "Widget", "severity": "high"});
+        let op = serde_json::json!({
+            "operation": "scan",
+            "response": "stream",
+            "target": format!("http://127.0.0.1:{tport}"),
+            "templates_dir": dir.to_string_lossy(),
+            "only": ["CVE-2099-0001", "CVE-2099-0002"],
+            "leads": [lead("CVE-2099-0001"), lead("CVE-2099-0002"), lead("CVE-2099-0003")],
+            "products_from": "toolmark's inventory of the test",
+            "evasive": false,
+            "timeout_ms": 5000,
+        });
+        let events = run_to_done(dport, &op).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let given = events
+            .iter()
+            .find(|e| e["type"] == "leads")
+            .expect("leads said");
+        assert_eq!(given["leads"].as_array().unwrap().len(), 3);
+        let answers = events
+            .iter()
+            .find(|e| e["type"] == "lead_answers")
+            .unwrap_or_else(|| panic!("no lead_answers in {events:?}"));
+        let said: Vec<(&str, &str)> = answers["answers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| (a["cve"].as_str().unwrap(), a["answer"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            said,
+            [
+                ("CVE-2099-0001", "confirmed"),
+                ("CVE-2099-0002", "checked, not found"),
+                ("CVE-2099-0003", "not checked"),
+            ]
+        );
+        assert_eq!(answers["answers"][2]["reason"], "no template checks it");
+        assert_eq!(answers["not_proof"], cfx_cve::inventory::NOT_PROOF);
+        assert_eq!(answers["from"], "toolmark's inventory of the test");
+        let at = |kind: &str| events.iter().position(|e| e["type"] == kind).unwrap();
+        assert!(at("lead_answers") < at("done"));
+    }
+
     /// A template whose method changes the target is not run, and the scan says so in
     /// the same event as the templates it held back for their products, with why.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -891,6 +953,8 @@ mod tests {
         assert!(!events.iter().any(|e| e["type"] == "finding"), "{events:?}");
     }
 
+    /// A template in the --templates folder with a pack template's id runs in its place,
+    /// once: the folder's is the one that finds, and the scan counts one template.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_folder_template_with_a_pack_templates_id_replaces_it() {
         let (tport, _) = target(Duration::ZERO).await;

@@ -119,6 +119,10 @@ pub struct ScanParams {
     /// Run every template, whatever `products` says.
     #[serde(default)]
     pub all_templates: bool,
+    /// toolmark's CVE leads for what it saw on the target, from the same inventory as
+    /// `products`, each answered once the templates that check it have run.
+    #[serde(default)]
+    pub leads: Vec<cfx_cve::inventory::HostLead>,
     /// Optional request auth (headers + cookie) resolved from a credential by the
     /// node, so scanning (and later authorization testing) runs authenticated.
     #[serde(default)]
@@ -285,6 +289,16 @@ pub async fn run<L: crate::ledger::Ledger>(
     };
 
     let _ = tx.send(json!({"type":"ack","target": base}));
+
+    // Which inventory chose the templates and gave the leads, said with both.
+    let from = params
+        .products_from
+        .as_deref()
+        .unwrap_or("the products the scan was given");
+    let mut leads = crate::leads::Leads::new(&params.leads, from);
+    if let Some(given) = leads.given() {
+        let _ = tx.send(given);
+    }
 
     // Fetch the base once and handle any WAF / anti-bot interference before
     // committing to the full scan: a challenge on the base means every
@@ -501,6 +515,10 @@ pub async fn run<L: crate::ledger::Ledger>(
             pack.into_iter().partition(|t| choice.runs(t));
         let (external, held_external): (Vec<template::Template>, Vec<template::Template>) =
             external.into_iter().partition(|t| choice.runs(t));
+        let not_seen = format!("{from} names none of its products");
+        for t in held_pack.iter().copied().chain(held_external.iter()) {
+            leads.record(t, crate::leads::Outcome::NotRun(not_seen.clone()));
+        }
         let held: Vec<&str> = held_pack
             .iter()
             .copied()
@@ -509,16 +527,12 @@ pub async fn run<L: crate::ledger::Ledger>(
             .filter(|id| allow_id(id))
             .collect();
         if !held.is_empty() {
-            let from = params
-                .products_from
-                .as_deref()
-                .unwrap_or("the products the scan was given");
             let _ = tx.send(json!({
                 "type": "templates_held_back",
                 "count": held.len(),
                 "templates": held,
                 "from": from,
-                "reason": format!("{from} names none of its products"),
+                "reason": not_seen,
                 "message": format!(
                     "{} product templates held back: {from} names none of their products. \
                      --all-templates runs them",
@@ -658,10 +672,26 @@ pub async fn run<L: crate::ledger::Ledger>(
             // only id-allowed templates. The severity filter stays inside the
             // loop, where it has always been counted as work done.
             if !allow_id(&tmpl.id) {
+                leads.record(
+                    tmpl,
+                    crate::leads::Outcome::NotRun("not among the templates asked for".into()),
+                );
                 continue;
             }
             // Run before this scan was stopped, and taken up again.
             if planning.done.contains(&tmpl.id) {
+                let found_then = planning
+                    .found
+                    .iter()
+                    .any(|f| f["template"].as_str() == Some(tmpl.id.as_str()));
+                leads.record(
+                    tmpl,
+                    if found_then {
+                        crate::leads::Outcome::Found
+                    } else {
+                        crate::leads::Outcome::Ran
+                    },
+                );
                 done += 1;
                 let _ = tx.send(json!({"type":"progress","processed": done, "total": total}));
                 continue;
@@ -670,6 +700,10 @@ pub async fn run<L: crate::ledger::Ledger>(
             // could. POST stays, for the reason the injection engine states.
             if !params.test_writes && template_changes_target(tmpl) {
                 write_templates.push(tmpl.id.clone());
+                leads.record(
+                    tmpl,
+                    crate::leads::Outcome::NotRun("what it sends changes the target".into()),
+                );
                 continue;
             }
             let sev = if tmpl.info.severity.is_empty() {
@@ -710,6 +744,24 @@ pub async fn run<L: crate::ledger::Ledger>(
                     State::Sent
                 };
                 ledger.state(&tmpl.id, state).await;
+                // One waiting on a callback ran; the callbacks say at the end if it found.
+                leads.record(
+                    tmpl,
+                    if confirmed {
+                        crate::leads::Outcome::Found
+                    } else if tmpl.needs_oob() && oob_reg.is_none() {
+                        crate::leads::Outcome::NotRun(
+                            "out-of-band callbacks were unavailable".into(),
+                        )
+                    } else {
+                        crate::leads::Outcome::Ran
+                    },
+                );
+            } else {
+                leads.record(
+                    tmpl,
+                    crate::leads::Outcome::NotRun("below the severities asked for".into()),
+                );
             }
             done += 1;
             let _ = tx.send(json!({"type":"progress","processed": done, "total": total}));
@@ -772,12 +824,27 @@ pub async fn run<L: crate::ledger::Ledger>(
                         State::Sent
                     };
                     ledger.state(&id, state).await;
+                    if called_back {
+                        leads.update(&id, crate::leads::Outcome::Found);
+                    }
                 }
             }
             oc.deregister(http, reg).await;
         }
     }
 
+    let unrun = if params.passive_only {
+        Some("the scan ran passive checks only")
+    } else if blocked {
+        Some("a WAF challenge on the target stopped the templates")
+    } else if !base_reachable {
+        Some("the target did not answer")
+    } else {
+        None
+    };
+    if let Some(answers) = leads.answers(unrun) {
+        let _ = tx.send(answers);
+    }
     let _ = tx.send(json!({"type":"done","found": found}));
 }
 
