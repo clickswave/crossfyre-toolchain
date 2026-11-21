@@ -178,6 +178,7 @@ async fn the_smuggling_probe_dials_only_the_host_the_scope_check_saw() {
     let route = crate::rawhttp::Route {
         egress: transport::Egress::Direct,
         block_internal: false,
+        resolve: Vec::new(),
     };
     let none = crate::scope::Scope::default();
     for url in [

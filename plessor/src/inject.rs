@@ -103,10 +103,10 @@ pub struct InjectParams {
     #[serde(default = "d_true")]
     pub follow_redirects: bool,
     /// Names pinned to addresses, `[["app.example.com", "203.0.113.7:443"], ...]`,
-    /// used on every connection the pass makes. A caller that has already decided
-    /// which addresses of a name may be dialled sends them, so the name is not looked
-    /// up again here and answered with somewhere else. The opt-in smuggling probe
-    /// opens raw sockets and looks names up itself.
+    /// used on every connection the pass makes, the opt-in smuggling probe's raw
+    /// sockets included. A caller that has already decided which addresses of a name
+    /// may be dialled sends them, so the name is not looked up again here and answered
+    /// with somewhere else.
     #[serde(default)]
     pub resolve: Vec<(String, std::net::SocketAddr)>,
     /// Check certificates on every connection the pass's HTTP clients make, the
@@ -749,6 +749,7 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
     let raw = Arc::new(crate::rawhttp::Route {
         egress: params.egress.clone(),
         block_internal: params.block_internal,
+        resolve: params.resolve.clone(),
     });
     let race_budget = Arc::new(AtomicUsize::new(if race.is_some() {
         MAX_RACE_ENDPOINTS

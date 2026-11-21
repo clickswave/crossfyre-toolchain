@@ -96,6 +96,13 @@ pub struct ScanParams {
     /// hops and DNS rebinding.
     #[serde(default)]
     pub block_internal: bool,
+    /// Names pinned to addresses, `[["app.example.com", "203.0.113.7:443"], ...]`, used on
+    /// every connection to the target, raw sends included. A caller that has already
+    /// decided which addresses of a name may be dialled sends them, so the name is not
+    /// looked up again here and answered with somewhere else. No challenge solver is
+    /// asked when there are any, since it would look the name up itself.
+    #[serde(default)]
+    pub resolve: Vec<(String, std::net::SocketAddr)>,
     /// Template-id allowlist. Empty = every template the severity filter admits.
     ///
     /// The severity filter alone cannot express "run the exposure pack and
@@ -185,6 +192,16 @@ pub(crate) fn announce_as(ident: &mut adaptive::identity::Identity, ua: Option<&
             || k.starts_with("sec-fetch")
             || k == "upgrade-insecure-requests")
     });
+}
+
+/// Why the challenge solver is not asked to clear this scan's target, or None when it
+/// may be: the scan's egress rules it out, or the scan dials only the addresses its names
+/// were pinned to, and the solver's browser would look them up again itself.
+fn solver_not_used(params: &ScanParams) -> Option<&'static str> {
+    crate::solver::not_used(&params.egress).or_else(|| {
+        (!params.resolve.is_empty())
+            .then_some("challenge solver not used: this op dials only the addresses it was given")
+    })
 }
 
 /// Whether this scan should present a browser TLS/HTTP2 fingerprint.
@@ -312,7 +329,7 @@ pub async fn run<L: crate::ledger::Ledger>(
                         // node's own egress. On success, retry the base carrying
                         // that cookie; if there is no solver, or it can't clear, or
                         // the challenge persists even with clearance, report + stop.
-                        if let Some(note) = crate::solver::not_used(&params.egress)
+                        if let Some(note) = solver_not_used(&params)
                             .filter(|_| clearance.is_none() && crate::solver::configured())
                         {
                             let _ = tx.send(json!({
@@ -606,6 +623,7 @@ pub async fn run<L: crate::ledger::Ledger>(
         let raw = crate::rawhttp::Route {
             egress: params.egress.clone(),
             block_internal: params.block_internal,
+            resolve: params.resolve.clone(),
         };
         // Templates held back because their method changes the target. Named
         // rather than dropped, so a shorter run is not mistaken for a clean one.
@@ -867,7 +885,7 @@ pub(crate) fn scan_client(
             browser_headers,
             extra_headers,
             emulate: should_emulate(params.user_agent.as_deref(), mode),
-            resolve: Vec::new(),
+            resolve: params.resolve.clone(),
             block_internal: params.block_internal,
             // A template request goes to the target. Off its origin a 307 or
             // 308 would carry the payload to a host nobody listed, and the
@@ -1024,6 +1042,26 @@ fn normalize_base(t: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A scan whose names are pinned is never handed to the challenge solver, whose
+    /// browser would look the names up again; nor is one through a proxy. Any other is.
+    #[test]
+    fn the_solver_is_not_asked_for_a_pinned_or_proxied_scan() {
+        let scan =
+            |v: serde_json::Value| -> super::ScanParams { serde_json::from_value(v).unwrap() };
+        let pinned = scan(serde_json::json!({"target": "http://h",
+                                             "resolve": [["h", "203.0.113.7:80"]]}));
+        assert!(super::solver_not_used(&pinned).is_some_and(|w| w.contains("addresses")));
+        let proxied = super::ScanParams {
+            egress: transport::Egress::Proxy("http://127.0.0.1:9".into()),
+            ..scan(serde_json::json!({"target": "http://h"}))
+        };
+        assert!(super::solver_not_used(&proxied).is_some_and(|w| w.contains("proxy")));
+        assert_eq!(
+            super::solver_not_used(&scan(serde_json::json!({"target": "http://h"}))),
+            None
+        );
+    }
 
     /// The node's scans do not name `pack`, and must keep running exactly the
     /// templates they ran before the pack was compiled in.

@@ -36,6 +36,14 @@ pub struct VerifyParams {
     pub timeout_ms: u64,
     #[serde(default)]
     pub block_internal: bool,
+    /// Follow same-origin redirects, as a scan does. A caller that checks each
+    /// destination itself sets it false.
+    #[serde(default = "yes")]
+    pub follow_redirects: bool,
+    /// Names pinned to addresses, `[["app.example.com", "203.0.113.7:443"], ...]`, as a
+    /// scan takes them: the proof's origin is dialled at the address its caller checked.
+    #[serde(default)]
+    pub resolve: Vec<(String, std::net::SocketAddr)>,
     /// Set by the daemon from the egress wrapper, never from the request.
     #[serde(skip)]
     pub egress: transport::Egress,
@@ -174,6 +182,7 @@ pub async fn replay(proof: &Proof, params: &VerifyParams) -> Value {
         "user_agent": params.user_agent,
         "timeout_ms": params.timeout_ms,
         "block_internal": params.block_internal,
+        "follow_redirects": params.follow_redirects,
     })) {
         Ok(scan) => scan,
         Err(e) => return failed(format!("its settings do not read: {e}")),
@@ -181,6 +190,7 @@ pub async fn replay(proof: &Proof, params: &VerifyParams) -> Value {
     let scan = crate::engine::ScanParams {
         egress: params.egress.clone(),
         auth: params.auth.clone(),
+        resolve: params.resolve.clone(),
         ..scan
     };
     let mode = adaptive::identity::Mode::from_flags(scan.evasive, scan.identify.clone());
@@ -193,6 +203,7 @@ pub async fn replay(proof: &Proof, params: &VerifyParams) -> Value {
     let raw = crate::rawhttp::Route {
         egress: scan.egress.clone(),
         block_internal: scan.block_internal,
+        resolve: scan.resolve.clone(),
     };
     match proof.kind {
         Kind::Header => {

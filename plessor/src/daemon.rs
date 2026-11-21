@@ -287,6 +287,8 @@ async fn handle_connection(
                         "type": "capabilities",
                         "cancel": true,
                         "inject": ["follow_redirects", "resolve", "verify_certs"],
+                        "scan": ["follow_redirects", "resolve"],
+                        "verify": ["follow_redirects", "resolve"],
                         // The version of the egress wrapper this daemon reads.
                         "egress": transport::WIRE_VERSION,
                         // Which process answers, for the client that started it.
@@ -1419,6 +1421,118 @@ mod tests {
         assert!(seen.lock().unwrap().is_empty(), "a refused proof was sent");
     }
 
+    /// A template scan and a verify given a name pinned to an address dial that address,
+    /// for the HTTP client's requests and a raw template's alike. The name is under
+    /// `.invalid`, which never resolves, so whatever arrives came through the pin.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_template_scan_and_a_verify_dial_a_pinned_name_at_its_address() {
+        let (tport, seen) = recording_target().await;
+        let dport = daemon().await;
+        let dir = std::env::temp_dir().join(format!("plessor-pinned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("pinned.yaml"),
+            "id: pinned-http\ninfo:\n  name: pinned\n  severity: info\n\
+             http:\n  - method: GET\n    path:\n      - \"{{BaseURL}}/pinned-http\"\n    \
+             matchers:\n      - type: word\n        words:\n          - ok\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("raw.yaml"),
+            "id: pinned-raw\ninfo:\n  name: pinned raw\n  severity: info\n\
+             http:\n  - method: GET\n    unsafe: true\n    path:\n\
+             \x20     - \"{{BaseURL}}/raw/.%2e/pinned\"\n    matchers:\n\
+             \x20     - type: status\n        status:\n          - 200\n",
+        )
+        .unwrap();
+        let pin = serde_json::json!([["pinned.invalid", format!("127.0.0.1:{tport}")]]);
+        let events = run_to_done(
+            dport,
+            &serde_json::json!({
+                "operation": "scan", "response": "stream",
+                "target": format!("http://pinned.invalid:{tport}"),
+                "templates_dir": dir.to_string_lossy(),
+                "only": ["pinned-http", "pinned-raw"],
+                "follow_redirects": false, "resolve": pin,
+                "evasive": false, "timeout_ms": 5000,
+            }),
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let sent = seen.lock().unwrap().clone();
+        for path in ["GET /pinned-http ", "GET /raw/.%2e/pinned "] {
+            assert!(
+                sent.iter().any(|r| r.starts_with(path)),
+                "{path} never arrived: {sent:?} {events:?}"
+            );
+        }
+        let proof = events
+            .iter()
+            .find(|e| e["type"] == "finding" && e["data"]["template"] == "pinned-http")
+            .map(|e| e["data"]["proof"].clone())
+            .unwrap_or_else(|| panic!("no finding in {events:?}"));
+        let verify = |resolve: Value| {
+            serde_json::json!({"operation": "verify", "response": "instant", "proof": proof,
+                               "follow_redirects": false, "resolve": resolve,
+                               "evasive": false, "timeout_ms": 3000})
+        };
+        let before = seen.lock().unwrap().len();
+        let again = verified(dport, &verify(pin)).await;
+        assert_eq!(again["answer"], "reproduced", "{again}");
+        assert!(seen.lock().unwrap().len() > before);
+        let again = verified(dport, &verify(serde_json::json!([]))).await;
+        assert_eq!(again["answer"], "unreachable", "{again}");
+    }
+
+    /// A template scan and a verify told not to follow redirects follow none, even on the
+    /// target's own origin, and a verify left to follow them does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_template_scan_and_a_verify_keep_to_follow_redirects_false() {
+        let (sport, landed) = same_origin_redirector().await;
+        let dport = daemon().await;
+        let dir = std::env::temp_dir().join(format!("plessor-noredirect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("p.yaml"),
+            "id: lands\ninfo:\n  name: lands\n  severity: info\n\
+             http:\n  - method: GET\n    path:\n      - \"{{BaseURL}}/p\"\n    \
+             matchers:\n      - type: word\n        words:\n          - ok\n",
+        )
+        .unwrap();
+        let events = run_to_done(
+            dport,
+            &serde_json::json!({
+                "operation": "scan", "response": "stream",
+                "target": format!("http://127.0.0.1:{sport}"),
+                "templates_dir": dir.to_string_lossy(), "only": ["lands"],
+                "follow_redirects": false, "evasive": false, "timeout_ms": 5000,
+            }),
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(landed.load(Ordering::SeqCst), 0, "{events:?}");
+        let proof = serde_json::json!({"format": 1, "engine": "plessor", "pack": "built in",
+            "kind": "template", "check": "lands",
+            "requests": [{"method": "GET", "url": format!("http://127.0.0.1:{sport}/p"),
+                          "fields": []}],
+            "matchers": [{"type": "word", "words": ["ok"]}],
+            "fired": [{"matcher": "word", "part": "body", "evidence": "ok"}],
+            "status": 200, "response_sha256": "", "slots": []});
+        let ask = |follow: bool| {
+            serde_json::json!({"operation": "verify", "response": "instant", "proof": proof,
+                               "follow_redirects": follow, "evasive": false,
+                               "timeout_ms": 3000})
+        };
+        let again = verified(dport, &ask(false)).await;
+        assert_eq!(again["answer"], "not reproduced", "{again}");
+        assert_eq!(landed.load(Ordering::SeqCst), 0);
+        let again = verified(dport, &ask(true)).await;
+        assert_eq!(again["answer"], "reproduced", "{again}");
+        assert!(landed.load(Ordering::SeqCst) > 0);
+    }
+
     /// The leads a scan is given come back answered: confirmed where the template for the
     /// CVE found it, checked and not found, with the line that this is no proof, where it
     /// ran and found nothing, and not checked where no template checks the CVE.
@@ -1658,12 +1772,20 @@ mod tests {
             .await
             .expect("an answer");
         assert_eq!(caps["type"], "capabilities", "{caps}");
-        for want in ["follow_redirects", "resolve", "verify_certs"] {
+        for (op, want) in [
+            ("inject", "follow_redirects"),
+            ("inject", "resolve"),
+            ("inject", "verify_certs"),
+            ("scan", "follow_redirects"),
+            ("scan", "resolve"),
+            ("verify", "follow_redirects"),
+            ("verify", "resolve"),
+        ] {
             assert!(
-                caps["inject"]
+                caps[op]
                     .as_array()
                     .is_some_and(|a| a.iter().any(|x| x == want)),
-                "{caps}"
+                "{op} {want}: {caps}"
             );
         }
         assert_eq!(caps["cancel"], true, "{caps}");
