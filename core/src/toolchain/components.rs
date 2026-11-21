@@ -12,10 +12,24 @@
 //! key whose plan no longer includes a component keeps what is installed, and it stops
 //! being updated; when Crossfyre cannot be reached, what is installed keeps working and
 //! only downloads wait.
+//!
+//! The components go out with texts of their own, the licence they are under and the
+//! notices of what they compile in, which the manifest names under `texts` and which are
+//! installed in `licences/` beside the binaries with the first component.
 
-use super::install::{Artifact, Manifest};
+use super::install::{Artifact, Component};
 use crate::api::SendApi;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+
+/// The components manifest: each component's version and files, and the texts every
+/// component goes out with, by the name each is installed under.
+#[derive(serde::Deserialize, Debug)]
+struct Manifest {
+    components: HashMap<String, Component>,
+    #[serde(default)]
+    texts: BTreeMap<String, Artifact>,
+}
 
 /// The closed components, as Crossfyre names them.
 pub const COMPONENTS: [&str; 3] = ["plessor-authz", "pacing", "egress"];
@@ -226,6 +240,33 @@ impl Here {
         };
         (file, self.bin.join(format!("{component}.version")))
     }
+
+    /// Where the components' texts go.
+    pub fn licences(&self) -> PathBuf {
+        self.bin.join("licences")
+    }
+
+    /// Every file a component puts here besides an engine's (plessor-authz is one, and
+    /// goes as engines go): the pacing module, its signature, the helper, and each one's
+    /// version.
+    pub fn component_files(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for component in COMPONENTS
+            .into_iter()
+            .filter(|c| super::engine(c).is_none())
+        {
+            let (file, sidecar) = self.placed(component);
+            if component == "pacing" {
+                out.push(PathBuf::from(format!(
+                    "{}{}",
+                    file.display(),
+                    cfx_pacing::SIG_SUFFIX
+                )));
+            }
+            out.extend([file, sidecar]);
+        }
+        out
+    }
 }
 
 /// The version of `component` installed `here`, None when it is not.
@@ -271,6 +312,9 @@ pub async fn install(
             bin.display()
         ));
     }
+    // Its licence and notices are fetched and checked before it, and written as it is
+    // placed, so nothing is written for a component that does not check out.
+    let texts = fetch_texts(client, creds, offer, component, here).await?;
     let bytes = download(client, creds, component, &artifact.file).await?;
     super::install::verify_artifact_bytes(artifact, &bytes)?;
     let (file, sidecar) = here.placed(component);
@@ -284,6 +328,7 @@ pub async fn install(
             let sig = String::from_utf8(sig).map_err(|_| "the module's signature does not read")?;
             let exe = std::env::current_exe().map_err(|e| e.to_string())?;
             cfx_pacing::install(bin, &exe, &bytes, &sig, keys, cfx_pacing::Limits::default())?;
+            write_texts(here, &texts)?;
         }
         _ => {
             let staged = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
@@ -294,6 +339,7 @@ pub async fn install(
                 super::service::try_stop(component);
             }
             super::install::place_binary(staged.path(), &file).map_err(|e| e.to_string())?;
+            write_texts(here, &texts)?;
             std::fs::write(&sidecar, &version)
                 .map_err(|e| format!("{}: {e}", sidecar.display()))?;
             if engine {
@@ -313,6 +359,52 @@ pub async fn install(
     }
     std::fs::write(&sidecar, &version).map_err(|e| format!("{}: {e}", sidecar.display()))?;
     Ok(version)
+}
+
+/// The texts the manifest names that `licences/` here does not hold as the manifest has
+/// them, each fetched with `component`, which the plan includes, and checked against the
+/// manifest. A manifest that names none is refused: a component does not go out without
+/// its licence.
+async fn fetch_texts(
+    client: &reqwest::Client,
+    creds: &Credentials,
+    offer: &Offer,
+    component: &str,
+    here: &Here,
+) -> Result<Vec<(PathBuf, Vec<u8>)>, String> {
+    if offer.manifest.texts.is_empty() {
+        return Err("the components manifest names no licence for them".into());
+    }
+    let mut out = Vec::new();
+    for (name, artifact) in &offer.manifest.texts {
+        let plain = Path::new(name)
+            .file_name()
+            .is_some_and(|f| f == name.as_str());
+        if !plain || name.starts_with('.') {
+            return Err(format!("the components manifest names a text as {name}"));
+        }
+        let dest = here.licences().join(name);
+        let current = std::fs::read(&dest)
+            .is_ok_and(|b| super::install::verify_artifact_bytes(artifact, &b).is_ok());
+        if !current {
+            let bytes = download(client, creds, component, &artifact.file).await?;
+            super::install::verify_artifact_bytes(artifact, &bytes)?;
+            out.push((dest, bytes));
+        }
+    }
+    Ok(out)
+}
+
+/// Write what [`fetch_texts`] gave, each by a rename.
+fn write_texts(here: &Here, texts: &[(PathBuf, Vec<u8>)]) -> Result<(), String> {
+    let dir = here.licences();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    for (dest, bytes) in texts {
+        let staged = dest.with_extension("new");
+        std::fs::write(&staged, bytes).map_err(|e| format!("{}: {e}", staged.display()))?;
+        std::fs::rename(&staged, dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+    }
+    Ok(())
 }
 
 /// What became of one component in [`bring_current`].

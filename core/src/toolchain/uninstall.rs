@@ -168,6 +168,7 @@ pub fn run(scope: Scope, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
                 for f in unowned_files(&bin, p) {
                     let _ = std::fs::remove_file(f);
                 }
+                let _ = std::fs::remove_dir_all(closed_here(&bin).licences());
                 if !p.owns("cfx-script")
                     && let Some(python) = fetched_python(&bin)
                 {
@@ -349,7 +350,8 @@ fn components() -> Vec<&'static str> {
 }
 
 /// What uninstall removes from `bin_dir` for a packaged install: the files of every
-/// component the package does not own, which the CLI fetched there.
+/// component the package does not own, which the CLI fetched there, and those of the
+/// closed components, which no package owns.
 #[cfg(any(not(windows), test))]
 fn unowned_files(bin_dir: &Path, p: &Packaging) -> Vec<PathBuf> {
     components()
@@ -357,7 +359,17 @@ fn unowned_files(bin_dir: &Path, p: &Packaging) -> Vec<PathBuf> {
         .filter(|c| !p.owns(c))
         .flat_map(component_files)
         .map(|f| bin_dir.join(f))
+        .chain(closed_here(bin_dir).component_files())
         .collect()
+}
+
+/// The closed components as they sit in `bin_dir`.
+#[cfg(any(not(windows), test))]
+fn closed_here(bin_dir: &Path) -> super::components::Here {
+    super::components::Here {
+        bin: bin_dir.to_path_buf(),
+        services: false,
+    }
 }
 
 /// The python folder the CLI put beside a cfx-script it fetched into `bin_dir`, when it is
@@ -578,12 +590,12 @@ mod tests {
             "/opt/crossfyre/bin/packaging.json",
         );
         let bin = Path::new("/opt/crossfyre/bin");
-        // A closed engine is no package's: the CLI fetches it after login, so uninstall
-        // takes it away again.
-        assert_eq!(
-            unowned_files(bin, &image),
-            [bin.join("plessor-authz"), bin.join("plessor-authz.version")]
-        );
+        // A closed component is no package's: the CLI fetches it after login, so
+        // uninstall takes it away again, the engine and the others alike.
+        let mut want = vec![bin.join("plessor-authz"), bin.join("plessor-authz.version")];
+        want.extend(closed_here(bin).component_files());
+        assert_eq!(unowned_files(bin, &image), want);
+        assert!(want.contains(&bin.join("pacing.wasm")) && want.contains(&bin.join("cfx-egress")));
         let root = Path::new(INSTALL_ROOT);
         assert!(has_files_under(
             &image,

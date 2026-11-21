@@ -113,6 +113,8 @@ fn sha(bytes: &[u8]) -> String {
 }
 
 const HELPER_BYTES: &[u8] = b"#!/bin/sh\necho the helper\n";
+const LICENCE: &[u8] = b"CROSSFYRE BINARY LICENCE\n\nThe terms of a test.\n";
+const NOTICES: &[u8] = b"THIRD-PARTY NOTICES: Crossfyre components\n\nBinaries: egress pacing\n";
 
 /// The release key the tests' module is signed with, and the data key it must not be.
 fn release_key() -> ed25519_dalek::SigningKey {
@@ -157,6 +159,9 @@ fn answers(
             platform.clone(): {"file": "cfx-egress-test", "sha256": sha(HELPER_BYTES)}}},
         "pacing": {"version": "0.3.0", "artifacts": {
             "any": {"file": "pacing.wasm", "sha256": sha(&m), "sig": "pacing.wasm.sig"}}},
+    }, "texts": {
+        "BINARY-LICENCE.txt": {"file": "BINARY-LICENCE-0.3.txt", "sha256": sha(LICENCE)},
+        "THIRD-PARTY-NOTICES-COMPONENTS": {"file": "notices-0.3.txt", "sha256": sha(NOTICES)},
     }})
     .to_string();
     Answers {
@@ -168,8 +173,18 @@ fn answers(
             ("cfx-egress-test".to_string(), HELPER_BYTES.to_vec()),
             ("pacing.wasm".to_string(), m.clone()),
             ("pacing.wasm.sig".to_string(), sign(signer, &m).into_bytes()),
+            ("BINARY-LICENCE-0.3.txt".to_string(), LICENCE.to_vec()),
+            ("notices-0.3.txt".to_string(), NOTICES.to_vec()),
         ]),
     }
+}
+
+/// `answers` with the manifest's texts as `edit` leaves them.
+fn with_texts(mut a: Answers, edit: impl FnOnce(&mut Value)) -> Answers {
+    let mut m: Value = serde_json::from_str(&a.manifest).unwrap();
+    edit(&mut m["texts"]);
+    a.manifest = m.to_string();
+    a
 }
 
 /// A binaries' folder of the test's own, writable by its owner only.
@@ -430,4 +445,113 @@ fn an_update_target_names_the_components_or_one_of_them() {
     assert_eq!(asked_for("pacing"), Some(vec!["pacing"]));
     assert_eq!(asked_for("plessor"), None);
     assert_eq!(asked_for("all"), None);
+}
+
+/// The licence and the notices come with the first component, into licences/ beside the
+/// binaries, once: the next component finds them there.
+#[tokio::test]
+async fn the_licence_and_the_notices_are_installed_beside_the_components() {
+    let cf = Crossfyre::start(answers(vec!["egress", "pacing"], "0.2.0", &release_key())).await;
+    let (_dir, here) = here();
+    let client = reqwest::Client::new();
+    let offer = offer(&client, &cf.creds()).await.unwrap();
+    let keys = [public(&release_key())];
+    let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+    let got = bring_current(
+        &client,
+        &cf.creds(),
+        &offer,
+        &COMPONENTS,
+        true,
+        &keys,
+        &here,
+    )
+    .await;
+    assert!(
+        got.iter().all(|(_, k)| matches!(k, Kept::Installed(_))),
+        "{got:?}"
+    );
+    assert_eq!(
+        std::fs::read(here.licences().join("BINARY-LICENCE.txt")).unwrap(),
+        LICENCE
+    );
+    assert_eq!(
+        std::fs::read(here.licences().join("THIRD-PARTY-NOTICES-COMPONENTS")).unwrap(),
+        NOTICES
+    );
+    let fetched: Vec<String> = cf
+        .downloads()
+        .into_iter()
+        .filter(|f| f.ends_with(".txt"))
+        .collect();
+    assert_eq!(fetched, ["BINARY-LICENCE-0.3.txt", "notices-0.3.txt"]);
+    let mut left: Vec<String> = std::fs::read_dir(here.licences())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        ["BINARY-LICENCE.txt", "THIRD-PARTY-NOTICES-COMPONENTS"]
+    );
+}
+
+/// A component does not go in without its licence: a manifest that names none, one that
+/// names a text by a path, and a text with other bytes than the manifest's are refused.
+#[tokio::test]
+async fn a_component_without_its_licence_is_not_installed() {
+    let cases: Vec<(Answers, &str)> = vec![
+        (
+            with_texts(answers(vec!["egress"], "0.2.0", &release_key()), |t| {
+                *t = json!({})
+            }),
+            "names no licence",
+        ),
+        (
+            with_texts(answers(vec!["egress"], "0.2.0", &release_key()), |t| {
+                t["../BINARY-LICENCE.txt"] = t["BINARY-LICENCE.txt"].clone();
+            }),
+            "names a text as ../BINARY-LICENCE.txt",
+        ),
+        (
+            with_texts(answers(vec!["egress"], "0.2.0", &release_key()), |t| {
+                t["BINARY-LICENCE.txt"]["sha256"] = json!(sha(b"other terms"));
+            }),
+            "checksum mismatch",
+        ),
+    ];
+    for (a, why) in cases {
+        let cf = Crossfyre::start(a).await;
+        let (_dir, here) = here();
+        let client = reqwest::Client::new();
+        let offer = offer(&client, &cf.creds()).await.unwrap();
+        let err = install(&client, &cf.creds(), &offer, "egress", &[], &here)
+            .await
+            .unwrap_err();
+        assert!(err.contains(why), "{why}: {err}");
+        assert!(!here.licences().join("../BINARY-LICENCE.txt").exists());
+        assert_eq!(installed_version(&here, "egress"), None, "{why}");
+    }
+}
+
+/// What uninstall takes away for the components besides an engine's.
+#[test]
+fn the_component_files_are_the_module_its_signature_the_helper_and_their_versions() {
+    let (_dir, here) = here();
+    let mut got: Vec<String> = here
+        .component_files()
+        .into_iter()
+        .map(|p| p.strip_prefix(&here.bin).unwrap().display().to_string())
+        .collect();
+    got.sort();
+    let helper = format!("cfx-egress{}", std::env::consts::EXE_SUFFIX);
+    let mut want = vec![
+        "egress.version".to_string(),
+        helper,
+        "pacing.version".to_string(),
+        "pacing.wasm".to_string(),
+        "pacing.wasm.sig".to_string(),
+    ];
+    want.sort();
+    assert_eq!(got, want);
 }
