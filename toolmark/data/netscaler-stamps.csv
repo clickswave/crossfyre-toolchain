@@ -1,7 +1,7 @@
 # Each NetScaler build, by the GZIP time of its /vpn/js/rdx/core/lang/rdx_en.json.gz:
 # Fox-IT's table, from fox-it/citrix-netscaler-triage (Apache License 2.0). Written
-# by the parent's cve_dataset job (manager.sh cve-dataset snapshot) and refreshed at
-# a release. A stamp not here gives no version.
+# by Clickswave's CVE dataset job and refreshed at a release. A stamp not here gives
+# no version.
 stamp,version
 1535167752,12.1-49.23
 1539712460,12.1-49.37

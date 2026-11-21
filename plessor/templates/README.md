@@ -1,8 +1,8 @@
 # Plessor templates
 
-The starter pack `plessor scan` runs on top of its built-in checks. The folder is
-compiled into the binary, so every installed copy has it. The format is a practical
-subset of the nuclei schema, so many existing nuclei templates work here unchanged.
+The templates `plessor scan` runs on top of its built-in checks. Each toolchain release
+compiles in a copy of this folder. The format is a practical subset of the nuclei
+schema, so many existing nuclei templates work here unchanged.
 
 The folder is read recursively, so the subdirectories below are just categories.
 
@@ -18,16 +18,14 @@ The folder is read recursively, so the subdirectories below are just categories.
 | `cves/` | Specific known CVEs, detected without running a destructive payload. |
 
 Naming the technology a host runs is toolmark's job, from its own signatures in
-[`toolmark/signatures`](../../toolmark/signatures/), so there is no category for it here.
+[`toolmark/`](../toolmark/), so there is no category for it here.
 
 ## Adding a template
 
-Drop a `.yaml` file into the category folder it fits, give it a unique `id`, and add
-a line for it to `src/template/pack.rs` (the tests name any file missing there). A
-template here ships in the next build; to run one before that, keep it in a folder
-of your own and pass `plessor scan <target> --templates <folder>`. A file that fails
-to parse, or uses a feature plessor does not support, is skipped without breaking
-the rest, and the test suite fails if one in this folder does.
+Drop a `.yaml` file into the category folder it fits and give it a unique `id`. It ships
+in the next toolchain release; to run one before that, keep it in a folder of your own
+and pass `plessor scan <target> --templates <folder>`. A file that fails to parse, or uses
+a feature plessor does not support, is skipped without breaking the rest.
 
 ## Writing good templates
 

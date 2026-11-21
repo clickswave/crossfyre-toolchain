@@ -1,7 +1,7 @@
 # For the products whose CVEs are filed under other numbering than the version
 # toolmark reads: what it reads, an exact version (eq) or a range (from, below), and
-# the version to ask the CVE data for. Written by the parent's cve_dataset job
-# (manager.sh cve-dataset snapshot) and refreshed at a release.
+# the version to ask the CVE data for. Written by Clickswave's CVE dataset job and
+# refreshed at a release.
 
 # Exchange's build, from Microsoft's list of Exchange builds.
 "a:microsoft:exchange_server":
