@@ -36,7 +36,9 @@ panel check does, names none.
 
 Every push is checked the way plessor reads templates: each file parses, has a request,
 uses only the matchers below and patterns that compile, has an id no other file has, and
-names a product toolmark names. To run the same check before sending a change:
+names a product toolmark names. A CVE template can also name a container where its product
+is vulnerable and one where it is patched, and is then run against both; see
+[`labs/`](../labs/). To run the check before sending a change:
 
 ```sh
 toolmark check toolmark --mappings mappings --names /tmp/names.txt

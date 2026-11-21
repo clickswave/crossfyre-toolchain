@@ -1138,6 +1138,12 @@ pub fn check_dir(
             ));
         }
         let meta = &template.info.metadata;
+        if meta.vendor.is_some() != meta.product.is_some() {
+            problems.push(format!(
+                "{shown}: it names a vendor or a product alone; give both, as the CPE does, \
+                 or neither"
+            ));
+        }
         if let (Some(known), Some(vendor), Some(product), false) =
             (known, &meta.vendor, &meta.product, meta.unseen)
             && !known.contains(&format!("{vendor}:{product}"))
@@ -1625,15 +1631,17 @@ mod tests {
             template("c", &named("acme", "inside", true), WORD),
         );
         write("misc/d.yaml", template("a", "", WORD));
+        write("misc/f.yaml", template("f", "    vendor: acme\n", WORD));
         write(".git/e.yaml", "id: [".to_string());
         let known: std::collections::HashSet<String> = ["acme:widget".to_string()].into();
 
         let problems = super::check_dir(&dir, Some(&known));
-        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert_eq!(problems.len(), 3, "{problems:?}");
         assert!(problems[0].starts_with("cves/b.yaml: toolmark names no acme:gadget"));
         assert!(problems[1].starts_with("misc/d.yaml: the id a is also"));
+        assert!(problems[2].starts_with("misc/f.yaml: it names a vendor or a product alone"));
         // Without the names, only the templates themselves are checked.
-        assert_eq!(super::check_dir(&dir, None).len(), 1);
+        assert_eq!(super::check_dir(&dir, None).len(), 2);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

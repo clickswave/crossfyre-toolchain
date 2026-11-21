@@ -6,7 +6,6 @@ info:
   tags: panel,portainer,docker,management
   metadata:
     category: panels
-    product: portainer
 http:
   - method: GET
     path:
