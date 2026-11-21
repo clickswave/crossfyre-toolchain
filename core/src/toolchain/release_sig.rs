@@ -378,16 +378,59 @@ mod tests {
         );
     }
 
+    /// The secret key at the path in `var`, a key file as relsign writes it.
+    fn secret_from(var: &str) -> ed25519_dalek::SigningKey {
+        let path = std::env::var(var).unwrap_or_else(|_| panic!("{var} names no key file"));
+        let text = std::fs::read_to_string(&path).expect("the key file reads");
+        keypair_from(text.trim())
+    }
+
+    /// With a release key and a data key compiled in, as a release is built, each set
+    /// vouches only for its own manifest: `verify` refuses a release manifest the data
+    /// key signed, so the data key cannot make this build accept a binary, and
+    /// `verify_data` refuses a data manifest a release key signed.
+    ///
+    /// The keys are read when this is built, so it runs only in a build given throwaway
+    /// ones: scripts/build_tests/test_key_separation.py makes two with relsign, builds
+    /// this with their public halves as CROSSFYRE_MANIFEST_PUBKEY and
+    /// CROSSFYRE_DATA_PUBKEY, and hands it the private halves' paths.
+    #[test]
+    #[ignore = "needs throwaway keys compiled in: scripts/build_tests/test_key_separation.py"]
+    fn with_keys_compiled_in_the_data_key_never_vouches_for_a_release_manifest() {
+        use ed25519_dalek::Signer;
+        let release = secret_from("CFX_TEST_RELEASE_SECKEY");
+        let data = secret_from("CFX_TEST_DATA_SECKEY");
+        assert_eq!(MANIFEST_PUBKEY, Some(pubkey_b64(&release).as_str()));
+        assert_eq!(DATA_PUBKEY, Some(pubkey_b64(&data).as_str()));
+        assert!(required() && data_required());
+        let sign =
+            |key: &ed25519_dalek::SigningKey, body: &[u8]| b64_encode(&key.sign(body).to_bytes());
+        let data_manifest = br#"{"format":1,"made":"2026-11-21T15:00:00Z"}"#;
+        assert!(verify(TEST_MANIFEST, &sign(&release, TEST_MANIFEST)).is_ok());
+        assert!(
+            verify(TEST_MANIFEST, &sign(&data, TEST_MANIFEST)).is_err(),
+            "the data key vouched for a release manifest"
+        );
+        assert!(verify_data(data_manifest, &sign(&data, data_manifest)).is_ok());
+        assert!(
+            verify_data(data_manifest, &sign(&release, data_manifest)).is_err(),
+            "a release key vouched for a data manifest"
+        );
+    }
+
     /// A build carries no data key unless it was built with one, and then checks nothing,
     /// as an unkeyed build skips the release manifest's check.
     #[test]
     fn an_unkeyed_build_skips_the_data_manifests_check() {
-        assert!(
-            DATA_PUBKEY.is_none(),
-            "this test binary is built without a data key"
-        );
-        assert!(!data_required());
-        assert!(verify_data(b"anything", "not a signature").is_ok());
+        // As for the release key, this means what it says in a build with no data key,
+        // which a development build and a public checkout are.
+        if DATA_PUBKEY.is_none() {
+            assert!(!data_required());
+            assert!(verify_data(b"anything", "not a signature").is_ok());
+        } else {
+            assert!(data_required());
+            assert!(verify_data(b"anything", "not a signature").is_err());
+        }
     }
 
     #[test]
