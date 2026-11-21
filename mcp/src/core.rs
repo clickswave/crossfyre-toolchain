@@ -541,7 +541,7 @@ impl Mcp {
     }
 
     /// Ask the engine whether it honours `options` for `operation`, before anything
-    /// is sent that it might run without them.
+    /// is sent that it might run without them, and which pacing it runs, when it says.
     pub(crate) async fn require(
         &self,
         conn: &mut EngineConn,
@@ -549,9 +549,9 @@ impl Mcp {
         port: u16,
         operation: &str,
         options: &[&str],
-    ) -> Result<(), Refusal> {
+    ) -> Result<Option<String>, Refusal> {
         match conn.supports(operation, options).await {
-            Support::Yes => Ok(()),
+            Support::Yes { pacing } => Ok(pacing),
             Support::Old => Err(Refusal::new(
                 Reason::EngineUnavailable,
                 format!(

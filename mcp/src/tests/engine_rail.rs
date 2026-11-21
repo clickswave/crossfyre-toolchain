@@ -29,13 +29,16 @@ async fn the_engines_are_pinned_to_the_cleared_address_with_redirects_off() {
         .build();
     let peer = FakePeer::new(Elicit::None);
 
-    ok(&t
+    let r = t
         .call(
             &peer,
             "fingerprint",
             json!({"url": "http://mixed.test:8080/"}),
         )
-        .await);
+        .await;
+    // Which pacing toolmark said it runs, before anything was sent.
+    assert_eq!(ok(&r)["pacing"], "module stub 1", "{}", r.text);
+    assert!(r.text.contains("pacing: module stub 1."), "{}", r.text);
     let op = &toolmark.ops()[0];
     assert_eq!(
         op["resolve"],

@@ -52,14 +52,15 @@ pub(crate) async fn run(
     let mut conn = engine::connect(port)
         .await
         .map_err(|_| mcp.engine_down("toolmark", port))?;
-    mcp.require(
-        &mut conn,
-        "toolmark",
-        port,
-        "fingerprint",
-        &["resolve", "block_internal"],
-    )
-    .await?;
+    let pacing = mcp
+        .require(
+            &mut conn,
+            "toolmark",
+            port,
+            "fingerprint",
+            &["resolve", "block_internal"],
+        )
+        .await?;
     let clearance = mcp.confirm(pending, peer, None, note, ct).await?;
     if ct.is_cancelled() {
         return Err(cancelled());
@@ -293,9 +294,17 @@ pub(crate) async fn run(
         "technologies": value["technologies"].as_array().map(|a| a.len()),
         "cve_leads": value["cve_leads"].as_array().map(|a| a.len()),
     }));
+    // Which pacing toolmark runs, as it said before the scan was sent.
+    let paced = match &pacing {
+        Some(p) => {
+            value["pacing"] = json!(p);
+            format!(" pacing: {p}.")
+        }
+        None => String::new(),
+    };
     let summary = format!(
         "toolmark fingerprinted {}: HTTP {}, {} technologies, {} CVE leads (inferred from \
-         versions, so verify the build).",
+         versions, so verify the build).{paced}",
         untrusted::clean(&dest.origin(), 200),
         status_code
             .map(|s| s.to_string())

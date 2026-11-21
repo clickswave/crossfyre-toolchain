@@ -48,6 +48,9 @@ async fn a_port_scan_tries_only_ports_the_scope_admits_and_is_pinned() {
     );
     assert_eq!(v["counts"]["findings"], 1, "an open port is a finding: {v}");
     assert_eq!(v["progress"]["done"], 2, "{v}");
+    // Which pacing doorward said it runs, before anything was sent.
+    assert_eq!(v["pacing"], "module stub 1", "{v}");
+    assert!(r.text.contains("pacing: module stub 1."), "{}", r.text);
     let op = &doorward.ops()[0];
     assert_eq!(op["operation"], "scan", "{op}");
     assert_eq!(op["targets"], json!(["app.test"]), "{op}");

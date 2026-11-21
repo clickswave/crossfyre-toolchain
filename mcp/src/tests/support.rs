@@ -385,6 +385,9 @@ pub(crate) async fn stub_engine(opts: StubOpts) -> Stub {
                                "inject": ["follow_redirects", "resolve", "verify_certs"],
                                "fingerprint": ["resolve", "block_internal"]})
                     };
+                    if !opts.old {
+                        answer["pacing"] = json!("module stub 1");
+                    }
                     if !opts.old && !opts.no_scan_pins {
                         // What plessor, doorward and ambulo each list under `scan`, together.
                         answer["scan"] = json!(["follow_redirects", "resolve", "block_internal"]);

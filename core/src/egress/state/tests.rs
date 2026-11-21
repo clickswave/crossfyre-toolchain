@@ -399,11 +399,18 @@ fn an_old_engine_is_told_apart_from_an_ordinary_error() {
     assert!(wrapper_refusal("plessor", r#"{"type":"ack","total":3}"#).is_none());
 }
 
-/// The heartbeat says, per engine, whether it sends a wrapped op through a proxy.
+/// The heartbeat says, per engine, whether it sends a wrapped op through a proxy, and
+/// which pacing it runs.
 #[tokio::test]
 async fn each_engine_is_asked_whether_it_reads_the_wrapper() {
-    let current =
-        FakeEngine::start(|_| async { vec![json!({"type": "capabilities", "egress": 1})] }).await;
+    let current = FakeEngine::start(|_| async {
+        vec![json!({"type": "capabilities", "egress": 1, "pacing": "module 0.1.45"})]
+    })
+    .await;
+    let unclean = FakeEngine::start(|_| async {
+        vec![json!({"type": "capabilities", "egress": 1, "pacing": "module 1\nforged: yes"})]
+    })
+    .await;
     let old = FakeEngine::old().await;
     let doorward = FakeEngine::start(|_| async {
         vec![json!({"operation_id": "", "status": "error",
@@ -413,11 +420,21 @@ async fn each_engine_is_asked_whether_it_reads_the_wrapper() {
     let newer =
         FakeEngine::start(|_| async { vec![json!({"type": "capabilities", "egress": 2})] }).await;
     let at = |p: u16| format!("127.0.0.1:{p}");
-    assert_eq!(engine_reads_egress(&at(current.port)).await, Some(true));
-    assert_eq!(engine_reads_egress(&at(old.port)).await, Some(false));
-    assert_eq!(engine_reads_egress(&at(doorward.port)).await, Some(false));
-    assert_eq!(engine_reads_egress(&at(newer.port)).await, Some(false));
-    assert_eq!(engine_reads_egress("127.0.0.1:0").await, None);
+    let said = |reads_egress: bool, pacing: Option<&str>| {
+        Some(EngineAnswer {
+            reads_egress,
+            pacing: pacing.map(str::to_string),
+        })
+    };
+    assert_eq!(
+        engine_answer(&at(current.port)).await,
+        said(true, Some("module 0.1.45"))
+    );
+    assert_eq!(engine_answer(&at(unclean.port)).await, said(true, None));
+    assert_eq!(engine_answer(&at(old.port)).await, said(false, None));
+    assert_eq!(engine_answer(&at(doorward.port)).await, said(false, None));
+    assert_eq!(engine_answer(&at(newer.port)).await, said(false, None));
+    assert_eq!(engine_answer("127.0.0.1:0").await, None);
     // The probe is wrapped, with a direct egress: it sends nothing anywhere.
     let probe = &current.seen()[0];
     assert_eq!(probe["operation"], "egress");
@@ -628,18 +645,27 @@ async fn a_controller_without_egress_settings_is_never_asked() {
 #[test]
 fn an_engine_is_asked_again_after_a_while() {
     let t0 = Instant::now();
-    let mut e = EngineEgress::default();
+    let said = |reads_egress: bool, pacing: Option<&str>| {
+        Some(EngineAnswer {
+            reads_egress,
+            pacing: pacing.map(str::to_string),
+        })
+    };
+    let mut e = EngineAnswers::default();
     assert!(e.due("ambulo", t0));
-    e.answered("ambulo".into(), Some(true), t0);
+    e.answered("ambulo".into(), said(true, Some("module 1")), t0);
     assert!(e.reads("ambulo"));
+    assert_eq!(e.pacing("ambulo"), Some("module 1"));
     assert!(!e.due("ambulo", t0 + Duration::from_secs(1)));
     assert!(e.due("ambulo", t0 + ENGINE_ASK_EVERY));
-    // The engine now in its place says it does not read the wrapper.
-    e.answered("ambulo".into(), Some(false), t0 + ENGINE_ASK_EVERY);
+    // The engine now in its place says it does not read the wrapper, and no pacing.
+    e.answered("ambulo".into(), said(false, None), t0 + ENGINE_ASK_EVERY);
     assert!(!e.reads("ambulo"));
+    assert_eq!(e.pacing("ambulo"), None);
     // No answer is not a yes, whatever the engine said before.
-    e.answered("ambulo".into(), Some(true), t0);
+    e.answered("ambulo".into(), said(true, Some("module 1")), t0);
     e.answered("ambulo".into(), None, t0 + ENGINE_ASK_EVERY);
     assert!(!e.reads("ambulo"));
+    assert_eq!(e.pacing("ambulo"), None);
     assert!(e.due("ambulo", t0 + ENGINE_ASK_EVERY));
 }

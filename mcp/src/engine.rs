@@ -68,7 +68,8 @@ pub(crate) static OWNERS: std::sync::LazyLock<
 
 /// Whether a daemon honours the options an operation is about to be sent with.
 pub(crate) enum Support {
-    Yes,
+    /// It honours them, and said which pacing it runs, when it said.
+    Yes { pacing: Option<String> },
     /// It does not know the question, or knows it and lacks an option: a daemon from
     /// before these options, which would run the operation and ignore them.
     Old,
@@ -149,7 +150,10 @@ impl EngineConn {
                 let listed = v.get(operation).and_then(|o| o.as_array());
                 let has = |o: &&str| listed.is_some_and(|l| l.iter().any(|x| x == *o));
                 if options.iter().all(has) {
-                    Support::Yes
+                    let pacing = v.get("pacing").and_then(|p| p.as_str());
+                    Support::Yes {
+                        pacing: pacing.map(|p| crate::untrusted::clean(p, 120)),
+                    }
                 } else {
                     Support::Old
                 }

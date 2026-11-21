@@ -222,7 +222,8 @@ pub(crate) async fn start_scan(
         _ if has_auth => &["follow_redirects", "resolve", "verify_certs"],
         _ => &["follow_redirects", "resolve"],
     };
-    mcp.require(&mut conn, name, port, operation, options)
+    let pacing = mcp
+        .require(&mut conn, name, port, operation, options)
         .await?;
     let clearance = mcp.confirm(pending, peer, plan.write, note, ct).await?;
     if ct.is_cancelled() {
@@ -456,10 +457,18 @@ pub(crate) async fn start_scan(
         .map(|m| m.clone())
         .unwrap_or_else(|_| meta.clone());
     note.result = Some(json!({"status": m.status, "findings": m.counts.findings}));
-    let value = scan_view(&m, mcp.settings.redact);
+    let mut value = scan_view(&m, mcp.settings.redact);
+    // Which pacing the engine runs, as it said before the scan was sent.
+    let paced = match &pacing {
+        Some(p) => {
+            value["pacing"] = json!(p);
+            format!(" pacing: {p}.")
+        }
+        None => String::new(),
+    };
     let summary = format!(
-        "{name} scan {} on {} is {}: {} of {} {unit} done, {} findings. Poll get_scan, and \
-         read results with list_findings.",
+        "{name} scan {} on {} is {}: {} of {} {unit} done, {} findings.{paced} Poll get_scan, \
+         and read results with list_findings.",
         m.id,
         untrusted::clean(&target, 200),
         m.status,

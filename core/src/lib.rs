@@ -2317,6 +2317,23 @@ fn toolchain_health(
     status
 }
 
+/// The heartbeat's `toolchain_status.pacing`: which pacing the node runs, and each of
+/// `engines` that said which it runs, by name.
+fn pacing_status<'a>(
+    node: &str,
+    answers: &egress::state::EngineAnswers,
+    engines: impl Iterator<Item = &'a String>,
+) -> serde_json::Value {
+    let mut pacing = serde_json::Map::new();
+    pacing.insert("node".into(), serde_json::json!(node));
+    for ext in engines {
+        if let Some(p) = answers.pacing(ext) {
+            pacing.insert(ext.clone(), serde_json::json!(p));
+        }
+    }
+    serde_json::Value::Object(pacing)
+}
+
 /// The heartbeat's `toolchain_status` with what the node last did with the data in
 /// `data`: nothing is said before the first run.
 fn with_data(
@@ -2898,7 +2915,7 @@ pub async fn run_daemon(
     // engine name. Asked once an engine is seen running, again after it is installed,
     // restarted or stopped, and every half minute besides, so the heartbeat can say
     // which engines a proxied op can use.
-    let mut engine_egress = egress::state::EngineEgress::default();
+    let mut engine_answers = egress::state::EngineAnswers::default();
 
     // The data the engines read: the crossfyre-templates pack and the CVE dataset, which
     // this node takes from the bins origin as it starts and once a day after, as
@@ -2970,8 +2987,8 @@ pub async fn run_daemon(
                         let port = crate::toolchain::config::engine_port(ext);
                         let running = engine_listening(port);
                         if !running {
-                            engine_egress.remove(ext);
-                        } else if engine_egress.due(ext, std::time::Instant::now()) {
+                            engine_answers.remove(ext);
+                        } else if engine_answers.due(ext, std::time::Instant::now()) {
                             ask.push((ext.to_string(), format!("127.0.0.1:{port}")));
                         }
                         map.insert(ext.to_string(), serde_json::json!({
@@ -2980,16 +2997,16 @@ pub async fn run_daemon(
                             "installed": installed
                         }));
                     }
-                    let answers = futures_util::future::join_all(ask.iter().map(|(_, addr)| {
-                        egress::state::engine_reads_egress(addr)
-                    }))
+                    let answers = futures_util::future::join_all(
+                        ask.iter().map(|(_, addr)| egress::state::engine_answer(addr)),
+                    )
                     .await;
                     let asked_at = std::time::Instant::now();
-                    for ((ext, _), reads) in ask.into_iter().zip(answers) {
-                        engine_egress.answered(ext, reads, asked_at);
+                    for ((ext, _), answer) in ask.into_iter().zip(answers) {
+                        engine_answers.answered(ext, answer, asked_at);
                     }
                     for (ext, status) in map.iter_mut() {
-                        status["egress"] = serde_json::json!(engine_egress.reads(ext));
+                        status["egress"] = serde_json::json!(engine_answers.reads(ext));
                     }
                     serde_json::Value::Object(map)
                 };
@@ -3011,9 +3028,14 @@ pub async fn run_daemon(
                     )
                 };
 
-                let toolchain_status = with_data(
+                let mut toolchain_status = with_data(
                     toolchain_status,
                     data_status.lock().unwrap_or_else(|e| e.into_inner()).as_ref(),
+                );
+                toolchain_status["pacing"] = pacing_status(
+                    &adaptive::backend::pacing().label(),
+                    &engine_answers,
+                    ext_status.as_object().into_iter().flat_map(|m| m.keys()),
                 );
 
                 let host_status = if first_tick {
@@ -3369,7 +3391,7 @@ pub async fn run_daemon(
                             }
                             Some("install_extension") => {
                                 let ext = cmd["extension"].as_str().unwrap_or("").to_string();
-                                engine_egress.remove(&ext);
+                                engine_answers.remove(&ext);
                                 println!("\n[install] Installing extension: {ext}");
 
                                 // Built-in package manager: download + verify +
@@ -3429,7 +3451,7 @@ pub async fn run_daemon(
                                 let updated = toolchain::install::update_for_dashboard().await;
                                 // An update can replace the engines without this node
                                 // restarting, so ask each again what it reads.
-                                engine_egress.clear();
+                                engine_answers.clear();
 
                                 if let Ok(u) = &updated {
                                     let mut held =
@@ -3469,7 +3491,7 @@ pub async fn run_daemon(
                             }
                             Some("remove_extension") => {
                                 let ext = cmd["extension"].as_str().unwrap_or("").to_string();
-                                engine_egress.remove(&ext);
+                                engine_answers.remove(&ext);
                                 println!("\n[remove] Removing extension: {ext}");
 
                                 let remove_ok = match toolchain::install::remove(&ext) {
@@ -3487,7 +3509,7 @@ pub async fn run_daemon(
                             }
                             Some("restart_extension") => {
                                 let ext = cmd["extension"].as_str().unwrap_or("").to_string();
-                                engine_egress.remove(&ext);
+                                engine_answers.remove(&ext);
                                 println!("\n[restart] Restarting extension: {ext}");
 
                                 let msg = match toolchain::service::restart(&ext) {
@@ -3518,7 +3540,7 @@ pub async fn run_daemon(
                             }
                             Some("reinstall_extension") => {
                                 let ext = cmd["extension"].as_str().unwrap_or("").to_string();
-                                engine_egress.remove(&ext);
+                                engine_answers.remove(&ext);
                                 println!("\n[reinstall] Reinstalling extension: {ext}");
 
                                 let writer = toolchain::install::Writer::node(node_version);
@@ -3544,7 +3566,7 @@ pub async fn run_daemon(
                             }
                             Some("stop_extension") => {
                                 let ext = cmd["extension"].as_str().unwrap_or("").to_string();
-                                engine_egress.remove(&ext);
+                                engine_answers.remove(&ext);
                                 println!("\n[stop] Stopping extension: {ext}");
 
                                 let success = match toolchain::service::stop(&ext) {
@@ -4236,6 +4258,38 @@ mod heartbeat_tests {
         assert_eq!(status["postgres"]["port"], 4440);
         assert_eq!(status["postgres"]["running"], true);
         assert!(status.get("managed_by").is_none(), "{status}");
+    }
+
+    /// The heartbeat says which pacing the node runs, and each engine that said which it
+    /// runs, as it said it. One that has not said is left out.
+    #[test]
+    fn the_heartbeat_says_which_pacing_the_node_and_each_engine_run() {
+        let t0 = std::time::Instant::now();
+        let mut answers = egress::state::EngineAnswers::default();
+        let said = |pacing: Option<&str>| {
+            Some(egress::state::EngineAnswer {
+                reads_egress: true,
+                pacing: pacing.map(str::to_string),
+            })
+        };
+        answers.answered("voyage".into(), said(Some("module 0.1.45")), t0);
+        answers.answered(
+            "ambulo".into(),
+            said(Some("baseline (no module is installed)")),
+            t0,
+        );
+        answers.answered("plessor".into(), said(None), t0);
+        let names: Vec<String> = ["voyage", "ambulo", "plessor", "doorward"]
+            .map(String::from)
+            .into();
+        assert_eq!(
+            pacing_status("module 0.1.45", &answers, names.iter()),
+            serde_json::json!({
+                "node": "module 0.1.45",
+                "voyage": "module 0.1.45",
+                "ambulo": "baseline (no module is installed)",
+            })
+        );
     }
 
     /// The heartbeat says what the node last did with the data once it has run: the
@@ -5385,7 +5439,7 @@ mod impostor_engine_tests {
         let imp = impostor();
         let addr = format!("127.0.0.1:{}", imp.port);
         let answer = ops::listener::TRUSTED
-            .scope(others(), egress::state::engine_reads_egress(&addr))
+            .scope(others(), egress::state::engine_answer(&addr))
             .await;
         assert_eq!(answer, None);
         assert!(imp.got.lock().unwrap().is_empty());

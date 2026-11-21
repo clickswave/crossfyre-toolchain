@@ -796,12 +796,22 @@ pub fn wrapper_refusal(engine: &str, first_line: &str) -> Option<String> {
     None
 }
 
-/// Whether the engine listening on `addr` sends a wrapped op through the proxy it names:
-/// `Some(true)` for an engine that reads egress version 1, `Some(false)` for one that
-/// does not (an engine older than the wrapper, or doorward, which reads the wrapper and
-/// sends nothing through a proxy), and `None` when it did not answer or its listener is
-/// not the engines' (see [`crate::ops::listener`]).
-pub async fn engine_reads_egress(addr: &str) -> Option<bool> {
+/// What an engine said when asked its capabilities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineAnswer {
+    /// Whether it sends a wrapped op through the proxy the wrapper names.
+    pub reads_egress: bool,
+    /// Which pacing it runs, as it said it (`module <version>` or `baseline (<why>)`):
+    /// None from an engine older than that, or a value that is not one short line.
+    pub pacing: Option<String>,
+}
+
+/// What the engine listening on `addr` says of itself: whether it sends a wrapped op
+/// through the proxy it names (true for an engine that reads egress version 1; false
+/// for one that does not, an engine older than the wrapper or doorward, which reads the
+/// wrapper and sends nothing through a proxy), and which pacing it runs. `None` when it
+/// did not answer or its listener is not the engines' (see [`crate::ops::listener`]).
+pub async fn engine_answer(addr: &str) -> Option<EngineAnswer> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let probe = async {
         let s = crate::ops::listener::connect(addr).await.ok()?;
@@ -820,25 +830,34 @@ pub async fn engine_reads_egress(addr: &str) -> Option<bool> {
         .ok()??;
     let v: Value = serde_json::from_str(&line).ok()?;
     if v["type"] == "capabilities" {
-        return Some(v["egress"].as_i64() == Some(SETTINGS_VERSION));
+        let pacing = v["pacing"].as_str().filter(|p| {
+            !p.is_empty() && p.len() <= 120 && p.bytes().all(|b| (b' '..=b'~').contains(&b))
+        });
+        return Some(EngineAnswer {
+            reads_egress: v["egress"].as_i64() == Some(SETTINGS_VERSION),
+            pacing: pacing.map(str::to_string),
+        });
     }
-    dguard::is_error(&line).then_some(false)
+    dguard::is_error(&line).then_some(EngineAnswer {
+        reads_egress: false,
+        pacing: None,
+    })
 }
 
-/// How long an engine's answer to [`engine_reads_egress`] stands. An engine replaced
+/// How long an engine's answer to [`engine_answer`] stands. An engine replaced
 /// between two heartbeats (a package upgrade or downgrade, a restart by hand) is back on
 /// the same port before the next one, so the heartbeat never sees it stopped; asking
 /// again this often bounds how long it reports the previous engine's answer.
 pub const ENGINE_ASK_EVERY: Duration = Duration::from_secs(30);
 
-/// What each running engine answered when asked whether it reads the egress wrapper,
-/// and when, by engine name. The heartbeat reports it per engine.
+/// What each running engine answered when asked its capabilities, and when, by engine
+/// name. The heartbeat reports it per engine.
 #[derive(Default)]
-pub struct EngineEgress {
-    answers: std::collections::HashMap<String, (bool, Instant)>,
+pub struct EngineAnswers {
+    answers: std::collections::HashMap<String, (EngineAnswer, Instant)>,
 }
 
-impl EngineEgress {
+impl EngineAnswers {
     /// Whether `ext` is to be asked at `now`: it has not answered yet, or answered
     /// [`ENGINE_ASK_EVERY`] ago or longer.
     pub fn due(&self, ext: &str, now: Instant) -> bool {
@@ -848,10 +867,10 @@ impl EngineEgress {
     }
 
     /// Keep an engine's answer, or forget the old one when it gave none.
-    pub fn answered(&mut self, ext: String, reads: Option<bool>, now: Instant) {
-        match reads {
-            Some(r) => {
-                self.answers.insert(ext, (r, now));
+    pub fn answered(&mut self, ext: String, answer: Option<EngineAnswer>, now: Instant) {
+        match answer {
+            Some(a) => {
+                self.answers.insert(ext, (a, now));
             }
             None => {
                 self.answers.remove(&ext);
@@ -861,7 +880,12 @@ impl EngineEgress {
 
     /// Whether `ext` said it reads the wrapper. An engine that has not said so does not.
     pub fn reads(&self, ext: &str) -> bool {
-        self.answers.get(ext).is_some_and(|(r, _)| *r)
+        self.answers.get(ext).is_some_and(|(a, _)| a.reads_egress)
+    }
+
+    /// Which pacing `ext` said it runs, when it said.
+    pub fn pacing(&self, ext: &str) -> Option<&str> {
+        self.answers.get(ext).and_then(|(a, _)| a.pacing.as_deref())
     }
 
     /// Forget `ext`'s answer: it was stopped, installed or restarted.
