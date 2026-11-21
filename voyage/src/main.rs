@@ -29,6 +29,8 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Before anything asks the adaptive crate, clap's defaults included.
+    cfx_pacing::load();
     let cli = Cli::parse();
 
     // -----------------------------------------------------------------------

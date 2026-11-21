@@ -10,6 +10,8 @@ use plessor::libs::cli_args::Cli;
 // debug form: in quotes, with a line break shown as a backslash and an n.
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    // Before anything asks the adaptive crate, clap's defaults included.
+    cfx_pacing::load();
     match plessor::run(Cli::parse()).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {

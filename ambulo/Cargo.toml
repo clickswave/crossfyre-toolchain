@@ -26,6 +26,7 @@ impersonate = ["transport/impersonate"]
 dguard = { path = "../dguard" }
 cfx_db = { path = "../db" }
 adaptive = { path = "../adaptive" }
+cfx_pacing = { path = "../pacing" }
 transport = { path = "../transport" }
 cfx_browser = { path = "../browser" }
 tokio = { version = "1.47.1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "process", "time"] }

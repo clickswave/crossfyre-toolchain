@@ -28,6 +28,7 @@ cfx_scope = { path = "../scope" }
 dguard = { path = "../dguard" }
 cfx_db = { path = "../db" }
 adaptive = { path = "../adaptive" }
+cfx_pacing = { path = "../pacing" }
 transport = { path = "../transport" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "time"] }
 clap = { version = "4", features = ["derive"] }

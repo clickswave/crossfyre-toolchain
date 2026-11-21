@@ -190,6 +190,7 @@ pub async fn run(port: u16, db: VoyageDb) -> Result<(), Box<dyn std::error::Erro
     let listener = TcpListener::bind(addr).await?;
     gate.announce("Voyage", addr);
     dguard::exit_when_idle("voyage");
+    eprintln!("[voyage] {}", cfx_pacing::load().say());
 
     let db = Arc::new(db);
 
@@ -276,6 +277,8 @@ async fn handle_connection(
                     "enum": ["scope", "follow_redirects", "block_internal"],
                     // The version of the egress wrapper this daemon reads.
                     "egress": transport::WIRE_VERSION,
+                    // Which pacing this daemon runs: `module <version>`, or `baseline (<why>)`.
+                    "pacing": cfx_pacing::load().label(),
                     // Which process answers, for the client that started it.
                     "pid": std::process::id(),
                 }),
@@ -319,6 +322,9 @@ async fn handle_connection(
             write_json(&mut writer, &answer.await).await?;
             continue;
         }
+
+        // Every operation from here on sends: say which pacing it runs with.
+        eprintln!("[voyage] {}: {}", req.operation, cfx_pacing::load().say());
 
         // Stream mode takes over the connection for the duration of the scan.
         // Routed by operation first: each stream handler parses its own params,
@@ -1966,6 +1972,8 @@ mod egress_tests {
         )
         .await;
         assert_eq!(events[0]["type"], "capabilities", "{events:?}");
+        // Which pacing runs, as the engine said it when it started.
+        assert_eq!(events[0]["pacing"], cfx_pacing::load().label().as_str());
         assert_eq!(
             events[0]["enum"],
             serde_json::json!(["scope", "follow_redirects", "block_internal"]),

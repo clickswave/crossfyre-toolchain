@@ -90,6 +90,7 @@ pub async fn run(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
     gate.announce("Plessor", addr);
     dguard::exit_when_idle("plessor");
+    eprintln!("[plessor] {}", cfx_pacing::load().say());
     // What `crossfyre update` put in the toolchain directory, or what is compiled in.
     let packs = std::sync::Arc::new(Packs::load(dguard::toolchain_dir().as_deref()));
     eprintln!("[plessor] templates from {}", packs.now().from);
@@ -291,6 +292,9 @@ async fn handle_connection(
                         "verify": ["follow_redirects", "resolve"],
                         // The version of the egress wrapper this daemon reads.
                         "egress": transport::WIRE_VERSION,
+                        // Which pacing this daemon runs: `module <version>`, or
+                        // `baseline (<why>)`.
+                        "pacing": cfx_pacing::load().label(),
                         // Which process answers, for the client that started it.
                         "pid": std::process::id(),
                     }),
@@ -407,6 +411,7 @@ where
     F: FnOnce(P, mpsc::UnboundedSender<Value>, Option<String>) -> Fut,
     Fut: Future<Output = ()> + Send + 'static,
 {
+    eprintln!("[plessor] {what}: {}", cfx_pacing::load().say());
     let asked = params.clone();
     let p: P = match serde_json::from_value(params) {
         Ok(mut p) => {
@@ -1772,6 +1777,8 @@ mod tests {
             .await
             .expect("an answer");
         assert_eq!(caps["type"], "capabilities", "{caps}");
+        // Which pacing runs, as the engine said it when it started.
+        assert_eq!(caps["pacing"], cfx_pacing::load().label().as_str());
         for (op, want) in [
             ("inject", "follow_redirects"),
             ("inject", "resolve"),

@@ -44,6 +44,7 @@ pub async fn run(
     let listener = TcpListener::bind(addr).await?;
     gate.announce("Toolmark", addr);
     dguard::exit_when_idle("toolmark");
+    eprintln!("[toolmark] {}", cfx_pacing::load().say());
 
     eprintln!("[toolmark] {}", knowledge.now().said());
 
@@ -98,6 +99,7 @@ async fn handle_connection(
 
         match req.operation.as_str() {
             "fingerprint" => {
+                eprintln!("[toolmark] fingerprint: {}", cfx_pacing::load().say());
                 let known = knowledge.now();
                 handle_fingerprint(req.params, req.egress, &mut writer, &db, known).await?;
                 return Ok(());
@@ -105,6 +107,7 @@ async fn handle_connection(
             // Non-HTTP service identification: what is really listening on a
             // port, and whether it lets anyone in.
             "services" => {
+                eprintln!("[toolmark] services: {}", cfx_pacing::load().say());
                 let known = knowledge.now();
                 handle_services(req.params, req.egress, &mut writer, &db, known).await?;
                 return Ok(());
@@ -219,6 +222,8 @@ async fn handle_connection(
                         "fingerprint": ["resolve", "block_internal"],
                         // The version of the egress wrapper this daemon reads.
                         "egress": transport::WIRE_VERSION,
+                        // Which pacing this daemon runs: `module <version>`, or `baseline (<why>)`.
+                        "pacing": cfx_pacing::load().label(),
                         // Which process answers, for the client that started it.
                         "pid": std::process::id(),
                     }),
@@ -683,6 +688,8 @@ mod tests {
         )
         .await;
         assert_eq!(caps["type"], "capabilities", "{caps}");
+        // Which pacing runs, as the engine said it when it started.
+        assert_eq!(caps["pacing"], cfx_pacing::load().label().as_str());
         for want in ["resolve", "block_internal"] {
             assert!(
                 caps["fingerprint"]

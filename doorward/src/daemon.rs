@@ -71,6 +71,7 @@ pub async fn run(port: u16, db: DoorwardDb) -> Result<(), Box<dyn std::error::Er
     let listener = TcpListener::bind(addr).await?;
     gate.announce("Doorward", addr);
     dguard::exit_when_idle("doorward");
+    eprintln!("[doorward] {}", cfx_pacing::load().say());
 
     let db = Arc::new(db);
 
@@ -135,6 +136,8 @@ async fn handle_connection(
                 &serde_json::json!({
                     "type": "capabilities",
                     "scan": ["resolve", "block_internal"],
+                    // Which pacing this daemon runs: `module <version>`, or `baseline (<why>)`.
+                    "pacing": cfx_pacing::load().label(),
                     "pid": std::process::id(),
                 }),
             )
@@ -173,6 +176,9 @@ async fn handle_connection(
             write_json(&mut writer, &answer.await).await?;
             continue;
         }
+
+        // Every operation from here on sends: say which pacing it runs with.
+        eprintln!("[doorward] {}: {}", req.operation, cfx_pacing::load().say());
 
         // Streaming mode takes over the connection. A stopped scan taken up again streams
         // as the scan did.
@@ -847,6 +853,8 @@ mod http_request_tests {
             .expect("a line");
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["type"], "capabilities", "{v}");
+        // Which pacing runs, as the engine said it when it started.
+        assert_eq!(v["pacing"], cfx_pacing::load().label().as_str());
         assert_eq!(v["pid"], std::process::id(), "{v}");
         assert_eq!(
             v["scan"],

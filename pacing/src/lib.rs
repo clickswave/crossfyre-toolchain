@@ -15,7 +15,7 @@
 use adaptive::backend::{Backend, INTERFACE};
 use base64::Engine as _;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 /// The module's file name beside the binaries, and its signature's beside it.
 pub const MODULE: &str = "pacing.wasm";
@@ -43,12 +43,18 @@ pub enum Loaded {
 }
 
 impl Loaded {
+    /// As an engine's `capabilities` answer gives it: `module <version>`, or
+    /// `baseline (<why>)`.
+    pub fn label(&self) -> String {
+        match self {
+            Loaded::Module(v) => format!("module {v}"),
+            Loaded::Baseline(why) => format!("baseline ({why})"),
+        }
+    }
+
     /// The line an engine says it in.
     pub fn say(&self) -> String {
-        match self {
-            Loaded::Module(v) => format!("pacing: module {v}"),
-            Loaded::Baseline(why) => format!("pacing: baseline ({why})"),
-        }
+        format!("pacing: {}", self.label())
     }
 }
 
@@ -73,14 +79,18 @@ impl Default for Limits {
 }
 
 /// Load the module beside the running executable, with this build's release keys, and
-/// install it.
-pub fn load() -> Loaded {
-    let exe = match std::env::current_exe().and_then(std::fs::canonicalize) {
-        Ok(exe) => exe,
-        Err(e) => return Loaded::Baseline(format!("the executable cannot be found: {e}")),
-    };
-    let dir = exe.parent().map(Path::to_path_buf).unwrap_or_default();
-    load_from(&dir.join(MODULE), &exe, &release_keys(), Limits::default())
+/// install it. An engine calls this first thing; the first call looks, and every call
+/// after gives what it found.
+pub fn load() -> &'static Loaded {
+    static LOADED: OnceLock<Loaded> = OnceLock::new();
+    LOADED.get_or_init(|| {
+        let exe = match std::env::current_exe().and_then(std::fs::canonicalize) {
+            Ok(exe) => exe,
+            Err(e) => return Loaded::Baseline(format!("the executable cannot be found: {e}")),
+        };
+        let dir = exe.parent().map(Path::to_path_buf).unwrap_or_default();
+        load_from(&dir.join(MODULE), &exe, &release_keys(), Limits::default())
+    })
 }
 
 /// Load the module at `path` for the executable at `exe`, checked with `keys`, and
@@ -115,6 +125,57 @@ pub fn open(path: &Path, exe: &Path, keys: &[&str], limits: Limits) -> Result<Mo
         .map_err(|_| "the module has no signature beside it".to_string())?;
     verify(keys, &bytes, sig.trim())?;
     Module::new(&bytes, limits)
+}
+
+/// Put a module and its signature in `dir`, the binaries' folder, as an install does:
+/// checked first as an engine checks it (signed by one of `keys`, of this interface,
+/// importing nothing), each file written beside its place and renamed over it, readable
+/// by all and writable by its owner only, and then opened from there for the engine at
+/// `exe` under the trust rule. Nothing is written when a check before writing fails;
+/// both files are taken away again when the last one does.
+pub fn install(
+    dir: &Path,
+    exe: &Path,
+    bytes: &[u8],
+    sig: &str,
+    keys: &[&str],
+    limits: Limits,
+) -> Result<PathBuf, String> {
+    verify(keys, bytes, sig.trim())?;
+    Module::new(bytes, limits)?;
+    let path = dir.join(MODULE);
+    let sig_path = dir.join(format!("{MODULE}{SIG_SUFFIX}"));
+    // The signature first: an engine starting between the two renames finds the new
+    // signature over the old module, refuses it, and runs the baseline.
+    write_over(&sig_path, sig.trim().as_bytes())?;
+    write_over(&path, bytes)?;
+    if let Err(why) = open(&path, exe, keys, limits) {
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&sig_path);
+        return Err(format!(
+            "an engine would not load it from {}: {why}",
+            dir.display()
+        ));
+    }
+    Ok(path)
+}
+
+/// Write `bytes` beside `path` and rename them over it, readable by all and writable by
+/// the owner only.
+fn write_over(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let new = PathBuf::from(format!("{}.new", path.display()));
+    let written = std::fs::write(&new, bytes).and_then(|()| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&new, std::fs::Permissions::from_mode(0o644))?;
+        }
+        std::fs::rename(&new, path)
+    });
+    written.map_err(|e| {
+        let _ = std::fs::remove_file(&new);
+        format!("{}: {e}", path.display())
+    })
 }
 
 /// Whether `sig` is one of `keys`' signatures of `bytes`.

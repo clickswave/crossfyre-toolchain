@@ -252,6 +252,7 @@ pub async fn run_on(listener: TcpListener, db: AmbuloDb) -> Result<(), Box<dyn s
     let gate = dguard::Gate::from_env();
     gate.announce("Ambulo", addr);
     dguard::exit_when_idle("ambulo");
+    eprintln!("[ambulo] {}", cfx_pacing::load().say());
 
     let db = Arc::new(db);
     // Shared by every probe that comes without an egress wrapper. A wrapped probe
@@ -404,6 +405,8 @@ async fn handle_connection(
                     "scan": ["resolve", "block_internal", "follow_redirects"],
                     // The version of the egress wrapper this daemon reads.
                     "egress": transport::WIRE_VERSION,
+                    // Which pacing this daemon runs: `module <version>`, or `baseline (<why>)`.
+                    "pacing": cfx_pacing::load().label(),
                     // Which process answers, for the client that started it.
                     "pid": std::process::id(),
                 }),
@@ -447,6 +450,9 @@ async fn handle_connection(
             write_json(&mut writer, &answer.await).await?;
             continue;
         }
+
+        // Every operation from here on sends: say which pacing it runs with.
+        eprintln!("[ambulo] {}: {}", req.operation, cfx_pacing::load().say());
 
         // Stream mode takes over the connection for the duration of the operation. A
         // stopped scan taken up again streams as the scan did.
@@ -1697,6 +1703,8 @@ mod egress_tests {
         )
         .await;
         assert_eq!(events[0]["type"], "capabilities", "{events:?}");
+        // Which pacing runs, as the engine said it when it started.
+        assert_eq!(events[0]["pacing"], cfx_pacing::load().label().as_str());
         assert_eq!(events[0]["egress"], 1, "{events:?}");
         assert_eq!(events[0]["pid"], std::process::id(), "{events:?}");
         assert_eq!(

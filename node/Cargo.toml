@@ -14,5 +14,6 @@ path = "src/main.rs"
 
 [dependencies]
 cfx_core = { path = "../core" }
+cfx_pacing = { path = "../pacing" }
 clap = { version = "4.5.60", features = ["derive"] }
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "time", "signal"] }

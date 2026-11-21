@@ -22,6 +22,7 @@ tuning = ["cfx_tui/tuning"]
 dguard = { path = "../dguard" }
 cfx_db = { path = "../db" }
 adaptive = { path = "../adaptive" }
+cfx_pacing = { path = "../pacing" }
 # Which addresses are private, loopback, link-local or reserved, as the other engines
 # read them.
 cfx_tunnel = { path = "../tunnel" }

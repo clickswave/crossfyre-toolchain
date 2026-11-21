@@ -116,6 +116,7 @@ dependencies = [
  "base64 0.22.1",
  "cfx_browser",
  "cfx_db",
+ "cfx_pacing",
  "cfx_tui",
  "cfx_tunnel",
  "clap",
@@ -1614,6 +1615,7 @@ version = "0.0.17"
 dependencies = [
  "adaptive",
  "cfx_db",
+ "cfx_pacing",
  "cfx_tui",
  "cfx_tunnel",
  "clap",
@@ -3095,6 +3097,7 @@ name = "node"
 version = "0.1.54"
 dependencies = [
  "cfx_core",
+ "cfx_pacing",
  "clap",
  "tokio",
 ]
@@ -3567,6 +3570,7 @@ dependencies = [
  "cfx_cve",
  "cfx_db",
  "cfx_finding",
+ "cfx_pacing",
  "cfx_pack",
  "cfx_scope",
  "cfx_tui",
@@ -5529,6 +5533,7 @@ dependencies = [
  "cfx_cve",
  "cfx_db",
  "cfx_finding",
+ "cfx_pacing",
  "cfx_pack",
  "cfx_tui",
  "cfx_tunnel",
@@ -5881,6 +5886,7 @@ version = "0.0.17"
 dependencies = [
  "adaptive",
  "cfx_db",
+ "cfx_pacing",
  "cfx_scope",
  "cfx_tui",
  "cfx_tunnel",
