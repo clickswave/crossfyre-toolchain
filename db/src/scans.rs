@@ -610,9 +610,11 @@ pub struct Listed {
     pub updated_at: String,
     /// Its settings as they were kept, with no credential in them.
     pub settings: serde_json::Value,
-    /// How far it got, as it last said, and how many findings it kept.
+    /// How far it got, as it last said, and how many findings it kept, in all and by
+    /// severity.
     pub progress: serde_json::Value,
     pub findings: i64,
+    pub by_severity: serde_json::Value,
 }
 
 impl Listed {
@@ -642,6 +644,7 @@ impl Listed {
             "settings": self.settings,
             "progress": self.progress,
             "findings": self.findings,
+            "by_severity": self.by_severity,
             "resumable": why_not.is_none(),
             "why_not": why_not,
         })
@@ -680,12 +683,16 @@ pub async fn list(pool: &PgPool, limit: i64) -> Result<Vec<Listed>, sqlx::Error>
         serde_json::Value,
         serde_json::Value,
         i64,
+        serde_json::Value,
     );
     let rows: Vec<Row> = sqlx::query_as(
         "SELECT id, target, status, \
          to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
          to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), params, \
-         progress, (SELECT count(*) FROM findings f WHERE f.scan_id = s.id) \
+         progress, (SELECT count(*) FROM findings f WHERE f.scan_id = s.id), \
+         (SELECT coalesce(jsonb_object_agg(sev, n), '{}') FROM \
+             (SELECT data->>'severity' AS sev, count(*) AS n FROM findings f \
+              WHERE f.scan_id = s.id AND data->>'severity' IS NOT NULL GROUP BY 1) bs) \
          FROM scans s ORDER BY created_at DESC, id LIMIT $1",
     )
     .bind(limit)
@@ -694,7 +701,7 @@ pub async fn list(pool: &PgPool, limit: i64) -> Result<Vec<Listed>, sqlx::Error>
     Ok(rows
         .into_iter()
         .map(
-            |(id, target, status, created_at, updated_at, settings, progress, findings)| Listed {
+            |(
                 id,
                 target,
                 status,
@@ -703,6 +710,19 @@ pub async fn list(pool: &PgPool, limit: i64) -> Result<Vec<Listed>, sqlx::Error>
                 settings,
                 progress,
                 findings,
+                by_severity,
+            )| {
+                Listed {
+                    id,
+                    target,
+                    status,
+                    created_at,
+                    updated_at,
+                    settings,
+                    progress,
+                    findings,
+                    by_severity,
+                }
             },
         )
         .collect())
@@ -1084,6 +1104,7 @@ mod tests {
             settings,
             progress: serde_json::json!({}),
             findings: 0,
+            by_severity: serde_json::json!({}),
         };
         assert_eq!(scan("stopped", serde_json::json!({})).why_not(), None);
         assert!(
@@ -1112,6 +1133,7 @@ mod tests {
                 "settings": {"tasks": 4},
                 "progress": {},
                 "findings": 0,
+                "by_severity": {},
                 "resumable": true,
                 "why_not": null,
             })

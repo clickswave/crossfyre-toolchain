@@ -3274,17 +3274,6 @@ mod injection {
 
     const SECRETS: [&str; 4] = ["S1-ck", "S3-bearer", "S6-tok", "S8-csrf"];
 
-    fn files_under(dir: &std::path::Path, out: &mut Vec<String>) {
-        for e in std::fs::read_dir(dir).unwrap().flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                files_under(&p, out);
-            } else {
-                out.push(std::fs::read_to_string(&p).unwrap_or_default());
-            }
-        }
-    }
-
     /// A loopback port is open to every account, and while plessor is stopped anyone
     /// can listen on its port. The captured session must not go to them.
     #[tokio::test]
@@ -3398,25 +3387,30 @@ mod injection {
         for s in SECRETS {
             assert!(!r.text.contains(s), "{s} in the result");
         }
-        let mut files = Vec::new();
-        files_under(&b.t.dir.path().join("jobs"), &mut files);
-        assert!(!files.is_empty());
-        for f in &files {
-            for s in SECRETS {
-                assert!(!f.contains(s), "{s} in a job file: {f}");
-            }
+        // What the engine was asked to keep of the scan, which it gives back to whoever
+        // reads it, holds none of the session; the session went as `auth`, which no
+        // engine keeps.
+        let kept = plessor.kept.lock().unwrap().scans.clone();
+        assert_eq!(kept.len(), 1);
+        let said = serde_json::to_string(&op["mcp"]).unwrap();
+        for s in SECRETS {
+            assert!(
+                !said.contains(s),
+                "{s} in what the scan is kept with: {said}"
+            );
         }
         let audit = b.t.audit_text();
         for s in SECRETS {
             assert!(!audit.contains(s), "{s} in the audit");
         }
-        let m = b.t.mcp.jobs.read_meta(&scan_id).unwrap();
-        assert_eq!(m.tool, "workbench_test_injection");
+        let mcp = &kept[0]["settings"]["mcp"];
+        assert_eq!(mcp["tool"], "workbench_test_injection");
+        assert_eq!(mcp["source"]["workbench"]["exchange"], handle(4));
+        assert_eq!(mcp["source"]["workbench"]["pid"], b.fake.pid);
         assert_eq!(
-            m.source.as_ref().unwrap()["workbench"]["exchange"],
-            handle(4)
+            scan_id,
+            format!("s_plessor_{}", kept[0]["id"].as_str().unwrap())
         );
-        assert_eq!(m.source.as_ref().unwrap()["workbench"]["pid"], b.fake.pid);
 
         // It counts toward the scope file's hourly cap.
         let r =
@@ -3515,20 +3509,26 @@ mod injection {
             )
             .await;
         let scan_id = ok(&r)["scan_id"].as_str().unwrap().to_string();
-        let m = b.t.mcp.jobs.read_meta(&scan_id).unwrap();
-        assert_eq!(m.counts.findings, 1, "{}", r.text);
+        let got = ok(&b
+            .t
+            .call(&peer, "get_scan", json!({"scan_id": scan_id}))
+            .await)
+        .clone();
+        assert_eq!(got["counts"]["findings"], 1, "{got}");
 
-        let found = std::fs::read_to_string(
-            b.t.dir
-                .path()
-                .join("jobs")
-                .join(format!("{scan_id}.findings.ndjson")),
-        )
-        .unwrap();
+        // A finding of a captured request is masked as it is read, whatever
+        // `--no-redact` says, as the model never saw the session unmasked.
+        let list =
+            b.t.call(&peer, "list_findings", json!({"scan_id": scan_id}))
+                .await;
         for s in ["S1-ck", "S3-bearer", "S6-tok", "S8-csrf"] {
-            assert!(!found.contains(s), "{s} in the findings file: {found}");
+            assert!(
+                !list.text.contains(s),
+                "{s} in list_findings: {}",
+                list.text
+            );
         }
-        assert!(found.contains("token=[redacted]"), "{found}");
+        assert!(list.text.contains("token=[redacted]"), "{}", list.text);
 
         let list =
             b.t.call(&peer, "list_findings", json!({"scan_id": scan_id}))
@@ -3544,7 +3544,7 @@ mod injection {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_json_body_is_tested_member_by_member_and_kept_out_of_the_files() {
+    async fn a_json_body_is_tested_member_by_member_and_kept_out_of_what_is_kept() {
         let plessor = stub_engine(StubOpts::default()).await;
         let b = bench_with(
             scope(&["app.example.test".into()], "")
@@ -3579,10 +3579,13 @@ mod injection {
             json!([{"name": "n", "value": "2", "type": "integer"},
                    {"name": "user", "value": "ann", "type": "string"}])
         );
-        let mut files = Vec::new();
-        files_under(&b.t.dir.path().join("jobs"), &mut files);
-        for f in &files {
-            assert!(!f.contains("S4-pw") && !f.contains("S1-ck"), "{f}");
+        let kept = serde_json::to_string(&plessor.kept.lock().unwrap().scans).unwrap();
+        let said = op["mcp"].to_string();
+        for s in ["S4-pw", "S1-ck"] {
+            assert!(
+                !kept.contains(s) && !said.contains(s),
+                "{s} in {kept} or {said}"
+            );
         }
     }
 
@@ -3973,22 +3976,19 @@ mod injection {
             restricted: true,
             rules: 1,
         });
-        let mcp = Arc::clone(&b.t.mcp);
-        let id = scan_id.clone();
-        eventually("the scan to be cancelled", 10, || {
-            mcp.jobs
-                .read_meta(&id)
-                .is_some_and(|m| m.status == crate::jobs::CANCELLED)
-        })
-        .await;
+        eventually("the scan to be cancelled", 10, || plessor.cancels() == 1).await;
         assert_eq!(plessor.cancels(), 1);
         assert_eq!(checks.load(Ordering::SeqCst), 2);
-        let m = b.t.mcp.jobs.read_meta(&scan_id).unwrap();
-        assert!(
-            m.notes.iter().any(|n| n.contains("no longer admits")),
-            "{:?}",
-            m.notes
-        );
+        let got = ok(&b
+            .t
+            .call(
+                &FakePeer::new(Elicit::None),
+                "get_scan",
+                json!({"scan_id": scan_id}),
+            )
+            .await)
+        .clone();
+        assert!(got.to_string().contains("no longer admits"), "{got}");
         let r =
             b.t.call(
                 &FakePeer::new(Elicit::None),
@@ -4023,20 +4023,18 @@ mod injection {
             .await;
         let scan_id = ok(&r)["scan_id"].as_str().unwrap().to_string();
         b.fake.switch(None);
-        let mcp = Arc::clone(&b.t.mcp);
-        let id = scan_id.clone();
-        eventually("the scan to be cancelled", 10, || {
-            mcp.jobs
-                .read_meta(&id)
-                .is_some_and(|m| m.status == crate::jobs::CANCELLED)
-        })
-        .await;
-        let m = b.t.mcp.jobs.read_meta(&scan_id).unwrap();
-        assert!(
-            m.notes.iter().any(|n| n.contains("closed")),
-            "{:?}",
-            m.notes
-        );
+        eventually("the scan to be cancelled", 10, || plessor.cancels() == 1).await;
+        let got = ok(&b
+            .t
+            .call(
+                &FakePeer::new(Elicit::None),
+                "get_scan",
+                json!({"scan_id": scan_id}),
+            )
+            .await)
+        .clone();
+        assert_eq!(got["status"], "cancelled", "{got}");
+        assert!(got.to_string().contains("closed"), "{got}");
         assert_eq!(plessor.cancels(), 1);
     }
 }

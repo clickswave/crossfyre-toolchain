@@ -120,6 +120,14 @@ async fn handle_connection(
                 )
                 .await?
             }
+            "finding" => {
+                let id = req.params["id"].as_i64().unwrap_or(0);
+                write_line(
+                    &mut writer,
+                    &cfx_db::found::answer_finding(db.pool(), id).await,
+                )
+                .await?
+            }
             "findings" => {
                 let answer = cfx_db::found::answer_findings(
                     db.pool(),
@@ -298,9 +306,15 @@ async fn forward(
         // What the scan found, said and how far it got, as every engine keeps it, beside
         // the inventory toolmark keeps of its own.
         let mut keeper = cfx_db::found::Keeper::new(keeping.pool(), id.as_deref());
-        while let Some(ev) = rx.recv().await {
+        while let Some(mut ev) = rx.recv().await {
             keeping.event(id.as_deref(), &ev).await;
             keeper.event(&ev).await;
+            // The ack names the scan it is kept as, for a client to read it back by.
+            if ev["type"] == "ack"
+                && let Some(id) = &id
+            {
+                ev["scan"] = Value::String(id.clone());
+            }
             let _ = out.send(ev);
         }
         let ended = match op.await {
@@ -607,7 +621,7 @@ mod tests {
             }
         });
         let (tport, _) = recording_page().await;
-        ask_then_run(
+        let (_, events) = ask_then_run(
             dport,
             serde_json::json!({"operation": "fingerprint",
                 "target": format!("http://127.0.0.1:{tport}/"), "evasive": false}),
@@ -632,6 +646,11 @@ mod tests {
             .find(|r| r["data"]["name"] == "Nginx")
             .unwrap_or_else(|| panic!("{found}"));
         assert_eq!(nginx["kind"], "technology");
+        let ack = events.iter().find(|e| e["type"] == "ack").expect("an ack");
+        assert_eq!(
+            ack["scan"], nginx["scan"],
+            "the ack names the scan it is kept as"
+        );
         // The scan is finished as its last event goes out, so it may be a moment after.
         let mut scan = Value::Null;
         for _ in 0..50 {

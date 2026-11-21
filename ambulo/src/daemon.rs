@@ -416,6 +416,15 @@ async fn handle_connection(
             .await?;
             continue;
         }
+        if req.operation == "finding" {
+            let id = req.params["id"].as_i64().unwrap_or(0);
+            write_json(
+                &mut writer,
+                &cfx_db::found::answer_finding(db.pool(), id).await,
+            )
+            .await?;
+            continue;
+        }
         if req.operation == "findings" {
             let answer = cfx_db::found::answer_findings(
                 db.pool(),
@@ -548,33 +557,31 @@ async fn handle_stream_scan(
         }
     };
 
-    // Send "ack" with operation_id and total entry count
-    write_json(
-        &mut writer,
-        &StreamEvent {
-            kind: "ack".to_string(),
-            operation_id: Some(operation_id.clone()),
-            total: Some(total),
-            tested: None,
-            retries: None,
-            url: None,
-            status: None,
-            code: None,
-            body_length: None,
-            headers_length: None,
-            found: None,
-            not_found: None,
-            error: None,
-            log_level: None,
-            message: None,
-            concurrency: None,
-            delay_ms: None,
-            posture: None,
-            score: None,
-            final_url: None,
-        },
-    )
-    .await?;
+    // Send "ack" with operation_id, total entry count, and the scan it is kept as
+    let mut ack = serde_json::to_value(StreamEvent {
+        kind: "ack".to_string(),
+        operation_id: Some(operation_id.clone()),
+        total: Some(total),
+        tested: None,
+        retries: None,
+        url: None,
+        status: None,
+        code: None,
+        body_length: None,
+        headers_length: None,
+        found: None,
+        not_found: None,
+        error: None,
+        log_level: None,
+        message: None,
+        concurrency: None,
+        delay_ms: None,
+        posture: None,
+        score: None,
+        final_url: None,
+    })?;
+    ack["scan"] = serde_json::json!(running.id);
+    write_json(&mut writer, &ack).await?;
 
     // Create event channel and run the scan
     let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();

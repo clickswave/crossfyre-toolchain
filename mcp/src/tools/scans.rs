@@ -1,10 +1,13 @@
-//! Reading scans and findings back, and stopping a scan. Nothing here sends traffic.
+//! Reading scans and findings back, as the engines keep them, and stopping a scan. Nothing
+//! here sends traffic. Only scans of targets inside the loaded scope file are shown: one
+//! outside it, or an id of one, is answered as none (see `kept`).
 
 use super::inject::scan_view;
 use super::{in_range, parse_args, result_size};
 use crate::core::{CallNote, Done, Mcp, Reason, Refusal};
 use crate::findings;
-use crate::jobs::{self, FindingKey, JobMeta};
+use crate::jobs::{self, JobMeta};
+use crate::kept::{self, FindingsCursor};
 use crate::redact;
 use crate::untrusted::{self, EVIDENCE_DEFAULT, EVIDENCE_MAX, RESULT_CAP};
 use serde::Deserialize;
@@ -24,7 +27,7 @@ fn scan_id_arg(id: &str) -> Result<(), Refusal> {
         Ok(())
     } else {
         Err(Refusal::invalid(
-            "scan_id is s_ followed by 10 lowercase hex characters",
+            "scan_id is s_, an engine's name, _ and the engine's id for the scan",
         ))
     }
 }
@@ -56,7 +59,7 @@ pub(crate) fn scan_row(m: &JobMeta, redact: bool) -> Value {
     })
 }
 
-pub(crate) fn list_scans(mcp: &Mcp, args: &Value) -> Result<Done, Refusal> {
+pub(crate) async fn list_scans(mcp: &Mcp, args: &Value) -> Result<Done, Refusal> {
     let a: ListScansArgs = parse_args(args)?;
     let limit = in_range("limit", a.limit.unwrap_or(20), 1, 50)? as usize;
     if let Some(s) = &a.status
@@ -74,9 +77,8 @@ pub(crate) fn list_scans(mcp: &Mcp, args: &Value) -> Result<Done, Refusal> {
         ),
         None => None,
     };
-    let mut all: Vec<JobMeta> = mcp
-        .jobs
-        .list()
+    let mut all: Vec<JobMeta> = kept::scans(mcp)
+        .await
         .into_iter()
         .filter(|m| a.status.as_deref().is_none_or(|s| m.status == s))
         .filter(|m| {
@@ -122,12 +124,11 @@ struct ScanIdArgs {
     scan_id: String,
 }
 
-pub(crate) fn get_scan(mcp: &Mcp, args: &Value) -> Result<Done, Refusal> {
+pub(crate) async fn get_scan(mcp: &Mcp, args: &Value) -> Result<Done, Refusal> {
     let a: ScanIdArgs = parse_args(args)?;
     scan_id_arg(&a.scan_id)?;
-    let m = mcp
-        .jobs
-        .read_meta(&a.scan_id)
+    let m = kept::scan(mcp, &a.scan_id)
+        .await
         .ok_or_else(|| not_found("scan"))?;
     let mut value = scan_view(&m, mcp.settings.redact);
     // Back off with each poll of the same scan: 5, 10, 20, then 30 s.
@@ -178,7 +179,7 @@ struct ListFindingsArgs {
     limit: Option<u64>,
 }
 
-pub(crate) fn list_findings(mcp: &Mcp, args: &Value) -> Result<Done, Refusal> {
+pub(crate) async fn list_findings(mcp: &Mcp, args: &Value) -> Result<Done, Refusal> {
     let a: ListFindingsArgs = parse_args(args)?;
     let limit = in_range("limit", a.limit.unwrap_or(20), 1, 50)? as usize;
     let min = match &a.severity_min {
@@ -192,50 +193,57 @@ pub(crate) fn list_findings(mcp: &Mcp, args: &Value) -> Result<Done, Refusal> {
         None => 0,
     };
     let after = match &a.cursor {
-        Some(c) => FindingKey::parse(c)
+        Some(c) => FindingsCursor::parse(c)
             .ok_or_else(|| Refusal::invalid("cursor is not one this server returned"))?,
-        None => FindingKey::start(),
+        None => FindingsCursor::default(),
     };
-    let scans: Vec<String> = match &a.scan_id {
-        Some(id) => {
-            scan_id_arg(id)?;
-            if mcp.jobs.read_meta(id).is_none() {
-                return Err(not_found("scan"));
-            }
-            vec![id.clone()]
-        }
-        None => mcp.jobs.list().into_iter().map(|m| m.id).collect(),
-    };
-    // Oldest first, after the cursor: the cursor from the last page always returns
-    // only what was recorded since, which is how a running scan is followed.
-    let mut found: Vec<(FindingKey, Value)> = Vec::new();
-    for id in &scans {
-        for f in mcp.jobs.read_findings(id) {
-            let Some(k) = FindingKey::of(&f) else {
-                continue;
-            };
-            if k > after && findings::severity_rank(f["severity"].as_str().unwrap_or("")) >= min {
-                found.push((k, f));
-            }
+    if let Some(id) = &a.scan_id {
+        scan_id_arg(id)?;
+        if kept::scan(mcp, id).await.is_none() {
+            return Err(not_found("scan"));
         }
     }
-    found.sort_by(|x, y| x.0.cmp(&y.0));
-    let more = found.len() > limit;
-    found.truncate(limit);
-    let items: Vec<Value> = found
+    // Oldest first, after the cursor: the cursor from the last page always returns only
+    // what was kept since, which is how a running scan is followed. A page is read on
+    // until it holds enough at the severity asked for, or nothing more is kept.
+    let mut items: Vec<Value> = Vec::new();
+    let mut at = after.clone();
+    let mut more;
+    loop {
+        let (page, next, more_kept) = kept::findings(mcp, a.scan_id.as_deref(), &at, limit).await;
+        let read_any = !page.is_empty();
+        for f in page {
+            if items.len() < limit
+                && findings::severity_rank(f["severity"].as_str().unwrap_or("")) >= min
+            {
+                items.push(f);
+            }
+        }
+        more = more_kept;
+        if items.len() >= limit || !more_kept || !read_any {
+            at = next;
+            break;
+        }
+        at = next;
+    }
+    let shown: Vec<Value> = items
         .iter()
-        .map(|(_, f)| findings::list_view(f, mcp.settings.redact))
+        .map(|f| findings::list_view(f, mcp.settings.redact))
         .collect();
-    let (summary, value) = fit(items.len(), |k| {
-        let next = if k == 0 {
-            after.clone()
-        } else {
-            found[k - 1].0.clone()
-        };
-        let more = more || k < items.len();
+    let (summary, value) = fit(shown.len(), |k| {
+        let mut next = after.clone();
+        for f in &items[..k] {
+            if let Some((engine, id)) = f["id"].as_str().and_then(engine_and_id) {
+                next.0.insert(engine, id);
+            }
+        }
+        if k == shown.len() {
+            next = at.clone();
+        }
+        let more = more || k < shown.len();
         let value = json!({
-            "findings": items[..k],
-            "next_cursor": next.cursor(),
+            "findings": shown[..k],
+            "next_cursor": next.text(),
             "more": more,
         });
         let summary = format!(
@@ -247,6 +255,16 @@ pub(crate) fn list_findings(mcp: &Mcp, args: &Value) -> Result<Done, Refusal> {
     Ok(Done { value, summary })
 }
 
+/// The engine and its own id a finding id names.
+fn engine_and_id(id: &str) -> Option<(&'static str, i64)> {
+    let rest = id.strip_prefix("f_")?;
+    let (engine, own) = rest.split_once('_')?;
+    Some((
+        kept::ENGINES.iter().find(|e| **e == engine)?,
+        own.parse().ok()?,
+    ))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GetFindingArgs {
@@ -255,11 +273,11 @@ struct GetFindingArgs {
     evidence_bytes: Option<u64>,
 }
 
-pub(crate) fn get_finding(mcp: &Mcp, args: &Value) -> Result<Done, Refusal> {
+pub(crate) async fn get_finding(mcp: &Mcp, args: &Value) -> Result<Done, Refusal> {
     let a: GetFindingArgs = parse_args(args)?;
     if !jobs::valid_finding_id(&a.finding_id) {
         return Err(Refusal::invalid(
-            "finding_id is f_ followed by 10 lowercase hex characters",
+            "finding_id is f_, an engine's name, _ and the engine's id for the finding",
         ));
     }
     let bytes = in_range(
@@ -268,9 +286,8 @@ pub(crate) fn get_finding(mcp: &Mcp, args: &Value) -> Result<Done, Refusal> {
         0,
         EVIDENCE_MAX as u64,
     )? as usize;
-    let stored = mcp
-        .jobs
-        .find_finding(&a.finding_id)
+    let stored = kept::finding(mcp, &a.finding_id)
+        .await
         .ok_or_else(|| not_found("finding"))?;
     let mut value = findings::full_view(&stored, bytes, mcp.settings.redact);
     let summary = format!(
@@ -300,11 +317,11 @@ pub(crate) async fn cancel_scan(
     let (status, cancel, note_text) = match running {
         Some(job) => {
             let how = mcp.cancel_running(&job).await;
-            let status = mcp
-                .jobs
-                .read_meta(&a.scan_id)
-                .map(|m| m.status)
-                .unwrap_or_else(|| jobs::CANCELLED.into());
+            let status = job
+                .meta
+                .lock()
+                .map(|m| m.status.clone())
+                .unwrap_or_else(|_| jobs::CANCELLED.into());
             let text = (how == "requested").then_some(
                 "this plessor version keeps running until it finishes; update the engine to \
                  stop scans on request",
@@ -312,9 +329,8 @@ pub(crate) async fn cancel_scan(
             (status, Some(how), text)
         }
         None => {
-            let m = mcp
-                .jobs
-                .read_meta(&a.scan_id)
+            let m = kept::scan(mcp, &a.scan_id)
+                .await
                 .ok_or_else(|| not_found("scan"))?;
             if m.status == jobs::RUNNING && m.owner.session != mcp.session {
                 return Err(Refusal::new(

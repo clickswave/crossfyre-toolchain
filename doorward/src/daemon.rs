@@ -150,6 +150,15 @@ async fn handle_connection(
             write_json(&mut writer, &cfx_db::found::answer_scan(&db.pool, id).await).await?;
             continue;
         }
+        if req.operation == "finding" {
+            let id = req.params["id"].as_i64().unwrap_or(0);
+            write_json(
+                &mut writer,
+                &cfx_db::found::answer_finding(&db.pool, id).await,
+            )
+            .await?;
+            continue;
+        }
         if req.operation == "findings" {
             let answer = cfx_db::found::answer_findings(
                 &db.pool,
@@ -221,8 +230,12 @@ async fn handle_stream_scan(
     let hosts = scanner::resolve_targets(&scan_params.targets);
     let total = hosts.len() * scan_params.ports.len();
 
-    // Send ack
-    write_json(&mut writer, &StreamEvent::ack(&operation_id, total)).await?;
+    // Send ack, with the scan it is kept as
+    let mut ack = serde_json::to_value(StreamEvent::ack(&operation_id, total))?;
+    if let Some(running) = &scan {
+        ack["scan"] = serde_json::json!(running.id);
+    }
+    write_json(&mut writer, &ack).await?;
 
     // Run scan in background, forward events to writer
     let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
@@ -534,6 +547,11 @@ mod kept_tests {
         assert_eq!(rows.len(), 1, "{found}");
         assert_eq!(rows[0]["data"]["port"], oport);
         assert_eq!(rows[0]["kind"], "result");
+        let ack = events.iter().find(|e| e["type"] == "ack").expect("an ack");
+        assert_eq!(
+            ack["scan"], rows[0]["scan"],
+            "the ack names the scan it is kept as"
+        );
         let scan = &ask(
             dport,
             &serde_json::json!({"operation": "scan_info", "id": rows[0]["scan"]}),

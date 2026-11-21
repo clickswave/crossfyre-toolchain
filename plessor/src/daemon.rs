@@ -229,6 +229,13 @@ async fn handle_connection(
                 write_line(&mut writer, &reply).await?;
                 continue;
             }
+            "finding" => {
+                let reply =
+                    cfx_db::found::answer_finding(db.pool(), params["id"].as_i64().unwrap_or(0))
+                        .await;
+                write_line(&mut writer, &reply).await?;
+                continue;
+            }
             "findings" => {
                 let reply = cfx_db::found::answer_findings(
                     db.pool(),

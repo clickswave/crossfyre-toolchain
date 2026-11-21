@@ -200,7 +200,8 @@ fn plessor() -> (u16, Arc<AtomicUsize>) {
                 let _ = writeln!(
                     w,
                     "{}",
-                    json!({"type": "ack", "target": op["target"], "cancellable": true})
+                    json!({"type": "ack", "target": op["target"], "cancellable": true,
+                           "scan": "01234567-89ab-cdef-0123-456789abcdef"})
                 );
                 let mut line = String::new();
                 while r.read_line(&mut line).unwrap_or(0) > 0 {
@@ -600,11 +601,9 @@ fn sigterm_stops_the_scans_and_closes_the_log() {
 
     let (audit, _) = audit_calls(&data);
     assert!(audit.contains("\"event\":\"stop\""), "{audit}");
-    let job: Value = serde_json::from_str(
-        &std::fs::read_to_string(data.join(format!("mcp/jobs/{scan_id}.json"))).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(job["status"], "interrupted", "{job}");
+    // The scan is plessor's to keep, as stopped: the server keeps no file of it.
+    assert_eq!(scan_id, "s_plessor_01234567-89ab-cdef-0123-456789abcdef");
+    assert!(!data.join("mcp/jobs").exists(), "a job file was written");
     assert_eq!(
         cancels.load(Ordering::SeqCst),
         1,

@@ -16,6 +16,8 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a daemon has to answer the capabilities question.
 const CAPABILITIES_WAIT: Duration = Duration::from_secs(5);
+/// How long a daemon has to answer a question about what it kept.
+const READ_WAIT: Duration = Duration::from_secs(10);
 /// An engine event longer than this is skipped, not buffered.
 pub(crate) const LINE_MAX: usize = 4 * 1024 * 1024;
 
@@ -145,6 +147,25 @@ impl EngineConn {
         }
     }
 
+    /// Ask one of the operations that read what the engine kept and send nothing
+    /// anywhere, and give its one answer. Any other operation is refused here, as it
+    /// needs a [`Clearance`] and goes through [`EngineConn::start`].
+    pub(crate) async fn read(mut self, op: &Value) -> std::io::Result<Value> {
+        const READS: [&str; 4] = ["scans", "scan_info", "findings", "finding"];
+        if !READS.contains(&event_op(op)) {
+            return Err(std::io::Error::other("not an operation that only reads"));
+        }
+        let mut line = dguard::encode(op);
+        line.push('\n');
+        self.writer.write_all(line.as_bytes()).await?;
+        match tokio::time::timeout(READ_WAIT, self.reader.next()).await {
+            Ok(Ok(Some(Line::Event(v)))) => Ok(v),
+            Ok(Ok(_)) => Err(std::io::Error::other("the engine gave no answer")),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(std::io::Error::other("the engine did not answer in time")),
+        }
+    }
+
     /// Send the operation. Taking a [`Clearance`] is the point: the only way to put a
     /// request in front of an engine is to have been through the guard first.
     pub(crate) async fn start(
@@ -228,6 +249,10 @@ impl LineReader {
             Err(_) => Line::NotJson,
         }))
     }
+}
+
+fn event_op(v: &Value) -> &str {
+    v.get("operation").and_then(|t| t.as_str()).unwrap_or("")
 }
 
 pub(crate) fn event_type(v: &Value) -> &str {

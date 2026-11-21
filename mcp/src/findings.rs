@@ -208,6 +208,78 @@ pub(crate) fn from_toolmark(data: &Value, st: Stamp<'_>) -> Option<Value> {
     Some(Value::Object(o))
 }
 
+/// What voyage, doorward or ambulo found: a name, an open port, a path. Each is said as
+/// a finding of `info` severity unless the engine gave it one, with the rest of what the
+/// engine kept as what the target said.
+pub(crate) fn from_result(engine: &str, data: &Value, st: Stamp<'_>) -> Value {
+    let text = |k: &str| {
+        data.get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let (class, name, url, evidence) = match engine {
+        "voyage" if data.get("type").and_then(|t| t.as_str()) == Some("takeover") => {
+            let host = text("subdomain");
+            (
+                "takeover",
+                format!("{host} can be taken over"),
+                host,
+                String::new(),
+            )
+        }
+        "voyage" => {
+            let host = text("subdomain");
+            ("subdomain", host.clone(), host, String::new())
+        }
+        "doorward" => {
+            let at = format!(
+                "{}:{}",
+                text("host"),
+                data.get("port").cloned().unwrap_or_default()
+            );
+            let service = text("service");
+            let name = if service.is_empty() {
+                format!("{at} open")
+            } else {
+                format!("{at} open ({service})")
+            };
+            ("open-port", name, at, text("banner"))
+        }
+        _ => {
+            let url = text("url");
+            ("content", url.clone(), url, String::new())
+        }
+    };
+    let mut o = base(st, engine);
+    o.insert("source_detail".into(), top(data.get("source")));
+    o.insert("vuln_class".into(), json!(class));
+    o.insert("name".into(), top(Some(&json!(name))));
+    let sev = severity(
+        data.get("severity")
+            .and_then(|s| s.as_str())
+            .unwrap_or("info"),
+    );
+    o.insert("severity".into(), json!(sev));
+    o.insert("confidence".into(), json!("observed"));
+    o.insert("url".into(), top(Some(&json!(url))));
+    o.insert("method".into(), Value::Null);
+    o.insert("param".into(), Value::Null);
+    o.insert("location".into(), Value::Null);
+    o.insert("template".into(), Value::Null);
+    let extra: Map<String, Value> = data
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .filter(|(k, _)| !["type", "banner", "severity"].contains(&k.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    o.insert("target_data".into(), target_data("", &evidence, extra));
+    Value::Object(o)
+}
+
 fn redact_strings(v: &mut Value) {
     match v {
         Value::String(s) => *s = redact::redact_text(s),

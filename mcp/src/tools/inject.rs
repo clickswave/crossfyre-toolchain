@@ -12,9 +12,9 @@ use crate::core::{
     Snap, TrafficRequest,
 };
 use crate::engine::{self, Line, LineReader, event_type};
-use crate::findings::{self, Stamp};
+use crate::findings;
 use crate::guard::{self, Dest};
-use crate::jobs::{self, FINDINGS_PER_JOB, JobMeta, JobStore, NewJob};
+use crate::jobs::{self, JobMeta, NewJob};
 use crate::peer::ClientPeer;
 use crate::{redact, untrusted};
 use cfx_scope::Point;
@@ -325,14 +325,14 @@ pub(crate) struct Plan {
     pub origin: String,
     /// plessor's endpoints, as its operation reads them.
     pub endpoints: Vec<Value>,
-    /// What the job file keeps of each endpoint.
+    /// What plessor keeps of each endpoint with the scan, under its `mcp` settings.
     pub shown_endpoints: Vec<String>,
     pub classes: Vec<String>,
     pub test_writes: bool,
-    /// Headers and cookies plessor sends with every probe. Handed over on loopback and
-    /// never written to a job file, the audit log or a result.
+    /// Headers and cookies plessor sends with every probe. Handed over on loopback as the
+    /// scan's `auth`, which no engine keeps, and never written to the audit log or a result.
     pub auth: Option<Value>,
-    /// Where the request came from, kept in the job.
+    /// Where the request came from, kept with the scan.
     pub source: Option<Value>,
     /// The entries plessor may follow up to.
     pub scope: Vec<String>,
@@ -410,9 +410,20 @@ pub(crate) async fn start_scan(
         op["auth"] = auth;
         op["verify_certs"] = Value::Bool(true);
     }
+    // What this server says of the scan, which plessor keeps with it and gives back to
+    // whoever reads it: which tool, which server and scope file, and where it came from.
+    op["mcp"] = json!({
+        "tool": plan.tool,
+        "process": mcp.session,
+        "pid": std::process::id(),
+        "scope_sha256": mcp.scope.sha256,
+        "test_writes": plan.test_writes,
+        "endpoints": plan.shown_endpoints,
+        "source": plan.source,
+    });
 
     let start_lock = mcp.scan_start.lock().await;
-    mcp.check_scan_caps()?;
+    mcp.check_scan_caps().await?;
     let (mut reader, writer) = conn.start(&clearance, &op).await.map_err(|e| {
         Refusal::new(
             Reason::EngineError,
@@ -440,11 +451,23 @@ pub(crate) async fn start_scan(
     .unwrap_or_else(|_| Err("engine did not acknowledge".into()))
     .map_err(|m| Refusal::new(Reason::EngineError, format!("plessor reported: {m}")))?;
     let cancellable = ack.get("cancellable").and_then(|c| c.as_bool()) == Some(true);
+    // The scan is read back by the id plessor kept it as. One it could not keep has no
+    // handle to read it by, so it is stopped.
+    let Some(kept_as) = ack.get("scan").and_then(|s| s.as_str()) else {
+        let mut w = writer;
+        let _ = w.send_cancel().await;
+        return Err(Refusal::new(
+            Reason::EngineError,
+            "plessor could not keep the scan, so it was stopped: check its database with \
+             `crossfyre db status`",
+        ));
+    };
 
     let origin = plan.origin;
     let mut meta = JobMeta::new(
         &mcp.session,
         NewJob {
+            id: crate::kept::scan_id("plessor", kept_as),
             tool: plan.tool,
             engine: "plessor",
             target: &origin,
@@ -457,14 +480,6 @@ pub(crate) async fn start_scan(
     meta.source = plan.source;
     meta.progress.total = meta.endpoints.len() as u64;
     meta.progress.phase = "testing endpoints".into();
-    if let Err(e) = mcp.jobs.write_meta(&meta) {
-        let mut w = writer;
-        let _ = w.send_cancel().await;
-        return Err(Refusal::new(
-            Reason::EngineError,
-            format!("the scan could not be recorded, so it was stopped: {e}"),
-        ));
-    }
     drop(start_lock);
     note.set_scan(meta.id.clone());
 
@@ -481,13 +496,7 @@ pub(crate) async fn start_scan(
     if let Ok(mut r) = mcp.running.lock() {
         r.insert(job.id.clone(), Arc::clone(&job));
     }
-    let handle = tokio::spawn(pump(
-        reader,
-        Arc::clone(&job),
-        Arc::clone(&mcp.jobs),
-        Arc::clone(&mcp.running),
-        tx,
-    ));
+    let handle = tokio::spawn(pump(reader, Arc::clone(&job), Arc::clone(&mcp.running), tx));
     if let Ok(mut p) = job.pump.lock() {
         *p = Some(handle);
     }
@@ -541,11 +550,6 @@ pub(crate) async fn start_scan(
         .lock()
         .map(|m| m.clone())
         .unwrap_or_else(|_| meta.clone());
-    let m = if jobs::is_terminal(&m.status) {
-        mcp.jobs.read_meta(&m.id).unwrap_or(m)
-    } else {
-        m
-    };
     note.result = Some(json!({"status": m.status, "findings": m.counts.findings}));
     let value = scan_view(&m, mcp.settings.redact);
     let summary = format!(
@@ -561,31 +565,16 @@ pub(crate) async fn start_scan(
     Ok(Done { value, summary })
 }
 
-/// Read a scan's events until it ends, writing the job as it goes.
+/// Read a scan's events until it ends, keeping the scan's state in memory for the call
+/// that started it. plessor keeps the scan and what it finds, which is what is read back.
 async fn pump(
     mut reader: LineReader,
     job: Arc<RunningJob>,
-    store: Arc<JobStore>,
     running: RunningMap,
     tx: watch::Sender<Snap>,
 ) {
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
-    heartbeat.tick().await;
     let limit = tokio::time::sleep(SCAN_TIME_LIMIT);
     tokio::pin!(limit);
-    let mut last_write = Instant::now();
-    let mut seq = 0u64;
-    let mut capped = false;
-    // A scan of a request captured somewhere else tests the URL and session that were
-    // captured, and plessor reports its findings on them. The model never saw those
-    // values unmasked, so the file keeps them masked too, the way the job keeps its
-    // endpoints, whatever `--no-redact` says about results.
-    let captured = job
-        .meta
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .source
-        .is_some();
 
     let update = |f: &mut dyn FnMut(&mut JobMeta)| -> JobMeta {
         let mut m = job.meta.lock().unwrap_or_else(|p| p.into_inner());
@@ -605,45 +594,15 @@ async fn pump(
                             if let Some(t) = total { m.progress.total = t; }
                         });
                         tx.send_replace(snap_of(&m));
-                        if last_write.elapsed() >= Duration::from_secs(1) {
-                            let m = update(&mut |m| m.touch());
-                            let _ = store.write_meta(&m);
-                            last_write = Instant::now();
-                        }
                     }
                     "finding" => {
-                        let count = job.meta.lock().map(|m| m.counts.findings).unwrap_or(0);
-                        if count >= FINDINGS_PER_JOB {
-                            if !capped {
-                                capped = true;
-                                update(&mut |m| m.note(format!(
-                                    "more than {FINDINGS_PER_JOB} findings; later ones were not stored"
-                                )));
-                            }
-                            continue;
-                        }
-                        seq += 1;
-                        let mut f = findings::from_plessor(
-                            v.get("data").unwrap_or(&Value::Null),
-                            Stamp {
-                                id: jobs::new_id("f"),
-                                scan_id: &job.id,
-                                seq,
-                                recorded_ms: jobs::now_ms(),
-                            },
-                        );
-                        if captured {
-                            findings::redact_finding(&mut f);
-                        }
-                        let sev = f["severity"].as_str().unwrap_or("unknown").to_string();
-                        if store.append_findings(&job.id, std::slice::from_ref(&f)).is_ok() {
-                            let m = update(&mut |m| m.count(&sev));
-                            tx.send_replace(snap_of(&m));
-                            if last_write.elapsed() >= Duration::from_secs(1) {
-                                let _ = store.write_meta(&m);
-                                last_write = Instant::now();
-                            }
-                        }
+                        let data = v.get("data").unwrap_or(&Value::Null);
+                        let sev = findings::severity(
+                            data.get("severity").and_then(|s| s.as_str()).unwrap_or(""),
+                        )
+                        .to_string();
+                        let m = update(&mut |m| m.count(&sev));
+                        tx.send_replace(snap_of(&m));
                     }
                     "log" => {
                         let msg = v.get("message").and_then(|x| x.as_str()).unwrap_or("");
@@ -694,11 +653,6 @@ async fn pump(
                     break;
                 }
             },
-            _ = heartbeat.tick() => {
-                let m = update(&mut |m| m.touch());
-                let _ = store.write_meta(&m);
-                last_write = Instant::now();
-            }
             _ = &mut limit => {
                 if let Some(w) = job.writer.lock().await.as_mut() {
                     let _ = w.send_cancel().await;
@@ -712,7 +666,6 @@ async fn pump(
         }
     }
     let m = update(&mut |_| {});
-    let _ = store.write_meta(&m);
     if let Ok(mut r) = running.lock() {
         r.remove(&job.id);
     }

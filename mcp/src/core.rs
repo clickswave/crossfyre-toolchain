@@ -11,7 +11,7 @@ use crate::audit::{Audit, now_rfc3339};
 use crate::confirm::{Confirmations, WriteAsk};
 use crate::engine::{EngineConn, EngineWriter, Support};
 use crate::guard::{self, AddrRefusal, Dest, Resolver};
-use crate::jobs::{self, JobMeta, JobStore};
+use crate::jobs::{self, JobMeta};
 use crate::limits::{CallBucket, HostPacer};
 use crate::peer::ClientPeer;
 use crate::scope_file::LoadedScope;
@@ -354,6 +354,19 @@ pub(crate) struct RunningJob {
     pub cancel_requested: AtomicBool,
 }
 
+/// The scans a process cancelled, by id: its engine keeps each as stopped, and what is
+/// said of the cancel is kept here.
+pub(crate) type CancelledSet = Arc<Mutex<HashMap<String, Cancelled>>>;
+
+/// What this process said of a scan it cancelled.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Cancelled {
+    /// `stopped` when the engine confirmed it stopped, `requested` when it could not.
+    pub how: Option<&'static str>,
+    /// Why, when something other than a client asked.
+    pub why: Option<String>,
+}
+
 pub(crate) type RunningMap = Arc<Mutex<HashMap<String, Arc<RunningJob>>>>;
 
 /// What the client was last given as its tool list. One record for every backend, so a
@@ -375,7 +388,6 @@ pub(crate) struct Mcp {
     pub dir: PathBuf,
     pub scope: LoadedScope,
     pub guard: Arc<Guard>,
-    pub jobs: Arc<JobStore>,
     pub audit: Audit,
     pub calls: CallBucket,
     pub pacer: HostPacer,
@@ -384,8 +396,11 @@ pub(crate) struct Mcp {
     pub session: String,
     seq: AtomicU64,
     pub running: RunningMap,
-    /// Held from the final cap check to the job being written, so two calls cannot
-    /// both take the last slot.
+    /// The scans this process cancelled, which their engines keep as stopped, as a scan
+    /// that went away is kept too: these are said to be cancelled, the rest interrupted.
+    pub cancelled: CancelledSet,
+    /// Held from the final cap check to the scan being kept, so two calls cannot both
+    /// take the last slot.
     pub scan_start: tokio::sync::Mutex<()>,
     pub polls: Mutex<HashMap<String, u32>>,
     /// The running Workbenches this server is connected to.
@@ -406,7 +421,6 @@ impl Mcp {
         dir: PathBuf,
         scope: LoadedScope,
         audit: Audit,
-        jobs: JobStore,
         resolver: Arc<dyn Resolver>,
     ) -> Self {
         let guard = scope.guard();
@@ -425,7 +439,6 @@ impl Mcp {
             settings,
             dir,
             guard,
-            jobs: Arc::new(jobs),
             audit,
             calls,
             pacer,
@@ -434,6 +447,7 @@ impl Mcp {
             session: jobs::new_id("m"),
             seq: AtomicU64::new(0),
             running: Arc::new(Mutex::new(HashMap::new())),
+            cancelled: Arc::new(Mutex::new(HashMap::new())),
             scan_start: tokio::sync::Mutex::new(()),
             polls: Mutex::new(HashMap::new()),
             open_calls: Mutex::new(HashMap::new()),
@@ -868,7 +882,7 @@ impl Mcp {
             ));
         }
         if req.scan_start {
-            self.check_scan_caps()?;
+            self.check_scan_caps().await?;
         }
         if req.pace {
             for c in &cleared {
@@ -979,9 +993,11 @@ impl Mcp {
         })
     }
 
-    pub(crate) fn check_scan_caps(&self) -> Result<(), Refusal> {
+    /// Whether one more scan may start: how many this scope file's servers have running,
+    /// and have started in the last hour, as the engines keep them.
+    pub(crate) async fn check_scan_caps(&self) -> Result<(), Refusal> {
         let now = jobs::now_ms();
-        let running = self.jobs.running_fresh(now);
+        let running = crate::kept::running(self).await;
         let max = self.scope.max_concurrent_scans as usize;
         if running >= max {
             return Err(Refusal::new(
@@ -993,9 +1009,7 @@ impl Mcp {
                 ),
             ));
         }
-        let starts = self
-            .jobs
-            .starts_since(&jobs::INJECTION_TOOLS, now - 3_600_000);
+        let starts = crate::kept::starts_since(self, &jobs::INJECTION_TOOLS, now - 3_600_000).await;
         let max = self.scope.max_scan_starts_per_hour as usize;
         if starts >= max {
             return Err(Refusal::new(
@@ -1016,7 +1030,17 @@ impl Mcp {
     /// Stop a scan this process owns. `stopped` when the engine confirmed it,
     /// `requested` when it could not say so.
     pub(crate) async fn cancel_running(&self, job: &Arc<RunningJob>) -> &'static str {
-        cancel_job(&self.jobs, &self.running, job).await
+        cancel_job(&self.running, &self.cancelled, job).await
+    }
+
+    /// Whether this process cancelled scan `id`.
+    pub(crate) fn was_cancelled(&self, id: &str) -> bool {
+        self.cancelled.lock().is_ok_and(|c| c.contains_key(id))
+    }
+
+    /// What this process said of scan `id` when it cancelled it.
+    pub(crate) fn cancelled(&self, id: &str) -> Option<Cancelled> {
+        self.cancelled.lock().ok()?.get(id).cloned()
     }
 
     /// On the way out: write the line for every call still open, ask every running
@@ -1072,15 +1096,11 @@ impl Mcp {
             if let Some(w) = job.writer.lock().await.as_mut() {
                 let _ = w.send_cancel().await;
             }
-            let meta = job.meta.lock().ok().map(|mut m| {
-                if !jobs::is_terminal(&m.status) {
-                    m.finish(jobs::INTERRUPTED);
-                    m.error = Some("server stopped".into());
-                }
-                m.clone()
-            });
-            if let Some(m) = meta {
-                let _ = self.jobs.write_meta(&m);
+            if let Ok(mut m) = job.meta.lock()
+                && !jobs::is_terminal(&m.status)
+            {
+                m.finish(jobs::INTERRUPTED);
+                m.error = Some("server stopped".into());
             }
             job.writer.lock().await.take();
         }
@@ -1093,11 +1113,24 @@ impl Mcp {
 /// Stop a running scan: ask the engine, wait briefly for it to confirm, and otherwise
 /// close the connection and record it as cancelled on request.
 pub(crate) async fn cancel_job(
-    store: &JobStore,
     running: &RunningMap,
+    cancelled: &CancelledSet,
     job: &Arc<RunningJob>,
 ) -> &'static str {
     job.cancel_requested.store(true, Ordering::SeqCst);
+    if let Ok(mut c) = cancelled.lock() {
+        c.entry(job.id.clone()).or_default();
+    }
+    let how = stop(running, job).await;
+    if let Ok(mut c) = cancelled.lock() {
+        c.entry(job.id.clone()).or_default().how = Some(how);
+    }
+    how
+}
+
+/// Stop a running scan and say how: `stopped` when the engine confirmed it, `requested`
+/// when it could not.
+async fn stop(running: &RunningMap, job: &Arc<RunningJob>) -> &'static str {
     let sent = match job.writer.lock().await.as_mut() {
         Some(w) => w.send_cancel().await.is_ok(),
         None => false,
@@ -1129,20 +1162,16 @@ pub(crate) async fn cancel_job(
         h.abort();
         let _ = h.await;
     }
-    let meta = job.meta.lock().ok().map(|mut m| {
-        if !jobs::is_terminal(&m.status) {
-            m.finish(jobs::CANCELLED);
-            m.cancel = Some("requested".into());
-            m.note(
-                "cancellation was requested; this engine version keeps running until it \
-                 finishes, so update it to stop scans on request"
-                    .into(),
-            );
-        }
-        m.clone()
-    });
-    if let Some(m) = meta {
-        let _ = store.write_meta(&m);
+    if let Ok(mut m) = job.meta.lock()
+        && !jobs::is_terminal(&m.status)
+    {
+        m.finish(jobs::CANCELLED);
+        m.cancel = Some("requested".into());
+        m.note(
+            "cancellation was requested; this engine version keeps running until it \
+             finishes, so update it to stop scans on request"
+                .into(),
+        );
     }
     if let Ok(mut r) = running.lock() {
         r.remove(&job.id);

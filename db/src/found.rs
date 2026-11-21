@@ -152,6 +152,18 @@ fn finding_json((id, scan, kind, check, data, found): FindingRow) -> Value {
     json!({"id": id, "scan": scan, "kind": kind, "check": check, "data": data, "found": found})
 }
 
+/// What a daemon answers a `finding` request with: finding `id` as it was kept, or that
+/// there is none.
+pub async fn answer_finding(pool: &PgPool, id: i64) -> Value {
+    match finding(pool, id).await {
+        Ok(Some(found)) => json!({"status": "completed", "finding": found}),
+        Ok(None) => json!({"status": "error", "message": format!("no finding {id} is kept here")}),
+        Err(e) => {
+            json!({"status": "error", "message": format!("could not read finding {id}: {e}")})
+        }
+    }
+}
+
 /// What a daemon answers a `findings` request with: what its scans found, oldest first,
 /// of scan `scan` when one is named, after finding `after` when one is, at most `limit`
 /// of them and never more than [`FINDINGS_AT_MOST`].
@@ -344,10 +356,15 @@ mod tests {
                 {"level": "error", "message": "the target went away"},
             ])
         );
-        let first = finding(&pool, rows[0]["id"].as_i64().unwrap())
-            .await
-            .unwrap();
-        assert_eq!(first.unwrap()["data"]["proof"]["response_sha256"], "aa");
+        let listed = crate::scans::list(&pool, 10).await.unwrap();
+        assert_eq!(listed[0].findings, 2);
+        assert_eq!(listed[0].by_severity, json!({"high": 1}));
+        let first = answer_finding(&pool, rows[0]["id"].as_i64().unwrap()).await;
+        assert_eq!(first["finding"]["data"]["proof"]["response_sha256"], "aa");
+        assert_eq!(
+            answer_finding(&pool, 999).await["message"],
+            "no finding 999 is kept here"
+        );
         assert_eq!(
             answer_scan(&pool, "nothing").await["message"],
             "no scan nothing is kept here"

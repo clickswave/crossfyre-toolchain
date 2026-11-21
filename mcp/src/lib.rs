@@ -21,6 +21,7 @@ mod engine;
 mod findings;
 mod guard;
 mod jobs;
+mod kept;
 mod limits;
 mod peer;
 mod redact;
@@ -123,8 +124,7 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 }
 
 /// Where the scope file is, made absolute. The directory holding it is where the audit
-/// log and the jobs live, so the record of what was done sits with the permission it
-/// was done under.
+/// log lives, so the record of what was done sits with the permission it was done under.
 fn scope_path(opts: &Options) -> Result<(PathBuf, PathBuf), StartError> {
     match &opts.scope_file {
         Some(p) => {
@@ -170,8 +170,6 @@ fn build(opts: Options, resolver: Arc<dyn guard::Resolver>) -> Result<core::Mcp,
             audit_path.display()
         ))
     })?;
-    let store = jobs::JobStore::open(&dir.join("jobs"))
-        .map_err(|e| StartError(format!("could not open the job store: {e}")))?;
     let settings = core::Settings {
         version: opts.version,
         redact: opts.redact,
@@ -182,10 +180,7 @@ fn build(opts: Options, resolver: Arc<dyn guard::Resolver>) -> Result<core::Mcp,
         call_burst: 10,
         calls_per_minute: 60,
     };
-    let mcp = core::Mcp::new(settings, dir, scope, audit, store, resolver);
-    mcp.jobs.recover(&mcp.session, jobs::now_ms());
-    mcp.jobs.prune(jobs::KEEP_FINISHED);
-    Ok(mcp)
+    Ok(core::Mcp::new(settings, dir, scope, audit, resolver))
 }
 
 /// SIGTERM or SIGHUP. A client that is done with the server closes its stdin and,

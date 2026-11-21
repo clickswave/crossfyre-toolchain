@@ -5,7 +5,6 @@
 use crate::audit::Audit;
 use crate::core::{CallOutput, Mcp, Settings, ToolResult};
 use crate::guard::{BoxFut, Resolver};
-use crate::jobs::JobStore;
 use crate::peer::{Answer, ClientPeer};
 use crate::scope_file;
 use crate::{EngineInfo, WorkbenchMode};
@@ -174,6 +173,121 @@ pub(crate) struct Stub {
     pub port: u16,
     ops: Arc<Mutex<Vec<Value>>>,
     cancels: Arc<AtomicUsize>,
+    /// What the engine keeps, as an engine's tables would: the scans it ran, and what
+    /// was seeded into it.
+    pub kept: Arc<Mutex<FakeKept>>,
+}
+
+/// An engine's kept scans and findings, answering the reads an engine daemon answers
+/// (`scans`, `scan_info`, `findings`, `finding`) in the shapes cfx_db gives them.
+#[derive(Default)]
+pub(crate) struct FakeKept {
+    pub scans: Vec<Value>,
+    pub findings: Vec<Value>,
+    pub notes: Vec<(String, String, String)>,
+}
+
+impl FakeKept {
+    /// Keep a scan of `target`, as `status`, made at `created_at`, with `settings`; its id.
+    pub(crate) fn scan(
+        &mut self,
+        target: &str,
+        status: &str,
+        settings: Value,
+        created_at: &str,
+    ) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        self.scans.push(json!({
+            "id": id, "target": target, "status": status, "created_at": created_at,
+            "updated_at": created_at, "settings": settings, "progress": {},
+        }));
+        id
+    }
+
+    /// Keep `data` as a finding of scan `scan`, found at `found`; its id.
+    pub(crate) fn finding(&mut self, scan: &str, data: Value, found: &str) -> i64 {
+        let id = self.findings.len() as i64 + 1;
+        self.findings.push(json!({
+            "id": id, "scan": scan, "kind": data["type"].as_str().unwrap_or(""),
+            "check": data["template"].as_str().unwrap_or(""), "data": data, "found": found,
+        }));
+        id
+    }
+
+    fn set(&mut self, scan: &str, key: &str, value: Value) {
+        if let Some(s) = self.scans.iter_mut().find(|s| s["id"] == scan) {
+            s[key] = value;
+        }
+    }
+
+    fn row(&self, s: &Value) -> Value {
+        let mine: Vec<&Value> = self
+            .findings
+            .iter()
+            .filter(|f| f["scan"] == s["id"])
+            .collect();
+        let mut by = serde_json::Map::new();
+        for f in &mine {
+            if let Some(sev) = f["data"]["severity"].as_str() {
+                let n = by.get(sev).and_then(|v| v.as_u64()).unwrap_or(0);
+                by.insert(sev.to_string(), json!(n + 1));
+            }
+        }
+        let mut row = s.clone();
+        row["findings"] = json!(mine.len());
+        row["by_severity"] = Value::Object(by);
+        row
+    }
+
+    /// What an engine answers `op`, a read, with.
+    pub(crate) fn answer(&self, op: &Value) -> Value {
+        match op["operation"].as_str().unwrap_or_default() {
+            "scans" => {
+                let mut rows: Vec<Value> = self.scans.iter().map(|s| self.row(s)).collect();
+                rows.reverse();
+                json!({"status": "completed", "scans": rows})
+            }
+            "scan_info" => match self.scans.iter().find(|s| s["id"] == op["id"]) {
+                Some(s) => {
+                    let mut row = self.row(s);
+                    row["notes"] = self
+                        .notes
+                        .iter()
+                        .filter(|(scan, ..)| op["id"] == scan.as_str())
+                        .map(|(_, level, message)| json!({"level": level, "message": message}))
+                        .collect();
+                    json!({"status": "completed", "scan": row})
+                }
+                None => json!({"status": "error", "message": "no scan is kept here"}),
+            },
+            "findings" => {
+                let after = op["after"].as_i64().unwrap_or(0);
+                let limit = op["limit"].as_u64().unwrap_or(200) as usize;
+                let rows: Vec<Value> = self
+                    .findings
+                    .iter()
+                    .filter(|f| f["id"].as_i64().unwrap_or(0) > after)
+                    .filter(|f| {
+                        op.get("scan")
+                            .is_none_or(|s| s.is_null() || f["scan"] == *s)
+                    })
+                    .take(limit)
+                    .cloned()
+                    .collect();
+                json!({"status": "completed", "findings": rows})
+            }
+            "finding" => match self.findings.iter().find(|f| f["id"] == op["id"]) {
+                Some(f) => json!({"status": "completed", "finding": f}),
+                None => json!({"status": "error", "message": "no finding is kept here"}),
+            },
+            other => json!({"status": "error", "message": format!("Unknown operation: {other}")}),
+        }
+    }
+}
+
+/// When the test runs, as an engine says it.
+pub(crate) fn now_utc() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 impl Stub {
@@ -222,13 +336,14 @@ pub(crate) async fn stub_engine(opts: StubOpts) -> Stub {
     let port = l.local_addr().unwrap().port();
     let ops = Arc::new(Mutex::new(Vec::new()));
     let cancels = Arc::new(AtomicUsize::new(0));
-    let (o, c) = (Arc::clone(&ops), Arc::clone(&cancels));
+    let kept = Arc::new(Mutex::new(FakeKept::default()));
+    let (o, c, k) = (Arc::clone(&ops), Arc::clone(&cancels), Arc::clone(&kept));
     tokio::spawn(async move {
         loop {
             let Ok((sock, _)) = l.accept().await else {
                 return;
             };
-            let (o, c, opts) = (Arc::clone(&o), Arc::clone(&c), opts.clone());
+            let (o, c, k, opts) = (Arc::clone(&o), Arc::clone(&c), Arc::clone(&k), opts.clone());
             tokio::spawn(async move {
                 let (r, mut w) = sock.into_split();
                 let mut lines = BufReader::new(r).lines();
@@ -258,7 +373,24 @@ pub(crate) async fn stub_engine(opts: StubOpts) -> Stub {
                         return;
                     }
                 };
+                let read = ["scans", "scan_info", "findings", "finding"]
+                    .contains(&op["operation"].as_str().unwrap_or_default());
+                if read {
+                    let mut a = k.lock().unwrap().answer(&op).to_string();
+                    a.push('\n');
+                    let _ = w.write_all(a.as_bytes()).await;
+                    return;
+                }
                 o.lock().unwrap().push(op.clone());
+                // Kept as an engine keeps a scan, with what the request said of itself.
+                let scan = k.lock().unwrap().scan(
+                    op.get("target")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or_default(),
+                    "running",
+                    json!({"operation": op["operation"], "mcp": op["mcp"]}),
+                    &now_utc(),
+                );
                 if let Some(map) = &opts.simulate {
                     if let Some(t) = op.get("target").and_then(|t| t.as_str())
                         && op.get("endpoints").is_none()
@@ -276,12 +408,17 @@ pub(crate) async fn stub_engine(opts: StubOpts) -> Stub {
                     s.push('\n');
                     s
                 };
-                let mut ack = json!({"type": "ack", "target": op.get("target")});
+                let mut ack = json!({"type": "ack", "target": op.get("target"), "scan": scan});
                 if opts.cancellable {
                     ack["cancellable"] = json!(true);
                 }
                 let mut out = send(ack);
                 for e in &opts.events {
+                    if e["type"] == "finding" {
+                        k.lock()
+                            .unwrap()
+                            .finding(&scan, e["data"].clone(), &now_utc());
+                    }
                     if opts.delay_ms > 0 {
                         if w.write_all(out.as_bytes()).await.is_err() {
                             return;
@@ -295,6 +432,7 @@ pub(crate) async fn stub_engine(opts: StubOpts) -> Stub {
                     return;
                 }
                 if !opts.hold {
+                    k.lock().unwrap().set(&scan, "status", json!("completed"));
                     let _ = w.write_all(send(json!({"type": "done"})).as_bytes()).await;
                     return;
                 }
@@ -302,6 +440,7 @@ pub(crate) async fn stub_engine(opts: StubOpts) -> Stub {
                     let v: Value = serde_json::from_str(&l).unwrap_or(Value::Null);
                     if v["operation"] == "cancel" {
                         c.fetch_add(1, Ordering::SeqCst);
+                        k.lock().unwrap().set(&scan, "status", json!("stopped"));
                         if opts.cancellable {
                             let _ = w
                                 .write_all(
@@ -315,7 +454,12 @@ pub(crate) async fn stub_engine(opts: StubOpts) -> Stub {
             });
         }
     });
-    Stub { port, ops, cancels }
+    Stub {
+        port,
+        ops,
+        cancels,
+        kept,
+    }
 }
 
 /// What toolmark sends for a page it fingerprinted.
@@ -477,6 +621,9 @@ impl Resolver for FakeResolver {
 pub(crate) struct TestMcp {
     pub dir: TempDir,
     pub mcp: Arc<Mcp>,
+    /// What a stub plessor this server reads from keeps, when the test gave it one to
+    /// seed scans into.
+    pub kept: Option<Arc<Mutex<FakeKept>>>,
     /// The closed ports the engines default to, kept closed while the server runs.
     _closed: Vec<ClosedPort>,
 }
@@ -570,7 +717,6 @@ impl Build {
             Some(f) => f(&audit_path),
             None => Audit::open(&audit_path).unwrap(),
         };
-        let store = JobStore::open(&dir.path().join("jobs")).unwrap();
         let settings = Settings {
             version: "0.0.0-test".into(),
             redact: self.redact,
@@ -597,12 +743,12 @@ impl Build {
             dir.path().to_path_buf(),
             scope,
             audit,
-            store,
             Arc::new(self.resolver),
         );
         TestMcp {
             dir,
             mcp: Arc::new(mcp),
+            kept: None,
             _closed: self.closed,
         }
     }
