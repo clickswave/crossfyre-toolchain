@@ -61,7 +61,7 @@ LEFT_OUT = ("tkinter", "idlelib", "turtledemo", "turtle.py", "ensurepip", "site-
 DYNLOAD_LEFT_OUT = ("_dbm", "_tkinter")
 # The newest glibc the release binaries may need: Debian 12's.
 GLIBC_CEILING = (2, 36)
-# The modes the folder's files are given, as the first-party zip gives them.
+# The modes the folder's files are given, as the release archives give them.
 FILE_MODE = 0o644
 
 

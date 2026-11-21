@@ -112,6 +112,18 @@ crossfyre node init
 
 The platform is optional. Nothing here needs it.
 
+## What comes with a plan
+
+Three components are not in this repository. They come with a Crossfyre plan that includes them, and the CLI installs them beside the binaries once you log in:
+
+| Component | What it adds | Without it |
+| --- | --- | --- |
+| `plessor-authz` | plessor's authorization testing (BOLA, BFLA and BOPLA), as a daemon of its own on port 4446, which the node sends a scan's authorization tests to | plessor's `authz` operation says it needs plessor-authz and reports no findings |
+| `pacing`, the pacing module | Pacing tuned to how each target answers | The engines pace with the baseline in [`adaptive`](adaptive/) |
+| `egress`, the egress helper | Brings up a node's VPN or Tor tunnel when it has one | The node sends from the machine's own address, or, with the node's kill switch on, runs no ops until a helper answers |
+
+`crossfyre login` offers to install the ones your plan includes, `crossfyre update components` installs them later, `crossfyre node init` installs what a node needs with the node's own key, `crossfyre update` keeps them current, and `crossfyre status` lists them with their versions. Each file is checked against a manifest signed with the release key before it is installed, and an engine checks the pacing module's own signature each time it loads it. Every engine says which pacing it runs as it starts, `pacing: module <version>` or `pacing: baseline (<why>)`. When a plan ends, what is installed stays and stops being updated.
+
 ## How the engines run
 
 Each engine is a daemon and the commands that talk to it. The daemon does the work, on 127.0.0.1 and a port of its own (ambulo 4441, voyage 4442, doorward 4443, toolmark 4444, plessor 4445), and the commands you type are its clients. When a command finds no daemon on its port it starts one: on Linux the engine's systemd user unit, when `crossfyre` registered one for you, and otherwise the engine's own binary, which writes to `logs/<engine>.log` in the toolchain directory (`~/.config/crossfyre` on Linux). The command says `started voyage daemon (pid N)` on stderr, so its JSON on stdout stays clean.
@@ -148,7 +160,7 @@ A source build sets up no services, and needs none: the first command you give a
 
 `cfx-script` embeds Python, so building it needs one. On Linux that is your distribution's Python and its development files. On macOS it has to be Python 3.10 or later, and the `python3` that comes with the Xcode command line tools is 3.9, so name another one: `PYO3_PYTHON=/opt/homebrew/bin/python3 cargo build --release`. Windows needs no Python to build it, and Python 3.10 or later to run scripts.
 
-A source build, like the binaries on the [Releases](../../releases) page, is the open build. The installer ships the first-party build, which adds the authorization checks, per-node egress isolation and tuned pacing.
+The binaries on the [Releases](../../releases) page are the ones the installer and the package managers install, built by GitHub Actions from the tag, and `gh attestation verify` says which commit each came from. What a plan adds is the three components in [What comes with a plan](#what-comes-with-a-plan), none of which is compiled into them.
 
 <details>
 <summary>Running an engine as a daemon on another address</summary>
@@ -173,7 +185,8 @@ Every engine can run as a daemon (`<engine> daemon`) that its client talks to ov
 | [`mcp`](mcp/) | The `crossfyre mcp` server: the engines as MCP tools, fenced by a scope file you write, with an audit line for every call. |
 | [`spec`](spec/) | Reads OpenAPI, Swagger, Postman, HAR and Insomnia files. |
 | [`surface`](surface/) | Describes a scanned attack surface and diffs it between runs. |
-| [`adaptive`](adaptive/) | The engines' pacing and retry decisions, with an untuned baseline. |
+| [`adaptive`](adaptive/) | The engines' pacing and retry decisions, answered by the pacing module when one is installed and by the baseline otherwise. |
+| [`pacing`](pacing/) | Checks the pacing module's signature and runs it, with a limit on what each call may use. |
 | [`relsign`](relsign/) | Signs the release manifest. Used to build releases, not shipped. |
 
 </details>

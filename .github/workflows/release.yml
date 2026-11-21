@@ -1,27 +1,25 @@
 name: Release
 
-# Publishes the OPEN build, and is careful to say so.
+# Publishes the release: the binaries bins.crossfyre.io serves.
 #
-# WHAT THIS IS NOT. These artifacts are not the binaries `get.crossfyre.io`
-# installs. This repo is open-core: `plessor/src/authz/private.rs`,
-# `core/src/egress/private.rs` and `adaptive-private/` are git-ignored and absent
-# from any public checkout, so `build.rs` compiles the `baseline.rs` stubs
-# instead. A release built here therefore has no authorization oracle, no
-# isolated egress and no tuned pacing. Its engines do present a browser's TLS and
-# HTTP/2 fingerprint: that code is public, and every published build turns it on. The first-party build does, and nobody
-# outside this company can reproduce it.
+# WHAT THIS IS. The archives hold the binaries get.crossfyre.io installs and every
+# package is made from, built here from the tag, and nowhere else. Three components
+# are not in this repo: plessor-authz, the pacing module and the egress helper. They
+# are built and signed elsewhere, and the CLI installs them after login for a plan
+# that includes them. Without them the binaries here run their baselines, and the
+# notes below say what each one adds. The engines present a browser's TLS and HTTP/2
+# fingerprint: that code is public, and every published build turns it on.
 #
-# Saying that plainly is the point. A release that quietly shipped a reduced
-# binary under the same name as the distributed one would be worse than no
-# release at all, so the notes below state the difference and the CI job that
-# proves no private drop-in leaked into the tag runs before anything is built.
+# The boundary job runs before anything is built and refuses a tag that holds a
+# private drop-in, since a release is the moment a leak would become permanent.
 #
 # WHAT IT BUYS. Integrity was already covered: the installer fetches
 # manifest.json and checks SHA256 before it installs anything. What was missing
 # is PROVENANCE, the claim that a given byte string came from a commit anyone can
 # read. `actions/attest-build-provenance` binds each artifact to this workflow
 # run and this commit, so `gh attestation verify` answers that without trusting
-# us. That is the whole reason this file exists.
+# us. Since bins serves these same binaries, the answer covers what the installer
+# puts on a machine too.
 
 on:
   push:
@@ -151,12 +149,12 @@ jobs:
       # loader searches before LD_LIBRARY_PATH and the system's directories (see
       # cfx-script/build.rs). It changes nothing in the other binaries.
       #
-      # Each binary is built on its own, as the first-party build builds it: built
-      # together, the crates they share are compiled once with every feature any of
-      # them asks for, and the CLI would get the engines' BoringSSL beside the OpenSSL
-      # it links, which define the same symbols. The four engines are built with
-      # BoringSSL, for a browser's TLS and HTTP/2 fingerprint. scripts/notices.py
-      # names the same binaries and features, and its test checks this step does.
+      # Each binary is built on its own: built together, the crates they share are
+      # compiled once with every feature any of them asks for, and the CLI would get
+      # the engines' BoringSSL beside the OpenSSL it links, which define the same
+      # symbols. The four engines are built with BoringSSL, for a browser's TLS and
+      # HTTP/2 fingerprint. scripts/notices.py names the same binaries and features,
+      # and its test checks this step does.
       - name: Build the workspace binaries
         run: |
           set -euo pipefail
@@ -180,7 +178,7 @@ jobs:
           python3 -I scripts/notices.py --target ${{ matrix.target }} \
             --out target/THIRD-PARTY-NOTICES.txt
 
-      # The python folder goes beside cfx-script as the first-party zip lays it out,
+      # The python folder goes beside cfx-script as the CLI and install.sh lay it out,
       # byte for byte the archive's files, with the licences of everything its
       # libpython compiles in beside the binaries.
       - name: Stage the artifacts
@@ -506,24 +504,27 @@ jobs:
           body: |
             ## What this is
 
-            The **open build** of the Crossfyre toolchain, compiled by GitHub
-            Actions from this tag. Engines and templates are Apache-2.0.
+            The Crossfyre toolchain, compiled by GitHub Actions from this tag.
+            These are the binaries `get.crossfyre.io` installs and
+            bins.crossfyre.io serves, and the ones apt, Homebrew, the AUR, Scoop
+            and winget install. They are Apache-2.0, like the source.
 
-            ## What this is not
+            ## What comes with a plan
 
-            This is **not** the binary `get.crossfyre.io` installs. The repo is
-            open-core: three things are absent from any public checkout.
+            Three components are not in this repository or this release. They
+            come with a Crossfyre plan that includes them, and `crossfyre login`
+            offers to install them:
 
-            | not in this build | effect on this build |
-            |---|---|
-            | `plessor/src/authz/private.rs` | no BOLA/BFLA/BOPLA authorization oracle |
-            | `core/src/egress/private.rs` | no per-node egress isolation |
-            | `adaptive-private/` | untuned pacing, not the shipped governor |
+            | component | what it adds | without it |
+            |---|---|---|
+            | `plessor-authz` | authorization testing: BOLA, BFLA and BOPLA | plessor's `authz` operation says it needs plessor-authz and reports no findings |
+            | the pacing module | pacing tuned to how each target answers | the baseline pacing, which each engine names as it starts |
+            | the egress helper | brings up a node's VPN or Tor tunnel when it has one | the node sends from its own address, or with its kill switch on runs no ops |
 
-            `build.rs` selects the `baseline.rs` stubs instead. The distributed
-            binary includes the real implementations and cannot be reproduced
-            from this source. That difference is the point of publishing this
-            separately rather than pretending the two are the same artifact.
+            Each is checked against a manifest signed with the release key
+            before it is installed. None of them is compiled into the binaries
+            here, so what these binaries do without them is what you can read in
+            this tag.
 
             This release also carries a standalone `oast` binary, the
             out-of-band interaction server. The first-party CLI runs the same
