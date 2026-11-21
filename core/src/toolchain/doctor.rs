@@ -1,5 +1,5 @@
 // `crossfyre doctor` - environment checks for the things that actually break
-// in the field: missing PostgreSQL or unzip, dead daemons, unreachable control
+// in the field: missing PostgreSQL or tar, dead daemons, unreachable control
 // plane.
 
 use super::packaging::Found;
@@ -31,14 +31,14 @@ fn has_binary(name: &str) -> bool {
     std::env::split_paths(&path).any(|dir| dir.join(&name).is_file())
 }
 
-/// Can extension downloads be unpacked here: by unzip, or on Windows by the bsdtar in
-/// System32 (see `install::extract_zip`).
-fn can_unzip() -> bool {
+/// Can extension downloads be unpacked here: by tar, on Windows by the bsdtar in
+/// System32 (see `install::extract_archive`).
+fn can_unpack() -> bool {
     if cfg!(windows) {
         let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
         Path::new(&root).join("System32").join("tar.exe").is_file()
     } else {
-        has_binary("unzip")
+        has_binary("tar")
     }
 }
 
@@ -82,18 +82,18 @@ pub async fn run(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
             failed += 1;
         }
     }
-    let (unzip_label, unzip_fix) = if cfg!(windows) {
+    let (unpack_label, unpack_fix) = if cfg!(windows) {
         (
             "tar.exe available",
             "Windows 10 1803 or later ships tar.exe in System32 (used to unpack extension downloads)",
         )
     } else {
         (
-            "unzip available",
-            "install unzip (used to unpack extension downloads)",
+            "tar available",
+            "install tar (used to unpack extension downloads)",
         )
     };
-    if !check(unzip_label, can_unzip(), unzip_fix) {
+    if !check(unpack_label, can_unpack(), unpack_fix) {
         failed += 1;
     }
     #[cfg(target_os = "linux")]

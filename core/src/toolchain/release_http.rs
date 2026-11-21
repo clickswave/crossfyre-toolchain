@@ -1,5 +1,5 @@
 //! The HTTP client for the release origin (`install::BASE_URL`): the manifest, its
-//! signature and the release zips.
+//! signature and the release archives.
 //!
 //! Each request carries a User-Agent of the form
 //! `crossfyre-cli/<version> (<platform>; <purpose>)`, such as

@@ -412,36 +412,29 @@ pub(crate) fn verify_artifact_bytes(artifact: &Artifact, bytes: &[u8]) -> Result
     Ok(())
 }
 
-/// Unzip `zip_path` into `extract_dir` (shells out to `unzip`, which the
-/// installer checks for). Windows has no unzip, and has had bsdtar, which reads zip
-/// archives, in System32 since Windows 10 1803; it is named by its full path so that
-/// another `tar` on PATH, which may not read zip at all, is not the one run.
-fn extract_zip(zip_path: &Path, extract_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+/// Unpack a release archive into `extract_dir` with the system `tar`: a tar.gz on Linux
+/// and macOS, which the installer checks `tar` for, and a zip on Windows. Windows has had
+/// bsdtar, which reads zip archives, in System32 since Windows 10 1803; it is named by
+/// its full path so that another `tar` on PATH, which may not read zip at all, is not
+/// the one run.
+fn extract_archive(archive: &Path, extract_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(extract_dir)?;
     #[cfg(windows)]
-    let status = {
+    let (tar, read) = {
         let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
-        Command::new(Path::new(&root).join("System32").join("tar.exe"))
-            .arg("-x")
-            .arg("-f")
-            .arg(zip_path)
-            .arg("-C")
-            .arg(extract_dir)
-            .status()
-            .map_err(|e| format!("tar.exe not found or failed to execute: {e}"))?
+        (Path::new(&root).join("System32").join("tar.exe"), "-xf")
     };
     #[cfg(not(windows))]
-    let status = Command::new("unzip")
-        .args([
-            "-q",
-            &zip_path.to_string_lossy(),
-            "-d",
-            &extract_dir.to_string_lossy(),
-        ])
+    let (tar, read) = (PathBuf::from("tar"), "-xzf");
+    let status = Command::new(&tar)
+        .arg(read)
+        .arg(archive)
+        .arg("-C")
+        .arg(extract_dir)
         .status()
-        .map_err(|e| format!("unzip not found or failed to execute: {e}"))?;
+        .map_err(|e| format!("{} not found or failed to execute: {e}", tar.display()))?;
     if !status.success() {
-        return Err(format!("Failed to extract {}", zip_path.display()).into());
+        return Err(format!("Failed to extract {}", archive.display()).into());
     }
     Ok(())
 }
@@ -694,14 +687,14 @@ pub async fn install_cfx_script(
     }
 
     let tmp_dir = tempfile::tempdir()?;
-    let zip_path = tmp_dir.path().join(&artifact.file);
+    let archive = tmp_dir.path().join(&artifact.file);
     let purpose = Purpose::replacing(replaced.is_some() || dest.exists());
-    download_verified(artifact, &zip_path, purpose).await?;
+    download_verified(artifact, &archive, purpose).await?;
     let extract_dir = tmp_dir.path().join("extracted");
-    extract_zip(&zip_path, &extract_dir)?;
+    extract_archive(&archive, &extract_dir)?;
     let extracted = extract_dir.join(file_name(CFX_SCRIPT));
     if !extracted.exists() {
-        return Err("cfx-script binary not found inside its zip".into());
+        return Err("cfx-script binary not found inside its archive".into());
     }
     if let Some(output) = place_helper_if_it_starts(&extracted, &dest)? {
         record_cannot_start(&version, &output);
@@ -874,19 +867,19 @@ async fn install_one(
     }
 
     let tmp_dir = tempfile::tempdir().map_err(|e| format!("Failed to create temp dir: {e}"))?;
-    let zip_path = tmp_dir.path().join(&artifact.file);
+    let archive = tmp_dir.path().join(&artifact.file);
     let purpose = Purpose::replacing(super::config::is_extension_installed(ext));
-    download_verified(artifact, &zip_path, purpose).await?;
+    download_verified(artifact, &archive, purpose).await?;
 
     if !quiet {
         working("Installing");
     }
     let extract_dir = tmp_dir.path().join("extracted");
-    extract_zip(&zip_path, &extract_dir)?;
+    extract_archive(&archive, &extract_dir)?;
 
     let extracted_binary = extract_dir.join(file_name(ext));
     if !extracted_binary.exists() {
-        return Err(format!("Binary '{}' not found inside zip", file_name(ext)).into());
+        return Err(format!("Binary '{}' not found inside its archive", file_name(ext)).into());
     }
 
     // Stop the running daemon (if any) before replacing the binary - on
@@ -1942,15 +1935,15 @@ pub async fn self_update(
         );
     }
     let tmp_dir = tempfile::tempdir()?;
-    let zip_path = tmp_dir.path().join(&artifact.file);
+    let archive = tmp_dir.path().join(&artifact.file);
     // The CLI asking is the installed copy, so this always replaces one.
-    download_verified(artifact, &zip_path, Purpose::Update).await?;
+    download_verified(artifact, &archive, Purpose::Update).await?;
 
     let extract_dir = tmp_dir.path().join("extracted");
-    extract_zip(&zip_path, &extract_dir)?;
+    extract_archive(&archive, &extract_dir)?;
     let extracted = extract_dir.join(file_name("crossfyre"));
     if !extracted.exists() {
-        return Err("crossfyre binary not found inside update zip".into());
+        return Err("crossfyre binary not found inside the update archive".into());
     }
 
     let exe = std::env::current_exe()?;
@@ -2055,13 +2048,13 @@ pub async fn download_node(
     }
 
     let tmp_dir = tempfile::tempdir()?;
-    let zip_path = tmp_dir.path().join(&artifact.file);
-    download_verified(artifact, &zip_path, Purpose::replacing(stable.exists())).await?;
+    let archive = tmp_dir.path().join(&artifact.file);
+    download_verified(artifact, &archive, Purpose::replacing(stable.exists())).await?;
     let extract_dir = tmp_dir.path().join("extracted");
-    extract_zip(&zip_path, &extract_dir)?;
+    extract_archive(&archive, &extract_dir)?;
     let extracted = extract_dir.join(file_name("node"));
     if !extracted.exists() {
-        return Err("node binary not found inside the node zip".into());
+        return Err("node binary not found inside the node archive".into());
     }
     place_binary(&extracted, &stable)?;
     let _ = std::fs::write(&ver_file, &comp.version);
@@ -2258,9 +2251,49 @@ mod tests {
     /// could reproduce with `sha256sum` rather than one copied out of a failure.
     const HELLO_SHA: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
 
+    /// On Linux and macOS a release archive is a tar.gz with the binary at its top and,
+    /// for cfx-script, its python folder beside it. Both come out where the install
+    /// looks for them, and the binary can still be run.
+    #[cfg(unix)]
+    #[test]
+    fn a_release_archive_unpacks_with_the_system_tar() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("python").join("lib")).unwrap();
+        fs::write(src.join("cfx-script"), b"the binary").unwrap();
+        fs::set_permissions(src.join("cfx-script"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(src.join("python").join("lib").join("os.py"), b"its library").unwrap();
+        let archive = tmp
+            .path()
+            .join("cfx-script-linux-x86_64-0.1.45-0123456789ab.tar.gz");
+        let made = Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&src)
+            .args(["cfx-script", "python"])
+            .status()
+            .unwrap();
+        assert!(made.success());
+
+        let out = tmp.path().join("extracted");
+        extract_archive(&archive, &out).expect("the archive unpacks");
+        assert_eq!(fs::read(out.join("cfx-script")).unwrap(), b"the binary");
+        let mode = fs::metadata(out.join("cfx-script"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o111, 0o111, "mode {mode:o}");
+        assert_eq!(
+            fs::read(out.join("python").join("lib").join("os.py")).unwrap(),
+            b"its library"
+        );
+    }
+
     #[test]
     fn matching_bytes_are_accepted_and_one_changed_byte_is_not() {
-        let a = artifact("ambulo-linux-x86_64.zip", HELLO_SHA);
+        let a = artifact("ambulo-linux-x86_64.tar.gz", HELLO_SHA);
         assert!(verify_artifact_bytes(&a, b"hello").is_ok());
 
         let err = verify_artifact_bytes(&a, b"hellp").expect_err("one byte changed");
@@ -2276,7 +2309,7 @@ mod tests {
         // The publish pipeline writes lowercase hex, but a hand-edited manifest or a
         // different tool may not, and a case mismatch refusing a correct artifact would
         // look exactly like a compromised bucket.
-        let a = artifact("ambulo.zip", &HELLO_SHA.to_ascii_uppercase());
+        let a = artifact("ambulo.tar.gz", &HELLO_SHA.to_ascii_uppercase());
         assert!(verify_artifact_bytes(&a, b"hello").is_ok());
     }
 
@@ -2287,7 +2320,7 @@ mod tests {
         // byte sequence is wrong, which is correct by accident. Being explicit also makes
         // the message say why instead of printing a mismatch against nothing.
         for blank in ["", "   "] {
-            let a = artifact("ambulo.zip", blank);
+            let a = artifact("ambulo.tar.gz", blank);
             let err = verify_artifact_bytes(&a, b"hello")
                 .expect_err("an artifact with no checksum must be refused");
             assert!(
@@ -2302,9 +2335,9 @@ mod tests {
         // Zero bytes has a sha256 like anything else. A truncated download that arrives
         // as an empty 200 must not pass because there is nothing to hash.
         let empty_sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        let a = artifact("ambulo.zip", empty_sha);
+        let a = artifact("ambulo.tar.gz", empty_sha);
         assert!(verify_artifact_bytes(&a, b"").is_ok());
-        let b = artifact("ambulo.zip", HELLO_SHA);
+        let b = artifact("ambulo.tar.gz", HELLO_SHA);
         assert!(verify_artifact_bytes(&b, b"").is_err());
     }
 
@@ -2517,7 +2550,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            // What an artifact unpacked out of a zip normally looks like.
+            // A binary that came out of its archive without its execute bit.
             fs::set_permissions(&src, fs::Permissions::from_mode(0o644)).expect("chmod src");
         }
 
@@ -2680,7 +2713,7 @@ mod tests {
         assert!(!dest.exists());
     }
 
-    /// A release's python folder beside `src`, as its zip unpacks: lib/ with a file that
+    /// A release's python folder beside `src`, as its archive unpacks: lib/ with a file that
     /// says which one it is.
     #[cfg(unix)]
     fn python_beside(src: &Path, which: &str) {
