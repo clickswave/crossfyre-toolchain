@@ -87,7 +87,7 @@ class Notices(unittest.TestCase):
         for step, target in zip(steps, ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]):
             built = {}
             for loop, feats in re.findall(r'for p in ([\w -]+); do\n\s*cargo build [^\n]*-p "\$p"'
-                                          r'(?: --features (\S+))?', step):
+                                          r'(?: --bin "\$p")?(?: --features (\S+))?', step):
                 for name in loop.split():
                     built[name] = feats.split(",") if feats else []
             for name, feats in re.findall(r"cargo build [^\n]*?-p ([\w-]+) --features (\S+)$",
