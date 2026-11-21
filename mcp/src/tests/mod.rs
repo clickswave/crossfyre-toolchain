@@ -11,6 +11,7 @@ mod cloud_launch_rail;
 mod cloud_read_rail;
 mod confirm_rail;
 mod engine_rail;
+mod engines_rail;
 mod fake_cloud;
 #[cfg(unix)]
 pub(crate) mod fake_wb;

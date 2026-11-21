@@ -2,7 +2,7 @@
 //! here sends traffic. Only scans of targets inside the loaded scope file are shown: one
 //! outside it, or an id of one, is answered as none (see `kept`).
 
-use super::inject::scan_view;
+use super::engine_scan::scan_view;
 use super::{in_range, parse_args, result_size};
 use crate::core::{CallNote, Done, Mcp, Reason, Refusal};
 use crate::findings;

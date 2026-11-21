@@ -72,7 +72,7 @@ fn the_list_says_what_the_key_may_do() {
     let mut expected: Vec<&str> = NAMES.to_vec();
     expected.extend(cloud::READ_NAMES);
     assert_eq!(names(&read), expected);
-    assert_eq!(listed.len(), 18);
+    assert_eq!(listed.len(), 21);
     let defs = cloud_defs();
     for t in &listed {
         let replaced = defs["replace"]
@@ -95,8 +95,8 @@ fn the_list_says_what_the_key_may_do() {
         workbench: Some(vec!["workbench_get_scope"]),
     };
     let n = names(&both);
-    assert_eq!(n.len(), 19);
-    assert_eq!(n[14], "workbench_get_scope");
+    assert_eq!(n.len(), 22);
+    assert_eq!(n[17], "workbench_get_scope");
 }
 
 #[test]
@@ -220,7 +220,7 @@ async fn what_whoami_answers_at_start_decides_the_list() {
 async fn a_key_refused_mid_session_takes_the_tools_away_once() {
     let (t, cloud, world) = fake_cloud::server(&[], World::new("launch")).await;
     let peer = FakePeer::new(Elicit::None);
-    assert_eq!(names(&t.mcp.backends()).len(), 24);
+    assert_eq!(names(&t.mcp.backends()).len(), 27);
     ok(&t.call(&peer, "list_nodes", json!({})).await);
     assert_eq!(peer.list_changed.load(Ordering::SeqCst), 0);
 

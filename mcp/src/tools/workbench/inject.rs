@@ -15,7 +15,8 @@ use crate::core::{
 };
 use crate::jobs;
 use crate::peer::ClientPeer;
-use crate::tools::inject::{Plan, Run, parse_classes, start_scan};
+use crate::tools::engine_scan::{Plan, Run, start_scan};
+use crate::tools::inject::parse_classes;
 use crate::tools::overrides::{self, Asked, Via};
 use crate::tools::{in_range, parse_args};
 use crate::workbench::{Instance, REQUEST_WAIT};

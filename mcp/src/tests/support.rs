@@ -193,6 +193,8 @@ pub(crate) struct FakeKept {
     pub notes: Vec<(String, String, String)>,
     /// toolmark's inventory rows.
     pub inventory: Vec<Value>,
+    /// The words that followed an operation, as voyage and ambulo read them.
+    pub words: Vec<String>,
     /// The `lead_answers` requests toolmark was handed.
     pub lead_answers: Vec<Value>,
 }
@@ -384,8 +386,10 @@ pub(crate) async fn stub_engine(opts: StubOpts) -> Stub {
                                "fingerprint": ["resolve", "block_internal"]})
                     };
                     if !opts.old && !opts.no_scan_pins {
-                        answer["scan"] = json!(["follow_redirects", "resolve"]);
+                        // What plessor, doorward and ambulo each list under `scan`, together.
+                        answer["scan"] = json!(["follow_redirects", "resolve", "block_internal"]);
                         answer["verify"] = json!(["follow_redirects", "resolve"]);
+                        answer["enum"] = json!(["scope", "follow_redirects", "block_internal"]);
                     }
                     let mut a = answer.to_string();
                     a.push('\n');
@@ -409,6 +413,22 @@ pub(crate) async fn stub_engine(opts: StubOpts) -> Stub {
                     return;
                 }
                 o.lock().unwrap().push(op.clone());
+                // Words that follow the operation are read before it is acknowledged.
+                if op["wordlist_follows"].is_string() {
+                    while let Ok(Some(l)) = lines.next_line().await {
+                        let v: Value = serde_json::from_str(&l).unwrap_or(Value::Null);
+                        let chunk: Vec<String> = v["words"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|w| w.as_str().map(str::to_string))
+                            .collect();
+                        if chunk.is_empty() {
+                            break;
+                        }
+                        k.lock().unwrap().words.extend(chunk);
+                    }
+                }
                 // A verify is answered once, as plessor answers it, and keeps no scan.
                 if op["operation"] == "verify" {
                     let answer = opts.verify.clone().unwrap_or_else(|| {
@@ -422,13 +442,24 @@ pub(crate) async fn stub_engine(opts: StubOpts) -> Stub {
                     let _ = w.write_all(a.as_bytes()).await;
                     return;
                 }
-                // Kept as an engine keeps a scan, with what the request said of itself.
+                // Kept as an engine keeps a scan, with what the request said of itself and,
+                // for a port scan, the ports it tries.
+                let target = ["target", "endpoint", "domain"]
+                    .iter()
+                    .find_map(|k| op[*k].as_str().map(str::to_string))
+                    .or_else(|| {
+                        op["targets"].as_array().map(|t| {
+                            t.iter()
+                                .filter_map(|h| h.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                    })
+                    .unwrap_or_default();
                 let scan = k.lock().unwrap().scan(
-                    op.get("target")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or_default(),
+                    &target,
                     "running",
-                    json!({"operation": op["operation"], "mcp": op["mcp"]}),
+                    json!({"operation": op["operation"], "mcp": op["mcp"], "ports": op["ports"]}),
                     &now_utc(),
                 );
                 if let Some(map) = &opts.simulate {
@@ -675,6 +706,8 @@ pub(crate) struct Build {
     scope: Option<String>,
     toolmark: u16,
     plessor: u16,
+    /// voyage, doorward and ambulo, each on the port a test gave it.
+    others: Vec<(&'static str, u16)>,
     resolver: FakeResolver,
     redact: bool,
     burst: u32,
@@ -698,6 +731,7 @@ impl Build {
             scope: text,
             toolmark: toolmark.port,
             plessor: plessor.port,
+            others: Vec::new(),
             resolver: FakeResolver::default(),
             redact: true,
             burst: 100_000,
@@ -714,6 +748,11 @@ impl Build {
     }
     pub(crate) fn plessor(mut self, port: u16) -> Self {
         self.plessor = port;
+        self
+    }
+    /// voyage, doorward or ambulo on `port`.
+    pub(crate) fn engine(mut self, name: &'static str, port: u16) -> Self {
+        self.others.push((name, port));
         self
     }
     pub(crate) fn resolver(mut self, r: FakeResolver) -> Self {
@@ -760,18 +799,15 @@ impl Build {
         let settings = Settings {
             version: "0.0.0-test".into(),
             redact: self.redact,
-            engines: vec![
-                EngineInfo {
-                    name: "toolmark".into(),
-                    port: self.toolmark,
+            engines: [("toolmark", self.toolmark), ("plessor", self.plessor)]
+                .into_iter()
+                .chain(self.others)
+                .map(|(name, port)| EngineInfo {
+                    name: name.into(),
+                    port,
                     installed: true,
-                },
-                EngineInfo {
-                    name: "plessor".into(),
-                    port: self.plessor,
-                    installed: true,
-                },
-            ],
+                })
+                .collect(),
             postgres_port: None,
             workbench: self.workbench,
             workbench_dir: self.workbench_dir,

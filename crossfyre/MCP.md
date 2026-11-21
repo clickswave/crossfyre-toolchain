@@ -1,12 +1,12 @@
 # crossfyre mcp
 
-`crossfyre mcp` serves `toolmark` and `plessor` to an MCP client over stdio. An agent can fingerprint a service, test endpoints for injection, run template checks, check a finding again by its proof, read toolmark's inventory and replay single requests. It needs no account. With an MCP key it can also reach a Crossfyre Cloud workspace; see [Cloud](#cloud). Tool calls are refused for any destination the scope file you write does not list; requests an engine makes on its own are covered under [Known limits](#known-limits).
+`crossfyre mcp` serves the five engines to an MCP client over stdio. An agent can find a domain's subdomains, scan a host's ports, look for content on a site, fingerprint a service, test endpoints for injection, run template checks, check a finding again by its proof, read toolmark's inventory and replay single requests. It needs no account. With an MCP key it can also reach a Crossfyre Cloud workspace; see [Cloud](#cloud). Tool calls are refused for any destination the scope file you write does not list; requests an engine makes on its own are covered under [Known limits](#known-limits).
 
-It is in crossfyre 0.1.38 and later, and needs the `toolmark` and `plessor` released with it. An older engine daemon is refused before anything is sent, because it cannot be told to dial only the addresses the server checked or to leave redirects alone.
+It is in crossfyre 0.1.38 and later, and needs the engines released with it. An older engine daemon is refused before anything is sent, because it cannot be told to dial only the addresses the server checked or to leave redirects alone.
 
 ## Before you start
 
-Install the engines and start the two daemons it uses:
+Install the engines and start their daemons. `toolmark` and `plessor` serve most tools; `voyage`, `doorward` and `ambulo` serve `find_subdomains`, `scan_ports` and `discover_content`:
 
 ```sh
 crossfyre extension install toolmark
@@ -15,7 +15,7 @@ crossfyre extension start toolmark
 crossfyre extension start plessor
 ```
 
-The two daemons keep what they find in PostgreSQL, so install PostgreSQL's programs first (`sudo apt install postgresql` on Debian, Ubuntu or Kali), or point them at a database you run with `crossfyre db external`. [Where scan state is kept](../README.md#where-scan-state-is-kept) has the details.
+The daemons keep what they find in PostgreSQL, so install PostgreSQL's programs first (`sudo apt install postgresql` on Debian, Ubuntu or Kali), or point them at a database you run with `crossfyre db external`. [Where scan state is kept](../README.md#where-scan-state-is-kept) has the details.
 
 ## The scope file
 
@@ -36,7 +36,7 @@ requests_per_second_per_host = 2      # 1..=20, for send_http_request and finger
 | `entries` | The destinations traffic may go to, in the same syntax as the [`scope`](../scope/) crate: a host, `host:port`, `*.domain` (subdomains only, not the domain itself), an address, or a range such as `10.0.0.0/24`. A wildcard covers every name under its base, so `*.co.uk` means every site under `.co.uk`. One whose base ends in a number, such as `*.0.0.1`, is refused, since it could only ever match addresses. |
 | `allow_writes` | Lets `test_injection`, `scan_templates`, `verify_finding` and `workbench_test_injection` use `test_writes`, and `send_http_request` and `workbench_replay` send methods other than GET, HEAD and OPTIONS. Each still needs a confirmation. |
 | `allow_private` | Lets a name in `entries` reach a private, loopback or link-local address. An address you list yourself is always allowed. |
-| `max_concurrent_scans`, `max_scan_starts_per_hour` | Caps on `test_injection`, `scan_templates` and `workbench_test_injection`, counted together. |
+| `max_concurrent_scans`, `max_scan_starts_per_hour` | Caps on `find_subdomains`, `scan_ports`, `discover_content`, `test_injection`, `scan_templates` and `workbench_test_injection`, counted together. |
 | `requests_per_second_per_host` | Pace for `send_http_request`, `workbench_replay`, `fingerprint` and `verify_finding`. |
 
 The server refuses to start if an entry does not parse, a key is unknown, a number is out of range, or, on Linux and macOS, the file or its directory belongs to another user or can be written by its group or by everyone. A missing file, or one with no entries, starts the server with every traffic tool refusing until you write it. Changes take effect when the server restarts; `status` says when the file on disk no longer matches what was loaded.
@@ -79,6 +79,9 @@ If the daemons require `CFX_DAEMON_TOKEN`, put it in the server's `env` in your 
 | `status` | Version, the loaded scope and its hash, which daemons are listening, limits, recent refusals, and hints. | No |
 | `get_scope` | The scope file's entries and settings, or how to write one. | No |
 | `check_scope` | Whether URLs, hosts, `host:port` or ranges are in scope, and which entry admits them. | No |
+| `find_subdomains` | voyage on one domain: its passive sources, and with words, names tried under it. The domain has to be listed, or covered by a `*.` entry; words need the `*.` entry. Returns a scan handle. | Yes |
+| `scan_ports` | doorward's connect scan of one host, on up to 1024 ports the scope file admits for it, with services and banners. Returns a scan handle. | Yes |
+| `discover_content` | ambulo on one origin: up to 5000 words in place of `::FUZZ::` in the URL's path or query, each requested with GET. Returns a scan handle. | Yes |
 | `fingerprint` | toolmark on one URL: technologies, CVE leads by version, title and server. | Yes |
 | `test_injection` | plessor's injection pass on one URL or up to 100 endpoints on one origin. Returns a scan handle. | Yes |
 | `scan_templates` | plessor's template checks on one target, chosen by what toolmark saw there in the last week, with that inventory's CVE leads answered. Returns a scan handle. | Yes |
@@ -252,9 +255,10 @@ With a key set up, each line, the one written for a call still open when the ser
 
 ## Known limits
 
-- `fingerprint`, `test_injection`, `scan_templates` and `verify_finding` run the engines with redirects off and each name pinned to the address the server checked. An endpoint that answers with a redirect is tested on the redirect response itself. plessor's challenge solver is not used for a pinned scan, since it would look the name up itself.
+- `scan_ports`, `discover_content`, `fingerprint`, `test_injection`, `scan_templates` and `verify_finding` run the engines with redirects off (a port scan follows none) and each name pinned to the address the server checked. An endpoint that answers with a redirect is tested on the redirect response itself. plessor's challenge solver is not used for a pinned scan, since it would look the name up itself.
 - If the plessor daemon has an OAST endpoint configured (`PLESSOR_OAST_DOMAIN` and `PLESSOR_OAST_API_URL` in its environment), `test_injection` and `scan_templates` register with and poll that endpoint, and blind payloads ask the target to call it. Neither host has to be in the scope file. `verify_finding` gives plessor no OAST endpoint, so a finding confirmed by a callback is not checked again.
-- Subdomain enumeration (voyage), port scans (doorward) and content discovery (ambulo) have no tools here yet, because those engines cannot yet be told to dial only the addresses the server checked. Their scans from the command line are listed all the same.
+- `find_subdomains` asks voyage's passive sources, which are third-party services, about the domain, and looks names up through the resolvers voyage is set up with. Neither has to be in the scope file. The names under the domain voyage probes over HTTP and HTTPS are held to the file's entries by voyage itself, since none of them is known before the call.
+- doorward and voyage cannot stop a scan they have started: `cancel_scan` says `requested`, and the scan runs to its end. Each call is capped (1024 ports, 5000 words) so that end comes. ambulo stops when its connection closes.
 - A request to a name never goes through a proxy, since the proxy would look the name up again. `HTTP(S)_PROXY` is not used for it, and while `CROSSFYRE_EGRESS_PROXY` is set the request is refused rather than sent directly. The same holds for the engines `fingerprint`, `test_injection`, `scan_templates` and `verify_finding` run, when their daemons have either set. A destination the scope file lists as an address can still be reached through a proxy, from wherever that proxy runs. `status` reports `egress_proxy: true` when one is set.
 - A `CROSSFYRE_EGRESS_PROXY` value that is not a usable proxy URL stops every request instead of being ignored. It names its type (`http`, `https`, `socks4`, `socks4a`, `socks5` or `socks5h`), and a name always goes to the proxy unresolved, whichever SOCKS type it names.
 - The scan caps are counted across every `crossfyre mcp` process started with the same scope file, from the scans the engines keep, but each process checks them under its own lock, so two processes can both start a scan in the last free slot.

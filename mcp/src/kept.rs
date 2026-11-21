@@ -59,6 +59,46 @@ pub(crate) fn in_scope(mcp: &Mcp, target: &str) -> bool {
         })
 }
 
+/// Whether `row`, a scan as `engine` kept it, is inside the loaded scope file. voyage's
+/// target is a domain, which is inside when the file lists it or a `*.` entry covers it.
+/// doorward's is a host, inside when every port the scan tried there is admitted, as
+/// the file can admit a host on some ports only. Every other target is inside when
+/// [`in_scope`] says so.
+fn row_in_scope(mcp: &Mcp, engine: &str, row: &Value) -> bool {
+    let target = row["target"].as_str().unwrap_or_default();
+    match (engine, row["settings"]["ports"].as_array()) {
+        ("voyage", _) => {
+            let domain = target.trim().trim_end_matches('.');
+            !domain.is_empty()
+                && mcp
+                    .scope
+                    .per_entry
+                    .iter()
+                    .any(|(_, s)| s.admits_zone(domain, false))
+        }
+        ("doorward", Some(ports)) if !ports.is_empty() => {
+            let hosts: Vec<&str> = target
+                .split([',', ' '])
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .collect();
+            !hosts.is_empty()
+                && hosts.iter().all(|host| {
+                    ports.iter().all(|p| {
+                        let port = p.as_u64().and_then(|p| u16::try_from(p).ok());
+                        port.is_some_and(|port| {
+                            mcp.scope
+                                .per_entry
+                                .iter()
+                                .any(|(_, s)| s.admits(host, Some(port)))
+                        })
+                    })
+                })
+        }
+        _ => in_scope(mcp, target),
+    }
+}
+
 /// A scan's id here, from its engine and the engine's own id.
 pub(crate) fn scan_id(engine: &str, id: &str) -> String {
     format!("s_{engine}_{id}")
@@ -192,7 +232,7 @@ pub(crate) async fn scans(mcp: &Mcp) -> Vec<JobMeta> {
             continue;
         };
         for row in answer["scans"].as_array().into_iter().flatten() {
-            if in_scope(mcp, row["target"].as_str().unwrap_or_default()) {
+            if row_in_scope(mcp, engine, row) {
                 all.push(meta_of(mcp, engine, row));
             }
         }
@@ -212,7 +252,7 @@ pub(crate) async fn scan(mcp: &Mcp, id: &str) -> Option<JobMeta> {
     )
     .await?;
     let row = &answer["scan"];
-    if !in_scope(mcp, row["target"].as_str().unwrap_or_default()) {
+    if !row_in_scope(mcp, engine, row) {
         return None;
     }
     let mut meta = meta_of(mcp, engine, row);

@@ -123,10 +123,13 @@ pub(crate) struct JobMeta {
 }
 
 /// The tools whose scans count toward `max_scan_starts_per_hour`.
-pub(crate) const SCAN_TOOLS: [&str; 3] = [
+pub(crate) const SCAN_TOOLS: [&str; 6] = [
     "test_injection",
     "workbench_test_injection",
     "scan_templates",
+    "find_subdomains",
+    "scan_ports",
+    "discover_content",
 ];
 
 pub(crate) struct NewJob<'a> {

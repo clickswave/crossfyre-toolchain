@@ -213,6 +213,21 @@ impl EngineWriter {
         line.push('\n');
         self.inner.write_all(line.as_bytes()).await
     }
+
+    /// Send `words` after an operation that said its words follow
+    /// ([`dguard::WORDS_FOLLOW`]), in chunks as the command line sends a wordlist file,
+    /// and the empty chunk that ends them.
+    pub(crate) async fn send_words(&mut self, words: &[String]) -> std::io::Result<()> {
+        for chunk in words
+            .chunks(dguard::CHUNK_WORDS)
+            .chain(std::iter::once(&[][..]))
+        {
+            let mut line = dguard::encode(&json!({ "words": chunk }));
+            line.push('\n');
+            self.inner.write_all(line.as_bytes()).await?;
+        }
+        Ok(())
+    }
 }
 
 pub(crate) enum Line {

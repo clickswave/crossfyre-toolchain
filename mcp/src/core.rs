@@ -766,7 +766,7 @@ impl Mcp {
     // -----------------------------------------------------------------------
     // The guard
 
-    fn no_scope(&self) -> Refusal {
+    pub(crate) fn no_scope(&self) -> Refusal {
         Refusal::new(
             Reason::NoScope,
             format!(

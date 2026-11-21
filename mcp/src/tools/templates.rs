@@ -4,7 +4,7 @@
 //! the target lately, which also gives the CVE leads the templates answer. toolmark is
 //! asked, never started, and the answers go back to it.
 
-use super::inject::{LeadsTo, Plan, Run, start_scan};
+use super::engine_scan::{LeadsTo, Plan, Run, start_scan};
 use super::{in_range, parse_args};
 use crate::confirm::{AskKind, WriteAsk};
 use crate::core::{CallNote, Done, Intent, Mcp, Refusal, TrafficRequest};
