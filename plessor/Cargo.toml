@@ -15,7 +15,7 @@ path = "src/main.rs"
 required-features = ["daemon"]
 
 # plessor's authorization testing as a daemon of its own. A release ships it only as the
-# closed component, built with the authz drop-in; the open build is plessor alone.
+# closed component, built with `closed-authz`; the open build is plessor alone.
 [[bin]]
 name = "plessor-authz"
 path = "src/authz_main.rs"
@@ -89,3 +89,7 @@ daemon = ["dep:dguard", "dep:cfx_finding", "dep:cfx_pack", "dep:cfx_cve", "dep:c
 # cmake and clang. Off by default, so a workspace build links no BoringSSL beside the
 # OpenSSL cfx_core uses.
 impersonate = ["transport/impersonate", "dep:boring2", "dep:tokio-boring2"]
+# Compiles the authorization drop-in, src/authz/private.rs, in place of the baseline
+# (see build.rs). Only plessor-authz's release build turns it on, so the open plessor
+# never carries it.
+closed-authz = []

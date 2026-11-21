@@ -18,7 +18,7 @@
 //! ## Open-core boundary
 //!
 //! The *choice* of which browser to present (the per-target UA) is a trade secret
-//! and lives in the private `adaptive` drop-in (the profile catalogue). This crate
+//! and lives in the pacing module (the profile catalogue). This crate
 //! only maps a browser *family* (read from the UA) to one of the emulation
 //! profiles in `emulation`; those profiles and that mapping are not secret, the
 //! selection is.

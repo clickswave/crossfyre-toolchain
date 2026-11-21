@@ -148,7 +148,7 @@ async fn scan<O: crate::observe::Observer>(
     // Present a coherent browser via the transport layer: the reqwest backend
     // sends UA + hint headers; the impersonate (wreq) backend presents a real
     // browser TLS/HTTP2 fingerprint (the profile owns the fingerprint headers).
-    // Fast posture skips emulation. Profile choice = the private `adaptive` drop-in.
+    // Fast posture skips emulation. Profile choice = the pacing module's, when installed.
     let mode = adaptive::identity::Mode::from_flags(params.evasive, params.identify.clone());
     let ident = adaptive::identity::resolve(&mode, Some(params.target.as_str()));
     let token = if let adaptive::identity::Mode::Identify(t) = &mode {

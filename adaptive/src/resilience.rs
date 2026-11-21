@@ -2,7 +2,7 @@
 //!
 //! Open baseline. Keeps the public shape (which classes are retryable, a per-
 //! probe ceiling, an exponential backoff) with simple, untuned defaults. The
-//! tuned policy is in the private drop-in.
+//! tuned policy is in the pacing module.
 
 use crate::health::{HealthStats, ProbeClass};
 use crate::rate::Posture;
@@ -80,7 +80,7 @@ impl ResilienceController {
         if !Self::retryable(class) {
             return RetryDecision::no();
         }
-        if let Some(d) = self.from_module(class, attempt, stats, health_score, retry_after_ms) {
+        if let Some(d) = self.module_decision(class, attempt, stats, health_score, retry_after_ms) {
             return d;
         }
         // Honour an explicit Retry-After with at least one retry.
@@ -104,7 +104,7 @@ impl ResilienceController {
     /// The installed module's decision, held to the ceiling and to the backoff's
     /// bounds: never sooner than `Retry-After`, or the base backoff without one, and
     /// never later than the maximum. None without a module or a readable answer.
-    fn from_module(
+    fn module_decision(
         &self,
         class: ProbeClass,
         attempt: u32,

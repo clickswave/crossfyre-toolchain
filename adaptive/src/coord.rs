@@ -4,7 +4,7 @@
 //! pace lets them speed up and slow down together instead of each adapting in
 //! isolation. This module holds the *tuning* of that arrangement, the re-eval
 //! cadence, the window sizing, the envelope, and the posture seed, with round
-//! placeholder values. The tuned numbers live in the private drop-in.
+//! placeholder values. The tuned numbers live in the pacing module.
 
 use crate::{Caps, HealthWindow};
 use std::sync::OnceLock;

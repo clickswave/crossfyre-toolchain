@@ -10,7 +10,7 @@
 //!
 //! This is the PUBLIC baseline: a few standard, transparent transforms. The tuned
 //! ordering and the richer set (keyword case folding, comment injection, unicode
-//! and mixed encodings, parameter pollution) live in the private drop-in, because
+//! and mixed encodings, parameter pollution) live in the pacing module, because
 //! the exact mutation policy is what a WAF vendor would want to fingerprint.
 
 /// Split a URL into (scheme://authority, path+query). Mutations only touch the

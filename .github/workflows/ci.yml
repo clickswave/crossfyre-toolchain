@@ -2,17 +2,13 @@ name: CI
 
 # What this guards, in priority order:
 #
-#   1. The OPEN checkout builds. This repo is open-core: `adaptive-private/`,
-#      `core/src/egress/private.rs` and `.cargo/config.toml` exist in first-party
-#      working copies and are git-ignored. Locally, `.cargo/config.toml` swaps the
-#      committed `adaptive` crate for the private drop-in and `core/build.rs`
-#      compiles the private egress module, so a first-party build is NOT the same
-#      build the public gets. CI runs on a clean checkout, which is the only
-#      honest test that the open baseline still compiles on its own.
+#   1. The checkout builds as it is. What is closed comes as separate components
+#      after login, and none of it is compiled into these binaries. The one
+#      drop-in left, `plessor/src/authz/private.rs`, is git-ignored and compiled
+#      only under plessor's `closed-authz` feature, for plessor-authz.
 #
-#   2. Those private paths never get committed. A stray `git add -A` would leak
-#      the tuned pacing crate and the isolated-egress implementation. The
-#      open-core job fails the build if any of them appear.
+#   2. That drop-in never gets committed. A stray `git add -A` would leak it. The
+#      open-core job fails the build if it appears.
 #
 # rustfmt and clippy are both REQUIRED: the workspace is formatted and at zero
 # clippy warnings. The dependency-advisory job is enforced on the nightly
@@ -53,21 +49,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Private drop-ins must not be committed
+      - name: The authorization drop-in must not be committed
         run: |
           set -eu
           leaked=0
-          for p in adaptive-private .cargo/config.toml core/src/egress/private.rs \
-                   plessor/src/authz/private.rs; do
-            if git ls-files --error-unmatch "$p" >/dev/null 2>&1; then
-              echo "::error file=$p::$p is tracked in git. This is a private \
-          drop-in and must never ship in the open repo."
-              leaked=1
-            fi
-          done
-          # Also catch the whole directory being added under any path.
-          if git ls-files | grep -qE '(^|/)adaptive-private/|(^|/)egress/private\.rs$|(^|/)authz/private\.rs$'; then
-            echo "::error::a private drop-in path is tracked in git"
+          # Under any path, should the engine's directory move.
+          if git ls-files | grep -qE '(^|/)authz/private\.rs$'; then
+            echo "::error::the authorization drop-in is tracked in git and must never ship in the open repo"
             leaked=1
           fi
           if [ "$leaked" -ne 0 ]; then
@@ -79,10 +67,6 @@ jobs:
       - name: The open baseline is what actually gets compiled
         run: |
           set -eu
-          test ! -e .cargo/config.toml || { echo "::error::.cargo/config.toml present in a clean checkout"; exit 1; }
-          test -f adaptive/src/lib.rs        || { echo "::error::open adaptive crate missing"; exit 1; }
-          test -f core/src/egress/baseline.rs || { echo "::error::open egress baseline missing"; exit 1; }
-          test ! -e core/src/egress/private.rs
           test -f plessor/src/authz/baseline.rs || { echo "::error::open authz baseline missing"; exit 1; }
           test ! -e plessor/src/authz/private.rs
           echo "clean checkout resolves to the open baseline"
@@ -382,9 +366,9 @@ jobs:
     runs-on: ubuntu-26.04
     # Required. This is green as of the workspace-wide rustfmt pass, and it also
     # guards the fix that made `cargo fmt` work on a public checkout at all: the
-    # egress module used to declare two cfg-gated `mod imp;` arms, and rustfmt
+    # authz module once declared two cfg-gated `mod imp;` arms, and rustfmt
     # resolves module paths without evaluating cfg, so it hard-errored on the
-    # private path that only exists in first-party clones.
+    # private path a public checkout lacks.
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust with rustfmt

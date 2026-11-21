@@ -10,8 +10,8 @@ name: Release
 # notes below say what each one adds. The engines present a browser's TLS and HTTP/2
 # fingerprint: that code is public, and every published build turns it on.
 #
-# The boundary job runs before anything is built and refuses a tag that holds a
-# private drop-in, since a release is the moment a leak would become permanent.
+# The boundary job runs before anything is built and refuses a tag that holds the
+# authorization drop-in, since a release is the moment a leak would become permanent.
 #
 # WHAT IT BUYS. Integrity was already covered: the installer fetches
 # manifest.json and checks SHA256 before it installs anything. What was missing
@@ -39,7 +39,7 @@ permissions:
   contents: read
 
 jobs:
-  # Refuses to build at all if a private drop-in is present in the tagged tree.
+  # Refuses to build at all if the authorization drop-in is present in the tagged tree.
   # Duplicated from ci.yml rather than referenced, because a release is exactly
   # the moment a leak would become permanent and public, and this job must not
   # depend on someone remembering that CI also ran.
@@ -49,25 +49,19 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Private drop-ins must not be in the tag
+      - name: The authorization drop-in must not be in the tag
         run: |
           set -euo pipefail
-          fail=0
-          for p in adaptive-private .cargo/config.toml \
-                   core/src/egress/private.rs plessor/src/authz/private.rs; do
-            if [ -e "$p" ]; then
-              echo "::error::$p is present in a clean checkout of this tag"
-              fail=1
-            fi
-          done
-          exit $fail
+          if [ -e plessor/src/authz/private.rs ]; then
+            echo "::error::plessor/src/authz/private.rs is present in a clean checkout of this tag"
+            exit 1
+          fi
 
       - name: The open baseline is what gets compiled
         run: |
           set -euo pipefail
           test -e plessor/src/authz/baseline.rs
-          test -e core/src/egress/baseline.rs
-          echo "open baseline present; build.rs will select it"
+          echo "open baseline present; plessor compiles it"
 
   build:
     name: build ${{ matrix.target }}

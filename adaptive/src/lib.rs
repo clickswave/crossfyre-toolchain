@@ -4,11 +4,10 @@
 //!
 //! This is the **open reference implementation**: it defines the interface the
 //! engines call and provides a conservative, untuned baseline behaviour. The
-//! production tuning (the operating constants and the tuned control policy) is a
-//! private drop-in that replaces this crate in first-party builds. Everything
+//! production tuning (the operating constants and the tuned control policy) is in
+//! the pacing module, which [`backend`] asks when one is installed. Everything
 //! here is safe to publish and builds standalone; nothing here is the tuned
-//! policy. Keep the public type/function signatures stable so the private
-//! implementation stays a clean drop-in.
+//! policy. Keep the public types stable: the module answers in their JSON shapes.
 //!
 //! Pure logic, no I/O, a workflow engine (ambulo content-discovery, the DS
 //! fan-out in `cfx_core`, future scanners) feeds it probe outcomes and asks it,

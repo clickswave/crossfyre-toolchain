@@ -8,7 +8,7 @@
 //!
 //! This is the PUBLIC baseline. It recognises only the obvious, well-documented
 //! signatures and reacts conservatively (no broker escalation). The tuned
-//! signature set, edge scoring, and thresholds live in the private drop-in:
+//! signature set, edge scoring, and thresholds live in the pacing module:
 //! challenge detection is adversarially sensitive, so a WAF vendor reading the
 //! open toolchain must not be able to enumerate exactly what we key on.
 
@@ -100,7 +100,7 @@ pub fn detect(
     }
 
     // A bare 403/503 from a known edge is suspicious but not conclusive; the
-    // private drop-in scores those. The baseline stays conservative.
+    // pacing module scores those. The baseline stays conservative.
     Challenge::None
 }
 

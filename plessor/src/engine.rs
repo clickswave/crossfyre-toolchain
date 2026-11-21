@@ -237,7 +237,7 @@ pub async fn run<L: crate::ledger::Ledger>(
     // sends UA + hint headers; the impersonate (wreq) backend presents a real
     // browser TLS/HTTP2 fingerprint, with the emulation profile owning the
     // fingerprint headers. Fast posture skips emulation. Stable-per-target; the
-    // profile choice is the private `adaptive` drop-in.
+    // profile choice is the pacing module's, when one is installed.
     let mode = adaptive::identity::Mode::from_flags(params.evasive, params.identify.clone());
 
     // Builds an outbound client for a resolved identity, again with a rotated one when a

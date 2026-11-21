@@ -3,8 +3,7 @@
 //! Open baseline. This keeps the public shape of the controller (postures, a
 //! composite score, an increase/decrease loop) but uses a single, conservative,
 //! untuned profile for every posture. The production tuning, the per-posture
-//! constant tables and the tuned control law, lives in the private drop-in that
-//! replaces this crate in first-party builds.
+//! constant tables and the tuned control law, lives in the pacing module.
 
 use crate::health::HealthStats;
 use serde::{Deserialize, Serialize};
@@ -37,7 +36,7 @@ impl Posture {
 
     /// The controller constants this posture resolves to. Baseline: one generic,
     /// conservative profile of round placeholder values for all postures (the
-    /// tuned per-posture tables live in the private drop-in). A module's are held
+    /// tuned per-posture tables live in the pacing module). A module's are held
     /// to bounds that keep the controller backing off under stress.
     pub fn params(self) -> PostureParams {
         #[derive(Serialize)]

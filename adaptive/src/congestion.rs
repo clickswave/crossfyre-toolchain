@@ -3,8 +3,7 @@
 //! Open baseline. Treats in-flight concurrency like a congestion window (grow
 //! while healthy, shrink under loss/latency) and derives the per-probe timeout
 //! from measured RTT, but with round, untuned placeholder constants. The tuned
-//! control law and its operating numbers live in the private drop-in that
-//! replaces this crate in first-party builds.
+//! control law and its operating numbers live in the pacing module.
 //!
 //! Pure policy: consumes a window of probe outcomes plus a running RTT estimator
 //! and returns the next knobs (concurrency / timeout / retries). No I/O, no clock,
@@ -163,72 +162,6 @@ pub fn decide(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn win(sent: u64, lost: u64, mean_rtt_ms: u64) -> Window {
-        let delivered = sent - lost;
-        Window {
-            sent,
-            lost,
-            delivered,
-            retried: 0,
-            recovered: 0,
-            rtt_sum_us: delivered * mean_rtt_ms * 1000,
-        }
-    }
-
-    #[test]
-    fn concurrency_respects_ceiling_and_floor() {
-        let limits = Limits {
-            conc_ceil: 120,
-            ..Limits::default()
-        };
-        let mut e = Estimator {
-            srtt_us: 100_000.0,
-            rttvar_us: 10_000.0,
-            warmup: false,
-        };
-        let d = decide(&mut e, 119, &win(1000, 0, 100), Some(100_000.0), &limits);
-        assert!(d.concurrency <= 120, "cannot exceed conc_ceil");
-
-        let mut e2 = Estimator {
-            srtt_us: 100_000.0,
-            rttvar_us: 10_000.0,
-            warmup: false,
-        };
-        let d2 = decide(
-            &mut e2,
-            limits.conc_floor,
-            &win(1000, 500, 100),
-            Some(100_000.0),
-            &limits,
-        );
-        assert_eq!(
-            d2.concurrency, limits.conc_floor,
-            "cannot drop below conc_floor"
-        );
-    }
-
-    #[test]
-    fn loss_backs_off() {
-        let mut e = Estimator {
-            srtt_us: 100_000.0,
-            rttvar_us: 10_000.0,
-            warmup: false,
-        };
-        let d = decide(
-            &mut e,
-            100,
-            &win(1000, 300, 100),
-            Some(100_000.0),
-            &Limits::default(),
-        );
-        assert!(d.concurrency < 100, "heavy loss must reduce concurrency");
-    }
-}
-
 /// The installed module's decision, held to `limits`, with the estimator it carries on;
 /// None without a module, or when its answer does not read or carries an estimator that
 /// is not a number of microseconds.
@@ -310,4 +243,70 @@ fn from_module(
             limits.retry_ceil.max(limits.retry_floor),
         ),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn win(sent: u64, lost: u64, mean_rtt_ms: u64) -> Window {
+        let delivered = sent - lost;
+        Window {
+            sent,
+            lost,
+            delivered,
+            retried: 0,
+            recovered: 0,
+            rtt_sum_us: delivered * mean_rtt_ms * 1000,
+        }
+    }
+
+    #[test]
+    fn concurrency_respects_ceiling_and_floor() {
+        let limits = Limits {
+            conc_ceil: 120,
+            ..Limits::default()
+        };
+        let mut e = Estimator {
+            srtt_us: 100_000.0,
+            rttvar_us: 10_000.0,
+            warmup: false,
+        };
+        let d = decide(&mut e, 119, &win(1000, 0, 100), Some(100_000.0), &limits);
+        assert!(d.concurrency <= 120, "cannot exceed conc_ceil");
+
+        let mut e2 = Estimator {
+            srtt_us: 100_000.0,
+            rttvar_us: 10_000.0,
+            warmup: false,
+        };
+        let d2 = decide(
+            &mut e2,
+            limits.conc_floor,
+            &win(1000, 500, 100),
+            Some(100_000.0),
+            &limits,
+        );
+        assert_eq!(
+            d2.concurrency, limits.conc_floor,
+            "cannot drop below conc_floor"
+        );
+    }
+
+    #[test]
+    fn loss_backs_off() {
+        let mut e = Estimator {
+            srtt_us: 100_000.0,
+            rttvar_us: 10_000.0,
+            warmup: false,
+        };
+        let d = decide(
+            &mut e,
+            100,
+            &win(1000, 300, 100),
+            Some(100_000.0),
+            &Limits::default(),
+        );
+        assert!(d.concurrency < 100, "heavy loss must reduce concurrency");
+    }
 }

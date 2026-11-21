@@ -7,7 +7,7 @@
 //! identity with a coherent header set and performs **no rotation**. It exists so
 //! the open toolchain presents a plausible, non-self-identifying client rather
 //! than a scanner banner. The tuned profile catalogue and per-target rotation is
-//! a private drop-in; keep these signatures stable so it stays a clean drop-in.
+//! in the pacing module; keep these types stable, since it answers in their shapes.
 //!
 //! Coherence is the whole point: bot-detection cross-checks the User-Agent
 //! against the header set (and, with real fingerprint parity, the TLS/HTTP2

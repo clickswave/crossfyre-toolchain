@@ -269,7 +269,7 @@ pub struct EgressState {
 /// Isolated egress as the node runs it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Isolated {
-    /// What the node says of it: `direct`, `helper <version>`, `built in`,
+    /// What the node says of it: `direct`, `helper <version>`,
     /// `baseline (<why>)` or `refused (kill switch on, <why>)`. Empty before the node
     /// has brought it up.
     pub label: String,
