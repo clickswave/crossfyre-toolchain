@@ -11,7 +11,7 @@ use crate::tools::{
 use serde_json::Value;
 
 /// sha256 of `tools.json` with CRLF read as LF, so a Windows checkout agrees.
-const PINNED: &str = "16d00a3d1d64b5bac399d8095db88a9cda2307b7c14e9a42d118fc117ea3af85";
+const PINNED: &str = "44b679945567316a287513b2e07be2bed1ff0c1a4ed23e60ca8ab6c73f5f63e1";
 
 /// The same for `tools_workbench.json`.
 const PINNED_WORKBENCH: &str = "ee94f06fe0ae72f9c549b53782503e9b7cad21865b2406cf1d484ce2c29ba073";
@@ -70,8 +70,24 @@ fn every_tool_is_described_completely() {
     }
     assert_eq!(hints("fingerprint"), (false, false, false, true));
     assert_eq!(hints("test_injection"), (false, true, false, true));
+    assert_eq!(hints("scan_templates"), (false, true, false, true));
+    assert_eq!(hints("verify_finding"), (false, true, false, true));
+    assert_eq!(hints("get_inventory"), (true, false, true, true));
     assert_eq!(hints("send_http_request"), (false, true, false, true));
     assert_eq!(hints("cancel_scan"), (false, false, true, false));
+}
+
+/// A tool that can say a check found nothing says, in the words the leads use, that this
+/// is not proof the host is safe.
+#[test]
+fn every_tool_that_answers_a_check_says_a_negative_is_not_proof() {
+    let tools: Vec<Value> = serde_json::from_str(TOOLS_JSON).unwrap();
+    for name in ["scan_templates", "verify_finding", "get_inventory"] {
+        let t = tools.iter().find(|t| t["name"] == name).unwrap();
+        let d = t["description"].as_str().unwrap();
+        assert!(d.contains(cfx_cve::inventory::NOT_PROOF), "{name}: {d}");
+        assert!(!d.contains("not exploitable"), "{name}");
+    }
 }
 
 #[test]
@@ -127,7 +143,7 @@ fn the_protocol_layer_reads_them() {
         workbench: None,
         ..Default::default()
     });
-    assert_eq!(off.len(), 11);
+    assert_eq!(off.len(), 14);
     assert!(
         off.iter()
             .all(|t| t.output_schema.is_some() && t.annotations.is_some())
@@ -138,13 +154,13 @@ fn the_protocol_layer_reads_them() {
             ..Default::default()
         })
         .len(),
-        11
+        14
     );
     let every = all(&Backends {
         workbench: Some(WORKBENCH_NAMES.to_vec()),
         ..Default::default()
     });
-    assert_eq!(every.len(), 18);
+    assert_eq!(every.len(), 21);
     assert!(
         every
             .iter()
@@ -155,7 +171,7 @@ fn the_protocol_layer_reads_them() {
         ..Default::default()
     });
     assert_eq!(some.last().unwrap().name, "workbench_get_scope");
-    assert_eq!(some.len(), 12);
+    assert_eq!(some.len(), 15);
 }
 
 #[test]
@@ -178,7 +194,7 @@ fn a_workbench_and_a_cloud_key_list_their_tools_side_by_side() {
         cloud: Some(Listing::Launch),
     });
     let names: Vec<&str> = both.iter().map(|t| t.name.as_ref()).collect();
-    assert_eq!(names.len(), 28, "{names:?}");
+    assert_eq!(names.len(), 31, "{names:?}");
     let mut unique = names.clone();
     unique.sort_unstable();
     unique.dedup();
@@ -223,7 +239,7 @@ fn the_backends_share_no_reason_and_no_id_prefix() {
 
     let mut prefixes = vec![cfx_bridge::HANDLE_PREFIX, cfx_bridge::CURSOR_PREFIX];
     prefixes.extend(cfx_cloud_wire::IdKind::ALL.map(cfx_cloud_wire::IdKind::prefix));
-    // Local scans and findings, as crate::jobs::new_id writes them.
+    // Local scans and findings, as crate::kept names them.
     prefixes.extend(["s_", "f_"]);
     for (i, a) in prefixes.iter().enumerate() {
         for b in &prefixes[i + 1..] {

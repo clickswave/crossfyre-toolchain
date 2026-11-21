@@ -384,7 +384,7 @@ fn a_client_session_over_stdio() {
 
     c.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
     let tools = c.reply(2)["result"]["tools"].clone();
-    assert_eq!(tools.as_array().unwrap().len(), 11);
+    assert_eq!(tools.as_array().unwrap().len(), 14);
 
     let r = c.call(
         3,
@@ -765,7 +765,7 @@ fn a_cloud_key_adds_the_cloud_tools_and_appears_in_no_output() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names.len(), 15, "{names:?}");
+    assert_eq!(names.len(), 18, "{names:?}");
     assert!(names.contains(&"whoami") && !names.contains(&"start_vuln_scan"));
     let who = c.call(3, "whoami", json!({}));
     assert_eq!(
@@ -804,7 +804,7 @@ fn a_cloud_key_adds_the_cloud_tools_and_appears_in_no_output() {
     c.initialize(false);
     c.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
     let tools = c.reply(2)["result"]["tools"].clone();
-    assert_eq!(tools.as_array().unwrap().len(), 11);
+    assert_eq!(tools.as_array().unwrap().len(), 14);
     drop(c.stdin);
     assert!(wait_exit(&mut child, Duration::from_secs(10)).success());
     assert_eq!(
@@ -832,7 +832,7 @@ fn a_key_refused_mid_session_changes_the_list_once() {
         c.initialize(false);
         c.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
         let before = tool_names(&c.reply(2)["result"]["tools"]);
-        assert_eq!(before.len(), 15, "{mode}: {before:?}");
+        assert_eq!(before.len(), 18, "{mode}: {before:?}");
 
         let r = c.call(3, "whoami", json!({}));
         assert_eq!(r["isError"], true, "{mode}: {r}");
@@ -860,7 +860,7 @@ fn a_key_refused_mid_session_changes_the_list_once() {
         );
         c.send(json!({"jsonrpc": "2.0", "id": 4, "method": "tools/list"}));
         let after = tool_names(&c.reply(4)["result"]["tools"]);
-        assert_eq!(after.len(), 11, "{mode}: {after:?}");
+        assert_eq!(after.len(), 14, "{mode}: {after:?}");
 
         drop(c);
         wait_exit(&mut child, Duration::from_secs(10));
@@ -961,7 +961,7 @@ fn a_workbench_that_starts_later_changes_the_tool_list() {
     c.initialize(false);
     c.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
     let tools = c.reply(2)["result"]["tools"].clone();
-    assert_eq!(tools.as_array().unwrap().len(), 11);
+    assert_eq!(tools.as_array().unwrap().len(), 14);
 
     let welcomed = workbench(&data.join("wb"));
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -985,7 +985,7 @@ fn a_workbench_that_starts_later_changes_the_tool_list() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names.len(), 18, "{names:?}");
+    assert_eq!(names.len(), 21, "{names:?}");
     assert!(names.contains(&"workbench_replay"), "{names:?}");
 
     drop(c);

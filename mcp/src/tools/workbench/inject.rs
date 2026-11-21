@@ -15,7 +15,7 @@ use crate::core::{
 };
 use crate::jobs;
 use crate::peer::ClientPeer;
-use crate::tools::inject::{Plan, parse_classes, start_scan};
+use crate::tools::inject::{Plan, Run, parse_classes, start_scan};
 use crate::tools::overrides::{self, Asked, Via};
 use crate::tools::{in_range, parse_args};
 use crate::workbench::{Instance, REQUEST_WAIT};
@@ -531,20 +531,22 @@ pub(crate) async fn run(
     );
     let plan = Plan {
         tool: "workbench_test_injection",
-        origin,
-        endpoints: vec![op],
+        target: origin,
+        run: Run::Inject {
+            endpoints: vec![op],
+            classes,
+            auth: session(&src),
+            scope,
+        },
         // What plessor keeps of the scan outlives the call; a token in the query does not
         // go in it.
         shown_endpoints: vec![redact::redact_url(&dest.url)],
-        classes,
         test_writes: a.test_writes,
-        auth: session(&src),
         source: Some(json!({"workbench": {
             "pid": o.inst.pid,
             "project_uid": o.project.uid,
             "exchange": handle,
         }})),
-        scope,
         wait,
         write,
         on_start: Some(Box::new(on_start)),

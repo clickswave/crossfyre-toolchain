@@ -24,7 +24,7 @@ async fn ask(mcp: &Mcp, engine: &str, op: Value) -> Option<Value> {
         .find(|e| e.name == engine && e.installed)?
         .port;
     let conn = crate::engine::connect(port).await.ok()?;
-    let answer = conn.read(&op).await.ok()?;
+    let answer = conn.local(&op).await.ok()?;
     (answer["status"] == "completed").then_some(answer)
 }
 
@@ -79,7 +79,7 @@ pub(crate) fn parse_scan_id(id: &str) -> Option<(&'static str, &str)> {
     Some((ENGINES.iter().find(|e| **e == engine)?, own))
 }
 
-fn parse_finding_id(id: &str) -> Option<(&'static str, i64)> {
+pub(crate) fn parse_finding_id(id: &str) -> Option<(&'static str, i64)> {
     if !jobs::valid_finding_id(id) {
         return None;
     }
@@ -362,22 +362,38 @@ pub(crate) async fn findings(
     (found.into_iter().map(|(.., f)| f).collect(), next, more)
 }
 
-/// Finding `id`, as this server shows it, or None when there is none in scope by that id.
-pub(crate) async fn finding(mcp: &Mcp, id: &str) -> Option<Value> {
+/// Finding `id` as its engine kept it, with the scan it is of, or None when there is none
+/// in scope by that id.
+pub(crate) async fn kept_finding(mcp: &Mcp, id: &str) -> Option<(&'static str, Value, JobMeta)> {
     let (engine, own) = parse_finding_id(id)?;
-    let answer = ask(
+    let mut answer = ask(
         mcp,
         engine,
         json!({"operation": "finding", "response": "instant", "id": own}),
     )
     .await?;
-    let row = &answer["finding"];
+    let row = answer["finding"].take();
     let of = scan(
         mcp,
         &scan_id(engine, row["scan"].as_str().unwrap_or_default()),
     )
     .await?;
-    shown(engine, row).map(|f| captured(&of, f))
+    Some((engine, row, of))
+}
+
+/// Finding `id`, as this server shows it, or None when there is none in scope by that id.
+pub(crate) async fn finding(mcp: &Mcp, id: &str) -> Option<Value> {
+    let (engine, row, of) = kept_finding(mcp, id).await?;
+    shown(engine, &row).map(|f| captured(&of, f))
+}
+
+/// What a finding of scan `of` shows of the target, masked as its finding is.
+pub(crate) fn masked(of: &JobMeta, text: &str, redact: bool) -> String {
+    if redact || of.source.is_some() {
+        crate::redact::redact_text(text)
+    } else {
+        text.to_string()
+    }
 }
 
 /// How many scans this scope file's servers started that are running now.

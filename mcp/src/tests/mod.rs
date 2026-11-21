@@ -21,5 +21,7 @@ mod limits_rail;
 mod redirect_rail;
 mod scope_rail;
 pub(crate) mod support;
+mod templates_rail;
 mod tools_snapshot;
+mod verify_rail;
 mod workbench_rail;

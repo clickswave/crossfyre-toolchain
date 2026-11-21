@@ -264,8 +264,8 @@ async fn a_read_key_lists_no_launch_and_sends_none() {
         .into_iter()
         .map(|t| t.name.to_string())
         .collect();
-    assert_eq!(listed.len(), 21);
-    assert_eq!(listed[15..], crate::cloud::LAUNCH_NAMES);
+    assert_eq!(listed.len(), 24);
+    assert_eq!(listed[18..], crate::cloud::LAUNCH_NAMES);
 }
 
 #[tokio::test]

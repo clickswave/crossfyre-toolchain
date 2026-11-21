@@ -58,6 +58,9 @@ pub(crate) enum Reason {
     InvalidArguments,
     UnknownTool,
     NotFound,
+    /// A finding that cannot be sent again as it was kept: no proof, or a proof that needs
+    /// what was not given.
+    NotVerifiable,
     OtherProcess,
     Cancelled,
     /// No Workbench with Agent access on answers, or the backend is off.
@@ -111,6 +114,7 @@ impl Reason {
             Reason::InvalidArguments => "invalid_arguments",
             Reason::UnknownTool => "unknown_tool",
             Reason::NotFound => "not_found",
+            Reason::NotVerifiable => "not_verifiable",
             Reason::OtherProcess => "other_process",
             Reason::Cancelled => "cancelled",
             Reason::WorkbenchUnavailable => "workbench_unavailable",
@@ -1009,7 +1013,7 @@ impl Mcp {
                 ),
             ));
         }
-        let starts = crate::kept::starts_since(self, &jobs::INJECTION_TOOLS, now - 3_600_000).await;
+        let starts = crate::kept::starts_since(self, &jobs::SCAN_TOOLS, now - 3_600_000).await;
         let max = self.scope.max_scan_starts_per_hour as usize;
         if starts >= max {
             return Err(Refusal::new(

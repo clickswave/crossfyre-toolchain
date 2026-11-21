@@ -1,8 +1,10 @@
-//! `test_injection`: plessor's `inject` operation, run as a scan with a handle.
+//! `test_injection`: plessor's `inject` operation, run as a scan with a handle, and the
+//! starting of every plessor scan.
 //!
 //! The call returns as soon as plessor acknowledges, or after `wait_seconds`, and the
-//! scan goes on in a task that owns the engine connection and writes the job to disk
-//! as events arrive. `get_scan` and `list_findings` read what it wrote.
+//! scan goes on in a task that owns the engine connection and keeps its state in memory
+//! for the call that started it. plessor keeps the scan and what it finds, which
+//! `get_scan` and `list_findings` read back.
 
 use super::overrides::{self, Asked, Via};
 use super::{in_range, parse_args};
@@ -303,14 +305,16 @@ pub(crate) async fn run(
     });
     let plan = Plan {
         tool: "test_injection",
-        origin,
-        endpoints: eps.iter().map(|e| e.op.clone()).collect(),
+        target: origin,
+        run: Run::Inject {
+            endpoints: eps.iter().map(|e| e.op.clone()).collect(),
+            classes,
+            auth: None,
+            scope: mcp.scope.entries.clone(),
+        },
         shown_endpoints: eps.iter().map(|e| e.dest.url.clone()).collect(),
-        classes,
         test_writes: a.test_writes,
-        auth: None,
         source: None,
-        scope: mcp.scope.entries.clone(),
         wait,
         write,
         on_start: None,
@@ -322,25 +326,73 @@ pub(crate) async fn run(
 pub(crate) struct Plan {
     /// The tool the job is recorded under.
     pub tool: &'static str,
-    pub origin: String,
-    /// plessor's endpoints, as its operation reads them.
-    pub endpoints: Vec<Value>,
+    /// What plessor is sent as the target: the origin for the injection pass, the base
+    /// URL for the templates.
+    pub target: String,
+    pub run: Run,
     /// What plessor keeps of each endpoint with the scan, under its `mcp` settings.
     pub shown_endpoints: Vec<String>,
-    pub classes: Vec<String>,
     pub test_writes: bool,
-    /// Headers and cookies plessor sends with every probe. Handed over on loopback as the
-    /// scan's `auth`, which no engine keeps, and never written to the audit log or a result.
-    pub auth: Option<Value>,
     /// Where the request came from, kept with the scan.
     pub source: Option<Value>,
-    /// The entries plessor may follow up to.
-    pub scope: Vec<String>,
     pub wait: u64,
     /// The question for a scan that writes.
     pub write: Option<WriteAsk>,
     /// Called once the scan is running, before the call waits on it.
     pub on_start: Option<Box<dyn FnOnce(Arc<RunningJob>) + Send>>,
+}
+
+/// What plessor is asked to run.
+pub(crate) enum Run {
+    /// The injection pass.
+    Inject {
+        /// plessor's endpoints, as its operation reads them.
+        endpoints: Vec<Value>,
+        classes: Vec<String>,
+        /// Headers and cookies plessor sends with every probe. Handed over on loopback as
+        /// the scan's `auth`, which no engine keeps, and never written to the audit log or
+        /// a result.
+        auth: Option<Value>,
+        /// The entries plessor may follow up to.
+        scope: Vec<String>,
+    },
+    /// The template scan, with the fields of its request that choose the templates.
+    Templates {
+        fields: serde_json::Map<String, Value>,
+        /// Where the answers to the CVE leads among `fields` go back to.
+        leads_to: Option<LeadsTo>,
+    },
+}
+
+impl Run {
+    fn operation(&self) -> &'static str {
+        match self {
+            Run::Inject { .. } => "inject",
+            Run::Templates { .. } => "scan",
+        }
+    }
+
+    /// What the scan is doing while it runs, and what its progress counts.
+    fn phase(&self) -> (&'static str, &'static str) {
+        match self {
+            Run::Inject { .. } => ("testing endpoints", "endpoints"),
+            Run::Templates { .. } => ("running templates", "templates"),
+        }
+    }
+}
+
+/// toolmark's daemon, which gave a template scan its CVE leads for one host and port, and
+/// keeps what the scan said of each.
+pub(crate) struct LeadsTo {
+    pub toolmark: u16,
+    pub host: String,
+    pub port: u16,
+}
+
+/// A [`LeadsTo`] for one scan, as plessor kept it.
+struct Answers {
+    to: LeadsTo,
+    scan: String,
 }
 
 /// Confirm and start a planned scan, then wait for it as long as it was asked to.
@@ -356,11 +408,12 @@ pub(crate) async fn start_scan(
     let mut conn = engine::connect(port)
         .await
         .map_err(|_| mcp.engine_down("plessor", port))?;
+    let operation = plan.run.operation();
+    let (phase, unit) = plan.run.phase();
+    let has_auth = matches!(&plan.run, Run::Inject { auth: Some(_), .. });
     // A captured session goes only to a daemon this user runs. Anyone on the machine can
     // listen on a loopback port while plessor is stopped.
-    if plan.auth.is_some()
-        && let Err(why) = conn.runs_as_this_user().await
-    {
+    if has_auth && let Err(why) = conn.runs_as_this_user().await {
         return Err(Refusal::new(
             Reason::EngineUnavailable,
             format!(
@@ -375,12 +428,12 @@ pub(crate) async fn start_scan(
     // A captured session goes out only past a certificate that checks out, as the
     // Workbench sends it. plessor otherwise accepts any certificate, so whoever answered
     // the handshake for the host would be sent the session.
-    let options: &[&str] = if plan.auth.is_some() {
+    let options: &[&str] = if has_auth {
         &["follow_redirects", "resolve", "verify_certs"]
     } else {
         &["follow_redirects", "resolve"]
     };
-    mcp.require(&mut conn, "plessor", port, "inject", options)
+    mcp.require(&mut conn, "plessor", port, operation, options)
         .await?;
     let clearance = mcp.confirm(pending, peer, plan.write, note, ct).await?;
     if ct.is_cancelled() {
@@ -394,21 +447,40 @@ pub(crate) async fn start_scan(
     // sees, and dials a name only at the address the guard cleared for it. Its
     // internal-address filter is on as well, for anything else it connects to.
     let mut op = json!({
-        "operation": "inject",
+        "operation": operation,
         "response": "stream",
-        "target": plan.origin,
-        "endpoints": plan.endpoints,
-        "classes": plan.classes,
+        "target": plan.target,
         "test_writes": plan.test_writes,
-        "scope": plan.scope,
         "block_internal": clearance.block_internal(mcp.scope.allow_private),
         "follow_redirects": false,
         "resolve": clearance.pins(),
         "timeout_ms": 12_000,
     });
-    if let Some(auth) = plan.auth {
-        op["auth"] = auth;
-        op["verify_certs"] = Value::Bool(true);
+    let mut leads_to = None;
+    match plan.run {
+        Run::Inject {
+            endpoints,
+            classes,
+            auth,
+            scope,
+        } => {
+            op["endpoints"] = json!(endpoints);
+            op["classes"] = json!(classes);
+            op["scope"] = json!(scope);
+            if let Some(auth) = auth {
+                op["auth"] = auth;
+                op["verify_certs"] = Value::Bool(true);
+            }
+        }
+        Run::Templates {
+            fields,
+            leads_to: to,
+        } => {
+            for (k, v) in fields {
+                op[k] = v;
+            }
+            leads_to = to;
+        }
     }
     // What this server says of the scan, which plessor keeps with it and gives back to
     // whoever reads it: which tool, which server and scope file, and where it came from.
@@ -463,14 +535,18 @@ pub(crate) async fn start_scan(
         ));
     };
 
-    let origin = plan.origin;
+    let answers = leads_to.map(|to| Answers {
+        to,
+        scan: kept_as.to_string(),
+    });
+    let target = plan.target;
     let mut meta = JobMeta::new(
         &mcp.session,
         NewJob {
             id: crate::kept::scan_id("plessor", kept_as),
             tool: plan.tool,
             engine: "plessor",
-            target: &origin,
+            target: &target,
             endpoints: plan.shown_endpoints,
             scope_sha256: mcp.scope.sha256.clone(),
             cancellable,
@@ -478,8 +554,10 @@ pub(crate) async fn start_scan(
         },
     );
     meta.source = plan.source;
-    meta.progress.total = meta.endpoints.len() as u64;
-    meta.progress.phase = "testing endpoints".into();
+    if operation == "inject" {
+        meta.progress.total = meta.endpoints.len() as u64;
+    }
+    meta.progress.phase = phase.into();
     drop(start_lock);
     note.set_scan(meta.id.clone());
 
@@ -496,7 +574,13 @@ pub(crate) async fn start_scan(
     if let Ok(mut r) = mcp.running.lock() {
         r.insert(job.id.clone(), Arc::clone(&job));
     }
-    let handle = tokio::spawn(pump(reader, Arc::clone(&job), Arc::clone(&mcp.running), tx));
+    let handle = tokio::spawn(pump(
+        reader,
+        Arc::clone(&job),
+        Arc::clone(&mcp.running),
+        tx,
+        answers,
+    ));
     if let Ok(mut p) = job.pump.lock() {
         *p = Some(handle);
     }
@@ -534,8 +618,7 @@ pub(crate) async fn start_scan(
                     if last_progress.elapsed() >= Duration::from_millis(500)
                         && last_done.is_none_or(|d| s.done > d)
                     {
-                        peer.progress(s.done as f64, Some(s.total as f64), "testing endpoints")
-                            .await;
+                        peer.progress(s.done as f64, Some(s.total as f64), phase).await;
                         last_progress = Instant::now();
                         last_done = Some(s.done);
                     }
@@ -553,10 +636,10 @@ pub(crate) async fn start_scan(
     note.result = Some(json!({"status": m.status, "findings": m.counts.findings}));
     let value = scan_view(&m, mcp.settings.redact);
     let summary = format!(
-        "plessor scan {} on {} is {}: {} of {} endpoints done, {} findings. Poll get_scan, and \
+        "plessor scan {} on {} is {}: {} of {} {unit} done, {} findings. Poll get_scan, and \
          read results with list_findings.",
         m.id,
-        untrusted::clean(&origin, 200),
+        untrusted::clean(&target, 200),
         m.status,
         m.progress.done,
         m.progress.total,
@@ -567,11 +650,13 @@ pub(crate) async fn start_scan(
 
 /// Read a scan's events until it ends, keeping the scan's state in memory for the call
 /// that started it. plessor keeps the scan and what it finds, which is what is read back.
+/// What the scan says of its CVE leads goes back to toolmark, which gave them.
 async fn pump(
     mut reader: LineReader,
     job: Arc<RunningJob>,
     running: RunningMap,
     tx: watch::Sender<Snap>,
+    answers: Option<Answers>,
 ) {
     let limit = tokio::time::sleep(SCAN_TIME_LIMIT);
     tokio::pin!(limit);
@@ -615,6 +700,25 @@ async fn pump(
                         let msg = v.get("message").and_then(|x| x.as_str()).unwrap_or("");
                         let msg = untrusted::clean(msg, untrusted::NOTE_CAP);
                         update(&mut |m| m.error = Some(msg.clone()));
+                    }
+                    "lead_answers" => {
+                        if let Some(a) = &answers
+                            && let Some(back) = cfx_cve::inventory::AnswersBack::from_event(
+                                &a.to.host,
+                                a.to.port,
+                                Some(&a.scan),
+                                &v,
+                            )
+                            && !keep_answers(a.to.toolmark, &back).await
+                        {
+                            update(&mut |m| {
+                                m.note(format!(
+                                    "toolmark did not keep the answers to the CVE leads of {}:{}",
+                                    untrusted::clean(&a.to.host, 200),
+                                    a.to.port
+                                ))
+                            });
+                        }
                     }
                     "done" => {
                         let stopped = v.get("cancelled").and_then(|c| c.as_bool()) == Some(true);
@@ -671,4 +775,15 @@ async fn pump(
     }
     tx.send_replace(snap_of(&m));
     job.writer.lock().await.take();
+}
+
+/// Hand toolmark's daemon on `port` what a scan said of its leads; whether it kept them.
+async fn keep_answers(port: u16, back: &cfx_cve::inventory::AnswersBack) -> bool {
+    match engine::connect(port).await {
+        Ok(conn) => conn
+            .local(&back.request())
+            .await
+            .is_ok_and(|a| a["status"] == "completed"),
+        Err(_) => false,
+    }
 }

@@ -8,8 +8,11 @@ pub(crate) mod fingerprint;
 pub(crate) mod http;
 pub(crate) mod info;
 pub(crate) mod inject;
+pub(crate) mod inventory;
 pub(crate) mod overrides;
 pub(crate) mod scans;
+pub(crate) mod templates;
+pub(crate) mod verify;
 pub(crate) mod workbench;
 
 use crate::core::{CallNote, Done, Mcp, Refusal};
@@ -30,17 +33,20 @@ pub(crate) const TOOLS_WORKBENCH_JSON: &str = include_str!("../tools_workbench.j
 pub(crate) const TOOLS_CLOUD_JSON: &str = include_str!("../tools_cloud.json");
 
 /// Every tool, in the order they are listed.
-pub(crate) const NAMES: [&str; 11] = [
+pub(crate) const NAMES: [&str; 14] = [
     "status",
     "get_scope",
     "check_scope",
     "fingerprint",
     "test_injection",
+    "scan_templates",
+    "verify_finding",
     "send_http_request",
     "list_scans",
     "get_scan",
     "list_findings",
     "get_finding",
+    "get_inventory",
     "cancel_scan",
 ];
 
@@ -79,13 +85,16 @@ pub(crate) fn known(name: &str, b: &Backends) -> bool {
 
 /// The tools whose results carry text from a scanned system.
 #[cfg(test)]
-pub(crate) const TARGET_DATA_TOOLS: [&str; 6] = [
+pub(crate) const TARGET_DATA_TOOLS: [&str; 9] = [
     "fingerprint",
     "test_injection",
+    "scan_templates",
+    "verify_finding",
     "send_http_request",
     "get_scan",
     "list_findings",
     "get_finding",
+    "get_inventory",
 ];
 
 #[cfg(test)]
@@ -118,11 +127,14 @@ pub(crate) async fn dispatch(
         "check_scope" => info::check_scope(mcp, args),
         "fingerprint" => fingerprint::run(mcp, args, peer, ct, note).await,
         "test_injection" => inject::run(mcp, args, peer, ct, note).await,
+        "scan_templates" => templates::run(mcp, args, peer, ct, note).await,
+        "verify_finding" => verify::run(mcp, args, peer, ct, note).await,
         "send_http_request" => http::run(mcp, args, peer, ct, note).await,
         "list_scans" => scans::list_scans(mcp, args).await,
         "get_scan" => scans::get_scan(mcp, args).await,
         "list_findings" => scans::list_findings(mcp, args).await,
         "get_finding" => scans::get_finding(mcp, args).await,
+        "get_inventory" => inventory::get_inventory(mcp, args).await,
         "cancel_scan" => scans::cancel_scan(mcp, args, note).await,
         t if WORKBENCH_NAMES.contains(&t) => workbench::run(mcp, t, args, peer, ct, note).await,
         _ => return Dispatched::Unknown,

@@ -165,6 +165,11 @@ pub(crate) struct StubOpts {
     /// Play a plessor from 0.1.42, which honours `follow_redirects` and `resolve` but
     /// cannot be told to check certificates.
     pub no_verify_certs: bool,
+    /// Play a plessor from 0.1.44, whose template scan and verify cannot be told to
+    /// dial only the addresses given or to leave redirects alone.
+    pub no_scan_pins: bool,
+    /// What a `verify` is answered with. Absent means a reproduced finding.
+    pub verify: Option<Value>,
     /// A pause before each of `events`, so a client sees them arrive one at a time.
     pub delay_ms: u64,
 }
@@ -179,12 +184,17 @@ pub(crate) struct Stub {
 }
 
 /// An engine's kept scans and findings, answering the reads an engine daemon answers
-/// (`scans`, `scan_info`, `findings`, `finding`) in the shapes cfx_db gives them.
+/// (`scans`, `scan_info`, `findings`, `finding`) in the shapes cfx_db gives them, and
+/// toolmark's `inventory` and `lead_answers`.
 #[derive(Default)]
 pub(crate) struct FakeKept {
     pub scans: Vec<Value>,
     pub findings: Vec<Value>,
     pub notes: Vec<(String, String, String)>,
+    /// toolmark's inventory rows.
+    pub inventory: Vec<Value>,
+    /// The `lead_answers` requests toolmark was handed.
+    pub lead_answers: Vec<Value>,
 }
 
 impl FakeKept {
@@ -239,9 +249,15 @@ impl FakeKept {
         row
     }
 
-    /// What an engine answers `op`, a read, with.
-    pub(crate) fn answer(&self, op: &Value) -> Value {
+    /// What an engine answers `op`, an operation that sends nothing anywhere, with.
+    pub(crate) fn answer(&mut self, op: &Value) -> Value {
         match op["operation"].as_str().unwrap_or_default() {
+            "inventory" => json!({"status": "completed", "inventory": self.inventory,
+                                  "cve_data": "the test's CVE data"}),
+            "lead_answers" => {
+                self.lead_answers.push(op.clone());
+                json!({"status": "completed", "kept": op["answers"].as_array().map(Vec::len)})
+            }
             "scans" => {
                 let mut rows: Vec<Value> = self.scans.iter().map(|s| self.row(s)).collect();
                 rows.reverse();
@@ -356,7 +372,7 @@ pub(crate) async fn stub_engine(opts: StubOpts) -> Stub {
                     if v["operation"] != "capabilities" {
                         break v;
                     }
-                    let answer = if opts.old {
+                    let mut answer = if opts.old {
                         json!({"type": "error", "message": "Unknown operation: capabilities"})
                     } else if opts.no_verify_certs {
                         json!({"type": "capabilities", "cancel": true,
@@ -367,21 +383,45 @@ pub(crate) async fn stub_engine(opts: StubOpts) -> Stub {
                                "inject": ["follow_redirects", "resolve", "verify_certs"],
                                "fingerprint": ["resolve", "block_internal"]})
                     };
+                    if !opts.old && !opts.no_scan_pins {
+                        answer["scan"] = json!(["follow_redirects", "resolve"]);
+                        answer["verify"] = json!(["follow_redirects", "resolve"]);
+                    }
                     let mut a = answer.to_string();
                     a.push('\n');
                     if w.write_all(a.as_bytes()).await.is_err() {
                         return;
                     }
                 };
-                let read = ["scans", "scan_info", "findings", "finding"]
-                    .contains(&op["operation"].as_str().unwrap_or_default());
-                if read {
+                let local = [
+                    "scans",
+                    "scan_info",
+                    "findings",
+                    "finding",
+                    "inventory",
+                    "lead_answers",
+                ]
+                .contains(&op["operation"].as_str().unwrap_or_default());
+                if local {
                     let mut a = k.lock().unwrap().answer(&op).to_string();
                     a.push('\n');
                     let _ = w.write_all(a.as_bytes()).await;
                     return;
                 }
                 o.lock().unwrap().push(op.clone());
+                // A verify is answered once, as plessor answers it, and keeps no scan.
+                if op["operation"] == "verify" {
+                    let answer = opts.verify.clone().unwrap_or_else(|| {
+                        json!({"status": "completed", "answer": "reproduced",
+                               "fired": [{"matcher": "word", "part": "body", "evidence": "ok"}],
+                               "http_status": 200, "response_sha256": "5d41402abc4b2a76",
+                               "finding": op["finding"]})
+                    });
+                    let mut a = answer.to_string();
+                    a.push('\n');
+                    let _ = w.write_all(a.as_bytes()).await;
+                    return;
+                }
                 // Kept as an engine keeps a scan, with what the request said of itself.
                 let scan = k.lock().unwrap().scan(
                     op.get("target")

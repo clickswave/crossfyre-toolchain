@@ -29,13 +29,13 @@ async fn the_mode_decides_what_is_listed_with_no_workbench() {
     let listed = |t: &TestMcp| crate::server::tool_list(&t.mcp.backends()).len();
 
     let auto = scope(&["app.example.test".into()], "").build();
-    assert_eq!(listed(&auto), 11);
+    assert_eq!(listed(&auto), 14);
 
     // For a client that never rereads the list: all seven, each refusing.
     let always = scope(&["app.example.test".into()], "")
         .workbench_mode(WorkbenchMode::Always)
         .build();
-    assert_eq!(listed(&always), 18);
+    assert_eq!(listed(&always), 21);
     let r = always
         .call(&peer, "workbench_list_history", json!({}))
         .await;
@@ -45,7 +45,7 @@ async fn the_mode_decides_what_is_listed_with_no_workbench() {
     let off = scope(&["app.example.test".into()], "")
         .workbench_mode(WorkbenchMode::Off)
         .build();
-    assert_eq!(listed(&off), 11);
+    assert_eq!(listed(&off), 14);
     let r = off.call(&peer, "workbench_list_history", json!({})).await;
     assert!(r.text.starts_with("protocol error"), "{}", r.text);
 }
@@ -86,7 +86,7 @@ mod discovery {
             .workbench_dir(wb.path())
             .build();
         t.mcp.workbench.refresh().await;
-        assert_eq!(listed(&t), 11);
+        assert_eq!(listed(&t), 14);
         let (w, _) = status_wb(&t).await;
         assert_eq!(w["mode"], "auto");
         assert_eq!(w["instances"], json!([]));
@@ -101,7 +101,7 @@ mod discovery {
             .build();
         let mut fake = FakeWb::start(wb.path(), WbOpts::default()).await;
         t.mcp.workbench.refresh().await;
-        assert_eq!(listed(&t), 18);
+        assert_eq!(listed(&t), 21);
         assert_eq!(fake.welcomed(), 1);
 
         let (w, _) = status_wb(&t).await;
@@ -117,7 +117,7 @@ mod discovery {
         fake.exit();
         let mcp = Arc::clone(&t.mcp);
         eventually("the tools to go", 5, || {
-            crate::server::tool_list(&mcp.backends()).len() == 11
+            crate::server::tool_list(&mcp.backends()).len() == 14
         })
         .await;
     }
@@ -134,7 +134,7 @@ mod discovery {
             .iter()
             .map(|t| t.name.to_string())
             .collect();
-        assert_eq!(names.len(), 17);
+        assert_eq!(names.len(), 20);
         assert!(!names.contains(&"workbench_replay".to_string()));
         assert!(names.contains(&"workbench_get_exchange".to_string()));
     }
@@ -154,7 +154,7 @@ mod discovery {
         )
         .await;
         t.mcp.workbench.refresh().await;
-        assert_eq!(listed(&t), 11);
+        assert_eq!(listed(&t), 14);
         assert_eq!(fake.hellos(), 0, "the socket was not even tried");
         let (w, hints) = status_wb(&t).await;
         assert_eq!(w["instances"], json!([]));
@@ -180,7 +180,7 @@ mod discovery {
         )
         .await;
         t.mcp.workbench.refresh().await;
-        assert_eq!(listed(&t), 11);
+        assert_eq!(listed(&t), 14);
         assert_eq!(fake.hellos(), 0);
         let ignored = t.mcp.workbench.ignored();
         assert_eq!(ignored.len(), 1);
@@ -202,7 +202,7 @@ mod discovery {
         )
         .await;
         t.mcp.workbench.refresh().await;
-        assert_eq!(listed(&t), 11);
+        assert_eq!(listed(&t), 14);
         assert_eq!(fake.hellos(), 1);
         assert_eq!(fake.welcomed(), 0);
         let ignored = t.mcp.workbench.ignored();
@@ -224,7 +224,7 @@ mod discovery {
                 .any(|h| h.contains("Agent access is off") && h.contains("Agents chip")),
             "{hints:?}"
         );
-        assert_eq!(listed(&t), 11);
+        assert_eq!(listed(&t), 14);
     }
 
     #[tokio::test]

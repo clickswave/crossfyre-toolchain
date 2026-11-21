@@ -84,6 +84,7 @@ fn base(st: Stamp<'_>, source: &str) -> Map<String, Value> {
     o.insert("seq".into(), json!(st.seq));
     o.insert("recorded_ms".into(), json!(st.recorded_ms));
     o.insert("source".into(), json!(source));
+    o.insert("verifiable".into(), json!(false));
     o
 }
 
@@ -121,6 +122,11 @@ pub(crate) fn from_plessor(data: &Value, st: Stamp<'_>) -> Value {
     o.insert("param".into(), top(data.get("param")));
     o.insert("location".into(), top(data.get("location")));
     o.insert("template".into(), top(data.get("template")));
+    // Kept with the proof verify_finding sends again.
+    o.insert(
+        "verifiable".into(),
+        json!(data.get("proof").is_some_and(Value::is_object)),
+    );
     let extra: Map<String, Value> = data
         .as_object()
         .map(|m| {

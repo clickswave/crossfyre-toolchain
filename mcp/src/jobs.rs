@@ -123,7 +123,11 @@ pub(crate) struct JobMeta {
 }
 
 /// The tools whose scans count toward `max_scan_starts_per_hour`.
-pub(crate) const INJECTION_TOOLS: [&str; 2] = ["test_injection", "workbench_test_injection"];
+pub(crate) const SCAN_TOOLS: [&str; 3] = [
+    "test_injection",
+    "workbench_test_injection",
+    "scan_templates",
+];
 
 pub(crate) struct NewJob<'a> {
     /// The id the engine kept the scan as, here (see `kept::scan_id`).

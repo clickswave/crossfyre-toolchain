@@ -20,6 +20,9 @@ cfx_bridge = { path = "../bridge" }
 transport = { path = "../transport" }
 # The Cloud API's shapes, shared with the platform.
 cfx_cloud_wire = { path = "../cloud_wire" }
+# What toolmark's inventory says of a host, and the words for the answers to its CVE
+# leads, read as the node and `plessor scan` read them.
+cfx_cve = { path = "../cve" }
 # HTTPS to the Cloud API: the reqwest and rustls that transport already brings, so
 # there is no second TLS stack, with no redirect ever followed.
 reqwest = { version = "0.12.22", default-features = false, features = ["rustls-tls"] }

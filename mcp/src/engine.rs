@@ -16,8 +16,8 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a daemon has to answer the capabilities question.
 const CAPABILITIES_WAIT: Duration = Duration::from_secs(5);
-/// How long a daemon has to answer a question about what it kept.
-const READ_WAIT: Duration = Duration::from_secs(10);
+/// How long a daemon has to answer an operation that sends nothing anywhere.
+const LOCAL_WAIT: Duration = Duration::from_secs(10);
 /// An engine event longer than this is skipped, not buffered.
 pub(crate) const LINE_MAX: usize = 4 * 1024 * 1024;
 
@@ -32,6 +32,7 @@ pub(crate) struct EngineConn {
 /// Connect without sending, so a stopped daemon is found before a person is asked
 /// to confirm anything.
 pub(crate) async fn connect(port: u16) -> std::io::Result<EngineConn> {
+    let port = not_the_hosts(port);
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(("127.0.0.1", port)))
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timed out"))??;
@@ -45,6 +46,17 @@ pub(crate) async fn connect(port: u16) -> std::io::Result<EngineConn> {
         writer,
         ends,
     })
+}
+
+/// `port`, which a test build refuses when it is one of the engines' or the database's
+/// own: an engine of the operator's may be listening there, so every test gives a port of
+/// its own.
+pub(crate) fn not_the_hosts(port: u16) -> u16 {
+    #[cfg(test)]
+    if (4440..=4445).contains(&port) {
+        panic!("a test asked for port {port}: a test reaches no engine of the host's");
+    }
+    port
 }
 
 /// A test's word for who owns the listener on a port, in place of the kernel's: a port
@@ -147,18 +159,28 @@ impl EngineConn {
         }
     }
 
-    /// Ask one of the operations that read what the engine kept and send nothing
-    /// anywhere, and give its one answer. Any other operation is refused here, as it
-    /// needs a [`Clearance`] and goes through [`EngineConn::start`].
-    pub(crate) async fn read(mut self, op: &Value) -> std::io::Result<Value> {
-        const READS: [&str; 4] = ["scans", "scan_info", "findings", "finding"];
-        if !READS.contains(&event_op(op)) {
-            return Err(std::io::Error::other("not an operation that only reads"));
+    /// Ask one of the operations that send nothing anywhere, and give its one answer:
+    /// those that read what the engine kept, and toolmark's keeping of what a scan said
+    /// of the CVE leads it was given. Any other operation is refused here, as it needs a
+    /// [`Clearance`] and goes through [`EngineConn::start`].
+    pub(crate) async fn local(mut self, op: &Value) -> std::io::Result<Value> {
+        const LOCAL: [&str; 6] = [
+            "scans",
+            "scan_info",
+            "findings",
+            "finding",
+            "inventory",
+            "lead_answers",
+        ];
+        if !LOCAL.contains(&event_op(op)) {
+            return Err(std::io::Error::other(
+                "not an operation that sends nothing anywhere",
+            ));
         }
         let mut line = dguard::encode(op);
         line.push('\n');
         self.writer.write_all(line.as_bytes()).await?;
-        match tokio::time::timeout(READ_WAIT, self.reader.next()).await {
+        match tokio::time::timeout(LOCAL_WAIT, self.reader.next()).await {
             Ok(Ok(Some(Line::Event(v)))) => Ok(v),
             Ok(Ok(_)) => Err(std::io::Error::other("the engine gave no answer")),
             Ok(Err(e)) => Err(e),
@@ -350,6 +372,18 @@ mod unit {
              0: 0000000000000000FFFF00000100007F:115A 0000000000000000FFFF00000100007F:A028 01 00000000:00000000 00:00000000 00000000  1002        0 4 1 0\n";
         assert_eq!(owners_in(v6, daemon, client), vec![1002]);
         assert!(owners_in("header\nnot a line\n", daemon, client).is_empty());
+    }
+
+    /// No test reaches an engine or database of the machine it runs on. Checked on the
+    /// port alone, so nothing is dialled to find out.
+    #[test]
+    fn a_test_build_refuses_the_hosts_engine_ports() {
+        for port in 4440..=4445 {
+            let refused = std::panic::catch_unwind(|| not_the_hosts(port));
+            assert!(refused.is_err(), "{port} was let through");
+        }
+        assert_eq!(not_the_hosts(4439), 4439);
+        assert_eq!(not_the_hosts(4446), 4446);
     }
 
     #[cfg(unix)]
