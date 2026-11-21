@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -209,6 +209,17 @@ pub struct ScanParams {
     /// + retry budget).
     #[serde(default)]
     pub posture: Option<String>,
+    /// Names pinned to addresses, `[["app.example.com", "203.0.113.7:443"], ...]`. A
+    /// target that is a pinned name is dialled at its pinned addresses only, on every
+    /// port the scan tries; the port written in a pin is not used. A caller that has
+    /// already decided which addresses of a name may be dialled sends them, so the name
+    /// is not looked up again here and answered with somewhere else.
+    #[serde(default)]
+    pub resolve: Vec<(String, SocketAddr)>,
+    /// Refuse to dial private, loopback, link-local and reserved addresses. A host
+    /// left with no other address is not scanned, and the scan says so.
+    #[serde(default)]
+    pub block_internal: bool,
 }
 
 fn default_tasks() -> u32 {
@@ -312,6 +323,64 @@ fn expand_cidr(cidr: &str) -> Option<Vec<String>> {
     Some(ips)
 }
 
+/// The addresses a scan dials `host` at: those a pin gives it, its own when it is an
+/// address, or what it resolves to, looked up once so every port of the host is tried at
+/// the same ones. None when the scan may dial none of them, with the reason; an empty
+/// list when the name does not resolve, which each probe reports as filtered.
+async fn addresses(params: &ScanParams, host: &str) -> Result<Vec<IpAddr>, String> {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let pinned: Vec<IpAddr> = params
+        .resolve
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case(bare))
+        .map(|(_, at)| at.ip())
+        .collect();
+    let found: Vec<IpAddr> = if !pinned.is_empty() {
+        pinned
+    } else if let Ok(ip) = bare.parse::<IpAddr>() {
+        vec![ip]
+    } else {
+        match tokio::net::lookup_host((bare, 0)).await {
+            Ok(addrs) => addrs.map(|a| a.ip()).collect(),
+            Err(_) => return Ok(Vec::new()),
+        }
+    };
+    if !params.block_internal {
+        return Ok(found);
+    }
+    let public: Vec<IpAddr> = found
+        .iter()
+        .copied()
+        .filter(|ip| !cfx_tunnel::is_internal(ip))
+        .collect();
+    if public.is_empty() && !found.is_empty() {
+        return Err(format!(
+            "{host} was not scanned: it is only at private, loopback, link-local or \
+             reserved addresses, which this scan may not dial"
+        ));
+    }
+    Ok(public)
+}
+
+/// The scan's hosts, each with the addresses it is dialled at. A host the scan may dial
+/// none of is left out, and said so on `tx`.
+async fn dialled(
+    params: &ScanParams,
+    hosts: Vec<String>,
+    tx: &mpsc::UnboundedSender<StreamEvent>,
+) -> Vec<(String, Vec<IpAddr>)> {
+    let mut out = Vec::with_capacity(hosts.len());
+    for host in hosts {
+        match addresses(params, &host).await {
+            Ok(addrs) => out.push((host, addrs)),
+            Err(why) => {
+                let _ = tx.send(StreamEvent::log("error", &why));
+            }
+        }
+    }
+    out
+}
+
 /// Below this many probes the adaptive control loop has no room to converge, so
 /// we run the simple fixed-rate path (also the DS-per-port and single-probe case).
 const ADAPTIVE_MIN: usize = 16;
@@ -320,7 +389,7 @@ const ADAPTIVE_MIN: usize = 16;
 /// rate governor when the batch is large enough (and `params.adaptive`), else a
 /// fixed-rate pass.
 pub async fn run_connect_scan(params: &ScanParams, tx: mpsc::UnboundedSender<StreamEvent>) {
-    let hosts = resolve_targets(&params.targets);
+    let hosts = dialled(params, resolve_targets(&params.targets), &tx).await;
     let total = hosts.len().saturating_mul(params.ports.len());
     if params.adaptive && total >= ADAPTIVE_MIN {
         run_adaptive_scan(params, hosts, tx).await;
@@ -339,7 +408,7 @@ struct ProbeReport {
 /// small batches, single-port probes, and `adaptive = false`.
 async fn run_fixed_scan(
     params: &ScanParams,
-    hosts: Vec<String>,
+    hosts: Vec<(String, Vec<IpAddr>)>,
     tx: mpsc::UnboundedSender<StreamEvent>,
 ) {
     let timeout_dur = Duration::from_millis(params.timeout);
@@ -349,10 +418,10 @@ async fn run_fixed_scan(
     let (result_tx, mut result_rx) = mpsc::unbounded_channel::<StreamEvent>();
     let delay = params.delay;
     let mut total_spawned = 0usize;
-    for host in &hosts {
+    for (host, addrs) in &hosts {
         for &port in &params.ports {
             let sem = semaphore.clone();
-            let host = host.clone();
+            let (host, addrs) = (host.clone(), addrs.clone());
             let rtx = result_tx.clone();
             let detect_service = params.service_detection;
             tokio::spawn(async move {
@@ -360,7 +429,7 @@ async fn run_fixed_scan(
                 if delay > 0 {
                     tokio::time::sleep(Duration::from_millis(delay)).await;
                 }
-                let rep = probe_port(&host, port, timeout_dur, 3, detect_service).await;
+                let rep = probe_port(&host, &addrs, port, timeout_dur, 3, detect_service).await;
                 let _ = rtx.send(rep.event);
             });
             total_spawned += 1;
@@ -396,7 +465,7 @@ async fn run_fixed_scan(
 /// overrunning a thin tunnel into false negatives (reliable).
 async fn run_adaptive_scan(
     params: &ScanParams,
-    hosts: Vec<String>,
+    hosts: Vec<(String, Vec<IpAddr>)>,
     tx: mpsc::UnboundedSender<StreamEvent>,
 ) {
     use crate::governor::{Governor, Limits};
@@ -448,16 +517,17 @@ async fn run_adaptive_scan(
     };
 
     let (result_tx, mut result_rx) = mpsc::unbounded_channel::<StreamEvent>();
-    for host in &hosts {
+    for (host, addrs) in &hosts {
         for &port in &params.ports {
             let gov = gov.clone();
-            let host = host.clone();
+            let (host, addrs) = (host.clone(), addrs.clone());
             let rtx = result_tx.clone();
             let detect_service = params.service_detection;
             tokio::spawn(async move {
                 let _permit = gov.slot().await;
                 let (timeout_dur, retries) = gov.probe_params();
-                let rep = probe_port(&host, port, timeout_dur, retries, detect_service).await;
+                let rep =
+                    probe_port(&host, &addrs, port, timeout_dur, retries, detect_service).await;
                 gov.record(&rep.sample);
                 let _ = rtx.send(rep.event);
             });
@@ -490,7 +560,8 @@ async fn run_adaptive_scan(
     let _ = tx.send(StreamEvent::done(open, closed, filtered));
 }
 
-/// Probe a single host:port via TCP connect.
+/// Probe a single host:port via TCP connect, at each of `ips`, the host's addresses (see
+/// [`addresses`]).
 ///
 /// For hostnames that resolve to multiple addresses (e.g. "localhost" →
 /// 127.0.0.1 *and* ::1) we try every one before declaring the port closed.
@@ -500,33 +571,16 @@ async fn run_adaptive_scan(
 /// SB scans of the same `localhost:5432` could disagree.
 async fn probe_port(
     host: &str,
+    ips: &[IpAddr],
     port: u16,
     timeout_dur: Duration,
     max_attempts: u32,
     detect_service: bool,
 ) -> ProbeReport {
     use crate::governor::{Outcome, Sample};
-    let addr_str = format!("{host}:{port}");
-
-    // Build the list of addresses to try.
-    let addrs: Vec<SocketAddr> = if let Ok(parsed) = addr_str.parse::<SocketAddr>() {
-        vec![parsed]
-    } else {
-        match tokio::net::lookup_host(&addr_str).await {
-            Ok(iter) => iter.collect(),
-            // DNS failure isn't network loss on the probe path; report as
-            // delivered-fast so it doesn't drag the governor's loss signal.
-            Err(_) => {
-                return ProbeReport {
-                    event: StreamEvent::result(host, port, "filtered", 0),
-                    sample: Sample {
-                        outcome: Outcome::Delivered { rtt_ms: 0 },
-                        attempts: 1,
-                    },
-                };
-            }
-        }
-    };
+    let addrs: Vec<SocketAddr> = ips.iter().map(|ip| SocketAddr::new(*ip, port)).collect();
+    // A name that resolved to nothing. DNS failure isn't network loss on the probe path;
+    // report as delivered-fast so it doesn't drag the governor's loss signal.
     if addrs.is_empty() {
         return ProbeReport {
             event: StreamEvent::result(host, port, "filtered", 0),
@@ -709,6 +763,8 @@ mod tests {
             max_concurrency: Some(128),
             posture: None,
             fresh_start: false,
+            resolve: Vec::new(),
+            block_internal: false,
         };
 
         let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();

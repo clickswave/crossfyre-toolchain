@@ -132,7 +132,11 @@ async fn handle_connection(
         if req.operation == "capabilities" {
             write_json(
                 &mut writer,
-                &serde_json::json!({"type": "capabilities", "pid": std::process::id()}),
+                &serde_json::json!({
+                    "type": "capabilities",
+                    "scan": ["resolve", "block_internal"],
+                    "pid": std::process::id(),
+                }),
             )
             .await?;
             continue;
@@ -411,6 +415,8 @@ async fn dispatch(req: DaemonRequest, db: Arc<DoorwardDb>) -> serde_json::Value 
                 max_concurrency: None,
                 posture: None,
                 fresh_start: false,
+                resolve: Vec::new(),
+                block_internal: false,
             };
 
             let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
@@ -714,6 +720,95 @@ mod http_request_tests {
         }
     }
 
+    /// The events of the stream scan `op`, to its `done`.
+    async fn scan_events(port: u16, op: &serde_json::Value) -> Vec<serde_json::Value> {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let (r, mut w) = s.into_split();
+        w.write_all(format!("{op}\n").as_bytes()).await.unwrap();
+        let mut lines = BufReader::new(r).lines();
+        let mut events = Vec::new();
+        while let Ok(Ok(Some(line))) =
+            tokio::time::timeout(Duration::from_secs(20), lines.next_line()).await
+        {
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let done = v["type"] == "done" || v["type"] == "error";
+            events.push(v);
+            if done {
+                break;
+            }
+        }
+        events
+    }
+
+    /// A listener on loopback that counts the connections it is given.
+    async fn counted() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        let l = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = l.local_addr().expect("addr").port();
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&n);
+        tokio::spawn(async move {
+            while let Ok((_sock, _)) = l.accept().await {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        (port, n)
+    }
+
+    fn open_ports(events: &[serde_json::Value]) -> Vec<u64> {
+        let mut open: Vec<u64> = events
+            .iter()
+            .filter(|e| e["type"] == "result" && e["status"] == "open")
+            .filter_map(|e| e["port"].as_u64())
+            .collect();
+        open.sort_unstable();
+        open
+    }
+
+    /// A name pinned to an address is dialled there on every port the scan tries. The
+    /// name is under `.invalid`, which never resolves, so a port found open was reached
+    /// through the pin.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pinned_name_is_dialled_at_its_address_on_every_port() {
+        let (a, _) = counted().await;
+        let (b, _) = counted().await;
+        let port = daemon().await;
+        let mut op = serde_json::json!({
+            "operation": "scan", "response": "stream", "targets": ["pinned.invalid"],
+            "ports": [a, b], "adaptive": false, "timeout": 2000,
+        });
+        assert!(open_ports(&scan_events(port, &op).await).is_empty());
+        op["resolve"] = serde_json::json!([["pinned.invalid", "127.0.0.1:9"]]);
+        let mut want = vec![u64::from(a), u64::from(b)];
+        want.sort_unstable();
+        assert_eq!(open_ports(&scan_events(port, &op).await), want);
+    }
+
+    /// With block_internal, a target at an internal address, its own or a pinned one, is
+    /// not dialled at all, and the scan says why.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn block_internal_leaves_an_internal_target_unscanned() {
+        let (a, seen) = counted().await;
+        let port = daemon().await;
+        for target in ["127.0.0.1", "pinned.invalid"] {
+            let op = serde_json::json!({
+                "operation": "scan", "response": "stream", "targets": [target],
+                "ports": [a], "adaptive": false, "timeout": 2000, "block_internal": true,
+                "resolve": [["pinned.invalid", "127.0.0.1:9"]],
+            });
+            let events = scan_events(port, &op).await;
+            assert!(
+                events.iter().any(|e| e["type"] == "log"
+                    && e["message"]
+                        .as_str()
+                        .is_some_and(|m| m.contains("was not scanned"))),
+                "{target}: {events:?}"
+            );
+            assert!(open_ports(&events).is_empty(), "{target}: {events:?}");
+        }
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn an_http_post_is_closed_at_its_request_line() {
         let port = daemon().await;
@@ -753,6 +848,11 @@ mod http_request_tests {
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["type"], "capabilities", "{v}");
         assert_eq!(v["pid"], std::process::id(), "{v}");
+        assert_eq!(
+            v["scan"],
+            serde_json::json!(["resolve", "block_internal"]),
+            "{v}"
+        );
         // A node that read an egress version here would send doorward ops through a
         // proxy, which it refuses.
         assert!(v.get("egress").is_none(), "{v}");
