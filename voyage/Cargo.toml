@@ -29,6 +29,7 @@ transport = { path = "../transport" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "time"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4.6.9"
+clap_mangen = "0.3.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Its runtime and TLS come with cfx_db, which makes every connection.
