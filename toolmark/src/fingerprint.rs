@@ -1265,6 +1265,32 @@ mod cve_lead_tests {
         assert!(!named(&later, "CVE-2021-41773") && !named(&later, "CVE-2021-42013"));
     }
 
+    /// Exchange, its build read from X-OWA-Version, gets the known-exploited CVEs of the
+    /// cumulative update that build is, from the snapshot.
+    #[tokio::test]
+    async fn exchange_read_from_its_header_gets_its_known_exploited_cves() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nX-OWA-Version: 15.2.1118.7\r\nContent-Length: 0\r\n\
+                      Connection: close\r\n\r\n",
+                );
+            }
+        });
+        let found = leads(port, &crate::cve::snapshot_for_tests()).await;
+        assert!(
+            found
+                .iter()
+                .any(|l| l["cve"] == "CVE-2022-41082" && l["kev"] == true),
+            "{found:?}"
+        );
+    }
+
     /// A dataset in the data folder answers in place of the snapshot, and its leads name
     /// it.
     #[tokio::test]
@@ -1347,6 +1373,52 @@ mod stamp_tests {
         (port, asked)
     }
 
+    /// What a standard fingerprint of `port` sends: its technologies and its leads.
+    async fn events(port: u16) -> Vec<Value> {
+        let params: FpParams = serde_json::from_value(json!({
+            "target": format!("http://127.0.0.1:{port}/"),
+            "evasive": false,
+            "favicon": false,
+            "timeout_ms": 3000,
+            "depth_tier": 2,
+        }))
+        .unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        scan(
+            Signatures::shipped(),
+            params,
+            tx,
+            Arc::new(Nowhere),
+            &crate::cve::snapshot_for_tests(),
+        )
+        .await;
+        let mut out = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            out.push(e["data"].clone());
+        }
+        out
+    }
+
+    /// A NetScaler whose stamp names a build before CVE-2023-3519's fix gets that
+    /// known-exploited CVE as a lead, from the snapshot toolmark ships.
+    #[tokio::test]
+    async fn a_netscaler_read_at_a_vulnerable_build_gets_its_known_exploited_cve() {
+        let (port, _) = host(GATEWAY, VULNERABLE.0);
+        let found = events(port).await;
+        assert!(
+            found
+                .iter()
+                .any(|d| d["type"] == "technology" && d["version"] == VULNERABLE.1),
+            "{found:?}"
+        );
+        assert!(
+            found.iter().any(|d| d["type"] == "vulnerability"
+                && d["cve"] == "CVE-2023-3519"
+                && d["kev"] == true),
+            "{found:?}"
+        );
+    }
+
     /// What a standard fingerprint of `port` names, with each version.
     async fn named(port: u16) -> Vec<(String, Option<String>)> {
         let params: FpParams = serde_json::from_value(json!({
@@ -1380,6 +1452,9 @@ mod stamp_tests {
     }
 
     const GATEWAY: &str = "<html><head><title>NetScaler Gateway</title></head><body></body></html>";
+
+    /// A build before CVE-2023-3519's fix (13.1-49.13), by its stamp in Fox-IT's table.
+    const VULNERABLE: (u32, &str) = (1685777750, "13.1-48.47");
 
     /// A stamp in Fox-IT's table gives NetScaler its build, and leads at it.
     #[tokio::test]
