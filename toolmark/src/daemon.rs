@@ -19,6 +19,17 @@ struct DaemonRequest {
     egress: transport::Egress,
 }
 
+/// The answers a client writes back for the leads of one host and port it gave a plessor
+/// scan, and which scan.
+#[derive(Deserialize)]
+struct LeadAnswers {
+    host: String,
+    port: u16,
+    #[serde(default)]
+    scan: String,
+    answers: Vec<cfx_cve::inventory::LeadAnswer>,
+}
+
 /// One request line: the operation it asks for, unwrapped, with the egress its
 /// wrapper names. An error is the message the client is answered with, and nothing
 /// is sent anywhere.
@@ -113,8 +124,29 @@ async fn handle_connection(
             "scans" => write_line(&mut writer, &db.scans().await).await?,
             // What it knows runs where.
             "inventory" => {
-                let answer = crate::inventory::with_leads(db.inventory().await, &knowledge.now());
+                let answer = crate::inventory::with_leads(
+                    db.inventory().await,
+                    &knowledge.now(),
+                    &db.answered().await,
+                );
                 write_line(&mut writer, &answer).await?
+            }
+            // What a plessor scan's templates said of the leads it was given for one host,
+            // written back by the client that gave them.
+            "lead_answers" => {
+                let reply = match serde_json::from_value::<LeadAnswers>(req.params) {
+                    Ok(asked) => match db
+                        .answer_leads(&asked.host, asked.port, &asked.scan, &asked.answers)
+                        .await
+                    {
+                        Ok(kept) => serde_json::json!({"status": "completed", "kept": kept}),
+                        Err(e) => serde_json::json!({"status": "error",
+                            "message": format!("could not keep the answers: {e}")}),
+                    },
+                    Err(e) => serde_json::json!({"status": "error",
+                        "message": format!("Invalid lead_answers: {e}")}),
+                };
+                write_line(&mut writer, &reply).await?;
             }
             // Read the pack and the CVE dataset in the toolchain directory again, as
             // `crossfyre update` asks after it writes new ones. A scan running goes on
@@ -341,6 +373,36 @@ mod tests {
         assert_eq!(
             answer["message"],
             Knowledge::load(None).now().said(),
+            "{answer}"
+        );
+    }
+
+    /// An answer that is not one of the three is refused before anything is written, so
+    /// no client can keep a lead as "not exploitable".
+    #[tokio::test]
+    async fn lead_answers_take_only_the_three_answers() {
+        let dport = daemon().await;
+        let stream = TcpStream::connect(("127.0.0.1", dport))
+            .await
+            .expect("connect");
+        let (reader, mut writer) = stream.into_split();
+        let ask = serde_json::json!({"operation": "lead_answers", "response": "instant",
+            "host": "app.test", "port": 80, "scan": "s1",
+            "answers": [{"cve": "CVE-2021-41773", "product": "Apache HTTP Server",
+                         "answer": "not exploitable"}]});
+        writer
+            .write_all(format!("{ask}\n").as_bytes())
+            .await
+            .expect("send");
+        let mut lines = BufReader::new(reader).lines();
+        let line = lines.next_line().await.expect("read").expect("an answer");
+        let answer: Value = serde_json::from_str(&line).expect("json");
+        assert_eq!(answer["status"], "error", "{answer}");
+        assert!(
+            answer["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("Invalid lead_answers"),
             "{answer}"
         );
     }

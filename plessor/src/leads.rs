@@ -4,7 +4,7 @@
 //! is safe, and one that did not run says why.
 
 use crate::template::Template;
-use cfx_cve::inventory::{Answer, HostLead, NOT_PROOF};
+use cfx_cve::inventory::{Answer, HostLead, LeadAnswer, NOT_PROOF};
 use serde_json::{Value, json};
 
 /// What became of one template in the scan.
@@ -95,19 +95,16 @@ impl<'a> Leads<'a> {
                 }
             })
             .collect();
-        let rows: Vec<Value> = self
+        let rows: Vec<LeadAnswer> = self
             .leads
             .iter()
             .zip(&answers)
-            .map(|(lead, (answer, template, reason))| {
-                let mut row = json!({"cve": lead.cve, "product": lead.product, "answer": answer});
-                if let Some(t) = template {
-                    row["template"] = json!(t);
-                }
-                if let Some(r) = reason {
-                    row["reason"] = json!(r);
-                }
-                row
+            .map(|(lead, (answer, template, reason))| LeadAnswer {
+                cve: lead.cve.clone(),
+                product: lead.product.clone(),
+                answer: *answer,
+                template: template.map(str::to_string),
+                reason: reason.map(str::to_string),
             })
             .collect();
         let mut event = json!({

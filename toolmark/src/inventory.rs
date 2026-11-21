@@ -1,11 +1,17 @@
 //! `toolmark inventory`: what toolmark knows runs where, from its inventory view.
 
+use cfx_cve::inventory::{Answer, NOT_PROOF};
 use serde_json::{Value, json};
 use std::io;
 
 /// The inventory `answer` with the CVE leads `known` gives each product at its version,
-/// and the data they come from.
-pub fn with_leads(mut answer: Value, known: &crate::knowledge::Known) -> Value {
+/// the data they come from, and what a plessor scan said of each lead it answered, from
+/// `answered`.
+pub fn with_leads(
+    mut answer: Value,
+    known: &crate::knowledge::Known,
+    answered: &[crate::libs::toolmark_db::Answered],
+) -> Value {
     let Some(rows) = answer["inventory"].as_array_mut() else {
         return answer;
     };
@@ -26,14 +32,35 @@ pub fn with_leads(mut answer: Value, known: &crate::knowledge::Known) -> Value {
         } else {
             known.leads(&names, &version, distro.as_deref()).0
         };
+        let (host, port, product) = (
+            row["host"].as_str().unwrap_or_default().to_string(),
+            row["port"].as_u64().unwrap_or_default(),
+            row["product"].as_str().unwrap_or_default().to_string(),
+        );
         row["leads"] = leads
             .iter()
             .map(|l| {
-                json!({
+                let mut lead = json!({
                     "cve": l.cve, "severity": l.known.severity, "cvss": l.known.score,
                     "kev": l.known.kev, "epss": l.known.epss, "possible": l.possible,
                     "backport": l.backport,
-                })
+                });
+                if let Some(a) = answered.iter().find(|a| {
+                    a.host.eq_ignore_ascii_case(&host)
+                        && u64::from(a.port) == port
+                        && a.product == product
+                        && a.cve == l.cve
+                }) {
+                    lead["answer"] = json!(a.answer);
+                    lead["answer_template"] = json!(a.template);
+                    lead["answer_reason"] = json!(a.reason);
+                    lead["answered_at"] = json!(a.at);
+                    lead["answer_scan"] = json!(a.scan);
+                    if a.answer == Answer::NotFound.as_str() {
+                        lead["not_proof"] = json!(NOT_PROOF);
+                    }
+                }
+                lead
             })
             .collect();
     }
@@ -68,8 +95,9 @@ fn print(out: &mut impl io::Write, rows: &[Value]) -> io::Result<()> {
 }
 
 /// The inventory as the table shows it: a host and port, the product, its version, its
-/// vendor, its CVE leads with how many are known to be exploited, and when it was last
-/// seen, to the minute.
+/// vendor, its CVE leads with how many are known to be exploited, what plessor's
+/// templates said of those it answered, and when it was last seen, to the minute. A lead
+/// checked and not found has the line that this is no proof in the summary.
 fn list(rows: &[Value]) -> cfx_tui::table::List<'static> {
     let text = |row: &Value, key: &str| row[key].as_str().unwrap_or_default().to_string();
     let or_dash = |s: String| if s.is_empty() { "-".to_string() } else { s };
@@ -94,6 +122,7 @@ fn list(rows: &[Value]) -> cfx_tui::table::List<'static> {
                     (n, 0) => n.to_string(),
                     (n, k) => format!("{n} ({k} KEV)"),
                 },
+                answers(row),
                 seen.get(..16)
                     .map(|m| format!("{} UTC", m.replace('T', " ")))
                     .unwrap_or(seen),
@@ -109,13 +138,18 @@ fn list(rows: &[Value]) -> cfx_tui::table::List<'static> {
         name: "TOOLMARK",
         title: "INVENTORY",
         summary: format!(
-            "{} on {}{}",
+            "{} on {}{}{}",
             plural(table.len(), "product", "products"),
             plural(hosts.len(), "host", "hosts"),
             rows.first()
                 .and_then(|r| r["cve_data"].as_str())
                 .map(|from| format!(", CVE leads from {from}"))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            if rows.iter().any(|r| said(r, Answer::NotFound) > 0) {
+                format!(". {NOT_PROOF}")
+            } else {
+                String::new()
+            }
         ),
         header: &[
             "HOST",
@@ -123,10 +157,38 @@ fn list(rows: &[Value]) -> cfx_tui::table::List<'static> {
             "VERSION",
             "VENDOR",
             "CVE LEADS",
+            "CHECKED BY PLESSOR",
             "LAST SEEN",
         ],
-        widths: &[26, 24, 14, 14, 12],
+        widths: &[26, 24, 14, 14, 12, 34],
         rows: table,
+    }
+}
+
+/// How many of `row`'s leads a plessor scan answered with `answer`.
+fn said(row: &Value, answer: Answer) -> usize {
+    row["leads"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|l| l["answer"] == answer.as_str())
+        .count()
+}
+
+/// What plessor's templates said of `row`'s leads, counted by answer, or a dash when no
+/// scan answered any.
+fn answers(row: &Value) -> String {
+    let said: Vec<String> = [Answer::Confirmed, Answer::NotFound, Answer::NotChecked]
+        .into_iter()
+        .filter_map(|a| match said(row, a) {
+            0 => None,
+            n => Some(format!("{n} {}", a.as_str())),
+        })
+        .collect();
+    if said.is_empty() {
+        "-".to_string()
+    } else {
+        said.join("; ")
     }
 }
 
@@ -156,6 +218,7 @@ mod tests {
                 "-",
                 "-",
                 "-",
+                "-",
                 "2026-11-20 03:31 UTC"
             ]
         );
@@ -179,7 +242,7 @@ mod tests {
             {"host": "app.test", "port": 443, "product": "Laravel", "version": "",
              "cpe_names": [], "distro": "", "last_seen": "2026-11-20T03:31:00Z"},
         ]});
-        let answer = with_leads(answer, &cves);
+        let answer = with_leads(answer, &cves, &[]);
         assert_eq!(answer["cve_data"], "CVE dataset 6 of 2026-11-23");
         let rows = answer["inventory"].as_array().unwrap();
         assert_eq!(rows[0]["leads"][0]["cve"], "CVE-2099-0050");
@@ -191,6 +254,66 @@ mod tests {
             "2 products on 1 host, CVE leads from CVE dataset 6 of 2026-11-23"
         );
         assert_eq!(list(rows).rows[1][4], "-");
+    }
+
+    /// A lead a plessor scan answered carries the answer, by which template or why none,
+    /// and when; a lead checked and not found carries the line that this is no proof,
+    /// which the table's summary says too, and the table counts the answers.
+    #[test]
+    fn a_lead_plessor_answered_shows_the_answer() {
+        let cves = crate::knowledge::with_dataset_for_tests(
+            r#"{"format": 1, "sequence": 6, "made": "2026-11-23T15:00:00Z", "products": [
+              {"part": "a", "vendor": "apache", "product": "http_server", "affected": [
+                {"cve": "CVE-2021-41773", "ranges": [{"eq": "2.4.49"}]},
+                {"cve": "CVE-2021-42013", "ranges": [{"eq": "2.4.49"}]},
+                {"cve": "CVE-2099-0001", "ranges": [{"eq": "2.4.49"}]}]}],
+             "cves": {"CVE-2021-41773": {}, "CVE-2021-42013": {}, "CVE-2099-0001": {}}}"#,
+        );
+        let answer = json!({"status": "completed", "inventory": [
+            {"host": "app.test", "port": 80, "product": "Apache HTTP Server", "version": "2.4.49",
+             "cpe_names": ["a:apache:http_server"], "distro": "", "last_seen": "2026-11-23T14:00:00Z"},
+        ]});
+        let answered = |cve: &str, said: &str, template: &str, reason: &str| {
+            crate::libs::toolmark_db::Answered {
+                host: "app.test".into(),
+                port: 80,
+                product: "Apache HTTP Server".into(),
+                cve: cve.into(),
+                answer: said.into(),
+                template: template.into(),
+                reason: reason.into(),
+                at: "2026-11-23T14:30:00Z".into(),
+                scan: "s1".into(),
+            }
+        };
+        let answer = with_leads(
+            answer,
+            &cves,
+            &[
+                answered("CVE-2021-41773", "confirmed", "CVE-2021-41773", ""),
+                answered("CVE-2021-42013", "checked, not found", "CVE-2021-42013", ""),
+            ],
+        );
+        let rows = answer["inventory"].as_array().unwrap();
+        let lead = |cve: &str| {
+            rows[0]["leads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|l| l["cve"] == cve)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(lead("CVE-2021-41773")["answer"], "confirmed");
+        assert_eq!(lead("CVE-2021-41773")["answer_template"], "CVE-2021-41773");
+        assert!(lead("CVE-2021-41773").get("not_proof").is_none());
+        assert_eq!(lead("CVE-2021-42013")["answer"], "checked, not found");
+        assert_eq!(lead("CVE-2021-42013")["not_proof"], NOT_PROOF);
+        assert!(lead("CVE-2099-0001").get("answer").is_none());
+        let list = list(rows);
+        assert_eq!(list.rows[0][5], "1 confirmed; 1 checked, not found");
+        assert!(list.summary.ends_with(NOT_PROOF), "{}", list.summary);
+        assert!(!list.summary.contains("exploitable"));
     }
 
     /// Written out for a reader that stops early, as `toolmark inventory | head` has.

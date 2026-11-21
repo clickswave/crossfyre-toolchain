@@ -183,8 +183,94 @@ impl ToolmarkDb {
             .bind(version)
             .execute(&mut *tx)
             .await?;
+            // What a scan said of the product's leads was about the version before.
+            sqlx::query(
+                "UPDATE leads SET answer = NULL, answer_template = '', answer_reason = '', \
+                 answered_at = NULL, answer_scan = '' WHERE host_id = $1 AND product = $2",
+            )
+            .bind(host)
+            .bind(product)
+            .execute(&mut *tx)
+            .await?;
         }
         tx.commit().await
+    }
+
+    /// What plessor scan `scan` said of the leads of `host`:`port`, as the client that gave
+    /// it the leads writes back, kept with each lead, and a lead not kept yet kept with its
+    /// answer. Nothing is written for a host toolmark never looked at. The number kept.
+    pub async fn answer_leads(
+        &self,
+        host: &str,
+        port: u16,
+        scan: &str,
+        answers: &[cfx_cve::inventory::LeadAnswer],
+    ) -> Result<usize, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let host_id: Option<i64> =
+            sqlx::query_scalar("SELECT id FROM hosts WHERE lower(host) = lower($1) AND port = $2")
+                .bind(host)
+                .bind(i32::from(port))
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(host_id) = host_id else {
+            return Ok(0);
+        };
+        for a in answers {
+            sqlx::query(
+                "INSERT INTO leads (host_id, product, cve, answer, answer_template, \
+                 answer_reason, answered_at, answer_scan) \
+                 VALUES ($1, $2, $3, $4, $5, $6, now(), $7) \
+                 ON CONFLICT (host_id, product, cve) DO UPDATE SET answer = $4, \
+                 answer_template = $5, answer_reason = $6, answered_at = now(), answer_scan = $7",
+            )
+            .bind(host_id)
+            .bind(&a.product)
+            .bind(&a.cve)
+            .bind(a.answer.as_str())
+            .bind(a.template.as_deref().unwrap_or_default())
+            .bind(a.reason.as_deref().unwrap_or_default())
+            .bind(scan)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(answers.len())
+    }
+
+    /// Every lead a scan has answered, with where, for the inventory to show.
+    pub async fn answered(&self) -> Vec<Answered> {
+        let rows: Result<Vec<AnsweredRow>, _> = sqlx::query_as(
+            "SELECT h.host, h.port, l.product, l.cve, l.answer, l.answer_template, \
+                 l.answer_reason, \
+                 to_char(l.answered_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
+                 l.answer_scan \
+             FROM leads l JOIN hosts h ON h.id = l.host_id WHERE l.answer IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await;
+        match rows {
+            Ok(rows) => rows
+                .into_iter()
+                .map(
+                    |(host, port, product, cve, answer, template, reason, at, scan)| Answered {
+                        host,
+                        port: u16::try_from(port).unwrap_or_default(),
+                        product,
+                        cve,
+                        answer,
+                        template,
+                        reason,
+                        at,
+                        scan,
+                    },
+                )
+                .collect(),
+            Err(e) => {
+                eprintln!("[toolmark] could not read the answered leads: {e}");
+                Vec::new()
+            }
+        }
     }
 
     /// A CVE lead reported for a product on a host, kept once.
@@ -383,6 +469,33 @@ impl ToolmarkDb {
         }
     }
 }
+
+/// A lead a plessor scan answered: where, what it said, by which template or why none,
+/// when, and which scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Answered {
+    pub host: String,
+    pub port: u16,
+    pub product: String,
+    pub cve: String,
+    pub answer: String,
+    pub template: String,
+    pub reason: String,
+    pub at: String,
+    pub scan: String,
+}
+
+type AnsweredRow = (
+    String,
+    i32,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
 
 /// A product the inventory holds at a version, where, and the leads reported for it.
 pub struct Stored {
@@ -612,6 +725,88 @@ mod tests {
             seen[0].as_str() < last_seen && last_seen <= seen[1].as_str(),
             "seen at the second scan: {last_seen}, scans at {seen:?}"
         );
+        scratch.done().await;
+    }
+
+    /// What a plessor scan said of a host's leads is kept with each lead, and a new
+    /// version of the product there clears it; a host toolmark never looked at keeps
+    /// nothing.
+    #[tokio::test]
+    #[ignore = "needs PostgreSQL's programs"]
+    async fn an_answer_is_kept_until_the_version_changes() {
+        use cfx_cve::inventory::{Answer, LeadAnswer};
+        let scratch = cfx_db::testing::Scratch::new(&ENGINE).await;
+        let db = ToolmarkDb::new(scratch.pool.clone());
+        let scan_of = async |version: &str| {
+            let params = serde_json::json!({"target": "https://app.test/"});
+            let scan = db.start("fingerprint", "https://app.test/", &params).await;
+            let cpe = format!("cpe:2.3:a:apache:http_server:{version}:*:*:*:*:*:*:*");
+            db.event(
+                scan.as_ref().map(|s| s.id.as_str()),
+                &found("app.test", "Apache HTTP Server", version, &cpe),
+            )
+            .await;
+            db.finish(scan, Status::Completed).await;
+        };
+        scan_of("2.4.49").await;
+        let answer = |cve: &str, answer: Answer, template: Option<&str>| LeadAnswer {
+            cve: cve.into(),
+            product: "Apache HTTP Server".into(),
+            answer,
+            template: template.map(str::to_string),
+            reason: None,
+        };
+        let kept = db
+            .answer_leads(
+                "app.test",
+                443,
+                "s1",
+                &[
+                    answer("CVE-2021-41773", Answer::Confirmed, Some("CVE-2021-41773")),
+                    answer("CVE-2021-42013", Answer::NotFound, Some("CVE-2021-42013")),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(kept, 2);
+        let said: Vec<(String, String, String, String)> = db
+            .answered()
+            .await
+            .into_iter()
+            .map(|a| (a.cve, a.answer, a.template, a.scan))
+            .collect();
+        assert_eq!(
+            said,
+            [
+                (
+                    "CVE-2021-41773".into(),
+                    "confirmed".into(),
+                    "CVE-2021-41773".into(),
+                    "s1".into()
+                ),
+                (
+                    "CVE-2021-42013".into(),
+                    "checked, not found".into(),
+                    "CVE-2021-42013".into(),
+                    "s1".into()
+                ),
+            ]
+        );
+        assert_eq!(
+            db.answer_leads(
+                "unseen.test",
+                443,
+                "s1",
+                &[answer("CVE-2021-41773", Answer::Confirmed, None)]
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        scan_of("2.4.49").await;
+        assert_eq!(db.answered().await.len(), 2, "the same version keeps them");
+        scan_of("2.4.50").await;
+        assert_eq!(db.answered().await, [], "a new version clears them");
         scratch.done().await;
     }
 

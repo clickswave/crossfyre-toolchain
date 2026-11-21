@@ -114,6 +114,21 @@ impl Answer {
     }
 }
 
+/// What a scan said of one lead: the row its `lead_answers` event carries, and what the
+/// client that gave it the lead writes back to toolmark.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeadAnswer {
+    pub cve: String,
+    pub product: String,
+    pub answer: Answer,
+    /// The template that answered, when one did or was held back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    /// Why no template checked it, when none did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// Said wherever "checked, not found" is shown.
 pub const NOT_PROOF: &str = "Checked, not found is not proof the host is safe: a WAF, \
                              another path, a needed login or another configuration can hide it.";

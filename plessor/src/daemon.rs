@@ -360,11 +360,7 @@ where
             ev = rx.recv() => match ev {
                 Some(mut ev) => {
                     db.event(id.as_deref(), &ev).await;
-                    if ev.get("type").and_then(|t| t.as_str()) == Some("ack")
-                        && let Some(o) = ev.as_object_mut()
-                    {
-                        o.insert("cancellable".into(), Value::Bool(true));
-                    }
+                    acked(&mut ev, id.as_deref());
                     if let Err(e) = write_line(writer, &ev).await {
                         op.abort();
                         db.finish(scan, Status::Stopped).await;
@@ -400,6 +396,19 @@ where
     }
 }
 
+/// An `ack` says the operation can be cancelled, and which scan it is when the scan is
+/// kept, so a client can name it, as one writing lead answers back to toolmark does.
+fn acked(ev: &mut Value, scan: Option<&str>) {
+    if ev.get("type").and_then(|t| t.as_str()) == Some("ack")
+        && let Some(o) = ev.as_object_mut()
+    {
+        o.insert("cancellable".into(), Value::Bool(true));
+        if let Some(scan) = scan {
+            o.insert("scan".into(), Value::String(scan.to_string()));
+        }
+    }
+}
+
 /// An operation that keeps nothing of its own between runs, as [`run_op`] takes one.
 fn plain<P, F, Fut>(run: F) -> impl FnOnce(P, mpsc::UnboundedSender<Value>, Option<String>) -> Fut
 where
@@ -423,6 +432,24 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
+
+    /// An ack names the scan when it is kept, and nothing else is touched.
+    #[test]
+    fn an_ack_names_the_scan_it_is() {
+        let mut ack = serde_json::json!({"type": "ack", "target": "http://app.test"});
+        acked(&mut ack, Some("s1"));
+        assert_eq!(
+            ack,
+            serde_json::json!({"type": "ack", "target": "http://app.test", "cancellable": true,
+                "scan": "s1"})
+        );
+        let mut unkept = serde_json::json!({"type": "ack"});
+        acked(&mut unkept, None);
+        assert!(unkept.get("scan").is_none());
+        let mut finding = serde_json::json!({"type": "finding"});
+        acked(&mut finding, Some("s1"));
+        assert_eq!(finding, serde_json::json!({"type": "finding"}));
+    }
 
     /// A target that answers every request after `delay` and counts them.
     async fn target(delay: Duration) -> (u16, Arc<AtomicUsize>) {

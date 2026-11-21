@@ -66,13 +66,22 @@ CREATE TABLE services (
     UNIQUE (host_id, service)
 );
 
--- A CVE lead reported for a product on a host, so a re-match reports only new ones.
+-- A CVE lead reported for a product on a host, so a re-match reports only new ones, and
+-- what a plessor scan's templates said of it, as the client that gave the scan the lead
+-- wrote back: confirmed, checked, not found, or not checked, with the template that
+-- answered or why none did, when, and which plessor scan. A new version of the product
+-- there clears the answer, as it was about the version before.
 CREATE TABLE leads (
-    id         BIGSERIAL PRIMARY KEY,
-    host_id    BIGINT NOT NULL REFERENCES hosts (id) ON DELETE CASCADE,
-    product    TEXT NOT NULL,
-    cve        TEXT NOT NULL,
-    first_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
+    id              BIGSERIAL PRIMARY KEY,
+    host_id         BIGINT NOT NULL REFERENCES hosts (id) ON DELETE CASCADE,
+    product         TEXT NOT NULL,
+    cve             TEXT NOT NULL,
+    first_seen      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    answer          TEXT CHECK (answer IN ('confirmed', 'checked, not found', 'not checked')),
+    answer_template TEXT NOT NULL DEFAULT '',
+    answer_reason   TEXT NOT NULL DEFAULT '',
+    answered_at     TIMESTAMPTZ,
+    answer_scan     TEXT NOT NULL DEFAULT '',
     UNIQUE (host_id, product, cve)
 );
 
