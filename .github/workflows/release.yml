@@ -7,7 +7,8 @@ name: Release
 # `core/src/egress/private.rs` and `adaptive-private/` are git-ignored and absent
 # from any public checkout, so `build.rs` compiles the `baseline.rs` stubs
 # instead. A release built here therefore has no authorization oracle, no
-# isolated egress and no tuned pacing. The first-party build does, and nobody
+# isolated egress and no tuned pacing. Its engines do present a browser's TLS and
+# HTTP/2 fingerprint: that code is public, and every published build turns it on. The first-party build does, and nobody
 # outside this company can reproduce it.
 #
 # Saying that plainly is the point. A release that quietly shipped a reduced
@@ -114,6 +115,14 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
+      # BoringSSL, which ambulo, voyage, toolmark and plessor build their scan clients
+      # on, needs cmake, and clang for bindgen. The image has neither.
+      - name: Install the BoringSSL build tools
+        run: |
+          set -euo pipefail
+          apt-get update -qq
+          apt-get install -y --no-install-recommends cmake clang libclang-dev
+
       # cfx-script, the .cfx runner, embeds Python and so links libpython; it is the
       # only binary here that does, which is what lets the CLI and node start on any
       # Linux. It is built against the CPython it goes out with, in a python folder
@@ -141,13 +150,33 @@ jobs:
       # bundled-python links cfx-script with DT_RPATH $ORIGIN/python/lib, which the
       # loader searches before LD_LIBRARY_PATH and the system's directories (see
       # cfx-script/build.rs). It changes nothing in the other binaries.
+      #
+      # Each binary is built on its own, as the first-party build builds it: built
+      # together, the crates they share are compiled once with every feature any of
+      # them asks for, and the CLI would get the engines' BoringSSL beside the OpenSSL
+      # it links, which define the same symbols. The four engines are built with
+      # BoringSSL, for a browser's TLS and HTTP/2 fingerprint. scripts/notices.py
+      # names the same binaries and features, and its test checks this step does.
       - name: Build the workspace binaries
         run: |
           set -euo pipefail
           export PYO3_CONFIG_FILE="$PWD/target/linux-python/pyo3.cfg"
-          cargo build --release --locked \
-            -p crossfyre -p plessor -p ambulo -p voyage -p doorward -p toolmark -p node -p oast \
-            -p cfx-script --features cfx-script/bundled-python
+          for p in crossfyre doorward node oast; do
+            cargo build --release --locked -p "$p"
+          done
+          for p in plessor ambulo voyage toolmark; do
+            cargo build --release --locked -p "$p" --features impersonate
+          done
+          cargo build --release --locked -p cfx-script --features bundled-python
+
+      # The licences of everything compiled into these binaries, for this target, with
+      # the C libraries' own files, beside the binaries.
+      - name: Write the third-party notices
+        run: |
+          set -euo pipefail
+          cargo install --locked cargo-about@0.9.2
+          python3 -I scripts/notices.py --target ${{ matrix.target }} \
+            --out target/THIRD-PARTY-NOTICES.txt
 
       # The python folder goes beside cfx-script as the first-party zip lays it out,
       # byte for byte the archive's files, with the licences of everything its
@@ -163,6 +192,7 @@ jobs:
             strip "$out/$b"
           done
           python3 -I scripts/linux_python.py check "$out/cfx-script" --version "$LINUX_PYTHON"
+          cp target/THIRD-PARTY-NOTICES.txt "$out/THIRD-PARTY-NOTICES.txt"
           cp -R target/linux-python/python "$out/python"
           python3 -I scripts/linux_python.py notices --version "$LINUX_PYTHON" \
             --release "$LINUX_PYTHON_RELEASE" --out "$out/THIRD-PARTY-NOTICES-PYTHON.txt"
@@ -255,8 +285,8 @@ jobs:
           rustup target add ${{ matrix.target }}
           rustc --version && cargo --version
 
-      # aws-lc-sys assembles its x86_64 code with NASM on Windows, and the runner
-      # image does not carry it. The version is named so the build does not take
+      # aws-lc-sys and BoringSSL assemble their x86_64 code with NASM on Windows, and
+      # the runner image does not carry it. The version is named so the build does not take
       # whatever was published last; the package checks the installer's hash.
       - name: Install NASM
         if: runner.os == 'Windows'
@@ -265,14 +295,27 @@ jobs:
           choco install nasm --version=3.2.0 -y --no-progress
           echo "C:\\Program Files\\NASM" >> "$GITHUB_PATH"
 
+      # Each binary on its own, for the reason the Linux job gives. The runner images
+      # carry the cmake and clang BoringSSL needs, and Windows the NASM above.
       - name: Build the workspace binaries
         env:
           PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
         run: |
           set -euo pipefail
-          cargo build --release --locked --target ${{ matrix.target }} \
-            -p crossfyre -p plessor -p ambulo -p voyage -p doorward -p toolmark -p node -p oast \
-            -p cfx-script --features cfx-script/abi3
+          for p in crossfyre doorward node oast; do
+            cargo build --release --locked --target ${{ matrix.target }} -p "$p"
+          done
+          for p in plessor ambulo voyage toolmark; do
+            cargo build --release --locked --target ${{ matrix.target }} -p "$p" --features impersonate
+          done
+          cargo build --release --locked --target ${{ matrix.target }} -p cfx-script --features abi3
+
+      - name: Write the third-party notices
+        run: |
+          set -euo pipefail
+          cargo install --locked cargo-about@0.9.2
+          "${{ steps.python.outputs.python-path }}" -I scripts/notices.py \
+            --target ${{ matrix.target }} --out target/THIRD-PARTY-NOTICES.txt
 
       - name: Stage the artifacts
         run: |
@@ -315,6 +358,8 @@ jobs:
             rm python.zip
             test -f "$out/python/python3.dll"
           fi
+          # After the macOS signing above, which strips and signs every file here.
+          cp target/THIRD-PARTY-NOTICES.txt "$out/THIRD-PARTY-NOTICES.txt"
           name="crossfyre-toolchain-${{ matrix.target }}.${{ matrix.archive }}"
           if [ "${{ matrix.archive }}" = "zip" ]; then
             (cd "$out" && 7z a -tzip -bso0 "../../$name" .)
@@ -465,15 +510,13 @@ jobs:
             ## What this is not
 
             This is **not** the binary `get.crossfyre.io` installs. The repo is
-            open-core: three things are absent from any public checkout, and
-            one feature that is in it is not turned on here.
+            open-core: three things are absent from any public checkout.
 
             | not in this build | effect on this build |
             |---|---|
             | `plessor/src/authz/private.rs` | no BOLA/BFLA/BOPLA authorization oracle |
             | `core/src/egress/private.rs` | no per-node egress isolation |
             | `adaptive-private/` | untuned pacing, not the shipped governor |
-            | the `impersonate` feature | the engines use rustls, not a browser's TLS and HTTP/2 fingerprint |
 
             `build.rs` selects the `baseline.rs` stubs instead. The distributed
             binary includes the real implementations and cannot be reproduced
@@ -507,6 +550,11 @@ jobs:
             later from python.org's framework or Homebrew's. On Windows the zip
             carries python.org's embeddable Python in a `python` folder beside it,
             which it loads first.
+
+            Every archive carries `THIRD-PARTY-NOTICES.txt`, the licences of the
+            open source code compiled into its binaries, with those of the C
+            libraries among it: BoringSSL in the four engines, which present a
+            browser's TLS and HTTP/2 fingerprint, and OpenSSL, AWS-LC and Zstandard.
 
             ## Verifying it
 

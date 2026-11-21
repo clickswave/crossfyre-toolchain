@@ -142,11 +142,13 @@ cargo build --release
 
 Or install one engine with `cargo install --git https://github.com/clickswave/crossfyre-toolchain.git ambulo`.
 
+A plain source build gives ambulo, voyage, toolmark and plessor rustls, with a TLS fingerprint a WAF can tell from a browser's. The released binaries are built each on its own, those four with `--features impersonate`, which puts them on BoringSSL and presents a browser's TLS and HTTP/2 fingerprint: `cargo build --release -p plessor --features impersonate`. That needs CMake and Clang (`sudo apt install cmake clang libclang-dev` on Debian, Ubuntu or Kali; `brew install cmake` on macOS; the MSVC toolchain, CMake and NASM on Windows, as MinGW cannot build BoringSSL). Build the four one at a time, and not together with the CLI: BoringSSL and the OpenSSL the CLI links define the same symbols.
+
 A source build sets up no services, and needs none: the first command you give an engine starts its daemon, and the first engine daemon to start makes the local database, so install PostgreSQL's programs before the first scan. [How the engines run](#how-the-engines-run) has the rest.
 
 `cfx-script` embeds Python, so building it needs one. On Linux that is your distribution's Python and its development files. On macOS it has to be Python 3.10 or later, and the `python3` that comes with the Xcode command line tools is 3.9, so name another one: `PYO3_PYTHON=/opt/homebrew/bin/python3 cargo build --release`. Windows needs no Python to build it, and Python 3.10 or later to run scripts.
 
-A source build, like the binaries on the [Releases](../../releases) page, is the open build. The installer ships the first-party build, which adds the authorization checks, per-node egress isolation, tuned pacing and the browser-fingerprint transport.
+A source build, like the binaries on the [Releases](../../releases) page, is the open build. The installer ships the first-party build, which adds the authorization checks, per-node egress isolation and tuned pacing.
 
 <details>
 <summary>Running an engine as a daemon on another address</summary>

@@ -50,7 +50,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tempfile = "3"
 
 [features]
-# First-party builds enable this to swap the scan client to wreq (BoringSSL) for
-# real browser TLS/HTTP2 fingerprints. Off by default so the open build stays on
-# reqwest (rustls, no C toolchain, no emulation policy shipped).
+# The scan client on wreq (BoringSSL), for a real browser's TLS and HTTP/2
+# fingerprint. Every published build turns it on; it needs cmake and clang. Off by
+# default, so a workspace build links no BoringSSL beside the OpenSSL cfx_core uses.
 impersonate = ["transport/impersonate"]

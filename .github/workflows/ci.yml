@@ -250,15 +250,26 @@ jobs:
           PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
         run: cargo clippy --workspace ${{ matrix.skip }} --all-targets --locked --target ${{ matrix.target }} -- -D warnings
 
-      # The impersonate feature compiles BoringSSL, which builds with MSVC on Windows
-      # and not with MinGW, so this is also what shows the MSVC target is the one the
-      # release can ship it on.
+      # The four engines as the release builds them: each on its own, with BoringSSL for
+      # a browser's TLS and HTTP/2 fingerprint. BoringSSL builds with MSVC on Windows and
+      # not with MinGW, so this is also what shows the MSVC target is the one the release
+      # can ship it on.
       - name: clippy (impersonate feature)
         run: |
           cargo clippy --locked --all-targets --target ${{ matrix.target }} \
             -p transport -p ambulo -p voyage -p toolmark -p plessor \
             --features transport/impersonate,ambulo/impersonate,voyage/impersonate,toolmark/impersonate,plessor/impersonate \
             -- -D warnings
+
+      - name: test (impersonate feature, each engine as released)
+        env:
+          CFX_BROWSER_NO_SANDBOX: '1'
+          CFX_BROWSER_LAUNCH_TIMEOUT_SECS: '90'
+        run: |
+          set -eu
+          for p in ambulo voyage toolmark plessor; do
+            cargo test --locked --no-fail-fast --target ${{ matrix.target }} -p "$p" --features impersonate
+          done
 
       # The redirect tests in ambulo and cfx_core listen on 127.0.0.2 as a second
       # host. Linux and Windows answer on all of 127.0.0.0/8, and macOS only on
@@ -433,20 +444,20 @@ jobs:
 
       # The impersonate feature swaps the engines' HTTP client from reqwest to
       # wreq, so `transport::Error` becomes a different type and anything naming
-      # reqwest directly stops compiling. Nothing else here builds that
-      # combination, and the only other thing that does is the release script, so
-      # for three weeks from 2026-09-11 `ambulo` could not be released at all:
-      # `fetch_reason` took a `&reqwest::Error` and the default build resolved it
-      # against ambulo's own direct reqwest dependency. Found by a release failing,
-      # which is the wrong way to find it.
-      #
-      # This builds BoringSSL and is therefore slow. Worth it: the artifacts we
-      # actually ship are built with this feature on.
-      - name: build (impersonate feature, which is what ships)
+      # reqwest directly stops compiling. The workspace build above is without it, as
+      # it has to be: built together with the CLI, BoringSSL and the OpenSSL cfx_core
+      # links for the trace proxy define the same symbols. Every published build turns
+      # it on, building each engine on its own, so these build, lint and test each
+      # engine that way. For three weeks from 2026-09-11 `ambulo` could not be
+      # released at all: `fetch_reason` took a `&reqwest::Error` and the default build
+      # resolved it against ambulo's own direct reqwest dependency. Found by a release
+      # failing, which is the wrong way to find it.
+      - name: build (impersonate feature, each engine as released)
         run: |
-          cargo build --locked \
-            -p ambulo -p voyage -p toolmark -p plessor \
-            --features ambulo/impersonate,voyage/impersonate,toolmark/impersonate,plessor/impersonate
+          set -eu
+          for p in ambulo voyage toolmark plessor; do
+            cargo build --locked -p "$p" --features impersonate
+          done
 
       # Code under the impersonate feature is compiled out of the default build, so
       # the workspace clippy and test runs above never see it: transport's browser
@@ -460,17 +471,35 @@ jobs:
             --features transport/impersonate,ambulo/impersonate,voyage/impersonate,toolmark/impersonate,plessor/impersonate \
             -- -D warnings
 
-      - name: test (impersonate feature)
+      - name: test (impersonate feature, each engine as released)
+        env:
+          CFX_BROWSER_NO_SANDBOX: '1'
+          CFX_BROWSER_LAUNCH_TIMEOUT_SECS: '90'
         run: |
-          cargo test --locked -p transport -p plessor \
-            --features transport/impersonate,plessor/impersonate
+          set -eu
+          cargo test --locked -p transport --features impersonate
+          for p in ambulo voyage toolmark plessor; do
+            cargo test --locked --no-fail-fast -p "$p" --features impersonate
+          done
+
+      # The notices a release archive carries, for this target: a crate under a licence
+      # scripts/notices/about.toml does not accept, or a new crate that compiles C code
+      # of its own, shows here, on the pull request that brings it, and not at a tag.
+      - name: Third-party notices
+        run: |
+          set -eu
+          cargo install --locked cargo-about@0.9.2
+          python3 -I scripts/test_notices.py
+          python3 -I scripts/notices.py --target x86_64-unknown-linux-gnu \
+            --out "$RUNNER_TEMP/THIRD-PARTY-NOTICES.txt"
 
   impersonate-aarch64:
     name: impersonate feature (aarch64)
     runs-on: ubuntu-24.04-arm
-    # The impersonate build, clippy and tests of the clippy job, on arm64. BoringSSL is
-    # compiled for each target, so a break in this feature that only arm64 shows would
-    # otherwise first appear in an arm64 release build.
+    # The impersonate build, clippy and tests of the clippy job, on arm64, each engine as
+    # the release builds it. BoringSSL is compiled for each target, so a break in this
+    # feature that only arm64 shows would otherwise first appear in an arm64 release
+    # build.
     steps:
       - uses: actions/checkout@v4
 
@@ -499,11 +528,12 @@ jobs:
           key: impersonate-arm-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: impersonate-arm-${{ runner.os }}-
 
-      - name: build (impersonate feature, aarch64)
+      - name: build (impersonate feature, aarch64, each engine as released)
         run: |
-          cargo build --locked \
-            -p ambulo -p voyage -p toolmark -p plessor \
-            --features ambulo/impersonate,voyage/impersonate,toolmark/impersonate,plessor/impersonate
+          set -eu
+          for p in ambulo voyage toolmark plessor; do
+            cargo build --locked -p "$p" --features impersonate
+          done
 
       - name: clippy (impersonate feature, aarch64)
         run: |
@@ -512,10 +542,16 @@ jobs:
             --features transport/impersonate,ambulo/impersonate,voyage/impersonate,toolmark/impersonate,plessor/impersonate \
             -- -D warnings
 
-      - name: test (impersonate feature, aarch64)
+      - name: test (impersonate feature, aarch64, each engine as released)
+        env:
+          CFX_BROWSER_NO_SANDBOX: '1'
+          CFX_BROWSER_LAUNCH_TIMEOUT_SECS: '90'
         run: |
-          cargo test --locked -p transport -p plessor \
-            --features transport/impersonate,plessor/impersonate
+          set -eu
+          cargo test --locked -p transport --features impersonate
+          for p in ambulo voyage toolmark plessor; do
+            cargo test --locked --no-fail-fast -p "$p" --features impersonate
+          done
 
   audit:
     name: dependency advisories

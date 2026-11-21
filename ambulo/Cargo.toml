@@ -17,8 +17,9 @@ authors = ["Clickswave <team@clickswave.org>"]
 # name, so an empty declaration here enables our `#[cfg(feature = "tuning")]`
 # blocks while leaving the items they reference compiled out of the dependency.
 tuning = ["cfx_tui/tuning"]
-# First-party builds enable this to swap the scan client to wreq (BoringSSL) for
-# real browser TLS/HTTP2 fingerprints. Off by default (open build stays reqwest).
+# The scan client on wreq (BoringSSL), for a real browser's TLS and HTTP/2
+# fingerprint. Every published build turns it on; it needs cmake and clang. Off by
+# default, so a workspace build links no BoringSSL beside the OpenSSL cfx_core uses.
 impersonate = ["transport/impersonate"]
 
 [dependencies]
