@@ -283,7 +283,7 @@ impl ToolmarkDb {
     /// on its host and port, with its version, by host.
     pub async fn inventory(&self) -> Value {
         let rows: Result<Vec<InventoryRow>, _> = sqlx::query_as(
-            "SELECT host, port, vendor, product, version, cpe, \
+            "SELECT host, port, vendor, product, version, cpe, cpe_names::text, distro, \
                  to_char(last_seen AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \
                  FROM inventory ORDER BY host, port, product",
         )
@@ -294,10 +294,12 @@ impl ToolmarkDb {
                 "status": "completed",
                 "inventory": rows
                     .into_iter()
-                    .map(|(host, port, vendor, product, version, cpe, last_seen)| {
+                    .map(|(host, port, vendor, product, version, cpe, names, distro, last_seen)| {
+                        let names: Value = serde_json::from_str(&names).unwrap_or_default();
                         serde_json::json!({
                             "host": host, "port": port, "vendor": vendor, "product": product,
-                            "version": version, "cpe": cpe, "last_seen": last_seen,
+                            "version": version, "cpe": cpe, "cpe_names": names,
+                            "distro": distro, "last_seen": last_seen,
                         })
                     })
                     .collect::<Vec<_>>(),
@@ -454,7 +456,17 @@ fn gunzipped(body: &[u8]) -> Vec<u8> {
 
 /// One row of the inventory view: host, port, vendor, product, version, CPE and when it
 /// was last seen.
-type InventoryRow = (String, i32, String, String, String, String, String);
+type InventoryRow = (
+    String,
+    i32,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
 
 /// One scan's [`Observer`], which keeps what it saw in toolmark's tables.
 pub struct ScanObserver {
@@ -590,6 +602,10 @@ mod tests {
                 &serde_json::json!("1.25.3")
             ),
             "{inventory}"
+        );
+        assert_eq!(
+            (&row["cpe_names"], &row["distro"]),
+            (&serde_json::json!([]), &serde_json::json!(""))
         );
         let last_seen = row["last_seen"].as_str().expect("last seen");
         assert!(

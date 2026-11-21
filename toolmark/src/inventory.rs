@@ -1,7 +1,49 @@
 //! `toolmark inventory`: what toolmark knows runs where, from its inventory view.
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::io;
+
+/// The inventory `answer` with the CVE leads `cves` gives each product at its version,
+/// and the data they come from.
+pub fn with_leads(mut answer: Value, cves: &crate::cve::Cves) -> Value {
+    let Some(rows) = answer["inventory"].as_array_mut() else {
+        return answer;
+    };
+    for row in rows.iter_mut() {
+        let names: Vec<cfx_cve::Cpe> = row["cpe_names"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|n| cfx_cve::Cpe::parse(n.as_str()?))
+            .collect();
+        let version = row["version"].as_str().unwrap_or_default().to_string();
+        let distro = row["distro"]
+            .as_str()
+            .filter(|d| !d.is_empty())
+            .map(str::to_string);
+        let leads = if names.is_empty() || version.is_empty() {
+            Vec::new()
+        } else {
+            cves.leads(&names, &version, distro.as_deref()).0
+        };
+        row["leads"] = leads
+            .iter()
+            .map(|l| {
+                json!({
+                    "cve": l.cve, "severity": l.known.severity, "cvss": l.known.score,
+                    "kev": l.known.kev, "epss": l.known.epss, "possible": l.possible,
+                    "backport": l.backport,
+                })
+            })
+            .collect();
+    }
+    let from = cves.from();
+    for row in rows.iter_mut() {
+        row["cve_data"] = json!(from);
+    }
+    answer["cve_data"] = json!(from);
+    answer
+}
 
 /// `rows`, the inventory the daemon answered with, as the `inventory` command shows it: in
 /// a table when `tui`, and otherwise written out a JSON object a line.
@@ -26,7 +68,8 @@ fn print(out: &mut impl io::Write, rows: &[Value]) -> io::Result<()> {
 }
 
 /// The inventory as the table shows it: a host and port, the product, its version, its
-/// vendor and when it was last seen, to the minute.
+/// vendor, its CVE leads with how many are known to be exploited, and when it was last
+/// seen, to the minute.
 fn list(rows: &[Value]) -> cfx_tui::table::List<'static> {
     let text = |row: &Value, key: &str| row[key].as_str().unwrap_or_default().to_string();
     let or_dash = |s: String| if s.is_empty() { "-".to_string() } else { s };
@@ -34,11 +77,23 @@ fn list(rows: &[Value]) -> cfx_tui::table::List<'static> {
         .iter()
         .map(|row| {
             let seen = text(row, "last_seen");
+            let leads = row["leads"].as_array().map_or(0, Vec::len);
+            let kev = row["leads"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|l| l["kev"] == true)
+                .count();
             vec![
                 format!("{}:{}", text(row, "host"), row["port"]),
                 text(row, "product"),
                 or_dash(text(row, "version")),
                 or_dash(text(row, "vendor")),
+                match (leads, kev) {
+                    (0, _) => "-".to_string(),
+                    (n, 0) => n.to_string(),
+                    (n, k) => format!("{n} ({k} KEV)"),
+                },
                 seen.get(..16)
                     .map(|m| format!("{} UTC", m.replace('T', " ")))
                     .unwrap_or(seen),
@@ -54,12 +109,23 @@ fn list(rows: &[Value]) -> cfx_tui::table::List<'static> {
         name: "TOOLMARK",
         title: "INVENTORY",
         summary: format!(
-            "{} on {}",
+            "{} on {}{}",
             plural(table.len(), "product", "products"),
-            plural(hosts.len(), "host", "hosts")
+            plural(hosts.len(), "host", "hosts"),
+            rows.first()
+                .and_then(|r| r["cve_data"].as_str())
+                .map(|from| format!(", CVE leads from {from}"))
+                .unwrap_or_default()
         ),
-        header: &["HOST", "PRODUCT", "VERSION", "VENDOR", "LAST SEEN"],
-        widths: &[26, 24, 14, 14],
+        header: &[
+            "HOST",
+            "PRODUCT",
+            "VERSION",
+            "VENDOR",
+            "CVE LEADS",
+            "LAST SEEN",
+        ],
+        widths: &[26, 24, 14, 14, 12],
         rows: table,
     }
 }
@@ -84,9 +150,56 @@ mod tests {
         assert_eq!(list.summary, "3 products on 2 hosts");
         assert_eq!(
             list.rows[1],
-            ["app.test:443", "Laravel", "-", "-", "2026-11-20 03:31 UTC"]
+            [
+                "app.test:443",
+                "Laravel",
+                "-",
+                "-",
+                "-",
+                "2026-11-20 03:31 UTC"
+            ]
         );
         assert_eq!(list.rows[2][..3], ["db.test:8080", "phpMyAdmin", "5.2.1"]);
+    }
+
+    /// Each product held at a version gets the leads the CVE data gives it, counted in
+    /// the table with those known to be exploited, and the answer says which data.
+    #[test]
+    fn each_product_gets_its_cve_leads() {
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(
+            folder.path().join(crate::cve::DATASET_FILE),
+            r#"{"format": 1, "sequence": 6, "made": "2026-11-23T15:00:00Z", "products": [
+              {"part": "a", "vendor": "f5", "product": "nginx", "affected": [
+                {"cve": "CVE-2099-0050", "ranges": [{"lt": "1.25.0"}]},
+                {"cve": "CVE-2099-0051", "ranges": [{"lt": "1.25.0"}]}]}],
+             "cves": {"CVE-2099-0050": {"kev": true, "severity": "high"}, "CVE-2099-0051": {}}}"#,
+        )
+        .unwrap();
+        let nginx = cfx_cve::Cpe::new("a", "f5", "nginx");
+        let cves = crate::cve::Cves::load(
+            Some(folder.path()),
+            &[nginx].into(),
+            crate::cve::DATASET_URL,
+        );
+        let answer = json!({"status": "completed", "inventory": [
+            {"host": "app.test", "port": 443, "product": "Nginx", "version": "1.24.0",
+             "cpe_names": ["a:f5:nginx"], "distro": "Ubuntu", "last_seen": "2026-11-20T03:31:00Z"},
+            {"host": "app.test", "port": 443, "product": "Laravel", "version": "",
+             "cpe_names": [], "distro": "", "last_seen": "2026-11-20T03:31:00Z"},
+        ]});
+        let answer = with_leads(answer, &cves);
+        assert_eq!(answer["cve_data"], "CVE dataset 6 of 2026-11-23");
+        let rows = answer["inventory"].as_array().unwrap();
+        assert_eq!(rows[0]["leads"][0]["cve"], "CVE-2099-0050");
+        assert_eq!(rows[0]["leads"][0]["backport"], true);
+        assert_eq!(rows[1]["leads"], json!([]));
+        assert_eq!(list(rows).rows[0][4], "2 (1 KEV)");
+        assert_eq!(
+            list(rows).summary,
+            "2 products on 1 host, CVE leads from CVE dataset 6 of 2026-11-23"
+        );
+        assert_eq!(list(rows).rows[1][4], "-");
     }
 
     /// Written out for a reader that stops early, as `toolmark inventory | head` has.

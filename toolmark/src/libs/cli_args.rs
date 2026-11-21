@@ -54,8 +54,8 @@ pub enum Commands {
     /// The scans this engine keeps, the latest first. toolmark keeps nothing a stopped
     /// scan could carry on from, so a scan is run again rather than taken up
     Scans,
-    /// What toolmark knows runs where: each host and port it scanned, and the products
-    /// and versions it found there
+    /// What toolmark knows runs where: each host and port it scanned, the products and
+    /// versions it found there, and the CVE leads each has in the CVE data it has now
     Inventory,
     /// Run the signatures toolmark has now over the pages it kept from earlier scans, and
     /// its CVE data over the products it holds, and report only what is new: products,

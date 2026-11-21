@@ -121,7 +121,10 @@ async fn handle_connection(
             // The scans this daemon keeps, the latest first.
             "scans" => write_line(&mut writer, &db.scans().await).await?,
             // What it knows runs where.
-            "inventory" => write_line(&mut writer, &db.inventory().await).await?,
+            "inventory" => {
+                let answer = crate::inventory::with_leads(db.inventory().await, &cves);
+                write_line(&mut writer, &answer).await?
+            }
             // Fetch the CVE dataset now, whatever the age of the copy kept.
             "cve_update" => {
                 let reply = match cves.refresh(true).await {

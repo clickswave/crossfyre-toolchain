@@ -21,8 +21,9 @@ postgresql` on Debian, Ubuntu or Kali), or point it at a database you run with
 `crossfyre db external`. `toolmark rematch` runs the signatures it has now over the
 pages it kept, and its CVE data over the products it holds, and reports only what is
 new there, products, versions and CVE leads, sending nothing to any host.
-`toolmark inventory` shows what it knows runs where: each host and port it scanned, and
-the products and versions it found there. `toolmark scans` lists the scans it keeps, the
+`toolmark inventory` shows what it knows runs where: each host and port it scanned, the
+products and versions it found there, and the CVE leads each has in the CVE data it has
+now. `toolmark scans` lists the scans it keeps, the
 latest first, `toolmark db purge --scan ID` deletes one, and `toolmark db reset`
 everything it keeps. The root [README](../#how-the-engines-run) has the details.
 

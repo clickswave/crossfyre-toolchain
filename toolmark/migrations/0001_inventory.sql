@@ -88,5 +88,6 @@ CREATE TABLE changes (
 
 -- What toolmark knows runs where: the one way other engines read toolmark's data.
 CREATE VIEW inventory AS
-    SELECT h.host, h.port, f.vendor, f.product, f.version, f.cpe, f.last_seen
+    SELECT h.host, h.port, f.vendor, f.product, f.version, f.cpe, f.cpe_names, f.distro,
+        f.last_seen
     FROM fingerprints f JOIN hosts h ON h.id = f.host_id;
