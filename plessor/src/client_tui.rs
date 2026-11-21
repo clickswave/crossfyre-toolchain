@@ -1,9 +1,10 @@
 //! Plessor's dashboard.
 //!
 //! Chrome, keys and logs come from `cfx_tui`. What stays here is the part that
-//! is about vulnerability scanning: tracking template progress and listing
+//! is about vulnerability scanning: tracking template progress, listing
 //! matches worst-first, since a critical three screens down is a critical
-//! nobody saw.
+//! nobody saw, and listing the templates the scan held back, so a shorter run
+//! is not taken for a clean one.
 
 use cfx_tui::{Dashboard, Level, Logs, Stat, View, widgets};
 use ratatui::{
@@ -16,7 +17,11 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 const FINDINGS: char = 'f';
-const VIEWS: &[View] = &[View::new(FINDINGS, "Findings")];
+const HELD_BACK: char = 'h';
+const VIEWS: &[View] = &[
+    View::new(FINDINGS, "Findings"),
+    View::new(HELD_BACK, "Held back"),
+];
 
 struct Finding {
     severity: String,
@@ -24,6 +29,12 @@ struct Finding {
     matched_at: String,
     /// Rank for sorting: lower is worse, so criticals float to the top.
     rank: u8,
+}
+
+/// A template the scan did not run, and why.
+struct HeldBack {
+    template: String,
+    why: String,
 }
 
 struct Plessor {
@@ -35,6 +46,8 @@ struct Plessor {
     high: usize,
     findings: Vec<Finding>,
     table: TableState,
+    held: Vec<HeldBack>,
+    held_table: TableState,
     logs: Logs,
     done: bool,
 }
@@ -50,6 +63,8 @@ impl Plessor {
             high: 0,
             findings: Vec::new(),
             table: TableState::default(),
+            held: Vec::new(),
+            held_table: TableState::default(),
             logs: Logs::new(),
             done: false,
         }
@@ -91,6 +106,26 @@ impl Plessor {
                 let at = self.findings.partition_point(|f| f.rank <= finding.rank);
                 self.findings.insert(at, finding);
             }
+            // What the scan could not test, and why.
+            "log" => {
+                if let Some(m) = event["message"].as_str() {
+                    self.logs.push(Level::Warn, m);
+                }
+            }
+            "templates_held_back" => {
+                let why = event["reason"].as_str().unwrap_or("held back");
+                for id in event["templates"].as_array().into_iter().flatten() {
+                    if let Some(id) = id.as_str() {
+                        self.held.push(HeldBack {
+                            template: id.to_string(),
+                            why: why.to_string(),
+                        });
+                    }
+                }
+                if let Some(m) = event["message"].as_str() {
+                    self.logs.push(Level::Warn, m);
+                }
+            }
             "error" => {
                 self.done = true;
                 self.logs.push(
@@ -130,6 +165,7 @@ impl Plessor {
                 Stat::bad("Critical", self.critical),
                 Stat::new("High", self.high),
                 Stat::new("Total", self.found),
+                Stat::new("Held back", self.held.len()),
             ],
         );
 
@@ -160,6 +196,37 @@ impl Plessor {
                 .row_highlight_style(cfx_tui::theme::selected()),
             rows[2],
             &mut self.table,
+        );
+    }
+
+    fn render_held_back(&mut self, frame: &mut Frame, area: Rect) {
+        let header = Row::new(
+            ["Template", "Why"]
+                .iter()
+                .map(|h| Cell::from(*h).style(cfx_tui::theme::title())),
+        )
+        .height(1);
+        let body: Vec<Row> = self
+            .held
+            .iter()
+            .map(|h| {
+                Row::new(vec![
+                    Cell::from(h.template.clone()),
+                    Cell::from(h.why.clone()).style(cfx_tui::theme::label()),
+                ])
+            })
+            .collect();
+        frame.render_stateful_widget(
+            Table::new(body, widgets::table_constraints(&[40]))
+                .header(header)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Held back: not run, so not tested"),
+                )
+                .row_highlight_style(cfx_tui::theme::selected()),
+            area,
+            &mut self.held_table,
         );
     }
 }
@@ -202,8 +269,10 @@ impl Dashboard for Plessor {
     }
 
     fn render(&mut self, key: char, frame: &mut Frame, area: Rect) {
-        if key == FINDINGS {
-            self.render_findings(frame, area);
+        match key {
+            FINDINGS => self.render_findings(frame, area),
+            HELD_BACK => self.render_held_back(frame, area),
+            _ => {}
         }
     }
 
@@ -226,4 +295,52 @@ pub async fn run(rx: mpsc::UnboundedReceiver<Value>, target: String) -> std::io:
     })
     .await
     .map_err(|e| std::io::Error::other(e.to_string()))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Templates held back, for a product the scan was not told of and for changing the
+    /// target, are listed with why, and what the scan says of them is in the log.
+    #[test]
+    fn held_back_templates_are_listed_with_why() {
+        let mut view = Plessor::new("http://app.test".into());
+        view.apply(json!({"type": "templates_held_back", "count": 1,
+            "templates": ["CVE-2021-41773"], "from": "toolmark's inventory of app.test:80",
+            "reason": "toolmark's inventory of app.test:80 names none of its products",
+            "message": "1 product templates held back"}));
+        view.apply(json!({"type": "templates_held_back", "count": 1,
+            "templates": ["mass-assignment-privilege-escalation"],
+            "reason": "what it sends changes the target",
+            "message": "1 template(s) were NOT run"}));
+        let held: Vec<(&str, &str)> = view
+            .held
+            .iter()
+            .map(|h| (h.template.as_str(), h.why.as_str()))
+            .collect();
+        assert_eq!(
+            held,
+            [
+                (
+                    "CVE-2021-41773",
+                    "toolmark's inventory of app.test:80 names none of its products"
+                ),
+                (
+                    "mass-assignment-privilege-escalation",
+                    "what it sends changes the target"
+                ),
+            ]
+        );
+        assert_eq!(view.logs.len(), 2);
+    }
+
+    /// A log line from the scan, such as out-of-band callbacks being unavailable, is shown.
+    #[test]
+    fn what_the_scan_could_not_test_is_in_the_log() {
+        let mut view = Plessor::new("http://app.test".into());
+        view.apply(json!({"type": "log", "message": "out-of-band callbacks are UNAVAILABLE"}));
+        assert_eq!(view.logs.len(), 1);
+    }
 }

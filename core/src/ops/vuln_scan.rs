@@ -321,12 +321,6 @@ pub async fn handle(env: OpEnv) {
                             total = t;
                         }
                     }
-                    // Coverage notes: what the engine could not test, and why.
-                    "log" => {
-                        if let Some(m) = event["message"].as_str() {
-                            relay.publish_note(m).await;
-                        }
-                    }
                     "done" => break,
                     "error" => {
                         eprintln!(
@@ -335,7 +329,11 @@ pub async fn handle(env: OpEnv) {
                         );
                         break;
                     }
-                    _ => {}
+                    _ => {
+                        if let Some(m) = coverage_note(&event) {
+                            relay.publish_note(m).await;
+                        }
+                    }
                 }
 
                 if last_prog.elapsed() >= std::time::Duration::from_millis(800) {
@@ -381,6 +379,15 @@ const FRESH_INVENTORY_SECS: i64 = 7 * 24 * 3600;
 
 /// What toolmark holds of the hosts it has fingerprinted, or none when it is not running
 /// or does not answer, and the scan then runs every template.
+/// What a plessor event says the scan did not test, and why, as a note for the workflow:
+/// a log line, or the templates it held back, so that none is left out in silence.
+fn coverage_note(event: &serde_json::Value) -> Option<&str> {
+    match event["type"].as_str()? {
+        "log" | "templates_held_back" => event["message"].as_str(),
+        _ => None,
+    }
+}
+
 async fn toolmark_inventory() -> Option<serde_json::Value> {
     let ask = serde_json::json!({"operation": "inventory", "response": "instant"});
     let (mut lines, _writer) = super::open_engine("toolmark", &ask, None).await.ok()?;
@@ -437,6 +444,24 @@ mod tests {
     use super::*;
 
     const NOW: i64 = 1_795_273_200; // 2026-11-21T15:00:00Z
+
+    /// A log line and the templates a scan held back reach the workflow as notes; a
+    /// finding is not one.
+    #[test]
+    fn what_a_scan_did_not_test_becomes_a_note() {
+        let log = serde_json::json!({"type": "log", "message": "no OAST"});
+        assert_eq!(coverage_note(&log), Some("no OAST"));
+        let held = serde_json::json!({
+            "type": "templates_held_back", "count": 1, "templates": ["CVE-2021-41773"],
+            "message": "1 product templates held back: toolmark's inventory of h:80 names none",
+        });
+        assert_eq!(
+            coverage_note(&held),
+            Some("1 product templates held back: toolmark's inventory of h:80 names none")
+        );
+        let finding = serde_json::json!({"type": "finding", "message": "x", "data": {}});
+        assert_eq!(coverage_note(&finding), None);
+    }
 
     fn inventory(rows: serde_json::Value) -> serde_json::Value {
         serde_json::json!({"status": "completed", "inventory": rows})

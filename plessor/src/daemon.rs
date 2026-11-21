@@ -823,6 +823,10 @@ mod tests {
             "the pack's and the folder's alike"
         );
         assert_eq!(said["from"], "toolmark's inventory of the test");
+        assert_eq!(
+            said["reason"],
+            "toolmark's inventory of the test names none of its products"
+        );
 
         let events = run_to_done(
             dport,
@@ -843,6 +847,50 @@ mod tests {
 
     /// A template in the --templates folder with a pack template's id runs in its place,
     /// once: the folder's is the one that finds, and the scan counts one template.
+    /// A template whose method changes the target is not run, and the scan says so in
+    /// the same event as the templates it held back for their products, with why.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_template_that_changes_the_target_is_said_held_back() {
+        let (tport, _) = target(Duration::ZERO).await;
+        let dport = daemon().await;
+        let dir = std::env::temp_dir().join(format!("plessor-writes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("rewrite.yaml"),
+            "id: rewrite-probe\ninfo:\n  name: rewrite probe\n  severity: high\n\
+             http:\n  - method: PATCH\n    path:\n      - \"{{BaseURL}}/account\"\n    \
+             body: \"{}\"\n    matchers:\n      - type: word\n        words:\n          - ok\n",
+        )
+        .unwrap();
+        let op = serde_json::json!({
+            "operation": "scan",
+            "response": "stream",
+            "target": format!("http://127.0.0.1:{tport}"),
+            "templates_dir": dir.to_string_lossy(),
+            "only": ["rewrite-probe"],
+            "evasive": false,
+            "timeout_ms": 5000,
+        });
+        let events = run_to_done(dport, &op).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let said = events
+            .iter()
+            .find(|e| e["type"] == "templates_held_back")
+            .unwrap_or_else(|| panic!("no templates_held_back in {events:?}"));
+        assert_eq!(said["templates"], serde_json::json!(["rewrite-probe"]));
+        assert_eq!(said["count"], 1);
+        assert_eq!(said["reason"], "what it sends changes the target");
+        assert!(
+            said["message"]
+                .as_str()
+                .unwrap()
+                .contains("were NOT run: rewrite-probe"),
+            "{said}"
+        );
+        assert!(!events.iter().any(|e| e["type"] == "finding"), "{events:?}");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_folder_template_with_a_pack_templates_id_replaces_it() {
         let (tport, _) = target(Duration::ZERO).await;

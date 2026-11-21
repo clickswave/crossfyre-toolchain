@@ -518,6 +518,7 @@ pub async fn run<L: crate::ledger::Ledger>(
                 "count": held.len(),
                 "templates": held,
                 "from": from,
+                "reason": format!("{from} names none of its products"),
                 "message": format!(
                     "{} product templates held back: {from} names none of their products. \
                      --all-templates runs them",
@@ -716,14 +717,20 @@ pub async fn run<L: crate::ledger::Ledger>(
         if !write_templates.is_empty() {
             write_templates.sort();
             write_templates.dedup();
-            let _ = tx.send(json!({"type":"log","message": format!(
-                "{} template(s) were NOT run: {}. Each one uses a method that overwrites or \
-                 destroys the resource, so sending it IS the change rather than a test of \
-                 whether it is possible. Whatever they check is untested here, not clean. \
-                 Re-run with writes enabled against a target you are willing to change.",
-                write_templates.len(),
-                write_templates.join(", ")
-            )}));
+            let _ = tx.send(json!({
+                "type": "templates_held_back",
+                "count": write_templates.len(),
+                "reason": "what it sends changes the target",
+                "message": format!(
+                    "{} template(s) were NOT run: {}. Each one uses a method that overwrites or \
+                     destroys the resource, so sending it IS the change rather than a test of \
+                     whether it is possible. Whatever they check is untested here, not clean. \
+                     Re-run with writes enabled against a target you are willing to change.",
+                    write_templates.len(),
+                    write_templates.join(", ")
+                ),
+                "templates": write_templates,
+            }));
         }
 
         // Out-of-band template callbacks, collected once for the whole scan.
