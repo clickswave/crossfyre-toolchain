@@ -2317,6 +2317,18 @@ fn toolchain_health(
     status
 }
 
+/// The heartbeat's `toolchain_status` with what the node last did with the data in
+/// `data`: nothing is said before the first run.
+fn with_data(
+    mut status: serde_json::Value,
+    data: Option<&toolchain::data_update::Status>,
+) -> serde_json::Value {
+    if let Some(data) = data {
+        status["data"] = data.to_json();
+    }
+    status
+}
+
 /// The engines a heartbeat reports, by name, in [`toolchain::ENGINES`] order, each with
 /// whether it is installed on this host: every engine `installed` says the host has,
 /// and any other that the node's own list (`listed`) names.
@@ -2888,8 +2900,32 @@ pub async fn run_daemon(
     // which engines a proxied op can use.
     let mut engine_egress = egress::state::EngineEgress::default();
 
+    // The data the engines read: the crossfyre-templates pack and the CVE dataset, which
+    // this node takes from the bins origin as it starts and once a day after, as
+    // `crossfyre update data` does, and its dashboard update takes too. What it last did is
+    // in each heartbeat, in toolchain_status.data.
+    let data_status: std::sync::Arc<std::sync::Mutex<Option<toolchain::data_update::Status>>> =
+        Default::default();
+    let data_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut data_interval = tokio::time::interval(tokio::time::Duration::from_secs(24 * 3600));
+
     loop {
         tokio::select! {
+            // The data, as the node starts and once a day after. A run still going when
+            // the next is due is left to finish.
+            _ = data_interval.tick() => {
+                if !data_running.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    let (status, running) = (data_status.clone(), data_running.clone());
+                    tokio::spawn(async move {
+                        let (now, lines) = toolchain::data_update::refresh_here().await;
+                        for line in lines {
+                            println!("[data] {line}");
+                        }
+                        *status.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
+                        running.store(false, std::sync::atomic::Ordering::SeqCst);
+                    });
+                }
+            }
             // Credential refresh (every 6 days)
             _ = refresh_interval.tick() => {
                 println!("[refresh] Proactively refreshing NATS credentials...");
@@ -2973,6 +3009,11 @@ pub async fn run_daemon(
                         egress_state.heartbeat(),
                     )
                 };
+
+                let toolchain_status = with_data(
+                    toolchain_status,
+                    data_status.lock().unwrap_or_else(|e| e.into_inner()).as_ref(),
+                );
 
                 let host_status = if first_tick {
                     first_tick = false;
@@ -3389,6 +3430,10 @@ pub async fn run_daemon(
                                 // restarting, so ask each again what it reads.
                                 engine_egress.clear();
 
+                                if let Ok(u) = &updated {
+                                    *data_status.lock().unwrap_or_else(|e| e.into_inner()) =
+                                        Some(u.data.clone());
+                                }
                                 let (success, restarting, managed_by) = match &updated {
                                     Ok(u) => (true, u.restart, u.cli_managed_by),
                                     Err(e) => {
@@ -4189,6 +4234,27 @@ mod heartbeat_tests {
         assert_eq!(status["postgres"]["port"], 4440);
         assert_eq!(status["postgres"]["running"], true);
         assert!(status.get("managed_by").is_none(), "{status}");
+    }
+
+    /// The heartbeat says what the node last did with the data once it has run: the
+    /// sequences in place and what went wrong, which Cloud keeps with the rest.
+    #[test]
+    fn the_heartbeat_carries_the_data_once_the_node_has_taken_it() {
+        let status = || toolchain_health("7.8.9", 4440, true, None, serde_json::json!({}));
+        assert!(with_data(status(), None).get("data").is_none());
+        let data = toolchain::data_update::Status {
+            checked: 1_795_273_200,
+            pack: Some(5),
+            dataset: None,
+            problem: Some("dataset: not there".to_string()),
+        };
+        let with = with_data(status(), Some(&data));
+        assert_eq!(
+            with["data"],
+            serde_json::json!({"checked": 1_795_273_200, "pack": 5, "dataset": null,
+                "problem": "dataset: not there"})
+        );
+        assert_eq!(with["version"], "node 7.8.9");
     }
 
     /// A node set up with an empty engine list, on a host where another node

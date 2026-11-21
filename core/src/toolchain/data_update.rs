@@ -84,7 +84,7 @@ impl Report {
 }
 
 /// Check the manifest's signature, when this build demands one, against the data key.
-pub type Verify<'a> = &'a dyn Fn(&[u8], &str) -> Result<(), String>;
+pub type Verify<'a> = &'a (dyn Fn(&[u8], &str) -> Result<(), String> + Sync);
 
 /// Fetch the data manifest from `base` and the data it names into the toolchain directory
 /// `dir`, `now` being the time in seconds since 1970. `signed` says the manifest must carry

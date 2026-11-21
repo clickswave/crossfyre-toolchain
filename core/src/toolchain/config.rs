@@ -160,6 +160,13 @@ impl TestToolchainDir {
 }
 
 #[cfg(test)]
+impl TestToolchainDir {
+    pub(crate) fn path(&self) -> &std::path::Path {
+        self._dir.path()
+    }
+}
+
+#[cfg(test)]
 impl Drop for TestToolchainDir {
     fn drop(&mut self) {
         TEST_TOOLCHAIN_DIR.with(|d| *d.borrow_mut() = None);
@@ -562,5 +569,30 @@ mod tests {
             load_or_create_config_at(&path).unwrap().postgres.password,
             Some(pw)
         );
+    }
+}
+
+#[cfg(test)]
+mod test_guard_tests {
+    use super::*;
+
+    /// A test build refuses the real toolchain directory, and with it the engines' ports
+    /// as this host's config gives them, until the test gives itself a directory; then
+    /// both are its own, and an engine's port is far from the real ones.
+    #[test]
+    fn a_test_build_refuses_the_real_toolchain_directory_and_ports() {
+        assert!(std::panic::catch_unwind(get_toolchain_dir).is_err());
+        assert!(std::panic::catch_unwind(|| engine_port("toolmark")).is_err());
+        let dir = TestToolchainDir::new();
+        assert_eq!(get_toolchain_dir(), dir.path());
+        assert_eq!(engine_port("toolmark"), 24444);
+        drop(dir);
+        assert!(std::panic::catch_unwind(get_toolchain_dir).is_err());
+    }
+
+    /// A test build refuses the bins origin: a test serves its own.
+    #[test]
+    fn a_test_build_refuses_the_bins_origin() {
+        assert!(std::panic::catch_unwind(super::super::install::bins_origin).is_err());
     }
 }

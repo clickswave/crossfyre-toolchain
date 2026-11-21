@@ -2109,18 +2109,21 @@ fn sibling_of_this_binary(name: &str) -> Option<PathBuf> {
 }
 
 /// What the dashboard's update did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DashboardUpdate {
     /// The CLI was replaced, and the node should restart to run it.
     pub restart: bool,
     /// The package manager the CLI belongs to, when one does. The update left the CLI
     /// alone, and the dashboard can say which manager updates it.
     pub cli_managed_by: Option<Manager>,
+    /// What the update did with the data the engines read.
+    pub data: super::data_update::Status,
 }
 
 /// The update the dashboard asks a node for: the crossfyre CLI and the cfx-script helper,
-/// from the release manifest. A component a package manager installed is left to it. A
-/// new helper needs no restart, since every job starts it afresh.
+/// from the release manifest, and then the data the engines read. A component a package
+/// manager installed is left to it. A new helper needs no restart, since every job starts
+/// it afresh.
 pub async fn update_for_dashboard() -> Result<DashboardUpdate, Box<dyn std::error::Error>> {
     let manifest = fetch_manifest().await?;
     // The dashboard has no --allow-downgrade: an older release is taken by hand.
@@ -2139,21 +2142,29 @@ pub async fn update_for_dashboard() -> Result<DashboardUpdate, Box<dyn std::erro
         Some(why) => println!("[update] {why}"),
         None => report_cfx_script(install_cfx_script(&manifest, false).await),
     }
-    if let Some(m) = packaging::owner("crossfyre") {
-        println!("[update] crossfyre is {}", update_note(m));
-        return Ok(DashboardUpdate {
-            restart: false,
-            cli_managed_by: Some(m),
-        });
+    let managed = packaging::owner("crossfyre");
+    let restart = match managed {
+        Some(m) => {
+            println!("[update] crossfyre is {}", update_note(m));
+            false
+        }
+        None => {
+            let have = installed_cli_version();
+            if let Some(why) = older("crossfyre", Some(&have)) {
+                return Err(why.into());
+            }
+            self_update(&manifest, &have, false, false).await?
+        }
+    };
+    // Then the data, as `crossfyre update` takes it after the components.
+    let (data, lines) = super::data_update::refresh_here().await;
+    for line in lines {
+        println!("[update] data: {line}");
     }
-    let have = installed_cli_version();
-    if let Some(why) = older("crossfyre", Some(&have)) {
-        return Err(why.into());
-    }
-    let restart = self_update(&manifest, &have, false, false).await?;
     Ok(DashboardUpdate {
         restart,
-        cli_managed_by: None,
+        cli_managed_by: managed,
+        data,
     })
 }
 
