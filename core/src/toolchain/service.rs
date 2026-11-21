@@ -1391,6 +1391,7 @@ mod imp {
 
         #[test]
         fn a_unit_another_release_wrote_is_written_again_and_one_this_build_wrote_is_not() {
+            let _dir = super::super::super::config::TestToolchainDir::new();
             let t = tempfile::tempdir().expect("tempdir");
             let path = t.path().join(dguard::unit_name("voyage"));
             let body = unit_body("voyage");
@@ -1429,7 +1430,9 @@ mod imp {
 
         #[test]
         fn an_engine_s_unit_runs_it_as_its_daemon_on_its_port() {
+            let _dir = super::super::super::config::TestToolchainDir::new();
             let port = super::super::super::config::engine_port("voyage");
+            assert_eq!(port, 24442, "the test's own config gives it");
             let exec = format!(
                 "ExecStart={} {}",
                 ext_bin_path("voyage").display(),

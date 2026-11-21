@@ -107,10 +107,63 @@ pub fn set_toolchain_dir(dir: PathBuf) {
 }
 
 pub fn get_toolchain_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(dir) = TEST_TOOLCHAIN_DIR.with(|d| d.borrow().clone()) {
+        return dir;
+    }
     if let Some(dir) = TOOLCHAIN_DIR_OVERRIDE.get() {
         return dir.clone();
     }
+    // A test build refuses the real one: what a test writes or reads there is the
+    // operator's.
+    #[cfg(test)]
+    panic!(
+        "a test asked for the real toolchain directory: a test gives it one of its own \
+         (TestToolchainDir)"
+    );
+    #[cfg(not(test))]
     default_toolchain_dir().expect("Could not find the toolchain directory")
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_TOOLCHAIN_DIR: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A toolchain directory of a test's own, for the thread it runs on until it is dropped:
+/// a config.toml in it gives each engine a port far from the real ones.
+#[cfg(test)]
+pub(crate) struct TestToolchainDir {
+    _dir: tempfile::TempDir,
+}
+
+#[cfg(test)]
+impl TestToolchainDir {
+    pub(crate) fn new() -> Self {
+        let dir = tempfile::tempdir().expect("a toolchain directory for the test");
+        let ports: String = super::ENGINES
+            .iter()
+            .map(|e| format!("{} = {}\n", e.name, 20_000 + e.port))
+            .collect();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            format!(
+                "[postgres]\nbackend = \"local\"\nport = 24440\nuser = \"postgres\"\n\
+                 db_name = \"crossfyre\"\n\n[extensions]\n{ports}"
+            ),
+        )
+        .expect("its config.toml");
+        TEST_TOOLCHAIN_DIR.with(|d| *d.borrow_mut() = Some(dir.path().to_path_buf()));
+        Self { _dir: dir }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestToolchainDir {
+    fn drop(&mut self) {
+        TEST_TOOLCHAIN_DIR.with(|d| *d.borrow_mut() = None);
+    }
 }
 
 /// The toolchain directory, the same root that holds `nodes.d/`, when `--data-dir`
@@ -231,11 +284,19 @@ pub fn engine_port(ext: &str) -> u16 {
         .ok()
         .map(|c| c.extensions.get(ext))
         .unwrap_or(0);
-    if configured != 0 {
-        return configured;
+    let port = if configured != 0 {
+        configured
+    } else {
+        // Unknown to the config (old file, or a brand-new engine): protocol default.
+        super::engine(ext).map(|e| e.port).unwrap_or(0)
+    };
+    // A test build refuses the engines' real ports: an engine of the operator's may be
+    // listening on one.
+    #[cfg(test)]
+    if (4440..=4445).contains(&port) {
+        panic!("a test asked for {ext}'s port {port}: a test reaches no engine of the host's");
     }
-    // Unknown to the config (old file, or a brand-new engine): protocol default.
-    super::engine(ext).map(|e| e.port).unwrap_or(0)
+    port
 }
 
 /// `127.0.0.1:<port>` for an extension daemon, ready to hand to `TcpStream::connect`.

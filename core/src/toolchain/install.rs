@@ -35,6 +35,18 @@ pub const BASE_URL: &str = match option_env!("CROSSFYRE_BINS_ORIGIN") {
     None => "https://bins.crossfyre.io",
 };
 
+/// The bins origin a request goes to: this build's. A test build refuses it, so a test
+/// can reach only an origin it serves itself, never the published releases.
+pub(crate) fn bins_origin() -> &'static str {
+    #[cfg(test)]
+    panic!(
+        "a test asked for the bins origin {BASE_URL}: a test reaches only an origin it \
+         serves itself"
+    );
+    #[cfg(not(test))]
+    BASE_URL
+}
+
 // Terminal styling now lives in the shared `super::ui` module so every command
 // renders with the same look; `update` uses `use super::ui::*` below.
 
@@ -264,7 +276,7 @@ pub fn platform_key() -> String {
 }
 
 pub async fn fetch_manifest() -> Result<Manifest, Box<dyn std::error::Error>> {
-    fetch_manifest_from(BASE_URL).await
+    fetch_manifest_from(bins_origin()).await
 }
 
 /// `fetch_manifest` against `base`, which a test points at a loopback origin.
@@ -351,7 +363,7 @@ async fn download_verified(
     dest: &Path,
     purpose: Purpose,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let url = format!("{}/{}", BASE_URL, artifact.file);
+    let url = format!("{}/{}", bins_origin(), artifact.file);
     let resp = http_client(purpose)?
         .get(&url)
         .send()
@@ -1204,6 +1216,7 @@ pub async fn update(
     let rules = Rules {
         force,
         allow_downgrade,
+        with_data: true,
     };
     update_with(&manifest, target, current_version, rules, handed_over).await
 }
@@ -1215,11 +1228,14 @@ pub const ALLOW_DOWNGRADE_ENV: &str = "CROSSFYRE_ALLOW_DOWNGRADE";
 const ALLOW_DOWNGRADE_FLAG: &str = "--allow-downgrade";
 
 /// What `update` may do: reinstall what is current (`--force`), and take a release
-/// older than what is installed (`--allow-downgrade`).
+/// older than what is installed (`--allow-downgrade`); and whether it takes the data
+/// too, from the bins origin into the toolchain directory, as only `update` itself asks:
+/// a test of the rest must reach neither.
 #[derive(Debug, Clone, Copy, Default)]
 struct Rules {
     force: bool,
     allow_downgrade: bool,
+    with_data: bool,
 }
 
 /// What `update` does with a component installed at `have` (none when it is not
@@ -1296,7 +1312,7 @@ async fn update_data(out: &mut Updated) {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
     let fetched = super::data_update::fetch(
-        BASE_URL,
+        bins_origin(),
         &dir,
         super::release_sig::data_required(),
         &super::release_sig::verify_data,
@@ -1826,7 +1842,7 @@ async fn update_with(
     service::set_quiet(false);
 
     // ── Data: the pack and the CVE dataset, with everything else ──────
-    if !hold && matches!(target, Some("all") | None) {
+    if rules.with_data && !hold && matches!(target, Some("all") | None) {
         update_data(&mut out).await;
     }
 
@@ -2758,6 +2774,7 @@ exit 127"#;
         let rules = |force, allow_downgrade| Rules {
             force,
             allow_downgrade,
+            with_data: false,
         };
         for (have, want, force, allow, verdict) in [
             (Some("0.1.44"), "0.1.44", false, false, Current),

@@ -195,7 +195,7 @@ pub async fn run(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
     // -- Connectivity ---------------------------------------------------------
     section("Connectivity");
-    let cdn = super::install::BASE_URL;
+    let cdn = super::install::bins_origin();
     let cdn_ok = match super::release_http::http_client(super::release_http::Purpose::Check) {
         Ok(c) => c
             .get(format!("{cdn}/manifest.json"))

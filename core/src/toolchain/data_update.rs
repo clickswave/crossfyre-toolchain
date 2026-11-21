@@ -299,6 +299,112 @@ pub async fn reload_engines(
     said
 }
 
+/// What a node last did with the data, for its log and its status to Cloud: when it
+/// looked, the sequence of the pack and of the dataset in place, and what went wrong, if
+/// anything did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Status {
+    /// When it looked, in seconds since 1970.
+    pub checked: i64,
+    pub pack: Option<u64>,
+    pub dataset: Option<u64>,
+    pub problem: Option<String>,
+}
+
+impl Status {
+    /// The status as the node's heartbeat carries it, in `toolchain_status.data`.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "checked": self.checked,
+            "pack": self.pack,
+            "dataset": self.dataset,
+            "problem": self.problem,
+        })
+    }
+}
+
+/// Take the data as `crossfyre update data` does and say what is in place, with a line
+/// for the log for each thing that happened, and what it did: the node's daily run and
+/// its dashboard update, which [`refresh_here`] makes. What is refused or fails leaves the
+/// data in place, and is said. The engines are told by `refresh_here`, never here, so a
+/// test of this reaches no engine on the host.
+pub async fn refresh(
+    base: &str,
+    dir: &Path,
+    signed: bool,
+    verify: Verify<'_>,
+    now: i64,
+) -> (Status, Vec<String>, Option<Report>) {
+    let mut lines = Vec::new();
+    let mut problems = Vec::new();
+    let mut done = None;
+    match fetch(base, dir, signed, verify, now).await {
+        Err(why) => problems.push(why),
+        Ok(report) if !report.published => lines.push("no data is published yet".to_string()),
+        Ok(report) => {
+            for (name, outcome) in [("templates", &report.pack), ("dataset", &report.dataset)] {
+                match outcome {
+                    None => {}
+                    Some(Outcome::Updated {
+                        from: Some(from),
+                        to,
+                    }) => lines.push(format!("{name} {from} -> {to}")),
+                    Some(Outcome::Updated { from: None, to }) => lines.push(format!("{name} {to}")),
+                    Some(Outcome::Current(at)) => lines.push(format!("{name} {at} is up to date")),
+                    Some(Outcome::Refused { offered, accepted }) => problems.push(format!(
+                        "{name} {offered} is published, older than the {accepted} accepted \
+                         here, so it is not used"
+                    )),
+                    Some(Outcome::Failed(why)) => problems.push(format!("{name}: {why}")),
+                }
+            }
+            if let Some(days) = report.stale_days {
+                problems.push(format!(
+                    "the published data was made {days} days ago, and nothing newer is published"
+                ));
+            }
+            done = Some(report);
+        }
+    }
+    lines.extend(problems.iter().cloned());
+    let accepted = read_record(dir);
+    let status = Status {
+        checked: now,
+        pack: accepted.packs.get(cfx_pack::NAME).copied(),
+        dataset: accepted.dataset,
+        problem: (!problems.is_empty()).then(|| problems.join("; ")),
+    };
+    (status, lines, done)
+}
+
+/// [`refresh`] from this build's bins origin into the toolchain directory, checked
+/// against this build's data key, now, and then the engines that read what changed told
+/// to read it again. Only the node calls this: no test does, as it reaches the bins
+/// origin, the toolchain directory and the engines on this host.
+pub async fn refresh_here() -> (Status, Vec<String>) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let (status, mut lines, report) = refresh(
+        super::install::bins_origin(),
+        &super::config::get_toolchain_dir(),
+        super::release_sig::data_required(),
+        &super::release_sig::verify_data,
+        now,
+    )
+    .await;
+    if let Some(report) = report {
+        for (engine, said) in reload_engines(&report).await {
+            lines.push(match said {
+                Some(Ok(_)) => format!("{engine} read it again"),
+                Some(Err(why)) => format!("{engine} did not read it again: {why}"),
+                None => format!("{engine} is not running, and reads it when it starts"),
+            });
+        }
+    }
+    (status, lines)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,6 +671,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(report.pack, Some(Outcome::Updated { from: None, to: 5 }));
+    }
+
+    /// The node's run says in its status what is in place and, after a refusal, why the
+    /// data in place was kept; its log has a line for each thing.
+    #[tokio::test]
+    async fn the_nodes_run_says_what_is_in_place_and_what_went_wrong() {
+        let dir = tempfile::tempdir().unwrap();
+        let (later, _) = origin(published(5, &pack(5, cfx_pack::NAME), 42, DATASET, MADE)).await;
+        let (status, lines, _) = refresh(&later, dir.path(), false, &unsigned, NOW).await;
+        assert_eq!(
+            status,
+            Status {
+                checked: NOW,
+                pack: Some(5),
+                dataset: Some(42),
+                problem: None
+            }
+        );
+        assert_eq!(lines, ["templates 5", "dataset 42"]);
+        let (earlier, _) = origin(published(4, &pack(4, cfx_pack::NAME), 42, DATASET, MADE)).await;
+        let (status, lines, _) = refresh(&earlier, dir.path(), false, &unsigned, NOW).await;
+        assert_eq!((status.pack, status.dataset), (Some(5), Some(42)));
+        let problem = status.problem.expect("the refusal is said");
+        assert!(
+            problem.starts_with("templates 4 is published, older than the 5"),
+            "{problem}"
+        );
+        assert!(
+            lines.contains(&"dataset 42 is up to date".to_string()),
+            "{lines:?}"
+        );
+        assert_eq!(
+            status_json(&Status {
+                checked: 1,
+                pack: Some(5),
+                dataset: None,
+                problem: None
+            }),
+            serde_json::json!({"checked": 1, "pack": 5, "dataset": null, "problem": null})
+        );
+        let (gone, _) = origin(BTreeMap::new()).await;
+        let (status, lines, _) = refresh(&gone, dir.path(), false, &unsigned, NOW).await;
+        assert_eq!((status.pack, status.problem), (Some(5), None));
+        assert_eq!(lines, ["no data is published yet"]);
+    }
+
+    fn status_json(status: &Status) -> serde_json::Value {
+        status.to_json()
     }
 
     /// With nothing published, nothing is done; published data more than two weeks old is
