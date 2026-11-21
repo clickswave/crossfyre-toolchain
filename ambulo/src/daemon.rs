@@ -134,6 +134,17 @@ struct ScanParams {
     /// taken up. Not one of the scan's settings.
     #[serde(default, skip_serializing)]
     resume: Option<String>,
+    /// Names pinned to addresses, `[["app.example.com", "203.0.113.7:443"], ...]`, which
+    /// every request of the scan dials. A caller that has already decided which addresses
+    /// of a name may be dialled sends them, so the name is not looked up again here and
+    /// answered with somewhere else.
+    #[serde(default)]
+    resolve: Vec<(String, std::net::SocketAddr)>,
+    /// Refuse to dial a private, loopback, link-local or reserved address that a name
+    /// resolves to, or that a redirect names. A pinned address, and an address written
+    /// as the target, are the caller's to have checked.
+    #[serde(default)]
+    block_internal: bool,
     /// Set by the daemon from the egress wrapper. See `DaemonRequest::egress`.
     #[serde(skip)]
     egress: transport::Egress,
@@ -390,6 +401,7 @@ async fn handle_connection(
                 &mut writer,
                 &serde_json::json!({
                     "type": "capabilities",
+                    "scan": ["resolve", "block_internal", "follow_redirects"],
                     // The version of the egress wrapper this daemon reads.
                     "egress": transport::WIRE_VERSION,
                     // Which process answers, for the client that started it.
@@ -1120,6 +1132,8 @@ fn build_args(params: &ScanParams, endpoint: String, http_method: HttpMethod) ->
         evasive: params.evasive,
         identify: params.identify.clone(),
         egress: params.egress.clone(),
+        resolve: params.resolve.clone(),
+        block_internal: params.block_internal,
     }
 }
 
@@ -1685,6 +1699,63 @@ mod egress_tests {
         assert_eq!(events[0]["type"], "capabilities", "{events:?}");
         assert_eq!(events[0]["egress"], 1, "{events:?}");
         assert_eq!(events[0]["pid"], std::process::id(), "{events:?}");
+        assert_eq!(
+            events[0]["scan"],
+            serde_json::json!(["resolve", "block_internal", "follow_redirects"]),
+            "{events:?}"
+        );
+    }
+
+    /// A scan's prober dials a name pinned to an address there, and with block_internal
+    /// it dials no internal address a name resolves to. `pinned.invalid` never resolves,
+    /// so a request that arrives for it came through the pin; `localhost` resolves to
+    /// loopback.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn content_discovery_dials_the_pins_and_no_internal_address_on_request() {
+        let fx = Fixture::http("text/html", PAGE.into()).await;
+        let prober = |host: &str, extra: Value| {
+            let mut asked = serde_json::json!({
+                "endpoint": format!("http://{host}:{}/::FUZZ::", fx.port),
+                "wordlist": "/dev/null",
+                "evasive": false,
+            });
+            for (k, v) in extra.as_object().unwrap() {
+                asked[k] = v.clone();
+            }
+            let params: ScanParams = serde_json::from_value(asked).unwrap();
+            build_args(&params, params.endpoint.clone(), HttpMethod::Get)
+        };
+        let work = |host: &str| crate::store::Work {
+            url: format!("http://{host}:{}/admin", fx.port),
+            entry_id: 1,
+            method: "get".into(),
+        };
+        let pin =
+            serde_json::json!({"resolve": [["pinned.invalid", format!("127.0.0.1:{}", fx.port)]]});
+        let pinned = crate::prober::Prober::new(&prober("pinned.invalid", pin))
+            .await
+            .unwrap();
+        assert!(
+            pinned
+                .probe_url(&work("pinned.invalid"), false)
+                .await
+                .is_ok()
+        );
+        assert_eq!(fx.requests().len(), 1);
+
+        let fenced = crate::prober::Prober::new(&prober(
+            "localhost",
+            serde_json::json!({"block_internal": true}),
+        ))
+        .await
+        .unwrap();
+        assert!(fenced.probe_url(&work("localhost"), false).await.is_err());
+        assert_eq!(fx.requests().len(), 1, "an internal address was dialled");
+        let open = crate::prober::Prober::new(&prober("localhost", serde_json::json!({})))
+            .await
+            .unwrap();
+        assert!(open.probe_url(&work("localhost"), false).await.is_ok());
+        assert_eq!(fx.requests().len(), 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

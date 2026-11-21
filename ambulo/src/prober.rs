@@ -149,11 +149,11 @@ impl Prober {
                 browser_headers: transport::HeaderMap::new(),
                 extra_headers: headers_map,
                 emulate: config.evasive,
-                resolve: Vec::new(),
+                resolve: config.resolve.clone(),
+                block_internal: config.block_internal,
                 // A redirect off the target's origin is reported as the 3xx it is,
                 // not followed to a host the run was not pointed at.
                 same_origin_redirects: true,
-                ..Default::default()
             },
             &config.egress,
         )

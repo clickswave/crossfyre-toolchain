@@ -264,6 +264,16 @@ pub struct ScanArgs {
     /// inherits, and the daemon sets it from the egress wrapper a node sends.
     #[arg(skip)]
     pub egress: transport::Egress,
+
+    /// Names pinned to addresses, which every request of the scan dials. Not a flag: a
+    /// caller that checked the addresses itself sends them to the daemon.
+    #[arg(skip)]
+    pub resolve: Vec<(String, std::net::SocketAddr)>,
+
+    /// Refuse to dial private, loopback, link-local and reserved addresses. Not a flag,
+    /// for the same caller.
+    #[arg(skip)]
+    pub block_internal: bool,
 }
 
 // Re-export FuzzArgs as Args so the rest of the codebase is unchanged.
