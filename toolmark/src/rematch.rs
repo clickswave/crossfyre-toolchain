@@ -1,15 +1,24 @@
 //! The `rematch` operation: the signatures toolmark has now, run over the pages it kept
-//! from earlier scans, reporting only what is new. It sends nothing to any host.
+//! from earlier scans, and the CVE data it has now, run over the products it holds,
+//! reporting only what is new. It sends nothing to any host.
 
 use crate::libs::toolmark_db::{KeptHost, ToolmarkDb};
 use crate::observe::Asked;
 use crate::signatures::{Answered, Detection, Host, RENDERED, Signatures};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use tokio::sync::mpsc;
 
 /// Run `signatures` over every host's kept pages and send, as a fingerprint would, a
-/// finding for each product that is new there, or whose version is new.
-pub async fn run(db: &ToolmarkDb, signatures: &Signatures, tx: mpsc::UnboundedSender<Value>) {
+/// finding for each product that is new there, or whose version is new. Then send each
+/// CVE lead `cves` gives a product toolmark holds, or has just found, that was not reported
+/// for it before.
+pub async fn run(
+    db: &ToolmarkDb,
+    signatures: &Signatures,
+    tx: mpsc::UnboundedSender<Value>,
+    cves: &crate::cve::Cves,
+) {
     let _ = tx.send(json!({"type": "ack", "target": "the pages toolmark kept"}));
     let hosts = match db.kept().await {
         Ok(hosts) => hosts,
@@ -19,6 +28,40 @@ pub async fn run(db: &ToolmarkDb, signatures: &Signatures, tx: mpsc::UnboundedSe
             return;
         }
     };
+    let stored = match db.stored().await {
+        Ok(stored) => stored,
+        Err(e) => {
+            let _ = tx.send(json!({"type": "error",
+                "message": format!("could not read the products toolmark holds: {e}")}));
+            return;
+        }
+    };
+    // Each product held at a version, by host, port and name: what the inventory has, with
+    // what this re-match finds in its place.
+    let mut held: BTreeMap<(String, u16, String), Held> = stored
+        .into_iter()
+        .filter_map(|s| {
+            let url = match s.scheme.as_str() {
+                "http" | "https" => format!("{}://{}:{}/", s.scheme, s.host, s.port),
+                _ => format!("{}:{}", s.host, s.port),
+            };
+            let key = (s.host.clone(), s.port, s.product.clone());
+            Some((
+                key,
+                Held {
+                    cpe: s.cpe?,
+                    url,
+                    host: s.host,
+                    port: s.port,
+                    scheme: s.scheme,
+                    product: s.product,
+                    version: s.version,
+                    distro: s.distro,
+                    reported: s.reported,
+                },
+            ))
+        })
+        .collect();
     for kept in &hosts {
         for (url, d) in new_on(kept, signatures) {
             let _ = tx.send(crate::fingerprint::technology(
@@ -28,9 +71,58 @@ pub async fn run(db: &ToolmarkDb, signatures: &Signatures, tx: mpsc::UnboundedSe
                 kept.port,
                 &kept.scheme,
             ));
+            let (Some(version), Some(cpe)) = (d.version.clone(), d.cpe_name.clone()) else {
+                continue;
+            };
+            let key = (kept.host.clone(), kept.port, d.name.clone());
+            let reported = held.remove(&key).map(|h| h.reported).unwrap_or_default();
+            held.insert(
+                key,
+                Held {
+                    cpe,
+                    url,
+                    host: kept.host.clone(),
+                    port: kept.port,
+                    scheme: kept.scheme.clone(),
+                    product: d.name.clone(),
+                    version,
+                    distro: d.distro.clone(),
+                    reported,
+                },
+            );
+        }
+    }
+    for h in held.values() {
+        let subject = crate::fingerprint::Subject {
+            product: &h.product,
+            version: &h.version,
+            cpe: &h.cpe,
+            distro: h.distro.as_deref(),
+            url: &h.url,
+            host: &h.host,
+            port: h.port,
+            scheme: &h.scheme,
+        };
+        for (cve, lead) in crate::fingerprint::leads_for(cves, &subject) {
+            if !h.reported.contains(&cve) {
+                let _ = tx.send(lead);
+            }
         }
     }
     let _ = tx.send(json!({"type": "done"}));
+}
+
+/// A product toolmark holds at a version, where, and the CVE leads reported for it.
+struct Held {
+    cpe: cfx_cve::Cpe,
+    url: String,
+    host: String,
+    port: u16,
+    scheme: String,
+    product: String,
+    version: String,
+    distro: Option<String>,
+    reported: std::collections::HashSet<String>,
 }
 
 /// What `signatures` find on `kept`'s pages that toolmark had not found there: a product
@@ -140,7 +232,13 @@ mod tests {
         let params = json!({});
         let scan = db.start("rematch", "kept", &params).await;
         let (tx, mut rx) = mpsc::unbounded_channel();
-        run(db, Signatures::shipped(), tx).await;
+        run(
+            db,
+            Signatures::shipped(),
+            tx,
+            &crate::cve::snapshot_for_tests(),
+        )
+        .await;
         let mut found = Vec::new();
         while let Ok(event) = rx.try_recv() {
             db.event(scan.as_ref().map(|s| s.id.as_str()), &event).await;
@@ -153,6 +251,98 @@ mod tests {
         }
         db.finish(scan, Status::Completed).await;
         found
+    }
+
+    /// The leads a re-match with `cves` sends, kept as the daemon keeps them.
+    async fn rematch_leads(db: &ToolmarkDb, cves: &crate::cve::Cves) -> Vec<Value> {
+        let scan = db.start("rematch", "kept", &json!({})).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        run(db, Signatures::shipped(), tx, cves).await;
+        let mut leads = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            db.event(scan.as_ref().map(|s| s.id.as_str()), &event).await;
+            if event.pointer("/data/type") == Some(&json!("vulnerability")) {
+                leads.push(event["data"].clone());
+            }
+        }
+        db.finish(scan, Status::Completed).await;
+        leads
+    }
+
+    /// A dataset numbered `sequence` in `folder`, with `cves` on Apache 2.4.49.
+    fn apache_dataset(folder: &std::path::Path, sequence: u64, cves: &[&str]) {
+        let affected: Vec<Value> = cves
+            .iter()
+            .map(|c| json!({"cve": c, "ranges": [{"eq": "2.4.49"}]}))
+            .collect();
+        let known: serde_json::Map<String, Value> = cves
+            .iter()
+            .map(|c| (c.to_string(), json!({"severity": "high", "score": 7.5})))
+            .collect();
+        let dataset = json!({
+            "format": 1, "sequence": sequence, "made": "2026-11-22T15:00:00Z",
+            "products": [{"part": "a", "vendor": "apache", "product": "http_server",
+                          "affected": affected}],
+            "cves": known,
+        });
+        std::fs::write(folder.join(crate::cve::DATASET_FILE), dataset.to_string()).unwrap();
+    }
+
+    /// A dataset a day newer, holding one more CVE for a product toolmark holds, gives
+    /// exactly that one lead, says which dataset it came from and that the distribution
+    /// that built it may have backported the fix, and gives nothing the next time.
+    /// Nothing reaches the host.
+    #[tokio::test]
+    #[ignore = "needs PostgreSQL's programs"]
+    async fn a_newer_dataset_gives_only_the_new_lead_and_sends_nothing() {
+        let scratch = cfx_db::testing::Scratch::new(&ENGINE).await;
+        let db = ToolmarkDb::new(scratch.pool.clone());
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let at = |data: Value| {
+            let mut data = data;
+            data["host"] = json!("127.0.0.1");
+            data["port"] = json!(port);
+            data["scheme"] = json!("http");
+            json!({"type": "finding", "data": data})
+        };
+        // A scan found Apache 2.4.49 that Ubuntu built, and reported one CVE for it.
+        let scan = db
+            .start("fingerprint", "http://127.0.0.1/", &json!({}))
+            .await;
+        let id = scan.as_ref().map(|s| s.id.as_str());
+        db.event(
+            id,
+            &at(json!({"type": "technology", "name": "Apache HTTP Server",
+            "version": "2.4.49", "distro": "Ubuntu", "confidence": 50, "evidence": [],
+            "cpe": "cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*"})),
+        )
+        .await;
+        db.event(
+            id,
+            &at(json!({"type": "vulnerability", "source": "toolmark-cve",
+            "product": "Apache HTTP Server", "cve": "CVE-2099-0001"})),
+        )
+        .await;
+        db.finish(scan, Status::Completed).await;
+
+        let folder = tempfile::tempdir().unwrap();
+        apache_dataset(folder.path(), 2, &["CVE-2099-0001", "CVE-2099-0002"]);
+        let names = Signatures::shipped().cpes();
+        let cves = crate::cve::Cves::load(Some(folder.path()), &names, crate::cve::DATASET_URL);
+        let leads = rematch_leads(&db, &cves).await;
+        assert_eq!(leads.len(), 1, "{leads:?}");
+        assert_eq!(leads[0]["cve"], "CVE-2099-0002");
+        assert_eq!(leads[0]["cve_data"], "CVE dataset 2 of 2026-11-22");
+        assert_eq!(leads[0]["backport"], true);
+        assert_eq!(leads[0]["target"], format!("http://127.0.0.1:{port}/"));
+        assert!(
+            rematch_leads(&db, &cves).await.is_empty(),
+            "a lead is reported once"
+        );
+        assert!(listener.accept().is_err(), "a connection reached the host");
+        scratch.done().await;
     }
 
     /// A product today's signatures find on a kept page is reported once: the next

@@ -65,6 +65,33 @@ impl Cpe {
             product: product.to_ascii_lowercase(),
         }
     }
+
+    /// The product a CPE 2.3 name names, as in `cpe:2.3:a:apache:http_server:2.4.49:...`,
+    /// with its escapes undone, or none when it is not one.
+    pub fn from_cpe23(name: &str) -> Option<Self> {
+        let rest = name.strip_prefix("cpe:2.3:")?;
+        let mut fields = Vec::new();
+        let mut field = String::new();
+        let mut chars = rest.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => field.extend(chars.next()),
+                ':' => fields.push(std::mem::take(&mut field)),
+                c => field.push(c),
+            }
+            if fields.len() == 3 {
+                break;
+            }
+        }
+        if fields.len() < 3 {
+            fields.push(field);
+        }
+        let [part, vendor, product] = fields.get(..3)? else {
+            return None;
+        };
+        let named = |f: &String| !f.is_empty() && f != "*" && f != "-";
+        (named(part) && named(vendor) && named(product)).then(|| Self::new(part, vendor, product))
+    }
 }
 
 impl fmt::Display for Cpe {
@@ -581,6 +608,30 @@ mod tests {
         let gateway = d.leads(&both[..1], "13.1-49.12", None);
         assert_eq!(ids(&gateway), ["CVE-2099-0001", "CVE-2099-0002"]);
         assert!(gateway.iter().all(|l| !l.possible));
+    }
+
+    #[test]
+    fn a_cpe_2_3_name_gives_its_product() {
+        assert_eq!(
+            Cpe::from_cpe23("cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*"),
+            Some(Cpe::new("a", "apache", "http_server"))
+        );
+        assert_eq!(
+            Cpe::from_cpe23(r"cpe:2.3:a:nodejs:node\.js:*:*:*:*:*:*:*:*"),
+            Some(Cpe::new("a", "nodejs", "node.js"))
+        );
+        assert_eq!(
+            Cpe::from_cpe23("cpe:2.3:o:fortinet:fortios"),
+            Some(Cpe::new("o", "fortinet", "fortios"))
+        );
+        for not in [
+            "",
+            "cpe:/a:apache:http_server",
+            "cpe:2.3:a:apache",
+            "cpe:2.3:a:*:*:1.0",
+        ] {
+            assert_eq!(Cpe::from_cpe23(not), None, "{not}");
+        }
     }
 
     #[test]

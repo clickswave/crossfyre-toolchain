@@ -133,9 +133,10 @@ async fn handle_connection(
                 };
                 write_line(&mut writer, &reply).await?;
             }
-            // The signatures it has now, over the pages it kept, and nothing sent.
+            // The signatures and CVE data it has now, over the pages and products it
+            // kept, and nothing sent.
             "rematch" => {
-                handle_rematch(&mut writer, &db).await?;
+                handle_rematch(&mut writer, &db, cves).await?;
                 return Ok(());
             }
             "resume" => {
@@ -234,6 +235,7 @@ async fn handle_fingerprint(
 async fn handle_rematch(
     writer: &mut OwnedWriteHalf,
     db: &ToolmarkDb,
+    cves: std::sync::Arc<crate::cve::Cves>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let scan = db
         .start("rematch", "the pages toolmark kept", &serde_json::json!({}))
@@ -241,7 +243,7 @@ async fn handle_rematch(
     let (tx, rx) = mpsc::unbounded_channel::<Value>();
     let kept = db.clone();
     let op = dguard::spawn_busy(async move {
-        crate::rematch::run(&kept, crate::signatures::Signatures::shipped(), tx).await;
+        crate::rematch::run(&kept, crate::signatures::Signatures::shipped(), tx, &cves).await;
     });
     forward(op, rx, writer, db, scan).await
 }

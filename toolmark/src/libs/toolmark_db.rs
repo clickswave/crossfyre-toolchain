@@ -79,14 +79,19 @@ impl ToolmarkDb {
         }
     }
 
-    /// What scan `scan` should keep of `event`: a product it found on a web host, or a
-    /// service it found listening.
+    /// What scan `scan` should keep of `event`: a product it found on a web host, a CVE
+    /// lead it reported, or a service it found listening.
     pub async fn event(&self, scan: Option<&str>, event: &Value) {
         if scan.is_none() {
             return;
         }
         let kept = match (event["type"].as_str(), event["data"]["type"].as_str()) {
             (Some("finding"), Some("technology")) => self.fingerprint(&event["data"]).await,
+            (Some("finding"), Some("vulnerability"))
+                if event["data"]["source"] == "toolmark-cve" =>
+            {
+                self.lead(&event["data"]).await
+            }
             (Some("service"), _) => self.service(event).await,
             _ => Ok(()),
         };
@@ -124,6 +129,7 @@ impl ToolmarkDb {
         }
         let version = data["version"].as_str().unwrap_or_default();
         let cpe = data["cpe"].as_str().unwrap_or_default();
+        let distro = data["distro"].as_str().unwrap_or_default();
         // cpe:2.3:a:<vendor>:<product>:...
         let vendor = cpe.split(':').nth(3).unwrap_or_default();
         let mut tx = self.pool.begin().await?;
@@ -144,16 +150,17 @@ impl ToolmarkDb {
         .await?;
         sqlx::query(
             "INSERT INTO fingerprints \
-             (host_id, product, vendor, version, cpe, confidence, evidence, signature_id) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $2) \
+             (host_id, product, vendor, version, cpe, distro, confidence, evidence, signature_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $2) \
              ON CONFLICT (host_id, product) DO UPDATE SET vendor = $3, version = $4, cpe = $5, \
-             confidence = $6, evidence = $7::jsonb, last_seen = now()",
+             distro = $6, confidence = $7, evidence = $8::jsonb, last_seen = now()",
         )
         .bind(host)
         .bind(product)
         .bind(vendor)
         .bind(version)
         .bind(cpe)
+        .bind(distro)
         .bind(data["confidence"].as_i64().unwrap_or_default() as i32)
         .bind(data["evidence"].to_string())
         .execute(&mut *tx)
@@ -171,6 +178,63 @@ impl ToolmarkDb {
             .await?;
         }
         tx.commit().await
+    }
+
+    /// A CVE lead reported for a product on a host, kept once.
+    async fn lead(&self, data: &Value) -> Result<(), sqlx::Error> {
+        let (Some(product), Some(cve)) = (data["product"].as_str(), data["cve"].as_str()) else {
+            return Ok(());
+        };
+        let mut tx = self.pool.begin().await?;
+        let host = self
+            .host(
+                &mut tx,
+                data["host"].as_str().unwrap_or_default(),
+                data["port"].as_i64().unwrap_or_default(),
+                data["scheme"].as_str().unwrap_or_default(),
+            )
+            .await?;
+        sqlx::query(
+            "INSERT INTO leads (host_id, product, cve) VALUES ($1, $2, $3) \
+             ON CONFLICT (host_id, product, cve) DO NOTHING",
+        )
+        .bind(host)
+        .bind(product)
+        .bind(cve)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await
+    }
+
+    /// Each product the inventory holds at a version, with what is needed to look up its
+    /// CVE leads and the leads already reported for it.
+    pub async fn stored(&self) -> Result<Vec<Stored>, sqlx::Error> {
+        let rows: Vec<StoredRow> = sqlx::query_as(
+            "SELECT h.host, h.port, h.scheme, f.product, f.version, f.cpe, f.distro, \
+                 COALESCE(array_agg(l.cve) FILTER (WHERE l.cve IS NOT NULL), '{}') \
+             FROM fingerprints f JOIN hosts h ON h.id = f.host_id \
+             LEFT JOIN leads l ON l.host_id = f.host_id AND l.product = f.product \
+             WHERE f.version <> '' \
+             GROUP BY h.host, h.port, h.scheme, f.product, f.version, f.cpe, f.distro \
+             ORDER BY h.host, h.port, f.product",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(host, port, scheme, product, version, cpe, distro, reported)| Stored {
+                    host,
+                    port: u16::try_from(port).unwrap_or_default(),
+                    scheme,
+                    product,
+                    version,
+                    cpe: cfx_cve::Cpe::from_cpe23(&cpe),
+                    distro: (!distro.is_empty()).then_some(distro),
+                    reported: reported.into_iter().collect(),
+                },
+            )
+            .collect())
     }
 
     /// A service found listening on a host's port, and whether it lets anyone in.
@@ -306,6 +370,31 @@ impl ToolmarkDb {
         }
     }
 }
+
+/// A product the inventory holds at a version, where, and the leads reported for it.
+pub struct Stored {
+    pub host: String,
+    pub port: u16,
+    pub scheme: String,
+    pub product: String,
+    pub version: String,
+    /// The product as its CPE names it, when the signature named one.
+    pub cpe: Option<cfx_cve::Cpe>,
+    pub distro: Option<String>,
+    /// The CVEs already reported for it there.
+    pub reported: std::collections::HashSet<String>,
+}
+
+type StoredRow = (
+    String,
+    i32,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Vec<String>,
+);
 
 /// A page a scan kept: what it was asked for, where, and what came back.
 pub struct Kept {

@@ -437,6 +437,19 @@ fn extract_title(body: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// What a CVE lead is about: a product at a version, built by a distribution when one was
+/// read, and where it was found.
+pub(crate) struct Subject<'a> {
+    pub product: &'a str,
+    pub version: &'a str,
+    pub cpe: &'a cfx_cve::Cpe,
+    pub distro: Option<&'a str>,
+    pub url: &'a str,
+    pub host: &'a str,
+    pub port: u16,
+    pub scheme: &'a str,
+}
+
 /// Send the CVE leads for `d` at its version from `cves`, each saying which data it came
 /// from. A lead is a version match, never confirmed.
 pub(crate) fn send_leads(
@@ -448,28 +461,36 @@ pub(crate) fn send_leads(
     port: u16,
     scheme: &str,
 ) {
-    let (Some(version), Some(name)) = (d.version.as_deref().filter(|v| !v.is_empty()), &d.cpe_name)
+    let (Some(version), Some(cpe)) = (d.version.as_deref().filter(|v| !v.is_empty()), &d.cpe_name)
     else {
         return;
     };
-    let (leads, from) = cves.leads(name, version, d.distro.as_deref());
-    for lead in &leads {
-        let _ = tx.send(cve_lead(lead, &from, d, url, host, port, scheme));
+    let subject = Subject {
+        product: &d.name,
+        version,
+        cpe,
+        distro: d.distro.as_deref(),
+        url,
+        host,
+        port,
+        scheme,
+    };
+    for (_, lead) in leads_for(cves, &subject) {
+        let _ = tx.send(lead);
     }
 }
 
-/// One CVE lead as a finding: `d`, at its version, is in a range `lead` affects, by the
-/// data `from` names.
-fn cve_lead(
-    lead: &cfx_cve::Lead,
-    from: &str,
-    d: &signatures::Detection,
-    url: &str,
-    host: &str,
-    port: u16,
-    scheme: &str,
-) -> Value {
-    let version = d.version.as_deref().unwrap_or_default();
+/// The CVE leads for `s` from `cves`, each with its CVE, as findings.
+pub(crate) fn leads_for(cves: &crate::cve::Cves, s: &Subject) -> Vec<(String, Value)> {
+    let (leads, from) = cves.leads(s.cpe, s.version, s.distro);
+    leads
+        .iter()
+        .map(|lead| (lead.cve.clone(), cve_lead(lead, &from, s)))
+        .collect()
+}
+
+/// One CVE lead as a finding: `s` is in a range `lead` affects, by the data `from` names.
+fn cve_lead(lead: &cfx_cve::Lead, from: &str, s: &Subject) -> Value {
     let reference = if lead.cve.starts_with("GHSA-") {
         format!("https://github.com/advisories/{}", lead.cve)
     } else {
@@ -488,28 +509,28 @@ fn cve_lead(
     json!({
         "type": "finding",
         "data": {
-            "target": url,
-            "host": host, "port": port, "scheme": scheme,
+            "target": s.url,
+            "host": s.host, "port": s.port, "scheme": s.scheme,
             "type": "vulnerability",
             "source": "toolmark-cve",
             "severity": lead.known.severity.as_deref().unwrap_or("medium"),
-            "name": format!("{} {version}: {}", d.name, lead.cve),
+            "name": format!("{} {}: {}", s.product, s.version, lead.cve),
             "cve": lead.cve,
             "cvss": lead.known.score,
             "kev": lead.known.kev,
             "epss": lead.known.epss,
-            "product": d.name,
-            "version": version,
-            "cpe": d.cpe_name.as_ref().map(ToString::to_string),
+            "product": s.product,
+            "version": s.version,
+            "cpe": s.cpe.to_string(),
             "confidence": "version-inferred",
             "possible": lead.possible,
             "backport": lead.backport,
             "cve_data": from,
             "reference": reference,
             "description": format!(
-                "{} {version} is in a version range {} affects{exploited}. A version match, not \
+                "{} {} is in a version range {} affects{exploited}. A version match, not \
                  a confirmed finding: check the exact build.{backport}",
-                d.name, lead.cve
+                s.product, s.version, lead.cve
             ),
         }
     })

@@ -33,7 +33,8 @@ CREATE TABLE observations (
 );
 CREATE INDEX observations_host_id ON observations (host_id, observed_at);
 
--- A product found on a host, and the evidence and signature that found it.
+-- A product found on a host, the tag of the distribution that built it when one was read,
+-- and the evidence and signature that found it.
 CREATE TABLE fingerprints (
     id           BIGSERIAL PRIMARY KEY,
     host_id      BIGINT NOT NULL REFERENCES hosts (id) ON DELETE CASCADE,
@@ -41,6 +42,7 @@ CREATE TABLE fingerprints (
     vendor       TEXT NOT NULL DEFAULT '',
     version      TEXT NOT NULL DEFAULT '',
     cpe          TEXT NOT NULL DEFAULT '',
+    distro       TEXT NOT NULL DEFAULT '',
     confidence   INTEGER NOT NULL DEFAULT 0,
     evidence     JSONB NOT NULL DEFAULT '[]',
     signature_id TEXT NOT NULL,
@@ -60,6 +62,16 @@ CREATE TABLE services (
     first_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_seen  TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (host_id, service)
+);
+
+-- A CVE lead reported for a product on a host, so a re-match reports only new ones.
+CREATE TABLE leads (
+    id         BIGSERIAL PRIMARY KEY,
+    host_id    BIGINT NOT NULL REFERENCES hosts (id) ON DELETE CASCADE,
+    product    TEXT NOT NULL,
+    cve        TEXT NOT NULL,
+    first_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (host_id, product, cve)
 );
 
 -- A product that appeared on a host, or whose version changed there.

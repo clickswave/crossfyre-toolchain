@@ -58,7 +58,8 @@ pub enum Commands {
     /// and versions it found there
     Inventory,
     /// Run the signatures toolmark has now over the pages it kept from earlier scans, and
-    /// report only what is new. Nothing is sent to any host
+    /// its CVE data over the products it holds, and report only what is new: products,
+    /// versions and CVE leads. Nothing is sent to any host
     Rematch,
     /// The CVE dataset toolmark's leads come from. The daemon fetches it when its copy is
     /// a day old

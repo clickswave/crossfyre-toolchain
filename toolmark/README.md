@@ -19,7 +19,8 @@ credentials saw the pages as that user, so it keeps no body. The first daemon ma
 database, so install PostgreSQL's programs before the first scan (`sudo apt install
 postgresql` on Debian, Ubuntu or Kali), or point it at a database you run with
 `crossfyre db external`. `toolmark rematch` runs the signatures it has now over the
-pages it kept, and reports only what is new there, sending nothing to any host.
+pages it kept, and its CVE data over the products it holds, and reports only what is
+new there, products, versions and CVE leads, sending nothing to any host.
 `toolmark inventory` shows what it knows runs where: each host and port it scanned, and
 the products and versions it found there. `toolmark scans` lists the scans it keeps, the
 latest first, `toolmark db purge --scan ID` deletes one, and `toolmark db reset`
