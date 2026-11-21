@@ -101,6 +101,9 @@ pub fn decide(
     min_rtt_us: Option<f64>,
     limits: &Limits,
 ) -> Decision {
+    if let Some(d) = from_module(est, cur_conc, w, min_rtt_us, limits) {
+        return d;
+    }
     let loss_ratio = w.lost as f64 / w.sent as f64;
 
     if w.delivered > 0 {
@@ -211,4 +214,87 @@ mod tests {
         );
         assert!(d.concurrency < 100, "heavy loss must reduce concurrency");
     }
+}
+
+/// The installed module's decision, held to `limits`, with the estimator it carries on;
+/// None without a module, or when its answer does not read or carries an estimator that
+/// is not a number of microseconds.
+fn from_module(
+    est: &mut Estimator,
+    cur_conc: usize,
+    w: &Window,
+    min_rtt_us: Option<f64>,
+    limits: &Limits,
+) -> Option<Decision> {
+    #[derive(serde::Serialize)]
+    struct CongestionAsk {
+        srtt_us: f64,
+        rttvar_us: f64,
+        warmup: bool,
+        concurrency: usize,
+        sent: u64,
+        lost: u64,
+        delivered: u64,
+        retried: u64,
+        recovered: u64,
+        rtt_sum_us: u64,
+        min_rtt_us: Option<f64>,
+        conc_floor: usize,
+        conc_ceil: usize,
+        timeout_floor_ms: u64,
+        timeout_ceil_ms: u64,
+        retry_floor: u32,
+        retry_ceil: u32,
+    }
+    #[derive(serde::Deserialize)]
+    struct CongestionAnswer {
+        srtt_us: f64,
+        rttvar_us: f64,
+        warmup: bool,
+        concurrency: usize,
+        timeout_ms: u64,
+        retries: u32,
+    }
+    let a: CongestionAnswer = crate::backend::ask(
+        "congestion.decide",
+        &CongestionAsk {
+            srtt_us: est.srtt_us,
+            rttvar_us: est.rttvar_us,
+            warmup: est.warmup,
+            concurrency: cur_conc,
+            sent: w.sent,
+            lost: w.lost,
+            delivered: w.delivered,
+            retried: w.retried,
+            recovered: w.recovered,
+            rtt_sum_us: w.rtt_sum_us,
+            min_rtt_us,
+            conc_floor: limits.conc_floor,
+            conc_ceil: limits.conc_ceil,
+            timeout_floor_ms: limits.timeout_floor_ms,
+            timeout_ceil_ms: limits.timeout_ceil_ms,
+            retry_floor: limits.retry_floor,
+            retry_ceil: limits.retry_ceil,
+        },
+    )?;
+    let us = |v: f64| v.is_finite() && v >= 0.0;
+    if !us(a.srtt_us) || !us(a.rttvar_us) {
+        return None;
+    }
+    est.srtt_us = a.srtt_us;
+    est.rttvar_us = a.rttvar_us;
+    est.warmup = a.warmup;
+    Some(Decision {
+        concurrency: a
+            .concurrency
+            .clamp(limits.conc_floor, limits.conc_ceil.max(limits.conc_floor)),
+        timeout_ms: a.timeout_ms.clamp(
+            limits.timeout_floor_ms,
+            limits.timeout_ceil_ms.max(limits.timeout_floor_ms),
+        ),
+        retries: a.retries.clamp(
+            limits.retry_floor,
+            limits.retry_ceil.max(limits.retry_floor),
+        ),
+    })
 }

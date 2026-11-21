@@ -31,6 +31,7 @@
 //! Time is not read internally (no `Instant::now`), so behaviour is fully
 //! deterministic and unit-testable: callers record `(class, rtt_ms)` and tick.
 
+pub mod backend;
 pub mod challenge;
 pub mod congestion;
 pub mod coord;
