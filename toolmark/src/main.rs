@@ -125,11 +125,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 /// `toolmark check`: the signatures in a folder and the mappings in another, read as
 /// toolmark reads a pack, each problem printed; and, when all of it loads, the products
-/// the signatures name, with their aliases, written out.
+/// the signatures name written out, by the names toolmark gives what it finds: a plessor
+/// template names its product that way, since plessor matches it against what toolmark
+/// saw, which carries no aliases.
 fn check(args: &libs::cli_args::CheckArgs) -> Result<(), Box<dyn std::error::Error>> {
     let signatures = files_in(&args.dir, |name| name.ends_with(".yaml"))?;
     let mappings = files_in(&args.mappings, knowledge::is_mapping)?;
-    let (signatures, mappings) = match knowledge::read(&pairs(&signatures), &pairs(&mappings)) {
+    let (signatures, _) = match knowledge::read(&pairs(&signatures), &pairs(&mappings)) {
         Ok(read) => read,
         Err(problems) => {
             for problem in &problems {
@@ -142,7 +144,6 @@ fn check(args: &libs::cli_args::CheckArgs) -> Result<(), Box<dyn std::error::Err
         let mut names: Vec<String> = signatures
             .cpes()
             .iter()
-            .flat_map(|cpe| mappings.with_aliases(cpe))
             .map(|c| format!("{}:{}", c.vendor, c.product))
             .collect();
         names.sort();
@@ -262,8 +263,8 @@ async fn send_stream(
 #[cfg(test)]
 mod tests {
     /// The shipped signatures and mappings pass the check, the names it writes for
-    /// plessor's check hold each product and its aliases, and a mapping it cannot read
-    /// is a problem.
+    /// plessor's check are the ones toolmark gives what it finds, without aliases, and a
+    /// mapping it cannot read is a problem.
     #[test]
     fn the_shipped_signatures_and_mappings_pass_the_check() {
         let root = env!("CARGO_MANIFEST_DIR");
@@ -279,8 +280,8 @@ mod tests {
         let lines: Vec<&str> = written.lines().collect();
         assert!(lines.contains(&"zimbra:collaboration"));
         assert!(
-            lines.contains(&"synacor:zimbra_collaboration_suite"),
-            "an alias"
+            !lines.contains(&"synacor:zimbra_collaboration_suite"),
+            "an alias is not what toolmark names what it finds"
         );
         assert!(lines.windows(2).all(|w| w[0] < w[1]), "sorted, once each");
 

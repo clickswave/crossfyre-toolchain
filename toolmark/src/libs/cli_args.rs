@@ -225,8 +225,8 @@ pub struct CheckArgs {
     /// names, <name>-stamps.csv
     #[arg(long)]
     pub mappings: std::path::PathBuf,
-    /// Write the products the signatures name, and their aliases, one vendor:product a
-    /// line, to this file
+    /// Write the products the signatures name, as toolmark names what it finds, one
+    /// vendor:product a line, to this file
     #[arg(long)]
     pub names: Option<std::path::PathBuf>,
 }

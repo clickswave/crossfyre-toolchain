@@ -1021,6 +1021,43 @@ pub static BUILTIN: LazyLock<Vec<Template>> = LazyLock::new(|| {
 mod pack;
 use pack::PACK_YAML;
 
+/// Which templates a scan runs, from the products toolmark saw on the target. A template
+/// that names no product is general and always runs, and so does one whose product cannot
+/// be seen from outside; one that names a product runs where toolmark saw it. With no
+/// products given, or `--all-templates`, every template runs.
+pub struct Choice {
+    seen: Option<std::collections::HashSet<(String, String)>>,
+}
+
+impl Choice {
+    /// From `products` as toolmark names them, part:vendor:product. A name that is not
+    /// one is passed over.
+    pub fn new(products: Option<&[String]>, all: bool) -> Self {
+        let seen = products.filter(|_| !all).map(|names| {
+            names
+                .iter()
+                .filter_map(|name| {
+                    let mut parts = name.splitn(3, ':');
+                    let (_, vendor, product) = (parts.next()?, parts.next()?, parts.next()?);
+                    Some((vendor.to_string(), product.to_string()))
+                })
+                .collect()
+        });
+        Self { seen }
+    }
+
+    /// Whether `t` runs.
+    pub fn runs(&self, t: &Template) -> bool {
+        let meta = &t.info.metadata;
+        match (&self.seen, &meta.vendor, &meta.product) {
+            (Some(seen), Some(vendor), Some(product)) if !meta.unseen => {
+                seen.contains(&(vendor.clone(), product.clone()))
+            }
+            _ => true,
+        }
+    }
+}
+
 /// The pack's templates plessor runs beside its built-in checks, crossfyre-templates'
 /// plessor folder, and where they come from. A release compiles in a copy (templates/),
 /// and the pack `crossfyre update` puts in the toolchain directory takes its place when it
@@ -1835,6 +1872,34 @@ pub(crate) mod tests {
         std::fs::write(cfx_pack::path_in(&dir), b"not a pack").unwrap();
         assert!(super::Pack::load(Some(&dir)).from.ends_with("compiled in"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A template about one product runs where toolmark saw it; a general one, or one
+    /// whose product cannot be seen from outside, always runs; with no products, or with
+    /// --all-templates, everything runs.
+    #[test]
+    fn a_product_template_runs_where_toolmark_saw_its_product() {
+        let parse = |meta: &str| super::check(&template("t", meta, WORD)).unwrap();
+        let general = parse("");
+        let apache = parse("    vendor: apache\n    product: http_server\n");
+        let metabase = parse("    vendor: metabase\n    product: metabase\n");
+        let unseen = parse("    vendor: apache\n    product: log4j\n    unseen: true\n");
+        let seen = ["a:apache:http_server".to_string(), "not a name".to_string()];
+        let choice = super::Choice::new(Some(&seen), false);
+        assert!(choice.runs(&general) && choice.runs(&apache) && choice.runs(&unseen));
+        assert!(!choice.runs(&metabase), "toolmark did not see Metabase");
+        for everything in [
+            super::Choice::new(None, false),
+            super::Choice::new(Some(&seen), true),
+        ] {
+            assert!(
+                [&general, &apache, &metabase, &unseen]
+                    .iter()
+                    .all(|t| everything.runs(t))
+            );
+        }
+        let nothing_seen = super::Choice::new(Some(&[]), false);
+        assert!(!nothing_seen.runs(&apache) && nothing_seen.runs(&general));
     }
 
     #[test]

@@ -239,6 +239,23 @@ pub async fn handle(env: OpEnv) {
         plessor_req["identify"] = serde_json::json!(tok);
     }
 
+    // A template scan runs the templates about a product only where toolmark saw that
+    // product on the target, when what it saw there is fresh; otherwise every template
+    // runs, as it always did.
+    if mode == "scan" && !data["all_templates"].as_bool().unwrap_or(false) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        if let Some(inventory) = toolmark_inventory().await
+            && let Some((products, from)) = fresh_products(&inventory, &target, now)
+        {
+            plessor_req["products"] = serde_json::json!(products);
+            plessor_req["products_from"] = serde_json::json!(from);
+        }
+    } else if data["all_templates"].as_bool().unwrap_or(false) {
+        plessor_req["all_templates"] = serde_json::json!(true);
+    }
+
     let relay = Relay {
         pubc: &pub_clone,
         status_subj: &status_subj,
@@ -348,4 +365,115 @@ pub async fn handle(env: OpEnv) {
             Some((processed.max(1), total.max(processed).max(1))),
         )
         .await;
+}
+
+/// How long what toolmark saw on a host is taken to be what still runs there, when a scan
+/// chooses its templates by it. A host's software changes, and a template held back on a
+/// fingerprint taken before the change would miss what it was written for; a week is as
+/// old as a fingerprint is trusted for that, and an older one chooses nothing, so every
+/// template runs. What toolmark found earlier in the same workflow run is always within it.
+const FRESH_INVENTORY_SECS: i64 = 7 * 24 * 3600;
+
+/// What toolmark holds of the hosts it has fingerprinted, or none when it is not running
+/// or does not answer, and the scan then runs every template.
+async fn toolmark_inventory() -> Option<serde_json::Value> {
+    let ask = serde_json::json!({"operation": "inventory", "response": "instant"});
+    let (mut lines, _writer) = super::open_engine("toolmark", &ask, None).await.ok()?;
+    let line = lines.next_line().await.ok()??;
+    let answer: serde_json::Value = serde_json::from_str(&line).ok()?;
+    (answer["status"] == "completed").then_some(answer)
+}
+
+/// The products toolmark saw on `target`'s host and port, by its names for them, from the
+/// rows of `inventory` last seen within [`FRESH_INVENTORY_SECS`] of `now`, and what the
+/// scan says of where they came from. None when no row for that host and port is fresh.
+fn fresh_products(
+    inventory: &serde_json::Value,
+    target: &str,
+    now: i64,
+) -> Option<(Vec<String>, String)> {
+    let with_scheme = if target.contains("://") {
+        target.to_string()
+    } else {
+        format!("http://{target}")
+    };
+    let url = reqwest::Url::parse(&with_scheme).ok()?;
+    let (host, port) = (url.host_str()?.to_lowercase(), url.port_or_known_default()?);
+    let mut products = std::collections::BTreeSet::new();
+    let mut newest: Option<i64> = None;
+    for row in inventory["inventory"].as_array()? {
+        let same = row["host"]
+            .as_str()
+            .is_some_and(|h| h.eq_ignore_ascii_case(&host))
+            && row["port"].as_u64() == Some(u64::from(port));
+        let seen = row["last_seen"]
+            .as_str()
+            .and_then(crate::toolchain::data_manifest::unix_time);
+        let Some(seen) = seen.filter(|t| same && now - t <= FRESH_INVENTORY_SECS) else {
+            continue;
+        };
+        newest = newest.max(Some(seen));
+        for name in row["cpe_names"].as_array().into_iter().flatten() {
+            if let Some(name) = name.as_str() {
+                products.insert(name.to_string());
+            }
+        }
+    }
+    let newest = newest?;
+    let hours = (now - newest).max(0) / 3600;
+    let s = if hours == 1 { "" } else { "s" };
+    let from =
+        format!("toolmark's inventory of {host}:{port}, last seen {hours} hour{s} before the scan");
+    Some((products.into_iter().collect(), from))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: i64 = 1_795_273_200; // 2026-11-21T15:00:00Z
+
+    fn inventory(rows: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"status": "completed", "inventory": rows})
+    }
+
+    /// The products of the target's host and port that toolmark saw within a week choose
+    /// the templates, and the scan says which inventory and how old.
+    #[test]
+    fn a_fresh_fingerprint_of_the_target_chooses_the_templates() {
+        let inv = inventory(serde_json::json!([
+            {"host": "app.test", "port": 443, "cpe_names": ["a:f5:nginx"], "last_seen": "2026-11-21T13:00:00Z"},
+            {"host": "APP.test", "port": 443, "cpe_names": ["a:metabase:metabase"], "last_seen": "2026-11-20T15:00:00Z"},
+            {"host": "app.test", "port": 443, "cpe_names": [], "last_seen": "2026-11-21T14:00:00Z"},
+            {"host": "app.test", "port": 8443, "cpe_names": ["a:apache:tomcat"], "last_seen": "2026-11-21T14:00:00Z"},
+            {"host": "other.test", "port": 443, "cpe_names": ["a:grafana:grafana"], "last_seen": "2026-11-21T14:00:00Z"},
+        ]));
+        let (products, from) = fresh_products(&inv, "https://app.test", NOW).unwrap();
+        assert_eq!(products, ["a:f5:nginx", "a:metabase:metabase"]);
+        assert_eq!(
+            from,
+            "toolmark's inventory of app.test:443, last seen 1 hour before the scan"
+        );
+        let (products, _) = fresh_products(&inv, "app.test:8443", NOW).unwrap();
+        assert_eq!(products, ["a:apache:tomcat"]);
+    }
+
+    /// What toolmark saw more than a week ago chooses nothing, so every template runs, and
+    /// so does a host it never saw.
+    #[test]
+    fn a_stale_fingerprint_or_none_chooses_nothing() {
+        let inv = inventory(serde_json::json!([
+            {"host": "app.test", "port": 443, "cpe_names": ["a:f5:nginx"], "last_seen": "2026-11-14T14:59:59Z"},
+            {"host": "app.test", "port": 443, "cpe_names": ["a:metabase:metabase"], "last_seen": "not a time"},
+        ]));
+        assert_eq!(fresh_products(&inv, "https://app.test", NOW), None);
+        assert_eq!(fresh_products(&inv, "https://unseen.test", NOW), None);
+        let week = inventory(serde_json::json!([
+            {"host": "app.test", "port": 443, "cpe_names": ["a:f5:nginx"], "last_seen": "2026-11-14T15:00:00Z"},
+        ]));
+        assert!(
+            fresh_products(&week, "https://app.test", NOW).is_some(),
+            "a week is fresh"
+        );
+    }
 }

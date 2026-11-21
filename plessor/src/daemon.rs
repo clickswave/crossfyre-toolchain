@@ -742,6 +742,150 @@ mod tests {
         );
     }
 
+    /// Given what toolmark saw, a scan runs the general templates and the ones about a
+    /// product it saw, and says which it held back and from what; given nothing, it runs
+    /// every template, as it always did.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_scan_holds_back_the_templates_for_products_toolmark_did_not_see() {
+        let (tport, _) = target(Duration::ZERO).await;
+        let dport = daemon().await;
+        let dir = std::env::temp_dir().join(format!("plessor-choice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let probe = |id: &str, meta: &str| {
+            format!(
+                "id: {id}\ninfo:\n  name: {id}\n  severity: info\n  metadata:\n{meta}\
+                 http:\n  - method: GET\n    path:\n      - \"{{{{BaseURL}}}}/{id}\"\n    \
+                 matchers:\n      - type: word\n        words:\n          - ok\n"
+            )
+        };
+        std::fs::write(
+            dir.join("general.yaml"),
+            probe("general-probe", "    category: misc\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("widget.yaml"),
+            probe("widget-probe", "    vendor: acme\n    product: widget\n"),
+        )
+        .unwrap();
+        // The pack's CVE-2021-41773 is asked for only where it is to be held back: run, it
+        // waits out its raw requests' timeouts against this target.
+        let scan = |products: Option<serde_json::Value>, with_pack_cve: bool| {
+            let mut only = vec!["general-probe", "widget-probe"];
+            if with_pack_cve {
+                only.push("cve-2021-41773");
+            }
+            let mut op = serde_json::json!({
+                "operation": "scan",
+                "response": "stream",
+                "target": format!("http://127.0.0.1:{tport}"),
+                "templates_dir": dir.to_string_lossy(),
+                "pack": true,
+                "only": only,
+                "evasive": false,
+                "timeout_ms": 5000,
+            });
+            if let Some(p) = products {
+                op["products"] = p;
+                op["products_from"] = serde_json::json!("toolmark's inventory of the test");
+            }
+            op
+        };
+        let found = |events: &[Value]| {
+            let mut ids: Vec<String> = events
+                .iter()
+                .filter(|e| e["type"] == "finding")
+                .filter_map(|e| e["data"]["template"].as_str().map(str::to_string))
+                .collect();
+            ids.sort();
+            ids.dedup();
+            ids
+        };
+        let held = |events: &[Value]| {
+            events
+                .iter()
+                .find(|e| e["type"] == "templates_held_back")
+                .cloned()
+        };
+
+        let events = run_to_done(
+            dport,
+            &scan(Some(serde_json::json!(["a:acme:gadget"])), true),
+        )
+        .await;
+        assert_eq!(found(&events), ["general-probe"]);
+        let said = held(&events).expect("the held back templates are said");
+        assert_eq!(said["count"], 2);
+        assert_eq!(
+            said["templates"],
+            serde_json::json!(["CVE-2021-41773", "widget-probe"]),
+            "the pack's and the folder's alike"
+        );
+        assert_eq!(said["from"], "toolmark's inventory of the test");
+
+        let events = run_to_done(
+            dport,
+            &scan(Some(serde_json::json!(["a:acme:widget"])), false),
+        )
+        .await;
+        assert_eq!(found(&events), ["general-probe", "widget-probe"]);
+        assert!(held(&events).is_none(), "{:?}", held(&events));
+
+        let events = run_to_done(dport, &scan(None, false)).await;
+        assert_eq!(
+            found(&events),
+            ["general-probe", "widget-probe"],
+            "as it always did"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A template in the --templates folder with a pack template's id runs in its place,
+    /// once: the folder's is the one that finds, and the scan counts one template.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_folder_template_with_a_pack_templates_id_replaces_it() {
+        let (tport, _) = target(Duration::ZERO).await;
+        let dport = daemon().await;
+        let dir = std::env::temp_dir().join(format!("plessor-replace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("mine.yaml"),
+            "id: CVE-2021-41773\ninfo:\n  name: my own\n  severity: info\n\
+             http:\n  - method: GET\n    path:\n      - \"{{BaseURL}}/mine\"\n    \
+             matchers:\n      - type: word\n        words:\n          - ok\n",
+        )
+        .unwrap();
+        let op = serde_json::json!({
+            "operation": "scan",
+            "response": "stream",
+            "target": format!("http://127.0.0.1:{tport}"),
+            "templates_dir": dir.to_string_lossy(),
+            "pack": true,
+            "only": ["cve-2021-41773"],
+            "evasive": false,
+            "timeout_ms": 5000,
+        });
+        let events = run_to_done(dport, &op).await;
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e["type"] == "finding" && e["data"]["template"] == "CVE-2021-41773"),
+            "the folder's template found: {events:?}"
+        );
+        let totals: Vec<&Value> = events
+            .iter()
+            .filter(|e| e["type"] == "progress")
+            .map(|e| &e["total"])
+            .collect();
+        assert!(
+            !totals.is_empty() && totals.iter().all(|t| **t == 1),
+            "{totals:?}"
+        );
+    }
+
     /// `reload`, as `crossfyre update` sends it after it writes a new pack, has the next
     /// scan run the pack's templates: one that was not there before runs after it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

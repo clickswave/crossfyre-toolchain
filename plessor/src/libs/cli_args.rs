@@ -83,6 +83,16 @@ pub struct ScanArgs {
     /// with the same id.
     #[arg(long, value_name = "DIR")]
     pub templates: Option<String>,
+
+    /// What runs on the target, as toolmark names it (part:vendor:product, comma
+    /// separated): a template about one product then runs only on the products named,
+    /// and those held back are listed. Without it, every template runs
+    #[arg(long, value_name = "NAMES", value_delimiter = ',')]
+    pub products: Option<Vec<String>>,
+
+    /// Run every template, whatever --products says
+    #[arg(long)]
+    pub all_templates: bool,
 }
 
 #[derive(Parser, Clone)]

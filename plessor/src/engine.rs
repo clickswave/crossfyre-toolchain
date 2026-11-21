@@ -107,6 +107,18 @@ pub struct ScanParams {
     /// blast radius rather than the engine.
     #[serde(default)]
     pub only: Vec<String>,
+    /// What toolmark saw on the target, by its names for them, part:vendor:product. With
+    /// them, a template about one product runs only where toolmark saw it; with none,
+    /// every template runs, as it always did. See [`template::Choice`].
+    #[serde(default)]
+    pub products: Option<Vec<String>>,
+    /// Which inventory `products` came from and how old it was, said with the templates
+    /// held back.
+    #[serde(default)]
+    pub products_from: Option<String>,
+    /// Run every template, whatever `products` says.
+    #[serde(default)]
+    pub all_templates: bool,
     /// Optional request auth (headers + cookie) resolved from a credential by the
     /// node, so scanning (and later authorization testing) runs authenticated.
     #[serde(default)]
@@ -482,6 +494,37 @@ pub async fn run<L: crate::ledger::Ledger>(
         } else {
             Vec::new()
         };
+        // A template about one product runs where toolmark saw that product, and the
+        // ones held back are said, never dropped in silence.
+        let choice = template::Choice::new(params.products.as_deref(), params.all_templates);
+        let (pack, held_pack): (Vec<&template::Template>, Vec<&template::Template>) =
+            pack.into_iter().partition(|t| choice.runs(t));
+        let (external, held_external): (Vec<template::Template>, Vec<template::Template>) =
+            external.into_iter().partition(|t| choice.runs(t));
+        let held: Vec<&str> = held_pack
+            .iter()
+            .copied()
+            .chain(held_external.iter())
+            .map(|t| t.id.as_str())
+            .filter(|id| allow_id(id))
+            .collect();
+        if !held.is_empty() {
+            let from = params
+                .products_from
+                .as_deref()
+                .unwrap_or("the products the scan was given");
+            let _ = tx.send(json!({
+                "type": "templates_held_back",
+                "count": held.len(),
+                "templates": held,
+                "from": from,
+                "message": format!(
+                    "{} product templates held back: {from} names none of their products. \
+                     --all-templates runs them",
+                    held.len()
+                ),
+            }));
+        }
         // Count only what will actually run, or a filtered scan reports progress
         // against a denominator it can never reach and the UI sticks at 20%.
         let total = template::BUILTIN

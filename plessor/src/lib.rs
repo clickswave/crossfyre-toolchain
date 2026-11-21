@@ -116,7 +116,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Some(Commands::Scan(args)) => {
-            let req = scan_request(&args.target, args.templates.as_deref())?;
+            let req = scan_request(&args)?;
             send_stream(
                 &daemon,
                 req,
@@ -221,14 +221,19 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 /// absolute path, because the daemon resolves it from its own working directory,
 /// which is wherever its service started it.
 #[cfg(feature = "daemon")]
-fn scan_request(target: &str, templates: Option<&str>) -> Result<serde_json::Value, String> {
+fn scan_request(args: &libs::cli_args::ScanArgs) -> Result<serde_json::Value, String> {
     let mut req = serde_json::json!({
         "operation": "scan",
         "response": "stream",
-        "target": target,
+        "target": args.target,
         "pack": true,
+        "all_templates": args.all_templates,
     });
-    if let Some(dir) = templates {
+    if let Some(products) = &args.products {
+        req["products"] = serde_json::json!(products);
+        req["products_from"] = serde_json::json!("the products given with --products");
+    }
+    if let Some(dir) = args.templates.as_deref() {
         let abs = std::fs::canonicalize(dir)
             .ok()
             .filter(|p| p.is_dir())
@@ -392,6 +397,9 @@ async fn send_stream(
 #[cfg(feature = "daemon")]
 mod tests {
     use super::{inject_requests, scan_request};
+    use crate::libs;
+    use crate::libs::cli_args::{Cli, Commands};
+    use clap::Parser;
 
     fn urls(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
@@ -399,21 +407,55 @@ mod tests {
 
     /// Without `pack`, an installed `plessor scan` ran twelve checks and never the
     /// hundred templates beside them.
+    fn scan(args: &[&str]) -> libs::cli_args::ScanArgs {
+        let cli = Cli::try_parse_from(["plessor", "scan"].iter().chain(args)).unwrap();
+        match cli.command {
+            Some(Commands::Scan(a)) => a,
+            _ => unreachable!("a scan was parsed"),
+        }
+    }
+
     #[test]
     fn scan_asks_for_the_pack() {
-        let req = scan_request("http://h", None).unwrap();
+        let req = scan_request(&scan(&["http://h"])).unwrap();
         assert_eq!(req["pack"], true);
         assert!(req.get("templates_dir").is_none());
+        assert!(
+            req.get("products").is_none(),
+            "with no products, every template runs"
+        );
+        assert_eq!(req["all_templates"], false);
+    }
+
+    /// The products toolmark names go to the daemon with where they came from, and
+    /// --all-templates says to run everything whatever they say.
+    #[test]
+    fn products_and_all_templates_go_to_the_daemon() {
+        let req = scan_request(&scan(&[
+            "http://h",
+            "--products",
+            "a:apache:http_server,a:metabase:metabase",
+            "--all-templates",
+        ]))
+        .unwrap();
+        assert_eq!(
+            req["products"],
+            serde_json::json!(["a:apache:http_server", "a:metabase:metabase"])
+        );
+        assert_eq!(req["products_from"], "the products given with --products");
+        assert_eq!(req["all_templates"], true);
     }
 
     #[test]
     fn a_templates_folder_goes_to_the_daemon_as_an_absolute_path() {
         let here = env!("CARGO_MANIFEST_DIR");
-        let req = scan_request("http://h", Some(&format!("{here}/templates"))).unwrap();
+        let dir = format!("{here}/templates");
+        let req = scan_request(&scan(&["http://h", "--templates", &dir])).unwrap();
         let sent = req["templates_dir"].as_str().unwrap();
         assert!(std::path::Path::new(sent).is_absolute());
         assert!(sent.ends_with("templates"));
-        assert!(scan_request("http://h", Some(&format!("{here}/no-such-folder"))).is_err());
+        let gone = format!("{here}/no-such-folder");
+        assert!(scan_request(&scan(&["http://h", "--templates", &gone])).is_err());
     }
 
     /// The injection pass drops endpoints on any host but its target, so two
