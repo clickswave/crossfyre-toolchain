@@ -1,5 +1,6 @@
 //! What plessor keeps: its scans, the plan of each template scan with the state of every
-//! template in it, and what each scan found.
+//! template in it, and each replay of a finding's proof. What each scan found is in the
+//! findings table every engine has (see [`cfx_db::found`]).
 
 use crate::ledger::{Ledger, Planned, Planning, State};
 use cfx_db::scans::{Key, Running, Status};
@@ -13,7 +14,7 @@ const NOT_A_TEMPLATE_SCAN: &str =
 pub const ENGINE: cfx_db::Engine = cfx_db::Engine {
     name: "plessor",
     version: env!("CARGO_PKG_VERSION"),
-    migrations: &[include_str!("../migrations/0001_plans_findings.sql")],
+    migrations: &[include_str!("../migrations/0001_plans_verifications.sql")],
 };
 
 #[derive(Clone)]
@@ -133,73 +134,6 @@ impl PlessorDb {
         }
     }
 
-    /// Keep what scan `scan` found in `event`, when it is a finding, with no credential
-    /// in it. A finding the scan has kept already is not kept again.
-    pub async fn event(&self, scan: Option<&str>, event: &Value) {
-        let (Some(scan), "finding") = (scan, event["type"].as_str().unwrap_or_default()) else {
-            return;
-        };
-        // A finding is the same finding with another proof, as an answer that differs
-        // in a timestamp gives one, so its proof is not part of what tells it apart.
-        let kept = sqlx::query(
-            "INSERT INTO findings (scan_id, template_id, data, digest) \
-             VALUES ($1, $2, $3::jsonb, md5(($3::jsonb - 'proof')::text)) \
-             ON CONFLICT (scan_id, digest) DO NOTHING",
-        )
-        .bind(scan)
-        .bind(event["data"]["template"].as_str())
-        .bind(cfx_db::scans::safe_json(&event["data"]).to_string())
-        .execute(&self.pool)
-        .await;
-        if let Err(e) = kept {
-            eprintln!("[plessor] could not keep a finding: {e}");
-        }
-    }
-
-    /// What this daemon kept of what its scans found, the latest first, of scan `scan`
-    /// when one is named: each finding's id, scan, check, severity, name and where, and
-    /// whether it was kept with a proof to verify it by.
-    pub async fn findings(&self, scan: Option<&str>, limit: i64) -> Value {
-        let rows: Result<Vec<FindingRow>, _> = sqlx::query_as(
-            "SELECT id, scan_id, coalesce(template_id, ''), coalesce(data->>'severity', ''), \
-                 coalesce(data->>'name', ''), coalesce(data->>'matched_at', ''), \
-                 data ? 'proof', \
-                 to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \
-             FROM findings WHERE ($1::text IS NULL OR scan_id = $1) \
-             ORDER BY id DESC LIMIT $2",
-        )
-        .bind(scan)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await;
-        match rows {
-            Ok(rows) => serde_json::json!({
-                "status": "completed",
-                "findings": rows
-                    .into_iter()
-                    .map(|(id, scan, check, severity, name, at, proof, found)| {
-                        serde_json::json!({
-                            "id": id, "scan": scan, "check": check, "severity": severity,
-                            "name": name, "matched_at": at, "proof": proof, "found": found,
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-            }),
-            Err(e) => serde_json::json!({
-                "status": "error",
-                "message": format!("could not read the findings: {e}"),
-            }),
-        }
-    }
-
-    /// The finding kept as `id`, as it was kept.
-    pub async fn finding(&self, id: i64) -> Result<Option<Value>, sqlx::Error> {
-        sqlx::query_scalar("SELECT data FROM findings WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await
-    }
-
     /// A replay of a proof, of finding `finding` when it was one kept here: what it came
     /// to. Kept beside the finding, which it never changes. A failure is only said.
     pub async fn verified(&self, finding: Option<i64>, proof_sha256: &str, verified: &Value) {
@@ -229,8 +163,6 @@ impl PlessorDb {
     }
 }
 
-type FindingRow = (i64, String, String, String, String, String, bool, String);
-
 /// One template scan's [`Ledger`], kept in plessor's tables.
 pub struct ScanLedger {
     db: PlessorDb,
@@ -259,7 +191,7 @@ impl ScanLedger {
             .await?;
             let found: Vec<Value> = sqlx::query_scalar(
                 "SELECT f.data FROM findings f JOIN template_states s \
-                 ON s.scan_id = f.scan_id AND s.template_id = f.template_id \
+                 ON s.scan_id = f.scan_id AND s.template_id = f.check_id \
                  WHERE f.scan_id = $1 AND s.state = 'confirmed' ORDER BY f.id",
             )
             .bind(scan)
@@ -274,7 +206,7 @@ impl ScanLedger {
         }
         // Starting over: what the templates of the old plan found goes with it.
         sqlx::query(
-            "DELETE FROM findings WHERE scan_id = $1 AND template_id IN \
+            "DELETE FROM findings WHERE scan_id = $1 AND check_id IN \
              (SELECT template_id FROM template_states WHERE scan_id = $1)",
         )
         .bind(scan)
@@ -341,40 +273,5 @@ impl Ledger for ScanLedger {
         .bind(state.as_str())
         .execute(&self.db.pool)
         .await;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A finding found again with another proof, or at a URL whose token has been
-    /// rotated, is kept once, with the proof it was first kept with: what tells findings
-    /// apart is what is kept of them, which holds no credential.
-    #[tokio::test]
-    #[ignore = "needs PostgreSQL's programs"]
-    async fn a_finding_is_kept_once_whatever_its_proof() {
-        let scratch = cfx_db::testing::Scratch::new(&ENGINE).await;
-        let db = PlessorDb::new(scratch.pool.clone());
-        let scan = db
-            .start("scan", &serde_json::json!({"target": "http://app.test"}))
-            .await
-            .expect("kept");
-        let found = |hash: &str, token: &str| {
-            serde_json::json!({"type": "finding", "data": {
-                "template": "t", "matched_at": format!("http://app.test/x?token={token}"),
-                "proof": {"format": 1, "response_sha256": hash},
-            }})
-        };
-        db.event(Some(&scan.id), &found("aa", "first")).await;
-        db.event(Some(&scan.id), &found("bb", "first")).await;
-        db.event(Some(&scan.id), &found("aa", "rotated")).await;
-        let kept: Vec<(String,)> =
-            sqlx::query_as("SELECT data->'proof'->>'response_sha256' FROM findings")
-                .fetch_all(db.pool())
-                .await
-                .unwrap();
-        assert_eq!(kept, [("aa".to_string(),)]);
-        scratch.done().await;
     }
 }

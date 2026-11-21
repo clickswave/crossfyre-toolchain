@@ -276,9 +276,29 @@ async fn handle_connection(
             continue;
         }
 
-        // The enumerations this daemon keeps, the latest first.
+        // The enumerations this daemon keeps, the latest first, one as it was kept, and what
+        // they found, oldest first.
         if req.operation == "scans" {
             let answer = cfx_db::scans::answer_scans(db.pool(), cfx_db::scans::Listed::why_not);
+            write_json(&mut writer, &answer.await).await?;
+            continue;
+        }
+        if req.operation == "scan_info" {
+            let id = req.params["id"].as_str().unwrap_or_default();
+            write_json(
+                &mut writer,
+                &cfx_db::found::answer_scan(db.pool(), id).await,
+            )
+            .await?;
+            continue;
+        }
+        if req.operation == "findings" {
+            let answer = cfx_db::found::answer_findings(
+                db.pool(),
+                req.params["scan"].as_str(),
+                req.params["after"].as_i64(),
+                req.params["limit"].as_i64().unwrap_or(200),
+            );
             write_json(&mut writer, &answer.await).await?;
             continue;
         }
@@ -422,6 +442,9 @@ async fn handle_stream_enum(
     let oid = operation_id.clone();
     let save = req.save;
     let db_clone = Arc::clone(&db);
+    // What the enumeration found, said and how far it got, as every engine keeps it: a
+    // name found is a finding, one tried and not found is not.
+    let mut keeper = cfx_db::found::Keeper::new(db.pool(), Some(running.id.as_str()));
 
     dguard::spawn_busy(async move {
         let ran = scanner.run_headless_stream(tx).await;
@@ -437,10 +460,19 @@ async fn handle_stream_enum(
 
     // Forward all events to the TCP stream
     while let Some(event) = rx.recv().await {
+        if kept(&event) {
+            keeper.event(&serde_json::to_value(&event)?).await;
+        }
         write_json(&mut writer, &event).await?;
     }
+    let _ = keeper.flush().await;
 
     Ok(())
+}
+
+/// Whether `event` is kept with its enumeration: a name found, and everything but a result.
+fn kept(event: &StreamEvent) -> bool {
+    event.kind != "result" || event.status.as_deref() == Some("found")
 }
 
 // ---------------------------------------------------------------------------
@@ -1382,6 +1414,101 @@ async fn handle_stream_takeover(
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod kept_tests {
+    //! What an enumeration found, kept as every engine keeps it, and read back.
+    use super::*;
+
+    /// What a daemon on `port` answers `ask` with.
+    async fn answer(port: u16, ask: serde_json::Value) -> serde_json::Value {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let (r, mut w) = stream.into_split();
+        w.write_all(format!("{ask}\n").as_bytes()).await.unwrap();
+        let line = BufReader::new(r)
+            .lines()
+            .next_line()
+            .await
+            .unwrap()
+            .unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    fn result(name: &str, status: &str) -> StreamEvent {
+        StreamEvent {
+            kind: "result".into(),
+            subdomain: Some(name.into()),
+            status: Some(status.into()),
+            ..Default::default()
+        }
+    }
+
+    /// A name found is kept with its enumeration, one tried and not found is not.
+    #[test]
+    fn only_a_name_found_is_kept() {
+        assert!(kept(&result("a.app.test", "found")));
+        assert!(!kept(&result("b.app.test", "not_found")));
+        assert!(kept(&StreamEvent {
+            kind: "progress".into(),
+            ..Default::default()
+        }));
+    }
+
+    /// The names an enumeration kept are what the daemon's `findings` and `scan_info`
+    /// answers give back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs PostgreSQL's programs"]
+    async fn the_names_kept_are_read_back() {
+        let scratch = cfx_db::testing::Scratch::new(&crate::libs::voyage_db::ENGINE).await;
+        let running = cfx_db::scans::start(
+            &scratch.pool,
+            cfx_db::scans::Asked::new("app.test", r#"{"domain":"app.test"}"#),
+            cfx_db::scans::Key::Settings("k"),
+            true,
+        )
+        .await
+        .unwrap();
+        let mut keeper = cfx_db::found::Keeper::new(&scratch.pool, Some(&running.id));
+        for ev in [
+            result("a.app.test", "found"),
+            result("b.app.test", "not_found"),
+        ] {
+            if kept(&ev) {
+                keeper.event(&serde_json::to_value(&ev).unwrap()).await;
+            }
+        }
+        cfx_db::scans::finish(running, cfx_db::scans::Status::Completed)
+            .await
+            .unwrap();
+        let db = Arc::new(VoyageDb::new(scratch.pool.clone()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(handle_connection(
+                    stream,
+                    dguard::Gate::default(),
+                    Arc::clone(&db),
+                ));
+            }
+        });
+        let found = answer(port, serde_json::json!({"operation": "findings"})).await;
+        let rows = found["findings"].as_array().expect("rows");
+        assert_eq!(rows.len(), 1, "{found}");
+        assert_eq!(rows[0]["data"]["subdomain"], "a.app.test");
+        let scan = answer(
+            port,
+            serde_json::json!({"operation": "scan_info", "id": rows[0]["scan"]}),
+        )
+        .await;
+        assert_eq!(scan["scan"]["findings"], 1, "{scan}");
+        assert_eq!(scan["scan"]["status"], "completed", "{scan}");
+        scratch.done().await;
+    }
 }
 
 #[cfg(test)]

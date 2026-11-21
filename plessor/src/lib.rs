@@ -413,18 +413,18 @@ fn show_findings(rows: &[serde_json::Value], tui: bool) -> std::io::Result<()> {
 /// The findings as the table shows them.
 #[cfg(feature = "daemon")]
 fn findings_list(rows: &[serde_json::Value]) -> cfx_tui::table::List<'static> {
-    let text =
-        |row: &serde_json::Value, key: &str| row[key].as_str().unwrap_or_default().to_string();
+    let text = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_string();
+    let has_proof = |row: &serde_json::Value| row["data"].get("proof").is_some();
     let table: Vec<Vec<String>> = rows
         .iter()
         .map(|row| {
-            let found = text(row, "found");
+            let found = text(&row["found"]);
             vec![
                 row["id"].to_string(),
-                text(row, "severity"),
-                text(row, "name"),
-                text(row, "matched_at"),
-                if row["proof"] == true {
+                text(&row["data"]["severity"]),
+                text(&row["data"]["name"]),
+                text(&row["data"]["matched_at"]),
+                if has_proof(row) {
                     "yes".to_string()
                 } else {
                     "no proof kept".to_string()
@@ -436,7 +436,7 @@ fn findings_list(rows: &[serde_json::Value]) -> cfx_tui::table::List<'static> {
             ]
         })
         .collect();
-    let proofs = rows.iter().filter(|r| r["proof"] == true).count();
+    let proofs = rows.iter().filter(|r| has_proof(r)).count();
     cfx_tui::table::List {
         name: "PLESSOR",
         title: "FINDINGS",
@@ -757,10 +757,11 @@ mod tests {
     #[test]
     fn the_findings_say_which_have_no_proof() {
         let list = findings_list(&[
-            serde_json::json!({"id": 3, "severity": "high", "name": "a", "matched_at": "http://h/a",
-                               "proof": true, "found": "2026-11-21T12:00:00Z"}),
-            serde_json::json!({"id": 2, "severity": "high", "name": "b", "matched_at": "http://h/b",
-                               "proof": false, "found": "2026-11-21T11:00:00Z"}),
+            serde_json::json!({"id": 2, "data": {"severity": "high", "name": "a",
+                               "matched_at": "http://h/a", "proof": {"format": 1}},
+                               "found": "2026-11-21T12:00:00Z"}),
+            serde_json::json!({"id": 3, "data": {"severity": "high", "name": "b",
+                               "matched_at": "http://h/b"}, "found": "2026-11-21T11:00:00Z"}),
         ]);
         assert_eq!(list.rows[0][4], "yes");
         assert_eq!(list.rows[1][4], "no proof kept");

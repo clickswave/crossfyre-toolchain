@@ -138,9 +138,25 @@ async fn handle_connection(
             continue;
         }
 
-        // The scans this daemon keeps, the latest first.
+        // The scans this daemon keeps, the latest first, one as it was kept, and what they
+        // found, oldest first.
         if req.operation == "scans" {
             let answer = cfx_db::scans::answer_scans(&db.pool, cfx_db::scans::Listed::why_not);
+            write_json(&mut writer, &answer.await).await?;
+            continue;
+        }
+        if req.operation == "scan_info" {
+            let id = req.params["id"].as_str().unwrap_or_default();
+            write_json(&mut writer, &cfx_db::found::answer_scan(&db.pool, id).await).await?;
+            continue;
+        }
+        if req.operation == "findings" {
+            let answer = cfx_db::found::answer_findings(
+                &db.pool,
+                req.params["scan"].as_str(),
+                req.params["after"].as_i64(),
+                req.params["limit"].as_i64().unwrap_or(200),
+            );
             write_json(&mut writer, &answer.await).await?;
             continue;
         }
@@ -212,6 +228,9 @@ async fn handle_stream_scan(
     let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
     let oid = operation_id.clone();
     let db_c = Arc::clone(&db);
+    // What the scan found, said and how far it got, as every engine keeps it: an open port
+    // is a finding, a filtered one is not.
+    let mut keeper = cfx_db::found::Keeper::new(&db.pool, scan.as_ref().map(|s| s.id.as_str()));
 
     dguard::spawn_busy(async move {
         scanner::run_connect_scan(&scan_params, tx).await;
@@ -227,13 +246,22 @@ async fn handle_stream_scan(
 
     while let Some(ev) = rx.recv().await {
         let done = ev.kind == "done";
+        if kept(&ev) {
+            keeper.event(&serde_json::to_value(&ev)?).await;
+        }
         write_json(&mut writer, &ev).await?;
         if done {
             break;
         }
     }
+    let _ = keeper.flush().await;
 
     Ok(())
+}
+
+/// Whether `ev` is kept with its scan: an open port, and everything but a result.
+fn kept(ev: &StreamEvent) -> bool {
+    ev.kind != "result" || ev.status.as_deref() == Some("open")
 }
 
 /// The stopped scan a `resume` request names, taken up again with the settings it was kept
@@ -441,6 +469,88 @@ async fn write_json<W: AsyncWriteExt + Unpin>(
     writer.write_all(json.as_bytes()).await?;
     writer.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod kept_tests {
+    //! What a scan found, kept as every engine keeps it, and read back through the daemon.
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// What a daemon on `pool` answers `ask` with, or every line of a stream until done.
+    async fn ask(port: u16, ask: &serde_json::Value) -> Vec<serde_json::Value> {
+        let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        w.write_all(format!("{ask}\n").as_bytes()).await.unwrap();
+        let mut lines = BufReader::new(r).lines();
+        let mut got = Vec::new();
+        while let Ok(Ok(Some(line))) =
+            tokio::time::timeout(std::time::Duration::from_secs(20), lines.next_line()).await
+        {
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let last = v["type"] == "done" || v.get("type").is_none();
+            got.push(v);
+            if last {
+                break;
+            }
+        }
+        got
+    }
+
+    /// The only open port of a scan is kept as its finding, a closed one is not, and the
+    /// `findings` and `scan_info` answers give them back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs PostgreSQL's programs"]
+    async fn an_open_port_is_kept_and_read_back() {
+        let scratch = cfx_db::testing::Scratch::new(&crate::libs::doorward_db::ENGINE).await;
+        let db = Arc::new(DoorwardDb::new(scratch.pool.clone()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dport = listener.local_addr().unwrap().port();
+        let serving = Arc::clone(&db);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(handle_connection(
+                    stream,
+                    dguard::Gate::default(),
+                    Arc::clone(&serving),
+                ));
+            }
+        });
+        let open = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let oport = open.local_addr().unwrap().port();
+        tokio::spawn(async move { while open.accept().await.is_ok() {} });
+        let (closed, _held) = cfx_db::testing::closed_port();
+        let events = ask(
+            dport,
+            &serde_json::json!({"operation": "scan", "response": "stream",
+                "targets": ["127.0.0.1"], "ports": [oport, closed], "adaptive": false,
+                "timeout": 2000}),
+        )
+        .await;
+        assert!(events.iter().any(|e| e["type"] == "done"), "{events:?}");
+        let found = &ask(dport, &serde_json::json!({"operation": "findings"})).await[0];
+        let rows = found["findings"].as_array().expect("rows");
+        assert_eq!(rows.len(), 1, "{found}");
+        assert_eq!(rows[0]["data"]["port"], oport);
+        assert_eq!(rows[0]["kind"], "result");
+        let scan = &ask(
+            dport,
+            &serde_json::json!({"operation": "scan_info", "id": rows[0]["scan"]}),
+        )
+        .await[0];
+        assert_eq!(scan["scan"]["findings"], 1, "{scan}");
+        scratch.done().await;
+    }
+
+    /// Only an open port is a finding of a scan.
+    #[test]
+    fn only_an_open_port_is_kept() {
+        let result = |status: &str| StreamEvent::result("127.0.0.1", 80, status, 1);
+        assert!(kept(&result("open")));
+        assert!(!kept(&result("filtered")));
+        assert!(kept(&StreamEvent::ack("op", 1)));
+    }
 }
 
 #[cfg(test)]

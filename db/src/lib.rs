@@ -17,6 +17,7 @@
 //! `crossfyre db` works on the same [`Toolchain`].
 
 mod account;
+pub mod found;
 mod held;
 mod local;
 mod migrate;

@@ -21,21 +21,10 @@ CREATE TABLE template_states (
     PRIMARY KEY (scan_id, template_id)
 );
 
--- What a scan found, kept with no credential in it, and each once: a scan taken up again
--- reports what it had found, and finds again what it checks again.
-CREATE TABLE findings (
-    id          BIGSERIAL PRIMARY KEY,
-    scan_id     TEXT NOT NULL REFERENCES scans (id) ON DELETE CASCADE,
-    template_id TEXT,
-    data        JSONB NOT NULL,
-    digest      TEXT NOT NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (scan_id, digest)
-);
-
 -- Each time a finding's proof was replayed: what it came to, on what evidence, the status
 -- and body hash of the answer, and when. A replay of a proof handed in names no finding,
--- only the proof's hash. A finding is never changed by one.
+-- only the proof's hash. A finding, kept in the findings table every engine has, is never
+-- changed by one.
 CREATE TABLE verifications (
     id              BIGSERIAL PRIMARY KEY,
     finding_id      BIGINT REFERENCES findings (id) ON DELETE CASCADE,

@@ -53,7 +53,7 @@ pub enum Commands {
     /// The scans this engine keeps, the latest first, and a stopped template scan to take
     /// up again
     Scans,
-    /// What this engine kept of what its scans found, the latest first: each finding's id,
+    /// What this engine kept of what its scans found, oldest first: each finding's id,
     /// check, severity and where, and whether it has a proof to verify it by
     Findings(FindingsArgs),
     /// Check one kept finding again by its proof, running nothing else of its scan, and say

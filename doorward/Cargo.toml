@@ -34,5 +34,7 @@ cfx_tui = { path = "../tui" }
 ratatui = { version = "0.30.0-alpha.5", features = ["crossterm"] }
 
 [dev-dependencies]
+# A database of a test's own, for what the engine keeps.
+cfx_db = { path = "../db", features = ["testing"] }
 # A recording SOCKS5 proxy and counting listeners for the egress tests.
 cfx_tunnel = { path = "../tunnel", features = ["recorder"] }

@@ -11,11 +11,29 @@ CREATE TABLE scans (
     params      JSONB NOT NULL DEFAULT '{}',
     status      TEXT NOT NULL DEFAULT 'queued'
                 CHECK (status IN ('queued', 'running', 'stopped', 'completed', 'failed')),
+    -- How far it has got, as it last said, about once a second.
+    progress    JSONB NOT NULL DEFAULT '{}',
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX scans_config_hash ON scans (config_hash, status);
 CREATE INDEX scans_created_at ON scans (created_at);
+
+-- What a scan found, kept with no credential in it, and each once: its digest is of what
+-- is kept, without the finding's proof, so the same finding with another proof, or at a
+-- URL whose token was rotated, is one. `kind` is what it is (a vulnerability, a
+-- technology, an open port), `check_id` the check that found it, where there is one.
+CREATE TABLE findings (
+    id         BIGSERIAL PRIMARY KEY,
+    scan_id    TEXT NOT NULL REFERENCES scans (id) ON DELETE CASCADE,
+    kind       TEXT NOT NULL DEFAULT '',
+    check_id   TEXT,
+    data       JSONB NOT NULL,
+    digest     TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (scan_id, digest)
+);
+CREATE INDEX findings_scan_id ON findings (scan_id, id);
 
 -- What a scan said as it ran.
 CREATE TABLE logs (

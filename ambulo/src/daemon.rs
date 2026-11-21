@@ -400,9 +400,29 @@ async fn handle_connection(
             continue;
         }
 
-        // The scans this daemon keeps, the latest first.
+        // The scans this daemon keeps, the latest first, one as it was kept, and what they
+        // found, oldest first.
         if req.operation == "scans" {
             let answer = cfx_db::scans::answer_scans(db.pool(), cfx_db::scans::Listed::why_not);
+            write_json(&mut writer, &answer.await).await?;
+            continue;
+        }
+        if req.operation == "scan_info" {
+            let id = req.params["id"].as_str().unwrap_or_default();
+            write_json(
+                &mut writer,
+                &cfx_db::found::answer_scan(db.pool(), id).await,
+            )
+            .await?;
+            continue;
+        }
+        if req.operation == "findings" {
+            let answer = cfx_db::found::answer_findings(
+                db.pool(),
+                req.params["scan"].as_str(),
+                req.params["after"].as_i64(),
+                req.params["limit"].as_i64().unwrap_or(200),
+            );
             write_json(&mut writer, &answer.await).await?;
             continue;
         }
@@ -562,6 +582,9 @@ async fn handle_stream_scan(
     let oid = operation_id.clone();
     let save = req.save;
     let db_clone = Arc::clone(&db);
+    // What the scan found and how far it got, as every engine keeps it: a path found is a
+    // finding, one tried and not found is not. Its log lines the scan keeps itself.
+    let mut keeper = cfx_db::found::Keeper::new(db.pool(), Some(running.id.as_str()));
 
     dguard::spawn_busy(async move {
         let ran = scanner.run_headless_stream(tx).await;
@@ -579,10 +602,24 @@ async fn handle_stream_scan(
 
     // Forward all events to the TCP stream
     while let Some(event) = rx.recv().await {
+        if kept(&event) {
+            keeper.event(&serde_json::to_value(&event)?).await;
+        }
         write_json(&mut writer, &event).await?;
     }
+    let _ = keeper.flush().await;
 
     Ok(())
+}
+
+/// Whether `event` is kept with its scan as every engine keeps one: a path found, and
+/// everything but a result and a log line, which the scan keeps itself.
+fn kept(event: &StreamEvent) -> bool {
+    match event.kind.as_str() {
+        "log" => false,
+        "result" => event.status.as_deref() == Some("found"),
+        _ => true,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1154,6 +1191,103 @@ pub(crate) async fn answer_not_ready(sock: TcpStream, why: String) {
         while matches!(reader.read(&mut sent).await, Ok(n) if n > 0) {}
     })
     .await;
+}
+
+#[cfg(test)]
+mod kept_tests {
+    //! What a content discovery found, kept as every engine keeps it, and read back.
+    use super::*;
+
+    /// What a daemon on `port` answers `ask` with.
+    async fn answer(port: u16, ask: serde_json::Value) -> serde_json::Value {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let (r, mut w) = stream.into_split();
+        w.write_all(format!("{ask}\n").as_bytes()).await.unwrap();
+        let line = BufReader::new(r)
+            .lines()
+            .next_line()
+            .await
+            .unwrap()
+            .unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    fn event(kind: &str, status: Option<&str>) -> StreamEvent {
+        StreamEvent {
+            kind: kind.into(),
+            url: Some("http://app.test/admin".into()),
+            status: status.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// A path found is kept with its scan; one not found, and a log line, which the scan
+    /// keeps itself, are not.
+    #[test]
+    fn only_a_path_found_is_kept() {
+        assert!(kept(&event("result", Some("found"))));
+        assert!(!kept(&event("result", Some("not_found"))));
+        assert!(!kept(&event("log", None)));
+        assert!(kept(&event("progress", None)));
+    }
+
+    /// The paths a scan kept are what the daemon's `findings` and `scan_info` answers give
+    /// back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs PostgreSQL's programs"]
+    async fn the_paths_kept_are_read_back() {
+        let scratch = cfx_db::testing::Scratch::new(&crate::libs::ambulo_db::ENGINE).await;
+        let running = cfx_db::scans::start(
+            &scratch.pool,
+            cfx_db::scans::Asked::new("http://app.test", r#"{"endpoint":"http://app.test"}"#),
+            cfx_db::scans::Key::Settings("k"),
+            true,
+        )
+        .await
+        .unwrap();
+        let mut keeper = cfx_db::found::Keeper::new(&scratch.pool, Some(&running.id));
+        for ev in [
+            event("result", Some("found")),
+            event("result", Some("not_found")),
+        ] {
+            if kept(&ev) {
+                keeper.event(&serde_json::to_value(&ev).unwrap()).await;
+            }
+        }
+        cfx_db::scans::finish(running, cfx_db::scans::Status::Completed)
+            .await
+            .unwrap();
+        let db = Arc::new(AmbuloDb::new(scratch.pool.clone()));
+        let follow = Arc::new(build_probe_client(true, &transport::Egress::Inherit).unwrap());
+        let stay = Arc::new(build_probe_client(false, &transport::Egress::Inherit).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(handle_connection(
+                    stream,
+                    dguard::Gate::default(),
+                    Arc::clone(&db),
+                    Arc::clone(&follow),
+                    Arc::clone(&stay),
+                ));
+            }
+        });
+        let found = answer(port, serde_json::json!({"operation": "findings"})).await;
+        let rows = found["findings"].as_array().expect("rows");
+        assert_eq!(rows.len(), 1, "{found}");
+        assert_eq!(rows[0]["data"]["url"], "http://app.test/admin");
+        let scan = answer(
+            port,
+            serde_json::json!({"operation": "scan_info", "id": rows[0]["scan"]}),
+        )
+        .await;
+        assert_eq!(scan["scan"]["findings"], 1, "{scan}");
+        scratch.done().await;
+    }
 }
 
 #[cfg(test)]

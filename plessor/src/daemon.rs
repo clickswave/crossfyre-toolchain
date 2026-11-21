@@ -219,14 +219,24 @@ async fn handle_connection(
                 write_line(&mut writer, &reply).await?;
                 continue;
             }
-            // What this daemon kept of what its scans found.
+            // One scan as it was kept, and what the scans found, oldest first.
+            "scan_info" => {
+                let reply = cfx_db::found::answer_scan(
+                    db.pool(),
+                    params["id"].as_str().unwrap_or_default(),
+                )
+                .await;
+                write_line(&mut writer, &reply).await?;
+                continue;
+            }
             "findings" => {
-                let reply = db
-                    .findings(
-                        params["scan"].as_str(),
-                        params["limit"].as_i64().unwrap_or(200),
-                    )
-                    .await;
+                let reply = cfx_db::found::answer_findings(
+                    db.pool(),
+                    params["scan"].as_str(),
+                    params["after"].as_i64(),
+                    params["limit"].as_i64().unwrap_or(200),
+                )
+                .await;
                 write_line(&mut writer, &reply).await?;
                 continue;
             }
@@ -308,8 +318,8 @@ async fn verify(params: Value, egress: transport::Egress, db: &PlessorDb) -> Val
     };
     asked.egress = egress;
     let proof = match (asked.finding, asked.proof.take()) {
-        (Some(id), _) => match db.finding(id).await {
-            Ok(Some(data)) => match data.get("proof").cloned() {
+        (Some(id), _) => match cfx_db::found::finding(db.pool(), id).await {
+            Ok(Some(kept)) => match kept["data"].get("proof").cloned() {
                 Some(kept) => match serde_json::from_value::<crate::proof::Proof>(kept) {
                     Ok(proof) => proof,
                     Err(e) => return refuse(format!("finding {id}'s proof does not read: {e}")),
@@ -413,6 +423,7 @@ where
         None => db.start(what, &asked).await,
     };
     let id = scan.as_ref().map(|s| s.id.clone());
+    let mut keeper = cfx_db::found::Keeper::new(db.pool(), id.as_deref());
     let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
     let op = dguard::spawn_busy(run(p, tx, id.clone()));
     let mut reading = true;
@@ -420,10 +431,11 @@ where
         tokio::select! {
             ev = rx.recv() => match ev {
                 Some(mut ev) => {
-                    db.event(id.as_deref(), &ev).await;
+                    keeper.event(&ev).await;
                     acked(&mut ev, id.as_deref());
                     if let Err(e) = write_line(writer, &ev).await {
                         op.abort();
+                        let _ = keeper.flush().await;
                         db.finish(scan, Status::Stopped).await;
                         return Err(e);
                     }
@@ -433,6 +445,7 @@ where
                         Ok(()) => Status::Completed,
                         Err(_) => Status::Failed,
                     };
+                    let _ = keeper.flush().await;
                     db.finish(scan, ended).await;
                     return Ok(());
                 }
@@ -442,6 +455,7 @@ where
                     if is_cancel(&l, gate) {
                         op.abort();
                         let _ = op.await;
+                        let _ = keeper.flush().await;
                         db.finish(scan, Status::Stopped).await;
                         write_line(
                             writer,
@@ -1301,15 +1315,31 @@ mod tests {
             .iter()
             .find(|r| r["check"] == "widget-version")
             .unwrap_or_else(|| panic!("{listed}"));
-        assert_eq!(widget["proof"], true);
+        assert!(widget["data"].get("proof").is_some(), "{widget}");
         let injected = rows
             .iter()
             .find(|r| r["check"] != "widget-version")
             .unwrap_or_else(|| panic!("no injection finding in {listed}"));
-        assert_eq!(injected["proof"], false);
+        assert!(injected["data"].get("proof").is_none(), "{injected}");
+        // The scan is finished as its last event goes out, so it may be a moment after.
+        let mut scan = Value::Null;
+        for _ in 0..50 {
+            scan = verified(
+                dport,
+                &serde_json::json!({"operation": "scan_info", "response": "instant",
+                                    "id": widget["scan"]}),
+            )
+            .await;
+            if scan["scan"]["status"] == "completed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(scan["scan"]["status"], "completed", "{scan}");
+        assert_eq!(scan["scan"]["findings"], 1, "{scan}");
 
         let id = widget["id"].as_i64().unwrap();
-        let before = db.finding(id).await.unwrap();
+        let before = cfx_db::found::finding(db.pool(), id).await.unwrap();
         let again = verified(
             dport,
             &serde_json::json!({"operation": "verify", "response": "instant", "finding": id,
@@ -1319,7 +1349,7 @@ mod tests {
         assert_eq!(again["answer"], "reproduced", "{again}");
         assert_eq!(again["finding"], id);
         assert_eq!(
-            db.finding(id).await.unwrap(),
+            cfx_db::found::finding(db.pool(), id).await.unwrap(),
             before,
             "a verify changed the finding"
         );

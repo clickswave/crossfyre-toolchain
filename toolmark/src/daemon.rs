@@ -109,8 +109,27 @@ async fn handle_connection(
                 handle_services(req.params, req.egress, &mut writer, &db, known).await?;
                 return Ok(());
             }
-            // The scans this daemon keeps, the latest first.
+            // The scans this daemon keeps, the latest first, one as it was kept, and what
+            // they found, oldest first.
             "scans" => write_line(&mut writer, &db.scans().await).await?,
+            "scan_info" => {
+                let id = req.params["id"].as_str().unwrap_or_default();
+                write_line(
+                    &mut writer,
+                    &cfx_db::found::answer_scan(db.pool(), id).await,
+                )
+                .await?
+            }
+            "findings" => {
+                let answer = cfx_db::found::answer_findings(
+                    db.pool(),
+                    req.params["scan"].as_str(),
+                    req.params["after"].as_i64(),
+                    req.params["limit"].as_i64().unwrap_or(200),
+                )
+                .await;
+                write_line(&mut writer, &answer).await?
+            }
             // What it knows runs where.
             "inventory" => {
                 let answer = crate::inventory::with_leads(
@@ -276,14 +295,19 @@ async fn forward(
     let keeping = db.clone();
     dguard::spawn_busy(async move {
         let id = scan.as_ref().map(|s| s.id.clone());
+        // What the scan found, said and how far it got, as every engine keeps it, beside
+        // the inventory toolmark keeps of its own.
+        let mut keeper = cfx_db::found::Keeper::new(keeping.pool(), id.as_deref());
         while let Some(ev) = rx.recv().await {
             keeping.event(id.as_deref(), &ev).await;
+            keeper.event(&ev).await;
             let _ = out.send(ev);
         }
         let ended = match op.await {
             Ok(()) => Status::Completed,
             Err(_) => Status::Failed,
         };
+        let _ = keeper.flush().await;
         keeping.finish(scan, ended).await;
     });
     while let Some(ev) = written.recv().await {
@@ -560,6 +584,66 @@ mod tests {
         for secret in ["tm-secret-1", "tm-secret-2", "page-secret-3"] {
             assert!(!out.contains(secret), "{secret} went out: {out}");
         }
+    }
+
+    /// What a fingerprint found is kept as every engine keeps it, beside the inventory, and
+    /// the `findings` and `scan_info` answers give it back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs PostgreSQL's programs"]
+    async fn a_fingerprint_is_kept_and_read_back() {
+        let scratch = cfx_db::testing::Scratch::new(&crate::libs::toolmark_db::ENGINE).await;
+        let db = ToolmarkDb::new(scratch.pool.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let dport = listener.local_addr().expect("addr").port();
+        let serving = db.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(handle_connection(
+                    stream,
+                    dguard::Gate::default(),
+                    serving.clone(),
+                    std::sync::Arc::new(Knowledge::load(None)),
+                ));
+            }
+        });
+        let (tport, _) = recording_page().await;
+        ask_then_run(
+            dport,
+            serde_json::json!({"operation": "fingerprint",
+                "target": format!("http://127.0.0.1:{tport}/"), "evasive": false}),
+        )
+        .await;
+        let answer = |op: Value| async move {
+            let stream = TcpStream::connect(("127.0.0.1", dport)).await.unwrap();
+            let (r, mut w) = stream.into_split();
+            w.write_all(format!("{op}\n").as_bytes()).await.unwrap();
+            let line = BufReader::new(r)
+                .lines()
+                .next_line()
+                .await
+                .unwrap()
+                .unwrap();
+            serde_json::from_str::<Value>(&line).unwrap()
+        };
+        let found = answer(serde_json::json!({"operation": "findings"})).await;
+        let rows = found["findings"].as_array().expect("rows");
+        let nginx = rows
+            .iter()
+            .find(|r| r["data"]["name"] == "Nginx")
+            .unwrap_or_else(|| panic!("{found}"));
+        assert_eq!(nginx["kind"], "technology");
+        // The scan is finished as its last event goes out, so it may be a moment after.
+        let mut scan = Value::Null;
+        for _ in 0..50 {
+            scan = answer(serde_json::json!({"operation": "scan_info", "id": nginx["scan"]})).await;
+            if scan["scan"]["status"] == "completed" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(scan["scan"]["status"], "completed", "{scan}");
+        assert_eq!(scan["scan"]["findings"], rows.len(), "{scan}");
+        scratch.done().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

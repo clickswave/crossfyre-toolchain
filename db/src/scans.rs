@@ -610,6 +610,9 @@ pub struct Listed {
     pub updated_at: String,
     /// Its settings as they were kept, with no credential in them.
     pub settings: serde_json::Value,
+    /// How far it got, as it last said, and how many findings it kept.
+    pub progress: serde_json::Value,
+    pub findings: i64,
 }
 
 impl Listed {
@@ -637,6 +640,8 @@ impl Listed {
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "settings": self.settings,
+            "progress": self.progress,
+            "findings": self.findings,
             "resumable": why_not.is_none(),
             "why_not": why_not,
         })
@@ -666,11 +671,22 @@ pub async fn answer_scans(
 
 /// The latest `limit` scans, the latest first.
 pub async fn list(pool: &PgPool, limit: i64) -> Result<Vec<Listed>, sqlx::Error> {
-    let rows: Vec<(String, String, String, String, String, serde_json::Value)> = sqlx::query_as(
+    type Row = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        serde_json::Value,
+        serde_json::Value,
+        i64,
+    );
+    let rows: Vec<Row> = sqlx::query_as(
         "SELECT id, target, status, \
          to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
-         to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), params \
-         FROM scans ORDER BY created_at DESC, id LIMIT $1",
+         to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), params, \
+         progress, (SELECT count(*) FROM findings f WHERE f.scan_id = s.id) \
+         FROM scans s ORDER BY created_at DESC, id LIMIT $1",
     )
     .bind(limit)
     .fetch_all(pool)
@@ -678,13 +694,15 @@ pub async fn list(pool: &PgPool, limit: i64) -> Result<Vec<Listed>, sqlx::Error>
     Ok(rows
         .into_iter()
         .map(
-            |(id, target, status, created_at, updated_at, settings)| Listed {
+            |(id, target, status, created_at, updated_at, settings, progress, findings)| Listed {
                 id,
                 target,
                 status,
                 created_at,
                 updated_at,
                 settings,
+                progress,
+                findings,
             },
         )
         .collect())
@@ -1064,6 +1082,8 @@ mod tests {
             created_at: "2026-11-19T10:00:00Z".into(),
             updated_at: "2026-11-19T11:00:00Z".into(),
             settings,
+            progress: serde_json::json!({}),
+            findings: 0,
         };
         assert_eq!(scan("stopped", serde_json::json!({})).why_not(), None);
         assert!(
@@ -1090,6 +1110,8 @@ mod tests {
                 "created_at": "2026-11-19T10:00:00Z",
                 "updated_at": "2026-11-19T11:00:00Z",
                 "settings": {"tasks": 4},
+                "progress": {},
+                "findings": 0,
                 "resumable": true,
                 "why_not": null,
             })

@@ -662,7 +662,10 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(schema, "cfx_db_test");
-        assert_eq!(tables(&made).await, ["kept", "logs", "operations", "scans"]);
+        assert_eq!(
+            tables(&made).await,
+            ["findings", "kept", "logs", "operations", "scans"]
+        );
         sqlx::query("INSERT INTO kept VALUES (7)")
             .execute(&made)
             .await
@@ -682,7 +685,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(
             tables(&newer).await,
-            ["kept", "logs", "more", "operations", "scans"]
+            ["findings", "kept", "logs", "more", "operations", "scans"]
         );
         assert_eq!(kept(&newer).await, [7]);
 
@@ -696,7 +699,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             tables(&newer).await,
-            ["kept", "logs", "more", "operations", "scans"]
+            ["findings", "kept", "logs", "more", "operations", "scans"]
         );
         assert_eq!(kept(&newer).await, [7]);
         newer.close().await;
