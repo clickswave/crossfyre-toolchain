@@ -5,7 +5,7 @@
 //! finding: a version can be read wrong, and a build may carry a fix its version does
 //! not show.
 
-use cfx_cve::{Cpe, Dataset, Lead};
+use cfx_cve::{Asked, Cpe, Dataset, Lead, Version};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
@@ -25,6 +25,10 @@ const SNAPSHOT: &[u8] = include_bytes!("../data/cve-known-exploited.json.gz");
 
 /// The other names the CVE data gives products the signatures name (toolmark/data).
 const ALIASES: &str = include_str!("../data/aliases.yaml");
+
+/// How the CVE data numbers the products whose CVEs are filed under other numbering than
+/// toolmark reads (toolmark/data).
+const VERSIONS: &str = include_str!("../data/versions.yaml");
 
 /// The dataset's file in toolmark's data folder.
 pub const DATASET_FILE: &str = "cve-dataset.json.gz";
@@ -50,6 +54,51 @@ fn named(text: &str) -> Cpe {
     Cpe::parse(text).unwrap_or_else(|| {
         panic!("{text} in toolmark/data/aliases.yaml is not part:vendor:product")
     })
+}
+
+/// One way a version toolmark reads maps to the one the CVE data files it under: an
+/// exact version, or a range from one up to and not including another.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Filed {
+    eq: Option<String>,
+    from: Option<String>,
+    below: Option<String>,
+    #[serde(rename = "as")]
+    filed: String,
+}
+
+impl Filed {
+    fn holds(&self, v: &Version) -> bool {
+        let at = |bound: &Option<String>| bound.as_deref().and_then(Version::parse);
+        at(&self.eq).is_none_or(|b| *v == b)
+            && at(&self.from).is_none_or(|b| *v >= b)
+            && at(&self.below).is_none_or(|b| *v < b)
+    }
+}
+
+/// Each product's map, from toolmark/data/versions.yaml.
+fn version_maps() -> &'static std::collections::HashMap<Cpe, Vec<Filed>> {
+    static ALL: std::sync::LazyLock<std::collections::HashMap<Cpe, Vec<Filed>>> =
+        std::sync::LazyLock::new(|| {
+            let read: std::collections::BTreeMap<String, Vec<Filed>> =
+                serde_yaml::from_str(VERSIONS).expect("toolmark/data/versions.yaml reads");
+            read.into_iter()
+                .map(|(name, map)| (named(&name), map))
+                .collect()
+        });
+    &ALL
+}
+
+/// `version` of `cpe` as the CVE data numbers it: itself, or for a product whose CVEs are
+/// filed under other numbering, what its map gives, and none when the map has nothing
+/// for it.
+fn as_filed(cpe: &Cpe, version: &str) -> Option<String> {
+    let Some(map) = version_maps().get(cpe) else {
+        return Some(version.to_string());
+    };
+    let v = Version::parse(version)?;
+    map.iter().find(|f| f.holds(&v)).map(|f| f.filed.clone())
 }
 
 /// `cpe` and its other names.
@@ -130,9 +179,12 @@ impl Cves {
         version: &str,
         distro: Option<&str>,
     ) -> (Vec<Lead>, String) {
-        let groups: Vec<Vec<Cpe>> = products.iter().map(with_aliases).collect();
+        let asked: Vec<Asked> = products
+            .iter()
+            .filter_map(|p| Some(Asked::new(with_aliases(p), &as_filed(p, version)?)))
+            .collect();
         let data = self.data.read().unwrap_or_else(|e| e.into_inner());
-        (data.0.leads(&groups, version, distro), data.1.clone())
+        (data.0.leads(&asked, distro), data.1.clone())
     }
 }
 
@@ -375,6 +427,92 @@ mod tests {
                 .contains("no data folder")
         );
         assert_eq!(asked.load(Ordering::SeqCst), 0);
+    }
+
+    /// Exchange's build is asked for as the cumulative update NVD names, SharePoint's as its
+    /// release, and Erlang/OTP's ssh version as the OTP release that shipped it; a build
+    /// the map does not hold gives nothing.
+    #[test]
+    fn a_version_filed_under_other_numbering_is_asked_for_as_it_is_filed() {
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(
+            folder.path().join(DATASET_FILE),
+            r#"{"format": 1, "sequence": 3, "made": "2026-11-22T15:00:00Z", "products": [
+              {"part": "a", "vendor": "microsoft", "product": "exchange_server",
+               "affected": [{"cve": "CVE-2099-0040", "ranges": [{"eq": "2019cumulative_update_12"}]}]},
+              {"part": "a", "vendor": "microsoft", "product": "sharepoint_server",
+               "affected": [{"cve": "CVE-2099-0041", "ranges": [{"eq": "2019"}]}]},
+              {"part": "a", "vendor": "erlang", "product": "erlang/otp",
+               "affected": [{"cve": "CVE-2099-0042", "ranges": [{"ge": "27.0", "lt": "27.3.3"}]}]}],
+             "cves": {"CVE-2099-0040": {}, "CVE-2099-0041": {}, "CVE-2099-0042": {}}}"#,
+        )
+        .unwrap();
+        let exchange = Cpe::new("a", "microsoft", "exchange_server");
+        let sharepoint = Cpe::new("a", "microsoft", "sharepoint_server");
+        let otp = Cpe::new("a", "erlang", "erlang/otp");
+        let names: HashSet<Cpe> = [exchange.clone(), sharepoint.clone(), otp.clone()].into();
+        let cves = Cves::load(Some(folder.path()), &names, DATASET_URL);
+        let ask = |cpe: &Cpe, version: &str| {
+            ids(&cves.leads(&[cpe.clone()], version, None).0)
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ask(&exchange, "15.2.1118.7"), ["CVE-2099-0040"]);
+        assert_eq!(
+            ask(&exchange, "15.2.1118.40"),
+            ["CVE-2099-0040"],
+            "any update of CU12"
+        );
+        assert!(ask(&exchange, "15.2.1258.12").is_empty(), "CU13");
+        assert!(
+            ask(&exchange, "15.2.2562.17").is_empty(),
+            "Subscription Edition is not mapped"
+        );
+        assert_eq!(ask(&sharepoint, "16.0.0.10337"), ["CVE-2099-0041"]);
+        assert_eq!(
+            ask(&otp, "5.2.9"),
+            ["CVE-2099-0042"],
+            "ssh 5.2.9 shipped with OTP 27.3.1"
+        );
+        assert!(ask(&otp, "5.2.10").is_empty(), "ssh 5.2.10 is OTP 27.3.3's");
+    }
+
+    /// FortiOS, NetScaler and Exchange, each at a version with known-exploited CVEs, give
+    /// them from the snapshot toolmark ships.
+    #[test]
+    fn the_snapshot_gives_fortios_netscaler_and_exchange_their_known_exploited_cves() {
+        let cves = snapshot_for_tests();
+        let kev = |products: &[Cpe], version: &str| {
+            let (leads, from) = cves.leads(products, version, None);
+            assert_eq!(from, SNAPSHOT_LABEL);
+            leads
+                .into_iter()
+                .filter(|l| l.known.kev)
+                .map(|l| l.cve)
+                .collect::<Vec<_>>()
+        };
+        let fortios = kev(&[Cpe::new("o", "fortinet", "fortios")], "7.2.4");
+        assert!(fortios.iter().any(|c| c == "CVE-2023-27997"), "{fortios:?}");
+        let netscaler = kev(
+            &[
+                Cpe::new("a", "citrix", "netscaler_application_delivery_controller"),
+                Cpe::new("a", "citrix", "netscaler_gateway"),
+            ],
+            "13.1-49.12",
+        );
+        assert!(
+            netscaler.iter().any(|c| c == "CVE-2023-3519"),
+            "{netscaler:?}"
+        );
+        let exchange = kev(
+            &[Cpe::new("a", "microsoft", "exchange_server")],
+            "15.2.1118.7",
+        );
+        assert!(
+            exchange.iter().any(|c| c == "CVE-2022-41082"),
+            "{exchange:?}"
+        );
     }
 
     /// A product is looked up under its aliases too, and a lead that affects some of

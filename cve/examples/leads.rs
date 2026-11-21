@@ -4,7 +4,7 @@
 //! cargo run -p cfx_cve --example leads -- DATASET PART:VENDOR:PRODUCT[,...] VERSION [DISTRO]
 //! ```
 
-use cfx_cve::{Cpe, Dataset};
+use cfx_cve::{Asked, Cpe, Dataset};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -24,8 +24,11 @@ fn main() {
     let dataset = Dataset::from_bytes_for(&bytes, &wanted).unwrap_or_else(|e| fail(&e.to_string()));
     println!("dataset {} made {}", dataset.sequence(), dataset.made());
     // Each name asked about is a product of its own.
-    let products: Vec<Vec<Cpe>> = names.iter().map(|n| vec![n.clone()]).collect();
-    for lead in dataset.leads(&products, version, rest.first().map(String::as_str)) {
+    let products: Vec<Asked> = names
+        .iter()
+        .map(|n| Asked::new(vec![n.clone()], version))
+        .collect();
+    for lead in dataset.leads(&products, rest.first().map(String::as_str)) {
         let known = &lead.known;
         println!(
             "{} {} {} kev={} epss={} possible={} backport={}",

@@ -1,5 +1,5 @@
 The known-exploited snapshot in cve-known-exploited.json.gz, the CVEs on CISA's list cut
-from the CVE dataset 2 made 2026-11-20T07:42:16Z, is compiled by Clickswave from the
+from the CVE dataset 4 made 2026-11-21T05:16:53Z, is compiled by Clickswave from the
 sources below, each used under its own terms. Version ranges are normalised into the
 dataset's own format.
 

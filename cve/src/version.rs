@@ -4,7 +4,8 @@ use std::cmp::Ordering;
 
 /// A version as a banner, a header or the dataset writes it: dotted ("2.4.49"), semver
 /// with a pre-release ("1.2.3-beta.1"), OpenSSH's portable releases ("8.9p1"),
-/// OpenSSL's letter releases ("1.1.1w"), a build after a dash ("13.1-49.13"), and any
+/// OpenSSL's letter releases ("1.1.1w"), a build after a dash ("13.1-49.13"), Cisco's
+/// interim releases in brackets ("9.16(3)23"), and any
 /// of them with a distribution's build on the end ("2.4.52-1ubuntu4.3",
 /// "1:8.9p1-3ubuntu0.6", "7.4.33-1+deb11u5"). A distribution's build is not ordered:
 /// it only marks the version as one a distribution built, which may carry a fix the
@@ -66,8 +67,15 @@ impl Version {
             text = rest;
         }
         // The release runs to the first '-', '~', '+', space or bracket. What follows is a
-        // build, a pre-release, a distribution's build or build metadata.
-        let end = text.find(['-', '~', '+', ' ', '(']).unwrap_or(text.len());
+        // build, a pre-release, a distribution's build or build metadata. A bracket around
+        // a number, as Cisco writes 9.16(3)23, is part of the release.
+        let end = text
+            .char_indices()
+            .find(|&(i, c)| {
+                matches!(c, '-' | '~' | '+' | ' ')
+                    || (c == '(' && !text[i + 1..].starts_with(|n: char| n.is_ascii_digit()))
+            })
+            .map_or(text.len(), |(i, _)| i);
         let (core, rest) = text.split_at(end);
         if !core.bytes().any(|b| b.is_ascii_digit()) {
             return None;
@@ -294,6 +302,20 @@ mod tests {
         in_order(&[
             "1.0.1", "1.0.1a", "1.0.1g", "1.0.2", "1.1.1", "1.1.1a", "1.1.1w", "3.0.0",
         ]);
+    }
+
+    #[test]
+    fn cisco_s_interim_releases_in_brackets_are_ordered() {
+        in_order(&[
+            "9.16",
+            "9.16(1)",
+            "9.16(3)",
+            "9.16(3)23",
+            "9.16(4)",
+            "9.17(1)",
+        ]);
+        assert!(!v("9.16(3)23").distro());
+        assert_eq!(v("2.4.52 (Ubuntu)"), v("2.4.52"));
     }
 
     #[test]
