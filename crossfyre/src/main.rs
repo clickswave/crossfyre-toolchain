@@ -170,6 +170,11 @@ enum Commands {
         /// release that kept its version number.
         #[arg(long)]
         force: bool,
+        /// Take a release older than what is installed. Without it, an update
+        /// refuses to go back, so a manifest kept from before cannot take a
+        /// machine back to a release with a known flaw.
+        #[arg(long)]
+        allow_downgrade: bool,
     },
 
     /// Show a full overview of the local node daemons, extensions and database.
@@ -444,6 +449,9 @@ enum ExtensionAction {
         /// Re-download even if the installed version already matches.
         #[arg(long)]
         force: bool,
+        /// Take a release older than what is installed.
+        #[arg(long)]
+        allow_downgrade: bool,
     },
     /// Start an extension daemon.
     Start { name: String },
@@ -684,11 +692,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Some(ext) => cfx_core::toolchain::install::remove(ext)?,
                 None => cfx_core::toolchain::print_extension_usage("remove"),
             },
-            ExtensionAction::Update { name, force } => {
+            ExtensionAction::Update {
+                name,
+                force,
+                allow_downgrade,
+            } => {
                 let updated = cfx_core::toolchain::install::update(
                     name.as_deref(),
                     env!("CARGO_PKG_VERSION"),
                     force,
+                    allow_downgrade,
                 )
                 .await?;
                 if !updated.succeeded() {
@@ -785,11 +798,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             })
             .await?;
         }
-        Commands::Update { target, force } => {
+        Commands::Update {
+            target,
+            force,
+            allow_downgrade,
+        } => {
             let updated = cfx_core::toolchain::install::update(
                 target.as_deref(),
                 env!("CARGO_PKG_VERSION"),
                 force,
+                allow_downgrade,
             )
             .await?;
             if updated.restart && cfx_core::toolchain::service::node_service_exists() {
@@ -1047,6 +1065,11 @@ mod tests {
             (&["update"][..], "update"),
             (&["update", "self"], "update"),
             (&["update", "voyage", "--force"], "update"),
+            (&["update", "--allow-downgrade"], "update"),
+            (
+                &["extension", "update", "voyage", "--allow-downgrade"],
+                "extension update",
+            ),
             (&["extension", "install", "voyage"], "extension install"),
             (&["extension", "remove", "voyage"], "extension remove"),
             (&["extension", "update"], "extension update"),

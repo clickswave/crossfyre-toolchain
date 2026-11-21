@@ -1186,6 +1186,7 @@ pub async fn update(
     target: Option<&str>,
     current_version: &str,
     force: bool,
+    allow_downgrade: bool,
 ) -> Result<Updated, Box<dyn std::error::Error>> {
     if target == Some(DATA) {
         print_heading();
@@ -1196,7 +1197,80 @@ pub async fn update(
     }
     let manifest = fetch_manifest().await?;
     let handed_over = std::env::var_os(UPDATED_FROM_ENV).is_some();
-    update_with(&manifest, target, current_version, force, handed_over).await
+    // A CLI handed the rest of an update was let take an older release by the one before
+    // it, which says so in the environment rather than in a flag an older CLI rejects.
+    let allow_downgrade = allow_downgrade
+        || (handed_over && std::env::var(ALLOW_DOWNGRADE_ENV).is_ok_and(|v| v == "1"));
+    let rules = Rules {
+        force,
+        allow_downgrade,
+    };
+    update_with(&manifest, target, current_version, rules, handed_over).await
+}
+
+/// Set by a CLI that was let take an older release, on the CLI it hands the rest to.
+pub const ALLOW_DOWNGRADE_ENV: &str = "CROSSFYRE_ALLOW_DOWNGRADE";
+
+/// The flag that lets `update` take a release older than what is installed.
+const ALLOW_DOWNGRADE_FLAG: &str = "--allow-downgrade";
+
+/// What `update` may do: reinstall what is current (`--force`), and take a release
+/// older than what is installed (`--allow-downgrade`).
+#[derive(Debug, Clone, Copy, Default)]
+struct Rules {
+    force: bool,
+    allow_downgrade: bool,
+}
+
+/// What `update` does with a component installed at `have` (none when it is not
+/// installed or its version is unknown) when the release names `want`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Current,
+    /// The release's is older, and nothing let update take it.
+    Downgrade,
+    Install,
+}
+
+impl Rules {
+    fn verdict(self, have: Option<&str>, want: &str) -> Verdict {
+        if want.is_empty() {
+            return Verdict::Install;
+        }
+        if have == Some(want) && !self.force {
+            return Verdict::Current;
+        }
+        if !self.allow_downgrade && have.is_some_and(|have| is_downgrade(want, have)) {
+            return Verdict::Downgrade;
+        }
+        Verdict::Install
+    }
+}
+
+/// Whether `want` is older than `have`. A version either side cannot be read as one is
+/// not taken for older.
+fn is_downgrade(want: &str, have: &str) -> bool {
+    match (cfx_cve::Version::parse(want), cfx_cve::Version::parse(have)) {
+        (Some(want), Some(have)) => want < have,
+        _ => false,
+    }
+}
+
+/// The row for a component `update` will not take back from `have` to `want`.
+fn downgrade_row(name: &str, have: &str, want: &str) -> String {
+    use super::ui::*;
+    row(
+        &bang(),
+        name,
+        &ver(have),
+        &format!(
+            "{YELLOW}refused{RESET} {}",
+            dim(&format!(
+                "the release's {want} is older than the {have} installed here; \
+                 `crossfyre update --allow-downgrade` takes it"
+            ))
+        ),
+    )
 }
 
 /// The target of `update` that takes the data the engines read and nothing else.
@@ -1349,8 +1423,11 @@ fn hand_over(cli: &Path, from: &str) -> Box<dyn std::error::Error> {
     use std::io::Write;
     let _ = std::io::stdout().flush();
     let mut cmd = Command::new(cli);
-    cmd.args(std::env::args_os().skip(1))
-        .env(UPDATED_FROM_ENV, from);
+    let (args, allow_downgrade) = forwarded(std::env::args_os().skip(1));
+    cmd.args(args).env(UPDATED_FROM_ENV, from);
+    if allow_downgrade {
+        cmd.env(ALLOW_DOWNGRADE_ENV, "1");
+    }
     let not_run = |e: std::io::Error| {
         format!(
             "the new crossfyre at {} did not start to finish the update: {e}. Run \
@@ -1372,6 +1449,20 @@ fn hand_over(cli: &Path, from: &str) -> Box<dyn std::error::Error> {
     }
 }
 
+/// This command's arguments as the CLI it hands over to is given them, and whether the
+/// downgrade flag was among them: without it, as a CLI older than the flag rejects it.
+fn forwarded(args: impl Iterator<Item = std::ffi::OsString>) -> (Vec<std::ffi::OsString>, bool) {
+    let mut allow = false;
+    let kept = args
+        .filter(|a| {
+            let flag = a == ALLOW_DOWNGRADE_FLAG;
+            allow |= flag;
+            !flag
+        })
+        .collect();
+    (kept, allow)
+}
+
 /// `update` against a manifest already fetched. The CLI goes first, and when it is
 /// replaced, the new CLI runs the rest, so what an update writes, an engine's unit above
 /// all, is the release's own. `handed_over` says this CLI is that new one: the one
@@ -1380,9 +1471,10 @@ async fn update_with(
     manifest: &Manifest,
     target: Option<&str>,
     current_version: &str,
-    force: bool,
+    rules: Rules,
     handed_over: bool,
 ) -> Result<Updated, Box<dyn std::error::Error>> {
+    let force = rules.force;
     let (do_self, exts): (bool, Vec<&str>) = match target {
         Some("self") => (true, vec![]),
         Some("all") | None => (true, installed_extensions()),
@@ -1434,13 +1526,17 @@ async fn update_with(
                 )
             );
             out.current += 1;
-        } else if !want.is_empty() && want == current_version && !force {
+        } else if rules.verdict(Some(current_version), &want) == Verdict::Current {
             println!("  {}", dim("Core"));
             println!(
                 "{}",
                 row(&check(), "crossfyre", &ver(&want), &dim("up to date"))
             );
             out.current += 1;
+        } else if rules.verdict(Some(current_version), &want) == Verdict::Downgrade {
+            println!("  {}", dim("Core"));
+            println!("{}", downgrade_row("crossfyre", current_version, &want));
+            out.failed += 1;
         } else if !can_write_in(&cli_dir) {
             println!("  {}", dim("Core"));
             println!(
@@ -1514,12 +1610,19 @@ async fn update_with(
                 println!("{}", row(&dot(), "node", "", &dim("not installed")));
             } else {
                 let nhave = installed_node_version();
-                if !nwant.is_empty() && nhave.as_deref() == Some(nwant.as_str()) && !force {
+                let verdict = rules.verdict(nhave.as_deref(), &nwant);
+                if verdict == Verdict::Current {
                     println!(
                         "{}",
                         row(&check(), "node", &ver(&nwant), &dim("up to date"))
                     );
                     out.current += 1;
+                } else if verdict == Verdict::Downgrade {
+                    println!(
+                        "{}",
+                        downgrade_row("node", nhave.as_deref().unwrap_or_default(), &nwant)
+                    );
+                    out.failed += 1;
                 } else if !writable {
                     println!(
                         "{}",
@@ -1586,12 +1689,19 @@ async fn update_with(
                 println!("{}", row(&dot(), CFX_SCRIPT, "", &dim("not installed")));
             } else if !hwant.is_empty() {
                 let hhave = installed_helper_version();
-                if hhave.as_deref() == Some(hwant.as_str()) && !force {
+                let verdict = rules.verdict(hhave.as_deref(), &hwant);
+                if verdict == Verdict::Current {
                     println!(
                         "{}",
                         row(&check(), CFX_SCRIPT, &ver(&hwant), &dim("up to date"))
                     );
                     out.current += 1;
+                } else if verdict == Verdict::Downgrade {
+                    println!(
+                        "{}",
+                        downgrade_row(CFX_SCRIPT, hhave.as_deref().unwrap_or_default(), &hwant)
+                    );
+                    out.failed += 1;
                 } else if let Some(output) = still_cannot_start(&hwant).filter(|_| !force) {
                     println!("{skipped_row}");
                     show_detail(&skipped_note(&output));
@@ -1666,13 +1776,22 @@ async fn update_with(
             }
             let want = manifest_version(manifest, ext);
             let have = installed_ext_version(ext);
-            let up_to_date = ext_bin_path(ext).exists()
-                && !want.is_empty()
-                && have.as_deref() == Some(want.as_str());
-            if up_to_date && !force {
-                println!("{}", row(&check(), ext, &ver(&want), &dim("up to date")));
-                out.current += 1;
-                continue;
+            let installed = have.as_deref().filter(|_| ext_bin_path(ext).exists());
+            match rules.verdict(installed, &want) {
+                Verdict::Current => {
+                    println!("{}", row(&check(), ext, &ver(&want), &dim("up to date")));
+                    out.current += 1;
+                    continue;
+                }
+                Verdict::Downgrade => {
+                    println!(
+                        "{}",
+                        downgrade_row(ext, installed.unwrap_or_default(), &want)
+                    );
+                    out.failed += 1;
+                    continue;
+                }
+                Verdict::Install => {}
             }
             if !writable {
                 println!(
@@ -1988,7 +2107,22 @@ pub struct DashboardUpdate {
 /// new helper needs no restart, since every job starts it afresh.
 pub async fn update_for_dashboard() -> Result<DashboardUpdate, Box<dyn std::error::Error>> {
     let manifest = fetch_manifest().await?;
-    report_cfx_script(install_cfx_script(&manifest, false).await);
+    // The dashboard has no --allow-downgrade: an older release is taken by hand.
+    let rules = Rules::default();
+    let older = |name: &str, have: Option<&str>| {
+        let want = manifest_version(&manifest, name);
+        (rules.verdict(have, &want) == Verdict::Downgrade).then(|| {
+            format!(
+                "the release's {name} {want} is older than the {} installed here, so the \
+                 dashboard's update does not take it",
+                have.unwrap_or_default()
+            )
+        })
+    };
+    match older(CFX_SCRIPT, installed_helper_version().as_deref()) {
+        Some(why) => println!("[update] {why}"),
+        None => report_cfx_script(install_cfx_script(&manifest, false).await),
+    }
     if let Some(m) = packaging::owner("crossfyre") {
         println!("[update] crossfyre is {}", update_note(m));
         return Ok(DashboardUpdate {
@@ -1996,7 +2130,11 @@ pub async fn update_for_dashboard() -> Result<DashboardUpdate, Box<dyn std::erro
             cli_managed_by: Some(m),
         });
     }
-    let restart = self_update(&manifest, &installed_cli_version(), false, false).await?;
+    let have = installed_cli_version();
+    if let Some(why) = older("crossfyre", Some(&have)) {
+        return Err(why.into());
+    }
+    let restart = self_update(&manifest, &have, false, false).await?;
     Ok(DashboardUpdate {
         restart,
         cli_managed_by: None,
@@ -2611,6 +2749,130 @@ exit 127"#;
         assert_eq!(installed_node_version().as_deref(), Some("9.9.9"));
     }
 
+    /// What update does with a component: current when it is the release's, refused when
+    /// the release's is older and nothing lets it take that, else installed; --force
+    /// reinstalls what is current, and only --allow-downgrade takes an older one.
+    #[test]
+    fn an_older_release_is_taken_only_when_allowed() {
+        use Verdict::*;
+        let rules = |force, allow_downgrade| Rules {
+            force,
+            allow_downgrade,
+        };
+        for (have, want, force, allow, verdict) in [
+            (Some("0.1.44"), "0.1.44", false, false, Current),
+            (Some("0.1.44"), "0.1.44", true, false, Install),
+            (Some("0.1.44"), "0.1.45", false, false, Install),
+            (Some("0.1.45"), "0.1.44", false, false, Downgrade),
+            (Some("0.1.45"), "0.1.44", true, false, Downgrade),
+            (Some("0.1.45"), "0.1.44", false, true, Install),
+            (Some("0.1.10"), "0.1.9", false, false, Downgrade),
+            (Some("0.2.0"), "0.2.0-rc.1", false, false, Downgrade),
+            (None, "0.1.44", false, false, Install),
+            (Some("dev build"), "0.1.44", false, false, Install),
+            (Some("0.1.44"), "", false, false, Install),
+        ] {
+            assert_eq!(
+                rules(force, allow).verdict(have, want),
+                verdict,
+                "{have:?} to {want:?}, force {force}, allow {allow}"
+            );
+        }
+    }
+
+    /// The CLI handed the rest of an update is told it may take an older release in its
+    /// environment, and the flag is left out of what it is given, as a CLI older than the
+    /// flag would refuse it.
+    #[test]
+    fn the_downgrade_flag_is_passed_on_in_the_environment_not_as_a_flag() {
+        let (args, allow) = forwarded(
+            ["update", "--allow-downgrade", "--force"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        );
+        assert_eq!(args, ["update", "--force"]);
+        assert!(allow);
+        let (args, allow) = forwarded(["update"].into_iter().map(std::ffi::OsString::from));
+        assert_eq!(args, ["update"]);
+        assert!(!allow);
+    }
+
+    /// Makes `dir` one this user may not write, until dropped. A refused downgrade is said
+    /// before update asks whether it may write, so in such a folder an update that
+    /// would have taken the older release asks for rights instead, and reaches no origin.
+    #[cfg(unix)]
+    struct ReadOnly<'a>(&'a Path);
+
+    #[cfg(unix)]
+    impl<'a> ReadOnly<'a> {
+        fn new(dir: &'a Path) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).expect("read-only");
+            Self(dir)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ReadOnly<'_> {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_engine_newer_than_the_release_is_left_and_the_update_fails() {
+        let s = Scratch::new("ext-newer");
+        bin_dir_at(&s.0);
+        fs::write(s.join("voyage"), "").expect("voyage");
+        fs::write(s.join("voyage.version"), "9.9.9").expect("its version");
+        let _ro = ReadOnly::new(&s.0);
+        let out = update_with(
+            &full_manifest("9.9.8"),
+            Some("voyage"),
+            "9.9.8",
+            Rules::default(),
+            false,
+        )
+        .await
+        .expect("runs");
+        assert_eq!(
+            out,
+            Updated {
+                failed: 1,
+                ..Updated::default()
+            }
+        );
+        assert!(!out.succeeded());
+        assert_eq!(installed_ext_version("voyage").as_deref(), Some("9.9.9"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cli_newer_than_the_release_is_left_and_the_update_fails() {
+        let s = Scratch::new("cli-newer");
+        bin_dir_at(&s.0);
+        reports(&s.0, "crossfyre", "9.9.9");
+        let _ro = ReadOnly::new(&s.0);
+        let out = update_with(
+            &full_manifest("9.9.8"),
+            Some("self"),
+            "9.9.9",
+            Rules::default(),
+            false,
+        )
+        .await
+        .expect("runs");
+        assert_eq!(
+            out,
+            Updated {
+                failed: 1,
+                ..Updated::default()
+            }
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn an_update_right_after_the_installer_changes_nothing() {
@@ -2619,9 +2881,15 @@ exit 127"#;
         reports(&s.0, "crossfyre", "9.9.9");
         reports(&s.0, "node", "9.9.9");
         reports(&s.0, CFX_SCRIPT, "9.9.9");
-        let out = update_with(&full_manifest("9.9.9"), Some("self"), "9.9.9", false, false)
-            .await
-            .expect("runs");
+        let out = update_with(
+            &full_manifest("9.9.9"),
+            Some("self"),
+            "9.9.9",
+            Rules::default(),
+            false,
+        )
+        .await
+        .expect("runs");
         assert_eq!(
             out,
             Updated {
@@ -2641,9 +2909,15 @@ exit 127"#;
         reports(&s.0, "crossfyre", "9.9.9");
         reports(&s.0, "node", "9.9.9");
         reports(&s.0, CFX_SCRIPT, "9.9.9");
-        let out = update_with(&full_manifest("9.9.9"), Some("self"), "9.9.9", false, true)
-            .await
-            .expect("runs");
+        let out = update_with(
+            &full_manifest("9.9.9"),
+            Some("self"),
+            "9.9.9",
+            Rules::default(),
+            true,
+        )
+        .await
+        .expect("runs");
         assert_eq!(
             out,
             Updated {
@@ -2668,9 +2942,15 @@ exit 127"#;
         ));
         fs::create_dir_all(s.join("bin")).expect("bin");
         reports(&s.join("bin"), "node", "9.9.9");
-        let out = update_with(&full_manifest("9.9.9"), Some("self"), "9.9.8", false, false)
-            .await
-            .expect("runs");
+        let out = update_with(
+            &full_manifest("9.9.9"),
+            Some("self"),
+            "9.9.8",
+            Rules::default(),
+            false,
+        )
+        .await
+        .expect("runs");
         assert_eq!(
             out,
             Updated {
@@ -2718,7 +2998,7 @@ exit 127"#;
         fs::write(s.join("voyage"), "").expect("voyage");
         fs::write(s.join("voyage.version"), "9.9.9").expect("its version");
         let manifest = full_manifest("9.9.9");
-        let refused = || update_with(&manifest, Some("voyage"), "9.9.8", false, false);
+        let refused = || update_with(&manifest, Some("voyage"), "9.9.8", Rules::default(), false);
         assert_eq!(
             refused().await.expect_err("refused").to_string(),
             "this crossfyre is 9.9.8, and the release's is 9.9.9: run `crossfyre update` \
@@ -2734,7 +3014,7 @@ exit 127"#;
              so the CLI is replaced before it writes an engine's unit"
         );
         // A CLI of the release updates it.
-        let out = update_with(&manifest, Some("voyage"), "9.9.9", false, false)
+        let out = update_with(&manifest, Some("voyage"), "9.9.9", Rules::default(), false)
             .await
             .expect("runs");
         assert_eq!(
@@ -2785,7 +3065,14 @@ exit 127"#;
         reports(&s.0, "node", "0.0.1");
         reports(&s.0, CFX_SCRIPT, "9.9.9");
         fs::set_permissions(&s.0, fs::Permissions::from_mode(0o555)).expect("lock");
-        let out = update_with(&full_manifest("9.9.9"), Some("self"), "9.9.9", false, false).await;
+        let out = update_with(
+            &full_manifest("9.9.9"),
+            Some("self"),
+            "9.9.9",
+            Rules::default(),
+            false,
+        )
+        .await;
         fs::set_permissions(&s.0, fs::Permissions::from_mode(0o755)).expect("unlock");
         let out = out.expect("runs");
         // Said before anything is downloaded, rather than a Permission denied after.
@@ -2815,9 +3102,15 @@ exit 127"#;
             r#"{{"manager":"brew","owns":["crossfyre"],"bin_dir":"{}"}}"#,
             s.join("bin").display()
         ));
-        let out = update_with(&full_manifest("9.9.9"), None, "9.9.8", false, false)
-            .await
-            .expect("runs");
+        let out = update_with(
+            &full_manifest("9.9.9"),
+            None,
+            "9.9.8",
+            Rules::default(),
+            false,
+        )
+        .await
+        .expect("runs");
         assert_eq!(
             out,
             Updated {
@@ -2851,9 +3144,15 @@ exit 127"#;
         assert_eq!(version, "9.9.9");
         assert_eq!(output, missing);
 
-        let out = update_with(&full_manifest("9.9.9"), Some("self"), "9.9.9", false, false)
-            .await
-            .expect("runs");
+        let out = update_with(
+            &full_manifest("9.9.9"),
+            Some("self"),
+            "9.9.9",
+            Rules::default(),
+            false,
+        )
+        .await
+        .expect("runs");
         assert_eq!(
             out,
             Updated {
