@@ -2499,10 +2499,15 @@ pub async fn run_daemon(
     // reach the controller) and before connecting, so subscriber traffic
     // routes through the configured egress. The guard tears egress down on
     // every exit path (Ctrl+C, SIGTERM, panic, normal return) and is bound to
-    // `_egress_guard` so it lives the full daemon lifetime.
-    let _egress_guard = config.network.as_ref().and_then(|net| {
-        egress::bring_up(net, &paths.network_dir, &paths.node_id, config.tunnel_hooks)
-    });
+    // `_egress_guard` so it lives the full daemon lifetime. While a kill switch
+    // has no egress helper to keep it, every op is refused (see egress::state).
+    let direct = NetworkConfig::default();
+    let _egress_guard = egress::bring_up(
+        config.network.as_ref().unwrap_or(&direct),
+        &paths.network_dir,
+        &paths.node_id,
+        config.tunnel_hooks,
+    );
 
     println!("Connecting to Jetstream at {}...", config.nats_url);
 

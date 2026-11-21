@@ -261,6 +261,19 @@ pub struct EgressState {
     /// controller older than proxies has no route to fetch them from, so its nodes
     /// never ask, and stay direct as they always were.
     platform_has_settings: AtomicBool,
+    /// Isolated egress as the node runs it (see [`crate::egress::bring_up`]): what it
+    /// says, and why nothing may be sent, when it may not.
+    isolation: Mutex<Isolated>,
+}
+
+/// Isolated egress as the node runs it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Isolated {
+    /// What the node says of it: `direct`, `helper <version>`, `baseline (<why>)` or
+    /// `refused (<why>)`. Empty before the node has brought it up.
+    pub label: String,
+    /// Why nothing may be sent: set while a kill switch has no helper to keep it.
+    pub refusal: Option<String>,
 }
 
 /// The daemon's state. Each node runs as its own process, so one per process is one
@@ -280,7 +293,33 @@ impl EgressState {
             gateway: tokio::sync::OnceCell::new(),
             resolver,
             platform_has_settings: AtomicBool::new(false),
+            isolation: Mutex::new(Isolated::default()),
         })
+    }
+
+    /// Say how isolated egress runs, and whether it refuses.
+    pub fn set_isolation(&self, isolated: Isolated) {
+        if let Ok(mut cur) = self.isolation.lock() {
+            *cur = isolated;
+        }
+    }
+
+    pub fn isolation(&self) -> Isolated {
+        self.isolation
+            .lock()
+            .map(|i| i.clone())
+            .unwrap_or_else(|_| Isolated {
+                label: String::new(),
+                refusal: Some("egress: refused (its state cannot be read)".into()),
+            })
+    }
+
+    /// Nothing is sent while isolated egress refuses.
+    fn isolation_allows(&self) -> Result<(), String> {
+        match self.isolation().refusal {
+            Some(why) => Err(why),
+            None => Ok(()),
+        }
     }
 
     pub fn current(&self) -> NodeEgress {
@@ -508,6 +547,7 @@ impl EgressState {
         data: &Value,
         f: &Fetch<'_>,
     ) -> Result<Option<Arc<Lease>>, String> {
+        self.isolation_allows()?;
         let want = Expect::read(&data["egress_expect"][node_id])?;
         let Some((id, upstream)) = self.decide(want.as_ref(), f).await? else {
             return Ok(None);
@@ -522,6 +562,7 @@ impl EgressState {
     /// its destination is vetted on the node as the platform vetted it: no private
     /// address.
     pub async fn for_bench(&self, cmd: &Value, f: &Fetch<'_>) -> Result<Option<Lease>, String> {
+        self.isolation_allows()?;
         let want = Expect::read(&cmd["egress_expect"])?;
         let Some((id, upstream)) = self.decide(want.as_ref(), f).await? else {
             return Ok(None);
@@ -622,6 +663,10 @@ impl EgressState {
         }
         if self.stale().is_some() {
             v["stale"] = json!(true);
+        }
+        let isolated = self.isolation();
+        if !isolated.label.is_empty() {
+            v["isolation"] = json!(isolated.label);
         }
         v
     }

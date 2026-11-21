@@ -1,17 +1,17 @@
 //! Isolated-egress orchestration.
 //!
-//! Open-core boundary. The real per-node egress mechanism (network isolation,
-//! tunnels, transparent routing) is a private drop-in (`private.rs`, git-ignored)
-//! that `build.rs` selects when it is present. A public checkout has only
-//! `baseline.rs` (direct egress, no isolation), so the open build compiles and
-//! runs but does not apply isolated egress. Isolated egress is a platform
-//! feature.
+//! Open-core boundary. Isolated egress is applied by the egress helper, a separate
+//! program installed beside the binaries ([`helper`]), which the node asks to take a
+//! network config and to hold egress up for the daemon's life ([`isolation`]). Without
+//! one that answers, the node keeps its config and sends directly, as the open build
+//! does (`baseline.rs`), and says why; with the config's kill switch on, it sends nothing
+//! until one answers. A first-party build still compiles the private drop-in
+//! (`private.rs`, git-ignored) in its place, which `build.rs` selects when it is present.
 //!
-//! Both implementations expose the same small surface, so `lib.rs` is identical
-//! regardless of which is compiled:
+//! The surface is the same either way, so `lib.rs` is identical whichever runs:
 //!   - [`process_network_config`] ingests a node's network config,
-//!   - [`bring_up`] applies egress and returns a `TunnelGuard`,
-//!   - `TunnelGuard` tears everything down on `Drop`.
+//!   - [`bring_up`] applies egress and returns an [`Isolation`],
+//!   - [`Isolation`] tears everything down on `Drop`.
 //!
 //! Proxies are the other way a node's traffic can leave, and they live here in the
 //! open ([`state`], [`gateway`]). The platform can set a node to send through one
@@ -39,7 +39,18 @@ pub mod state;
 #[cfg(test)]
 pub(crate) mod testkit;
 
-pub use imp::bring_up;
+#[cfg(not(egress_private))]
+pub mod helper;
+#[cfg(not(egress_private))]
+pub mod isolation;
+
+#[cfg(not(egress_private))]
+pub use isolation::Isolation;
+
+/// The config as the platform last sent it, so a helper that answers only later is
+/// handed it as sent.
+#[cfg(not(egress_private))]
+static GIVEN: std::sync::Mutex<Option<serde_json::Value>> = std::sync::Mutex::new(None);
 
 /// Ingest a node's network config: the tunnel selection the egress impl applies.
 ///
@@ -50,5 +61,79 @@ pub fn process_network_config(
     net_dir: &std::path::Path,
     tunnel_hooks: bool,
 ) -> Option<crate::NetworkConfig> {
+    #[cfg(not(egress_private))]
+    {
+        if let Ok(mut given) = GIVEN.lock() {
+            *given = Some(raw.clone());
+        }
+        let setup = isolation::Setup::for_this_process();
+        let why = match helper::find(&setup.exe) {
+            Ok(found) => match helper::config(&found, raw, net_dir, tunnel_hooks, setup.limits) {
+                Ok((_, net)) => return net,
+                Err(why) => why,
+            },
+            Err(why) => why,
+        };
+        let net = imp::process_network_config(raw, net_dir, tunnel_hooks);
+        if let Some(n) = net
+            .as_ref()
+            .filter(|n| !n.kind.is_empty() && n.kind != "direct")
+        {
+            println!(
+                "[network] Isolated egress ({}): egress helper {why}. The config is kept as sent.",
+                n.kind
+            );
+        }
+        net
+    }
+    #[cfg(egress_private)]
     imp::process_network_config(raw, net_dir, tunnel_hooks)
+}
+
+/// Apply egress for a configured node, and hold it up until the [`Isolation`] is
+/// dropped. How it runs is said in the node's log and in
+/// [`state::EgressState::isolation`], which refuses every op while a kill switch has no
+/// helper to keep it.
+#[cfg(not(egress_private))]
+pub fn bring_up(
+    net: &crate::NetworkConfig,
+    net_dir: &std::path::Path,
+    node_id: &str,
+    tunnel_hooks: bool,
+) -> Isolation {
+    let raw = GIVEN.lock().ok().and_then(|g| g.clone());
+    isolation::start(
+        isolation::Asked {
+            raw,
+            net: net.clone(),
+            net_dir: net_dir.to_path_buf(),
+            node_id: node_id.to_string(),
+            tunnel_hooks,
+        },
+        isolation::Setup::for_this_process(),
+        std::sync::Arc::clone(state::global()),
+    )
+}
+
+/// Egress as the drop-in compiled into this build applies it.
+#[cfg(egress_private)]
+pub struct Isolation {
+    _guard: Option<imp::TunnelGuard>,
+}
+
+#[cfg(egress_private)]
+pub fn bring_up(
+    net: &crate::NetworkConfig,
+    net_dir: &std::path::Path,
+    node_id: &str,
+    tunnel_hooks: bool,
+) -> Isolation {
+    println!("[network] egress: built in");
+    state::global().set_isolation(state::Isolated {
+        label: "built in".into(),
+        refusal: None,
+    });
+    Isolation {
+        _guard: imp::bring_up(net, net_dir, node_id, tunnel_hooks),
+    }
 }

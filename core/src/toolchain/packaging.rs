@@ -363,9 +363,10 @@ fn judge(checked: &[Checked], exe_owner: u32) -> Result<bool, String> {
 
 /// Is the `packaging.json` at `file` one to believe for the executable at `exe`? The file
 /// is checked where its symlinks lead, along with the directory that holds it there and
-/// the directory that holds the name that was looked up.
+/// the directory that holds the name that was looked up. The egress helper is run under
+/// the same rule.
 #[cfg(unix)]
-fn trust(file: &Path, exe: &Path) -> Result<bool, String> {
+pub(crate) fn trust(file: &Path, exe: &Path) -> Result<bool, String> {
     use std::os::unix::fs::MetadataExt;
     let exe_owner = std::fs::metadata(exe)
         .map_err(|e| format!("the executable cannot be read: {e}"))?
@@ -395,8 +396,8 @@ fn trust(file: &Path, exe: &Path) -> Result<bool, String> {
 }
 
 #[cfg(not(unix))]
-fn trust(_file: &Path, _exe: &Path) -> Result<bool, String> {
-    Err("packaged mode is read on Unix only".into())
+pub(crate) fn trust(_file: &Path, _exe: &Path) -> Result<bool, String> {
+    Err("this is checked on Unix only".into())
 }
 
 #[cfg(unix)]
