@@ -149,6 +149,11 @@ pub async fn handle(env: OpEnv) {
             "follow_redirects": data["follow_redirects"].as_bool().unwrap_or(true),
             "severity": sev_arr,
             "templates_dir": data["templates_dir"].clone(),
+            // The template pack, crossfyre-templates' plessor folder as `crossfyre update`
+            // last brought it or the release compiled it in, beside the built-in checks.
+            // A workflow asks for it; absent is built-in checks only, as every workflow
+            // before it got.
+            "pack": data["pack"].as_bool().unwrap_or(false),
             // Template-id allowlist. Empty/absent = every template the severity
             // filter admits, which is the behaviour every existing workflow got.
             // The public free tools set it so a checker that advertises one thing
