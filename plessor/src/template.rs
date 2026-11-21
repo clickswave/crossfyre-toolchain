@@ -8,7 +8,7 @@
 //! implementation is the documented next step (docs/tier1-engines-plan.md s6).
 
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 use transport::Client;
 
@@ -138,7 +138,7 @@ const MAX_PAYLOAD_REQUESTS: usize = 256;
 /// does not multiply request volume on unprotected targets.
 const MAX_EVASION_VARIANTS: usize = 8;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Matcher {
     #[serde(rename = "type")]
     pub mtype: String,
@@ -180,6 +180,8 @@ pub struct Match {
     pub severity: String,
     pub description: String,
     pub matched_at: String,
+    /// What found it, to check it again with.
+    pub proof: crate::proof::Proof,
 }
 
 struct Resp {
@@ -204,7 +206,8 @@ fn references_oob(req: &HttpReq) -> bool {
 /// Execute a template against `base` (e.g. "https://example.com"), returning
 /// confirmed matches. Response-based matchers are re-requested once (reproduce);
 /// out-of-band (interactsh) requests are confirmed by an actual OAST callback.
-/// `unsafe` requests go out over raw sockets by `raw`, the op's egress.
+/// `unsafe` requests go out over raw sockets by `raw`, the op's egress. Each match, and
+/// each finding waiting on a callback, carries its proof, of a template from `pack`.
 #[allow(clippy::too_many_arguments)]
 pub async fn eval_template(
     client: &Client,
@@ -215,6 +218,8 @@ pub async fn eval_template(
     oob_queue: Option<&crate::inject::OobQueue>,
     evasive: bool,
     raw: &crate::rawhttp::Route,
+    proof: &crate::proof::Ctx,
+    pack: &str,
 ) -> Vec<Match> {
     let mut out = Vec::new();
     for req in &tmpl.http {
@@ -230,15 +235,17 @@ pub async fn eval_template(
             // to what the injector was doing, but it is the same mistake and it
             // is paid on every scan, so it goes the same way.
             let (host, marker) = oc.host_marked(reg);
-            let mut fired = false;
+            let mut sent = Vec::new();
             for raw_path in &req.path {
                 for mut v in expand_request(req, raw_path, base, MAX_PAYLOAD_REQUESTS) {
+                    let mut kept = v.clone();
+                    apply_oob(&mut kept, crate::proof::OAST_SLOT);
                     apply_oob(&mut v, &host);
                     let _ = fetch(client, &method, &v).await;
-                    fired = true;
+                    sent.push(sent_as(&method, &kept, false));
                 }
             }
-            if !fired {
+            if sent.is_empty() {
                 continue;
             }
             {
@@ -269,6 +276,23 @@ pub async fn eval_template(
                      scan knows, so the payload was processed."
                 ))
                 .build();
+                let mut finding = finding;
+                finding["proof"] = serde_json::json!(crate::proof::Proof::new(
+                    proof,
+                    pack,
+                    crate::proof::Kind::Template,
+                    &tmpl.id,
+                    sent,
+                    Vec::new(),
+                    "and",
+                    vec![crate::proof::Fired {
+                        matcher: "callback".into(),
+                        part: String::new(),
+                        evidence: "the target called back to the out-of-band host".into(),
+                    }],
+                    0,
+                    "",
+                ));
                 if let Ok(mut v) = q.lock() {
                     v.push(crate::inject::PendingOob { marker, finding });
                 }
@@ -325,9 +349,9 @@ pub async fn eval_template(
                     Some(r) => r,
                     None => continue,
                 };
-                if !matches_all(req, &r2) {
+                let Some(fired) = fired(req, &r2) else {
                     continue;
-                }
+                };
 
                 let mut description = tmpl.info.description.clone();
                 if evaded {
@@ -348,11 +372,36 @@ pub async fn eval_template(
                     },
                     description,
                     matched_at: winner.url.clone(),
+                    proof: crate::proof::Proof::new(
+                        proof,
+                        pack,
+                        crate::proof::Kind::Template,
+                        &tmpl.id,
+                        vec![sent_as(&method, &winner, req.unsafe_raw)],
+                        req.matchers.clone(),
+                        &req.matchers_condition,
+                        fired,
+                        r2.status,
+                        &r2.body,
+                    ),
                 });
             }
         }
     }
     out
+}
+
+/// `v`, sent with `method`, as a proof records it.
+fn sent_as(method: &str, v: &ReqVariant, raw: bool) -> crate::proof::Sent {
+    let mut fields = v.headers.clone();
+    fields.sort();
+    crate::proof::Sent {
+        method: method.to_string(),
+        url: v.url.clone(),
+        fields,
+        body: v.body.clone(),
+        raw,
+    }
 }
 
 fn substitute_oob(s: &str, host: &str) -> String {
@@ -576,21 +625,83 @@ fn retry_after_ms(headers: &reqwest::header::HeaderMap, attempt: u32) -> u64 {
 }
 
 fn matches_all(req: &HttpReq, resp: &Resp) -> bool {
-    if req.matchers.is_empty() {
-        return false;
+    fired(req, resp).is_some()
+}
+
+/// When `req`'s matchers say `resp` matches, each matcher that held and what it held on;
+/// None when they do not.
+fn fired(req: &HttpReq, resp: &Resp) -> Option<Vec<crate::proof::Fired>> {
+    judge(&req.matchers, &req.matchers_condition, resp)
+}
+
+/// [`fired`] for `matchers` under `condition`, as a replay of a proof judges.
+fn judge(matchers: &[Matcher], condition: &str, resp: &Resp) -> Option<Vec<crate::proof::Fired>> {
+    if matchers.is_empty() {
+        return None;
     }
-    let cond_and = req.matchers_condition.to_lowercase() != "or";
-    let mut any = false;
+    let cond_and = condition.to_lowercase() != "or";
+    let mut fired = Vec::new();
     let mut all = true;
-    for m in &req.matchers {
+    for m in matchers {
         let mut matched = matches_one(m, resp);
         if m.negative {
             matched = !matched;
         }
-        any = any || matched;
-        all = all && matched;
+        if matched {
+            fired.push(crate::proof::Fired {
+                matcher: m.mtype.clone(),
+                part: m.part.clone(),
+                evidence: evidence_of(m, resp),
+            });
+        } else {
+            all = false;
+        }
     }
-    if cond_and { all } else { any }
+    let matches = if cond_and { all } else { !fired.is_empty() };
+    matches.then_some(fired)
+}
+
+/// What `m`, which held on `resp`, held on: the status or size it saw, the words it
+/// found, the text each pattern matched, or the expressions that held. A negative
+/// matcher held on what was not there.
+fn evidence_of(m: &Matcher, resp: &Resp) -> String {
+    if m.negative {
+        return "not present".to_string();
+    }
+    let hay = part_text(&m.part, resp);
+    match m.mtype.as_str() {
+        "status" => format!("status {}", resp.status),
+        "size" => format!("size {}", resp.body.len()),
+        "word" => {
+            let header_part = matches!(m.part.as_str(), "header" | "all_headers");
+            let hay = if header_part { hay.to_lowercase() } else { hay };
+            m.words
+                .iter()
+                .filter(|w| {
+                    if header_part {
+                        hay.contains(&w.to_lowercase())
+                    } else {
+                        hay.contains(w.as_str())
+                    }
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+        "regex" => m
+            .regex
+            .iter()
+            .filter_map(|p| {
+                Regex::new(p)
+                    .ok()?
+                    .find(&hay)
+                    .map(|f| f.as_str().to_string())
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        "dsl" => m.dsl.join(" && "),
+        _ => String::new(),
+    }
 }
 
 /// Does this response simply echo the requested path back into its body?
@@ -1090,6 +1201,9 @@ impl Choice {
 pub struct Pack {
     pub templates: Vec<Template>,
     pub from: String,
+    /// Which pack it is, as a proof names it: its name, sequence and commit, and whether it
+    /// is the copy compiled in, with no path of the machine's.
+    pub named: String,
 }
 
 /// The templates in `files`, by path and text, or each one that plessor would not run:
@@ -1133,7 +1247,11 @@ impl Pack {
             cfx_pack::COMPILED.sequence,
             short(cfx_pack::COMPILED.commit)
         );
-        Self { templates, from }
+        Self {
+            templates,
+            named: from.clone(),
+            from,
+        }
     }
 
     fn from_dir(dir: &std::path::Path) -> Option<Self> {
@@ -1158,15 +1276,18 @@ impl Pack {
         }
         let files: Vec<(&str, &str)> = pack.files_in("plessor").collect();
         match read_pack(&files) {
-            Ok(templates) => Some(Self {
-                templates,
-                from: format!(
-                    "crossfyre-templates {} ({}), from {}",
+            Ok(templates) => {
+                let named = format!(
+                    "crossfyre-templates {} ({})",
                     pack.sequence(),
-                    short(pack.commit()),
-                    path.display()
-                ),
-            }),
+                    short(pack.commit())
+                );
+                Some(Self {
+                    templates,
+                    from: format!("{named}, from {}", path.display()),
+                    named,
+                })
+            }
             Err(problems) => {
                 eprintln!(
                     "[plessor] the pack at {} is not used, as not all of it reads:",

@@ -59,6 +59,8 @@ cfx_db = { path = "../db", optional = true }
 sqlx = { version = "0.8.6", features = ["postgres"], optional = true }
 
 [dev-dependencies]
+# A database of a test's own, for what plessor keeps.
+cfx_db = { path = "../db", features = ["testing"] }
 # A recording SOCKS5 proxy and counting listeners for the egress tests.
 cfx_tunnel = { path = "../tunnel", features = ["recorder"] }
 # To mint a certificate nothing trusts, which is what the certificate-policy test needs

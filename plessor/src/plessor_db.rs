@@ -139,9 +139,11 @@ impl PlessorDb {
         let (Some(scan), "finding") = (scan, event["type"].as_str().unwrap_or_default()) else {
             return;
         };
+        // A finding is the same finding with another proof, as an answer that differs
+        // in a timestamp gives one, so its proof is not part of what tells it apart.
         let kept = sqlx::query(
             "INSERT INTO findings (scan_id, template_id, data, digest) \
-             VALUES ($1, $2, $3::jsonb, md5($3::jsonb::text)) \
+             VALUES ($1, $2, $3::jsonb, md5(($3::jsonb - 'proof')::text)) \
              ON CONFLICT (scan_id, digest) DO NOTHING",
         )
         .bind(scan)
@@ -273,5 +275,38 @@ impl Ledger for ScanLedger {
         .bind(state.as_str())
         .execute(&self.db.pool)
         .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A finding found again with another proof is kept once, with the proof it was
+    /// first kept with.
+    #[tokio::test]
+    #[ignore = "needs PostgreSQL's programs"]
+    async fn a_finding_is_kept_once_whatever_its_proof() {
+        let scratch = cfx_db::testing::Scratch::new(&ENGINE).await;
+        let db = PlessorDb::new(scratch.pool.clone());
+        let scan = db
+            .start("scan", &serde_json::json!({"target": "http://app.test"}))
+            .await
+            .expect("kept");
+        let found = |hash: &str| {
+            serde_json::json!({"type": "finding", "data": {
+                "template": "t", "matched_at": "http://app.test/x",
+                "proof": {"format": 1, "response_sha256": hash},
+            }})
+        };
+        db.event(Some(&scan.id), &found("aa")).await;
+        db.event(Some(&scan.id), &found("bb")).await;
+        let kept: Vec<(String,)> =
+            sqlx::query_as("SELECT data->'proof'->>'response_sha256' FROM findings")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(kept, [("aa".to_string(),)]);
+        scratch.done().await;
     }
 }

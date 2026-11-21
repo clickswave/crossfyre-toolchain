@@ -65,6 +65,8 @@ mod plessor_db;
 #[cfg(feature = "daemon")]
 mod probe;
 #[cfg(feature = "daemon")]
+mod proof;
+#[cfg(feature = "daemon")]
 pub mod race;
 pub mod rawhttp;
 pub use cfx_scope as scope;

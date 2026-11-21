@@ -459,6 +459,9 @@ pub async fn run<L: crate::ledger::Ledger>(
     let allow_id = |id: &str| only.is_empty() || only.iter().any(|s| s == &id.to_lowercase());
 
     let mut found: i64 = 0;
+    // Each finding is kept with its proof, which names the slots the scan's credential
+    // fills and never what is in them.
+    let proof_ctx = crate::proof::Ctx::new(params.auth.as_ref());
 
     // --- Passive header checks on the base response (deterministic) ---
     // fetch_base returns None only on a transport-level failure (connection
@@ -472,15 +475,16 @@ pub async fn run<L: crate::ledger::Ledger>(
         for (name, template, severity, description) in header_checks(&resp) {
             if allow(severity) && allow_id(template) {
                 found += 1;
-                let _ = tx.send(
-                    Finding::new("plessor", "misconfig", name, severity, &base)
-                        .template(template)
-                        // These are read off the base response's headers, so the
-                        // location is not a guess.
-                        .location("header")
-                        .describe(description)
-                        .event(),
-                );
+                let mut event = Finding::new("plessor", "misconfig", name, severity, &base)
+                    .template(template)
+                    // These are read off the base response's headers, so the
+                    // location is not a guess.
+                    .location("header")
+                    .describe(description)
+                    .event();
+                event["data"]["proof"] =
+                    json!(header_proof(&proof_ctx, &base, template, name, &resp));
+                let _ = tx.send(event);
             }
         }
         true
@@ -498,6 +502,8 @@ pub async fn run<L: crate::ledger::Ledger>(
             .as_deref()
             .map(template::load_dir)
             .unwrap_or_default();
+        // Which pack it is, as the proofs of its templates name it.
+        let pack_named = pack.named.as_str();
         // A directory template with a pack template's id replaces it, so a copy
         // of the pack pointed at with --templates runs each check once.
         let pack: Vec<&template::Template> = if params.pack {
@@ -714,6 +720,14 @@ pub async fn run<L: crate::ledger::Ledger>(
             if allow(&sev) {
                 let pending_before = oob_queue.lock().map(|q| q.len()).unwrap_or_default();
                 let mut confirmed = false;
+                // Where the template came from, as its proofs name it.
+                let origin = if template::BUILTIN.iter().any(|b| std::ptr::eq(b, tmpl)) {
+                    "built in"
+                } else if pack.iter().any(|p| std::ptr::eq(*p, tmpl)) {
+                    pack_named
+                } else {
+                    "a templates folder"
+                };
                 for m in template::eval_template(
                     &client,
                     &base,
@@ -723,17 +737,20 @@ pub async fn run<L: crate::ledger::Ledger>(
                     Some(&oob_queue),
                     params.evasive,
                     &raw,
+                    &proof_ctx,
+                    origin,
                 )
                 .await
                 {
                     found += 1;
                     confirmed = true;
-                    let _ = tx.send(
+                    let mut event =
                         Finding::new("plessor", &m.class, m.name, m.severity, m.matched_at)
                             .template(m.template_id)
                             .describe(m.description)
-                            .event(),
-                    );
+                            .event();
+                    event["data"]["proof"] = json!(m.proof);
+                    let _ = tx.send(event);
                 }
                 let pending = oob_queue.lock().map(|q| q.len()).unwrap_or_default();
                 let state = if confirmed {
@@ -846,6 +863,39 @@ pub async fn run<L: crate::ledger::Ledger>(
         let _ = tx.send(answers);
     }
     let _ = tx.send(json!({"type":"done","found": found}));
+}
+
+/// The proof of the header check `check`, `name`, on the base response `resp` of `base`:
+/// a GET of the base, and the header it lacked.
+fn header_proof(
+    ctx: &crate::proof::Ctx,
+    base: &str,
+    check: &str,
+    name: &str,
+    resp: &BaseResp,
+) -> crate::proof::Proof {
+    crate::proof::Proof::new(
+        ctx,
+        "built in",
+        crate::proof::Kind::Header,
+        check,
+        vec![crate::proof::Sent {
+            method: "GET".into(),
+            url: base.to_string(),
+            fields: Vec::new(),
+            body: None,
+            raw: false,
+        }],
+        Vec::new(),
+        "and",
+        vec![crate::proof::Fired {
+            matcher: "header".into(),
+            part: "header".into(),
+            evidence: name.to_string(),
+        }],
+        resp.status,
+        &resp.body_prefix,
+    )
 }
 
 /// Does running this template change the target rather than test it?

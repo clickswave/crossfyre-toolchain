@@ -872,6 +872,108 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A target that answers every request with "ok" and keeps each request it was sent.
+    async fn recording_target() -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let kept = Arc::clone(&kept);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 16384];
+                    while let Ok(n) = sock.read(&mut buf).await {
+                        if n == 0 {
+                            return;
+                        }
+                        kept.lock()
+                            .unwrap()
+                            .push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                        let body = b"<html><body>ok</body></html>";
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n",
+                            body.len()
+                        );
+                        if sock.write_all(head.as_bytes()).await.is_err()
+                            || sock.write_all(body).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    /// A finding of an authenticated scan goes out with a proof. Nothing that goes out
+    /// holds the scan's cookie or token, and the proof holds neither a credential header
+    /// the template sent nor a secret in its URL, though the target was sent each one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_proof_of_an_authenticated_scan_carries_no_secret() {
+        let (tport, seen) = recording_target().await;
+        let dport = daemon().await;
+        let dir = std::env::temp_dir().join(format!("plessor-proof-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("probe.yaml"),
+            "id: proof-probe\ninfo:\n  name: proof probe\n  severity: high\n\
+             http:\n  - method: GET\n    path:\n      - \"{{BaseURL}}/p?access_token=url-secret-4\"\n    \
+             headers:\n      X-Api-Token: tmpl-secret-3\n    \
+             matchers:\n      - type: word\n        words:\n          - ok\n",
+        )
+        .unwrap();
+        let op = serde_json::json!({
+            "operation": "scan",
+            "response": "stream",
+            "target": format!("http://127.0.0.1:{tport}"),
+            "templates_dir": dir.to_string_lossy(),
+            "only": ["proof-probe"],
+            "auth": {"cookies": "session=sess-secret-1",
+                     "headers": {"Authorization": "Bearer bearer-secret-2"}},
+            "evasive": false,
+            "timeout_ms": 5000,
+        });
+        let events = run_to_done(dport, &op).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let secrets = [
+            "sess-secret-1",
+            "bearer-secret-2",
+            "tmpl-secret-3",
+            "url-secret-4",
+        ];
+        let sent = seen.lock().unwrap().join("\n");
+        for secret in secrets {
+            assert!(sent.contains(secret), "the target was never sent {secret}");
+        }
+        let finding = events
+            .iter()
+            .find(|e| e["type"] == "finding" && e["data"]["template"] == "proof-probe")
+            .unwrap_or_else(|| panic!("no finding in {events:?}"));
+        let proof = &finding["data"]["proof"];
+        assert_eq!(proof["check"], "proof-probe");
+        assert_eq!(
+            proof["slots"],
+            serde_json::json!([
+                "auth.cookie",
+                "auth.header:Authorization",
+                "url",
+                "header:X-Api-Token"
+            ])
+        );
+        assert_eq!(proof["fired"][0]["evidence"], "ok");
+        let out = serde_json::to_string(&events).unwrap();
+        for secret in &secrets[..2] {
+            assert!(!out.contains(secret), "{secret} went out: {out}");
+        }
+        let kept = proof.to_string();
+        for secret in secrets {
+            assert!(!kept.contains(secret), "{secret} is in the proof: {kept}");
+        }
+    }
+
     /// The leads a scan is given come back answered: confirmed where the template for the
     /// CVE found it, checked and not found, with the line that this is no proof, where it
     /// ran and found nothing, and not checked where no template checks the CVE.
