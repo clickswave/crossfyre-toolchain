@@ -1832,6 +1832,10 @@ pub async fn run_init(
     // is built in - no external installer involved.
     let writer = toolchain::install::Writer::cli(cli_version);
     for ext in &selected_extensions {
+        // A closed engine comes with the node's plan, below, not with the release.
+        if toolchain::engine(ext).is_some_and(|e| e.closed) {
+            continue;
+        }
         if toolchain::config::is_extension_installed(ext) {
             // Where no service manager runs, `crossfyre node up` runs it.
             if !toolchain::service::user_manager_started() {
@@ -1865,6 +1869,52 @@ pub async fn run_init(
             Ok(false) => ok(&format!("{ext} installed")),
             Err(e) => fail(&format!("{ext} install failed: {e}")),
         }
+    }
+
+    // The closed components the node's plan includes, with the node's own key: Crossfyre
+    // answers it as it answers the account the node belongs to. Out of reach, they wait
+    // for `crossfyre update components`.
+    let creds = toolchain::components::Credentials {
+        api_url: api_url.to_string(),
+        key: node_api_key.clone(),
+    };
+    match toolchain::components::offer(&client, &creds).await {
+        Ok(offer) if !offer.included.is_empty() => {
+            working("Installing the components the node's plan includes");
+            let keys = cfx_pacing::release_keys();
+            let results = toolchain::components::bring_current(
+                &client,
+                &creds,
+                &offer,
+                &toolchain::components::COMPONENTS,
+                true,
+                &keys,
+                &toolchain::components::Here::this_host(),
+            )
+            .await;
+            toolchain::components::say(&results);
+            let authz_here = results.iter().any(|(c, k)| {
+                *c == "plessor-authz"
+                    && matches!(
+                        k,
+                        toolchain::components::Kept::Installed(_)
+                            | toolchain::components::Kept::Current(_)
+                    )
+            });
+            if authz_here && toolchain::service::user_manager_started() {
+                if let Err(e) = toolchain::service::enable("plessor-authz")
+                    .and_then(|()| toolchain::service::start("plessor-authz"))
+                {
+                    fail(&format!(
+                        "plessor-authz is installed but did not start: {e}"
+                    ));
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(why) => warn(&format!(
+            "the plan's components wait for `crossfyre update components`: {why}"
+        )),
     }
 
     // Bring up the toolchain database the extensions persist scan state to: the local

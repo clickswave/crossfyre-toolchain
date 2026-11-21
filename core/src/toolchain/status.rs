@@ -194,6 +194,17 @@ pub fn extensions() -> Result<(), Box<dyn std::error::Error>> {
         };
         println!("{}", row(&sym, e.name, &mid, &status));
     }
+    // What comes with a plan rather than with the release, and at which version.
+    section("Components");
+    for (component, said) in super::components::rows(&super::components::Here::this_host()) {
+        let installed = said != super::NEEDS_A_PLAN;
+        let (sym, version) = if installed {
+            (check(), format!("v{said}"))
+        } else {
+            (dot(), dim(&said))
+        };
+        println!("{}", row(&sym, component, "", &version));
+    }
     end();
     Ok(())
 }

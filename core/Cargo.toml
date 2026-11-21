@@ -21,6 +21,8 @@ cfx_cve = { path = "../cve" }
 # The engines' database settings in config.toml, and the password they get.
 cfx_db = { path = "../db" }
 adaptive = { path = "../adaptive" }
+# Installs the pacing module, after checking it as an engine will (components.rs).
+cfx_pacing = { path = "../pacing" }
 async-nats = "0.50.0"
 # Direct handle so run_daemon can install a rustls CryptoProvider before the
 # NATS TLS handshake (both aws-lc-rs and ring are in the workspace graph).
@@ -70,6 +72,8 @@ tokio-rustls = "0.26"
 toml = "1.0.3"
 
 [dev-dependencies]
+# Pacing modules written as text, for the components tests.
+wat = "1"
 # A recording SOCKS5 proxy and counting listeners, for the gateway's tests.
 cfx_tunnel = { path = "../tunnel", features = ["recorder"] }
 # A certificate for the TLS origin the gateway's tests send to.

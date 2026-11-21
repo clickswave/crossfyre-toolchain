@@ -9,6 +9,7 @@
 // VpnService netstack can reuse it without pulling in the rest of cfx_core. Re-exported here so the
 // desktop proxy keeps referring to it as `toolchain::capture`.
 pub use cfx_capture as capture;
+pub mod components;
 pub mod config;
 pub mod data_manifest;
 pub mod data_update;
@@ -58,18 +59,6 @@ pub struct Engine {
 pub const NEEDS_A_PLAN: &str = "not installed (needs a plan that includes it)";
 
 impl Engine {
-    /// Why it is not installed or updated from the release: a closed engine comes with
-    /// a plan that includes it, after login. None for every other.
-    pub fn from_a_plan(&self) -> Option<String> {
-        self.closed.then(|| {
-            format!(
-                "{} comes with a Crossfyre plan that includes it. Log in with `crossfyre \
-                 login`, and it is installed with `crossfyre update`.",
-                self.name
-            )
-        })
-    }
-
     /// How it is said not to be installed.
     pub fn not_installed(&self) -> &'static str {
         if self.closed {
@@ -198,13 +187,6 @@ mod tests {
             "not installed (needs a plan that includes it)"
         );
         assert_eq!(engine("plessor").unwrap().not_installed(), "not installed");
-        assert!(
-            authz
-                .from_a_plan()
-                .unwrap()
-                .starts_with("plessor-authz comes with a Crossfyre plan that includes it.")
-        );
-        assert_eq!(engine("plessor").unwrap().from_a_plan(), None);
         let err = resolve_extensions("nope").unwrap_err().to_string();
         assert!(
             err.contains("Use: ambulo, voyage, doorward, toolmark, plessor, plessor-authz, or all"),

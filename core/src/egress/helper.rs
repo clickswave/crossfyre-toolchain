@@ -25,8 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// The helper's file name beside the binaries.
-pub const HELPER: &str = "cfx-egress";
+pub use super::HELPER;
 
 /// The interface a request is written for.
 pub const INTERFACE: u32 = 1;

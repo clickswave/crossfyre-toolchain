@@ -264,6 +264,10 @@ pub struct Component {
 pub struct Artifact {
     pub file: String,
     pub sha256: String,
+    /// The file holding its own signature, for an artifact that is checked again when
+    /// it is loaded: the pacing module's.
+    #[serde(default)]
+    pub sig: Option<String>,
 }
 
 /// "linux-x86_64" style key for the running host.
@@ -385,7 +389,7 @@ async fn download_verified(
 /// Split out of the download because this is the decision, and `BASE_URL` is a build-time
 /// constant, so nothing that goes through `reqwest` can be reached from a test. Keeping
 /// the check pure means the refusal is testable and the download stays thin glue.
-fn verify_artifact_bytes(artifact: &Artifact, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn verify_artifact_bytes(artifact: &Artifact, bytes: &[u8]) -> Result<(), String> {
     // An artifact with no recorded checksum is refused rather than waved through. A
     // manifest can be hand-edited and a missing field deserialises to an empty string;
     // comparing against it would otherwise mean "no checksum, no check".
@@ -450,7 +454,7 @@ fn extract_zip(zip_path: &Path, extract_dir: &Path) -> Result<(), Box<dyn std::e
 /// 0644 is the normal case rather than a strange one. A process killed in that window, or
 /// an update interrupted by a reboot, leaves a binary that is installed, current, and not
 /// executable, and the next run reports it as missing rather than as broken.
-fn place_binary(src: &Path, dest: &Path) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn place_binary(src: &Path, dest: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let staged = stage_binary(src, dest)?;
     commit_staged(&staged, dest)
 }
@@ -756,8 +760,15 @@ pub async fn install(
     // nothing from the release.
     let mut manifest = None;
     for ext in super::resolve_extensions(extension)? {
-        if let Some(why) = super::engine(ext).and_then(|e| e.from_a_plan()) {
-            return Err(why.into());
+        // A closed engine comes from Crossfyre, with the plan of the key saved here.
+        if super::engine(ext).is_some_and(|e| e.closed) {
+            use super::ui::*;
+            let dir = this_hosts_data_dir()?;
+            title("Crossfyre extension install", ext);
+            let version = super::components::install_closed(ext, &dir).await?;
+            ok(&format!("{ext} {version} installed"));
+            end();
+            continue;
         }
         if let Some(m) = packaging::owner(ext) {
             adopt_packaged(ext, m, false)?;
@@ -775,6 +786,15 @@ pub async fn install(
         }
     }
     Ok(())
+}
+
+/// The data directory the key a closed component is installed with is in. A test never
+/// reads this host's: it would find the operator's own key.
+fn this_hosts_data_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    #[cfg(test)]
+    panic!("a test asked for this host's data directory: a test reads only one it made");
+    #[cfg(not(test))]
+    crate::resolve_data_dir(None)
 }
 
 /// An engine a package manager put in place: its binary is the package's, and the unit
@@ -1083,7 +1103,7 @@ pub fn may_replace_binaries() -> bool {
 /// is downloaded, so that an update run by a user who may not write the bin directory
 /// says what it needs at once. Without it, each component was downloaded and then failed
 /// with a bare "Permission denied (os error 13)" when it was moved into place.
-fn can_write_in(dir: &Path) -> bool {
+pub(crate) fn can_write_in(dir: &Path) -> bool {
     let mut at = dir;
     while !at.is_dir() {
         match at.parent() {
@@ -1195,18 +1215,29 @@ impl<'a> Writer<'a> {
     }
 }
 
-/// `crossfyre update [self|<ext>|all]`. With no target: update self plus
-/// every installed extension.
+/// `crossfyre update [self|<ext>|components|all]`. With no target: update self, every
+/// installed extension, and the closed components installed here, which come from
+/// Crossfyre with the plan of the key in `data_dir` rather than from the release.
+/// `components`, or a closed component's name, installs what the plan includes too.
 pub async fn update(
     target: Option<&str>,
     current_version: &str,
     force: bool,
     allow_downgrade: bool,
+    data_dir: &Path,
 ) -> Result<Updated, Box<dyn std::error::Error>> {
     if target == Some(DATA) {
         print_heading();
         let mut out = Updated::default();
         update_data(&mut out).await;
+        print_summary(&out, target, force);
+        return Ok(out);
+    }
+    let creds = super::components::credentials(data_dir);
+    if let Some(which) = target.and_then(super::components::asked_for) {
+        print_heading();
+        let mut out = Updated::default();
+        super::components::update_step(creds.as_ref(), &which, true, &mut out).await;
         print_summary(&out, target, force);
         return Ok(out);
     }
@@ -1221,7 +1252,18 @@ pub async fn update(
         allow_downgrade,
         with_data: true,
     };
-    update_with(&manifest, target, current_version, rules, handed_over).await
+    let mut out = update_with(&manifest, target, current_version, rules, handed_over).await?;
+    if matches!(target, Some("all") | None) {
+        super::components::update_step(
+            creds.as_ref(),
+            &super::components::COMPONENTS,
+            false,
+            &mut out,
+        )
+        .await;
+    }
+    print_summary(&out, target, force);
+    Ok(out)
 }
 
 /// Set by a CLI that was let take an older release, on the CLI it hands the rest to.
@@ -1497,16 +1539,7 @@ async fn update_with(
     let (do_self, exts): (bool, Vec<&str>) = match target {
         Some("self") => (true, vec![]),
         Some("all") | None => (true, installed_extensions()),
-        Some(ext) => {
-            let exts = super::resolve_extensions(ext)?;
-            if let Some(why) = exts
-                .iter()
-                .find_map(|e| super::engine(e).and_then(|e| e.from_a_plan()))
-            {
-                return Err(why.into());
-            }
-            (false, exts)
-        }
+        Some(ext) => (false, super::resolve_extensions(ext)?),
     };
 
     // Only a CLI of the release being installed updates the rest (see `Writer`). One of
@@ -1857,8 +1890,6 @@ async fn update_with(
     if rules.with_data && !hold && matches!(target, Some("all") | None) {
         update_data(&mut out).await;
     }
-
-    print_summary(&out, target, force);
     Ok(out)
 }
 
@@ -2196,10 +2227,11 @@ mod tests {
     /// refused with how to get it, before anything is fetched.
     #[tokio::test]
     async fn a_closed_engine_is_not_installed_or_updated_from_the_release() {
-        let err = install("plessor-authz", false, Writer::cli("0.0.0"))
+        // Signed in nowhere: how to get it.
+        let dir = tempfile::tempdir().unwrap();
+        let err = super::super::components::install_closed("plessor-authz", dir.path())
             .await
-            .unwrap_err()
-            .to_string();
+            .unwrap_err();
         assert!(
             err.starts_with("plessor-authz comes with a Crossfyre plan that includes it."),
             "{err}"

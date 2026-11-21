@@ -718,6 +718,7 @@ pub async fn run_login(
         .to_string();
     title("Crossfyre login", &host);
 
+    let ask = !flags.no_prompt && std::io::stdin().is_terminal();
     let account = perform_login(data_dir, flags).await?;
 
     let who = if account.username.is_empty() {
@@ -730,6 +731,15 @@ pub async fn run_login(
     field("file", &account_path(data_dir).display().to_string());
     end();
     done(&format!("Signed in as {who}"));
+    // What the plan includes beside the release, offered now.
+    crate::toolchain::components::after_login(
+        &crate::toolchain::components::Credentials {
+            api_url: account.api_url.clone(),
+            key: account.api_key.clone(),
+        },
+        ask,
+    )
+    .await;
     hint(&format!(
         "Next, enrol this machine: {}",
         crate::os::elevated("crossfyre node init")

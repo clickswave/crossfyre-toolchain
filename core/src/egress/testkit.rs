@@ -282,7 +282,7 @@ impl FakePlatform {
 }
 
 /// One request's path and JSON body.
-async fn read_http_request(s: &mut TcpStream) -> Option<(String, Value)> {
+pub(crate) async fn read_http_request(s: &mut TcpStream) -> Option<(String, Value)> {
     let mut head = Vec::new();
     let mut b = [0u8; 1];
     while !head.ends_with(b"\r\n\r\n") {

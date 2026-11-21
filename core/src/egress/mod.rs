@@ -39,6 +39,9 @@ pub mod state;
 #[cfg(test)]
 pub(crate) mod testkit;
 
+/// The egress helper's file name beside the binaries.
+pub const HELPER: &str = "cfx-egress";
+
 #[cfg(not(egress_private))]
 pub mod helper;
 #[cfg(not(egress_private))]

@@ -158,10 +158,12 @@ enum Commands {
     },
 
     /// Update from the release manifest: `self`, an extension name, or `all`
-    /// (default: self + every installed extension, and the data the engines read).
-    /// `data` takes only that data: the template and signature pack and the CVE
-    /// dataset. For a single extension you can also use `crossfyre extension update
-    /// <name>`.
+    /// (default: self + every installed extension, the data the engines read, and the
+    /// closed components installed here). `data` takes only that data: the template and
+    /// signature pack and the CVE dataset. `components` installs and updates the closed
+    /// components the signed-in plan includes (plessor-authz, pacing and egress), and
+    /// one of their names only that one. For a single extension you can also use
+    /// `crossfyre extension update <name>`.
     Update {
         target: Option<String>,
         /// Re-download and reinstall even when the installed version already
@@ -702,6 +704,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     env!("CARGO_PKG_VERSION"),
                     force,
                     allow_downgrade,
+                    &base,
                 )
                 .await?;
                 if !updated.succeeded() {
@@ -808,6 +811,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 env!("CARGO_PKG_VERSION"),
                 force,
                 allow_downgrade,
+                &base,
             )
             .await?;
             if updated.restart && cfx_core::toolchain::service::node_service_exists() {
