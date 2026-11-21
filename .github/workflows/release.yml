@@ -153,7 +153,7 @@ jobs:
         run: |
           set -euo pipefail
           export PYO3_CONFIG_FILE="$PWD/target/linux-python/pyo3.cfg"
-          for p in crossfyre doorward node oast; do
+          for p in crossfyre doorward node; do
             cargo build --release --locked -p "$p"
           done
           # Each engine's own binary only: plessor's crate also builds plessor-authz,
@@ -181,7 +181,7 @@ jobs:
           set -euo pipefail
           out="dist/${{ matrix.target }}"
           mkdir -p "$out"
-          for b in crossfyre plessor ambulo voyage doorward toolmark node oast cfx-script; do
+          for b in crossfyre plessor ambulo voyage doorward toolmark node cfx-script; do
             cp "target/release/$b" "$out/$b"
             strip "$out/$b"
           done
@@ -204,7 +204,7 @@ jobs:
           set -euo pipefail
           dir="$(mktemp -d)"
           tar -C "$dir" -xzf "crossfyre-toolchain-${{ matrix.target }}.tar.gz"
-          for b in crossfyre plessor ambulo voyage doorward toolmark node oast cfx-script; do
+          for b in crossfyre plessor ambulo voyage doorward toolmark node cfx-script; do
             "$dir/$b" --version
           done
           rc=0
@@ -296,7 +296,7 @@ jobs:
           PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
         run: |
           set -euo pipefail
-          for p in crossfyre doorward node oast; do
+          for p in crossfyre doorward node; do
             cargo build --release --locked --target ${{ matrix.target }} -p "$p"
           done
           for p in plessor ambulo voyage toolmark; do
@@ -318,7 +318,7 @@ jobs:
           [ "${{ runner.os }}" != "Windows" ] || exe=".exe"
           out="dist/${{ matrix.target }}"
           mkdir -p "$out"
-          for b in crossfyre plessor ambulo voyage doorward toolmark node oast cfx-script; do
+          for b in crossfyre plessor ambulo voyage doorward toolmark node cfx-script; do
             cp "target/${{ matrix.target }}/release/$b$exe" "$out/$b$exe"
           done
           if [ "${{ runner.os }}" = "macOS" ]; then
@@ -382,7 +382,7 @@ jobs:
           set -euo pipefail
           exe=""
           [ "${{ runner.os }}" != "Windows" ] || exe=".exe"
-          for b in crossfyre plessor ambulo voyage doorward toolmark node oast; do
+          for b in crossfyre plessor ambulo voyage doorward toolmark node; do
             "dist/${{ matrix.target }}/$b$exe" --version
           done
           if [ "${{ runner.os }}" = "macOS" ]; then
@@ -520,9 +520,7 @@ jobs:
             here, so what these binaries do without them is what you can read in
             this tag.
 
-            This release also carries a standalone `oast` binary, the
-            out-of-band interaction server. The first-party CLI runs the same
-            server as `crossfyre oast serve`.
+            The out-of-band interaction server runs as `crossfyre oast serve`.
 
             ## Platforms
 

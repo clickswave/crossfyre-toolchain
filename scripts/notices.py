@@ -37,7 +37,6 @@ BINARIES = [
     ("doorward", []),
     ("toolmark", ["impersonate"]),
     ("node", []),
-    ("oast", []),
     ("cfx-script", None),
 ]
 

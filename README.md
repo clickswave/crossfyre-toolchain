@@ -21,7 +21,7 @@ Five engines for recon and vulnerability scanning, written in Rust, that you run
 | [`toolmark`](toolmark/) | Fingerprints services and technologies, and flags CVE leads by version. |
 | [`plessor`](plessor/) | Tests for vulnerabilities with nuclei-compatible templates and an injection engine, and confirms each finding before it reports it. |
 
-Alongside them: [`crossfyre`](crossfyre/), the CLI that installs and updates everything, [`node`](node/), the agent that runs the engines for the platform, [`oast`](oast/), an out-of-band server you can host so `plessor` confirms blind bugs on your own domain, and [`mobile`](mobile/), Crossfyre Mobile for Android, which is [on Google Play](https://play.google.com/store/apps/details?id=io.crossfyre.mobile).
+Alongside them: [`crossfyre`](crossfyre/), the CLI that installs and updates everything, [`node`](node/), the agent that runs the engines for the platform, [`oast`](oast/), an out-of-band server you can host with `crossfyre oast serve` so `plessor` confirms blind bugs on your own domain, and [`mobile`](mobile/), Crossfyre Mobile for Android, which is [on Google Play](https://play.google.com/store/apps/details?id=io.crossfyre.mobile).
 
 This repository began as [voyage](https://github.com/clickswave/crossfyre-toolchain/tree/voyage), the standalone subdomain finder, and its history is kept on that branch. ambulo began as [mach](https://github.com/clickswave/mach).
 

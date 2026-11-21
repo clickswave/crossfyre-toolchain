@@ -28,17 +28,17 @@ crossfyre oast setup --domain oob.yourdomain.com --email you@yourdomain.com
 See the [self-host guide](https://github.com/clickswave/crossfyre-toolchain) for the
 full walk-through.
 
-## Running the binary directly
+## Running it from the environment
 
-The `oast` binary reads its config from the environment. This is handy for containers
-or a systemd unit you manage yourself:
+Given no `--domain`, `crossfyre oast serve` reads its config from the environment.
+This is handy for containers or a systemd unit you manage yourself:
 
 ```sh
 OAST_DOMAIN=oob.yourdomain.com \
 OAST_PUBLIC_IP=203.0.113.9 \
 OAST_TLS_CERT=/etc/oast/fullchain.pem \
 OAST_TLS_KEY=/etc/oast/privkey.pem \
-oast
+crossfyre oast serve
 ```
 
 It listens on:
