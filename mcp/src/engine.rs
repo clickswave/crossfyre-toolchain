@@ -397,12 +397,12 @@ mod unit {
     /// port alone, so nothing is dialled to find out.
     #[test]
     fn a_test_build_refuses_the_hosts_engine_ports() {
-        for port in 4440..=4445 {
+        for port in 4440..=4446 {
             let refused = std::panic::catch_unwind(|| not_the_hosts(port));
             assert!(refused.is_err(), "{port} was let through");
         }
         assert_eq!(not_the_hosts(4439), 4439);
-        assert_eq!(not_the_hosts(4446), 4446);
+        assert_eq!(not_the_hosts(4447), 4447);
     }
 
     #[cfg(unix)]
