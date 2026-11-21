@@ -1293,3 +1293,125 @@ mod cve_lead_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod stamp_tests {
+    //! NetScaler's build, from the time in the gzip header of a file every build ships,
+    //! asked for only once NetScaler is found.
+    use super::*;
+    use crate::observe::{Observation, Observer};
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    struct Nowhere;
+
+    impl Observer for Nowhere {
+        async fn observed(&self, _: Observation<'_>) {}
+    }
+
+    const RDX: &str = "/vpn/js/rdx/core/lang/rdx_en.json.gz";
+
+    /// A host whose landing page is `landing`, and whose rdx_en.json.gz carries `stamp`,
+    /// with the paths it was asked for.
+    fn host(landing: &'static str, stamp: u32) -> (u16, Arc<Mutex<Vec<String>>>) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let line = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = line.split(' ').nth(1).unwrap_or("/").to_string();
+                seen.lock().unwrap().push(path.clone());
+                let (status, body): (u16, Vec<u8>) = if path == "/" {
+                    (200, landing.as_bytes().to_vec())
+                } else if path == RDX {
+                    let mut gz = vec![0x1f, 0x8b, 0x08, 0x08];
+                    gz.extend(stamp.to_le_bytes());
+                    gz.extend(b"\x00\x03rdx_en.json\x00compressed");
+                    (200, gz)
+                } else {
+                    (404, b"not here".to_vec())
+                };
+                let head = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&body);
+            }
+        });
+        (port, asked)
+    }
+
+    /// What a standard fingerprint of `port` names, with each version.
+    async fn named(port: u16) -> Vec<(String, Option<String>)> {
+        let params: FpParams = serde_json::from_value(json!({
+            "target": format!("http://127.0.0.1:{port}/"),
+            "evasive": false,
+            "favicon": false,
+            "timeout_ms": 3000,
+            "depth_tier": 2,
+        }))
+        .unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        scan(
+            Signatures::shipped(),
+            params,
+            tx,
+            Arc::new(Nowhere),
+            &crate::cve::snapshot_for_tests(),
+        )
+        .await;
+        let mut out = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            if e.pointer("/data/type") == Some(&json!("technology")) {
+                let d = &e["data"];
+                out.push((
+                    d["name"].as_str().unwrap().to_string(),
+                    d["version"].as_str().map(str::to_string),
+                ));
+            }
+        }
+        out
+    }
+
+    const GATEWAY: &str = "<html><head><title>NetScaler Gateway</title></head><body></body></html>";
+
+    /// A stamp in Fox-IT's table gives NetScaler its build, and leads at it.
+    #[tokio::test]
+    async fn a_known_stamp_gives_netscaler_its_build() {
+        let (port, _) = host(GATEWAY, 1689014191);
+        let found = named(port).await;
+        assert!(
+            found.contains(&(
+                "Citrix NetScaler".to_string(),
+                Some("13.1-49.13".to_string())
+            )),
+            "{found:?}"
+        );
+    }
+
+    /// A stamp the table does not hold gives no version, never a guess.
+    #[tokio::test]
+    async fn an_unknown_stamp_gives_no_version() {
+        let (port, _) = host(GATEWAY, 1_000_000_000);
+        let found = named(port).await;
+        assert!(
+            found.contains(&("Citrix NetScaler".to_string(), None)),
+            "{found:?}"
+        );
+    }
+
+    /// A host that is not NetScaler is never asked for the file.
+    #[tokio::test]
+    async fn no_other_host_is_asked_for_the_file() {
+        let (port, asked) = host("<html><body>a plain page</body></html>", 1689014191);
+        let _ = named(port).await;
+        let asked = asked.lock().unwrap().clone();
+        assert!(!asked.iter().any(|p| p == RDX), "{asked:?}");
+    }
+}

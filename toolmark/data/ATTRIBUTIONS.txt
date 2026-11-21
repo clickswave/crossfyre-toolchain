@@ -41,3 +41,9 @@ Version maps (versions.yaml)
   Licensed under the Apache License, Version 2.0,
   https://www.apache.org/licenses/LICENSE-2.0. Changed: read into the first OTP release
   that shipped each ssh version.
+
+NetScaler builds by stamp (netscaler-stamps.csv)
+  From the version table in scan-citrix-netscaler-version.py by Fox-IT,
+  https://github.com/fox-it/citrix-netscaler-triage. Licensed under the Apache License,
+  Version 2.0, https://www.apache.org/licenses/LICENSE-2.0. Changed: the stamps whose
+  build it does not know are left out.

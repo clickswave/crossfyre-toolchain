@@ -215,6 +215,33 @@ struct Leaf {
     range: Option<Range>,
     /// What it adds to the confidence when it is present.
     confidence: u32,
+    /// For a version leaf on a path that is a gzip file, the table that names the build
+    /// its header's time belongs to.
+    stamp: Option<&'static Stamps>,
+}
+
+/// A table of builds by the time a gzip file shipped with them carries: a time not in
+/// it gives no version.
+pub(crate) struct Stamps(std::collections::HashMap<u32, String>);
+
+/// Each table a `stamp` names, from toolmark/data.
+pub(crate) fn stamps(name: &str) -> Option<&'static Stamps> {
+    static NETSCALER: LazyLock<Stamps> = LazyLock::new(|| {
+        Stamps(
+            include_str!("../data/netscaler-stamps.csv")
+                .lines()
+                .filter(|l| !l.starts_with('#') && *l != "stamp,version")
+                .filter_map(|l| {
+                    let (stamp, build) = l.split_once(',')?;
+                    Some((stamp.parse().ok()?, build.to_string()))
+                })
+                .collect(),
+        )
+    });
+    match name {
+        "netscaler" => Some(&NETSCALER),
+        _ => None,
+    }
 }
 
 /// How a signature's evidence combines.
@@ -403,6 +430,8 @@ pub struct Answered {
     body: String,
     /// The SHA-256 of the body as it came, before it was read as text.
     sha256: [u8; 32],
+    /// The time a gzip file's header gives, when the body is one.
+    gzip_stamp: Option<u32>,
 }
 
 impl Answered {
@@ -415,6 +444,12 @@ impl Answered {
             moved,
             body: String::from_utf8_lossy(body).into_owned(),
             sha256: sha2::Sha256::digest(body).into(),
+            gzip_stamp: match body {
+                [0x1f, 0x8b, 0x08, _, a, b, c, d, ..] => {
+                    Some(u32::from_le_bytes([*a, *b, *c, *d])).filter(|&t| t != 0)
+                }
+                _ => None,
+            },
         }
     }
 
@@ -425,6 +460,7 @@ impl Answered {
             moved: false,
             body: String::new(),
             sha256: [0; 32],
+            gzip_stamp: None,
         }
     }
 }
@@ -986,27 +1022,37 @@ impl<'a> Host<'a> {
                 .into_iter()
                 .collect();
         }
-        let Some(Request::Ask(path)) = self.request(leaf) else {
+        if !matches!(self.request(leaf), Some(Request::Ask(_))) {
             return self.page.text(&leaf.source).into_iter().collect();
+        }
+        self.answered(leaf)
+            .map(|a| a.body.as_str())
+            .into_iter()
+            .collect()
+    }
+
+    /// What the host answered for the path `leaf` asks for, when it answered with the
+    /// file and not its not-found page.
+    fn answered(&self, leaf: &Leaf) -> Option<&Answered> {
+        let Some(Request::Ask(path)) = self.request(leaf) else {
+            return None;
         };
-        let Some(answered) = self.asked.get(&path) else {
-            return Vec::new();
-        };
+        let answered = self.asked.get(&path)?;
         match answered.status {
             Some(s) if (200..300).contains(&s) && !answered.moved => {
-                if self.not_found.is(&path, s, &answered.body) {
-                    Vec::new()
-                } else {
-                    vec![answered.body.as_str()]
-                }
+                (!self.not_found.is(&path, s, &answered.body)).then_some(answered)
             }
-            _ => Vec::new(),
+            _ => None,
         }
     }
 
     /// The group of `leaf`'s pattern that reads a version here, and what it reads: the
     /// first group that takes part in the first match.
     fn version_of(&self, leaf: &Leaf) -> Option<(usize, String)> {
+        if let Some(table) = leaf.stamp {
+            let stamp = self.answered(leaf)?.gzip_stamp?;
+            return table.0.get(&stamp).map(|build| (1, build.clone()));
+        }
         let regex = leaf.regex.as_ref()?;
         self.texts(leaf).into_iter().find_map(|text| {
             let captures = regex.captures(text)?;

@@ -58,6 +58,9 @@ struct LeafSpec {
     since: Option<String>,
     until: Option<String>,
     confidence: Option<u32>,
+    /// For a version leaf on a path that is a gzip file: the table its header's time is
+    /// looked up in.
+    stamp: Option<String>,
 }
 
 /// The signatures in `files`, in order, and why each file left out was left out: it did
@@ -285,6 +288,18 @@ fn leaf(kind: &str, value: Value, version: bool) -> Result<Leaf, String> {
     if spec.sha256.is_some() && !matches!(known, Kind::Path | Kind::Script) {
         return Err(format!("this {kind} leaf has no sha256"));
     }
+    let stamp = match &spec.stamp {
+        None => None,
+        Some(_) if !matches!(known, Kind::Path) || !version => {
+            return Err("only a version leaf on a path reads a stamp".into());
+        }
+        Some(_) if spec.regex.is_some() || spec.sha256.is_some() => {
+            return Err("a stamp leaf reads its version from its table, with no regex".into());
+        }
+        Some(name) => {
+            Some(super::stamps(name).ok_or_else(|| format!("there is no stamp table {name:?}"))?)
+        }
+    };
     let range = match (&spec.since, &spec.until) {
         (None, None) => None,
         _ if !version => {
@@ -441,7 +456,7 @@ fn leaf(kind: &str, value: Value, version: bool) -> Result<Leaf, String> {
             }
             let regex = match spec.regex {
                 Some(pattern) => Some(compile(&pattern)?),
-                None if version && range.is_none() && sha256.is_none() => {
+                None if version && range.is_none() && sha256.is_none() && stamp.is_none() => {
                     return Err("a version leaf needs a regex".into());
                 }
                 None => None,
@@ -469,6 +484,7 @@ fn leaf(kind: &str, value: Value, version: bool) -> Result<Leaf, String> {
         sha256,
         range,
         confidence,
+        stamp,
     })
 }
 
@@ -722,6 +738,37 @@ mod tests {
                 ),
             ),
             (
+                "stamp-on-html.yaml".into(),
+                format!(
+                    "id: stamp-on-html\n{}",
+                    x("detect: { html: { regex: 'x' } }\n\
+                       version: [ { html: { regex: '(x)', stamp: netscaler } } ]\n")
+                ),
+            ),
+            (
+                "stamp-with-regex.yaml".into(),
+                format!(
+                    "id: stamp-with-regex\n{}",
+                    x("detect: { html: { regex: 'x' } }\n\
+                       version: [ { path: { path: /x.gz, regex: '(x)', stamp: netscaler } } ]\n")
+                ),
+            ),
+            (
+                "stamp-unknown.yaml".into(),
+                format!(
+                    "id: stamp-unknown\n{}",
+                    x("detect: { html: { regex: 'x' } }\n\
+                       version: [ { path: { path: /x.gz, stamp: nowhere } } ]\n")
+                ),
+            ),
+            (
+                "stamp-detects.yaml".into(),
+                format!(
+                    "id: stamp-detects\n{}",
+                    x("detect: { path: { path: /x.gz, stamp: netscaler } }\n")
+                ),
+            ),
+            (
                 "loop-a.yaml".into(),
                 format!(
                     "id: loop-a\n{}",
@@ -752,6 +799,19 @@ mod tests {
         };
         let expected = [
             ("extra-key.yaml", "unknown field `tags`"),
+            (
+                "stamp-on-html.yaml",
+                "only a version leaf on a path reads a stamp",
+            ),
+            (
+                "stamp-with-regex.yaml",
+                "reads its version from its table, with no regex",
+            ),
+            ("stamp-unknown.yaml", "there is no stamp table \"nowhere\""),
+            (
+                "stamp-detects.yaml",
+                "only a version leaf on a path reads a stamp",
+            ),
             ("unknown-leaf.yaml", "unknown leaf `title`"),
             ("unknown-group.yaml", "unknown leaf `either`"),
             ("bad-pattern.yaml", "does not compile"),
