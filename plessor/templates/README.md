@@ -27,6 +27,22 @@ in the next toolchain release; to run one before that, keep it in a folder of yo
 and pass `plessor scan <target> --templates <folder>`. A file that fails to parse, or uses
 a feature plessor does not support, is skipped without breaking the rest.
 
+A template about one product names it in `info.metadata` the way its CPE does, as
+`vendor` and `product`, and toolmark must name the same product, by a signature in
+[`toolmark/`](../toolmark/) or an alias in [`mappings/aliases.yaml`](../mappings/aliases.yaml).
+When the product cannot be seen from outside, as a library inside an application cannot,
+the template says `unseen: true` instead. A template that finds the product itself, as a
+panel check does, names none.
+
+Every push is checked the way plessor reads templates: each file parses, has a request,
+uses only the matchers below and patterns that compile, has an id no other file has, and
+names a product toolmark names. To run the same check before sending a change:
+
+```sh
+toolmark check toolmark --mappings mappings --names /tmp/names.txt
+plessor check plessor --known /tmp/names.txt
+```
+
 ## Writing good templates
 
 A few rules keep templates useful instead of noisy:
@@ -60,5 +76,5 @@ Templates may use:
   the client.
 
 Extractors, matcher types or parts not in the lists above, and multi-document files
-are not loaded. `info.tags`, `info.metadata`, and `info.classification` are kept for
-readability and ignored when running.
+are not loaded. `info.tags`, `info.classification` and the rest of `info.metadata` are
+kept for readability and ignored when running.

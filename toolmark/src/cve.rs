@@ -39,28 +39,34 @@ pub const SNAPSHOT_LABEL: &str = "built-in known-exploited snapshot";
 /// Each product's other names in the CVE data, from toolmark/data/aliases.yaml.
 fn aliases() -> &'static std::collections::HashMap<Cpe, Vec<Cpe>> {
     static ALL: std::sync::LazyLock<std::collections::HashMap<Cpe, Vec<Cpe>>> =
-        std::sync::LazyLock::new(|| {
-            let read: std::collections::BTreeMap<String, Vec<String>> =
-                serde_yaml::from_str(ALIASES).expect("toolmark/data/aliases.yaml reads");
-            read.into_iter()
-                .map(|(name, also)| (named(&name), also.iter().map(|a| named(a)).collect()))
-                .collect()
-        });
+        std::sync::LazyLock::new(|| read_aliases(ALIASES).expect("toolmark/data/aliases.yaml"));
     &ALL
 }
 
-/// A name in toolmark/data/aliases.yaml, part:vendor:product.
-fn named(text: &str) -> Cpe {
-    Cpe::parse(text).unwrap_or_else(|| {
-        panic!("{text} in toolmark/data/aliases.yaml is not part:vendor:product")
-    })
+/// The aliases `text` gives, as aliases.yaml writes them, or what is wrong with it.
+pub(crate) fn read_aliases(text: &str) -> Result<std::collections::HashMap<Cpe, Vec<Cpe>>, String> {
+    let read: std::collections::BTreeMap<String, Vec<String>> =
+        serde_yaml::from_str(text).map_err(|e| e.to_string())?;
+    read.into_iter()
+        .map(|(name, also)| {
+            Ok((
+                named(&name)?,
+                also.iter().map(|a| named(a)).collect::<Result<_, _>>()?,
+            ))
+        })
+        .collect()
+}
+
+/// A name in a mapping, part:vendor:product.
+fn named(text: &str) -> Result<Cpe, String> {
+    Cpe::parse(text).ok_or_else(|| format!("{text:?} is not part:vendor:product"))
 }
 
 /// One way a version toolmark reads maps to the one the CVE data files it under: an
 /// exact version, or a range from one up to and not including another.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Filed {
+pub(crate) struct Filed {
     eq: Option<String>,
     from: Option<String>,
     below: Option<String>,
@@ -80,14 +86,31 @@ impl Filed {
 /// Each product's map, from toolmark/data/versions.yaml.
 fn version_maps() -> &'static std::collections::HashMap<Cpe, Vec<Filed>> {
     static ALL: std::sync::LazyLock<std::collections::HashMap<Cpe, Vec<Filed>>> =
-        std::sync::LazyLock::new(|| {
-            let read: std::collections::BTreeMap<String, Vec<Filed>> =
-                serde_yaml::from_str(VERSIONS).expect("toolmark/data/versions.yaml reads");
-            read.into_iter()
-                .map(|(name, map)| (named(&name), map))
-                .collect()
-        });
+        std::sync::LazyLock::new(|| read_versions(VERSIONS).expect("toolmark/data/versions.yaml"));
     &ALL
+}
+
+/// The version maps `text` gives, as versions.yaml writes them, or what is wrong with it:
+/// a name that is not part:vendor:product, or a bound that is no version.
+pub(crate) fn read_versions(
+    text: &str,
+) -> Result<std::collections::HashMap<Cpe, Vec<Filed>>, String> {
+    let read: std::collections::BTreeMap<String, Vec<Filed>> =
+        serde_yaml::from_str(text).map_err(|e| e.to_string())?;
+    read.into_iter()
+        .map(|(name, map)| {
+            for f in &map {
+                for bound in [&f.eq, &f.from, &f.below].into_iter().flatten() {
+                    Version::parse(bound)
+                        .ok_or_else(|| format!("{name}: {bound:?} is no version"))?;
+                }
+                if f.eq.is_none() && f.from.is_none() && f.below.is_none() {
+                    return Err(format!("{name}: an entry for {:?} has no version", f.filed));
+                }
+            }
+            Ok((named(&name)?, map))
+        })
+        .collect()
 }
 
 /// `version` of `cpe` as the CVE data numbers it: itself, or for a product whose CVEs are
@@ -427,6 +450,42 @@ mod tests {
                 .contains("no data folder")
         );
         assert_eq!(asked.load(Ordering::SeqCst), 0);
+    }
+
+    /// A mapping that does not read says what is wrong with it rather than being read
+    /// in part.
+    #[test]
+    fn a_mapping_that_does_not_read_says_why() {
+        let aliases = read_aliases(r#""a:acme:widget": ["a:acme:gadget"]"#).unwrap();
+        assert_eq!(
+            aliases[&Cpe::new("a", "acme", "widget")],
+            [Cpe::new("a", "acme", "gadget")]
+        );
+        assert_eq!(
+            read_aliases(r#""a:acme:widget": ["acme:gadget"]"#)
+                .err()
+                .as_deref(),
+            Some(r#""acme:gadget" is not part:vendor:product"#)
+        );
+        assert!(read_aliases("[").is_err());
+
+        let versions =
+            read_versions(r#""a:acme:widget": [{from: "1.0", below: "2.0", as: "one"}]"#).unwrap();
+        assert_eq!(versions[&Cpe::new("a", "acme", "widget")].len(), 1);
+        assert_eq!(
+            read_versions(r#""a:acme:widget": [{eq: "none", as: "one"}]"#)
+                .err()
+                .as_deref(),
+            Some(r#"a:acme:widget: "none" is no version"#)
+        );
+        assert_eq!(
+            read_versions(r#""a:acme:widget": [{as: "one"}]"#)
+                .err()
+                .as_deref(),
+            Some(r#"a:acme:widget: an entry for "one" has no version"#)
+        );
+        assert!(read_versions(r#""acme": [{eq: "1", as: "one"}]"#).is_err());
+        assert!(read_versions(r#""a:acme:widget": [{eq: "1", as: "one", to: "2"}]"#).is_err());
     }
 
     /// Exchange's build is asked for as the cumulative update NVD names, SharePoint's as its

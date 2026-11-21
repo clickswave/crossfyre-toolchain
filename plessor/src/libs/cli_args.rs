@@ -53,6 +53,10 @@ pub enum Commands {
     /// The scans this engine keeps, the latest first, and a stopped template scan to take
     /// up again
     Scans,
+    /// Check a folder of templates as plessor reads them: each parses, has a request, runs
+    /// only matchers plessor has and patterns that compile, has an id of its own, and names
+    /// a product toolmark names, when it names one
+    Check(CheckArgs),
     /// What this engine keeps: delete one scan, old scans, or everything
     Db {
         #[command(subcommand)]
@@ -152,4 +156,14 @@ mod tests {
         assert!(!parsed(&["plessor", "scan", "example.com"]));
         assert!(Cli::try_parse_from(["plessor", "--tui", "scan", "example.com"]).is_err());
     }
+}
+
+#[derive(Parser, Clone)]
+pub struct CheckArgs {
+    /// The folder of templates
+    pub dir: std::path::PathBuf,
+    /// The products toolmark names, one vendor:product a line, as `toolmark check --names`
+    /// writes them. Without it, the products templates name are not checked
+    #[arg(long)]
+    pub known: Option<std::path::PathBuf>,
 }

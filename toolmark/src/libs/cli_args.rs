@@ -67,6 +67,9 @@ pub enum Commands {
         #[command(subcommand)]
         action: CveAction,
     },
+    /// Check a folder of signatures, and the mappings beside them, as toolmark reads them,
+    /// and write the products they name for plessor's check of its templates
+    Check(CheckArgs),
     /// What this engine keeps: delete one scan, old scans, or everything
     Db {
         #[command(subcommand)]
@@ -225,4 +228,17 @@ mod tests {
         assert!(!parsed(&["toolmark", "scan", "example.com"]));
         assert!(Cli::try_parse_from(["toolmark", "--tui", "scan", "example.com"]).is_err());
     }
+}
+
+#[derive(Parser, Clone)]
+pub struct CheckArgs {
+    /// The folder of signatures
+    pub dir: std::path::PathBuf,
+    /// The folder of mappings: aliases.yaml, versions.yaml and netscaler-stamps.csv
+    #[arg(long)]
+    pub mappings: Option<std::path::PathBuf>,
+    /// Write the products the signatures name, and their aliases, one vendor:product a
+    /// line, to this file
+    #[arg(long)]
+    pub names: Option<std::path::PathBuf>,
 }

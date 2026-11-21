@@ -38,6 +38,44 @@ fn the_compiled_set_is_the_signatures_folder() {
     assert_eq!(signatures.list.len(), files::FILES.len());
 }
 
+/// A stamp table reads a stamp,version line under its header and comments, and a line
+/// that is not one says so.
+#[test]
+fn a_stamp_table_line_that_is_not_one_says_why() {
+    let table = read_stamps("# from somewhere\nstamp,version\n1687271820,13.1-48.47\n\n").unwrap();
+    assert_eq!(
+        table.0.get(&1687271820).map(String::as_str),
+        Some("13.1-48.47")
+    );
+    assert_eq!(table.0.len(), 1);
+    assert_eq!(
+        read_stamps("stamp,version\n1687271820\n").err().as_deref(),
+        Some(r#""1687271820" is not stamp,version"#)
+    );
+    assert_eq!(
+        read_stamps("stamp,version\nsoon,13.1-48.47\n")
+            .err()
+            .as_deref(),
+        Some(r#""soon" is no stamp"#)
+    );
+}
+
+/// A folder's .yaml files load as the compiled set does, and a file that does not is
+/// named with why.
+#[test]
+fn a_folder_of_signatures_loads_and_names_what_it_left_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let (good, text) = file("acme", "{ header: { name: server, regex: acme } }");
+    std::fs::write(dir.path().join(good), text).unwrap();
+    std::fs::write(dir.path().join("broken.yaml"), "id: [").unwrap();
+    std::fs::write(dir.path().join("notes.txt"), "id: [").unwrap();
+    let (signatures, skipped) = load_dir(dir.path()).unwrap();
+    assert_eq!(signatures.list.len(), 1);
+    assert_eq!(signatures.list[0].id, "acme");
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert!(skipped[0].starts_with("broken.yaml: "), "{skipped:?}");
+}
+
 #[test]
 fn a_cpe_escapes_what_its_formatted_string_escapes() {
     assert_eq!(cpe_value("joomla!"), "joomla\\!");

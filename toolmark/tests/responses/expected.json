@@ -3021,6 +3021,25 @@
       "version_range": null
     }
   ],
+  "metabase.http": [
+    {
+      "candidates": [],
+      "category": "Monitoring",
+      "confidence": 50,
+      "cpe": "cpe:2.3:a:metabase:metabase:0.46.5:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:metabase:metabase"
+      ],
+      "distro": null,
+      "evidence": [
+        "body pattern",
+        "body pattern"
+      ],
+      "name": "Metabase",
+      "version": "0.46.5",
+      "version_range": null
+    }
+  ],
   "minio.http": [
     {
       "candidates": [],

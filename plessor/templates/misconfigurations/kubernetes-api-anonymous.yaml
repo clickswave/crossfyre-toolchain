@@ -6,8 +6,6 @@ info:
   tags: misconfig,kubernetes,unauth
   metadata:
     category: misconfigurations
-    vendor: kubernetes
-    product: kubernetes
 http:
   - method: GET
     path:

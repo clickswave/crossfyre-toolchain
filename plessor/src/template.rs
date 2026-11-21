@@ -57,6 +57,14 @@ pub struct Meta {
     /// template carries no tags.
     #[serde(default)]
     pub category: String,
+    /// The product the template is about, as its CPE names it, which toolmark names it by.
+    #[serde(default)]
+    pub vendor: Option<String>,
+    #[serde(default)]
+    pub product: Option<String>,
+    /// The product cannot be seen from outside, so toolmark has no signature for it.
+    #[serde(default)]
+    pub unseen: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1070,6 +1078,101 @@ fn load_dir_into(dir: &std::path::Path, out: &mut Vec<Template>) {
     }
 }
 
+/// The matcher types plessor runs; any other never matches.
+const MATCHERS: &[&str] = &["status", "size", "word", "regex", "dsl"];
+
+/// Why `text` is no template plessor runs: it does not parse, has no request, a matcher
+/// of a type plessor does not run, or a pattern that does not compile. The template when
+/// it is one.
+pub fn check(text: &str) -> Result<Template, String> {
+    let template: Template = serde_yaml::from_str(text).map_err(|e| e.to_string())?;
+    if template.http.is_empty() {
+        return Err("it has no request".to_string());
+    }
+    for m in template.http.iter().flat_map(|h| &h.matchers) {
+        if !MATCHERS.contains(&m.mtype.as_str()) {
+            return Err(format!("plessor runs no {:?} matcher", m.mtype));
+        }
+        for pattern in &m.regex {
+            Regex::new(pattern)
+                .map_err(|e| format!("pattern {pattern:?} does not compile: {e}"))?;
+        }
+    }
+    Ok(template)
+}
+
+/// Each template in `dir` and its subfolders, checked as [`check`] checks one, with the
+/// vendor and product each that names one names: each must be one of `known`, as
+/// `vendor:product`, unless the template says its product cannot be seen from outside.
+/// What is wrong, by file; nothing when all is well. Ids must be unique.
+pub fn check_dir(
+    dir: &std::path::Path,
+    known: Option<&std::collections::HashSet<String>>,
+) -> Vec<String> {
+    let mut files = Vec::new();
+    collect_yaml(dir, &mut files);
+    files.sort();
+    let mut problems = Vec::new();
+    let mut ids: std::collections::HashMap<String, std::path::PathBuf> = Default::default();
+    for path in files {
+        let shown = path
+            .strip_prefix(dir)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        let template = match std::fs::read_to_string(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|t| check(&t))
+        {
+            Ok(t) => t,
+            Err(why) => {
+                problems.push(format!("{shown}: {why}"));
+                continue;
+            }
+        };
+        if let Some(first) = ids.insert(template.id.clone(), path.clone()) {
+            problems.push(format!(
+                "{shown}: the id {} is also {}'s",
+                template.id,
+                first.display()
+            ));
+        }
+        let meta = &template.info.metadata;
+        if let (Some(known), Some(vendor), Some(product), false) =
+            (known, &meta.vendor, &meta.product, meta.unseen)
+            && !known.contains(&format!("{vendor}:{product}"))
+        {
+            problems.push(format!(
+                "{shown}: toolmark names no {vendor}:{product}; give it a signature, or say \
+                 `unseen: true` when it cannot be seen from outside"
+            ));
+        }
+    }
+    problems
+}
+
+fn collect_yaml(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let hidden = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with('.'));
+        if path.is_dir() && !hidden {
+            collect_yaml(&path, out);
+        } else if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e == "yaml" || e == "yml")
+        {
+            out.push(path);
+        }
+    }
+}
+
 /// The class a template finding belongs to, from its own metadata.
 ///
 /// Template findings used to carry no class at all, so every consumer that
@@ -1460,5 +1563,83 @@ mod tests {
             req,
             &resp(200, "location: https://example.com/\n", "")
         ));
+    }
+
+    fn template(id: &str, meta: &str, matcher: &str) -> String {
+        format!(
+            "id: {id}\ninfo:\n  name: {id}\n  severity: info\n  metadata:\n    category: cves\n{meta}\
+             http:\n  - method: GET\n    path:\n      - \"{{{{BaseURL}}}}/\"\n    matchers:\n{matcher}"
+        )
+    }
+
+    const WORD: &str = "      - type: word\n        words:\n          - ok\n";
+
+    #[test]
+    fn a_template_plessor_would_not_run_does_not_pass_the_check() {
+        use super::check;
+        assert!(check(&template("fine", "", WORD)).is_ok());
+        let none = "id: none\ninfo:\n  name: none\n";
+        assert_eq!(check(none).err().as_deref(), Some("it has no request"));
+        let binary = template(
+            "binary",
+            "",
+            "      - type: binary\n        binary:\n          - 00\n",
+        );
+        assert!(check(&binary).unwrap_err().contains("\"binary\""));
+        let regex = template(
+            "regex",
+            "",
+            "      - type: regex\n        regex:\n          - '(unclosed'\n",
+        );
+        assert!(check(&regex).unwrap_err().contains("does not compile"));
+        assert!(check("id: [").is_err());
+    }
+
+    /// Ids are unique across the folder and its subfolders, a product a template names
+    /// is one toolmark names unless the template says it cannot be seen from outside,
+    /// and a hidden folder, as .git is, is not read.
+    #[test]
+    fn the_folder_check_finds_a_taken_id_and_a_product_toolmark_does_not_name() {
+        let dir = std::env::temp_dir().join(format!("plessor-check-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for sub in ["cves", ".git", "misc"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        let named = |vendor: &str, product: &str, unseen: bool| {
+            format!(
+                "    vendor: {vendor}\n    product: {product}\n{}",
+                if unseen { "    unseen: true\n" } else { "" }
+            )
+        };
+        let write = |path: &str, text: String| std::fs::write(dir.join(path), text).unwrap();
+        write(
+            "cves/a.yaml",
+            template("a", &named("acme", "widget", false), WORD),
+        );
+        write(
+            "cves/b.yaml",
+            template("b", &named("acme", "gadget", false), WORD),
+        );
+        write(
+            "cves/c.yaml",
+            template("c", &named("acme", "inside", true), WORD),
+        );
+        write("misc/d.yaml", template("a", "", WORD));
+        write(".git/e.yaml", "id: [".to_string());
+        let known: std::collections::HashSet<String> = ["acme:widget".to_string()].into();
+
+        let problems = super::check_dir(&dir, Some(&known));
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(problems[0].starts_with("cves/b.yaml: toolmark names no acme:gadget"));
+        assert!(problems[1].starts_with("misc/d.yaml: the id a is also"));
+        // Without the names, only the templates themselves are checked.
+        assert_eq!(super::check_dir(&dir, None).len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_shipped_templates_pass_the_check() {
+        let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/templates"));
+        assert_eq!(super::check_dir(dir, None), Vec::<String>::new());
     }
 }

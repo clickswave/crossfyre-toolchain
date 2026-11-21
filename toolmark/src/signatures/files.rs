@@ -448,6 +448,10 @@ pub(super) static FILES: &[(&str, &str)] = &[
         include_str!("../../signatures/goahead.yaml"),
     ),
     (
+        "metabase.yaml",
+        include_str!("../../signatures/metabase.yaml"),
+    ),
+    (
         "mini-httpd.yaml",
         include_str!("../../signatures/mini-httpd.yaml"),
     ),

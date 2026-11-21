@@ -175,6 +175,29 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 None => Ok(()),
             }
         }
+        Some(Commands::Check(args)) => {
+            let known = match &args.known {
+                Some(path) => Some(
+                    std::fs::read_to_string(path)
+                        .map_err(|e| format!("{}: {e}", path.display()))?
+                        .lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                ),
+                None => None,
+            };
+            let problems = template::check_dir(&args.dir, known.as_ref());
+            for problem in &problems {
+                println!("{problem}");
+            }
+            if problems.is_empty() {
+                Ok(())
+            } else {
+                Err(format!("{} problem(s) in {}", problems.len(), args.dir.display()).into())
+            }
+        }
         Some(Commands::Db { action }) => dguard::run_db(&daemon, &action).await,
         Some(Commands::Completions { shell }) => {
             let mut script = Vec::new();

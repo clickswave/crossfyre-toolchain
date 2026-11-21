@@ -224,19 +224,51 @@ struct Leaf {
 /// it gives no version.
 pub(crate) struct Stamps(std::collections::HashMap<u32, String>);
 
+/// The table `text` gives, stamp,version a line under its header and comments, or the
+/// first line that is not one.
+pub(crate) fn read_stamps(text: &str) -> Result<Stamps, String> {
+    text.lines()
+        .filter(|l| !l.starts_with('#') && *l != "stamp,version" && !l.is_empty())
+        .map(|l| {
+            let (stamp, build) = l
+                .split_once(',')
+                .ok_or_else(|| format!("{l:?} is not stamp,version"))?;
+            let stamp = stamp
+                .parse()
+                .map_err(|_| format!("{stamp:?} is no stamp"))?;
+            Ok((stamp, build.to_string()))
+        })
+        .collect::<Result<_, String>>()
+        .map(Stamps)
+}
+
+/// The signatures in `dir`, its .yaml files, and why each left out was left out.
+pub(crate) fn load_dir(dir: &std::path::Path) -> std::io::Result<(Signatures, Vec<String>)> {
+    let mut texts = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("yaml") {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            texts.push((name, std::fs::read_to_string(&path)?));
+        }
+    }
+    texts.sort();
+    let files: Vec<(&str, &str)> = texts
+        .iter()
+        .map(|(n, t)| (n.as_str(), t.as_str()))
+        .collect();
+    Ok(load::load(&files))
+}
+
 /// Each table a `stamp` names, from toolmark/data.
 pub(crate) fn stamps(name: &str) -> Option<&'static Stamps> {
     static NETSCALER: LazyLock<Stamps> = LazyLock::new(|| {
-        Stamps(
-            include_str!("../data/netscaler-stamps.csv")
-                .lines()
-                .filter(|l| !l.starts_with('#') && *l != "stamp,version")
-                .filter_map(|l| {
-                    let (stamp, build) = l.split_once(',')?;
-                    Some((stamp.parse().ok()?, build.to_string()))
-                })
-                .collect(),
-        )
+        read_stamps(include_str!("../data/netscaler-stamps.csv"))
+            .expect("toolmark/data/netscaler-stamps.csv")
     });
     match name {
         "netscaler" => Some(&NETSCALER),

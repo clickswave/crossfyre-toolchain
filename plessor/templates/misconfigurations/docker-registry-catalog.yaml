@@ -6,8 +6,6 @@ info:
   tags: misconfig,docker,registry,unauth
   metadata:
     category: misconfigurations
-    vendor: docker
-    product: distribution
 http:
   - method: GET
     path:

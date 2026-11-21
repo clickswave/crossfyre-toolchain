@@ -122,12 +122,58 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             print_all(&script)?;
             Ok(())
         }
+        Some(Commands::Check(args)) => check(&args),
         Some(Commands::Daemon) | None => {
             eprintln!(
                 "No command given. Use `toolmark scan <target>`, `toolmark services <host:port>...`, `toolmark exec <json>`, or `toolmark daemon`."
             );
             std::process::exit(1);
         }
+    }
+}
+
+/// `toolmark check`: the signatures in a folder, and the mappings when given, read as
+/// toolmark reads them, each problem printed; and the products they name written out.
+fn check(args: &libs::cli_args::CheckArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let (signatures, mut problems) =
+        signatures::load_dir(&args.dir).map_err(|e| format!("{}: {e}", args.dir.display()))?;
+    let mut aliases = std::collections::HashMap::new();
+    if let Some(dir) = &args.mappings {
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).map_err(|e| e.to_string());
+        match read("aliases.yaml").and_then(|t| cve::read_aliases(&t)) {
+            Ok(read) => aliases = read,
+            Err(why) => problems.push(format!("aliases.yaml: {why}")),
+        }
+        if let Err(why) = read("versions.yaml").and_then(|t| cve::read_versions(&t).map(|_| ())) {
+            problems.push(format!("versions.yaml: {why}"));
+        }
+        if let Err(why) =
+            read("netscaler-stamps.csv").and_then(|t| signatures::read_stamps(&t).map(|_| ()))
+        {
+            problems.push(format!("netscaler-stamps.csv: {why}"));
+        }
+    }
+    if let Some(path) = &args.names {
+        let mut names: Vec<String> = signatures
+            .cpes()
+            .into_iter()
+            .flat_map(|cpe| {
+                let also = aliases.get(&cpe).cloned().unwrap_or_default();
+                std::iter::once(cpe).chain(also)
+            })
+            .map(|c| format!("{}:{}", c.vendor, c.product))
+            .collect();
+        names.sort();
+        names.dedup();
+        std::fs::write(path, names.join("\n") + "\n")?;
+    }
+    for problem in &problems {
+        println!("{problem}");
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{} problem(s) in {}", problems.len(), args.dir.display()).into())
     }
 }
 
@@ -205,4 +251,35 @@ async fn send_stream(
         std::process::exit(1);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// The shipped signatures and mappings pass the check, the names it writes for
+    /// plessor's check hold each product and its aliases, and a mapping it cannot read
+    /// is a problem.
+    #[test]
+    fn the_shipped_signatures_and_mappings_pass_the_check() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let out = tempfile::tempdir().unwrap();
+        let names = out.path().join("names.txt");
+        let args = |mappings: &std::path::Path| super::libs::cli_args::CheckArgs {
+            dir: format!("{root}/signatures").into(),
+            mappings: Some(mappings.to_path_buf()),
+            names: Some(names.clone()),
+        };
+        super::check(&args(std::path::Path::new(&format!("{root}/data")))).unwrap();
+        let written = std::fs::read_to_string(&names).unwrap();
+        let lines: Vec<&str> = written.lines().collect();
+        assert!(lines.contains(&"zimbra:collaboration"));
+        assert!(
+            lines.contains(&"synacor:zimbra_collaboration_suite"),
+            "an alias"
+        );
+        assert!(lines.windows(2).all(|w| w[0] < w[1]), "sorted, once each");
+
+        let empty = tempfile::tempdir().unwrap();
+        let err = super::check(&args(empty.path())).unwrap_err();
+        assert!(err.to_string().starts_with("3 problem(s)"), "{err}");
+    }
 }
