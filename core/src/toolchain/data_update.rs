@@ -309,6 +309,8 @@ pub struct Status {
     pub pack: Option<u64>,
     pub dataset: Option<u64>,
     pub problem: Option<String>,
+    /// Since when a run has had a problem, each run since too, in seconds since 1970.
+    pub problem_since: Option<i64>,
 }
 
 impl Status {
@@ -319,7 +321,20 @@ impl Status {
             "pack": self.pack,
             "dataset": self.dataset,
             "problem": self.problem,
+            "problem_since": self.problem_since,
         })
+    }
+
+    /// This run's status after `before`, the one the run before it gave: a problem that
+    /// was there then too has been there since it first was.
+    pub fn after(mut self, before: Option<&Status>) -> Status {
+        self.problem_since = self.problem.as_ref().map(|_| {
+            before
+                .filter(|b| b.problem.is_some())
+                .and_then(|b| b.problem_since)
+                .unwrap_or(self.checked)
+        });
+        self
     }
 }
 
@@ -373,6 +388,7 @@ pub async fn refresh(
         pack: accepted.packs.get(cfx_pack::NAME).copied(),
         dataset: accepted.dataset,
         problem: (!problems.is_empty()).then(|| problems.join("; ")),
+        problem_since: None,
     };
     (status, lines, done)
 }
@@ -686,7 +702,8 @@ mod tests {
                 checked: NOW,
                 pack: Some(5),
                 dataset: Some(42),
-                problem: None
+                problem: None,
+                problem_since: None,
             }
         );
         assert_eq!(lines, ["templates 5", "dataset 42"]);
@@ -706,10 +723,10 @@ mod tests {
             status_json(&Status {
                 checked: 1,
                 pack: Some(5),
-                dataset: None,
-                problem: None
+                ..Status::default()
             }),
-            serde_json::json!({"checked": 1, "pack": 5, "dataset": null, "problem": null})
+            serde_json::json!({"checked": 1, "pack": 5, "dataset": null, "problem": null,
+                "problem_since": null})
         );
         let (gone, _) = origin(BTreeMap::new()).await;
         let (status, lines, _) = refresh(&gone, dir.path(), false, &unsigned, NOW).await;
@@ -719,6 +736,27 @@ mod tests {
 
     fn status_json(status: &Status) -> serde_json::Value {
         status.to_json()
+    }
+
+    /// A problem that every run since has had too is dated from the first run that had
+    /// it, and a run without one ends it.
+    #[test]
+    fn a_problem_is_dated_from_the_first_run_that_had_it() {
+        let run = |checked, problem: Option<&str>| Status {
+            checked,
+            problem: problem.map(str::to_string),
+            ..Status::default()
+        };
+        let first = run(100, Some("refused")).after(None);
+        assert_eq!(first.problem_since, Some(100));
+        let second = run(200, Some("refused again")).after(Some(&first));
+        assert_eq!(second.problem_since, Some(100));
+        let fine = run(300, None).after(Some(&second));
+        assert_eq!(fine.problem_since, None);
+        assert_eq!(
+            run(400, Some("new")).after(Some(&fine)).problem_since,
+            Some(400)
+        );
     }
 
     /// With nothing published, nothing is done; published data more than two weeks old is

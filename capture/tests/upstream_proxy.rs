@@ -58,6 +58,31 @@ fn up(addr: &str, auth: Option<(&str, &str)>) -> UpstreamProxy {
     }
 }
 
+/// A port that refuses every connection for the rest of this test process. A socket is
+/// bound to it and never listens, so no other test is given the port, and no connect can
+/// be given it as its own end and meet itself, as one to a freed port can, and then wait
+/// forever. macOS drops a connection to such a socket unanswered, so there the port is the
+/// local end of a connection to a listener of its own instead.
+fn closed_port() -> u16 {
+    static HELD: std::sync::Mutex<Vec<Box<dyn std::any::Any + Send>>> =
+        std::sync::Mutex::new(Vec::new());
+    #[cfg(not(target_os = "macos"))]
+    let (port, held): (u16, Box<dyn std::any::Any + Send>) = {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        (socket.local_addr().unwrap().port(), Box::new(socket))
+    };
+    #[cfg(target_os = "macos")]
+    let (port, held): (u16, Box<dyn std::any::Any + Send>) = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let near = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (far, _) = l.accept().unwrap();
+        (near.local_addr().unwrap().port(), Box::new((near, far)))
+    };
+    HELD.lock().unwrap().push(held);
+    port
+}
+
 #[tokio::test]
 async fn a_tunnel_is_opened_and_the_bytes_go_through() {
     // Something to reach, so the tunnel can be shown to carry rather than only to open.
@@ -187,9 +212,7 @@ async fn a_refusal_and_a_silence_are_both_reported_against_the_proxy() {
     // Nothing listening at all. The message has to name the PROXY, because "connection
     // refused" with no subject reads as the target refusing and sends somebody to look at
     // the wrong machine.
-    let dead = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
-    let dead_addr = dead.local_addr().expect("addr").to_string();
-    drop(dead);
+    let dead_addr = format!("127.0.0.1:{}", closed_port());
     let e = Egress::Upstream(up(&dead_addr, None))
         .connect("example.test", 443)
         .await

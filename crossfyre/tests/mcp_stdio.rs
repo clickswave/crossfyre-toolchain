@@ -95,12 +95,29 @@ fn read_op(r: &mut impl BufRead, w: &mut TcpStream, caps: &Value) -> Option<Valu
     }
 }
 
+/// A port that refuses every connection for the rest of this test process. A socket is
+/// bound to it and never listens, so no other test is given the port, and no connect can
+/// be given it as its own end and meet itself, as one to a freed port can, and then wait
+/// forever. macOS drops a connection to such a socket unanswered, so there the port is the
+/// local end of a connection to a listener of its own instead.
 fn closed_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    static HELD: std::sync::Mutex<Vec<Box<dyn std::any::Any + Send>>> =
+        std::sync::Mutex::new(Vec::new());
+    #[cfg(not(target_os = "macos"))]
+    let (port, held): (u16, Box<dyn std::any::Any + Send>) = {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        (socket.local_addr().unwrap().port(), Box::new(socket))
+    };
+    #[cfg(target_os = "macos")]
+    let (port, held): (u16, Box<dyn std::any::Any + Send>) = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let near = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (far, _) = l.accept().unwrap();
+        (near.local_addr().unwrap().port(), Box::new((near, far)))
+    };
+    HELD.lock().unwrap().push(held);
+    port
 }
 
 /// An HTTP listener that counts connections.

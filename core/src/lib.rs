@@ -2921,7 +2921,8 @@ pub async fn run_daemon(
                         for line in lines {
                             println!("[data] {line}");
                         }
-                        *status.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
+                        let mut held = status.lock().unwrap_or_else(|e| e.into_inner());
+                        *held = Some(now.after(held.as_ref()));
                         running.store(false, std::sync::atomic::Ordering::SeqCst);
                     });
                 }
@@ -3431,8 +3432,9 @@ pub async fn run_daemon(
                                 engine_egress.clear();
 
                                 if let Ok(u) = &updated {
-                                    *data_status.lock().unwrap_or_else(|e| e.into_inner()) =
-                                        Some(u.data.clone());
+                                    let mut held =
+                                        data_status.lock().unwrap_or_else(|e| e.into_inner());
+                                    *held = Some(u.data.clone().after(held.as_ref()));
                                 }
                                 let (success, restarting, managed_by) = match &updated {
                                     Ok(u) => (true, u.restart, u.cli_managed_by),
@@ -4247,12 +4249,13 @@ mod heartbeat_tests {
             pack: Some(5),
             dataset: None,
             problem: Some("dataset: not there".to_string()),
+            problem_since: Some(1_795_186_800),
         };
         let with = with_data(status(), Some(&data));
         assert_eq!(
             with["data"],
             serde_json::json!({"checked": 1_795_273_200, "pack": 5, "dataset": null,
-                "problem": "dataset: not there"})
+                "problem": "dataset: not there", "problem_since": 1_795_186_800})
         );
         assert_eq!(with["version"], "node 7.8.9");
     }
@@ -4939,7 +4942,13 @@ mod op_failure_tests {
             "op_type": op_type, "pre_claimed": true, "data": data,
         });
         let client = ctx.pub_clone.clone();
-        ops::test_engines::with(&[(ext, port)], run_operation(cmd, ctx)).await;
+        // An op that hangs fails the test in a minute, rather than holding up the run.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            ops::test_engines::with(&[(ext, port)], run_operation(cmd, ctx)),
+        )
+        .await
+        .expect("the op ended within a minute");
         client.flush().await.unwrap();
         let done = nats.wait_for("completed").await.expect("no completed");
         let subject = nats
