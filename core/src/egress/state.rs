@@ -887,12 +887,11 @@ pub struct EngineAnswer {
     pub pacing: Option<String>,
 }
 
-/// What the engine listening on `addr` says of itself: whether it sends a wrapped op
-/// through the proxy it names (true for an engine that reads egress version 1; false
-/// for one that does not, an engine older than the wrapper or doorward, which reads the
-/// wrapper and sends nothing through a proxy), and which pacing it runs. `None` when it
-/// did not answer or its listener is not the engines' (see [`crate::ops::listener`]).
-pub async fn engine_answer(addr: &str) -> Option<EngineAnswer> {
+/// What the engine listening on `addr` answers when asked its capabilities: its one
+/// line, read, or `None` when it did not answer or its listener is not the engines' (see
+/// [`crate::ops::listener`]). The question is wrapped, with a direct egress, so it sends
+/// nothing anywhere.
+pub async fn engine_capabilities(addr: &str) -> Option<Value> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let probe = async {
         let s = crate::ops::listener::connect(addr).await.ok()?;
@@ -909,7 +908,16 @@ pub async fn engine_answer(addr: &str) -> Option<EngineAnswer> {
     let line = tokio::time::timeout(Duration::from_secs(2), probe)
         .await
         .ok()??;
-    let v: Value = serde_json::from_str(&line).ok()?;
+    serde_json::from_str(&line).ok()
+}
+
+/// What the engine listening on `addr` says of itself: whether it sends a wrapped op
+/// through the proxy it names (true for an engine that reads egress version 1; false
+/// for one that does not, an engine older than the wrapper or doorward, which reads the
+/// wrapper and sends nothing through a proxy), and which pacing it runs. `None` when it
+/// did not answer or its listener is not the engines'.
+pub async fn engine_answer(addr: &str) -> Option<EngineAnswer> {
+    let v = engine_capabilities(addr).await?;
     if v["type"] == "capabilities" {
         let pacing = v["pacing"].as_str().filter(|p| {
             !p.is_empty() && p.len() <= 120 && p.bytes().all(|b| (b' '..=b'~').contains(&b))
@@ -919,7 +927,7 @@ pub async fn engine_answer(addr: &str) -> Option<EngineAnswer> {
             pacing: pacing.map(str::to_string),
         });
     }
-    dguard::is_error(&line).then_some(EngineAnswer {
+    dguard::is_error(&v.to_string()).then_some(EngineAnswer {
         reads_egress: false,
         pacing: None,
     })

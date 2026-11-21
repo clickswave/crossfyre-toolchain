@@ -289,7 +289,14 @@ pub async fn handle(env: OpEnv) {
     // The scan the ack names, and its answers to the leads.
     let mut scan_id: Option<String> = None;
     let mut answered: Option<serde_json::Value> = None;
-    match super::open_engine("plessor", &plessor_req, lease).await {
+    // Authorization testing goes to plessor-authz when it is installed, and to plessor
+    // otherwise, whose open build says what is needed.
+    let engine = if mode == "authz" {
+        authz_engine(&super::engine_addr("plessor-authz")).await
+    } else {
+        "plessor"
+    };
+    match super::open_engine(engine, &plessor_req, lease).await {
         Ok((mut lines, writer)) => {
             while let Ok(Some(line)) = lines.next_line().await {
                 if !workflow_id.is_empty() && is_workflow_cancelled(&workflow_id) {
@@ -339,7 +346,7 @@ pub async fn handle(env: OpEnv) {
                     "done" => break,
                     "error" => {
                         eprintln!(
-                            "[op] FAIL plessor error: {}",
+                            "[op] FAIL {engine} error: {}",
                             event["message"].as_str().unwrap_or("unknown")
                         );
                         break;
@@ -372,7 +379,7 @@ pub async fn handle(env: OpEnv) {
             return;
         }
         Err(super::EngineOpen::Unreachable(e)) => {
-            relay.fail(&super::unreachable("plessor", &e)).await;
+            relay.fail(&super::unreachable(engine, &e)).await;
             return;
         }
     }
@@ -390,6 +397,15 @@ pub async fn handle(env: OpEnv) {
             Some((processed.max(1), total.max(processed).max(1))),
         )
         .await;
+}
+
+/// The engine authorization testing goes to: plessor-authz, listening on `addr`, when
+/// it answers that it runs it, and plessor otherwise.
+async fn authz_engine(addr: &str) -> &'static str {
+    match crate::egress::state::engine_capabilities(addr).await {
+        Some(caps) if caps["type"] == "capabilities" && caps["authz"].is_array() => "plessor-authz",
+        _ => "plessor",
+    }
 }
 
 /// What a plessor event says the scan did not test, and why, as a note for the workflow:

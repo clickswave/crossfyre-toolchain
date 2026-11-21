@@ -53,7 +53,7 @@ pub(crate) async fn connect(port: u16) -> std::io::Result<EngineConn> {
 /// its own.
 pub(crate) fn not_the_hosts(port: u16) -> u16 {
     #[cfg(test)]
-    if (4440..=4445).contains(&port) {
+    if dguard::ports::RESERVED.contains(&port) {
         panic!("a test asked for port {port}: a test reaches no engine of the host's");
     }
     port

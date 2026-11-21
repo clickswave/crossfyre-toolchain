@@ -197,7 +197,7 @@ async fn handle_connection(
             "db_reset" | "purge" => {
                 let done = match req.operation.as_str() {
                     "db_reset" => {
-                        cfx_db::scans::reset(db.pool(), crate::libs::toolmark_db::ENGINE.name)
+                        cfx_db::scans::reset(db.pool(), &crate::libs::toolmark_db::ENGINE)
                             .await
                             .map(|()| "All tables truncated.".to_string())
                             .map_err(|e| format!("DB reset failed: {e}"))

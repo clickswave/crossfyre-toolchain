@@ -447,7 +447,7 @@ async fn dispatch(req: DaemonRequest, db: Arc<DoorwardDb>) -> serde_json::Value 
         }
 
         "db_reset" => {
-            match cfx_db::scans::reset(&db.pool, super::libs::doorward_db::ENGINE.name).await {
+            match cfx_db::scans::reset(&db.pool, &super::libs::doorward_db::ENGINE).await {
                 Ok(_) => serde_json::json!({
                     "operation_id": operation_id,
                     "status": "completed",

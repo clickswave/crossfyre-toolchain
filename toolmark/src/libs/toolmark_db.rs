@@ -14,6 +14,7 @@ pub const NOTHING_TO_TAKE_UP: &str =
 /// toolmark's part of the database: its schema, and the files that make its tables.
 pub const ENGINE: cfx_db::Engine = cfx_db::Engine {
     name: "toolmark",
+    schema: "toolmark",
     version: env!("CARGO_PKG_VERSION"),
     migrations: &[include_str!("../../migrations/0001_inventory.sql")],
 };

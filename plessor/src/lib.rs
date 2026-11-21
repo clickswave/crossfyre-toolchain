@@ -114,7 +114,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[cfg(feature = "daemon")]
 pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     if matches!(cli.command, Some(Commands::Daemon)) {
-        return daemon::run(cli.port).await;
+        return daemon::run(cli.port, daemon::Role::Plessor).await;
     }
 
     // The daemon every command below talks to, started when it is not running.
@@ -272,12 +272,22 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// The `plessor-authz` command: plessor's authorization testing as a daemon of its own,
+/// on its own port and schema, which runs `authz` and nothing else.
+#[cfg(feature = "daemon")]
+pub async fn run_authz(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    match cli.command {
+        Some(Commands::Daemon) => daemon::run(cli.port, daemon::Role::Authz).await,
+        _ => Err("plessor-authz runs only as a daemon: plessor-authz daemon --port <port>".into()),
+    }
+}
+
 /// `engine`'s daemon on `port`. A test build refuses the engines' real ports: an engine of
 /// the operator's may be listening on one, so every test gives a port of its own.
 #[cfg(feature = "daemon")]
 fn engine_daemon(engine: &'static str, port: u16, autostart: bool) -> dguard::Daemon {
     #[cfg(test)]
-    if (4440..=4445).contains(&port) {
+    if dguard::ports::RESERVED.contains(&port) {
         panic!("a test asked for {engine}'s port {port}: a test reaches no engine of the host's");
     }
     dguard::Daemon::new(engine, port, autostart)

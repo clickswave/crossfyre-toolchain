@@ -14,6 +14,13 @@ name = "plessor"
 path = "src/main.rs"
 required-features = ["daemon"]
 
+# plessor's authorization testing as a daemon of its own. A release ships it only as the
+# closed component, built with the authz drop-in; the open build is plessor alone.
+[[bin]]
+name = "plessor-authz"
+path = "src/authz_main.rs"
+required-features = ["daemon"]
+
 [dependencies]
 dguard = { path = "../dguard", optional = true }
 cfx_finding = { path = "../finding", optional = true }

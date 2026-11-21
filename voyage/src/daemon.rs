@@ -652,7 +652,7 @@ async fn dispatch(req: DaemonRequest, db: Arc<VoyageDb>) -> DaemonResponse {
             }
         }
         "db_reset" => {
-            match cfx_db::scans::reset(db.pool(), crate::libs::voyage_db::ENGINE.name).await {
+            match cfx_db::scans::reset(db.pool(), &crate::libs::voyage_db::ENGINE).await {
                 Ok(_) => DaemonResponse {
                     operation_id,
                     status: "completed".to_string(),

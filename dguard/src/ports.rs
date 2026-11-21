@@ -9,6 +9,12 @@ pub const VOYAGE: u16 = 4442;
 pub const DOORWARD: u16 = 4443;
 pub const TOOLMARK: u16 = 4444;
 pub const PLESSOR: u16 = 4445;
+/// plessor-authz: plessor's authorization testing, as a daemon of its own.
+pub const PLESSOR_AUTHZ: u16 = 4446;
+
+/// The ports a host's own database and engines listen on, which no test reaches: a test
+/// build refuses them, and every test gives a port of its own.
+pub const RESERVED: std::ops::RangeInclusive<u16> = 4440..=4446;
 
 /// The protocol's port for `engine`, or None for a name that is not an engine.
 pub fn default_of(engine: &str) -> Option<u16> {
@@ -18,6 +24,7 @@ pub fn default_of(engine: &str) -> Option<u16> {
         "doorward" => Some(DOORWARD),
         "toolmark" => Some(TOOLMARK),
         "plessor" => Some(PLESSOR),
+        "plessor-authz" => Some(PLESSOR_AUTHZ),
         _ => None,
     }
 }
@@ -43,6 +50,23 @@ pub fn engine_port_in(dir: Option<&Path>, engine: &str) -> Option<u16> {
 mod tests {
     use super::*;
 
+    /// Every engine's port and the database's are reserved, and only those.
+    #[test]
+    fn the_reserved_ports_are_the_database_and_every_engine() {
+        for port in [
+            4440,
+            AMBULO,
+            VOYAGE,
+            DOORWARD,
+            TOOLMARK,
+            PLESSOR,
+            PLESSOR_AUTHZ,
+        ] {
+            assert!(RESERVED.contains(&port), "{port}");
+        }
+        assert!(!RESERVED.contains(&4439) && !RESERVED.contains(&4447));
+    }
+
     /// config.toml's `[extensions]` moves an engine's port; with no entry, no file, or an
     /// entry that is not a port, the protocol's stands.
     #[test]
@@ -59,6 +83,10 @@ mod tests {
         assert_eq!(engine_port_in(Some(&dir), "toolmark"), Some(14444));
         assert_eq!(engine_port_in(Some(&dir), "voyage"), Some(VOYAGE));
         assert_eq!(engine_port_in(Some(&dir), "plessor"), Some(PLESSOR));
+        assert_eq!(
+            engine_port_in(Some(&dir), "plessor-authz"),
+            Some(PLESSOR_AUTHZ)
+        );
         assert_eq!(engine_port_in(Some(&dir), "nothing"), None);
         assert_eq!(engine_port_in(None, "ambulo"), Some(AMBULO));
         let _ = std::fs::remove_dir_all(&dir);

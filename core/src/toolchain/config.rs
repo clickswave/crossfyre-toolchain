@@ -300,7 +300,7 @@ pub fn engine_port(ext: &str) -> u16 {
     // A test build refuses the engines' real ports: an engine of the operator's may be
     // listening on one.
     #[cfg(test)]
-    if (4440..=4445).contains(&port) {
+    if dguard::ports::RESERVED.contains(&port) {
         panic!("a test asked for {ext}'s port {port}: a test reaches no engine of the host's");
     }
     port

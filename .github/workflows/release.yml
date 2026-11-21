@@ -164,8 +164,10 @@ jobs:
           for p in crossfyre doorward node oast; do
             cargo build --release --locked -p "$p"
           done
+          # Each engine's own binary only: plessor's crate also builds plessor-authz,
+          # which is a closed component and never in a release archive.
           for p in plessor ambulo voyage toolmark; do
-            cargo build --release --locked -p "$p" --features impersonate
+            cargo build --release --locked -p "$p" --bin "$p" --features impersonate
           done
           cargo build --release --locked -p cfx-script --features bundled-python
 
@@ -306,7 +308,7 @@ jobs:
             cargo build --release --locked --target ${{ matrix.target }} -p "$p"
           done
           for p in plessor ambulo voyage toolmark; do
-            cargo build --release --locked --target ${{ matrix.target }} -p "$p" --features impersonate
+            cargo build --release --locked --target ${{ matrix.target }} -p "$p" --bin "$p" --features impersonate
           done
           cargo build --release --locked --target ${{ matrix.target }} -p cfx-script --features abi3
 

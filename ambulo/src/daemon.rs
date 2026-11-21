@@ -778,7 +778,7 @@ async fn dispatch(
             run_probe(probe_params, client, db).await
         }
         "db_reset" => {
-            match cfx_db::scans::reset(db.pool(), crate::libs::ambulo_db::ENGINE.name).await {
+            match cfx_db::scans::reset(db.pool(), &crate::libs::ambulo_db::ENGINE).await {
                 Ok(_) => DaemonResponse {
                     operation_id,
                     status: "completed".to_string(),

@@ -66,14 +66,47 @@ routed!(
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-pub async fn run(port: u16) -> Result<(), Box<dyn std::error::Error>> {
+/// Which daemon this process is: plessor, or plessor-authz, which runs authorization
+/// testing and nothing else, keeping its scans in its own schema.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    Plessor,
+    Authz,
+}
+
+impl Role {
+    fn name(self) -> &'static str {
+        match self {
+            Role::Plessor => "plessor",
+            Role::Authz => "plessor-authz",
+        }
+    }
+
+    fn engine(self) -> &'static cfx_db::Engine {
+        match self {
+            Role::Plessor => &crate::plessor_db::ENGINE,
+            Role::Authz => &crate::plessor_db::AUTHZ_ENGINE,
+        }
+    }
+
+    /// Whether this daemon runs `operation`. plessor-authz answers what it honours and
+    /// runs authorization testing, and refuses everything else.
+    fn serves(self, operation: &str) -> bool {
+        match self {
+            Role::Plessor => true,
+            Role::Authz => matches!(operation, "authz" | "capabilities"),
+        }
+    }
+}
+
+pub async fn run(port: u16, role: Role) -> Result<(), Box<dyn std::error::Error>> {
     // The database being briefly unreachable is not a reason to exit: wait for it,
     // saying why each time, and start as soon as it answers.
     let db = dguard::wait_for(
         "the database",
         std::time::Duration::from_secs(3600),
         || async {
-            let pool = cfx_db::ensure_ready(&crate::plessor_db::ENGINE)
+            let pool = cfx_db::ensure_ready(role.engine())
                 .await
                 .map_err(|e| e.to_string())?;
             cfx_db::scans::stop_abandoned(&pool)
@@ -88,13 +121,22 @@ pub async fn run(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let addr = dguard::bind_addr(port);
     let gate = dguard::Gate::from_env();
     let listener = TcpListener::bind(addr).await?;
-    gate.announce("Plessor", addr);
-    dguard::exit_when_idle("plessor");
-    eprintln!("[plessor] {}", cfx_pacing::load().say());
+    let name = role.name();
+    gate.announce(
+        match role {
+            Role::Plessor => "Plessor",
+            Role::Authz => "plessor-authz",
+        },
+        addr,
+    );
+    dguard::exit_when_idle(name);
+    eprintln!("[{name}] {}", cfx_pacing::load().say());
     // What `crossfyre update` put in the toolchain directory, or what is compiled in.
     let packs = std::sync::Arc::new(Packs::load(dguard::toolchain_dir().as_deref()));
-    eprintln!("[plessor] templates from {}", packs.now().from);
-    serve(listener, gate, db, packs).await?;
+    if role == Role::Plessor {
+        eprintln!("[plessor] templates from {}", packs.now().from);
+    }
+    serve(listener, gate, db, packs, role).await?;
     Ok(())
 }
 
@@ -105,6 +147,7 @@ pub(crate) async fn serve(
     gate: dguard::Gate,
     db: PlessorDb,
     packs: std::sync::Arc<Packs>,
+    role: Role,
 ) -> std::io::Result<()> {
     loop {
         let (stream, addr) = listener.accept().await?;
@@ -113,7 +156,7 @@ pub(crate) async fn serve(
         let db = db.clone();
         let packs = packs.clone();
         dguard::spawn_busy(async move {
-            if let Err(e) = handle_connection(stream, gate_clone, db, packs).await {
+            if let Err(e) = handle_connection(stream, gate_clone, db, packs, role).await {
                 eprintln!("Connection error from {addr}: {e}");
             }
         });
@@ -125,6 +168,7 @@ async fn handle_connection(
     gate: dguard::Gate,
     db: PlessorDb,
     packs: std::sync::Arc<Packs>,
+    role: Role,
 ) -> Result<(), BoxError> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -155,12 +199,29 @@ async fn handle_connection(
             }
         };
 
+        if !role.serves(&req.operation) {
+            write_line(
+                &mut writer,
+                &serde_json::json!({
+                    "type": "error",
+                    "message": format!(
+                        "plessor-authz runs only authz, not {}: plessor runs the rest",
+                        req.operation
+                    ),
+                }),
+            )
+            .await?;
+            continue;
+        }
         let (params, egress) = (req.params, req.egress);
         // The template scan keeps its plan; every operation keeps its record and findings.
         let scan =
             |p, tx, id| crate::engine::run(p, tx, std::sync::Arc::new(db.ledger(id)), packs.now());
+        // Every operation from here on sends: say which pacing it runs with.
+        let says = |what: &str| eprintln!("[{}] {what}: {}", role.name(), cfx_pacing::load().say());
         macro_rules! op {
-            ($what:literal, $run:expr) => {
+            ($what:literal, $run:expr) => {{
+                says($what);
                 run_op(
                     params,
                     egress,
@@ -173,7 +234,7 @@ async fn handle_connection(
                     None,
                 )
                 .await?
-            };
+            }};
         }
         match req.operation.as_str() {
             "scan" => op!("scan", scan),
@@ -183,6 +244,7 @@ async fn handle_connection(
                 .await
             {
                 Ok((kept, taken)) => {
+                    says("scan");
                     run_op(
                         kept,
                         egress,
@@ -264,7 +326,7 @@ async fn handle_connection(
             "flow" => op!("flow", plain(crate::flow::run)),
             "db_reset" | "purge" => {
                 let done = match req.operation.as_str() {
-                    "db_reset" => cfx_db::scans::reset(db.pool(), crate::plessor_db::ENGINE.name)
+                    "db_reset" => cfx_db::scans::reset(db.pool(), role.engine())
                         .await
                         .map(|()| "All tables truncated.".to_string())
                         .map_err(|e| format!("DB reset failed: {e}")),
@@ -282,24 +344,28 @@ async fn handle_connection(
             // older daemon answers `Unknown operation` before anything is sent. The
             // connection stays open for the operation that follows.
             "capabilities" => {
-                write_line(
-                    &mut writer,
-                    &serde_json::json!({
-                        "type": "capabilities",
-                        "cancel": true,
-                        "inject": ["follow_redirects", "resolve", "verify_certs"],
-                        "scan": ["follow_redirects", "resolve"],
-                        "verify": ["follow_redirects", "resolve"],
-                        // The version of the egress wrapper this daemon reads.
-                        "egress": transport::WIRE_VERSION,
-                        // Which pacing this daemon runs: `module <version>`, or
-                        // `baseline (<why>)`.
-                        "pacing": cfx_pacing::load().label(),
-                        // Which process answers, for the client that started it.
-                        "pid": std::process::id(),
-                    }),
-                )
-                .await?;
+                let mut caps = serde_json::json!({
+                    "type": "capabilities",
+                    "cancel": true,
+                    // The version of the egress wrapper this daemon reads.
+                    "egress": transport::WIRE_VERSION,
+                    // Which pacing this daemon runs: `module <version>`, or
+                    // `baseline (<why>)`.
+                    "pacing": cfx_pacing::load().label(),
+                    // Which process answers, for the client that started it.
+                    "pid": std::process::id(),
+                });
+                match role {
+                    Role::Plessor => {
+                        caps["inject"] =
+                            serde_json::json!(["follow_redirects", "resolve", "verify_certs"]);
+                        caps["scan"] = serde_json::json!(["follow_redirects", "resolve"]);
+                        caps["verify"] = serde_json::json!(["follow_redirects", "resolve"]);
+                    }
+                    // What the node looks for before it sends authorization testing here.
+                    Role::Authz => caps["authz"] = serde_json::json!(["scope", "block_internal"]),
+                }
+                write_line(&mut writer, &caps).await?;
                 continue;
             }
             other => {
@@ -411,7 +477,6 @@ where
     F: FnOnce(P, mpsc::UnboundedSender<Value>, Option<String>) -> Fut,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    eprintln!("[plessor] {what}: {}", cfx_pacing::load().say());
     let asked = params.clone();
     let p: P = match serde_json::from_value(params) {
         Ok(mut p) => {
@@ -583,6 +648,10 @@ mod tests {
     }
 
     async fn daemon() -> u16 {
+        daemon_as(Role::Plessor).await
+    }
+
+    async fn daemon_as(role: Role) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("addr").port();
         tokio::spawn(serve(
@@ -590,8 +659,88 @@ mod tests {
             dguard::Gate::default(),
             PlessorDb::unconnected(),
             std::sync::Arc::new(Packs::load(None)),
+            role,
         ));
         port
+    }
+
+    /// plessor-authz answers that it runs authz, runs it, and refuses everything else
+    /// before anything is sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plessor_authz_runs_authz_and_nothing_else() {
+        let (tport, seen) = target(Duration::ZERO).await;
+        let dport = daemon_as(Role::Authz).await;
+        let caps = run_one(dport, &serde_json::json!({"operation": "capabilities"})).await;
+        assert_eq!(caps["type"], "capabilities", "{caps}");
+        assert_eq!(
+            caps["authz"],
+            serde_json::json!(["scope", "block_internal"])
+        );
+        assert!(
+            caps.get("scan").is_none() && caps.get("inject").is_none(),
+            "{caps}"
+        );
+        let url = format!("http://127.0.0.1:{tport}/p?q=1");
+        for op in [
+            one_endpoint_op(&url),
+            serde_json::json!({"operation": "scans"}),
+        ] {
+            let answer = run_one(dport, &op).await;
+            assert_eq!(answer["type"], "error", "{answer}");
+            assert!(
+                answer["message"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("plessor-authz runs only authz"),
+                "{answer}"
+            );
+        }
+        let events = run_to_done(
+            dport,
+            &serde_json::json!({"operation": "authz", "response": "stream",
+                                "target": url, "endpoints": [], "identities": []}),
+        )
+        .await;
+        assert_eq!(events.last().unwrap()["type"], "done", "{events:?}");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            0,
+            "a refused operation sent something"
+        );
+    }
+
+    /// The open build's authz says what is needed, as a note the platform shows.
+    #[cfg(not(authz_private))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_open_authz_says_it_needs_plessor_authz() {
+        let dport = daemon().await;
+        let events = run_to_done(
+            dport,
+            &serde_json::json!({"operation": "authz", "response": "stream",
+                                "target": "http://app.test/", "endpoints": [], "identities": []}),
+        )
+        .await;
+        let said: Vec<&str> = events
+            .iter()
+            .filter(|e| e["type"] == "log")
+            .filter_map(|e| e["message"].as_str())
+            .collect();
+        assert_eq!(said.len(), 1, "{events:?}");
+        assert!(
+            said[0].starts_with("Authorization testing needs plessor-authz, which comes with"),
+            "{said:?}"
+        );
+    }
+
+    /// One answer to `op`.
+    async fn run_one(dport: u16, op: &Value) -> Value {
+        let stream = TcpStream::connect(("127.0.0.1", dport)).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut lines = BufReader::new(r).lines();
+        w.write_all(format!("{op}\n").as_bytes()).await.unwrap();
+        next_event(&mut lines, Duration::from_secs(10))
+            .await
+            .expect("an answer")
     }
 
     fn inject_op(tport: u16, n: usize) -> String {
@@ -1285,6 +1434,7 @@ mod tests {
             dguard::Gate::default(),
             db.clone(),
             std::sync::Arc::new(Packs::load(None)),
+            Role::Plessor,
         ));
         let (tport, _) = settable_target("", "<html>widget version 1.2</html>").await;
         let (rport, _) = reflecting_target().await;
@@ -1705,6 +1855,7 @@ mod tests {
             dguard::Gate::default(),
             PlessorDb::unconnected(),
             Arc::new(Packs::load(Some(&dir))),
+            Role::Plessor,
         ));
         let op = serde_json::json!({
             "operation": "scan",
@@ -2052,6 +2203,7 @@ mod http_request_tests {
             dguard::Gate::default(),
             PlessorDb::unconnected(),
             std::sync::Arc::new(Packs::load(None)),
+            Role::Plessor,
         ));
         port
     }
@@ -2131,6 +2283,7 @@ mod session_tls_tests {
             dguard::Gate::default(),
             PlessorDb::unconnected(),
             std::sync::Arc::new(Packs::load(None)),
+            Role::Plessor,
         ));
         port
     }

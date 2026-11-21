@@ -178,7 +178,7 @@ pub fn extensions() -> Result<(), Box<dyn std::error::Error>> {
 
         let mid = dim(&format!("port {port}"));
         let (sym, status) = if !installed {
-            (dot(), dim("not installed"))
+            (dot(), dim(e.not_installed()))
         } else {
             let listen_note = if listening == "yes" {
                 dim("listening")

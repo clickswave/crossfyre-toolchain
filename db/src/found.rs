@@ -267,6 +267,7 @@ mod tests {
     /// An engine of the tests' own, with only the tables every engine has.
     const ENGINE: crate::Engine = crate::Engine {
         name: "found_test",
+        schema: "found_test",
         version: "0.0.1",
         migrations: &[],
     };

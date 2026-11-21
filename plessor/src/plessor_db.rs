@@ -13,8 +13,16 @@ const NOT_A_TEMPLATE_SCAN: &str =
 /// plessor's part of the database: its schema, and the files that make its tables.
 pub const ENGINE: cfx_db::Engine = cfx_db::Engine {
     name: "plessor",
+    schema: "plessor",
     version: env!("CARGO_PKG_VERSION"),
     migrations: &[include_str!("../migrations/0001_plans_verifications.sql")],
+};
+
+/// plessor-authz's: the same tables, in a schema of its own, so each daemon has one.
+pub const AUTHZ_ENGINE: cfx_db::Engine = cfx_db::Engine {
+    name: "plessor-authz",
+    schema: "plessor_authz",
+    ..ENGINE
 };
 
 #[derive(Clone)]
@@ -273,5 +281,55 @@ impl Ledger for ScanLedger {
         .bind(state.as_str())
         .execute(&self.db.pool)
         .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// plessor-authz starts, makes its tables and keeps a scan in a schema of its own,
+    /// a plain identifier where its name is not one, and none of it lands in plessor's.
+    #[tokio::test]
+    #[ignore = "needs PostgreSQL's programs"]
+    async fn plessor_authz_keeps_its_scans_in_its_own_schema() {
+        let scratch = cfx_db::testing::Scratch::new(&AUTHZ_ENGINE).await;
+        let pool = scratch.pool.clone();
+        let schema: String = sqlx::query_scalar("SELECT current_schema()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(schema, "plessor_authz");
+        let scan = cfx_db::scans::start(
+            &pool,
+            cfx_db::scans::Asked::new("http://app.test/", "{}"),
+            Key::Settings("authz"),
+            false,
+        )
+        .await
+        .unwrap();
+        cfx_db::scans::finish(scan, Status::Completed)
+            .await
+            .unwrap();
+        let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM plessor_authz.scans")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kept, 1);
+        let plessors: Option<String> =
+            sqlx::query_scalar("SELECT nspname::text FROM pg_namespace WHERE nspname = 'plessor'")
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert_eq!(plessors, None, "plessor's schema was made too");
+        let recorded: (String, String) = sqlx::query_as(
+            "SELECT DISTINCT schema_name, engine FROM meta.migrations WHERE schema_name = $1",
+        )
+        .bind("plessor_authz")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(recorded, ("plessor_authz".into(), "plessor-authz".into()));
+        scratch.done().await;
     }
 }

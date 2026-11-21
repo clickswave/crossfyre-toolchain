@@ -4,6 +4,7 @@ use sqlx::{Pool, Postgres};
 /// operations it was sent are in the tables every engine has.
 pub const ENGINE: cfx_db::Engine = cfx_db::Engine {
     name: "doorward",
+    schema: "doorward",
     version: env!("CARGO_PKG_VERSION"),
     migrations: &[],
 };

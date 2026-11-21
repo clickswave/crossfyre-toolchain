@@ -909,10 +909,11 @@ pub async fn purge_operation(pool: &PgPool, params: &serde_json::Value) -> Resul
 }
 
 /// Empty every table in the schema of engine `engine`, keeping the tables.
-pub async fn reset(pool: &PgPool, engine: &str) -> Result<(), sqlx::Error> {
+pub async fn reset(pool: &PgPool, engine: &crate::Engine) -> Result<(), sqlx::Error> {
+    let schema = engine.schema;
     let tables: Vec<String> =
         sqlx::query_scalar("SELECT tablename FROM pg_tables WHERE schemaname = $1")
-            .bind(engine)
+            .bind(schema)
             .fetch_all(pool)
             .await?;
     if tables.is_empty() {
@@ -921,7 +922,7 @@ pub async fn reset(pool: &PgPool, engine: &str) -> Result<(), sqlx::Error> {
     let quote = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
     let list = tables
         .iter()
-        .map(|t| format!("{}.{}", quote(engine), quote(t)))
+        .map(|t| format!("{}.{}", quote(schema), quote(t)))
         .collect::<Vec<_>>()
         .join(", ");
     sqlx::query(&format!("TRUNCATE TABLE {list} RESTART IDENTITY CASCADE"))
@@ -1587,7 +1588,7 @@ mod tests {
             .unwrap();
         log(&pool, Some(&scan.id), "info", "a line").await.unwrap();
         finish(scan, Status::Completed).await.unwrap();
-        reset(&pool, "cfx_db_test").await.unwrap();
+        reset(&pool, &engine_at("0.0.1", &[])).await.unwrap();
         for table in ["scans", "logs", "operations"] {
             let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
                 .fetch_one(&pool)

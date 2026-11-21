@@ -5451,6 +5451,111 @@ mod impostor_engine_tests {
     }
 }
 
+/// Authorization testing goes to plessor-authz when it is installed and says it runs it,
+/// and to plessor otherwise, whose open build says what is needed.
+#[cfg(test)]
+mod authz_routing_tests {
+    use super::*;
+    use egress::state::EgressState;
+    use egress::testkit::{FakeEngine, FakeNats, FakePlatform, direct_settings, http, resolver};
+    use serde_json::{Value, json};
+
+    fn inner(req: &Value) -> Value {
+        if req["operation"] == "egress" {
+            req["inner"].clone()
+        } else {
+            req.clone()
+        }
+    }
+
+    /// Run authz op `id` with the engines at `places`. Each op has its own id, since
+    /// one already run is not run again.
+    async fn run_authz(id: &str, places: &[(&str, &FakeEngine)]) {
+        let nats = FakeNats::start().await;
+        let platform = FakePlatform::start(|_, _| (404, json!({}))).await;
+        let st = EgressState::new(resolver(&[]));
+        st.apply_authorize(&direct_settings(1));
+        let ctx = OpCtx {
+            pub_clone: nats.client().await,
+            status_subj: "cfx.node.n.status".into(),
+            result_subj: "cfx.results.n".into(),
+            node_id: "n".into(),
+            http: http(),
+            api_url: platform.url.clone(),
+            api_key: "cfk_node".into(),
+            egress: st,
+        };
+        let cmd = json!({
+            "type": "operation", "operation_id": id, "workflow_id": format!("wf-{id}"),
+            "op_type": "vuln-scan-1", "pre_claimed": true,
+            "data": {"target": "http://app.test/", "mode": "authz", "endpoints": [],
+                     "identities": []},
+        });
+        let client = ctx.pub_clone.clone();
+        let ports: Vec<(&str, u16)> = places.iter().map(|(n, e)| (*n, e.port)).collect();
+        ops::test_engines::with(&ports, run_operation(cmd, ctx)).await;
+        client.flush().await.unwrap();
+        nats.wait_for("operation_completed").await;
+    }
+
+    fn operations(e: &FakeEngine) -> Vec<String> {
+        e.seen()
+            .iter()
+            .map(|r| inner(r)["operation"].as_str().unwrap_or("").to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn authz_goes_to_plessor_authz_when_it_says_it_runs_it() {
+        let runs_it = || {
+            FakeEngine::start(|req| async move {
+                if inner(&req)["operation"] == "capabilities" {
+                    vec![json!({"type": "capabilities", "authz": ["scope", "block_internal"]})]
+                } else {
+                    vec![json!({"type": "done", "found": 0})]
+                }
+            })
+        };
+        let done = || FakeEngine::start(|_| async { vec![json!({"type": "done", "found": 0})] });
+
+        let (authz, plessor) = (runs_it().await, done().await);
+        run_authz(
+            "op-authz-1",
+            &[("plessor-authz", &authz), ("plessor", &plessor)],
+        )
+        .await;
+        assert_eq!(operations(&authz), ["capabilities", "authz"]);
+        assert!(
+            operations(&plessor).is_empty(),
+            "{:?}",
+            operations(&plessor)
+        );
+
+        // Not installed, or something on its port that does not run authz: plessor.
+        let plessor = done().await;
+        run_authz("op-authz-2", &[("plessor", &plessor)]).await;
+        assert_eq!(operations(&plessor), ["authz"]);
+        // An engine that answers but runs no authz, plessor itself on that port, say.
+        let runs_other = || {
+            FakeEngine::start(|req| async move {
+                if inner(&req)["operation"] == "capabilities" {
+                    vec![json!({"type": "capabilities", "scan": ["resolve"]})]
+                } else {
+                    vec![json!({"type": "done", "found": 0})]
+                }
+            })
+        };
+        let (other, plessor) = (runs_other().await, done().await);
+        run_authz(
+            "op-authz-3",
+            &[("plessor-authz", &other), ("plessor", &plessor)],
+        )
+        .await;
+        assert_eq!(operations(&other), ["capabilities"]);
+        assert_eq!(operations(&plessor), ["authz"]);
+    }
+}
+
 /// A saved credential reaches only the hosts it was saved for. The platform checks
 /// those hosts against the op's target alone, and an op can send the engine on to
 /// other hosts, which it reaches carrying the credential on every request.

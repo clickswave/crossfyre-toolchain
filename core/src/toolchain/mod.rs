@@ -37,9 +37,10 @@ pub mod win;
 
 /// One scan engine installable as a node extension.
 ///
-/// `name` is the engine's only name: its crate, binary, manifest key, service unit,
-/// CLI argument and `config.toml` key, the key the node reports it under and takes
-/// commands for, and the start of the `source` of every finding it makes.
+/// `name` is the engine's only name: its binary, manifest key, service unit, CLI
+/// argument and `config.toml` key, the key the node reports it under and takes commands
+/// for, and the start of the `source` of every finding it makes. It is its crate's name
+/// too, but for plessor-authz, a second binary of the plessor crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Engine {
     pub name: &'static str,
@@ -48,6 +49,35 @@ pub struct Engine {
     /// them over TCP JSON.
     pub port: u16,
     pub about: &'static str,
+    /// It comes with a Crossfyre plan that includes it, after login, rather than with
+    /// the release: `all` leaves it out, and where it is not installed it says so.
+    pub closed: bool,
+}
+
+/// What is said of a closed engine that is not installed.
+pub const NEEDS_A_PLAN: &str = "not installed (needs a plan that includes it)";
+
+impl Engine {
+    /// Why it is not installed or updated from the release: a closed engine comes with
+    /// a plan that includes it, after login. None for every other.
+    pub fn from_a_plan(&self) -> Option<String> {
+        self.closed.then(|| {
+            format!(
+                "{} comes with a Crossfyre plan that includes it. Log in with `crossfyre \
+                 login`, and it is installed with `crossfyre update`.",
+                self.name
+            )
+        })
+    }
+
+    /// How it is said not to be installed.
+    pub fn not_installed(&self) -> &'static str {
+        if self.closed {
+            NEEDS_A_PLAN
+        } else {
+            "not installed"
+        }
+    }
 }
 
 /// Every engine, in the order they are listed to a person.
@@ -56,26 +86,37 @@ pub const ENGINES: &[Engine] = &[
         name: "ambulo",
         port: dguard::ports::AMBULO,
         about: "HTTP fuzzer, content-discovery and web-crawl engine",
+        closed: false,
     },
     Engine {
         name: "voyage",
         port: dguard::ports::VOYAGE,
         about: "Subdomain enumeration engine",
+        closed: false,
     },
     Engine {
         name: "doorward",
         port: dguard::ports::DOORWARD,
         about: "Network host and port-scanning engine",
+        closed: false,
     },
     Engine {
         name: "toolmark",
         port: dguard::ports::TOOLMARK,
         about: "Service enumeration and web fingerprinting engine",
+        closed: false,
     },
     Engine {
         name: "plessor",
         port: dguard::ports::PLESSOR,
         about: "Vulnerability detection engine",
+        closed: false,
+    },
+    Engine {
+        name: "plessor-authz",
+        port: dguard::ports::PLESSOR_AUTHZ,
+        about: "Authorization testing engine (BOLA, BFLA, BOPLA)",
+        closed: true,
     },
 ];
 
@@ -87,7 +128,11 @@ pub fn engine(name: &str) -> Option<&'static Engine> {
 /// Expand an extension argument (an engine's name, or "all") into engine names.
 pub fn resolve_extensions(name: &str) -> Result<Vec<&'static str>, Box<dyn std::error::Error>> {
     if name == "all" {
-        return Ok(ENGINES.iter().map(|e| e.name).collect());
+        return Ok(ENGINES
+            .iter()
+            .filter(|e| !e.closed)
+            .map(|e| e.name)
+            .collect());
     }
     match engine(name) {
         Some(e) => Ok(vec![e.name]),
@@ -139,12 +184,30 @@ mod tests {
     fn an_extension_argument_is_an_engine_s_name_or_all() {
         assert_eq!(resolve_extensions("plessor").unwrap(), vec!["plessor"]);
         assert_eq!(
+            resolve_extensions("plessor-authz").unwrap(),
+            vec!["plessor-authz"]
+        );
+        // A closed engine comes with a plan, not with the release, so `all` leaves it out.
+        assert_eq!(
             resolve_extensions("all").unwrap(),
             vec!["ambulo", "voyage", "doorward", "toolmark", "plessor"]
         );
+        let authz = engine("plessor-authz").unwrap();
+        assert_eq!(
+            authz.not_installed(),
+            "not installed (needs a plan that includes it)"
+        );
+        assert_eq!(engine("plessor").unwrap().not_installed(), "not installed");
+        assert!(
+            authz
+                .from_a_plan()
+                .unwrap()
+                .starts_with("plessor-authz comes with a Crossfyre plan that includes it.")
+        );
+        assert_eq!(engine("plessor").unwrap().from_a_plan(), None);
         let err = resolve_extensions("nope").unwrap_err().to_string();
         assert!(
-            err.contains("Use: ambulo, voyage, doorward, toolmark, plessor, or all"),
+            err.contains("Use: ambulo, voyage, doorward, toolmark, plessor, plessor-authz, or all"),
             "{err}"
         );
     }

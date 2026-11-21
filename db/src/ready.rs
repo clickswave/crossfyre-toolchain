@@ -133,7 +133,7 @@ pub(crate) async fn ready_in(dir: PathBuf, engine: &Engine) -> Result<PgPool, No
         .connect_with(
             settings
                 .options(database)
-                .options([("search_path", engine.name)]),
+                .options([("search_path", engine.schema)]),
         )
         .await
         .map_err(|e| not_reached(&settings, Some(&path), e))
@@ -315,6 +315,7 @@ pub(crate) mod tests {
     fn engine(name: &'static str) -> Engine {
         Engine {
             name,
+            schema: name,
             version: "0.0.1",
             migrations: &[],
         }
@@ -627,6 +628,7 @@ pub(crate) mod tests {
     pub(crate) fn engine_at(version: &'static str, migrations: &'static [&'static str]) -> Engine {
         Engine {
             name: "cfx_db_test",
+            schema: "cfx_db_test",
             version,
             migrations,
         }

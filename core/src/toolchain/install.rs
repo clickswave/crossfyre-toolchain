@@ -756,6 +756,9 @@ pub async fn install(
     // nothing from the release.
     let mut manifest = None;
     for ext in super::resolve_extensions(extension)? {
+        if let Some(why) = super::engine(ext).and_then(|e| e.from_a_plan()) {
+            return Err(why.into());
+        }
         if let Some(m) = packaging::owner(ext) {
             adopt_packaged(ext, m, false)?;
             continue;
@@ -1494,7 +1497,16 @@ async fn update_with(
     let (do_self, exts): (bool, Vec<&str>) = match target {
         Some("self") => (true, vec![]),
         Some("all") | None => (true, installed_extensions()),
-        Some(ext) => (false, super::resolve_extensions(ext)?),
+        Some(ext) => {
+            let exts = super::resolve_extensions(ext)?;
+            if let Some(why) = exts
+                .iter()
+                .find_map(|e| super::engine(e).and_then(|e| e.from_a_plan()))
+            {
+                return Err(why.into());
+            }
+            (false, exts)
+        }
     };
 
     // Only a CLI of the release being installed updates the rest (see `Writer`). One of
@@ -1850,11 +1862,19 @@ async fn update_with(
     Ok(out)
 }
 
+/// The engines installed from the release. A closed engine is kept current with its
+/// plan, not from the release.
 fn installed_extensions() -> Vec<&'static str> {
+    release_engines(super::config::is_extension_installed)
+}
+
+/// The engines `installed` says are here that come with the release.
+fn release_engines(installed: impl Fn(&str) -> bool) -> Vec<&'static str> {
     super::ENGINES
         .iter()
+        .filter(|e| !e.closed)
         .map(|e| e.name)
-        .filter(|e| super::config::is_extension_installed(e))
+        .filter(|e| installed(e))
         .collect()
 }
 
@@ -2171,6 +2191,25 @@ pub async fn update_for_dashboard() -> Result<DashboardUpdate, Box<dyn std::erro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A closed engine comes with a plan, after login: asking for it from the release is
+    /// refused with how to get it, before anything is fetched.
+    #[tokio::test]
+    async fn a_closed_engine_is_not_installed_or_updated_from_the_release() {
+        let err = install("plessor-authz", false, Writer::cli("0.0.0"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("plessor-authz comes with a Crossfyre plan that includes it."),
+            "{err}"
+        );
+        // Installed or not, `crossfyre update` does not take it from the release.
+        assert_eq!(
+            release_engines(|_| true),
+            ["ambulo", "voyage", "doorward", "toolmark", "plessor"]
+        );
+    }
 
     /// A manifest as it arrives: parsed from JSON, because the types only derive
     /// `Deserialize` and because the parse is part of what is being checked.

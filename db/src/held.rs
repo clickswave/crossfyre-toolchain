@@ -42,17 +42,19 @@ async fn connect(settings: &Settings) -> Result<Option<PgConnection>, NotReady> 
     }
 }
 
-/// The engines that have a schema in the database, by name.
-async fn engines(conn: &mut PgConnection) -> Result<Vec<String>, sqlx::Error> {
+/// The engines that have a schema in the database: each one's schema and name.
+async fn engines(conn: &mut PgConnection) -> Result<Vec<(String, String)>, sqlx::Error> {
     let made: bool = sqlx::query_scalar("SELECT to_regclass('meta.migrations') IS NOT NULL")
         .fetch_one(&mut *conn)
         .await?;
     if !made {
         return Ok(Vec::new());
     }
-    sqlx::query_scalar("SELECT DISTINCT schema_name FROM meta.migrations ORDER BY schema_name")
-        .fetch_all(&mut *conn)
-        .await
+    sqlx::query_as(
+        "SELECT DISTINCT schema_name, engine FROM meta.migrations ORDER BY schema_name, engine",
+    )
+    .fetch_all(&mut *conn)
+    .await
 }
 
 fn quoted(name: &str) -> String {
@@ -67,9 +69,9 @@ pub async fn held(settings: &Settings) -> Result<Vec<Held>, NotReady> {
     };
     let failed = |e: sqlx::Error| NotReady::new(format!("could not read the database: {e}"), None);
     let mut out = Vec::new();
-    for engine in engines(&mut conn).await.map_err(failed)? {
+    for (schema, engine) in engines(&mut conn).await.map_err(failed)? {
         let scans: i64 =
-            sqlx::query_scalar(&format!("SELECT count(*) FROM {}.scans", quoted(&engine)))
+            sqlx::query_scalar(&format!("SELECT count(*) FROM {}.scans", quoted(&schema)))
                 .fetch_one(&mut conn)
                 .await
                 .map_err(failed)?;
@@ -78,7 +80,7 @@ pub async fn held(settings: &Settings) -> Result<Vec<Held>, NotReady> {
              JOIN pg_namespace n ON n.oid = c.relnamespace \
              WHERE n.nspname = $1 AND c.relkind = 'r'",
         )
-        .bind(&engine)
+        .bind(&schema)
         .fetch_one(&mut conn)
         .await
         .map_err(failed)?;
@@ -103,8 +105,8 @@ pub async fn purge_all(
     };
     let failed = |e: sqlx::Error| NotReady::new(format!("could not purge: {e}"), None);
     let mut out = Vec::new();
-    for engine in engines(&mut conn).await.map_err(failed)? {
-        sqlx::query(&format!("SET search_path TO {}", quoted(&engine)))
+    for (schema, engine) in engines(&mut conn).await.map_err(failed)? {
+        sqlx::query(&format!("SET search_path TO {}", quoted(&schema)))
             .execute(&mut conn)
             .await
             .map_err(failed)?;
@@ -123,6 +125,8 @@ mod tests {
     use crate::testing::{free_port, local_on, toolchain_with};
     use crate::{Engine, Stop, ThisAccount, Toolchain};
 
+    /// Each engine keeps its scans in its own schema, a plain identifier even where its
+    /// name is not one, and is counted and purged under its name.
     #[tokio::test]
     #[ignore = "needs PostgreSQL's programs"]
     async fn every_engine_is_counted_and_purged_in_its_own_schema() {
@@ -133,17 +137,38 @@ mod tests {
             None,
             "not started yet"
         );
-        for name in ["one", "two"] {
+        let refused = ready_in(
+            toolchain.clone(),
+            &Engine {
+                name: "two-x",
+                schema: "two-x",
+                version: "0.0.1",
+                migrations: &[],
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            refused.to_string().contains("is not a plain identifier"),
+            "{refused}"
+        );
+        for (name, schema) in [("one", "one"), ("two-x", "two_x")] {
             let pool = ready_in(
                 toolchain.clone(),
                 &Engine {
                     name,
+                    schema,
                     version: "0.0.1",
                     migrations: &[],
                 },
             )
             .await
             .unwrap();
+            let current: String = sqlx::query_scalar("SELECT current_schema()")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(current, schema);
             for target in ["a", "b"] {
                 let scan = start(
                     &pool,
@@ -163,13 +188,13 @@ mod tests {
                 .iter()
                 .map(|h| (h.engine.as_str(), h.scans))
                 .collect::<Vec<_>>(),
-            [("one", 2), ("two", 2)]
+            [("one", 2), ("two-x", 2)]
         );
         assert!(counted.iter().all(|h| h.bytes > 0));
 
         assert_eq!(
             purge_all(&settings, Purge::OlderThanDays(0)).await.unwrap(),
-            [("one".to_string(), 2), ("two".to_string(), 2)]
+            [("one".to_string(), 2), ("two-x".to_string(), 2)]
         );
         assert!(held(&settings).await.unwrap().iter().all(|h| h.scans == 0));
         let account = ThisAccount::new().unwrap();

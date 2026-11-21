@@ -578,7 +578,12 @@ mod tests {
             "/opt/crossfyre/bin/packaging.json",
         );
         let bin = Path::new("/opt/crossfyre/bin");
-        assert!(unowned_files(bin, &image).is_empty());
+        // A closed engine is no package's: the CLI fetches it after login, so uninstall
+        // takes it away again.
+        assert_eq!(
+            unowned_files(bin, &image),
+            [bin.join("plessor-authz"), bin.join("plessor-authz.version")]
+        );
         let root = Path::new(INSTALL_ROOT);
         assert!(has_files_under(
             &image,

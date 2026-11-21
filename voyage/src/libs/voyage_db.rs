@@ -4,6 +4,7 @@ use sqlx::QueryBuilder;
 /// voyage's part of the database: its schema, and the files that make its tables.
 pub const ENGINE: cfx_db::Engine = cfx_db::Engine {
     name: "voyage",
+    schema: "voyage",
     version: env!("CARGO_PKG_VERSION"),
     migrations: &[include_str!("../../migrations/0001_entries.sql")],
 };

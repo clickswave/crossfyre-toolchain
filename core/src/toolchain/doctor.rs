@@ -174,7 +174,7 @@ pub async fn run(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 failed += 1;
             }
         } else {
-            step(&format!("{} {}", e.name, dim("not installed")));
+            step(&format!("{} {}", e.name, dim(e.not_installed())));
         }
     }
     if let Ok(Some(db)) = super::db::status() {

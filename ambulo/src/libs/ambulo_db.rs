@@ -6,6 +6,7 @@ use sqlx::QueryBuilder;
 /// ambulo's part of the database: its schema, and the files that make its tables.
 pub const ENGINE: cfx_db::Engine = cfx_db::Engine {
     name: "ambulo",
+    schema: "ambulo",
     version: env!("CARGO_PKG_VERSION"),
     migrations: &[include_str!("../../migrations/0001_entries.sql")],
 };

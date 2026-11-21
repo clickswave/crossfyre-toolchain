@@ -1,7 +1,7 @@
 //! Each engine's tables, in a schema of its own in the one database, made and brought up
 //! to date by numbered SQL files compiled into the engine.
 //!
-//! The database config.toml names has a schema per engine, named after it, and `meta`,
+//! The database config.toml names has a schema per engine, [`Engine::schema`], and `meta`,
 //! whose `migrations` table records the files each schema has had: what each said, and
 //! which version of the engine applied it. The tables every engine has are made by this
 //! crate's own files, the same in every schema and before the engine's.
@@ -17,8 +17,11 @@ use sqlx::{Connection, Executor, PgConnection};
 /// One engine's part of the database.
 #[derive(Debug, Clone, Copy)]
 pub struct Engine {
-    /// The engine's name, which its schema has too.
+    /// The engine's name, as people and the platform know it.
     pub name: &'static str,
+    /// Its schema: a plain identifier (lowercase letters, digits and underscores, not
+    /// starting with a digit), which a name such as `plessor-authz` is not.
+    pub schema: &'static str,
     /// The engine's version, recorded with each file it applies.
     pub version: &'static str,
     /// The engine's own SQL files, in order: the first is number 1.
@@ -45,6 +48,7 @@ const MIGRATING: i64 = 0x0063_6678_5f6d_6967;
 const META: &str = "CREATE SCHEMA IF NOT EXISTS meta;
 CREATE TABLE IF NOT EXISTS meta.migrations (
     schema_name TEXT NOT NULL,
+    engine      TEXT NOT NULL,
     source      TEXT NOT NULL,
     number      INTEGER NOT NULL,
     body        TEXT NOT NULL,
@@ -71,6 +75,15 @@ pub(crate) async fn migrate(
     engine: &Engine,
 ) -> Result<Migrated, NotReady> {
     let name = engine.name;
+    if !plain(engine.schema) {
+        return Err(NotReady::new(
+            format!(
+                "{name}'s schema {:?} is not a plain identifier, so it is not made",
+                engine.schema
+            ),
+            None,
+        ));
+    }
     let mut tx = conn.begin().await.map_err(|e| failed(name, e))?;
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(MIGRATING)
@@ -81,7 +94,7 @@ pub(crate) async fn migrate(
     let had: Vec<(String, i32, String, String)> = sqlx::query_as(
         "SELECT source, number, body, version FROM meta.migrations WHERE schema_name = $1",
     )
-    .bind(name)
+    .bind(engine.schema)
     .fetch_all(&mut *tx)
     .await
     .map_err(|e| failed(name, e))?;
@@ -98,13 +111,13 @@ pub(crate) async fn migrate(
         .iter()
         .any(|(source, number, body, _)| file(engine, source, *number) != Some(body.as_str()));
 
-    let schema = format!("\"{}\"", engine.name.replace('"', "\"\""));
+    let schema = engine.schema;
     if changed {
         tx.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
             .await
             .map_err(|e| failed(name, e))?;
         sqlx::query("DELETE FROM meta.migrations WHERE schema_name = $1")
-            .bind(engine.name)
+            .bind(engine.schema)
             .execute(&mut *tx)
             .await
             .map_err(|e| failed(name, e))?;
@@ -116,7 +129,7 @@ pub(crate) async fn migrate(
     .map_err(|e| failed(name, e))?;
 
     let mut applied = 0;
-    for (source, files) in [(SHARED_SOURCE, SHARED), (engine.name, engine.migrations)] {
+    for (source, files) in [(SHARED_SOURCE, SHARED), (engine.schema, engine.migrations)] {
         for (number, body) in (1..).zip(files.iter().copied()) {
             let had_it = !changed && had.iter().any(|(s, n, _, _)| s == source && *n == number);
             if had_it {
@@ -129,9 +142,10 @@ pub(crate) async fn migrate(
                 )
             })?;
             sqlx::query(
-                "INSERT INTO meta.migrations (schema_name, source, number, body, version) \
-                 VALUES ($1, $2, $3, $4, $5)",
+                "INSERT INTO meta.migrations (schema_name, engine, source, number, body, version) \
+                 VALUES ($1, $2, $3, $4, $5, $6)",
             )
+            .bind(engine.schema)
             .bind(engine.name)
             .bind(source)
             .bind(number)
@@ -164,11 +178,22 @@ pub(crate) fn cleared(engine: &str) -> String {
     format!("{engine}'s stored scans were cleared because this version keeps them differently")
 }
 
+/// Whether `schema` is a plain identifier, one that needs no quoting anywhere.
+pub(crate) fn plain(schema: &str) -> bool {
+    schema
+        .bytes()
+        .next()
+        .is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
+        && schema
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
 /// The file `number` from `source` that `engine` knows, if it knows one.
 fn file(engine: &Engine, source: &str, number: i32) -> Option<&'static str> {
     let files = match source {
         SHARED_SOURCE => SHARED,
-        _ if source == engine.name => engine.migrations,
+        _ if source == engine.schema => engine.migrations,
         _ => return None,
     };
     usize::try_from(number - 1)
