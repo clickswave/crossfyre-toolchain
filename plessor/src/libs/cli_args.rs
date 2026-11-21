@@ -53,6 +53,12 @@ pub enum Commands {
     /// The scans this engine keeps, the latest first, and a stopped template scan to take
     /// up again
     Scans,
+    /// What this engine kept of what its scans found, the latest first: each finding's id,
+    /// check, severity and where, and whether it has a proof to verify it by
+    Findings(FindingsArgs),
+    /// Check one kept finding again by its proof, running nothing else of its scan, and say
+    /// whether it is reproduced, changed, not reproduced or unreachable
+    Verify(VerifyArgs),
     /// Check a folder of templates as plessor reads them: each parses, has a request, runs
     /// only matchers plessor has and patterns that compile, has an id of its own, and names
     /// a product toolmark names, when it names one
@@ -122,6 +128,36 @@ pub struct InjectArgs {
     /// tests these fields as well as the query.
     #[arg(short = 'd', long, value_name = "FORM")]
     pub data: Option<String>,
+}
+
+#[derive(Parser, Clone)]
+pub struct FindingsArgs {
+    /// Only what this scan found
+    #[arg(long, value_name = "ID")]
+    pub scan: Option<String>,
+
+    /// The most to list
+    #[arg(long, default_value_t = 200)]
+    pub limit: i64,
+}
+
+#[derive(Parser, Clone)]
+pub struct VerifyArgs {
+    /// The finding's id, as `plessor findings` lists it
+    pub id: i64,
+
+    /// Cookie header for a finding of a scan behind a login: the proof names the slot,
+    /// never the value
+    #[arg(long, value_name = "COOKIES")]
+    pub cookie: Option<String>,
+
+    /// A header the proof needs, as "Name: value". Repeatable.
+    #[arg(short = 'H', long = "header", value_name = "HEADER")]
+    pub headers: Vec<String>,
+
+    /// Send again what changes the target, which is not sent otherwise
+    #[arg(long)]
+    pub test_writes: bool,
 }
 
 #[derive(Parser, Clone)]

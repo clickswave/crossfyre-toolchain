@@ -174,7 +174,7 @@ pub(crate) struct BaseResp {
 /// Keeping `sec-ch-ua` and the `Sec-Fetch-*` set alongside a scanner name would
 /// be a client claiming to be two different things at once, which is worse than
 /// either alone: it reads as evasion that forgot to change its User-Agent.
-fn announce_as(ident: &mut adaptive::identity::Identity, ua: Option<&str>) {
+pub(crate) fn announce_as(ident: &mut adaptive::identity::Identity, ua: Option<&str>) {
     let Some(ua) = ua.map(str::trim).filter(|u| !u.is_empty()) else {
         return;
     };
@@ -223,69 +223,11 @@ pub async fn run<L: crate::ledger::Ledger>(
     // profile choice is the private `adaptive` drop-in.
     let mode = adaptive::identity::Mode::from_flags(params.evasive, params.identify.clone());
 
-    // Builds an outbound client for a resolved identity. Closed over so a
-    // challenge retry can rebuild it with a rotated identity.
+    // Builds an outbound client for a resolved identity, again with a rotated one when a
+    // challenge retry asks.
     let build_client = |ident: &adaptive::identity::Identity,
                         clearance: Option<&crate::solver::Solved>| {
-        let mut browser_headers = transport::HeaderMap::new();
-        for (k, v) in &ident.headers {
-            if let (Ok(name), Ok(val)) = (
-                transport::HeaderName::from_bytes(k.as_bytes()),
-                transport::HeaderValue::from_str(v),
-            ) {
-                browser_headers.insert(name, val);
-            }
-        }
-        let mut extra_headers = transport::HeaderMap::new();
-        if let Some(auth) = params.auth.as_ref().filter(|a| a.is_meaningful()) {
-            for (k, v) in auth.to_header_map().iter() {
-                extra_headers.insert(k.clone(), v.clone());
-            }
-        }
-        // The attribution token (Identify posture) is an app header: it must
-        // survive emulation, so it goes in extra_headers, not the fingerprint set.
-        if let adaptive::identity::Mode::Identify(token) = &mode {
-            if let Ok(val) = transport::HeaderValue::from_str(token) {
-                extra_headers.insert(transport::HeaderName::from_static("x-bug-bounty"), val);
-            }
-        }
-        // Challenge clearance (from the solver): the cf_clearance cookie must ride
-        // on every request, and the UA must match the solver's browser or the
-        // cookie is rejected - so adopt the solver's UA for the fingerprint too.
-        let mut ua = ident.user_agent.clone();
-        if let Some(sol) = clearance {
-            if let Ok(val) = transport::HeaderValue::from_str(&sol.cookie_header) {
-                extra_headers.insert(transport::header::COOKIE, val);
-            }
-            if let Some(sua) = &sol.user_agent {
-                ua = sua.clone();
-            }
-        }
-        transport::build_client(
-            transport::ClientConfig {
-                timeout: Some(Duration::from_millis(
-                    params.timeout_ms.clamp(1000, 120_000),
-                )),
-                redirect: if params.follow_redirects {
-                    transport::Redirect::Limited(5)
-                } else {
-                    transport::Redirect::None
-                },
-                accept_invalid_certs: true,
-                cookie_store: true,
-                user_agent: Some(ua),
-                browser_headers,
-                extra_headers,
-                emulate: should_emulate(params.user_agent.as_deref(), &mode),
-                resolve: Vec::new(),
-                block_internal: params.block_internal,
-                // A template request goes to the target. Off its origin a 307 or
-                // 308 would carry the payload to a host nobody listed, and the
-                // matchers would read that host's answer as the target's.
-                same_origin_redirects: true,
-            },
-            &params.egress,
-        )
+        scan_client(&params, &mode, ident, clearance)
     };
 
     let _ = tx.send(json!({"type":"ack","target": base}));
@@ -865,6 +807,77 @@ pub async fn run<L: crate::ledger::Ledger>(
     let _ = tx.send(json!({"type":"done","found": found}));
 }
 
+/// The outbound client of a scan asked for with `params`, for the identity `ident` of
+/// posture `mode` and any challenge `clearance`: the scan's credential on every request,
+/// its timeout, redirects and refusal of internal addresses, through its egress. A replay
+/// of a finding's proof goes through the same client.
+pub(crate) fn scan_client(
+    params: &ScanParams,
+    mode: &adaptive::identity::Mode,
+    ident: &adaptive::identity::Identity,
+    clearance: Option<&crate::solver::Solved>,
+) -> Result<transport::Client, transport::BuildError> {
+    let mut browser_headers = transport::HeaderMap::new();
+    for (k, v) in &ident.headers {
+        if let (Ok(name), Ok(val)) = (
+            transport::HeaderName::from_bytes(k.as_bytes()),
+            transport::HeaderValue::from_str(v),
+        ) {
+            browser_headers.insert(name, val);
+        }
+    }
+    let mut extra_headers = transport::HeaderMap::new();
+    if let Some(auth) = params.auth.as_ref().filter(|a| a.is_meaningful()) {
+        for (k, v) in auth.to_header_map().iter() {
+            extra_headers.insert(k.clone(), v.clone());
+        }
+    }
+    // The attribution token (Identify posture) is an app header: it must
+    // survive emulation, so it goes in extra_headers, not the fingerprint set.
+    if let adaptive::identity::Mode::Identify(token) = mode {
+        if let Ok(val) = transport::HeaderValue::from_str(token) {
+            extra_headers.insert(transport::HeaderName::from_static("x-bug-bounty"), val);
+        }
+    }
+    // Challenge clearance (from the solver): the cf_clearance cookie must ride
+    // on every request, and the UA must match the solver's browser or the
+    // cookie is rejected - so adopt the solver's UA for the fingerprint too.
+    let mut ua = ident.user_agent.clone();
+    if let Some(sol) = clearance {
+        if let Ok(val) = transport::HeaderValue::from_str(&sol.cookie_header) {
+            extra_headers.insert(transport::header::COOKIE, val);
+        }
+        if let Some(sua) = &sol.user_agent {
+            ua = sua.clone();
+        }
+    }
+    transport::build_client(
+        transport::ClientConfig {
+            timeout: Some(Duration::from_millis(
+                params.timeout_ms.clamp(1000, 120_000),
+            )),
+            redirect: if params.follow_redirects {
+                transport::Redirect::Limited(5)
+            } else {
+                transport::Redirect::None
+            },
+            accept_invalid_certs: true,
+            cookie_store: true,
+            user_agent: Some(ua),
+            browser_headers,
+            extra_headers,
+            emulate: should_emulate(params.user_agent.as_deref(), mode),
+            resolve: Vec::new(),
+            block_internal: params.block_internal,
+            // A template request goes to the target. Off its origin a 307 or
+            // 308 would carry the payload to a host nobody listed, and the
+            // matchers would read that host's answer as the target's.
+            same_origin_redirects: true,
+        },
+        &params.egress,
+    )
+}
+
 /// The proof of the header check `check`, `name`, on the base response `resp` of `base`:
 /// a GET of the base, and the header it lacked.
 fn header_proof(
@@ -913,7 +926,9 @@ fn template_changes_target(tmpl: &template::Template) -> bool {
 }
 
 /// Passive security-header checks. Returns (name, template-id, severity, description).
-fn header_checks(resp: &BaseResp) -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
+pub(crate) fn header_checks(
+    resp: &BaseResp,
+) -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
     let has = |n: &str| resp.headers.iter().any(|(k, _)| k == n);
     let mut out = Vec::new();
     if !has("x-frame-options") && !has("content-security-policy") {

@@ -92,6 +92,8 @@ mod action_rail;
 mod scope_rail;
 // One test for the rail five engines each had to learn separately. Not a module
 // with anything in it: the test IS the artefact.
+#[cfg(feature = "daemon")]
+mod verify;
 #[cfg(test)]
 #[cfg(feature = "daemon")]
 mod writes_rail;
@@ -212,6 +214,24 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 None => Ok(()),
             }
+        }
+        Some(Commands::Findings(args)) => {
+            let mut ask = serde_json::json!({
+                "operation": "findings", "response": "instant", "limit": args.limit,
+            });
+            if let Some(scan) = &args.scan {
+                ask["scan"] = serde_json::json!(scan);
+            }
+            let answer = dguard::ask(&daemon, &ask).await?;
+            let rows = answer["findings"].as_array().cloned().unwrap_or_default();
+            let tui = cfx_tui::wanted(cli.no_tui);
+            tokio::task::spawn_blocking(move || show_findings(&rows, tui)).await??;
+            Ok(())
+        }
+        Some(Commands::Verify(args)) => {
+            let answer = dguard::ask(&daemon, &verify_request(&args)?).await?;
+            println!("{answer}");
+            Ok(())
         }
         Some(Commands::Check(args)) => {
             let known = match &args.known {
@@ -341,6 +361,95 @@ fn scan_request(
     Ok(req)
 }
 
+/// `-H` headers, each "Name: value", as a map of name to value.
+#[cfg(feature = "daemon")]
+fn header_map(headers: &[String]) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let mut map = serde_json::Map::new();
+    for h in headers {
+        let (name, value) = h
+            .split_once(':')
+            .ok_or_else(|| format!("-H {h:?}: expected \"Name: value\""))?;
+        map.insert(name.trim().to_string(), serde_json::json!(value.trim()));
+    }
+    Ok(map)
+}
+
+/// The daemon request for `plessor verify`: the finding, and the credential for the slots
+/// its proof names, in the shape a scan takes it.
+#[cfg(feature = "daemon")]
+fn verify_request(args: &libs::cli_args::VerifyArgs) -> Result<serde_json::Value, String> {
+    let mut req = serde_json::json!({
+        "operation": "verify",
+        "response": "instant",
+        "finding": args.id,
+        "test_writes": args.test_writes,
+    });
+    let headers = header_map(&args.headers)?;
+    if args.cookie.is_some() || !headers.is_empty() {
+        req["auth"] = serde_json::json!({
+            "cookies": args.cookie.as_deref().unwrap_or(""),
+            "headers": headers,
+        });
+    }
+    Ok(req)
+}
+
+/// `rows`, the findings the daemon answered with, in a table when `tui`, and otherwise a
+/// JSON object a line. A finding with no proof, as an injection or authorization finding
+/// is, says so, as it cannot be verified.
+#[cfg(feature = "daemon")]
+fn show_findings(rows: &[serde_json::Value], tui: bool) -> std::io::Result<()> {
+    if !tui {
+        let mut out = String::new();
+        for row in rows {
+            out.push_str(&row.to_string());
+            out.push('\n');
+        }
+        return print_all(out.as_bytes());
+    }
+    cfx_tui::table::show(&findings_list(rows))
+}
+
+/// The findings as the table shows them.
+#[cfg(feature = "daemon")]
+fn findings_list(rows: &[serde_json::Value]) -> cfx_tui::table::List<'static> {
+    let text =
+        |row: &serde_json::Value, key: &str| row[key].as_str().unwrap_or_default().to_string();
+    let table: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| {
+            let found = text(row, "found");
+            vec![
+                row["id"].to_string(),
+                text(row, "severity"),
+                text(row, "name"),
+                text(row, "matched_at"),
+                if row["proof"] == true {
+                    "yes".to_string()
+                } else {
+                    "no proof kept".to_string()
+                },
+                found
+                    .get(..16)
+                    .map(|m| format!("{} UTC", m.replace('T', " ")))
+                    .unwrap_or(found),
+            ]
+        })
+        .collect();
+    let proofs = rows.iter().filter(|r| r["proof"] == true).count();
+    cfx_tui::table::List {
+        name: "PLESSOR",
+        title: "FINDINGS",
+        summary: format!(
+            "{} findings, {proofs} with a proof: `plessor verify <id>` checks one again",
+            table.len()
+        ),
+        header: &["ID", "SEVERITY", "NAME", "WHERE", "PROOF", "FOUND"],
+        widths: &[8, 10, 34, 40, 14],
+        rows: table,
+    }
+}
+
 /// The daemon requests for `plessor inject`, one per origin, each paired with the
 /// origin it targets.
 ///
@@ -355,13 +464,7 @@ fn inject_requests(
     headers: &[String],
     data: Option<&str>,
 ) -> Result<Vec<(String, serde_json::Value)>, String> {
-    let mut header_map = serde_json::Map::new();
-    for h in headers {
-        let (name, value) = h
-            .split_once(':')
-            .ok_or_else(|| format!("-H {h:?}: expected \"Name: value\""))?;
-        header_map.insert(name.trim().to_string(), serde_json::json!(value.trim()));
-    }
+    let header_map = header_map(headers)?;
     // Decoded as a form is, so `a=b+c` tests the value "b c".
     let body: Vec<serde_json::Value> = match data {
         Some(d) => reqwest::Url::parse(&format!("http://form.invalid/?{d}"))
@@ -517,7 +620,10 @@ async fn send_stream(
 #[cfg(test)]
 #[cfg(feature = "daemon")]
 mod tests {
-    use super::{Ran, engine_daemon, inject_requests, scan_request, toolmark_port};
+    use super::{
+        Ran, engine_daemon, findings_list, inject_requests, scan_request, toolmark_port,
+        verify_request,
+    };
     use crate::libs;
     use crate::libs::cli_args::{Cli, Commands};
     use clap::Parser;
@@ -612,6 +718,54 @@ mod tests {
         }
         assert_eq!(ran.scan.as_deref(), Some("s1"));
         assert_eq!(ran.answers.unwrap()["type"], "lead_answers");
+    }
+
+    /// `plessor verify` asks for the finding by its id, with the credential the slots need
+    /// as a scan takes it, and only when one is given.
+    #[test]
+    fn verify_asks_by_id_with_the_credential_given() {
+        let args =
+            |argv: &[&str]| match Cli::try_parse_from(["plessor", "verify"].iter().chain(argv))
+                .unwrap()
+                .command
+            {
+                Some(Commands::Verify(a)) => a,
+                _ => unreachable!("a verify was parsed"),
+            };
+        let plain = verify_request(&args(&["7"])).unwrap();
+        assert_eq!(plain["finding"], 7);
+        assert_eq!(plain["test_writes"], false);
+        assert!(plain.get("auth").is_none());
+        let given = verify_request(&args(&[
+            "7",
+            "--cookie",
+            "s=1",
+            "-H",
+            "X-Api-Token: t0",
+            "--test-writes",
+        ]))
+        .unwrap();
+        assert_eq!(
+            given["auth"],
+            serde_json::json!({"cookies": "s=1", "headers": {"X-Api-Token": "t0"}})
+        );
+        assert_eq!(given["test_writes"], true);
+        assert!(verify_request(&args(&["7", "-H", "no colon"])).is_err());
+    }
+
+    /// The findings table says which have no proof, and so cannot be verified.
+    #[test]
+    fn the_findings_say_which_have_no_proof() {
+        let list = findings_list(&[
+            serde_json::json!({"id": 3, "severity": "high", "name": "a", "matched_at": "http://h/a",
+                               "proof": true, "found": "2026-11-21T12:00:00Z"}),
+            serde_json::json!({"id": 2, "severity": "high", "name": "b", "matched_at": "http://h/b",
+                               "proof": false, "found": "2026-11-21T11:00:00Z"}),
+        ]);
+        assert_eq!(list.rows[0][4], "yes");
+        assert_eq!(list.rows[1][4], "no proof kept");
+        assert_eq!(list.rows[0][5], "2026-11-21 12:00 UTC");
+        assert!(list.summary.starts_with("2 findings, 1 with a proof"));
     }
 
     /// A test build refuses the engines' real ports, where the operator's own engines may

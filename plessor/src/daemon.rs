@@ -219,6 +219,24 @@ async fn handle_connection(
                 write_line(&mut writer, &reply).await?;
                 continue;
             }
+            // What this daemon kept of what its scans found.
+            "findings" => {
+                let reply = db
+                    .findings(
+                        params["scan"].as_str(),
+                        params["limit"].as_i64().unwrap_or(200),
+                    )
+                    .await;
+                write_line(&mut writer, &reply).await?;
+                continue;
+            }
+            // One finding checked again by its proof: one kept here, by its id, or a proof
+            // handed in, as a node is handed one.
+            "verify" => {
+                let reply = verify(params, egress, &db).await;
+                write_line(&mut writer, &reply).await?;
+                continue;
+            }
             "authz" => op!("authz", plain(crate::authz::run)),
             "inject" => op!("inject", plain(crate::inject::run)),
             "discover" => op!("discover", plain(crate::discover::run)),
@@ -277,6 +295,49 @@ async fn handle_connection(
     }
 
     Ok(())
+}
+
+/// Replay the proof of the finding `params` names, or of the proof it hands in, through
+/// `egress`, and keep what it came to beside the finding. A finding kept with no proof,
+/// as an injection or authorization finding is, is refused with that reason.
+async fn verify(params: Value, egress: transport::Egress, db: &PlessorDb) -> Value {
+    let refuse = |message: String| serde_json::json!({"status": "error", "message": message});
+    let mut asked: crate::verify::VerifyParams = match serde_json::from_value(params) {
+        Ok(asked) => asked,
+        Err(e) => return refuse(format!("Invalid verify params: {e}")),
+    };
+    asked.egress = egress;
+    let proof = match (asked.finding, asked.proof.take()) {
+        (Some(id), _) => match db.finding(id).await {
+            Ok(Some(data)) => match data.get("proof").cloned() {
+                Some(kept) => match serde_json::from_value::<crate::proof::Proof>(kept) {
+                    Ok(proof) => proof,
+                    Err(e) => return refuse(format!("finding {id}'s proof does not read: {e}")),
+                },
+                None => {
+                    return refuse(format!(
+                        "finding {id} has no proof kept, so it cannot be verified"
+                    ));
+                }
+            },
+            Ok(None) => return refuse(format!("no finding {id} is kept here")),
+            Err(e) => return refuse(format!("could not read finding {id}: {e}")),
+        },
+        (None, Some(proof)) => proof,
+        (None, None) => return refuse("give a finding's id or a proof".to_string()),
+    };
+    if let Some(why) = crate::verify::refusal(&proof, &asked) {
+        return refuse(format!("not replayed: {why}"));
+    }
+    let mut reply = crate::verify::replay(&proof, &asked).await;
+    if reply["status"] == "completed" {
+        let digest = crate::proof::sha256(&serde_json::to_string(&proof).unwrap_or_default());
+        db.verified(asked.finding, &digest, &reply).await;
+        if let Some(id) = asked.finding {
+            reply["finding"] = serde_json::json!(id);
+        }
+    }
+    reply
 }
 
 /// Is this line a request to stop the operation running on this connection?
@@ -1044,6 +1105,281 @@ mod tests {
         for secret in ["inj-secret-1", "inj-secret-2"] {
             assert!(!out.contains(secret), "{secret} went out: {out}");
         }
+    }
+
+    /// A target whose answer a test sets: its status line's extra headers and its body,
+    /// or no answer at all when it is down.
+    #[derive(Clone)]
+    struct Settable {
+        page: Arc<std::sync::Mutex<(String, String)>>,
+        down: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    async fn settable_target(headers: &str, body: &str) -> (u16, Settable) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let set = Settable {
+            page: Arc::new(std::sync::Mutex::new((
+                headers.to_string(),
+                body.to_string(),
+            ))),
+            down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let serve = set.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let serve = serve.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 16384];
+                    while let Ok(n) = sock.read(&mut buf).await {
+                        if n == 0 || serve.down.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        let (headers, body) = serve.page.lock().unwrap().clone();
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\n{headers}Content-Type: text/html\r\n\
+                             Content-Length: {}\r\n\r\n",
+                            body.len()
+                        );
+                        if sock.write_all(head.as_bytes()).await.is_err()
+                            || sock.write_all(body.as_bytes()).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (port, set)
+    }
+
+    /// A verify answer, sent as a client sends one.
+    async fn verified(dport: u16, ask: &Value) -> Value {
+        let stream = TcpStream::connect(("127.0.0.1", dport)).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        w.write_all(format!("{ask}\n").as_bytes()).await.unwrap();
+        let line = BufReader::new(r)
+            .lines()
+            .next_line()
+            .await
+            .unwrap()
+            .unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    /// A finding's proof, replayed, says reproduced while the target still answers as it
+    /// did, with the evidence; changed when the matchers hold on other evidence; not
+    /// reproduced when they do not; and unreachable when the target does not answer. A
+    /// header check's proof is replayed by the same check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_proof_replayed_says_what_the_target_does_now() {
+        let (tport, target) = settable_target("", "<html>widget version 1.2</html>").await;
+        let dport = daemon().await;
+        let dir = std::env::temp_dir().join(format!("plessor-verify-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("widget.yaml"),
+            "id: widget-version\ninfo:\n  name: widget version\n  severity: info\n\
+             http:\n  - method: GET\n    path:\n      - \"{{BaseURL}}/about\"\n    \
+             matchers:\n      - type: regex\n        regex:\n          - \"widget version [0-9.]+\"\n",
+        )
+        .unwrap();
+        let events = run_to_done(
+            dport,
+            &serde_json::json!({
+                "operation": "scan", "response": "stream",
+                "target": format!("http://127.0.0.1:{tport}"),
+                "templates_dir": dir.to_string_lossy(),
+                "only": ["widget-version", "missing-csp"],
+                "evasive": false, "timeout_ms": 5000,
+            }),
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let proof_of = |check: &str| {
+            events
+                .iter()
+                .find(|e| e["type"] == "finding" && e["data"]["template"] == check)
+                .map(|e| e["data"]["proof"].clone())
+                .unwrap_or_else(|| panic!("no {check} in {events:?}"))
+        };
+        let (widget, csp) = (proof_of("widget-version"), proof_of("missing-csp"));
+        assert_eq!(widget["fired"][0]["evidence"], "widget version 1.2");
+        let replay = |proof: &Value| {
+            serde_json::json!({"operation": "verify", "response": "instant", "proof": proof,
+                               "evasive": false, "timeout_ms": 3000})
+        };
+
+        let again = verified(dport, &replay(&widget)).await;
+        assert_eq!(again["answer"], "reproduced", "{again}");
+        assert_eq!(again["fired"][0]["evidence"], "widget version 1.2");
+        assert_eq!(again["http_status"], 200);
+        assert_eq!(again["response_sha256"], widget["response_sha256"]);
+        assert_eq!(verified(dport, &replay(&csp)).await["answer"], "reproduced");
+
+        *target.page.lock().unwrap() = (
+            "Content-Security-Policy: default-src 'self'\r\n".into(),
+            "<html>widget version 1.3</html>".into(),
+        );
+        let again = verified(dport, &replay(&widget)).await;
+        assert_eq!(again["answer"], "changed", "{again}");
+        assert_eq!(again["fired"][0]["evidence"], "widget version 1.3");
+        assert_eq!(
+            verified(dport, &replay(&csp)).await["answer"],
+            "not reproduced"
+        );
+
+        *target.page.lock().unwrap() = (String::new(), "<html>gone</html>".into());
+        let again = verified(dport, &replay(&widget)).await;
+        assert_eq!(again["answer"], "not reproduced", "{again}");
+        assert_eq!(again["fired"], serde_json::json!([]));
+
+        target.down.store(true, Ordering::SeqCst);
+        assert_eq!(
+            verified(dport, &replay(&widget)).await["answer"],
+            "unreachable"
+        );
+    }
+
+    /// A finding kept with its proof is listed, and verified by its id, and what that came
+    /// to is kept beside it, which it does not change. One kept with no proof, as an
+    /// injection finding is, is listed as having none and refused for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs PostgreSQL's programs"]
+    async fn a_kept_finding_is_listed_and_verified_by_its_id() {
+        let scratch = cfx_db::testing::Scratch::new(&crate::plessor_db::ENGINE).await;
+        let db = PlessorDb::new(scratch.pool.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let dport = listener.local_addr().expect("addr").port();
+        tokio::spawn(serve(
+            listener,
+            dguard::Gate::default(),
+            db.clone(),
+            std::sync::Arc::new(Packs::load(None)),
+        ));
+        let (tport, _) = settable_target("", "<html>widget version 1.2</html>").await;
+        let (rport, _) = reflecting_target().await;
+        let dir = std::env::temp_dir().join(format!("plessor-kept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("widget.yaml"),
+            "id: widget-version\ninfo:\n  name: widget version\n  severity: info\n\
+             http:\n  - method: GET\n    path:\n      - \"{{BaseURL}}/about\"\n    \
+             matchers:\n      - type: regex\n        regex:\n          - \"widget version [0-9.]+\"\n",
+        )
+        .unwrap();
+        run_to_done(
+            dport,
+            &serde_json::json!({
+                "operation": "scan", "response": "stream",
+                "target": format!("http://127.0.0.1:{tport}"),
+                "templates_dir": dir.to_string_lossy(), "only": ["widget-version"],
+                "evasive": false, "timeout_ms": 5000,
+            }),
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+        run_to_done(
+            dport,
+            &serde_json::json!({
+                "operation": "inject", "response": "stream",
+                "target": format!("http://127.0.0.1:{rport}"),
+                "endpoints": [{"method": "GET", "url": format!("http://127.0.0.1:{rport}/s?q=1")}],
+                "classes": ["xss"], "evasive": false,
+            }),
+        )
+        .await;
+        let listed = verified(
+            dport,
+            &serde_json::json!({"operation": "findings", "response": "instant"}),
+        )
+        .await;
+        let rows = listed["findings"].as_array().expect("rows").clone();
+        let widget = rows
+            .iter()
+            .find(|r| r["check"] == "widget-version")
+            .unwrap_or_else(|| panic!("{listed}"));
+        assert_eq!(widget["proof"], true);
+        let injected = rows
+            .iter()
+            .find(|r| r["check"] != "widget-version")
+            .unwrap_or_else(|| panic!("no injection finding in {listed}"));
+        assert_eq!(injected["proof"], false);
+
+        let id = widget["id"].as_i64().unwrap();
+        let before = db.finding(id).await.unwrap();
+        let again = verified(
+            dport,
+            &serde_json::json!({"operation": "verify", "response": "instant", "finding": id,
+                                "evasive": false}),
+        )
+        .await;
+        assert_eq!(again["answer"], "reproduced", "{again}");
+        assert_eq!(again["finding"], id);
+        assert_eq!(
+            db.finding(id).await.unwrap(),
+            before,
+            "a verify changed the finding"
+        );
+        let kept: Vec<(Option<i64>, String)> =
+            sqlx::query_as("SELECT finding_id, answer FROM verifications")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(kept, [(Some(id), "reproduced".to_string())]);
+
+        let refused = verified(
+            dport,
+            &serde_json::json!({"operation": "verify", "response": "instant",
+                                "finding": injected["id"]}),
+        )
+        .await;
+        assert_eq!(refused["status"], "error");
+        assert!(
+            refused["message"]
+                .as_str()
+                .unwrap()
+                .contains("has no proof kept"),
+            "{refused}"
+        );
+        scratch.done().await;
+    }
+
+    /// A proof that needs what was not given, or would change the target, is not sent at
+    /// all, and the answer says why.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_proof_that_cannot_be_sent_is_refused_unsent() {
+        let (tport, seen) = recording_target().await;
+        let dport = daemon().await;
+        let proof = |method: &str, slots: Value| {
+            serde_json::json!({"format": 1, "engine": "plessor", "pack": "built in",
+                "kind": "template", "check": "t",
+                "requests": [{"method": method, "url": format!("http://127.0.0.1:{tport}/a"),
+                              "fields": []}],
+                "matchers": [{"type": "word", "words": ["ok"]}],
+                "fired": [], "status": 200, "response_sha256": "", "slots": slots})
+        };
+        for (p, why) in [
+            (
+                proof("GET", serde_json::json!(["auth.cookie"])),
+                "it needs auth.cookie",
+            ),
+            (proof("DELETE", serde_json::json!([])), "test_writes"),
+        ] {
+            let answer = verified(
+                dport,
+                &serde_json::json!({"operation": "verify", "response": "instant", "proof": p}),
+            )
+            .await;
+            assert_eq!(answer["status"], "error", "{answer}");
+            assert!(
+                answer["message"].as_str().unwrap().contains(why),
+                "{answer}"
+            );
+        }
+        assert!(seen.lock().unwrap().is_empty(), "a refused proof was sent");
     }
 
     /// The leads a scan is given come back answered: confirmed where the template for the

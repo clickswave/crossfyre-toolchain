@@ -156,6 +156,70 @@ impl PlessorDb {
         }
     }
 
+    /// What this daemon kept of what its scans found, the latest first, of scan `scan`
+    /// when one is named: each finding's id, scan, check, severity, name and where, and
+    /// whether it was kept with a proof to verify it by.
+    pub async fn findings(&self, scan: Option<&str>, limit: i64) -> Value {
+        let rows: Result<Vec<FindingRow>, _> = sqlx::query_as(
+            "SELECT id, scan_id, coalesce(template_id, ''), coalesce(data->>'severity', ''), \
+                 coalesce(data->>'name', ''), coalesce(data->>'matched_at', ''), \
+                 data ? 'proof', \
+                 to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \
+             FROM findings WHERE ($1::text IS NULL OR scan_id = $1) \
+             ORDER BY id DESC LIMIT $2",
+        )
+        .bind(scan)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await;
+        match rows {
+            Ok(rows) => serde_json::json!({
+                "status": "completed",
+                "findings": rows
+                    .into_iter()
+                    .map(|(id, scan, check, severity, name, at, proof, found)| {
+                        serde_json::json!({
+                            "id": id, "scan": scan, "check": check, "severity": severity,
+                            "name": name, "matched_at": at, "proof": proof, "found": found,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            }),
+            Err(e) => serde_json::json!({
+                "status": "error",
+                "message": format!("could not read the findings: {e}"),
+            }),
+        }
+    }
+
+    /// The finding kept as `id`, as it was kept.
+    pub async fn finding(&self, id: i64) -> Result<Option<Value>, sqlx::Error> {
+        sqlx::query_scalar("SELECT data FROM findings WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+    }
+
+    /// A replay of a proof, of finding `finding` when it was one kept here: what it came
+    /// to. Kept beside the finding, which it never changes. A failure is only said.
+    pub async fn verified(&self, finding: Option<i64>, proof_sha256: &str, verified: &Value) {
+        let kept = sqlx::query(
+            "INSERT INTO verifications (finding_id, proof_sha256, answer, evidence, status, \
+             response_sha256) VALUES ($1, $2, $3, $4::jsonb, $5, $6)",
+        )
+        .bind(finding)
+        .bind(proof_sha256)
+        .bind(verified["answer"].as_str().unwrap_or_default())
+        .bind(cfx_db::scans::safe_json(&verified["fired"]).to_string())
+        .bind(verified["http_status"].as_i64().map(|s| s as i32))
+        .bind(verified["response_sha256"].as_str().unwrap_or_default())
+        .execute(&self.pool)
+        .await;
+        if let Err(e) = kept {
+            eprintln!("[plessor] could not keep a verification: {e}");
+        }
+    }
+
     /// The [`Ledger`] of template scan `scan`.
     pub fn ledger(&self, scan: Option<String>) -> ScanLedger {
         ScanLedger {
@@ -164,6 +228,8 @@ impl PlessorDb {
         }
     }
 }
+
+type FindingRow = (i64, String, String, String, String, String, bool, String);
 
 /// One template scan's [`Ledger`], kept in plessor's tables.
 pub struct ScanLedger {

@@ -391,6 +391,78 @@ pub async fn eval_template(
     out
 }
 
+/// What a proof's requests came to when they were sent again.
+pub(crate) enum Again {
+    /// The last answer met the proof's matchers: each that fired, and on what.
+    Fired {
+        fired: Vec<crate::proof::Fired>,
+        status: u16,
+        body: String,
+    },
+    /// The target answered, and the matchers did not hold.
+    Quiet { status: u16, body: String },
+    /// A request had no answer.
+    Unreachable,
+}
+
+/// Send `requests` again in order, `raw` where a proof says it went raw, and judge the last
+/// answer by `matchers` under `condition`, as the scan that found it did.
+pub(crate) async fn send_again(
+    client: &Client,
+    raw: &crate::rawhttp::Route,
+    requests: &[crate::proof::Sent],
+    matchers: &[Matcher],
+    condition: &str,
+) -> Again {
+    let mut last = None;
+    for sent in requests {
+        let v = ReqVariant {
+            url: sent.url.clone(),
+            headers: sent.fields.clone(),
+            body: sent.body.clone(),
+        };
+        match send_variant(client, raw, &sent.method, sent.raw, &v).await {
+            Some(answer) => last = Some(answer),
+            None => return Again::Unreachable,
+        }
+    }
+    let Some(answer) = last else {
+        return Again::Unreachable;
+    };
+    match judge(matchers, condition, &answer) {
+        Some(fired) => Again::Fired {
+            fired,
+            status: answer.status,
+            body: answer.body,
+        },
+        None => Again::Quiet {
+            status: answer.status,
+            body: answer.body,
+        },
+    }
+}
+
+/// Send each of `requests` and keep no answer, as an out-of-band check's are judged by
+/// whether the target calls back. False when none was answered.
+pub(crate) async fn send_blind(
+    client: &Client,
+    raw: &crate::rawhttp::Route,
+    requests: &[crate::proof::Sent],
+) -> bool {
+    let mut answered = false;
+    for sent in requests {
+        let v = ReqVariant {
+            url: sent.url.clone(),
+            headers: sent.fields.clone(),
+            body: sent.body.clone(),
+        };
+        answered |= send_variant(client, raw, &sent.method, sent.raw, &v)
+            .await
+            .is_some();
+    }
+    answered
+}
+
 /// `v`, sent with `method`, as a proof records it.
 fn sent_as(method: &str, v: &ReqVariant, raw: bool) -> crate::proof::Sent {
     let mut fields = v.headers.clone();
