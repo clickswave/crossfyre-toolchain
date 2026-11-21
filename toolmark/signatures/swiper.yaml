@@ -2,6 +2,9 @@ id: swiper
 info:
   name: Swiper
   category: JavaScript Library
+  metadata:
+    vendor: swiperjs
+    product: swiper
 detect:
   any:
     - script_src: { regex: '/swiper(?:-bundle)?(?:\.min)?\.js' }

@@ -46,10 +46,10 @@ pub async fn run(
                 _ => format!("{}:{}", s.host, s.port),
             };
             let key = (s.host.clone(), s.port, s.product.clone());
-            Some((
+            (!s.cpes.is_empty()).then_some((
                 key,
                 Held {
-                    cpe: s.cpe?,
+                    cpes: s.cpes,
                     url,
                     host: s.host,
                     port: s.port,
@@ -71,7 +71,7 @@ pub async fn run(
                 kept.port,
                 &kept.scheme,
             ));
-            let (Some(version), Some(cpe)) = (d.version.clone(), d.cpe_name.clone()) else {
+            let Some(version) = d.version.clone().filter(|_| !d.cpe_names.is_empty()) else {
                 continue;
             };
             let key = (kept.host.clone(), kept.port, d.name.clone());
@@ -79,7 +79,7 @@ pub async fn run(
             held.insert(
                 key,
                 Held {
-                    cpe,
+                    cpes: d.cpe_names.clone(),
                     url,
                     host: kept.host.clone(),
                     port: kept.port,
@@ -96,7 +96,7 @@ pub async fn run(
         let subject = crate::fingerprint::Subject {
             product: &h.product,
             version: &h.version,
-            cpe: &h.cpe,
+            cpes: &h.cpes,
             distro: h.distro.as_deref(),
             url: &h.url,
             host: &h.host,
@@ -114,7 +114,7 @@ pub async fn run(
 
 /// A product toolmark holds at a version, where, and the CVE leads reported for it.
 struct Held {
-    cpe: cfx_cve::Cpe,
+    cpes: Vec<cfx_cve::Cpe>,
     url: String,
     host: String,
     port: u16,
@@ -316,7 +316,8 @@ mod tests {
             id,
             &at(json!({"type": "technology", "name": "Apache HTTP Server",
             "version": "2.4.49", "distro": "Ubuntu", "confidence": 50, "evidence": [],
-            "cpe": "cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*"})),
+            "cpe": "cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*",
+            "cpe_names": ["a:apache:http_server"]})),
         )
         .await;
         db.event(

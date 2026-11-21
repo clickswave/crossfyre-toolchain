@@ -2,6 +2,9 @@ id: openssh-windows
 info:
   name: OpenSSH for Windows
   category: SSH Server
+  metadata:
+    vendor: openbsd
+    product: openssh
 detect:
   any:
     - banner: { name: ssh, regex: 'OpenSSH_for_Windows_' }

@@ -2,4 +2,7 @@ id: confluence-server
 info:
   name: Atlassian Confluence Server
   category: Wiki
+  metadata:
+    vendor: atlassian
+    product: confluence_server
 refines: confluence

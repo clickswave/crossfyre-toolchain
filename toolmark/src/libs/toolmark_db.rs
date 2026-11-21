@@ -130,6 +130,7 @@ impl ToolmarkDb {
         let version = data["version"].as_str().unwrap_or_default();
         let cpe = data["cpe"].as_str().unwrap_or_default();
         let distro = data["distro"].as_str().unwrap_or_default();
+        let cpe_names = data["cpe_names"].to_string();
         // cpe:2.3:a:<vendor>:<product>:...
         let vendor = cpe.split(':').nth(3).unwrap_or_default();
         let mut tx = self.pool.begin().await?;
@@ -150,16 +151,22 @@ impl ToolmarkDb {
         .await?;
         sqlx::query(
             "INSERT INTO fingerprints \
-             (host_id, product, vendor, version, cpe, distro, confidence, evidence, signature_id) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $2) \
+             (host_id, product, vendor, version, cpe, cpe_names, distro, confidence, evidence, \
+             signature_id) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9::jsonb, $2) \
              ON CONFLICT (host_id, product) DO UPDATE SET vendor = $3, version = $4, cpe = $5, \
-             distro = $6, confidence = $7, evidence = $8::jsonb, last_seen = now()",
+             cpe_names = $6::jsonb, distro = $7, confidence = $8, evidence = $9::jsonb, \
+             last_seen = now()",
         )
         .bind(host)
         .bind(product)
         .bind(vendor)
         .bind(version)
         .bind(cpe)
+        .bind(if data["cpe_names"].is_array() {
+            cpe_names
+        } else {
+            "[]".to_string()
+        })
         .bind(distro)
         .bind(data["confidence"].as_i64().unwrap_or_default() as i32)
         .bind(data["evidence"].to_string())
@@ -210,12 +217,12 @@ impl ToolmarkDb {
     /// CVE leads and the leads already reported for it.
     pub async fn stored(&self) -> Result<Vec<Stored>, sqlx::Error> {
         let rows: Vec<StoredRow> = sqlx::query_as(
-            "SELECT h.host, h.port, h.scheme, f.product, f.version, f.cpe, f.distro, \
+            "SELECT h.host, h.port, h.scheme, f.product, f.version, f.cpe_names::text, f.distro, \
                  COALESCE(array_agg(l.cve) FILTER (WHERE l.cve IS NOT NULL), '{}') \
              FROM fingerprints f JOIN hosts h ON h.id = f.host_id \
              LEFT JOIN leads l ON l.host_id = f.host_id AND l.product = f.product \
              WHERE f.version <> '' \
-             GROUP BY h.host, h.port, h.scheme, f.product, f.version, f.cpe, f.distro \
+             GROUP BY h.host, h.port, h.scheme, f.product, f.version, f.cpe_names::text, f.distro \
              ORDER BY h.host, h.port, f.product",
         )
         .fetch_all(&self.pool)
@@ -223,13 +230,17 @@ impl ToolmarkDb {
         Ok(rows
             .into_iter()
             .map(
-                |(host, port, scheme, product, version, cpe, distro, reported)| Stored {
+                |(host, port, scheme, product, version, names, distro, reported)| Stored {
                     host,
                     port: u16::try_from(port).unwrap_or_default(),
                     scheme,
                     product,
                     version,
-                    cpe: cfx_cve::Cpe::from_cpe23(&cpe),
+                    cpes: serde_json::from_str::<Vec<String>>(&names)
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(|n| cfx_cve::Cpe::parse(n))
+                        .collect(),
                     distro: (!distro.is_empty()).then_some(distro),
                     reported: reported.into_iter().collect(),
                 },
@@ -378,8 +389,8 @@ pub struct Stored {
     pub scheme: String,
     pub product: String,
     pub version: String,
-    /// The product as its CPE names it, when the signature named one.
-    pub cpe: Option<cfx_cve::Cpe>,
+    /// The products it may be, by their CPEs.
+    pub cpes: Vec<cfx_cve::Cpe>,
     pub distro: Option<String>,
     /// The CVEs already reported for it there.
     pub reported: std::collections::HashSet<String>,

@@ -2,6 +2,9 @@ id: zimbra
 info:
   name: Zimbra Collaboration
   category: Mail Server
+  metadata:
+    vendor: zimbra
+    product: collaboration
 detect:
   any:
     - html: { regex: '(?i)<title>\s*Zimbra Web Client Sign In\s*</title>' }

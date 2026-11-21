@@ -5,6 +5,9 @@
       "category": "CMS",
       "confidence": 25,
       "cpe": "cpe:2.3:a:adobe:experience_manager:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:adobe:experience_manager"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -18,6 +21,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Adobe Experience Manager"
@@ -32,7 +36,10 @@
       "candidates": [],
       "category": "JavaScript Framework",
       "confidence": 50,
-      "cpe": "",
+      "cpe": "cpe:2.3:a:angular:angular:17.3.0:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:angular:angular"
+      ],
       "distro": null,
       "evidence": [
         "rendered page pattern"
@@ -47,7 +54,10 @@
       "candidates": [],
       "category": "JavaScript Framework",
       "confidence": 25,
-      "cpe": "",
+      "cpe": "cpe:2.3:a:angular:angular:17.0.8:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:angular:angular"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -63,6 +73,9 @@
       "category": "Message Broker",
       "confidence": 50,
       "cpe": "cpe:2.3:a:apache:activemq:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:apache:activemq"
+      ],
       "distro": null,
       "evidence": [
         "header www-authenticate: basic realm=\"ActiveMQRealm\""
@@ -76,6 +89,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Apache ActiveMQ"
@@ -91,6 +105,9 @@
       "category": "Message Broker",
       "confidence": 25,
       "cpe": "cpe:2.3:a:apache:activemq:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:apache:activemq"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -104,6 +121,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Apache ActiveMQ"
@@ -119,6 +137,9 @@
       "category": "Web Server",
       "confidence": 40,
       "cpe": "cpe:2.3:a:apache:http_server:2.4.58:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:apache:http_server"
+      ],
       "distro": null,
       "evidence": [
         "not-found page: 404"
@@ -134,6 +155,9 @@
       "category": "ERP",
       "confidence": 45,
       "cpe": "cpe:2.3:a:apache:ofbiz:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:apache:ofbiz"
+      ],
       "distro": null,
       "evidence": [
         "cookie OFBiz.Visitor"
@@ -147,6 +171,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Apache OFBiz"
@@ -162,6 +187,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:apache:http_server:2.4.41:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:apache:http_server"
+      ],
       "distro": null,
       "evidence": [
         "header server: Apache/2.4.41 (Unix) PHP/7.4.3"
@@ -175,6 +203,9 @@
       "category": "Language",
       "confidence": 45,
       "cpe": "cpe:2.3:a:php:php:7.4.3:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:php:php"
+      ],
       "distro": null,
       "evidence": [
         "cookie PHPSESSID"
@@ -190,6 +221,9 @@
       "category": "Search Engine",
       "confidence": 25,
       "cpe": "cpe:2.3:a:apache:solr:8.11.2:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:apache:solr"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -203,6 +237,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Apache Solr"
@@ -218,6 +253,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:apache:http_server:2.4.58:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:apache:http_server"
+      ],
       "distro": null,
       "evidence": [
         "header server: Apache"
@@ -233,6 +271,7 @@
       "category": "CMS",
       "confidence": 95,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "header x-powered-cms: Bitrix Site Manager (0000000000000000000000000000000)",
@@ -247,6 +286,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by 1C-Bitrix Site Manager"
@@ -262,6 +302,7 @@
       "category": "Blog",
       "confidence": 60,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "meta generator: blogger"
@@ -276,7 +317,10 @@
       "candidates": [],
       "category": "UI Framework",
       "confidence": 25,
-      "cpe": "",
+      "cpe": "cpe:2.3:a:getbootstrap:bootstrap:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:getbootstrap:bootstrap"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -292,6 +336,9 @@
       "category": "Monitoring",
       "confidence": 25,
       "cpe": "cpe:2.3:a:cacti:cacti:1.2.22:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:cacti:cacti"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -305,6 +352,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Cacti"
@@ -320,6 +368,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:caddyserver:caddy:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:caddyserver:caddy"
+      ],
       "distro": null,
       "evidence": [
         "header server: Caddy"
@@ -338,6 +389,10 @@
       "category": "VPN",
       "confidence": 70,
       "cpe": "",
+      "cpe_names": [
+        "o:cisco:adaptive_security_appliance_software",
+        "o:cisco:firepower_threat_defense"
+      ],
       "distro": null,
       "evidence": [
         "body pattern",
@@ -353,7 +408,11 @@
       "candidates": [],
       "category": "Load Balancer",
       "confidence": 70,
-      "cpe": "",
+      "cpe": "cpe:2.3:a:citrix:netscaler_application_delivery_controller:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:citrix:netscaler_application_delivery_controller",
+        "a:citrix:netscaler_gateway"
+      ],
       "distro": null,
       "evidence": [
         "cookie NSC_TMAS",
@@ -370,6 +429,7 @@
       "category": "CDN",
       "confidence": 100,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "header server: cloudflare",
@@ -389,6 +449,10 @@
       "category": "Wiki",
       "confidence": 75,
       "cpe": "",
+      "cpe_names": [
+        "a:atlassian:confluence_server",
+        "a:atlassian:confluence_data_center"
+      ],
       "distro": null,
       "evidence": [
         "header x-confluence-request-time: 1763618400000",
@@ -403,6 +467,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Atlassian Confluence"
@@ -418,6 +483,9 @@
       "category": "Service Discovery",
       "confidence": 50,
       "cpe": "cpe:2.3:a:hashicorp:consul:1.16.2:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:hashicorp:consul"
+      ],
       "distro": null,
       "evidence": [
         "path /v1/agent/self: 200"
@@ -433,6 +501,9 @@
       "category": "CMS",
       "confidence": 95,
       "cpe": "cpe:2.3:a:craftcms:craft_cms:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:craftcms:craft_cms"
+      ],
       "distro": null,
       "evidence": [
         "header x-powered-by: Craft CMS",
@@ -447,6 +518,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Craft CMS"
@@ -462,6 +534,9 @@
       "category": "File Transfer",
       "confidence": 50,
       "cpe": "cpe:2.3:a:crushftp:crushftp:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:crushftp:crushftp"
+      ],
       "distro": null,
       "evidence": [
         "header server: CrushFTP HTTP Server"
@@ -477,6 +552,7 @@
       "category": "Framework",
       "confidence": 50,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "path /admin/login/: 200"
@@ -490,6 +566,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Django"
@@ -505,6 +582,9 @@
       "category": "SSH Server",
       "confidence": 60,
       "cpe": "cpe:2.3:a:dropbear_ssh_project:dropbear_ssh:2022.83:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:dropbear_ssh_project:dropbear_ssh"
+      ],
       "distro": null,
       "evidence": [
         "ssh banner: 2.0-dropbear_2022.83"
@@ -520,6 +600,9 @@
       "category": "CMS",
       "confidence": 50,
       "cpe": "cpe:2.3:a:drupal:drupal:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:drupal:drupal"
+      ],
       "distro": null,
       "evidence": [
         "path /core/misc/drupal.js: 200"
@@ -533,6 +616,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Drupal"
@@ -548,6 +632,9 @@
       "category": "CMS",
       "confidence": 100,
       "cpe": "cpe:2.3:a:drupal:drupal:10:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:drupal:drupal"
+      ],
       "distro": null,
       "evidence": [
         "meta generator: Drupal 10 (https://www.drupal.org)",
@@ -563,6 +650,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Drupal"
@@ -578,6 +666,9 @@
       "category": "Search Engine",
       "confidence": 50,
       "cpe": "cpe:2.3:a:elastic:elasticsearch:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:elastic:elasticsearch"
+      ],
       "distro": null,
       "evidence": [
         "header x-elastic-product: Elasticsearch"
@@ -591,6 +682,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Elasticsearch"
@@ -606,6 +698,9 @@
       "category": "Search Engine",
       "confidence": 25,
       "cpe": "cpe:2.3:a:elastic:elasticsearch:7.10.2:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:elastic:elasticsearch"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -619,6 +714,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Elasticsearch"
@@ -634,6 +730,9 @@
       "category": "Reverse Proxy",
       "confidence": 50,
       "cpe": "cpe:2.3:a:envoyproxy:envoy:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:envoyproxy:envoy"
+      ],
       "distro": null,
       "evidence": [
         "header server: envoy"
@@ -648,7 +747,10 @@
       "candidates": [],
       "category": "SSH Server",
       "confidence": 60,
-      "cpe": "",
+      "cpe": "cpe:2.3:a:erlang:erlang\\/otp:5.2.9:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:erlang:erlang/otp"
+      ],
       "distro": null,
       "evidence": [
         "ssh banner: 2.0-Erlang/5.2.9"
@@ -664,6 +766,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:microsoft:internet_information_services:10.0:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:microsoft:internet_information_services"
+      ],
       "distro": null,
       "evidence": [
         "header server: Microsoft-IIS/10.0"
@@ -677,6 +782,9 @@
       "category": "Framework",
       "confidence": 50,
       "cpe": "cpe:2.3:a:microsoft:asp.net:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:microsoft:asp.net"
+      ],
       "distro": null,
       "evidence": [
         "header x-powered-by: ASP.NET"
@@ -689,7 +797,10 @@
       "candidates": [],
       "category": "Mail Server",
       "confidence": 75,
-      "cpe": "",
+      "cpe": "cpe:2.3:a:microsoft:exchange_server:15.2.1258.12:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:microsoft:exchange_server"
+      ],
       "distro": null,
       "evidence": [
         "header x-owa-version: 15.2.1258.12",
@@ -706,6 +817,9 @@
       "category": "Mail Server",
       "confidence": 60,
       "cpe": "cpe:2.3:a:exim:exim:4.96:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:exim:exim"
+      ],
       "distro": null,
       "evidence": [
         "smtp banner: mail.example.test ESMTP Exim 4.96 Fri, 20 Nov 2026 06:00:00 +0000"
@@ -721,6 +835,9 @@
       "category": "Framework",
       "confidence": 50,
       "cpe": "cpe:2.3:a:openjsf:express:*:*:*:*:*:node.js:*:*",
+      "cpe_names": [
+        "a:openjsf:express"
+      ],
       "distro": null,
       "evidence": [
         "header x-powered-by: Express"
@@ -734,6 +851,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Express"
@@ -749,6 +867,9 @@
       "category": "Framework",
       "confidence": 40,
       "cpe": "cpe:2.3:a:openjsf:express:*:*:*:*:*:node.js:*:*",
+      "cpe_names": [
+        "a:openjsf:express"
+      ],
       "distro": null,
       "evidence": [
         "not-found page: 404"
@@ -762,6 +883,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Express"
@@ -776,7 +898,31 @@
       "candidates": [],
       "category": "Load Balancer",
       "confidence": 45,
-      "cpe": "",
+      "cpe": "cpe:2.3:a:f5:big-ip_local_traffic_manager:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:f5:big-ip_local_traffic_manager",
+        "a:f5:big-ip_access_policy_manager",
+        "a:f5:big-ip_advanced_firewall_manager",
+        "a:f5:big-ip_application_security_manager",
+        "a:f5:big-ip_advanced_web_application_firewall",
+        "a:f5:big-ip_global_traffic_manager",
+        "a:f5:big-ip_domain_name_system",
+        "a:f5:big-ip_link_controller",
+        "a:f5:big-ip_policy_enforcement_manager",
+        "a:f5:big-ip_analytics",
+        "a:f5:big-ip_application_acceleration_manager",
+        "a:f5:big-ip_fraud_protection_service",
+        "a:f5:big-ip_ddos_hybrid_defender",
+        "a:f5:big-ip_ssl_orchestrator",
+        "a:f5:big-ip_websafe",
+        "a:f5:big-ip_edge_gateway",
+        "a:f5:big-ip_webaccelerator",
+        "a:f5:big-ip_carrier-grade_nat",
+        "a:f5:big-ip_application_visibility_and_reporting",
+        "a:f5:big-ip_protocol_security_module",
+        "a:f5:big-ip_wan_optimization_manager",
+        "a:f5:big-ip_automation_toolchain"
+      ],
       "distro": null,
       "evidence": [
         "cookie BIGipServerpool_web"
@@ -791,7 +937,31 @@
       "candidates": [],
       "category": "Load Balancer",
       "confidence": 25,
-      "cpe": "",
+      "cpe": "cpe:2.3:a:f5:big-ip_local_traffic_manager:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:f5:big-ip_local_traffic_manager",
+        "a:f5:big-ip_access_policy_manager",
+        "a:f5:big-ip_advanced_firewall_manager",
+        "a:f5:big-ip_application_security_manager",
+        "a:f5:big-ip_advanced_web_application_firewall",
+        "a:f5:big-ip_global_traffic_manager",
+        "a:f5:big-ip_domain_name_system",
+        "a:f5:big-ip_link_controller",
+        "a:f5:big-ip_policy_enforcement_manager",
+        "a:f5:big-ip_analytics",
+        "a:f5:big-ip_application_acceleration_manager",
+        "a:f5:big-ip_fraud_protection_service",
+        "a:f5:big-ip_ddos_hybrid_defender",
+        "a:f5:big-ip_ssl_orchestrator",
+        "a:f5:big-ip_websafe",
+        "a:f5:big-ip_edge_gateway",
+        "a:f5:big-ip_webaccelerator",
+        "a:f5:big-ip_carrier-grade_nat",
+        "a:f5:big-ip_application_visibility_and_reporting",
+        "a:f5:big-ip_protocol_security_module",
+        "a:f5:big-ip_wan_optimization_manager",
+        "a:f5:big-ip_automation_toolchain"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -807,6 +977,9 @@
       "category": "FTP Server",
       "confidence": 60,
       "cpe": "cpe:2.3:a:filezilla-project:filezilla_server:1.7.0:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:filezilla-project:filezilla_server"
+      ],
       "distro": null,
       "evidence": [
         "ftp banner: FileZilla Server 1.7.0..220 Please visit https://filezilla-project.org"
@@ -822,6 +995,7 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "header server: gunicorn"
@@ -835,6 +1009,7 @@
       "category": "Framework",
       "confidence": 45,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "cookie session"
@@ -848,6 +1023,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Gunicorn"
@@ -863,6 +1039,7 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "header server: Werkzeug/3.0.1 Python/3.12.1"
@@ -876,6 +1053,7 @@
       "category": "Framework",
       "confidence": 95,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "cookie session",
@@ -890,6 +1068,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Werkzeug"
@@ -908,6 +1087,10 @@
       "category": "Firewall",
       "confidence": 25,
       "cpe": "",
+      "cpe_names": [
+        "o:fortinet:fortios",
+        "a:fortinet:fortiproxy"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -926,6 +1109,10 @@
       "category": "Firewall",
       "confidence": 50,
       "cpe": "",
+      "cpe_names": [
+        "o:fortinet:fortios",
+        "a:fortinet:fortiproxy"
+      ],
       "distro": null,
       "evidence": [
         "header server: xxxxxxxx-xxxxx"
@@ -941,6 +1128,9 @@
       "category": "CMS",
       "confidence": 60,
       "cpe": "cpe:2.3:a:wordpress:wordpress:6.5:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:wordpress:wordpress"
+      ],
       "distro": null,
       "evidence": [
         "meta generator: WordPress 6.5"
@@ -954,6 +1144,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by WordPress"
@@ -967,6 +1158,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by WordPress"
@@ -982,6 +1174,9 @@
       "category": "CMS",
       "confidence": 60,
       "cpe": "cpe:2.3:a:drupal:drupal:9:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:drupal:drupal"
+      ],
       "distro": null,
       "evidence": [
         "meta generator: Drupal 9 (https://www.drupal.org)"
@@ -995,6 +1190,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Drupal"
@@ -1010,6 +1206,9 @@
       "category": "Framework",
       "confidence": 50,
       "cpe": "cpe:2.3:a:openjsf:express:*:*:*:*:*:node.js:*:*",
+      "cpe_names": [
+        "a:openjsf:express"
+      ],
       "distro": null,
       "evidence": [
         "header x-powered-by: Express"
@@ -1023,6 +1222,7 @@
       "category": "CMS",
       "confidence": 85,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "meta generator: Ghost 5.75",
@@ -1037,6 +1237,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Express"
@@ -1052,6 +1253,7 @@
       "category": "Framework",
       "confidence": 45,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "cookie _gitlab_session"
@@ -1065,6 +1267,9 @@
       "category": "DevOps",
       "confidence": 70,
       "cpe": "cpe:2.3:a:gitlab:gitlab:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:gitlab:gitlab"
+      ],
       "distro": null,
       "evidence": [
         "cookie _gitlab_session",
@@ -1079,6 +1284,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Ruby on Rails"
@@ -1094,6 +1300,7 @@
       "category": "VPN",
       "confidence": 25,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -1109,6 +1316,9 @@
       "category": "File Transfer",
       "confidence": 25,
       "cpe": "cpe:2.3:a:fortra:goanywhere_managed_file_transfer:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:fortra:goanywhere_managed_file_transfer"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -1122,6 +1332,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Fortra GoAnywhere MFT"
@@ -1137,6 +1348,9 @@
       "category": "Monitoring",
       "confidence": 25,
       "cpe": "cpe:2.3:a:grafana:grafana:10.2.3:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:grafana:grafana"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -1152,6 +1366,7 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "header server: gunicorn/20.1.0"
@@ -1165,6 +1380,7 @@
       "category": "Framework",
       "confidence": 90,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "cookie csrftoken",
@@ -1179,6 +1395,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Gunicorn"
@@ -1194,6 +1411,9 @@
       "category": "DevOps",
       "confidence": 50,
       "cpe": "cpe:2.3:a:linuxfoundation:harbor:2.9.1:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:linuxfoundation:harbor"
+      ],
       "distro": null,
       "evidence": [
         "path /api/v2.0/systeminfo: 200"
@@ -1209,6 +1429,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:microsoft:internet_information_services:10.0:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:microsoft:internet_information_services"
+      ],
       "distro": null,
       "evidence": [
         "header server: Microsoft-IIS/10.0"
@@ -1222,6 +1445,9 @@
       "category": "Framework",
       "confidence": 100,
       "cpe": "cpe:2.3:a:microsoft:asp.net:4.0.30319:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:microsoft:asp.net"
+      ],
       "distro": null,
       "evidence": [
         "header x-powered-by: ASP.NET",
@@ -1239,6 +1465,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:microsoft:internet_information_services:10.0:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:microsoft:internet_information_services"
+      ],
       "distro": null,
       "evidence": [
         "header server: Microsoft-IIS/10.0"
@@ -1252,6 +1481,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Microsoft IIS"
@@ -1267,6 +1497,9 @@
       "category": "Reverse Proxy",
       "confidence": 60,
       "cpe": "cpe:2.3:a:kubernetes:ingress-nginx:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:kubernetes:ingress-nginx"
+      ],
       "distro": null,
       "evidence": [
         "certificate subject: CN=Kubernetes Ingress Controller Fake Certificate,O=Acme Co"
@@ -1285,6 +1518,10 @@
       "category": "VPN",
       "confidence": 70,
       "cpe": "",
+      "cpe_names": [
+        "a:ivanti:connect_secure",
+        "a:ivanti:policy_secure"
+      ],
       "distro": null,
       "evidence": [
         "body pattern",
@@ -1301,6 +1538,7 @@
       "category": "Application Server",
       "confidence": 50,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "header x-powered-by: Servlet 2.5; JBoss-5.0/JBossWeb-2.1"
@@ -1314,6 +1552,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by JBoss"
@@ -1329,6 +1568,9 @@
       "category": "DevOps",
       "confidence": 100,
       "cpe": "cpe:2.3:a:jenkins:jenkins:2.426.1:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:jenkins:jenkins"
+      ],
       "distro": null,
       "evidence": [
         "header x-jenkins: 2.426.1",
@@ -1343,6 +1585,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Jenkins"
@@ -1358,6 +1601,7 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "header server: Jetty(9.4.53.v20231009)"
@@ -1371,6 +1615,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Jetty"
@@ -1386,6 +1631,9 @@
       "category": "Issue Tracker",
       "confidence": 60,
       "cpe": "cpe:2.3:a:atlassian:jira:9.4.14:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:atlassian:jira"
+      ],
       "distro": null,
       "evidence": [
         "meta application-name: JIRA"
@@ -1399,6 +1647,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Atlassian Jira"
@@ -1414,6 +1663,9 @@
       "category": "CMS",
       "confidence": 85,
       "cpe": "cpe:2.3:a:joomla:joomla\\!:1.5:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:joomla:joomla!"
+      ],
       "distro": null,
       "evidence": [
         "meta generator: Joomla! 1.5 - Open Source Content Management",
@@ -1428,6 +1680,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Joomla"
@@ -1443,6 +1696,9 @@
       "category": "CMS",
       "confidence": 50,
       "cpe": "cpe:2.3:a:joomla:joomla\\!:4.4.0:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:joomla:joomla!"
+      ],
       "distro": null,
       "evidence": [
         "path /administrator/manifests/files/joomla.xml: 200"
@@ -1456,6 +1712,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Joomla"
@@ -1471,6 +1728,9 @@
       "category": "CMS",
       "confidence": 85,
       "cpe": "cpe:2.3:a:joomla:joomla\\!:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:joomla:joomla!"
+      ],
       "distro": null,
       "evidence": [
         "meta generator: Joomla! - Open Source Content Management",
@@ -1485,6 +1745,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Joomla"
@@ -1500,6 +1761,9 @@
       "category": "JavaScript Library",
       "confidence": 25,
       "cpe": "cpe:2.3:a:jquery:jquery:3.7.1:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:jquery:jquery"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -1515,6 +1779,9 @@
       "category": "JavaScript Library",
       "confidence": 40,
       "cpe": "cpe:2.3:a:jquery:jquery:3.4.1:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:jquery:jquery"
+      ],
       "distro": null,
       "evidence": [
         "script src https://cdnjs.cloudflare.com/ajax/libs/jquery/3.4.1/jquery.min.js"
@@ -1530,6 +1797,9 @@
       "category": "JavaScript Library",
       "confidence": 65,
       "cpe": "cpe:2.3:a:jquery:jquery:3.6.0:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:jquery:jquery"
+      ],
       "distro": null,
       "evidence": [
         "body pattern",
@@ -1546,6 +1816,9 @@
       "category": "JavaScript Library",
       "confidence": 40,
       "cpe": "cpe:2.3:a:jquery:jquery:3.5.1:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:jquery:jquery"
+      ],
       "distro": null,
       "evidence": [
         "script src /static/js/jquery.min.js"
@@ -1561,6 +1834,9 @@
       "category": "CMS",
       "confidence": 25,
       "cpe": "cpe:2.3:a:wordpress:wordpress:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:wordpress:wordpress"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -1574,6 +1850,9 @@
       "category": "JavaScript Library",
       "confidence": 40,
       "cpe": "cpe:2.3:a:jquery:jquery:3.7.1:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:jquery:jquery"
+      ],
       "distro": null,
       "evidence": [
         "script src /wp-includes/js/jquery/jquery.min.js?ver=3.7.1"
@@ -1587,6 +1866,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by WordPress"
@@ -1600,6 +1880,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by WordPress"
@@ -1615,6 +1896,9 @@
       "category": "JavaScript Library",
       "confidence": 40,
       "cpe": "cpe:2.3:a:underscorejs:underscore:1.13.6:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:underscorejs:underscore"
+      ],
       "distro": null,
       "evidence": [
         "script src https://cdnjs.cloudflare.com/ajax/libs/underscore.js/1.13.6/underscore-min.js"
@@ -1628,6 +1912,9 @@
       "category": "JavaScript Library",
       "confidence": 40,
       "cpe": "cpe:2.3:a:handlebarsjs:handlebars:4.7.8:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:handlebarsjs:handlebars"
+      ],
       "distro": null,
       "evidence": [
         "script src https://cdn.jsdelivr.net/npm/handlebars@4.7.8/dist/handlebars.min.js"
@@ -1640,7 +1927,10 @@
       "candidates": [],
       "category": "JavaScript Library",
       "confidence": 40,
-      "cpe": "",
+      "cpe": "cpe:2.3:a:backbone_project:backbone:1.5.0:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:backbone_project:backbone"
+      ],
       "distro": null,
       "evidence": [
         "script src https://cdnjs.cloudflare.com/ajax/libs/backbone.js/1.5.0/backbone-min.js"
@@ -1654,6 +1944,7 @@
       "category": "JavaScript Library",
       "confidence": 40,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "script src https://cdn.jsdelivr.net/npm/@popperjs/core@2.11.8/dist/umd/popper.min.js"
@@ -1667,6 +1958,7 @@
       "category": "JavaScript Library",
       "confidence": 40,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "script src https://cdnjs.cloudflare.com/ajax/libs/modernizr/2.8.3/modernizr.min.js"
@@ -1680,6 +1972,7 @@
       "category": "JavaScript Library",
       "confidence": 40,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "script src https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js"
@@ -1692,7 +1985,10 @@
       "candidates": [],
       "category": "JavaScript Library",
       "confidence": 40,
-      "cpe": "",
+      "cpe": "cpe:2.3:a:swiperjs:swiper:11.0.5:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:swiperjs:swiper"
+      ],
       "distro": null,
       "evidence": [
         "script src https://cdn.jsdelivr.net/npm/swiper@11.0.5/swiper-bundle.min.js"
@@ -1706,6 +2002,7 @@
       "category": "JavaScript Library",
       "confidence": 40,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "script src https://cdn.jsdelivr.net/npm/alpinejs@3.13.3/dist/cdn.min.js"
@@ -1719,6 +2016,9 @@
       "category": "JavaScript Library",
       "confidence": 40,
       "cpe": "cpe:2.3:a:chartjs:chart.js:4.4.0:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:chartjs:chart.js"
+      ],
       "distro": null,
       "evidence": [
         "script src https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"
@@ -1732,6 +2032,7 @@
       "category": "JavaScript Library",
       "confidence": 40,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "script src https://cdn.jsdelivr.net/npm/d3@7.8.5/dist/d3.min.js"
@@ -1747,6 +2048,7 @@
       "category": "Network Device",
       "confidence": 25,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -1762,6 +2064,7 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "header server: Kestrel"
@@ -1775,6 +2078,7 @@
       "category": "Framework",
       "confidence": 50,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "header server: Kestrel"
@@ -1790,6 +2094,9 @@
       "category": "Monitoring",
       "confidence": 100,
       "cpe": "cpe:2.3:a:elastic:kibana:8.11.1:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:elastic:kibana"
+      ],
       "distro": null,
       "evidence": [
         "header kbn-name: kibana",
@@ -1806,6 +2113,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:apache:http_server:2.4.7:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:apache:http_server"
+      ],
       "distro": null,
       "evidence": [
         "header server: Apache/2.4.7 (Ubuntu)"
@@ -1819,6 +2129,9 @@
       "category": "Language",
       "confidence": 50,
       "cpe": "cpe:2.3:a:php:php:5.5.9:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:php:php"
+      ],
       "distro": null,
       "evidence": [
         "header x-powered-by: PHP/5.5.9-1ubuntu4.14"
@@ -1835,6 +2148,9 @@
       "category": "JavaScript Library",
       "confidence": 40,
       "cpe": "cpe:2.3:a:jquery:jquery:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:jquery:jquery"
+      ],
       "distro": null,
       "evidence": [
         "script src /static/jquery/jquery.min.js"
@@ -1847,7 +2163,10 @@
       "candidates": [],
       "category": "UI Framework",
       "confidence": 25,
-      "cpe": "",
+      "cpe": "cpe:2.3:a:getbootstrap:bootstrap:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:getbootstrap:bootstrap"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -1863,6 +2182,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:apache:http_server:2.4.68:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:apache:http_server"
+      ],
       "distro": null,
       "evidence": [
         "header server: Apache/2.4.68 (Debian)"
@@ -1876,6 +2198,9 @@
       "category": "Language",
       "confidence": 50,
       "cpe": "cpe:2.3:a:php:php:8.5.9:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:php:php"
+      ],
       "distro": null,
       "evidence": [
         "header x-powered-by: PHP/8.5.9"
@@ -1891,6 +2216,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:f5:nginx:1.20.2:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:f5:nginx"
+      ],
       "distro": null,
       "evidence": [
         "header server: nginx/1.20.2"
@@ -1907,6 +2235,9 @@
       "category": "Framework",
       "confidence": 65,
       "cpe": "cpe:2.3:a:vmware:spring_boot:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:vmware:spring_boot"
+      ],
       "distro": null,
       "evidence": [
         "body pattern",
@@ -1921,6 +2252,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Spring Boot"
@@ -1937,6 +2269,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:f5:nginx:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:f5:nginx"
+      ],
       "distro": null,
       "evidence": [
         "header server: nginx"
@@ -1952,6 +2287,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:f5:nginx:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:f5:nginx"
+      ],
       "distro": null,
       "evidence": [
         "header server: nginx"
@@ -1967,6 +2305,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:f5:nginx:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:f5:nginx"
+      ],
       "distro": null,
       "evidence": [
         "header server: nginx"
@@ -1982,6 +2323,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:apache:http_server:2.4.67:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:apache:http_server"
+      ],
       "distro": null,
       "evidence": [
         "header server: Apache/2.4.67 (Debian)"
@@ -1995,6 +2339,9 @@
       "category": "Language",
       "confidence": 95,
       "cpe": "cpe:2.3:a:php:php:8.5.7:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:php:php"
+      ],
       "distro": null,
       "evidence": [
         "header x-powered-by: PHP/8.5.7",
@@ -2009,6 +2356,9 @@
       "category": "JavaScript Library",
       "confidence": 40,
       "cpe": "cpe:2.3:a:jquery:jquery:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:jquery:jquery"
+      ],
       "distro": null,
       "evidence": [
         "script src javascript/jQuery/jquery.js"
@@ -2024,6 +2374,7 @@
       "category": "Framework",
       "confidence": 45,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "cookie csrftoken"
@@ -2036,7 +2387,10 @@
       "candidates": [],
       "category": "UI Framework",
       "confidence": 25,
-      "cpe": "",
+      "cpe": "cpe:2.3:a:getbootstrap:bootstrap:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:getbootstrap:bootstrap"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -2050,6 +2404,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Django"
@@ -2065,6 +2420,7 @@
       "category": "Framework",
       "confidence": 95,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "cookie _railsgoat_session",
@@ -2079,6 +2435,9 @@
       "category": "JavaScript Library",
       "confidence": 40,
       "cpe": "cpe:2.3:a:jquery:jquery:3.6.0:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:jquery:jquery"
+      ],
       "distro": null,
       "evidence": [
         "script src https://cdn.jsdelivr.net/npm/jquery@3.6.0/dist/jquery.min.js"
@@ -2091,7 +2450,10 @@
       "candidates": [],
       "category": "UI Framework",
       "confidence": 25,
-      "cpe": "",
+      "cpe": "cpe:2.3:a:getbootstrap:bootstrap:5.3.0:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:getbootstrap:bootstrap"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -2105,6 +2467,9 @@
       "category": "JavaScript Library",
       "confidence": 40,
       "cpe": "cpe:2.3:a:momentjs:moment:2.29.4:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:momentjs:moment"
+      ],
       "distro": null,
       "evidence": [
         "script src https://cdn.jsdelivr.net/npm/moment@2.29.4/moment.min.js"
@@ -2118,6 +2483,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Ruby on Rails"
@@ -2133,6 +2499,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:f5:nginx:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:f5:nginx"
+      ],
       "distro": null,
       "evidence": [
         "header server: nginx"
@@ -2146,6 +2515,7 @@
       "category": "Framework",
       "confidence": 45,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "cookie csrftoken"
@@ -2159,6 +2529,9 @@
       "category": "JavaScript Library",
       "confidence": 40,
       "cpe": "cpe:2.3:a:jquery:jquery:3.5.1:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:jquery:jquery"
+      ],
       "distro": null,
       "evidence": [
         "script src /static/js/jquery-3.5.1.min.dc5e7f18c8d3.js"
@@ -2172,6 +2545,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Django"
@@ -2187,6 +2561,7 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "header server: Werkzeug/2.2.3 Python/3.11.15"
@@ -2200,6 +2575,7 @@
       "category": "Framework",
       "confidence": 50,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "header server: Werkzeug/2.2.3 Python/3.11.15"
@@ -2213,6 +2589,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Werkzeug"
@@ -2227,7 +2604,10 @@
       "candidates": [],
       "category": "UI Framework",
       "confidence": 25,
-      "cpe": "",
+      "cpe": "cpe:2.3:a:getbootstrap:bootstrap:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:getbootstrap:bootstrap"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -2243,6 +2623,9 @@
       "category": "Framework",
       "confidence": 50,
       "cpe": "cpe:2.3:a:openjsf:express:*:*:*:*:*:node.js:*:*",
+      "cpe_names": [
+        "a:openjsf:express"
+      ],
       "distro": null,
       "evidence": [
         "header x-powered-by: Express"
@@ -2256,6 +2639,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Express"
@@ -2272,6 +2656,7 @@
       "category": "Framework",
       "confidence": 45,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "cookie XSRF-TOKEN"
@@ -2285,6 +2670,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Laravel"
@@ -2300,6 +2686,7 @@
       "category": "Framework",
       "confidence": 90,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "cookie laravel_session",
@@ -2314,6 +2701,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Laravel"
@@ -2329,6 +2717,9 @@
       "category": "SSH Server",
       "confidence": 60,
       "cpe": "cpe:2.3:a:libssh:libssh:0.9.6:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:libssh:libssh"
+      ],
       "distro": null,
       "evidence": [
         "ssh banner: 2.0-libssh_0.9.6"
@@ -2344,6 +2735,7 @@
       "category": "CMS",
       "confidence": 50,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "header liferay-portal: Liferay Digital Experience Platform 7.4"
@@ -2357,6 +2749,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Liferay"
@@ -2372,6 +2765,9 @@
       "category": "CMS",
       "confidence": 50,
       "cpe": "cpe:2.3:a:liferay:liferay_portal:7.2.0:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:liferay:liferay_portal"
+      ],
       "distro": null,
       "evidence": [
         "header liferay-portal: Liferay Community Edition Portal 7.2.0 CE GA1 (Mueller / Build 7200 / June 4, 20…"
@@ -2385,6 +2781,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Liferay Portal"
@@ -2400,6 +2797,7 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "header server: LiteSpeed"
@@ -2413,6 +2811,9 @@
       "category": "Language",
       "confidence": 50,
       "cpe": "cpe:2.3:a:php:php:8.2.12:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:php:php"
+      ],
       "distro": null,
       "evidence": [
         "header x-powered-by: PHP/8.2.12"
@@ -2428,6 +2829,9 @@
       "category": "JavaScript Library",
       "confidence": 40,
       "cpe": "cpe:2.3:a:lodash:lodash:4.17.21:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:lodash:lodash"
+      ],
       "distro": null,
       "evidence": [
         "script src https://cdnjs.cloudflare.com/ajax/libs/lodash.js/4.17.21/lodash.min.js"
@@ -2443,6 +2847,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:apache:http_server:2.4.62:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:apache:http_server"
+      ],
       "distro": null,
       "evidence": [
         "header server: Apache/2.4.62 (Unix) OpenSSL/3.0.13 mod_perl/2.0.12 Perl/v5.38.2 mod_wsgi/5.0.0 …"
@@ -2458,6 +2865,7 @@
       "category": "CMS",
       "confidence": 50,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "body pattern",
@@ -2472,6 +2880,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Magento"
@@ -2487,6 +2896,7 @@
       "category": "CMS",
       "confidence": 70,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "cookie X-Magento-Vary",
@@ -2501,6 +2911,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Magento"
@@ -2516,6 +2927,9 @@
       "category": "Identity",
       "confidence": 25,
       "cpe": "cpe:2.3:a:zohocorp:manageengine_adselfservice_plus:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:zohocorp:manageengine_adselfservice_plus"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -2529,6 +2943,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by ManageEngine ADSelfService Plus"
@@ -2544,6 +2959,9 @@
       "category": "Issue Tracker",
       "confidence": 25,
       "cpe": "cpe:2.3:a:zohocorp:manageengine_servicedesk_plus:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:zohocorp:manageengine_servicedesk_plus"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -2557,6 +2975,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by ManageEngine ServiceDesk Plus"
@@ -2572,6 +2991,9 @@
       "category": "Database",
       "confidence": 60,
       "cpe": "cpe:2.3:a:mariadb:mariadb:10.6.12:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:mariadb:mariadb"
+      ],
       "distro": "0ubuntu0.22.04.1",
       "evidence": [
         "mysql banner: 5.5.5-10.6.12-MariaDB-0ubuntu0.22.04.1"
@@ -2587,6 +3009,9 @@
       "category": "Database",
       "confidence": 60,
       "cpe": "cpe:2.3:a:mariadb:mariadb:11.4.2:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:mariadb:mariadb"
+      ],
       "distro": null,
       "evidence": [
         "mysql banner: 11.4.2-MariaDB"
@@ -2602,6 +3027,9 @@
       "category": "Object Storage",
       "confidence": 50,
       "cpe": "cpe:2.3:a:minio:minio:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:minio:minio"
+      ],
       "distro": null,
       "evidence": [
         "header server: MinIO"
@@ -2620,6 +3048,10 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "",
+      "cpe_names": [
+        "a:webmin:webmin",
+        "a:webmin:usermin"
+      ],
       "distro": null,
       "evidence": [
         "header server: MiniServ/2.105"
@@ -2635,6 +3067,9 @@
       "category": "JavaScript Library",
       "confidence": 40,
       "cpe": "cpe:2.3:a:momentjs:moment:2.29.4:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:momentjs:moment"
+      ],
       "distro": null,
       "evidence": [
         "script src https://cdn.jsdelivr.net/npm/moment@2.29.4/moment.min.js"
@@ -2650,6 +3085,9 @@
       "category": "File Transfer",
       "confidence": 50,
       "cpe": "cpe:2.3:a:progress:moveit_transfer:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:progress:moveit_transfer"
+      ],
       "distro": null,
       "evidence": [
         "body pattern",
@@ -2665,7 +3103,10 @@
       "candidates": [],
       "category": "JavaScript Framework",
       "confidence": 25,
-      "cpe": "",
+      "cpe": "cpe:2.3:a:vercel:next.js:14.0.4:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:vercel:next.js"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -2679,6 +3120,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Next.js"
@@ -2692,6 +3134,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Next.js"
@@ -2706,7 +3149,10 @@
       "candidates": [],
       "category": "JavaScript Framework",
       "confidence": 75,
-      "cpe": "",
+      "cpe": "cpe:2.3:a:vercel:next.js:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:vercel:next.js"
+      ],
       "distro": null,
       "evidence": [
         "header x-powered-by: Next.js",
@@ -2721,6 +3167,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Next.js"
@@ -2734,6 +3181,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Next.js"
@@ -2749,6 +3197,9 @@
       "category": "Web Server",
       "confidence": 40,
       "cpe": "cpe:2.3:a:f5:nginx:1.24.0:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:f5:nginx"
+      ],
       "distro": null,
       "evidence": [
         "not-found page: 404"
@@ -2762,6 +3213,7 @@
       "category": "CDN",
       "confidence": 100,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "header server: cloudflare",
@@ -2778,6 +3230,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:f5:nginx:1.24.0:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:f5:nginx"
+      ],
       "distro": null,
       "evidence": [
         "header server: nginx"
@@ -2793,6 +3248,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:nazgul:nostromo_nhttpd:1.9.6:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:nazgul:nostromo_nhttpd"
+      ],
       "distro": null,
       "evidence": [
         "header server: nostromo 1.9.6"
@@ -2807,7 +3265,10 @@
       "candidates": [],
       "category": "JavaScript Framework",
       "confidence": 25,
-      "cpe": "",
+      "cpe": "cpe:2.3:a:nuxt:nuxt:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:nuxt:nuxt"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -2821,6 +3282,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Nuxt.js"
@@ -2834,6 +3296,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Nuxt.js"
@@ -2849,6 +3312,9 @@
       "category": "Messaging",
       "confidence": 25,
       "cpe": "cpe:2.3:a:igniterealtime:openfire:4.7.4:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:igniterealtime:openfire"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -2862,6 +3328,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Openfire"
@@ -2877,6 +3344,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:openresty:openresty:1.21.4.3:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:openresty:openresty"
+      ],
       "distro": null,
       "evidence": [
         "header server: openresty"
@@ -2890,6 +3360,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by OpenResty"
@@ -2905,6 +3376,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:openresty:openresty:1.21.4.3:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:openresty:openresty"
+      ],
       "distro": null,
       "evidence": [
         "header server: openresty/1.21.4.3"
@@ -2918,6 +3392,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by OpenResty"
@@ -2933,6 +3408,9 @@
       "category": "Mail Server",
       "confidence": 60,
       "cpe": "cpe:2.3:a:openbsd:opensmtpd:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:openbsd:opensmtpd"
+      ],
       "distro": null,
       "evidence": [
         "smtp banner: mail.example.test ESMTP OpenSMTPD"
@@ -2948,6 +3426,9 @@
       "category": "SSH Server",
       "confidence": 60,
       "cpe": "cpe:2.3:a:openbsd:openssh:9.2p1:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:openbsd:openssh"
+      ],
       "distro": "Debian-2+deb12u3",
       "evidence": [
         "ssh banner: 2.0-OpenSSH_9.2p1 Debian-2+deb12u3"
@@ -2963,6 +3444,9 @@
       "category": "SSH Server",
       "confidence": 60,
       "cpe": "cpe:2.3:a:openbsd:openssh:8.9p1:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:openbsd:openssh"
+      ],
       "distro": "Ubuntu-3ubuntu0.6",
       "evidence": [
         "ssh banner: 2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6"
@@ -2977,7 +3461,10 @@
       "candidates": [],
       "category": "SSH Server",
       "confidence": 60,
-      "cpe": "",
+      "cpe": "cpe:2.3:a:openbsd:openssh:8.1:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:openbsd:openssh"
+      ],
       "distro": null,
       "evidence": [
         "ssh banner: 2.0-OpenSSH_for_Windows_8.1"
@@ -2993,6 +3480,9 @@
       "category": "SSH Server",
       "confidence": 60,
       "cpe": "cpe:2.3:a:openbsd:openssh:9.6:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:openbsd:openssh"
+      ],
       "distro": null,
       "evidence": [
         "ssh banner: 2.0-OpenSSH_9.6"
@@ -3008,6 +3498,7 @@
       "category": "ERP",
       "confidence": 25,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -3021,6 +3512,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Oracle E-Business Suite"
@@ -3036,6 +3528,9 @@
       "category": "Database Admin",
       "confidence": 50,
       "cpe": "cpe:2.3:a:phpmyadmin:phpmyadmin:5.2.1:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:phpmyadmin:phpmyadmin"
+      ],
       "distro": null,
       "evidence": [
         "path /phpmyadmin/index.php: 200"
@@ -3049,6 +3544,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by phpMyAdmin"
@@ -3064,6 +3560,9 @@
       "category": "JavaScript Library",
       "confidence": 40,
       "cpe": "cpe:2.3:a:jquery:jquery:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:jquery:jquery"
+      ],
       "distro": null,
       "evidence": [
         "script src js/vendor/jquery/jquery.min.js?v=5.2.1"
@@ -3077,6 +3576,9 @@
       "category": "Database Admin",
       "confidence": 25,
       "cpe": "cpe:2.3:a:phpmyadmin:phpmyadmin:5.2.1:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:phpmyadmin:phpmyadmin"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -3090,6 +3592,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by phpMyAdmin"
@@ -3105,6 +3608,9 @@
       "category": "Mail Server",
       "confidence": 60,
       "cpe": "cpe:2.3:a:postfix:postfix:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:postfix:postfix"
+      ],
       "distro": "Ubuntu",
       "evidence": [
         "smtp banner: mail.example.test ESMTP Postfix (Ubuntu"
@@ -3120,6 +3626,9 @@
       "category": "Ecommerce",
       "confidence": 45,
       "cpe": "cpe:2.3:a:prestashop:prestashop:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:prestashop:prestashop"
+      ],
       "distro": null,
       "evidence": [
         "cookie PrestaShop-0123456789abcdef0123456789abcdef"
@@ -3133,6 +3642,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by PrestaShop"
@@ -3148,6 +3658,9 @@
       "category": "FTP Server",
       "confidence": 60,
       "cpe": "cpe:2.3:a:proftpd:proftpd:1.3.5e:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:proftpd:proftpd"
+      ],
       "distro": "Debian",
       "evidence": [
         "ftp banner: ProFTPD 1.3.5e Server (Debian) [::ffff:10.0.0.5"
@@ -3163,6 +3676,9 @@
       "category": "FTP Server",
       "confidence": 60,
       "cpe": "cpe:2.3:a:pureftpd:pure-ftpd:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:pureftpd:pure-ftpd"
+      ],
       "distro": null,
       "evidence": [
         "ftp banner: Welcome to Pure-FTPd [privsep] [TLS] ----------..220-You are user number 1 of 50…"
@@ -3178,6 +3694,7 @@
       "category": "Framework",
       "confidence": 100,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "cookie _session_id",
@@ -3193,6 +3710,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Ruby on Rails"
@@ -3207,7 +3725,10 @@
       "candidates": [],
       "category": "JavaScript Framework",
       "confidence": 25,
-      "cpe": "",
+      "cpe": "cpe:2.3:a:facebook:react:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:facebook:react"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -3223,6 +3744,9 @@
       "category": "File Transfer",
       "confidence": 50,
       "cpe": "cpe:2.3:a:rejetto:http_file_server:2.3m:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:rejetto:http_file_server"
+      ],
       "distro": null,
       "evidence": [
         "header server: HFS 2.3m"
@@ -3238,6 +3762,9 @@
       "category": "Webmail",
       "confidence": 70,
       "cpe": "cpe:2.3:a:roundcube:webmail:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:roundcube:webmail"
+      ],
       "distro": null,
       "evidence": [
         "cookie roundcube_sessid",
@@ -3252,6 +3779,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Roundcube Webmail"
@@ -3267,6 +3795,7 @@
       "category": "Application Server",
       "confidence": 50,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "header server: SAP NetWeaver Application Server 7.50 / AS Java 7.50"
@@ -3282,6 +3811,9 @@
       "category": "Remote Access",
       "confidence": 50,
       "cpe": "cpe:2.3:a:connectwise:screenconnect:23.9.7.8804:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:connectwise:screenconnect"
+      ],
       "distro": null,
       "evidence": [
         "header server: ScreenConnect/23.9.7.8804-2862393838 Microsoft-HTTPAPI/2.0"
@@ -3297,6 +3829,9 @@
       "category": "Mail Server",
       "confidence": 60,
       "cpe": "cpe:2.3:a:sendmail:sendmail:8.15.2:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:sendmail:sendmail"
+      ],
       "distro": null,
       "evidence": [
         "smtp banner: mail.example.test ESMTP Sendmail 8.15.2/8.15.2; Fri, 20 Nov 2026 06:00:00 GMT"
@@ -3312,6 +3847,7 @@
       "category": "Monitoring",
       "confidence": 50,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "body pattern",
@@ -3326,6 +3862,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Sentry"
@@ -3339,6 +3876,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Sentry"
@@ -3354,6 +3892,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:apache:traffic_server:9.2.3:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:apache:traffic_server"
+      ],
       "distro": null,
       "evidence": [
         "header server: ATS/9.2.3"
@@ -3369,6 +3910,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:boa:boa:0.94.14rc21:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:boa:boa"
+      ],
       "distro": null,
       "evidence": [
         "header server: Boa/0.94.14rc21"
@@ -3384,6 +3928,7 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "header server: Cowboy"
@@ -3399,6 +3944,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:embedthis:goahead:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:embedthis:goahead"
+      ],
       "distro": null,
       "evidence": [
         "header server: GoAhead-Webs"
@@ -3414,6 +3962,7 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "header server: Microsoft-HTTPAPI/2.0"
@@ -3429,6 +3978,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:ibm:http_server:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:ibm:http_server"
+      ],
       "distro": null,
       "evidence": [
         "header server: IBM_HTTP_Server"
@@ -3444,6 +3996,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:lighttpd:lighttpd:1.4.69:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:lighttpd:lighttpd"
+      ],
       "distro": null,
       "evidence": [
         "header server: lighttpd/1.4.69"
@@ -3459,6 +4014,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:acme:mini_httpd:1.30:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:acme:mini_httpd"
+      ],
       "distro": null,
       "evidence": [
         "header server: mini_httpd/1.30 26Oct2018"
@@ -3474,6 +4032,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:caucho:resin:4.0.66:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:caucho:resin"
+      ],
       "distro": null,
       "evidence": [
         "header server: Resin/4.0.66"
@@ -3489,6 +4050,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:squid-cache:squid:5.7:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:squid-cache:squid"
+      ],
       "distro": null,
       "evidence": [
         "header server: squid/5.7"
@@ -3504,6 +4068,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:acme:thttpd:2.29:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:acme:thttpd"
+      ],
       "distro": null,
       "evidence": [
         "header server: thttpd/2.29 23May2018"
@@ -3519,6 +4086,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:tornadoweb:tornado:6.3.3:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:tornadoweb:tornado"
+      ],
       "distro": null,
       "evidence": [
         "header server: TornadoServer/6.3.3"
@@ -3534,6 +4104,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:encode:uvicorn:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:encode:uvicorn"
+      ],
       "distro": null,
       "evidence": [
         "header server: uvicorn"
@@ -3549,6 +4122,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:ruby-lang:webrick:1.7.0:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:ruby-lang:webrick"
+      ],
       "distro": null,
       "evidence": [
         "header server: WEBrick/1.7.0 (Ruby/3.2.2/2023-03-30)"
@@ -3564,6 +4140,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:microsoft:internet_information_services:10.0:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:microsoft:internet_information_services"
+      ],
       "distro": null,
       "evidence": [
         "header server: Microsoft-IIS/10.0"
@@ -3577,6 +4156,9 @@
       "category": "Framework",
       "confidence": 50,
       "cpe": "cpe:2.3:a:microsoft:asp.net:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:microsoft:asp.net"
+      ],
       "distro": null,
       "evidence": [
         "header x-powered-by: ASP.NET"
@@ -3589,7 +4171,10 @@
       "candidates": [],
       "category": "CMS",
       "confidence": 100,
-      "cpe": "",
+      "cpe": "cpe:2.3:a:microsoft:sharepoint_server:16.0.0.10337:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:microsoft:sharepoint_server"
+      ],
       "distro": null,
       "evidence": [
         "header microsoftsharepointteamservices: 16.0.0.10337",
@@ -3606,6 +4191,7 @@
       "category": "Ecommerce",
       "confidence": 100,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "header x-shopify-stage: production",
@@ -3623,6 +4209,9 @@
       "category": "DevOps",
       "confidence": 25,
       "cpe": "cpe:2.3:a:sonarsource:sonarqube:10.3.0.82913:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:sonarsource:sonarqube"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -3638,6 +4227,9 @@
       "category": "Framework",
       "confidence": 40,
       "cpe": "cpe:2.3:a:vmware:spring_boot:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:vmware:spring_boot"
+      ],
       "distro": null,
       "evidence": [
         "not-found page: 404"
@@ -3651,6 +4243,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Spring Boot"
@@ -3666,6 +4259,7 @@
       "category": "Framework",
       "confidence": 25,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -3679,6 +4273,7 @@
       "category": "Language",
       "confidence": 45,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "cookie JSESSIONID"
@@ -3695,6 +4290,7 @@
       "category": "CMS",
       "confidence": 75,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "header server: Squarespace",
@@ -3711,6 +4307,7 @@
       "category": "Framework",
       "confidence": 100,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "header x-debug-token: a1b2c3",
@@ -3725,6 +4322,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Symfony"
@@ -3740,6 +4338,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:microsoft:internet_information_services:10.0:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:microsoft:internet_information_services"
+      ],
       "distro": null,
       "evidence": [
         "header server: Microsoft-IIS/10.0"
@@ -3753,6 +4354,9 @@
       "category": "Framework",
       "confidence": 100,
       "cpe": "cpe:2.3:a:microsoft:asp.net:4.0.30319:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:microsoft:asp.net"
+      ],
       "distro": null,
       "evidence": [
         "header x-powered-by: ASP.NET",
@@ -3767,6 +4371,9 @@
       "category": "UI Framework",
       "confidence": 40,
       "cpe": "cpe:2.3:a:telerik:ui_for_asp.net_ajax:2019.3.1023:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:telerik:ui_for_asp.net_ajax"
+      ],
       "distro": null,
       "evidence": [
         "script src /Telerik.Web.UI.WebResource.axd?_TSM_HiddenField_=RadScriptManager1_TSM&amp;compress=1&amp;_TSM_CombinedScripts_=%3b%3bS…"
@@ -3782,6 +4389,7 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "header server: Tengine/2.3.3"
@@ -3797,6 +4405,7 @@
       "category": "CMS",
       "confidence": 25,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -3812,6 +4421,9 @@
       "category": "Web Server",
       "confidence": 40,
       "cpe": "cpe:2.3:a:apache:tomcat:9.0.83:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:apache:tomcat"
+      ],
       "distro": null,
       "evidence": [
         "not-found page: 404"
@@ -3825,6 +4437,7 @@
       "category": "Language",
       "confidence": 45,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "cookie JSESSIONID"
@@ -3840,6 +4453,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:apache:tomcat:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:apache:tomcat"
+      ],
       "distro": null,
       "evidence": [
         "header server: Apache-Coyote/1.1"
@@ -3853,6 +4469,7 @@
       "category": "Language",
       "confidence": 45,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "cookie JSESSIONID"
@@ -3868,6 +4485,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:apache:tomcat:9.0.83:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:apache:tomcat"
+      ],
       "distro": null,
       "evidence": [
         "path /docs/: 200"
@@ -3881,6 +4501,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Apache Tomcat"
@@ -3896,6 +4517,9 @@
       "category": "Web Server",
       "confidence": 25,
       "cpe": "cpe:2.3:a:apache:tomcat:9.0.83:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:apache:tomcat"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -3909,6 +4533,7 @@
       "category": "Language",
       "confidence": 45,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "cookie JSESSIONID"
@@ -3924,6 +4549,9 @@
       "category": "Reverse Proxy",
       "confidence": 60,
       "cpe": "cpe:2.3:a:traefik:traefik:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:traefik:traefik"
+      ],
       "distro": null,
       "evidence": [
         "certificate subject: CN=TRAEFIK DEFAULT CERT"
@@ -3939,6 +4567,9 @@
       "category": "CMS",
       "confidence": 60,
       "cpe": "cpe:2.3:a:typo3:typo3:4.5:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:typo3:typo3"
+      ],
       "distro": null,
       "evidence": [
         "meta generator: TYPO3 4.5 CMS"
@@ -3952,6 +4583,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by TYPO3"
@@ -3967,6 +4599,9 @@
       "category": "CMS",
       "confidence": 60,
       "cpe": "cpe:2.3:a:typo3:typo3:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:typo3:typo3"
+      ],
       "distro": null,
       "evidence": [
         "meta generator: TYPO3 CMS"
@@ -3980,6 +4615,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by TYPO3"
@@ -3995,6 +4631,9 @@
       "category": "Control Panel",
       "confidence": 100,
       "cpe": "cpe:2.3:a:webmin:usermin:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:webmin:usermin"
+      ],
       "distro": null,
       "evidence": [
         "header server: MiniServ/2.102",
@@ -4011,6 +4650,9 @@
       "category": "Control Panel",
       "confidence": 25,
       "cpe": "cpe:2.3:a:webmin:usermin:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:webmin:usermin"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -4026,6 +4668,7 @@
       "category": "Caching",
       "confidence": 100,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "header via: 1.1 varnish (Varnish/7.4)",
@@ -4042,6 +4685,9 @@
       "category": "Secrets",
       "confidence": 50,
       "cpe": "cpe:2.3:a:hashicorp:vault:1.15.2:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:hashicorp:vault"
+      ],
       "distro": null,
       "evidence": [
         "path /v1/sys/health: 200"
@@ -4058,6 +4704,7 @@
       "category": "Virtualization",
       "confidence": 25,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -4073,6 +4720,9 @@
       "category": "Virtualization",
       "confidence": 25,
       "cpe": "cpe:2.3:a:vmware:vcenter_server:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:vmware:vcenter_server"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -4088,6 +4738,9 @@
       "category": "FTP Server",
       "confidence": 60,
       "cpe": "cpe:2.3:a:vsftpd_project:vsftpd:3.0.3:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:vsftpd_project:vsftpd"
+      ],
       "distro": null,
       "evidence": [
         "ftp banner: vsFTPd 3.0.3"
@@ -4102,7 +4755,10 @@
       "candidates": [],
       "category": "JavaScript Framework",
       "confidence": 50,
-      "cpe": "",
+      "cpe": "cpe:2.3:a:vuejs:vue:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:vuejs:vue"
+      ],
       "distro": null,
       "evidence": [
         "rendered page pattern"
@@ -4117,7 +4773,10 @@
       "candidates": [],
       "category": "JavaScript Framework",
       "confidence": 25,
-      "cpe": "",
+      "cpe": "cpe:2.3:a:vuejs:vue:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:vuejs:vue"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -4133,6 +4792,7 @@
       "category": "CMS",
       "confidence": 50,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "body pattern",
@@ -4149,6 +4809,9 @@
       "category": "Application Server",
       "confidence": 40,
       "cpe": "cpe:2.3:a:oracle:weblogic_server:12.2.1.4.0:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:oracle:weblogic_server"
+      ],
       "distro": null,
       "evidence": [
         "not-found page: 404"
@@ -4162,6 +4825,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Oracle WebLogic Server"
@@ -4177,6 +4841,9 @@
       "category": "Control Panel",
       "confidence": 100,
       "cpe": "cpe:2.3:a:webmin:webmin:2.105:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:webmin:webmin"
+      ],
       "distro": null,
       "evidence": [
         "header server: MiniServ/2.105",
@@ -4193,6 +4860,9 @@
       "category": "Control Panel",
       "confidence": 25,
       "cpe": "cpe:2.3:a:webmin:webmin:1.890:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:webmin:webmin"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -4208,6 +4878,7 @@
       "category": "CMS",
       "confidence": 75,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "header x-wix-request-id: 1700000000.123456789",
@@ -4224,6 +4895,9 @@
       "category": "CMS",
       "confidence": 25,
       "cpe": "cpe:2.3:a:wordpress:wordpress:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:wordpress:wordpress"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -4240,6 +4914,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by WordPress"
@@ -4253,6 +4928,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by WordPress"
@@ -4268,6 +4944,9 @@
       "category": "CMS",
       "confidence": 50,
       "cpe": "cpe:2.3:a:wordpress:wordpress:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:wordpress:wordpress"
+      ],
       "distro": null,
       "evidence": [
         "path /wp-login.php: 200"
@@ -4281,6 +4960,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by WordPress"
@@ -4294,6 +4974,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by WordPress"
@@ -4309,6 +4990,9 @@
       "category": "CMS",
       "confidence": 45,
       "cpe": "cpe:2.3:a:wordpress:wordpress:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:wordpress:wordpress"
+      ],
       "distro": null,
       "evidence": [
         "cookie wordpress_test_cookie"
@@ -4322,6 +5006,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by WordPress"
@@ -4335,6 +5020,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by WordPress"
@@ -4350,6 +5036,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:apache:http_server:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:apache:http_server"
+      ],
       "distro": null,
       "evidence": [
         "header server: Apache"
@@ -4363,6 +5052,9 @@
       "category": "CMS",
       "confidence": 25,
       "cpe": "cpe:2.3:a:wordpress:wordpress:6.4.2:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:wordpress:wordpress"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -4376,6 +5068,9 @@
       "category": "WordPress Plugin",
       "confidence": 85,
       "cpe": "cpe:2.3:a:elementor:website_builder:3.18.3:*:*:*:*:wordpress:*:*",
+      "cpe_names": [
+        "a:elementor:website_builder"
+      ],
       "distro": null,
       "evidence": [
         "body pattern",
@@ -4390,6 +5085,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by WordPress"
@@ -4403,6 +5099,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by WordPress"
@@ -4418,6 +5115,9 @@
       "category": "CMS",
       "confidence": 25,
       "cpe": "cpe:2.3:a:wordpress:wordpress:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:wordpress:wordpress"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -4431,6 +5131,9 @@
       "category": "WordPress Plugin",
       "confidence": 25,
       "cpe": "cpe:2.3:a:woocommerce:woocommerce:8.2.1:*:*:*:*:wordpress:*:*",
+      "cpe_names": [
+        "a:woocommerce:woocommerce"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -4444,6 +5147,9 @@
       "category": "WordPress Plugin",
       "confidence": 25,
       "cpe": "cpe:2.3:a:elementor:website_builder:3.17.2:*:*:*:*:wordpress:*:*",
+      "cpe_names": [
+        "a:elementor:website_builder"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -4457,6 +5163,9 @@
       "category": "WordPress Plugin",
       "confidence": 25,
       "cpe": "cpe:2.3:a:rocklobster:contact_form_7:5.8.2:*:*:*:*:wordpress:*:*",
+      "cpe_names": [
+        "a:rocklobster:contact_form_7"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -4470,6 +5179,9 @@
       "category": "WordPress Plugin",
       "confidence": 25,
       "cpe": "cpe:2.3:a:automattic:jetpack:12.8:*:*:*:*:wordpress:*:*",
+      "cpe_names": [
+        "a:automattic:jetpack"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -4483,6 +5195,9 @@
       "category": "WordPress Plugin",
       "confidence": 25,
       "cpe": "cpe:2.3:a:yoast:yoast_seo:21.5:*:*:*:*:wordpress:*:*",
+      "cpe_names": [
+        "a:yoast:yoast_seo"
+      ],
       "distro": null,
       "evidence": [
         "body pattern"
@@ -4496,6 +5211,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by WordPress"
@@ -4509,6 +5225,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by WordPress"
@@ -4524,6 +5241,9 @@
       "category": "Web Server",
       "confidence": 50,
       "cpe": "cpe:2.3:a:f5:nginx:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:f5:nginx"
+      ],
       "distro": null,
       "evidence": [
         "header server: nginx"
@@ -4537,6 +5257,9 @@
       "category": "CMS",
       "confidence": 85,
       "cpe": "cpe:2.3:a:wordpress:wordpress:6.4.2:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:wordpress:wordpress"
+      ],
       "distro": null,
       "evidence": [
         "meta generator: WordPress 6.4.2",
@@ -4551,6 +5274,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by WordPress"
@@ -4564,6 +5288,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by WordPress"
@@ -4579,6 +5304,9 @@
       "category": "Monitoring",
       "confidence": 50,
       "cpe": "cpe:2.3:a:zabbix:zabbix:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:zabbix:zabbix"
+      ],
       "distro": null,
       "evidence": [
         "body pattern",
@@ -4593,6 +5321,7 @@
       "category": "Implied",
       "confidence": 30,
       "cpe": "",
+      "cpe_names": [],
       "distro": null,
       "evidence": [
         "implied by Zabbix"
@@ -4607,7 +5336,10 @@
       "candidates": [],
       "category": "Mail Server",
       "confidence": 70,
-      "cpe": "",
+      "cpe": "cpe:2.3:a:zimbra:collaboration:*:*:*:*:*:*:*:*",
+      "cpe_names": [
+        "a:zimbra:collaboration"
+      ],
       "distro": null,
       "evidence": [
         "body pattern",

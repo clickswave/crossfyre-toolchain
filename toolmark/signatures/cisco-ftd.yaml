@@ -2,4 +2,8 @@ id: cisco-ftd
 info:
   name: Cisco Firepower Threat Defense
   category: Firewall
+  metadata:
+    part: o
+    vendor: cisco
+    product: firepower_threat_defense
 refines: cisco-webvpn

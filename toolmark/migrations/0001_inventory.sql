@@ -33,8 +33,9 @@ CREATE TABLE observations (
 );
 CREATE INDEX observations_host_id ON observations (host_id, observed_at);
 
--- A product found on a host, the tag of the distribution that built it when one was read,
--- and the evidence and signature that found it.
+-- A product found on a host, the products it may be by their CPEs (part:vendor:product),
+-- the tag of the distribution that built it when one was read, and the evidence and
+-- signature that found it.
 CREATE TABLE fingerprints (
     id           BIGSERIAL PRIMARY KEY,
     host_id      BIGINT NOT NULL REFERENCES hosts (id) ON DELETE CASCADE,
@@ -42,6 +43,7 @@ CREATE TABLE fingerprints (
     vendor       TEXT NOT NULL DEFAULT '',
     version      TEXT NOT NULL DEFAULT '',
     cpe          TEXT NOT NULL DEFAULT '',
+    cpe_names    JSONB NOT NULL DEFAULT '[]',
     distro       TEXT NOT NULL DEFAULT '',
     confidence   INTEGER NOT NULL DEFAULT 0,
     evidence     JSONB NOT NULL DEFAULT '[]',

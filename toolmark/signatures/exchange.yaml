@@ -2,6 +2,9 @@ id: exchange
 info:
   name: Microsoft Exchange Server
   category: Mail Server
+  metadata:
+    vendor: microsoft
+    product: exchange_server
 implies: [iis, aspnet]
 detect:
   any:

@@ -2,6 +2,9 @@ id: citrix-netscaler
 info:
   name: Citrix NetScaler
   category: Load Balancer
+  metadata:
+    vendor: citrix
+    product: [netscaler_application_delivery_controller, netscaler_gateway]
 detect:
   any:
     - cookie: { name: '^NSC_' }

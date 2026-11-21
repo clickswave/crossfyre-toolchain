@@ -23,7 +23,9 @@ fn main() {
     let wanted = names.iter().cloned().collect();
     let dataset = Dataset::from_bytes_for(&bytes, &wanted).unwrap_or_else(|e| fail(&e.to_string()));
     println!("dataset {} made {}", dataset.sequence(), dataset.made());
-    for lead in dataset.leads(&names, version, rest.first().map(String::as_str)) {
+    // Each name asked about is a product of its own.
+    let products: Vec<Vec<Cpe>> = names.iter().map(|n| vec![n.clone()]).collect();
+    for lead in dataset.leads(&products, version, rest.first().map(String::as_str)) {
         let known = &lead.known;
         println!(
             "{} {} {} kev={} epss={} possible={} backport={}",

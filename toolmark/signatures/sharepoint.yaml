@@ -2,6 +2,9 @@ id: sharepoint
 info:
   name: Microsoft SharePoint
   category: CMS
+  metadata:
+    vendor: microsoft
+    product: sharepoint_server
 implies: [iis, aspnet]
 detect:
   any:

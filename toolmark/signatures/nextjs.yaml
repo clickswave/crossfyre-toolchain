@@ -2,6 +2,9 @@ id: nextjs
 info:
   name: Next.js
   category: JavaScript Framework
+  metadata:
+    vendor: vercel
+    product: next.js
 implies: [react, nodejs]
 detect:
   any:

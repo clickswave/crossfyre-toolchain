@@ -2,4 +2,7 @@ id: fortiproxy
 info:
   name: Fortinet FortiProxy
   category: Proxy
+  metadata:
+    vendor: fortinet
+    product: fortiproxy
 refines: fortinet

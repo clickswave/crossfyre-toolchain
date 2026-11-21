@@ -31,9 +31,20 @@ struct InfoSpec {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MetadataSpec {
+    /// The CPE part: `a` for an application, the default, or `o` for an operating
+    /// system.
+    part: Option<String>,
     vendor: String,
-    product: String,
+    /// The product, or the products the CPE dictionary splits it in.
+    product: Products,
     target_sw: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Products {
+    One(String),
+    Several(Vec<String>),
 }
 
 #[derive(Deserialize)]
@@ -169,10 +180,15 @@ fn parse(file: &str, text: &str) -> Result<Signature, String> {
         id: spec.id,
         name: spec.info.name,
         category: spec.info.category,
-        cpe: spec
-            .info
-            .metadata
-            .map(|m| (m.vendor, m.product, m.target_sw)),
+        cpe: spec.info.metadata.map(|m| super::CpeSpec {
+            part: m.part.unwrap_or_else(|| "a".to_string()),
+            vendor: m.vendor,
+            products: match m.product {
+                Products::One(product) => vec![product],
+                Products::Several(products) => products,
+            },
+            target: m.target_sw,
+        }),
         implies: spec.implies,
         refines: spec.refines,
         detect,

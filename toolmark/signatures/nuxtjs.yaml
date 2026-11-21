@@ -2,6 +2,9 @@ id: nuxtjs
 info:
   name: Nuxt.js
   category: JavaScript Framework
+  metadata:
+    vendor: nuxt
+    product: nuxt
 implies: [vuejs, nodejs]
 detect:
   any:

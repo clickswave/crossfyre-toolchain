@@ -66,31 +66,11 @@ impl Cpe {
         }
     }
 
-    /// The product a CPE 2.3 name names, as in `cpe:2.3:a:apache:http_server:2.4.49:...`,
-    /// with its escapes undone, or none when it is not one.
-    pub fn from_cpe23(name: &str) -> Option<Self> {
-        let rest = name.strip_prefix("cpe:2.3:")?;
-        let mut fields = Vec::new();
-        let mut field = String::new();
-        let mut chars = rest.chars();
-        while let Some(c) = chars.next() {
-            match c {
-                '\\' => field.extend(chars.next()),
-                ':' => fields.push(std::mem::take(&mut field)),
-                c => field.push(c),
-            }
-            if fields.len() == 3 {
-                break;
-            }
-        }
-        if fields.len() < 3 {
-            fields.push(field);
-        }
-        let [part, vendor, product] = fields.get(..3)? else {
-            return None;
-        };
-        let named = |f: &String| !f.is_empty() && f != "*" && f != "-";
-        (named(part) && named(vendor) && named(product)).then(|| Self::new(part, vendor, product))
+    /// A name as it is displayed, part:vendor:product, or none when it is not one.
+    pub fn parse(text: &str) -> Option<Self> {
+        let mut parts = text.splitn(3, ':');
+        let (part, vendor, product) = (parts.next()?, parts.next()?, parts.next()?);
+        (!part.is_empty() && !product.is_empty()).then(|| Self::new(part, vendor, product))
     }
 }
 
@@ -288,34 +268,42 @@ impl Dataset {
         &self.made
     }
 
-    /// The CVEs that affect `version` of what `names` name. One product is one name. A
-    /// product the CPE dictionary splits in several, or a base whose candidates are each
-    /// a product, is several: the leads are those of any of them, and one that affects
-    /// only some of them is possible. With `distro`, the tag of the distribution that
-    /// built it, or a distribution's suffix on the version, each lead says the build may
-    /// carry a backported fix. Known-exploited first, then by score.
-    pub fn leads(&self, names: &[Cpe], version: &str, distro: Option<&str>) -> Vec<Lead> {
+    /// The CVEs that affect `version` of what `products` name. Each product is the names
+    /// the CVE data may give it: its own CPE, and its aliases (an older vendor, or a
+    /// package in a registry). Several products are a product the CPE dictionary splits in
+    /// several, or a base whose candidates are each a product: the leads are those of any
+    /// of them, and one that affects only some of them is possible. With `distro`, the tag
+    /// of the distribution that built it, or a distribution's suffix on the version, each
+    /// lead says the build may carry a backported fix. Known-exploited first, then by
+    /// score.
+    pub fn leads(&self, products: &[Vec<Cpe>], version: &str, distro: Option<&str>) -> Vec<Lead> {
         let Some(version) = Version::parse(version) else {
             return Vec::new();
         };
-        let mut names = names.to_vec();
-        names.sort();
-        names.dedup();
         let backport = distro.is_some_and(|d| !d.trim().is_empty()) || version.distro();
-        let mut affects: BTreeMap<&str, Vec<Cpe>> = BTreeMap::new();
-        for name in &names {
-            for a in self.products.get(name).into_iter().flatten() {
-                if a.ranges.iter().any(|r| r.holds(&version)) {
-                    affects.entry(&a.cve).or_default().push(name.clone());
+        // Each CVE: the names it affects, and how many of the products.
+        let mut found: BTreeMap<&str, (Vec<Cpe>, usize)> = BTreeMap::new();
+        for names in products {
+            let mut this: BTreeMap<&str, Vec<Cpe>> = BTreeMap::new();
+            for name in names {
+                for a in self.products.get(name).into_iter().flatten() {
+                    if a.ranges.iter().any(|r| r.holds(&version)) {
+                        this.entry(&a.cve).or_default().push(name.clone());
+                    }
                 }
             }
+            for (cve, names) in this {
+                let (affects, products) = found.entry(cve).or_default();
+                affects.extend(names);
+                *products += 1;
+            }
         }
-        let mut leads: Vec<Lead> = affects
+        let mut leads: Vec<Lead> = found
             .into_iter()
-            .map(|(cve, affects)| Lead {
+            .map(|(cve, (affects, count))| Lead {
                 cve: cve.to_string(),
                 known: self.cves.get(cve).cloned().unwrap_or_default(),
-                possible: affects.len() < names.len(),
+                possible: count < products.len(),
                 affects,
                 backport,
             })
@@ -541,17 +529,20 @@ mod tests {
     fn apache_2_4_49_has_both_path_traversals_and_2_4_51_neither() {
         let d = small();
         assert_eq!(
-            ids(&d.leads(&apache(), "2.4.49", None)),
+            ids(&d.leads(&[apache()], "2.4.49", None)),
             ["CVE-2021-42013", "CVE-2021-41773"]
         );
-        assert_eq!(ids(&d.leads(&apache(), "2.4.50", None)), ["CVE-2021-42013"]);
-        assert!(d.leads(&apache(), "2.4.51", None).is_empty());
-        assert!(d.leads(&apache(), "2.4.48", None).is_empty());
+        assert_eq!(
+            ids(&d.leads(&[apache()], "2.4.50", None)),
+            ["CVE-2021-42013"]
+        );
+        assert!(d.leads(&[apache()], "2.4.51", None).is_empty());
+        assert!(d.leads(&[apache()], "2.4.48", None).is_empty());
     }
 
     #[test]
     fn a_lead_carries_what_is_known_of_its_cve() {
-        let leads = small().leads(&apache(), "2.4.49", None);
+        let leads = small().leads(&[apache()], "2.4.49", None);
         let lead = leads.iter().find(|l| l.cve == "CVE-2021-41773").unwrap();
         assert!(lead.known.kev);
         assert_eq!(lead.known.severity.as_deref(), Some("high"));
@@ -572,7 +563,7 @@ mod tests {
             ("9.7p1", true),
             ("9.8p1", false),
         ] {
-            let leads = d.leads(&openssh, version, None);
+            let leads = d.leads(&[openssh.to_vec()], version, None);
             assert_eq!(!leads.is_empty(), hit, "{version}: {:?}", ids(&leads));
         }
     }
@@ -581,12 +572,16 @@ mod tests {
     fn a_distribution_s_build_may_carry_a_backported_fix() {
         let d = small();
         let openssh = [Cpe::new("a", "openbsd", "openssh")];
-        let tagged = d.leads(&openssh, "8.9p1", Some("Ubuntu-3ubuntu0.6"));
+        let tagged = d.leads(&[openssh.to_vec()], "8.9p1", Some("Ubuntu-3ubuntu0.6"));
         assert!(!tagged.is_empty() && tagged.iter().all(|l| l.backport));
-        let suffixed = d.leads(&apache(), "2.4.49-1ubuntu1", None);
+        let suffixed = d.leads(&[apache()], "2.4.49-1ubuntu1", None);
         assert_eq!(ids(&suffixed), ["CVE-2021-42013", "CVE-2021-41773"]);
         assert!(suffixed.iter().all(|l| l.backport));
-        assert!(d.leads(&openssh, "8.9p1", None).iter().all(|l| !l.backport));
+        assert!(
+            d.leads(&[openssh.to_vec()], "8.9p1", None)
+                .iter()
+                .all(|l| !l.backport)
+        );
     }
 
     #[test]
@@ -597,48 +592,54 @@ mod tests {
             Cpe::new("a", "example", "appliance_gateway"),
             Cpe::new("a", "example", "appliance_controller"),
         ];
-        let leads = d.leads(&both, "13.1-49.12", None);
+        let leads = d.leads(&both.clone().map(|c| vec![c]), "13.1-49.12", None);
         assert_eq!(ids(&leads), ["CVE-2099-0001", "CVE-2099-0002"]);
         assert!(!leads[0].possible, "it affects both, whichever this is");
         assert_eq!(leads[0].affects.len(), 2);
         assert!(leads[1].possible, "it affects the gateway only");
         assert_eq!(leads[1].affects, [both[0].clone()]);
-        assert!(d.leads(&both, "13.1-49.13", None).is_empty());
+        assert!(
+            d.leads(&both.clone().map(|c| vec![c]), "13.1-49.13", None)
+                .is_empty()
+        );
         // Asked about one edition alone, nothing is possible.
-        let gateway = d.leads(&both[..1], "13.1-49.12", None);
+        let gateway = d.leads(&[vec![both[0].clone()]], "13.1-49.12", None);
         assert_eq!(ids(&gateway), ["CVE-2099-0001", "CVE-2099-0002"]);
         assert!(gateway.iter().all(|l| !l.possible));
     }
 
     #[test]
-    fn a_cpe_2_3_name_gives_its_product() {
-        assert_eq!(
-            Cpe::from_cpe23("cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*"),
-            Some(Cpe::new("a", "apache", "http_server"))
-        );
-        assert_eq!(
-            Cpe::from_cpe23(r"cpe:2.3:a:nodejs:node\.js:*:*:*:*:*:*:*:*"),
-            Some(Cpe::new("a", "nodejs", "node.js"))
-        );
-        assert_eq!(
-            Cpe::from_cpe23("cpe:2.3:o:fortinet:fortios"),
-            Some(Cpe::new("o", "fortinet", "fortios"))
-        );
-        for not in [
-            "",
-            "cpe:/a:apache:http_server",
-            "cpe:2.3:a:apache",
-            "cpe:2.3:a:*:*:1.0",
+    fn a_name_reads_back_as_it_is_displayed() {
+        for cpe in [
+            Cpe::new("a", "apache", "http_server"),
+            Cpe::new("a", "erlang", "erlang/otp"),
+            Cpe::new("npm", "", "@angular/core"),
         ] {
-            assert_eq!(Cpe::from_cpe23(not), None, "{not}");
+            assert_eq!(Cpe::parse(&cpe.to_string()), Some(cpe));
         }
+        for not in ["", "a:apache", "a:v:", ":v:p"] {
+            assert_eq!(Cpe::parse(not), None, "{not}");
+        }
+    }
+
+    #[test]
+    fn a_product_s_aliases_give_its_cves_and_none_is_possible() {
+        let d = small();
+        let gateway = vec![
+            Cpe::new("a", "example", "appliance_gateway"),
+            Cpe::new("a", "example", "appliance_controller"),
+        ];
+        let leads = d.leads(&[gateway], "13.1-49.12", None);
+        assert_eq!(ids(&leads), ["CVE-2099-0001", "CVE-2099-0002"]);
+        assert!(leads.iter().all(|l| !l.possible));
+        assert_eq!(leads[0].affects.len(), 2, "both names give CVE-2099-0001");
     }
 
     #[test]
     fn a_name_is_matched_whatever_its_case() {
         let d = small();
         let named = [Cpe::new("A", "Apache", "HTTP_Server")];
-        assert_eq!(d.leads(&named, "2.4.50", None).len(), 1);
+        assert_eq!(d.leads(&[named.to_vec()], "2.4.50", None).len(), 1);
     }
 
     #[test]
@@ -646,20 +647,24 @@ mod tests {
         let d = small();
         let os = [Cpe::new("o", "example", "firewall_os")];
         assert_eq!(
-            ids(&d.leads(&os, "7.2.4", None)),
+            ids(&d.leads(&[os.to_vec()], "7.2.4", None)),
             ["CVE-2099-0011", "CVE-2099-0013", "CVE-2099-0012"]
         );
         // The same names as an application are another product.
         assert!(
-            d.leads(&[Cpe::new("a", "example", "firewall_os")], "7.2.4", None)
-                .is_empty()
+            d.leads(
+                &[vec![Cpe::new("a", "example", "firewall_os")]],
+                "7.2.4",
+                None
+            )
+            .is_empty()
         );
     }
 
     #[test]
     fn a_version_that_is_none_gives_no_lead() {
-        assert!(small().leads(&apache(), "", None).is_empty());
-        assert!(small().leads(&apache(), "unknown", None).is_empty());
+        assert!(small().leads(&[apache()], "", None).is_empty());
+        assert!(small().leads(&[apache()], "unknown", None).is_empty());
     }
 
     #[test]
@@ -669,9 +674,9 @@ mod tests {
         let gz = gz.finish().unwrap();
         let d = Dataset::from_bytes(&gz).unwrap();
         assert_eq!((d.sequence(), d.made()), (7, "2026-11-20T03:00:00Z"));
-        assert_eq!(d.leads(&apache(), "2.4.49", None).len(), 2);
+        assert_eq!(d.leads(&[apache()], "2.4.49", None).len(), 2);
         let some = Dataset::from_bytes_for(&gz, &apache().into_iter().collect()).unwrap();
-        assert_eq!(some.leads(&apache(), "2.4.49", None).len(), 2);
+        assert_eq!(some.leads(&[apache()], "2.4.49", None).len(), 2);
     }
 
     /// Products before CVEs, as the job writes them, and one product whose name comes
@@ -690,17 +695,20 @@ mod tests {
         let p = Cpe::new("a", "v", "p");
         let q = Cpe::new("a", "v", "q");
         let only_p = Dataset::from_bytes_for(ORDERED.as_bytes(), &[p.clone()].into()).unwrap();
-        assert_eq!(ids(&only_p.leads(&[p.clone()], "1.0", None)), ["CVE-1"]);
-        assert!(only_p.leads(&[q.clone()], "1.0", None).is_empty());
+        assert_eq!(
+            ids(&only_p.leads(&[vec![p.clone()]], "1.0", None)),
+            ["CVE-1"]
+        );
+        assert!(only_p.leads(&[vec![q.clone()]], "1.0", None).is_empty());
         assert!(only_p.known("CVE-1").is_some_and(|k| k.kev));
         assert!(only_p.known("CVE-2").is_none());
         let only_q = Dataset::from_bytes_for(ORDERED.as_bytes(), &[q.clone()].into()).unwrap();
-        assert_eq!(ids(&only_q.leads(&[q], "1.0", None)), ["CVE-2"]);
+        assert_eq!(ids(&only_q.leads(&[vec![q]], "1.0", None)), ["CVE-2"]);
         assert!(only_q.known("CVE-1").is_none());
         // CVEs before products, as in the small dataset, are kept for the products wanted.
         let apache_only =
             Dataset::from_bytes_for(SMALL.as_bytes(), &apache().into_iter().collect()).unwrap();
-        assert_eq!(apache_only.leads(&apache(), "2.4.49", None).len(), 2);
+        assert_eq!(apache_only.leads(&[apache()], "2.4.49", None).len(), 2);
         assert!(apache_only.known("CVE-2024-6387").is_none());
         assert!(apache_only.known("CVE-2021-41773").is_some());
     }

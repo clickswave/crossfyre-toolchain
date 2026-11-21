@@ -216,6 +216,7 @@ fn as_json(d: &Detection) -> Value {
         "category": d.category,
         "version": d.version,
         "cpe": d.cpe,
+        "cpe_names": d.cpe_names.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "confidence": d.confidence,
         "evidence": d.evidence,
         "candidates": d.candidates,

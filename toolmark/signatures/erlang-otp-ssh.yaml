@@ -2,6 +2,9 @@ id: erlang-otp-ssh
 info:
   name: Erlang/OTP SSH
   category: SSH Server
+  metadata:
+    vendor: erlang
+    product: erlang/otp
 detect:
   any:
     - banner: { name: ssh, regex: '-Erlang/' }

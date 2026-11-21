@@ -2,6 +2,9 @@ id: bootstrap
 info:
   name: Bootstrap
   category: UI Framework
+  metadata:
+    vendor: getbootstrap
+    product: bootstrap
 detect:
   any:
     - html: { regex: '(?i)bootstrap(?:\.min)?\.(?:css|js)|class=.(?:container|navbar)-' }

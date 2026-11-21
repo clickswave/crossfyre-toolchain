@@ -410,6 +410,7 @@ pub fn technology(
             "category": d.category,
             "version": d.version,
             "cpe": d.cpe,
+            "cpe_names": d.cpe_names.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "confidence": d.confidence,
             "evidence": d.evidence,
             "candidates": d.candidates,
@@ -442,7 +443,8 @@ fn extract_title(body: &str) -> Option<String> {
 pub(crate) struct Subject<'a> {
     pub product: &'a str,
     pub version: &'a str,
-    pub cpe: &'a cfx_cve::Cpe,
+    /// The products it may be, by their CPEs.
+    pub cpes: &'a [cfx_cve::Cpe],
     pub distro: Option<&'a str>,
     pub url: &'a str,
     pub host: &'a str,
@@ -461,14 +463,13 @@ pub(crate) fn send_leads(
     port: u16,
     scheme: &str,
 ) {
-    let (Some(version), Some(cpe)) = (d.version.as_deref().filter(|v| !v.is_empty()), &d.cpe_name)
-    else {
+    let Some(version) = d.version.as_deref().filter(|v| !v.is_empty()) else {
         return;
     };
     let subject = Subject {
         product: &d.name,
         version,
-        cpe,
+        cpes: &d.cpe_names,
         distro: d.distro.as_deref(),
         url,
         host,
@@ -482,7 +483,10 @@ pub(crate) fn send_leads(
 
 /// The CVE leads for `s` from `cves`, each with its CVE, as findings.
 pub(crate) fn leads_for(cves: &crate::cve::Cves, s: &Subject) -> Vec<(String, Value)> {
-    let (leads, from) = cves.leads(s.cpe, s.version, s.distro);
+    if s.cpes.is_empty() {
+        return Vec::new();
+    }
+    let (leads, from) = cves.leads(s.cpes, s.version, s.distro);
     leads
         .iter()
         .map(|lead| (lead.cve.clone(), cve_lead(lead, &from, s)))
@@ -521,7 +525,7 @@ fn cve_lead(lead: &cfx_cve::Lead, from: &str, s: &Subject) -> Value {
             "epss": lead.known.epss,
             "product": s.product,
             "version": s.version,
-            "cpe": s.cpe.to_string(),
+            "cpes": lead.affects.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "confidence": "version-inferred",
             "possible": lead.possible,
             "backport": lead.backport,
@@ -1251,7 +1255,7 @@ mod cve_lead_tests {
         let lead = found.iter().find(|l| l["cve"] == "CVE-2021-41773").unwrap();
         assert_eq!(lead["cve_data"], crate::cve::SNAPSHOT_LABEL);
         assert_eq!(lead["confidence"], "version-inferred");
-        assert_eq!(lead["cpe"], "a:apache:http_server");
+        assert_eq!(lead["cpes"], json!(["a:apache:http_server"]));
         assert_eq!(lead["version"], "2.4.49");
         assert_eq!(
             (lead["kev"].as_bool(), lead["backport"].as_bool()),

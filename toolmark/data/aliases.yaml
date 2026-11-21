@@ -1,0 +1,36 @@
+# The other names the CVE data gives a product a signature names by its CPE: a vendor's or
+# product's earlier name, the same product filed as firmware or software, or the package
+# a library is published as. A product's CVE leads are looked up under its own name and
+# each of these, as one product, so a lead under an alias is never merely possible.
+#
+# Each key and name is part:vendor:product, as the CVE dataset writes it; a package is
+# its registry, no vendor, and its name.
+
+# Vendors' earlier names.
+"a:zimbra:collaboration": ["a:synacor:zimbra_collaboration_suite"]
+"a:ivanti:connect_secure": ["a:pulsesecure:pulse_connect_secure"]
+"a:ivanti:policy_secure": ["a:pulsesecure:pulse_policy_secure"]
+"a:vercel:next.js": ["a:zeit:next.js", "npm::next"]
+"a:nuxt:nuxt": ["a:nuxtlabs:nuxt", "npm::nuxt"]
+
+# The same product filed as firmware or software.
+"a:citrix:netscaler_application_delivery_controller":
+  ["o:citrix:application_delivery_controller_firmware"]
+"a:citrix:netscaler_gateway": ["o:citrix:netscaler_gateway_firmware", "o:citrix:gateway_firmware"]
+"o:cisco:firepower_threat_defense":
+  ["a:cisco:firepower_threat_defense", "a:cisco:firepower_threat_defense_software"]
+"a:microsoft:sharepoint_server": ["a:microsoft:sharepoint_enterprise_server"]
+
+# Libraries, as npm publishes them.
+"a:jquery:jquery": ["npm::jquery"]
+"a:lodash:lodash": ["npm::lodash"]
+"a:momentjs:moment": ["npm::moment"]
+"a:handlebarsjs:handlebars": ["npm::handlebars"]
+"a:underscorejs:underscore": ["npm::underscore"]
+"a:chartjs:chart.js": ["npm::chart.js"]
+"a:getbootstrap:bootstrap": ["npm::bootstrap"]
+"a:facebook:react": ["npm::react"]
+"a:vuejs:vue": ["npm::vue"]
+"a:angular:angular": ["npm::@angular/core"]
+"a:backbone_project:backbone": ["npm::backbone"]
+"a:swiperjs:swiper": ["npm::swiper"]

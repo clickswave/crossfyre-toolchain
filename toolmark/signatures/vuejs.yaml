@@ -2,6 +2,9 @@ id: vuejs
 info:
   name: Vue.js
   category: JavaScript Framework
+  metadata:
+    vendor: vuejs
+    product: vue
 detect:
   any:
     - html: { regex: '(?i)data-v-[0-9a-f]{6,8}|vue(?:\.runtime)?(?:\.min)?\.js' }

@@ -23,11 +23,41 @@ const MAX_DATASET_BYTES: usize = 64 * 1024 * 1024;
 /// The known-exploited CVEs of the dataset, cut at the last release (toolmark/data).
 const SNAPSHOT: &[u8] = include_bytes!("../data/cve-known-exploited.json.gz");
 
+/// The other names the CVE data gives products the signatures name (toolmark/data).
+const ALIASES: &str = include_str!("../data/aliases.yaml");
+
 /// The dataset's file in toolmark's data folder.
 pub const DATASET_FILE: &str = "cve-dataset.json.gz";
 
 /// What a lead from the snapshot says of where it came from.
 pub const SNAPSHOT_LABEL: &str = "built-in known-exploited snapshot";
+
+/// Each product's other names in the CVE data, from toolmark/data/aliases.yaml.
+fn aliases() -> &'static std::collections::HashMap<Cpe, Vec<Cpe>> {
+    static ALL: std::sync::LazyLock<std::collections::HashMap<Cpe, Vec<Cpe>>> =
+        std::sync::LazyLock::new(|| {
+            let read: std::collections::BTreeMap<String, Vec<String>> =
+                serde_yaml::from_str(ALIASES).expect("toolmark/data/aliases.yaml reads");
+            read.into_iter()
+                .map(|(name, also)| (named(&name), also.iter().map(|a| named(a)).collect()))
+                .collect()
+        });
+    &ALL
+}
+
+/// A name in toolmark/data/aliases.yaml, part:vendor:product.
+fn named(text: &str) -> Cpe {
+    Cpe::parse(text).unwrap_or_else(|| {
+        panic!("{text} in toolmark/data/aliases.yaml is not part:vendor:product")
+    })
+}
+
+/// `cpe` and its other names.
+fn with_aliases(cpe: &Cpe) -> Vec<Cpe> {
+    let mut names = vec![cpe.clone()];
+    names.extend(aliases().get(cpe).into_iter().flatten().cloned());
+    names
+}
 
 /// Where leads come from, and what each says of it.
 pub struct Cves {
@@ -43,13 +73,14 @@ impl Cves {
     /// The dataset in `folder` when there is one this reads, else the snapshot, with only
     /// the products `names` name. A refresh fetches the dataset from `url`.
     pub fn load(folder: Option<&Path>, names: &HashSet<Cpe>, url: &str) -> Self {
+        let names: HashSet<Cpe> = names.iter().flat_map(with_aliases).collect();
         let data = folder
-            .and_then(|f| read(&f.join(DATASET_FILE), names))
-            .unwrap_or_else(|| snapshot(names));
+            .and_then(|f| read(&f.join(DATASET_FILE), &names))
+            .unwrap_or_else(|| snapshot(&names));
         Self {
             folder: folder.map(Path::to_path_buf),
             url: url.to_string(),
-            names: names.clone(),
+            names,
             data: RwLock::new(data),
         }
     }
@@ -89,12 +120,19 @@ impl Cves {
             .clone()
     }
 
-    /// The leads for `name` at `version`, built by the distribution `distro` names when
-    /// one is known, and the data they come from.
-    pub fn leads(&self, name: &Cpe, version: &str, distro: Option<&str>) -> (Vec<Lead>, String) {
+    /// The leads at `version` for what `products` name, each under its own name and its
+    /// aliases, built by the distribution `distro` names when one is known, and the data
+    /// they come from. A lead that affects some of several products and not others is
+    /// possible.
+    pub fn leads(
+        &self,
+        products: &[Cpe],
+        version: &str,
+        distro: Option<&str>,
+    ) -> (Vec<Lead>, String) {
+        let groups: Vec<Vec<Cpe>> = products.iter().map(with_aliases).collect();
         let data = self.data.read().unwrap_or_else(|e| e.into_inner());
-        let leads = data.0.leads(std::slice::from_ref(name), version, distro);
-        (leads, data.1.clone())
+        (data.0.leads(&groups, version, distro), data.1.clone())
     }
 }
 
@@ -207,13 +245,13 @@ mod tests {
             Cves::load(None, &names, DATASET_URL),
             Cves::load(Some(folder.path()), &names, DATASET_URL),
         ] {
-            let (leads, from) = cves.leads(&apache(), "2.4.49", None);
+            let (leads, from) = cves.leads(&[apache()], "2.4.49", None);
             assert_eq!(from, SNAPSHOT_LABEL);
             for cve in ["CVE-2021-41773", "CVE-2021-42013"] {
                 assert!(ids(&leads).contains(&cve), "{cve} in {:?}", ids(&leads));
             }
             assert!(leads.iter().all(|l| l.known.kev));
-            let (later, _) = cves.leads(&apache(), "2.4.51", None);
+            let (later, _) = cves.leads(&[apache()], "2.4.51", None);
             assert!(
                 !ids(&later)
                     .iter()
@@ -229,7 +267,7 @@ mod tests {
         let folder = tempfile::tempdir().unwrap();
         std::fs::write(folder.path().join(DATASET_FILE), dataset(9)).unwrap();
         let cves = Cves::load(Some(folder.path()), &[apache()].into(), DATASET_URL);
-        let (leads, from) = cves.leads(&apache(), "2.4.49", Some("Ubuntu"));
+        let (leads, from) = cves.leads(&[apache()], "2.4.49", Some("Ubuntu"));
         assert_eq!(from, "CVE dataset 9 of 2026-11-21");
         assert_eq!(ids(&leads), ["CVE-2099-0049"]);
         assert!(leads[0].backport);
@@ -241,7 +279,7 @@ mod tests {
         let folder = tempfile::tempdir().unwrap();
         std::fs::write(folder.path().join(DATASET_FILE), b"not a dataset").unwrap();
         let cves = Cves::load(Some(folder.path()), &[apache()].into(), DATASET_URL);
-        assert_eq!(cves.leads(&apache(), "2.4.49", None).1, SNAPSHOT_LABEL);
+        assert_eq!(cves.leads(&[apache()], "2.4.49", None).1, SNAPSHOT_LABEL);
     }
 
     /// A server that answers every request with `status` and `body`, its URL, and how
@@ -284,7 +322,7 @@ mod tests {
         assert_eq!(asked.load(Ordering::SeqCst), 1);
         assert!(folder.path().join(DATASET_FILE).is_file());
         assert_eq!(
-            ids(&cves.leads(&apache(), "2.4.49", None).0),
+            ids(&cves.leads(&[apache()], "2.4.49", None).0),
             ["CVE-2099-0049"]
         );
         cves.refresh(false).await.unwrap();
@@ -339,6 +377,62 @@ mod tests {
         assert_eq!(asked.load(Ordering::SeqCst), 0);
     }
 
+    /// A product is looked up under its aliases too, and a lead that affects some of
+    /// several products and not others is possible, whatever name each came under.
+    #[test]
+    fn products_are_looked_up_with_their_aliases_and_marked_possible() {
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(
+            folder.path().join(DATASET_FILE),
+            r#"{"format": 1, "sequence": 3, "made": "2026-11-22T15:00:00Z", "products": [
+              {"part": "a", "vendor": "citrix", "product": "netscaler_application_delivery_controller",
+               "affected": [{"cve": "CVE-2099-0010", "ranges": [{"lt": "13.1-49.13"}]},
+                            {"cve": "CVE-2099-0011", "ranges": [{"lt": "13.1-49.13"}]}]},
+              {"part": "o", "vendor": "citrix", "product": "netscaler_gateway_firmware",
+               "affected": [{"cve": "CVE-2099-0010", "ranges": [{"lt": "13.1-49.13"}]}]},
+              {"part": "a", "vendor": "synacor", "product": "zimbra_collaboration_suite",
+               "affected": [{"cve": "CVE-2099-0020", "ranges": [{"lt": "9.0.0"}]}]},
+              {"part": "o", "vendor": "fortinet", "product": "fortios",
+               "affected": [{"cve": "CVE-2099-0030", "ranges": [{"le": "7.2.4"}]}]}],
+             "cves": {"CVE-2099-0010": {}, "CVE-2099-0011": {}, "CVE-2099-0020": {},
+                      "CVE-2099-0030": {"kev": true}}}"#,
+        )
+        .unwrap();
+        let netscaler = [
+            Cpe::new("a", "citrix", "netscaler_application_delivery_controller"),
+            Cpe::new("a", "citrix", "netscaler_gateway"),
+        ];
+        let zimbra = [Cpe::new("a", "zimbra", "collaboration")];
+        let fortinet = [
+            Cpe::new("o", "fortinet", "fortios"),
+            Cpe::new("a", "fortinet", "fortiproxy"),
+        ];
+        let names: HashSet<Cpe> = netscaler
+            .iter()
+            .chain(&zimbra)
+            .chain(&fortinet)
+            .cloned()
+            .collect();
+        let cves = Cves::load(Some(folder.path()), &names, DATASET_URL);
+        let (leads, _) = cves.leads(&netscaler, "13.1-49.12", None);
+        assert_eq!(ids(&leads), ["CVE-2099-0010", "CVE-2099-0011"]);
+        assert!(
+            !leads[0].possible,
+            "the gateway has it as its firmware: both editions do"
+        );
+        assert!(leads[1].possible, "the ADC alone has it");
+        let (leads, _) = cves.leads(&zimbra, "8.8.15", None);
+        assert_eq!(
+            ids(&leads),
+            ["CVE-2099-0020"],
+            "under the vendor's earlier name"
+        );
+        assert!(!leads[0].possible);
+        let (leads, _) = cves.leads(&fortinet, "7.2.4", None);
+        assert_eq!(ids(&leads), ["CVE-2099-0030"]);
+        assert!(leads[0].possible, "FortiOS has it, FortiProxy does not");
+    }
+
     /// Every product a shipped signature names by CPE is one the snapshot can be asked
     /// about, and the snapshot reads.
     #[test]
@@ -346,6 +440,6 @@ mod tests {
         let names = crate::signatures::Signatures::shipped().cpes();
         assert!(names.contains(&apache()), "{} products", names.len());
         let cves = Cves::load(None, &names, DATASET_URL);
-        assert!(!cves.leads(&apache(), "2.4.49", None).0.is_empty());
+        assert!(!cves.leads(&[apache()], "2.4.49", None).0.is_empty());
     }
 }

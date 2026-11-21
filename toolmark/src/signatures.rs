@@ -23,8 +23,10 @@ pub struct Detection {
     pub category: String,
     pub version: Option<String>,
     pub cpe: String,
-    /// The product as its CPE names it, which its CVE leads are looked up by.
-    pub cpe_name: Option<cfx_cve::Cpe>,
+    /// The products it may be, as their CPEs name them, which its CVE leads are looked up
+    /// by: one for most; each a CPE splits it in; or, for a base none of whose candidates
+    /// could be told apart, each candidate's.
+    pub cpe_names: Vec<cfx_cve::Cpe>,
     pub confidence: u8,
     pub evidence: Vec<String>,
     /// The products that refine this one and could not be told apart from it: the
@@ -256,8 +258,8 @@ struct Signature {
     id: String,
     name: String,
     category: String,
-    /// Vendor, product and target software, for the CPE.
-    cpe: Option<(String, String, Option<String>)>,
+    /// What its CPE names: part, vendor, products and target software.
+    cpe: Option<CpeSpec>,
     /// The ids of the signatures for what this one implies.
     implies: Vec<String>,
     /// The id of the signature this one replaces when both are present.
@@ -275,24 +277,38 @@ impl Signature {
     /// The CPE 2.3 name for this product at `version`, or empty when the file names no
     /// vendor and product.
     fn cpe(&self, version: Option<&str>) -> String {
-        let Some((vendor, product, target)) = &self.cpe else {
+        let Some(spec) = &self.cpe else {
             return String::new();
         };
         format!(
-            "cpe:2.3:a:{}:{}:{}:*:*:*:*:{}:*:*",
-            cpe_value(vendor),
-            cpe_value(product),
+            "cpe:2.3:{}:{}:{}:{}:*:*:*:*:{}:*:*",
+            cpe_value(&spec.part),
+            cpe_value(&spec.vendor),
+            cpe_value(&spec.products[0]),
             version.map_or("*".into(), cpe_value),
-            target.as_deref().map_or("*".into(), cpe_value),
+            spec.target.as_deref().map_or("*".into(), cpe_value),
         )
     }
 }
 
+/// What a signature's CPE names: its part, vendor, each product, and target software.
+struct CpeSpec {
+    part: String,
+    vendor: String,
+    products: Vec<String>,
+    target: Option<String>,
+}
+
 impl Signature {
-    /// The product as its CPE names it, when the file names its vendor and product.
-    fn cpe_name(&self) -> Option<cfx_cve::Cpe> {
-        let (vendor, product, _) = self.cpe.as_ref()?;
-        Some(cfx_cve::Cpe::new("a", vendor, product))
+    /// The products the file names, as their CPEs name them.
+    fn cpe_names(&self) -> Vec<cfx_cve::Cpe> {
+        let Some(spec) = &self.cpe else {
+            return Vec::new();
+        };
+        spec.products
+            .iter()
+            .map(|p| cfx_cve::Cpe::new(&spec.part, &spec.vendor, p))
+            .collect()
     }
 }
 
@@ -338,7 +354,7 @@ impl Signatures {
 
     /// The products these signatures name by CPE: what CVE leads are looked up for.
     pub fn cpes(&self) -> std::collections::HashSet<cfx_cve::Cpe> {
-        self.list.iter().filter_map(Signature::cpe_name).collect()
+        self.list.iter().flat_map(Signature::cpe_names).collect()
     }
 }
 
@@ -1071,6 +1087,24 @@ impl<'a> Host<'a> {
         out
     }
 
+    /// The products `signature`, found, may be by their CPEs: its own, or with none, those
+    /// of the candidates that could not be told apart from it.
+    fn cpe_names(
+        &self,
+        signature: &Signature,
+        outcomes: &[(&Signature, Outcome)],
+    ) -> Vec<cfx_cve::Cpe> {
+        let own = signature.cpe_names();
+        if !own.is_empty() {
+            return own;
+        }
+        self.candidates(signature, outcomes)
+            .iter()
+            .filter_map(|name| self.signatures.list.iter().find(|s| &s.name == name))
+            .flat_map(Signature::cpe_names)
+            .collect()
+    }
+
     /// What was found: each signature present and not replaced by one that refines it, in
     /// the order of the files, then what those imply and were not found themselves.
     pub fn detections(&self) -> Vec<Detection> {
@@ -1091,7 +1125,7 @@ impl<'a> Host<'a> {
                     name: signature.name.clone(),
                     category: signature.category.clone(),
                     cpe: signature.cpe(version.as_deref()),
-                    cpe_name: signature.cpe_name(),
+                    cpe_names: self.cpe_names(signature, &outcomes),
                     version,
                     confidence: outcome.confidence.min(100) as u8,
                     evidence: outcome.evidence.clone(),
@@ -1119,7 +1153,7 @@ impl<'a> Host<'a> {
                     category: "Implied".to_string(),
                     version: None,
                     cpe: String::new(),
-                    cpe_name: None,
+                    cpe_names: Vec::new(),
                     confidence: 30,
                     evidence: vec![format!("implied by {}", detection.name)],
                     candidates: Vec::new(),
