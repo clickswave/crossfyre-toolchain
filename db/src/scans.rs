@@ -74,7 +74,14 @@ pub fn safe_url_keeping(url: &str, placeholder: &str) -> String {
 
 fn clean_url(url: &str, placeholder: Option<&str>) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
-        return url.to_string();
+        // A path with a query, as a request line or a link gives one, has its query made
+        // safe the same way.
+        return match url.split_once('?') {
+            Some((path, query)) if url.starts_with('/') => {
+                format!("{path}?{}", clean_query(query, placeholder))
+            }
+            _ => url.to_string(),
+        };
     };
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (authority, tail) = rest.split_at(end);
@@ -86,29 +93,32 @@ fn clean_url(url: &str, placeholder: Option<&str>) -> String {
         None => (tail, None),
     };
     let tail = match before.split_once('?') {
-        Some((path, query)) => {
-            let query = query
-                .split('&')
-                .map(|pair| match pair.split_once('=') {
-                    Some((name, value))
-                        if (secret_name(name)
-                            || SECRET_PARAMS.contains(&name.to_ascii_lowercase().as_str()))
-                            && placeholder != Some(value) =>
-                    {
-                        format!("{name}=")
-                    }
-                    _ => pair.to_string(),
-                })
-                .collect::<Vec<_>>()
-                .join("&");
-            format!("{path}?{query}")
-        }
+        Some((path, query)) => format!("{path}?{}", clean_query(query, placeholder)),
         None => before.to_string(),
     };
     match fragment {
         Some(fragment) => format!("{scheme}://{host}{tail}#{fragment}"),
         None => format!("{scheme}://{host}{tail}"),
     }
+}
+
+/// `query`, a URL's after its `?`, with the value of each parameter that carries a
+/// credential left out, unless it is `placeholder`.
+fn clean_query(query: &str, placeholder: Option<&str>) -> String {
+    query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((name, value))
+                if (secret_name(name)
+                    || SECRET_PARAMS.contains(&name.to_ascii_lowercase().as_str()))
+                    && placeholder != Some(value) =>
+            {
+                format!("{name}=")
+            }
+            _ => pair.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 /// Text to keep, such as a log line or a result: every URL in it made safe (see
@@ -120,16 +130,18 @@ pub fn safe_text(text: &str) -> String {
 fn clean_text(text: &str, placeholder: Option<&str>) -> String {
     text.lines()
         .map(|line| {
+            // A header line, or one said as a header is, such as "header set-cookie: ...":
+            // the name is the last word before the colon.
             if let Some((name, _)) = line.split_once(':')
-                && !name.trim().contains(' ')
                 && !name.contains("//")
-                && secret_name(name.trim())
+                && name.split_whitespace().count() <= 3
+                && name.split_whitespace().next_back().is_some_and(secret_name)
             {
                 return format!("{name}: [not kept]");
             }
             line.split(' ')
                 .map(|word| {
-                    if word.contains("://") {
+                    if word.contains("://") || (word.starts_with('/') && word.contains('?')) {
                         // Punctuation after a URL, as in "(url)" or "url,", is not part of it.
                         let url = word.trim_end_matches([')', ']', '>', ',', '.', ';', '"', '\'']);
                         format!("{}{}", clean_url(url, placeholder), &word[url.len()..])
@@ -228,6 +240,53 @@ fn strip(value: &mut serde_json::Value, placeholder: Option<&str>) -> bool {
         _ => false,
     }
 }
+
+/// `event`, a line an engine sends its client, as it may leave the engine: every text in
+/// it made safe as [`safe_text`] makes it, so each URL loses its userinfo and its
+/// credentials' values and a header line that carries a credential loses its value, and
+/// the value of a key or of a `[name, value]` pair whose name marks a credential replaced
+/// with `[not kept]`. What the node relays to Cloud is what an engine sends, so this is
+/// what keeps a secret in a target's URL, or in a header a scan sent, off the stream. A
+/// slot a proof names in place of a value (`{{slot:...}}`) is kept, as it is none.
+pub fn safe_stream(event: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    fn hidden(value: &str) -> bool {
+        value.is_empty() || value.starts_with("{{slot:") || value == NOT_KEPT
+    }
+    fn clean(value: &mut Value) {
+        match value {
+            Value::String(text) => *text = safe_text(text),
+            Value::Array(items) => {
+                if let [Value::String(name), Value::String(held)] = items.as_mut_slice()
+                    && !name.contains([' ', ':'])
+                    && secret_name(name)
+                    && !hidden(held)
+                {
+                    *held = NOT_KEPT.to_string();
+                    return;
+                }
+                items.iter_mut().for_each(clean);
+            }
+            Value::Object(map) => {
+                for (key, v) in map.iter_mut() {
+                    match v {
+                        Value::String(held) if secret_name(key) && !hidden(held) => {
+                            *held = NOT_KEPT.to_string();
+                        }
+                        _ => clean(v),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut event = event.clone();
+    clean(&mut event);
+    event
+}
+
+/// What a credential's value is replaced with in a line an engine sends.
+const NOT_KEPT: &str = "[not kept]";
 
 /// `value`, a result such as a finding, with no credential in it: taken out as
 /// [`without_secrets`] takes them out of settings, with no mark where one was.
@@ -835,6 +894,46 @@ pub async fn reset(pool: &PgPool, engine: &str) -> Result<(), sqlx::Error> {
 
 #[cfg(test)]
 mod tests {
+    /// An engine's line keeps no credential: not a URL's userinfo or secret query value,
+    /// not a credential header's value in a text or under a key or in a name and value
+    /// pair, and a proof's slot is left as it is.
+    #[test]
+    fn a_line_an_engine_sends_carries_no_credential() {
+        let event = serde_json::json!({"type": "finding", "data": {
+            "target": "https://u:pw-secret-1@app.test/a?token=q-secret-2&page=1",
+            "evidence": ["header set-cookie: session=c-secret-3", "header server: nginx"],
+            "banner": "HTTP/1.1 200 OK\nSet-Cookie: sid=c-secret-4\nServer: x",
+            "headers": {"Authorization": "Bearer h-secret-5", "Accept": "*/*"},
+            "fields": [["X-Api-Token", "p-secret-6"], ["X-Kept", "{{slot:header.X-Kept}}"],
+                       ["Cookie", "{{slot:auth.cookie}}"]],
+            "count": 3,
+            "auth_checks": false,
+            "request": "GET /search?q=1&token=r-secret-7 HTTP/1.1",
+        }});
+        let safe = safe_stream(&event);
+        let text = safe.to_string();
+        for secret in [
+            "pw-secret-1",
+            "q-secret-2",
+            "c-secret-3",
+            "c-secret-4",
+            "h-secret-5",
+            "p-secret-6",
+            "r-secret-7",
+        ] {
+            assert!(!text.contains(secret), "{secret} in {text}");
+        }
+        assert_eq!(safe["data"]["target"], "https://app.test/a?token=&page=1");
+        assert_eq!(safe["data"]["evidence"][1], "header server: nginx");
+        assert_eq!(safe["data"]["headers"]["Accept"], "*/*");
+        assert_eq!(safe["data"]["fields"][1][1], "{{slot:header.X-Kept}}");
+        assert_eq!(safe["data"]["fields"][2][1], "{{slot:auth.cookie}}");
+        assert_eq!(safe["data"]["count"], 3);
+        assert_eq!(safe["data"]["auth_checks"], false);
+        let plain = serde_json::json!({"type": "progress", "processed": 2, "total": 9});
+        assert_eq!(safe_stream(&plain), plain);
+    }
+
     use super::*;
     use crate::ready::tests::engine_at;
     use crate::testing::Scratch;

@@ -322,11 +322,13 @@ async fn handle_services(
     forward(op, rx, writer, db, scan).await
 }
 
+/// Send `v` to the client, made safe to leave the engine (see
+/// [`cfx_db::scans::safe_stream`]): the node relays it to Cloud as it is.
 async fn write_line(
     writer: &mut OwnedWriteHalf,
     v: &Value,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut s = serde_json::to_string(v)?;
+    let mut s = serde_json::to_string(&cfx_db::scans::safe_stream(v))?;
     s.push('\n');
     writer.write_all(s.as_bytes()).await?;
     Ok(())
@@ -487,6 +489,77 @@ mod tests {
             }
         }
         (caps, events)
+    }
+
+    /// A page that names itself as nginx with a version, answers with a session cookie of
+    /// its own, and keeps each request it was sent.
+    async fn recording_page() -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let kept = Arc::clone(&kept);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 16384];
+                    while let Ok(n) = sock.read(&mut buf).await {
+                        if n == 0 {
+                            return;
+                        }
+                        kept.lock()
+                            .unwrap()
+                            .push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                        let body = b"<html><head><title>x</title></head><body>ok</body></html>";
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nServer: nginx/1.24.0\r\n\
+                             Set-Cookie: sid=page-secret-3; Path=/\r\n\
+                             Content-Type: text/html\r\nContent-Length: {}\r\n\r\n",
+                            body.len()
+                        );
+                        if sock.write_all(head.as_bytes()).await.is_err()
+                            || sock.write_all(body).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    /// A fingerprint of a target with a secret in its query, sent with a credential
+    /// header, reaches the target with both, and nothing that comes out carries either,
+    /// nor the session cookie the target gave.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fingerprint_sends_no_secret_out() {
+        let (tport, seen) = recording_page().await;
+        let dport = daemon().await;
+        let (_, events) = ask_then_run(
+            dport,
+            serde_json::json!({
+                "operation": "fingerprint",
+                "target": format!("http://127.0.0.1:{tport}/?token=tm-secret-1&x=1"),
+                "evasive": false,
+                "auth": {"headers": {"X-Api-Key": "tm-secret-2"}, "cookies": ""},
+            }),
+        )
+        .await;
+        let sent = seen.lock().unwrap().join("\n");
+        for secret in ["tm-secret-1", "tm-secret-2"] {
+            assert!(sent.contains(secret), "the target was never sent {secret}");
+        }
+        assert!(
+            events
+                .iter()
+                .any(|e| e["type"] == "finding" && e["data"]["name"] == "Nginx"),
+            "nginx was not found: {events:?}"
+        );
+        let out = serde_json::to_string(&events).unwrap();
+        for secret in ["tm-secret-1", "tm-secret-2", "page-secret-3"] {
+            assert!(!out.contains(secret), "{secret} went out: {out}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

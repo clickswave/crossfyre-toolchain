@@ -430,6 +430,8 @@ async fn handle_connection(
     Ok(())
 }
 
+/// Send `value` to the client, made safe to leave the engine (see
+/// [`cfx_db::scans::safe_stream`]): the node relays it to Cloud as it is.
 async fn write_json<W, T>(
     writer: &mut W,
     value: &T,
@@ -438,7 +440,7 @@ where
     W: AsyncWriteExt + Unpin,
     T: Serialize,
 {
-    let mut s = serde_json::to_string(value)?;
+    let mut s = serde_json::to_string(&cfx_db::scans::safe_stream(&serde_json::to_value(value)?))?;
     s.push('\n');
     writer.write_all(s.as_bytes()).await?;
     Ok(())
@@ -1144,6 +1146,7 @@ pub(crate) async fn answer_not_ready(sock: TcpStream, why: String) {
         "type": "error",
         "message": format!("ambulo is not ready, waiting for its database: {why}"),
     });
+    let msg = cfx_db::scans::safe_stream(&msg);
     let _ = writer.write_all(format!("{msg}\n").as_bytes()).await;
     let _ = writer.shutdown().await;
     let mut sent = [0u8; 8192];
@@ -1303,6 +1306,77 @@ mod egress_tests {
             );
         }
         assert_all_through(&fx, &proxy, &[]);
+    }
+
+    /// A site whose page links on to another with the same query, and that keeps each
+    /// request it was sent.
+    async fn recording_site() -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::AsyncReadExt;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let kept = Arc::clone(&kept);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 16384];
+                    while let Ok(n) = sock.read(&mut buf).await {
+                        if n == 0 {
+                            return;
+                        }
+                        kept.lock()
+                            .unwrap()
+                            .push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                        let body = "<html><body><a href=\"/next?token=am-secret-1\">next</a></body></html>";
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n",
+                            body.len()
+                        );
+                        if sock.write_all(head.as_bytes()).await.is_err()
+                            || sock.write_all(body.as_bytes()).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    /// A crawl from a seed with a secret in its query, sent with a credential header,
+    /// reaches the target with both, and nothing that comes out carries either, though
+    /// the page links on with the same secret.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_crawl_sends_no_secret_out() {
+        let (tport, seen) = recording_site().await;
+        let dport = daemon().await;
+        let op = serde_json::json!({
+            "operation": "crawl",
+            "response": "stream",
+            "seed": format!("http://127.0.0.1:{tport}/?token=am-secret-1&x=1"),
+            "max_pages": 5,
+            "evasive": false,
+            "auth": {"headers": {"X-Api-Key": "am-secret-2"}, "cookies": ""},
+        });
+        let events = exchange(dport, &op).await;
+        let sent = seen.lock().unwrap().join("\n");
+        for secret in ["am-secret-1", "am-secret-2"] {
+            assert!(sent.contains(secret), "the target was never sent {secret}");
+        }
+        assert!(
+            sent.contains("GET /next?"),
+            "the crawl did not follow the link: {sent}"
+        );
+        let out = serde_json::to_string(&events).unwrap();
+        assert!(
+            out.contains("/next"),
+            "the crawl said nothing of what it found: {out}"
+        );
+        for secret in ["am-secret-1", "am-secret-2"] {
+            assert!(!out.contains(secret), "{secret} went out: {out}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

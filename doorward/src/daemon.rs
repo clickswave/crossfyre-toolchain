@@ -429,11 +429,14 @@ async fn dispatch(req: DaemonRequest, db: Arc<DoorwardDb>) -> serde_json::Value 
     }
 }
 
+/// Send `value` to the client, made safe to leave the engine (see
+/// [`cfx_db::scans::safe_stream`]): the node relays it to Cloud as it is.
 async fn write_json<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     value: &impl serde::Serialize,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut json = serde_json::to_string(value)?;
+    let mut json =
+        serde_json::to_string(&cfx_db::scans::safe_stream(&serde_json::to_value(value)?))?;
     json.push('\n');
     writer.write_all(json.as_bytes()).await?;
     writer.flush().await?;
@@ -537,6 +540,50 @@ mod http_request_tests {
             .map(str::to_string)
             .collect();
         (lines, closed)
+    }
+
+    /// A service's banner that names a URL with a credential in it and a session cookie
+    /// comes out of a scan with neither.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_banner_goes_out_with_no_secret() {
+        let service = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let sport = service.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = service.accept().await {
+                let _ = sock
+                    .write_all(
+                        b"220 ready, see http://u:dw-secret-1@x.test/?token=dw-secret-2\r\n\
+                          Set-Cookie: s=dw-secret-3\r\n",
+                    )
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        });
+        let port = daemon().await;
+        let op = serde_json::json!({
+            "operation": "scan", "response": "stream", "targets": ["127.0.0.1"],
+            "ports": [sport], "service_detection": true, "adaptive": false, "timeout": 2000,
+        });
+        let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        s.write_all(format!("{op}\n").as_bytes()).await.unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 8192];
+        while let Ok(Ok(n)) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), s.read(&mut buf)).await
+        {
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+            if String::from_utf8_lossy(&got).contains("\"done\"") {
+                break;
+            }
+        }
+        let out = String::from_utf8_lossy(&got).into_owned();
+        assert!(out.contains("220 ready"), "no banner came out: {out}");
+        for secret in ["dw-secret-1", "dw-secret-2", "dw-secret-3"] {
+            assert!(!out.contains(secret), "{secret} went out: {out}");
+        }
     }
 
     #[tokio::test]

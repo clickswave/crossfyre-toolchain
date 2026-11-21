@@ -305,6 +305,8 @@ async fn handle_connection(
     Ok(())
 }
 
+/// Send `value` to the client, made safe to leave the engine (see
+/// [`cfx_db::scans::safe_stream`]): the node relays it to Cloud as it is.
 async fn write_json<W, T>(
     writer: &mut W,
     value: &T,
@@ -313,7 +315,7 @@ where
     W: AsyncWriteExt + Unpin,
     T: Serialize,
 {
-    let mut s = serde_json::to_string(value)?;
+    let mut s = serde_json::to_string(&cfx_db::scans::safe_stream(&serde_json::to_value(value)?))?;
     s.push('\n');
     writer.write_all(s.as_bytes()).await?;
     Ok(())
@@ -1380,6 +1382,29 @@ async fn handle_stream_takeover(
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+
+    /// What voyage sends its client leaves the engine with no credential in it: a probed
+    /// URL's userinfo and secret query value, and a session cookie a page set.
+    #[tokio::test]
+    async fn a_line_voyage_sends_carries_no_secret() {
+        let event = serde_json::json!({"type": "result", "data": {
+            "subdomain": "app.test",
+            "url": "https://u:vy-secret-1@app.test/?token=vy-secret-2",
+            "headers": {"Set-Cookie": "sid=vy-secret-3", "Server": "nginx"},
+        }});
+        let mut out: Vec<u8> = Vec::new();
+        write_json(&mut out, &event).await.unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("app.test") && out.contains("nginx"), "{out}");
+        for secret in ["vy-secret-1", "vy-secret-2", "vy-secret-3"] {
+            assert!(!out.contains(secret), "{secret} went out: {out}");
+        }
+    }
 }
 
 #[cfg(test)]

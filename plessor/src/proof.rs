@@ -4,7 +4,7 @@
 //!
 //! A proof keeps no secret. The scan's own credential goes on the client, not in the
 //! requests, and the proof names only the slots it fills (`auth.cookie`,
-//! `auth.header:<name>`). A header whose name marks a credential is a slot too, every
+//! `auth.header.<name>`). A header whose name marks a credential is a slot too, every
 //! URL is made safe as a finding's are, and so is the evidence, so that the proof can
 //! travel with the finding to Cloud. A replay fills the slots from what it is given and
 //! refuses a proof with one it cannot fill.
@@ -112,7 +112,7 @@ impl Ctx {
             let mut names: Vec<&String> = auth.headers.keys().collect();
             names.sort();
             for name in names {
-                slots.push(format!("auth.header:{name}"));
+                slots.push(format!("auth.header.{name}"));
             }
         }
         Self {
@@ -206,7 +206,7 @@ fn kept(mut sent: Sent, slots: &mut Vec<String>) -> Sent {
     sent.url = safe;
     for (name, value) in &mut sent.fields {
         if cfx_db::scans::secret_name(name) {
-            let slot = format!("header:{name}");
+            let slot = format!("header.{name}");
             *value = format!("{{{{slot:{slot}}}}}");
             add(slots, &slot);
         } else {
@@ -328,10 +328,10 @@ mod tests {
             proof.slots,
             [
                 "auth.cookie",
-                "auth.header:Authorization",
-                "auth.header:X-Api-Key",
+                "auth.header.Authorization",
+                "auth.header.X-Api-Key",
                 "url",
-                "header:Authorization"
+                "header.Authorization"
             ]
         );
         assert_eq!(

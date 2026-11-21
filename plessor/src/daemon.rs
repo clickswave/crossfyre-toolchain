@@ -417,8 +417,10 @@ where
     move |p, tx, _| run(p, tx)
 }
 
+/// Send `v` to the client, made safe to leave the engine (see
+/// [`cfx_db::scans::safe_stream`]): the node relays it to Cloud as it is.
 async fn write_line(writer: &mut OwnedWriteHalf, v: &Value) -> Result<(), BoxError> {
-    let mut s = serde_json::to_string(v)?;
+    let mut s = serde_json::to_string(&cfx_db::scans::safe_stream(v))?;
     s.push('\n');
     writer.write_all(s.as_bytes()).await?;
     Ok(())
@@ -907,9 +909,10 @@ mod tests {
         (port, seen)
     }
 
-    /// A finding of an authenticated scan goes out with a proof. Nothing that goes out
-    /// holds the scan's cookie or token, and the proof holds neither a credential header
-    /// the template sent nor a secret in its URL, though the target was sent each one.
+    /// A finding of an authenticated scan goes out with a proof, and nothing that goes
+    /// out holds the scan's cookie or token, a credential header the template sent, a
+    /// secret in the template's URL or one in the target's own query, though the target
+    /// was sent each one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_proof_of_an_authenticated_scan_carries_no_secret() {
         let (tport, seen) = recording_target().await;
@@ -928,7 +931,7 @@ mod tests {
         let op = serde_json::json!({
             "operation": "scan",
             "response": "stream",
-            "target": format!("http://127.0.0.1:{tport}"),
+            "target": format!("http://127.0.0.1:{tport}/?api_key=target-secret-5"),
             "templates_dir": dir.to_string_lossy(),
             "only": ["proof-probe"],
             "auth": {"cookies": "session=sess-secret-1",
@@ -943,9 +946,12 @@ mod tests {
             "bearer-secret-2",
             "tmpl-secret-3",
             "url-secret-4",
+            "target-secret-5",
         ];
         let sent = seen.lock().unwrap().join("\n");
-        for secret in secrets {
+        // A template scan goes from the target's origin, so the target's own query is not
+        // sent: it must not go out either.
+        for secret in &secrets[..4] {
             assert!(sent.contains(secret), "the target was never sent {secret}");
         }
         let finding = events
@@ -958,19 +964,85 @@ mod tests {
             proof["slots"],
             serde_json::json!([
                 "auth.cookie",
-                "auth.header:Authorization",
+                "auth.header.Authorization",
                 "url",
-                "header:X-Api-Token"
+                "header.X-Api-Token"
             ])
         );
         assert_eq!(proof["fired"][0]["evidence"], "ok");
         let out = serde_json::to_string(&events).unwrap();
-        for secret in &secrets[..2] {
+        for secret in secrets {
             assert!(!out.contains(secret), "{secret} went out: {out}");
         }
-        let kept = proof.to_string();
-        for secret in secrets {
-            assert!(!kept.contains(secret), "{secret} is in the proof: {kept}");
+    }
+
+    /// A target that answers every request with the request's own line, decoded, so
+    /// whatever was asked for is reflected, and keeps each request it was sent.
+    async fn reflecting_target() -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let kept = Arc::clone(&kept);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 16384];
+                    while let Ok(n) = sock.read(&mut buf).await {
+                        if n == 0 {
+                            return;
+                        }
+                        let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                        let line = crate::probe::pct_decode(
+                            &request.lines().next().unwrap_or_default().replace('+', " "),
+                        );
+                        kept.lock().unwrap().push(request);
+                        let body = format!("<html><body>{line}</body></html>");
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n",
+                            body.len()
+                        );
+                        if sock.write_all(head.as_bytes()).await.is_err()
+                            || sock.write_all(body.as_bytes()).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    /// An injection test of a URL with a secret in its query, sent with a cookie, goes to
+    /// the target with both, and nothing that comes back out carries either, though the
+    /// target reflects every request it is sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_injection_test_sends_no_secret_out() {
+        let (tport, seen) = reflecting_target().await;
+        let dport = daemon().await;
+        let op = serde_json::json!({
+            "operation": "inject",
+            "response": "stream",
+            "target": format!("http://127.0.0.1:{tport}"),
+            "endpoints": [{"method": "GET",
+                           "url": format!("http://127.0.0.1:{tport}/search?q=1&token=inj-secret-1")}],
+            "classes": ["xss"],
+            "auth": {"cookies": "session=inj-secret-2", "headers": {}},
+            "evasive": false,
+        });
+        let events = run_to_done(dport, &op).await;
+        let sent = seen.lock().unwrap().join("\n");
+        for secret in ["inj-secret-1", "inj-secret-2"] {
+            assert!(sent.contains(secret), "the target was never sent {secret}");
+        }
+        assert!(
+            events.iter().any(|e| e["type"] == "finding"),
+            "the reflection was not found: {events:?}"
+        );
+        let out = serde_json::to_string(&events).unwrap();
+        for secret in ["inj-secret-1", "inj-secret-2"] {
+            assert!(!out.contains(secret), "{secret} went out: {out}");
         }
     }
 

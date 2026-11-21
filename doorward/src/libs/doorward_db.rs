@@ -18,8 +18,8 @@ impl DoorwardDb {
         Self { pool }
     }
 
-    /// A handle that has never connected and connects only if it is used, for tests
-    /// of daemon paths that do not touch the database.
+    /// A handle that has never connected and gives up at once when used, for tests of
+    /// daemon paths that run without a database: their scans are not kept.
     #[cfg(test)]
     pub fn unconnected() -> Self {
         let opts = sqlx::postgres::PgConnectOptions::new()
@@ -28,7 +28,9 @@ impl DoorwardDb {
             .username("none")
             .database("none");
         Self {
-            pool: sqlx::PgPool::connect_lazy_with(opts),
+            pool: sqlx::postgres::PgPoolOptions::new()
+                .acquire_timeout(std::time::Duration::from_millis(100))
+                .connect_lazy_with(opts),
         }
     }
 

@@ -282,8 +282,9 @@ impl Ledger for ScanLedger {
 mod tests {
     use super::*;
 
-    /// A finding found again with another proof is kept once, with the proof it was
-    /// first kept with.
+    /// A finding found again with another proof, or at a URL whose token has been
+    /// rotated, is kept once, with the proof it was first kept with: what tells findings
+    /// apart is what is kept of them, which holds no credential.
     #[tokio::test]
     #[ignore = "needs PostgreSQL's programs"]
     async fn a_finding_is_kept_once_whatever_its_proof() {
@@ -293,14 +294,15 @@ mod tests {
             .start("scan", &serde_json::json!({"target": "http://app.test"}))
             .await
             .expect("kept");
-        let found = |hash: &str| {
+        let found = |hash: &str, token: &str| {
             serde_json::json!({"type": "finding", "data": {
-                "template": "t", "matched_at": "http://app.test/x",
+                "template": "t", "matched_at": format!("http://app.test/x?token={token}"),
                 "proof": {"format": 1, "response_sha256": hash},
             }})
         };
-        db.event(Some(&scan.id), &found("aa")).await;
-        db.event(Some(&scan.id), &found("bb")).await;
+        db.event(Some(&scan.id), &found("aa", "first")).await;
+        db.event(Some(&scan.id), &found("bb", "first")).await;
+        db.event(Some(&scan.id), &found("aa", "rotated")).await;
         let kept: Vec<(String,)> =
             sqlx::query_as("SELECT data->'proof'->>'response_sha256' FROM findings")
                 .fetch_all(db.pool())
