@@ -61,6 +61,18 @@
 //!
 //! Signing lives in the `relsign` dev tool, not here. This module verifies and nothing
 //! else, so the shipped binary carries no code path that produces a signature.
+//!
+//! # The data key
+//!
+//! The pack of templates and signatures and the CVE dataset change far more often than a
+//! release, and a job that runs each day unattended publishes them. That job must not
+//! hold the release key, so it signs with a key of its own: the data key, which signs the
+//! data manifest (`data_manifest`) and nothing else. A build carries its public half,
+//! `CROSSFYRE_DATA_PUBKEY` and `CROSSFYRE_DATA_PUBKEY_NEXT`, for the environment it is
+//! built for, under the same rule as the release key: built with one, a data manifest
+//! must carry a valid signature; built with none, it is not checked. The two sets of keys
+//! are never mixed. A release manifest is checked against the release keys alone, so
+//! whoever holds the data key cannot make a client accept a binary.
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
@@ -72,6 +84,13 @@ const MANIFEST_PUBKEY: Option<&str> = option_env!("CROSSFYRE_MANIFEST_PUBKEY");
 /// Base64 of the key the NEXT release will sign with, shipped one release early so a
 /// rotation does not strand anything already installed. See the module note on rotation.
 const MANIFEST_PUBKEY_NEXT: Option<&str> = option_env!("CROSSFYRE_MANIFEST_PUBKEY_NEXT");
+
+/// Base64 of the data key's public half for the environment this build is for: the key
+/// the data manifest is signed with. See the module note on the data key.
+const DATA_PUBKEY: Option<&str> = option_env!("CROSSFYRE_DATA_PUBKEY");
+
+/// The data key the next release will sign with, as for the release key.
+const DATA_PUBKEY_NEXT: Option<&str> = option_env!("CROSSFYRE_DATA_PUBKEY_NEXT");
 
 /// Where the detached signature sits, relative to the manifest.
 pub const SIG_SUFFIX: &str = ".sig";
@@ -95,6 +114,28 @@ fn trusted_keys() -> Vec<&'static str> {
 /// so the error a user sees names the real problem rather than a 404.
 pub fn required() -> bool {
     !trusted_keys().is_empty()
+}
+
+/// Every key this build will accept a data manifest from, current first.
+fn data_keys() -> Vec<&'static str> {
+    [DATA_PUBKEY, DATA_PUBKEY_NEXT]
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// Does this build demand a signed data manifest?
+pub fn data_required() -> bool {
+    !data_keys().is_empty()
+}
+
+/// Verify a detached signature over the data manifest's bytes, with the data keys alone.
+pub fn verify_data(manifest: &[u8], sig_b64: &str) -> Result<(), String> {
+    let keys = data_keys();
+    if keys.is_empty() {
+        return Ok(()); // unkeyed build: nothing to verify against
+    }
+    verify_against(&keys, "data manifest", manifest, sig_b64)
 }
 
 /// Decode a base64 ed25519 public key into a verifying key.
@@ -129,6 +170,11 @@ pub fn verify(manifest: &[u8], sig_b64: &str) -> Result<(), String> {
 /// reports as malformed instead of as "did not verify against any key", which would send
 /// whoever reads it looking for a rotation problem that is not there.
 pub fn verify_with_any(keys: &[&str], manifest: &[u8], sig_b64: &str) -> Result<(), String> {
+    verify_against(keys, "release manifest", manifest, sig_b64)
+}
+
+/// [`verify_with_any`] for the manifest `what` names, which the error names.
+fn verify_against(keys: &[&str], what: &str, manifest: &[u8], sig_b64: &str) -> Result<(), String> {
     let sig = parse_sig(sig_b64)?;
     for k in keys {
         // A key that does not parse is a build misconfiguration, not a bad manifest, and
@@ -138,7 +184,7 @@ pub fn verify_with_any(keys: &[&str], manifest: &[u8], sig_b64: &str) -> Result<
         }
     }
     Err(format!(
-        "release manifest signature does not verify against any of this build's {} \
+        "{what} signature does not verify against any of this build's {} \
          public key(s). Refusing to install anything described by it. Either the manifest \
          was modified in transit or on the release origin, or this binary predates a key \
          rotation and needs replacing from a trusted source.",
@@ -288,6 +334,60 @@ mod tests {
         assert_eq!(b64_decode("ab$d"), None);
         // Whitespace is tolerated, because a signature file may end with a newline.
         assert_eq!(b64_decode("YWJj\n").as_deref(), Some(&b"abc"[..]));
+    }
+
+    /// The release keys and the data key are kept apart: a release manifest signed with
+    /// the data key is not accepted as one, so the data key cannot make a client install a
+    /// binary, and a data manifest signed with a release key, or with any key but the data
+    /// key, is not accepted either.
+    #[test]
+    fn the_data_key_and_the_release_keys_never_vouch_for_each_others_manifests() {
+        use ed25519_dalek::Signer;
+        let release = keypair_from(TEST_SEED_B64);
+        let data = keypair_from(TEST_SEED_NEXT_B64);
+        let (release_pk, data_pk) = (pubkey_b64(&release), pubkey_b64(&data));
+        let sign =
+            |key: &ed25519_dalek::SigningKey, body: &[u8]| b64_encode(&key.sign(body).to_bytes());
+        let data_manifest = br#"{"format":1,"made":"2026-11-21T15:00:00Z"}"#;
+        let by_data = sign(&data, TEST_MANIFEST);
+        let err = verify_against(&[&release_pk], "release manifest", TEST_MANIFEST, &by_data)
+            .unwrap_err();
+        assert!(
+            err.starts_with("release manifest signature does not verify"),
+            "{err}"
+        );
+        assert!(
+            verify_against(
+                &[&data_pk],
+                "data manifest",
+                data_manifest,
+                &sign(&data, data_manifest)
+            )
+            .is_ok()
+        );
+        let err = verify_against(
+            &[&data_pk],
+            "data manifest",
+            data_manifest,
+            &sign(&release, data_manifest),
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with("data manifest signature does not verify"),
+            "{err}"
+        );
+    }
+
+    /// A build carries no data key unless it was built with one, and then checks nothing,
+    /// as an unkeyed build skips the release manifest's check.
+    #[test]
+    fn an_unkeyed_build_skips_the_data_manifests_check() {
+        assert!(
+            DATA_PUBKEY.is_none(),
+            "this test binary is built without a data key"
+        );
+        assert!(!data_required());
+        assert!(verify_data(b"anything", "not a signature").is_ok());
     }
 
     #[test]

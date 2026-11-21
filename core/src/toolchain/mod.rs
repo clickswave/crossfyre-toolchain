@@ -10,6 +10,7 @@
 // desktop proxy keeps referring to it as `toolchain::capture`.
 pub use cfx_capture as capture;
 pub mod config;
+pub mod data_manifest;
 pub mod db;
 pub mod doctor;
 pub mod install;
