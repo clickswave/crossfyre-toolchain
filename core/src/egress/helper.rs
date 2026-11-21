@@ -12,7 +12,11 @@
 //! - `up` applies egress for that config and answers once it has (`up`), then keeps
 //!   running for as long as egress is to stay up. Closing its stdin takes egress down,
 //!   which happens when the [`Up`] is dropped and when the node ends, however it ends.
-//!   After its answer it writes nothing more to its stdout.
+//!   After its answer it writes nothing more to its stdout. When egress cannot come
+//!   up it answers `up: false` with `why`, and ends.
+//!
+//! Every error here is a whole reason, as the node says it: `helper not installed`,
+//! `helper did not answer within 30 s`, `egress not up: <why>`.
 
 use crate::NetworkConfig;
 use serde_json::{Value, json};
@@ -54,9 +58,10 @@ pub fn find(exe: &Path) -> Result<PathBuf, String> {
     let dir = exe.parent().ok_or("the executable has no folder")?;
     let path = dir.join(format!("{HELPER}{}", std::env::consts::EXE_SUFFIX));
     if !path.exists() {
-        return Err("not installed".into());
+        return Err("helper not installed".into());
     }
-    crate::toolchain::packaging::trust(&path, exe).map_err(|why| format!("not run: {why}"))?;
+    crate::toolchain::packaging::trust(&path, exe)
+        .map_err(|why| format!("helper not run: {why}"))?;
     Ok(path)
 }
 
@@ -74,24 +79,27 @@ pub fn config(
         "net_dir": net_dir,
         "tunnel_hooks": tunnel_hooks,
     });
-    let mut child = spawn(helper, "config")?;
-    let mut stdin = child.stdin.take().ok_or("its stdin was not opened")?;
-    let written = writeln!(stdin, "{request}");
-    drop(stdin);
-    let answer = written
-        .map_err(|e| format!("could not be asked: {e}"))
-        .and_then(|()| answer_within(&mut child, limits.config));
-    end(&mut child, limits.down.min(Duration::from_secs(5)));
-    let answer = answer?;
-    let version = version_of(&answer)?;
-    let network = match &answer["network"] {
-        Value::Null => None,
-        n => Some(
-            serde_json::from_value(n.clone())
-                .map_err(|_| "answered with a config that does not read".to_string())?,
-        ),
+    let asked = || -> Result<(String, Option<NetworkConfig>), String> {
+        let mut child = spawn(helper, "config")?;
+        let mut stdin = child.stdin.take().ok_or("its stdin was not opened")?;
+        let written = writeln!(stdin, "{request}");
+        drop(stdin);
+        let answer = written
+            .map_err(|e| format!("could not be asked: {e}"))
+            .and_then(|()| answer_within(&mut child, limits.config));
+        end(&mut child, limits.down.min(Duration::from_secs(5)));
+        let answer = answer?;
+        let version = version_of(&answer)?;
+        let network = match &answer["network"] {
+            Value::Null => None,
+            n => Some(
+                serde_json::from_value(n.clone())
+                    .map_err(|_| "answered with a config that does not read".to_string())?,
+            ),
+        };
+        Ok((version, network))
     };
-    Ok((version, network))
+    asked().map_err(|why| format!("helper {why}"))
 }
 
 /// An `up` helper, holding egress up until it is dropped.
@@ -133,18 +141,26 @@ pub fn up(
         "node_id": node_id,
         "tunnel_hooks": tunnel_hooks,
     });
-    let mut child = spawn(helper, "up")?;
-    let mut stdin = child.stdin.take().ok_or("its stdin was not opened")?;
+    let mut child = spawn(helper, "up").map_err(|why| format!("helper {why}"))?;
+    let mut stdin = child.stdin.take().ok_or("helper's stdin was not opened")?;
     let answered = writeln!(stdin, "{request}")
         .and_then(|()| stdin.flush())
         .map_err(|e| format!("could not be asked: {e}"))
         .and_then(|()| answer_within(&mut child, limits.up))
+        .map_err(|why| format!("helper {why}"))
         .and_then(|a| {
-            let version = version_of(&a)?;
-            if a["up"] != true {
-                return Err("answered without bringing egress up".into());
+            let version = version_of(&a).map_err(|why| format!("helper {why}"))?;
+            match a["up"].as_bool() {
+                Some(true) => Ok(version),
+                Some(false) => Err(format!(
+                    "egress not up: {}",
+                    a["why"]
+                        .as_str()
+                        .map(|w| clean(w, 200))
+                        .unwrap_or_else(|| "no reason given".into())
+                )),
+                None => Err("helper answered without saying whether egress is up".into()),
             }
-            Ok(version)
         });
     match answered {
         Ok(version) => Ok(Up {

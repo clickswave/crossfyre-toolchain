@@ -105,38 +105,12 @@ fn try_up(setup: &Setup, asked: &Asked) -> Tried {
     }
 }
 
-/// What the node says and refuses, for egress up by `up`, or not up for `why`.
+/// What the node says and refuses, for egress up by the helper at `version`, or not up
+/// for `why`.
 fn isolated(net: &NetworkConfig, outcome: Result<&str, &str>) -> Isolated {
     match outcome {
-        Ok(version) => Isolated {
-            label: format!("helper {version}"),
-            refusal: None,
-        },
-        Err(why) if net.kill_switch => {
-            let label = format!("refused (kill switch on, helper {why})");
-            Isolated {
-                refusal: Some(format!("egress: {label}")),
-                label,
-            }
-        }
-        Err(why) => Isolated {
-            label: format!("baseline (helper {why})"),
-            refusal: None,
-        },
-    }
-}
-
-fn say(state: &EgressState, now: Isolated) {
-    if state.isolation() != now {
-        println!("[network] egress: {}", now.label);
-        if now.refusal.is_some() {
-            println!(
-                "[network] Nothing is sent until the egress helper answers: the kill switch is on."
-            );
-        } else if now.label.starts_with("baseline") {
-            println!("[network] This node sends directly.");
-        }
-        state.set_isolation(now);
+        Ok(version) => Isolated::of(net.kill_switch, Ok(&format!("helper {version}"))),
+        Err(why) => Isolated::of(net.kill_switch, Err(why)),
     }
 }
 
@@ -154,10 +128,10 @@ pub fn start(asked: Asked, setup: Setup, state: Arc<EgressState>) -> Isolation {
     }
     match try_up(&setup, &asked) {
         Tried::Up(u) => {
-            say(&state, isolated(net, Ok(&u.version)));
+            state.set_isolation(isolated(net, Ok(&u.version)));
             *up.lock().unwrap_or_else(|e| e.into_inner()) = Some(u);
         }
-        Tried::No(why) => say(&state, isolated(net, Err(&why))),
+        Tried::No(why) => state.set_isolation(isolated(net, Err(&why))),
     }
     let (held, stopped) = (Arc::clone(&up), Arc::clone(&stop));
     std::thread::spawn(move || {
@@ -173,7 +147,7 @@ pub fn start(asked: Asked, setup: Setup, state: Arc<EgressState>) -> Isolation {
                         continue;
                     }
                     drop(cur.take());
-                    say(&state, isolated(&asked.net, Err("stopped")));
+                    state.set_isolation(isolated(&asked.net, Err("helper stopped")));
                 }
             }
             match try_up(&setup, &asked) {
@@ -182,10 +156,10 @@ pub fn start(asked: Asked, setup: Setup, state: Arc<EgressState>) -> Isolation {
                     if stopped.load(Ordering::SeqCst) {
                         return;
                     }
-                    say(&state, isolated(&asked.net, Ok(&u.version)));
+                    state.set_isolation(isolated(&asked.net, Ok(&u.version)));
                     *cur = Some(u);
                 }
-                Tried::No(why) => say(&state, isolated(&asked.net, Err(&why))),
+                Tried::No(why) => state.set_isolation(isolated(&asked.net, Err(&why))),
             }
         }
     });

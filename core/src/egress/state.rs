@@ -269,11 +269,36 @@ pub struct EgressState {
 /// Isolated egress as the node runs it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Isolated {
-    /// What the node says of it: `direct`, `helper <version>`, `baseline (<why>)` or
-    /// `refused (<why>)`. Empty before the node has brought it up.
+    /// What the node says of it: `direct`, `helper <version>`, `built in`,
+    /// `baseline (<why>)` or `refused (kill switch on, <why>)`. Empty before the node
+    /// has brought it up.
     pub label: String,
-    /// Why nothing may be sent: set while a kill switch has no helper to keep it.
+    /// Why nothing may be sent: set while a kill switch is on and egress is not up.
     pub refusal: Option<String>,
+}
+
+impl Isolated {
+    /// Egress up as `up` says, or not up for `why`, a whole reason. Not up, a node
+    /// with the kill switch on sends nothing, and one without it sends directly.
+    pub fn of(kill_switch: bool, outcome: Result<&str, &str>) -> Isolated {
+        match outcome {
+            Ok(up) => Isolated {
+                label: up.to_string(),
+                refusal: None,
+            },
+            Err(why) if kill_switch => {
+                let label = format!("refused (kill switch on, {why})");
+                Isolated {
+                    refusal: Some(format!("egress: {label}")),
+                    label,
+                }
+            }
+            Err(why) => Isolated {
+                label: format!("baseline ({why})"),
+                refusal: None,
+            },
+        }
+    }
 }
 
 /// The daemon's state. Each node runs as its own process, so one per process is one
@@ -297,11 +322,22 @@ impl EgressState {
         })
     }
 
-    /// Say how isolated egress runs, and whether it refuses.
-    pub fn set_isolation(&self, isolated: Isolated) {
-        if let Ok(mut cur) = self.isolation.lock() {
-            *cur = isolated;
+    /// Say how isolated egress runs, and whether it refuses: in the node's log when it
+    /// changes, and from then on to each op and the heartbeat.
+    pub fn set_isolation(&self, now: Isolated) {
+        let Ok(mut cur) = self.isolation.lock() else {
+            return;
+        };
+        if *cur == now {
+            return;
         }
+        println!("[network] egress: {}", now.label);
+        if now.refusal.is_some() {
+            println!("[network] Nothing is sent until egress is up: the kill switch is on.");
+        } else if now.label.starts_with("baseline") {
+            println!("[network] This node sends directly.");
+        }
+        *cur = now;
     }
 
     pub fn isolation(&self) -> Isolated {

@@ -80,7 +80,7 @@ pub fn process_network_config(
             .filter(|n| !n.kind.is_empty() && n.kind != "direct")
         {
             println!(
-                "[network] Isolated egress ({}): egress helper {why}. The config is kept as sent.",
+                "[network] Isolated egress ({}): {why}. The config is kept as sent.",
                 n.kind
             );
         }
@@ -128,12 +128,41 @@ pub fn bring_up(
     node_id: &str,
     tunnel_hooks: bool,
 ) -> Isolation {
-    println!("[network] egress: built in");
-    state::global().set_isolation(state::Isolated {
-        label: "built in".into(),
-        refusal: None,
-    });
-    Isolation {
-        _guard: imp::bring_up(net, net_dir, node_id, tunnel_hooks),
+    let direct = net.kind.is_empty() || net.kind == "direct";
+    let (outcome, guard) = match imp::bring_up(net, net_dir, node_id, tunnel_hooks) {
+        Ok(guard) => (Ok(if direct { "direct" } else { "built in" }), guard),
+        Err(why) => (Err(format!("egress not up: {why}")), None),
+    };
+    state::global().set_isolation(state::Isolated::of(
+        net.kill_switch,
+        outcome.as_ref().map(|s| *s).map_err(String::as_str),
+    ));
+    Isolation { _guard: guard }
+}
+
+/// With the drop-in compiled in, egress that cannot come up holds the kill switch as
+/// the helper's does. As root this would really bring egress up, so it runs as any
+/// other user only.
+#[cfg(all(test, egress_private))]
+mod built_in_tests {
+    #[test]
+    fn egress_that_is_not_up_holds_the_kill_switch() {
+        if crate::is_root() {
+            return;
+        }
+        let t = tempfile::tempdir().unwrap();
+        let net: crate::NetworkConfig = serde_json::from_value(serde_json::json!({
+            "kind": "openvpn", "kill_switch": true, "config_path": t.path().join("x.ovpn"),
+        }))
+        .unwrap();
+        let _held = super::bring_up(&net, t.path(), "node-test", false);
+        let isolated = super::state::global().isolation();
+        assert!(
+            isolated
+                .refusal
+                .as_deref()
+                .is_some_and(|r| r.starts_with("egress: refused (kill switch on, egress not up: ")),
+            "{isolated:?}"
+        );
     }
 }

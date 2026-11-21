@@ -229,7 +229,11 @@ fn a_helper_that_does_not_answer_or_answers_badly_is_not_taken() {
         ),
         (
             r#"printf '%s\n' '{"version": "v", "up": false}'"#,
-            "helper answered without bringing egress up",
+            "egress not up: no reason given",
+        ),
+        (
+            r#"printf '%s\n' '{"version": "v"}'"#,
+            "helper answered without saying whether egress is up",
         ),
     ] {
         beside.helper(
@@ -271,6 +275,33 @@ fn config_is_the_helpers_answer() {
     assert_eq!(asked["tunnel_hooks"], true);
     assert_eq!(
         helper::find(&beside.path("elsewhere/node")).unwrap_err(),
-        "not installed"
+        "helper not installed"
+    );
+}
+
+/// A helper that answers but could not bring egress up holds the kill switch as surely
+/// as no helper does, and says why.
+#[test]
+fn egress_the_helper_could_not_bring_up_holds_the_kill_switch() {
+    let beside = Beside::new();
+    let down = r#"IFS= read -r line
+printf '%s\n' '{"version": "fake 1", "up": false, "why": "not running as root"}'"#;
+    beside.helper(down, GOOD_CONFIG, 0o755);
+    let st = state();
+    let _held = start(asked(&beside, true), beside.setup(), Arc::clone(&st));
+    assert_eq!(
+        st.isolation(),
+        Isolated {
+            label: "refused (kill switch on, egress not up: not running as root)".into(),
+            refusal: Some(
+                "egress: refused (kill switch on, egress not up: not running as root)".into()
+            ),
+        }
+    );
+    let st = state();
+    let _held = start(asked(&beside, false), beside.setup(), Arc::clone(&st));
+    assert_eq!(
+        st.isolation().label,
+        "baseline (egress not up: not running as root)"
     );
 }
