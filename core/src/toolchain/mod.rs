@@ -43,8 +43,9 @@ pub mod win;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Engine {
     pub name: &'static str,
-    /// Default daemon port. A fixed protocol constant: the daemons listen on
-    /// localhost and the node talks to them over TCP JSON.
+    /// Default daemon port. A fixed protocol constant, from dguard::ports, which every
+    /// engine's client takes too: the daemons listen on localhost and the node talks to
+    /// them over TCP JSON.
     pub port: u16,
     pub about: &'static str,
 }
@@ -53,27 +54,27 @@ pub struct Engine {
 pub const ENGINES: &[Engine] = &[
     Engine {
         name: "ambulo",
-        port: 4441,
+        port: dguard::ports::AMBULO,
         about: "HTTP fuzzer, content-discovery and web-crawl engine",
     },
     Engine {
         name: "voyage",
-        port: 4442,
+        port: dguard::ports::VOYAGE,
         about: "Subdomain enumeration engine",
     },
     Engine {
         name: "doorward",
-        port: 4443,
+        port: dguard::ports::DOORWARD,
         about: "Network host and port-scanning engine",
     },
     Engine {
         name: "toolmark",
-        port: 4444,
+        port: dguard::ports::TOOLMARK,
         about: "Service enumeration and web fingerprinting engine",
     },
     Engine {
         name: "plessor",
-        port: 4445,
+        port: dguard::ports::PLESSOR,
         about: "Vulnerability detection engine",
     },
 ];

@@ -73,7 +73,7 @@ pub struct Cli {
         long,
         global = true,
         help_heading = "Global options",
-        default_value_t = 4441
+        default_value_t = dguard::ports::AMBULO
     )]
     pub port: u16,
 

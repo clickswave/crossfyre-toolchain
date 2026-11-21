@@ -19,17 +19,6 @@ struct DaemonRequest {
     egress: transport::Egress,
 }
 
-/// The answers a client writes back for the leads of one host and port it gave a plessor
-/// scan, and which scan.
-#[derive(Deserialize)]
-struct LeadAnswers {
-    host: String,
-    port: u16,
-    #[serde(default)]
-    scan: String,
-    answers: Vec<cfx_cve::inventory::LeadAnswer>,
-}
-
 /// One request line: the operation it asks for, unwrapped, with the egress its
 /// wrapper names. An error is the message the client is answered with, and nothing
 /// is sent anywhere.
@@ -134,18 +123,19 @@ async fn handle_connection(
             // What a plessor scan's templates said of the leads it was given for one host,
             // written back by the client that gave them.
             "lead_answers" => {
-                let reply = match serde_json::from_value::<LeadAnswers>(req.params) {
-                    Ok(asked) => match db
-                        .answer_leads(&asked.host, asked.port, &asked.scan, &asked.answers)
-                        .await
-                    {
-                        Ok(kept) => serde_json::json!({"status": "completed", "kept": kept}),
-                        Err(e) => serde_json::json!({"status": "error",
+                let reply =
+                    match serde_json::from_value::<cfx_cve::inventory::AnswersBack>(req.params) {
+                        Ok(asked) => match db
+                            .answer_leads(&asked.host, asked.port, &asked.scan, &asked.answers)
+                            .await
+                        {
+                            Ok(kept) => serde_json::json!({"status": "completed", "kept": kept}),
+                            Err(e) => serde_json::json!({"status": "error",
                             "message": format!("could not keep the answers: {e}")}),
-                    },
-                    Err(e) => serde_json::json!({"status": "error",
+                        },
+                        Err(e) => serde_json::json!({"status": "error",
                         "message": format!("Invalid lead_answers: {e}")}),
-                };
+                    };
                 write_line(&mut writer, &reply).await?;
             }
             // Read the pack and the CVE dataset in the toolchain directory again, as

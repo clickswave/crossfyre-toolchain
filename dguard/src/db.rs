@@ -89,7 +89,7 @@ pub async fn answer(
 
 /// Send `request` to the engine's daemon, and give its answer when it is done. An answer
 /// other than done is an error, in the daemon's words.
-async fn ask(
+pub async fn ask(
     daemon: &Daemon,
     request: &serde_json::Value,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {

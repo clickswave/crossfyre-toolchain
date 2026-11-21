@@ -246,6 +246,8 @@ pub async fn handle(env: OpEnv) {
 
     // What toolmark saw on the target's host and port lately chooses the templates, unless
     // the workflow asks for all of them, and its CVE leads go to be answered either way.
+    // The answers go back to toolmark for that host and port once the scan has run.
+    let mut answer_back: Option<(String, u16)> = None;
     if mode == "scan" {
         if data["all_templates"].as_bool().unwrap_or(false) {
             plessor_req["all_templates"] = serde_json::json!(true);
@@ -254,12 +256,15 @@ pub async fn handle(env: OpEnv) {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as i64);
         if let Some(inventory) = toolmark_inventory().await
-            && let Some((host, port)) = host_and_port(&target)
+            && let Some((host, port)) = cfx_cve::inventory::host_and_port(&target)
             && let Some(fresh) = cfx_cve::inventory::fresh(&inventory, &host, port, now)
         {
             plessor_req["products"] = serde_json::json!(fresh.products);
             plessor_req["leads"] = serde_json::json!(fresh.leads);
             plessor_req["products_from"] = serde_json::json!(fresh.from);
+            if !fresh.leads.is_empty() {
+                answer_back = Some((host, port));
+            }
         }
     }
 
@@ -281,6 +286,9 @@ pub async fn handle(env: OpEnv) {
     let mut processed: i64 = 0;
     let mut total: i64 = 0;
     let mut last_prog = std::time::Instant::now();
+    // The scan the ack names, and its answers to the leads.
+    let mut scan_id: Option<String> = None;
+    let mut answered: Option<serde_json::Value> = None;
     match super::open_engine("plessor", &plessor_req, lease).await {
         Ok((mut lines, writer)) => {
             while let Ok(Some(line)) = lines.next_line().await {
@@ -296,6 +304,11 @@ pub async fn handle(env: OpEnv) {
                     Ok(e) => e,
                     Err(_) => continue,
                 };
+                match event["type"].as_str() {
+                    Some("ack") => scan_id = event["scan"].as_str().map(str::to_string),
+                    Some("lead_answers") => answered = Some(event.clone()),
+                    _ => {}
+                }
                 match event["type"].as_str().unwrap_or("") {
                     "finding" => {
                         found_count += 1;
@@ -364,6 +377,13 @@ pub async fn handle(env: OpEnv) {
         }
     }
 
+    if let (Some((host, port)), Some(event)) = (answer_back, answered)
+        && let Some(back) =
+            cfx_cve::inventory::AnswersBack::from_event(&host, port, scan_id.as_deref(), &event)
+    {
+        tell_toolmark(&back).await;
+    }
+
     relay
         .finish(
             found_count,
@@ -382,6 +402,28 @@ fn coverage_note(event: &serde_json::Value) -> Option<&str> {
     }
 }
 
+/// Hand toolmark what the scan's templates said of its leads, which it keeps with each lead
+/// for its inventory to show. A toolmark that is not running, or refuses, is said in the
+/// node's log, and the scan's own answers stand in the workflow's note.
+async fn tell_toolmark(back: &cfx_cve::inventory::AnswersBack) {
+    let said = match super::open_engine("toolmark", &back.request(), None).await {
+        Ok((mut lines, _writer)) => match lines.next_line().await {
+            Ok(Some(line)) => serde_json::from_str::<serde_json::Value>(&line)
+                .ok()
+                .filter(|a| a["status"] != "completed")
+                .map(|a| a["message"].as_str().unwrap_or("refused").to_string()),
+            _ => Some("no answer".to_string()),
+        },
+        Err(_) => Some("not running".to_string()),
+    };
+    if let Some(why) = said {
+        eprintln!(
+            "[op] toolmark did not keep the answers to the leads of {}:{}: {why}",
+            back.host, back.port
+        );
+    }
+}
+
 /// What toolmark holds of the hosts it has fingerprinted, or none when it is not running
 /// or does not answer, and the scan then runs every template.
 async fn toolmark_inventory() -> Option<serde_json::Value> {
@@ -390,17 +432,6 @@ async fn toolmark_inventory() -> Option<serde_json::Value> {
     let line = lines.next_line().await.ok()??;
     let answer: serde_json::Value = serde_json::from_str(&line).ok()?;
     (answer["status"] == "completed").then_some(answer)
-}
-
-/// The host, lowercased, and port a scan of `target` reaches.
-fn host_and_port(target: &str) -> Option<(String, u16)> {
-    let with_scheme = if target.contains("://") {
-        target.to_string()
-    } else {
-        format!("http://{target}")
-    };
-    let url = reqwest::Url::parse(&with_scheme).ok()?;
-    Some((url.host_str()?.to_lowercase(), url.port_or_known_default()?))
 }
 
 #[cfg(test)]
@@ -431,19 +462,5 @@ mod tests {
         );
         let finding = serde_json::json!({"type": "finding", "message": "x", "data": {}});
         assert_eq!(coverage_note(&finding), None);
-    }
-
-    /// A scan reaches the host and port its target names, or the scheme's.
-    #[test]
-    fn a_target_names_its_host_and_port() {
-        assert_eq!(
-            host_and_port("https://APP.test/path"),
-            Some(("app.test".into(), 443))
-        );
-        assert_eq!(
-            host_and_port("app.test:8443"),
-            Some(("app.test".into(), 8443))
-        );
-        assert_eq!(host_and_port("app.test"), Some(("app.test".into(), 80)));
     }
 }

@@ -15,3 +15,5 @@ serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.142"
 # The dataset is one gzipped file.
 flate2 = "1.1"
+# The host and port a scan's target names, to find its rows in toolmark's inventory.
+url = "2.5"

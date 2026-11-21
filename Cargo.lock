@@ -793,6 +793,7 @@ dependencies = [
  "flate2",
  "serde",
  "serde_json",
+ "url",
 ]
 
 [[package]]
@@ -1503,6 +1504,7 @@ dependencies = [
  "libc",
  "serde_json",
  "tokio",
+ "toml",
 ]
 
 [[package]]

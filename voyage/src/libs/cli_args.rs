@@ -52,7 +52,7 @@ pub struct Cli {
         long,
         global = true,
         help_heading = "Global options",
-        default_value_t = 4442
+        default_value_t = dguard::ports::VOYAGE
     )]
     pub port: u16,
 

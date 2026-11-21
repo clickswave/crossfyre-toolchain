@@ -39,6 +39,18 @@ pub struct Fresh {
     pub from: String,
 }
 
+/// The host, lowercased, and port a scan of `target` reaches: a URL's, or a host[:port]'s
+/// over http.
+pub fn host_and_port(target: &str) -> Option<(String, u16)> {
+    let with_scheme = if target.contains("://") {
+        target.to_string()
+    } else {
+        format!("http://{target}")
+    };
+    let url = url::Url::parse(&with_scheme).ok()?;
+    Some((url.host_str()?.to_lowercase(), url.port_or_known_default()?))
+}
+
 /// The rows of `inventory`, toolmark's answer to `inventory`, for `host` and `port` last
 /// seen within [`FRESH_INVENTORY_SECS`] of `now`. None when no row for them is fresh.
 pub fn fresh(inventory: &Value, host: &str, port: u16, now: i64) -> Option<Fresh> {
@@ -129,6 +141,40 @@ pub struct LeadAnswer {
     pub reason: Option<String>,
 }
 
+/// What a scan said of the leads of one host and port, as the client that gave it the
+/// leads writes it back to toolmark, which keeps each answer with its lead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnswersBack {
+    pub host: String,
+    pub port: u16,
+    /// The plessor scan that answered, as its ack named it; empty when it was not kept.
+    #[serde(default)]
+    pub scan: String,
+    pub answers: Vec<LeadAnswer>,
+}
+
+impl AnswersBack {
+    /// The answers of a scan's `lead_answers` event for `host`:`port`, or None when the
+    /// event has none it can read.
+    pub fn from_event(host: &str, port: u16, scan: Option<&str>, event: &Value) -> Option<Self> {
+        let answers: Vec<LeadAnswer> = serde_json::from_value(event["answers"].clone()).ok()?;
+        (!answers.is_empty()).then(|| AnswersBack {
+            host: host.to_string(),
+            port,
+            scan: scan.unwrap_or_default().to_string(),
+            answers,
+        })
+    }
+
+    /// The request toolmark's daemon takes them in.
+    pub fn request(&self) -> Value {
+        let mut request = serde_json::to_value(self).unwrap_or_default();
+        request["operation"] = Value::from("lead_answers");
+        request["response"] = Value::from("instant");
+        request
+    }
+}
+
 /// Said wherever "checked, not found" is shown.
 pub const NOT_PROOF: &str = "Checked, not found is not proof the host is safe: a WAF, \
                              another path, a needed login or another configuration can hide it.";
@@ -217,6 +263,52 @@ mod tests {
                 lead("CVE-2021-41773", "high", true),
                 lead("CVE-2021-42013", "critical", false)
             ]
+        );
+    }
+
+    /// A target names its host, lowercased, and its port, or the scheme's.
+    #[test]
+    fn a_target_names_its_host_and_port() {
+        assert_eq!(
+            host_and_port("https://APP.test/path"),
+            Some(("app.test".into(), 443))
+        );
+        assert_eq!(
+            host_and_port("app.test:8443"),
+            Some(("app.test".into(), 8443))
+        );
+        assert_eq!(host_and_port("app.test"), Some(("app.test".into(), 80)));
+    }
+
+    /// The answers of a scan's event go back to toolmark for their host and port, with the
+    /// scan that gave them, as the `lead_answers` request; an event with none sends none.
+    #[test]
+    fn the_answers_go_back_as_toolmark_takes_them() {
+        let event = json!({"type": "lead_answers", "answers": [
+            {"cve": "CVE-2021-41773", "product": "Apache HTTP Server", "answer": "confirmed",
+             "template": "CVE-2021-41773"},
+            {"cve": "CVE-2099-0001", "product": "Apache HTTP Server", "answer": "not checked",
+             "reason": "no template checks it"},
+        ]});
+        let back = AnswersBack::from_event("app.test", 80, Some("s1"), &event).unwrap();
+        assert_eq!(
+            back.request(),
+            json!({"operation": "lead_answers", "response": "instant", "host": "app.test",
+                   "port": 80, "scan": "s1", "answers": event["answers"]})
+        );
+        let parsed: AnswersBack = serde_json::from_value(back.request()).unwrap();
+        assert_eq!(parsed, back);
+        assert!(AnswersBack::from_event("app.test", 80, None, &json!({"answers": []})).is_none());
+        assert!(
+            AnswersBack::from_event(
+                "app.test",
+                80,
+                None,
+                &json!({"answers": [{"cve": "x",
+                "product": "y", "answer": "not exploitable"}]})
+            )
+            .is_none(),
+            "only the three answers are read"
         );
     }
 

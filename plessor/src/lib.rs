@@ -114,18 +114,50 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // The daemon every command below talks to, started when it is not running.
-    let daemon = dguard::Daemon::new("plessor", cli.port, !cli.no_autostart);
+    let daemon = engine_daemon("plessor", cli.port, !cli.no_autostart);
 
     match cli.command {
         Some(Commands::Scan(args)) => {
-            let req = scan_request(&args)?;
-            send_stream(
+            // What toolmark saw on the target lately, unless the products are given: it
+            // chooses the templates, and its CVE leads go to be answered. toolmark is
+            // asked, never started.
+            let place = cfx_cve::inventory::host_and_port(&args.target);
+            let toolmark = match (&args.products, &place) {
+                (None, Some(_)) => {
+                    let port = toolmark_port(args.toolmark_port);
+                    Some((engine_daemon("toolmark", port, false), port))
+                }
+                _ => None,
+            };
+            let fresh = match (&toolmark, &place) {
+                (Some((toolmark, tport)), Some((host, port))) => {
+                    what_toolmark_saw(toolmark, *tport, host, *port).await
+                }
+                _ => None,
+            };
+            let req = scan_request(&args, fresh.as_ref())?;
+            let ran = send_stream(
                 &daemon,
                 req,
                 cfx_tui::wanted(cli.no_tui),
                 args.target.clone(),
             )
-            .await
+            .await?;
+            // The answers to its leads go back to toolmark, which keeps them for its
+            // inventory to show.
+            if let (Some((toolmark, _)), Some((host, port)), Some(answers)) =
+                (&toolmark, &place, &ran.answers)
+                && let Some(back) = cfx_cve::inventory::AnswersBack::from_event(
+                    host,
+                    *port,
+                    ran.scan.as_deref(),
+                    answers,
+                )
+                && let Err(e) = dguard::ask(toolmark, &back.request()).await
+            {
+                eprintln!("toolmark did not keep the answers to the leads of {host}:{port}: {e}");
+            }
+            Ok(())
         }
         Some(Commands::Inject(args)) => {
             let mut urls = args.urls.clone();
@@ -160,7 +192,8 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 payload["response"] = serde_json::json!("stream");
             }
             let target = payload["target"].as_str().unwrap_or("").to_string();
-            send_stream(&daemon, payload, false, target).await
+            send_stream(&daemon, payload, false, target).await?;
+            Ok(())
         }
         Some(Commands::Scans) => {
             let scans = dguard::list_scans(&daemon).await?;
@@ -172,7 +205,8 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 Some(scan) => {
                     let id = scan["id"].as_str().unwrap_or_default();
                     let target = scan["target"].as_str().unwrap_or_default().to_string();
-                    send_stream(&daemon, dguard::resume_request(id), tui, target).await
+                    send_stream(&daemon, dguard::resume_request(id), tui, target).await?;
+                    Ok(())
                 }
                 None => Ok(()),
             }
@@ -216,14 +250,70 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// `engine`'s daemon on `port`. A test build refuses the engines' real ports: an engine of
+/// the operator's may be listening on one, so every test gives a port of its own.
+#[cfg(feature = "daemon")]
+fn engine_daemon(engine: &'static str, port: u16, autostart: bool) -> dguard::Daemon {
+    #[cfg(test)]
+    if (4440..=4445).contains(&port) {
+        panic!("a test asked for {engine}'s port {port}: a test reaches no engine of the host's");
+    }
+    dguard::Daemon::new(engine, port, autostart)
+}
+
+/// toolmark's port: --toolmark-port, else where every client finds an engine's, the
+/// toolchain's config.toml or the protocol's. A test build never reads the toolchain's
+/// config, so a test always gives the port.
+#[cfg(feature = "daemon")]
+fn toolmark_port(given: Option<u16>) -> u16 {
+    #[cfg(test)]
+    let port = given.expect("a test gives toolmark's port");
+    #[cfg(not(test))]
+    let port = given
+        .or_else(|| dguard::ports::engine_port("toolmark"))
+        .unwrap_or(dguard::ports::TOOLMARK);
+    port
+}
+
+/// What toolmark's daemon on `tport` saw on `host`:`port` lately, or None when it saw
+/// nothing fresh there. When it does not answer the scan runs every template and answers
+/// no leads, and says so in a line.
+#[cfg(feature = "daemon")]
+async fn what_toolmark_saw(
+    toolmark: &dguard::Daemon,
+    tport: u16,
+    host: &str,
+    port: u16,
+) -> Option<cfx_cve::inventory::Fresh> {
+    match dguard::answer(toolmark, "inventory").await {
+        Ok(inventory) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64);
+            cfx_cve::inventory::fresh(&inventory, host, port, now)
+        }
+        Err(_) => {
+            eprintln!(
+                "toolmark is not answering on port {tport}, so every template runs and no CVE \
+                 leads are answered"
+            );
+            None
+        }
+    }
+}
+
 /// The daemon request for `plessor scan`.
 ///
 /// It asks for the starter pack, which the daemon leaves off for anyone who does
 /// not ask (the node sends its own scans). A templates directory goes as an
 /// absolute path, because the daemon resolves it from its own working directory,
-/// which is wherever its service started it.
+/// which is wherever its service started it. The products given choose the templates;
+/// without them, what toolmark saw lately, `fresh`, does, and gives the leads.
 #[cfg(feature = "daemon")]
-fn scan_request(args: &libs::cli_args::ScanArgs) -> Result<serde_json::Value, String> {
+fn scan_request(
+    args: &libs::cli_args::ScanArgs,
+    fresh: Option<&cfx_cve::inventory::Fresh>,
+) -> Result<serde_json::Value, String> {
     let mut req = serde_json::json!({
         "operation": "scan",
         "response": "stream",
@@ -234,6 +324,10 @@ fn scan_request(args: &libs::cli_args::ScanArgs) -> Result<serde_json::Value, St
     if let Some(products) = &args.products {
         req["products"] = serde_json::json!(products);
         req["products_from"] = serde_json::json!("the products given with --products");
+    } else if let Some(fresh) = fresh {
+        req["products"] = serde_json::json!(fresh.products);
+        req["leads"] = serde_json::json!(fresh.leads);
+        req["products_from"] = serde_json::json!(fresh.from);
     }
     if let Some(dir) = args.templates.as_deref() {
         let abs = std::fs::canonicalize(dir)
@@ -332,13 +426,33 @@ fn print_all(bytes: &[u8]) -> std::io::Result<()> {
     }
 }
 
+/// What a client keeps of an operation's stream once it is done: the scan its ack named,
+/// and its answers to the leads it was given.
+#[cfg(feature = "daemon")]
+#[derive(Default)]
+struct Ran {
+    scan: Option<String>,
+    answers: Option<serde_json::Value>,
+}
+
+#[cfg(feature = "daemon")]
+impl Ran {
+    fn saw(&mut self, event: &serde_json::Value) {
+        match event["type"].as_str() {
+            Some("ack") => self.scan = event["scan"].as_str().map(str::to_string),
+            Some("lead_answers") => self.answers = Some(event.clone()),
+            _ => {}
+        }
+    }
+}
+
 #[cfg(feature = "daemon")]
 async fn send_stream(
     daemon: &dguard::Daemon,
     req: serde_json::Value,
     tui: bool,
     target: String,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Ran, Box<dyn std::error::Error>> {
     let stream = daemon.connect().await?;
     let (reader, mut writer) = tokio::io::split(stream);
     let mut s = dguard::encode(&req);
@@ -348,6 +462,7 @@ async fn send_stream(
     let mut lines = BufReader::new(reader).lines();
     // Set when the daemon reports an error, so the exit code can carry it.
     let mut failed = false;
+    let mut ran = Ran::default();
 
     // Only take over the terminal when there is one. Under the node stdout is
     // a pipe, and drawing into it would put escape sequences in a log file.
@@ -358,6 +473,7 @@ async fn send_stream(
         while let Some(line) = lines.next_line().await? {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
                 let t = v["type"].as_str().unwrap_or("").to_string();
+                ran.saw(&v);
                 let _ = tx.send(v);
                 if t == "error" {
                     failed = true;
@@ -372,7 +488,7 @@ async fn send_stream(
         if failed {
             std::process::exit(1);
         }
-        return Ok(());
+        return Ok(ran);
     }
 
     while let Some(line) = lines.next_line().await? {
@@ -382,6 +498,7 @@ async fn send_stream(
             break;
         }
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+            ran.saw(&v);
             if v["type"].as_str() == Some("done") {
                 break;
             }
@@ -392,13 +509,13 @@ async fn send_stream(
     if failed {
         std::process::exit(1);
     }
-    Ok(())
+    Ok(ran)
 }
 
 #[cfg(test)]
 #[cfg(feature = "daemon")]
 mod tests {
-    use super::{inject_requests, scan_request};
+    use super::{Ran, engine_daemon, inject_requests, scan_request, toolmark_port};
     use crate::libs;
     use crate::libs::cli_args::{Cli, Commands};
     use clap::Parser;
@@ -419,7 +536,7 @@ mod tests {
 
     #[test]
     fn scan_asks_for_the_pack() {
-        let req = scan_request(&scan(&["http://h"])).unwrap();
+        let req = scan_request(&scan(&["http://h"]), None).unwrap();
         assert_eq!(req["pack"], true);
         assert!(req.get("templates_dir").is_none());
         assert!(
@@ -433,12 +550,15 @@ mod tests {
     /// --all-templates says to run everything whatever they say.
     #[test]
     fn products_and_all_templates_go_to_the_daemon() {
-        let req = scan_request(&scan(&[
-            "http://h",
-            "--products",
-            "a:apache:http_server,a:metabase:metabase",
-            "--all-templates",
-        ]))
+        let req = scan_request(
+            &scan(&[
+                "http://h",
+                "--products",
+                "a:apache:http_server,a:metabase:metabase",
+                "--all-templates",
+            ]),
+            None,
+        )
         .unwrap();
         assert_eq!(
             req["products"],
@@ -448,16 +568,73 @@ mod tests {
         assert_eq!(req["all_templates"], true);
     }
 
+    /// What toolmark saw lately chooses the templates and gives the leads, said with where
+    /// it came from; products given by hand are what the scan goes by instead.
+    #[test]
+    fn what_toolmark_saw_goes_to_the_daemon() {
+        let fresh = cfx_cve::inventory::Fresh {
+            products: vec!["a:apache:http_server".into()],
+            leads: vec![cfx_cve::inventory::HostLead {
+                cve: "CVE-2021-41773".into(),
+                product: "Apache HTTP Server".into(),
+                severity: "high".into(),
+                kev: true,
+            }],
+            from: "toolmark's inventory of h:80, last seen 1 hour before the scan".into(),
+        };
+        let req = scan_request(&scan(&["http://h"]), Some(&fresh)).unwrap();
+        assert_eq!(req["products"], serde_json::json!(["a:apache:http_server"]));
+        assert_eq!(req["leads"][0]["cve"], "CVE-2021-41773");
+        assert_eq!(req["products_from"], fresh.from);
+        let given = scan_request(
+            &scan(&["http://h", "--products", "a:f5:nginx"]),
+            Some(&fresh),
+        )
+        .unwrap();
+        assert_eq!(given["products"], serde_json::json!(["a:f5:nginx"]));
+        assert!(given.get("leads").is_none());
+    }
+
+    /// The stream's ack names the scan and its last event the answers to the leads, which
+    /// the client keeps to hand toolmark.
+    #[test]
+    fn the_stream_keeps_the_scan_and_its_answers() {
+        let mut ran = Ran::default();
+        for event in [
+            serde_json::json!({"type": "ack", "scan": "s1"}),
+            serde_json::json!({"type": "finding"}),
+            serde_json::json!({"type": "lead_answers", "answers": []}),
+            serde_json::json!({"type": "done"}),
+        ] {
+            ran.saw(&event);
+        }
+        assert_eq!(ran.scan.as_deref(), Some("s1"));
+        assert_eq!(ran.answers.unwrap()["type"], "lead_answers");
+    }
+
+    /// A test build refuses the engines' real ports, where the operator's own engines may
+    /// listen, and never reads the toolchain's config for toolmark's.
+    #[test]
+    fn a_test_reaches_no_engine_of_the_hosts() {
+        for port in [4440, 4444, 4445] {
+            let refused = std::panic::catch_unwind(|| engine_daemon("toolmark", port, false));
+            assert!(refused.is_err(), "port {port} was let through");
+        }
+        let _ = engine_daemon("toolmark", 14444, false);
+        assert!(std::panic::catch_unwind(|| toolmark_port(None)).is_err());
+        assert_eq!(toolmark_port(Some(14444)), 14444);
+    }
+
     #[test]
     fn a_templates_folder_goes_to_the_daemon_as_an_absolute_path() {
         let here = env!("CARGO_MANIFEST_DIR");
         let dir = format!("{here}/templates");
-        let req = scan_request(&scan(&["http://h", "--templates", &dir])).unwrap();
+        let req = scan_request(&scan(&["http://h", "--templates", &dir]), None).unwrap();
         let sent = req["templates_dir"].as_str().unwrap();
         assert!(std::path::Path::new(sent).is_absolute());
         assert!(sent.ends_with("templates"));
         let gone = format!("{here}/no-such-folder");
-        assert!(scan_request(&scan(&["http://h", "--templates", &gone])).is_err());
+        assert!(scan_request(&scan(&["http://h", "--templates", &gone]), None).is_err());
     }
 
     /// The injection pass drops endpoints on any host but its target, so two

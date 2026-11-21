@@ -15,7 +15,7 @@ pub struct Cli {
         long,
         global = true,
         help_heading = "Global options",
-        default_value_t = 4445
+        default_value_t = dguard::ports::PLESSOR
     )]
     pub port: u16,
 
@@ -86,13 +86,21 @@ pub struct ScanArgs {
 
     /// What runs on the target, as toolmark names it (part:vendor:product, comma
     /// separated): a template about one product then runs only on the products named,
-    /// and those held back are listed. Without it, every template runs
+    /// and those held back are listed. Without it, toolmark's daemon is asked what it saw
+    /// there in the last week, and with nothing fresh every template runs
     #[arg(long, value_name = "NAMES", value_delimiter = ',')]
     pub products: Option<Vec<String>>,
 
     /// Run every template, whatever --products says
     #[arg(long)]
     pub all_templates: bool,
+
+    /// The port of toolmark's daemon, which the scan asks what it saw on the target
+    /// lately: the products that choose the templates and the CVE leads to answer.
+    /// Without it, the toolchain's config.toml names the port, as for every engine. With
+    /// --products, toolmark is not asked
+    #[arg(long, value_name = "PORT")]
+    pub toolmark_port: Option<u16>,
 }
 
 #[derive(Parser, Clone)]
