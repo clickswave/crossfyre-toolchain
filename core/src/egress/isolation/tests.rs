@@ -216,6 +216,8 @@ fn a_helper_others_can_write_is_not_run() {
 #[test]
 fn a_helper_that_does_not_answer_or_answers_badly_is_not_taken() {
     let beside = Beside::new();
+    // Each reads its request first, as a helper does: one that answers before reading it
+    // can exit before the node has written it, and the node then fails to ask.
     for (up, why) in [
         ("sleep 30", "helper did not answer within 800 ms"),
         ("printf 'nope\\n'", "helper answered something unreadable"),
@@ -237,8 +239,8 @@ fn a_helper_that_does_not_answer_or_answers_badly_is_not_taken() {
         ),
     ] {
         beside.helper(
-            up,
-            r#"printf '%s\n' '{"version": "v", "network": null}'"#,
+            &format!("IFS= read -r _req\n{up}"),
+            r#"cat > /dev/null; printf '%s\n' '{"version": "v", "network": null}'"#,
             0o755,
         );
         let st = state();
