@@ -118,6 +118,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // -----------------------------------------------------------------------
+    // Man subcommand - print the roff man page to stdout (no daemon needed)
+    // -----------------------------------------------------------------------
+    if let Some(Commands::Man) = &cli.command {
+        let mut page = Vec::new();
+        clap_mangen::Man::new(Cli::command()).render(&mut page)?;
+        print_all(&page)?;
+        return Ok(());
+    }
+
+    // -----------------------------------------------------------------------
     // Scan subcommand - client that talks to the running daemon
     // -----------------------------------------------------------------------
     let mut enum_args = match cli.command {
@@ -128,6 +138,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         | Some(Commands::Origin(_))
         | Some(Commands::Axfr(_))
         | Some(Commands::Completions { .. })
+        | Some(Commands::Man)
         | Some(Commands::Daemon)
         | None => {
             eprintln!(
