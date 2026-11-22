@@ -30,20 +30,40 @@ pub fn toolchain_with(settings: &Settings) -> (tempfile::TempDir, PathBuf) {
     (dir, toolchain)
 }
 
-/// A port nothing listens on, which stays this test's while the socket that comes with it
-/// is held: bound and not listening, so no test running meanwhile is given it by the
-/// system and answers on it.
-pub fn closed_port() -> (u16, tokio::net::TcpSocket) {
-    let socket = tokio::net::TcpSocket::new_v4().expect("a socket");
-    socket
-        .bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
-        .expect("a port");
-    (socket.local_addr().expect("its address").port(), socket)
+/// A port nothing listens on, which stays this test's while what comes with it is held,
+/// so no test running meanwhile is given it by the system and answers on it. That is a
+/// socket bound to it and not listening, which refuses every connection. macOS drops a
+/// connection to such a socket unanswered, so a connect there waits for its timeout
+/// instead of being refused; on macOS the port is the local end of a connection to a
+/// listener of its own, which refuses a new connection at once.
+pub fn closed_port() -> (u16, impl Send) {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let socket = bound();
+        (socket.local_addr().expect("its address").port(), socket)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("a listener");
+        let near = std::net::TcpStream::connect(l.local_addr().expect("its address"))
+            .expect("a connection");
+        let (far, _) = l.accept().expect("the connection");
+        (near.local_addr().expect("its address").port(), (near, far))
+    }
 }
 
 /// A free port for a local database of a test's own, which its server binds.
 pub fn free_port() -> u16 {
-    closed_port().0
+    bound().local_addr().expect("its address").port()
+}
+
+/// A socket bound to a port of the system's choosing on 127.0.0.1, not listening.
+fn bound() -> tokio::net::TcpSocket {
+    let socket = tokio::net::TcpSocket::new_v4().expect("a socket");
+    socket
+        .bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
+        .expect("a port");
+    socket
 }
 
 /// A local database of a test's own, with an engine's schema ready in it. [`Scratch::done`]

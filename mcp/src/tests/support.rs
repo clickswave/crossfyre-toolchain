@@ -840,10 +840,16 @@ impl Build {
 /// The port stays bound without listening, so a connection to it is refused and no
 /// listener is given it meanwhile, in this process or another. A port freed at once
 /// could go to the listener of a test running alongside, which then counted a
-/// connection meant for a closed port as one it was sent.
+/// connection meant for a closed port as one it was sent. macOS drops a connection to
+/// a socket that is bound and not listening unanswered, so a connect there waits for
+/// its timeout instead of being refused; on macOS the port is the local end of a
+/// connection to a listener of its own, which refuses a new connection at once.
 pub(crate) struct ClosedPort {
     pub port: u16,
+    #[cfg(not(target_os = "macos"))]
     _held: tokio::net::TcpSocket,
+    #[cfg(target_os = "macos")]
+    _held: (std::net::TcpStream, std::net::TcpStream),
 }
 
 impl std::fmt::Display for ClosedPort {
@@ -852,11 +858,24 @@ impl std::fmt::Display for ClosedPort {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn closed_port() -> ClosedPort {
     let s = tokio::net::TcpSocket::new_v4().unwrap();
     s.bind((std::net::Ipv4Addr::LOCALHOST, 0).into()).unwrap();
     let port = s.local_addr().unwrap().port();
     ClosedPort { port, _held: s }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn closed_port() -> ClosedPort {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let near = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+    let (far, _) = l.accept().unwrap();
+    let port = near.local_addr().unwrap().port();
+    ClosedPort {
+        port,
+        _held: (near, far),
+    }
 }
 
 impl TestMcp {
