@@ -53,6 +53,22 @@ pub fn for_this_run(data_dir: &Path) -> InForce {
     cfx_policy::in_force_now(&load(data_dir))
 }
 
+/// `policy: offline (why)`, when this run is offline.
+pub fn offline_line(data_dir: &Path) -> Option<String> {
+    let machine = load(data_dir);
+    cfx_policy::offline_line(&machine, &cfx_policy::in_force_now(&machine))
+}
+
+/// For something that would contact Crossfyre, `what`: why it does not run on this
+/// machine now, when the machine is offline.
+pub fn offline_refuses(data_dir: &Path, what: &str) -> Option<String> {
+    let machine = load(data_dir);
+    let run = cfx_policy::in_force_now(&machine);
+    (run.policy == Policy::Offline)
+        .then(|| cfx_policy::turned_off(&machine, &run, what))
+        .flatten()
+}
+
 /// For a local tool that sends data about a target, `what`: why it does not run on this
 /// machine now, when it does not.
 pub fn turned_off(data_dir: &Path, what: &str) -> Option<String> {

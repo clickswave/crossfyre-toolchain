@@ -596,6 +596,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     cfx_core::toolchain::config::set_toolchain_dir(base.clone());
     // Named in the User-Agent of requests to the release origin.
     cfx_core::toolchain::release_http::set_version(env!("CARGO_PKG_VERSION"));
+    // On a machine taken offline, only a login or an update run by hand reaches
+    // Crossfyre, and says so, and setting a policy to leave offline. Anything else that
+    // would says why it does not run.
+    match when_offline(&cli.command) {
+        Offline::Refuse(what) => {
+            if let Some(why) = cfx_core::policy::offline_refuses(&base, what) {
+                return Err(why.into());
+            }
+        }
+        Offline::Say(what) => {
+            if let Some(line) = cfx_core::policy::offline_line(&base) {
+                cfx_core::toolchain::ui::warn(&format!(
+                    "{line}. {what} contacts Crossfyre all the same, as you ran it."
+                ));
+            }
+        }
+        Offline::Free => {}
+    }
 
     // No account gate here on purpose. The engines are free, and every command
     // that isn't node enrolment is either local or served from the PUBLIC
@@ -950,6 +968,51 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// What a command does on a machine taken offline.
+#[derive(Debug, PartialEq, Eq)]
+enum Offline {
+    /// It would contact Crossfyre, which an offline machine does not: it says why.
+    Refuse(&'static str),
+    /// It contacts Crossfyre because the person ran it, and says so first.
+    Say(&'static str),
+    /// It contacts nothing, or says for itself what offline means for it.
+    Free,
+}
+
+/// Which [`Offline`] `cmd` is. A login says it for itself, a trace is refused by its own
+/// policy check, `policy set` is how a machine leaves offline, and doctor leaves out the
+/// checks that would reach Crossfyre.
+fn when_offline(cmd: &Commands) -> Offline {
+    match cmd {
+        Commands::Update { .. } => Offline::Say("crossfyre update"),
+        Commands::Extension {
+            action: ExtensionAction::Update { .. },
+        } => Offline::Say("crossfyre extension update"),
+        Commands::Extension {
+            action: ExtensionAction::Install { .. },
+        } => Offline::Refuse("crossfyre extension install"),
+        Commands::Node { action } => match action {
+            NodeAction::Init { .. } => Offline::Refuse("crossfyre node init"),
+            NodeAction::List { .. } => Offline::Refuse("crossfyre node list"),
+            NodeAction::Remove { .. } => Offline::Refuse("crossfyre node remove"),
+            NodeAction::Up { .. } => Offline::Refuse("crossfyre node up"),
+            _ => Offline::Free,
+        },
+        Commands::Mcp {
+            command: Some(McpCommand::Cloud(cloud)),
+            ..
+        } => match cloud {
+            CloudCommand::Login { .. } => Offline::Say("crossfyre mcp cloud login"),
+            CloudCommand::Status { .. } => Offline::Refuse("crossfyre mcp cloud status"),
+            CloudCommand::Logout { revoke: true, .. } => {
+                Offline::Refuse("crossfyre mcp cloud logout --revoke")
+            }
+            CloudCommand::Logout { .. } => Offline::Free,
+        },
+        _ => Offline::Free,
+    }
+}
+
 /// The command as a person names it, as `node init`, when it needs root on Linux and
 /// macOS, where it then runs itself again through sudo. The node service, the node's
 /// configs (which only root may change, and which `node remove` reads and deletes),
@@ -1119,6 +1182,59 @@ mod tests {
         ] {
             assert_eq!(root_for(args, false), Some(name), "{args:?}");
             assert_eq!(root_for(args, true), None, "{args:?}");
+        }
+    }
+
+    fn offline_for(args: &[&str]) -> Offline {
+        let cli = Cli::try_parse_from(std::iter::once("crossfyre").chain(args.iter().copied()))
+            .expect("parses");
+        when_offline(&cli.command)
+    }
+
+    /// On a machine taken offline, a login or an update run by hand goes and says so, and
+    /// every other command that would reach Crossfyre is refused by name.
+    #[test]
+    fn offline_lets_through_only_what_reaches_crossfyre_on_purpose() {
+        for (args, what) in [
+            (&["update"][..], "crossfyre update"),
+            (&["update", "plessor"], "crossfyre update"),
+            (&["extension", "update"], "crossfyre extension update"),
+            (&["mcp", "cloud", "login"], "crossfyre mcp cloud login"),
+        ] {
+            assert_eq!(offline_for(args), Offline::Say(what), "{args:?}");
+        }
+        for (args, what) in [
+            (
+                &["extension", "install", "voyage"][..],
+                "crossfyre extension install",
+            ),
+            (&["node", "init"], "crossfyre node init"),
+            (&["node", "list"], "crossfyre node list"),
+            (&["node", "remove"], "crossfyre node remove"),
+            (&["node", "up"], "crossfyre node up"),
+            (&["mcp", "cloud", "status"], "crossfyre mcp cloud status"),
+            (
+                &["mcp", "cloud", "logout", "--revoke"],
+                "crossfyre mcp cloud logout --revoke",
+            ),
+        ] {
+            assert_eq!(offline_for(args), Offline::Refuse(what), "{args:?}");
+        }
+        for args in [
+            &["login"][..],
+            &["logout"],
+            &["policy", "set", "connected"],
+            &["policy", "list"],
+            &["status"],
+            &["doctor"],
+            &["run", "x.cfx", "domain:example.com"],
+            &["node", "status"],
+            &["node", "down"],
+            &["extension", "list"],
+            &["mcp", "cloud", "logout"],
+            &["db", "up"],
+        ] {
+            assert_eq!(offline_for(args), Offline::Free, "{args:?}");
         }
     }
 

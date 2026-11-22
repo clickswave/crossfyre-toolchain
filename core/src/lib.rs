@@ -3031,9 +3031,12 @@ pub async fn run_daemon(
     loop {
         tokio::select! {
             // The data, as the node starts and once a day after. A run still going when
-            // the next is due is left to finish.
+            // the next is due is left to finish. An offline machine fetches none: the
+            // node runs on, on the data it has.
             _ = data_interval.tick() => {
-                if !data_running.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                if let Some(line) = policy::offline_line(&paths.base) {
+                    println!("[data] {line}, so the data is not refreshed.");
+                } else if !data_running.swap(true, std::sync::atomic::Ordering::SeqCst) {
                     let (status, running) = (data_status.clone(), data_running.clone());
                     tokio::spawn(async move {
                         let (now, lines) = toolchain::data_update::refresh_here().await;

@@ -10,18 +10,18 @@ fn crossfyre_stand_in() -> (String, std::net::TcpListener) {
     (format!("http://{}", l.local_addr().unwrap()), l)
 }
 
-/// `crossfyre trace` against `api_url`, stopped if it is still running after 20 s, as a
-/// trace that started would be: its status when it ended on its own, and its stderr.
-fn trace(
+/// `crossfyre` with `args` on the data directory `data`, stopped if it is still running
+/// after 20 s, as one that started would be, waiting on a stand-in that never answers:
+/// its status when it ended on its own, and its stderr.
+fn crossfyre(
     data: &std::path::Path,
-    api_url: &str,
+    args: &[&str],
     env: Option<&str>,
 ) -> (Option<std::process::ExitStatus>, String) {
     let mut c = Command::new(env!("CARGO_BIN_EXE_crossfyre"));
     c.arg("--data-dir")
         .arg(data)
-        .args(["trace", "--workflow-id", "w1", "--token", "cfxt_test"])
-        .args(["--api-url", api_url])
+        .args(args)
         .env_remove("CROSSFYRE_POLICY")
         .env("NO_COLOR", "1")
         .stdin(std::process::Stdio::null())
@@ -72,7 +72,16 @@ fn trace_does_not_run_where_the_policy_sends_nothing_about_targets() {
     ] {
         let data = tempfile::tempdir().unwrap();
         std::fs::write(data.path().join("policy.toml"), state).unwrap();
-        let (status, err) = trace(data.path(), &api_url, env);
+        let trace = [
+            "trace",
+            "--workflow-id",
+            "w1",
+            "--token",
+            "cfxt_test",
+            "--api-url",
+            &api_url,
+        ];
+        let (status, err) = crossfyre(data.path(), &trace, env);
         assert!(status.is_some_and(|s| !s.success()), "{state:?} ran: {err}");
         assert!(err.contains(says), "{state:?}: {err}");
         assert!(err.contains("so crossfyre trace does not run"), "{err}");
@@ -80,5 +89,39 @@ fn trace_does_not_run_where_the_policy_sends_nothing_about_targets() {
     assert!(
         listener.accept().is_err(),
         "a trace the policy turned off contacted Crossfyre"
+    );
+}
+
+/// On a machine taken offline, a command that would reach Crossfyre says why it does not
+/// run, and nothing is contacted.
+#[test]
+fn an_offline_machine_lists_no_nodes_and_contacts_nothing() {
+    let (api_url, listener) = crossfyre_stand_in();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::write(
+        data.path().join("auth.toml"),
+        format!(
+            "api_url = \"{api_url}\"\napi_key = \"cfk_test\"\nuser_id = \"u1\"\nusername = \"op\"\nemail = \"op@example.test\"\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        data.path().join("policy.toml"),
+        "[offline]\nreason = \"chosen\"\nsince = \"2026-11-22T05:30:07Z\"\n",
+    )
+    .unwrap();
+    let (status, err) = crossfyre(data.path(), &["node", "list"], None);
+    assert!(
+        status.is_some_and(|s| !s.success()),
+        "node list ran offline: {err}"
+    );
+    assert!(
+        err.contains("policy: offline (you chose it).")
+            && err.contains("so crossfyre node list does not run"),
+        "{err}"
+    );
+    assert!(
+        listener.accept().is_err(),
+        "an offline machine contacted Crossfyre"
     );
 }

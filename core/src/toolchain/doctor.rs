@@ -195,61 +195,68 @@ pub async fn run(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
     // -- Connectivity ---------------------------------------------------------
     section("Connectivity");
-    let cdn = super::install::bins_origin();
-    let cdn_ok = match super::release_http::http_client(super::release_http::Purpose::Check) {
-        Ok(c) => c
-            .get(format!("{cdn}/manifest.json"))
-            .send()
-            .await
-            .is_ok_and(|r| r.status().is_success()),
-        Err(_) => false,
-    };
-    let label = format!("release CDN reachable {}", dim(&format!("({cdn})")));
-    if !check(
-        &label,
-        cdn_ok,
-        "check network/DNS; installs and updates need this",
-    ) {
-        failed += 1;
-    }
-
-    // Control plane, per registered node config.
-    if let Ok(ids) = crate::discover_nodes(base) {
-        for id in ids {
-            let paths = crate::NodePaths::new(base, &id);
-            // As root, through the reader that refuses a config another account could
-            // have written: root would otherwise call whatever API it names.
-            let Ok(text) = super::node_config::read(&paths.config) else {
-                continue;
-            };
-            let Ok(cfg) = toml::from_str::<crate::Config>(&text) else {
-                continue;
-            };
-            let reachable = crate::api::client()
-                .get(format!("{}/api/v1", cfg.api_url))
-                .timeout(std::time::Duration::from_secs(5))
-                .send_api()
-                .await
-                .is_ok();
-            let short = &id[..id.len().min(8)];
-            let label = format!(
-                "Crossfyre reachable for node {} {}",
-                short,
-                dim(&format!("({})", cfg.api_url))
-            );
-            if !check(
-                &label,
-                reachable,
-                "check the api_url in this node's config and your network",
-            ) {
-                failed += 1;
-            }
-        }
-    } else {
+    // An offline machine makes no contact with Crossfyre, a diagnosis included.
+    if let Some(line) = crate::policy::offline_line(base) {
         step(&format!(
-            "no nodes registered yet {}",
-            dim("(run `crossfyre node init`)")
+            "not checked: {line}, so this machine makes no contact with Crossfyre"
         ));
+    } else {
+        let cdn = super::install::bins_origin();
+        let cdn_ok = match super::release_http::http_client(super::release_http::Purpose::Check) {
+            Ok(c) => c
+                .get(format!("{cdn}/manifest.json"))
+                .send()
+                .await
+                .is_ok_and(|r| r.status().is_success()),
+            Err(_) => false,
+        };
+        let label = format!("release CDN reachable {}", dim(&format!("({cdn})")));
+        if !check(
+            &label,
+            cdn_ok,
+            "check network/DNS; installs and updates need this",
+        ) {
+            failed += 1;
+        }
+
+        // Control plane, per registered node config.
+        if let Ok(ids) = crate::discover_nodes(base) {
+            for id in ids {
+                let paths = crate::NodePaths::new(base, &id);
+                // As root, through the reader that refuses a config another account could
+                // have written: root would otherwise call whatever API it names.
+                let Ok(text) = super::node_config::read(&paths.config) else {
+                    continue;
+                };
+                let Ok(cfg) = toml::from_str::<crate::Config>(&text) else {
+                    continue;
+                };
+                let reachable = crate::api::client()
+                    .get(format!("{}/api/v1", cfg.api_url))
+                    .timeout(std::time::Duration::from_secs(5))
+                    .send_api()
+                    .await
+                    .is_ok();
+                let short = &id[..id.len().min(8)];
+                let label = format!(
+                    "Crossfyre reachable for node {} {}",
+                    short,
+                    dim(&format!("({})", cfg.api_url))
+                );
+                if !check(
+                    &label,
+                    reachable,
+                    "check the api_url in this node's config and your network",
+                ) {
+                    failed += 1;
+                }
+            }
+        } else {
+            step(&format!(
+                "no nodes registered yet {}",
+                dim("(run `crossfyre node init`)")
+            ));
+        }
     }
 
     // -- Summary --------------------------------------------------------------

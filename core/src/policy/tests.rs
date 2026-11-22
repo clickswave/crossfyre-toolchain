@@ -567,3 +567,28 @@ fn a_node_here_is_one_registered_in_this_data_directory() {
     std::fs::write(crate::nodes_dir(dir.path()).join("n1.toml"), "").unwrap();
     assert!(here.runs());
 }
+
+/// What an offline machine says, and only an offline one.
+#[test]
+fn an_offline_machine_says_why_and_a_connected_one_says_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(offline_line(dir.path()), None);
+    assert_eq!(offline_refuses(dir.path(), "crossfyre node list"), None);
+    save(
+        dir.path(),
+        &Machine {
+            offline: Some(Offline {
+                reason: Reason::SessionEnded,
+                since: "2026-11-22T05:30:07Z".into(),
+            }),
+            ..Machine::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        offline_line(dir.path()).as_deref(),
+        Some("policy: offline (your session ended; run crossfyre login)")
+    );
+    let why = offline_refuses(dir.path(), "crossfyre node list").unwrap();
+    assert!(why.contains("so crossfyre node list does not run"), "{why}");
+}

@@ -205,14 +205,25 @@ pub fn in_force_now(machine: &Machine) -> InForce {
     in_force(machine, std::env::var(ENV).ok().as_deref())
 }
 
-/// What a local tool that sends data about a target says when `run` turns it off, with
-/// `what` naming the tool. None under connected.
-pub fn turned_off(machine: &Machine, run: &InForce, what: &str) -> Option<String> {
-    let why = match (&run.note, &machine.offline) {
+/// Why `run` is under its policy, as the parenthesis after its name says it: the
+/// variable that tightened it, why the machine is offline, or that it is the account's.
+pub fn why(machine: &Machine, run: &InForce) -> String {
+    match (&run.note, &machine.offline) {
         (Some(note), _) => note.clone(),
         (None, Some(o)) if run.policy == Policy::Offline => o.reason.says().to_string(),
         (None, _) => "the account's".to_string(),
-    };
+    }
+}
+
+/// `policy: offline (why)`, when `run` is offline.
+pub fn offline_line(machine: &Machine, run: &InForce) -> Option<String> {
+    (run.policy == Policy::Offline).then(|| format!("policy: offline ({})", why(machine, run)))
+}
+
+/// What a local tool that sends data about a target says when `run` turns it off, with
+/// `what` naming the tool. None under connected.
+pub fn turned_off(machine: &Machine, run: &InForce, what: &str) -> Option<String> {
+    let why = why(machine, run);
     match run.policy {
         Policy::Connected => None,
         Policy::Private => Some(format!(
