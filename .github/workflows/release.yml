@@ -139,6 +139,35 @@ jobs:
             --sha256 "${{ matrix.python_sha256 }}" --version "$LINUX_PYTHON" \
             --out "$PWD/target/linux-python"
 
+      # The public halves of the release key and the data key, which bins.crossfyre.io
+      # serves these binaries with: a build that carries the release key refuses a
+      # manifest that key did not sign, and checks the pacing module with it, and one
+      # that carries the data key checks the templates and the CVE data. They come from
+      # the repository's variables, and only one that is set reaches cargo, since an
+      # empty one would count as a key. A tag is not built without both.
+      - name: The keys the binaries carry
+        env:
+          MANIFEST_PUBKEY: ${{ vars.CROSSFYRE_MANIFEST_PUBKEY }}
+          MANIFEST_PUBKEY_NEXT: ${{ vars.CROSSFYRE_MANIFEST_PUBKEY_NEXT }}
+          DATA_PUBKEY: ${{ vars.CROSSFYRE_DATA_PUBKEY }}
+          DATA_PUBKEY_NEXT: ${{ vars.CROSSFYRE_DATA_PUBKEY_NEXT }}
+        run: |
+          set -euo pipefail
+          for name in MANIFEST_PUBKEY MANIFEST_PUBKEY_NEXT DATA_PUBKEY DATA_PUBKEY_NEXT; do
+            value="${!name}"
+            if [ -n "$value" ]; then
+              echo "CROSSFYRE_$name=$value" >> "$GITHUB_ENV"
+            fi
+          done
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            for name in MANIFEST_PUBKEY DATA_PUBKEY; do
+              if [ -z "${!name}" ]; then
+                echo "::error::vars.CROSSFYRE_$name is not set, and a release is not built without it"
+                exit 1
+              fi
+            done
+          fi
+
       # bundled-python links cfx-script with DT_RPATH $ORIGIN/python/lib, which the
       # loader searches before LD_LIBRARY_PATH and the system's directories (see
       # cfx-script/build.rs). It changes nothing in the other binaries.
@@ -291,6 +320,35 @@ jobs:
           set -euo pipefail
           choco install nasm --version=3.2.0 -y --no-progress
           echo "C:\\Program Files\\NASM" >> "$GITHUB_PATH"
+
+      # The public halves of the release key and the data key, which bins.crossfyre.io
+      # serves these binaries with: a build that carries the release key refuses a
+      # manifest that key did not sign, and checks the pacing module with it, and one
+      # that carries the data key checks the templates and the CVE data. They come from
+      # the repository's variables, and only one that is set reaches cargo, since an
+      # empty one would count as a key. A tag is not built without both.
+      - name: The keys the binaries carry
+        env:
+          MANIFEST_PUBKEY: ${{ vars.CROSSFYRE_MANIFEST_PUBKEY }}
+          MANIFEST_PUBKEY_NEXT: ${{ vars.CROSSFYRE_MANIFEST_PUBKEY_NEXT }}
+          DATA_PUBKEY: ${{ vars.CROSSFYRE_DATA_PUBKEY }}
+          DATA_PUBKEY_NEXT: ${{ vars.CROSSFYRE_DATA_PUBKEY_NEXT }}
+        run: |
+          set -euo pipefail
+          for name in MANIFEST_PUBKEY MANIFEST_PUBKEY_NEXT DATA_PUBKEY DATA_PUBKEY_NEXT; do
+            value="${!name}"
+            if [ -n "$value" ]; then
+              echo "CROSSFYRE_$name=$value" >> "$GITHUB_ENV"
+            fi
+          done
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            for name in MANIFEST_PUBKEY DATA_PUBKEY; do
+              if [ -z "${!name}" ]; then
+                echo "::error::vars.CROSSFYRE_$name is not set, and a release is not built without it"
+                exit 1
+              fi
+            done
+          fi
 
       # Each binary on its own, for the reason the Linux job gives. The runner images
       # carry the cmake and clang BoringSSL needs, and Windows the NASM above.
