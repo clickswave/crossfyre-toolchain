@@ -1488,13 +1488,17 @@ pub fn check_dir(
     collect_yaml(dir, &mut files);
     files.sort();
     let mut problems = Vec::new();
-    let mut ids: std::collections::HashMap<String, std::path::PathBuf> = Default::default();
+    let mut ids: std::collections::HashMap<String, String> = Default::default();
     for path in files {
+        // A file as the templates repository names it: from `dir`, with `/` on every
+        // system, so the same template reads the same on Windows.
         let shown = path
             .strip_prefix(dir)
             .unwrap_or(&path)
-            .display()
-            .to_string();
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
         let template = match std::fs::read_to_string(&path)
             .map_err(|e| e.to_string())
             .and_then(|t| check(&t))
@@ -1505,12 +1509,8 @@ pub fn check_dir(
                 continue;
             }
         };
-        if let Some(first) = ids.insert(template.id.clone(), path.clone()) {
-            problems.push(format!(
-                "{shown}: the id {} is also {}'s",
-                template.id,
-                first.display()
-            ));
+        if let Some(first) = ids.insert(template.id.clone(), shown.clone()) {
+            problems.push(format!("{shown}: the id {} is also {first}'s", template.id));
         }
         let meta = &template.info.metadata;
         if meta.vendor.is_some() != meta.product.is_some() {
@@ -2016,7 +2016,7 @@ pub(crate) mod tests {
         let problems = super::check_dir(&dir, Some(&known));
         assert_eq!(problems.len(), 3, "{problems:?}");
         assert!(problems[0].starts_with("cves/b.yaml: toolmark names no acme:gadget"));
-        assert!(problems[1].starts_with("misc/d.yaml: the id a is also"));
+        assert_eq!(problems[1], "misc/d.yaml: the id a is also cves/a.yaml's");
         assert!(problems[2].starts_with("misc/f.yaml: it names a vendor or a product alone"));
         // Without the names, only the templates themselves are checked.
         assert_eq!(super::check_dir(&dir, None).len(), 2);
