@@ -3,6 +3,7 @@ package io.crossfyre.mobile
 import io.crossfyre.mobile.account.AccountApi
 import io.crossfyre.mobile.account.Outcome
 import io.crossfyre.mobile.account.Problem
+import io.crossfyre.mobile.account.Refusal
 import io.crossfyre.mobile.account.Reply
 import io.crossfyre.mobile.account.Transport
 import io.crossfyre.mobile.approve.ApprovalApi
@@ -221,5 +222,14 @@ class NoticesTest {
         assertTrue(n.body, n.body.startsWith("Only a phone that approves can read your notifications here."))
         val a = activityNotice(problem(api.activity("cfk_k", ActivityScope.Account)), "crossfyre.io")
         assertTrue(a.body, a.body.startsWith("Only a phone that approves can read your activity here."))
+    }
+
+    @Test
+    fun a_pairing_a_private_account_refuses_says_which_policy_and_how_to_change_it() {
+        val p = Problem.Refused(403, "Refused by the account's privacy policy", Refusal.POLICY_PRIVATE)
+        val n = pairNotice(p, "crossfyre.io")
+        assertEquals(Level.WARN, n.level)
+        assertEquals("This account is private.", n.title)
+        assertTrue(n.body, n.body.endsWith("Change it in account settings, or with crossfyre policy set connected."))
     }
 }

@@ -315,4 +315,38 @@ class AccountApiTest {
         val gone = problem(api(Fake(envelope(404, "Unknown login request"))).pollDeviceLogin("cfd_gone")) as Problem.Refused
         assertEquals(Refusal.UNKNOWN, gone.reason)
     }
+
+    // ── policy ─────────────────────────────────────────────────────────────
+
+    @Test
+    fun the_accounts_policy_is_read_as_cli_policy_gives_it() {
+        val fake = Fake(envelope(200, "ok", JSONObject()
+            .put("policy", "private").put("chosen", true)
+            .put("changed_at", "2026-11-22T05:30:07Z").put("changed_via", "web")))
+        val p = ok(api(fake).policy("cfk_k"))
+        val (url, body) = fake.calls.single()
+        assertEquals("https://crossfyre.io/api/v1/cli/policy", url)
+        assertEquals("cfk_k", body.getString("api_key"))
+        assertEquals(AccountPolicy("private", true, "2026-11-22T05:30:07Z", "web"), p)
+        assertFalse(p.sendsTargets)
+        assertTrue(p.line, p.line.startsWith("This account's tools send nothing about targets"))
+        assertTrue(p.line, p.line.endsWith("Changed 2026-11-22T05:30:07Z from web."))
+
+        val unchosen = ok(api(Fake(envelope(200, "ok", JSONObject().put("policy", "connected").put("chosen", false)))).policy("cfk_k"))
+        assertTrue(unchosen.sendsTargets)
+        assertTrue(unchosen.line, unchosen.line.startsWith("None is chosen yet"))
+        assertEquals(Problem.SignedOut, problem(api(Fake(envelope(401, "Not logged in"))).policy("cfk_gone")))
+        // Offline is a mode of a machine, never an account's, so it does not read as one.
+        assertTrue(problem(api(Fake(envelope(200, "ok", JSONObject().put("policy", "offline")))).policy("cfk_k")) is Problem.Broken)
+    }
+
+    @Test
+    fun a_pairing_the_accounts_policy_refuses_says_so() {
+        val reply = envelope(
+            403, "Refused by the account's privacy policy", JSONObject().put("policy", "private"),
+            errors = listOf("policy: private. This account's local tools send nothing about targets to Crossfyre."),
+        )
+        val p = problem(api(Fake(reply)).pair("cfk_k", "w1", "dev-1", "Pixel")) as Problem.Refused
+        assertEquals(Refusal.POLICY_PRIVATE, p.reason)
+    }
 }
