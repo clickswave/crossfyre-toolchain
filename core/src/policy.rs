@@ -69,18 +69,16 @@ impl Policy {
 pub enum Reason {
     /// The user chose it.
     Chosen,
-    /// The session expired.
-    SessionExpired,
-    /// The session was revoked.
-    SessionRevoked,
+    /// Crossfyre stopped taking the session: an account key ends only when it is
+    /// revoked, and Crossfyre's answer does not say how.
+    SessionEnded,
 }
 
 impl Reason {
     pub fn says(self) -> &'static str {
         match self {
             Reason::Chosen => "you chose it",
-            Reason::SessionExpired => "your session expired; run crossfyre login",
-            Reason::SessionRevoked => "your session was revoked; run crossfyre login",
+            Reason::SessionEnded => "your session ended; run crossfyre login",
         }
     }
 }
@@ -144,6 +142,27 @@ pub fn save(data_dir: &Path, machine: &Machine) -> Result<(), String> {
     let file = path(data_dir);
     crate::toolchain::sudo_user::write_for_invoking_user(&file, body.as_bytes(), 0o600)
         .map_err(|e| format!("{}: {e}", file.display()))
+}
+
+/// Crossfyre refused `key`. When that is this machine's session, the machine goes
+/// offline with the reason, as every tool on the session's key then is; a node's own key
+/// is not the session and changes nothing here. A machine already offline stays as it
+/// is. The line to show, when the key was the session's.
+pub fn session_ended(data_dir: &Path, key: &str) -> Option<String> {
+    let account = crate::auth::load_account(data_dir)?;
+    if account.api_key != key {
+        return None;
+    }
+    let mut machine = load(data_dir);
+    let offline = machine.offline.get_or_insert_with(|| Offline {
+        reason: Reason::SessionEnded,
+        since: utc_now(),
+    });
+    let line = format!("policy: offline ({})", offline.reason.says());
+    Some(match save(data_dir, &machine) {
+        Ok(()) => line,
+        Err(e) => format!("{line}, though it could not be recorded: {e}"),
+    })
 }
 
 /// The variable that tightens the policy for one run.

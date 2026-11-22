@@ -654,6 +654,7 @@ pub async fn authorize_existing_node(
 // one, so a first-run install needs only the account key.
 pub async fn provision_node(
     client: &reqwest::Client,
+    data_dir: &Path,
     account: &Account,
     name: Option<&str>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
@@ -669,18 +670,37 @@ pub async fn provision_node(
         }))
         .send_api()
         .await?;
-    let ok = res.status().is_success();
+    let status = res.status();
     let body: serde_json::Value = res.json().await.unwrap_or(serde_json::json!({}));
-    if !ok {
-        return Err(body_message(&body).into());
+    if !status.is_success() {
+        return Err(refused(data_dir, account, status, &body).into());
     }
     Ok(body["data"].clone())
+}
+
+/// What Crossfyre's refusal of an account call says, and when it no longer takes the
+/// session, what that did to this machine's policy.
+fn refused(
+    data_dir: &Path,
+    account: &Account,
+    status: reqwest::StatusCode,
+    body: &serde_json::Value,
+) -> String {
+    let message = body_message(body);
+    let ended = (status == reqwest::StatusCode::UNAUTHORIZED)
+        .then(|| crate::policy::session_ended(data_dir, &account.api_key))
+        .flatten();
+    match ended {
+        Some(line) => format!("{message}\n{line}"),
+        None => message,
+    }
 }
 
 /// `crossfyre node list`: fetch the account's node fleet (scoped to its team)
 /// with live online/offline status. Returns the `nodes` array.
 pub async fn list_nodes(
     client: &reqwest::Client,
+    data_dir: &Path,
     account: &Account,
 ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
     let res = client
@@ -691,10 +711,10 @@ pub async fn list_nodes(
         .json(&serde_json::json!({ "api_key": account.api_key }))
         .send_api()
         .await?;
-    let ok = res.status().is_success();
+    let status = res.status();
     let body: serde_json::Value = res.json().await.unwrap_or(serde_json::json!({}));
-    if !ok {
-        return Err(body_message(&body).into());
+    if !status.is_success() {
+        return Err(refused(data_dir, account, status, &body).into());
     }
     Ok(body["data"]["nodes"]
         .as_array()
@@ -719,6 +739,12 @@ pub async fn run_login(
     title("Crossfyre login", &host);
 
     let ask = !flags.no_prompt && std::io::stdin().is_terminal();
+    let before = load_account(data_dir);
+    if crate::policy::load(data_dir).offline.is_some() {
+        warn(
+            "This machine is offline. crossfyre login contacts Crossfyre all the same, as you ran it.",
+        );
+    }
     let account = perform_login(data_dir, flags).await?;
 
     let who = if account.username.is_empty() {
@@ -731,6 +757,27 @@ pub async fn run_login(
     field("file", &account_path(data_dir).display().to_string());
     end();
     done(&format!("Signed in as {who}"));
+    let same_account =
+        before.is_some_and(|b| b.user_id == account.user_id && b.api_url == account.api_url);
+    let policy = crate::policy::command::at_login(
+        data_dir,
+        &crate::policy::cloud::Session::of(&account),
+        same_account,
+        &crate::policy::cloud::Crossfyre,
+        || {
+            ask && dialoguer::Confirm::new()
+                .with_prompt("This machine is offline, which you chose. Leave offline?")
+                .default(false)
+                .interact()
+                .unwrap_or(false)
+        },
+        || ask.then(crate::policy::command::pick_for_account).flatten(),
+    )
+    .await;
+    ok(&policy.line);
+    if let Some(n) = &policy.note {
+        warn(n);
+    }
     // What the plan includes beside the release, offered now.
     crate::toolchain::components::after_login(
         &crate::toolchain::components::Credentials {
@@ -894,6 +941,30 @@ mod tests {
         let info = client_info("7.8.9");
         assert_eq!(info["version"], "7.8.9");
         assert_eq!(info["os"], os_label());
+    }
+    /// An account call Crossfyre refuses the session for says so, and puts the machine
+    /// offline with the reason; any other refusal is only its message.
+    #[test]
+    fn a_refused_session_says_what_it_did_to_the_policy() {
+        let t = tempfile::tempdir().unwrap();
+        let a = Account {
+            api_url: "http://127.0.0.1:9".into(),
+            api_key: "cfk_test".into(),
+            user_id: "u1".into(),
+            username: "op".into(),
+            email: "op@example.test".into(),
+        };
+        save_account(t.path(), &a).unwrap();
+        let body = serde_json::json!({ "message": "Not logged in" });
+        assert_eq!(
+            refused(t.path(), &a, reqwest::StatusCode::FORBIDDEN, &body),
+            "Not logged in"
+        );
+        assert_eq!(crate::policy::load(t.path()).offline, None);
+        assert_eq!(
+            refused(t.path(), &a, reqwest::StatusCode::UNAUTHORIZED, &body),
+            "Not logged in\npolicy: offline (your session ended; run crossfyre login)"
+        );
     }
 }
 

@@ -1397,7 +1397,7 @@ pub async fn run_node_list(
     };
 
     let client = api::client();
-    let nodes = auth::list_nodes(&client, &account).await?;
+    let nodes = auth::list_nodes(&client, base, &account).await?;
 
     if as_json {
         println!("{}", serde_json::to_string_pretty(&nodes)?);
@@ -1715,7 +1715,7 @@ pub async fn run_init(
                 end();
                 section("Register");
                 working("Claiming a node for this host…");
-                let resp = auth::provision_node(&client, &account, None).await?;
+                let resp = auth::provision_node(&client, data_dir, &account, None).await?;
                 let issued = resp["api_key"]
                     .as_str()
                     .ok_or("The server did not return a node key")?
@@ -5910,14 +5910,12 @@ mod offline_node_tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(super::offline_stops_nodes(dir.path()), None);
         let mut m = load(dir.path());
-        for reason in [Reason::SessionExpired, Reason::SessionRevoked] {
-            m.offline = Some(Offline {
-                reason,
-                since: "2026-11-22T05:30:07Z".into(),
-            });
-            save(dir.path(), &m).unwrap();
-            assert_eq!(super::offline_stops_nodes(dir.path()), None, "{reason:?}");
-        }
+        m.offline = Some(Offline {
+            reason: Reason::SessionEnded,
+            since: "2026-11-22T05:30:07Z".into(),
+        });
+        save(dir.path(), &m).unwrap();
+        assert_eq!(super::offline_stops_nodes(dir.path()), None);
         m.offline = Some(Offline {
             reason: Reason::Chosen,
             since: "2026-11-22T05:30:07Z".into(),

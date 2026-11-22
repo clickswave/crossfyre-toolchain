@@ -372,16 +372,67 @@ async fn out_of_reach_waits_and_a_refusal_says_why() {
         offer(&client, &cf.creds()).await,
         Err(Unavailable::Unreachable(_))
     ));
+    let mut ended = answers(vec![], "0.1.0", &release_key());
+    ended.status = 401;
+    ended.message = "The key is invalid or revoked.".into();
+    let cf = Crossfyre::start(ended).await;
+    assert_eq!(
+        offer(&client, &cf.creds()).await.err(),
+        Some(Unavailable::NotLoggedIn(
+            "The key is invalid or revoked.".into()
+        ))
+    );
     let mut refused = answers(vec![], "0.1.0", &release_key());
-    refused.status = 401;
-    refused.message = "The key is invalid or revoked.".into();
+    refused.status = 403;
+    refused.message = "The plan does not include components.".into();
     let cf = Crossfyre::start(refused).await;
     assert_eq!(
         offer(&client, &cf.creds()).await.err(),
         Some(Unavailable::Refused(
-            "The key is invalid or revoked.".into()
+            "The plan does not include components.".into()
         ))
     );
+}
+
+/// A session Crossfyre no longer takes puts the machine offline, with the reason; a
+/// node's key it refuses is not the session, and changes nothing.
+#[test]
+fn a_refused_session_takes_the_machine_offline_and_a_refused_node_key_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    crate::auth::save_account(
+        dir.path(),
+        &crate::auth::Account {
+            api_url: "http://127.0.0.1:9".into(),
+            api_key: KEY.into(),
+            user_id: "u1".into(),
+            username: "someone".into(),
+            email: "someone@example.test".into(),
+        },
+    )
+    .unwrap();
+    let node = Credentials {
+        api_url: "http://127.0.0.1:9".into(),
+        key: "cfn_node".into(),
+    };
+    let ended = Unavailable::NotLoggedIn("The key is invalid or revoked.".into());
+    assert_eq!(
+        with_session_end(dir.path(), &node, &ended),
+        "The key is invalid or revoked."
+    );
+    assert_eq!(crate::policy::load(dir.path()).offline, None);
+    let session = Credentials {
+        api_url: "http://127.0.0.1:9".into(),
+        key: KEY.into(),
+    };
+    let refused = Unavailable::Refused("No.".into());
+    assert_eq!(with_session_end(dir.path(), &session, &refused), "No.");
+    assert_eq!(crate::policy::load(dir.path()).offline, None);
+    assert_eq!(
+        with_session_end(dir.path(), &session, &ended),
+        "The key is invalid or revoked.\npolicy: offline (your session ended; run crossfyre login)"
+    );
+    let offline = crate::policy::load(dir.path()).offline.unwrap();
+    assert_eq!(offline.reason, crate::policy::Reason::SessionEnded);
 }
 
 #[tokio::test]

@@ -79,7 +79,7 @@ fn the_machines_policy_is_kept_beside_the_session() {
         changed_via: Some("web".into()),
         unsent: false,
         offline: Some(Offline {
-            reason: Reason::SessionRevoked,
+            reason: Reason::SessionEnded,
             since: "t".into(),
         }),
     };
@@ -314,9 +314,26 @@ async fn offline_is_recorded_with_why_and_a_node_here_stops_only_when_told() {
     assert_eq!(load(dir.path()).offline, None);
 }
 
+fn logged_in(dir: &std::path::Path, user: &str) {
+    crate::auth::save_account(
+        dir,
+        &crate::auth::Account {
+            api_url: session().api_url,
+            api_key: session().key,
+            user_id: user.into(),
+            username: user.into(),
+            email: format!("{user}@example.test"),
+        },
+    )
+    .unwrap();
+}
+
+/// A session Crossfyre no longer takes puts the machine offline, saying why, and the
+/// contacts after it ask Crossfyre nothing.
 #[tokio::test]
-async fn a_session_crossfyre_does_not_take_changes_nothing() {
+async fn a_session_crossfyre_does_not_take_puts_the_machine_offline() {
     let dir = tempfile::tempdir().unwrap();
+    logged_in(dir.path(), "u1");
     let cloud = Fake::failing(Failed::NotLoggedIn("The key is invalid or revoked.".into()));
     let err = command::set(
         dir.path(),
@@ -328,8 +345,220 @@ async fn a_session_crossfyre_does_not_take_changes_nothing() {
     )
     .await
     .unwrap_err();
-    assert!(err.contains("Run crossfyre login"), "{err}");
-    assert_eq!(load(dir.path()), Machine::default());
+    assert!(
+        err.ends_with("policy: offline (your session ended; run crossfyre login)"),
+        "{err}"
+    );
+    let m = load(dir.path());
+    assert_eq!(m.account, None);
+    assert_eq!(m.offline.map(|o| o.reason), Some(Reason::SessionEnded));
+    command::refresh(dir.path(), &session(), &cloud)
+        .await
+        .unwrap();
+    assert_eq!(cloud.calls(), ["set private"]);
+}
+
+/// Noticed at the next contact: a refresh Crossfyre refuses the session for.
+#[tokio::test]
+async fn a_revoked_session_is_noticed_at_the_next_contact() {
+    let dir = tempfile::tempdir().unwrap();
+    logged_in(dir.path(), "u1");
+    let cloud = Fake::failing(Failed::NotLoggedIn("The key is invalid or revoked.".into()));
+    assert!(matches!(
+        command::refresh(dir.path(), &session(), &cloud).await,
+        Err(Failed::NotLoggedIn(_))
+    ));
+    assert_eq!(
+        load(dir.path()).offline.map(|o| o.reason),
+        Some(Reason::SessionEnded)
+    );
+    // A key that is not the session's, a node's, records nothing.
+    let other = tempfile::tempdir().unwrap();
+    logged_in(other.path(), "u1");
+    assert_eq!(session_ended(other.path(), "cfn_a_node"), None);
+    assert_eq!(load(other.path()), Machine::default());
+}
+
+async fn login(
+    dir: &std::path::Path,
+    same: bool,
+    cloud: &Fake,
+    leave: Option<bool>,
+    choose: Option<Policy>,
+) -> command::AtLogin {
+    command::at_login(
+        dir,
+        &session(),
+        same,
+        cloud,
+        || leave.expect("login asked to leave offline"),
+        || choose,
+    )
+    .await
+}
+
+/// Login takes the account's policy in place of the machine's, and says which and why.
+#[tokio::test]
+async fn login_takes_the_accounts_policy_and_says_which() {
+    let dir = tempfile::tempdir().unwrap();
+    // Set here while logged out: the account's replaces it.
+    save(
+        dir.path(),
+        &Machine {
+            account: Some(Policy::Private),
+            changed_via: Some(command::HERE.into()),
+            ..Machine::default()
+        },
+    )
+    .unwrap();
+    let cloud = Fake::answering(Policy::Connected);
+    let got = login(dir.path(), false, &cloud, None, None).await;
+    assert_eq!(cloud.calls(), ["fetch"]);
+    assert_eq!(got.machine.account, Some(Policy::Connected));
+    assert_eq!(
+        got.line,
+        "policy: the account's connected, changed 2026-11-22T05:30:07Z from web"
+    );
+    assert_eq!(got.note, None);
+    assert_eq!(load(dir.path()), got.machine);
+}
+
+/// A tightening held for this account is sent at its login; another account's never is.
+#[tokio::test]
+async fn a_held_tightening_goes_to_its_own_account_alone() {
+    let held = Machine {
+        account: Some(Policy::Private),
+        changed_via: Some(command::HERE.into()),
+        unsent: true,
+        ..Machine::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    save(dir.path(), &held).unwrap();
+    let cloud = Fake::answering(Policy::Connected);
+    let got = login(dir.path(), true, &cloud, None, None).await;
+    assert_eq!(cloud.calls(), ["set private", "fetch"]);
+    assert_eq!(
+        (got.machine.account, got.machine.unsent),
+        (Some(Policy::Private), false)
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    save(dir.path(), &held).unwrap();
+    let cloud = Fake::answering(Policy::Connected);
+    let got = login(dir.path(), false, &cloud, None, None).await;
+    assert_eq!(cloud.calls(), ["fetch"]);
+    assert_eq!(
+        (got.machine.account, got.machine.unsent),
+        (Some(Policy::Connected), false)
+    );
+
+    // Crossfyre out of reach: the other account's tightening stays here, unsent.
+    let dir = tempfile::tempdir().unwrap();
+    save(dir.path(), &held).unwrap();
+    let down = Fake::failing(Failed::Unreachable("connection refused".into()));
+    let got = login(dir.path(), false, &down, None, None).await;
+    assert_eq!(
+        (got.machine.account, got.machine.unsent),
+        (Some(Policy::Private), false)
+    );
+    assert!(got.note.unwrap().contains("keeps what it had"));
+}
+
+/// Offline the user chose is left only when they say so at login; one a session's end
+/// caused is left without asking.
+#[tokio::test]
+async fn login_asks_before_leaving_an_offline_the_user_chose() {
+    let chosen = |reason| Machine {
+        offline: Some(Offline {
+            reason,
+            since: "2026-11-22T05:30:07Z".into(),
+        }),
+        ..Machine::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    save(dir.path(), &chosen(Reason::Chosen)).unwrap();
+    let cloud = Fake::answering(Policy::Private);
+    let got = login(dir.path(), true, &cloud, Some(false), None).await;
+    assert_eq!(got.machine.active(), Policy::Offline);
+    assert_eq!(got.machine.account, Some(Policy::Private));
+    assert!(
+        got.line
+            .starts_with("policy: offline (you chose it), and the account's is private."),
+        "{}",
+        got.line
+    );
+    assert_eq!(cloud.calls(), ["fetch"]);
+
+    let got = login(dir.path(), true, &cloud, Some(true), None).await;
+    assert_eq!(got.machine.offline, None);
+    assert_eq!(got.machine.active(), Policy::Private);
+
+    let dir = tempfile::tempdir().unwrap();
+    save(dir.path(), &chosen(Reason::SessionEnded)).unwrap();
+    let got = login(dir.path(), true, &cloud, None, None).await;
+    assert_eq!(got.machine.offline, None);
+}
+
+/// An account with no policy yet is asked for one, connected selected, when someone is
+/// here; with nobody here, it is left unchosen, which runs as connected, and says so.
+#[tokio::test]
+async fn a_first_login_asks_for_a_policy_or_leaves_it_unchosen() {
+    /// Crossfyre for an account that has chosen none.
+    struct Unchosen(Fake);
+    impl Cloud for Unchosen {
+        async fn fetch(&self, s: &Session) -> Result<Remote, Failed> {
+            self.0.fetch(s).await.map(|r| Remote {
+                chosen: false,
+                changed_at: None,
+                changed_via: None,
+                ..r
+            })
+        }
+        async fn set(&self, s: &Session, policy: Policy) -> Result<Remote, Failed> {
+            self.0.set(s, policy).await
+        }
+    }
+    let cloud = Unchosen(Fake::answering(Policy::Connected));
+    let dir = tempfile::tempdir().unwrap();
+    let got = command::at_login(dir.path(), &session(), false, &cloud, || false, || None).await;
+    assert_eq!(cloud.0.calls(), ["fetch"]);
+    assert_eq!(got.machine.account, None);
+    assert_eq!(got.machine.active(), Policy::Connected);
+    assert_eq!(
+        got.line,
+        "policy: connected, as none is chosen yet; choose one with crossfyre policy set"
+    );
+
+    let got = command::at_login(
+        dir.path(),
+        &session(),
+        true,
+        &cloud,
+        || false,
+        || Some(Policy::Private),
+    )
+    .await;
+    assert_eq!(cloud.0.calls(), ["fetch", "fetch", "set private"]);
+    assert_eq!(got.machine.account, Some(Policy::Private));
+    assert!(
+        got.line.starts_with("policy: the account's private"),
+        "{}",
+        got.line
+    );
+}
+
+/// Logout leaves the machine's policy as it is.
+#[test]
+fn logout_leaves_the_policy_as_it_is() {
+    let dir = tempfile::tempdir().unwrap();
+    logged_in(dir.path(), "u1");
+    let m = Machine {
+        account: Some(Policy::Private),
+        ..Machine::default()
+    };
+    save(dir.path(), &m).unwrap();
+    assert!(crate::auth::clear_account(dir.path()));
+    assert_eq!(load(dir.path()), m);
 }
 
 #[test]

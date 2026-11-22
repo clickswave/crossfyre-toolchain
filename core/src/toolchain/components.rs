@@ -109,6 +109,8 @@ impl Offer {
 pub enum Unavailable {
     /// Crossfyre could not be reached, or answered as though it could not.
     Unreachable(String),
+    /// It does not take the key.
+    NotLoggedIn(String),
     /// It answered, and said no.
     Refused(String),
 }
@@ -116,8 +118,22 @@ pub enum Unavailable {
 impl std::fmt::Display for Unavailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Unavailable::Unreachable(why) | Unavailable::Refused(why) => f.write_str(why),
+            Unavailable::Unreachable(why)
+            | Unavailable::NotLoggedIn(why)
+            | Unavailable::Refused(why) => f.write_str(why),
         }
+    }
+}
+
+/// `e`, and when Crossfyre no longer takes the session `creds` came from, what that did to
+/// this machine's policy.
+fn with_session_end(data_dir: &Path, creds: &Credentials, e: &Unavailable) -> String {
+    let ended = matches!(e, Unavailable::NotLoggedIn(_))
+        .then(|| crate::policy::session_ended(data_dir, &creds.key))
+        .flatten();
+    match ended {
+        Some(line) => format!("{e}\n{line}"),
+        None => e.to_string(),
     }
 }
 
@@ -147,6 +163,9 @@ pub async fn offer(client: &reqwest::Client, creds: &Credentials) -> Result<Offe
     let status = resp.status();
     if status.is_server_error() {
         return Err(Unavailable::Unreachable(refusal(resp).await));
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(Unavailable::NotLoggedIn(refusal(resp).await));
     }
     if !status.is_success() {
         return Err(Unavailable::Refused(refusal(resp).await));
@@ -481,6 +500,7 @@ pub fn asked_for(target: &str) -> Option<Vec<&'static str>> {
 /// installed. Nothing is said when none is here and none is asked for. Crossfyre out of
 /// reach is no failure: what is installed keeps working.
 pub async fn update_step(
+    data_dir: &Path,
     creds: Option<&Credentials>,
     which: &[&'static str],
     install_missing: bool,
@@ -520,7 +540,8 @@ pub async fn update_step(
             out.skipped += 1;
             return;
         }
-        Err(Unavailable::Refused(why)) => {
+        Err(e @ (Unavailable::NotLoggedIn(_) | Unavailable::Refused(_))) => {
+            let why = with_session_end(data_dir, creds, &e);
             println!(
                 "{}",
                 row(&bang(), "components", "", &format!("{YELLOW}{why}{RESET}"))
@@ -579,7 +600,9 @@ pub async fn install_closed(component: &str, data_dir: &Path) -> Result<String, 
         )
     })?;
     let client = crate::api::client();
-    let offer = offer(&client, &creds).await.map_err(|e| e.to_string())?;
+    let offer = offer(&client, &creds)
+        .await
+        .map_err(|e| with_session_end(data_dir, &creds, &e))?;
     let keys = cfx_pacing::release_keys();
     install(
         &client,

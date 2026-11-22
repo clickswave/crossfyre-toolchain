@@ -1230,7 +1230,7 @@ pub async fn update(
     if let Some(which) = target.and_then(super::components::asked_for) {
         print_heading();
         let mut out = Updated::default();
-        super::components::update_step(creds.as_ref(), &which, true, &mut out).await;
+        super::components::update_step(data_dir, creds.as_ref(), &which, true, &mut out).await;
         print_summary(&out, target, force);
         return Ok(out);
     }
@@ -1248,6 +1248,7 @@ pub async fn update(
     let mut out = update_with(&manifest, target, current_version, rules, handed_over).await?;
     if matches!(target, Some("all") | None) {
         super::components::update_step(
+            data_dir,
             creds.as_ref(),
             &super::components::COMPONENTS,
             false,

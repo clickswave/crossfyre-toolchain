@@ -4,7 +4,9 @@
 //! first. When it cannot be reached, a tightening holds on this machine at once and is
 //! sent at the next contact, and a loosening changes nothing. Logged out, they change
 //! this machine alone, and the next login replaces them with the account's. `offline`
-//! is this machine's alone, recorded with why, and a node here stops for it.
+//! is this machine's alone, recorded with why, and a node here stops for it. A session
+//! Crossfyre no longer takes puts the machine offline too, and `crossfyre login` leaves
+//! it.
 
 use super::cloud::{Cloud, Failed, Session};
 use super::{ALL, Machine, Offline, Policy, Reason, utc_now};
@@ -125,10 +127,13 @@ pub async fn set(
             "Nothing changed: Crossfyre could not be reached ({why}), and a looser policy is \
              set there first."
         )),
-        Err(Failed::NotLoggedIn(why)) => Err(format!(
-            "Nothing changed: Crossfyre does not take this machine's session ({why}). Run \
-             crossfyre login."
-        )),
+        Err(Failed::NotLoggedIn(why)) => {
+            let line = super::session_ended(data_dir, &session.key)
+                .unwrap_or_else(|| "Run crossfyre login.".into());
+            Err(format!(
+                "Crossfyre does not take this machine's session: {why}\n{line}"
+            ))
+        }
         Err(Failed::Refused(why)) => Err(format!("Nothing changed: {why}")),
     }
 }
@@ -145,6 +150,18 @@ pub async fn refresh(
     if machine.offline.is_some() {
         return Ok(machine);
     }
+    if let Err(e) = sync(&mut machine, session, cloud).await {
+        if matches!(e, Failed::NotLoggedIn(_)) {
+            super::session_ended(data_dir, &session.key);
+        }
+        return Err(e);
+    }
+    super::save(data_dir, &machine).map_err(Failed::Refused)?;
+    Ok(machine)
+}
+
+/// Take the account's policy into `machine`, sending a tightening held here first.
+async fn sync(machine: &mut Machine, session: &Session, cloud: &impl Cloud) -> Result<(), Failed> {
     if machine.unsent
         && let Some(held) = machine.account
     {
@@ -153,8 +170,116 @@ pub async fn refresh(
     }
     let remote = cloud.fetch(session).await?;
     machine.take(&remote);
-    super::save(data_dir, &machine).map_err(Failed::Refused)?;
-    Ok(machine)
+    Ok(())
+}
+
+/// What `crossfyre login` did to this machine's policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AtLogin {
+    pub machine: Machine,
+    /// The one line login prints: which policy is active, and why.
+    pub line: String,
+    /// What did not go as it should have, when something did not.
+    pub note: Option<String>,
+}
+
+/// After `crossfyre login` saved `session`: leave offline, asking first when the user
+/// chose it, and take the account's policy in place of whatever this machine had. An
+/// account with none yet is asked for one when someone is here to answer, and is left
+/// without one otherwise, running as connected. `same_account` says the session is the
+/// account's this machine had before, so a tightening held for it is sent; another
+/// account's never is. `choose` answers None when nobody is here.
+pub async fn at_login(
+    data_dir: &Path,
+    session: &Session,
+    same_account: bool,
+    cloud: &impl Cloud,
+    leave_offline: impl FnOnce() -> bool,
+    choose: impl FnOnce() -> Option<Policy>,
+) -> AtLogin {
+    let mut machine = super::load(data_dir);
+    let stays = machine
+        .offline
+        .as_ref()
+        .is_some_and(|o| o.reason == Reason::Chosen)
+        && !leave_offline();
+    if !stays {
+        machine.offline = None;
+    }
+    if !same_account {
+        machine.unsent = false;
+    }
+    let mut note = None;
+    match sync(&mut machine, session, cloud).await {
+        Ok(()) if machine.account.is_none() => {
+            if let Some(p) = choose() {
+                match cloud.set(session, p).await {
+                    Ok(remote) => machine.take(&remote),
+                    Err(e) => {
+                        note = Some(format!(
+                            "{} was not saved to Crossfyre ({e}). Choose again with crossfyre \
+                             policy set.",
+                            p.key()
+                        ))
+                    }
+                }
+            }
+        }
+        Ok(()) => {}
+        Err(Failed::NotLoggedIn(why)) => {
+            machine.offline = Some(Offline {
+                reason: Reason::SessionEnded,
+                since: utc_now(),
+            });
+            note = Some(format!("Crossfyre did not take the new session: {why}"));
+        }
+        Err(e) => {
+            note = Some(format!(
+                "Crossfyre did not give the account's policy ({e}), so this machine keeps what \
+                 it had until its next contact."
+            ))
+        }
+    }
+    if let Err(e) = super::save(data_dir, &machine) {
+        note = Some(format!("The policy could not be recorded here: {e}"));
+    }
+    let line = login_line(&machine);
+    AtLogin {
+        machine,
+        line,
+        note,
+    }
+}
+
+fn login_line(machine: &Machine) -> String {
+    match (&machine.offline, machine.account) {
+        (Some(o), _) if o.reason == Reason::Chosen => format!(
+            "policy: offline (you chose it), and the account's is {}. Leave offline with \
+             crossfyre policy set connected or private.",
+            machine.account.unwrap_or(Policy::Connected).key()
+        ),
+        (Some(o), _) => format!("policy: offline ({})", o.reason.says()),
+        (None, None) => {
+            "policy: connected, as none is chosen yet; choose one with crossfyre policy set".into()
+        }
+        (None, Some(_)) => format!("policy: {}", why(machine, true)),
+    }
+}
+
+/// The question a first login asks an account with no policy yet: connected or private,
+/// with connected selected. None when it is not answered.
+pub fn pick_for_account() -> Option<Policy> {
+    let items: Vec<String> = [Policy::Connected, Policy::Private]
+        .iter()
+        .map(|p| format!("{:<10} {}", p.key(), p.sends()))
+        .collect();
+    let pick = dialoguer::Select::new()
+        .with_prompt("Your account has no policy yet. Which should it have?")
+        .items(&items)
+        .default(0)
+        .interact()
+        .ok()?;
+    [Policy::Connected, Policy::Private].get(pick).copied()
 }
 
 /// `crossfyre policy list`.
@@ -169,9 +294,15 @@ pub async fn run_list(data_dir: &Path) -> Result<(), Box<dyn std::error::Error>>
     let machine = match &session {
         Some(s) => match refresh(data_dir, s, &super::cloud::Crossfyre).await {
             Ok(m) => m,
+            Err(Failed::NotLoggedIn(e)) => {
+                note = Some(format!(
+                    "Crossfyre does not take this machine's session: {e}"
+                ));
+                super::load(data_dir)
+            }
             Err(e) => {
                 note = Some(format!(
-                    "Crossfyre was not asked ({e}): this is what this machine last had."
+                    "Crossfyre did not answer ({e}), so this is what this machine last had."
                 ));
                 super::load(data_dir)
             }
