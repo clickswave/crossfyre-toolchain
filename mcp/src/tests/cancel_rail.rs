@@ -88,8 +88,11 @@ async fn a_call_cancelled_while_waiting_cancels_its_scan() {
     let peer = FakePeer::new(Elicit::None);
     let ct = CancellationToken::new();
     let stop = ct.clone();
+    // Cancelled once plessor has the scan, so the call is cancelled while it waits for
+    // it, however long the checks before the start take on this machine.
+    let engine = plessor.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        eventually("the scan to start", 10, || engine.ops().len() == 1).await;
         stop.cancel();
     });
     let started = std::time::Instant::now();

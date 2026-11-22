@@ -174,6 +174,7 @@ pub(crate) struct StubOpts {
     pub delay_ms: u64,
 }
 
+#[derive(Clone)]
 pub(crate) struct Stub {
     pub port: u16,
     ops: Arc<Mutex<Vec<Value>>>,
