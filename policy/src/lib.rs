@@ -44,8 +44,8 @@ impl Policy {
     pub fn sends(self) -> &'static str {
         match self {
             Policy::Connected => {
-                "Local tools send what their features need: Web Tracer shapes, Mobile captures, \
-                 MCP's Cloud tools, and the managed OAST pool's callbacks."
+                "Local tools send what their features need: Web Tracer shapes, Mobile captures \
+                 and MCP's Cloud tools."
             }
             Policy::Private => {
                 "Local tools send nothing about targets. Login, updates and downloads still work, \
