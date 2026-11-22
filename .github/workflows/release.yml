@@ -169,6 +169,9 @@ jobs:
         run: |
           set -euo pipefail
           cargo install --locked cargo-about@0.9.2 --features cli
+          # notices.py reads the crates offline, and cargo metadata wants those of
+          # every platform, which a build for one target does not download.
+          cargo fetch --locked
           python3 -I scripts/notices.py --target ${{ matrix.target }} \
             --out target/THIRD-PARTY-NOTICES.txt
 
@@ -308,6 +311,9 @@ jobs:
         run: |
           set -euo pipefail
           cargo install --locked cargo-about@0.9.2 --features cli
+          # notices.py reads the crates offline, and cargo metadata wants those of
+          # every platform, which a build for one target does not download.
+          cargo fetch --locked
           "${{ steps.python.outputs.python-path }}" -I scripts/notices.py \
             --target ${{ matrix.target }} --out target/THIRD-PARTY-NOTICES.txt
 
