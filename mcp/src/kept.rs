@@ -220,15 +220,18 @@ fn meta_of(mcp: &Mcp, engine: &str, row: &Value) -> JobMeta {
 
 /// Every scan the engines keep whose target is in scope, newest first.
 pub(crate) async fn scans(mcp: &Mcp) -> Vec<JobMeta> {
+    // The engines are asked together, so one that is not running costs one refused
+    // connect and not one each. On Windows a refused connect is tried again before it
+    // fails, which took half a second an engine when they were asked in turn.
+    let listed = |engine: &'static str| async move {
+        let op = json!({"operation": "scans", "response": "instant"});
+        (engine, ask(mcp, engine, op).await)
+    };
+    let [a, b, c, d, e] = ENGINES;
+    let (a, b, c, d, e) = tokio::join!(listed(a), listed(b), listed(c), listed(d), listed(e));
     let mut all = Vec::new();
-    for engine in ENGINES {
-        let Some(answer) = ask(
-            mcp,
-            engine,
-            json!({"operation": "scans", "response": "instant"}),
-        )
-        .await
-        else {
+    for (engine, answer) in [a, b, c, d, e] {
+        let Some(answer) = answer else {
             continue;
         };
         for row in answer["scans"].as_array().into_iter().flatten() {
@@ -436,19 +439,17 @@ pub(crate) fn masked(of: &JobMeta, text: &str, redact: bool) -> String {
     }
 }
 
-/// How many scans this scope file's servers started that are running now.
-pub(crate) async fn running(mcp: &Mcp) -> usize {
-    scans(mcp)
-        .await
+/// How many of `scans` this scope file's servers started that are running now.
+pub(crate) fn running(mcp: &Mcp, scans: &[JobMeta]) -> usize {
+    scans
         .iter()
         .filter(|m| m.status == jobs::RUNNING && m.scope_sha256 == mcp.scope.sha256)
         .count()
 }
 
-/// How many scans of `tools` this scope file's servers started since `since_ms`.
-pub(crate) async fn starts_since(mcp: &Mcp, tools: &[&str], since_ms: i64) -> usize {
-    scans(mcp)
-        .await
+/// How many of `scans`, of `tools`, this scope file's servers started since `since_ms`.
+pub(crate) fn starts_since(mcp: &Mcp, scans: &[JobMeta], tools: &[&str], since_ms: i64) -> usize {
+    scans
         .iter()
         .filter(|m| {
             tools.contains(&m.tool.as_str())

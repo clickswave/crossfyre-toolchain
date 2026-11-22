@@ -1017,7 +1017,8 @@ impl Mcp {
     /// and have started in the last hour, as the engines keep them.
     pub(crate) async fn check_scan_caps(&self) -> Result<(), Refusal> {
         let now = jobs::now_ms();
-        let running = crate::kept::running(self).await;
+        let scans = crate::kept::scans(self).await;
+        let running = crate::kept::running(self, &scans);
         let max = self.scope.max_concurrent_scans as usize;
         if running >= max {
             return Err(Refusal::new(
@@ -1029,7 +1030,7 @@ impl Mcp {
                 ),
             ));
         }
-        let starts = crate::kept::starts_since(self, &jobs::SCAN_TOOLS, now - 3_600_000).await;
+        let starts = crate::kept::starts_since(self, &scans, &jobs::SCAN_TOOLS, now - 3_600_000);
         let max = self.scope.max_scan_starts_per_hour as usize;
         if starts >= max {
             return Err(Refusal::new(
