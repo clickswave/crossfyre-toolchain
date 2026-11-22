@@ -359,6 +359,23 @@ mod tests {
         assert_eq!(owned_by(None, &[0]), Ok(()));
     }
 
+    /// Whether this kernel's /proc/net/tcp lists the listener on `port` with `uid` as
+    /// its owner, read here without the code under test. Linux does. A sandbox kernel
+    /// such as gVisor does not, and there `connect` refuses every listener, which is
+    /// the safe answer but leaves the test below nothing to tell apart.
+    #[cfg(target_os = "linux")]
+    fn kernel_shows_owner(port: u16, uid: u32) -> bool {
+        let Ok(table) = std::fs::read_to_string("/proc/net/tcp") else {
+            return false;
+        };
+        let local = format!(":{port:04X}");
+        let uid = uid.to_string();
+        table.lines().skip(1).any(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            f.len() > 7 && f[1].ends_with(&local) && f[3] == "0A" && f[7] == uid
+        })
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_listener_of_another_account_is_refused_and_this_ones_is_not() {
@@ -366,6 +383,10 @@ mod tests {
         let addr = l.local_addr().unwrap();
         // SAFETY: geteuid has no preconditions and cannot fail.
         let me = unsafe { libc::geteuid() };
+        if !kernel_shows_owner(addr.port(), me) {
+            eprintln!("skipped: /proc/net/tcp here does not show who owns {addr}");
+            return;
+        }
         assert!(connect(&addr.to_string()).await.is_ok());
         assert!(connect_blocking(addr, Duration::from_secs(1)).is_ok());
         let refused = TRUSTED
