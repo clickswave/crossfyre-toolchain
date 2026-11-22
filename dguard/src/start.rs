@@ -372,7 +372,13 @@ fn open_log(dir: &Path, log: &Path) -> std::io::Result<std::fs::File> {
     }
     let file = options.open(log)?;
     if file.metadata()?.len() > LOG_LIMIT {
-        file.set_len(0)?;
+        // Windows does not shorten a file through a handle opened to append, which has
+        // no right to write over what is there, so the log is started over through one
+        // opened to write. The appending handle then writes at the new end.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(log)?
+            .set_len(0)?;
     }
     Ok(file)
 }
@@ -636,7 +642,7 @@ mod tests {
 
         std::fs::write(&log, "an earlier run\n").unwrap();
         std::fs::File::options()
-            .append(true)
+            .write(true)
             .open(&log)
             .unwrap()
             .set_len(LOG_LIMIT)
@@ -649,7 +655,7 @@ mod tests {
         );
 
         std::fs::File::options()
-            .append(true)
+            .write(true)
             .open(&log)
             .unwrap()
             .set_len(LOG_LIMIT + 1)
