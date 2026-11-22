@@ -732,6 +732,14 @@ fn worded(r: &wire::Refusal, answer: &client::Answer, route: &str) -> Refusal {
              key. They can review the list and confirm it again in Settings, Agent access."
                 .to_string(),
         ),
+        W::PolicyPrivate => (
+            Reason::CloudRefused(W::PolicyPrivate.as_str()),
+            "The account's privacy policy is private, under which its local tools send nothing \
+             about a target to Crossfyre, so the Cloud refused it and nothing was started. The \
+             account's owner can change it in account settings or with crossfyre policy set \
+             connected."
+                .to_string(),
+        ),
         other => (
             Reason::CloudRefused(other.as_str()),
             format!("The Cloud refused {route}: {}.", other.as_str()),

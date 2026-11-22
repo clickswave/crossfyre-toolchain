@@ -399,6 +399,10 @@ async fn the_platforms_refusals_of_a_launch_say_what_to_do() {
         "scans/start",
         Resp::refusal(403, wire::Reason::ApprovalRequired),
     );
+    w.queue(
+        "scans/start",
+        Resp::refusal(403, wire::Reason::PolicyPrivate),
+    );
     let (t, _, _) = fake_cloud::server(&[], w).await;
     let peer = FakePeer::new(Elicit::None);
     let authz = json!({"url": "https://app.example.com/", "identities": ["admin"]});
@@ -414,9 +418,16 @@ async fn the_platforms_refusals_of_a_launch_say_what_to_do() {
     assert!(r.text.contains(&cid(IdKind::Node, 902)), "{}", r.text);
     let r = t.call(&peer, "start_authz_scan", authz.clone()).await;
     assert_eq!(reason(&r), "scan_limit");
-    let r = t.call(&peer, "start_authz_scan", authz).await;
+    let r = t.call(&peer, "start_authz_scan", authz.clone()).await;
     assert_eq!(reason(&r), "approval_required");
     assert!(r.text.contains("Register a phone"), "{}", r.text);
+    let r = t.call(&peer, "start_authz_scan", authz).await;
+    assert_eq!(reason(&r), "policy_private");
+    assert!(
+        r.text.contains("privacy policy is private") && r.text.contains("nothing was started"),
+        "{}",
+        r.text
+    );
 }
 
 #[tokio::test]
