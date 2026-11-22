@@ -10,7 +10,6 @@ use serde_json::{Value, json};
 use std::net::IpAddr;
 use std::time::Duration;
 
-
 async fn listening(port: u16) -> bool {
     matches!(
         tokio::time::timeout(
