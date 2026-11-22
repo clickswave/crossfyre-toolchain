@@ -5906,6 +5906,7 @@ dependencies = [
  "cfx_tunnel",
  "clap",
  "clap_complete",
+ "clap_mangen",
  "dguard",
  "dialoguer 0.11.0",
  "hickory-proto",
