@@ -5073,6 +5073,9 @@ mod op_failure_tests {
         ext: &str,
         data: Value,
     ) -> (Value, String, Vec<String>, u16) {
+        // On Windows an op hands its files over under the toolchain directory, so the
+        // test gives it one of its own.
+        let _toolchain = crate::toolchain::config::TestToolchainDir::new();
         let (_held, port) = refusing_port();
         let nats = FakeNats::start().await;
         let st = EgressState::new(resolver(&[]));

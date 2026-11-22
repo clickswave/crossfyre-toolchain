@@ -457,8 +457,10 @@ fn the_account_key_is_asked_with_before_a_nodes() {
     assert_eq!(credentials(dir.path()), None);
     let nodes = crate::nodes_dir(dir.path());
     std::fs::create_dir_all(&nodes).unwrap();
-    std::fs::write(
-        nodes.join("n1.toml"),
+    // Written as a node writes it: a privileged run (an elevated one, on Windows) reads
+    // only a node config that only administrators can change.
+    crate::toolchain::node_config::write(
+        &nodes.join("n1.toml"),
         "api_key = \"cfxn_node_key\"\nnode_id = \"n1\"\napi_url = \"http://cf.test\"\n",
     )
     .unwrap();

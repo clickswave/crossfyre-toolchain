@@ -592,10 +592,17 @@ mod tests {
         let bin = Path::new("/opt/crossfyre/bin");
         // A closed component is no package's: the CLI fetches it after login, so
         // uninstall takes it away again, the engine and the others alike.
-        let mut want = vec![bin.join("plessor-authz"), bin.join("plessor-authz.version")];
+        let exe = std::env::consts::EXE_SUFFIX;
+        let mut want = vec![
+            bin.join(format!("plessor-authz{exe}")),
+            bin.join("plessor-authz.version"),
+        ];
         want.extend(closed_here(bin).component_files());
         assert_eq!(unowned_files(bin, &image), want);
-        assert!(want.contains(&bin.join("pacing.wasm")) && want.contains(&bin.join("cfx-egress")));
+        assert!(
+            want.contains(&bin.join("pacing.wasm"))
+                && want.contains(&bin.join(format!("cfx-egress{exe}")))
+        );
         let root = Path::new(INSTALL_ROOT);
         assert!(has_files_under(
             &image,
