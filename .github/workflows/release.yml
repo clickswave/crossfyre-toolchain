@@ -168,7 +168,7 @@ jobs:
       - name: Write the third-party notices
         run: |
           set -euo pipefail
-          cargo install --locked cargo-about@0.9.2
+          cargo install --locked cargo-about@0.9.2 --features cli
           python3 -I scripts/notices.py --target ${{ matrix.target }} \
             --out target/THIRD-PARTY-NOTICES.txt
 
@@ -307,7 +307,7 @@ jobs:
       - name: Write the third-party notices
         run: |
           set -euo pipefail
-          cargo install --locked cargo-about@0.9.2
+          cargo install --locked cargo-about@0.9.2 --features cli
           "${{ steps.python.outputs.python-path }}" -I scripts/notices.py \
             --target ${{ matrix.target }} --out target/THIRD-PARTY-NOTICES.txt
 

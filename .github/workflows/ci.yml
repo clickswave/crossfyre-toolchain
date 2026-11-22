@@ -245,6 +245,13 @@ jobs:
             --features transport/impersonate,ambulo/impersonate,voyage/impersonate,toolmark/impersonate,plessor/impersonate \
             -- -D warnings
 
+      # The redirect tests in ambulo and cfx_core listen on 127.0.0.2 as a second
+      # host. Linux and Windows answer on all of 127.0.0.0/8, and macOS only on
+      # the addresses lo0 has. Both test steps below run them, so this comes first.
+      - name: Give lo0 a second address
+        if: runner.os == 'macOS'
+        run: sudo ifconfig lo0 alias 127.0.0.2 up
+
       - name: test (impersonate feature, each engine as released)
         env:
           CFX_BROWSER_NO_SANDBOX: '1'
@@ -254,13 +261,6 @@ jobs:
           for p in ambulo voyage toolmark plessor; do
             cargo test --locked --no-fail-fast --target ${{ matrix.target }} -p "$p" --features impersonate
           done
-
-      # The redirect tests in ambulo and cfx_core listen on 127.0.0.2 as a second
-      # host. Linux and Windows answer on all of 127.0.0.0/8, and macOS only on
-      # the addresses lo0 has.
-      - name: Give lo0 a second address
-        if: runner.os == 'macOS'
-        run: sudo ifconfig lo0 alias 127.0.0.2 up
 
       - name: Test
         env:
@@ -472,7 +472,7 @@ jobs:
       - name: Third-party notices
         run: |
           set -eu
-          cargo install --locked cargo-about@0.9.2
+          cargo install --locked cargo-about@0.9.2 --features cli
           python3 -I scripts/test_notices.py
           python3 -I scripts/notices.py --target x86_64-unknown-linux-gnu \
             --out "$RUNNER_TEMP/THIRD-PARTY-NOTICES.txt"
