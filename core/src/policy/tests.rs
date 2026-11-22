@@ -4,64 +4,6 @@ use super::*;
 use std::sync::Mutex;
 
 #[test]
-fn the_policies_go_from_most_sent_to_least() {
-    assert!(Policy::Connected < Policy::Private && Policy::Private < Policy::Offline);
-    assert_eq!(Policy::parse(" private "), Some(Policy::Private));
-    assert_eq!(Policy::parse("open"), None);
-    assert!(!Policy::Offline.is_account());
-}
-
-#[test]
-fn offline_comes_before_the_accounts_policy_and_none_is_connected() {
-    let mut m = Machine::default();
-    assert_eq!(m.active(), Policy::Connected);
-    m.account = Some(Policy::Private);
-    assert_eq!(m.active(), Policy::Private);
-    m.offline = Some(Offline {
-        reason: Reason::Chosen,
-        since: "x".into(),
-    });
-    assert_eq!(m.active(), Policy::Offline);
-}
-
-/// CROSSFYRE_POLICY tightens a run and never loosens it, and says when it is ignored.
-#[test]
-fn the_variable_tightens_a_run_and_never_loosens_it() {
-    let private = Machine {
-        account: Some(Policy::Private),
-        ..Machine::default()
-    };
-    let run = in_force(&private, Some("offline"));
-    assert_eq!(run.policy, Policy::Offline);
-    assert!(run.note.unwrap().contains("tightens this run from private"));
-    let run = in_force(&private, Some("connected"));
-    assert_eq!(run.policy, Policy::Private);
-    assert!(
-        run.note
-            .unwrap()
-            .contains("looser than this machine's private, so it is ignored")
-    );
-    let run = in_force(&private, Some("loose"));
-    assert_eq!(run.policy, Policy::Private);
-    assert!(run.note.unwrap().contains("names no policy"));
-    assert_eq!(
-        in_force(&private, Some("private")),
-        InForce {
-            policy: Policy::Private,
-            note: None
-        }
-    );
-    assert_eq!(
-        in_force(&private, None),
-        InForce {
-            policy: Policy::Private,
-            note: None
-        }
-    );
-    assert_eq!(in_force(&private, Some("  ")).note, None);
-}
-
-#[test]
 fn a_time_is_written_as_crossfyre_writes_one() {
     assert_eq!(utc(0), "1970-01-01T00:00:00Z");
     assert_eq!(utc(1_795_325_407), "2026-11-22T05:30:07Z");
@@ -604,7 +546,7 @@ fn the_accounts_policy_reads_from_crossfyres_answer() {
         unsent: true,
         ..Machine::default()
     };
-    m.take(&unchosen);
+    super::cloud::take(&mut m, &unchosen);
     assert_eq!(m, Machine::default());
     assert_eq!(
         super::cloud::remote(&serde_json::json!({ "policy": "offline", "chosen": true })),

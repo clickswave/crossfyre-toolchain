@@ -61,6 +61,9 @@ cfx_tunnel = { path = "../tunnel" }
 getrandom = "0.3"
 # The gateway's place for a scope check on each connection, unused until that check lands.
 cfx_scope = { path = "../scope" }
+# The privacy policy and policy.toml, read here the way every program on the machine reads
+# them; this crate writes the file.
+cfx_policy = { path = "../policy" }
 # Web Tracer Method 2 (local intercepting proxy): a Burp-style MITM proxy built in-process so capture
 # needs only a browser (no Wireshark). cfx_capture mints a session CA + per-host leaf certs; hyper serves
 # HTTP/1.1 over the tokio-rustls-terminated tunnel; reqwest (above) forwards to the origin.

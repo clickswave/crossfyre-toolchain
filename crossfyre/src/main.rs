@@ -814,6 +814,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             proxy_port,
             seed_credentials,
         } => {
+            // What it captures goes to Crossfyre, so the policy decides before anything
+            // is opened.
+            if let Some(why) = cfx_core::policy::turned_off(&base, "crossfyre trace") {
+                return Err(why.into());
+            }
             let method = match method.to_lowercase().as_str() {
                 "keylog" | "packet" | "pcap" => cfx_core::toolchain::trace::CaptureMethod::Keylog,
                 _ => cfx_core::toolchain::trace::CaptureMethod::Proxy,
@@ -918,6 +923,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 cloud_file,
                 no_cloud,
+                policy_dir: base.clone(),
             };
             match cfx_mcp::serve(opts).await {
                 // Exit here rather than returning: a read of stdin still parked on the

@@ -239,8 +239,17 @@ impl Cloud {
             .filter(|id| wire::is_uuid(id))
     }
 
-    /// Ask `whoami` once, within [`STARTUP_LIMIT`], before the first tool list.
+    /// Ask `whoami` once, within [`STARTUP_LIMIT`], before the first tool list. An
+    /// offline machine asks nothing, and lists what the last login cached.
     pub(crate) async fn connect(&self, mcp: &Mcp) {
+        let (machine, run) = mcp.policy();
+        if let Some(why) = (run.policy == cfx_policy::Policy::Offline)
+            .then(|| cfx_policy::turned_off(&machine, &run, "the Cloud backend"))
+            .flatten()
+        {
+            self.set_state(State::Unreachable(why));
+            return mcp.listing_settled();
+        }
         let meta = client::Meta {
             tool: "startup",
             client: "crossfyre-mcp",
@@ -317,6 +326,9 @@ impl Cloud {
         hold: Duration,
         note: &mut CallNote,
     ) -> Result<(u16, T), Refusal> {
+        if let Some(r) = policy_refusal(mcp, tool, route) {
+            return Err(r);
+        }
         if let State::Rejected(r) = self.state() {
             return Err(key_rejected(r));
         }
@@ -783,6 +795,26 @@ fn worded(r: &wire::Refusal, answer: &client::Answer, route: &str) -> Refusal {
     Refusal::new(reason, message)
         .with_refused(refused)
         .with_detail(detail)
+}
+
+/// Why `tool` does not call `route` on this machine now, when it does not: offline makes
+/// no contact at all, and private sends nothing about a target, which a scope check and a
+/// scan start carry.
+fn policy_refusal(mcp: &Mcp, tool: &str, route: &str) -> Option<Refusal> {
+    use cfx_policy::Policy;
+    let (machine, run) = mcp.policy();
+    let reason = match run.policy {
+        Policy::Offline => Reason::PolicyOffline,
+        Policy::Private if matches!(route, wire::route::SCOPE_CHECK | wire::route::SCANS_START) => {
+            Reason::PolicyPrivate
+        }
+        _ => return None,
+    };
+    let why = cfx_policy::turned_off(&machine, &run, tool)?;
+    Some(Refusal::new(
+        reason,
+        format!("{why} Nothing was sent to the Cloud."),
+    ))
 }
 
 /// The largest `k` of `n` items whose page fits the result cap, at least 1 when there

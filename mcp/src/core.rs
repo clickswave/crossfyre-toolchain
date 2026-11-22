@@ -91,6 +91,10 @@ pub(crate) enum Reason {
     /// The platform's own reason code, passed on as it was sent.
     #[allow(dead_code)]
     CloudRefused(&'static str),
+    /// This machine's policy is private, and the call would carry a target.
+    PolicyPrivate,
+    /// This machine is offline, and the call would contact Crossfyre.
+    PolicyOffline,
 }
 
 impl Reason {
@@ -129,6 +133,8 @@ impl Reason {
             Reason::ApprovalExpired => "approval_expired",
             Reason::ApprovalRequired => "approval_required",
             Reason::CloudRefused(code) => code,
+            Reason::PolicyPrivate => "policy_private",
+            Reason::PolicyOffline => "policy_offline",
         }
     }
 
@@ -335,6 +341,8 @@ pub(crate) struct Settings {
     pub workbench: WorkbenchMode,
     /// Where a running Workbench writes its endpoint file. Never from a tool argument.
     pub workbench_dir: Option<PathBuf>,
+    /// The CLI's data directory, holding this machine's policy.toml.
+    pub policy_dir: PathBuf,
     pub call_burst: u32,
     pub calls_per_minute: u32,
 }
@@ -460,6 +468,14 @@ impl Mcp {
             site_map: Mutex::new(None),
             scope,
         }
+    }
+
+    /// This machine's policy now, and the policy this run is under. Read on every call,
+    /// so a `crossfyre policy set` holds from the next one.
+    pub(crate) fn policy(&self) -> (cfx_policy::Machine, cfx_policy::InForce) {
+        let machine = cfx_policy::read(&self.settings.policy_dir);
+        let run = cfx_policy::in_force_now(&machine);
+        (machine, run)
     }
 
     /// The listing for an answer to `tools/list`, recorded as what the client now holds.

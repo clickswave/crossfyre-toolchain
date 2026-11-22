@@ -33,3 +33,5 @@ sha2 = "0.10"
 cfx_bridge = { path = "../bridge" }
 # tests/mcp_stdio.rs holds the ports nothing listens on with sockets bound to them.
 tokio = { version = "1.49.0", features = ["net"] }
+# tests/policy.rs gives each run a data directory of its own.
+tempfile = "3"

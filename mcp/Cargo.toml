@@ -20,6 +20,8 @@ cfx_bridge = { path = "../bridge" }
 transport = { path = "../transport" }
 # The Cloud API's shapes, shared with the platform.
 cfx_cloud_wire = { path = "../cloud_wire" }
+# This machine's privacy policy, read from the CLI's policy.toml on every Cloud call.
+cfx_policy = { path = "../policy" }
 # What toolmark's inventory says of a host, and the words for the answers to its CVE
 # leads, read as the node and `plessor scan` read them.
 cfx_cve = { path = "../cve" }

@@ -99,7 +99,7 @@ pub async fn set(
     let current = machine.account.unwrap_or(Policy::Connected);
     match cloud.set(session, want).await {
         Ok(remote) => {
-            machine.take(&remote);
+            super::cloud::take(&mut machine, &remote);
             machine.offline = None;
             super::save(data_dir, &machine)?;
             Ok(Outcome::Saved(want))
@@ -166,10 +166,10 @@ async fn sync(machine: &mut Machine, session: &Session, cloud: &impl Cloud) -> R
         && let Some(held) = machine.account
     {
         let remote = cloud.set(session, held).await?;
-        machine.take(&remote);
+        super::cloud::take(machine, &remote);
     }
     let remote = cloud.fetch(session).await?;
-    machine.take(&remote);
+    super::cloud::take(machine, &remote);
     Ok(())
 }
 
@@ -214,7 +214,7 @@ pub async fn at_login(
         Ok(()) if machine.account.is_none() => {
             if let Some(p) = choose() {
                 match cloud.set(session, p).await {
-                    Ok(remote) => machine.take(&remote),
+                    Ok(remote) => super::cloud::take(&mut machine, &remote),
                     Err(e) => {
                         note = Some(format!(
                             "{} was not saved to Crossfyre ({e}). Choose again with crossfyre \

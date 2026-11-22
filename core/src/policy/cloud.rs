@@ -117,12 +117,10 @@ impl Cloud for Crossfyre {
     }
 }
 
-impl Machine {
-    /// Take the account's policy as Crossfyre gave it.
-    pub fn take(&mut self, r: &Remote) {
-        self.account = r.chosen.then_some(r.policy);
-        self.changed_at = r.changed_at.clone();
-        self.changed_via = r.changed_via.clone();
-        self.unsent = false;
-    }
+/// Take the account's policy into `machine`, as Crossfyre gave it.
+pub fn take(machine: &mut Machine, r: &Remote) {
+    machine.account = r.chosen.then_some(r.policy);
+    machine.changed_at = r.changed_at.clone();
+    machine.changed_via = r.changed_via.clone();
+    machine.unsent = false;
 }

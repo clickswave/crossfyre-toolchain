@@ -756,6 +756,7 @@ dependencies = [
  "cfx_db",
  "cfx_pacing",
  "cfx_pack",
+ "cfx_policy",
  "cfx_scope",
  "cfx_tunnel",
  "clap",
@@ -828,6 +829,7 @@ dependencies = [
  "cfx_bridge",
  "cfx_cloud_wire",
  "cfx_cve",
+ "cfx_policy",
  "cfx_scope",
  "chrono",
  "dguard",
@@ -878,6 +880,15 @@ dependencies = [
  "flate2",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "cfx_policy"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]
@@ -1313,6 +1324,7 @@ dependencies = [
  "oast",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "tokio",
 ]
 

@@ -98,6 +98,9 @@ pub struct Options {
     pub cloud_file: Option<PathBuf>,
     /// `--no-cloud`: no Cloud backend, whatever key is set up.
     pub no_cloud: bool,
+    /// The CLI's data directory, whose policy.toml says what this machine may send to
+    /// Crossfyre.
+    pub policy_dir: PathBuf,
 }
 
 /// A reason the server did not start. Its text is printed and the process exits 2.
@@ -177,6 +180,7 @@ fn build(opts: Options, resolver: Arc<dyn guard::Resolver>) -> Result<core::Mcp,
         postgres_port: opts.postgres_port,
         workbench: opts.workbench,
         workbench_dir: opts.workbench_dir,
+        policy_dir: opts.policy_dir,
         call_burst: 10,
         calls_per_minute: 60,
     };

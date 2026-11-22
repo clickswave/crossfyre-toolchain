@@ -8,6 +8,7 @@ mod cancel_rail;
 mod cloud_approval_rail;
 mod cloud_key_rail;
 mod cloud_launch_rail;
+mod cloud_policy_rail;
 mod cloud_read_rail;
 mod confirm_rail;
 mod engine_rail;

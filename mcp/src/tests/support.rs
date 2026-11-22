@@ -814,6 +814,8 @@ impl Build {
             postgres_port: None,
             workbench: self.workbench,
             workbench_dir: self.workbench_dir,
+            // The test's own directory, so a test writes the machine's policy.toml there.
+            policy_dir: dir.path().to_path_buf(),
             call_burst: self.burst,
             calls_per_minute: self.per_minute,
         };
