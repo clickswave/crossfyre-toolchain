@@ -14,6 +14,7 @@ pub mod executor;
 mod init_summary;
 pub mod oast;
 mod ops;
+pub mod policy;
 
 /// Connecting to an engine on its loopback port, for the helpers that talk to engines
 /// themselves: a listener the engines' account does not own is refused before anything
@@ -1086,6 +1087,23 @@ pub fn load_node_config(path: &std::path::Path) -> Result<Config, Box<dyn std::e
 /// online almost immediately without busy-spinning on the filesystem.
 const BOOT_RESCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Why no node runs here: the user took the machine offline, which a node, reporting to
+/// Crossfyre, would not be. None otherwise: a machine offline because its session ended
+/// keeps its nodes, which run on keys of their own.
+fn offline_stops_nodes(base: &std::path::Path) -> Option<String> {
+    policy::load(base)
+        .offline
+        .filter(|o| o.reason == policy::Reason::Chosen)
+        .map(|o| {
+            format!(
+                "policy: offline ({}), and a node does not run on a machine taken offline. \
+                 Leave offline with crossfyre policy set connected or private, or crossfyre \
+                 login.",
+                o.reason.says()
+            )
+        })
+}
+
 /// Spawn one `crossfyre node daemon <node-id>` child pinned to `base`.
 pub fn spawn_node_daemon(
     exe: &std::path::Path,
@@ -1168,14 +1186,20 @@ pub async fn run_boot(
     // gives it a fresh attempt.
     let mut dead: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for id in &node_ids {
-        if let Some(child) = spawn_node_daemon(&exe, base, id, force) {
-            children.insert(id.clone(), child);
+    // An offline machine runs no node: the supervisor waits, and starts them once the
+    // machine leaves offline.
+    let mut offline = offline_stops_nodes(base);
+    if let Some(why) = &offline {
+        println!("[boot] {why}");
+    } else {
+        for id in &node_ids {
+            if let Some(child) = spawn_node_daemon(&exe, base, id, force) {
+                children.insert(id.clone(), child);
+            }
         }
-    }
-
-    if children.is_empty() {
-        return Err("no node daemons could be started".into());
+        if children.is_empty() {
+            return Err("no node daemons could be started".into());
+        }
     }
 
     let mut engines = toolchain::node_engines::NodeEngines::start();
@@ -1201,6 +1225,25 @@ pub async fn run_boot(
             _ = sigterm.recv() => { println!("\n[boot] {} received - stopping all nodes...", os::STOP_SIGNAL_NAME); break; }
             _ = rescan.tick() => {
                 engines.tend();
+
+                // 0. Offline: every node stops, and none starts until the machine
+                //    leaves offline, when each gets a fresh start.
+                let now_offline = offline_stops_nodes(base);
+                if now_offline.is_some() != offline.is_some() {
+                    match &now_offline {
+                        Some(why) => println!("[boot] {why} Stopping {} node(s).", children.len()),
+                        None => println!("[boot] This machine is no longer offline: starting its nodes."),
+                    }
+                    dead.clear();
+                }
+                offline = now_offline;
+                if offline.is_some() {
+                    for (_, mut child) in children.drain() {
+                        os::ask_to_stop(&mut child);
+                        let _ = child.try_wait();
+                    }
+                    continue;
+                }
 
                 // 1. Reap children that exited on their own; park them in
                 //    `dead` so we don't respawn a flapping node every tick.
@@ -2437,6 +2480,10 @@ pub async fn run_daemon(
     println!("Starting Crossfyre Node Client Daemon...");
     println!("Node id       : {}", paths.node_id);
     println!("Config root   : {}", paths.base.display());
+    // A node does not run on an offline machine: it would report to Crossfyre.
+    if let Some(why) = offline_stops_nodes(&paths.base) {
+        return Err(why.into());
+    }
     print_privilege_banner(std::env::var("CFX_ALLOW_UNPRIV_DAEMON").is_err());
     // Before anything is opened: the egress gateway holds two descriptors per tunnel,
     // and a service's usual soft limit runs out at a quarter of its cap.
@@ -5849,5 +5896,38 @@ mod credential_scope_tests {
             engine_request("web-crawl-1", "ambulo", "op-cs-crawl-anon", data, json!([])).await;
         assert_eq!(req["follow_external"], true);
         assert_eq!(req["scope_hosts"], json!(["m.attacker.test"]));
+    }
+}
+
+#[cfg(test)]
+mod offline_node_tests {
+    use crate::policy::{Offline, Reason, load, save};
+
+    /// A node does not run on a machine the user took offline, and says why and how to
+    /// leave it. Offline because the session ended, nodes run on: their keys are their own.
+    #[test]
+    fn a_machine_taken_offline_runs_no_node_and_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(super::offline_stops_nodes(dir.path()), None);
+        let mut m = load(dir.path());
+        for reason in [Reason::SessionExpired, Reason::SessionRevoked] {
+            m.offline = Some(Offline {
+                reason,
+                since: "2026-11-22T05:30:07Z".into(),
+            });
+            save(dir.path(), &m).unwrap();
+            assert_eq!(super::offline_stops_nodes(dir.path()), None, "{reason:?}");
+        }
+        m.offline = Some(Offline {
+            reason: Reason::Chosen,
+            since: "2026-11-22T05:30:07Z".into(),
+        });
+        save(dir.path(), &m).unwrap();
+        let why = super::offline_stops_nodes(dir.path()).expect("offline stops nodes");
+        assert!(why.starts_with("policy: offline (you chose it)"), "{why}");
+        assert!(
+            why.contains("crossfyre policy set connected or private, or crossfyre login"),
+            "{why}"
+        );
     }
 }

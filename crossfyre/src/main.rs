@@ -65,6 +65,20 @@ enum Commands {
     /// Log out: remove the saved account session (auth.toml).
     Logout,
 
+    /// What this machine may send to Crossfyre: connected or private, which are your
+    /// account's, or offline, which is this machine's alone.
+    ///
+    ///   crossfyre policy list           the three, what each sends, and which is active
+    ///   crossfyre policy set private    or connected, or offline; with no name, a picker
+    ///
+    /// CROSSFYRE_POLICY tightens one run (CROSSFYRE_POLICY=offline crossfyre ...) and
+    /// never loosens it.
+    #[command(verbatim_doc_comment)]
+    Policy {
+        #[command(subcommand)]
+        action: PolicyAction,
+    },
+
     /// Manage Crossfyre nodes: register this host (`node init`), see your fleet
     /// (`node list`), bring nodes online (`node up` / `node down`), or check the
     /// local daemons (`node status`). All node commands live under here.
@@ -391,6 +405,18 @@ enum NodeAction {
 }
 
 #[derive(Subcommand, Debug)]
+enum PolicyAction {
+    /// The three policies, what each sends, which is active and when it last changed.
+    List,
+    /// Set this machine's policy: connected or private for the account, offline for
+    /// this machine. With no name, a picker at a terminal.
+    Set {
+        /// connected, private or offline
+        name: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum OastAction {
     /// Install the OAST server as a systemd service (cf-oast) on this machine for your domain, then obtain
     /// a wildcard TLS cert (ACME DNS-01) and print the DNS-delegation records to add.
@@ -610,6 +636,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Logout => {
             cfx_core::auth::run_logout(&base);
         }
+        Commands::Policy { action } => match action {
+            PolicyAction::List => cfx_core::policy::command::run_list(&base).await?,
+            PolicyAction::Set { name } => {
+                cfx_core::policy::command::run_set(&base, name.as_deref()).await?
+            }
+        },
         Commands::Node { action } => match action {
             NodeAction::Init {
                 force,
@@ -1107,6 +1139,8 @@ mod tests {
         for args in [
             &["login"][..],
             &["logout"],
+            &["policy", "list"],
+            &["policy", "set", "offline"],
             &["status"],
             &["doctor"],
             &["node", "status"],
