@@ -73,7 +73,8 @@ def features(name, target):
 
 
 def run(cmd):
-    got = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+    # cargo writes UTF-8 on every system; Windows would read it in its own code page.
+    got = subprocess.run(cmd, cwd=ROOT, capture_output=True, encoding="utf-8")
     if got.returncode != 0:
         raise NoticesError(f"{' '.join(cmd[:3])} failed:\n{got.stderr[-3000:]}")
     return got.stdout
@@ -99,7 +100,7 @@ def compiles_c(name, target):
         feats = features(name, target)
         if feats:
             cmd += ["--features", ",".join(feats)]
-        got = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+        got = subprocess.run(cmd, cwd=ROOT, capture_output=True, encoding="utf-8")
         if got.returncode != 0:
             # `-i` names a package the build does not have.
             if "did not match any packages" in got.stderr:
