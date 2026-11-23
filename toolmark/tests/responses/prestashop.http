@@ -1,0 +1,16 @@
+# Synthetic: A PrestaShop shop, with the cookie PrestaShop names after a hash.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+set-cookie: PrestaShop-0123456789abcdef0123456789abcdef=x; path=/; HttpOnly
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Shop</title>
+</head>
+<body>
+<div id="products"></div>
+</body>
+</html>

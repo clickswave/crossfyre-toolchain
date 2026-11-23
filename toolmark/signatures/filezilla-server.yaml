@@ -1,0 +1,12 @@
+id: filezilla-server
+info:
+  name: FileZilla Server
+  category: FTP Server
+  metadata:
+    vendor: filezilla-project
+    product: filezilla_server
+detect:
+  any:
+    - banner: { name: ftp, regex: 'FileZilla Server' }
+version:
+  - banner: { name: ftp, regex: 'FileZilla Server (?:version )?([0-9]+\.[0-9]+\.[0-9]+)' }

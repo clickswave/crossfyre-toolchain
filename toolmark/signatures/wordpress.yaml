@@ -1,0 +1,18 @@
+id: wordpress
+info:
+  name: WordPress
+  category: CMS
+  metadata:
+    vendor: wordpress
+    product: wordpress
+implies: [php, mysql]
+detect:
+  any:
+    - meta: { name: generator, regex: '(?i)wordpress' }
+    - html: { regex: '(?i)/wp-content/|/wp-includes/' }
+    - cookie: { name: '(?i)^wordpress_|^wp-settings' }
+    - path: { path: /wp-login.php, regex: 'id="wp-submit"' }
+version:
+  - meta: { name: generator, regex: '(?i)WordPress ([0-9.]+)' }
+  - html: { regex: '(?i)WordPress ([0-9.]+)' }
+  - html: { regex: '/wp-includes/css/dist/block-library/style', since: '5.0' }

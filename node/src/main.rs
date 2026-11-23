@@ -48,8 +48,22 @@ enum Cmd {
     },
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+// An error is printed once, as the sentence it is. Returned from `main`, Rust printed it
+// a second time, in debug form, after the line that had said it already.
+fn main() -> std::process::ExitCode {
+    // Before anything asks the adaptive crate the node's operations use.
+    cfx_pacing::load();
+    cfx_core::api::name_client("crossfyre-node", env!("CARGO_PKG_VERSION"));
+    match start(Cli::parse()) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn start(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // The service manager calls back on a thread of its own, which makes its own runtime.
     #[cfg(windows)]
     if let Cmd::Service {
@@ -89,6 +103,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Cmd::Supervise { force } => cfx_core::run_boot(force, &base).await?,
         Cmd::Daemon { node_id, force } => {
+            eprintln!("[node] {}", cfx_pacing::load().say());
             let paths = cfx_core::NodePaths::checked(&base, &node_id)?;
             cfx_core::run_daemon(force, &paths, env!("CARGO_PKG_VERSION")).await?;
         }

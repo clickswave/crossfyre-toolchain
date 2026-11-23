@@ -70,8 +70,8 @@ fn write_config(data: &std::path::Path, toolmark: u16, plessor: u16) {
     std::fs::write(
         data.join("config.toml"),
         format!(
-            "[postgres]\nhost = \"127.0.0.1\"\nport = {}\nuser = \"crossfyre\"\n\
-             db_name = \"crossfyre\"\n\n[container]\n\n[extensions]\ntoolmark = {toolmark}\n\
+            "[postgres]\nbackend = \"external\"\nhost = \"127.0.0.1\"\nport = {}\n\
+             user = \"crossfyre\"\ndb_name = \"crossfyre\"\n\n[extensions]\ntoolmark = {toolmark}\n\
              plessor = {plessor}\n",
             closed_port()
         ),
@@ -95,12 +95,29 @@ fn read_op(r: &mut impl BufRead, w: &mut TcpStream, caps: &Value) -> Option<Valu
     }
 }
 
+/// A port that refuses every connection for the rest of this test process. A socket is
+/// bound to it and never listens, so no other test is given the port, and no connect can
+/// be given it as its own end and meet itself, as one to a freed port can, and then wait
+/// forever. macOS drops a connection to such a socket unanswered, so there the port is the
+/// local end of a connection to a listener of its own instead.
 fn closed_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    static HELD: std::sync::Mutex<Vec<Box<dyn std::any::Any + Send>>> =
+        std::sync::Mutex::new(Vec::new());
+    #[cfg(not(target_os = "macos"))]
+    let (port, held): (u16, Box<dyn std::any::Any + Send>) = {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        (socket.local_addr().unwrap().port(), Box::new(socket))
+    };
+    #[cfg(target_os = "macos")]
+    let (port, held): (u16, Box<dyn std::any::Any + Send>) = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let near = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (far, _) = l.accept().unwrap();
+        (near.local_addr().unwrap().port(), Box::new((near, far)))
+    };
+    HELD.lock().unwrap().push(held);
+    port
 }
 
 /// An HTTP listener that counts connections.
@@ -146,10 +163,10 @@ fn toolmark() -> (u16, Arc<Mutex<Vec<Value>>>) {
             }
             for ev in [
                 json!({"type": "ack", "target": t}),
-                json!({"type": "finding", "data": {"type": "technology", "source": "scout",
+                json!({"type": "finding", "data": {"type": "technology", "source": "toolmark",
                     "severity": "info", "name": "nginx", "category": "web-server",
                     "version": "1.25.3", "cpe": "", "confidence": 100, "evidence": "server"}}),
-                json!({"type": "finding", "data": {"type": "service", "source": "scout",
+                json!({"type": "finding", "data": {"type": "service", "source": "toolmark",
                     "severity": "info", "status_code": 200, "title": "t", "server": "nginx"}}),
                 json!({"type": "done"}),
             ] {
@@ -183,7 +200,8 @@ fn plessor() -> (u16, Arc<AtomicUsize>) {
                 let _ = writeln!(
                     w,
                     "{}",
-                    json!({"type": "ack", "target": op["target"], "cancellable": true})
+                    json!({"type": "ack", "target": op["target"], "cancellable": true,
+                           "scan": "01234567-89ab-cdef-0123-456789abcdef"})
                 );
                 let mut line = String::new();
                 while r.read_line(&mut line).unwrap_or(0) > 0 {
@@ -366,7 +384,7 @@ fn a_client_session_over_stdio() {
 
     c.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
     let tools = c.reply(2)["result"]["tools"].clone();
-    assert_eq!(tools.as_array().unwrap().len(), 11);
+    assert_eq!(tools.as_array().unwrap().len(), 17);
 
     let r = c.call(
         3,
@@ -583,11 +601,9 @@ fn sigterm_stops_the_scans_and_closes_the_log() {
 
     let (audit, _) = audit_calls(&data);
     assert!(audit.contains("\"event\":\"stop\""), "{audit}");
-    let job: Value = serde_json::from_str(
-        &std::fs::read_to_string(data.join(format!("mcp/jobs/{scan_id}.json"))).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(job["status"], "interrupted", "{job}");
+    // The scan is plessor's to keep, as stopped: the server keeps no file of it.
+    assert_eq!(scan_id, "s_plessor_01234567-89ab-cdef-0123-456789abcdef");
+    assert!(!data.join("mcp/jobs").exists(), "a job file was written");
     assert_eq!(
         cancels.load(Ordering::SeqCst),
         1,
@@ -749,7 +765,7 @@ fn a_cloud_key_adds_the_cloud_tools_and_appears_in_no_output() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names.len(), 15, "{names:?}");
+    assert_eq!(names.len(), 21, "{names:?}");
     assert!(names.contains(&"whoami") && !names.contains(&"start_vuln_scan"));
     let who = c.call(3, "whoami", json!({}));
     assert_eq!(
@@ -788,7 +804,7 @@ fn a_cloud_key_adds_the_cloud_tools_and_appears_in_no_output() {
     c.initialize(false);
     c.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
     let tools = c.reply(2)["result"]["tools"].clone();
-    assert_eq!(tools.as_array().unwrap().len(), 11);
+    assert_eq!(tools.as_array().unwrap().len(), 17);
     drop(c.stdin);
     assert!(wait_exit(&mut child, Duration::from_secs(10)).success());
     assert_eq!(
@@ -816,7 +832,7 @@ fn a_key_refused_mid_session_changes_the_list_once() {
         c.initialize(false);
         c.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
         let before = tool_names(&c.reply(2)["result"]["tools"]);
-        assert_eq!(before.len(), 15, "{mode}: {before:?}");
+        assert_eq!(before.len(), 21, "{mode}: {before:?}");
 
         let r = c.call(3, "whoami", json!({}));
         assert_eq!(r["isError"], true, "{mode}: {r}");
@@ -844,7 +860,7 @@ fn a_key_refused_mid_session_changes_the_list_once() {
         );
         c.send(json!({"jsonrpc": "2.0", "id": 4, "method": "tools/list"}));
         let after = tool_names(&c.reply(4)["result"]["tools"]);
-        assert_eq!(after.len(), 11, "{mode}: {after:?}");
+        assert_eq!(after.len(), 17, "{mode}: {after:?}");
 
         drop(c);
         wait_exit(&mut child, Duration::from_secs(10));
@@ -945,7 +961,7 @@ fn a_workbench_that_starts_later_changes_the_tool_list() {
     c.initialize(false);
     c.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
     let tools = c.reply(2)["result"]["tools"].clone();
-    assert_eq!(tools.as_array().unwrap().len(), 11);
+    assert_eq!(tools.as_array().unwrap().len(), 17);
 
     let welcomed = workbench(&data.join("wb"));
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -969,7 +985,7 @@ fn a_workbench_that_starts_later_changes_the_tool_list() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names.len(), 18, "{names:?}");
+    assert_eq!(names.len(), 24, "{names:?}");
     assert!(names.contains(&"workbench_replay"), "{names:?}");
 
     drop(c);

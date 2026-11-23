@@ -575,7 +575,7 @@ pub(crate) fn audit_args(tool: &str, args: &serde_json::Value) -> serde_json::Va
                 }
             }
         }
-        "test_injection" | "fingerprint" => {
+        "test_injection" | "fingerprint" | "scan_templates" | "discover_content" => {
             url_in(&mut v, "url");
             if let Some(eps) = v.get_mut("endpoints").and_then(|e| e.as_array_mut()) {
                 for ep in eps.iter_mut() {

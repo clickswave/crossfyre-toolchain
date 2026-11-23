@@ -1,0 +1,12 @@
+id: vault
+info:
+  name: HashiCorp Vault
+  category: Secrets
+  metadata:
+    vendor: hashicorp
+    product: vault
+detect:
+  any:
+    - path: { path: /v1/sys/health, regex: '(?s)"initialized"\s*:.*"sealed"\s*:' }
+version:
+  - path: { path: /v1/sys/health, regex: '"version"\s*:\s*"([0-9]+(?:\.[0-9]+)*)' }

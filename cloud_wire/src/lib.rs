@@ -228,6 +228,9 @@ pub enum Reason {
     ScopeNotAttested,
     /// A target is outside the entries the key may launch against. 403, with `refused`.
     OutOfScope,
+    /// The key's owner's privacy policy is private, under which their local tools send
+    /// nothing about a target. 403.
+    PolicyPrivate,
     /// A named node is not in the workspace, not online, or lacks the engine. 400.
     NodeUnavailable,
     /// No node was named and none is online with the engine. 409.
@@ -260,7 +263,7 @@ pub enum Reason {
 }
 
 impl Reason {
-    pub const ALL: [Reason; 30] = [
+    pub const ALL: [Reason; 31] = [
         Reason::McpDisabled,
         Reason::KeyInvalid,
         Reason::KeyRevoked,
@@ -276,6 +279,7 @@ impl Reason {
         Reason::ScopeEmpty,
         Reason::ScopeNotAttested,
         Reason::OutOfScope,
+        Reason::PolicyPrivate,
         Reason::NodeUnavailable,
         Reason::NoOnlineNode,
         Reason::PlanLimit,
@@ -310,6 +314,7 @@ impl Reason {
             Reason::ScopeEmpty => "scope_empty",
             Reason::ScopeNotAttested => "scope_not_attested",
             Reason::OutOfScope => "out_of_scope",
+            Reason::PolicyPrivate => "policy_private",
             Reason::NodeUnavailable => "node_unavailable",
             Reason::NoOnlineNode => "no_online_node",
             Reason::PlanLimit => "plan_limit",

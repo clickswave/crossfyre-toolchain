@@ -23,6 +23,7 @@
 //!     protocol leaves the stream in a state the next probe would misread.
 //!   * The port is a hint for ordering, never the answer.
 
+use crate::signatures::Host;
 use cfx_finding::Finding;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -83,7 +84,13 @@ impl Svc {
     }
 }
 
-pub async fn run(params: SvcParams, tx: mpsc::UnboundedSender<Value>) {
+/// Identify the service on each target, sending what is found on `tx`, with the CVE leads
+/// of each product named from `cves`.
+pub async fn run(
+    params: SvcParams,
+    tx: mpsc::UnboundedSender<Value>,
+    known: std::sync::Arc<crate::knowledge::Known>,
+) {
     let _ = tx.send(json!({"type":"ack","targets": params.targets.len()}));
     let to = Duration::from_millis(params.timeout_ms.clamp(500, 30_000));
     let tasks = params.tasks.clamp(1, 64);
@@ -128,6 +135,23 @@ pub async fn run(params: SvcParams, tx: mpsc::UnboundedSender<Value>) {
             }));
             for f in svc.findings {
                 let _ = tx.send(json!({"type":"finding","data": f}));
+            }
+            // What the probe read names the product, through the signatures a page is read
+            // with: the version the service gave, or its greeting where it gave none apart.
+            let text = if svc.version.is_empty() {
+                &svc.banner
+            } else {
+                &svc.version
+            };
+            for d in Host::service(&known.signatures, &svc.service, text).detections() {
+                let _ = tx.send(crate::fingerprint::technology(
+                    &d,
+                    &target,
+                    &host,
+                    port,
+                    &svc.service,
+                ));
+                crate::fingerprint::send_leads(&tx, &known, &d, &target, &host, port, &svc.service);
             }
         }
         let _ = tx.send(json!({"type":"progress","processed":done,"total":total}));
@@ -293,7 +317,7 @@ fn printable(b: &[u8]) -> String {
 }
 
 fn open_finding(service: &str, target: &str, severity: &str, name: &str, detail: String) -> Value {
-    Finding::new("scout-services", "misconfig", name, severity, target)
+    Finding::new("toolmark-services", "misconfig", name, severity, target)
         .location("service")
         .describe(detail)
         .with("service", json!(service))
@@ -301,11 +325,17 @@ fn open_finding(service: &str, target: &str, severity: &str, name: &str, detail:
 }
 
 fn creds_finding(service: &str, target: &str, name: &str, detail: String) -> Value {
-    Finding::new("scout-services", "default_creds", name, "critical", target)
-        .location("service")
-        .describe(detail)
-        .with("service", json!(service))
-        .build()
+    Finding::new(
+        "toolmark-services",
+        "default_creds",
+        name,
+        "critical",
+        target,
+    )
+    .location("service")
+    .describe(detail)
+    .with("service", json!(service))
+    .build()
 }
 
 // ---------------------------------------------------------------------------
@@ -329,7 +359,12 @@ async fn banner_service(egress: &Egress, target: &str, to: Duration) -> Option<S
 
     if low.starts_with("ssh-") {
         svc.service = "ssh".into();
-        svc.version = text.trim_start_matches("SSH-").to_string();
+        // The identification string is the first line, which the protocol ends with CR LF.
+        let line = b
+            .split(|c| *c == b'\r' || *c == b'\n')
+            .next()
+            .unwrap_or_default();
+        svc.version = printable(line).trim_start_matches("SSH-").to_string();
     } else if low.starts_with("220") && low.contains("ftp") {
         svc.service = "ftp".into();
         svc.version = text.clone();
@@ -908,6 +943,116 @@ mod tests {
         let len = i32::from_le_bytes([m[0], m[1], m[2], m[3]]) as usize;
         assert_eq!(len, m.len());
         assert_eq!(i32::from_le_bytes([m[12], m[13], m[14], m[15]]), 2013);
+    }
+
+    /// A product a probe names gets its CVE leads, and one a distribution built says the
+    /// build may carry a backported fix.
+    #[tokio::test]
+    async fn a_service_s_product_gets_its_cve_leads() {
+        let cves = crate::knowledge::with_dataset_for_tests(
+            r#"{"format": 1, "sequence": 5, "made": "2026-11-22T15:00:00Z",
+                "products": [{"part": "a", "vendor": "openbsd", "product": "openssh",
+                  "affected": [{"cve": "CVE-2099-0089", "ranges": [{"ge": "8.5p1", "lt": "9.8p1"}]}]}],
+                "cves": {"CVE-2099-0089": {"severity": "high", "score": 8.1}}}"#,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let _ = stream
+                    .write_all(b"SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6\r\n")
+                    .await;
+            }
+        });
+        let params: SvcParams = serde_json::from_value(json!({
+            "targets": [format!("127.0.0.1:{port}")],
+            "timeout_ms": 1000,
+            "auth_checks": false,
+        }))
+        .unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        run(params, tx, cves).await;
+        let mut leads = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if event["type"] == "finding" && event["data"]["type"] == "vulnerability" {
+                leads.push(event["data"].clone());
+            }
+        }
+        assert_eq!(leads.len(), 1, "{leads:?}");
+        assert_eq!(leads[0]["cve"], "CVE-2099-0089");
+        assert_eq!(leads[0]["cve_data"], "CVE dataset 5 of 2026-11-22");
+        assert_eq!(leads[0]["backport"], true);
+        assert_eq!(leads[0]["product"], "OpenSSH");
+    }
+
+    /// A service is named by the signatures from what its probe read: the product, its
+    /// version and the distribution that built it, as a technology on the service's own
+    /// host and port, from the text the probe keeps of each protocol's greeting.
+    #[tokio::test]
+    async fn a_service_is_named_from_its_banner() {
+        // What the service sends, the service it is, and the name, version and distro read.
+        type Case = (
+            &'static [u8],
+            &'static str,
+            &'static str,
+            Option<&'static str>,
+            Option<&'static str>,
+        );
+        let cases: [Case; 3] = [
+            (
+                b"SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6\r\n",
+                "ssh",
+                "OpenSSH",
+                Some("8.9p1"),
+                Some("Ubuntu-3ubuntu0.6"),
+            ),
+            (
+                b"220 ProFTPD 1.3.5e Server (Debian) [::ffff:127.0.0.1]\r\n",
+                "ftp",
+                "ProFTPD",
+                Some("1.3.5e"),
+                Some("Debian"),
+            ),
+            (
+                b"220 mail.example.test ESMTP Postfix (Ubuntu)\r\n",
+                "smtp",
+                "Postfix",
+                None,
+                Some("Ubuntu"),
+            ),
+        ];
+        for (greeting, service, name, version, distro) in cases {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let _ = stream.write_all(greeting).await;
+                }
+            });
+            let target = format!("127.0.0.1:{port}");
+            let params: SvcParams = serde_json::from_value(json!({
+                "targets": [target],
+                "timeout_ms": 1000,
+                "auth_checks": false,
+            }))
+            .unwrap();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            run(params, tx, crate::knowledge::compiled_for_tests()).await;
+            let mut named = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                if event["type"] == "finding" && event["data"]["type"] == "technology" {
+                    named.push(event["data"].clone());
+                }
+            }
+            assert_eq!(named.len(), 1, "{service}: {named:?}");
+            let found = &named[0];
+            assert_eq!(found["name"], name, "{found}");
+            assert_eq!(found["version"].as_str(), version, "{found}");
+            assert_eq!(found["distro"].as_str(), distro, "{found}");
+            assert_eq!(found["target"], target.as_str(), "{found}");
+            assert_eq!(found["port"], port, "{found}");
+            assert_eq!(found["scheme"], service, "{found}");
+        }
     }
 
     #[test]

@@ -1,0 +1,7 @@
+id: blogger
+info:
+  name: Blogger
+  category: Blog
+detect:
+  any:
+    - meta: { name: generator, regex: '^blogger$' }

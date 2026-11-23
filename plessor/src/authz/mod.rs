@@ -9,10 +9,10 @@
 //! single [`run`] entry point. The differential identity-matrix oracle that powers
 //! it - privilege-aware pairing, confirm-before-report, the BOPLA data-exposure
 //! probe, and the correctness tuning that keeps false positives near zero - is a
-//! private drop-in (`private.rs`, git-ignored) that `build.rs` selects when it is
-//! present (first-party builds). A public checkout has only `baseline.rs`, so the
-//! open build compiles and runs but does not perform the authorization oracle:
-//! authorization testing is a platform feature.
+//! private drop-in (`private.rs`, git-ignored) that `build.rs` compiles under the
+//! `closed-authz` feature, for plessor-authz. Without the feature, and in a public
+//! checkout, which has only `baseline.rs`, plessor compiles and runs but does not
+//! perform the authorization oracle: authorization testing comes with plessor-authz.
 //!
 //! Both impls expose the same `run(AuthzParams, tx)` surface, so `daemon.rs` is
 //! identical regardless of which is compiled.
@@ -117,7 +117,7 @@ mod imp;
 /// Run the authorization pass on the endpoints inside the scan's scope.
 ///
 /// The fence is applied here rather than in either implementation, so the open
-/// baseline and the first-party oracle both get it and neither can drop it.
+/// baseline and plessor-authz's oracle both get it and neither can drop it.
 pub async fn run(
     mut params: AuthzParams,
     tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
@@ -130,4 +130,14 @@ pub async fn run(
         &tx,
     );
     imp::run(params, tx).await
+}
+
+#[cfg(test)]
+mod tests {
+    /// plessor itself compiles the baseline even where the drop-in is present: only a
+    /// build with `closed-authz`, plessor-authz's, carries it.
+    #[test]
+    fn plessor_alone_never_carries_the_authz_drop_in() {
+        assert_eq!(cfg!(authz_private), cfg!(feature = "closed-authz"));
+    }
 }

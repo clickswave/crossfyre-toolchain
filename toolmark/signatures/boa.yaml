@@ -1,0 +1,12 @@
+id: boa
+info:
+  name: Boa
+  category: Web Server
+  metadata:
+    vendor: boa
+    product: boa
+detect:
+  any:
+    - header: { name: server, regex: '^Boa/' }
+version:
+  - header: { name: server, regex: '^Boa/([0-9]+(?:\.[0-9]+)*(?:rc[0-9]+)?)' }

@@ -1,7 +1,5 @@
 # plessor
 
-Formerly `cortex`, renamed in 0.1.31.
-
 The vulnerability engine. plessor runs template-based checks against a target,
 confirms anything that looks like a hit before reporting it, and can confirm blind
 bugs out of band. It reads nuclei-style templates (a supported subset) plus its own
@@ -11,25 +9,31 @@ Part of the [Crossfyre toolchain](../).
 
 ## How it runs
 
-Like toolmark, plessor is a daemon you feed targets:
+The checks run in plessor's daemon, on 127.0.0.1:4445, and the commands here are its
+clients. The first command starts the daemon when none is running, and a daemon
+started that way exits after 30 minutes with no client and no scan. `plessor daemon`
+runs one by hand, and `--no-autostart` turns the starting off. It keeps each scan in
+PostgreSQL with what it found, and for a template scan where each template got to, so a
+scan stopped part way carries on from there when the same scan is asked for again, and
+reports what it had found before. The first daemon makes the database, so install
+PostgreSQL's programs before the first scan (`sudo apt install postgresql` on Debian,
+Ubuntu or Kali), or point it at a database you run with `crossfyre db external`.
+`plessor scans` lists the scans it keeps, the latest first, and Enter on a stopped
+template scan takes it up again. `plessor db purge --scan ID` deletes one scan, and
+`plessor db reset` everything it keeps. The root [README](../#how-the-engines-run) has the details.
 
 ```sh
-# start the daemon (default port 4445)
-plessor --daemon
-
-# scan a target through it
+# scan a target
 plessor scan https://example.com
 
-# same run, with the live dashboard
-plessor --tui scan https://example.com
+# same run, as JSON in the terminal
+plessor scan https://example.com --no-tui
 ```
 
-`--no-tui` is accepted for symmetry with the other engines; here JSON is
-already the default.
-
-`--tui` brings up the shared toolchain dashboard, with findings ordered by
-severity so a critical sits at the top the moment it is confirmed. It is
-ignored when output is piped, so the node and any scripts still get JSON.
+In a terminal, `scan` and `inject` bring up the shared toolchain dashboard, with
+findings ordered by severity so a critical sits at the top the moment it is
+confirmed. `--no-tui` prints the events as JSON instead, which is what piped or
+redirected output always gets, so the node and any scripts still get JSON.
 
 Every finding streams back as a JSON event. plessor only emits a finding after it
 re-issues the request and gets the same result twice, so what you get out is the set

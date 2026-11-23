@@ -1,0 +1,12 @@
+id: grafana
+info:
+  name: Grafana
+  category: Monitoring
+  metadata:
+    vendor: grafana
+    product: grafana
+detect:
+  any:
+    - html: { regex: 'window\.grafanaBootData' }
+version:
+  - html: { regex: '"buildInfo"\s*:\s*\{[^}]*"version"\s*:\s*"([0-9]+(?:\.[0-9]+)*)' }

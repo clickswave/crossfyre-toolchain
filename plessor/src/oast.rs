@@ -7,8 +7,7 @@
 //! private key, decrypts on poll. Each template gets a fresh correlation id (bound
 //! to the same scan keypair) so callbacks stay attributable per check.
 //!
-//! Enabled only when PLESSOR_OAST_DOMAIN + PLESSOR_OAST_API_URL are set (the old
-//! CORTEX_OAST_* names are still read for this release).
+//! Enabled only when PLESSOR_OAST_DOMAIN + PLESSOR_OAST_API_URL are set.
 
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
@@ -60,15 +59,12 @@ impl OastClient {
     /// Build a client (generating a fresh keypair) if OAST is configured.
     pub fn from_env() -> Option<OastClient> {
         // PLESSOR_OAST_DOMAIN may be a comma-separated pool of callback domains.
-        // The old CORTEX_OAST_* names are still read, because nodes set them in a
-        // systemd drop-in nobody revisits, and a scan without OAST finds nothing
-        // blind and says nothing about it.
-        let domains: Vec<String> =
-            dguard::env_renamed("PLESSOR_OAST_DOMAIN", "CORTEX_OAST_DOMAIN")?
-                .split(',')
-                .map(String::from)
-                .collect();
-        let api_base = dguard::env_renamed("PLESSOR_OAST_API_URL", "CORTEX_OAST_API_URL")?;
+        let domains: Vec<String> = std::env::var("PLESSOR_OAST_DOMAIN")
+            .ok()?
+            .split(',')
+            .map(String::from)
+            .collect();
+        let api_base = std::env::var("PLESSOR_OAST_API_URL").ok()?;
         Self::from_spec(domains, &api_base)
     }
 

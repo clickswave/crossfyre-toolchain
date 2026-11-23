@@ -9,9 +9,9 @@
 //! unchanged. TLS uses the same accept-any-cert posture as the reqwest client
 //! (plessor scans hosts with self-signed / mismatched certs).
 //!
-//! Every connection is opened by `transport::dial`, with the egress and the
-//! private-address rule the caller names in a [`Route`], so a raw send leaves the
-//! machine the same way the op's HTTP client does.
+//! Every connection is opened by `transport::dial`, with the egress, the
+//! private-address rule and the pinned names the caller names in a [`Route`], so a raw
+//! send leaves the machine the same way the op's HTTP client does.
 
 use std::net::SocketAddr;
 #[cfg(not(feature = "impersonate"))]
@@ -27,6 +27,9 @@ pub struct Route {
     pub egress: transport::Egress,
     /// Refuse private and reserved destinations, as the op's HTTP client does.
     pub block_internal: bool,
+    /// Names pinned to addresses, as the op's HTTP client is given them. A send to a
+    /// pinned name dials its address, and one on another port is refused.
+    pub resolve: Vec<(String, SocketAddr)>,
 }
 
 impl Route {
@@ -478,8 +481,8 @@ pub fn split_url(url: &str) -> Option<(bool, String, u16, String)> {
 }
 
 /// The one place a raw send opens its connection: through the route's egress, at the
-/// pinned address when there is one. `transport::dial` refuses a pin on another port
-/// and a pin through a proxy without dialling.
+/// pinned address when there is one, given here or by the route. `transport::dial`
+/// refuses a pin on another port and a pin through a proxy without dialling.
 async fn dial(
     route: &Route,
     host: &str,
@@ -487,6 +490,13 @@ async fn dial(
     pin: Option<SocketAddr>,
     timeout: Duration,
 ) -> Result<Tunnel, SendFail> {
+    let pin = pin.or_else(|| {
+        route
+            .resolve
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(host))
+            .map(|(_, at)| *at)
+    });
     transport::dial(
         &route.egress,
         host,

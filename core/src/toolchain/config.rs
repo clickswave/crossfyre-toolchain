@@ -1,46 +1,27 @@
-// Toolchain configuration: where extension binaries live, and how the
-// extensions reach the shared Postgres instance. Lives in the same
-// `~/.config/crossfyre` root as the node configs (`nodes.d/`), in a
-// `config.toml` the extension daemons also read.
+// Toolchain configuration: where extension binaries live, which database the
+// extensions keep their state in, and the ports they listen on. Lives in the same
+// `~/.config/crossfyre` root as the node configs (`nodes.d/`), in a `config.toml`
+// the extension daemons also read.
 
 use serde::{Deserialize, Serialize};
-use std::fs;
 use std::path::PathBuf;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ToolchainConfig {
-    pub postgres: PostgresSection,
-    pub container: ContainerSection,
+    /// Which database the engines use, in the shape the engines read it.
+    pub postgres: cfx_db::Settings,
     // Local TCP ports the extension daemons listen on. Host-level (all nodes on
     // this machine share one set of engine daemons + one Postgres), overridable
-    // per install so an operator can dodge a port clash. Defaulted via serde so
-    // an older config.toml still parses.
+    // per install so an operator can dodge a port clash. Defaulted via serde, so
+    // a file without the section gets the protocol defaults.
     #[serde(default)]
     pub extensions: ExtensionPorts,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PostgresSection {
-    pub host: String,
-    pub port: u16,
-    pub user: String,
-    pub password: Option<String>,
-    pub db_name: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ContainerSection {
-    pub id: Option<String>,
-}
-
-/// Per-extension daemon ports, keyed by engine id.
-///
-/// In `config.toml` the `[extensions]` table is keyed by each engine's public name.
-/// A key may also be an engine's id or its legacy name, so a file written before an
-/// engine took its current name still loads with its ports intact; the public name
-/// wins when a file carries both. A file that predates this section, or omits an
-/// engine, gets the protocol default ([`super::Engine::port`]) for it, and an
-/// unknown key is ignored. Written back, the table always uses public names.
+/// Per-extension daemon ports, keyed by engine name, as the `[extensions]` table of
+/// `config.toml` is. A file without the section, or one that leaves an engine out,
+/// gets the protocol default ([`super::Engine::port`]) for it, and any other key is
+/// ignored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionPorts {
     ports: Vec<(&'static str, u16)>,
@@ -48,52 +29,25 @@ pub struct ExtensionPorts {
 
 impl Default for ExtensionPorts {
     fn default() -> Self {
-        Self::defaults_in(super::ENGINES)
+        Self {
+            ports: super::ENGINES.iter().map(|e| (e.name, e.port)).collect(),
+        }
     }
 }
 
 impl ExtensionPorts {
-    fn defaults_in(table: &'static [super::Engine]) -> Self {
-        Self {
-            ports: table.iter().map(|e| (e.id, e.port)).collect(),
-        }
-    }
-
-    /// Ports from `[extensions]` entries, read against `table`.
-    fn from_entries_in<'a>(
-        table: &'static [super::Engine],
-        entries: impl IntoIterator<Item = (&'a str, u16)> + Clone,
-    ) -> Self {
-        let mut out = Self::defaults_in(table);
-        // Two passes so a public-name key beats an id or legacy key for the same
-        // engine whatever order the file lists them in.
-        for public in [false, true] {
-            for (key, port) in entries.clone() {
-                if let Some(e) = super::find_engine(table, key)
-                    && (key == e.name) == public
-                {
-                    out.set(e.id, port);
-                }
-            }
-        }
-        out
-    }
-
-    /// Configured port for `ext` (an id, public name or legacy name), or 0 if it
-    /// isn't a known engine.
+    /// Configured port for engine `ext`, or 0 if it isn't a known engine.
     pub fn get(&self, ext: &str) -> u16 {
-        let id = super::engine(ext).map(|e| e.id).unwrap_or(ext);
         self.ports
             .iter()
-            .find(|(k, _)| *k == id)
+            .find(|(k, _)| *k == ext)
             .map(|(_, p)| *p)
             .unwrap_or(0)
     }
 
     /// Set `ext`'s port; no-op for an unknown engine name.
     pub fn set(&mut self, ext: &str, port: u16) {
-        let id = super::engine(ext).map(|e| e.id).unwrap_or(ext);
-        if let Some(slot) = self.ports.iter_mut().find(|(k, _)| *k == id) {
+        if let Some(slot) = self.ports.iter_mut().find(|(k, _)| *k == ext) {
             slot.1 = port;
         }
     }
@@ -101,11 +55,7 @@ impl ExtensionPorts {
 
 impl Serialize for ExtensionPorts {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_map(
-            self.ports
-                .iter()
-                .map(|(id, port)| (super::public_name(id), *port)),
-        )
+        serializer.collect_map(self.ports.iter().copied())
     }
 }
 
@@ -121,40 +71,24 @@ impl<'de> Deserialize<'de> for ExtensionPorts {
         }
         let raw: std::collections::BTreeMap<String, Entry> =
             std::collections::BTreeMap::deserialize(deserializer)?;
-        let mut entries: Vec<(&str, u16)> = Vec::new();
+        let mut ports = Self::default();
         for (key, value) in &raw {
+            let Some(e) = super::engine(key) else {
+                continue;
+            };
             match value {
-                Entry::Port(p) => entries.push((key.as_str(), *p)),
-                Entry::Other(_) if super::engine(key).is_some() => {
+                Entry::Port(p) => ports.set(e.name, *p),
+                Entry::Other(_) => {
                     return Err(serde::de::Error::custom(format!(
                         "[extensions] {key} must be a port number"
                     )));
                 }
-                Entry::Other(_) => {}
             }
         }
-        Ok(Self::from_entries_in(super::ENGINES, entries))
+        Ok(ports)
     }
 }
 
-impl Default for ToolchainConfig {
-    fn default() -> Self {
-        Self {
-            postgres: PostgresSection {
-                host: "localhost".to_string(),
-                port: 4440,
-                user: "postgres".to_string(),
-                password: None,
-                db_name: "crossfyre".to_string(),
-            },
-            container: ContainerSection { id: None },
-            extensions: ExtensionPorts::default(),
-        }
-    }
-}
-
-/// `~/.config/crossfyre` of the *invoking* user (honors SUDO_USER), the same
-/// root that holds `nodes.d/`.
 /// Process-wide override for the toolchain directory, set once from `--data-dir`.
 ///
 /// `--data-dir` is documented as "the directory that holds `nodes.d` and
@@ -173,20 +107,87 @@ pub fn set_toolchain_dir(dir: PathBuf) {
 }
 
 pub fn get_toolchain_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(dir) = TEST_TOOLCHAIN_DIR.with(|d| d.borrow().clone()) {
+        return dir;
+    }
     if let Some(dir) = TOOLCHAIN_DIR_OVERRIDE.get() {
         return dir.clone();
     }
-    super::sudo_user::invoking_user_config_dir().join("crossfyre")
+    // A test build refuses the real one: what a test writes or reads there is the
+    // operator's.
+    #[cfg(test)]
+    panic!(
+        "a test asked for the real toolchain directory: a test gives it one of its own \
+         (TestToolchainDir)"
+    );
+    #[cfg(not(test))]
+    default_toolchain_dir().expect("Could not find the toolchain directory")
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_TOOLCHAIN_DIR: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A toolchain directory of a test's own, for the thread it runs on until it is dropped:
+/// a config.toml in it gives each engine a port far from the real ones.
+#[cfg(test)]
+pub(crate) struct TestToolchainDir {
+    _dir: tempfile::TempDir,
+}
+
+#[cfg(test)]
+impl TestToolchainDir {
+    pub(crate) fn new() -> Self {
+        let dir = tempfile::tempdir().expect("a toolchain directory for the test");
+        let ports: String = super::ENGINES
+            .iter()
+            .map(|e| format!("{} = {}\n", e.name, 20_000 + e.port))
+            .collect();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            format!(
+                "[postgres]\nbackend = \"local\"\nport = 24440\nuser = \"postgres\"\n\
+                 db_name = \"crossfyre\"\n\n[extensions]\n{ports}"
+            ),
+        )
+        .expect("its config.toml");
+        TEST_TOOLCHAIN_DIR.with(|d| *d.borrow_mut() = Some(dir.path().to_path_buf()));
+        Self { _dir: dir }
+    }
+}
+
+#[cfg(test)]
+impl TestToolchainDir {
+    pub(crate) fn path(&self) -> &std::path::Path {
+        self._dir.path()
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestToolchainDir {
+    fn drop(&mut self) {
+        TEST_TOOLCHAIN_DIR.with(|d| *d.borrow_mut() = None);
+    }
+}
+
+/// The toolchain directory, the same root that holds `nodes.d/`, when `--data-dir`
+/// names none. As root it is the one of the user crossfyre was run for through sudo.
+/// Otherwise it is the one the engines find (`dguard::toolchain_dir`), so the CLI and
+/// the engines read one config.toml: `~/.config/crossfyre` on Linux whatever
+/// XDG_CONFIG_HOME says.
+pub fn default_toolchain_dir() -> Option<PathBuf> {
+    if let Some((_, _, home, _)) = super::sudo_user::sudo_user_info() {
+        return Some(super::sudo_user::config_root_in(&home).join("crossfyre"));
+    }
+    dguard::toolchain_dir()
 }
 
 pub fn get_config_path() -> PathBuf {
     get_toolchain_dir().join("config.toml")
 }
-
-/// The variable that tells an engine daemon where the toolchain directory, and so its
-/// `config.toml`, is. The engine host sets it on macOS and Windows; an engine without
-/// it looks in the per-user default, as it always has on Linux.
-pub const TOOLCHAIN_DIR_ENV: &str = "CROSSFYRE_TOOLCHAIN_DIR";
 
 /// The file holding the egress-proxy variables the engine daemons start with. Linux
 /// keeps the path its systemd units have always named; elsewhere it is in the
@@ -230,14 +231,9 @@ pub fn get_bin_dir() -> PathBuf {
     }
 }
 
-/// On-disk file name of an extension binary (adds `.exe` on Windows). `ext` may be an
-/// engine id or any other component name; an engine is named by its public name.
-pub fn ext_file_name(ext: &str) -> String {
-    file_name(super::public_name(ext))
-}
-
-/// `name` as a file name on this OS.
-pub(crate) fn file_name(name: &str) -> String {
+/// The file name of the program called `name` on this OS: an engine, `crossfyre`,
+/// `node` or `cfx-script`, with `.exe` on Windows.
+pub fn file_name(name: &str) -> String {
     if cfg!(windows) {
         format!("{name}.exe")
     } else {
@@ -247,29 +243,12 @@ pub(crate) fn file_name(name: &str) -> String {
 
 /// Full path to an installed extension binary, OS-correct extension included.
 pub fn ext_bin_path(ext: &str) -> PathBuf {
-    get_bin_dir().join(ext_file_name(ext))
+    get_bin_dir().join(file_name(ext))
 }
 
-/// Where the binary of an engine that has been renamed was installed under its legacy
-/// name. `None` for an engine that has never had another name.
-pub fn legacy_bin_path(ext: &str) -> Option<PathBuf> {
-    let legacy = super::engine(ext)?.legacy?;
-    Some(get_bin_dir().join(file_name(legacy)))
-}
-
-/// `path` exists and is a file in its own right, not a symlink to one.
-pub fn is_regular_file(path: &std::path::Path) -> bool {
-    fs::symlink_metadata(path)
-        .map(|m| m.file_type().is_file())
-        .unwrap_or(false)
-}
-
-/// An engine counts as installed under its public name, or as a binary still sitting
-/// under its legacy name on a machine the rename has not been carried to yet. A
-/// legacy symlink does not count: that is what the migration in 0.1.31 and 0.1.32 left
-/// behind, pointing at the binary under the public name, until the migration removes it.
+/// An engine counts as installed when its binary is in the bin directory.
 pub fn is_extension_installed(ext: &str) -> bool {
-    ext_bin_path(ext).exists() || legacy_bin_path(ext).is_some_and(|p| is_regular_file(&p))
+    ext_bin_path(ext).exists()
 }
 
 pub fn load_config() -> Result<ToolchainConfig, Box<dyn std::error::Error>> {
@@ -281,12 +260,9 @@ pub(crate) fn load_config_at(
 ) -> Result<ToolchainConfig, Box<dyn std::error::Error>> {
     // The node service reads this as root from the operator's home.
     let contents = super::sudo_user::read_to_string(path)?;
-    let config: ToolchainConfig = toml::from_str(&contents)?;
+    let config: ToolchainConfig =
+        toml::from_str(&contents).map_err(|e| cfx_db::config_unreadable(&contents, path, &e))?;
     Ok(config)
-}
-
-pub fn save_config(config: &ToolchainConfig) -> Result<(), Box<dyn std::error::Error>> {
-    save_config_at(&get_config_path(), config)
 }
 
 /// The file holds the database password, so it is written owner-only. The engine
@@ -304,33 +280,6 @@ pub(crate) fn save_config_at(
     Ok(())
 }
 
-/// A new random password for the toolchain database: 32 bytes as hex.
-pub fn new_postgres_password() -> Result<String, Box<dyn std::error::Error>> {
-    let mut b = [0u8; 32];
-    getrandom::fill(&mut b).map_err(|e| format!("no randomness for a database password: {e}"))?;
-    Ok(b.iter().map(|x| format!("{x:02x}")).collect())
-}
-
-/// The config at `path` with a database password, generating and saving one if the
-/// file has none. The flag says whether one was generated, which means anything
-/// that read the file earlier (the engine daemons) still holds the old settings.
-pub(crate) fn ensure_postgres_password_at(
-    path: &std::path::Path,
-) -> Result<(ToolchainConfig, bool), Box<dyn std::error::Error>> {
-    let mut config = load_config_at(path)?;
-    if config
-        .postgres
-        .password
-        .as_deref()
-        .is_some_and(|p| !p.is_empty())
-    {
-        return Ok((config, false));
-    }
-    config.postgres.password = Some(new_postgres_password()?);
-    save_config_at(path, &config)?;
-    Ok((config, true))
-}
-
 /// Resolve an extension daemon's port from `config.toml`, falling back to the
 /// protocol default if the file is missing/unreadable or the engine is unknown.
 /// This is the single lookup every op-client and the service installer use, so
@@ -342,11 +291,19 @@ pub fn engine_port(ext: &str) -> u16 {
         .ok()
         .map(|c| c.extensions.get(ext))
         .unwrap_or(0);
-    if configured != 0 {
-        return configured;
+    let port = if configured != 0 {
+        configured
+    } else {
+        // Unknown to the config (old file, or a brand-new engine): protocol default.
+        super::engine(ext).map(|e| e.port).unwrap_or(0)
+    };
+    // A test build refuses the engines' real ports: an engine of the operator's may be
+    // listening on one.
+    #[cfg(test)]
+    if dguard::ports::RESERVED.contains(&port) {
+        panic!("a test asked for {ext}'s port {port}: a test reaches no engine of the host's");
     }
-    // Unknown to the config (old file, or a brand-new engine): protocol default.
-    super::engine(ext).map(|e| e.port).unwrap_or(0)
+    port
 }
 
 /// `127.0.0.1:<port>` for an extension daemon, ready to hand to `TcpStream::connect`.
@@ -355,17 +312,24 @@ pub fn engine_addr(ext: &str) -> String {
 }
 
 /// Merge server-provided port overrides into the host `config.toml`. The JSON
-/// is a flat map of service name to port, keyed by engine id (the ids are the
-/// engines' original names), e.g.
-/// `{ "postgres": 4440, "mach": 4441, "pulse": 4443 }` - "postgres" targets the
-/// database, every other key an engine daemon. A public name is accepted in place
-/// of an id. Missing/unknown keys keep their current value. Ensures `config.toml` exists first, and only writes when
-/// something actually changed. Returns the list of services whose port moved
-/// (so a live re-apply can restart exactly those), postgres included.
+/// is a flat map of service name to port, e.g.
+/// `{ "postgres": 4440, "ambulo": 4441, "doorward": 4443 }`: "postgres" targets the
+/// database, every other key an engine daemon by its name. Missing or unknown keys
+/// keep their current value. Ensures `config.toml` exists first, and only writes when
+/// something actually changed. Returns the services whose port moved (so a live
+/// re-apply can restart exactly those), postgres included.
 pub fn apply_ports_from_json(
     ports: &serde_json::Value,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let mut config = load_or_create_config()?;
+    apply_ports_from_json_at(&get_config_path(), ports)
+}
+
+/// [`apply_ports_from_json`] for the config at `path`.
+pub(crate) fn apply_ports_from_json_at(
+    path: &std::path::Path,
+    ports: &serde_json::Value,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut config = load_or_create_config_at(path)?;
     let obj = match ports.as_object() {
         Some(o) => o,
         None => return Ok(Vec::new()),
@@ -380,63 +344,31 @@ pub fn apply_ports_from_json(
         }
     }
     for e in super::ENGINES {
-        let given = obj.get(e.id).or_else(|| obj.get(e.name));
-        if let Some(p) = given.and_then(|v| v.as_u64()) {
+        if let Some(p) = obj.get(e.name).and_then(|v| v.as_u64()) {
             let p = p as u16;
-            if p != 0 && config.extensions.get(e.id) != p {
-                config.extensions.set(e.id, p);
-                changed.push(e.id.to_string());
+            if p != 0 && config.extensions.get(e.name) != p {
+                config.extensions.set(e.name, p);
+                changed.push(e.name.to_string());
             }
         }
     }
 
     if !changed.is_empty() {
-        save_config(&config)?;
+        save_config_at(path, &config)?;
     }
     Ok(changed)
 }
 
-/// Rewrite the `config.toml` at `path` so `[extensions]` is keyed by public names, if
-/// it still names an engine by an id or legacy name that differs from its public name.
-/// The file loads either way; this keeps what a person reads in it current. Returns
-/// whether the file was written. A missing file is not an error.
-pub fn rewrite_legacy_keys(path: &std::path::Path) -> Result<bool, Box<dyn std::error::Error>> {
-    let Ok(text) = super::sudo_user::read_to_string(path) else {
-        return Ok(false);
-    };
-    let value: toml::Value = toml::from_str(&text)?;
-    let stale = value
-        .get("extensions")
-        .and_then(|v| v.as_table())
-        .is_some_and(|t| {
-            t.keys()
-                .any(|k| super::engine(k).is_some_and(|e| e.name != k))
-        });
-    if !stale {
-        return Ok(false);
-    }
-    let config: ToolchainConfig = toml::from_str(&text)?;
-    crate::write_secret_file(path, &toml::to_string(&config)?)?;
-    super::sudo_user::chown_to_invoking_user(path);
-    Ok(true)
-}
-
-/// Load the toolchain config, writing the defaults first if none exists.
-/// Defaults are sane for a single-host install; operators can edit
-/// `config.toml` afterwards to point at an external Postgres.
-pub fn load_or_create_config() -> Result<ToolchainConfig, Box<dyn std::error::Error>> {
-    load_or_create_config_at(&get_config_path())
-}
-
-/// A new file gets a generated database password, so the container `crossfyre db up`
-/// makes from it, and the engines that read it, never run without one.
+/// The toolchain config at `path`, written first when there is none. A new file is made
+/// the way an engine makes one, under the same lock: for the local database, with a new
+/// password, readable by the account the database belongs to.
 pub(crate) fn load_or_create_config_at(
     path: &std::path::Path,
 ) -> Result<ToolchainConfig, Box<dyn std::error::Error>> {
     if !path.exists() {
-        let mut config = ToolchainConfig::default();
-        config.postgres.password = Some(new_postgres_password()?);
-        save_config_at(path, &config)?;
+        let dir = path.parent().ok_or("config.toml has no directory")?;
+        let account = super::db::account()?;
+        cfx_db::Toolchain::new(dir.to_path_buf(), account.as_ref()).settings()?;
         println!(
             "[config] Wrote default toolchain config: {}",
             path.display()
@@ -449,8 +381,8 @@ pub(crate) fn load_or_create_config_at(
 mod root_link_tests {
     use super::*;
 
-    const A_CONFIG: &str = "[postgres]\nhost = \"localhost\"\nport = 4440\nuser = \"postgres\"\n\
-                            db_name = \"crossfyre\"\n\n[container]\n";
+    const A_CONFIG: &str = "[postgres]\nbackend = \"local\"\nport = 4440\nuser = \"postgres\"\n\
+                            db_name = \"crossfyre\"\n";
 
     /// The node service reads the toolchain config as root from the operator's home.
     #[test]
@@ -486,12 +418,12 @@ mod root_link_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::toolchain::{ENGINES, Engine};
+    use crate::toolchain::ENGINES;
 
     fn ports(text: &str) -> ExtensionPorts {
         let cfg: ToolchainConfig = toml::from_str(&format!(
-            "[postgres]\nhost = \"localhost\"\nport = 4440\nuser = \"postgres\"\n\
-             db_name = \"crossfyre\"\n\n[container]\n\n{text}"
+            "[postgres]\nbackend = \"local\"\nport = 4440\nuser = \"postgres\"\n\
+             db_name = \"crossfyre\"\n\n{text}"
         ))
         .expect("config parses");
         cfg.extensions
@@ -501,14 +433,14 @@ mod tests {
     fn a_config_without_the_section_gets_every_default() {
         let p = ports("");
         for e in ENGINES {
-            assert_eq!(p.get(e.id), e.port, "{}", e.id);
+            assert_eq!(p.get(e.name), e.port, "{}", e.name);
         }
     }
 
     #[test]
-    fn a_port_is_read_under_an_engine_id() {
-        let p = ports("[extensions]\nmach = 5999\n");
-        assert_eq!(p.get("mach"), 5999);
+    fn a_port_is_read_under_the_engine_s_name() {
+        let p = ports("[extensions]\nambulo = 5999\n");
+        assert_eq!(p.get("ambulo"), 5999);
         assert_eq!(
             p.get("voyage"),
             4442,
@@ -521,8 +453,8 @@ mod tests {
         let p = ports("[extensions]\nsomething_else = \"x\"\nvoyage = 5000\n");
         assert_eq!(p.get("voyage"), 5000);
         let bad: Result<ToolchainConfig, _> = toml::from_str(
-            "[postgres]\nhost = \"h\"\nport = 1\nuser = \"u\"\ndb_name = \"d\"\n\
-             [container]\n[extensions]\nvoyage = \"x\"\n",
+            "[postgres]\nbackend = \"local\"\nport = 1\nuser = \"u\"\ndb_name = \"d\"\n\
+             [extensions]\nvoyage = \"x\"\n",
         );
         assert!(
             bad.is_err(),
@@ -531,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn written_back_the_section_uses_public_names_in_table_order() {
+    fn written_back_the_section_is_in_table_order() {
         let text = toml::to_string(&ToolchainConfig::default()).expect("serialises");
         let section = text.split("[extensions]").nth(1).expect("section");
         let keys: Vec<&str> = section
@@ -543,25 +475,9 @@ mod tests {
     }
 
     #[test]
-    fn a_config_written_before_the_rename_keeps_its_ports() {
-        let p = ports("[extensions]\ncortex = 5001\nmach = 5002\npulse = 5003\nscout = 5004\n");
-        assert_eq!(
-            [
-                p.get("cortex"),
-                p.get("mach"),
-                p.get("pulse"),
-                p.get("scout")
-            ],
-            [5001, 5002, 5003, 5004]
-        );
-        // Reached by the new names as well, since a port is the engine's.
-        assert_eq!(p.get("plessor"), 5001);
-    }
-
-    #[test]
-    fn a_config_written_after_the_rename_uses_the_new_names() {
+    fn ports_are_written_back_as_they_were_read() {
         let p = ports("[extensions]\nplessor = 5001\nambulo = 5002\n");
-        assert_eq!((p.get("cortex"), p.get("mach")), (5001, 5002));
+        assert_eq!((p.get("plessor"), p.get("ambulo")), (5001, 5002));
         let cfg = ToolchainConfig {
             extensions: p,
             ..ToolchainConfig::default()
@@ -571,64 +487,71 @@ mod tests {
             text.contains("plessor = 5001") && text.contains("ambulo = 5002"),
             "{text}"
         );
-        for old in ["cortex", "mach", "pulse", "scout"] {
-            assert!(!text.contains(old), "{old} written back: {text}");
-        }
     }
 
+    /// The API sends the ports map keyed by engine name, and the node answers with the
+    /// names of what moved.
     #[test]
-    fn the_migration_rewrites_old_keys_and_leaves_a_current_file_alone() {
-        let dir = std::env::temp_dir().join(format!("cfx-config-rewrite-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("dir");
-        let path = dir.join("config.toml");
-        fs::write(
-            &path,
-            "[postgres]\nhost = \"localhost\"\nport = 4440\nuser = \"postgres\"\n\
-             db_name = \"crossfyre\"\n\n[container]\n\n[extensions]\ncortex = 5001\n",
-        )
-        .expect("old config");
-
-        assert!(rewrite_legacy_keys(&path).expect("rewrites"));
-        let text = fs::read_to_string(&path).expect("read");
-        assert!(
-            text.contains("plessor = 5001") && !text.contains("cortex"),
-            "{text}"
+    fn a_ports_map_moves_each_engine_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let ports = serde_json::json!({"postgres": 4999, "plessor": 5001, "voyage": 0, "nope": 7});
+        assert_eq!(
+            apply_ports_from_json_at(&path, &ports).unwrap(),
+            ["postgres", "plessor"]
+        );
+        let cfg = load_config_at(&path).unwrap();
+        assert_eq!(cfg.postgres.port, 4999);
+        assert_eq!(cfg.extensions.get("plessor"), 5001);
+        assert_eq!(
+            cfg.extensions.get("voyage"),
+            4442,
+            "a port of 0 moves nothing"
         );
         assert!(
-            !rewrite_legacy_keys(&path).expect("reads"),
-            "a current file is not written"
+            apply_ports_from_json_at(&path, &ports).unwrap().is_empty(),
+            "the same map again moves nothing"
         );
-        assert!(!rewrite_legacy_keys(&dir.join("absent.toml")).expect("absent is fine"));
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// The alias reading against a table in which an engine was renamed.
-    const RENAMED: &[Engine] = &[Engine {
-        id: "cortex",
-        name: "fresh",
-        legacy: Some("cortex"),
-        port: 4445,
-        about: "",
-    }];
-
-    #[test]
-    fn a_legacy_key_is_read_and_the_public_name_wins_over_it() {
-        let p = ExtensionPorts::from_entries_in(RENAMED, vec![("cortex", 5001)]);
-        assert_eq!(p.get("cortex"), 5001);
-        for order in [
-            vec![("fresh", 5002), ("cortex", 5001)],
-            vec![("cortex", 5001), ("fresh", 5002)],
-        ] {
-            let p = ExtensionPorts::from_entries_in(RENAMED, order.clone());
-            assert_eq!(p.get("cortex"), 5002, "{order:?}");
-        }
     }
 
     #[cfg(unix)]
     fn mode(path: &std::path::Path) -> u32 {
         use std::os::unix::fs::PermissionsExt;
-        fs::metadata(path).unwrap().permissions().mode() & 0o777
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// With XDG_CONFIG_HOME pointing elsewhere, the CLI still finds the directory the
+    /// engines read, which follows HOME on Linux. Run again in a child process, which
+    /// has the environment this needs and prints what it found.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_cli_finds_the_directory_the_engines_read_whatever_xdg_config_home_says() {
+        const NAME: &str = "toolchain::config::tests::the_cli_finds_the_directory_the_engines_read_whatever_xdg_config_home_says";
+        const CHILD: &str = "CFX_TEST_PRINT_TOOLCHAIN_DIR";
+        if std::env::var_os(CHILD).is_some() {
+            println!("dir={}", crate::resolve_data_dir(None).unwrap().display());
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join("elsewhere"))
+            .env_remove(dguard::TOOLCHAIN_DIR_ENV)
+            .env_remove("SUDO_USER")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        // libtest prints the test's name on the line the child's output starts.
+        let dir = text
+            .lines()
+            .find_map(|l| l.split_once("dir=").map(|(_, d)| d.trim()))
+            .unwrap_or_else(|| panic!("the child said: {text}"));
+        assert_eq!(
+            std::path::Path::new(dir),
+            home.path().join(".config").join("crossfyre")
+        );
     }
 
     #[test]
@@ -647,48 +570,29 @@ mod tests {
             Some(pw)
         );
     }
+}
 
+#[cfg(test)]
+mod test_guard_tests {
+    use super::*;
+
+    /// A test build refuses the real toolchain directory, and with it the engines' ports
+    /// as this host's config gives them, until the test gives itself a directory; then
+    /// both are its own, and an engine's port is far from the real ones.
     #[test]
-    fn a_config_without_a_password_gets_one_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        fs::write(
-            &path,
-            "[postgres]\nhost = \"localhost\"\nport = 4440\nuser = \"postgres\"\n\
-             db_name = \"crossfyre\"\n\n[container]\n",
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        }
-        let (cfg, generated) = ensure_postgres_password_at(&path).unwrap();
-        assert!(generated);
-        let pw = cfg.postgres.password.expect("a password");
-        assert_eq!(
-            load_config_at(&path).unwrap().postgres.password,
-            Some(pw.clone())
-        );
-        #[cfg(unix)]
-        assert_eq!(mode(&path), 0o600, "tightened when the password went in");
-        let (again, generated) = ensure_postgres_password_at(&path).unwrap();
-        assert!(!generated);
-        assert_eq!(again.postgres.password, Some(pw));
+    fn a_test_build_refuses_the_real_toolchain_directory_and_ports() {
+        assert!(std::panic::catch_unwind(get_toolchain_dir).is_err());
+        assert!(std::panic::catch_unwind(|| engine_port("toolmark")).is_err());
+        let dir = TestToolchainDir::new();
+        assert_eq!(get_toolchain_dir(), dir.path());
+        assert_eq!(engine_port("toolmark"), 24444);
+        drop(dir);
+        assert!(std::panic::catch_unwind(get_toolchain_dir).is_err());
     }
 
+    /// A test build refuses the bins origin: a test serves its own.
     #[test]
-    fn an_operator_password_is_kept() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        fs::write(
-            &path,
-            "[postgres]\nhost = \"db.internal\"\nport = 5432\nuser = \"cfx\"\n\
-             password = \"mine\"\ndb_name = \"crossfyre\"\n\n[container]\n",
-        )
-        .unwrap();
-        let (cfg, generated) = ensure_postgres_password_at(&path).unwrap();
-        assert!(!generated);
-        assert_eq!(cfg.postgres.password.as_deref(), Some("mine"));
+    fn a_test_build_refuses_the_bins_origin() {
+        assert!(std::panic::catch_unwind(super::super::install::bins_origin).is_err());
     }
 }

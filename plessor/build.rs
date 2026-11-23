@@ -1,14 +1,22 @@
-//! Selects the authorization-oracle implementation at build time.
+//! Selects the authorization-testing implementation at build time.
 //!
-//! If the private drop-in `src/authz/private.rs` is present (first-party builds),
-//! compile it and set `cfg(authz_private)`. A public checkout has only
-//! `src/authz/baseline.rs`, so the open build compiles the baseline (no oracle).
-//! See `src/authz/mod.rs`. This mirrors `core/build.rs` (isolated egress).
+//! With the `closed-authz` feature, which only plessor-authz's release build turns on,
+//! the private drop-in `src/authz/private.rs` is compiled and `cfg(authz_private)` set,
+//! and the build stops when the file is not there. Without it, `src/authz/baseline.rs`
+//! is compiled whether or not the file is present, so plessor itself never carries the
+//! drop-in. See `src/authz/mod.rs`.
 
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(authz_private)");
-    if std::path::Path::new("src/authz/private.rs").exists() {
-        println!("cargo::rustc-cfg=authz_private");
-    }
     println!("cargo::rerun-if-changed=src/authz/private.rs");
+    if std::env::var_os("CARGO_FEATURE_CLOSED_AUTHZ").is_none() {
+        return;
+    }
+    if !std::path::Path::new("src/authz/private.rs").exists() {
+        panic!(
+            "the closed-authz feature compiles src/authz/private.rs, which this checkout \
+             does not have"
+        );
+    }
+    println!("cargo::rustc-cfg=authz_private");
 }

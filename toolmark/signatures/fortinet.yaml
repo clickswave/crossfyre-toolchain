@@ -1,0 +1,8 @@
+id: fortinet
+info:
+  name: Fortinet appliance
+  category: Firewall
+detect:
+  any:
+    - header: { name: server, regex: '^xxxxxxxx-xxxxx$' }
+    - html: { regex: 'top\.location="/remote/login"' }

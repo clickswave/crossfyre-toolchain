@@ -1,0 +1,16 @@
+# Synthetic: A generator tag written with its content before its name.
+HTTP/1.1 200 OK
+date: Fri, 20 Nov 2026 06:00:00 GMT
+content-type: text/html; charset=UTF-8
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Notes</title>
+<meta content="WordPress 6.5" name="generator">
+</head>
+<body>
+<article></article>
+</body>
+</html>

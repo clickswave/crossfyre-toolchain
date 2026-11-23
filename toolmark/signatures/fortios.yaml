@@ -1,0 +1,9 @@
+id: fortios
+info:
+  name: Fortinet FortiOS
+  category: Firewall
+  metadata:
+    part: o
+    vendor: fortinet
+    product: fortios
+refines: fortinet

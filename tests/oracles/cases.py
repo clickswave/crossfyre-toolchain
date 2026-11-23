@@ -332,7 +332,7 @@ CASES = {
     "headless-absent-is-loud": {
         "what": "no browser means a named gap, not a silent pass",
         "engine": "ambulo",
-        "env": {"AMBULO_BROWSER": "/nonexistent/chrome", "PATH": "/nonexistent"},
+        "env": {"CFX_BROWSER": "/nonexistent/chrome", "PATH": "/nonexistent"},
         "fixtures": [{"name": "app", "script": "runtime.py"}],
         "request": lambda p: crawl(_u(p["app"], "/"), browser=True),
         "must_say": ["no browser was found"],

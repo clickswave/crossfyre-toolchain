@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 const ENGINES: &[&str] = &[
     "plessor/src",
     "ambulo/src",
+    "browser/src",
     "voyage/src",
     "toolmark/src",
     "doorward/src",
@@ -37,12 +38,6 @@ const PATTERNS: &[&str] = &[
 /// (file, pattern, how many, why it is not target traffic or not an op's egress)
 const ALLOWED: &[(&str, &str, usize, &str)] = &[
     (
-        "plessor/src/lib.rs",
-        "TcpStream::connect(",
-        1,
-        "the command line talking to its own daemon on loopback",
-    ),
-    (
         "plessor/src/solver.rs",
         "reqwest::Client::builder(",
         1,
@@ -55,52 +50,22 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
         "the solver is told the environment's proxy only for an op that inherits it",
     ),
     (
-        "ambulo/src/main.rs",
-        "TcpStream::connect(",
-        3,
-        "the command line talking to its own daemon on loopback",
-    ),
-    (
-        "ambulo/src/main.rs",
-        "Egress::Inherit",
-        1,
-        "the daemon's default scan settings; each op sets its own egress",
-    ),
-    (
         "ambulo/src/daemon.rs",
         "Egress::Inherit",
         3,
         "the shared probe clients serve only requests that came without a wrapper",
     ),
     (
-        "ambulo/src/browser.rs",
+        "browser/src/lib.rs",
         "TcpStream::connect(",
         1,
         "the DevTools socket of the browser this process started, on loopback",
     ),
     (
         "voyage/src/main.rs",
-        "TcpStream::connect(",
-        4,
-        "the command line talking to its own daemon on loopback",
-    ),
-    (
-        "voyage/src/main.rs",
         "Egress::Inherit",
         1,
         "origin discovery run from the command line, which inherits",
-    ),
-    (
-        "toolmark/src/main.rs",
-        "TcpStream::connect(",
-        1,
-        "the command line talking to its own daemon on loopback",
-    ),
-    (
-        "doorward/src/main.rs",
-        "TcpStream::connect(",
-        3,
-        "the command line talking to its own daemon on loopback",
     ),
     (
         "doorward/src/scanner.rs",

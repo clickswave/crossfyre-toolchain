@@ -1,17 +1,15 @@
 //! Isolated-egress orchestration.
 //!
-//! Open-core boundary. The real per-node egress mechanism (network isolation,
-//! tunnels, transparent routing) is a private drop-in (`private.rs`, git-ignored)
-//! that `build.rs` selects when it is present. A public checkout has only
-//! `baseline.rs` (direct egress, no isolation), so the open build compiles and
-//! runs but does not apply isolated egress. Isolated egress is a platform
-//! feature.
+//! Isolated egress is applied by the egress helper, a separate program installed beside
+//! the binaries ([`helper`]), which the node asks to take a network config and to hold
+//! egress up for the daemon's life ([`isolation`]). Without one that answers, the node
+//! keeps its config and sends directly (`baseline.rs`), and says why; with the config's
+//! kill switch on, it sends nothing until one answers.
 //!
-//! Both implementations expose the same small surface, so `lib.rs` is identical
-//! regardless of which is compiled:
+//! The surface:
 //!   - [`process_network_config`] ingests a node's network config,
-//!   - [`bring_up`] applies egress and returns a [`TunnelGuard`],
-//!   - [`TunnelGuard`] tears everything down on `Drop`.
+//!   - [`bring_up`] applies egress and returns an [`Isolation`],
+//!   - [`Isolation`] tears everything down on `Drop`.
 //!
 //! Proxies are the other way a node's traffic can leave, and they live here in the
 //! open ([`state`], [`gateway`]). The platform can set a node to send through one
@@ -20,26 +18,24 @@
 //! connection through that lease. Nothing a proxied node sends for an op goes out from
 //! its own address: when it cannot be sent through the proxy, it is not sent.
 
-// One `mod`, with the path chosen by cfg, rather than two cfg-gated `mod imp;`
-// declarations. Both forms compile identically, but tools that resolve modules
-// without evaluating cfg (rustfmt, rustdoc, rust-analyzer) tried to read BOTH
-// arms of the old form and hard-errored on a public checkout, where private.rs
-// does not exist:
-//
-//     error: couldn't read core/src/egress/private.rs: No such file or directory
-//
-// That made `cargo fmt` and `cargo doc` unusable for outside contributors.
-#[cfg_attr(egress_private, path = "private.rs")]
-#[cfg_attr(not(egress_private), path = "baseline.rs")]
-mod imp;
-
+mod baseline;
 pub mod gateway;
 pub mod state;
 
 #[cfg(test)]
 pub(crate) mod testkit;
 
-pub use imp::{TunnelGuard, bring_up};
+/// The egress helper's file name beside the binaries.
+pub const HELPER: &str = "cfx-egress";
+
+pub mod helper;
+pub mod isolation;
+
+pub use isolation::Isolation;
+
+/// The config as the platform last sent it, so a helper that answers only later is
+/// handed it as sent.
+static GIVEN: std::sync::Mutex<Option<serde_json::Value>> = std::sync::Mutex::new(None);
 
 /// Ingest a node's network config: the tunnel selection the egress impl applies.
 ///
@@ -50,121 +46,50 @@ pub fn process_network_config(
     net_dir: &std::path::Path,
     tunnel_hooks: bool,
 ) -> Option<crate::NetworkConfig> {
-    imp::process_network_config(raw, net_dir, tunnel_hooks)
-}
-
-/// The variable older nodes wrote into the engines' environment file.
-const LEGACY_VAR: &str = "CROSSFYRE_EGRESS_PROXY";
-
-/// Whether `text` is exactly what an older node wrote to `egress.env`: one line,
-/// `CROSSFYRE_EGRESS_PROXY=<url>`, and a newline.
-fn is_legacy_env(text: &str) -> bool {
-    let Some(line) = text.strip_suffix('\n') else {
-        return false;
-    };
-    !line.contains('\n')
-        && line
-            .strip_prefix(LEGACY_VAR)
-            .and_then(|r| r.strip_prefix('='))
-            .is_some_and(|url| !url.trim().is_empty())
-}
-
-/// Remove the engines' environment file at `path` when an older node wrote it.
-///
-/// Those nodes copied a residential proxy URL from the network config into it, and the
-/// engines sent every request of every op through whatever it named. A node's proxy is
-/// now a per-op lease, so that file would only route a direct node's traffic through a
-/// proxy nobody switched on. A file with anything else in it was written by a person
-/// and is left alone. Returns whether the file was removed.
-///
-/// The daemon does this as root (LocalSystem on Windows) in the operator's tree, so it
-/// reads and removes through helpers that follow no link there.
-pub fn cleanup_legacy_env_file_at(path: &std::path::Path) -> std::io::Result<bool> {
-    use crate::toolchain::sudo_user;
-    let text = match sudo_user::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e),
-    };
-    if !is_legacy_env(&text) {
-        return Ok(false);
+    if let Ok(mut given) = GIVEN.lock() {
+        *given = Some(raw.clone());
     }
-    sudo_user::remove_file(path)?;
-    Ok(true)
-}
-
-/// [`cleanup_legacy_env_file_at`] for the file the engine services read. Run once when
-/// the daemon starts.
-pub fn cleanup_legacy_env_file() {
-    let path = crate::toolchain::config::egress_env_path();
-    match cleanup_legacy_env_file_at(&path) {
-        Ok(true) => println!(
-            "[egress] removed {}, which an older node wrote to send every engine request \
-             through a proxy. A proxy is now set per node on the platform. Engines already \
-             running keep the old setting until they restart.",
-            path.display()
-        ),
-        Ok(false) => {}
-        Err(e) => eprintln!("[egress] could not check {}: {e}", path.display()),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The exact file an older node wrote is removed; a file a person
-    /// wrote, or edited, is kept.
-    #[test]
-    fn legacy_env_file_cleanup() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("egress.env");
-        assert!(
-            !cleanup_legacy_env_file_at(&path).unwrap(),
-            "no file is nothing to do"
+    let setup = isolation::Setup::for_this_process();
+    let why = match helper::find(&setup.exe) {
+        Ok(found) => match helper::config(&found, raw, net_dir, tunnel_hooks, setup.limits) {
+            Ok((_, net)) => return net,
+            Err(why) => why,
+        },
+        Err(why) => why,
+    };
+    let net = baseline::process_network_config(raw, net_dir, tunnel_hooks);
+    if let Some(n) = net
+        .as_ref()
+        .filter(|n| !n.kind.is_empty() && n.kind != "direct")
+    {
+        println!(
+            "[network] Isolated egress ({}): {why}. The config is kept as sent.",
+            n.kind
         );
-
-        std::fs::write(
-            &path,
-            "CROSSFYRE_EGRESS_PROXY=socks5://u:p@gw.example.net:1080\n",
-        )
-        .unwrap();
-        assert!(cleanup_legacy_env_file_at(&path).unwrap());
-        assert!(!path.exists());
-
-        for kept in [
-            "# my proxy\nCROSSFYRE_EGRESS_PROXY=http://proxy.corp:3128\n",
-            "CROSSFYRE_EGRESS_PROXY=http://proxy.corp:3128\nHTTPS_PROXY=http://proxy.corp:3128\n",
-            "CROSSFYRE_EGRESS_PROXY=http://proxy.corp:3128",
-            "HTTPS_PROXY=http://proxy.corp:3128\n",
-            "CROSSFYRE_EGRESS_PROXY=\n",
-            "",
-        ] {
-            std::fs::write(&path, kept).unwrap();
-            assert!(
-                !cleanup_legacy_env_file_at(&path).unwrap(),
-                "{kept:?} was removed"
-            );
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), kept);
-        }
     }
+    net
+}
 
-    /// The node service checks and removes this file as root (LocalSystem on Windows)
-    /// in the operator's tree: a link on the way there is not followed.
-    #[cfg(windows)]
-    #[test]
-    fn an_elevated_cleanup_will_not_remove_through_a_junction() {
-        let t = tempfile::tempdir().unwrap();
-        let victim = t.path().join("victim");
-        std::fs::create_dir(&victim).unwrap();
-        let legacy = "CROSSFYRE_EGRESS_PROXY=socks5://u:p@gw.example.net:1080\n";
-        std::fs::write(victim.join("egress.env"), legacy).unwrap();
-        let data = t.path().join("crossfyre");
-        crate::toolchain::sudo_user::junction(&data, &victim);
-
-        let _root = crate::toolchain::sudo_user::act_as_root();
-        let r = cleanup_legacy_env_file_at(&data.join("egress.env"));
-        assert!(!matches!(r, Ok(true)), "removed through a junction");
-        assert!(victim.join("egress.env").exists());
-    }
+/// Apply egress for a configured node, and hold it up until the [`Isolation`] is
+/// dropped. How it runs is said in the node's log and in
+/// [`state::EgressState::isolation`], which refuses every op while a kill switch has no
+/// helper to keep it.
+pub fn bring_up(
+    net: &crate::NetworkConfig,
+    net_dir: &std::path::Path,
+    node_id: &str,
+    tunnel_hooks: bool,
+) -> Isolation {
+    let raw = GIVEN.lock().ok().and_then(|g| g.clone());
+    isolation::start(
+        isolation::Asked {
+            raw,
+            net: net.clone(),
+            net_dir: net_dir.to_path_buf(),
+            node_id: node_id.to_string(),
+            tunnel_hooks,
+        },
+        isolation::Setup::for_this_process(),
+        std::sync::Arc::clone(state::global()),
+    )
 }

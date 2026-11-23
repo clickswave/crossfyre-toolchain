@@ -1,0 +1,14 @@
+id: yoast-seo
+info:
+  name: Yoast SEO
+  category: WordPress Plugin
+  metadata:
+    vendor: yoast
+    product: yoast_seo
+    target_sw: wordpress
+implies: [wordpress]
+detect:
+  any:
+    - html: { regex: '<!-- This site is optimized with the Yoast SEO (?:Premium )?plugin v' }
+version:
+  - html: { regex: '<!-- This site is optimized with the Yoast SEO (?:Premium )?plugin v([0-9]+\.[0-9]+(?:\.[0-9]+)?)' }

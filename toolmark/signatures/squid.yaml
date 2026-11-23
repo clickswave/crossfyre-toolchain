@@ -1,0 +1,12 @@
+id: squid
+info:
+  name: Squid
+  category: Web Server
+  metadata:
+    vendor: squid-cache
+    product: squid
+detect:
+  any:
+    - header: { name: server, regex: '^squid' }
+version:
+  - header: { name: server, regex: '^squid/([0-9]+(?:\.[0-9]+)*)' }

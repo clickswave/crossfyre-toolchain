@@ -1,0 +1,14 @@
+# Synthetic: WebLogic Server's own 404 page.
+HTTP/1.1 404 Not Found
+content-type: text/html; charset=UTF-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.0 Draft//EN">
+<HTML>
+<HEAD>
+<TITLE>Error 404--Not Found</TITLE>
+</HEAD>
+<BODY>
+<H2>Error 404--Not Found</H2>
+</BODY>
+</HTML>

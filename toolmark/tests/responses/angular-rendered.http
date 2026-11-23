@@ -1,0 +1,20 @@
+# Synthetic: An Angular application rendered in the browser. The page the server sends
+# is a shell, which names no framework; the page in angular-rendered.rendered.html, as
+# a browser built it, has its root component's ng-version.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Console</title>
+<base href="/">
+</head>
+<body>
+<app-root></app-root>
+<script src="runtime.3f1a2b.js" type="module"></script>
+<script src="main.7c9d0e.js" type="module"></script>
+</body>
+</html>

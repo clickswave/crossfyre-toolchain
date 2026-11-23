@@ -1,0 +1,10 @@
+id: minio
+info:
+  name: MinIO
+  category: Object Storage
+  metadata:
+    vendor: minio
+    product: minio
+detect:
+  any:
+    - header: { name: server, regex: '^MinIO' }

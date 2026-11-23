@@ -1,0 +1,12 @@
+id: tornado
+info:
+  name: Tornado
+  category: Web Server
+  metadata:
+    vendor: tornadoweb
+    product: tornado
+detect:
+  any:
+    - header: { name: server, regex: '^TornadoServer' }
+version:
+  - header: { name: server, regex: '^TornadoServer/([0-9]+(?:\.[0-9]+)*)' }

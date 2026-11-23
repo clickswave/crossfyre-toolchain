@@ -7,14 +7,14 @@
 //! identity with a coherent header set and performs **no rotation**. It exists so
 //! the open toolchain presents a plausible, non-self-identifying client rather
 //! than a scanner banner. The tuned profile catalogue and per-target rotation is
-//! a private drop-in; keep these signatures stable so it stays a clean drop-in.
+//! in the pacing module; keep these types stable, since it answers in their shapes.
 //!
 //! Coherence is the whole point: bot-detection cross-checks the User-Agent
 //! against the header set (and, with real fingerprint parity, the TLS/HTTP2
 //! handshake), so the UA and the headers must always describe the *same* browser.
 
 /// How the caller wants to present on the wire.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Mode {
     /// Blend in as a real, current browser. The default for external targets.
     Evasive,
@@ -55,17 +55,135 @@ pub struct Identity {
 /// Resolve the identity to present for `mode`. `seed` (e.g. the target host) lets
 /// a rotation policy pick a stable-per-target profile; this baseline ignores it
 /// and always returns the same honest identity.
-pub fn resolve(mode: &Mode, _seed: Option<&str>) -> Identity {
+pub fn resolve(mode: &Mode, seed: Option<&str>) -> Identity {
+    from_module(mode, seed).unwrap_or_else(|| baseline(mode))
+}
+
+fn baseline(mode: &Mode) -> Identity {
     match mode {
         // The baseline has no catalogue, so every mode maps to the one honest
         // desktop-Chrome identity. `Identify` additionally advertises the token.
         Mode::Identify(token) => {
             let mut id = chrome_desktop();
-            id.headers.push(("X-Bug-Bounty", token.clone()));
+            id.headers.push((ATTRIBUTION, token.clone()));
             id
         }
         _ => chrome_desktop(),
     }
+}
+
+/// Headers an identity may not set: the transport's own, and credentials.
+const NOT_AN_IDENTITY: [&str; 9] = [
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "cookie",
+    "authorization",
+    "proxy-authorization",
+    "te",
+    "upgrade",
+];
+
+/// The installed module's identity for `mode` and `seed`, kept per pair, as a
+/// module's answer for one never changes. None without a module, or when its answer
+/// is not a clean identity: a User-Agent and at most 32 headers, every name an HTTP
+/// token and every value printable on one line, none of the transport's headers or
+/// credentials, and in `Identify` mode the attribution header carrying the token.
+fn from_module(mode: &Mode, seed: Option<&str>) -> Option<Identity> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    #[derive(serde::Serialize)]
+    struct Ask<'a> {
+        mode: &'static str,
+        token: Option<&'a str>,
+        seed: Option<&'a str>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Answer {
+        user_agent: String,
+        headers: Vec<(String, String)>,
+    }
+    type Kept = Mutex<HashMap<(Mode, Option<String>), Option<Identity>>>;
+    static KEPT: std::sync::OnceLock<Kept> = std::sync::OnceLock::new();
+    if !crate::backend::installed() {
+        return None;
+    }
+    let kept = KEPT.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (mode.clone(), seed.map(str::to_string));
+    if let Some(id) = kept.lock().ok()?.get(&key) {
+        return id.clone();
+    }
+    let (name, token) = match mode {
+        Mode::Evasive => ("evasive", None),
+        Mode::Fast => ("fast", None),
+        Mode::Identify(t) => ("identify", Some(t.as_str())),
+    };
+    let id = crate::backend::ask(
+        "identity.resolve",
+        &Ask {
+            mode: name,
+            token,
+            seed,
+        },
+    )
+    .and_then(|a: Answer| {
+        let clean = !a.user_agent.is_empty()
+            && crate::backend::is_header_value(&a.user_agent)
+            && a.headers.len() <= 32
+            && a.headers.iter().all(|(k, v)| {
+                crate::backend::is_header_name(k)
+                    && crate::backend::is_header_value(v)
+                    && !k.eq_ignore_ascii_case("user-agent")
+                    && !NOT_AN_IDENTITY.contains(&k.to_ascii_lowercase().as_str())
+            });
+        let attributed = match token {
+            Some(t) => a.headers.iter().any(|(k, v)| k == ATTRIBUTION && v == t),
+            None => true,
+        };
+        if !(clean && attributed) {
+            return None;
+        }
+        let headers = a
+            .headers
+            .into_iter()
+            .map(|(k, v)| Some((interned(&k)?, v)))
+            .collect::<Option<Vec<_>>>()?;
+        Some(Identity {
+            user_agent: a.user_agent,
+            headers,
+        })
+    });
+    let mut kept = kept.lock().ok()?;
+    if kept.len() >= 4096 {
+        kept.clear();
+    }
+    kept.insert(key, id.clone());
+    id
+}
+
+/// The header carrying an `Identify` token.
+const ATTRIBUTION: &str = "X-Bug-Bounty";
+
+/// `name` as a static string. Header names come from a small set, so each is leaked
+/// once and reused; past 256 different names, None.
+fn interned(name: &str) -> Option<&'static str> {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static NAMES: std::sync::OnceLock<Mutex<HashSet<&'static str>>> = std::sync::OnceLock::new();
+    let mut names = NAMES
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(n) = names.get(name) {
+        return Some(n);
+    }
+    if names.len() >= 256 {
+        return None;
+    }
+    let n: &'static str = Box::leak(name.to_string().into_boxed_str());
+    names.insert(n);
+    Some(n)
 }
 
 /// One current desktop-Chrome identity with a coherent navigation header set.

@@ -1,0 +1,8 @@
+id: spring
+info:
+  name: Spring
+  category: Framework
+implies: [java]
+detect:
+  any:
+    - html: { regex: '(?i)org\.springframework' }

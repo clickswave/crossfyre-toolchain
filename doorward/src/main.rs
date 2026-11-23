@@ -1,9 +1,7 @@
-use crate::libs::cli_args::{Cli, Commands, DbArgs, ExecArgs};
+use crate::libs::cli_args::{Cli, Commands, EVENT_POLL_TIMEOUT_MS, ExecArgs};
 use crate::scanner::StreamEvent;
 use clap::{CommandFactory, Parser};
-use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 mod client_tui;
@@ -11,56 +9,6 @@ mod daemon;
 mod governor;
 mod libs;
 mod scanner;
-
-/// Mirrors the toolchain config at ~/.config/crossfyre/config.toml (see `toolchain_dir`)
-#[derive(Debug, Deserialize)]
-struct ToolchainConfig {
-    postgres: PostgresConfig,
-}
-
-#[derive(Debug, Deserialize)]
-struct PostgresConfig {
-    host: String,
-    port: u16,
-    user: String,
-    password: Option<String>,
-    #[allow(dead_code)]
-    db_name: String,
-}
-
-/// The toolchain directory: `CROSSFYRE_TOOLCHAIN_DIR` when the service that started this
-/// daemon names one, as the engine host does on macOS and Windows, else
-/// `~/.config/crossfyre` on Linux and the per-user config directory elsewhere
-/// (`~/Library/Application Support` on macOS, `%APPDATA%` on Windows), which is where
-/// the CLI writes it.
-fn toolchain_dir() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
-    if let Some(dir) = std::env::var_os("CROSSFYRE_TOOLCHAIN_DIR").filter(|d| !d.is_empty()) {
-        return Ok(dir.into());
-    }
-    let root = if cfg!(target_os = "linux") {
-        dirs::home_dir()
-            .ok_or("Could not find home directory")?
-            .join(".config")
-    } else {
-        dirs::config_dir().ok_or("Could not find the config directory")?
-    };
-    Ok(root.join("crossfyre"))
-}
-
-fn load_toolchain_config() -> Result<ToolchainConfig, Box<dyn std::error::Error>> {
-    let config_path = toolchain_dir()?.join("config.toml");
-
-    let contents = std::fs::read_to_string(&config_path).map_err(|e| {
-        format!(
-            "Cannot read toolchain config at {}: {}. Run 'crossfyre db up' first.",
-            config_path.display(),
-            e
-        )
-    })?;
-
-    let config: ToolchainConfig = toml::from_str(&contents)?;
-    Ok(config)
-}
 
 // An error is printed as the sentence it is. Returned from `main`, Rust prints it in
 // debug form: in quotes, with a line break shown as a backslash and an n.
@@ -76,39 +24,29 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Before anything asks the adaptive crate, clap's defaults included.
+    cfx_pacing::load();
     let cli = Cli::parse();
 
     // -----------------------------------------------------------------------
     // Daemon mode - starts the TCP service and connects to postgres
     // -----------------------------------------------------------------------
-    if cli.daemon {
-        let toolchain_cfg = load_toolchain_config()?;
-
+    if matches!(cli.command, Some(Commands::Daemon)) {
         // Postgres being briefly unreachable is not a reason to exit: systemd
         // would restart us straight into the same failure, which is how one
         // host logged 2,663 restarts and reported nothing but "down". Wait for
-        // it, saying so each time, and start as soon as it answers.
+        // it, saying why each time, and start as soon as it answers.
         let doorward_db = dguard::wait_for(
-            // Name the endpoint and the fix. "pool timed out while waiting
-            // for an open connection" is true and useless: it does not say
-            // which host, which port, or that the container may simply not
-            // have been created on this machine yet.
-            &format!(
-                "postgres at {}:{} (create it with `crossfyre db up`)",
-                toolchain_cfg.postgres.host, toolchain_cfg.postgres.port
-            ),
+            "the database",
             std::time::Duration::from_secs(3600),
             || async {
-                let db = libs::doorward_db::DoorwardDb::init(
-                    &toolchain_cfg.postgres.host,
-                    toolchain_cfg.postgres.port,
-                    &toolchain_cfg.postgres.user,
-                    toolchain_cfg.postgres.password.as_deref(),
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-                db.create_tables().await.map_err(|e| e.to_string())?;
-                Ok::<_, String>(db)
+                let pool = cfx_db::ensure_ready(&libs::doorward_db::ENGINE)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                cfx_db::scans::stop_abandoned(&pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok::<_, String>(libs::doorward_db::DoorwardDb::new(pool))
             },
         )
         .await?;
@@ -116,18 +54,37 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return daemon::run(cli.port, doorward_db).await;
     }
 
+    // The daemon every command below talks to, started when it is not running.
+    let daemon = dguard::Daemon::new("doorward", cli.port, !cli.no_autostart);
+
     // -----------------------------------------------------------------------
-    // Db subcommand
+    // Db subcommand: sent to the daemon, which keeps the scans
     // -----------------------------------------------------------------------
-    if let Some(Commands::Db(db_args)) = &cli.command {
-        return handle_db(db_args.clone(), cli.port).await;
+    if let Some(Commands::Db { action }) = &cli.command {
+        return dguard::run_db(&daemon, action).await;
     }
 
     // -----------------------------------------------------------------------
     // Exec subcommand - send raw JSON to daemon
     // -----------------------------------------------------------------------
     if let Some(Commands::Exec(exec_args)) = &cli.command {
-        return handle_scan_exec(exec_args.clone(), cli.port).await;
+        return handle_scan_exec(exec_args.clone(), &daemon).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Scans subcommand: what the daemon keeps, and a stopped one taken up again
+    // -----------------------------------------------------------------------
+    if let Some(Commands::Scans) = &cli.command {
+        let scans = dguard::list_scans(&daemon).await?;
+        let tui = cfx_tui::wanted(cli.no_tui);
+        let chosen =
+            tokio::task::spawn_blocking(move || cfx_tui::scans::show("DOORWARD", &scans, tui))
+                .await??;
+        if let Some(scan) = chosen {
+            let request = dguard::resume_request(scan["id"].as_str().unwrap_or_default());
+            stream_scan(&daemon, &request, tui, EVENT_POLL_TIMEOUT_MS).await?;
+        }
+        return Ok(());
     }
 
     // -----------------------------------------------------------------------
@@ -147,49 +104,30 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Scan(args)) => args,
         _ => {
             eprintln!(
-                "No command given. Use `doorward scan`, `doorward exec`, `doorward db`, or `doorward --daemon`. Try --help."
+                "No command given. Use `doorward scan <target>...`, `doorward exec <json>`, `doorward db`, or `doorward daemon`. Try --help."
             );
             std::process::exit(1);
         }
     };
 
-    if scan_args.targets.is_empty() {
-        eprintln!("Error: --targets is required");
-        std::process::exit(1);
-    }
-
-    // Connect to the daemon
-    let daemon_addr = format!("127.0.0.1:{}", cli.port);
-    let stream = TcpStream::connect(&daemon_addr).await.map_err(|_| {
-        format!(
-            "Doorward daemon is not running on port {}.\nStart it with `doorward --daemon`, or with `crossfyre extension start doorward` if crossfyre installed it.",
-            cli.port
-        )
-    })?;
-
     let ports = libs::cli_args::resolve_ports(&scan_args.ports);
+    let request = scan_request(&scan_args, &ports);
+    let tui = cfx_tui::wanted(cli.no_tui);
+    stream_scan(&daemon, &request, tui, scan_args.event_poll_timeout).await
+}
 
-    // On stderr, so a piped scan's JSON on stdout stays clean.
-    if let Some(notice) = scan_args.technique.notice() {
-        eprintln!("{notice}");
-    }
-
-    // Build and send the stream scan request
-    let request = serde_json::json!({
-        "operation": "scan",
-        "response": "stream",
-        "save": true,
-        "targets": scan_args.targets,
-        "ports": ports,
-        "technique": scan_args.technique.runs(),
-        "tasks": scan_args.tasks,
-        "timeout": scan_args.timeout,
-        "delay": scan_args.delay,
-        "service_detection": scan_args.service_detection,
-    });
-
+/// Send `request` to the daemon and show the scan it starts: drawn on the dashboard when
+/// `tui`, polling for events every `poll_timeout` ms, and otherwise written out as the
+/// daemon's own newline-delimited JSON.
+async fn stream_scan(
+    daemon: &dguard::Daemon,
+    request: &serde_json::Value,
+    tui: bool,
+    poll_timeout: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stream = daemon.connect().await?;
     let (reader, mut writer) = tokio::io::split(stream);
-    let mut req_str = dguard::encode(&request);
+    let mut req_str = dguard::encode(request);
     req_str.push('\n');
     writer.write_all(req_str.as_bytes()).await?;
 
@@ -208,9 +146,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let operation_id = ack.operation_id.unwrap_or_else(|| "unknown".to_string());
     let total = ack.total.unwrap_or(0);
-    let poll_timeout = scan_args.event_poll_timeout;
 
-    if cfx_tui::wanted(cli.tui, cli.no_tui, true) {
+    if tui {
         let (tx, rx) = mpsc::unbounded_channel::<StreamEvent>();
         tokio::spawn(async move {
             while let Ok(Some(line)) = lines.next_line().await {
@@ -258,39 +195,27 @@ fn print_all(bytes: &[u8]) -> std::io::Result<()> {
     }
 }
 
-async fn handle_db(args: DbArgs, port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    if !args.full_reset {
-        eprintln!("No action given. See `doorward db --help`.");
-        std::process::exit(1);
-    }
-
-    let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
-        .await
-        .map_err(|_| {
-            format!(
-                "Doorward daemon is not running on port {port}. Start it with `doorward --daemon`, or with `crossfyre extension start doorward` if crossfyre installed it."
-            )
-        })?;
-
-    let request = serde_json::json!({ "operation": "db_reset", "response": "instant" });
-    let (reader, mut writer) = tokio::io::split(stream);
-    let mut req_str = dguard::encode(&request);
-    req_str.push('\n');
-    writer.write_all(req_str.as_bytes()).await?;
-
-    let mut lines = BufReader::new(reader).lines();
-    if let Some(line) = lines.next_line().await? {
-        let resp: serde_json::Value = serde_json::from_str(&line)?;
-        match resp["status"].as_str().unwrap_or("error") {
-            "completed" => println!("{}", resp["message"].as_str().unwrap_or("Done.")),
-            _ => eprintln!("Error: {}", resp["message"].as_str().unwrap_or("unknown")),
-        }
-    }
-
-    Ok(())
+/// The stream scan request for `ports` of `args`' targets, with every flag of `args` the
+/// daemon honours.
+fn scan_request(args: &libs::cli_args::ScanArgs, ports: &[u16]) -> serde_json::Value {
+    serde_json::json!({
+        "operation": "scan",
+        "response": "stream",
+        "save": true,
+        "targets": args.targets,
+        "ports": ports,
+        "tasks": args.tasks,
+        "timeout": args.timeout,
+        "delay": args.delay,
+        "service_detection": args.service_detection,
+        "fresh_start": args.fresh_start,
+    })
 }
 
-async fn handle_scan_exec(args: ExecArgs, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+async fn handle_scan_exec(
+    args: ExecArgs,
+    daemon: &dguard::Daemon,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut payload: serde_json::Value =
         serde_json::from_str(&args.json).map_err(|e| format!("Invalid JSON: {e}"))?;
 
@@ -306,13 +231,7 @@ async fn handle_scan_exec(args: ExecArgs, port: u16) -> Result<(), Box<dyn std::
     obj.entry("response")
         .or_insert_with(|| serde_json::json!("instant"));
 
-    let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
-        .await
-        .map_err(|_| {
-            format!(
-                "Doorward daemon is not running on port {port}. Start it with `doorward --daemon`, or with `crossfyre extension start doorward` if crossfyre installed it."
-            )
-        })?;
+    let stream = daemon.connect().await?;
     let _ = stream.set_nodelay(true);
 
     let (reader, mut writer) = tokio::io::split(stream);

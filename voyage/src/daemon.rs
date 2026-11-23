@@ -3,8 +3,9 @@ use crate::scanner::{EnumConfig, Scanner, StreamEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
+use tokio::io::Lines;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream, tcp::OwnedWriteHalf};
+use tokio::net::{TcpListener, TcpStream, tcp::OwnedReadHalf, tcp::OwnedWriteHalf};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -53,7 +54,7 @@ struct DaemonResponse {
     message: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct EnumParams {
     domain: String,
     /// Evasiveness posture: present as a real browser (default) vs neutral.
@@ -62,8 +63,13 @@ struct EnumParams {
     /// Attribution token for authorized programs (sent as X-Bug-Bounty).
     #[serde(default)]
     identify: Option<String>,
+    /// A wordlist file, which is read only inside the permitted directories.
     #[serde(default)]
     wordlist: String,
+    /// In place of `wordlist`: the name of a list whose words follow the request on
+    /// the connection (see [`dguard::WordChunks`]). Only a stream enum takes them.
+    #[serde(default)]
+    wordlist_follows: Option<String>,
     #[serde(default = "default_tasks")]
     tasks: usize,
     /// Per-task wait between requests in ms. Same semantic as doorward's
@@ -87,6 +93,9 @@ struct EnumParams {
     https_probing_ports: Vec<u16>,
     #[serde(default = "default_active_ua")]
     active_user_agent: String,
+    /// A new random User-Agent for every active request.
+    #[serde(default)]
+    active_random_user_agent: bool,
     #[serde(default = "default_passive_ua")]
     passive_user_agent: String,
     /// Explicit DNS server IP to resolve against. Empty = use the node's
@@ -107,6 +116,13 @@ struct EnumParams {
     /// authorised enum gets.
     #[serde(default)]
     block_internal: bool,
+    /// Scope entries, in cfx_scope's syntax, that an HTTP or HTTPS probe of a name found
+    /// has to be admitted by. Empty probes every name.
+    #[serde(default)]
+    scope: Vec<String>,
+    /// Follow a probe's redirects. Absent = true, as an enum always has.
+    #[serde(default = "default_true")]
+    follow_redirects: bool,
     /// Set by the daemon from the egress wrapper. See `DaemonRequest::egress`.
     #[serde(skip)]
     egress: transport::Egress,
@@ -173,6 +189,8 @@ pub async fn run(port: u16, db: VoyageDb) -> Result<(), Box<dyn std::error::Erro
     let gate = dguard::Gate::from_env();
     let listener = TcpListener::bind(addr).await?;
     gate.announce("Voyage", addr);
+    dguard::exit_when_idle("voyage");
+    eprintln!("[voyage] {}", cfx_pacing::load().say());
 
     let db = Arc::new(db);
 
@@ -197,7 +215,7 @@ pub async fn run(port: u16, db: VoyageDb) -> Result<(), Box<dyn std::error::Erro
         let _ = stream.set_nodelay(true);
         let gate_clone = gate.clone();
         let db_clone = Arc::clone(&db);
-        tokio::spawn(async move {
+        dguard::spawn_busy(async move {
             if let Err(e) = handle_connection(stream, gate_clone, db_clone).await {
                 eprintln!("Connection error from {addr}: {e}");
             }
@@ -256,24 +274,69 @@ async fn handle_connection(
                 &mut writer,
                 &serde_json::json!({
                     "type": "capabilities",
+                    "enum": ["scope", "follow_redirects", "block_internal"],
                     // The version of the egress wrapper this daemon reads.
                     "egress": transport::WIRE_VERSION,
+                    // Which pacing this daemon runs: `module <version>`, or `baseline (<why>)`.
+                    "pacing": cfx_pacing::load().label(),
+                    // Which process answers, for the client that started it.
+                    "pid": std::process::id(),
                 }),
             )
             .await?;
             continue;
         }
 
+        // The enumerations this daemon keeps, the latest first, one as it was kept, and what
+        // they found, oldest first.
+        if req.operation == "scans" {
+            let answer = cfx_db::scans::answer_scans(db.pool(), cfx_db::scans::Listed::why_not);
+            write_json(&mut writer, &answer.await).await?;
+            continue;
+        }
+        if req.operation == "scan_info" {
+            let id = req.params["id"].as_str().unwrap_or_default();
+            write_json(
+                &mut writer,
+                &cfx_db::found::answer_scan(db.pool(), id).await,
+            )
+            .await?;
+            continue;
+        }
+        if req.operation == "finding" {
+            let id = req.params["id"].as_i64().unwrap_or(0);
+            write_json(
+                &mut writer,
+                &cfx_db::found::answer_finding(db.pool(), id).await,
+            )
+            .await?;
+            continue;
+        }
+        if req.operation == "findings" {
+            let answer = cfx_db::found::answer_findings(
+                db.pool(),
+                req.params["scan"].as_str(),
+                req.params["after"].as_i64(),
+                req.params["limit"].as_i64().unwrap_or(200),
+            );
+            write_json(&mut writer, &answer.await).await?;
+            continue;
+        }
+
+        // Every operation from here on sends: say which pacing it runs with.
+        eprintln!("[voyage] {}: {}", req.operation, cfx_pacing::load().say());
+
         // Stream mode takes over the connection for the duration of the scan.
         // Routed by operation first: each stream handler parses its own params,
-        // so takeover requests must not reach the enum parser.
+        // so takeover requests must not reach the enum parser. A stopped enumeration
+        // taken up again streams as it did.
         if req.response == "stream" {
             match req.operation.as_str() {
                 "takeover" => handle_stream_takeover(req, writer).await?,
                 // Zone transfer: when a nameserver answers it, the zone lists
                 // every name it holds and the brute-force phase is redundant.
                 "axfr" => handle_stream_axfr(req, writer).await?,
-                _ => handle_stream_enum(req, writer, Arc::clone(&db)).await?,
+                _ => handle_stream_enum(req, writer, &mut lines, &gate, Arc::clone(&db)).await?,
             }
             return Ok(());
         }
@@ -285,6 +348,8 @@ async fn handle_connection(
     Ok(())
 }
 
+/// Send `value` to the client, made safe to leave the engine (see
+/// [`cfx_db::scans::safe_stream`]): the node relays it to Cloud as it is.
 async fn write_json<W, T>(
     writer: &mut W,
     value: &T,
@@ -293,7 +358,7 @@ where
     W: AsyncWriteExt + Unpin,
     T: Serialize,
 {
-    let mut s = serde_json::to_string(value)?;
+    let mut s = serde_json::to_string(&cfx_db::scans::safe_stream(&serde_json::to_value(value)?))?;
     s.push('\n');
     writer.write_all(s.as_bytes()).await?;
     Ok(())
@@ -306,22 +371,37 @@ where
 async fn handle_stream_enum(
     req: DaemonRequest,
     mut writer: OwnedWriteHalf,
+    lines: &mut Lines<BufReader<OwnedReadHalf>>,
+    gate: &dguard::Gate,
     db: Arc<VoyageDb>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let operation_id = Uuid::new_v4().to_string();
 
-    let params: EnumParams = match serde_json::from_value(req.params.clone()) {
-        Ok(p) => EnumParams {
-            egress: req.egress.clone(),
-            ..p
-        },
-        Err(e) => {
+    // The enumeration as asked for, or a stopped one taken up again with the settings it
+    // was kept with.
+    let asked = match req.operation.as_str() {
+        "resume" => taken_up(&req, &db)
+            .await
+            .map(|(p, running)| (p, Some(running))),
+        _ => serde_json::from_value::<EnumParams>(req.params.clone())
+            .map(|p| (p, None))
+            .map_err(|e| format!("Invalid enum params: {e}")),
+    };
+    let (params, taken) = match asked {
+        Ok((p, taken)) => (
+            EnumParams {
+                egress: req.egress.clone(),
+                ..p
+            },
+            taken,
+        ),
+        Err(message) => {
             write_json(
                 &mut writer,
                 &serde_json::json!({
                     "type": "error",
                     "operation_id": operation_id,
-                    "message": format!("Invalid enum params: {}", e),
+                    "message": message,
                 }),
             )
             .await?;
@@ -330,13 +410,21 @@ async fn handle_stream_enum(
     };
 
     if req.save {
-        let params_str = serde_json::to_string(&req.params).unwrap_or_default();
-        let _ = db
-            .create_operation(&operation_id, "enum", &params_str)
-            .await;
+        let _ = cfx_db::scans::record_operation(
+            db.pool(),
+            &operation_id,
+            "enum",
+            None,
+            &req.params.to_string(),
+        )
+        .await;
     }
 
-    let (scanner, total) = match prepare_enum(&params, &db).await {
+    let following = params
+        .wordlist_follows
+        .is_some()
+        .then(|| dguard::WordChunks::new(lines, gate));
+    let (scanner, total, running) = match prepare_enum(&params, &db, following, taken).await {
         Ok(v) => v,
         Err(e) => {
             write_json(
@@ -352,57 +440,60 @@ async fn handle_stream_enum(
         }
     };
 
-    // Send "ack" with operation_id and total entry count
-    write_json(
-        &mut writer,
-        &StreamEvent {
-            kind: "ack".to_string(),
-            operation_id: Some(operation_id.clone()),
-            total: Some(total),
-            subdomain: None,
-            status: None,
-            source: None,
-            found: None,
-            not_found: None,
-            log_level: None,
-            message: None,
-            error: None,
-            ..Default::default()
-        },
-    )
-    .await?;
+    // Send "ack" with operation_id, total entry count, and the scan it is kept as
+    let mut ack = serde_json::to_value(StreamEvent {
+        kind: "ack".to_string(),
+        operation_id: Some(operation_id.clone()),
+        total: Some(total),
+        subdomain: None,
+        status: None,
+        source: None,
+        found: None,
+        not_found: None,
+        log_level: None,
+        message: None,
+        error: None,
+        ..Default::default()
+    })?;
+    ack["scan"] = serde_json::json!(running.id);
+    write_json(&mut writer, &ack).await?;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
 
     let oid = operation_id.clone();
     let save = req.save;
     let db_clone = Arc::clone(&db);
+    // What the enumeration found, said and how far it got, as every engine keeps it: a
+    // name found is a finding, one tried and not found is not.
+    let mut keeper = cfx_db::found::Keeper::new(db.pool(), Some(running.id.as_str()));
 
-    tokio::spawn(async move {
-        match scanner.run_headless_stream(tx).await {
-            Ok(_) => {
-                if save {
-                    let _ = db_clone
-                        .update_operation_status(&oid, "completed", None)
-                        .await;
-                }
-            }
-            Err(e) => {
-                if save {
-                    let _ = db_clone
-                        .update_operation_status(&oid, "error", Some(&e.to_string()))
-                        .await;
-                }
-            }
+    dguard::spawn_busy(async move {
+        let ran = scanner.run_headless_stream(tx).await;
+        let _ = db_clone.end_scan(running, ran.is_err()).await;
+        if save {
+            let (status, result) = match &ran {
+                Ok(()) => (cfx_db::scans::Status::Completed, None),
+                Err(e) => (cfx_db::scans::Status::Failed, Some(e.as_str())),
+            };
+            let _ = cfx_db::scans::finish_operation(db_clone.pool(), &oid, status, result).await;
         }
     });
 
     // Forward all events to the TCP stream
     while let Some(event) = rx.recv().await {
+        if kept(&event) {
+            keeper.event(&serde_json::to_value(&event)?).await;
+        }
         write_json(&mut writer, &event).await?;
     }
+    let _ = keeper.flush().await;
 
     Ok(())
+}
+
+/// Whether `event` is kept with its enumeration: a name found, and everything but a result.
+fn kept(event: &StreamEvent) -> bool {
+    event.kind != "result" || event.status.as_deref() == Some("found")
 }
 
 // ---------------------------------------------------------------------------
@@ -430,10 +521,14 @@ async fn dispatch(req: DaemonRequest, db: Arc<VoyageDb>) -> DaemonResponse {
             };
 
             if req.save {
-                let params_str = serde_json::to_string(&req.params).unwrap_or_default();
-                let _ = db
-                    .create_operation(&operation_id, "enum", &params_str)
-                    .await;
+                let _ = cfx_db::scans::record_operation(
+                    db.pool(),
+                    &operation_id,
+                    "enum",
+                    None,
+                    &req.params.to_string(),
+                )
+                .await;
             }
 
             match req.response.as_str() {
@@ -442,9 +537,13 @@ async fn dispatch(req: DaemonRequest, db: Arc<VoyageDb>) -> DaemonResponse {
                         let result_json = serde_json::to_value(&found).unwrap_or(Value::Null);
                         if req.save {
                             let s = serde_json::to_string(&result_json).unwrap_or_default();
-                            let _ = db
-                                .update_operation_status(&operation_id, "completed", Some(&s))
-                                .await;
+                            let _ = cfx_db::scans::finish_operation(
+                                db.pool(),
+                                &operation_id,
+                                cfx_db::scans::Status::Completed,
+                                Some(&s),
+                            )
+                            .await;
                         }
                         DaemonResponse {
                             operation_id,
@@ -455,13 +554,13 @@ async fn dispatch(req: DaemonRequest, db: Arc<VoyageDb>) -> DaemonResponse {
                     }
                     Err(e) => {
                         if req.save {
-                            let _ = db
-                                .update_operation_status(
-                                    &operation_id,
-                                    "error",
-                                    Some(&e.to_string()),
-                                )
-                                .await;
+                            let _ = cfx_db::scans::finish_operation(
+                                db.pool(),
+                                &operation_id,
+                                cfx_db::scans::Status::Failed,
+                                Some(&e.to_string()),
+                            )
+                            .await;
                         }
                         DaemonResponse {
                             operation_id,
@@ -474,9 +573,13 @@ async fn dispatch(req: DaemonRequest, db: Arc<VoyageDb>) -> DaemonResponse {
                 _ => {
                     let oid = operation_id.clone();
                     let db2 = Arc::clone(&db);
-                    tokio::spawn(async move {
-                        let _ = run_enum_instant(&params, &db2).await;
-                        let _ = db2.update_operation_status(&oid, "completed", None).await;
+                    dguard::spawn_busy(async move {
+                        let status = match run_enum_instant(&params, &db2).await {
+                            Ok(_) => cfx_db::scans::Status::Completed,
+                            Err(_) => cfx_db::scans::Status::Failed,
+                        };
+                        let _ =
+                            cfx_db::scans::finish_operation(db2.pool(), &oid, status, None).await;
                     });
                     DaemonResponse {
                         operation_id,
@@ -548,18 +651,34 @@ async fn dispatch(req: DaemonRequest, db: Arc<VoyageDb>) -> DaemonResponse {
                 message: None,
             }
         }
-        "db_reset" => match db.truncate_tables().await {
-            Ok(_) => DaemonResponse {
+        "db_reset" => {
+            match cfx_db::scans::reset(db.pool(), &crate::libs::voyage_db::ENGINE).await {
+                Ok(_) => DaemonResponse {
+                    operation_id,
+                    status: "completed".to_string(),
+                    results: None,
+                    message: Some("All tables truncated.".to_string()),
+                },
+                Err(e) => DaemonResponse {
+                    operation_id,
+                    status: "error".to_string(),
+                    results: None,
+                    message: Some(format!("DB reset failed: {e}")),
+                },
+            }
+        }
+        "purge" => match cfx_db::scans::purge_operation(db.pool(), &req.params).await {
+            Ok(done) => DaemonResponse {
                 operation_id,
                 status: "completed".to_string(),
                 results: None,
-                message: Some("All tables truncated.".to_string()),
+                message: Some(done),
             },
-            Err(e) => DaemonResponse {
+            Err(why) => DaemonResponse {
                 operation_id,
                 status: "error".to_string(),
                 results: None,
-                message: Some(format!("DB reset failed: {e}")),
+                message: Some(why),
             },
         },
         unknown => DaemonResponse {
@@ -574,6 +693,22 @@ async fn dispatch(req: DaemonRequest, db: Arc<VoyageDb>) -> DaemonResponse {
 // ---------------------------------------------------------------------------
 // Shared enum setup → returns (Scanner, total_entries)
 // ---------------------------------------------------------------------------
+
+/// The scope an enum's probes keep to: None for no entries, or the entries parsed, all
+/// of them or the enum is refused, as one misread entry would probe names nobody listed.
+fn probe_scope(entries: &[String]) -> Result<Option<cfx_scope::Scope>, String> {
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let (scope, refused) = cfx_scope::parse(entries);
+    if !refused.is_empty() {
+        return Err(format!(
+            "scope entries that do not parse: {}",
+            refused.join(", ")
+        ));
+    }
+    Ok(Some(scope))
+}
 
 /// The wordlist an enum reads, if it reads one, contained as ambulo contains its own.
 /// `wordlist` is a path from the request, and the enum sends one DNS query per line for
@@ -610,129 +745,200 @@ fn scan_key(domain: &str, wordlist: &str, words: Option<&[String]>) -> String {
     crate::libs::sha::sha512(config.to_string())
 }
 
+/// The stopped enumeration a `resume` request names, taken up again with the settings it
+/// was kept with: or why it cannot be. Its names are queued already, so no words follow.
+async fn taken_up(
+    req: &DaemonRequest,
+    db: &VoyageDb,
+) -> Result<(EnumParams, cfx_db::scans::Running), String> {
+    let id = req.params["scan"]
+        .as_str()
+        .ok_or("a resume names the enumeration to take up again")?;
+    let (running, settings) = cfx_db::scans::take_up(db.pool(), id, None)
+        .await
+        .map_err(|e| e.to_string())?;
+    match serde_json::from_value::<EnumParams>(settings) {
+        Ok(params) => Ok((
+            EnumParams {
+                wordlist_follows: None,
+                ..params
+            },
+            running,
+        )),
+        Err(e) => {
+            let _ = cfx_db::scans::finish(running, cfx_db::scans::Status::Stopped).await;
+            Err(format!(
+                "scan {id} was kept with settings this voyage cannot read: {e}"
+            ))
+        }
+    }
+}
+
+/// Set up an enumeration of `params.domain`, or `taken`, a stopped one taken up again by
+/// its id. Its words are those of the wordlist file the request names, or, when
+/// `following` is given, the chunks that follow the request on the connection. They are
+/// held once, and made into entries a batch at a time.
 async fn prepare_enum(
     params: &EnumParams,
     db: &Arc<VoyageDb>,
-) -> Result<(Scanner, usize), Box<dyn std::error::Error + Send + Sync>> {
-    let words = match active_wordlist(params)? {
-        Some(file) => Some(
-            crate::libs::wordlist::read_lines_from(file)
+    following: Option<dguard::WordChunks<'_, BufReader<OwnedReadHalf>>>,
+    taken: Option<cfx_db::scans::Running>,
+) -> Result<
+    (Scanner<VoyageDb>, usize, cfx_db::scans::Running),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    // Before anything is sent, so an entry misread never reaches the sources or a probe.
+    let scope = probe_scope(&params.scope)?;
+    let words = match following {
+        Some(mut chunks) => {
+            if !params.wordlist.is_empty() || params.disable_active {
+                return Err(
+                    "an enum that sends its words names no wordlist file, and has \
+                            active enumeration on"
+                        .into(),
+                );
+            }
+            let mut words = Vec::new();
+            while let Some(chunk) = chunks
+                .next()
                 .await
-                .map_err(|e| format!("Wordlist error: {e}"))?,
-        ),
-        None => None,
+                .map_err(|e| format!("Wordlist error: {e}"))?
+            {
+                words.extend(chunk);
+            }
+            Some(words)
+        }
+        None => match active_wordlist(params)? {
+            Some(file) => Some(
+                crate::libs::wordlist::read_lines_from(file)
+                    .await
+                    .map_err(|e| format!("Wordlist error: {e}"))?,
+            ),
+            None => None,
+        },
     };
-    let config_hash = scan_key(&params.domain, &params.wordlist, words.as_deref());
-
-    let scan_id = db
-        .get_or_create_scan(&config_hash, &params.domain, &params.wordlist)
-        .await
-        .map_err(|e| format!("DB error: {e}"))?;
-
-    if params.fresh_start {
-        db.fresh_start_scan(&scan_id)
+    let running = match taken {
+        Some(running) => running,
+        None => {
+            let config_hash = scan_key(&params.domain, &params.wordlist, words.as_deref());
+            let asked =
+                serde_json::to_string(params).map_err(|e| format!("Invalid params: {e}"))?;
+            db.start_scan(&params.domain, &config_hash, &asked, params.fresh_start)
+                .await
+                .map_err(|e| format!("DB error: {e}"))?
+        }
+    };
+    let scan_id = running.id.clone();
+    // What fails from here on ends the scan as failed, rather than leaving it running.
+    let ready = async {
+        // Passive scan - insert results with status="found"
+        if !params.disable_passive {
+            match crate::scanners::passive_scan::execute(
+                &params.domain,
+                &params.passive_user_agent,
+                &params.exclude_passive_sources,
+                &params.egress,
+            )
             .await
-            .map_err(|e| format!("DB error: {e}"))?;
-    }
+            {
+                Ok(results) => {
+                    let entries: Vec<(String, String, String, String)> = results
+                        .iter()
+                        .map(|(subdomain, source)| {
+                            (
+                                subdomain.clone(),
+                                "passive".to_string(),
+                                source.clone(),
+                                "found".to_string(),
+                            )
+                        })
+                        .collect();
+                    let _ = db.insert_entries_batch(&scan_id, &entries).await;
+                }
+                Err(e) => eprintln!("[WARN] Passive scan error: {e}"),
+            }
+        }
 
-    // Passive scan - insert results with status="found"
-    if !params.disable_passive {
-        match crate::scanners::passive_scan::execute(
-            &params.domain,
-            &params.passive_user_agent,
-            &params.exclude_passive_sources,
-            &params.egress,
-        )
-        .await
-        {
-            Ok(results) => {
-                let entries: Vec<(String, String, String, String)> = results
+        // Active wordlist - insert entries with status="queued", a batch at a time, so the
+        // words are never held a second time as entries
+        if let Some(words) = words {
+            for batch in words.chunks(dguard::CHUNK_WORDS) {
+                let entries: Vec<(String, String, String, String)> = batch
                     .iter()
-                    .map(|(subdomain, source)| {
+                    .filter(|w| !w.trim().is_empty())
+                    .map(|word| {
                         (
-                            subdomain.clone(),
-                            "passive".to_string(),
-                            source.clone(),
-                            "found".to_string(),
+                            format!("{}.{}", word.trim(), params.domain),
+                            "active".to_string(),
+                            String::new(),
+                            "queued".to_string(),
                         )
                     })
                     .collect();
-                let _ = db.insert_entries_batch(&scan_id, &entries).await;
+                db.insert_entries_batch(&scan_id, &entries)
+                    .await
+                    .map_err(|e| format!("DB error: {e}"))?;
             }
-            Err(e) => eprintln!("[WARN] Passive scan error: {e}"),
         }
-    }
 
-    // Active wordlist - insert entries with status="queued"
-    if let Some(words) = words {
-        let entries: Vec<(String, String, String, String)> = words
-            .iter()
-            .filter(|w| !w.trim().is_empty())
-            .map(|word| {
-                (
-                    format!("{}.{}", word.trim(), params.domain),
-                    "active".to_string(),
-                    String::new(),
-                    "queued".to_string(),
-                )
-            })
-            .collect();
-
-        db.insert_entries_batch(&scan_id, &entries)
+        db.reset_halted_entries(&scan_id)
             .await
             .map_err(|e| format!("DB error: {e}"))?;
+
+        let total = db
+            .get_scan_entry_total(&scan_id)
+            .await
+            .map_err(|e| format!("DB error: {e}"))? as usize;
+
+        let config = EnumConfig {
+            scan_id,
+            tasks: params.tasks,
+            interval_ms: params.delay,
+            exclude_active_techniques: params.exclude_active_techniques.clone(),
+            block_internal: params.block_internal,
+            scope,
+            follow_redirects: params.follow_redirects,
+            http_probing_ports: params.http_probing_ports.clone(),
+            https_probing_ports: params.https_probing_ports.clone(),
+            active_user_agent: params.active_user_agent.clone(),
+            active_random_user_agent: params.active_random_user_agent,
+            dns_server: params.dns_server.clone(),
+            adaptive_rate: params.adaptive_rate,
+            adaptive_resilience: params.adaptive_resilience,
+            posture: params.posture.clone(),
+            evasive: params.evasive,
+            identify: params.identify.clone(),
+            egress: params.egress.clone(),
+        };
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>((config, total))
     }
-
-    db.set_scan_status(&scan_id, "populated")
-        .await
-        .map_err(|e| format!("DB error: {e}"))?;
-    db.reset_halted_entries(&scan_id)
-        .await
-        .map_err(|e| format!("DB error: {e}"))?;
-
-    let total = db
-        .get_scan_entry_total(&scan_id)
-        .await
-        .map_err(|e| format!("DB error: {e}"))? as usize;
-
-    let config = EnumConfig {
-        scan_id,
-        domain: params.domain.clone(),
-        tasks: params.tasks,
-        interval_ms: params.delay,
-        exclude_passive_sources: params.exclude_passive_sources.clone(),
-        exclude_active_techniques: params.exclude_active_techniques.clone(),
-        block_internal: params.block_internal,
-        http_probing_ports: params.http_probing_ports.clone(),
-        https_probing_ports: params.https_probing_ports.clone(),
-        active_user_agent: params.active_user_agent.clone(),
-        passive_user_agent: params.passive_user_agent.clone(),
-        active_random_user_agent: false,
-        dns_server: params.dns_server.clone(),
-        adaptive_rate: params.adaptive_rate,
-        adaptive_resilience: params.adaptive_resilience,
-        posture: params.posture.clone(),
-        evasive: params.evasive,
-        identify: params.identify.clone(),
-        egress: params.egress.clone(),
-    };
-
-    let scanner = Scanner::new(config, Arc::clone(db));
-    Ok((scanner, total))
+    .await;
+    match ready {
+        Ok((config, total)) => Ok((Scanner::new(config, Arc::clone(db)), total, running)),
+        Err(e) => {
+            let _ = cfx_db::scans::finish(running, cfx_db::scans::Status::Failed).await;
+            Err(e)
+        }
+    }
 }
 
 async fn run_enum_instant(
     params: &EnumParams,
     db: &Arc<VoyageDb>,
 ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-    let (scanner, _) = prepare_enum(params, db).await?;
-    let scan_id = scanner.config.scan_id.clone();
-    let db2 = Arc::clone(&scanner.db);
+    if params.wordlist_follows.is_some() {
+        return Err("words can follow only a stream enum's request".into());
+    }
+    let (scanner, _, running) = prepare_enum(params, db, None, None).await?;
+    let scan_id = running.id.clone();
+    let db2 = Arc::clone(&scanner.store);
 
     let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
 
-    tokio::spawn(async move {
-        let _ = scanner.run_headless_stream(tx).await;
+    let ending = Arc::clone(&db2);
+    dguard::spawn_busy(async move {
+        let ran = scanner.run_headless_stream(tx).await;
+        let _ = ending.end_scan(running, ran.is_err()).await;
     });
 
     // Drain until channel closes (after "done" is sent)
@@ -1252,6 +1458,124 @@ async fn handle_stream_takeover(
 }
 
 #[cfg(test)]
+mod kept_tests {
+    //! What an enumeration found, kept as every engine keeps it, and read back.
+    use super::*;
+
+    /// What a daemon on `port` answers `ask` with.
+    async fn answer(port: u16, ask: serde_json::Value) -> serde_json::Value {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let (r, mut w) = stream.into_split();
+        w.write_all(format!("{ask}\n").as_bytes()).await.unwrap();
+        let line = BufReader::new(r)
+            .lines()
+            .next_line()
+            .await
+            .unwrap()
+            .unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    fn result(name: &str, status: &str) -> StreamEvent {
+        StreamEvent {
+            kind: "result".into(),
+            subdomain: Some(name.into()),
+            status: Some(status.into()),
+            ..Default::default()
+        }
+    }
+
+    /// A name found is kept with its enumeration, one tried and not found is not.
+    #[test]
+    fn only_a_name_found_is_kept() {
+        assert!(kept(&result("a.app.test", "found")));
+        assert!(!kept(&result("b.app.test", "not_found")));
+        assert!(kept(&StreamEvent {
+            kind: "progress".into(),
+            ..Default::default()
+        }));
+    }
+
+    /// The names an enumeration kept are what the daemon's `findings` and `scan_info`
+    /// answers give back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs PostgreSQL's programs"]
+    async fn the_names_kept_are_read_back() {
+        let scratch = cfx_db::testing::Scratch::new(&crate::libs::voyage_db::ENGINE).await;
+        let running = cfx_db::scans::start(
+            &scratch.pool,
+            cfx_db::scans::Asked::new("app.test", r#"{"domain":"app.test"}"#),
+            cfx_db::scans::Key::Settings("k"),
+            true,
+        )
+        .await
+        .unwrap();
+        let mut keeper = cfx_db::found::Keeper::new(&scratch.pool, Some(&running.id));
+        for ev in [
+            result("a.app.test", "found"),
+            result("b.app.test", "not_found"),
+        ] {
+            if kept(&ev) {
+                keeper.event(&serde_json::to_value(&ev).unwrap()).await;
+            }
+        }
+        cfx_db::scans::finish(running, cfx_db::scans::Status::Completed)
+            .await
+            .unwrap();
+        let db = Arc::new(VoyageDb::new(scratch.pool.clone()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(handle_connection(
+                    stream,
+                    dguard::Gate::default(),
+                    Arc::clone(&db),
+                ));
+            }
+        });
+        let found = answer(port, serde_json::json!({"operation": "findings"})).await;
+        let rows = found["findings"].as_array().expect("rows");
+        assert_eq!(rows.len(), 1, "{found}");
+        assert_eq!(rows[0]["data"]["subdomain"], "a.app.test");
+        let scan = answer(
+            port,
+            serde_json::json!({"operation": "scan_info", "id": rows[0]["scan"]}),
+        )
+        .await;
+        assert_eq!(scan["scan"]["findings"], 1, "{scan}");
+        assert_eq!(scan["scan"]["status"], "completed", "{scan}");
+        scratch.done().await;
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+
+    /// What voyage sends its client leaves the engine with no credential in it: a probed
+    /// URL's userinfo and secret query value, and a session cookie a page set.
+    #[tokio::test]
+    async fn a_line_voyage_sends_carries_no_secret() {
+        let event = serde_json::json!({"type": "result", "data": {
+            "subdomain": "app.test",
+            "url": "https://u:vy-secret-1@app.test/?token=vy-secret-2",
+            "headers": {"Set-Cookie": "sid=vy-secret-3", "Server": "nginx"},
+        }});
+        let mut out: Vec<u8> = Vec::new();
+        write_json(&mut out, &event).await.unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("app.test") && out.contains("nginx"), "{out}");
+        for secret in ["vy-secret-1", "vy-secret-2", "vy-secret-3"] {
+            assert!(!out.contains(secret), "{secret} went out: {out}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod wordlist_tests {
     use super::*;
 
@@ -1337,6 +1661,14 @@ mod wordlist_tests {
             Ok(None)
         ));
         assert!(matches!(active_wordlist(&enum_params("", false)), Ok(None)));
+        // An enum's probe scope is all of its entries or nothing sent.
+        assert!(matches!(probe_scope(&[]), Ok(None)));
+        let scope = probe_scope(&["*.example.com".to_string()])
+            .unwrap()
+            .unwrap();
+        assert!(scope.admits("www.example.com", Some(80)));
+        let refused = probe_scope(&["*.example.com".to_string(), "*.0.0.1".to_string()]);
+        assert!(refused.is_err_and(|e| e.contains("*.0.0.1")));
     }
 
     // The enum reads its words after the passive sources have run, long after the
@@ -1522,15 +1854,12 @@ mod egress_tests {
         let proxy = Recorder::start(to_loopback).await;
         let config = EnumConfig {
             scan_id: "s".into(),
-            domain: "example.test".into(),
             tasks: 1,
             interval_ms: 0,
-            exclude_passive_sources: vec![],
             exclude_active_techniques: vec![],
             http_probing_ports: vec![fx.port],
             https_probing_ports: vec![],
             active_user_agent: "voyage-test".into(),
-            passive_user_agent: "voyage-test".into(),
             active_random_user_agent: false,
             dns_server: local_dns().await,
             adaptive_rate: false,
@@ -1539,6 +1868,8 @@ mod egress_tests {
             evasive: false,
             identify: None,
             block_internal: false,
+            scope: None,
+            follow_redirects: true,
             egress: proxied(&proxy),
         };
         let client = crate::scanner::probe_client(&config, "voyage-test").unwrap();
@@ -1641,7 +1972,15 @@ mod egress_tests {
         )
         .await;
         assert_eq!(events[0]["type"], "capabilities", "{events:?}");
+        // Which pacing runs, as the engine said it when it started.
+        assert_eq!(events[0]["pacing"], cfx_pacing::load().label().as_str());
+        assert_eq!(
+            events[0]["enum"],
+            serde_json::json!(["scope", "follow_redirects", "block_internal"]),
+            "{events:?}"
+        );
         assert_eq!(events[0]["egress"], 1, "{events:?}");
+        assert_eq!(events[0]["pid"], std::process::id(), "{events:?}");
     }
 }
 
@@ -1722,5 +2061,81 @@ mod http_request_tests {
             !lines.iter().any(|l| l.contains("capabilities")),
             "read on past the first line: {lines:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod flag_tests {
+    use super::*;
+    use clap::Parser;
+
+    /// Every flag `voyage scan` takes reaches the daemon, from the command line through
+    /// the request the client sends, into what the daemon reads: all but the log level,
+    /// which the client applies to what it shows, and the dashboard's poll timeout and
+    /// --interactive, which are the client's own. The wordlist's words follow the
+    /// request, so it asks for the active part.
+    #[test]
+    fn every_scan_flag_reaches_the_daemon() {
+        let cli = crate::libs::cli_args::Cli::try_parse_from([
+            "voyage",
+            "scan",
+            "example.com",
+            "-w",
+            "words.txt",
+            "--tasks",
+            "9",
+            "--interval",
+            "250",
+            "--fresh-start",
+            "--disable-passive-enum",
+            "--exclude-passive-source",
+            crate::scanners::passive_scan::SOURCES[0],
+            "--exclude-active-technique",
+            crate::scanners::active_scan::TECHNIQUES[0],
+            "--http-probing-port",
+            "8080",
+            "--https-probing-port",
+            "8443",
+            "--active-user-agent",
+            "ua-active",
+            "--passive-user-agent",
+            "ua-passive",
+            "--active-random-user-agent",
+            "--log-level",
+            "warn",
+        ])
+        .unwrap();
+        let Some(crate::libs::cli_args::Commands::Scan(args)) = cli.command else {
+            panic!("not a scan");
+        };
+        let request = crate::enum_request(&args, "example.com", !args.wordlist_path.is_empty());
+        let params: EnumParams = serde_json::from_value(request).unwrap();
+        assert_eq!(params.domain, "example.com");
+        assert!(!params.disable_active, "the words follow");
+        assert_eq!(params.tasks, 9);
+        assert_eq!(params.delay, 250);
+        assert!(params.fresh_start);
+        assert!(params.disable_passive);
+        assert_eq!(
+            params.exclude_passive_sources,
+            [crate::scanners::passive_scan::SOURCES[0]]
+        );
+        assert_eq!(
+            params.exclude_active_techniques,
+            [crate::scanners::active_scan::TECHNIQUES[0]]
+        );
+        assert_eq!(params.http_probing_ports, [8080]);
+        assert_eq!(params.https_probing_ports, [8443]);
+        assert_eq!(params.active_user_agent, "ua-active");
+        assert_eq!(params.passive_user_agent, "ua-passive");
+        assert!(params.active_random_user_agent);
+        let line = |level: &str| format!(r#"{{"type":"log","log_level":"{level}","message":"m"}}"#);
+        assert!(!crate::shown(&line("info"), &args.log_level));
+        assert!(crate::shown(&line("warn"), &args.log_level));
+        assert!(crate::shown(&line("error"), &args.log_level));
+        assert!(crate::shown(
+            r#"{"type":"result","subdomain":"a.example.com"}"#,
+            &args.log_level
+        ));
     }
 }

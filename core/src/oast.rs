@@ -4,6 +4,7 @@
 //! The node resolves it via the control plane into { domains, api_url } and hands
 //! that to plessor, which registers/polls/decrypts directly (zero-knowledge).
 
+use crate::api::SendApi;
 use serde_json::{Value, json};
 
 /// Resolve an OAST endpoint id into (callback_domains, poll_api_url). Returns
@@ -23,7 +24,7 @@ pub async fn resolve(
     let resp = http
         .post(&url)
         .json(&json!({ "api_key": node_api_key, "endpoint_id": want }))
-        .send()
+        .send_api()
         .await
         .map_err(|e| format!("resolve request failed: {e}"))?;
     let body: Value = resp

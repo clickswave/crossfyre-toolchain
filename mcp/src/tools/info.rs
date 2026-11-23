@@ -10,14 +10,11 @@ use serde_json::{Value, json};
 use std::net::IpAddr;
 use std::time::Duration;
 
-/// The engines this server drives.
-pub(crate) const MCP_ENGINES: [&str; 2] = ["toolmark", "plessor"];
-
 async fn listening(port: u16) -> bool {
     matches!(
         tokio::time::timeout(
             Duration::from_millis(300),
-            tokio::net::TcpStream::connect(("127.0.0.1", port))
+            tokio::net::TcpStream::connect(("127.0.0.1", crate::engine::not_the_hosts(port)))
         )
         .await,
         Ok(Ok(_))
@@ -58,7 +55,7 @@ pub(crate) async fn status(mcp: &Mcp, args: &Value) -> Result<Done, Refusal> {
     let mut hints = Vec::new();
     for (e, check) in mcp.settings.engines.iter().zip(checks) {
         let up = check.await.unwrap_or(false);
-        let used = MCP_ENGINES.contains(&e.name.as_str());
+        let used = crate::kept::ENGINES.contains(&e.name.as_str());
         if used && !up {
             hints.push(if e.installed {
                 format!(

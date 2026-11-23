@@ -1,0 +1,9 @@
+id: cisco-asa
+info:
+  name: Cisco ASA
+  category: Firewall
+  metadata:
+    part: o
+    vendor: cisco
+    product: adaptive_security_appliance_software
+refines: cisco-webvpn

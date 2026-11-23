@@ -1,0 +1,16 @@
+# Synthetic: Jetty 9.4, which puts its full build name in the Server header.
+HTTP/1.1 200 OK
+date: Fri, 20 Nov 2026 06:00:00 GMT
+content-type: text/html;charset=utf-8
+server: Jetty(9.4.53.v20231009)
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Console</title>
+</head>
+<body>
+<div id="console"></div>
+</body>
+</html>

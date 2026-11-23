@@ -1,0 +1,17 @@
+# Synthetic: A site on Craft CMS, which says so in X-Powered-By, and its session cookie.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+x-powered-by: Craft CMS
+set-cookie: CraftSessionId=0000000000000000000000000000; path=/; secure; HttpOnly
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Studio</title>
+</head>
+<body>
+<main id="main"></main>
+</body>
+</html>

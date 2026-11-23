@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use plessor::rawhttp::{ReadUntil, Route, SendFail, Verify, send_until_via};
+use plessor::rawhttp::{RawReq, ReadUntil, Route, SendFail, Verify, send_until_via};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -104,6 +104,7 @@ async fn send(
         &Route {
             egress: transport::Egress::Inherit,
             block_internal: false,
+            resolve: Vec::new(),
         },
         host,
         port,
@@ -207,6 +208,7 @@ async fn a_pin_is_refused_through_a_proxy_and_nothing_is_dialled() {
     let route = Route {
         egress: transport::Egress::Proxy(format!("socks5h://127.0.0.1:{}", proxy.port())),
         block_internal: false,
+        resolve: Vec::new(),
     };
     let out = send_via(&route, NAME, addr.port(), Some(addr), false).await;
     match out {
@@ -224,8 +226,47 @@ async fn block_internal_refuses_a_private_pin_before_dialling_it() {
     let route = Route {
         egress: transport::Egress::Direct,
         block_internal: true,
+        resolve: Vec::new(),
     };
     let out = send_via(&route, NAME, addr.port(), Some(addr), false).await;
     assert!(matches!(out, Err(SendFail::Connect(_))), "{out:?}");
     assert_eq!(seen.connections.load(Ordering::SeqCst), 0);
+}
+
+/// The names a route pins are dialled at their addresses by every raw send on it: a
+/// template's `unsafe` request, which gives no pin of its own, and one sent by host and
+/// port. A name pinned on another port is refused rather than looked up.
+#[tokio::test]
+async fn a_routes_pins_steer_every_raw_send_on_it() {
+    let (addr, seen) = plain_listener().await;
+    let route = Route {
+        egress: transport::Egress::Direct,
+        block_internal: false,
+        resolve: vec![(NAME.to_string(), addr)],
+    };
+    let url = format!("http://{NAME}:{}/raw/.%2e/probe", addr.port());
+    let answer = plessor::rawhttp::send(RawReq {
+        method: "GET",
+        url: &url,
+        headers: &[],
+        body: None,
+        timeout: Duration::from_secs(5),
+        route: &route,
+    })
+    .await
+    .expect("the route's pin is reachable though the name is not");
+    assert_eq!(answer.status, 200);
+    assert!(
+        seen.notes.lock().unwrap()[0].starts_with("GET /raw/.%2e/probe "),
+        "{:?}",
+        seen.notes.lock().unwrap()
+    );
+    let out = send_via(&route, NAME, addr.port(), None, false).await;
+    assert!(String::from_utf8_lossy(&out.expect("reachable")).contains("200 OK"));
+    assert_eq!(seen.connections.load(Ordering::SeqCst), 2);
+
+    let other = if addr.port() == 1 { 2 } else { addr.port() - 1 };
+    let out = send_via(&route, NAME, other, None, false).await;
+    assert!(matches!(out, Err(SendFail::Connect(_))), "{out:?}");
+    assert_eq!(seen.connections.load(Ordering::SeqCst), 2);
 }

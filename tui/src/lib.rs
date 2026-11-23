@@ -12,6 +12,8 @@
 //! Nothing here depends on any engine crate. It takes numbers and strings, so
 //! it cannot become a path for internals to reach the screen by accident.
 
+pub mod scans;
+pub mod table;
 pub mod theme;
 pub mod widgets;
 
@@ -90,29 +92,19 @@ pub fn available() -> bool {
     io::stdout().is_terminal()
 }
 
-/// Whether to draw a dashboard, given the flags and the engine's own default.
-///
-/// `--no-tui` wins over `--tui`, and with neither flag `default_on` decides, so
-/// the long-running engines can default to a dashboard and the single-target
-/// ones to JSON. A non-terminal stdout overrides all three: no caller who piped
-/// us wanted escape sequences, and the engines used to draw anyway.
-pub fn wanted(tui: bool, no_tui: bool, default_on: bool) -> bool {
-    wanted_from(tui, no_tui, default_on, available())
+/// Whether to draw a dashboard: in a terminal, unless `--no-tui` asks for JSON. A
+/// stdout that is not a terminal never gets one: no caller who piped us wanted escape
+/// sequences, and the engines used to draw anyway.
+pub fn wanted(no_tui: bool) -> bool {
+    wanted_from(no_tui, available())
 }
 
 /// The decision, without asking the terminal. See [`wanted`].
 ///
 /// Split out so the policy is testable: under a test harness stdout is never a
-/// terminal, so [`available`] would answer the question before the flags did.
-pub fn wanted_from(tui: bool, no_tui: bool, default_on: bool, available: bool) -> bool {
-    let asked = if no_tui {
-        false
-    } else if tui {
-        true
-    } else {
-        default_on
-    };
-    asked && available
+/// terminal, so [`available`] would answer the question before the flag did.
+pub fn wanted_from(no_tui: bool, available: bool) -> bool {
+    !no_tui && available
 }
 
 /// Drive a dashboard until the user quits.
@@ -315,33 +307,13 @@ mod wanted_tests {
 
     #[test]
     fn a_pipe_never_gets_a_dashboard() {
-        for (tui, no_tui, default_on) in [
-            (false, false, true),
-            (true, false, true),
-            (false, false, false),
-            (true, false, false),
-        ] {
-            assert!(
-                !wanted_from(tui, no_tui, default_on, false),
-                "piped stdout drew a dashboard for ({tui}, {no_tui}, {default_on})"
-            );
-        }
+        assert!(!wanted_from(false, false));
+        assert!(!wanted_from(true, false));
     }
 
     #[test]
-    fn no_tui_beats_tui_and_the_default() {
-        assert!(!wanted_from(true, true, true, true));
-        assert!(!wanted_from(false, true, true, true));
-    }
-
-    #[test]
-    fn the_engine_default_applies_when_neither_flag_is_given() {
-        assert!(wanted_from(false, false, true, true));
-        assert!(!wanted_from(false, false, false, true));
-    }
-
-    #[test]
-    fn tui_opts_in_where_the_default_is_off() {
-        assert!(wanted_from(true, false, false, true));
+    fn a_terminal_gets_one_unless_no_tui_asks_for_json() {
+        assert!(wanted_from(false, true));
+        assert!(!wanted_from(true, true));
     }
 }

@@ -1,0 +1,10 @@
+id: django
+info:
+  name: Django
+  category: Framework
+implies: [python]
+detect:
+  any:
+    - cookie: { name: '(?i)^csrftoken$' }
+    - cookie: { name: '(?i)^django' }
+    - path: { path: /admin/login/, regex: 'Django administration|Django site admin' }

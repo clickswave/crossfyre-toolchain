@@ -1,0 +1,19 @@
+# Synthetic: phpMyAdmin's login page, served as a host's landing page.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+set-cookie: phpMyAdmin=
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>phpMyAdmin</title>
+<script src="js/vendor/jquery/jquery.min.js?v=5.2.1"></script>
+</head>
+<body>
+<form method="post" action="index.php?route=/" name="login_form">
+<input type="text" name="pma_username" id="input_username">
+</form>
+</body>
+</html>

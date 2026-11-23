@@ -1,0 +1,12 @@
+id: sendmail
+info:
+  name: Sendmail
+  category: Mail Server
+  metadata:
+    vendor: sendmail
+    product: sendmail
+detect:
+  any:
+    - banner: { name: smtp, regex: 'ESMTP Sendmail' }
+version:
+  - banner: { name: smtp, regex: 'ESMTP Sendmail ([0-9]+\.[0-9]+\.[0-9]+)' }

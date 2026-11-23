@@ -1,0 +1,11 @@
+id: prestashop
+info:
+  name: PrestaShop
+  category: Ecommerce
+  metadata:
+    vendor: prestashop
+    product: prestashop
+implies: [php]
+detect:
+  any:
+    - cookie: { name: '^PrestaShop-[0-9a-f]{32}$' }

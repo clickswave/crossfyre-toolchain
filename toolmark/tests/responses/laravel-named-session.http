@@ -1,0 +1,19 @@
+# Synthetic: A Laravel application whose session cookie takes the application's name, as
+# it does by default, so that only the encrypted values of its cookies say Laravel.
+HTTP/1.1 200 OK
+content-type: text/html; charset=UTF-8
+cache-control: no-cache, private
+date: Fri, 20 Nov 2026 06:00:00 GMT
+set-cookie: XSRF-TOKEN=eyJpdiI6Ikx2Q2NhZ2EwMW42NEw2bk5PMm12WlE9PSIsInZhbHVlIjoiSHhXTXdGR212K045SDBpdm1CbXJMZ2N0UmZIWlRxRitJV2c3bFpOU3BhZGhxTlpIaTRlZCtLSW5naVgwL0N3USIsIm1hYyI6ImQyZjkyNWY1MzdjNmNkZDc5MjFjN2YxNDdhMGZhZjJhYTU5MTc1NTY2ZTcyZjNiNzE1N2E5OTU2MTA0Y2VhMDkiLCJ0YWciOiIifQ%3D%3D; expires=Fri, 20 Nov 2026 08:00:00 GMT; Max-Age=7200; path=/; samesite=lax
+set-cookie: acme_shop_session=eyJpdiI6Imcvb3lEV1dQbkorem0vcDlVSjZQNEE9PSIsInZhbHVlIjoib0ZLdEJHdHo2WEpDTkNRYVh6dU11dEVIdmZ3WXZQYWljbFdIZldIbit3VUl5RTJZeUNqT2trVXpzaURzU3FraiIsIm1hYyI6ImY4OTVlZWYyMjkwODgxZDc5NDY0ZmM3YjdjMmRiNDhhYTQ3YzE3YjJiMjQ3YjMwOTQyMWFmNmQ4NzRkYjZiN2YiLCJ0YWciOiIifQ%3D%3D; expires=Fri, 20 Nov 2026 08:00:00 GMT; Max-Age=7200; path=/; httponly; samesite=lax
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Acme Shop</title>
+</head>
+<body>
+<div id="app"></div>
+</body>
+</html>

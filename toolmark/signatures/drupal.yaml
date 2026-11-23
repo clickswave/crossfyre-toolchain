@@ -1,0 +1,17 @@
+id: drupal
+info:
+  name: Drupal
+  category: CMS
+  metadata:
+    vendor: drupal
+    product: drupal
+implies: [php]
+detect:
+  any:
+    - meta: { name: generator, regex: '(?i)drupal' }
+    - header: { name: x-generator, regex: '(?i)drupal' }
+    - html: { regex: '(?i)/sites/all/|/sites/default/files|Drupal\.settings' }
+    - path: { path: /core/misc/drupal.js, regex: 'Drupal\.behaviors' }
+version:
+  - meta: { name: generator, regex: '(?i)Drupal ([0-9]+)' }
+  - html: { regex: '(?i)Drupal ([0-9]+)' }

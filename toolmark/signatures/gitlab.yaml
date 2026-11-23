@@ -1,0 +1,12 @@
+id: gitlab
+info:
+  name: GitLab
+  category: DevOps
+  metadata:
+    vendor: gitlab
+    product: gitlab
+implies: [ruby, rails]
+detect:
+  any:
+    - cookie: { name: '^_gitlab_session$' }
+    - html: { regex: 'gon\.gitlab_url' }

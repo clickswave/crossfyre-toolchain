@@ -1,0 +1,10 @@
+id: traefik
+info:
+  name: Traefik
+  category: Reverse Proxy
+  metadata:
+    vendor: traefik
+    product: traefik
+detect:
+  any:
+    - tls: { name: subject, regex: 'CN=TRAEFIK DEFAULT CERT' }

@@ -1,0 +1,8 @@
+id: cisco-webvpn
+info:
+  name: Cisco WebVPN portal
+  category: VPN
+detect:
+  any:
+    - html: { regex: '(?:src|href|action)="/\+(?:CSCOE|webvpn)\+/' }
+    - cookie: { name: '^webvpn(?:login|Lang)?$' }

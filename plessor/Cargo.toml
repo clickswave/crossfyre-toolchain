@@ -1,6 +1,6 @@
 [package]
 name = "plessor"
-version = "0.0.34"
+version = "0.0.35"
 edition = "2024"
 license.workspace = true
 publish.workspace = true
@@ -9,19 +9,36 @@ repository = "https://github.com/clickswave/crossfyre-toolchain"
 keywords = ["vulnerability", "security", "scanner", "dast"]
 authors = ["Clickswave <team@clickswave.org>"]
 
+[[bin]]
+name = "plessor"
+path = "src/main.rs"
+required-features = ["daemon"]
+
+# plessor's authorization testing as a daemon of its own. A release ships it only as the
+# closed component, built with `closed-authz`; the open build is plessor alone.
+[[bin]]
+name = "plessor-authz"
+path = "src/authz_main.rs"
+required-features = ["daemon"]
+
 [dependencies]
-dguard = { path = "../dguard" }
-cfx_finding = { path = "../finding" }
+dguard = { path = "../dguard", optional = true }
+cfx_finding = { path = "../finding", optional = true }
+# The crossfyre-templates pack `crossfyre update` puts in the toolchain directory.
+cfx_pack = { path = "../pack", optional = true }
+# The CVE leads a scan is given to answer, and the words for each answer.
+cfx_cve = { path = "../cve", optional = true }
 cfx_scope = { path = "../scope" }
-cfx_tui = { path = "../tui" }
-ratatui = { version = "0.30.0-alpha.5", features = ["crossterm"] }
+cfx_tui = { path = "../tui", optional = true }
+ratatui = { version = "0.30.0-alpha.5", features = ["crossterm"], optional = true }
 tokio = { version = "1.47.1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "time"] }
-clap = { version = "4.5.42", features = ["derive"] }
-clap_complete = "4.6.9"
-serde = { version = "1.0.219", features = ["derive"] }
-serde_json = "1.0.142"
-serde_yaml = "0.9"
+clap = { version = "4.5.42", features = ["derive"], optional = true }
+clap_complete = { version = "4.6.9", optional = true }
+serde = { version = "1.0.219", features = ["derive"], optional = true }
+serde_json = { version = "1.0.142", optional = true }
+serde_yaml = { version = "0.9", optional = true }
 adaptive = { path = "../adaptive" }
+cfx_pacing = { path = "../pacing" }
 transport = { path = "../transport" }
 reqwest = { version = "0.12.22", default-features = false, features = ["rustls-tls", "http2", "charset", "cookies", "gzip", "json"] }
 # Raw HTTP/1.1 sender for `unsafe` templates: reqwest normalises dot-segments in
@@ -40,15 +57,18 @@ webpki-roots = "0.26"
 boring2 = { version = "4.15", optional = true }
 tokio-boring2 = { version = "4.15", optional = true }
 # OAST client-side crypto: keygen, RSA-OAEP unwrap, AES-256-GCM open.
-rsa = "0.9"
-aes-gcm = "0.10"
-sha2 = "0.10"
-rand = "0.8"
-base64 = "0.22"
-regex = "1"
-uuid = { version = "1.18.0", features = ["v4"] }
+rsa = { version = "0.9", optional = true }
+aes-gcm = { version = "0.10", optional = true }
+sha2 = { version = "0.10", optional = true }
+rand = { version = "0.8", optional = true }
+base64 = { version = "0.22", optional = true }
+regex = { version = "1", optional = true }
+cfx_db = { path = "../db", optional = true }
+sqlx = { version = "0.8.6", features = ["postgres"], optional = true }
 
 [dev-dependencies]
+# A database of a test's own, for what plessor keeps.
+cfx_db = { path = "../db", features = ["testing"] }
 # A recording SOCKS5 proxy and counting listeners for the egress tests.
 cfx_tunnel = { path = "../tunnel", features = ["recorder"] }
 # To mint a certificate nothing trusts, which is what the certificate-policy test needs
@@ -56,7 +76,20 @@ cfx_tunnel = { path = "../tunnel", features = ["recorder"] }
 rcgen = "0.13"
 
 [features]
-# First-party builds enable this to swap the outward scan client to wreq
-# (BoringSSL) for real browser TLS/HTTP2 fingerprints. Off by default so the open
-# build stays on reqwest (rustls, no C toolchain, no emulation policy shipped).
+default = ["daemon"]
+# The scanner, its daemon, which keeps the engine's state in Postgres, and the command
+# line, with what only they use. The binary needs it. A crate that links this library for
+# its sender and nothing else, as the Workbench does, turns the default features off and
+# gets none of them, and no database.
+daemon = ["dep:dguard", "dep:cfx_finding", "dep:cfx_pack", "dep:cfx_cve", "dep:cfx_tui", "dep:ratatui", "dep:clap", "dep:clap_complete",
+          "dep:serde", "dep:serde_json", "dep:serde_yaml", "dep:rsa", "dep:aes-gcm", "dep:sha2", "dep:rand",
+          "dep:base64", "dep:regex", "dep:cfx_db", "dep:sqlx"]
+# The outward scan client and the raw sender's TLS on wreq and BoringSSL, for a real
+# browser's TLS and HTTP/2 fingerprint. Every published build turns it on; it needs
+# cmake and clang. Off by default, so a workspace build links no BoringSSL beside the
+# OpenSSL cfx_core uses.
 impersonate = ["transport/impersonate", "dep:boring2", "dep:tokio-boring2"]
+# Compiles the authorization drop-in, src/authz/private.rs, in place of the baseline
+# (see build.rs). Only plessor-authz's release build turns it on, so the open plessor
+# never carries it.
+closed-authz = []

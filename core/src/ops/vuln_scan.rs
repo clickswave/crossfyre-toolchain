@@ -149,6 +149,11 @@ pub async fn handle(env: OpEnv) {
             "follow_redirects": data["follow_redirects"].as_bool().unwrap_or(true),
             "severity": sev_arr,
             "templates_dir": data["templates_dir"].clone(),
+            // The template pack, crossfyre-templates' plessor folder as `crossfyre update`
+            // last brought it or the release compiled it in, beside the built-in checks.
+            // A workflow asks for it; absent is built-in checks only, as every workflow
+            // before it got.
+            "pack": data["pack"].as_bool().unwrap_or(false),
             // Template-id allowlist. Empty/absent = every template the severity
             // filter admits, which is the behaviour every existing workflow got.
             // The public free tools set it so a checker that advertises one thing
@@ -239,6 +244,30 @@ pub async fn handle(env: OpEnv) {
         plessor_req["identify"] = serde_json::json!(tok);
     }
 
+    // What toolmark saw on the target's host and port lately chooses the templates, unless
+    // the workflow asks for all of them, and its CVE leads go to be answered either way.
+    // The answers go back to toolmark for that host and port once the scan has run.
+    let mut answer_back: Option<(String, u16)> = None;
+    if mode == "scan" {
+        if data["all_templates"].as_bool().unwrap_or(false) {
+            plessor_req["all_templates"] = serde_json::json!(true);
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        if let Some(inventory) = toolmark_inventory().await
+            && let Some((host, port)) = cfx_cve::inventory::host_and_port(&target)
+            && let Some(fresh) = cfx_cve::inventory::fresh(&inventory, &host, port, now)
+        {
+            plessor_req["products"] = serde_json::json!(fresh.products);
+            plessor_req["leads"] = serde_json::json!(fresh.leads);
+            plessor_req["products_from"] = serde_json::json!(fresh.from);
+            if !fresh.leads.is_empty() {
+                answer_back = Some((host, port));
+            }
+        }
+    }
+
     let relay = Relay {
         pubc: &pub_clone,
         status_subj: &status_subj,
@@ -257,7 +286,17 @@ pub async fn handle(env: OpEnv) {
     let mut processed: i64 = 0;
     let mut total: i64 = 0;
     let mut last_prog = std::time::Instant::now();
-    match super::open_engine("cortex", &plessor_req, lease).await {
+    // The scan the ack names, and its answers to the leads.
+    let mut scan_id: Option<String> = None;
+    let mut answered: Option<serde_json::Value> = None;
+    // Authorization testing goes to plessor-authz when it is installed, and to plessor
+    // otherwise, whose open build says what is needed.
+    let engine = if mode == "authz" {
+        authz_engine(&super::engine_addr("plessor-authz")).await
+    } else {
+        "plessor"
+    };
+    match super::open_engine(engine, &plessor_req, lease).await {
         Ok((mut lines, writer)) => {
             while let Ok(Some(line)) = lines.next_line().await {
                 if !workflow_id.is_empty() && is_workflow_cancelled(&workflow_id) {
@@ -272,6 +311,11 @@ pub async fn handle(env: OpEnv) {
                     Ok(e) => e,
                     Err(_) => continue,
                 };
+                match event["type"].as_str() {
+                    Some("ack") => scan_id = event["scan"].as_str().map(str::to_string),
+                    Some("lead_answers") => answered = Some(event.clone()),
+                    _ => {}
+                }
                 match event["type"].as_str().unwrap_or("") {
                     "finding" => {
                         found_count += 1;
@@ -299,21 +343,19 @@ pub async fn handle(env: OpEnv) {
                             total = t;
                         }
                     }
-                    // Coverage notes: what the engine could not test, and why.
-                    "log" => {
-                        if let Some(m) = event["message"].as_str() {
-                            relay.publish_note(m).await;
-                        }
-                    }
                     "done" => break,
                     "error" => {
                         eprintln!(
-                            "[op] FAIL plessor error: {}",
+                            "[op] FAIL {engine} error: {}",
                             event["message"].as_str().unwrap_or("unknown")
                         );
                         break;
                     }
-                    _ => {}
+                    _ => {
+                        if let Some(m) = coverage_note(&event) {
+                            relay.publish_note(m).await;
+                        }
+                    }
                 }
 
                 if last_prog.elapsed() >= std::time::Duration::from_millis(800) {
@@ -337,9 +379,16 @@ pub async fn handle(env: OpEnv) {
             return;
         }
         Err(super::EngineOpen::Unreachable(e)) => {
-            relay.fail(&super::unreachable("cortex", &e)).await;
+            relay.fail(&super::unreachable(engine, &e)).await;
             return;
         }
+    }
+
+    if let (Some((host, port)), Some(event)) = (answer_back, answered)
+        && let Some(back) =
+            cfx_cve::inventory::AnswersBack::from_event(&host, port, scan_id.as_deref(), &event)
+    {
+        tell_toolmark(&back).await;
     }
 
     relay
@@ -348,4 +397,86 @@ pub async fn handle(env: OpEnv) {
             Some((processed.max(1), total.max(processed).max(1))),
         )
         .await;
+}
+
+/// The engine authorization testing goes to: plessor-authz, listening on `addr`, when
+/// it answers that it runs it, and plessor otherwise.
+async fn authz_engine(addr: &str) -> &'static str {
+    match crate::egress::state::engine_capabilities(addr).await {
+        Some(caps) if caps["type"] == "capabilities" && caps["authz"].is_array() => "plessor-authz",
+        _ => "plessor",
+    }
+}
+
+/// What a plessor event says the scan did not test, and why, as a note for the workflow:
+/// a log line, the templates it held back, so that none is left out in silence, or what
+/// its templates said of toolmark's CVE leads.
+fn coverage_note(event: &serde_json::Value) -> Option<&str> {
+    match event["type"].as_str()? {
+        "log" | "templates_held_back" | "lead_answers" => event["message"].as_str(),
+        _ => None,
+    }
+}
+
+/// Hand toolmark what the scan's templates said of its leads, which it keeps with each lead
+/// for its inventory to show. A toolmark that is not running, or refuses, is said in the
+/// node's log, and the scan's own answers stand in the workflow's note.
+async fn tell_toolmark(back: &cfx_cve::inventory::AnswersBack) {
+    let said = match super::open_engine("toolmark", &back.request(), None).await {
+        Ok((mut lines, _writer)) => match lines.next_line().await {
+            Ok(Some(line)) => serde_json::from_str::<serde_json::Value>(&line)
+                .ok()
+                .filter(|a| a["status"] != "completed")
+                .map(|a| a["message"].as_str().unwrap_or("refused").to_string()),
+            _ => Some("no answer".to_string()),
+        },
+        Err(_) => Some("not running".to_string()),
+    };
+    if let Some(why) = said {
+        eprintln!(
+            "[op] toolmark did not keep the answers to the leads of {}:{}: {why}",
+            back.host, back.port
+        );
+    }
+}
+
+/// What toolmark holds of the hosts it has fingerprinted, or none when it is not running
+/// or does not answer, and the scan then runs every template.
+async fn toolmark_inventory() -> Option<serde_json::Value> {
+    let ask = serde_json::json!({"operation": "inventory", "response": "instant"});
+    let (mut lines, _writer) = super::open_engine("toolmark", &ask, None).await.ok()?;
+    let line = lines.next_line().await.ok()??;
+    let answer: serde_json::Value = serde_json::from_str(&line).ok()?;
+    (answer["status"] == "completed").then_some(answer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A log line, the templates a scan held back and its answers to the leads reach the
+    /// workflow as notes; a finding is not one.
+    #[test]
+    fn what_a_scan_did_not_test_becomes_a_note() {
+        let log = serde_json::json!({"type": "log", "message": "no OAST"});
+        assert_eq!(coverage_note(&log), Some("no OAST"));
+        let held = serde_json::json!({
+            "type": "templates_held_back", "count": 1, "templates": ["CVE-2021-41773"],
+            "message": "1 product templates held back: toolmark's inventory of h:80 names none",
+        });
+        assert_eq!(
+            coverage_note(&held),
+            Some("1 product templates held back: toolmark's inventory of h:80 names none")
+        );
+        let answered = serde_json::json!({
+            "type": "lead_answers", "answers": [],
+            "message": "1 CVE leads from toolmark's inventory of h:80: 1 confirmed (CVE-2021-41773).",
+        });
+        assert_eq!(
+            coverage_note(&answered),
+            Some("1 CVE leads from toolmark's inventory of h:80: 1 confirmed (CVE-2021-41773).")
+        );
+        let finding = serde_json::json!({"type": "finding", "message": "x", "data": {}});
+        assert_eq!(coverage_note(&finding), None);
+    }
 }

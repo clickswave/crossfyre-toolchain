@@ -1,10 +1,11 @@
 // `crossfyre doctor` - environment checks for the things that actually break
-// in the field: missing docker/unzip, dead daemons, unreachable control
-// plane, leftover OrionChain installs.
+// in the field: missing PostgreSQL or tar, dead daemons, unreachable control
+// plane.
 
 use super::packaging::Found;
-use super::ui::{dim, done, error, fail, ok, section, step, title, warn};
+use super::ui::{dim, done, error, fail, ok, section, step, title};
 use super::{ENGINES, config};
+use crate::api::SendApi;
 use std::path::Path;
 
 /// Render one check as a styled status line. Returns true when the check
@@ -30,14 +31,14 @@ fn has_binary(name: &str) -> bool {
     std::env::split_paths(&path).any(|dir| dir.join(&name).is_file())
 }
 
-/// Can extension downloads be unpacked here: by unzip, or on Windows by the bsdtar in
-/// System32 (see `install::extract_zip`).
-fn can_unzip() -> bool {
+/// Can extension downloads be unpacked here: by tar, on Windows by the bsdtar in
+/// System32 (see `install::extract_archive`).
+fn can_unpack() -> bool {
     if cfg!(windows) {
         let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
         Path::new(&root).join("System32").join("tar.exe").is_file()
     } else {
-        has_binary("unzip")
+        has_binary("tar")
     }
 }
 
@@ -56,25 +57,43 @@ pub async fn run(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
     // -- Host tooling -----------------------------------------------------
     section("Host tooling");
-    if !check(
-        "docker available",
-        has_binary("docker"),
-        "install Docker (the toolchain database runs in a container)",
+    // The local database is made with the PostgreSQL programs installed here; a database
+    // the operator runs needs none of them.
+    let settings = config::load_config().ok().map(|c| c.postgres);
+    if !matches!(
+        settings.as_ref().map(|s| &s.backend),
+        Some(cfx_db::Backend::External { .. })
     ) {
-        failed += 1;
+        let found = super::db::account()
+            .map_err(|e| e.to_string())
+            .and_then(|a| cfx_db::find_postgres(a.as_ref(), None).map_err(|e| e.to_string()));
+        let (label, fix) = match &found {
+            Ok(pg) => (
+                format!(
+                    "PostgreSQL {} available {}",
+                    pg.major,
+                    dim(&format!("({})", pg.dir.display()))
+                ),
+                String::new(),
+            ),
+            Err(e) => ("PostgreSQL available".to_string(), e.clone()),
+        };
+        if !check(&label, found.is_ok(), &fix) {
+            failed += 1;
+        }
     }
-    let (unzip_label, unzip_fix) = if cfg!(windows) {
+    let (unpack_label, unpack_fix) = if cfg!(windows) {
         (
             "tar.exe available",
             "Windows 10 1803 or later ships tar.exe in System32 (used to unpack extension downloads)",
         )
     } else {
         (
-            "unzip available",
-            "install unzip (used to unpack extension downloads)",
+            "tar available",
+            "install tar (used to unpack extension downloads)",
         )
     };
-    if !check(unzip_label, can_unzip(), unzip_fix) {
+    if !check(unpack_label, can_unpack(), unpack_fix) {
         failed += 1;
     }
     #[cfg(target_os = "linux")]
@@ -145,7 +164,7 @@ pub async fn run(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // -- Daemons ------------------------------------------------------------
     section("Daemons");
     for e in ENGINES {
-        if config::is_extension_installed(e.id) {
+        if config::is_extension_installed(e.name) {
             let label = format!("{} daemon listening on {}", e.name, e.port);
             if !check(
                 &label,
@@ -155,91 +174,89 @@ pub async fn run(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 failed += 1;
             }
         } else {
-            step(&format!("{} {}", e.name, dim("not installed")));
+            step(&format!("{} {}", e.name, dim(e.not_installed())));
         }
     }
-    if let Ok(c) = config::load_config() {
-        let label = format!("postgres listening on {}", c.postgres.port);
-        if !check(&label, port_open(c.postgres.port), "crossfyre db start") {
+    if let Ok(Some(db)) = super::db::status() {
+        let (label, fix) = match db.settings.backend {
+            cfx_db::Backend::Local => (
+                format!("local database running on {}", db.settings.address()),
+                "crossfyre db up",
+            ),
+            cfx_db::Backend::External { .. } => (
+                format!("database answering on {}", db.settings.address()),
+                "start the database you run, or record another with `crossfyre db external`",
+            ),
+        };
+        if !check(&label, db.running, fix) {
             failed += 1;
         }
     }
 
     // -- Connectivity ---------------------------------------------------------
     section("Connectivity");
-    let cdn = super::install::BASE_URL;
-    let cdn_ok = match super::release_http::http_client(super::release_http::Purpose::Check) {
-        Ok(c) => c
-            .get(format!("{cdn}/manifest.json"))
-            .send()
-            .await
-            .is_ok_and(|r| r.status().is_success()),
-        Err(_) => false,
-    };
-    let label = format!("release CDN reachable {}", dim(&format!("({cdn})")));
-    if !check(
-        &label,
-        cdn_ok,
-        "check network/DNS; installs and updates need this",
-    ) {
-        failed += 1;
-    }
-
-    // Control plane, per registered node config.
-    if let Ok(ids) = crate::discover_nodes(base) {
-        for id in ids {
-            let paths = crate::NodePaths::new(base, &id);
-            // As root, through the reader that refuses a config another account could
-            // have written: root would otherwise call whatever API it names.
-            let Ok(text) = super::node_config::read(&paths.config) else {
-                continue;
-            };
-            let Ok(cfg) = toml::from_str::<crate::Config>(&text) else {
-                continue;
-            };
-            let reachable = reqwest::Client::new()
-                .get(format!("{}/api/v1", cfg.api_url))
-                .timeout(std::time::Duration::from_secs(5))
+    // An offline machine makes no contact with Crossfyre, a diagnosis included.
+    if let Some(line) = crate::policy::offline_line(base) {
+        step(&format!(
+            "not checked: {line}, so this machine makes no contact with Crossfyre"
+        ));
+    } else {
+        let cdn = super::install::bins_origin();
+        let cdn_ok = match super::release_http::http_client(super::release_http::Purpose::Check) {
+            Ok(c) => c
+                .get(format!("{cdn}/manifest.json"))
                 .send()
                 .await
-                .is_ok();
-            let short = &id[..id.len().min(8)];
-            let label = format!(
-                "Crossfyre reachable for node {} {}",
-                short,
-                dim(&format!("({})", cfg.api_url))
-            );
-            if !check(
-                &label,
-                reachable,
-                "check the api_url in this node's config and your network",
-            ) {
-                failed += 1;
-            }
+                .is_ok_and(|r| r.status().is_success()),
+            Err(_) => false,
+        };
+        let label = format!("release CDN reachable {}", dim(&format!("({cdn})")));
+        if !check(
+            &label,
+            cdn_ok,
+            "check network/DNS; installs and updates need this",
+        ) {
+            failed += 1;
         }
-    } else {
-        step(&format!(
-            "no nodes registered yet {}",
-            dim("(run `crossfyre node init`)")
-        ));
-    }
 
-    // -- Legacy OrionChain leftovers ------------------------------------------
-    // Said only when there is something to say. "No legacy OrionChain leftovers" on
-    // every run named a product most people running this have never heard of.
-    let legacy_opt = Path::new("/opt/orionchain").exists();
-    let legacy_cfg = super::sudo_user::invoking_user_config_dir()
-        .join("orionchain")
-        .exists();
-    if legacy_opt || legacy_cfg {
-        section("Legacy");
-        warn("legacy OrionChain install detected");
-        println!(
-            "      {}",
-            dim(
-                "-> re-run `sudo crossfyre node init` to migrate, or remove /opt/orionchain and ~/.config/orionchain manually"
-            )
-        );
+        // Control plane, per registered node config.
+        if let Ok(ids) = crate::discover_nodes(base) {
+            for id in ids {
+                let paths = crate::NodePaths::new(base, &id);
+                // As root, through the reader that refuses a config another account could
+                // have written: root would otherwise call whatever API it names.
+                let Ok(text) = super::node_config::read(&paths.config) else {
+                    continue;
+                };
+                let Ok(cfg) = toml::from_str::<crate::Config>(&text) else {
+                    continue;
+                };
+                let reachable = crate::api::client()
+                    .get(format!("{}/api/v1", cfg.api_url))
+                    .timeout(std::time::Duration::from_secs(5))
+                    .send_api()
+                    .await
+                    .is_ok();
+                let short = &id[..id.len().min(8)];
+                let label = format!(
+                    "Crossfyre reachable for node {} {}",
+                    short,
+                    dim(&format!("({})", cfg.api_url))
+                );
+                if !check(
+                    &label,
+                    reachable,
+                    "check the api_url in this node's config and your network",
+                ) {
+                    failed += 1;
+                }
+            }
+        } else {
+            step(&format!(
+                "no nodes registered yet {}",
+                dim("(run `crossfyre node init`)")
+            ));
+        }
     }
 
     // -- Summary --------------------------------------------------------------

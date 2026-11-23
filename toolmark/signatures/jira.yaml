@@ -1,0 +1,14 @@
+id: jira
+info:
+  name: Atlassian Jira
+  category: Issue Tracker
+  metadata:
+    vendor: atlassian
+    product: jira
+implies: [java]
+detect:
+  any:
+    - meta: { name: application-name, regex: '(?i)^jira$' }
+version:
+  - html: { regex: '<meta name="application-name" content="JIRA" data-name="jira" data-version="([0-9]+(?:\.[0-9]+)*)"' }
+  - meta: { name: ajs-version-number, regex: '^([0-9]+(?:\.[0-9]+)*)' }

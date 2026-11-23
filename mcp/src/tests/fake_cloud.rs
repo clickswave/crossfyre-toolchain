@@ -700,7 +700,7 @@ fn word_filter(name: &str, v: &Option<String>) -> Result<(), Resp> {
     }
 }
 
-/// The engine a launch type runs on, by the public name a node lists it under.
+/// The engine a launch type runs on, by the name a node lists it under.
 fn engine(kind: wire::LaunchType) -> &'static str {
     use wire::LaunchType as T;
     match kind {
@@ -1576,7 +1576,12 @@ pub(crate) async fn server(
     let cloud = FakeCloud::start(platform(Arc::clone(&world))).await;
     world.lock().unwrap().origin = cloud.url();
     let list: Vec<String> = entries.iter().map(|e| e.to_string()).collect();
-    let mut t = super::support::scope(&list, "").build();
+    // A plessor whose kept scans a test seeds, as the local side of a merged list.
+    let plessor = super::support::stub_engine(super::support::StubOpts::default()).await;
+    let mut t = super::support::scope(&list, "")
+        .plessor(plessor.port)
+        .build();
+    t.kept = Some(Arc::clone(&plessor.kept));
     connect(&mut t, &cloud.url(), None).await;
     (t, cloud, world)
 }

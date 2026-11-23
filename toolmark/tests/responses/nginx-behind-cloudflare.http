@@ -1,0 +1,13 @@
+# Synthetic: A site behind Cloudflare, whose origin is nginx. The 404 for a path it
+# does not have, in nginx-behind-cloudflare/, is nginx's own page.
+HTTP/1.1 200 OK
+date: Fri, 20 Nov 2026 06:00:00 GMT
+content-type: text/html; charset=UTF-8
+server: cloudflare
+cf-ray: 8e1f2a3b4c5d6e7f-BOM
+
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Shop</title></head>
+<body><div class="shop"></div></body>
+</html>

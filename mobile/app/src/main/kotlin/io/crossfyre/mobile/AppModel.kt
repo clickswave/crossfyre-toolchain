@@ -15,6 +15,7 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import io.crossfyre.mobile.account.AccountApi
+import io.crossfyre.mobile.account.AccountPolicy
 import io.crossfyre.mobile.account.AccountStore
 import io.crossfyre.mobile.account.ChosenWorkspace
 import io.crossfyre.mobile.account.ClientInfo
@@ -94,6 +95,8 @@ sealed interface Overlay {
     data class Preflight(val apps: List<String>) : Overlay
     data class PairConfirm(val pairing: Pairing) : Overlay
     data object PairInvalid : Overlay
+    /** A code scanned on a phone whose account is private. */
+    data object PolicyPrivate : Overlay
     data object ResetCert : Overlay
     data object RemoveOldCert : Overlay
     data object SignOut : Overlay
@@ -265,6 +268,30 @@ class AppModel(app: Application) : AndroidViewModel(app) {
     var revoked by mutableStateOf(false)
         private set
 
+    /**
+     * The account's privacy policy as Crossfyre last answered it, None until it has.
+     * Asked at sign-in, when the app starts, and again before pairing or capturing.
+     */
+    var accountPolicy by mutableStateOf<AccountPolicy?>(null)
+        private set
+
+    /**
+     * The account's policy now, or the last one known when Crossfyre can't say. The
+     * server refuses a private account's pairing and captures whatever this answers,
+     * so a phone that could not ask is told by it.
+     */
+    private suspend fun freshPolicy(key: String): AccountPolicy? {
+        when (val r = withContext(Dispatchers.IO) { api().policy(key) }) {
+            is Outcome.Ok -> accountPolicy = r.value
+            is Outcome.Failed -> if (r.problem == Problem.SignedOut) revoked = true
+        }
+        return accountPolicy
+    }
+
+    /** Whether a signed-in phone's account is private now, asking Crossfyre first. */
+    private suspend fun isPrivate(): Boolean =
+        store.key()?.let { freshPolicy(it) }?.sendsTargets == false
+
     // Sign-in form.
     var siUser by mutableStateOf("")
     var siPass by mutableStateOf("")
@@ -309,6 +336,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
         user = store.user()
         revoked = false
         say("Signed in as ${s.user.username.ifEmpty { s.user.email }}")
+        viewModelScope.launch { freshPolicy(s.key) }
         openWorkspaces(back = false)
     }
 
@@ -469,6 +497,11 @@ class AppModel(app: Application) : AndroidViewModel(app) {
         wsBusy = true
         wsError = null
         viewModelScope.launch {
+            if (freshPolicy(key)?.sendsTargets == false) {
+                wsBusy = false
+                wsError = policyNotice()
+                return@launch
+            }
             // A different session is about to get this phone's traffic, so the old
             // one stops first rather than carrying on under a token being replaced.
             if (running) stopCapture()
@@ -512,6 +545,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
         workspace = null
         user = null
         signedInWith = null
+        accountPolicy = null
         route = Route.SIGN_IN
         say("You have been signed out. Sign in again.", R.drawable.ic_info)
     }
@@ -631,8 +665,15 @@ class AppModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun scanned(payload: String) {
-        val parsed = Pairing.parseQr(payload)
-        overlay = if (parsed == null) Overlay.PairInvalid else Overlay.PairConfirm(parsed)
+        val parsed = Pairing.parseQr(payload) ?: run {
+            overlay = Overlay.PairInvalid
+            return
+        }
+        // A private account's phone pairs into nothing, whoever made the code: the
+        // server knows only who made it, so this phone is the one that can say no.
+        viewModelScope.launch {
+            overlay = if (isPrivate()) Overlay.PolicyPrivate else Overlay.PairConfirm(parsed)
+        }
     }
 
     fun confirmPairing(p: Pairing) {
@@ -754,6 +795,7 @@ class AppModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val r = withContext(Dispatchers.IO) { api().verifyKey(key) }
             if (r is Outcome.Failed && r.problem == Problem.SignedOut) revoked = true
+            else freshPolicy(key)
         }
     }
 
@@ -862,7 +904,13 @@ class AppModel(app: Application) : AndroidViewModel(app) {
     fun onStartTapped() {
         startError = null
         failMessage = null
-        continueStart()
+        viewModelScope.launch {
+            if (isPrivate()) {
+                startError = policyNotice()
+                return@launch
+            }
+            continueStart()
+        }
     }
 
     /** Walk the gates in [nextStartStep]'s order, stopping at the first that needs an answer. */

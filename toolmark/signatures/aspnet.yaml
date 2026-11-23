@@ -1,0 +1,14 @@
+id: aspnet
+info:
+  name: ASP.NET
+  category: Framework
+  metadata:
+    vendor: microsoft
+    product: asp.net
+detect:
+  any:
+    - header: { name: x-powered-by, regex: '(?i)asp\.net' }
+    - header: { name: x-aspnet-version, regex: '.+' }
+    - cookie: { name: '(?i)^ASP\.NET_SessionId$' }
+version:
+  - header: { name: x-aspnet-version, regex: '^([0-9]+(?:\.[0-9]+)*)' }

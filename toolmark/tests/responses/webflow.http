@@ -1,0 +1,15 @@
+# Synthetic: A site built on Webflow, which marks its pages with their Webflow ids.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html data-wf-page="000000000000000000000001" data-wf-site="000000000000000000000002">
+<head>
+<meta charset="utf-8">
+<title>Studio</title>
+</head>
+<body>
+<main></main>
+</body>
+</html>

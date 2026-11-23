@@ -20,6 +20,7 @@ use cfx_tunnel::{Kind, Upstream};
 use serde_json::{Value, json};
 
 use super::gateway::{Gateway, Lease, Resolver, system_resolver};
+use crate::api::SendApi;
 
 /// The version of the `egress` object this node reads.
 pub const SETTINGS_VERSION: i64 = 1;
@@ -260,6 +261,44 @@ pub struct EgressState {
     /// controller older than proxies has no route to fetch them from, so its nodes
     /// never ask, and stay direct as they always were.
     platform_has_settings: AtomicBool,
+    /// Isolated egress as the node runs it (see [`crate::egress::bring_up`]): what it
+    /// says, and why nothing may be sent, when it may not.
+    isolation: Mutex<Isolated>,
+}
+
+/// Isolated egress as the node runs it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Isolated {
+    /// What the node says of it: `direct`, `helper <version>`,
+    /// `baseline (<why>)` or `refused (kill switch on, <why>)`. Empty before the node
+    /// has brought it up.
+    pub label: String,
+    /// Why nothing may be sent: set while a kill switch is on and egress is not up.
+    pub refusal: Option<String>,
+}
+
+impl Isolated {
+    /// Egress up as `up` says, or not up for `why`, a whole reason. Not up, a node
+    /// with the kill switch on sends nothing, and one without it sends directly.
+    pub fn of(kill_switch: bool, outcome: Result<&str, &str>) -> Isolated {
+        match outcome {
+            Ok(up) => Isolated {
+                label: up.to_string(),
+                refusal: None,
+            },
+            Err(why) if kill_switch => {
+                let label = format!("refused (kill switch on, {why})");
+                Isolated {
+                    refusal: Some(format!("egress: {label}")),
+                    label,
+                }
+            }
+            Err(why) => Isolated {
+                label: format!("baseline ({why})"),
+                refusal: None,
+            },
+        }
+    }
 }
 
 /// The daemon's state. Each node runs as its own process, so one per process is one
@@ -279,7 +318,44 @@ impl EgressState {
             gateway: tokio::sync::OnceCell::new(),
             resolver,
             platform_has_settings: AtomicBool::new(false),
+            isolation: Mutex::new(Isolated::default()),
         })
+    }
+
+    /// Say how isolated egress runs, and whether it refuses: in the node's log when it
+    /// changes, and from then on to each op and the heartbeat.
+    pub fn set_isolation(&self, now: Isolated) {
+        let Ok(mut cur) = self.isolation.lock() else {
+            return;
+        };
+        if *cur == now {
+            return;
+        }
+        println!("[network] egress: {}", now.label);
+        if now.refusal.is_some() {
+            println!("[network] Nothing is sent until egress is up: the kill switch is on.");
+        } else if now.label.starts_with("baseline") {
+            println!("[network] This node sends directly.");
+        }
+        *cur = now;
+    }
+
+    pub fn isolation(&self) -> Isolated {
+        self.isolation
+            .lock()
+            .map(|i| i.clone())
+            .unwrap_or_else(|_| Isolated {
+                label: String::new(),
+                refusal: Some("egress: refused (its state cannot be read)".into()),
+            })
+    }
+
+    /// Nothing is sent while isolated egress refuses.
+    fn isolation_allows(&self) -> Result<(), String> {
+        match self.isolation().refusal {
+            Some(why) => Err(why),
+            None => Ok(()),
+        }
     }
 
     pub fn current(&self) -> NodeEgress {
@@ -507,6 +583,7 @@ impl EgressState {
         data: &Value,
         f: &Fetch<'_>,
     ) -> Result<Option<Arc<Lease>>, String> {
+        self.isolation_allows()?;
         let want = Expect::read(&data["egress_expect"][node_id])?;
         let Some((id, upstream)) = self.decide(want.as_ref(), f).await? else {
             return Ok(None);
@@ -521,6 +598,7 @@ impl EgressState {
     /// its destination is vetted on the node as the platform vetted it: no private
     /// address.
     pub async fn for_bench(&self, cmd: &Value, f: &Fetch<'_>) -> Result<Option<Lease>, String> {
+        self.isolation_allows()?;
         let want = Expect::read(&cmd["egress_expect"])?;
         let Some((id, upstream)) = self.decide(want.as_ref(), f).await? else {
             return Ok(None);
@@ -621,6 +699,10 @@ impl EgressState {
         }
         if self.stale().is_some() {
             v["stale"] = json!(true);
+        }
+        let isolated = self.isolation();
+        if !isolated.label.is_empty() {
+            v["isolation"] = json!(isolated.label);
         }
         v
     }
@@ -725,7 +807,7 @@ async fn post_settings(f: &Fetch<'_>, mut body: Value) -> Result<Value, String> 
         .post(&url)
         .json(&body)
         .timeout(FETCH_TIMEOUT)
-        .send()
+        .send_api()
         .await
         .map_err(|e| format!("the request failed: {}", e.without_url()))?;
     let code = resp.status();
@@ -795,12 +877,21 @@ pub fn wrapper_refusal(engine: &str, first_line: &str) -> Option<String> {
     None
 }
 
-/// Whether the engine listening on `addr` sends a wrapped op through the proxy it names:
-/// `Some(true)` for an engine that reads egress version 1, `Some(false)` for one that
-/// does not (an engine older than the wrapper, or doorward, which reads the wrapper and
-/// sends nothing through a proxy), and `None` when it did not answer or its listener is
-/// not the engines' (see [`crate::ops::listener`]).
-pub async fn engine_reads_egress(addr: &str) -> Option<bool> {
+/// What an engine said when asked its capabilities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineAnswer {
+    /// Whether it sends a wrapped op through the proxy the wrapper names.
+    pub reads_egress: bool,
+    /// Which pacing it runs, as it said it (`module <version>` or `baseline (<why>)`):
+    /// None from an engine older than that, or a value that is not one short line.
+    pub pacing: Option<String>,
+}
+
+/// What the engine listening on `addr` answers when asked its capabilities: its one
+/// line, read, or `None` when it did not answer or its listener is not the engines' (see
+/// [`crate::ops::listener`]). The question is wrapped, with a direct egress, so it sends
+/// nothing anywhere.
+pub async fn engine_capabilities(addr: &str) -> Option<Value> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let probe = async {
         let s = crate::ops::listener::connect(addr).await.ok()?;
@@ -817,27 +908,45 @@ pub async fn engine_reads_egress(addr: &str) -> Option<bool> {
     let line = tokio::time::timeout(Duration::from_secs(2), probe)
         .await
         .ok()??;
-    let v: Value = serde_json::from_str(&line).ok()?;
-    if v["type"] == "capabilities" {
-        return Some(v["egress"].as_i64() == Some(SETTINGS_VERSION));
-    }
-    dguard::is_error(&line).then_some(false)
+    serde_json::from_str(&line).ok()
 }
 
-/// How long an engine's answer to [`engine_reads_egress`] stands. An engine replaced
+/// What the engine listening on `addr` says of itself: whether it sends a wrapped op
+/// through the proxy it names (true for an engine that reads egress version 1; false
+/// for one that does not, an engine older than the wrapper or doorward, which reads the
+/// wrapper and sends nothing through a proxy), and which pacing it runs. `None` when it
+/// did not answer or its listener is not the engines'.
+pub async fn engine_answer(addr: &str) -> Option<EngineAnswer> {
+    let v = engine_capabilities(addr).await?;
+    if v["type"] == "capabilities" {
+        let pacing = v["pacing"].as_str().filter(|p| {
+            !p.is_empty() && p.len() <= 120 && p.bytes().all(|b| (b' '..=b'~').contains(&b))
+        });
+        return Some(EngineAnswer {
+            reads_egress: v["egress"].as_i64() == Some(SETTINGS_VERSION),
+            pacing: pacing.map(str::to_string),
+        });
+    }
+    dguard::is_error(&v.to_string()).then_some(EngineAnswer {
+        reads_egress: false,
+        pacing: None,
+    })
+}
+
+/// How long an engine's answer to [`engine_answer`] stands. An engine replaced
 /// between two heartbeats (a package upgrade or downgrade, a restart by hand) is back on
 /// the same port before the next one, so the heartbeat never sees it stopped; asking
 /// again this often bounds how long it reports the previous engine's answer.
 pub const ENGINE_ASK_EVERY: Duration = Duration::from_secs(30);
 
-/// What each running engine answered when asked whether it reads the egress wrapper,
-/// and when, by engine id. The heartbeat reports it per engine.
+/// What each running engine answered when asked its capabilities, and when, by engine
+/// name. The heartbeat reports it per engine.
 #[derive(Default)]
-pub struct EngineEgress {
-    answers: std::collections::HashMap<String, (bool, Instant)>,
+pub struct EngineAnswers {
+    answers: std::collections::HashMap<String, (EngineAnswer, Instant)>,
 }
 
-impl EngineEgress {
+impl EngineAnswers {
     /// Whether `ext` is to be asked at `now`: it has not answered yet, or answered
     /// [`ENGINE_ASK_EVERY`] ago or longer.
     pub fn due(&self, ext: &str, now: Instant) -> bool {
@@ -847,10 +956,10 @@ impl EngineEgress {
     }
 
     /// Keep an engine's answer, or forget the old one when it gave none.
-    pub fn answered(&mut self, ext: String, reads: Option<bool>, now: Instant) {
-        match reads {
-            Some(r) => {
-                self.answers.insert(ext, (r, now));
+    pub fn answered(&mut self, ext: String, answer: Option<EngineAnswer>, now: Instant) {
+        match answer {
+            Some(a) => {
+                self.answers.insert(ext, (a, now));
             }
             None => {
                 self.answers.remove(&ext);
@@ -860,7 +969,12 @@ impl EngineEgress {
 
     /// Whether `ext` said it reads the wrapper. An engine that has not said so does not.
     pub fn reads(&self, ext: &str) -> bool {
-        self.answers.get(ext).is_some_and(|(r, _)| *r)
+        self.answers.get(ext).is_some_and(|(a, _)| a.reads_egress)
+    }
+
+    /// Which pacing `ext` said it runs, when it said.
+    pub fn pacing(&self, ext: &str) -> Option<&str> {
+        self.answers.get(ext).and_then(|(a, _)| a.pacing.as_deref())
     }
 
     /// Forget `ext`'s answer: it was stopped, installed or restarted.

@@ -1,0 +1,11 @@
+id: adobe-experience-manager
+info:
+  name: Adobe Experience Manager
+  category: CMS
+  metadata:
+    vendor: adobe
+    product: experience_manager
+implies: [java]
+detect:
+  any:
+    - html: { regex: '(?:src|href)="/etc\.clientlibs/' }

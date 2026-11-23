@@ -1,0 +1,10 @@
+id: ibm-http-server
+info:
+  name: IBM HTTP Server
+  category: Web Server
+  metadata:
+    vendor: ibm
+    product: http_server
+detect:
+  any:
+    - header: { name: server, regex: '^IBM_HTTP_Server' }

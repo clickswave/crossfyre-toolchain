@@ -1,8 +1,8 @@
 # Plessor templates
 
-The starter pack `plessor scan` runs on top of its built-in checks. The folder is
-compiled into the binary, so every installed copy has it. The format is a practical
-subset of the nuclei schema, so many existing nuclei templates work here unchanged.
+The templates `plessor scan` runs on top of its built-in checks. Each toolchain release
+compiles in a copy of this folder. The format is a practical subset of the nuclei
+schema, so many existing nuclei templates work here unchanged.
 
 The folder is read recursively, so the subdirectories below are just categories.
 
@@ -10,7 +10,6 @@ The folder is read recursively, so the subdirectories below are just categories.
 
 | Folder | What it holds |
 |---|---|
-| `technologies/` | Passive fingerprints for web tech, frameworks, servers, and CDNs (WordPress, Django, Laravel, Spring Boot, Jenkins, GitLab, Grafana, nginx, IIS, and so on). |
 | `exposures/` | Sensitive files left web-readable (.git/HEAD, .npmrc, .htpasswd, Dockerfile, docker-compose, Spring actuator env and heapdump, backups). |
 | `misconfigurations/` | Insecure defaults and exposed services (CORS reflection, open redirect, unauthenticated Elasticsearch, Docker registry, Kubernetes, Prometheus). |
 | `panels/` | Reachable admin and login consoles (Tomcat Manager, Adminer, Swagger UI, Keycloak, Portainer). |
@@ -18,14 +17,35 @@ The folder is read recursively, so the subdirectories below are just categories.
 | `vulnerabilities/` | Active probes for injection and logic flaws (SQLi, XXE, SSRF, command injection, reflected XSS, SSTI, CRLF, cloud-metadata SSRF, mass assignment, JWT alg:none). |
 | `cves/` | Specific known CVEs, detected without running a destructive payload. |
 
+Naming the technology a host runs is toolmark's job, from its own signatures in
+[`toolmark/`](../toolmark/), so there is no category for it here.
+
 ## Adding a template
 
-Drop a `.yaml` file into the category folder it fits, give it a unique `id`, and add
-a line for it to `src/template/pack.rs` (the tests name any file missing there). A
-template here ships in the next build; to run one before that, keep it in a folder
-of your own and pass `plessor scan <target> --templates <folder>`. A file that fails
-to parse, or uses a feature plessor does not support, is skipped without breaking
-the rest, and the test suite fails if one in this folder does.
+Drop a `.yaml` file into the category folder it fits and give it a unique `id`. It ships
+in the next toolchain release; to run one before that, keep it in a folder of your own
+and pass `plessor scan <target> --templates <folder>`. A file that fails to parse, or uses
+a feature plessor does not support, is skipped without breaking the rest.
+
+A template about one product names it in `info.metadata` the way toolmark's signature
+for it in [`toolmark/`](../toolmark/) names it, as `vendor` and `product`, not by an alias
+in [`mappings/aliases.yaml`](../mappings/aliases.yaml). Given what toolmark saw on a host,
+plessor runs such a template only where toolmark saw its product, and says which it held
+back; `--all-templates` runs them all. When the product cannot be seen from outside, as a
+library inside an application cannot, the template says `unseen: true` instead, and
+always runs. A template that finds the product itself, as a panel check does, names none,
+and always runs.
+
+Every push is checked the way plessor reads templates: each file parses, has a request,
+uses only the matchers below and patterns that compile, has an id no other file has, and
+names a product toolmark names. A CVE template can also name a container where its product
+is vulnerable and one where it is patched, and is then run against both; see
+[`labs/`](../labs/). To run the check before sending a change:
+
+```sh
+toolmark check toolmark --mappings mappings --names /tmp/names.txt
+plessor check plessor --known /tmp/names.txt
+```
 
 ## Writing good templates
 
@@ -60,5 +80,5 @@ Templates may use:
   the client.
 
 Extractors, matcher types or parts not in the lists above, and multi-document files
-are not loaded. `info.tags`, `info.metadata`, and `info.classification` are kept for
-readability and ignored when running.
+are not loaded. `info.tags`, `info.classification` and the rest of `info.metadata` are
+kept for readability and ignored when running.

@@ -1,0 +1,9 @@
+id: shopify
+info:
+  name: Shopify
+  category: Ecommerce
+detect:
+  any:
+    - header: { name: x-shopify-stage, regex: '.+' }
+    - header: { name: x-sorting-hat-shopid, regex: '.+' }
+    - html: { regex: '(?i)cdn\.shopify\.com' }

@@ -1,0 +1,18 @@
+id: jquery
+info:
+  name: jQuery
+  category: JavaScript Library
+  metadata:
+    vendor: jquery
+    product: jquery
+detect:
+  any:
+    - html: { regex: '(?i)jquery[.-]([0-9.]+)(?:\.min)?\.js|jQuery v[0-9.]+' }
+    - script_src: { regex: '(?i)(?:^|/)jquery(?:[.-][0-9]+(?:\.[0-9]+)*)?(?:\.min)?(?:\.[0-9a-f]{8,})?\.js(?:[?#]|$)' }
+version:
+  - html: { regex: '(?i)jquery[.-]([0-9]+(?:\.[0-9]+)*)|jQuery v([0-9]+(?:\.[0-9]+)*)' }
+  - script_src: { regex: '(?i)jquery[.-]([0-9]+(?:\.[0-9]+)+)(?:\.min)?(?:\.[0-9a-f]{8,})?\.js' }
+  - script_src: { regex: '(?i)jquery@([0-9]+(?:\.[0-9]+)+)/' }
+  - script_src: { regex: '(?i)/jquery/([0-9]+(?:\.[0-9]+)+)/jquery' }
+  - script_src: { regex: '(?i)(?:^|/)jquery(?:\.min)?\.js\?ver=([0-9]+(?:\.[0-9]+)+)' }
+  - script: { src: '(?i)(?:^|/)jquery(?:\.min)?\.js(?:[?#]|$)', regex: 'jQuery v([0-9]+(?:\.[0-9]+)*)' }

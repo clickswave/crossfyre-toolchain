@@ -3,8 +3,7 @@
 use super::{in_range, parse_args};
 use crate::core::{CallNote, Done, Intent, Mcp, Reason, Refusal, TrafficRequest};
 use crate::engine::{self, Line, event_type};
-use crate::findings::{self, Stamp};
-use crate::jobs::{self, JobMeta, NewJob};
+use crate::findings;
 use crate::peer::ClientPeer;
 use crate::{guard, redact, untrusted};
 use cfx_scope::Point;
@@ -53,14 +52,15 @@ pub(crate) async fn run(
     let mut conn = engine::connect(port)
         .await
         .map_err(|_| mcp.engine_down("toolmark", port))?;
-    mcp.require(
-        &mut conn,
-        "toolmark",
-        port,
-        "fingerprint",
-        &["resolve", "block_internal"],
-    )
-    .await?;
+    let pacing = mcp
+        .require(
+            &mut conn,
+            "toolmark",
+            port,
+            "fingerprint",
+            &["resolve", "block_internal"],
+        )
+        .await?;
     let clearance = mcp.confirm(pending, peer, None, note, ct).await?;
     if ct.is_cancelled() {
         return Err(cancelled());
@@ -71,6 +71,7 @@ pub(crate) async fn run(
     // Redirects off: toolmark would otherwise follow up to five hops this server
     // never sees, to wherever the target points them. A name is pinned to the address
     // the guard cleared, so toolmark does not look it up again and get another one.
+    // What this server says of the scan, which toolmark keeps with it.
     let op = json!({
         "operation": "fingerprint",
         "response": "stream",
@@ -79,21 +80,11 @@ pub(crate) async fn run(
         "resolve": clearance.pins(),
         "block_internal": clearance.block_internal(mcp.scope.allow_private),
         "timeout_ms": timeout * 1000,
+        "mcp": {"tool": "fingerprint", "process": mcp.session, "pid": std::process::id(),
+                "scope_sha256": mcp.scope.sha256},
     });
-    let mut meta = JobMeta::new(
-        &mcp.session,
-        NewJob {
-            tool: "fingerprint",
-            engine: "toolmark",
-            target: &dest.url,
-            endpoints: Vec::new(),
-            scope_sha256: mcp.scope.sha256.clone(),
-            cancellable: false,
-            test_writes: false,
-        },
-    );
-    let _ = mcp.jobs.write_meta(&meta);
-    note.set_scan(meta.id.clone());
+    // The id toolmark kept the scan as, from its ack, which the scan is read back by.
+    let mut scan_id: Option<String> = None;
 
     let (mut reader, _writer) = conn.start(&clearance, &op).await.map_err(|e| {
         Refusal::new(
@@ -108,11 +99,7 @@ pub(crate) async fn run(
     let mut finished = false;
     loop {
         let next = tokio::select! {
-            _ = ct.cancelled() => {
-                meta.finish(jobs::CANCELLED);
-                let _ = mcp.jobs.write_meta(&meta);
-                return Err(cancelled());
-            }
+            _ = ct.cancelled() => return Err(cancelled()),
             r = tokio::time::timeout_at(deadline, reader.next()) => r,
         };
         match next {
@@ -122,7 +109,14 @@ pub(crate) async fn run(
             }
             Ok(Err(_)) | Ok(Ok(None)) => break,
             Ok(Ok(Some(Line::Event(v)))) => match event_type(&v) {
-                "ack" => peer.progress(1.0, Some(3.0), "fetching the target").await,
+                "ack" => {
+                    if let Some(kept) = v.get("scan").and_then(|s| s.as_str()) {
+                        let id = crate::kept::scan_id("toolmark", kept);
+                        note.set_scan(id.clone());
+                        scan_id = Some(id);
+                    }
+                    peer.progress(1.0, Some(3.0), "fetching the target").await
+                }
                 "finding" => {
                     if events.len() < 500 {
                         events.push(v.get("data").cloned().unwrap_or(Value::Null));
@@ -154,9 +148,6 @@ pub(crate) async fn run(
                 "toolmark closed the connection before finishing".into()
             }
         });
-        meta.error = Some(why.clone());
-        meta.finish(jobs::FAILED);
-        let _ = mcp.jobs.write_meta(&meta);
         return Err(Refusal::new(
             Reason::EngineError,
             format!("toolmark reported: {why}"),
@@ -173,18 +164,38 @@ pub(crate) async fn run(
     let mut versions = Map::new();
     let mut evidence = Vec::new();
     let mut cve_leads = Vec::new();
-    let mut stored = Vec::new();
-    let mut seq = 0u64;
     for e in &events {
         let kind = e.get("type").and_then(|t| t.as_str()).unwrap_or("");
         let name = untrusted::clean(e.get("name").and_then(|n| n.as_str()).unwrap_or(""), 200);
         match kind {
             "technology" => {
+                // What refines it and could not be told apart from it.
+                let candidates: Vec<String> = e
+                    .get("candidates")
+                    .and_then(|c| c.as_array())
+                    .map(|c| {
+                        c.iter()
+                            .filter_map(|n| n.as_str())
+                            .take(20)
+                            .map(|n| untrusted::clean(n, 200))
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 technologies.push(json!({
                     "name": name,
                     "category": untrusted::clean(e.get("category").and_then(|c| c.as_str()).unwrap_or(""), 200),
                     "cpe": untrusted::clean(e.get("cpe").and_then(|c| c.as_str()).unwrap_or(""), 200),
                     "confidence": e.get("confidence").filter(|c| c.is_number()).cloned().unwrap_or(Value::Null),
+                    "candidates": candidates,
+                    "version_range": untrusted::sanitize_value(
+                        e.get("version_range").unwrap_or(&Value::Null),
+                        200,
+                        2,
+                    ),
+                    "distro": e
+                        .get("distro")
+                        .and_then(|d| d.as_str())
+                        .map(|d| untrusted::clean(d, 200)),
                 }));
                 if let Some(v) = e
                     .get("version")
@@ -195,13 +206,15 @@ pub(crate) async fn run(
                     truncated |= cut;
                     versions.insert(name.clone(), json!(v));
                 }
-                if let Some(ev) = e
-                    .get("evidence")
-                    .and_then(|v| v.as_str())
-                    .filter(|v| !v.is_empty())
-                    && evidence.len() < 20
-                {
-                    let (ev, cut) = shown(ev, 500);
+                // toolmark sends each piece of evidence as an item of a list.
+                let said: Vec<&str> = match e.get("evidence") {
+                    Some(Value::Array(items)) => items.iter().filter_map(|i| i.as_str()).collect(),
+                    Some(Value::String(s)) => vec![s.as_str()],
+                    _ => Vec::new(),
+                };
+                let said = said.join("; ");
+                if !said.is_empty() && evidence.len() < 20 {
+                    let (ev, cut) = shown(&said, 500);
                     truncated |= cut;
                     evidence.push(json!({"technology": name, "evidence": ev}));
                 }
@@ -216,29 +229,22 @@ pub(crate) async fn run(
                 let s = |k: &str| {
                     untrusted::clean(e.get(k).and_then(|v| v.as_str()).unwrap_or(""), 200)
                 };
+                let flag = |k: &str| e.get(k).and_then(Value::as_bool).unwrap_or(false);
                 cve_leads.push(json!({
                     "cve": s("cve"),
                     "severity": findings::severity(&s("severity")),
                     "cvss": num("cvss"),
+                    "kev": flag("kev"),
+                    "epss": num("epss"),
                     "product": s("product"),
                     "confidence": "version-inferred",
+                    "possible": flag("possible"),
+                    "backport": flag("backport"),
+                    "cve_data": s("cve_data"),
                     "reference": s("reference"),
                 }));
             }
             _ => continue,
-        }
-        seq += 1;
-        if let Some(f) = findings::from_toolmark(
-            e,
-            Stamp {
-                id: jobs::new_id("f"),
-                scan_id: &meta.id,
-                seq,
-                recorded_ms: jobs::now_ms(),
-            },
-        ) {
-            meta.count(f["severity"].as_str().unwrap_or("info"));
-            stored.push(f);
         }
     }
     let svc = service.cloned().unwrap_or(Value::Null);
@@ -267,18 +273,10 @@ pub(crate) async fn run(
         "truncated": truncated,
     });
 
-    if !stored.is_empty() {
-        let _ = mcp.jobs.append_findings(&meta.id, &stored);
-    }
-    meta.progress.done = 1;
-    meta.progress.total = 1;
-    meta.progress.phase = "done".into();
-    meta.finish(jobs::COMPLETED);
-    let _ = mcp.jobs.write_meta(&meta);
     peer.progress(3.0, Some(3.0), "done").await;
 
     let mut value = json!({
-        "scan_id": meta.id,
+        "scan_id": scan_id,
         "url": if redact { redact::redact_url(&dest.url) } else { dest.url.clone() },
         "status_code": status_code,
         "technologies": technologies,
@@ -296,9 +294,17 @@ pub(crate) async fn run(
         "technologies": value["technologies"].as_array().map(|a| a.len()),
         "cve_leads": value["cve_leads"].as_array().map(|a| a.len()),
     }));
+    // Which pacing toolmark runs, as it said before the scan was sent.
+    let paced = match &pacing {
+        Some(p) => {
+            value["pacing"] = json!(p);
+            format!(" pacing: {p}.")
+        }
+        None => String::new(),
+    };
     let summary = format!(
         "toolmark fingerprinted {}: HTTP {}, {} technologies, {} CVE leads (inferred from \
-         versions, so verify the build).",
+         versions, so verify the build).{paced}",
         untrusted::clean(&dest.origin(), 200),
         status_code
             .map(|s| s.to_string())

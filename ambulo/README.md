@@ -1,7 +1,5 @@
 # ambulo
 
-Formerly `mach`, renamed in 0.1.31.
-
 Content discovery and HTTP fuzzing. Point it at a URL with a `FUZZ` marker and a
 wordlist, and it walks the list looking for paths that exist. There is a live TUI so
 you can watch hits come in, and the run is written to a local database as it goes, so
@@ -13,13 +11,13 @@ Part of the [Crossfyre toolchain](../). Works on its own; no account needed.
 
 ```sh
 # fuzz a path. ::FUZZ:: is where each wordlist entry gets substituted
-ambulo scan --url https://example.com/::FUZZ:: --wordlist-path ./words.txt
+ambulo scan https://example.com/::FUZZ:: --wordlist-path ./words.txt
 
 # tune concurrency and pacing
-ambulo scan -u https://example.com/::FUZZ:: -w ./words.txt --tasks 40 --interval 20
+ambulo scan https://example.com/::FUZZ:: -w ./words.txt --tasks 40 --interval 20
 
 # only treat these as hits
-ambulo scan -u https://example.com/::FUZZ:: -w ./words.txt --success-status-codes 200,204,301,403
+ambulo scan https://example.com/::FUZZ:: -w ./words.txt --success-status-codes 200,204,301,403
 ```
 
 A stopped scan resumes by default. Use `--fresh-start` if you want to ignore prior
@@ -36,7 +34,18 @@ ambulo exec '{"url":"https://example.com/robots.txt","success_codes":[200],"meth
 The dashboard is on by default when stdout is a terminal, and off when it is
 not, so piping or redirecting a scan gives you the daemon's newline-delimited
 JSON rather than escape sequences. `--no-tui` forces the JSON path even in a
-terminal, and `--tui` is accepted for symmetry with the other engines.
+terminal.
+
+## How it runs
+
+The scans run in ambulo's daemon, on 127.0.0.1:4441, and the commands here are its
+clients. The first command starts the daemon when none is running, and a daemon
+started that way exits after 30 minutes with no client and no scan. `ambulo daemon`
+runs one by hand, and `--no-autostart` turns the starting off. It keeps each scan's
+state in PostgreSQL, and the first daemon makes the database, so install PostgreSQL's
+programs before the first scan (`sudo apt install postgresql` on Debian, Ubuntu or
+Kali), or point it at a database you run with `crossfyre db external`. The root
+[README](../#how-the-engines-run) has the details.
 
 ## Handy flags
 
@@ -47,9 +56,8 @@ terminal, and `--tui` is accepted for symmetry with the other engines.
 - `--headers` / `--cookies` / `--basic-auth` send auth or custom headers
 - `--follow-redirects` and `--follow-redirects-depth`
 - `--random-user-agent-request` rotate the UA per request
-- `--save-response-body` keep bodies for later inspection
 
-Run `ambulo scan --help` for the full list. Stored runs live under `ambulo db`.
+Run `ambulo scan --help` for the full list. `ambulo scans` lists the scans it keeps, the latest first, and Enter on a stopped one takes it up again. A scan given credentials keeps none of them, so it is taken up by asking for it as it was first asked for, with `--resume ID`. `ambulo db reset` deletes every stored run, and `ambulo db purge --scan ID` one of them.
 
 ## Notes
 

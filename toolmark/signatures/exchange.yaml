@@ -1,0 +1,15 @@
+id: exchange
+info:
+  name: Microsoft Exchange Server
+  category: Mail Server
+  metadata:
+    vendor: microsoft
+    product: exchange_server
+implies: [iis, aspnet]
+detect:
+  any:
+    - header: { name: x-owa-version, regex: '.' }
+    - html: { regex: '(?:src|href)="/owa/auth/' }
+version:
+  - header: { name: x-owa-version, regex: '^([0-9]+(?:\.[0-9]+)*)' }
+  - html: { regex: '(?:src|href)="/owa/auth/([0-9]+(?:\.[0-9]+)+)/' }

@@ -91,7 +91,6 @@ pub struct Governor {
     shutdown: Notify,
 }
 
-const WINDOW: Duration = Duration::from_millis(congestion::WINDOW_MS);
 const NO_RTT: u64 = u64::MAX;
 
 impl Governor {
@@ -183,12 +182,13 @@ impl Governor {
     /// the policy is unit-testable without real time or sockets.
     pub async fn run<F: Fn(Telemetry)>(self: Arc<Self>, on_tick: F) {
         let mut est = Estimator::warmup(self.timeout_ms.load(Ordering::Relaxed));
+        let window = Duration::from_millis(congestion::window_ms());
 
         loop {
             // Either a periodic tick, or a shutdown that flushes one final
             // snapshot (so even a sub-window scan surfaces its closing state).
             let shutting = tokio::select! {
-                _ = tokio::time::sleep(WINDOW) => false,
+                _ = tokio::time::sleep(window) => false,
                 _ = self.shutdown.notified() => true,
             };
 
@@ -228,7 +228,7 @@ impl Governor {
                 min_rtt_ms: (min_rtt.unwrap_or(est.srtt_us) / 1000.0).round() as u64,
                 loss_pct: ((w.lost as f64 / w.sent as f64) * 100.0).round() as u64,
                 recovered: w.recovered,
-                goodput: (w.sent as f64 / WINDOW.as_secs_f64()).round() as u64,
+                goodput: (w.sent as f64 / window.as_secs_f64()).round() as u64,
                 phase: if est.warmup { "calibrate" } else { "adapt" },
             });
 

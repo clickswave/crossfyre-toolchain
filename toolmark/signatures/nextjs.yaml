@@ -1,0 +1,14 @@
+id: nextjs
+info:
+  name: Next.js
+  category: JavaScript Framework
+  metadata:
+    vendor: vercel
+    product: next.js
+implies: [react, nodejs]
+detect:
+  any:
+    - header: { name: x-powered-by, regex: '(?i)next\.js' }
+    - html: { regex: '(?i)/_next/|__NEXT_DATA__' }
+version:
+  - html: { regex: '(?i)next\.js\s*([0-9.]+)' }

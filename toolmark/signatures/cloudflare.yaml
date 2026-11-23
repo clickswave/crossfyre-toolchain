@@ -1,0 +1,8 @@
+id: cloudflare
+info:
+  name: Cloudflare
+  category: CDN
+detect:
+  any:
+    - header: { name: server, regex: '(?i)cloudflare' }
+    - header: { name: cf-ray, regex: '.+' }

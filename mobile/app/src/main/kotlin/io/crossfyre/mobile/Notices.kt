@@ -76,8 +76,15 @@ fun listNotice(p: Problem, host: String): Notice = when (listTrouble(p)) {
     ListTrouble.OTHER -> Notice(Level.DANGER, "Couldn't load your workspaces.", p.text)
 }
 
+/** What a private account's phone says when asked to pair or capture. */
+fun policyNotice(): Notice = Notice(
+    Level.WARN, "This account is private.",
+    "Its tools send nothing about targets to Crossfyre, so this phone doesn't pair or capture. Change it in account settings, or with crossfyre policy set connected.",
+)
+
 /** What pairing with the chosen workspace says when the server refuses it. */
 fun pairNotice(p: Problem, host: String): Notice = when {
+    reasonOf(p) == Refusal.POLICY_PRIVATE -> policyNotice()
     reasonOf(p) == Refusal.WORKSPACE_ARCHIVED -> Notice(Level.DANGER, "This workspace is archived.", "Restore it in the dashboard, or pick another workspace.")
     reasonOf(p) == Refusal.WORKSPACE_SUSPENDED -> Notice(
         Level.DANGER, "This workspace is suspended.",

@@ -1,0 +1,22 @@
+# Synthetic: An ASP.NET Web Forms page on IIS 10, with the version headers IIS sends by default.
+HTTP/1.1 200 OK
+cache-control: private
+content-type: text/html; charset=utf-8
+server: Microsoft-IIS/10.0
+x-aspnet-version: 4.0.30319
+set-cookie: ASP.NET_SessionId=
+x-powered-by: ASP.NET
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Sign in</title>
+</head>
+<body>
+<form method="post" action="./Login.aspx" id="form1">
+<input type="hidden" name="__VIEWSTATE" id="__VIEWSTATE" value="" />
+</form>
+</body>
+</html>

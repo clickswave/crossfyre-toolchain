@@ -1,0 +1,17 @@
+# Synthetic: A page loading its own copy of jQuery under a name with no version. The
+# file itself, in jquery-unversioned/, carries the version in its banner.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Portal</title>
+<script src="/static/js/jquery.min.js"></script>
+</head>
+<body>
+<div id="portal"></div>
+</body>
+</html>

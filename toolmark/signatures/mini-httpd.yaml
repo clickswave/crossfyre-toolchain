@@ -1,0 +1,12 @@
+id: mini-httpd
+info:
+  name: mini_httpd
+  category: Web Server
+  metadata:
+    vendor: acme
+    product: mini_httpd
+detect:
+  any:
+    - header: { name: server, regex: '^mini_httpd' }
+version:
+  - header: { name: server, regex: '^mini_httpd/([0-9]+(?:\.[0-9]+)*)' }

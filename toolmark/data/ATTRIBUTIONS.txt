@@ -1,0 +1,49 @@
+The known-exploited snapshot in cve-known-exploited.json.gz, the CVEs on CISA's list cut
+from the CVE dataset 4 made 2026-11-21T05:16:53Z, is compiled by Clickswave from the
+sources below, each used under its own terms. Version ranges are normalised into the
+dataset's own format.
+
+CVE
+  Copyright (c) 1999-2026, The MITRE Corporation. CVE and the CVE logo are registered
+  trademarks of The MITRE Corporation. https://www.cve.org
+
+  CVE Usage: MITRE hereby grants you a perpetual, worldwide, non-exclusive, no-charge,
+  royalty-free, irrevocable copyright license to reproduce, prepare derivative works of,
+  publicly display, publicly perform, sublicense, and distribute Common Vulnerabilities and
+  Exposures (CVE). Any copy you make for such purposes is authorized provided that you
+  reproduce MITRE's copyright designation and this license in any such copy.
+
+NVD
+  This product uses data from the NVD API but is not endorsed or certified by the NVD.
+  https://nvd.nist.gov
+
+CISA Known Exploited Vulnerabilities Catalog
+  https://www.cisa.gov/known-exploited-vulnerabilities-catalog, distributed under the
+  Creative Commons 0 1.0 licence.
+
+EPSS
+  Exploit Prediction Scoring System scores from FIRST, https://www.first.org/epss/
+  Jacobs, J., Romanosky, S., Edwards, B., Roytman, M., Adjerid, I. (2021). Exploit
+  Prediction Scoring System (EPSS). Digital Threats: Research and Practice, 2(3).
+
+GitHub Advisory Database
+  Advisories from the GitHub Advisory Database, https://github.com/github/advisory-database,
+  as published by OSV, https://osv.dev, licensed under Creative Commons Attribution 4.0
+  International, https://creativecommons.org/licenses/by/4.0/. Changed: version ranges
+  are normalised into this dataset's format.
+
+Version maps (versions.yaml)
+  Exchange Server's builds, from Microsoft's "Exchange Server build numbers and release
+  dates", https://learn.microsoft.com/en-us/exchange/new-features/build-numbers-and-release-dates
+
+  The versions of Erlang/OTP's ssh application in each OTP release, from
+  otp_versions.table in Erlang/OTP, https://github.com/erlang/otp. Copyright Ericsson AB.
+  Licensed under the Apache License, Version 2.0,
+  https://www.apache.org/licenses/LICENSE-2.0. Changed: read into the first OTP release
+  that shipped each ssh version.
+
+NetScaler builds by stamp (netscaler-stamps.csv)
+  From the version table in scan-citrix-netscaler-version.py by Fox-IT,
+  https://github.com/fox-it/citrix-netscaler-triage. Licensed under the Apache License,
+  Version 2.0, https://www.apache.org/licenses/LICENSE-2.0. Changed: the stamps whose
+  build it does not know are left out.

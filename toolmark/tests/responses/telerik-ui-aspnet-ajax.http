@@ -1,0 +1,21 @@
+# Synthetic: An ASP.NET page with Telerik's controls, which loads their scripts through
+# the WebResource handler, the assembly's version in the URL.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+server: Microsoft-IIS/10.0
+x-aspnet-version: 4.0.30319
+x-powered-by: ASP.NET
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Customer Portal</title>
+</head>
+<body>
+<form method="post" action="./Default.aspx" id="form1">
+<script src="/Telerik.Web.UI.WebResource.axd?_TSM_HiddenField_=RadScriptManager1_TSM&amp;compress=1&amp;_TSM_CombinedScripts_=%3b%3bSystem.Web.Extensions%2c+Version%3d4.0.0.0%2c+Culture%3dneutral%2c+PublicKeyToken%3d31bf3856ad364e35%3aen-US%3a0d787d5c-3903-4814-ad72-296cea810318%3aea597d4b%3ab25378d2%3bTelerik.Web.UI%2c+Version%3d2019.3.1023.45%2c+Culture%3dneutral%2c+PublicKeyToken%3d121fae78165ba3d4%3aen-US%3a3d3ecc3e-2bd4-4e14-9fa3-eb4f6ba8b3c5%3a16e4e7cd%3af7645509" type="text/javascript"></script>
+</form>
+</body>
+</html>

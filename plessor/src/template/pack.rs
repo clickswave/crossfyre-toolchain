@@ -55,10 +55,6 @@ pub(super) static PACK_YAML: &[(&str, &str)] = &[
         include_str!("../../templates/cves/CVE-2021-44228-log4shell.yaml"),
     ),
     (
-        "cves/CVE-2023-38646-metabase-token.yaml",
-        include_str!("../../templates/cves/CVE-2023-38646-metabase-token.yaml"),
-    ),
-    (
         "cves/langflow-instance-exposed.yaml",
         include_str!("../../templates/cves/langflow-instance-exposed.yaml"),
     ),
@@ -175,6 +171,10 @@ pub(super) static PACK_YAML: &[(&str, &str)] = &[
         include_str!("../../templates/misconfigurations/kubernetes-api-anonymous.yaml"),
     ),
     (
+        "misconfigurations/metabase-setup-open.yaml",
+        include_str!("../../templates/misconfigurations/metabase-setup-open.yaml"),
+    ),
+    (
         "misconfigurations/nginx-default-page.yaml",
         include_str!("../../templates/misconfigurations/nginx-default-page.yaml"),
     ),
@@ -225,126 +225,6 @@ pub(super) static PACK_YAML: &[(&str, &str)] = &[
     (
         "panels/webmin.yaml",
         include_str!("../../templates/panels/webmin.yaml"),
-    ),
-    (
-        "technologies/apache-httpd.yaml",
-        include_str!("../../templates/technologies/apache-httpd.yaml"),
-    ),
-    (
-        "technologies/aspnet.yaml",
-        include_str!("../../templates/technologies/aspnet.yaml"),
-    ),
-    (
-        "technologies/cloudflare.yaml",
-        include_str!("../../templates/technologies/cloudflare.yaml"),
-    ),
-    (
-        "technologies/consul.yaml",
-        include_str!("../../templates/technologies/consul.yaml"),
-    ),
-    (
-        "technologies/django.yaml",
-        include_str!("../../templates/technologies/django.yaml"),
-    ),
-    (
-        "technologies/drupal.yaml",
-        include_str!("../../templates/technologies/drupal.yaml"),
-    ),
-    (
-        "technologies/express.yaml",
-        include_str!("../../templates/technologies/express.yaml"),
-    ),
-    (
-        "technologies/flask.yaml",
-        include_str!("../../templates/technologies/flask.yaml"),
-    ),
-    (
-        "technologies/gitlab.yaml",
-        include_str!("../../templates/technologies/gitlab.yaml"),
-    ),
-    (
-        "technologies/grafana.yaml",
-        include_str!("../../templates/technologies/grafana.yaml"),
-    ),
-    (
-        "technologies/harbor.yaml",
-        include_str!("../../templates/technologies/harbor.yaml"),
-    ),
-    (
-        "technologies/iis.yaml",
-        include_str!("../../templates/technologies/iis.yaml"),
-    ),
-    (
-        "technologies/jenkins.yaml",
-        include_str!("../../templates/technologies/jenkins.yaml"),
-    ),
-    (
-        "technologies/joomla.yaml",
-        include_str!("../../templates/technologies/joomla.yaml"),
-    ),
-    (
-        "technologies/kibana.yaml",
-        include_str!("../../templates/technologies/kibana.yaml"),
-    ),
-    (
-        "technologies/laravel.yaml",
-        include_str!("../../templates/technologies/laravel.yaml"),
-    ),
-    (
-        "technologies/magento.yaml",
-        include_str!("../../templates/technologies/magento.yaml"),
-    ),
-    (
-        "technologies/minio.yaml",
-        include_str!("../../templates/technologies/minio.yaml"),
-    ),
-    (
-        "technologies/nextjs.yaml",
-        include_str!("../../templates/technologies/nextjs.yaml"),
-    ),
-    (
-        "technologies/nginx.yaml",
-        include_str!("../../templates/technologies/nginx.yaml"),
-    ),
-    (
-        "technologies/phpmyadmin.yaml",
-        include_str!("../../templates/technologies/phpmyadmin.yaml"),
-    ),
-    (
-        "technologies/rails.yaml",
-        include_str!("../../templates/technologies/rails.yaml"),
-    ),
-    (
-        "technologies/sentry.yaml",
-        include_str!("../../templates/technologies/sentry.yaml"),
-    ),
-    (
-        "technologies/sonarqube.yaml",
-        include_str!("../../templates/technologies/sonarqube.yaml"),
-    ),
-    (
-        "technologies/spring-boot.yaml",
-        include_str!("../../templates/technologies/spring-boot.yaml"),
-    ),
-    (
-        "technologies/symfony.yaml",
-        include_str!("../../templates/technologies/symfony.yaml"),
-    ),
-    (
-        "technologies/tomcat.yaml",
-        include_str!("../../templates/technologies/tomcat.yaml"),
-    ),
-    (
-        "technologies/vault.yaml",
-        include_str!("../../templates/technologies/vault.yaml"),
-    ),
-    (
-        "technologies/wordpress.yaml",
-        include_str!("../../templates/technologies/wordpress.yaml"),
-    ),
-    (
-        "technologies/zabbix.yaml",
-        include_str!("../../templates/technologies/zabbix.yaml"),
     ),
     (
         "vulnerabilities/cloud-metadata-gcp-azure.yaml",

@@ -1,0 +1,20 @@
+# Synthetic: A Rails application with the default session cookie name and the CSRF meta tags
+# Rails layouts print.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+x-request-id: 00000000-0000-0000-0000-000000000000
+x-runtime: 0.012000
+set-cookie: _session_id=
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Store</title>
+<meta name="csrf-param" content="authenticity_token" />
+<meta name="csrf-token" content="" />
+</head>
+<body>
+<div id="store"></div>
+</body>
+</html>

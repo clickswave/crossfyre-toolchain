@@ -1,0 +1,12 @@
+id: backbone
+info:
+  name: Backbone.js
+  category: JavaScript Library
+  metadata:
+    vendor: backbone_project
+    product: backbone
+detect:
+  any:
+    - script_src: { regex: '/backbone(?:-min|\.min)?\.js' }
+version:
+  - script_src: { regex: '(?:backbone\.js/|backbone@)([0-9]+\.[0-9]+\.[0-9]+)' }

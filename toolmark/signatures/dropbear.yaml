@@ -1,0 +1,12 @@
+id: dropbear
+info:
+  name: Dropbear SSH
+  category: SSH Server
+  metadata:
+    vendor: dropbear_ssh_project
+    product: dropbear_ssh
+detect:
+  any:
+    - banner: { name: ssh, regex: '-dropbear' }
+version:
+  - banner: { name: ssh, regex: '-dropbear_([0-9]+\.[0-9]+(?:\.[0-9]+)?)' }

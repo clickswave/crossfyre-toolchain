@@ -1,0 +1,16 @@
+# Synthetic: A Next.js page whose footer says which version built it.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Docs</title>
+<link rel="stylesheet" href="/_next/static/css/app.css" />
+</head>
+<body>
+<footer>Built with Next.js 14.0.4</footer>
+</body>
+</html>

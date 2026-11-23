@@ -1,0 +1,12 @@
+id: thttpd
+info:
+  name: thttpd
+  category: Web Server
+  metadata:
+    vendor: acme
+    product: thttpd
+detect:
+  any:
+    - header: { name: server, regex: '^thttpd' }
+version:
+  - header: { name: server, regex: '^thttpd/([0-9]+(?:\.[0-9]+)*)' }

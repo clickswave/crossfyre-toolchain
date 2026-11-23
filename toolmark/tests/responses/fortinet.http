@@ -1,0 +1,17 @@
+# Synthetic: A page from a Fortinet appliance, with the server name FortiOS and
+# FortiProxy send.
+HTTP/1.1 200 OK
+content-type: text/html;charset=UTF-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+server: xxxxxxxx-xxxxx
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Please Login</title>
+</head>
+<body>
+<form method="post"></form>
+</body>
+</html>

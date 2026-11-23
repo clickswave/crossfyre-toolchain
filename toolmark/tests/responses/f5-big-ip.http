@@ -1,0 +1,16 @@
+# Synthetic: An application behind an F5 BIG-IP load balancer, which sets its pool cookie.
+HTTP/1.1 200 OK
+content-type: text/html;charset=UTF-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+set-cookie: BIGipServerpool_web=
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Portal</title>
+</head>
+<body>
+<div id="portal"></div>
+</body>
+</html>

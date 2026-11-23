@@ -8,7 +8,7 @@
 //!
 //! This is the PUBLIC baseline. It recognises only the obvious, well-documented
 //! signatures and reacts conservatively (no broker escalation). The tuned
-//! signature set, edge scoring, and thresholds live in the private drop-in:
+//! signature set, edge scoring, and thresholds live in the pacing module:
 //! challenge detection is adversarially sensitive, so a WAF vendor reading the
 //! open toolchain must not be able to enumerate exactly what we key on.
 
@@ -75,6 +75,9 @@ pub fn detect(
     if status == 429 {
         return Challenge::RateLimited;
     }
+    if let Some(c) = from_module(status, &header, body_prefix) {
+        return c;
+    }
 
     let body = body_prefix.to_ascii_lowercase();
 
@@ -97,7 +100,7 @@ pub fn detect(
     }
 
     // A bare 403/503 from a known edge is suspicious but not conclusive; the
-    // private drop-in scores those. The baseline stays conservative.
+    // pacing module scores those. The baseline stays conservative.
     Challenge::None
 }
 
@@ -107,6 +110,11 @@ pub fn detect(
 /// Baseline policy: backoff with identity rotation for the first tries, then give
 /// up. The broker is never invoked here (it is a private, paid escalation).
 pub fn react(challenge: Challenge, attempt: u32) -> Reaction {
+    if challenge.is_challenge()
+        && let Some(r) = react_from_module(challenge, attempt)
+    {
+        return r;
+    }
     match challenge {
         Challenge::None => Reaction::Proceed,
         Challenge::RateLimited => {
@@ -129,6 +137,124 @@ pub fn react(challenge: Challenge, attempt: u32) -> Reaction {
                 }
             }
         }
+    }
+}
+
+/// What a module looks for in a response: header names, and strings in the
+/// lowercased body.
+#[derive(Clone)]
+struct Looks {
+    headers: Vec<String>,
+    markers: Vec<String>,
+}
+
+/// The installed module's verdict. The module says once which headers and body
+/// strings it reads; the body is searched for those here, and the module decides
+/// from the status, those headers' values, which strings were found and the body's
+/// trimmed length. None without a module or a readable answer.
+fn from_module(
+    status: u16,
+    header: &impl Fn(&str) -> Option<String>,
+    body_prefix: &str,
+) -> Option<Challenge> {
+    use std::collections::BTreeMap;
+    #[derive(serde::Deserialize)]
+    struct LooksAnswer {
+        headers: Vec<String>,
+        markers: Vec<String>,
+    }
+    #[derive(serde::Serialize)]
+    struct Ask<'a> {
+        status: u16,
+        headers: BTreeMap<&'a str, String>,
+        found: Vec<usize>,
+        body_len: usize,
+    }
+    #[derive(serde::Deserialize)]
+    struct Answer {
+        challenge: String,
+    }
+    static LOOKS: std::sync::OnceLock<Option<Looks>> = std::sync::OnceLock::new();
+    let looks = crate::backend::ask_once(&LOOKS, "challenge.markers", &(), |a: LooksAnswer| {
+        let fits = a.headers.len() <= 32
+            && a.markers.len() <= 64
+            && a.headers.iter().all(|h| crate::backend::is_header_name(h))
+            && a.markers.iter().all(|m| !m.is_empty() && m.len() <= 128);
+        fits.then(|| Looks {
+            headers: a.headers.iter().map(|h| h.to_ascii_lowercase()).collect(),
+            markers: a.markers.iter().map(|m| m.to_ascii_lowercase()).collect(),
+        })
+    })?;
+    let body = body_prefix.to_ascii_lowercase();
+    let ask = Ask {
+        status,
+        headers: looks
+            .headers
+            .iter()
+            .filter_map(|h| header(h).map(|v| (h.as_str(), v)))
+            .collect(),
+        found: (0..looks.markers.len())
+            .filter(|&i| body.contains(looks.markers[i].as_str()))
+            .collect(),
+        body_len: body.trim().len(),
+    };
+    let a: Answer = crate::backend::ask("challenge.detect", &ask)?;
+    [
+        Challenge::None,
+        Challenge::Interactive,
+        Challenge::Blocked,
+        Challenge::RateLimited,
+    ]
+    .into_iter()
+    .find(|c| c.label() == a.challenge)
+}
+
+/// The most challenges one target may see before a module's reaction becomes
+/// [`Reaction::Abort`], so no module can keep an engine retrying a target that
+/// refuses it.
+const MOST_ATTEMPTS: u32 = 8;
+
+/// The longest backoff a module may ask for.
+const LONGEST_BACKOFF_MS: u64 = 300_000;
+
+/// The installed module's reaction, held to [`MOST_ATTEMPTS`] and
+/// [`LONGEST_BACKOFF_MS`]. None without a module or a readable answer.
+fn react_from_module(challenge: Challenge, attempt: u32) -> Option<Reaction> {
+    #[derive(serde::Serialize)]
+    struct Ask {
+        challenge: &'static str,
+        attempt: u32,
+    }
+    #[derive(serde::Deserialize)]
+    struct Answer {
+        reaction: String,
+        #[serde(default)]
+        delay_ms: u64,
+        #[serde(default)]
+        rotate_identity: bool,
+    }
+    if !crate::backend::installed() {
+        return None;
+    }
+    if attempt >= MOST_ATTEMPTS {
+        return Some(Reaction::Abort);
+    }
+    let a: Answer = crate::backend::ask(
+        "challenge.react",
+        &Ask {
+            challenge: challenge.label(),
+            attempt,
+        },
+    )?;
+    match a.reaction.as_str() {
+        "proceed" => Some(Reaction::Proceed),
+        "backoff" => Some(Reaction::Backoff {
+            delay_ms: a.delay_ms.min(LONGEST_BACKOFF_MS),
+            rotate_identity: a.rotate_identity,
+        }),
+        "broker" => Some(Reaction::Broker),
+        "abort" => Some(Reaction::Abort),
+        _ => None,
     }
 }
 

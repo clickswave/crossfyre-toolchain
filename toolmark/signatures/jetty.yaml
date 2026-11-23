@@ -1,0 +1,10 @@
+id: jetty
+info:
+  name: Jetty
+  category: Web Server
+implies: [java]
+detect:
+  any:
+    - header: { name: server, regex: '(?i)jetty' }
+version:
+  - header: { name: server, regex: '(?i)jetty\(?([0-9]+(?:\.[0-9]+)*)' }

@@ -2,7 +2,7 @@
 //!
 //! Open baseline. Keeps the public shape (which classes are retryable, a per-
 //! probe ceiling, an exponential backoff) with simple, untuned defaults. The
-//! tuned policy is in the private drop-in.
+//! tuned policy is in the pacing module.
 
 use crate::health::{HealthStats, ProbeClass};
 use crate::rate::Posture;
@@ -77,9 +77,11 @@ impl ResilienceController {
         health_score: f64,
         retry_after_ms: Option<u64>,
     ) -> RetryDecision {
-        let _ = stats;
         if !Self::retryable(class) {
             return RetryDecision::no();
+        }
+        if let Some(d) = self.module_decision(class, attempt, stats, health_score, retry_after_ms) {
+            return d;
         }
         // Honour an explicit Retry-After with at least one retry.
         let floor = if retry_after_ms.is_some() { 1 } else { 0 };
@@ -99,12 +101,78 @@ impl ResilienceController {
         }
     }
 
+    /// The installed module's decision, held to the ceiling and to the backoff's
+    /// bounds: never sooner than `Retry-After`, or the base backoff without one, and
+    /// never later than the maximum. None without a module or a readable answer.
+    fn module_decision(
+        &self,
+        class: ProbeClass,
+        attempt: u32,
+        stats: &HealthStats,
+        health_score: f64,
+        retry_after_ms: Option<u64>,
+    ) -> Option<RetryDecision> {
+        #[derive(serde::Serialize)]
+        struct Ask<'a> {
+            posture: Posture,
+            ceiling: u32,
+            base_backoff_ms: u64,
+            max_backoff_ms: u64,
+            class: &'static str,
+            attempt: u32,
+            stats: &'a HealthStats,
+            health_score: f64,
+            retry_after_ms: Option<u64>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Answer {
+            retry: bool,
+            backoff_ms: u64,
+        }
+        let a: Answer = crate::backend::ask(
+            "resilience.decide",
+            &Ask {
+                posture: self.posture,
+                ceiling: self.ceiling,
+                base_backoff_ms: self.base_backoff_ms,
+                max_backoff_ms: self.max_backoff_ms,
+                class: class_name(class),
+                attempt,
+                stats,
+                health_score,
+                retry_after_ms,
+            },
+        )?;
+        if !a.retry || attempt >= self.ceiling {
+            return Some(RetryDecision::no());
+        }
+        let soonest = retry_after_ms
+            .unwrap_or(self.base_backoff_ms)
+            .min(self.max_backoff_ms);
+        Some(RetryDecision {
+            retry: true,
+            backoff_ms: a.backoff_ms.clamp(soonest, self.max_backoff_ms),
+        })
+    }
+
     fn exp_backoff(&self, attempt: u32, health_score: f64) -> u64 {
         let mult = 1u64 << attempt.min(5);
         let stress = if health_score < 0.5 { 2 } else { 1 };
         self.base_backoff_ms
             .saturating_mul(mult)
             .saturating_mul(stress)
+    }
+}
+
+/// A probe class as a module is told it.
+fn class_name(class: ProbeClass) -> &'static str {
+    match class {
+        ProbeClass::Success => "success",
+        ProbeClass::NotFound => "not_found",
+        ProbeClass::RateLimited => "rate_limited",
+        ProbeClass::ServerError => "server_error",
+        ProbeClass::Timeout => "timeout",
+        ProbeClass::ConnError => "conn_error",
     }
 }
 

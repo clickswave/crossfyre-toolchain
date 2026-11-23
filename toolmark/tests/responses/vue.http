@@ -1,0 +1,15 @@
+# Synthetic: A prerendered Vue page with scoped style attributes.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>App</title>
+</head>
+<body>
+<div data-v-7ba5bd90 class="home"></div>
+</body>
+</html>

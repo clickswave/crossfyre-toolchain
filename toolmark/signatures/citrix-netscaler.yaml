@@ -1,0 +1,15 @@
+id: citrix-netscaler
+info:
+  name: Citrix NetScaler
+  category: Load Balancer
+  metadata:
+    vendor: citrix
+    product: [netscaler_application_delivery_controller, netscaler_gateway]
+detect:
+  any:
+    - cookie: { name: '^NSC_' }
+    - html: { regex: '(?i)<title>\s*(?:Citrix|NetScaler) Gateway\s*</title>' }
+version:
+  # The build, by the time in the gzip header of a file every build ships, which
+  # Fox-IT's table names (toolmark/data/netscaler-stamps.csv).
+  - path: { path: /vpn/js/rdx/core/lang/rdx_en.json.gz, stamp: netscaler }

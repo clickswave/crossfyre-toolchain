@@ -1,4 +1,3 @@
-#![allow(dead_code, unused_imports, unused_variables, unused_mut)]
 use clap::Subcommand;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -7,12 +6,15 @@ use std::sync::{Arc, OnceLock};
 use sysinfo::System;
 use tokio::sync::Semaphore;
 
+pub mod api;
 pub mod auth;
 pub mod creds;
 mod egress;
 pub mod executor;
+mod init_summary;
 pub mod oast;
 mod ops;
+pub mod policy;
 
 /// Connecting to an engine on its loopback port, for the helpers that talk to engines
 /// themselves: a listener the engines' account does not own is refused before anything
@@ -25,6 +27,7 @@ pub mod engine_link {
 pub mod os;
 pub mod toolchain;
 
+use api::SendApi;
 use toolchain::sudo_user::chown_to_invoking_user;
 
 /// Per-workflow metrics so we can log a real-time snapshot ("2 in flight,
@@ -33,7 +36,6 @@ use toolchain::sudo_user::chown_to_invoking_user;
 pub struct WorkflowMetrics {
     in_flight: std::sync::atomic::AtomicUsize,
     completed: std::sync::atomic::AtomicUsize,
-    errored: std::sync::atomic::AtomicUsize,
 }
 
 static WORKFLOW_METRICS: OnceLock<
@@ -49,31 +51,23 @@ pub fn workflow_metrics(workflow_id: &str) -> Arc<WorkflowMetrics> {
             Arc::new(WorkflowMetrics {
                 in_flight: 0.into(),
                 completed: 0.into(),
-                errored: 0.into(),
             })
         })
         .clone()
 }
 
-/// RAII guard that bumps `in_flight` while alive and finalises completed/
-/// errored on drop. Lets us track concurrency through the actual permit
-/// lifetime without manual decrement at every return path.
+/// RAII guard that bumps `in_flight` while alive and counts the op as done on
+/// drop. Lets us track concurrency through the actual permit lifetime without
+/// manual decrement at every return path.
 pub struct InFlightGuard {
     metrics: Arc<WorkflowMetrics>,
-    errored: bool,
 }
 impl InFlightGuard {
     fn start(metrics: Arc<WorkflowMetrics>) -> Self {
         metrics
             .in_flight
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Self {
-            metrics,
-            errored: false,
-        }
-    }
-    fn fail(&mut self) {
-        self.errored = true;
+        Self { metrics }
     }
 }
 impl Drop for InFlightGuard {
@@ -81,15 +75,9 @@ impl Drop for InFlightGuard {
         self.metrics
             .in_flight
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        if self.errored {
-            self.metrics
-                .errored
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        } else {
-            self.metrics
-                .completed
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
+        self.metrics
+            .completed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -229,7 +217,7 @@ impl TargetPace {
             w.record(class, 0);
         }
         let n = self.since_tick.fetch_add(1, Ordering::Relaxed) + 1;
-        if n >= adaptive::coord::TICK_EVERY {
+        if n >= adaptive::coord::tick_every() {
             self.since_tick.store(0, Ordering::Relaxed);
             let stats = { self.window.lock().unwrap().stats() };
             let dir = { self.controller.lock().unwrap().tick(&stats) };
@@ -473,9 +461,8 @@ async fn run_operation(cmd: serde_json::Value, ctx: OpCtx) {
         use std::sync::atomic::Ordering;
         let ifl = m.in_flight.load(Ordering::Relaxed);
         let done = m.completed.load(Ordering::Relaxed);
-        let fail = m.errored.load(Ordering::Relaxed);
         let short = workflow_id.get(..8).unwrap_or(&workflow_id);
-        println!("[scan {short}] claim in_flight={ifl} done={done} failed={fail}");
+        println!("[scan {short}] claim in_flight={ifl} done={done}");
         Some(g)
     } else {
         None
@@ -496,7 +483,7 @@ async fn run_operation(cmd: serde_json::Value, ctx: OpCtx) {
                 // could claim another tenant's queued operations.
                 "api_key": api_key,
             }))
-            .send()
+            .send_api()
             .await;
 
         // Losing the race and failing to ask are NOT the same thing, and treating
@@ -709,17 +696,28 @@ static CLAIM_MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 
 #[derive(Subcommand, Debug)]
 pub enum DbCommands {
-    /// Make a new, empty database container and start it, replacing the one there
-    /// is. The scan state kept in the old one is lost
+    /// Make the local database if there is none, and start it if it is stopped, going
+    /// back to it from a database you run. What is there is never replaced or emptied
     Up,
-    /// Stop and remove the database container. The scan state kept in it is lost
-    Down,
-    /// Start the database container
-    Start,
-    /// Stop the database container
+    /// Stop the local database
     Stop,
-    /// Restart the database container
+    /// Stop the local database and start it again
     Restart,
+    /// Show which database the engines use, whether it runs, and what each engine keeps
+    Status,
+    /// Delete one scan with what it found, or every scan made more than a number of days
+    /// ago, from every engine. A running scan is left alone
+    Purge(dguard::PurgeArgs),
+    /// Use a database you run yourself, in Docker or anywhere else, in place of the local
+    /// one. The password is asked for, or read from CROSSFYRE_DB_PASSWORD
+    External {
+        /// The server's host name or address
+        host: String,
+        /// The port it listens on
+        port: u16,
+        /// The user to log in as, which may make databases
+        user: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -733,8 +731,8 @@ pub struct Config {
     nats_url: String,
     nats_nkey_seed: Option<String>,
     nats_user_jwt: Option<String>,
-    /// Extensions installed on this node, as engine ids (e.g. ["mach", "voyage"]),
-    /// which is what the API sends and what never changes.
+    /// Extensions installed on this node, by engine name (e.g. ["ambulo", "voyage"]),
+    /// as the API sends them.
     #[serde(default)]
     extensions: Vec<String>,
     /// Deploy-time network identity (tunnel selection + OPSEC toggles).
@@ -801,57 +799,17 @@ pub fn default_nats_url() -> String {
     "nats://localhost:4222".to_string()
 }
 
-/// Resolve the data directory for this invocation. Order of preference:
-///   1. `--data-dir <PATH>` (if provided)
-///   2. `$SUDO_USER`'s config root + `crossfyre` (`~/.config` on Linux,
-///      `~/Library/Application Support` on macOS) - keeps the user's data
-///      visible when they `sudo crossfyre node up`
-///   3. `dirs::config_dir()/crossfyre`
+/// Resolve the data directory for this invocation: `--data-dir <PATH>` when given,
+/// otherwise the toolchain directory (see [`toolchain::config::default_toolchain_dir`]),
+/// which under sudo is the invoking user's, so their data stays theirs when they
+/// `sudo crossfyre node up`.
 pub fn resolve_data_dir(
     cli_arg: Option<&std::path::Path>,
 ) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
     if let Some(p) = cli_arg {
         return Ok(p.to_path_buf());
     }
-    if let Ok(sudo_user) = std::env::var("SUDO_USER")
-        && !sudo_user.is_empty()
-        && sudo_user != "root"
-    {
-        // Best effort - fall back to dirs::config_dir() if the home directory
-        // can't be resolved (e.g. unusual NSS setup).
-        if let Some(home) = home_for_user(&sudo_user) {
-            let mut p = toolchain::sudo_user::config_root_in(&home);
-            p.push("crossfyre");
-            return Ok(p);
-        }
-    }
-    let mut p = dirs::config_dir().ok_or("Could not resolve config directory")?;
-    p.push("crossfyre");
-    Ok(p)
-}
-
-#[cfg(unix)]
-pub fn home_for_user(name: &str) -> Option<std::path::PathBuf> {
-    use std::ffi::CString;
-    let c = CString::new(name).ok()?;
-    unsafe {
-        let pwd = libc::getpwnam(c.as_ptr());
-        if pwd.is_null() {
-            return None;
-        }
-        let dir_ptr = (*pwd).pw_dir;
-        if dir_ptr.is_null() {
-            return None;
-        }
-        let cstr = std::ffi::CStr::from_ptr(dir_ptr);
-        Some(std::path::PathBuf::from(
-            cstr.to_string_lossy().into_owned(),
-        ))
-    }
-}
-#[cfg(not(unix))]
-pub fn home_for_user(_name: &str) -> Option<std::path::PathBuf> {
-    None
+    Ok(toolchain::config::default_toolchain_dir().ok_or("Could not resolve config directory")?)
 }
 
 /// When running under `sudo`, `chown` files we just wrote back to the
@@ -885,15 +843,15 @@ pub fn print_privilege_banner(needs_root: bool) {
         .filter(|s| !s.is_empty() && s != "root");
     if elevated && sudo_user.is_none() && cfg!(unix) {
         eprintln!(
-            "[security] WARNING: launched as plain root. Re-run with `sudo crossfyre ...` from your user shell."
+            "[security] WARNING: launched as plain root, so the config and the engines go to root's account. Run crossfyre from your own account: it uses sudo where it needs root."
         );
     } else if !elevated && needs_root {
         if cfg!(windows) {
             eprintln!("Please re-run from an elevated prompt (Run as administrator):");
             eprintln!("  crossfyre node up");
         } else {
-            eprintln!("Please re-run with sudo:");
-            eprintln!("  sudo crossfyre node up");
+            eprintln!("The node needs root. Start it with:");
+            eprintln!("  crossfyre node up");
         }
         std::process::exit(1);
     }
@@ -992,44 +950,6 @@ pub fn write_secret_file(path: &std::path::Path, contents: &str) -> std::io::Res
         fs::write(path, contents)
     }
 }
-
-/// Tighten a credential file that an earlier build left world-readable.
-///
-/// Installs created before [`write_secret_file`] existed still have 0644 configs
-/// on disk, and rewriting the file is not part of a normal start. This runs on
-/// load so those installs are repaired without operator action, and says so once
-/// rather than silently, because the secrets in it should be treated as having
-/// been exposed.
-#[cfg(unix)]
-pub fn repair_secret_file_mode(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-    // Through the file's own fd, opened without following a link when root: a chmod by
-    // path would land on whatever a link there names.
-    let file = if toolchain::sudo_user::root_guards() {
-        toolchain::root_fs::open_file(path)
-    } else {
-        fs::File::open(path)
-    };
-    let Ok(file) = file else { return };
-    let Ok(meta) = file.metadata() else { return };
-    let mode = meta.permissions().mode() & 0o777;
-    if mode & 0o077 != 0
-        && file
-            .set_permissions(fs::Permissions::from_mode(0o600))
-            .is_ok()
-    {
-        eprintln!(
-            "[security] {} was mode {:o} (group/other readable) and holds node \
-             credentials; tightened to 600. Rotate this node's key if the host \
-             has other accounts: `crossfyre node revoke`.",
-            path.display(),
-            mode
-        );
-    }
-}
-
-#[cfg(not(unix))]
-pub fn repair_secret_file_mode(_path: &std::path::Path) {}
 
 /// Validate the `~/.config/crossfyre` layout before booting: the config root
 /// must exist and contain a `nodes.d` directory. Returns the list of
@@ -1162,53 +1082,27 @@ pub fn load_node_config(path: &std::path::Path) -> Result<Config, Box<dyn std::e
     Ok(toml::from_str(&text)?)
 }
 
-/// One-time migration for hosts initialized before the `nodes.d` layout:
-/// move a legacy `<base>/config.toml` to `<base>/nodes.d/<node-id>.toml`
-/// (and its `network/` dir to `<node-id>.network/`). Best-effort and silent
-/// when there's nothing to migrate.
-pub fn migrate_legacy_config(base: &std::path::Path) {
-    let legacy = base.join("config.toml");
-    if !legacy.is_file() {
-        return;
-    }
-    let Ok(text) = toolchain::sudo_user::read_to_string(&legacy) else {
-        return;
-    };
-    let Ok(cfg) = toml::from_str::<Config>(&text) else {
-        return;
-    };
-    // The id is the operator's, read from their file, and root makes paths from it.
-    let Ok(paths) = NodePaths::checked(base, &cfg.node_id) else {
-        eprintln!(
-            "[migrate] Not moving {legacy:?}: its node_id {:?} is not a node id",
-            cfg.node_id
-        );
-        return;
-    };
-    if paths.config.exists() {
-        return; // already migrated
-    }
-    if let Err(e) = toolchain::sudo_user::create_dir_all_for_invoking_user(&nodes_dir(base)) {
-        eprintln!("[migrate] Could not create nodes.d: {e}");
-        return;
-    }
-    if toolchain::sudo_user::rename(&legacy, &paths.config).is_ok() {
-        println!("[migrate] Moved legacy config.toml -> {:?}", paths.config);
-        let legacy_net = base.join("network");
-        let net_dir = toolchain::node_config::operator_network_dir(&nodes_dir(base), &cfg.node_id);
-        if legacy_net.is_dir() && !net_dir.exists() {
-            let _ = toolchain::sudo_user::rename(&legacy_net, &net_dir);
-        }
-        // The config itself stays as it is: the tree chown leaves node configs alone,
-        // and taking over an earlier release's configs is node_config's.
-        chown_tree_to_sudo_user(&nodes_dir(base));
-    }
-}
-
 /// How often `up` re-scans `nodes.d` to pick up nodes registered (or
 /// removed) after it started. 2s keeps a freshly `--init`'d node coming
 /// online almost immediately without busy-spinning on the filesystem.
 const BOOT_RESCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Why no node runs here: the user took the machine offline, which a node, reporting to
+/// Crossfyre, would not be. None otherwise: a machine offline because its session ended
+/// keeps its nodes, which run on keys of their own.
+fn offline_stops_nodes(base: &std::path::Path) -> Option<String> {
+    policy::load(base)
+        .offline
+        .filter(|o| o.reason == policy::Reason::Chosen)
+        .map(|o| {
+            format!(
+                "policy: offline ({}), and a node does not run on a machine taken offline. \
+                 Leave offline with crossfyre policy set connected or private, or crossfyre \
+                 login.",
+                o.reason.says()
+            )
+        })
+}
 
 /// Spawn one `crossfyre node daemon <node-id>` child pinned to `base`.
 pub fn spawn_node_daemon(
@@ -1249,33 +1143,26 @@ pub async fn run_boot(
     force: bool,
     base: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Before anything is written: on macOS the service's output may still be going to
-    // a file launchd opened in the operator's data dir.
-    #[cfg(target_os = "macos")]
-    toolchain::service::adopt_root_node_log();
     println!("Booting Crossfyre nodes from {base:?}...");
 
-    // Pull a pre-nodes.d single-node install into the new layout if present.
-    migrate_legacy_config(base);
-    // Node configs an earlier release handed to the operator become root's, once.
-    toolchain::node_config::take_over_earlier_configs(base);
-    // Engines still installed under the names they had before: carry them over
-    // before any node starts using them.
-    toolchain::migrate::renamed_engines();
-    // A database container made by 0.1.42 or earlier was published on every
-    // interface with no password. Rebuild it on loopback with a password, keeping the
-    // engines' rows. Nodes do not use it, so they start meanwhile rather than wait on Docker,
-    // which may be slow to answer or not running yet.
-    let securing = std::thread::spawn(|| {
-        if let Err(e) = toolchain::db::secure_existing() {
+    // The engines run as units of the user's service manager, or where none runs, as
+    // this supervisor's children (see toolchain::node_engines).
+    let units = toolchain::service::user_manager_started();
+
+    // An engine's unit is a file crossfyre generates, and an upgrade by a package
+    // manager or by the dashboard leaves the ones another release wrote, so each
+    // installed engine's is made this build's before the nodes start.
+    for e in toolchain::ENGINES {
+        if !units || !toolchain::config::is_extension_installed(e.name) {
+            continue;
+        }
+        if let Err(err) = toolchain::service::refresh_service_file(e.name) {
             eprintln!(
-                "[db] FAIL could not secure the toolchain database container: {e}. If \
-                 Docker could not be asked, it may still accept connections from the \
-                 network without a password. Run `crossfyre db restart` from the account \
-                 that runs Docker to secure it, or stop it with `crossfyre db stop`."
+                "[boot] {}'s service could not be made this release's: {err}",
+                e.name
             );
         }
-    });
+    }
 
     let node_ids = discover_nodes(base)?;
     if node_ids.is_empty() {
@@ -1283,8 +1170,6 @@ pub async fn run_boot(
             "No nodes registered under {:?}.\nRegister one with: crossfyre node init",
             nodes_dir(base)
         );
-        // Not cut short halfway through a move.
-        let _ = securing.join();
         std::process::exit(1);
     }
 
@@ -1301,15 +1186,23 @@ pub async fn run_boot(
     // gives it a fresh attempt.
     let mut dead: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for id in &node_ids {
-        if let Some(child) = spawn_node_daemon(&exe, base, id, force) {
-            children.insert(id.clone(), child);
+    // An offline machine runs no node: the supervisor waits, and starts them once the
+    // machine leaves offline.
+    let mut offline = offline_stops_nodes(base);
+    if let Some(why) = &offline {
+        println!("[boot] {why}");
+    } else {
+        for id in &node_ids {
+            if let Some(child) = spawn_node_daemon(&exe, base, id, force) {
+                children.insert(id.clone(), child);
+            }
+        }
+        if children.is_empty() {
+            return Err("no node daemons could be started".into());
         }
     }
 
-    if children.is_empty() {
-        return Err("no node daemons could be started".into());
-    }
+    let mut engines = toolchain::node_engines::NodeEngines::start();
 
     let mut sigterm = os::StopSignal::new().expect("failed to install SIGTERM handler");
     let mut rescan = tokio::time::interval(BOOT_RESCAN_INTERVAL);
@@ -1325,9 +1218,33 @@ pub async fn run_boot(
     // tick until a shutdown signal arrives.
     loop {
         tokio::select! {
+            // A stop first: the Ctrl+C that ends this ends the engines it runs as well,
+            // which are not to be started again.
+            biased;
             _ = tokio::signal::ctrl_c() => { println!("\n[boot] Ctrl+C received - stopping all nodes..."); break; }
             _ = sigterm.recv() => { println!("\n[boot] {} received - stopping all nodes...", os::STOP_SIGNAL_NAME); break; }
             _ = rescan.tick() => {
+                engines.tend();
+
+                // 0. Offline: every node stops, and none starts until the machine
+                //    leaves offline, when each gets a fresh start.
+                let now_offline = offline_stops_nodes(base);
+                if now_offline.is_some() != offline.is_some() {
+                    match &now_offline {
+                        Some(why) => println!("[boot] {why} Stopping {} node(s).", children.len()),
+                        None => println!("[boot] This machine is no longer offline: starting its nodes."),
+                    }
+                    dead.clear();
+                }
+                offline = now_offline;
+                if offline.is_some() {
+                    for (_, mut child) in children.drain() {
+                        os::ask_to_stop(&mut child);
+                        let _ = child.try_wait();
+                    }
+                    continue;
+                }
+
                 // 1. Reap children that exited on their own; park them in
                 //    `dead` so we don't respawn a flapping node every tick.
                 let exited: Vec<String> = children.iter_mut()
@@ -1400,6 +1317,7 @@ pub async fn run_boot(
         let _ = child.wait();
         println!("[boot] Node {id} stopped.");
     }
+    engines.stop();
 
     Ok(())
 }
@@ -1449,7 +1367,7 @@ pub fn remove_node_files(base: &std::path::Path, node_id: &str) -> std::io::Resu
     if paths.pid.exists() {
         let _ = toolchain::sudo_user::remove_file(&paths.pid);
     }
-    // Root's network dir, and the one in nodes.d that an earlier release used.
+    // Root's network dir, and the one in nodes.d that a node run without root keeps.
     let operator_net = toolchain::node_config::operator_network_dir(&nodes_dir(base), node_id);
     for dir in [&paths.network_dir, &operator_net] {
         if dir.exists() {
@@ -1478,8 +1396,8 @@ pub async fn run_node_list(
         std::process::exit(1);
     };
 
-    let client = reqwest::Client::new();
-    let nodes = auth::list_nodes(&client, &account).await?;
+    let client = api::client();
+    let nodes = auth::list_nodes(&client, base, &account).await?;
 
     if as_json {
         println!("{}", serde_json::to_string_pretty(&nodes)?);
@@ -1649,7 +1567,7 @@ pub async fn run_node_remove(
     // ── --inactive: only nodes the server no longer knows ───────────────
     if inactive {
         println!("  {}", dim("Nodes"));
-        let client = reqwest::Client::new();
+        let client = api::client();
         let mut removed = 0usize;
         for id in &ids {
             let paths = NodePaths::new(base, id);
@@ -1671,7 +1589,7 @@ pub async fn run_node_remove(
             let res = client
                 .post(format!("{}/api/v1/authorize-node", cfg.api_url))
                 .json(&serde_json::json!({ "api_key": cfg.api_key, "force": false }))
-                .send()
+                .send_api()
                 .await;
             match res {
                 Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => {
@@ -1747,6 +1665,8 @@ pub async fn run_node_remove(
     std::process::exit(1);
 }
 
+/// `crossfyre node init`, run by the CLI at `cli_version`, which installs the node's
+/// engines only when it is the release's (see [`toolchain::install::Writer`]).
 pub async fn run_init(
     force: bool,
     api_url: &str,
@@ -1754,6 +1674,7 @@ pub async fn run_init(
     no_service: bool,
     node_key: Option<String>,
     no_prompt: bool,
+    cli_version: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::toolchain::ui::*;
 
@@ -1764,13 +1685,8 @@ pub async fn run_init(
     field("Server", api_url);
     field("Data directory", &data_dir.display().to_string());
     print_privilege_banner(false);
-    // Before anything is written: on a host with no node service and no earlier node
-    // worker, record that there is nothing from an earlier release to take over, so the
-    // service installed below never hands root a config the operator's account put in
-    // nodes.d.
-    toolchain::node_config::settle_before_init(data_dir)?;
 
-    let client = reqwest::Client::new();
+    let client = api::client();
 
     // Enrol this host. Two routes, in order of how little the operator has to do:
     //
@@ -1799,7 +1715,7 @@ pub async fn run_init(
                 end();
                 section("Register");
                 working("Claiming a node for this host…");
-                let resp = auth::provision_node(&client, &account, None).await?;
+                let resp = auth::provision_node(&client, data_dir, &account, None).await?;
                 let issued = resp["api_key"]
                     .as_str()
                     .ok_or("The server did not return a node key")?
@@ -1865,11 +1781,7 @@ pub async fn run_init(
     if selected_extensions.is_empty() {
         field("Extensions", "none assigned");
     } else {
-        let names: Vec<&str> = selected_extensions
-            .iter()
-            .map(|e| toolchain::public_name(e))
-            .collect();
-        field("Extensions", &names.join(", "));
+        field("Extensions", &selected_extensions.join(", "));
     }
 
     // Extract NATS URL from server response (falls back to localhost for dev)
@@ -1922,14 +1834,6 @@ pub async fn run_init(
     end();
     section("Toolchain");
 
-    // One-time migration: clean up a pre-merge OrionChain install so the old
-    // orion services and binaries don't fight the new ones.
-    toolchain::uninstall::cleanup_legacy_orionchain();
-    toolchain::migrate::renamed_engines();
-    // An older installer put the bin directory at the front of PATH, where its `node`
-    // hides Node.js.
-    toolchain::rcfile::fix_for_invoking_user();
-
     // Put the crossfyre binary at its stable path so OS services have a
     // fixed ExecStart (no-op when already running from /opt/crossfyre/bin, or
     // when a package manager installed it).
@@ -1969,9 +1873,19 @@ pub async fn run_init(
     // Install each extension assigned to this node: download, verify against
     // the release manifest, enable and start its daemon. The package manager
     // is built in - no external installer involved.
+    let writer = toolchain::install::Writer::cli(cli_version);
     for ext in &selected_extensions {
-        let name = toolchain::public_name(ext);
+        // A closed engine comes with the node's plan, below, not with the release.
+        if toolchain::engine(ext).is_some_and(|e| e.closed) {
+            continue;
+        }
         if toolchain::config::is_extension_installed(ext) {
+            // Where no service manager runs, `crossfyre node up` runs it.
+            if !toolchain::service::user_manager_started() {
+                toolchain::service::say_node_up_runs_engines();
+                ok(&format!("{ext} already installed"));
+                continue;
+            }
             // Installed before this node was set up (by an earlier init, by
             // `extension install`, or by a package), which is no promise that its
             // service exists: register it if it does not, then enable and start it,
@@ -1985,57 +1899,113 @@ pub async fn run_init(
                 .and_then(|()| toolchain::service::enable(ext))
                 .and_then(|()| toolchain::service::start(ext))
             {
-                Ok(()) => ok(&format!("{name} already installed, started")),
-                Err(e) => {
-                    fail(&format!(
-                        "{name} is installed but its service did not start: {e}"
-                    ));
-                    hint(&format!("Run manually: crossfyre extension install {name}"));
-                }
+                Ok(()) => ok(&format!("{ext} already installed, started")),
+                Err(e) => fail(&format!(
+                    "{ext} is installed but its service did not start: {e}"
+                )),
             }
             continue;
         }
-        working(&format!("Installing {name}"));
-        match toolchain::install::install_and_start(ext).await {
-            Ok(()) => ok(&format!("{name} installed and started")),
-            Err(e) => {
-                fail(&format!("{name} install failed: {e}"));
-                hint(&format!("Run manually: crossfyre extension install {name}"));
-            }
+        working(&format!("Installing {ext}"));
+        match toolchain::install::install_and_start(ext, false, writer).await {
+            Ok(true) => ok(&format!("{ext} installed and started")),
+            Ok(false) => ok(&format!("{ext} installed")),
+            Err(e) => fail(&format!("{ext} install failed: {e}")),
         }
     }
 
-    // Bring up the toolchain database the extensions persist scan state to.
-    if !selected_extensions.is_empty() {
+    // The closed components the node's plan includes, with the node's own key: Crossfyre
+    // answers it as it answers the account the node belongs to. Out of reach, they wait
+    // for `crossfyre update components`.
+    let creds = toolchain::components::Credentials {
+        api_url: api_url.to_string(),
+        key: node_api_key.clone(),
+    };
+    match toolchain::components::offer(&client, &creds).await {
+        Ok(offer) if !offer.included.is_empty() => {
+            working("Installing the components the node's plan includes");
+            let keys = cfx_pacing::release_keys();
+            let results = toolchain::components::bring_current(
+                &client,
+                &creds,
+                &offer,
+                &toolchain::components::COMPONENTS,
+                true,
+                &keys,
+                &toolchain::components::Here::this_host(),
+            )
+            .await;
+            toolchain::components::say(&results);
+            let authz_here = results.iter().any(|(c, k)| {
+                *c == "plessor-authz"
+                    && matches!(
+                        k,
+                        toolchain::components::Kept::Installed(_)
+                            | toolchain::components::Kept::Current(_)
+                    )
+            });
+            if authz_here && toolchain::service::user_manager_started() {
+                if let Err(e) = toolchain::service::enable("plessor-authz")
+                    .and_then(|()| toolchain::service::start("plessor-authz"))
+                {
+                    fail(&format!(
+                        "plessor-authz is installed but did not start: {e}"
+                    ));
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(why) => warn(&format!(
+            "the plan's components wait for `crossfyre update components`: {why}"
+        )),
+    }
+
+    // Bring up the toolchain database the extensions persist scan state to: the local
+    // one, made and started as the user the engines run as, or the one config.toml names.
+    let database = if selected_extensions.is_empty() {
+        None
+    } else {
         working("Starting the toolchain database");
-        match toolchain::db::ensure_up() {
-            Ok(()) => ok("Database ready"),
+        Some(match toolchain::db::up() {
+            Ok(up) => {
+                ok(match up {
+                    cfx_db::Up::Made => "Database made and started",
+                    cfx_db::Up::Started => "Database started",
+                    cfx_db::Up::Running => "Database running",
+                    cfx_db::Up::External => "Database is the one config.toml names",
+                });
+                true
+            }
             Err(e) => {
                 fail(&format!("Database start failed: {e}"));
-                hint("Run manually: crossfyre db up");
+                false
             }
-        }
-    }
+        })
+    };
 
     // Register the node supervisor as an OS service so the node survives
-    // reboots and closed terminals (Linux; needs root).
+    // reboots and closed terminals.
     end();
     section("Service");
-    if no_service {
+    let node = if no_service {
         warn("Skipped node service install (--no-service)");
-        hint("Run the node with: crossfyre node up");
+        init_summary::NodeService::Skipped
     } else {
         match toolchain::service::install_node_service(&stable_exe, data_dir) {
-            Ok(()) => ok("Node service installed and started (crossfyre-node)"),
+            Ok(()) if toolchain::service::node_service_running() => {
+                ok("Node service installed and started (crossfyre-node)");
+                init_summary::NodeService::Running
+            }
+            Ok(()) => {
+                warn("the node service is installed and is not running");
+                init_summary::NodeService::Stopped
+            }
             Err(e) => {
                 warn(&format!("could not install the node service: {e}"));
-                hint(&format!(
-                    "Run the node manually with: {}",
-                    os::elevated("crossfyre node up")
-                ));
+                init_summary::NodeService::Stopped
             }
         }
-    }
+    };
 
     // Update node status on the server
     let status_res = client
@@ -2046,7 +2016,7 @@ pub async fn run_init(
             "event": "initialization",
             "message": "Node successfully initialized on CLI"
         }))
-        .send()
+        .send_api()
         .await;
 
     if let Err(e) = status_res {
@@ -2067,11 +2037,38 @@ pub async fn run_init(
     // node configs in it stay root's: the root node service runs what they say.
     chown_tree_to_sudo_user(&config_dir);
 
+    // The true state, last: what runs, and how to start what does not.
+    let mut parts: Vec<init_summary::Part> =
+        selected_extensions.iter().map(|e| engine_part(e)).collect();
+    if let Some(running) = database {
+        parts.push(init_summary::Part {
+            name: "database".to_string(),
+            running,
+            start: "crossfyre db up".to_string(),
+        });
+    }
     end();
-    done("Node ready");
-    hint("Run `crossfyre node status` to see it running.");
-    end();
+    let summary = init_summary::Summary { node, parts };
+    summary.print();
+    if !summary.succeeded() {
+        std::process::exit(1);
+    }
     Ok(())
+}
+
+/// How `node init` left engine `ext`, with the command that starts it when it is not
+/// running (see [`init_summary::engine_start`]).
+fn engine_part(ext: &str) -> init_summary::Part {
+    init_summary::Part {
+        name: ext.to_string(),
+        running: toolchain::service::daemon_status(ext) == "running",
+        start: init_summary::engine_start(
+            ext,
+            toolchain::config::is_extension_installed(ext),
+            toolchain::service::has_service_file(ext),
+            !toolchain::service::user_manager_runs(),
+        ),
+    }
 }
 
 /// The client the Bench repeater sends with. It does not follow redirects.
@@ -2258,11 +2255,11 @@ pub async fn refresh_node_state(
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Refreshing node state from controller...");
-    let client = reqwest::Client::new();
+    let client = api::client();
     let res = client
         .post(format!("{}/api/v1/authorize-node", config.api_url))
         .json(&serde_json::json!({ "api_key": &config.api_key, "force": force }))
-        .send()
+        .send_api()
         .await?;
 
     // 401 = the server doesn't know this api_key (node deleted / key revoked).
@@ -2349,15 +2346,19 @@ fn reconcile_ports(ports_json: &serde_json::Value) -> Vec<String> {
     if changed.is_empty() {
         return changed;
     }
-    // Postgres port moved: re-provision the container on the new port.
-    if changed.iter().any(|c| c == "postgres")
-        && let Err(e) = toolchain::db::up()
-    {
-        eprintln!("[ports] FAIL re-provision the database: {e}");
+    // Postgres port moved: start the local database again on its new port, and then
+    // the engines, whose connections are to the old one.
+    if changed.iter().any(|c| c == "postgres") {
+        match toolchain::db::restart() {
+            Ok(_) => toolchain::db::restart_engines(),
+            Err(e) => eprintln!("[ports] FAIL restart the database on its new port: {e}"),
+        }
     }
-    // Engine port moved: rewrite its unit (ExecStart reads config.toml) + restart.
+    // Engine port moved: rewrite its unit (ExecStart reads config.toml) + restart. Where
+    // no service manager runs, `crossfyre node up` starts the engine again on its new port.
     for ext in changed.iter().filter(|c| c.as_str() != "postgres") {
-        if toolchain::config::is_extension_installed(ext) {
+        if toolchain::config::is_extension_installed(ext) && toolchain::service::user_manager_runs()
+        {
             let _ = toolchain::service::create_service_file(ext);
             let _ = toolchain::service::restart(ext);
         }
@@ -2409,7 +2410,36 @@ fn toolchain_health(
     status
 }
 
-/// The engines a heartbeat reports, by id, in [`toolchain::ENGINES`] order, each with
+/// The heartbeat's `toolchain_status.pacing`: which pacing the node runs, and each of
+/// `engines` that said which it runs, by name.
+fn pacing_status<'a>(
+    node: &str,
+    answers: &egress::state::EngineAnswers,
+    engines: impl Iterator<Item = &'a String>,
+) -> serde_json::Value {
+    let mut pacing = serde_json::Map::new();
+    pacing.insert("node".into(), serde_json::json!(node));
+    for ext in engines {
+        if let Some(p) = answers.pacing(ext) {
+            pacing.insert(ext.clone(), serde_json::json!(p));
+        }
+    }
+    serde_json::Value::Object(pacing)
+}
+
+/// The heartbeat's `toolchain_status` with what the node last did with the data in
+/// `data`: nothing is said before the first run.
+fn with_data(
+    mut status: serde_json::Value,
+    data: Option<&toolchain::data_update::Status>,
+) -> serde_json::Value {
+    if let Some(data) = data {
+        status["data"] = data.to_json();
+    }
+    status
+}
+
+/// The engines a heartbeat reports, by name, in [`toolchain::ENGINES`] order, each with
 /// whether it is installed on this host: every engine `installed` says the host has,
 /// and any other that the node's own list (`listed`) names.
 ///
@@ -2425,13 +2455,8 @@ fn heartbeat_engines(
 ) -> Vec<(&'static str, bool)> {
     toolchain::ENGINES
         .iter()
-        .map(|e| (e.id, installed(e.id)))
-        .filter(|(id, here)| {
-            *here
-                || listed
-                    .iter()
-                    .any(|l| toolchain::engine(l).is_some_and(|e| e.id == *id))
-        })
+        .map(|e| (e.name, installed(e.name)))
+        .filter(|(name, here)| *here || listed.iter().any(|l| l == name))
         .collect()
 }
 
@@ -2455,6 +2480,10 @@ pub async fn run_daemon(
     println!("Starting Crossfyre Node Client Daemon...");
     println!("Node id       : {}", paths.node_id);
     println!("Config root   : {}", paths.base.display());
+    // A node does not run on an offline machine: it would report to Crossfyre.
+    if let Some(why) = offline_stops_nodes(&paths.base) {
+        return Err(why.into());
+    }
     print_privilege_banner(std::env::var("CFX_ALLOW_UNPRIV_DAEMON").is_err());
     // Before anything is opened: the egress gateway holds two descriptors per tunnel,
     // and a service's usual soft limit runs out at a quarter of its cap.
@@ -2524,11 +2553,6 @@ pub async fn run_daemon(
     }
 
     // Load config
-    // A daemon started on its own, or by the supervisor of an earlier release, takes
-    // over an earlier release's configs as the supervisor does.
-    toolchain::node_config::take_over_earlier_configs(&paths.base);
-    // Repair installs written before the config was mode-restricted.
-    repair_secret_file_mode(&config_path);
     let mut config = load_node_config(&config_path)?;
     // As root, the tunnel config goes to a directory only root can change.
     toolchain::node_config::prepare_network_dir(&nodes_dir(&paths.base), &paths.node_id)?;
@@ -2539,44 +2563,14 @@ pub async fn run_daemon(
     // controller on every daemon start. The server enforces "one running
     // node per api_key" - so if it returns valid=false we abort instead of
     // falling through to a cached config (which would let two daemons race
-    // for the same NATS subjects).
-    // Retry a control plane that is not up YET, rather than treating it as fatal.
-    //
-    // WHY: on a reboot the node service and the control plane start together, and
-    // the node usually wins the race. It used to call exit(1) on the resulting
-    // connection error; the supervisor then parked it as dead and "held until its
-    // config changes", i.e. forever. systemd never intervened either, because
-    // Restart=on-failure watches the SUPERVISOR, which stayed perfectly healthy
-    // holding a corpse. Net effect: every reboot silently killed the fleet until a
-    // human ran `systemctl restart` by hand, and the dashboard just said 0 nodes
-    // online without saying why.
-    //
-    // Only genuinely transient failures are retried. A deleted node, a revoked key
-    // or another daemon holding the same api_key are permanent and still exit
-    // immediately: retrying those would spin forever hiding a real problem.
-    const AUTH_RETRY_WINDOW_SECS: u64 = 600;
-    let auth_started = std::time::Instant::now();
-    let mut backoff = std::time::Duration::from_secs(2);
-    let refresh_result = loop {
-        match refresh_node_state(&mut config, &config_path, &paths.network_dir, force).await {
-            Ok(()) => break Ok(()),
-            Err(e) => {
-                let transient = e
-                    .downcast_ref::<reqwest::Error>()
-                    .map(|re| re.is_connect() || re.is_timeout() || re.is_request())
-                    .unwrap_or(false);
-                if !transient || auth_started.elapsed().as_secs() >= AUTH_RETRY_WINDOW_SECS {
-                    break Err(e);
-                }
-                eprintln!(
-                    "  Crossfyre is not reachable yet ({e}); retrying in {}s",
-                    backoff.as_secs()
-                );
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
-            }
-        }
-    };
+    // for the same NATS subjects). A controller that is not up yet is waited
+    // for (see START_RETRY_WINDOW).
+    let refresh_result = until_reachable(
+        "Crossfyre",
+        async || refresh_node_state(&mut config, &config_path, &paths.network_dir, force).await,
+        |e| controller_unreachable(&**e),
+    )
+    .await;
 
     if let Err(e) = refresh_result {
         if e.downcast_ref::<NodeDeleted>().is_some() {
@@ -2595,9 +2589,6 @@ pub async fn run_daemon(
         std::process::exit(1);
     }
 
-    // An older node may have left a proxy in the engines' environment file, where it
-    // would carry a direct node's traffic. The node's proxy is a per-op lease now.
-    egress::cleanup_legacy_env_file();
     let egress_state = Arc::clone(egress::state::global());
 
     // -- Apply isolated egress (if configured) before scanning starts ----
@@ -2605,10 +2596,15 @@ pub async fn run_daemon(
     // reach the controller) and before connecting, so subscriber traffic
     // routes through the configured egress. The guard tears egress down on
     // every exit path (Ctrl+C, SIGTERM, panic, normal return) and is bound to
-    // `_egress_guard` so it lives the full daemon lifetime.
-    let _egress_guard = config.network.as_ref().and_then(|net| {
-        egress::bring_up(net, &paths.network_dir, &paths.node_id, config.tunnel_hooks)
-    });
+    // `_egress_guard` so it lives the full daemon lifetime. While a kill switch
+    // has no egress helper to keep it, every op is refused (see egress::state).
+    let direct = NetworkConfig::default();
+    let _egress_guard = egress::bring_up(
+        config.network.as_ref().unwrap_or(&direct),
+        &paths.network_dir,
+        &paths.node_id,
+        config.tunnel_hooks,
+    );
 
     println!("Connecting to Jetstream at {}...", config.nats_url);
 
@@ -2645,27 +2641,6 @@ pub async fn run_daemon(
     // settings are fetched again, ops ask for them first, and the fetch is made as soon
     // as the connection is back.
     let reconnected = Arc::new(tokio::sync::Notify::new());
-    let on_event = {
-        let egress_state = Arc::clone(&egress_state);
-        let reconnected = Arc::clone(&reconnected);
-        move |event: async_nats::Event| {
-            match event {
-                async_nats::Event::Disconnected => egress_state.connection_lost(),
-                async_nats::Event::Connected => reconnected.notify_one(),
-                _ => {}
-            }
-            std::future::ready(())
-        }
-    };
-    let opts = async_nats::ConnectOptions::with_jwt(jwt_str, move |nonce: Vec<u8>| {
-        let kp = key_pair.clone();
-        async move { kp.sign(&nonce).map_err(async_nats::AuthError::new) }
-    })
-    // Increase the subscriber buffer so large bursts (e.g. a 65k-op scan)
-    // don't overflow and drop messages as "slow consumer".
-    .subscription_capacity(1_000_000)
-    .event_callback(on_event);
-    let opts = with_node_inbox(opts, &config.node_id);
 
     // TLS to the control plane.
     //
@@ -2684,36 +2659,68 @@ pub async fn run_daemon(
     // downgraded or tampered NATS_PUBLIC_URL (say `nats://`) would silently
     // reconnect in cleartext, which is precisely the failure this is meant to
     // prevent.
-    let opts = if nats_url.starts_with("tls://") {
-        match write_origin_root_cert() {
-            Ok(ca_path) => opts.add_root_certificates(ca_path).require_tls(true),
-            Err(e) => {
-                eprintln!("ERROR: could not stage the NATS root certificate: {e}");
-                return Err(e.into());
-            }
-        }
+    let root_certificate = if nats_url.starts_with("tls://") {
+        Some(
+            write_origin_root_cert()
+                .map_err(|e| format!("could not stage the NATS root certificate: {e}"))?,
+        )
     } else {
         eprintln!(
             "WARNING: NATS_PUBLIC_URL is not tls:// - this connection is UNENCRYPTED. \
              Scan targets and findings will cross the network in cleartext."
         );
-        opts
+        None
     };
 
-    let nats_client = opts.connect(nats_url).await.map_err(|e| {
-        eprintln!("ERROR: Failed to connect to NATS: {e}");
-        e
-    })?;
+    // A connection attempt uses its options up, so each one is given its own.
+    let options = || {
+        let on_event = {
+            let egress_state = Arc::clone(&egress_state);
+            let reconnected = Arc::clone(&reconnected);
+            move |event: async_nats::Event| {
+                match event {
+                    async_nats::Event::Disconnected => egress_state.connection_lost(),
+                    async_nats::Event::Connected => reconnected.notify_one(),
+                    _ => {}
+                }
+                std::future::ready(())
+            }
+        };
+        let key_pair = Arc::clone(&key_pair);
+        let opts = async_nats::ConnectOptions::with_jwt(jwt_str.clone(), move |nonce: Vec<u8>| {
+            let kp = key_pair.clone();
+            async move { kp.sign(&nonce).map_err(async_nats::AuthError::new) }
+        })
+        // Increase the subscriber buffer so large bursts (e.g. a 65k-op scan)
+        // don't overflow and drop messages as "slow consumer".
+        .subscription_capacity(1_000_000)
+        .event_callback(on_event);
+        let opts = with_node_inbox(opts, &config.node_id);
+        match &root_certificate {
+            Some(ca_path) => opts
+                .add_root_certificates(ca_path.clone())
+                .require_tls(true),
+            None => opts,
+        }
+    };
+
+    // NATS that is not up yet is waited for, as the controller is (see
+    // START_RETRY_WINDOW). Not with async-nats' retry_on_initial_connect: that retries
+    // for good in the background while the node looks connected.
+    let nats_client = until_reachable(
+        &format!("NATS at {nats_url}"),
+        async || options().connect(nats_url).await,
+        nats_unreachable,
+    )
+    .await
+    .map_err(|e| format!("could not connect to NATS at {nats_url}: {e}"))?;
 
     // Subscribe to the job/control channel for this node
     let job_subject = format!("cfx.jobs.{}", config.node_id);
     let mut job_sub = nats_client
         .subscribe(job_subject.clone())
         .await
-        .map_err(|e| {
-            eprintln!("ERROR: Failed to subscribe to {job_subject}: {e}");
-            e
-        })?;
+        .map_err(|e| format!("could not subscribe to {job_subject}: {e}"))?;
 
     // Keep a clone for publishing status updates (nats_client is cheap to clone)
     let publisher = nats_client.clone();
@@ -2769,7 +2776,7 @@ pub async fn run_daemon(
 
     // -- Validate API key before going online -------------------------------
     // This blocks the node from ever appearing online with a revoked key.
-    let http_client = reqwest::Client::new();
+    let http_client = api::client();
     let bench_client = bench_client();
     let validate_res = http_client
         .post(format!("{}/api/v1/node-status", config.api_url))
@@ -2794,7 +2801,7 @@ pub async fn run_daemon(
                 "host_seed": host_seed_str.clone()
             })
         }))
-        .send()
+        .send_api()
         .await;
 
     match validate_res {
@@ -2840,7 +2847,7 @@ pub async fn run_daemon(
         let resume_res = http_client
             .post(format!("{api_url}/api/v1/resume-pending"))
             .json(&serde_json::json!({ "api_key": api_key }))
-            .send()
+            .send_api()
             .await;
         match resume_res {
             Ok(r) if r.status().is_success() => {
@@ -3007,13 +3014,41 @@ pub async fn run_daemon(
     const EVICT_AFTER_401: u32 = 4; // ~20s of sustained auth failure at the 5s interval
 
     // Whether each running engine sends a wrapped op through the proxy it names, by
-    // engine id. Asked once an engine is seen running, again after it is installed,
+    // engine name. Asked once an engine is seen running, again after it is installed,
     // restarted or stopped, and every half minute besides, so the heartbeat can say
     // which engines a proxied op can use.
-    let mut engine_egress = egress::state::EngineEgress::default();
+    let mut engine_answers = egress::state::EngineAnswers::default();
+
+    // The data the engines read: the crossfyre-templates pack and the CVE dataset, which
+    // this node takes from the bins origin as it starts and once a day after, as
+    // `crossfyre update data` does, and its dashboard update takes too. What it last did is
+    // in each heartbeat, in toolchain_status.data.
+    let data_status: std::sync::Arc<std::sync::Mutex<Option<toolchain::data_update::Status>>> =
+        Default::default();
+    let data_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut data_interval = tokio::time::interval(tokio::time::Duration::from_secs(24 * 3600));
 
     loop {
         tokio::select! {
+            // The data, as the node starts and once a day after. A run still going when
+            // the next is due is left to finish. An offline machine fetches none: the
+            // node runs on, on the data it has.
+            _ = data_interval.tick() => {
+                if let Some(line) = policy::offline_line(&paths.base) {
+                    println!("[data] {line}, so the data is not refreshed.");
+                } else if !data_running.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    let (status, running) = (data_status.clone(), data_running.clone());
+                    tokio::spawn(async move {
+                        let (now, lines) = toolchain::data_update::refresh_here().await;
+                        for line in lines {
+                            println!("[data] {line}");
+                        }
+                        let mut held = status.lock().unwrap_or_else(|e| e.into_inner());
+                        *held = Some(now.after(held.as_ref()));
+                        running.store(false, std::sync::atomic::Ordering::SeqCst);
+                    });
+                }
+            }
             // Credential refresh (every 6 days)
             _ = refresh_interval.tick() => {
                 println!("[refresh] Proactively refreshing NATS credentials...");
@@ -3057,8 +3092,8 @@ pub async fn run_daemon(
                         let port = crate::toolchain::config::engine_port(ext);
                         let running = engine_listening(port);
                         if !running {
-                            engine_egress.remove(ext);
-                        } else if engine_egress.due(ext, std::time::Instant::now()) {
+                            engine_answers.remove(ext);
+                        } else if engine_answers.due(ext, std::time::Instant::now()) {
                             ask.push((ext.to_string(), format!("127.0.0.1:{port}")));
                         }
                         map.insert(ext.to_string(), serde_json::json!({
@@ -3067,30 +3102,28 @@ pub async fn run_daemon(
                             "installed": installed
                         }));
                     }
-                    let answers = futures_util::future::join_all(ask.iter().map(|(_, addr)| {
-                        egress::state::engine_reads_egress(addr)
-                    }))
+                    let answers = futures_util::future::join_all(
+                        ask.iter().map(|(_, addr)| egress::state::engine_answer(addr)),
+                    )
                     .await;
                     let asked_at = std::time::Instant::now();
-                    for ((ext, _), reads) in ask.into_iter().zip(answers) {
-                        engine_egress.answered(ext, reads, asked_at);
+                    for ((ext, _), answer) in ask.into_iter().zip(answers) {
+                        engine_answers.answered(ext, answer, asked_at);
                     }
                     for (ext, status) in map.iter_mut() {
-                        status["egress"] = serde_json::json!(engine_egress.reads(ext));
+                        status["egress"] = serde_json::json!(engine_answers.reads(ext));
                     }
                     serde_json::Value::Object(map)
                 };
 
-                // Toolchain health: the node's own version, and Postgres
-                // probed on its configured TCP port.
+                // Toolchain health: the node's own version, and the database config.toml
+                // names, probed on its port: 127.0.0.1 for the local one, or the host of
+                // one the operator runs.
                 let toolchain_status: serde_json::Value = {
-                    let pg_port = crate::toolchain::config::load_config()
-                        .map(|c| c.postgres.port)
-                        .unwrap_or(4440);
-                    let pg_running = std::net::TcpStream::connect_timeout(
-                        &std::net::SocketAddr::from(([127, 0, 0, 1], pg_port)),
-                        std::time::Duration::from_millis(200),
-                    ).is_ok();
+                    let (pg_port, pg_running) = match crate::toolchain::config::load_config() {
+                        Ok(c) => (c.postgres.port, c.postgres.answers()),
+                        Err(_) => (cfx_db::Settings::default().port, false),
+                    };
                     toolchain_health(
                         node_version,
                         pg_port,
@@ -3099,6 +3132,16 @@ pub async fn run_daemon(
                         egress_state.heartbeat(),
                     )
                 };
+
+                let mut toolchain_status = with_data(
+                    toolchain_status,
+                    data_status.lock().unwrap_or_else(|e| e.into_inner()).as_ref(),
+                );
+                toolchain_status["pacing"] = pacing_status(
+                    &adaptive::backend::pacing().label(),
+                    &engine_answers,
+                    ext_status.as_object().into_iter().flat_map(|m| m.keys()),
+                );
 
                 let host_status = if first_tick {
                     first_tick = false;
@@ -3138,7 +3181,7 @@ pub async fn run_daemon(
                         "message": serde_json::Value::Null,
                         "host_status": host_status
                     }))
-                    .send()
+                    .send_api()
                     .await;
 
                 match status_res {
@@ -3453,25 +3496,26 @@ pub async fn run_daemon(
                             }
                             Some("install_extension") => {
                                 let ext = cmd["extension"].as_str().unwrap_or("").to_string();
-                                engine_egress.remove(&ext);
-                                // Printed by public name; `ext` stays the id the API sent, for the reply.
-                                let name = toolchain::public_name(&ext).to_string();
-                                println!("\n[install] Installing extension: {name}");
+                                engine_answers.remove(&ext);
+                                println!("\n[install] Installing extension: {ext}");
 
                                 // Built-in package manager: download + verify +
-                                // enable + start in one call.
-                                let msg = match toolchain::install::install_and_start(&ext).await {
-                                    Ok(()) => {
-                                        println!("[install] OK {name} installed and started");
+                                // enable + start in one call. Where no service manager
+                                // runs, `crossfyre node up` starts it within seconds.
+                                let writer = toolchain::install::Writer::node(node_version);
+                                let msg = match toolchain::install::install_and_start(&ext, false, writer).await {
+                                    Ok(started) => {
+                                        let and = if started { " and started" } else { "" };
+                                        println!("[install] OK {ext} installed{and}");
                                         serde_json::json!({
                                             "type": "extension_installed",
                                             "extension": ext,
-                                            "started": true,
+                                            "started": started,
                                             "node_id": &node_id
                                         })
                                     }
                                     Err(e) => {
-                                        eprintln!("[install] FAIL Failed to install {name}: {e}");
+                                        eprintln!("[install] FAIL Failed to install {ext}: {e}");
                                         serde_json::json!({
                                             "type": "extension_install_failed",
                                             "extension": ext,
@@ -3484,14 +3528,13 @@ pub async fn run_daemon(
                             }
                             Some("start_postgres") => {
                                 println!("\n[toolchain] Starting PostgreSQL...");
-                                // Blocking, and slow when a container from an earlier release
-                                // has to be secured first.
+                                // Blocking: making the local database runs initdb.
                                 let started = tokio::task::spawn_blocking(|| {
-                                    toolchain::db::ensure_up().map_err(|e| e.to_string())
+                                    toolchain::db::up().map_err(|e| e.to_string())
                                 })
                                 .await;
                                 let success = match started {
-                                    Ok(Ok(())) => { println!("[toolchain] OK PostgreSQL started"); true }
+                                    Ok(Ok(_)) => { println!("[toolchain] OK PostgreSQL started"); true }
                                     Ok(Err(e)) => { eprintln!("[toolchain] FAIL PostgreSQL failed to start: {e}"); false }
                                     Err(e) => { eprintln!("[toolchain] FAIL PostgreSQL failed to start: {e}"); false }
                                 };
@@ -3513,8 +3556,13 @@ pub async fn run_daemon(
                                 let updated = toolchain::install::update_for_dashboard().await;
                                 // An update can replace the engines without this node
                                 // restarting, so ask each again what it reads.
-                                engine_egress.clear();
+                                engine_answers.clear();
 
+                                if let Ok(u) = &updated {
+                                    let mut held =
+                                        data_status.lock().unwrap_or_else(|e| e.into_inner());
+                                    *held = Some(u.data.clone().after(held.as_ref()));
+                                }
                                 let (success, restarting, managed_by) = match &updated {
                                     Ok(u) => (true, u.restart, u.cli_managed_by),
                                     Err(e) => {
@@ -3548,14 +3596,12 @@ pub async fn run_daemon(
                             }
                             Some("remove_extension") => {
                                 let ext = cmd["extension"].as_str().unwrap_or("").to_string();
-                                engine_egress.remove(&ext);
-                                // Printed by public name; `ext` stays the id the API sent, for the reply.
-                                let name = toolchain::public_name(&ext).to_string();
-                                println!("\n[remove] Removing extension: {name}");
+                                engine_answers.remove(&ext);
+                                println!("\n[remove] Removing extension: {ext}");
 
                                 let remove_ok = match toolchain::install::remove(&ext) {
-                                    Ok(()) => { println!("[remove] OK {name} removed"); true }
-                                    Err(e) => { eprintln!("[remove] FAIL Failed to remove {name}: {e}"); false }
+                                    Ok(()) => { println!("[remove] OK {ext} removed"); true }
+                                    Err(e) => { eprintln!("[remove] FAIL Failed to remove {ext}: {e}"); false }
                                 };
 
                                 let msg = serde_json::json!({
@@ -3568,14 +3614,12 @@ pub async fn run_daemon(
                             }
                             Some("restart_extension") => {
                                 let ext = cmd["extension"].as_str().unwrap_or("").to_string();
-                                engine_egress.remove(&ext);
-                                // Printed by public name; `ext` stays the id the API sent, for the reply.
-                                let name = toolchain::public_name(&ext).to_string();
-                                println!("\n[restart] Restarting extension: {name}");
+                                engine_answers.remove(&ext);
+                                println!("\n[restart] Restarting extension: {ext}");
 
                                 let msg = match toolchain::service::restart(&ext) {
                                     Ok(()) => {
-                                        println!("[restart] OK {name} restarted");
+                                        println!("[restart] OK {ext} restarted");
                                         serde_json::json!({
                                             "type": "extension_restarted",
                                             "extension": ext,
@@ -3583,12 +3627,16 @@ pub async fn run_daemon(
                                             "node_id": &node_id
                                         })
                                     }
+                                    // Why it did not, which the dashboard shows: where no
+                                    // service manager runs, that `crossfyre node up` runs the
+                                    // engines.
                                     Err(e) => {
-                                        eprintln!("[restart] FAIL Failed to restart {name}: {e}");
+                                        eprintln!("[restart] FAIL Failed to restart {ext}: {e}");
                                         serde_json::json!({
                                             "type": "extension_restart_failed",
                                             "extension": ext,
                                             "success": false,
+                                            "error": e.to_string(),
                                             "node_id": &node_id
                                         })
                                     }
@@ -3597,19 +3645,18 @@ pub async fn run_daemon(
                             }
                             Some("reinstall_extension") => {
                                 let ext = cmd["extension"].as_str().unwrap_or("").to_string();
-                                engine_egress.remove(&ext);
-                                // Printed by public name; `ext` stays the id the API sent, for the reply.
-                                let name = toolchain::public_name(&ext).to_string();
-                                println!("\n[reinstall] Reinstalling extension: {name}");
+                                engine_answers.remove(&ext);
+                                println!("\n[reinstall] Reinstalling extension: {ext}");
 
-                                let success = match toolchain::install::install(&ext, true).await {
+                                let writer = toolchain::install::Writer::node(node_version);
+                                let success = match toolchain::install::install(&ext, true, writer).await {
                                     Ok(()) => {
-                                        println!("[reinstall] OK {name} reinstalled, starting service...");
+                                        println!("[reinstall] OK {ext} reinstalled, starting service...");
                                         let _ = toolchain::service::start(&ext);
                                         true
                                     }
                                     Err(e) => {
-                                        eprintln!("[reinstall] FAIL Failed to reinstall {name}: {e}");
+                                        eprintln!("[reinstall] FAIL Failed to reinstall {ext}: {e}");
                                         false
                                     }
                                 };
@@ -3624,14 +3671,12 @@ pub async fn run_daemon(
                             }
                             Some("stop_extension") => {
                                 let ext = cmd["extension"].as_str().unwrap_or("").to_string();
-                                engine_egress.remove(&ext);
-                                // Printed by public name; `ext` stays the id the API sent, for the reply.
-                                let name = toolchain::public_name(&ext).to_string();
-                                println!("\n[stop] Stopping extension: {name}");
+                                engine_answers.remove(&ext);
+                                println!("\n[stop] Stopping extension: {ext}");
 
                                 let success = match toolchain::service::stop(&ext) {
-                                    Ok(()) => { println!("[stop] OK {name} stopped"); true }
-                                    Err(e) => { eprintln!("[stop] FAIL Failed to stop {name}: {e}"); false }
+                                    Ok(()) => { println!("[stop] OK {ext} stopped"); true }
+                                    Err(e) => { eprintln!("[stop] FAIL Failed to stop {ext}: {e}"); false }
                                 };
 
                                 let msg = serde_json::json!({
@@ -3773,6 +3818,155 @@ fn stage_origin_root_cert(dir: Option<&std::path::Path>) -> std::io::Result<std:
     Ok(path)
 }
 
+/// How long a starting node keeps trying a control plane that is not up yet: the
+/// controller it refreshes its state from, and then NATS.
+///
+/// WHY: on a reboot the node service and the control plane start together, and the
+/// node usually wins the race. It used to call exit(1) on the resulting connection
+/// error; the supervisor then parked it as dead and "held until its config changes",
+/// i.e. forever. systemd never intervened either, because Restart=on-failure watches
+/// the SUPERVISOR, which stayed perfectly healthy holding a corpse. Net effect: every
+/// reboot silently killed the fleet until a human ran `systemctl restart` by hand, and
+/// the dashboard just said 0 nodes online without saying why.
+///
+/// Only genuinely transient failures are retried. A deleted node, a revoked key, another
+/// daemon holding the same api_key or a refused NATS login are permanent and still exit
+/// immediately: retrying those would spin forever hiding a real problem.
+const START_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Try `attempt` until it succeeds, until it fails in a way `transient` says waiting
+/// will not mend, or until [`START_RETRY_WINDOW`] has passed since the first try. The
+/// wait after a failure is 2 seconds and then twice the one before, up to 30, and each
+/// one is announced with `what`, the part of the control plane that did not answer.
+async fn until_reachable<T, E: std::fmt::Display>(
+    what: &str,
+    mut attempt: impl AsyncFnMut() -> Result<T, E>,
+    transient: impl Fn(&E) -> bool,
+) -> Result<T, E> {
+    let started = tokio::time::Instant::now();
+    let mut wait = std::time::Duration::from_secs(2);
+    loop {
+        let e = match attempt().await {
+            Ok(done) => return Ok(done),
+            Err(e) => e,
+        };
+        if !transient(&e) || started.elapsed() >= START_RETRY_WINDOW {
+            return Err(e);
+        }
+        eprintln!(
+            "  {what} is not reachable yet ({e}); retrying in {}s",
+            wait.as_secs()
+        );
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(std::time::Duration::from_secs(30));
+    }
+}
+
+/// Whether a refresh that failed may succeed if tried again: the controller did not
+/// answer, as while it starts. An answer it gave is final.
+fn controller_unreachable(e: &(dyn std::error::Error + 'static)) -> bool {
+    e.downcast_ref::<reqwest::Error>()
+        .is_some_and(|re| re.is_connect() || re.is_timeout() || re.is_request())
+}
+
+/// Whether a first connection to NATS that failed may succeed if tried again: nothing
+/// listened yet, nothing answered in time, or the name did not resolve yet. A refused
+/// login, a TLS failure and an address that does not parse are not mended by waiting.
+fn nats_unreachable(e: &async_nats::ConnectError) -> bool {
+    use async_nats::ConnectErrorKind::{Dns, Io, TimedOut};
+    matches!(e.kind(), Io | TimedOut | Dns)
+}
+
+#[cfg(test)]
+mod start_retry_tests {
+    use super::*;
+    use async_nats::{ConnectError, ConnectErrorKind};
+    use std::time::Duration;
+
+    fn refused() -> ConnectError {
+        ConnectError::with_source(
+            ConnectErrorKind::Io,
+            std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+        )
+    }
+
+    /// NATS that is still starting, as on a reboot, is waited for: the node used to exit
+    /// at the first refusal and stay down.
+    #[tokio::test(start_paused = true)]
+    async fn a_node_waits_for_nats_that_is_still_starting() {
+        let started = tokio::time::Instant::now();
+        let mut tries = 0;
+        let got = until_reachable(
+            "NATS",
+            async || {
+                tries += 1;
+                if tries < 4 { Err(refused()) } else { Ok(tries) }
+            },
+            nats_unreachable,
+        )
+        .await;
+        assert_eq!(got.ok(), Some(4));
+        // 2, 4 and 8 seconds between the four tries.
+        assert_eq!(started.elapsed(), Duration::from_secs(14));
+    }
+
+    /// A refusal that waiting will not mend ends the start at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_login_is_not_tried_again() {
+        let mut tries = 0;
+        let got = until_reachable(
+            "NATS",
+            async || {
+                tries += 1;
+                Err::<(), _>(ConnectError::new(ConnectErrorKind::AuthorizationViolation))
+            },
+            nats_unreachable,
+        )
+        .await;
+        assert_eq!(
+            got.map_err(|e| e.kind()),
+            Err(ConnectErrorKind::AuthorizationViolation)
+        );
+        assert_eq!(tries, 1);
+    }
+
+    /// Nor does a start wait for good: NATS that has not answered in ten minutes is a
+    /// problem to show.
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_ends_after_ten_minutes() {
+        let started = tokio::time::Instant::now();
+        let got = until_reachable("NATS", async || Err::<(), _>(refused()), nats_unreachable).await;
+        assert!(got.is_err());
+        assert!(
+            started.elapsed() >= START_RETRY_WINDOW,
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() <= START_RETRY_WINDOW + Duration::from_secs(30),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn only_what_waiting_can_mend_is_tried_again() {
+        use ConnectErrorKind::*;
+        for kind in [Io, TimedOut, Dns] {
+            assert!(nats_unreachable(&ConnectError::new(kind)), "{kind:?}");
+        }
+        for kind in [
+            AuthorizationViolation,
+            Authentication,
+            Tls,
+            ServerParse,
+            MaxReconnects,
+        ] {
+            assert!(!nats_unreachable(&ConnectError::new(kind)), "{kind:?}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod inbox_tests {
     use super::*;
@@ -3830,27 +4024,8 @@ mod security_tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Installs written before this existed still have 0644 configs on disk, and
-    /// a normal start does not rewrite the file, so load-time repair is the only
-    /// thing that fixes them.
-    #[cfg(unix)]
-    #[test]
-    fn an_existing_wide_open_config_is_repaired_on_load() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("cfx-sec3-{}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
-        let p = dir.join("node.toml");
-        fs::write(&p, "api_key = \"x\"").unwrap();
-        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
-        repair_secret_file_mode(&p);
-        let mode = fs::metadata(&p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "repair left {mode:o}");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
     /// The node service runs as root over a config root the operator owns. A link the
-    /// operator leaves there must not carry root's reads, writes and chmods to files
-    /// outside it.
+    /// operator leaves there must not carry root's reads and writes to files outside it.
     #[cfg(unix)]
     fn node_root_with_link(name: &str, target: &std::path::Path) -> tempfile::TempDir {
         let t = tempfile::tempdir().expect("tempdir");
@@ -3894,23 +4069,6 @@ mod security_tests {
         );
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn a_root_repair_does_not_chmod_through_a_link() {
-        use std::os::unix::fs::PermissionsExt;
-        let outside = tempfile::tempdir().expect("tempdir");
-        let target = outside.path().join("passwd");
-        fs::write(&target, "x").unwrap();
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
-        let base = node_root_with_link("n.toml", &target);
-
-        let _root = toolchain::sudo_user::act_as_root();
-        repair_secret_file_mode(&base.path().join("nodes.d/n.toml"));
-
-        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o644, "chmodded the link's target");
-    }
-
     /// A hard link is a second name for the same file, and on macOS (or a Linux host
     /// with fs.protected_hardlinks off) the operator can make one to a root file they
     /// cannot read. The scan must not read it, or its parse error quotes the file.
@@ -3949,25 +4107,6 @@ mod security_tests {
         let ids = discover_nodes(base.path()).unwrap();
 
         assert_eq!(ids, vec!["ok".to_string()]);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_root_repair_does_not_chmod_a_hard_linked_file() {
-        use std::os::unix::fs::PermissionsExt;
-        let base = tempfile::tempdir().expect("tempdir");
-        fs::create_dir(base.path().join("nodes.d")).unwrap();
-        let outside = tempfile::tempdir().expect("tempdir");
-        let target = outside.path().join("hosts");
-        fs::write(&target, "127.0.0.1 localhost\n").unwrap();
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
-        fs::hard_link(&target, base.path().join("nodes.d/n.toml")).unwrap();
-
-        let _root = toolchain::sudo_user::act_as_root();
-        repair_secret_file_mode(&base.path().join("nodes.d/n.toml"));
-
-        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o644, "chmodded the other name's file");
     }
 
     #[cfg(unix)]
@@ -4042,69 +4181,6 @@ mod security_tests {
         let _ = stage_origin_root_cert(Some(dir.path()));
 
         assert_eq!(fs::read_to_string(&victim).unwrap(), "kept\n");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn the_legacy_migration_does_not_move_a_config_through_a_linked_nodes_dir() {
-        let base = tempfile::tempdir().expect("tempdir");
-        let elsewhere = tempfile::tempdir().expect("tempdir");
-        std::os::unix::fs::symlink(elsewhere.path(), base.path().join("nodes.d")).unwrap();
-        fs::write(base.path().join("config.toml"), A_NODE_CONFIG).unwrap();
-
-        let _root = toolchain::sudo_user::act_as_root();
-        migrate_legacy_config(base.path());
-
-        assert!(
-            !elsewhere.path().join("n.toml").exists(),
-            "moved the config into the link's target"
-        );
-    }
-
-    /// The legacy config.toml is the operator's, and so is the node id in it. Root
-    /// makes paths from that id only when it is one plain name, so nothing of the
-    /// operator's is moved out of their config root.
-    #[cfg(unix)]
-    #[test]
-    fn the_legacy_migration_takes_a_node_id_only_as_one_plain_name() {
-        let base = tempfile::tempdir().expect("tempdir");
-        let elsewhere = tempfile::tempdir().expect("tempdir");
-        let victim = elsewhere.path().join("victim");
-        fs::write(
-            base.path().join("config.toml"),
-            format!(
-                "api_key = \"k\"\nnode_id = \"{}\"\napi_url = \"http://127.0.0.1:9\"\n",
-                victim.display()
-            ),
-        )
-        .unwrap();
-        fs::create_dir(base.path().join("network")).unwrap();
-
-        let _root = toolchain::sudo_user::act_as_root();
-        migrate_legacy_config(base.path());
-
-        let left: Vec<_> = fs::read_dir(elsewhere.path()).unwrap().flatten().collect();
-        assert!(left.is_empty(), "moved {left:?} out of the config root");
-        assert!(base.path().join("config.toml").exists());
-        assert!(base.path().join("network").is_dir());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn the_legacy_migration_moves_a_plain_node_id_s_config() {
-        let base = tempfile::tempdir().expect("tempdir");
-        fs::write(base.path().join("config.toml"), A_NODE_CONFIG).unwrap();
-        fs::create_dir(base.path().join("network")).unwrap();
-
-        let _root = toolchain::sudo_user::act_as_root();
-        migrate_legacy_config(base.path());
-
-        assert_eq!(
-            fs::read_to_string(base.path().join("nodes.d/n.toml")).unwrap(),
-            A_NODE_CONFIG
-        );
-        assert!(base.path().join("nodes.d/n.network").is_dir());
-        assert!(!base.path().join("config.toml").exists());
     }
 
     /// A node id from the command line or the control plane names files only when it
@@ -4289,26 +4365,80 @@ mod heartbeat_tests {
         assert!(status.get("managed_by").is_none(), "{status}");
     }
 
+    /// The heartbeat says which pacing the node runs, and each engine that said which it
+    /// runs, as it said it. One that has not said is left out.
+    #[test]
+    fn the_heartbeat_says_which_pacing_the_node_and_each_engine_run() {
+        let t0 = std::time::Instant::now();
+        let mut answers = egress::state::EngineAnswers::default();
+        let said = |pacing: Option<&str>| {
+            Some(egress::state::EngineAnswer {
+                reads_egress: true,
+                pacing: pacing.map(str::to_string),
+            })
+        };
+        answers.answered("voyage".into(), said(Some("module 0.1.45")), t0);
+        answers.answered(
+            "ambulo".into(),
+            said(Some("baseline (no module is installed)")),
+            t0,
+        );
+        answers.answered("plessor".into(), said(None), t0);
+        let names: Vec<String> = ["voyage", "ambulo", "plessor", "doorward"]
+            .map(String::from)
+            .into();
+        assert_eq!(
+            pacing_status("module 0.1.45", &answers, names.iter()),
+            serde_json::json!({
+                "node": "module 0.1.45",
+                "voyage": "module 0.1.45",
+                "ambulo": "baseline (no module is installed)",
+            })
+        );
+    }
+
+    /// The heartbeat says what the node last did with the data once it has run: the
+    /// sequences in place and what went wrong, which Cloud keeps with the rest.
+    #[test]
+    fn the_heartbeat_carries_the_data_once_the_node_has_taken_it() {
+        let status = || toolchain_health("7.8.9", 4440, true, None, serde_json::json!({}));
+        assert!(with_data(status(), None).get("data").is_none());
+        let data = toolchain::data_update::Status {
+            checked: 1_795_273_200,
+            pack: Some(5),
+            dataset: None,
+            problem: Some("dataset: not there".to_string()),
+            problem_since: Some(1_795_186_800),
+        };
+        let with = with_data(status(), Some(&data));
+        assert_eq!(
+            with["data"],
+            serde_json::json!({"checked": 1_795_273_200, "pack": 5, "dataset": null,
+                "problem": "dataset: not there", "problem_since": 1_795_186_800})
+        );
+        assert_eq!(with["version"], "node 7.8.9");
+    }
+
     /// A node set up with an empty engine list, on a host where another node
     /// installed doorward, ran a port scan with it while the dashboard said doorward
     /// was not installed on it: the heartbeat reported only the node's own list.
     #[test]
     fn the_heartbeat_reports_every_engine_installed_on_the_host() {
-        let on_host = |id: &str| id == "pulse" || id == "cortex";
+        let on_host = |name: &str| name == "doorward" || name == "plessor";
         assert_eq!(
             heartbeat_engines(&[], on_host),
-            vec![("pulse", true), ("cortex", true)]
+            vec![("doorward", true), ("plessor", true)]
         );
-        // The node's own list still counts, installed or not, under any of an
-        // engine's names, and nothing is reported twice.
+        // The node's own list still counts, installed or not, and nothing is reported
+        // twice.
         let listed = [
-            "mach".to_string(),
+            "ambulo".to_string(),
             "doorward".to_string(),
             "postgres".to_string(),
         ];
         assert_eq!(
             heartbeat_engines(&listed, on_host),
-            vec![("mach", false), ("pulse", true), ("cortex", true)]
+            vec![("ambulo", false), ("doorward", true), ("plessor", true)]
         );
         assert!(heartbeat_engines(&[], |_| false).is_empty());
     }
@@ -4464,7 +4594,7 @@ mod egress_tests {
         run(
             op("op9", "vuln-scan-1", data),
             c,
-            &[("cortex", plessor.port)],
+            &[("plessor", plessor.port)],
             &nats,
         )
         .await;
@@ -4506,7 +4636,7 @@ mod egress_tests {
         run(
             op("op10", "vuln-scan-1", data),
             c,
-            &[("cortex", plessor.port)],
+            &[("plessor", plessor.port)],
             &nats,
         )
         .await;
@@ -4546,7 +4676,7 @@ mod egress_tests {
         run(
             op("op10b", "vuln-scan-1", data),
             c,
-            &[("cortex", plessor.port)],
+            &[("plessor", plessor.port)],
             &nats,
         )
         .await;
@@ -4590,7 +4720,7 @@ mod egress_tests {
         run(
             op("op-ps", "network-scan-ds", data),
             c,
-            &[("pulse", doorward.port)],
+            &[("doorward", doorward.port)],
             &nats,
         )
         .await;
@@ -4777,7 +4907,7 @@ mod egress_tests {
             "target": "http://app.example.test/",
             "egress_expect": {NODE: {"mode": "direct", "proxy_id": null, "rev": 5}},
         });
-        let engines = [("cortex", port)];
+        let engines = [("plessor", port)];
         let run =
             ops::test_engines::with(&engines, run_operation(op("op-sw", "vuln-scan-1", data), c));
         let switch = async {
@@ -4943,6 +5073,9 @@ mod op_failure_tests {
         ext: &str,
         data: Value,
     ) -> (Value, String, Vec<String>, u16) {
+        // On Windows an op hands its files over under the toolchain directory, so the
+        // test gives it one of its own.
+        let _toolchain = crate::toolchain::config::TestToolchainDir::new();
         let (_held, port) = refusing_port();
         let nats = FakeNats::start().await;
         let st = EgressState::new(resolver(&[]));
@@ -4971,7 +5104,13 @@ mod op_failure_tests {
             "op_type": op_type, "pre_claimed": true, "data": data,
         });
         let client = ctx.pub_clone.clone();
-        ops::test_engines::with(&[(ext, port)], run_operation(cmd, ctx)).await;
+        // An op that hangs fails the test in a minute, rather than holding up the run.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            ops::test_engines::with(&[(ext, port)], run_operation(cmd, ctx)),
+        )
+        .await
+        .expect("the op ended within a minute");
         client.flush().await.unwrap();
         let done = nats.wait_for("completed").await.expect("no completed");
         let subject = nats
@@ -4983,9 +5122,9 @@ mod op_failure_tests {
         (done, subject, nats.types(), port)
     }
 
-    async fn assert_failed_with_reason(op_type: &str, ext: &str, engine: &str, data: Value) {
+    async fn assert_failed_with_reason(op_type: &str, engine: &str, data: Value) {
         let op_id = format!("op-{op_type}-{}", data.as_object().map_or(0, |m| m.len()));
-        let (done, subject, types, port) = run_unreachable(&op_id, op_type, ext, data).await;
+        let (done, subject, types, port) = run_unreachable(&op_id, op_type, engine, data).await;
         assert_eq!(subject, format!("cfx.results.{NODE}"), "{op_type}");
         assert_eq!(done["code"], 1, "{op_type}: {done}");
         assert_eq!(done["job_id"], format!("{WF}-{op_id}"), "{op_type}: {done}");
@@ -5000,7 +5139,7 @@ mod op_failure_tests {
             "{op_type}: {done}"
         );
         assert!(
-            why.ends_with(&format!("Is `{engine} --daemon` running?")),
+            why.ends_with(&format!("Is `{engine} daemon` running?")),
             "{op_type}: {done}"
         );
         assert!(
@@ -5019,28 +5158,28 @@ mod op_failure_tests {
         let cases = [
             (
                 "vuln-scan-1",
-                "cortex",
+                "plessor",
                 json!({"target": hostile, "credential_id": "c1"}),
             ),
             (
                 "vuln-scan-1",
-                "cortex",
+                "plessor",
                 json!({"target": hostile, "mode": "authz",
                        "identities": [{"role": "admin", "credential_id": "c2"}]}),
             ),
             (
                 "service-enum-1",
-                "scout",
+                "toolmark",
                 json!({"target": hostile, "credential_id": "c3"}),
             ),
             (
                 "web-crawl-1",
-                "mach",
+                "ambulo",
                 json!({"seed": hostile, "credential_id": "c4"}),
             ),
             (
                 "content-discovery-db",
-                "mach",
+                "ambulo",
                 json!({"url": hostile, "wordlist_url": "", "credential_id": "c5"}),
             ),
         ];
@@ -5061,49 +5200,49 @@ mod op_failure_tests {
     #[tokio::test]
     async fn a_vuln_scan_with_plessor_down_says_so() {
         let data = json!({"target": "http://127.0.0.1:9/"});
-        assert_failed_with_reason("vuln-scan-1", "cortex", "plessor", data).await;
+        assert_failed_with_reason("vuln-scan-1", "plessor", data).await;
     }
 
     #[tokio::test]
     async fn a_service_scan_with_toolmark_down_says_so() {
         let data = json!({"target": "http://127.0.0.1:9/"});
-        assert_failed_with_reason("service-enum-1", "scout", "toolmark", data).await;
+        assert_failed_with_reason("service-enum-1", "toolmark", data).await;
     }
 
     #[tokio::test]
     async fn a_crawl_with_ambulo_down_says_so() {
         let data = json!({"seed": "http://127.0.0.1:9/"});
-        assert_failed_with_reason("web-crawl-1", "mach", "ambulo", data).await;
+        assert_failed_with_reason("web-crawl-1", "ambulo", data).await;
     }
 
     #[tokio::test]
     async fn a_takeover_check_with_voyage_down_says_so() {
         let data = json!({"domain": "example.test"});
-        assert_failed_with_reason("takeover-1", "voyage", "voyage", data).await;
+        assert_failed_with_reason("takeover-1", "voyage", data).await;
     }
 
     #[tokio::test]
     async fn origin_discovery_with_voyage_down_says_so() {
         let data = json!({"domain": "example.test"});
-        assert_failed_with_reason("origin-discovery-1", "voyage", "voyage", data).await;
+        assert_failed_with_reason("origin-discovery-1", "voyage", data).await;
     }
 
     #[tokio::test]
     async fn subdomain_enumeration_with_voyage_down_says_so() {
         let data = json!({"domain": "example.test", "disable_active": true});
-        assert_failed_with_reason("subdomain-enum-ds", "voyage", "voyage", data).await;
+        assert_failed_with_reason("subdomain-enum-ds", "voyage", data).await;
     }
 
     #[tokio::test]
     async fn a_port_probe_with_doorward_down_says_so() {
         let data = json!({"host": "127.0.0.1", "port": 22});
-        assert_failed_with_reason("network-scan-ds", "pulse", "doorward", data).await;
+        assert_failed_with_reason("network-scan-ds", "doorward", data).await;
     }
 
     #[tokio::test]
     async fn a_port_batch_with_doorward_down_says_so() {
         let data = json!({"targets": ["127.0.0.1"], "ports": "22", "tasks": 1});
-        assert_failed_with_reason("network-scan-db", "pulse", "doorward", data).await;
+        assert_failed_with_reason("network-scan-db", "doorward", data).await;
     }
 
     /// A probe that could not reach ambulo used to be reported as done with nothing
@@ -5111,13 +5250,13 @@ mod op_failure_tests {
     #[tokio::test]
     async fn a_content_probe_with_ambulo_down_says_so() {
         let data = json!({"mode": "probe", "probe_url": "http://127.0.0.1:9/x"});
-        assert_failed_with_reason("content-discovery-ds", "mach", "ambulo", data).await;
+        assert_failed_with_reason("content-discovery-ds", "ambulo", data).await;
     }
 
     #[tokio::test]
     async fn a_content_scan_with_ambulo_down_says_so() {
         let data = json!({"url": "http://127.0.0.1:9/", "wordlist_url": ""});
-        assert_failed_with_reason("content-discovery-db", "mach", "ambulo", data).await;
+        assert_failed_with_reason("content-discovery-db", "ambulo", data).await;
     }
 
     /// A downloaded wordlist used to be written to a fixed name in /tmp, following
@@ -5132,7 +5271,6 @@ mod op_failure_tests {
             (
                 "subdomain-enum-ds",
                 "voyage",
-                "voyage",
                 format!("op-planted-sub-wl-{pid}"),
                 format!("cfx-wl-sub-{wl}.txt"),
                 json!({"domain": "example.test", "wordlists": [{"id": wl, "url": ""}]}),
@@ -5140,14 +5278,12 @@ mod op_failure_tests {
             (
                 "subdomain-enum-ds",
                 "voyage",
-                "voyage",
                 format!("op-planted-sub-url-{pid}"),
                 format!("cfx-wl-sub-op-planted-sub-url-{pid}.txt"),
                 json!({"domain": "example.test", "wordlist_url": ""}),
             ),
             (
                 "content-discovery-db",
-                "mach",
                 "ambulo",
                 format!("op-planted-cd-wl-{pid}"),
                 format!("cfx-wl-{wl}.txt"),
@@ -5155,7 +5291,6 @@ mod op_failure_tests {
             ),
             (
                 "content-discovery-db",
-                "mach",
                 "ambulo",
                 format!("op-planted-cd-url-{pid}"),
                 format!("cfx-wl-chunk-op-planted-cd-url-{pid}.txt"),
@@ -5163,7 +5298,6 @@ mod op_failure_tests {
             ),
             (
                 "content-discovery-db",
-                "mach",
                 "ambulo",
                 format!("op-planted-cd-rec-{pid}"),
                 format!("cfx-wl-recurse-op-planted-cd-rec-{pid}.txt"),
@@ -5176,14 +5310,14 @@ mod op_failure_tests {
                 }),
             ),
         ];
-        for (op_type, ext, engine, op_id, name, data) in cases {
+        for (op_type, engine, op_id, name, data) in cases {
             let scratch = tempfile::tempdir().unwrap();
             let victim = scratch.path().join("victim");
             std::fs::write(&victim, "kept\n").unwrap();
             let planted = std::path::PathBuf::from("/tmp").join(&name);
             let _ = std::fs::remove_file(&planted);
             std::os::unix::fs::symlink(&victim, &planted).unwrap();
-            let (done, ..) = run_unreachable(&op_id, op_type, ext, data).await;
+            let (done, ..) = run_unreachable(&op_id, op_type, engine, data).await;
             let _ = std::fs::remove_file(&planted);
             assert_eq!(
                 std::fs::read_to_string(&victim).unwrap(),
@@ -5213,7 +5347,7 @@ mod op_failure_tests {
             "recurse_wordlist_url": "",
         });
         let (done, _, types, _) =
-            run_unreachable(&op_id, "content-discovery-db", "mach", data).await;
+            run_unreachable(&op_id, "content-discovery-db", "ambulo", data).await;
         let _ = std::fs::remove_file(format!("/tmp/cfx-wl-recurse-{op_id}.txt"));
         assert_eq!(done["code"], 1, "{done}");
         let why = done["error"].as_str().unwrap_or_default();
@@ -5343,17 +5477,17 @@ mod impostor_engine_tests {
         let cases = [
             (
                 "vuln-scan-1",
-                "cortex",
+                "plessor",
                 json!({"target": "http://127.0.0.1:9/"}),
             ),
             (
                 "service-enum-1",
-                "scout",
+                "toolmark",
                 json!({"target": "http://127.0.0.1:9/"}),
             ),
             (
                 "web-crawl-1",
-                "mach",
+                "ambulo",
                 json!({"seed": "http://127.0.0.1:9/"}),
             ),
             ("takeover-1", "voyage", json!({"domain": "example.test"})),
@@ -5369,22 +5503,22 @@ mod impostor_engine_tests {
             ),
             (
                 "network-scan-ds",
-                "pulse",
+                "doorward",
                 json!({"host": "127.0.0.1", "port": 22}),
             ),
             (
                 "network-scan-db",
-                "pulse",
+                "doorward",
                 json!({"targets": ["127.0.0.1"], "ports": "22", "tasks": 1}),
             ),
             (
                 "content-discovery-ds",
-                "mach",
+                "ambulo",
                 json!({"mode": "probe", "probe_url": "http://127.0.0.1:9/x"}),
             ),
             (
                 "content-discovery-db",
-                "mach",
+                "ambulo",
                 json!({"url": "http://127.0.0.1:9/", "wordlist_url": ""}),
             ),
         ];
@@ -5413,10 +5547,115 @@ mod impostor_engine_tests {
         let imp = impostor();
         let addr = format!("127.0.0.1:{}", imp.port);
         let answer = ops::listener::TRUSTED
-            .scope(others(), egress::state::engine_reads_egress(&addr))
+            .scope(others(), egress::state::engine_answer(&addr))
             .await;
         assert_eq!(answer, None);
         assert!(imp.got.lock().unwrap().is_empty());
+    }
+}
+
+/// Authorization testing goes to plessor-authz when it is installed and says it runs it,
+/// and to plessor otherwise, whose open build says what is needed.
+#[cfg(test)]
+mod authz_routing_tests {
+    use super::*;
+    use egress::state::EgressState;
+    use egress::testkit::{FakeEngine, FakeNats, FakePlatform, direct_settings, http, resolver};
+    use serde_json::{Value, json};
+
+    fn inner(req: &Value) -> Value {
+        if req["operation"] == "egress" {
+            req["inner"].clone()
+        } else {
+            req.clone()
+        }
+    }
+
+    /// Run authz op `id` with the engines at `places`. Each op has its own id, since
+    /// one already run is not run again.
+    async fn run_authz(id: &str, places: &[(&str, &FakeEngine)]) {
+        let nats = FakeNats::start().await;
+        let platform = FakePlatform::start(|_, _| (404, json!({}))).await;
+        let st = EgressState::new(resolver(&[]));
+        st.apply_authorize(&direct_settings(1));
+        let ctx = OpCtx {
+            pub_clone: nats.client().await,
+            status_subj: "cfx.node.n.status".into(),
+            result_subj: "cfx.results.n".into(),
+            node_id: "n".into(),
+            http: http(),
+            api_url: platform.url.clone(),
+            api_key: "cfk_node".into(),
+            egress: st,
+        };
+        let cmd = json!({
+            "type": "operation", "operation_id": id, "workflow_id": format!("wf-{id}"),
+            "op_type": "vuln-scan-1", "pre_claimed": true,
+            "data": {"target": "http://app.test/", "mode": "authz", "endpoints": [],
+                     "identities": []},
+        });
+        let client = ctx.pub_clone.clone();
+        let ports: Vec<(&str, u16)> = places.iter().map(|(n, e)| (*n, e.port)).collect();
+        ops::test_engines::with(&ports, run_operation(cmd, ctx)).await;
+        client.flush().await.unwrap();
+        nats.wait_for("operation_completed").await;
+    }
+
+    fn operations(e: &FakeEngine) -> Vec<String> {
+        e.seen()
+            .iter()
+            .map(|r| inner(r)["operation"].as_str().unwrap_or("").to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn authz_goes_to_plessor_authz_when_it_says_it_runs_it() {
+        let runs_it = || {
+            FakeEngine::start(|req| async move {
+                if inner(&req)["operation"] == "capabilities" {
+                    vec![json!({"type": "capabilities", "authz": ["scope", "block_internal"]})]
+                } else {
+                    vec![json!({"type": "done", "found": 0})]
+                }
+            })
+        };
+        let done = || FakeEngine::start(|_| async { vec![json!({"type": "done", "found": 0})] });
+
+        let (authz, plessor) = (runs_it().await, done().await);
+        run_authz(
+            "op-authz-1",
+            &[("plessor-authz", &authz), ("plessor", &plessor)],
+        )
+        .await;
+        assert_eq!(operations(&authz), ["capabilities", "authz"]);
+        assert!(
+            operations(&plessor).is_empty(),
+            "{:?}",
+            operations(&plessor)
+        );
+
+        // Not installed, or something on its port that does not run authz: plessor.
+        let plessor = done().await;
+        run_authz("op-authz-2", &[("plessor", &plessor)]).await;
+        assert_eq!(operations(&plessor), ["authz"]);
+        // An engine that answers but runs no authz, plessor itself on that port, say.
+        let runs_other = || {
+            FakeEngine::start(|req| async move {
+                if inner(&req)["operation"] == "capabilities" {
+                    vec![json!({"type": "capabilities", "scan": ["resolve"]})]
+                } else {
+                    vec![json!({"type": "done", "found": 0})]
+                }
+            })
+        };
+        let (other, plessor) = (runs_other().await, done().await);
+        run_authz(
+            "op-authz-3",
+            &[("plessor-authz", &other), ("plessor", &plessor)],
+        )
+        .await;
+        assert_eq!(operations(&other), ["capabilities"]);
+        assert_eq!(operations(&plessor), ["authz"]);
     }
 }
 
@@ -5533,7 +5772,7 @@ mod credential_scope_tests {
             }
             let (req, notes) = engine_request(
                 "vuln-scan-1",
-                "cortex",
+                "plessor",
                 &format!("op-cs-{mode}"),
                 data,
                 json!(["app.victim.test"]),
@@ -5573,7 +5812,7 @@ mod credential_scope_tests {
             "scope": ["m.attacker.test"], "credential_id": "cs-unscoped",
         });
         let (req, notes) =
-            engine_request("vuln-scan-1", "cortex", "op-cs-unscoped", data, json!([])).await;
+            engine_request("vuln-scan-1", "plessor", "op-cs-unscoped", data, json!([])).await;
         assert_eq!(
             req["auth"]["headers"]["Authorization"],
             "Bearer saved-token"
@@ -5601,7 +5840,7 @@ mod credential_scope_tests {
             });
             let (req, notes) = engine_request(
                 "vuln-scan-1",
-                "cortex",
+                "plessor",
                 &format!("op-cs-gql-{n}"),
                 data,
                 json!(["app.victim.test"]),
@@ -5637,7 +5876,7 @@ mod credential_scope_tests {
         });
         let (req, notes) = engine_request(
             "web-crawl-1",
-            "mach",
+            "ambulo",
             "op-cs-crawl",
             data,
             json!(["app.victim.test", "*.api.victim.test"]),
@@ -5660,8 +5899,39 @@ mod credential_scope_tests {
             "seed": TARGET, "follow_external": true, "scope_hosts": ["m.attacker.test"],
         });
         let (req, _) =
-            engine_request("web-crawl-1", "mach", "op-cs-crawl-anon", data, json!([])).await;
+            engine_request("web-crawl-1", "ambulo", "op-cs-crawl-anon", data, json!([])).await;
         assert_eq!(req["follow_external"], true);
         assert_eq!(req["scope_hosts"], json!(["m.attacker.test"]));
+    }
+}
+
+#[cfg(test)]
+mod offline_node_tests {
+    use crate::policy::{Offline, Reason, load, save};
+
+    /// A node does not run on a machine the user took offline, and says why and how to
+    /// leave it. Offline because the session ended, nodes run on: their keys are their own.
+    #[test]
+    fn a_machine_taken_offline_runs_no_node_and_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(super::offline_stops_nodes(dir.path()), None);
+        let mut m = load(dir.path());
+        m.offline = Some(Offline {
+            reason: Reason::SessionEnded,
+            since: "2026-11-22T05:30:07Z".into(),
+        });
+        save(dir.path(), &m).unwrap();
+        assert_eq!(super::offline_stops_nodes(dir.path()), None);
+        m.offline = Some(Offline {
+            reason: Reason::Chosen,
+            since: "2026-11-22T05:30:07Z".into(),
+        });
+        save(dir.path(), &m).unwrap();
+        let why = super::offline_stops_nodes(dir.path()).expect("offline stops nodes");
+        assert!(why.starts_with("policy: offline (you chose it)"), "{why}");
+        assert!(
+            why.contains("crossfyre policy set connected or private, or crossfyre login"),
+            "{why}"
+        );
     }
 }

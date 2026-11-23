@@ -1,0 +1,10 @@
+id: vmware-vcenter
+info:
+  name: VMware vCenter Server
+  category: Virtualization
+  metadata:
+    vendor: vmware
+    product: vcenter_server
+detect:
+  any:
+    - html: { regex: '<title>\s*ID_VC_Welcome\s*</title>' }

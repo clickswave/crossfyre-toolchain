@@ -1,0 +1,17 @@
+# Synthetic: Roundcube's login page.
+HTTP/1.1 200 OK
+content-type: text/html;charset=UTF-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+set-cookie: roundcube_sessid=
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Roundcube Webmail :: Welcome to Roundcube Webmail</title>
+</head>
+<body>
+<form name="form" method="post"></form>
+<script>var rcmail = new rcube_webmail();</script>
+</body>
+</html>

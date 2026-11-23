@@ -1,0 +1,16 @@
+# Synthetic: Metabase's landing page, whose bootstrap object names its build.
+HTTP/1.1 200 OK
+content-type: text/html;charset=utf-8
+date: Sat, 21 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Metabase</title>
+</head>
+<body>
+<script type="application/json" id="_metabaseBootstrap">{"version":{"date":"2023-06-29","tag":"v0.46.5","branch":"release-x.46.x","hash":"0000000"},"site-name":"Metabase"}</script>
+<script>window.MetabaseBootstrap = JSON.parse(document.getElementById("_metabaseBootstrap").textContent);</script>
+</body>
+</html>

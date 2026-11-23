@@ -1,0 +1,8 @@
+id: ivanti-connect-secure
+info:
+  name: Ivanti Connect Secure
+  category: VPN
+  metadata:
+    vendor: ivanti
+    product: connect_secure
+refines: ivanti-gateway

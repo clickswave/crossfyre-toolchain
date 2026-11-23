@@ -1,0 +1,11 @@
+id: manageengine-adselfservice-plus
+info:
+  name: ManageEngine ADSelfService Plus
+  category: Identity
+  metadata:
+    vendor: zohocorp
+    product: manageengine_adselfservice_plus
+implies: [java]
+detect:
+  any:
+    - html: { regex: '<title>\s*ManageEngine\W{0,3}ADSelfService Plus' }

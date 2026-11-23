@@ -1,0 +1,14 @@
+id: mariadb
+info:
+  name: MariaDB
+  category: Database
+  metadata:
+    vendor: mariadb
+    product: mariadb
+detect:
+  any:
+    - banner: { name: mysql, regex: '-MariaDB' }
+version:
+  - banner: { name: mysql, regex: '^(?:5\.5\.5-)?([0-9]+\.[0-9]+\.[0-9]+)-MariaDB' }
+distro:
+  - banner: { name: mysql, regex: '-MariaDB-(\S*(?:ubuntu|deb)\S*)' }

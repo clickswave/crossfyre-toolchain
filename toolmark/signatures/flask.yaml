@@ -1,0 +1,9 @@
+id: flask
+info:
+  name: Flask
+  category: Framework
+implies: [python]
+detect:
+  any:
+    - cookie: { name: '^session$', regex: '^(?:\.eJ|eyJ)[A-Za-z0-9_-]*\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27}$' }
+    - header: { name: server, regex: '(?i)werkzeug' }

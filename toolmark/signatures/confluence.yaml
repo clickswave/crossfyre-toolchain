@@ -1,0 +1,11 @@
+id: confluence
+info:
+  name: Atlassian Confluence
+  category: Wiki
+implies: [java]
+detect:
+  any:
+    - header: { name: x-confluence-request-time, regex: '.' }
+    - html: { regex: 'id="com-atlassian-confluence"' }
+version:
+  - meta: { name: ajs-version-number, regex: '^([0-9]+(?:\.[0-9]+)*)' }

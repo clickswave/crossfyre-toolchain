@@ -1,0 +1,9 @@
+id: alpinejs
+info:
+  name: Alpine.js
+  category: JavaScript Library
+detect:
+  any:
+    - script_src: { regex: '/alpinejs@' }
+version:
+  - script_src: { regex: 'alpinejs@([0-9]+\.[0-9]+\.[0-9]+)' }

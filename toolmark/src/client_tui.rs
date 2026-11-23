@@ -74,19 +74,32 @@ impl Toolmark {
                 // pick per type rather than showing one field that is empty
                 // for two of the three.
                 let detail = match kind.as_str() {
-                    "technology" => data["version"].as_str().unwrap_or("").to_string(),
+                    "technology" => match (data["version"].as_str(), data["distro"].as_str()) {
+                        (Some(version), Some(distro)) => format!("{version} ({distro})"),
+                        (Some(version), None) => version.to_string(),
+                        (None, _) => range_text(&data["version_range"]),
+                    },
                     "vulnerability" => data["cve"].as_str().unwrap_or("").to_string(),
                     _ => data["server"].as_str().unwrap_or("").to_string(),
                 };
 
+                let mut name = data["name"]
+                    .as_str()
+                    .or_else(|| data["title"].as_str())
+                    .unwrap_or("-")
+                    .to_string();
+                // What could not be told apart from it, said with it.
+                let candidates: Vec<&str> = data["candidates"]
+                    .as_array()
+                    .map(|c| c.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                if !candidates.is_empty() {
+                    name = format!("{name}, possibly {}", candidates.join(" or "));
+                }
                 self.findings.push(Finding {
                     severity: data["severity"].as_str().unwrap_or("info").to_string(),
                     kind,
-                    name: data["name"]
-                        .as_str()
-                        .or_else(|| data["title"].as_str())
-                        .unwrap_or("-")
-                        .to_string(),
+                    name,
                     detail,
                 });
                 self.table
@@ -214,4 +227,76 @@ pub async fn run(rx: mpsc::UnboundedReceiver<Value>, target: String) -> std::io:
     })
     .await
     .map_err(|e| std::io::Error::other(e.to_string()))?
+}
+
+/// Where a version lies, as `>= 5.0, < 6.5`, or empty for no range.
+fn range_text(range: &Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(since) = range["since"].as_str() {
+        parts.push(format!(">= {since}"));
+    }
+    if let Some(until) = range["until"].as_str() {
+        parts.push(format!("< {until}"));
+    }
+    parts.join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A technology that could not be told apart from what refines it is listed with
+    /// those it may be.
+    #[test]
+    fn a_technology_is_listed_with_what_it_may_be() {
+        let mut view = Toolmark::new("http://example.test/".into());
+        for candidates in [json!([]), json!(["Framework B", "Framework C"])] {
+            view.apply(json!({"type": "finding", "data": {
+                "type": "technology", "name": "Framework A", "version": "2.1",
+                "candidates": candidates,
+            }}));
+        }
+        let names: Vec<&str> = view.findings.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "Framework A",
+                "Framework A, possibly Framework B or Framework C"
+            ]
+        );
+    }
+
+    /// A technology with no exact version shows where its version lies.
+    #[test]
+    fn a_technology_shows_a_version_range_when_it_has_no_version() {
+        let mut view = Toolmark::new("http://example.test/".into());
+        for (version, range) in [
+            (json!("6.4.2"), json!(null)),
+            (json!(null), json!({"since": "5.0", "until": null})),
+            (json!(null), json!({"since": "6.4", "until": "6.5"})),
+        ] {
+            view.apply(json!({"type": "finding", "data": {
+                "type": "technology", "name": "WordPress", "version": version,
+                "version_range": range,
+            }}));
+        }
+        let details: Vec<&str> = view.findings.iter().map(|f| f.detail.as_str()).collect();
+        assert_eq!(details, ["6.4.2", ">= 5.0", ">= 6.4, < 6.5"]);
+    }
+
+    /// A technology whose banner named the distribution that built it says so beside the
+    /// version.
+    #[test]
+    fn a_technology_shows_the_distro_that_built_it() {
+        let mut view = Toolmark::new("10.0.0.1:22".into());
+        for distro in [json!("Ubuntu-3ubuntu0.6"), json!(null)] {
+            view.apply(json!({"type": "finding", "data": {
+                "type": "technology", "name": "OpenSSH", "version": "8.9p1",
+                "distro": distro,
+            }}));
+        }
+        let details: Vec<&str> = view.findings.iter().map(|f| f.detail.as_str()).collect();
+        assert_eq!(details, ["8.9p1 (Ubuntu-3ubuntu0.6)", "8.9p1"]);
+    }
 }

@@ -1,0 +1,10 @@
+# Synthetic: ActiveMQ's web console where it asks for a login, under the realm ActiveMQ
+# names.
+HTTP/1.1 401 Unauthorized
+www-authenticate: basic realm="ActiveMQRealm"
+content-type: text/html;charset=iso-8859-1
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<html>
+<body><h2>HTTP ERROR 401 Unauthorized</h2></body>
+</html>

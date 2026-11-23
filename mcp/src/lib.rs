@@ -21,6 +21,7 @@ mod engine;
 mod findings;
 mod guard;
 mod jobs;
+mod kept;
 mod limits;
 mod peer;
 mod redact;
@@ -44,7 +45,7 @@ use std::sync::Arc;
 /// One engine as the CLI knows it.
 #[derive(Debug, Clone)]
 pub struct EngineInfo {
-    /// The public name: `toolmark`, `plessor`, ...
+    /// The engine's name: `toolmark`, `plessor`, ...
     pub name: String,
     /// The daemon's port on 127.0.0.1, from `config.toml`.
     pub port: u16,
@@ -97,6 +98,9 @@ pub struct Options {
     pub cloud_file: Option<PathBuf>,
     /// `--no-cloud`: no Cloud backend, whatever key is set up.
     pub no_cloud: bool,
+    /// The CLI's data directory, whose policy.toml says what this machine may send to
+    /// Crossfyre.
+    pub policy_dir: PathBuf,
 }
 
 /// A reason the server did not start. Its text is printed and the process exits 2.
@@ -123,8 +127,7 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 }
 
 /// Where the scope file is, made absolute. The directory holding it is where the audit
-/// log and the jobs live, so the record of what was done sits with the permission it
-/// was done under.
+/// log lives, so the record of what was done sits with the permission it was done under.
 fn scope_path(opts: &Options) -> Result<(PathBuf, PathBuf), StartError> {
     match &opts.scope_file {
         Some(p) => {
@@ -170,8 +173,6 @@ fn build(opts: Options, resolver: Arc<dyn guard::Resolver>) -> Result<core::Mcp,
             audit_path.display()
         ))
     })?;
-    let store = jobs::JobStore::open(&dir.join("jobs"))
-        .map_err(|e| StartError(format!("could not open the job store: {e}")))?;
     let settings = core::Settings {
         version: opts.version,
         redact: opts.redact,
@@ -179,13 +180,11 @@ fn build(opts: Options, resolver: Arc<dyn guard::Resolver>) -> Result<core::Mcp,
         postgres_port: opts.postgres_port,
         workbench: opts.workbench,
         workbench_dir: opts.workbench_dir,
+        policy_dir: opts.policy_dir,
         call_burst: 10,
         calls_per_minute: 60,
     };
-    let mcp = core::Mcp::new(settings, dir, scope, audit, store, resolver);
-    mcp.jobs.recover(&mcp.session, jobs::now_ms());
-    mcp.jobs.prune(jobs::KEEP_FINISHED);
-    Ok(mcp)
+    Ok(core::Mcp::new(settings, dir, scope, audit, resolver))
 }
 
 /// SIGTERM or SIGHUP. A client that is done with the server closes its stdin and,

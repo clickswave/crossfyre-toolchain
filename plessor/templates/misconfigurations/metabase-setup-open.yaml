@@ -1,0 +1,33 @@
+id: metabase-setup-open
+info:
+  name: Metabase setup left open
+  severity: critical
+  description: A Metabase whose setup was never finished hands its setup token to anyone who asks, and that token makes the first admin account, so whoever reaches it first takes the instance over. A finished setup also leaves a token in the same place, so the check needs the instance to say it has no user yet.
+  tags: misconfig,metabase,setup,takeover
+  metadata:
+    category: misconfigurations
+    vendor: metabase
+    product: metabase
+    lab:
+      port: 3000
+      ready: /api/health
+      wait: 300
+      vulnerable: { image: metabase/metabase:v0.47.0 }
+      patched: { build: labs/metabase-set-up, args: { version: v0.47.0 } }
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/api/session/properties"
+    matchers-condition: and
+    matchers:
+      - type: regex
+        part: body
+        regex:
+          - '"setup-token"\s*:\s*"[a-f0-9-]{36}"'
+      - type: regex
+        part: body
+        regex:
+          - '"has-user-setup"\s*:\s*false'
+      - type: status
+        status:
+          - 200

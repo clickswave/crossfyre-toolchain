@@ -20,6 +20,7 @@ use plessor::rawhttp::{ReadUntil, Route, SendFail, Verify, send_until};
 const DIRECT: Route = Route {
     egress: transport::Egress::Direct,
     block_internal: false,
+    resolve: Vec::new(),
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -179,6 +180,7 @@ async fn through_a_proxy_the_certificate_is_checked_whatever_was_asked() {
     let route = Route {
         egress: transport::Egress::Proxy(format!("socks5h://{USER}:{PASS}@127.0.0.1:{}", rec.port)),
         block_internal: false,
+        resolve: Vec::new(),
     };
     let req = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
 

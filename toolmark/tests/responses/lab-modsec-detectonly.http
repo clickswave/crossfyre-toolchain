@@ -1,0 +1,10 @@
+# Lab target modsec-detectonly at http://127.0.0.1:7303/, as toolmark kept it on 2026-11-20.
+# The body, an echo of the request, is left out.
+HTTP/1.1 200 OK
+server: nginx
+date: Thu, 19 Nov 2026 19:55:35 GMT
+content-type: text/plain; charset=utf-8
+content-length: 630
+connection: keep-alive
+access-control-allow-headers: *
+

@@ -1,0 +1,14 @@
+id: angular
+info:
+  name: Angular
+  category: JavaScript Framework
+  metadata:
+    vendor: angular
+    product: angular
+detect:
+  any:
+    - html: { regex: '(?i)ng-version|_nghost|angular(?:\.min)?\.js' }
+    - rendered: { regex: 'ng-version="' }
+version:
+  - html: { regex: '(?i)ng-version="([0-9.]+)"' }
+  - rendered: { regex: 'ng-version="([0-9.]+)"' }

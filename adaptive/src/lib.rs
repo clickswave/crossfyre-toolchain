@@ -4,11 +4,10 @@
 //!
 //! This is the **open reference implementation**: it defines the interface the
 //! engines call and provides a conservative, untuned baseline behaviour. The
-//! production tuning (the operating constants and the tuned control policy) is a
-//! private drop-in that replaces this crate in first-party builds. Everything
+//! production tuning (the operating constants and the tuned control policy) is in
+//! the pacing module, which [`backend`] asks when one is installed. Everything
 //! here is safe to publish and builds standalone; nothing here is the tuned
-//! policy. Keep the public type/function signatures stable so the private
-//! implementation stays a clean drop-in.
+//! policy. Keep the public types stable: the module answers in their JSON shapes.
 //!
 //! Pure logic, no I/O, a workflow engine (ambulo content-discovery, the DS
 //! fan-out in `cfx_core`, future scanners) feeds it probe outcomes and asks it,
@@ -31,6 +30,7 @@
 //! Time is not read internally (no `Instant::now`), so behaviour is fully
 //! deterministic and unit-testable: callers record `(class, rtt_ms)` and tick.
 
+pub mod backend;
 pub mod challenge;
 pub mod congestion;
 pub mod coord;
@@ -43,7 +43,7 @@ pub mod wire;
 
 pub use challenge::{Challenge, Reaction};
 pub use congestion::{
-    Decision, Estimator, Limits, Outcome, Sample, WINDOW_MS, Window, decide as congestion_decide,
+    Decision, Estimator, Limits, Outcome, Sample, Window, decide as congestion_decide,
 };
 pub use health::{HealthStats, HealthWindow, ProbeClass};
 pub use rate::{Caps, Directive, Posture, PostureParams, RateController, score};

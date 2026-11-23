@@ -1,0 +1,3 @@
+# Saved HTTP responses the toolmark tests replay. The tests read them with LF line
+# endings, so a checkout must not turn those into CRLF, which Windows does by default.
+toolmark/tests/responses/** -text

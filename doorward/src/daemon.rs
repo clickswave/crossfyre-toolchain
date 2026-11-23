@@ -70,30 +70,17 @@ pub async fn run(port: u16, db: DoorwardDb) -> Result<(), Box<dyn std::error::Er
     let gate = dguard::Gate::from_env();
     let listener = TcpListener::bind(addr).await?;
     gate.announce("Doorward", addr);
+    dguard::exit_when_idle("doorward");
+    eprintln!("[doorward] {}", cfx_pacing::load().say());
 
     let db = Arc::new(db);
-
-    // Background: clean up expired probe results every 5 minutes
-    {
-        let db_c = Arc::clone(&db);
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-                if let Ok(n) = db_c.delete_expired_probe_results().await
-                    && n > 0
-                {
-                    println!("Cleaned {n} expired probe result(s)");
-                }
-            }
-        });
-    }
 
     loop {
         let (stream, addr) = listener.accept().await?;
         let _ = stream.set_nodelay(true);
         let gate_clone = gate.clone();
         let db_clone = Arc::clone(&db);
-        tokio::spawn(async move {
+        dguard::spawn_busy(async move {
             if let Err(e) = handle_connection(stream, gate_clone, db_clone).await {
                 eprintln!("Connection error from {addr}: {e}");
             }
@@ -138,7 +125,63 @@ async fn handle_connection(
             }
         };
 
-        // Streaming mode takes over the connection
+        // What this daemon honours beyond the original protocol, and which process it
+        // is, asked before an operation is sent and by a client waiting for the daemon
+        // it started. It reads the egress wrapper only to refuse a proxy, so it names no
+        // egress version, and a node sends it nothing through one. The connection stays
+        // open for the operation that follows.
+        if req.operation == "capabilities" {
+            write_json(
+                &mut writer,
+                &serde_json::json!({
+                    "type": "capabilities",
+                    "scan": ["resolve", "block_internal"],
+                    // Which pacing this daemon runs: `module <version>`, or `baseline (<why>)`.
+                    "pacing": cfx_pacing::load().label(),
+                    "pid": std::process::id(),
+                }),
+            )
+            .await?;
+            continue;
+        }
+
+        // The scans this daemon keeps, the latest first, one as it was kept, and what they
+        // found, oldest first.
+        if req.operation == "scans" {
+            let answer = cfx_db::scans::answer_scans(&db.pool, cfx_db::scans::Listed::why_not);
+            write_json(&mut writer, &answer.await).await?;
+            continue;
+        }
+        if req.operation == "scan_info" {
+            let id = req.params["id"].as_str().unwrap_or_default();
+            write_json(&mut writer, &cfx_db::found::answer_scan(&db.pool, id).await).await?;
+            continue;
+        }
+        if req.operation == "finding" {
+            let id = req.params["id"].as_i64().unwrap_or(0);
+            write_json(
+                &mut writer,
+                &cfx_db::found::answer_finding(&db.pool, id).await,
+            )
+            .await?;
+            continue;
+        }
+        if req.operation == "findings" {
+            let answer = cfx_db::found::answer_findings(
+                &db.pool,
+                req.params["scan"].as_str(),
+                req.params["after"].as_i64(),
+                req.params["limit"].as_i64().unwrap_or(200),
+            );
+            write_json(&mut writer, &answer.await).await?;
+            continue;
+        }
+
+        // Every operation from here on sends: say which pacing it runs with.
+        eprintln!("[doorward] {}: {}", req.operation, cfx_pacing::load().say());
+
+        // Streaming mode takes over the connection. A stopped scan taken up again streams
+        // as the scan did.
         if req.response == "stream" {
             handle_stream_scan(req, writer, Arc::clone(&db)).await?;
             return Ok(());
@@ -159,51 +202,113 @@ async fn handle_stream_scan(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let operation_id = uuid::Uuid::new_v4().to_string();
 
-    let scan_params: ScanParams = match serde_json::from_value(req.params.clone()) {
-        Ok(p) => p,
-        Err(e) => {
-            write_json(
-                &mut writer,
-                &StreamEvent::error(&format!("Invalid scan params: {e}")),
-            )
-            .await?;
+    // The scan as asked for, or a stopped one taken up again with the settings it was
+    // kept with.
+    let begun = match req.operation.as_str() {
+        "resume" => taken_up(&req, &db)
+            .await
+            .map(|(params, running)| (params, Some(running))),
+        _ => match serde_json::from_value::<ScanParams>(req.params.clone()) {
+            Ok(params) => {
+                let scan = db
+                    .start_scan(&params.targets, &req.params, params.fresh_start)
+                    .await;
+                Ok((params, scan))
+            }
+            Err(e) => Err(format!("Invalid scan params: {e}")),
+        },
+    };
+    let (scan_params, scan) = match begun {
+        Ok(begun) => begun,
+        Err(message) => {
+            write_json(&mut writer, &StreamEvent::error(&message)).await?;
             return Ok(());
         }
     };
-
     if req.save {
-        let params_str = serde_json::to_string(&req.params).unwrap_or_default();
-        let _ = db
-            .create_operation(&operation_id, "scan", &params_str)
-            .await;
+        let _ = cfx_db::scans::record_operation(
+            &db.pool,
+            &operation_id,
+            "scan",
+            scan.as_ref().map(|s| s.id.as_str()),
+            &req.params.to_string(),
+        )
+        .await;
     }
 
     // Resolve hosts and compute total probes
     let hosts = scanner::resolve_targets(&scan_params.targets);
     let total = hosts.len() * scan_params.ports.len();
 
-    // Send ack
-    write_json(&mut writer, &StreamEvent::ack(&operation_id, total)).await?;
+    // Send ack, with the scan it is kept as
+    let mut ack = serde_json::to_value(StreamEvent::ack(&operation_id, total))?;
+    if let Some(running) = &scan {
+        ack["scan"] = serde_json::json!(running.id);
+    }
+    write_json(&mut writer, &ack).await?;
 
     // Run scan in background, forward events to writer
     let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
     let oid = operation_id.clone();
     let db_c = Arc::clone(&db);
+    // What the scan found, said and how far it got, as every engine keeps it: an open port
+    // is a finding, a filtered one is not.
+    let mut keeper = cfx_db::found::Keeper::new(&db.pool, scan.as_ref().map(|s| s.id.as_str()));
 
-    tokio::spawn(async move {
+    dguard::spawn_busy(async move {
         scanner::run_connect_scan(&scan_params, tx).await;
-        let _ = db_c.update_operation_status(&oid, "completed", None).await;
+        db_c.finish_scan(scan).await;
+        let _ = cfx_db::scans::finish_operation(
+            &db_c.pool,
+            &oid,
+            cfx_db::scans::Status::Completed,
+            None,
+        )
+        .await;
     });
 
     while let Some(ev) = rx.recv().await {
         let done = ev.kind == "done";
+        if kept(&ev) {
+            keeper.event(&serde_json::to_value(&ev)?).await;
+        }
         write_json(&mut writer, &ev).await?;
         if done {
             break;
         }
     }
+    let _ = keeper.flush().await;
 
     Ok(())
+}
+
+/// Whether `ev` is kept with its scan: an open port, and everything but a result.
+fn kept(ev: &StreamEvent) -> bool {
+    ev.kind != "result" || ev.status.as_deref() == Some("open")
+}
+
+/// The stopped scan a `resume` request names, taken up again with the settings it was kept
+/// with: or why it cannot be. A port scan keeps nothing to carry on from, so it runs again
+/// from the start, under its own record.
+async fn taken_up(
+    req: &DaemonRequest,
+    db: &DoorwardDb,
+) -> Result<(ScanParams, cfx_db::scans::Running), String> {
+    let id = req.params["scan"]
+        .as_str()
+        .ok_or("a resume names the scan to take up again")?;
+    let (running, settings) = cfx_db::scans::take_up(&db.pool, id, None)
+        .await
+        .map_err(|e| e.to_string())?;
+    match serde_json::from_value(settings) {
+        Ok(params) => Ok((params, running)),
+        Err(e) => {
+            let _ = cfx_db::scans::finish(running, cfx_db::scans::Status::Stopped).await;
+            Err(format!(
+                "scan {id} was kept with settings this doorward cannot read: {e}"
+            ))
+        }
+    }
 }
 
 async fn dispatch(req: DaemonRequest, db: Arc<DoorwardDb>) -> serde_json::Value {
@@ -222,11 +327,18 @@ async fn dispatch(req: DaemonRequest, db: Arc<DoorwardDb>) -> serde_json::Value 
                 }
             };
 
+            let scan = db
+                .start_scan(&scan_params.targets, &req.params, scan_params.fresh_start)
+                .await;
             if req.save {
-                let params_str = serde_json::to_string(&req.params).unwrap_or_default();
-                let _ = db
-                    .create_operation(&operation_id, "scan", &params_str)
-                    .await;
+                let _ = cfx_db::scans::record_operation(
+                    &db.pool,
+                    &operation_id,
+                    "scan",
+                    scan.as_ref().map(|s| s.id.as_str()),
+                    &req.params.to_string(),
+                )
+                .await;
             }
 
             match req.response.as_str() {
@@ -244,9 +356,14 @@ async fn dispatch(req: DaemonRequest, db: Arc<DoorwardDb>) -> serde_json::Value 
                         }
                     }
 
-                    let _ = db
-                        .update_operation_status(&operation_id, "completed", None)
-                        .await;
+                    db.finish_scan(scan).await;
+                    let _ = cfx_db::scans::finish_operation(
+                        &db.pool,
+                        &operation_id,
+                        cfx_db::scans::Status::Completed,
+                        None,
+                    )
+                    .await;
 
                     serde_json::json!({
                         "operation_id": operation_id,
@@ -258,10 +375,17 @@ async fn dispatch(req: DaemonRequest, db: Arc<DoorwardDb>) -> serde_json::Value 
                     // Queue mode
                     let oid = operation_id.clone();
                     let db_c = Arc::clone(&db);
-                    tokio::spawn(async move {
+                    dguard::spawn_busy(async move {
                         let (tx, mut _rx) = mpsc::unbounded_channel::<StreamEvent>();
                         scanner::run_connect_scan(&scan_params, tx).await;
-                        let _ = db_c.update_operation_status(&oid, "completed", None).await;
+                        db_c.finish_scan(scan).await;
+                        let _ = cfx_db::scans::finish_operation(
+                            &db_c.pool,
+                            &oid,
+                            cfx_db::scans::Status::Completed,
+                            None,
+                        )
+                        .await;
                     });
 
                     serde_json::json!({
@@ -289,7 +413,6 @@ async fn dispatch(req: DaemonRequest, db: Arc<DoorwardDb>) -> serde_json::Value 
             let params = ScanParams {
                 targets: vec![host],
                 ports: vec![port],
-                technique: "connect".to_string(),
                 tasks: 1,
                 timeout: timeout_ms,
                 delay: 0, // single-port probe path - no pacing needed; daemon-level handles it
@@ -297,6 +420,9 @@ async fn dispatch(req: DaemonRequest, db: Arc<DoorwardDb>) -> serde_json::Value 
                 adaptive: false, // one probe: nothing for the governor to tune
                 max_concurrency: None,
                 posture: None,
+                fresh_start: false,
+                resolve: Vec::new(),
+                block_internal: false,
             };
 
             let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
@@ -320,16 +446,31 @@ async fn dispatch(req: DaemonRequest, db: Arc<DoorwardDb>) -> serde_json::Value 
             })
         }
 
-        "db_reset" => match db.truncate_tables().await {
-            Ok(_) => serde_json::json!({
+        "db_reset" => {
+            match cfx_db::scans::reset(&db.pool, &super::libs::doorward_db::ENGINE).await {
+                Ok(_) => serde_json::json!({
+                    "operation_id": operation_id,
+                    "status": "completed",
+                    "message": "All tables truncated.",
+                }),
+                Err(e) => serde_json::json!({
+                    "operation_id": operation_id,
+                    "status": "error",
+                    "message": format!("DB reset failed: {}", e),
+                }),
+            }
+        }
+
+        "purge" => match cfx_db::scans::purge_operation(&db.pool, &req.params).await {
+            Ok(done) => serde_json::json!({
                 "operation_id": operation_id,
                 "status": "completed",
-                "message": "All tables truncated.",
+                "message": done,
             }),
-            Err(e) => serde_json::json!({
+            Err(why) => serde_json::json!({
                 "operation_id": operation_id,
                 "status": "error",
-                "message": format!("DB reset failed: {}", e),
+                "message": why,
             }),
         },
 
@@ -341,15 +482,105 @@ async fn dispatch(req: DaemonRequest, db: Arc<DoorwardDb>) -> serde_json::Value 
     }
 }
 
+/// Send `value` to the client, made safe to leave the engine (see
+/// [`cfx_db::scans::safe_stream`]): the node relays it to Cloud as it is.
 async fn write_json<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     value: &impl serde::Serialize,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut json = serde_json::to_string(value)?;
+    let mut json =
+        serde_json::to_string(&cfx_db::scans::safe_stream(&serde_json::to_value(value)?))?;
     json.push('\n');
     writer.write_all(json.as_bytes()).await?;
     writer.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod kept_tests {
+    //! What a scan found, kept as every engine keeps it, and read back through the daemon.
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// What a daemon on `pool` answers `ask` with, or every line of a stream until done.
+    async fn ask(port: u16, ask: &serde_json::Value) -> Vec<serde_json::Value> {
+        let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        w.write_all(format!("{ask}\n").as_bytes()).await.unwrap();
+        let mut lines = BufReader::new(r).lines();
+        let mut got = Vec::new();
+        while let Ok(Ok(Some(line))) =
+            tokio::time::timeout(std::time::Duration::from_secs(20), lines.next_line()).await
+        {
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let last = v["type"] == "done" || v.get("type").is_none();
+            got.push(v);
+            if last {
+                break;
+            }
+        }
+        got
+    }
+
+    /// The only open port of a scan is kept as its finding, a closed one is not, and the
+    /// `findings` and `scan_info` answers give them back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs PostgreSQL's programs"]
+    async fn an_open_port_is_kept_and_read_back() {
+        let scratch = cfx_db::testing::Scratch::new(&crate::libs::doorward_db::ENGINE).await;
+        let db = Arc::new(DoorwardDb::new(scratch.pool.clone()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dport = listener.local_addr().unwrap().port();
+        let serving = Arc::clone(&db);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(handle_connection(
+                    stream,
+                    dguard::Gate::default(),
+                    Arc::clone(&serving),
+                ));
+            }
+        });
+        let open = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let oport = open.local_addr().unwrap().port();
+        tokio::spawn(async move { while open.accept().await.is_ok() {} });
+        let (closed, _held) = cfx_db::testing::closed_port();
+        let events = ask(
+            dport,
+            &serde_json::json!({"operation": "scan", "response": "stream",
+                "targets": ["127.0.0.1"], "ports": [oport, closed], "adaptive": false,
+                "timeout": 2000}),
+        )
+        .await;
+        assert!(events.iter().any(|e| e["type"] == "done"), "{events:?}");
+        let found = &ask(dport, &serde_json::json!({"operation": "findings"})).await[0];
+        let rows = found["findings"].as_array().expect("rows");
+        assert_eq!(rows.len(), 1, "{found}");
+        assert_eq!(rows[0]["data"]["port"], oport);
+        assert_eq!(rows[0]["kind"], "result");
+        let ack = events.iter().find(|e| e["type"] == "ack").expect("an ack");
+        assert_eq!(
+            ack["scan"], rows[0]["scan"],
+            "the ack names the scan it is kept as"
+        );
+        let scan = &ask(
+            dport,
+            &serde_json::json!({"operation": "scan_info", "id": rows[0]["scan"]}),
+        )
+        .await[0];
+        assert_eq!(scan["scan"]["findings"], 1, "{scan}");
+        scratch.done().await;
+    }
+
+    /// Only an open port is a finding of a scan.
+    #[test]
+    fn only_an_open_port_is_kept() {
+        let result = |status: &str| StreamEvent::result("127.0.0.1", 80, status, 1);
+        assert!(kept(&result("open")));
+        assert!(!kept(&result("filtered")));
+        assert!(kept(&StreamEvent::ack("op", 1)));
+    }
 }
 
 #[cfg(test)]
@@ -451,6 +682,139 @@ mod http_request_tests {
         (lines, closed)
     }
 
+    /// A service's banner that names a URL with a credential in it and a session cookie
+    /// comes out of a scan with neither.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_banner_goes_out_with_no_secret() {
+        let service = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let sport = service.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = service.accept().await {
+                let _ = sock
+                    .write_all(
+                        b"220 ready, see http://u:dw-secret-1@x.test/?token=dw-secret-2\r\n\
+                          Set-Cookie: s=dw-secret-3\r\n",
+                    )
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        });
+        let port = daemon().await;
+        let op = serde_json::json!({
+            "operation": "scan", "response": "stream", "targets": ["127.0.0.1"],
+            "ports": [sport], "service_detection": true, "adaptive": false, "timeout": 2000,
+        });
+        let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        s.write_all(format!("{op}\n").as_bytes()).await.unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 8192];
+        while let Ok(Ok(n)) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), s.read(&mut buf)).await
+        {
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+            if String::from_utf8_lossy(&got).contains("\"done\"") {
+                break;
+            }
+        }
+        let out = String::from_utf8_lossy(&got).into_owned();
+        assert!(out.contains("220 ready"), "no banner came out: {out}");
+        for secret in ["dw-secret-1", "dw-secret-2", "dw-secret-3"] {
+            assert!(!out.contains(secret), "{secret} went out: {out}");
+        }
+    }
+
+    /// The events of the stream scan `op`, to its `done`.
+    async fn scan_events(port: u16, op: &serde_json::Value) -> Vec<serde_json::Value> {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let (r, mut w) = s.into_split();
+        w.write_all(format!("{op}\n").as_bytes()).await.unwrap();
+        let mut lines = BufReader::new(r).lines();
+        let mut events = Vec::new();
+        while let Ok(Ok(Some(line))) =
+            tokio::time::timeout(Duration::from_secs(20), lines.next_line()).await
+        {
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let done = v["type"] == "done" || v["type"] == "error";
+            events.push(v);
+            if done {
+                break;
+            }
+        }
+        events
+    }
+
+    /// A listener on loopback that counts the connections it is given.
+    async fn counted() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        let l = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = l.local_addr().expect("addr").port();
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&n);
+        tokio::spawn(async move {
+            while let Ok((_sock, _)) = l.accept().await {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        (port, n)
+    }
+
+    fn open_ports(events: &[serde_json::Value]) -> Vec<u64> {
+        let mut open: Vec<u64> = events
+            .iter()
+            .filter(|e| e["type"] == "result" && e["status"] == "open")
+            .filter_map(|e| e["port"].as_u64())
+            .collect();
+        open.sort_unstable();
+        open
+    }
+
+    /// A name pinned to an address is dialled there on every port the scan tries. The
+    /// name is under `.invalid`, which never resolves, so a port found open was reached
+    /// through the pin.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pinned_name_is_dialled_at_its_address_on_every_port() {
+        let (a, _) = counted().await;
+        let (b, _) = counted().await;
+        let port = daemon().await;
+        let mut op = serde_json::json!({
+            "operation": "scan", "response": "stream", "targets": ["pinned.invalid"],
+            "ports": [a, b], "adaptive": false, "timeout": 2000,
+        });
+        assert!(open_ports(&scan_events(port, &op).await).is_empty());
+        op["resolve"] = serde_json::json!([["pinned.invalid", "127.0.0.1:9"]]);
+        let mut want = vec![u64::from(a), u64::from(b)];
+        want.sort_unstable();
+        assert_eq!(open_ports(&scan_events(port, &op).await), want);
+    }
+
+    /// With block_internal, a target at an internal address, its own or a pinned one, is
+    /// not dialled at all, and the scan says why.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn block_internal_leaves_an_internal_target_unscanned() {
+        let (a, seen) = counted().await;
+        let port = daemon().await;
+        for target in ["127.0.0.1", "pinned.invalid"] {
+            let op = serde_json::json!({
+                "operation": "scan", "response": "stream", "targets": [target],
+                "ports": [a], "adaptive": false, "timeout": 2000, "block_internal": true,
+                "resolve": [["pinned.invalid", "127.0.0.1:9"]],
+            });
+            let events = scan_events(port, &op).await;
+            assert!(
+                events.iter().any(|e| e["type"] == "log"
+                    && e["message"]
+                        .as_str()
+                        .is_some_and(|m| m.contains("was not scanned"))),
+                "{target}: {events:?}"
+            );
+            assert!(open_ports(&events).is_empty(), "{target}: {events:?}");
+        }
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn an_http_post_is_closed_at_its_request_line() {
         let port = daemon().await;
@@ -473,6 +837,36 @@ mod http_request_tests {
     }
 
     #[tokio::test]
+    async fn capabilities_say_which_process_answers_and_name_no_egress_version() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let port = daemon().await;
+        let s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let (r, mut w) = s.into_split();
+        w.write_all(b"{\"operation\":\"capabilities\"}\n")
+            .await
+            .unwrap();
+        let mut lines = BufReader::new(r).lines();
+        let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("an answer in time")
+            .unwrap()
+            .expect("a line");
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["type"], "capabilities", "{v}");
+        // Which pacing runs, as the engine said it when it started.
+        assert_eq!(v["pacing"], cfx_pacing::load().label().as_str());
+        assert_eq!(v["pid"], std::process::id(), "{v}");
+        assert_eq!(
+            v["scan"],
+            serde_json::json!(["resolve", "block_internal"]),
+            "{v}"
+        );
+        // A node that read an egress version here would send doorward ops through a
+        // proxy, which it refuses.
+        assert!(v.get("egress").is_none(), "{v}");
+    }
+
+    #[tokio::test]
     async fn a_line_that_is_json_but_not_an_object_closes_too() {
         let port = daemon().await;
         let (lines, closed) = send(port, "[1]\n{\"operation\":\"capabilities\"}\n").await;
@@ -481,5 +875,47 @@ mod http_request_tests {
             !lines.iter().any(|l| l.contains("capabilities")),
             "read on past the first line: {lines:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod flag_tests {
+    use crate::scanner::ScanParams;
+    use clap::Parser;
+
+    /// Every flag `doorward scan` takes reaches the daemon, from the command line through
+    /// the request the client sends, into what the daemon reads: all but the dashboard's
+    /// poll timeout, which is the client's own.
+    #[test]
+    fn every_scan_flag_reaches_the_daemon() {
+        let cli = crate::libs::cli_args::Cli::try_parse_from([
+            "doorward",
+            "scan",
+            "10.0.0.1",
+            "-p",
+            "80",
+            "--tasks",
+            "7",
+            "--timeout",
+            "900",
+            "--delay",
+            "30",
+            "--service-detection",
+            "--fresh-start",
+        ])
+        .unwrap();
+        let Some(crate::libs::cli_args::Commands::Scan(args)) = cli.command else {
+            panic!("not a scan");
+        };
+        let ports = crate::libs::cli_args::resolve_ports(&args.ports);
+        let params: ScanParams =
+            serde_json::from_value(crate::scan_request(&args, &ports)).unwrap();
+        assert_eq!(params.targets, ["10.0.0.1"]);
+        assert_eq!(params.ports, [80]);
+        assert_eq!(params.tasks, 7);
+        assert_eq!(params.timeout, 900);
+        assert_eq!(params.delay, 30);
+        assert!(params.service_detection);
+        assert!(params.fresh_start);
     }
 }

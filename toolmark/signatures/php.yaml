@@ -1,0 +1,14 @@
+id: php
+info:
+  name: PHP
+  category: Language
+  metadata:
+    vendor: php
+    product: php
+detect:
+  any:
+    - header: { name: x-powered-by, regex: '(?i)php' }
+    - cookie: { name: '(?i)^PHPSESSID$' }
+version:
+  - header: { name: server, regex: '(?i)php/([0-9.]+)' }
+  - header: { name: x-powered-by, regex: '(?i)php/([0-9.]+)' }

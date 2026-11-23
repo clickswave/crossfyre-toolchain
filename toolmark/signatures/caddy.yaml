@@ -1,0 +1,10 @@
+id: caddy
+info:
+  name: Caddy
+  category: Web Server
+  metadata:
+    vendor: caddyserver
+    product: caddy
+detect:
+  any:
+    - header: { name: server, regex: '^Caddy' }

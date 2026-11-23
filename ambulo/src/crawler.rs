@@ -73,11 +73,6 @@ pub struct CrawlParams {
     /// Substring patterns; any discovered URL containing one is skipped.
     #[serde(default)]
     pub exclude: Vec<String>,
-    /// Controller posture (reserved for adaptive pacing): stealth|balanced|throughput.
-    #[serde(default = "d_posture")]
-    // populated but not read yet; kept so the struct still mirrors its config
-    #[allow(dead_code)]
-    pub posture: String,
     /// Optional request auth (headers + cookie) resolved from a credential by the
     /// node. Applied as default headers so every fetched page is authenticated.
     #[serde(default)]
@@ -121,9 +116,6 @@ fn d_tasks() -> usize {
 }
 fn d_timeout() -> u64 {
     8000
-}
-fn d_posture() -> String {
-    "balanced".to_string()
 }
 
 /// A single streamed crawl event (newline JSON). The node maps `type:"url"` events
@@ -1147,27 +1139,26 @@ async fn run_browser_tier(
         let _ = tx.send(CrawlEvent::note(HEADLESS_SKIPPED.to_string()));
         return;
     }
-    let Some(exe) = crate::browser::find_browser() else {
+    let Some(exe) = cfx_browser::find_browser() else {
         let _ = tx.send(CrawlEvent::note(
-            "the headless tier was requested but no browser was found. Set AMBULO_BROWSER to a \
+            "the headless tier was requested but no browser was found. Set CFX_BROWSER to a \
              Chrome or Chromium binary. Endpoints that only exist once the application is running \
              were NOT looked for in this crawl."
                 .to_string(),
         ));
         return;
     };
-    let no_sandbox =
-        dguard::env_renamed("AMBULO_BROWSER_NO_SANDBOX", "MACH_BROWSER_NO_SANDBOX").is_some();
-    let (browser, mut cdp) = match crate::browser::Browser::launch(&exe, no_sandbox).await {
-        Ok(b) => b,
-        Err(e) => {
-            let _ = tx.send(CrawlEvent::note(format!(
-                "the headless tier could not start a browser ({e}). Endpoints that only exist \
+    let (browser, mut cdp) =
+        match cfx_browser::Browser::launch(&exe, cfx_browser::no_sandbox()).await {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = tx.send(CrawlEvent::note(format!(
+                    "the headless tier could not start a browser ({e}). Endpoints that only exist \
                  once the application is running were NOT looked for in this crawl."
-            )));
-            return;
-        }
-    };
+                )));
+                return;
+            }
+        };
     // The seed first, then the routes the static tiers recovered. Those routes
     // are the lazily-loaded sections - the admin area, the reports section - and
     // loading one makes the application fetch its own data, which is the whole
@@ -1186,7 +1177,7 @@ async fn run_browser_tier(
     // redirect, a script navigation or a frame pointing anywhere else is failed
     // before it is sent, so a hostile page cannot use the browser to reach a host
     // the operator never listed.
-    let gate: crate::browser::Gate = {
+    let gate: cfx_browser::Gate = {
         let (base, scope, host) = (seed.clone(), params.clone(), seed_host.to_string());
         std::sync::Arc::new(move |u: &str| resolve_and_scope(u, &base, &scope, &host).is_some())
     };
@@ -1195,7 +1186,7 @@ async fn run_browser_tier(
     let mut visited = 0usize;
     let mut refused: Vec<String> = Vec::new();
     for url in &plan {
-        let Ok(v) = crate::browser::visit(&mut cdp, url.as_str(), gate.clone()).await else {
+        let Ok(v) = cfx_browser::visit(&mut cdp, url.as_str(), gate.clone(), false).await else {
             continue;
         };
         for r in v.refused {
@@ -2453,7 +2444,7 @@ mod redirect_tests {
     /// A crawl with the headless tier on, or `None` when this machine has no
     /// browser to drive.
     async fn browser_crawl(seed: &str, scope_hosts: &[&str]) -> Option<Vec<CrawlEvent>> {
-        crate::browser::find_browser()?;
+        cfx_browser::find_browser()?;
         Some(
             run(serde_json::json!({
                 "seed": seed,

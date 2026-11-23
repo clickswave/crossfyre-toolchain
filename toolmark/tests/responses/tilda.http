@@ -1,0 +1,16 @@
+# Synthetic: A site built on Tilda, which loads its styles and scripts from Tilda's CDN.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Studio</title>
+<link rel="stylesheet" href="https://static.tildacdn.com/css/tilda-grid-3.0.min.css">
+</head>
+<body>
+<main></main>
+</body>
+</html>

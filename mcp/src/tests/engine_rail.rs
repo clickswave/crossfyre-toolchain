@@ -29,13 +29,16 @@ async fn the_engines_are_pinned_to_the_cleared_address_with_redirects_off() {
         .build();
     let peer = FakePeer::new(Elicit::None);
 
-    ok(&t
+    let r = t
         .call(
             &peer,
             "fingerprint",
             json!({"url": "http://mixed.test:8080/"}),
         )
-        .await);
+        .await;
+    // Which pacing toolmark said it runs, before anything was sent.
+    assert_eq!(ok(&r)["pacing"], "module stub 1", "{}", r.text);
+    assert!(r.text.contains("pacing: module stub 1."), "{}", r.text);
     let op = &toolmark.ops()[0];
     assert_eq!(
         op["resolve"],
@@ -220,5 +223,53 @@ async fn progress_only_ever_goes_up() {
     assert!(
         done.windows(2).all(|w| w[1] > w[0]),
         "progress went sideways: {done:?}"
+    );
+}
+
+/// A technology reaches the client with its evidence, which toolmark sends as a list,
+/// with what it could not be told apart from, with where its version lies when no exact
+/// one was read, and with the distribution that built it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_technology_reaches_the_client_with_all_toolmark_says_of_it() {
+    let target = listener(Reply::ok("x")).await;
+    let mut events = toolmark_events("t", "s");
+    events[0] = json!({"type": "finding", "data": {
+        "type": "technology", "source": "toolmark", "severity": "info",
+        "name": "Framework A", "category": "Test", "version": null, "cpe": "",
+        "confidence": 100, "evidence": ["path /a/one.js: 200", "path /a/two.js: 200"],
+        "candidates": ["Framework B"], "version_range": {"since": "2.0", "until": null},
+        "distro": "Debian-2+deb12u3"}});
+    let toolmark = stub_engine(StubOpts {
+        events,
+        ..Default::default()
+    })
+    .await;
+    let t = scope(&[format!("127.0.0.1:{}", target.port)], "")
+        .toolmark(toolmark.port)
+        .build();
+    let r = t
+        .call(
+            &FakePeer::new(Elicit::None),
+            "fingerprint",
+            json!({"url": format!("http://127.0.0.1:{}/", target.port)}),
+        )
+        .await;
+    let v = ok(&r);
+    assert_eq!(v["technologies"][0]["name"], "Framework A", "{v}");
+    assert_eq!(
+        v["technologies"][0]["candidates"],
+        json!(["Framework B"]),
+        "{v}"
+    );
+    assert_eq!(
+        v["technologies"][0]["version_range"],
+        json!({"since": "2.0", "until": null}),
+        "{v}"
+    );
+    assert_eq!(v["technologies"][0]["distro"], "Debian-2+deb12u3", "{v}");
+    assert_eq!(
+        v["target_data"]["evidence"],
+        json!([{"technology": "Framework A", "evidence": "path /a/one.js: 200; path /a/two.js: 200"}]),
+        "{v}"
     );
 }

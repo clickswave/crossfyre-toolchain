@@ -6,7 +6,6 @@ info:
   tags: panel,adminer,database
   metadata:
     category: panels
-    product: adminer
 http:
   - method: GET
     path:

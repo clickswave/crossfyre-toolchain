@@ -1,0 +1,14 @@
+id: liferay-portal
+info:
+  name: Liferay Portal
+  category: CMS
+  metadata:
+    vendor: liferay
+    product: liferay_portal
+implies: [java]
+refines: liferay
+detect:
+  any:
+    - header: { name: liferay-portal, regex: 'Community Edition' }
+version:
+  - header: { name: liferay-portal, regex: '(?:Portal|Edition) ([0-9]+(?:\.[0-9]+)*)' }

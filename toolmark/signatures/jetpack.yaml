@@ -1,0 +1,14 @@
+id: jetpack
+info:
+  name: Jetpack
+  category: WordPress Plugin
+  metadata:
+    vendor: automattic
+    product: jetpack
+    target_sw: wordpress
+implies: [wordpress]
+detect:
+  any:
+    - html: { regex: '(?:src|href)="[^"]*/wp-content/plugins/jetpack/' }
+version:
+  - html: { regex: '/wp-content/plugins/jetpack/[^"]*\?ver=([0-9]+\.[0-9]+(?:\.[0-9]+)?)"' }

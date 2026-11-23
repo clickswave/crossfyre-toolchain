@@ -1,0 +1,8 @@
+id: kestrel
+info:
+  name: Kestrel
+  category: Web Server
+implies: [aspnet-core]
+detect:
+  any:
+    - header: { name: server, regex: '(?i)kestrel' }

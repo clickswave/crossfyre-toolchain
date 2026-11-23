@@ -1,0 +1,12 @@
+id: zabbix
+info:
+  name: Zabbix
+  category: Monitoring
+  metadata:
+    vendor: zabbix
+    product: zabbix
+implies: [php]
+detect:
+  all:
+    - html: { regex: '(?i)<title>[^<]*Zabbix' }
+    - html: { regex: 'name="password"' }

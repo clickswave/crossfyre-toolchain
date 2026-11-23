@@ -1,0 +1,13 @@
+id: apache-solr
+info:
+  name: Apache Solr
+  category: Search Engine
+  metadata:
+    vendor: apache
+    product: solr
+implies: [java]
+detect:
+  any:
+    - html: { regex: '<title>\s*Solr Admin\s*</title>' }
+version:
+  - path: { path: /solr/admin/info/system, regex: 'solr-spec-version"?\s*(?:>|:\s*")([0-9]+(?:\.[0-9]+)*)' }

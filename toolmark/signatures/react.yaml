@@ -1,0 +1,10 @@
+id: react
+info:
+  name: React
+  category: JavaScript Framework
+  metadata:
+    vendor: facebook
+    product: react
+detect:
+  any:
+    - html: { regex: '(?i)data-reactroot|react(?:-dom)?(?:\.production)?\.min\.js|__REACT_DEVTOOLS' }

@@ -11,9 +11,7 @@
 // manifest", which conflated the two and read as a stronger guarantee than the
 // code gave.
 
-use super::config::{
-    ext_bin_path, ext_file_name, file_name, get_bin_dir, is_regular_file, legacy_bin_path,
-};
+use super::config::{ext_bin_path, file_name, get_bin_dir};
 use super::packaging::{self, Manager, remove_note, update_note};
 use super::release_http::{Purpose, http_client};
 use super::service;
@@ -37,6 +35,18 @@ pub const BASE_URL: &str = match option_env!("CROSSFYRE_BINS_ORIGIN") {
     None => "https://bins.crossfyre.io",
 };
 
+/// The bins origin a request goes to: this build's. A test build refuses it, so a test
+/// can reach only an origin it serves itself, never the published releases.
+pub(crate) fn bins_origin() -> &'static str {
+    #[cfg(test)]
+    panic!(
+        "a test asked for the bins origin {BASE_URL}: a test reaches only an origin it \
+         serves itself"
+    );
+    #[cfg(not(test))]
+    BASE_URL
+}
+
 // Terminal styling now lives in the shared `super::ui` module so every command
 // renders with the same look; `update` uses `use super::ui::*` below.
 
@@ -49,27 +59,14 @@ fn origin_host() -> &'static str {
 
 /// Sidecar recording an installed extension's version (mirrors node.version),
 /// so `update` can tell "already current" from "needs update" without a reinstall.
-/// Named by the public name, as the binary is.
 fn ext_version_file(ext: &str) -> std::path::PathBuf {
-    get_bin_dir().join(format!("{}.version", super::public_name(ext)))
-}
-
-/// The sidecar an engine's binary had under its legacy name, if it was renamed.
-fn legacy_version_file(ext: &str) -> Option<std::path::PathBuf> {
-    let legacy = super::engine(ext)?.legacy?;
-    Some(get_bin_dir().join(format!("{legacy}.version")))
+    get_bin_dir().join(format!("{ext}.version"))
 }
 
 fn installed_ext_version(ext: &str) -> Option<String> {
-    let read = |p: std::path::PathBuf| fs::read_to_string(p).ok().map(|s| s.trim().to_string());
-    if ext_bin_path(ext).exists() {
-        return read(ext_version_file(ext));
-    }
-    // Installed under the legacy name only: the migration has not run here yet.
-    match (legacy_bin_path(ext), legacy_version_file(ext)) {
-        (Some(bin), Some(v)) if is_regular_file(&bin) => read(v),
-        _ => read(ext_version_file(ext)),
-    }
+    fs::read_to_string(ext_version_file(ext))
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 /// The version in `sidecar`, or when there is none, the version the binary at `bin`
@@ -151,24 +148,6 @@ fn installed_node_version() -> Option<String> {
         "node",
         Command::new(&bin),
     )
-}
-
-/// Whether the node worker in the bin directory is from a release whose node, run as
-/// root, hands the configs it writes back to the operator: node 0.1.52 (shipped with
-/// crossfyre 0.1.42) and every one before it, and a worker that cannot say which
-/// version it is. False when there is no worker.
-pub fn installed_node_predates_root_configs() -> bool {
-    if !ext_bin_path("node").exists() {
-        return false;
-    }
-    let Some(v) = installed_node_version() else {
-        return true;
-    };
-    let mut parts = v.split(['.', '-', '+']).map(|p| p.parse::<u64>().ok());
-    match (parts.next(), parts.next(), parts.next()) {
-        (Some(Some(a)), Some(Some(b)), Some(Some(c))) => (a, b, c) <= (0, 1, 52),
-        _ => true,
-    }
 }
 
 /// The version of the cfx-script in the bin directory, if there is one.
@@ -262,37 +241,6 @@ fn cannot_start_note(output: &str) -> String {
     note
 }
 
-/// The manifest keys `component` may be published under, in the order to try them: an
-/// engine's public name first, then its legacy name and its id. A manifest from before
-/// the rename has only the legacy key, and one from after it has both, so the CLI does
-/// not depend on the order in which the manifest gains keys. Any other component is
-/// published under its own name.
-fn manifest_keys(component: &str) -> Vec<&str> {
-    keys_for(super::engine(component), component)
-}
-
-fn keys_for<'a>(engine: Option<&'a super::Engine>, component: &'a str) -> Vec<&'a str> {
-    let Some(e) = engine else {
-        return vec![component];
-    };
-    let mut keys = vec![e.name];
-    for k in e.legacy.into_iter().chain([e.id]) {
-        if !keys.contains(&k) {
-            keys.push(k);
-        }
-    }
-    keys
-}
-
-/// The file inside an unpacked artifact that is `component`'s binary: one named by any
-/// of its manifest keys, public name first. An alias artifact published under the
-/// legacy key carries the binary under the legacy name.
-fn find_member(extract_dir: &Path, keys: &[&str]) -> Option<PathBuf> {
-    keys.iter()
-        .map(|k| extract_dir.join(file_name(k)))
-        .find(|p| p.exists())
-}
-
 /// The version string in `resolve_artifact` for a component, or "" if absent.
 fn manifest_version(manifest: &Manifest, comp: &str) -> String {
     resolve_artifact(manifest, comp)
@@ -316,6 +264,10 @@ pub struct Component {
 pub struct Artifact {
     pub file: String,
     pub sha256: String,
+    /// The file holding its own signature, for an artifact that is checked again when
+    /// it is loaded: the pacing module's.
+    #[serde(default)]
+    pub sig: Option<String>,
 }
 
 /// "linux-x86_64" style key for the running host.
@@ -328,7 +280,7 @@ pub fn platform_key() -> String {
 }
 
 pub async fn fetch_manifest() -> Result<Manifest, Box<dyn std::error::Error>> {
-    fetch_manifest_from(BASE_URL).await
+    fetch_manifest_from(bins_origin()).await
 }
 
 /// `fetch_manifest` against `base`, which a test points at a loopback origin.
@@ -392,29 +344,19 @@ async fn fetch_signature(url: &str) -> Result<String, Box<dyn std::error::Error>
         .map_err(|e| format!("could not read the release manifest signature: {e}"))?)
 }
 
+/// The manifest's entry for `component` and its artifact for this platform.
 fn resolve_artifact<'m>(
     manifest: &'m Manifest,
     component: &str,
 ) -> Result<(&'m Component, &'m Artifact), Box<dyn std::error::Error>> {
-    resolve_keys(manifest, &manifest_keys(component))
-}
-
-/// The first of `keys` the manifest has a component for, and that component's artifact
-/// for this platform. The error names the first key, which is the public name.
-fn resolve_keys<'m>(
-    manifest: &'m Manifest,
-    keys: &[&str],
-) -> Result<(&'m Component, &'m Artifact), Box<dyn std::error::Error>> {
-    let shown = keys.first().copied().unwrap_or("");
-    let comp = keys
-        .iter()
-        .find_map(|k| manifest.components.get(*k))
-        .ok_or_else(|| format!("component '{shown}' not in release manifest"))?;
+    let comp = manifest
+        .components
+        .get(component)
+        .ok_or_else(|| format!("component '{component}' not in release manifest"))?;
     let key = platform_key();
-    let artifact = comp
-        .artifacts
-        .get(&key)
-        .ok_or_else(|| format!("no '{shown}' artifact for platform {key} in release manifest"))?;
+    let artifact = comp.artifacts.get(&key).ok_or_else(|| {
+        format!("no '{component}' artifact for platform {key} in release manifest")
+    })?;
     Ok((comp, artifact))
 }
 
@@ -425,7 +367,7 @@ async fn download_verified(
     dest: &Path,
     purpose: Purpose,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let url = format!("{}/{}", BASE_URL, artifact.file);
+    let url = format!("{}/{}", bins_origin(), artifact.file);
     let resp = http_client(purpose)?
         .get(&url)
         .send()
@@ -447,7 +389,7 @@ async fn download_verified(
 /// Split out of the download because this is the decision, and `BASE_URL` is a build-time
 /// constant, so nothing that goes through `reqwest` can be reached from a test. Keeping
 /// the check pure means the refusal is testable and the download stays thin glue.
-fn verify_artifact_bytes(artifact: &Artifact, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn verify_artifact_bytes(artifact: &Artifact, bytes: &[u8]) -> Result<(), String> {
     // An artifact with no recorded checksum is refused rather than waved through. A
     // manifest can be hand-edited and a missing field deserialises to an empty string;
     // comparing against it would otherwise mean "no checksum, no check".
@@ -470,36 +412,29 @@ fn verify_artifact_bytes(artifact: &Artifact, bytes: &[u8]) -> Result<(), String
     Ok(())
 }
 
-/// Unzip `zip_path` into `extract_dir` (shells out to `unzip`, which the
-/// installer checks for). Windows has no unzip, and has had bsdtar, which reads zip
-/// archives, in System32 since Windows 10 1803; it is named by its full path so that
-/// another `tar` on PATH, which may not read zip at all, is not the one run.
-fn extract_zip(zip_path: &Path, extract_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+/// Unpack a release archive into `extract_dir` with the system `tar`: a tar.gz on Linux
+/// and macOS, which the installer checks `tar` for, and a zip on Windows. Windows has had
+/// bsdtar, which reads zip archives, in System32 since Windows 10 1803; it is named by
+/// its full path so that another `tar` on PATH, which may not read zip at all, is not
+/// the one run.
+fn extract_archive(archive: &Path, extract_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(extract_dir)?;
     #[cfg(windows)]
-    let status = {
+    let (tar, read) = {
         let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
-        Command::new(Path::new(&root).join("System32").join("tar.exe"))
-            .arg("-x")
-            .arg("-f")
-            .arg(zip_path)
-            .arg("-C")
-            .arg(extract_dir)
-            .status()
-            .map_err(|e| format!("tar.exe not found or failed to execute: {e}"))?
+        (Path::new(&root).join("System32").join("tar.exe"), "-xf")
     };
     #[cfg(not(windows))]
-    let status = Command::new("unzip")
-        .args([
-            "-q",
-            &zip_path.to_string_lossy(),
-            "-d",
-            &extract_dir.to_string_lossy(),
-        ])
+    let (tar, read) = (PathBuf::from("tar"), "-xzf");
+    let status = Command::new(&tar)
+        .arg(read)
+        .arg(archive)
+        .arg("-C")
+        .arg(extract_dir)
         .status()
-        .map_err(|e| format!("unzip not found or failed to execute: {e}"))?;
+        .map_err(|e| format!("{} not found or failed to execute: {e}", tar.display()))?;
     if !status.success() {
-        return Err(format!("Failed to extract {}", zip_path.display()).into());
+        return Err(format!("Failed to extract {}", archive.display()).into());
     }
     Ok(())
 }
@@ -512,7 +447,7 @@ fn extract_zip(zip_path: &Path, extract_dir: &Path) -> Result<(), Box<dyn std::e
 /// 0644 is the normal case rather than a strange one. A process killed in that window, or
 /// an update interrupted by a reboot, leaves a binary that is installed, current, and not
 /// executable, and the next run reports it as missing rather than as broken.
-fn place_binary(src: &Path, dest: &Path) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn place_binary(src: &Path, dest: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let staged = stage_binary(src, dest)?;
     commit_staged(&staged, dest)
 }
@@ -752,14 +687,14 @@ pub async fn install_cfx_script(
     }
 
     let tmp_dir = tempfile::tempdir()?;
-    let zip_path = tmp_dir.path().join(&artifact.file);
+    let archive = tmp_dir.path().join(&artifact.file);
     let purpose = Purpose::replacing(replaced.is_some() || dest.exists());
-    download_verified(artifact, &zip_path, purpose).await?;
+    download_verified(artifact, &archive, purpose).await?;
     let extract_dir = tmp_dir.path().join("extracted");
-    extract_zip(&zip_path, &extract_dir)?;
-    let extracted = extract_dir.join(ext_file_name(CFX_SCRIPT));
+    extract_archive(&archive, &extract_dir)?;
+    let extracted = extract_dir.join(file_name(CFX_SCRIPT));
     if !extracted.exists() {
-        return Err("cfx-script binary not found inside its zip".into());
+        return Err("cfx-script binary not found inside its archive".into());
     }
     if let Some(output) = place_helper_if_it_starts(&extracted, &dest)? {
         record_cannot_start(&version, &output);
@@ -804,21 +739,40 @@ fn report_cfx_script(result: Result<HelperOutcome, Box<dyn std::error::Error>>) 
 
 /// Install one or more extensions ("ambulo" | "all"). Download + verify +
 /// register the daemon service. The service is created but only started by
-/// `install_and_start` (or an explicit `crossfyre service start`).
-pub async fn install(extension: &str, force: bool) -> Result<(), Box<dyn std::error::Error>> {
-    // Before anything is placed: an engine still installed under its legacy name
-    // would otherwise end up with a second unit on its port.
-    super::migrate::renamed_engines();
+/// `install_and_start` (or an explicit `crossfyre extension start`). Where no service
+/// manager runs, no service is made, and `crossfyre node up` runs the engines.
+///
+/// `writer` is the CLI or node doing it, which refuses when it is not of the release (see
+/// [`Writer`]).
+pub async fn install(
+    extension: &str,
+    force: bool,
+    writer: Writer<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Fetched only for an engine that is ours to download: one a package installed needs
     // nothing from the release.
     let mut manifest = None;
     for ext in super::resolve_extensions(extension)? {
+        // A closed engine comes from Crossfyre, with the plan of the key saved here.
+        if super::engine(ext).is_some_and(|e| e.closed) {
+            use super::ui::*;
+            let dir = this_hosts_data_dir()?;
+            title("Crossfyre extension install", ext);
+            let version = super::components::install_closed(ext, &dir).await?;
+            ok(&format!("{ext} {version} installed"));
+            end();
+            continue;
+        }
         if let Some(m) = packaging::owner(ext) {
             adopt_packaged(ext, m, false)?;
             continue;
         }
         if manifest.is_none() {
-            manifest = Some(fetch_manifest().await?);
+            let release = fetch_manifest().await?;
+            if let Some(why) = writer.refusal(&release) {
+                return Err(why.into());
+            }
+            manifest = Some(release);
         }
         if let Some(manifest) = &manifest {
             install_one(manifest, ext, force, false).await?;
@@ -827,25 +781,37 @@ pub async fn install(extension: &str, force: bool) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+/// The data directory the key a closed component is installed with is in. A test never
+/// reads this host's: it would find the operator's own key.
+fn this_hosts_data_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    #[cfg(test)]
+    panic!("a test asked for this host's data directory: a test reads only one it made");
+    #[cfg(not(test))]
+    crate::resolve_data_dir(None)
+}
+
 /// An engine a package manager put in place: its binary is the package's, and the unit
 /// that runs it, which no package writes, is still ours to register.
 fn adopt_packaged(ext: &str, m: Manager, quiet: bool) -> Result<(), Box<dyn std::error::Error>> {
     use super::ui::*;
     let bin_path = ext_bin_path(ext);
-    let name = super::public_name(ext);
     if !bin_path.exists() {
         return Err(format!(
-            "{name} is installed by {m}, but {} is missing; reinstall it with {m}",
+            "{ext} is installed by {m}, but {} is missing; reinstall it with {m}",
             bin_path.display()
         )
         .into());
     }
-    if !service::has_service_file(ext) {
-        service::create_service_file(ext)?;
+    if !quiet {
+        title("Crossfyre extension install", ext);
+    }
+    if service::user_manager_started() {
+        service::refresh_service_file(ext)?;
+    } else {
+        service::say_node_up_runs_engines();
     }
     if !quiet {
-        title("Crossfyre extension install", name);
-        ok(&format!("{name} is {}", update_note(m)));
+        ok(&format!("{ext} is {}", update_note(m)));
         end();
     }
     Ok(())
@@ -859,47 +825,62 @@ async fn install_one(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use super::ui::*;
     let bin_path = ext_bin_path(ext);
-    let name = super::public_name(ext);
 
     if let Some(m) = packaging::owner(ext) {
         return adopt_packaged(ext, m, quiet);
     }
 
     if !quiet {
-        title("Crossfyre extension install", name);
+        title("Crossfyre extension install", ext);
     }
 
     if super::config::is_extension_installed(ext) && !force {
         if !quiet {
             warn(&format!(
-                "{name} is already installed {}",
+                "{ext} is already installed {}",
                 dim("(use --force to reinstall)")
             ));
+        }
+        // Its unit may be one another release wrote.
+        let refreshed = if service::user_manager_started() {
+            service::refresh_service_file(ext).map(|_| ())
+        } else {
+            service::say_node_up_runs_engines();
+            Ok(())
+        };
+        if !quiet {
+            if let Err(e) = &refreshed {
+                fail(&format!(
+                    "Failed to make its service this release's: {}",
+                    dim(&e.to_string())
+                ));
+            }
             end();
         }
+        refreshed?;
         return Ok(());
     }
 
-    let keys = manifest_keys(ext);
-    let (comp, artifact) = resolve_keys(manifest, &keys)?;
+    let (comp, artifact) = resolve_artifact(manifest, ext)?;
     if !quiet {
-        working(&format!("Downloading {name} {}", dim(&comp.version)));
+        working(&format!("Downloading {ext} {}", dim(&comp.version)));
     }
 
     let tmp_dir = tempfile::tempdir().map_err(|e| format!("Failed to create temp dir: {e}"))?;
-    let zip_path = tmp_dir.path().join(&artifact.file);
+    let archive = tmp_dir.path().join(&artifact.file);
     let purpose = Purpose::replacing(super::config::is_extension_installed(ext));
-    download_verified(artifact, &zip_path, purpose).await?;
+    download_verified(artifact, &archive, purpose).await?;
 
     if !quiet {
         working("Installing");
     }
     let extract_dir = tmp_dir.path().join("extracted");
-    extract_zip(&zip_path, &extract_dir)?;
+    extract_archive(&archive, &extract_dir)?;
 
-    let Some(extracted_binary) = find_member(&extract_dir, &keys) else {
-        return Err(format!("Binary '{}' not found inside zip", ext_file_name(ext)).into());
-    };
+    let extracted_binary = extract_dir.join(file_name(ext));
+    if !extracted_binary.exists() {
+        return Err(format!("Binary '{}' not found inside its archive", file_name(ext)).into());
+    }
 
     // Stop the running daemon (if any) before replacing the binary - on
     // Windows the file is locked while the task runs. Best-effort, OS-aware.
@@ -912,10 +893,12 @@ async fn install_one(
     // node.version). Best-effort: a missing sidecar just triggers one reinstall.
     let _ = fs::write(ext_version_file(ext), &comp.version);
     if !quiet {
-        ok(&format!("{name} {} installed", comp.version));
+        ok(&format!("{ext} {} installed", comp.version));
     }
 
-    if let Err(e) = service::create_service_file(ext)
+    if !service::user_manager_started() {
+        service::say_node_up_runs_engines();
+    } else if let Err(e) = service::create_service_file(ext)
         && !quiet
     {
         fail(&format!(
@@ -931,15 +914,24 @@ async fn install_one(
     Ok(())
 }
 
-/// One-step install used by `crossfyre install`, `init`, and the dashboard's
-/// install-extension path: download + verify + enable + start.
-pub async fn install_and_start(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
-    install(ext, false).await?;
+/// One-step install used by `crossfyre extension install`, `node init`, and the
+/// dashboard's install-extension path: download, verify, and enable and start its
+/// service, as `writer` (see [`install`]). Whether it was started: where no service
+/// manager runs, it is left for `crossfyre node up` to run.
+pub async fn install_and_start(
+    ext: &str,
+    force: bool,
+    writer: Writer<'_>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    install(ext, force, writer).await?;
+    if !service::user_manager_started() {
+        return Ok(false);
+    }
     for e in super::resolve_extensions(ext)? {
         service::enable(e)?;
         service::start(e)?;
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Remove one or more extensions: stop + disable + deregister + delete binary.
@@ -953,42 +945,31 @@ pub fn remove(extension: &str) -> Result<(), Box<dyn std::error::Error>> {
 fn remove_one(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
     use super::ui::*;
     let bin_path = ext_bin_path(ext);
-    let name = super::public_name(ext);
-    // The legacy path, whether it is the binary itself (not migrated yet) or the
-    // link an earlier migration left there.
-    let legacy = legacy_bin_path(ext).filter(|p| fs::symlink_metadata(p).is_ok());
 
-    title("Crossfyre extension remove", name);
+    title("Crossfyre extension remove", ext);
 
-    if !bin_path.exists() && legacy.is_none() {
-        warn(&format!("{name} is not installed, nothing to remove"));
+    if !bin_path.exists() {
+        warn(&format!("{ext} is not installed, nothing to remove"));
         end();
         return Ok(());
     }
 
-    step(&format!("Stopping and disabling {name} service"));
-    service::try_stop_and_disable_all(ext);
+    step(&format!("Stopping and disabling {ext} service"));
+    service::try_stop_and_disable(ext);
     service::remove_service_file(ext)?;
 
     if let Some(m) = packaging::owner(ext) {
         warn(&format!(
-            "{name}'s service is removed and its binary stays: {}",
+            "{ext}'s service is removed and its binary stays: {}",
             remove_note(m)
         ));
         end();
         return Ok(());
     }
 
-    if bin_path.exists() {
-        remove_stopped_binary(&bin_path)?;
-    }
-    if let Some(p) = &legacy {
-        remove_stopped_binary(p)?;
-    }
-    for v in std::iter::once(ext_version_file(ext)).chain(legacy_version_file(ext)) {
-        let _ = fs::remove_file(v);
-    }
-    ok(&format!("{name} removed"));
+    remove_stopped_binary(&bin_path)?;
+    let _ = fs::remove_file(ext_version_file(ext));
+    ok(&format!("{ext} removed"));
     end();
     Ok(())
 }
@@ -1083,11 +1064,39 @@ const RIGHTS: &str = if cfg!(windows) {
     "root"
 };
 
+/// The directory `update` writes the CLI to first (see `cli_targets`).
+fn cli_dir(bin_dir: &Path) -> PathBuf {
+    cli_path(bin_dir)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| bin_dir.to_path_buf())
+}
+
+/// The CLI `update` writes first (see `cli_targets`), which is the one it hands the rest
+/// of the update to. Asked before the running CLI is replaced: after that, the running
+/// binary's path names a file that is gone.
+fn cli_path(bin_dir: &Path) -> PathBuf {
+    let stable = bin_dir.join(file_name("crossfyre"));
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| cli_targets(&exe, &stable).into_iter().next())
+        .unwrap_or(stable)
+}
+
+/// May this user replace what `update` and the engine commands replace: what is in the
+/// bin directory, and the CLI unless a package keeps it? On Linux and macOS a command
+/// that may not runs itself again through sudo.
+pub fn may_replace_binaries() -> bool {
+    let bin_dir = get_bin_dir();
+    can_write_in(&bin_dir)
+        && (packaging::owner("crossfyre").is_some() || can_write_in(&cli_dir(&bin_dir)))
+}
+
 /// Can this process create files in `dir`, or create `dir` itself? Asked before anything
 /// is downloaded, so that an update run by a user who may not write the bin directory
 /// says what it needs at once. Without it, each component was downloaded and then failed
 /// with a bare "Permission denied (os error 13)" when it was moved into place.
-fn can_write_in(dir: &Path) -> bool {
+pub(crate) fn can_write_in(dir: &Path) -> bool {
     let mut at = dir;
     while !at.is_dir() {
         match at.parent() {
@@ -1148,314 +1157,290 @@ fn needs_rights_row(name: &str, mid: &str) -> String {
     )
 }
 
-/// `crossfyre update [self|<ext>|all]`. With no target: update self plus
-/// every installed extension.
+/// The binary that writes what an engine runs from, its unit above all: the CLI or the
+/// node worker, at the version it is. Only one of the release being installed may write
+/// them, since one of another release writes what its own release runs.
+#[derive(Debug, Clone, Copy)]
+pub struct Writer<'a> {
+    component: &'static str,
+    version: &'a str,
+}
+
+impl<'a> Writer<'a> {
+    /// The crossfyre CLI at `version`.
+    pub fn cli(version: &'a str) -> Self {
+        Self {
+            component: "crossfyre",
+            version,
+        }
+    }
+
+    /// The node worker at `version`.
+    pub fn node(version: &'a str) -> Self {
+        Self {
+            component: "node",
+            version,
+        }
+    }
+
+    /// Why it may not install or update an engine of `manifest`'s release: it is of
+    /// another release, and what replaces it first. None when it is of this one, or the
+    /// release does not name it.
+    fn refusal(&self, manifest: &Manifest) -> Option<String> {
+        let want = manifest_version(manifest, self.component);
+        if want.is_empty() || want == self.version {
+            return None;
+        }
+        let first = match packaging::owner(self.component) {
+            Some(m) => format!("update it with {m}"),
+            None => "run `crossfyre update`".to_string(),
+        };
+        let replaced = if self.component == "node" {
+            "node"
+        } else {
+            "CLI"
+        };
+        Some(format!(
+            "this {} is {}, and the release's is {want}: {first} first, so the {replaced} is \
+             replaced before it writes an engine's unit",
+            self.component, self.version
+        ))
+    }
+}
+
+/// `crossfyre update [self|<ext>|components|all]`. With no target: update self, every
+/// installed extension, and the closed components installed here, which come from
+/// Crossfyre with the plan of the key in `data_dir` rather than from the release.
+/// `components`, or a closed component's name, installs what the plan includes too.
 pub async fn update(
     target: Option<&str>,
     current_version: &str,
     force: bool,
+    allow_downgrade: bool,
+    data_dir: &Path,
 ) -> Result<Updated, Box<dyn std::error::Error>> {
-    // First, so what follows sees every engine under its public name.
-    super::migrate::renamed_engines();
+    if target == Some(DATA) {
+        print_heading();
+        let mut out = Updated::default();
+        update_data(&mut out).await;
+        print_summary(&out, target, force);
+        return Ok(out);
+    }
+    let creds = super::components::credentials(data_dir);
+    if let Some(which) = target.and_then(super::components::asked_for) {
+        print_heading();
+        let mut out = Updated::default();
+        super::components::update_step(data_dir, creds.as_ref(), &which, true, &mut out).await;
+        print_summary(&out, target, force);
+        return Ok(out);
+    }
     let manifest = fetch_manifest().await?;
-    update_with(&manifest, target, current_version, force).await
+    let handed_over = std::env::var_os(UPDATED_FROM_ENV).is_some();
+    // A CLI handed the rest of an update was let take an older release by the one before
+    // it, which says so in the environment rather than in a flag an older CLI rejects.
+    let allow_downgrade = allow_downgrade
+        || (handed_over && std::env::var(ALLOW_DOWNGRADE_ENV).is_ok_and(|v| v == "1"));
+    let rules = Rules {
+        force,
+        allow_downgrade,
+        with_data: true,
+    };
+    let mut out = update_with(&manifest, target, current_version, rules, handed_over).await?;
+    if matches!(target, Some("all") | None) {
+        super::components::update_step(
+            data_dir,
+            creds.as_ref(),
+            &super::components::COMPONENTS,
+            false,
+            &mut out,
+        )
+        .await;
+    }
+    print_summary(&out, target, force);
+    Ok(out)
 }
 
-/// `update` against a manifest already fetched.
-async fn update_with(
-    manifest: &Manifest,
-    target: Option<&str>,
-    current_version: &str,
-    force: bool,
-) -> Result<Updated, Box<dyn std::error::Error>> {
-    let (do_self, exts): (bool, Vec<&str>) = match target {
-        Some("self") => (true, vec![]),
-        Some("all") | None => (true, installed_extensions()),
-        Some(ext) => (false, super::resolve_extensions(ext)?),
-    };
+/// Set by a CLI that was let take an older release, on the CLI it hands the rest to.
+pub const ALLOW_DOWNGRADE_ENV: &str = "CROSSFYRE_ALLOW_DOWNGRADE";
 
+/// The flag that lets `update` take a release older than what is installed.
+const ALLOW_DOWNGRADE_FLAG: &str = "--allow-downgrade";
+
+/// What `update` may do: reinstall what is current (`--force`), and take a release
+/// older than what is installed (`--allow-downgrade`); and whether it takes the data
+/// too, from the bins origin into the toolchain directory, as only `update` itself asks:
+/// a test of the rest must reach neither.
+#[derive(Debug, Clone, Copy, Default)]
+struct Rules {
+    force: bool,
+    allow_downgrade: bool,
+    with_data: bool,
+}
+
+/// What `update` does with a component installed at `have` (none when it is not
+/// installed or its version is unknown) when the release names `want`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Current,
+    /// The release's is older, and nothing let update take it.
+    Downgrade,
+    Install,
+}
+
+impl Rules {
+    fn verdict(self, have: Option<&str>, want: &str) -> Verdict {
+        if want.is_empty() {
+            return Verdict::Install;
+        }
+        if have == Some(want) && !self.force {
+            return Verdict::Current;
+        }
+        if !self.allow_downgrade && have.is_some_and(|have| is_downgrade(want, have)) {
+            return Verdict::Downgrade;
+        }
+        Verdict::Install
+    }
+}
+
+/// Whether `want` is older than `have`. A version either side cannot be read as one is
+/// not taken for older.
+fn is_downgrade(want: &str, have: &str) -> bool {
+    match (cfx_cve::Version::parse(want), cfx_cve::Version::parse(have)) {
+        (Some(want), Some(have)) => want < have,
+        _ => false,
+    }
+}
+
+/// The row for a component `update` will not take back from `have` to `want`.
+fn downgrade_row(name: &str, have: &str, want: &str) -> String {
+    use super::ui::*;
+    row(
+        &bang(),
+        name,
+        &ver(have),
+        &format!(
+            "{YELLOW}refused{RESET} {}",
+            dim(&format!(
+                "the release's {want} is older than the {have} installed here; \
+                 `crossfyre update --allow-downgrade` takes it"
+            ))
+        ),
+    )
+}
+
+/// The target of `update` that takes the data the engines read and nothing else.
+pub const DATA: &str = "data";
+
+/// The line `update` opens with.
+fn print_heading() {
     use super::ui::*;
     println!();
     println!("  {BOLD}Crossfyre update{RESET}   {}", dim(origin_host()));
     println!();
+}
 
-    let mut out = Updated::default();
-    let bin_dir = get_bin_dir();
-    let writable = can_write_in(&bin_dir);
-
-    // Suppress the per-service status lines from install/service ops - this
-    // command renders its own summary. No `?` runs between the toggle pair, so
-    // it is always restored before returning.
-    service::set_quiet(true);
-
-    // ── Extensions ────────────────────────────────────────────────────
-    if !exts.is_empty() {
-        println!("  {}", dim("Extensions"));
-        for ext in &exts {
-            let name = super::public_name(ext);
-            if let Some(m) = packaging::owner(ext) {
-                println!("{}", row(&check(), name, "", &dim(&update_note(m))));
-                out.current += 1;
-                continue;
-            }
-            let want = manifest_version(manifest, ext);
-            let have = installed_ext_version(ext);
-            let up_to_date = ext_bin_path(ext).exists()
-                && !want.is_empty()
-                && have.as_deref() == Some(want.as_str());
-            if up_to_date && !force {
-                println!("{}", row(&check(), name, &ver(&want), &dim("up to date")));
-                out.current += 1;
-                continue;
-            }
-            if !writable {
-                println!(
-                    "{}",
-                    needs_rights_row(name, &version_change(have.as_deref(), &want))
-                );
-                out.need_rights += 1;
-                continue;
-            }
-            show_progress(name);
-            match install_one(manifest, ext, true, true).await {
-                Ok(()) => {
-                    let _ = service::start(ext);
-                    let mid = version_change(have.as_deref(), &want);
-                    show_result(&row(
-                        &check(),
-                        name,
-                        &mid,
-                        &format!("{GREEN}updated{RESET}"),
-                    ));
-                    out.changed += 1;
-                }
-                Err(e) => {
-                    show_result(&row(
-                        &bang(),
-                        name,
-                        "",
-                        &format!("{YELLOW}failed{RESET} {}", dim(&e.to_string())),
-                    ));
-                    out.failed += 1;
-                }
-            }
+/// The data the engines read: the crossfyre-templates pack and the CVE dataset, from the
+/// data manifest on the bins origin (`data_update`), and the engines told to read them
+/// again. Its rows go under their own heading, and count in `out`.
+async fn update_data(out: &mut Updated) {
+    use super::data_update::Outcome;
+    use super::ui::*;
+    println!("  {}", dim("Data"));
+    let dir = super::config::get_toolchain_dir();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let fetched = super::data_update::fetch(
+        bins_origin(),
+        &dir,
+        super::release_sig::data_required(),
+        &super::release_sig::verify_data,
+        now,
+    )
+    .await;
+    let report = match fetched {
+        Ok(report) if !report.published => {
+            println!("{}", row(&check(), "data", "", &dim("none published yet")));
+            println!();
+            return;
         }
-        println!();
-    }
-
-    // ── Core: crossfyre CLI + node worker ─────────────────────────────
-    if do_self {
-        println!("  {}", dim("Core"));
-
-        let want = manifest_version(manifest, "crossfyre");
-        // Where the update writes the CLI first (see `cli_targets`).
-        let cli_dir = std::env::current_exe()
-            .ok()
-            .and_then(|exe| {
-                let stable = bin_dir.join(ext_file_name("crossfyre"));
-                cli_targets(&exe, &stable).into_iter().next()
-            })
-            .and_then(|p| p.parent().map(Path::to_path_buf))
-            .unwrap_or_else(|| bin_dir.clone());
-        if let Some(m) = packaging::owner("crossfyre") {
+        Ok(report) => report,
+        Err(why) => {
             println!(
                 "{}",
                 row(
-                    &check(),
-                    "crossfyre",
-                    &ver(current_version),
-                    &dim(&update_note(m))
+                    &bang(),
+                    "data",
+                    "",
+                    &format!("{YELLOW}failed{RESET} {}", dim(&why))
                 )
             );
-            out.current += 1;
-        } else if !want.is_empty() && want == current_version && !force {
-            println!(
-                "{}",
-                row(&check(), "crossfyre", &ver(&want), &dim("up to date"))
-            );
-            out.current += 1;
-        } else if !can_write_in(&cli_dir) {
-            println!(
-                "{}",
-                needs_rights_row("crossfyre", &version_change(Some(current_version), &want))
-            );
-            out.need_rights += 1;
-        } else {
-            show_progress("crossfyre");
-            match self_update(manifest, current_version, true, force).await {
-                Ok(true) => {
-                    let mid = version_change(Some(current_version), &want);
-                    show_result(&row(
-                        &check(),
-                        "crossfyre",
-                        &mid,
-                        &format!("{GREEN}updated{RESET}"),
-                    ));
-                    out.restart = true;
-                    out.changed += 1;
-                }
-                Ok(false) => {
-                    show_result(&row(&check(), "crossfyre", &ver(&want), &dim("up to date")));
-                    out.current += 1;
-                }
-                Err(e) => {
-                    show_result(&row(
-                        &bang(),
-                        "crossfyre",
-                        "",
-                        &format!("{YELLOW}failed{RESET} {}", dim(&e.to_string())),
-                    ));
-                    out.failed += 1;
-                }
-            }
+            out.failed += 1;
+            println!();
+            return;
         }
-
-        // The node worker. One that is not here is not installed by an update: `node
-        // init` sets a node up, and a CLI that Homebrew or apt installed runs without one.
-        let nwant = manifest_version(manifest, "node");
-        let node_installed = ext_bin_path("node").exists();
-        if let Some(m) = packaging::owner("node") {
-            println!("{}", row(&check(), "node", "", &dim(&update_note(m))));
-            out.current += 1;
-        } else if !node_installed {
-            println!("{}", row(&dot(), "node", "", &dim("not installed")));
-        } else {
-            let nhave = installed_node_version();
-            if !nwant.is_empty() && nhave.as_deref() == Some(nwant.as_str()) && !force {
-                println!(
-                    "{}",
-                    row(&check(), "node", &ver(&nwant), &dim("up to date"))
-                );
+    };
+    for (name, outcome) in [("templates", &report.pack), ("dataset", &report.dataset)] {
+        let line = match outcome {
+            None => continue,
+            Some(Outcome::Updated { from, to }) => {
+                out.changed += 1;
+                let mid = version_change(from.map(|f| f.to_string()).as_deref(), &to.to_string());
+                row(&check(), name, &mid, &format!("{GREEN}updated{RESET}"))
+            }
+            Some(Outcome::Current(at)) => {
                 out.current += 1;
-            } else if !writable {
-                println!(
-                    "{}",
-                    needs_rights_row("node", &version_change(nhave.as_deref(), &nwant))
-                );
-                out.need_rights += 1;
-            } else {
-                show_progress("node");
-                match download_node(manifest, true, force).await {
-                    Ok(true) => {
-                        let mid = version_change(nhave.as_deref(), &nwant);
-                        show_result(&row(
-                            &check(),
-                            "node",
-                            &mid,
-                            &format!("{GREEN}updated{RESET}"),
-                        ));
-                        out.restart = true;
-                        out.changed += 1;
-                    }
-                    Ok(false) => {
-                        show_result(&row(&check(), "node", &ver(&nwant), &dim("up to date")));
-                        out.current += 1;
-                    }
-                    Err(e) => {
-                        show_result(&row(
-                            &bang(),
-                            "node",
-                            "",
-                            &format!("{YELLOW}failed{RESET} {}", dim(&e.to_string())),
-                        ));
-                        out.failed += 1;
-                    }
-                }
+                row(&check(), name, &ver(&at.to_string()), &dim("up to date"))
             }
-        }
-
-        // The cfx-script helper beside node. Optional, as in the installer, and a release
-        // without one is passed over in silence. A new one needs no restart: every job
-        // starts it afresh.
-        let hwant = manifest_version(manifest, CFX_SCRIPT);
-        let helper_installed = ext_bin_path(CFX_SCRIPT).exists();
-        // The row and the note for a cfx-script this host cannot start.
-        let skipped_row = row(
-            &bang(),
-            CFX_SCRIPT,
-            &ver(&hwant),
-            &format!(
-                "{YELLOW}skipped{RESET} {}",
-                dim("cannot start on this host")
-            ),
-        );
-        let skipped_note = |output: &str| {
-            format!(
-                "{} Until it can, {}.",
-                cannot_start_note(output),
-                without_new_helper()
-            )
+            Some(Outcome::Refused { offered, accepted }) => {
+                out.failed += 1;
+                let why = format!(
+                    "{offered} is published, older than the {accepted} accepted here, so it \
+                     is not used"
+                );
+                row(
+                    &bang(),
+                    name,
+                    &ver(&accepted.to_string()),
+                    &format!("{YELLOW}refused{RESET} {}", dim(&why)),
+                )
+            }
+            Some(Outcome::Failed(why)) => {
+                out.failed += 1;
+                row(
+                    &bang(),
+                    name,
+                    "",
+                    &format!("{YELLOW}failed{RESET} {}", dim(why)),
+                )
+            }
         };
-        if let Some(m) = packaging::owner(CFX_SCRIPT) {
-            println!("{}", row(&check(), CFX_SCRIPT, "", &dim(&update_note(m))));
-            out.current += 1;
-        } else if !hwant.is_empty() && !helper_installed && !node_installed {
-            println!("{}", row(&dot(), CFX_SCRIPT, "", &dim("not installed")));
-        } else if !hwant.is_empty() {
-            let hhave = installed_helper_version();
-            if hhave.as_deref() == Some(hwant.as_str()) && !force {
-                println!(
-                    "{}",
-                    row(&check(), CFX_SCRIPT, &ver(&hwant), &dim("up to date"))
-                );
-                out.current += 1;
-            } else if let Some(output) = still_cannot_start(&hwant).filter(|_| !force) {
-                println!("{skipped_row}");
-                show_detail(&skipped_note(&output));
-                out.skipped += 1;
-            } else if !writable {
-                println!(
-                    "{}",
-                    needs_rights_row(CFX_SCRIPT, &version_change(hhave.as_deref(), &hwant))
-                );
-                out.need_rights += 1;
-            } else {
-                show_progress(CFX_SCRIPT);
-                match install_cfx_script(manifest, force).await {
-                    Ok(HelperOutcome::Installed { version, replaced }) => {
-                        let mid = version_change(replaced.as_deref(), &version);
-                        show_result(&row(
-                            &check(),
-                            CFX_SCRIPT,
-                            &mid,
-                            &format!("{GREEN}updated{RESET}"),
-                        ));
-                        out.changed += 1;
-                    }
-                    Ok(HelperOutcome::Current { .. } | HelperOutcome::NotInRelease) => {
-                        show_result(&row(&check(), CFX_SCRIPT, &ver(&hwant), &dim("up to date")));
-                        out.current += 1;
-                    }
-                    Ok(HelperOutcome::Owned(m)) => {
-                        show_result(&row(&check(), CFX_SCRIPT, "", &dim(&update_note(m))));
-                        out.current += 1;
-                    }
-                    Ok(HelperOutcome::CannotStart { output, .. }) => {
-                        show_result(&skipped_row);
-                        show_detail(&skipped_note(&output));
-                        out.skipped += 1;
-                    }
-                    Err(e) => {
-                        show_result(&row(
-                            &bang(),
-                            CFX_SCRIPT,
-                            "",
-                            &format!(
-                                "{YELLOW}failed{RESET} {}",
-                                dim(&format!("{e}. Until it installs, {}", without_new_helper()))
-                            ),
-                        ));
-                        out.failed += 1;
-                    }
-                }
-            }
-        }
-        println!();
+        println!("{line}");
     }
+    if let Some(days) = report.stale_days {
+        println!(
+            "    {YELLOW}!{RESET} {}",
+            dim(&format!(
+                "the data on {} was made {days} days ago, and nothing newer has been published",
+                origin_host()
+            ))
+        );
+    }
+    for (engine, said) in super::data_update::reload_engines(&report).await {
+        let status = match said {
+            Some(Ok(_)) => dim("read it again"),
+            Some(Err(why)) => format!("{YELLOW}did not read it again{RESET} {}", dim(&why)),
+            None => dim("not running: reads it when it starts"),
+        };
+        println!("{}", row(&check(), engine, "", &status));
+    }
+    println!();
+}
 
-    service::set_quiet(false);
-
-    // ── Summary ───────────────────────────────────────────────────────
+/// The lines `update` closes with: the summary, and the command that finishes what this
+/// one could not.
+fn print_summary(out: &Updated, target: Option<&str>, force: bool) {
+    use super::ui::*;
     let colour = if out.succeeded() && out.skipped == 0 {
         GREEN
     } else {
@@ -1478,15 +1463,443 @@ async fn update_with(
         );
     }
     println!();
+}
 
+/// Set by a CLI that replaced itself during `update` on the new CLI it hands the rest of
+/// the update to, holding the version it was. The new CLI counts the CLI as updated and
+/// does not replace itself again.
+pub const UPDATED_FROM_ENV: &str = "CROSSFYRE_UPDATED_FROM";
+
+/// Hand the rest of an update to the CLI at `cli`, which has just replaced this one,
+/// version `from`: run it with this process's arguments and [`UPDATED_FROM_ENV`]. On
+/// Unix it takes this process's place. On Windows this one waits for it, and exits as
+/// it does. Returns only when the new CLI could not be started, with why.
+fn hand_over(cli: &Path, from: &str) -> Box<dyn std::error::Error> {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let mut cmd = Command::new(cli);
+    let (args, allow_downgrade) = forwarded(std::env::args_os().skip(1));
+    cmd.args(args).env(UPDATED_FROM_ENV, from);
+    if allow_downgrade {
+        cmd.env(ALLOW_DOWNGRADE_ENV, "1");
+    }
+    let not_run = |e: std::io::Error| {
+        format!(
+            "the new crossfyre at {} did not start to finish the update: {e}. Run \
+             `crossfyre update` again",
+            cli.display()
+        )
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        not_run(cmd.exec()).into()
+    }
+    #[cfg(not(unix))]
+    {
+        match cmd.status() {
+            Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+            Err(e) => not_run(e).into(),
+        }
+    }
+}
+
+/// This command's arguments as the CLI it hands over to is given them, and whether the
+/// downgrade flag was among them: without it, as a CLI older than the flag rejects it.
+fn forwarded(args: impl Iterator<Item = std::ffi::OsString>) -> (Vec<std::ffi::OsString>, bool) {
+    let mut allow = false;
+    let kept = args
+        .filter(|a| {
+            let flag = a == ALLOW_DOWNGRADE_FLAG;
+            allow |= flag;
+            !flag
+        })
+        .collect();
+    (kept, allow)
+}
+
+/// `update` against a manifest already fetched. The CLI goes first, and when it is
+/// replaced, the new CLI runs the rest, so what an update writes, an engine's unit above
+/// all, is the release's own. `handed_over` says this CLI is that new one: the one
+/// before it replaced itself with this one and printed the heading and its own row.
+async fn update_with(
+    manifest: &Manifest,
+    target: Option<&str>,
+    current_version: &str,
+    rules: Rules,
+    handed_over: bool,
+) -> Result<Updated, Box<dyn std::error::Error>> {
+    let force = rules.force;
+    let (do_self, exts): (bool, Vec<&str>) = match target {
+        Some("self") => (true, vec![]),
+        Some("all") | None => (true, installed_extensions()),
+        Some(ext) => (false, super::resolve_extensions(ext)?),
+    };
+
+    // Only a CLI of the release being installed updates the rest (see `Writer`). One of
+    // another release replaces itself first, which an update of one engine does not do.
+    let refusal = Writer::cli(current_version).refusal(manifest);
+    if !do_self && let Some(why) = &refusal {
+        return Err(why.clone().into());
+    }
+
+    use super::ui::*;
+    if !handed_over {
+        print_heading();
+    }
+
+    let mut out = Updated::default();
+    let bin_dir = get_bin_dir();
+    let writable = can_write_in(&bin_dir);
+
+    // Suppress the per-service status lines from install/service ops - this
+    // command renders its own summary. No `?` runs between the toggle pair, so
+    // it is always restored before returning.
+    service::set_quiet(true);
+
+    // Set when the rest has to wait for the CLI (see below).
+    let mut hold = false;
+
+    // ── Core: the crossfyre CLI first, then the node worker ──────────
+    if do_self {
+        let want = manifest_version(manifest, "crossfyre");
+        let cli = cli_path(&bin_dir);
+        let cli_dir = cli_dir(&bin_dir);
+        if handed_over {
+            // The CLI this one replaced printed its row.
+            out.restart = true;
+            out.changed += 1;
+        } else if let Some(m) = packaging::owner("crossfyre") {
+            println!("  {}", dim("Core"));
+            println!(
+                "{}",
+                row(
+                    &check(),
+                    "crossfyre",
+                    &ver(current_version),
+                    &dim(&update_note(m))
+                )
+            );
+            out.current += 1;
+        } else if rules.verdict(Some(current_version), &want) == Verdict::Current {
+            println!("  {}", dim("Core"));
+            println!(
+                "{}",
+                row(&check(), "crossfyre", &ver(&want), &dim("up to date"))
+            );
+            out.current += 1;
+        } else if rules.verdict(Some(current_version), &want) == Verdict::Downgrade {
+            println!("  {}", dim("Core"));
+            println!("{}", downgrade_row("crossfyre", current_version, &want));
+            out.failed += 1;
+        } else if !can_write_in(&cli_dir) {
+            println!("  {}", dim("Core"));
+            println!(
+                "{}",
+                needs_rights_row("crossfyre", &version_change(Some(current_version), &want))
+            );
+            out.need_rights += 1;
+        } else {
+            println!("  {}", dim("Core"));
+            show_progress("crossfyre");
+            match self_update(manifest, current_version, true, force).await {
+                Ok(true) => {
+                    let mid = version_change(Some(current_version), &want);
+                    show_result(&row(
+                        &check(),
+                        "crossfyre",
+                        &mid,
+                        &format!("{GREEN}updated{RESET}"),
+                    ));
+                    // The new CLI does the rest, writing what its release writes.
+                    service::set_quiet(false);
+                    return Err(hand_over(&cli, current_version));
+                }
+                Ok(false) => {
+                    show_result(&row(&check(), "crossfyre", &ver(&want), &dim("up to date")));
+                    out.current += 1;
+                }
+                Err(e) => {
+                    show_result(&row(
+                        &bang(),
+                        "crossfyre",
+                        "",
+                        &format!("{YELLOW}failed{RESET} {}", dim(&e.to_string())),
+                    ));
+                    out.failed += 1;
+                }
+            }
+        }
+
+        // A CLI of another release that was not replaced here, because a package manager
+        // keeps it or replacing it failed, leaves the rest for a run of one that is.
+        hold = !handed_over
+            && refusal.is_some()
+            && (ext_bin_path("node").exists()
+                || ext_bin_path(CFX_SCRIPT).exists()
+                || !exts.is_empty());
+        if hold {
+            println!(
+                "{}",
+                row(
+                    &dot(),
+                    "the rest",
+                    "",
+                    &dim(&format!(
+                        "waits for crossfyre {want}, whose release writes what it runs from"
+                    ))
+                )
+            );
+            out.skipped += 1;
+        }
+
+        if !hold {
+            // The node worker. One that is not here is not installed by an update: `node
+            // init` sets a node up, and a CLI that Homebrew or apt installed runs without one.
+            let nwant = manifest_version(manifest, "node");
+            let node_installed = ext_bin_path("node").exists();
+            if let Some(m) = packaging::owner("node") {
+                println!("{}", row(&check(), "node", "", &dim(&update_note(m))));
+                out.current += 1;
+            } else if !node_installed {
+                println!("{}", row(&dot(), "node", "", &dim("not installed")));
+            } else {
+                let nhave = installed_node_version();
+                let verdict = rules.verdict(nhave.as_deref(), &nwant);
+                if verdict == Verdict::Current {
+                    println!(
+                        "{}",
+                        row(&check(), "node", &ver(&nwant), &dim("up to date"))
+                    );
+                    out.current += 1;
+                } else if verdict == Verdict::Downgrade {
+                    println!(
+                        "{}",
+                        downgrade_row("node", nhave.as_deref().unwrap_or_default(), &nwant)
+                    );
+                    out.failed += 1;
+                } else if !writable {
+                    println!(
+                        "{}",
+                        needs_rights_row("node", &version_change(nhave.as_deref(), &nwant))
+                    );
+                    out.need_rights += 1;
+                } else {
+                    show_progress("node");
+                    match download_node(manifest, true, force).await {
+                        Ok(true) => {
+                            let mid = version_change(nhave.as_deref(), &nwant);
+                            show_result(&row(
+                                &check(),
+                                "node",
+                                &mid,
+                                &format!("{GREEN}updated{RESET}"),
+                            ));
+                            out.restart = true;
+                            out.changed += 1;
+                        }
+                        Ok(false) => {
+                            show_result(&row(&check(), "node", &ver(&nwant), &dim("up to date")));
+                            out.current += 1;
+                        }
+                        Err(e) => {
+                            show_result(&row(
+                                &bang(),
+                                "node",
+                                "",
+                                &format!("{YELLOW}failed{RESET} {}", dim(&e.to_string())),
+                            ));
+                            out.failed += 1;
+                        }
+                    }
+                }
+            }
+
+            // The cfx-script helper beside node. Optional, as in the installer, and a release
+            // without one is passed over in silence. A new one needs no restart: every job
+            // starts it afresh.
+            let hwant = manifest_version(manifest, CFX_SCRIPT);
+            let helper_installed = ext_bin_path(CFX_SCRIPT).exists();
+            // The row and the note for a cfx-script this host cannot start.
+            let skipped_row = row(
+                &bang(),
+                CFX_SCRIPT,
+                &ver(&hwant),
+                &format!(
+                    "{YELLOW}skipped{RESET} {}",
+                    dim("cannot start on this host")
+                ),
+            );
+            let skipped_note = |output: &str| {
+                format!(
+                    "{} Until it can, {}.",
+                    cannot_start_note(output),
+                    without_new_helper()
+                )
+            };
+            if let Some(m) = packaging::owner(CFX_SCRIPT) {
+                println!("{}", row(&check(), CFX_SCRIPT, "", &dim(&update_note(m))));
+                out.current += 1;
+            } else if !hwant.is_empty() && !helper_installed && !node_installed {
+                println!("{}", row(&dot(), CFX_SCRIPT, "", &dim("not installed")));
+            } else if !hwant.is_empty() {
+                let hhave = installed_helper_version();
+                let verdict = rules.verdict(hhave.as_deref(), &hwant);
+                if verdict == Verdict::Current {
+                    println!(
+                        "{}",
+                        row(&check(), CFX_SCRIPT, &ver(&hwant), &dim("up to date"))
+                    );
+                    out.current += 1;
+                } else if verdict == Verdict::Downgrade {
+                    println!(
+                        "{}",
+                        downgrade_row(CFX_SCRIPT, hhave.as_deref().unwrap_or_default(), &hwant)
+                    );
+                    out.failed += 1;
+                } else if let Some(output) = still_cannot_start(&hwant).filter(|_| !force) {
+                    println!("{skipped_row}");
+                    show_detail(&skipped_note(&output));
+                    out.skipped += 1;
+                } else if !writable {
+                    println!(
+                        "{}",
+                        needs_rights_row(CFX_SCRIPT, &version_change(hhave.as_deref(), &hwant))
+                    );
+                    out.need_rights += 1;
+                } else {
+                    show_progress(CFX_SCRIPT);
+                    match install_cfx_script(manifest, force).await {
+                        Ok(HelperOutcome::Installed { version, replaced }) => {
+                            let mid = version_change(replaced.as_deref(), &version);
+                            show_result(&row(
+                                &check(),
+                                CFX_SCRIPT,
+                                &mid,
+                                &format!("{GREEN}updated{RESET}"),
+                            ));
+                            out.changed += 1;
+                        }
+                        Ok(HelperOutcome::Current { .. } | HelperOutcome::NotInRelease) => {
+                            show_result(&row(
+                                &check(),
+                                CFX_SCRIPT,
+                                &ver(&hwant),
+                                &dim("up to date"),
+                            ));
+                            out.current += 1;
+                        }
+                        Ok(HelperOutcome::Owned(m)) => {
+                            show_result(&row(&check(), CFX_SCRIPT, "", &dim(&update_note(m))));
+                            out.current += 1;
+                        }
+                        Ok(HelperOutcome::CannotStart { output, .. }) => {
+                            show_result(&skipped_row);
+                            show_detail(&skipped_note(&output));
+                            out.skipped += 1;
+                        }
+                        Err(e) => {
+                            show_result(&row(
+                                &bang(),
+                                CFX_SCRIPT,
+                                "",
+                                &format!(
+                                    "{YELLOW}failed{RESET} {}",
+                                    dim(&format!(
+                                        "{e}. Until it installs, {}",
+                                        without_new_helper()
+                                    ))
+                                ),
+                            ));
+                            out.failed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        println!();
+    }
+
+    // ── Extensions ────────────────────────────────────────────────────
+    if !hold && !exts.is_empty() {
+        println!("  {}", dim("Extensions"));
+        for &ext in &exts {
+            if let Some(m) = packaging::owner(ext) {
+                println!("{}", row(&check(), ext, "", &dim(&update_note(m))));
+                out.current += 1;
+                continue;
+            }
+            let want = manifest_version(manifest, ext);
+            let have = installed_ext_version(ext);
+            let installed = have.as_deref().filter(|_| ext_bin_path(ext).exists());
+            match rules.verdict(installed, &want) {
+                Verdict::Current => {
+                    println!("{}", row(&check(), ext, &ver(&want), &dim("up to date")));
+                    out.current += 1;
+                    continue;
+                }
+                Verdict::Downgrade => {
+                    println!(
+                        "{}",
+                        downgrade_row(ext, installed.unwrap_or_default(), &want)
+                    );
+                    out.failed += 1;
+                    continue;
+                }
+                Verdict::Install => {}
+            }
+            if !writable {
+                println!(
+                    "{}",
+                    needs_rights_row(ext, &version_change(have.as_deref(), &want))
+                );
+                out.need_rights += 1;
+                continue;
+            }
+            show_progress(ext);
+            match install_one(manifest, ext, true, true).await {
+                Ok(()) => {
+                    let _ = service::start(ext);
+                    let mid = version_change(have.as_deref(), &want);
+                    show_result(&row(&check(), ext, &mid, &format!("{GREEN}updated{RESET}")));
+                    out.changed += 1;
+                }
+                Err(e) => {
+                    show_result(&row(
+                        &bang(),
+                        ext,
+                        "",
+                        &format!("{YELLOW}failed{RESET} {}", dim(&e.to_string())),
+                    ));
+                    out.failed += 1;
+                }
+            }
+        }
+        println!();
+    }
+
+    service::set_quiet(false);
+
+    // ── Data: the pack and the CVE dataset, with everything else ──────
+    if rules.with_data && !hold && matches!(target, Some("all") | None) {
+        update_data(&mut out).await;
+    }
     Ok(out)
 }
 
+/// The engines installed from the release. A closed engine is kept current with its
+/// plan, not from the release.
 fn installed_extensions() -> Vec<&'static str> {
-    super::EXTENSIONS
+    release_engines(super::config::is_extension_installed)
+}
+
+/// The engines `installed` says are here that come with the release.
+fn release_engines(installed: impl Fn(&str) -> bool) -> Vec<&'static str> {
+    super::ENGINES
         .iter()
-        .copied()
-        .filter(|e| super::config::is_extension_installed(e))
+        .filter(|e| !e.closed)
+        .map(|e| e.name)
+        .filter(|e| installed(e))
         .collect()
 }
 
@@ -1523,19 +1936,19 @@ pub async fn self_update(
         );
     }
     let tmp_dir = tempfile::tempdir()?;
-    let zip_path = tmp_dir.path().join(&artifact.file);
+    let archive = tmp_dir.path().join(&artifact.file);
     // The CLI asking is the installed copy, so this always replaces one.
-    download_verified(artifact, &zip_path, Purpose::Update).await?;
+    download_verified(artifact, &archive, Purpose::Update).await?;
 
     let extract_dir = tmp_dir.path().join("extracted");
-    extract_zip(&zip_path, &extract_dir)?;
-    let extracted = extract_dir.join(ext_file_name("crossfyre"));
+    extract_archive(&archive, &extract_dir)?;
+    let extracted = extract_dir.join(file_name("crossfyre"));
     if !extracted.exists() {
-        return Err("crossfyre binary not found inside update zip".into());
+        return Err("crossfyre binary not found inside the update archive".into());
     }
 
     let exe = std::env::current_exe()?;
-    let stable = get_bin_dir().join(ext_file_name("crossfyre"));
+    let stable = get_bin_dir().join(file_name("crossfyre"));
     let mut targets = cli_targets(&exe, &stable).into_iter();
     if let Some(first) = targets.next() {
         place_binary(&extracted, &first)?;
@@ -1583,7 +1996,7 @@ fn cli_targets(exe: &Path, stable: &Path) -> Vec<PathBuf> {
 /// dashboard-triggered self-update).
 pub fn installed_cli_version() -> String {
     let dir = get_bin_dir();
-    let bin = dir.join(ext_file_name("crossfyre"));
+    let bin = dir.join(file_name("crossfyre"));
     recorded_or_reported(
         &dir.join("crossfyre.version"),
         "crossfyre",
@@ -1602,7 +2015,7 @@ pub fn ensure_self_installed() -> Result<std::path::PathBuf, Box<dyn std::error:
     if super::packaging::owner("crossfyre").is_some() {
         return Ok(super::packaging::cli_path_for(&exe));
     }
-    let stable = get_bin_dir().join(ext_file_name("crossfyre"));
+    let stable = get_bin_dir().join(file_name("crossfyre"));
     if exe == stable {
         return Ok(stable);
     }
@@ -1629,20 +2042,20 @@ pub async fn download_node(
         return Err(format!("node is {}", update_note(m)).into());
     }
     let (comp, artifact) = resolve_artifact(manifest, "node")?;
-    let stable = get_bin_dir().join(ext_file_name("node"));
+    let stable = get_bin_dir().join(file_name("node"));
     let ver_file = get_bin_dir().join("node.version");
     if installed_node_version().as_deref() == Some(comp.version.as_str()) && !force {
         return Ok(false); // already current
     }
 
     let tmp_dir = tempfile::tempdir()?;
-    let zip_path = tmp_dir.path().join(&artifact.file);
-    download_verified(artifact, &zip_path, Purpose::replacing(stable.exists())).await?;
+    let archive = tmp_dir.path().join(&artifact.file);
+    download_verified(artifact, &archive, Purpose::replacing(stable.exists())).await?;
     let extract_dir = tmp_dir.path().join("extracted");
-    extract_zip(&zip_path, &extract_dir)?;
-    let extracted = extract_dir.join(ext_file_name("node"));
+    extract_archive(&archive, &extract_dir)?;
+    let extracted = extract_dir.join(file_name("node"));
     if !extracted.exists() {
-        return Err("node binary not found inside the node zip".into());
+        return Err("node binary not found inside the node archive".into());
     }
     place_binary(&extracted, &stable)?;
     let _ = std::fs::write(&ver_file, &comp.version);
@@ -1664,7 +2077,7 @@ pub async fn download_node(
 /// service's ExecStart resolves. A helper that cannot be installed is a warning, not an
 /// error, since only .cfx scripts need it.
 pub async fn ensure_node_installed() -> Result<(), Box<dyn std::error::Error>> {
-    let stable = get_bin_dir().join(ext_file_name("node"));
+    let stable = get_bin_dir().join(file_name("node"));
     let mut manifest = None;
     if let Some(m) = packaging::owner("node") {
         if !stable.exists() {
@@ -1734,45 +2147,95 @@ fn sibling_of_this_binary(name: &str) -> Option<PathBuf> {
     if super::packaging::current().is_some() {
         return None;
     }
-    let installed = get_bin_dir().join(ext_file_name(name));
+    let installed = get_bin_dir().join(file_name(name));
     let exe = std::env::current_exe().ok()?;
-    let sib = exe.parent()?.join(ext_file_name(name));
+    let sib = exe.parent()?.join(file_name(name));
     (sib.exists() && sib != installed).then_some(sib)
 }
 
 /// What the dashboard's update did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DashboardUpdate {
     /// The CLI was replaced, and the node should restart to run it.
     pub restart: bool,
     /// The package manager the CLI belongs to, when one does. The update left the CLI
     /// alone, and the dashboard can say which manager updates it.
     pub cli_managed_by: Option<Manager>,
+    /// What the update did with the data the engines read.
+    pub data: super::data_update::Status,
 }
 
 /// The update the dashboard asks a node for: the crossfyre CLI and the cfx-script helper,
-/// from the release manifest. A component a package manager installed is left to it. A
-/// new helper needs no restart, since every job starts it afresh.
+/// from the release manifest, and then the data the engines read. A component a package
+/// manager installed is left to it. A new helper needs no restart, since every job starts
+/// it afresh.
 pub async fn update_for_dashboard() -> Result<DashboardUpdate, Box<dyn std::error::Error>> {
     let manifest = fetch_manifest().await?;
-    report_cfx_script(install_cfx_script(&manifest, false).await);
-    if let Some(m) = packaging::owner("crossfyre") {
-        println!("[update] crossfyre is {}", update_note(m));
-        return Ok(DashboardUpdate {
-            restart: false,
-            cli_managed_by: Some(m),
-        });
+    // The dashboard has no --allow-downgrade: an older release is taken by hand.
+    let rules = Rules::default();
+    let older = |name: &str, have: Option<&str>| {
+        let want = manifest_version(&manifest, name);
+        (rules.verdict(have, &want) == Verdict::Downgrade).then(|| {
+            format!(
+                "the release's {name} {want} is older than the {} installed here, so the \
+                 dashboard's update does not take it",
+                have.unwrap_or_default()
+            )
+        })
+    };
+    match older(CFX_SCRIPT, installed_helper_version().as_deref()) {
+        Some(why) => println!("[update] {why}"),
+        None => report_cfx_script(install_cfx_script(&manifest, false).await),
     }
-    let restart = self_update(&manifest, &installed_cli_version(), false, false).await?;
+    let managed = packaging::owner("crossfyre");
+    let restart = match managed {
+        Some(m) => {
+            println!("[update] crossfyre is {}", update_note(m));
+            false
+        }
+        None => {
+            let have = installed_cli_version();
+            if let Some(why) = older("crossfyre", Some(&have)) {
+                return Err(why.into());
+            }
+            self_update(&manifest, &have, false, false).await?
+        }
+    };
+    // Then the data, as `crossfyre update` takes it after the components.
+    let (data, lines) = super::data_update::refresh_here().await;
+    for line in lines {
+        println!("[update] data: {line}");
+    }
     Ok(DashboardUpdate {
         restart,
-        cli_managed_by: None,
+        cli_managed_by: managed,
+        data,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A closed engine comes with a plan, after login: asking for it from the release is
+    /// refused with how to get it, before anything is fetched.
+    #[tokio::test]
+    async fn a_closed_engine_is_not_installed_or_updated_from_the_release() {
+        // Signed in nowhere: how to get it.
+        let dir = tempfile::tempdir().unwrap();
+        let err = super::super::components::install_closed("plessor-authz", dir.path())
+            .await
+            .unwrap_err();
+        assert!(
+            err.starts_with("plessor-authz comes with a Crossfyre plan that includes it."),
+            "{err}"
+        );
+        // Installed or not, `crossfyre update` does not take it from the release.
+        assert_eq!(
+            release_engines(|_| true),
+            ["ambulo", "voyage", "doorward", "toolmark", "plessor"]
+        );
+    }
 
     /// A manifest as it arrives: parsed from JSON, because the types only derive
     /// `Deserialize` and because the parse is part of what is being checked.
@@ -1789,9 +2252,49 @@ mod tests {
     /// could reproduce with `sha256sum` rather than one copied out of a failure.
     const HELLO_SHA: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
 
+    /// On Linux and macOS a release archive is a tar.gz with the binary at its top and,
+    /// for cfx-script, its python folder beside it. Both come out where the install
+    /// looks for them, and the binary can still be run.
+    #[cfg(unix)]
+    #[test]
+    fn a_release_archive_unpacks_with_the_system_tar() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("python").join("lib")).unwrap();
+        fs::write(src.join("cfx-script"), b"the binary").unwrap();
+        fs::set_permissions(src.join("cfx-script"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(src.join("python").join("lib").join("os.py"), b"its library").unwrap();
+        let archive = tmp
+            .path()
+            .join("cfx-script-linux-x86_64-0.1.45-0123456789ab.tar.gz");
+        let made = Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&src)
+            .args(["cfx-script", "python"])
+            .status()
+            .unwrap();
+        assert!(made.success());
+
+        let out = tmp.path().join("extracted");
+        extract_archive(&archive, &out).expect("the archive unpacks");
+        assert_eq!(fs::read(out.join("cfx-script")).unwrap(), b"the binary");
+        let mode = fs::metadata(out.join("cfx-script"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o111, 0o111, "mode {mode:o}");
+        assert_eq!(
+            fs::read(out.join("python").join("lib").join("os.py")).unwrap(),
+            b"its library"
+        );
+    }
+
     #[test]
     fn matching_bytes_are_accepted_and_one_changed_byte_is_not() {
-        let a = artifact("ambulo-linux-x86_64.zip", HELLO_SHA);
+        let a = artifact("ambulo-linux-x86_64.tar.gz", HELLO_SHA);
         assert!(verify_artifact_bytes(&a, b"hello").is_ok());
 
         let err = verify_artifact_bytes(&a, b"hellp").expect_err("one byte changed");
@@ -1807,7 +2310,7 @@ mod tests {
         // The publish pipeline writes lowercase hex, but a hand-edited manifest or a
         // different tool may not, and a case mismatch refusing a correct artifact would
         // look exactly like a compromised bucket.
-        let a = artifact("ambulo.zip", &HELLO_SHA.to_ascii_uppercase());
+        let a = artifact("ambulo.tar.gz", &HELLO_SHA.to_ascii_uppercase());
         assert!(verify_artifact_bytes(&a, b"hello").is_ok());
     }
 
@@ -1818,7 +2321,7 @@ mod tests {
         // byte sequence is wrong, which is correct by accident. Being explicit also makes
         // the message say why instead of printing a mismatch against nothing.
         for blank in ["", "   "] {
-            let a = artifact("ambulo.zip", blank);
+            let a = artifact("ambulo.tar.gz", blank);
             let err = verify_artifact_bytes(&a, b"hello")
                 .expect_err("an artifact with no checksum must be refused");
             assert!(
@@ -1833,9 +2336,9 @@ mod tests {
         // Zero bytes has a sha256 like anything else. A truncated download that arrives
         // as an empty 200 must not pass because there is nothing to hash.
         let empty_sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        let a = artifact("ambulo.zip", empty_sha);
+        let a = artifact("ambulo.tar.gz", empty_sha);
         assert!(verify_artifact_bytes(&a, b"").is_ok());
-        let b = artifact("ambulo.zip", HELLO_SHA);
+        let b = artifact("ambulo.tar.gz", HELLO_SHA);
         assert!(verify_artifact_bytes(&b, b"").is_err());
     }
 
@@ -1880,96 +2383,6 @@ mod tests {
             manifest_version(&m, "nope"),
             "",
             "an absent component reports no version rather than panicking"
-        );
-    }
-
-    #[test]
-    fn an_engine_resolves_under_its_new_key_and_falls_back_to_its_old_one() {
-        let key = platform_key();
-        let entry = |v: &str| {
-            format!(
-                r#"{{"version":"{v}","artifacts":{{"{key}":{{"file":"f-{v}","sha256":"{HELLO_SHA}"}}}}}}"#
-            )
-        };
-        // The release manifest carries the new key and, for one release, the old one
-        // as an alias. The new key is the one taken.
-        let both = manifest(&format!(
-            r#"{{"components":{{"cortex":{},"plessor":{}}}}}"#,
-            entry("0.0.22"),
-            entry("0.0.23")
-        ));
-        assert_eq!(manifest_version(&both, "cortex"), "0.0.23");
-        assert_eq!(manifest_version(&both, "plessor"), "0.0.23");
-        // A manifest that has not gained the new key yet still installs the engine.
-        let old = manifest(&format!(
-            r#"{{"components":{{"cortex":{}}}}}"#,
-            entry("0.0.22")
-        ));
-        assert_eq!(manifest_version(&old, "cortex"), "0.0.22");
-        assert_eq!(manifest_version(&old, "plessor"), "0.0.22");
-    }
-
-    /// An engine that was renamed, as the table describes one.
-    const RENAMED: crate::toolchain::Engine = crate::toolchain::Engine {
-        id: "cortex",
-        name: "fresh",
-        legacy: Some("cortex"),
-        port: 4445,
-        about: "",
-    };
-
-    #[test]
-    fn a_renamed_engine_is_looked_up_under_its_public_name_then_its_legacy_one() {
-        assert_eq!(keys_for(Some(&RENAMED), "cortex"), ["fresh", "cortex"]);
-        assert_eq!(keys_for(None, "crossfyre"), ["crossfyre"]);
-        let key = platform_key();
-        let entry = |v: &str| {
-            format!(
-                r#"{{"version":"{v}","artifacts":{{"{key}":{{"file":"f-{v}","sha256":"{HELLO_SHA}"}}}}}}"#
-            )
-        };
-
-        // A manifest from before the rename has only the legacy key.
-        let old = manifest(&format!(
-            r#"{{"components":{{"cortex":{}}}}}"#,
-            entry("0.0.22")
-        ));
-        let (c, _) = resolve_keys(&old, &keys_for(Some(&RENAMED), "cortex")).expect("falls back");
-        assert_eq!(c.version, "0.0.22");
-
-        // One from after it carries both, and the public name is taken.
-        let both = manifest(&format!(
-            r#"{{"components":{{"cortex":{},"fresh":{}}}}}"#,
-            entry("0.0.22"),
-            entry("0.0.23")
-        ));
-        let (c, a) = resolve_keys(&both, &keys_for(Some(&RENAMED), "cortex")).expect("found");
-        assert_eq!(
-            (c.version.as_str(), a.file.as_str()),
-            ("0.0.23", "f-0.0.23")
-        );
-
-        let err = resolve_keys(&manifest(r#"{"components":{}}"#), &["fresh", "cortex"])
-            .expect_err("in neither")
-            .to_string();
-        assert!(
-            err.contains("'fresh'"),
-            "the public name is the one reported: {err}"
-        );
-    }
-
-    #[test]
-    fn the_binary_inside_an_artifact_may_carry_either_name() {
-        let s = Scratch::new("member");
-        let keys = keys_for(Some(&RENAMED), "cortex");
-        assert_eq!(find_member(&s.0, &keys), None);
-        fs::write(s.join(&file_name("cortex")), b"alias").expect("legacy member");
-        assert_eq!(find_member(&s.0, &keys), Some(s.join(&file_name("cortex"))));
-        fs::write(s.join(&file_name("fresh")), b"new").expect("public member");
-        assert_eq!(
-            find_member(&s.0, &keys),
-            Some(s.join(&file_name("fresh"))),
-            "the public name first"
         );
     }
 
@@ -2086,7 +2499,7 @@ mod tests {
         );
         let dir = PathBuf::from("/nix/store/x-crossfyre/libexec");
         assert_eq!(get_bin_dir(), dir);
-        assert_eq!(ext_bin_path("cortex"), dir.join("plessor"));
+        assert_eq!(ext_bin_path("plessor"), dir.join("plessor"));
         assert_eq!(service::node_binary(), dir.join("node"));
     }
 
@@ -2138,7 +2551,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            // What an artifact unpacked out of a zip normally looks like.
+            // A binary that came out of its archive without its execute bit.
             fs::set_permissions(&src, fs::Permissions::from_mode(0o644)).expect("chmod src");
         }
 
@@ -2301,7 +2714,7 @@ mod tests {
         assert!(!dest.exists());
     }
 
-    /// A release's python folder beside `src`, as its zip unpacks: lib/ with a file that
+    /// A release's python folder beside `src`, as its archive unpacks: lib/ with a file that
     /// says which one it is.
     #[cfg(unix)]
     fn python_beside(src: &Path, which: &str) {
@@ -2411,6 +2824,7 @@ exit 127"#;
 
     /// Have this test's thread keep everything but the engine named in it in `dir`, as a
     /// package with that bin_dir would, and own nothing else.
+    #[cfg(unix)]
     fn bin_dir_at(dir: &Path) {
         packaged(&format!(
             r#"{{"manager":"nix","owns":["ambulo"],"bin_dir":"{}"}}"#,
@@ -2449,39 +2863,6 @@ exit 127"#;
         shared libraries: libpython3.11.so.1.0: cannot open shared object file: No such \
         file or directory";
 
-    /// Node 0.1.52, the worker shipped with crossfyre 0.1.42, and every one before it
-    /// hands the configs it writes back to the operator. So does a worker that cannot
-    /// say which it is. One from a later release keeps them root's, and a host with no
-    /// worker has nothing to hand back.
-    #[cfg(unix)]
-    #[test]
-    fn a_node_worker_from_0_1_42_or_before_is_an_earlier_one() {
-        let s = Scratch::new("node-predates");
-        bin_dir_at(&s.0);
-        assert!(!installed_node_predates_root_configs(), "no worker at all");
-        for (v, earlier) in [
-            ("0.1.52", true),
-            ("0.1.9", true),
-            ("0.0.99", true),
-            ("0.1.53", false),
-            ("0.1.53-rc.1", false),
-            ("0.2.0", false),
-            ("1.0.0", false),
-        ] {
-            reports(&s.0, "node", v);
-            let _ = fs::remove_file(s.0.join("node.version"));
-            assert_eq!(installed_node_predates_root_configs(), earlier, "node {v}");
-        }
-        // The version recorded beside it counts first, as for an update.
-        fs::write(s.0.join("node.version"), "0.1.51\n").unwrap();
-        assert!(installed_node_predates_root_configs(), "recorded 0.1.51");
-        // A worker that answers no version.
-        let _ = fs::remove_file(s.0.join("node.version"));
-        old_helper(&s.0);
-        fs::rename(s.0.join(CFX_SCRIPT), s.0.join("node")).unwrap();
-        assert!(installed_node_predates_root_configs(), "no version");
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn a_node_with_no_version_record_is_asked_for_its_version() {
@@ -2500,6 +2881,131 @@ exit 127"#;
         assert_eq!(installed_node_version().as_deref(), Some("9.9.9"));
     }
 
+    /// What update does with a component: current when it is the release's, refused when
+    /// the release's is older and nothing lets it take that, else installed; --force
+    /// reinstalls what is current, and only --allow-downgrade takes an older one.
+    #[test]
+    fn an_older_release_is_taken_only_when_allowed() {
+        use Verdict::*;
+        let rules = |force, allow_downgrade| Rules {
+            force,
+            allow_downgrade,
+            with_data: false,
+        };
+        for (have, want, force, allow, verdict) in [
+            (Some("0.1.44"), "0.1.44", false, false, Current),
+            (Some("0.1.44"), "0.1.44", true, false, Install),
+            (Some("0.1.44"), "0.1.45", false, false, Install),
+            (Some("0.1.45"), "0.1.44", false, false, Downgrade),
+            (Some("0.1.45"), "0.1.44", true, false, Downgrade),
+            (Some("0.1.45"), "0.1.44", false, true, Install),
+            (Some("0.1.10"), "0.1.9", false, false, Downgrade),
+            (Some("0.2.0"), "0.2.0-rc.1", false, false, Downgrade),
+            (None, "0.1.44", false, false, Install),
+            (Some("dev build"), "0.1.44", false, false, Install),
+            (Some("0.1.44"), "", false, false, Install),
+        ] {
+            assert_eq!(
+                rules(force, allow).verdict(have, want),
+                verdict,
+                "{have:?} to {want:?}, force {force}, allow {allow}"
+            );
+        }
+    }
+
+    /// The CLI handed the rest of an update is told it may take an older release in its
+    /// environment, and the flag is left out of what it is given, as a CLI older than the
+    /// flag would refuse it.
+    #[test]
+    fn the_downgrade_flag_is_passed_on_in_the_environment_not_as_a_flag() {
+        let (args, allow) = forwarded(
+            ["update", "--allow-downgrade", "--force"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        );
+        assert_eq!(args, ["update", "--force"]);
+        assert!(allow);
+        let (args, allow) = forwarded(["update"].into_iter().map(std::ffi::OsString::from));
+        assert_eq!(args, ["update"]);
+        assert!(!allow);
+    }
+
+    /// Makes `dir` one this user may not write, until dropped. A refused downgrade is said
+    /// before update asks whether it may write, so in such a folder an update that
+    /// would have taken the older release asks for rights instead, and reaches no origin.
+    #[cfg(unix)]
+    struct ReadOnly<'a>(&'a Path);
+
+    #[cfg(unix)]
+    impl<'a> ReadOnly<'a> {
+        fn new(dir: &'a Path) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).expect("read-only");
+            Self(dir)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ReadOnly<'_> {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_engine_newer_than_the_release_is_left_and_the_update_fails() {
+        let s = Scratch::new("ext-newer");
+        bin_dir_at(&s.0);
+        fs::write(s.join("voyage"), "").expect("voyage");
+        fs::write(s.join("voyage.version"), "9.9.9").expect("its version");
+        let _ro = ReadOnly::new(&s.0);
+        let out = update_with(
+            &full_manifest("9.9.8"),
+            Some("voyage"),
+            "9.9.8",
+            Rules::default(),
+            false,
+        )
+        .await
+        .expect("runs");
+        assert_eq!(
+            out,
+            Updated {
+                failed: 1,
+                ..Updated::default()
+            }
+        );
+        assert!(!out.succeeded());
+        assert_eq!(installed_ext_version("voyage").as_deref(), Some("9.9.9"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cli_newer_than_the_release_is_left_and_the_update_fails() {
+        let s = Scratch::new("cli-newer");
+        bin_dir_at(&s.0);
+        reports(&s.0, "crossfyre", "9.9.9");
+        let _ro = ReadOnly::new(&s.0);
+        let out = update_with(
+            &full_manifest("9.9.8"),
+            Some("self"),
+            "9.9.9",
+            Rules::default(),
+            false,
+        )
+        .await
+        .expect("runs");
+        assert_eq!(
+            out,
+            Updated {
+                failed: 1,
+                ..Updated::default()
+            }
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn an_update_right_after_the_installer_changes_nothing() {
@@ -2508,9 +3014,15 @@ exit 127"#;
         reports(&s.0, "crossfyre", "9.9.9");
         reports(&s.0, "node", "9.9.9");
         reports(&s.0, CFX_SCRIPT, "9.9.9");
-        let out = update_with(&full_manifest("9.9.9"), Some("self"), "9.9.9", false)
-            .await
-            .expect("runs");
+        let out = update_with(
+            &full_manifest("9.9.9"),
+            Some("self"),
+            "9.9.9",
+            Rules::default(),
+            false,
+        )
+        .await
+        .expect("runs");
         assert_eq!(
             out,
             Updated {
@@ -2520,6 +3032,131 @@ exit 127"#;
         );
         assert_eq!(out.summary(), "Everything is up to date.");
         assert_eq!(installed_cli_version(), "9.9.9");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_cli_an_update_was_handed_to_counts_itself_updated_and_has_the_node_restarted() {
+        let s = Scratch::new("handed-over");
+        bin_dir_at(&s.0);
+        reports(&s.0, "crossfyre", "9.9.9");
+        reports(&s.0, "node", "9.9.9");
+        reports(&s.0, CFX_SCRIPT, "9.9.9");
+        let out = update_with(
+            &full_manifest("9.9.9"),
+            Some("self"),
+            "9.9.9",
+            Rules::default(),
+            true,
+        )
+        .await
+        .expect("runs");
+        assert_eq!(
+            out,
+            Updated {
+                restart: true,
+                changed: 1,
+                current: 2,
+                ..Updated::default()
+            }
+        );
+        assert_eq!(out.summary(), "Updated 1 component, 2 already current.");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cli_that_stays_behind_leaves_the_rest_for_one_of_the_release() {
+        // A package manager keeps this CLI, a release behind. What it updated would run
+        // from what its own release writes, an engine's unit above all.
+        let s = Scratch::new("cli-behind");
+        packaged(&format!(
+            r#"{{"manager":"brew","owns":["crossfyre"],"bin_dir":"{}"}}"#,
+            s.join("bin").display()
+        ));
+        fs::create_dir_all(s.join("bin")).expect("bin");
+        reports(&s.join("bin"), "node", "9.9.9");
+        let out = update_with(
+            &full_manifest("9.9.9"),
+            Some("self"),
+            "9.9.8",
+            Rules::default(),
+            false,
+        )
+        .await
+        .expect("runs");
+        assert_eq!(
+            out,
+            Updated {
+                current: 1,
+                skipped: 1,
+                ..Updated::default()
+            }
+        );
+        assert_eq!(
+            out.summary(),
+            "Nothing was updated: 1 already current, 1 skipped."
+        );
+    }
+
+    /// The dashboard's one command installs the release's CLI with install.sh just before
+    /// `node init`, so node init's engine installs go ahead. A CLI or a node of another
+    /// release refuses them, since it would write the unit its own release writes.
+    #[test]
+    fn only_a_cli_or_node_of_the_release_installs_an_engine() {
+        let m = full_manifest("9.9.9");
+        assert_eq!(Writer::cli("9.9.9").refusal(&m), None);
+        assert_eq!(Writer::node("9.9.9").refusal(&m), None);
+        assert_eq!(
+            Writer::cli("9.9.8").refusal(&m).as_deref(),
+            Some(
+                "this crossfyre is 9.9.8, and the release's is 9.9.9: run `crossfyre update` \
+                 first, so the CLI is replaced before it writes an engine's unit"
+            )
+        );
+        assert_eq!(
+            Writer::node("9.9.8").refusal(&m).as_deref(),
+            Some(
+                "this node is 9.9.8, and the release's is 9.9.9: run `crossfyre update` \
+                 first, so the node is replaced before it writes an engine's unit"
+            )
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_engine_is_updated_only_by_a_cli_of_the_release() {
+        // The engine is current here, so nothing but the CLI's release stops the update.
+        let s = Scratch::new("ext-cli-behind");
+        bin_dir_at(&s.0);
+        fs::write(s.join("voyage"), "").expect("voyage");
+        fs::write(s.join("voyage.version"), "9.9.9").expect("its version");
+        let manifest = full_manifest("9.9.9");
+        let refused = || update_with(&manifest, Some("voyage"), "9.9.8", Rules::default(), false);
+        assert_eq!(
+            refused().await.expect_err("refused").to_string(),
+            "this crossfyre is 9.9.8, and the release's is 9.9.9: run `crossfyre update` \
+             first, so the CLI is replaced before it writes an engine's unit"
+        );
+        packaged(&format!(
+            r#"{{"manager":"brew","owns":["crossfyre"],"bin_dir":"{}"}}"#,
+            s.0.display()
+        ));
+        assert_eq!(
+            refused().await.expect_err("refused").to_string(),
+            "this crossfyre is 9.9.8, and the release's is 9.9.9: update it with brew first, \
+             so the CLI is replaced before it writes an engine's unit"
+        );
+        // A CLI of the release updates it.
+        let out = update_with(&manifest, Some("voyage"), "9.9.9", Rules::default(), false)
+            .await
+            .expect("runs");
+        assert_eq!(
+            out,
+            Updated {
+                current: 1,
+                ..Updated::default()
+            }
+        );
     }
 
     #[cfg(unix)]
@@ -2561,7 +3198,14 @@ exit 127"#;
         reports(&s.0, "node", "0.0.1");
         reports(&s.0, CFX_SCRIPT, "9.9.9");
         fs::set_permissions(&s.0, fs::Permissions::from_mode(0o555)).expect("lock");
-        let out = update_with(&full_manifest("9.9.9"), Some("self"), "9.9.9", false).await;
+        let out = update_with(
+            &full_manifest("9.9.9"),
+            Some("self"),
+            "9.9.9",
+            Rules::default(),
+            false,
+        )
+        .await;
         fs::set_permissions(&s.0, fs::Permissions::from_mode(0o755)).expect("unlock");
         let out = out.expect("runs");
         // Said before anything is downloaded, rather than a Permission denied after.
@@ -2591,9 +3235,15 @@ exit 127"#;
             r#"{{"manager":"brew","owns":["crossfyre"],"bin_dir":"{}"}}"#,
             s.join("bin").display()
         ));
-        let out = update_with(&full_manifest("9.9.9"), None, "9.9.8", false)
-            .await
-            .expect("runs");
+        let out = update_with(
+            &full_manifest("9.9.9"),
+            None,
+            "9.9.8",
+            Rules::default(),
+            false,
+        )
+        .await
+        .expect("runs");
         assert_eq!(
             out,
             Updated {
@@ -2627,9 +3277,15 @@ exit 127"#;
         assert_eq!(version, "9.9.9");
         assert_eq!(output, missing);
 
-        let out = update_with(&full_manifest("9.9.9"), Some("self"), "9.9.9", false)
-            .await
-            .expect("runs");
+        let out = update_with(
+            &full_manifest("9.9.9"),
+            Some("self"),
+            "9.9.9",
+            Rules::default(),
+            false,
+        )
+        .await
+        .expect("runs");
         assert_eq!(
             out,
             Updated {

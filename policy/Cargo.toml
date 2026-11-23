@@ -1,0 +1,21 @@
+[package]
+name = "cfx_policy"
+version = "0.0.1"
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+homepage = "https://clickswave.org"
+repository = "https://github.com/clickswave/crossfyre-toolchain"
+keywords = ["privacy", "policy", "pentest"]
+description = "The privacy policy a machine runs under: its names, the state the CLI keeps in policy.toml, and how CROSSFYRE_POLICY tightens one run."
+authors = ["Clickswave <team@clickswave.org>"]
+
+# A leaf with no network code, so every program on a machine reads the one file the
+# same way: the CLI and node through cfx_core, which also writes it, `crossfyre mcp`,
+# and the Workbench.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "1.0.3"
+
+[dev-dependencies]
+tempfile = "3"

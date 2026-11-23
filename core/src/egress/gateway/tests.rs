@@ -323,7 +323,7 @@ async fn a_wrong_secret_is_refused() {
     assert!(matches!(got, Err(TunnelError::Auth)), "{}", shown(&got));
     assert_eq!(rec.connections(), 0);
     // A lease's URL and wire object name only the gateway.
-    assert!(lease.proxy_url().ends_with(&format!("@{}", gw.addr())));
+    assert!(lease.proxy_url().ends_with(&format!("@{}", gw.addr)));
     assert_eq!(lease.wire()["v"], 1);
     assert!(!format!("{lease:?}").contains(&pass_of(&lease)));
 }
@@ -406,7 +406,7 @@ async fn connections_that_never_authenticate_count_against_the_cap() {
     let mut held = Vec::new();
     for _ in 0..300 {
         // Connect and send nothing: no greeting, no credentials.
-        held.push(TcpStream::connect(gw.addr()).await.unwrap());
+        held.push(TcpStream::connect(gw.addr).await.unwrap());
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
     // A connection the gateway has closed reads as ended at once; one it still holds

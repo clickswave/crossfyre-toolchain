@@ -1,0 +1,17 @@
+# Synthetic: Confluence's login page, with the header and page markers Confluence sends.
+HTTP/1.1 200 OK
+content-type: text/html;charset=UTF-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+x-confluence-request-time: 1763618400000
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Log In - Confluence</title>
+<meta name="ajs-version-number" content="7.19.16">
+</head>
+<body id="com-atlassian-confluence" class="login">
+<div id="main"></div>
+</body>
+</html>

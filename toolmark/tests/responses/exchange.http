@@ -1,0 +1,19 @@
+# Synthetic: Outlook on the web's sign-in page, where Exchange sends anyone not signed in.
+HTTP/1.1 200 OK
+content-type: text/html;charset=UTF-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+server: Microsoft-IIS/10.0
+x-owa-version: 15.2.1258.12
+x-powered-by: ASP.NET
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Outlook</title>
+<link rel="shortcut icon" href="/owa/auth/15.2.1258/themes/resources/favicon.ico" type="image/x-icon">
+</head>
+<body>
+<form action="/owa/auth.owa" method="POST" name="logonForm"></form>
+</body>
+</html>

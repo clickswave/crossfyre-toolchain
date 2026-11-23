@@ -10,6 +10,7 @@
 //! node-key paste). Flags `--agree-tos` and `--no-prompt` make the flow
 //! scriptable; mismatched/missing flags error rather than silently prompting.
 
+use crate::api::SendApi;
 use serde::{Deserialize, Serialize};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -373,7 +374,7 @@ pub async fn perform_login(
         resolve_method(&mut flags).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     require_tos(&flags).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
-    let client = reqwest::Client::new();
+    let client = crate::api::client();
     let api_url = flags.api_url.trim_end_matches('/').to_string();
 
     let (api_key, user) = match method {
@@ -442,7 +443,7 @@ async fn verify_key(
     let res = client
         .post(format!("{api_url}/api/v1/cli/verify-key"))
         .json(&serde_json::json!({ "api_key": key }))
-        .send()
+        .send_api()
         .await?;
     let ok = res.status().is_success();
     let body: serde_json::Value = res.json().await.unwrap_or(serde_json::json!({}));
@@ -465,7 +466,7 @@ async fn password_login(
             "password": password,
             "key_name": hostname(),
         }))
-        .send()
+        .send_api()
         .await?;
     let ok = res.status().is_success();
     let body: serde_json::Value = res.json().await.unwrap_or(serde_json::json!({}));
@@ -491,7 +492,7 @@ async fn browser_login(
         .json(&serde_json::json!({
             "client_info": client_info(cli_version)
         }))
-        .send()
+        .send_api()
         .await?;
     if !res.status().is_success() {
         let body: serde_json::Value = res.json().await.unwrap_or(serde_json::json!({}));
@@ -540,7 +541,7 @@ async fn browser_login(
         let answer = client
             .post(format!("{api_url}/api/v1/cli/device/poll"))
             .json(&serde_json::json!({ "device_code": device_code }))
-            .send()
+            .send_api()
             .await;
 
         let body = match answer {
@@ -611,8 +612,8 @@ async fn browser_login(
 
 // ---- node provisioning (used by `init`) --------------------------------
 
-/// Authenticate an existing dashboard-created node by its `cfx_...` key
-/// (legacy `crossfyre node init --node-key` path). Returns the authorize-node body.
+/// Authenticate an existing dashboard-created node by its `cfxn_...` key
+/// (the `crossfyre node init --node-key` path). Returns the authorize-node body.
 pub async fn authorize_existing_node(
     client: &reqwest::Client,
     api_url: &str,
@@ -625,7 +626,7 @@ pub async fn authorize_existing_node(
             api_url.trim_end_matches('/')
         ))
         .json(&serde_json::json!({ "api_key": node_key, "force": force }))
-        .send()
+        .send_api()
         .await?;
     // Which of the two it was. One sentence for both left a person with a good key
     // retyping it while the server was the problem.
@@ -653,6 +654,7 @@ pub async fn authorize_existing_node(
 // one, so a first-run install needs only the account key.
 pub async fn provision_node(
     client: &reqwest::Client,
+    data_dir: &Path,
     account: &Account,
     name: Option<&str>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
@@ -666,20 +668,39 @@ pub async fn provision_node(
             "hostname": hostname(),
             "name": name,
         }))
-        .send()
+        .send_api()
         .await?;
-    let ok = res.status().is_success();
+    let status = res.status();
     let body: serde_json::Value = res.json().await.unwrap_or(serde_json::json!({}));
-    if !ok {
-        return Err(body_message(&body).into());
+    if !status.is_success() {
+        return Err(refused(data_dir, account, status, &body).into());
     }
     Ok(body["data"].clone())
+}
+
+/// What Crossfyre's refusal of an account call says, and when it no longer takes the
+/// session, what that did to this machine's policy.
+fn refused(
+    data_dir: &Path,
+    account: &Account,
+    status: reqwest::StatusCode,
+    body: &serde_json::Value,
+) -> String {
+    let message = body_message(body);
+    let ended = (status == reqwest::StatusCode::UNAUTHORIZED)
+        .then(|| crate::policy::session_ended(data_dir, &account.api_key))
+        .flatten();
+    match ended {
+        Some(line) => format!("{message}\n{line}"),
+        None => message,
+    }
 }
 
 /// `crossfyre node list`: fetch the account's node fleet (scoped to its team)
 /// with live online/offline status. Returns the `nodes` array.
 pub async fn list_nodes(
     client: &reqwest::Client,
+    data_dir: &Path,
     account: &Account,
 ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
     let res = client
@@ -688,12 +709,12 @@ pub async fn list_nodes(
             account.api_url.trim_end_matches('/')
         ))
         .json(&serde_json::json!({ "api_key": account.api_key }))
-        .send()
+        .send_api()
         .await?;
-    let ok = res.status().is_success();
+    let status = res.status();
     let body: serde_json::Value = res.json().await.unwrap_or(serde_json::json!({}));
-    if !ok {
-        return Err(body_message(&body).into());
+    if !status.is_success() {
+        return Err(refused(data_dir, account, status, &body).into());
     }
     Ok(body["data"]["nodes"]
         .as_array()
@@ -717,6 +738,13 @@ pub async fn run_login(
         .to_string();
     title("Crossfyre login", &host);
 
+    let ask = !flags.no_prompt && std::io::stdin().is_terminal();
+    let before = load_account(data_dir);
+    if crate::policy::load(data_dir).offline.is_some() {
+        warn(
+            "This machine is offline. crossfyre login contacts Crossfyre all the same, as you ran it.",
+        );
+    }
     let account = perform_login(data_dir, flags).await?;
 
     let who = if account.username.is_empty() {
@@ -729,6 +757,36 @@ pub async fn run_login(
     field("file", &account_path(data_dir).display().to_string());
     end();
     done(&format!("Signed in as {who}"));
+    let same_account =
+        before.is_some_and(|b| b.user_id == account.user_id && b.api_url == account.api_url);
+    let policy = crate::policy::command::at_login(
+        data_dir,
+        &crate::policy::cloud::Session::of(&account),
+        same_account,
+        &crate::policy::cloud::Crossfyre,
+        || {
+            ask && dialoguer::Confirm::new()
+                .with_prompt("This machine is offline, which you chose. Leave offline?")
+                .default(false)
+                .interact()
+                .unwrap_or(false)
+        },
+        || ask.then(crate::policy::command::pick_for_account).flatten(),
+    )
+    .await;
+    ok(&policy.line);
+    if let Some(n) = &policy.note {
+        warn(n);
+    }
+    // What the plan includes beside the release, offered now.
+    crate::toolchain::components::after_login(
+        &crate::toolchain::components::Credentials {
+            api_url: account.api_url.clone(),
+            key: account.api_key.clone(),
+        },
+        ask,
+    )
+    .await;
     hint(&format!(
         "Next, enrol this machine: {}",
         crate::os::elevated("crossfyre node init")
@@ -883,6 +941,30 @@ mod tests {
         let info = client_info("7.8.9");
         assert_eq!(info["version"], "7.8.9");
         assert_eq!(info["os"], os_label());
+    }
+    /// An account call Crossfyre refuses the session for says so, and puts the machine
+    /// offline with the reason; any other refusal is only its message.
+    #[test]
+    fn a_refused_session_says_what_it_did_to_the_policy() {
+        let t = tempfile::tempdir().unwrap();
+        let a = Account {
+            api_url: "http://127.0.0.1:9".into(),
+            api_key: "cfk_test".into(),
+            user_id: "u1".into(),
+            username: "op".into(),
+            email: "op@example.test".into(),
+        };
+        save_account(t.path(), &a).unwrap();
+        let body = serde_json::json!({ "message": "Not logged in" });
+        assert_eq!(
+            refused(t.path(), &a, reqwest::StatusCode::FORBIDDEN, &body),
+            "Not logged in"
+        );
+        assert_eq!(crate::policy::load(t.path()).offline, None);
+        assert_eq!(
+            refused(t.path(), &a, reqwest::StatusCode::UNAUTHORIZED, &body),
+            "Not logged in\npolicy: offline (your session ended; run crossfyre login)"
+        );
     }
 }
 

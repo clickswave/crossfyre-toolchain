@@ -1,9 +1,9 @@
-use crate::libs::cli_args::{Cli, Commands, DbArgs, ExecArgs, OriginArgs};
+use crate::libs::cli_args::{
+    Cli, Commands, EVENT_POLL_TIMEOUT_MS, ExecArgs, LogLevel, OriginArgs, ScanArgs,
+};
 use crate::scanner::StreamEvent;
 use clap::{CommandFactory, Parser};
-use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 mod axfr;
@@ -12,57 +12,8 @@ mod daemon;
 mod libs;
 mod scanner;
 mod scanners;
+mod store;
 mod takeover;
-
-/// Mirrors the toolchain config at ~/.config/crossfyre/config.toml (see `toolchain_dir`)
-#[derive(Debug, Deserialize)]
-struct ToolchainConfig {
-    postgres: PostgresConfig,
-}
-
-#[derive(Debug, Deserialize)]
-struct PostgresConfig {
-    host: String,
-    port: u16,
-    user: String,
-    password: Option<String>,
-    #[allow(dead_code)]
-    db_name: String,
-}
-
-/// The toolchain directory: `CROSSFYRE_TOOLCHAIN_DIR` when the service that started this
-/// daemon names one, as the engine host does on macOS and Windows, else
-/// `~/.config/crossfyre` on Linux and the per-user config directory elsewhere
-/// (`~/Library/Application Support` on macOS, `%APPDATA%` on Windows), which is where
-/// the CLI writes it.
-fn toolchain_dir() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
-    if let Some(dir) = std::env::var_os("CROSSFYRE_TOOLCHAIN_DIR").filter(|d| !d.is_empty()) {
-        return Ok(dir.into());
-    }
-    let root = if cfg!(target_os = "linux") {
-        dirs::home_dir()
-            .ok_or("Could not find home directory")?
-            .join(".config")
-    } else {
-        dirs::config_dir().ok_or("Could not find the config directory")?
-    };
-    Ok(root.join("crossfyre"))
-}
-
-fn load_toolchain_config() -> Result<ToolchainConfig, Box<dyn std::error::Error>> {
-    let config_path = toolchain_dir()?.join("config.toml");
-
-    let contents = std::fs::read_to_string(&config_path).map_err(|e| {
-        format!(
-            "Cannot read toolchain config at {}: {}. Run 'crossfyre db up' first.",
-            config_path.display(),
-            e
-        )
-    })?;
-
-    let config: ToolchainConfig = toml::from_str(&contents)?;
-    Ok(config)
-}
 
 // An error is printed as the sentence it is. Returned from `main`, Rust prints it in
 // debug form: in quotes, with a line break shown as a backslash and an n.
@@ -78,38 +29,29 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Before anything asks the adaptive crate, clap's defaults included.
+    cfx_pacing::load();
     let cli = Cli::parse();
 
     // -----------------------------------------------------------------------
     // Daemon mode - starts the TCP service and connects directly to postgres
     // -----------------------------------------------------------------------
-    if cli.daemon {
-        let toolchain_cfg = load_toolchain_config()?;
-
+    if matches!(cli.command, Some(Commands::Daemon)) {
         // Postgres being briefly unreachable is not a reason to exit: systemd
         // would restart us straight into the same failure, which is how one
         // host logged 2,663 restarts and reported nothing but "down". Wait for
-        // it, saying so each time, and start as soon as it answers.
+        // it, saying why each time, and start as soon as it answers.
         let voyage_db = dguard::wait_for(
-            // Name the endpoint and the fix. "pool timed out while waiting
-            // for an open connection" is true and useless: it does not say
-            // which host, which port, or that the container may simply not
-            // have been created on this machine yet.
-            &format!(
-                "postgres at {}:{} (create it with `crossfyre db up`)",
-                toolchain_cfg.postgres.host, toolchain_cfg.postgres.port
-            ),
+            "the database",
             std::time::Duration::from_secs(3600),
             || async {
-                let db = libs::voyage_db::VoyageDb::init(
-                    &toolchain_cfg.postgres.host,
-                    toolchain_cfg.postgres.port,
-                    &toolchain_cfg.postgres.user,
-                    toolchain_cfg.postgres.password.as_deref(),
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-                db.create_tables().await.map_err(|e| e.to_string())?;
+                let pool = cfx_db::ensure_ready(&libs::voyage_db::ENGINE)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                cfx_db::scans::stop_abandoned(&pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let db = libs::voyage_db::VoyageDb::new(pool);
                 Ok::<_, String>(db)
             },
         )
@@ -118,15 +60,42 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return daemon::run(cli.port, voyage_db).await;
     }
 
+    // The daemon every command below talks to, started when it is not running.
+    let daemon = dguard::Daemon::new("voyage", cli.port, !cli.no_autostart);
+
     // -----------------------------------------------------------------------
-    // Db subcommand - send db_reset to daemon
+    // Db subcommand: sent to the daemon, which keeps the scans
     // -----------------------------------------------------------------------
-    if let Some(Commands::Db(db_args)) = &cli.command {
-        return handle_db(db_args.clone(), cli.port).await;
+    if let Some(Commands::Db { action }) = &cli.command {
+        return dguard::run_db(&daemon, action).await;
     }
 
     if let Some(Commands::Exec(exec_args)) = &cli.command {
-        return handle_enum_exec(exec_args.clone(), cli.port).await;
+        return handle_enum_exec(exec_args.clone(), &daemon).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Scans subcommand: what the daemon keeps, and a stopped one taken up again
+    // -----------------------------------------------------------------------
+    if let Some(Commands::Scans) = &cli.command {
+        let scans = dguard::list_scans(&daemon).await?;
+        let tui = cfx_tui::wanted(cli.no_tui);
+        let chosen =
+            tokio::task::spawn_blocking(move || cfx_tui::scans::show("VOYAGE", &scans, tui))
+                .await??;
+        if let Some(scan) = chosen {
+            let request = dguard::resume_request(scan["id"].as_str().unwrap_or_default());
+            stream_enum(
+                &daemon,
+                &request,
+                None,
+                tui,
+                EVENT_POLL_TIMEOUT_MS,
+                LogLevel::Info,
+            )
+            .await?;
+        }
+        return Ok(());
     }
 
     // -----------------------------------------------------------------------
@@ -137,7 +106,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some(Commands::Axfr(args)) = &cli.command {
-        return handle_axfr(args.clone(), cli.port).await;
+        return handle_axfr(args.clone(), &daemon).await;
     }
 
     // -----------------------------------------------------------------------
@@ -151,18 +120,31 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // -----------------------------------------------------------------------
+    // Man subcommand - print the roff man page to stdout (no daemon needed)
+    // -----------------------------------------------------------------------
+    if let Some(Commands::Man) = &cli.command {
+        let mut page = Vec::new();
+        clap_mangen::Man::new(Cli::command()).render(&mut page)?;
+        print_all(&page)?;
+        return Ok(());
+    }
+
+    // -----------------------------------------------------------------------
     // Scan subcommand - client that talks to the running daemon
     // -----------------------------------------------------------------------
     let mut enum_args = match cli.command {
         Some(Commands::Scan(args)) => args,
         Some(Commands::Exec(_))
-        | Some(Commands::Db(_))
+        | Some(Commands::Scans)
+        | Some(Commands::Db { .. })
         | Some(Commands::Origin(_))
         | Some(Commands::Axfr(_))
         | Some(Commands::Completions { .. })
+        | Some(Commands::Man)
+        | Some(Commands::Daemon)
         | None => {
             eprintln!(
-                "No command given. Use `voyage scan`, `voyage exec`, `voyage db`, or `voyage --daemon`. Try --help."
+                "No command given. Use `voyage scan <domain>...`, `voyage exec <json>`, `voyage db`, or `voyage daemon`. Try --help."
             );
             std::process::exit(1);
         }
@@ -174,72 +156,130 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     }
 
-    if enum_args.domain.is_empty() {
-        eprintln!("Error: --domain is required (or use --interactive)");
-        std::process::exit(1);
+    // Without a wordlist only the passive sources run, and with those off as well there
+    // is nothing to run.
+    match enum_args.passive_only() {
+        Ok(note) => {
+            if let Some(note) = note {
+                eprintln!("{note}");
+            }
+        }
+        Err(why) => {
+            eprintln!("Error: {why}");
+            std::process::exit(1);
+        }
     }
 
-    if enum_args.disable_passive_enum && enum_args.disable_active_enum {
-        eprintln!("Error: cannot disable both passive and active enumeration");
-        std::process::exit(1);
+    // A wordlist is read here and its words sent after the request, so the daemon
+    // opens no path for this scan and any file this user can read will do.
+    let wordlist = (!enum_args.wordlist_path.is_empty())
+        .then(|| std::path::Path::new(&enum_args.wordlist_path));
+    let tui = cfx_tui::wanted(cli.no_tui);
+    for domain in &enum_args.domain {
+        scan_domain(&daemon, &enum_args, domain, wordlist, tui).await?;
     }
+    Ok(())
+}
 
-    if !enum_args.disable_active_enum && enum_args.wordlist_path.is_empty() {
-        eprintln!(
-            "Error: --wordlist-path is required for active enumeration (or use --disable-active-enum / --interactive)"
-        );
-        std::process::exit(1);
-    }
-
-    // Connect to the daemon
-    let daemon_addr = format!("127.0.0.1:{}", cli.port);
-    let stream = TcpStream::connect(&daemon_addr).await.map_err(|_| {
-        format!(
-            "Voyage daemon is not running on port {}.\nStart it with `voyage --daemon`, or with `crossfyre extension start voyage` if crossfyre installed it.",
-            cli.port
-        )
-    })?;
-
-    // Resolve wordlist to absolute path (daemon runs from a different cwd), as ambulo
-    // does. An empty path stays empty: no active enumeration.
-    let wordlist_abs = if enum_args.wordlist_path.is_empty() {
-        String::new()
-    } else {
-        std::fs::canonicalize(&enum_args.wordlist_path)
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| enum_args.wordlist_path.clone())
-    };
-
-    // Build and send the stream enum request
-    let request = serde_json::json!({
+/// The stream enumeration request for `domain` with every flag of `args` the daemon
+/// honours, the interval between requests as `delay`. `active` says whether words
+/// follow it for the active part.
+fn enum_request(args: &ScanArgs, domain: &str, active: bool) -> serde_json::Value {
+    serde_json::json!({
         "operation": "enum",
         "response": "stream",
         "save": true,
-        "domain": enum_args.domain[0],
-        "wordlist": wordlist_abs,
-        "tasks": enum_args.tasks,
-        "fresh_start": enum_args.fresh_start,
-        "disable_passive": enum_args.disable_passive_enum,
-        "disable_active": enum_args.disable_active_enum,
-        "exclude_passive_sources": enum_args.exclude_passive_source,
-        "exclude_active_techniques": enum_args.exclude_active_technique,
-        "http_probing_ports": enum_args.http_probing_port,
-        "https_probing_ports": enum_args.https_probing_port,
-        "active_user_agent": enum_args.active_user_agent,
-        "passive_user_agent": enum_args.passive_user_agent,
-    });
+        "domain": domain,
+        "tasks": args.tasks,
+        "delay": args.interval,
+        "fresh_start": args.fresh_start,
+        "disable_passive": args.disable_passive_enum,
+        "disable_active": !active,
+        "exclude_passive_sources": args.exclude_passive_source,
+        "exclude_active_techniques": args.exclude_active_technique,
+        "http_probing_ports": args.http_probing_port,
+        "https_probing_ports": args.https_probing_port,
+        "active_user_agent": args.active_user_agent,
+        "active_random_user_agent": args.active_random_user_agent,
+        "passive_user_agent": args.passive_user_agent,
+    })
+}
 
+/// Whether event `line` is shown at log level `least`: every event but a log line below
+/// it.
+fn shown(line: &str, least: &libs::cli_args::LogLevel) -> bool {
+    let rank = |level: &str| {
+        ["debug", "info", "warn", "error"]
+            .iter()
+            .position(|l| *l == level)
+    };
+    match serde_json::from_str::<StreamEvent>(line) {
+        Ok(ev) if ev.kind == "log" => {
+            rank(ev.log_level.as_deref().unwrap_or("info")) >= rank(&least.to_string())
+        }
+        _ => true,
+    }
+}
+
+/// One enumeration of `domain` by the daemon, with the words of the file at `wordlist`
+/// when there is one: drawn on the dashboard when `tui`, and otherwise written out as
+/// the daemon's own newline-delimited JSON.
+async fn scan_domain(
+    daemon: &dguard::Daemon,
+    enum_args: &ScanArgs,
+    domain: &str,
+    wordlist: Option<&std::path::Path>,
+    tui: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut request = enum_request(enum_args, domain, wordlist.is_some());
+    if let Some(wordlist) = wordlist {
+        request[dguard::WORDS_FOLLOW] = dguard::list_name(wordlist).into();
+    }
+    let least = enum_args.log_level.clone();
+    stream_enum(
+        daemon,
+        &request,
+        wordlist,
+        tui,
+        enum_args.event_poll_timeout,
+        least,
+    )
+    .await
+}
+
+/// Send `request` to the daemon, with the words of the file at `wordlist` after it when
+/// there is one, and show the enumeration it starts: drawn on the dashboard when `tui`,
+/// polling for events every `poll_timeout` ms, and otherwise written out as the daemon's
+/// own newline-delimited JSON, with no log line below level `least`.
+async fn stream_enum(
+    daemon: &dguard::Daemon,
+    request: &serde_json::Value,
+    wordlist: Option<&std::path::Path>,
+    tui: bool,
+    poll_timeout: u64,
+    least: LogLevel,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stream = daemon.connect().await?;
     let (reader, mut writer) = tokio::io::split(stream);
-    let mut req_str = dguard::encode(&request);
+    let mut req_str = dguard::encode(request);
     req_str.push('\n');
     writer.write_all(req_str.as_bytes()).await?;
-
-    // Read the "ack" event to get operation_id and total
+    let sent = match wordlist {
+        Some(wordlist) => dguard::send_words(&mut writer, wordlist).await,
+        None => Ok(()),
+    };
+    // Read the "ack" event to get operation_id and total. A daemon that refused the
+    // scan says why here, which is more use than a write it stopped reading.
     let mut lines = BufReader::new(reader).lines();
-    let ack_line = lines
-        .next_line()
-        .await?
-        .ok_or("Daemon closed connection before ack")?;
+    let ack_line = match lines.next_line().await? {
+        Some(line) => line,
+        None => {
+            return Err(sent
+                .err()
+                .unwrap_or_else(|| "Daemon closed connection before ack".to_string())
+                .into());
+        }
+    };
     let ack: StreamEvent = serde_json::from_str(&ack_line)?;
 
     if ack.kind == "error" {
@@ -249,15 +289,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
         std::process::exit(1);
     }
+    sent?;
 
     let operation_id = ack.operation_id.unwrap_or_else(|| "unknown".to_string());
     let total = ack.total.unwrap_or(0);
-    let poll_timeout = enum_args.event_poll_timeout;
 
-    if cfx_tui::wanted(cli.tui, cli.no_tui, true) {
+    if tui {
         let (tx, rx) = mpsc::unbounded_channel::<StreamEvent>();
         tokio::spawn(async move {
             while let Ok(Some(line)) = lines.next_line().await {
+                if !shown(&line, &least) {
+                    continue;
+                }
                 if let Ok(ev) = serde_json::from_str::<StreamEvent>(&line) {
                     let done = ev.kind == "done";
                     let _ = tx.send(ev);
@@ -278,7 +321,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // out too rather than being swallowed by the line that read it.
     println!("{ack_line}");
     while let Some(line) = lines.next_line().await? {
-        println!("{line}");
+        if shown(&line, &least) {
+            println!("{line}");
+        }
         if dguard::is_error(&line) {
             std::process::exit(1);
         }
@@ -302,40 +347,9 @@ fn print_all(bytes: &[u8]) -> std::io::Result<()> {
     }
 }
 
-async fn handle_db(args: DbArgs, port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    if !args.full_reset {
-        eprintln!("No action given. See `voyage db --help`.");
-        std::process::exit(1);
-    }
-
-    let daemon_addr = format!("127.0.0.1:{port}");
-    let stream = TcpStream::connect(&daemon_addr).await.map_err(|_| {
-        format!(
-            "Voyage daemon is not running on port {port}.\nStart it with `voyage --daemon`, or with `crossfyre extension start voyage` if crossfyre installed it."
-        )
-    })?;
-
-    let request = serde_json::json!({ "operation": "db_reset", "response": "instant" });
-    let (reader, mut writer) = tokio::io::split(stream);
-    let mut req_str = dguard::encode(&request);
-    req_str.push('\n');
-    writer.write_all(req_str.as_bytes()).await?;
-
-    let mut lines = BufReader::new(reader).lines();
-    if let Some(line) = lines.next_line().await? {
-        let resp: serde_json::Value = serde_json::from_str(&line)?;
-        match resp["status"].as_str().unwrap_or("error") {
-            "completed" => println!("{}", resp["message"].as_str().unwrap_or("Done.")),
-            _ => eprintln!("Error: {}", resp["message"].as_str().unwrap_or("unknown")),
-        }
-    }
-
-    Ok(())
-}
-
 async fn handle_origin(args: OriginArgs) -> Result<(), Box<dyn std::error::Error>> {
     if args.domain.trim().is_empty() {
-        eprintln!("Error: --domain is required");
+        eprintln!("Error: the domain is empty");
         std::process::exit(1);
     }
 
@@ -349,19 +363,10 @@ async fn handle_origin(args: OriginArgs) -> Result<(), Box<dyn std::error::Error
         scanners::origin::discover(&args.domain, args.timeout, !args.no_evasive, &egress, &log)
             .await;
 
-    if args.json {
-        let arr: Vec<serde_json::Value> = findings
-            .iter()
-            .map(|f| {
-                serde_json::json!({
-                    "ip": f.ip.to_string(),
-                    "host": f.host,
-                    "confidence": f.confidence,
-                    "note": f.note,
-                })
-            })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&arr)?);
+    if args.json || !to_terminal() {
+        for line in origin_json(&findings) {
+            println!("{line}");
+        }
     } else if findings.is_empty() {
         println!(
             "\nNo origin candidates found behind the CDN for {}.",
@@ -378,6 +383,33 @@ async fn handle_origin(args: OriginArgs) -> Result<(), Box<dyn std::error::Error
     }
 
     Ok(())
+}
+
+/// Whether stdout is a terminal, where `origin` and `axfr` write text. Piped or
+/// redirected, they write JSON lines, as every engine's commands do.
+fn to_terminal() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdout().is_terminal()
+}
+
+/// `origin`'s findings as JSON lines: a result for each candidate, and then done.
+fn origin_json(findings: &[scanners::origin::OriginFinding]) -> Vec<String> {
+    findings
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "type": "result",
+                "ip": f.ip.to_string(),
+                "host": f.host,
+                "confidence": f.confidence,
+                "note": f.note,
+            })
+            .to_string()
+        })
+        .chain(std::iter::once(
+            serde_json::json!({"type": "done", "found": findings.len()}).to_string(),
+        ))
+        .collect()
 }
 
 /// The request `exec` sends for the caller's JSON, with the operation, the response
@@ -406,16 +438,14 @@ fn exec_request(json: &str) -> Result<serde_json::Value, String> {
     Ok(payload)
 }
 
-async fn handle_enum_exec(args: ExecArgs, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+async fn handle_enum_exec(
+    args: ExecArgs,
+    daemon: &dguard::Daemon,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Parse the caller's JSON and fill in the operation if they did not name one.
     let payload = exec_request(&args.json)?;
 
-    let daemon_addr = format!("127.0.0.1:{port}");
-    let stream = TcpStream::connect(&daemon_addr).await.map_err(|_| {
-        format!(
-            "Voyage daemon is not running on port {port}.\nStart it with `voyage --daemon`, or with `crossfyre extension start voyage` if crossfyre installed it."
-        )
-    })?;
+    let stream = daemon.connect().await?;
     let _ = stream.set_nodelay(true);
 
     let (reader, mut writer) = tokio::io::split(stream);
@@ -440,13 +470,9 @@ async fn handle_enum_exec(args: ExecArgs, port: u16) -> Result<(), Box<dyn std::
 /// `voyage axfr`: ask the daemon for a zone transfer and print what comes back.
 async fn handle_axfr(
     args: crate::libs::cli_args::AxfrArgs,
-    port: u16,
+    daemon: &dguard::Daemon,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
-        .await
-        .map_err(|_| {
-            format!("Voyage daemon is not running on port {port}. Start it with `voyage --daemon`, or with `crossfyre extension start voyage` if crossfyre installed it.")
-        })?;
+    let stream = daemon.connect().await?;
     let request = serde_json::json!({
         "operation": "axfr",
         "response": "stream",
@@ -459,20 +485,110 @@ async fn handle_axfr(
     req_str.push('\n');
     writer.write_all(req_str.as_bytes()).await?;
 
+    let json = !to_terminal();
     let mut lines = BufReader::new(reader).lines();
     while let Some(line) = lines.next_line().await? {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        match v["type"].as_str().unwrap_or("") {
-            "result" => println!("{}", v["subdomain"].as_str().unwrap_or("")),
-            "finding" => eprintln!("[!] {}", v["data"]["name"].as_str().unwrap_or("")),
-            "log" | "error" => eprintln!("[-] {}", v["message"].as_str().unwrap_or("")),
-            "done" => break,
-            _ => {}
+        match axfr_shown(&line, json) {
+            Some(Shown::Out(text)) => println!("{text}"),
+            Some(Shown::Err(text)) => eprintln!("{text}"),
+            None => {}
+        }
+        if serde_json::from_str::<serde_json::Value>(&line).is_ok_and(|v| v["type"] == "done") {
+            break;
         }
     }
     Ok(())
+}
+
+/// What `axfr` shows of a line from the daemon, and where.
+#[derive(Debug, PartialEq, Eq)]
+enum Shown {
+    Out(String),
+    Err(String),
+}
+
+/// A line the daemon sent `axfr`, as it is shown: piped (`json`), the line itself; in a
+/// terminal, a name it found on stdout, and what else happened on stderr.
+fn axfr_shown(line: &str, json: bool) -> Option<Shown> {
+    let v = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if json {
+        return Some(Shown::Out(line.to_string()));
+    }
+    match v["type"].as_str().unwrap_or("") {
+        "result" => Some(Shown::Out(
+            v["subdomain"].as_str().unwrap_or("").to_string(),
+        )),
+        "finding" => Some(Shown::Err(format!(
+            "[!] {}",
+            v["data"]["name"].as_str().unwrap_or("")
+        ))),
+        "log" | "error" => Some(Shown::Err(format!(
+            "[-] {}",
+            v["message"].as_str().unwrap_or("")
+        ))),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod piped_tests {
+    use super::*;
+
+    fn finding(ip: &str) -> scanners::origin::OriginFinding {
+        scanners::origin::OriginFinding {
+            ip: ip.parse().unwrap(),
+            host: "direct.lab.test".to_string(),
+            confidence: "likely",
+            note: "answers for the site".to_string(),
+        }
+    }
+
+    /// Piped, `origin` writes one JSON line per candidate and then one that it is done,
+    /// as every engine's commands do. It wrote a pretty-printed array, a line of which
+    /// was not JSON on its own.
+    #[test]
+    fn origin_writes_json_lines() {
+        let lines = origin_json(&[finding("192.0.2.1"), finding("192.0.2.2")]);
+        let parsed: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|l| serde_json::from_str(l).expect("a line of JSON"))
+            .collect();
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0]["type"], "result");
+        assert_eq!(parsed[0]["ip"], "192.0.2.1");
+        assert_eq!(parsed[1]["host"], "direct.lab.test");
+        assert_eq!(parsed[2], serde_json::json!({"type": "done", "found": 2}));
+        assert_eq!(
+            origin_json(&[]),
+            [serde_json::json!({"type": "done", "found": 0}).to_string()]
+        );
+    }
+
+    /// Piped, `axfr` passes on the daemon's JSON lines; in a terminal it prints the
+    /// names, and what else happened on stderr.
+    #[test]
+    fn axfr_writes_json_lines_when_piped_and_names_in_a_terminal() {
+        let result = r#"{"type":"result","subdomain":"www.lab.test","status":"found"}"#;
+        let log = r#"{"type":"log","message":"ns1.lab.test refused the transfer"}"#;
+        let done = r#"{"type":"done","total":1}"#;
+        assert_eq!(
+            axfr_shown(result, true),
+            Some(Shown::Out(result.to_string()))
+        );
+        assert_eq!(axfr_shown(log, true), Some(Shown::Out(log.to_string())));
+        assert_eq!(axfr_shown(done, true), Some(Shown::Out(done.to_string())));
+        assert_eq!(
+            axfr_shown(result, false),
+            Some(Shown::Out("www.lab.test".to_string()))
+        );
+        assert_eq!(
+            axfr_shown(log, false),
+            Some(Shown::Err(
+                "[-] ns1.lab.test refused the transfer".to_string()
+            ))
+        );
+        assert_eq!(axfr_shown(done, false), None);
+    }
 }
 
 #[cfg(test)]

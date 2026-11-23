@@ -1,0 +1,17 @@
+id: joomla
+info:
+  name: Joomla
+  category: CMS
+  metadata:
+    vendor: joomla
+    product: 'joomla!'
+implies: [php]
+detect:
+  any:
+    - meta: { name: generator, regex: '(?i)joomla' }
+    - html: { regex: '(?i)/media/jui/|/media/system/js/|option=com_' }
+    - path: { path: /administrator/manifests/files/joomla.xml, regex: '<name>files_joomla</name>' }
+version:
+  - meta: { name: generator, regex: '(?i)Joomla!?\s*([0-9.]+)' }
+  - html: { regex: '(?i)Joomla!?\s*([0-9.]+)' }
+  - path: { path: /administrator/manifests/files/joomla.xml, regex: '<version>([0-9]+(?:\.[0-9]+)*)</version>' }

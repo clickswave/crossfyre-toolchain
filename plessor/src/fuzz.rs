@@ -226,7 +226,7 @@ async fn probe_typefuzz(client: &Client, ep: &InjEndpoint) -> Vec<Value> {
                 {
                     out.push(
                         Finding::new(
-                            "cortex-fuzz",
+                            "plessor-fuzz",
                             "type_confusion",
                             "Unhandled input type (type confusion)",
                             "medium",
@@ -320,7 +320,7 @@ async fn probe_massassign(client: &Client, ep: &InjEndpoint) -> Vec<Value> {
         if r.body.contains(s) {
             out.push(
                 Finding::new(
-                    "cortex-fuzz",
+                    "plessor-fuzz",
                     "mass_assignment",
                     "Mass assignment (unexpected field bound)",
                     "high",

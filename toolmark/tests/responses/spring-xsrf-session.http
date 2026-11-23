@@ -1,0 +1,19 @@
+# Synthetic: A Spring application whose CSRF token cookie is named XSRF-TOKEN, as Spring
+# Security names it, and whose session cookie is Spring Session's SESSION: neither is
+# Laravel's or Flask's.
+HTTP/1.1 200 OK
+content-type: text/html;charset=UTF-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+set-cookie: XSRF-TOKEN=6f1d2c3b-9a8e-4d7c-8b6a-5f4e3d2c1b0a; Path=/
+set-cookie: SESSION=MGQ5YzhiN2EtNmY1ZS00ZDNjLTliMmEtMWYwZTlkOGM3YjZh; Path=/; HttpOnly; SameSite=Lax
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Orders</title>
+</head>
+<body>
+<div id="orders"></div>
+</body>
+</html>

@@ -1,0 +1,18 @@
+# Synthetic: Apache httpd with mod_php and ServerTokens Full: PHP's version is in the Server
+# header, and there is no X-Powered-By.
+HTTP/1.1 200 OK
+date: Fri, 20 Nov 2026 06:00:00 GMT
+server: Apache/2.4.41 (Unix) PHP/7.4.3
+set-cookie: PHPSESSID=
+content-type: text/html; charset=UTF-8
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Members</title>
+</head>
+<body>
+<form method="post" action="login.php"><input name="user"></form>
+</body>
+</html>

@@ -1,0 +1,12 @@
+id: harbor
+info:
+  name: Harbor
+  category: DevOps
+  metadata:
+    vendor: linuxfoundation
+    product: harbor
+detect:
+  any:
+    - path: { path: /api/v2.0/systeminfo, regex: '"harbor_version"' }
+version:
+  - path: { path: /api/v2.0/systeminfo, regex: '"harbor_version"\s*:\s*"v?([0-9]+(?:\.[0-9]+)*)' }

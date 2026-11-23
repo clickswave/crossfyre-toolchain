@@ -1,0 +1,15 @@
+# Synthetic: A page WEBrick serves, which names it as the server.
+HTTP/1.1 200 OK
+server: WEBrick/1.7.0 (Ruby/3.2.2/2023-03-30)
+content-type: text/html
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<title>Index</title>
+</head>
+<body>
+<p>It works.</p>
+</body>
+</html>

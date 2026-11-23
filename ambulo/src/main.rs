@@ -1,72 +1,18 @@
-use crate::libs::cli_args::{Cli, Commands, DbArgs, ExecArgs};
+use crate::libs::cli_args::{Cli, Commands, EVENT_POLL_TIMEOUT_MS, ExecArgs, ScanArgs};
 use crate::scanner::StreamEvent;
 use clap::{CommandFactory, Parser};
-use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
-mod browser;
 mod client_tui;
 mod crawler;
 mod daemon;
-mod exporter;
 mod libs;
 mod prober;
 mod routetable;
 mod scanner;
 mod spa;
-mod tui;
-
-/// Mirrors the toolchain config at ~/.config/crossfyre/config.toml (see `toolchain_dir`)
-#[derive(Debug, Deserialize)]
-struct ToolchainConfig {
-    postgres: PostgresConfig,
-}
-
-#[derive(Debug, Deserialize)]
-struct PostgresConfig {
-    host: String,
-    port: u16,
-    user: String,
-    password: Option<String>,
-    #[allow(dead_code)]
-    db_name: String,
-}
-
-/// The toolchain directory: `CROSSFYRE_TOOLCHAIN_DIR` when the service that started this
-/// daemon names one, as the engine host does on macOS and Windows, else
-/// `~/.config/crossfyre` on Linux and the per-user config directory elsewhere
-/// (`~/Library/Application Support` on macOS, `%APPDATA%` on Windows), which is where
-/// the CLI writes it.
-fn toolchain_dir() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
-    if let Some(dir) = std::env::var_os("CROSSFYRE_TOOLCHAIN_DIR").filter(|d| !d.is_empty()) {
-        return Ok(dir.into());
-    }
-    let root = if cfg!(target_os = "linux") {
-        dirs::home_dir()
-            .ok_or("Could not find home directory")?
-            .join(".config")
-    } else {
-        dirs::config_dir().ok_or("Could not find the config directory")?
-    };
-    Ok(root.join("crossfyre"))
-}
-
-fn load_toolchain_config() -> Result<ToolchainConfig, Box<dyn std::error::Error>> {
-    let config_path = toolchain_dir()?.join("config.toml");
-
-    let contents = std::fs::read_to_string(&config_path).map_err(|e| {
-        format!(
-            "Cannot read toolchain config at {}: {}. Run 'crossfyre db up' first.",
-            config_path.display(),
-            e
-        )
-    })?;
-
-    let config: ToolchainConfig = toml::from_str(&contents)?;
-    Ok(config)
-}
+mod store;
 
 // An error is printed as the sentence it is. Returned from `main`, Rust prints it in
 // debug form: in quotes, with a line break shown as a backslash and an n.
@@ -82,57 +28,18 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Before anything asks the adaptive crate, clap's defaults included.
+    cfx_pacing::load();
     let cli = Cli::parse();
 
     // -----------------------------------------------------------------------
     // Daemon mode - starts the TCP service and connects directly to postgres
     // -----------------------------------------------------------------------
-    if cli.daemon {
-        let toolchain_cfg = load_toolchain_config()?;
-
-        let dummy_config = libs::cli_args::ScanArgs {
-            url: vec![],
-            wordlist_path: String::new(),
-            fuzz_marker: "::FUZZ::".to_string(),
-            cookies: vec![],
-            headers: vec![],
-            basic_auth: String::new(),
-            store_cookies: false,
-            success_status_codes: vec![200],
-            follow_redirects: true,
-            follow_redirects_depth: 5,
-            http_method: libs::cli_args::HttpMethod::Get,
-            interval: 0,
-            tasks: 1,
-            fresh_start: false,
-            random_user_agent_scan: false,
-            random_user_agent_request: false,
-            append_slash: false,
-            save_response_body: false,
-            save_response_headers: false,
-            user_agent: adaptive::identity::resolve(&adaptive::identity::Mode::Evasive, None)
-                .user_agent,
-            evasive: true,
-            identify: None,
-            no_exit_banner: true,
-            recreate_db: false,
-            launch_delay: 0,
-            log_level: libs::cli_args::LogLevel::Info,
-            output_format: libs::cli_args::OutputFormat::Text,
-            output_path: String::new(),
-            event_poll_timeout: 1000,
-            enable_offset_pagination: false,
-            interactive: false,
-            adaptive_rate: false,
-            adaptive_resilience: false,
-            posture: "balanced".to_string(),
-            egress: transport::Egress::Inherit,
-        };
-
+    if matches!(cli.command, Some(Commands::Daemon)) {
         // Postgres being briefly unreachable is not a reason to exit: systemd
         // would restart us straight into the same failure, which is how one
         // host logged 2,663 restarts and reported nothing but "down". Wait for
-        // it, saying so each time, and start as soon as it answers.
+        // it, saying why each time, and start as soon as it answers.
         // Bind before the database is reachable, and answer while waiting.
         //
         // Binding after the database meant a database problem looked exactly
@@ -146,27 +53,31 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         eprintln!("Ambulo daemon listening on {addr} (waiting for database)");
 
-        // Name the endpoint and the fix. "pool timed out while waiting for an
-        // open connection" is true and useless: it does not say which host,
-        // which port, or that the container may simply not have been created on
-        // this machine yet.
-        let db_label = format!(
-            "postgres at {}:{} (create it with `crossfyre db up`)",
-            toolchain_cfg.postgres.host, toolchain_cfg.postgres.port
+        // Why the last try failed, for whoever connects before one succeeds.
+        let not_ready = std::sync::Mutex::new(String::from("no answer yet"));
+        let db_fut = dguard::wait_for(
+            "the database",
+            std::time::Duration::from_secs(3600),
+            || async {
+                let ready = async {
+                    let pool = cfx_db::ensure_ready(&libs::ambulo_db::ENGINE)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    cfx_db::scans::stop_abandoned(&pool)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let db = libs::ambulo_db::AmbuloDb::new(pool);
+                    Ok::<_, String>(db)
+                }
+                .await;
+                if let Err(why) = &ready
+                    && let Ok(mut last) = not_ready.lock()
+                {
+                    last.clone_from(why);
+                }
+                ready
+            },
         );
-        let db_fut = dguard::wait_for(&db_label, std::time::Duration::from_secs(3600), || async {
-            let db = libs::ambulo_db::AmbuloDb::init(
-                &toolchain_cfg.postgres.host,
-                toolchain_cfg.postgres.port,
-                &toolchain_cfg.postgres.user,
-                toolchain_cfg.postgres.password.as_deref(),
-                &dummy_config,
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-            db.create_tables().await.map_err(|e| e.to_string())?;
-            Ok::<_, String>(db)
-        });
         tokio::pin!(db_fut);
 
         // Do not answer yet. An ordinary start reaches the database in well
@@ -191,17 +102,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 tokio::select! {
                     res = &mut db_fut => break res?,
                     accepted = listener.accept() => {
-                        if let Ok((mut sock, _)) = accepted {
-                            tokio::spawn(async move {
-                                use tokio::io::AsyncWriteExt;
-                                let msg = serde_json::json!({
-                                    "type": "error",
-                                    "message": "ambulo is not ready: waiting for its \
-                                                database. Create it with `crossfyre db up`.",
-                                });
-                                let _ = sock.write_all(format!("{msg}\n").as_bytes()).await;
-                                let _ = sock.flush().await;
-                            });
+                        if let Ok((sock, _)) = accepted {
+                            let why = not_ready.lock().map(|w| w.clone()).unwrap_or_default();
+                            tokio::spawn(daemon::answer_not_ready(sock, why));
                         }
                     }
                 }
@@ -211,15 +114,34 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return daemon::run_on(listener, ambulo_db).await;
     }
 
+    // The daemon every command below talks to, started when it is not running.
+    let daemon = dguard::Daemon::new("ambulo", cli.port, !cli.no_autostart);
+
     // -----------------------------------------------------------------------
-    // Db subcommand - database management (connects directly to postgres)
+    // Db subcommand: sent to the daemon, which keeps the scans
     // -----------------------------------------------------------------------
-    if let Some(Commands::Db(db_args)) = &cli.command {
-        return handle_db(db_args.clone(), cli.port).await;
+    if let Some(Commands::Db { action }) = &cli.command {
+        return dguard::run_db(&daemon, action).await;
     }
 
     if let Some(Commands::Exec(exec_args)) = &cli.command {
-        return handle_fuzz_exec(exec_args.clone(), cli.port).await;
+        return handle_fuzz_exec(exec_args.clone(), &daemon).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Scans subcommand: what the daemon keeps, and a stopped one taken up again
+    // -----------------------------------------------------------------------
+    if let Some(Commands::Scans) = &cli.command {
+        let scans = dguard::list_scans(&daemon).await?;
+        let tui = cfx_tui::wanted(cli.no_tui);
+        let chosen =
+            tokio::task::spawn_blocking(move || cfx_tui::scans::show("AMBULO", &scans, tui))
+                .await??;
+        if let Some(scan) = chosen {
+            let request = dguard::resume_request(scan["id"].as_str().unwrap_or_default());
+            stream_scan(&daemon, &request, None, tui, EVENT_POLL_TIMEOUT_MS).await?;
+        }
+        return Ok(());
     }
 
     // -----------------------------------------------------------------------
@@ -238,11 +160,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut fuzz_args = match cli.command {
         Some(Commands::Scan(args)) => args,
         Some(Commands::Exec(_))
-        | Some(Commands::Db(_))
+        | Some(Commands::Scans)
+        | Some(Commands::Db { .. })
         | Some(Commands::Completions { .. })
+        | Some(Commands::Daemon)
         | None => {
             eprintln!(
-                "No command given. Use `ambulo scan`, `ambulo exec`, `ambulo db`, or `ambulo --daemon`. Try --help."
+                "No command given. Use `ambulo scan <url>...`, `ambulo exec <json>`, `ambulo db`, or `ambulo daemon`. Try --help."
             );
             std::process::exit(1);
         }
@@ -254,12 +178,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     }
 
-    if fuzz_args.url.is_empty() {
-        eprintln!("Error: --url is required (or use --interactive)");
-        std::process::exit(1);
-    }
     if fuzz_args.wordlist_path.is_empty() {
-        eprintln!("Error: --wordlist-path is required (or use --interactive)");
+        eprintln!("Error: a wordlist is needed: -w <wordlist> (or use --interactive)");
         std::process::exit(1);
     }
 
@@ -272,60 +192,136 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     fuzz_args
         .validate_urls()
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    if fuzz_args.resume.is_some() && fuzz_args.url.len() > 1 {
+        eprintln!("Error: --resume takes up one scan: give the one URL it was asked for with");
+        std::process::exit(1);
+    }
 
-    // Connect to the daemon
-    let daemon_addr = format!("127.0.0.1:{}", cli.port);
-    let stream = TcpStream::connect(&daemon_addr).await.map_err(|_| {
-        format!(
-            "Ambulo daemon is not running on port {}.\nStart it with `ambulo --daemon`, or with `crossfyre extension start ambulo` if crossfyre installed it.",
-            cli.port
-        )
-    })?;
+    // The wordlist is read here and its words sent after the request, so the daemon
+    // opens no path for this scan and any file this user can read will do.
+    let wordlist = std::path::Path::new(&fuzz_args.wordlist_path);
+    let tui = cfx_tui::wanted(cli.no_tui);
+    for url in &fuzz_args.url {
+        scan_url(&daemon, &fuzz_args, url, wordlist, tui).await?;
+    }
+    Ok(())
+}
 
-    // Resolve wordlist to absolute path (daemon runs from a different cwd)
-    let wordlist_abs = std::fs::canonicalize(&fuzz_args.wordlist_path)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| fuzz_args.wordlist_path.clone());
-
-    // Build and send the stream scan request
-    let request = serde_json::json!({
+/// The stream scan request for `url` with every flag of `args` the daemon's scanner
+/// honours: credentials in `auth`, the interval between requests as `delay`.
+fn scan_request(args: &ScanArgs, url: &str) -> serde_json::Value {
+    let header = |line: &String| {
+        line.split_once(':')
+            .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
+    };
+    let headers: serde_json::Map<String, serde_json::Value> = args
+        .headers
+        .iter()
+        .filter_map(header)
+        .map(|(name, value)| (name, value.into()))
+        .collect();
+    let cookies = args
+        .cookies
+        .iter()
+        .filter_map(header)
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    serde_json::json!({
         "operation": "scan",
         "response": "stream",
         "save": true,
-        "endpoint": fuzz_args.url[0],
-        "wordlist": wordlist_abs,
-        "method": fuzz_args.http_method.to_string(),
-        "tasks": fuzz_args.tasks,
-        "follow_redirects": fuzz_args.follow_redirects,
-        "follow_redirects_depth": fuzz_args.follow_redirects_depth,
-        "fresh_start": fuzz_args.fresh_start,
-        "fuzz_marker": fuzz_args.fuzz_marker,
-        "success_status_codes": fuzz_args.success_status_codes,
-    });
+        "endpoint": url,
+        "method": args.http_method.to_string(),
+        "tasks": args.tasks,
+        "delay": args.interval,
+        "follow_redirects": args.follow_redirects,
+        "follow_redirects_depth": args.follow_redirects_depth,
+        "fresh_start": args.fresh_start,
+        "resume": args.resume,
+        "fuzz_marker": args.fuzz_marker,
+        "success_status_codes": args.success_status_codes,
+        "auth": {"headers": headers, "cookies": cookies, "basic_auth": args.basic_auth},
+        "store_cookies": args.store_cookies,
+        "random_user_agent_scan": args.random_user_agent_scan,
+        "random_user_agent_request": args.random_user_agent_request,
+        "append_slash": args.append_slash,
+        "user_agent": args.user_agent,
+        "evasive": args.evasive,
+        "identify": args.identify,
+        "log_level": args.log_level.to_string(),
+        "adaptive_rate": args.adaptive_rate,
+        "adaptive_resilience": args.adaptive_resilience,
+        "posture": args.posture,
+    })
+}
 
+/// One scan of `url` by the daemon with the words of the file at `wordlist`: drawn on
+/// the dashboard when `tui`, and otherwise written out as the daemon's own
+/// newline-delimited JSON.
+async fn scan_url(
+    daemon: &dguard::Daemon,
+    fuzz_args: &ScanArgs,
+    url: &str,
+    wordlist: &std::path::Path,
+    tui: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut request = scan_request(fuzz_args, url);
+    request[dguard::WORDS_FOLLOW] = dguard::list_name(wordlist).into();
+    stream_scan(
+        daemon,
+        &request,
+        Some(wordlist),
+        tui,
+        fuzz_args.event_poll_timeout,
+    )
+    .await
+}
+
+/// Send `request` to the daemon, with the words of the file at `wordlist` after it when
+/// there is one, and show the scan it starts: drawn on the dashboard when `tui`, polling
+/// for events every `poll_timeout` ms, and otherwise written out as the daemon's own
+/// newline-delimited JSON.
+async fn stream_scan(
+    daemon: &dguard::Daemon,
+    request: &serde_json::Value,
+    wordlist: Option<&std::path::Path>,
+    tui: bool,
+    poll_timeout: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stream = daemon.connect().await?;
     let (reader, mut writer) = tokio::io::split(stream);
-    let mut req_str = dguard::encode(&request);
+    let mut req_str = dguard::encode(request);
     req_str.push('\n');
     writer.write_all(req_str.as_bytes()).await?;
-
-    // Read the "ack" event to get operation_id and total
+    let sent = match wordlist {
+        Some(wordlist) => dguard::send_words(&mut writer, wordlist).await,
+        None => Ok(()),
+    };
+    // Read the "ack" event to get operation_id and total. A daemon that refused the
+    // scan says why here, which is more use than a write it stopped reading.
     let mut lines = BufReader::new(reader).lines();
-    let ack_line = lines
-        .next_line()
-        .await?
-        .ok_or("Daemon closed connection before ack")?;
+    let ack_line = match lines.next_line().await? {
+        Some(line) => line,
+        None => {
+            return Err(sent
+                .err()
+                .unwrap_or_else(|| "Daemon closed connection before ack".to_string())
+                .into());
+        }
+    };
     let ack: StreamEvent = serde_json::from_str(&ack_line)?;
 
     if ack.kind == "error" {
         eprintln!("Error: {}", ack.message.as_deref().unwrap_or("unknown"));
         std::process::exit(1);
     }
+    sent?;
 
     let operation_id = ack.operation_id.unwrap_or_else(|| "unknown".to_string());
     let total = ack.total.unwrap_or(0);
-    let poll_timeout = fuzz_args.event_poll_timeout;
 
-    if cfx_tui::wanted(cli.tui, cli.no_tui, true) {
+    if tui {
         let (tx, rx) = mpsc::unbounded_channel::<StreamEvent>();
         tokio::spawn(async move {
             while let Ok(Some(line)) = lines.next_line().await {
@@ -373,37 +369,6 @@ fn print_all(bytes: &[u8]) -> std::io::Result<()> {
     }
 }
 
-async fn handle_db(args: DbArgs, port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    if !args.full_reset {
-        eprintln!("No action given. See `ambulo db --help`.");
-        std::process::exit(1);
-    }
-
-    let daemon_addr = format!("127.0.0.1:{port}");
-    let stream = TcpStream::connect(&daemon_addr).await.map_err(|_| {
-        format!(
-            "Ambulo daemon is not running on port {port}.\nStart it with `ambulo --daemon`, or with `crossfyre extension start ambulo` if crossfyre installed it."
-        )
-    })?;
-
-    let request = serde_json::json!({ "operation": "db_reset", "response": "instant" });
-    let (reader, mut writer) = tokio::io::split(stream);
-    let mut req_str = dguard::encode(&request);
-    req_str.push('\n');
-    writer.write_all(req_str.as_bytes()).await?;
-
-    let mut lines = BufReader::new(reader).lines();
-    if let Some(line) = lines.next_line().await? {
-        let resp: serde_json::Value = serde_json::from_str(&line)?;
-        match resp["status"].as_str().unwrap_or("error") {
-            "completed" => println!("{}", resp["message"].as_str().unwrap_or("Done.")),
-            _ => eprintln!("Error: {}", resp["message"].as_str().unwrap_or("unknown")),
-        }
-    }
-
-    Ok(())
-}
-
 /// The request `exec` sends for the caller's JSON, with the operation, the response
 /// mode and, for a probe, an operation id filled in where the caller left them out. The
 /// daemon files a probe's result under its operation id and refuses a probe without
@@ -430,16 +395,14 @@ fn exec_request(json: &str) -> Result<serde_json::Value, String> {
     Ok(payload)
 }
 
-async fn handle_fuzz_exec(args: ExecArgs, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+async fn handle_fuzz_exec(
+    args: ExecArgs,
+    daemon: &dguard::Daemon,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Parse the caller's JSON and fill in the operation if they did not name one.
     let payload = exec_request(&args.json)?;
 
-    let daemon_addr = format!("127.0.0.1:{port}");
-    let stream = TcpStream::connect(&daemon_addr).await.map_err(|_| {
-        format!(
-            "Ambulo daemon is not running on port {port}.\nStart it with `ambulo --daemon`, or with `crossfyre extension start ambulo` if crossfyre installed it."
-        )
-    })?;
+    let stream = daemon.connect().await?;
     let _ = stream.set_nodelay(true);
 
     let (reader, mut writer) = tokio::io::split(stream);

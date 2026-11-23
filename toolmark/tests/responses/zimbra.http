@@ -1,0 +1,16 @@
+# Synthetic: Zimbra's web client sign-in page, with the cookie it sets to check cookies work.
+HTTP/1.1 200 OK
+content-type: text/html;charset=UTF-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+set-cookie: ZM_TEST=
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Zimbra Web Client Sign In</title>
+</head>
+<body>
+<form method="post" name="loginForm"></form>
+</body>
+</html>

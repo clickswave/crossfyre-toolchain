@@ -1,0 +1,19 @@
+# Synthetic: The SSL VPN login page of a Cisco firewall, with the cookies it sets there.
+# The ASA and Firepower Threat Defense serve the same one.
+HTTP/1.1 200 OK
+content-type: text/html; charset=UTF-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+set-cookie: webvpnlogin=1; path=/; secure
+set-cookie: webvpnLang=en; path=/; secure
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>SSL VPN Service</title>
+<script src="/+CSCOE+/win.js"></script>
+</head>
+<body>
+<form id="unicorn_form" method="post" action="/+webvpn+/index.html"></form>
+</body>
+</html>

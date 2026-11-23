@@ -11,11 +11,17 @@ repository = "https://github.com/clickswave/crossfyre-toolchain"
 keywords = ["security"]
 
 [dependencies]
+# The `db` subcommand every engine has.
+clap = { version = "4.5.42", features = ["derive"] }
+# The per-user config directory the toolchain directory is found in.
+dirs = "6"
 serde_json = "1"
-tokio = { version = "1", features = ["time", "macros"] }
+# config.toml's [extensions], where an engine's port is moved.
+toml = "1.0.3"
+tokio = { version = "1", features = ["time", "macros", "rt", "net", "io-util", "fs"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["time", "macros", "rt", "rt-multi-thread"] }
+tokio = { version = "1", features = ["time", "macros", "rt", "rt-multi-thread", "sync"] }

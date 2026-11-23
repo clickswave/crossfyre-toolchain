@@ -1,13 +1,16 @@
 use crate::libs::cli_args::{Cli, Commands};
 use clap::{CommandFactory, Parser};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
 
 mod client_tui;
 mod cve;
 mod daemon;
 mod fingerprint;
+mod inventory;
+mod knowledge;
 mod libs;
+mod observe;
+mod rematch;
 mod services;
 mod signatures;
 
@@ -25,24 +28,43 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Before anything asks the adaptive crate, clap's defaults included.
+    cfx_pacing::load();
     let cli = Cli::parse();
 
-    // Toolmark is stateless: no DB, just a fingerprinting TCP service.
-    if cli.daemon {
-        return daemon::run(cli.port).await;
+    if matches!(cli.command, Some(Commands::Daemon)) {
+        // The database being briefly unreachable is not a reason to exit: wait for it,
+        // saying why each time, and start as soon as it answers.
+        let db = dguard::wait_for(
+            "the database",
+            std::time::Duration::from_secs(3600),
+            || async {
+                let pool = cfx_db::ensure_ready(&libs::toolmark_db::ENGINE)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                cfx_db::scans::stop_abandoned(&pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok::<_, String>(libs::toolmark_db::ToolmarkDb::new(pool))
+            },
+        )
+        .await?;
+        // What `crossfyre update` put in the toolchain directory, or what is compiled in.
+        let dir = dguard::toolchain_dir();
+        let knowledge = std::sync::Arc::new(knowledge::Knowledge::load(dir.as_deref()));
+        return daemon::run(cli.port, db, knowledge).await;
     }
+
+    // The daemon every command below talks to, started when it is not running.
+    let daemon = dguard::Daemon::new("toolmark", cli.port, !cli.no_autostart);
 
     match cli.command {
         Some(Commands::Scan(args)) => {
-            let req = serde_json::json!({
-                "operation": "fingerprint",
-                "response": "stream",
-                "target": args.target,
-            });
+            let req = args.request();
             send_stream(
-                cli.port,
+                &daemon,
                 req,
-                cfx_tui::wanted(cli.tui, cli.no_tui, false),
+                cfx_tui::wanted(cli.no_tui),
                 args.target.clone(),
             )
             .await
@@ -56,13 +78,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "timeout_ms": args.timeout_ms,
             });
             let label = args.targets.join(", ");
-            send_stream(
-                cli.port,
-                req,
-                cfx_tui::wanted(cli.tui, cli.no_tui, false),
-                label,
-            )
-            .await
+            send_stream(&daemon, req, cfx_tui::wanted(cli.no_tui), label).await
         }
         Some(Commands::Exec(args)) => {
             let mut payload: serde_json::Value =
@@ -71,27 +87,103 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 payload["response"] = serde_json::json!("stream");
             }
             let target = payload["target"].as_str().unwrap_or("").to_string();
-            send_stream(
-                cli.port,
-                payload,
-                cfx_tui::wanted(cli.tui, cli.no_tui, false),
-                target,
-            )
-            .await
+            send_stream(&daemon, payload, false, target).await
         }
+        Some(Commands::Scans) => {
+            let scans = dguard::list_scans(&daemon).await?;
+            let tui = cfx_tui::wanted(cli.no_tui);
+            tokio::task::spawn_blocking(move || cfx_tui::scans::show("TOOLMARK", &scans, tui))
+                .await??;
+            Ok(())
+        }
+        Some(Commands::Rematch) => {
+            let req = serde_json::json!({"operation": "rematch", "response": "stream"});
+            let label = "the pages toolmark kept".to_string();
+            send_stream(&daemon, req, cfx_tui::wanted(cli.no_tui), label).await
+        }
+        Some(Commands::Inventory) => {
+            let answer = dguard::answer(&daemon, "inventory").await?;
+            let rows = answer["inventory"].as_array().cloned().unwrap_or_default();
+            let tui = cfx_tui::wanted(cli.no_tui);
+            tokio::task::spawn_blocking(move || inventory::show(&rows, tui)).await??;
+            Ok(())
+        }
+        Some(Commands::Db { action }) => dguard::run_db(&daemon, &action).await,
         Some(Commands::Completions { shell }) => {
             let mut script = Vec::new();
             clap_complete::generate(shell, &mut Cli::command(), "toolmark", &mut script);
             print_all(&script)?;
             Ok(())
         }
-        None => {
+        Some(Commands::Check(args)) => check(&args),
+        Some(Commands::Daemon) | None => {
             eprintln!(
-                "No command given. Use `toolmark scan <target>`, `toolmark services <host:port>...`, `toolmark exec <json>`, or `toolmark --daemon`."
+                "No command given. Use `toolmark scan <target>`, `toolmark services <host:port>...`, `toolmark exec <json>`, or `toolmark daemon`."
             );
             std::process::exit(1);
         }
     }
+}
+
+/// `toolmark check`: the signatures in a folder and the mappings in another, read as
+/// toolmark reads a pack, each problem printed; and, when all of it loads, the products
+/// the signatures name written out, by the names toolmark gives what it finds: a plessor
+/// template names its product that way, since plessor matches it against what toolmark
+/// saw, which carries no aliases.
+fn check(args: &libs::cli_args::CheckArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let signatures = files_in(&args.dir, |name| name.ends_with(".yaml"))?;
+    let mappings = files_in(&args.mappings, knowledge::is_mapping)?;
+    let (signatures, _) = match knowledge::read(&pairs(&signatures), &pairs(&mappings)) {
+        Ok(read) => read,
+        Err(problems) => {
+            for problem in &problems {
+                println!("{problem}");
+            }
+            return Err(format!("{} problem(s) in {}", problems.len(), args.dir.display()).into());
+        }
+    };
+    if let Some(path) = &args.names {
+        let mut names: Vec<String> = signatures
+            .cpes()
+            .iter()
+            .map(|c| format!("{}:{}", c.vendor, c.product))
+            .collect();
+        names.sort();
+        names.dedup();
+        std::fs::write(path, names.join("\n") + "\n")?;
+    }
+    Ok(())
+}
+
+/// `files` as names and texts.
+fn pairs(files: &[(String, String)]) -> Vec<(&str, &str)> {
+    files
+        .iter()
+        .map(|(n, t)| (n.as_str(), t.as_str()))
+        .collect()
+}
+
+/// The files directly in `dir` whose names `wanted` takes, by name and text, in order.
+fn files_in(
+    dir: &std::path::Path,
+    wanted: impl Fn(&str) -> bool,
+) -> Result<Vec<(String, String)>, String> {
+    let fail = |e: std::io::Error| format!("{}: {e}", dir.display());
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(fail)? {
+        let path = entry.map_err(fail)?.path();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if path.is_file() && wanted(name) {
+            let text =
+                std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            files.push((name.to_string(), text));
+        }
+    }
+    files.sort();
+    Ok(files)
 }
 
 /// Write `bytes` to stdout. A reader that stops early, as `head` does, closes the pipe,
@@ -107,18 +199,12 @@ fn print_all(bytes: &[u8]) -> std::io::Result<()> {
 }
 
 async fn send_stream(
-    port: u16,
+    daemon: &dguard::Daemon,
     req: serde_json::Value,
     tui: bool,
     target: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
-        .await
-        .map_err(|_| {
-            format!(
-                "Toolmark daemon is not running on port {port}. Start it with `toolmark --daemon`, or with `crossfyre extension start toolmark` if crossfyre installed it."
-            )
-        })?;
+    let stream = daemon.connect().await?;
     let (reader, mut writer) = tokio::io::split(stream);
     let mut s = dguard::encode(&req);
     s.push('\n');
@@ -174,4 +260,60 @@ async fn send_stream(
         std::process::exit(1);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// The shipped signatures and mappings pass the check, the names it writes for
+    /// plessor's check are the ones toolmark gives what it finds, without aliases, and a
+    /// mapping it cannot read is a problem.
+    #[test]
+    fn the_shipped_signatures_and_mappings_pass_the_check() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let out = tempfile::tempdir().unwrap();
+        let names = out.path().join("names.txt");
+        let args = |mappings: &std::path::Path| super::libs::cli_args::CheckArgs {
+            dir: format!("{root}/signatures").into(),
+            mappings: mappings.to_path_buf(),
+            names: Some(names.clone()),
+        };
+        super::check(&args(std::path::Path::new(&format!("{root}/data")))).unwrap();
+        let written = std::fs::read_to_string(&names).unwrap();
+        let lines: Vec<&str> = written.lines().collect();
+        assert!(lines.contains(&"zimbra:collaboration"));
+        assert!(
+            !lines.contains(&"synacor:zimbra_collaboration_suite"),
+            "an alias is not what toolmark names what it finds"
+        );
+        assert!(lines.windows(2).all(|w| w[0] < w[1]), "sorted, once each");
+
+        // No mappings: neither file, nor the stamp table NetScaler's signature names.
+        let empty = tempfile::tempdir().unwrap();
+        let err = super::check(&args(empty.path())).unwrap_err();
+        assert!(err.to_string().starts_with("3 problem(s)"), "{err}");
+    }
+
+    /// A folder's .yaml files are read as a pack's are, a file that does not load is a
+    /// problem that names it, and what is not a .yaml file is not read.
+    #[test]
+    fn a_signature_that_does_not_load_is_named_and_other_files_are_not_read() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("acme.yaml"),
+            "id: acme\ninfo: { name: Acme, category: Test }\ndetect: { header: { name: server, regex: acme } }\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("broken.yaml"), "id: [").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "id: [").unwrap();
+        let args = super::libs::cli_args::CheckArgs {
+            dir: dir.path().to_path_buf(),
+            mappings: format!("{root}/data").into(),
+            names: None,
+        };
+        let err = super::check(&args).unwrap_err();
+        assert!(err.to_string().starts_with("1 problem(s)"), "{err}");
+        std::fs::remove_file(dir.path().join("broken.yaml")).unwrap();
+        super::check(&args).unwrap();
+    }
 }

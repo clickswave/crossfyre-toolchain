@@ -1,6 +1,6 @@
 [package]
 name = "toolmark"
-version = "0.0.16"
+version = "0.0.17"
 edition = "2024"
 license.workspace = true
 publish.workspace = true
@@ -11,6 +11,10 @@ authors = ["Clickswave <team@clickswave.org>"]
 
 [dependencies]
 dguard = { path = "../dguard" }
+# Which CVEs may affect a technology found, from the CVE dataset.
+cfx_cve = { path = "../cve" }
+# The crossfyre-templates pack `crossfyre update` puts in the toolchain directory.
+cfx_pack = { path = "../pack" }
 cfx_finding = { path = "../finding" }
 cfx_tui = { path = "../tui" }
 ratatui = { version = "0.30.0-alpha.5", features = ["crossterm"] }
@@ -20,19 +24,34 @@ clap_complete = "4.6.9"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.142"
 adaptive = { path = "../adaptive" }
+cfx_pacing = { path = "../pacing" }
 transport = { path = "../transport" }
-reqwest = { version = "0.12.22", default-features = false, features = ["rustls-tls", "http2", "charset", "cookies", "gzip"] }
+# The browser the rendered tier builds a landing page in.
+cfx_browser = { path = "../browser" }
 regex = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+# Reads the subject and issuer of the certificate a server presents, for `tls` leaves.
+x509-cert = "0.2"
+cfx_db = { path = "../db" }
+sqlx = { version = "0.8.6", features = ["postgres"] }
+flate2 = "1.1"
 base64 = "0.22.1"
 md5 = "0.7"
-uuid = { version = "1.18.0", features = ["v4"] }
 
 [dev-dependencies]
 # A recording SOCKS5 proxy and counting listeners for the egress tests.
 cfx_tunnel = { path = "../tunnel", features = ["recorder"] }
+# A database of a test's own, for the tests of what toolmark keeps.
+cfx_db = { path = "../db", features = ["testing"] }
+# Certificates for the `tls` leaf's tests, and a server that presents one.
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# A data folder of a test's own.
+tempfile = "3"
 
 [features]
-# First-party builds enable this to swap the scan client to wreq (BoringSSL) for
-# real browser TLS/HTTP2 fingerprints. Off by default so the open build stays on
-# reqwest (rustls, no C toolchain, no emulation policy shipped).
+# The scan client on wreq (BoringSSL), for a real browser's TLS and HTTP/2
+# fingerprint. Every published build turns it on; it needs cmake and clang. Off by
+# default, so a workspace build links no BoringSSL beside the OpenSSL cfx_core uses.
 impersonate = ["transport/impersonate"]

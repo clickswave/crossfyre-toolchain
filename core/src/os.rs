@@ -164,14 +164,80 @@ pub fn process_account() -> Option<(String, String)> {
     }
 }
 
-/// `command` as a person runs it with administrative rights: under sudo on Unix, from an
-/// elevated prompt on Windows.
+/// `command` as a person runs it with administrative rights: as it is on Unix, where a
+/// command that needs root runs itself again through sudo (see [`rerun_as_root`]), and
+/// from an elevated prompt on Windows.
 pub fn elevated(command: &str) -> String {
     if cfg!(windows) {
         format!("{command} (from an elevated prompt)")
     } else {
-        format!("sudo {command}")
+        command.to_string()
     }
+}
+
+/// Run this program again as root through sudo, with the same arguments, and end with
+/// its exit status. `command` is what the person ran, as `node init`.
+///
+/// sudo is given the program's full path, not its name: sudo looks a name up in its own
+/// search path, and Kali's sudo, like Debian's from 14, leaves out /usr/local/bin, where
+/// the installer links crossfyre. When sudo is not installed, or does not allow it, this
+/// says that the command needs root and exits 1.
+#[cfg(unix)]
+pub fn rerun_as_root(command: &str) -> ! {
+    use std::os::unix::process::CommandExt;
+    let needs_root = |why: &str| -> ! {
+        eprintln!("crossfyre {command} needs root, {why}");
+        std::process::exit(1)
+    };
+    let Some(sudo) = find_sudo() else {
+        needs_root("and sudo is not installed here. Run it as root.");
+    };
+    let exe = match std::env::current_exe().and_then(std::fs::canonicalize) {
+        Ok(exe) => exe,
+        Err(e) => needs_root(&format!(
+            "and the path of this program could not be read: {e}"
+        )),
+    };
+    eprintln!("crossfyre {command} needs root, so it runs again through sudo.");
+    let args = rerun_args(&exe, std::env::args_os().skip(1));
+    // First sudo is asked whether it allows this very command (`-l`), which takes a
+    // password where its policy wants one, and the run after it then asks for none. It
+    // exits 1 when it refuses, as the command does when it fails, and only this tells
+    // the two apart. Not `-v`: unless every rule for the user is NOPASSWD, that wants a
+    // password even from a user sudo would let run this without one.
+    let allowed = std::process::Command::new(&sudo)
+        .arg("-l")
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !allowed {
+        needs_root("and sudo did not allow it.");
+    }
+    let err = std::process::Command::new(&sudo).args(&args).exec();
+    needs_root(&format!("and sudo could not be run: {err}"))
+}
+
+/// What sudo is given to run `exe` with `args`: the program by its full path, after
+/// `--`, so that nothing from here on is read as one of sudo's own options.
+#[cfg(unix)]
+fn rerun_args(
+    exe: &std::path::Path,
+    args: impl Iterator<Item = std::ffi::OsString>,
+) -> Vec<std::ffi::OsString> {
+    let mut out = vec!["--".into(), exe.as_os_str().to_owned()];
+    out.extend(args);
+    out
+}
+
+/// sudo on PATH, or where systems put it.
+#[cfg(unix)]
+fn find_sudo() -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .chain(["/usr/bin", "/bin"].map(std::path::PathBuf::from))
+        .map(|dir| dir.join("sudo"))
+        .find(|p| p.is_file())
 }
 
 /// Is there a process with this id?
@@ -563,13 +629,32 @@ mod tests {
         assert!(!process_alive(0));
     }
 
+    /// On Unix the command asks sudo for root itself, so a person types it as it is.
     #[test]
     fn an_elevated_command_says_how_to_get_the_rights() {
         let cmd = elevated("crossfyre node up");
         if cfg!(windows) {
             assert_eq!(cmd, "crossfyre node up (from an elevated prompt)");
         } else {
-            assert_eq!(cmd, "sudo crossfyre node up");
+            assert_eq!(cmd, "crossfyre node up");
         }
+    }
+
+    /// sudo runs the program by the full path it was started from, never by a name it
+    /// would look up, and with the arguments exactly as given.
+    #[cfg(unix)]
+    #[test]
+    fn sudo_runs_this_program_by_its_full_path_with_the_same_arguments() {
+        let args = ["node", "init", "--api-url", "https://x", "--node-key", "-k"];
+        let got = rerun_args(
+            std::path::Path::new("/opt/crossfyre/bin/crossfyre"),
+            args.iter().map(std::ffi::OsString::from),
+        );
+        let want: Vec<std::ffi::OsString> = ["--", "/opt/crossfyre/bin/crossfyre"]
+            .iter()
+            .chain(args.iter())
+            .map(std::ffi::OsString::from)
+            .collect();
+        assert_eq!(got, want);
     }
 }

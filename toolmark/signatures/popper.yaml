@@ -1,0 +1,9 @@
+id: popper
+info:
+  name: Popper
+  category: JavaScript Library
+detect:
+  any:
+    - script_src: { regex: '/popper(?:\.min)?\.js' }
+version:
+  - script_src: { regex: '(?:popper\.js/|popper\.js@|@popperjs/core@)([0-9]+\.[0-9]+\.[0-9]+)' }

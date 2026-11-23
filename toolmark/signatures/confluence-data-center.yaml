@@ -1,0 +1,8 @@
+id: confluence-data-center
+info:
+  name: Atlassian Confluence Data Center
+  category: Wiki
+  metadata:
+    vendor: atlassian
+    product: confluence_data_center
+refines: confluence

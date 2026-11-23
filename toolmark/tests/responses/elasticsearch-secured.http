@@ -1,0 +1,8 @@
+# Synthetic: An Elasticsearch node with security on, which refuses an anonymous caller
+# but names itself in a header.
+HTTP/1.1 401 Unauthorized
+www-authenticate: Basic realm="security" charset="UTF-8"
+x-elastic-product: Elasticsearch
+content-type: application/json; charset=UTF-8
+
+{"error":{"root_cause":[{"type":"security_exception","reason":"missing authentication credentials for REST request [/]"}],"type":"security_exception","reason":"missing authentication credentials for REST request [/]"},"status":401}

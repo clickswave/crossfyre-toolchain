@@ -336,13 +336,13 @@ fn the_toolchain_dir_comes_from_the_environment_even_when_it_is_not_utf8() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("config.toml"),
-        "[postgres]\nhost = \"localhost\"\nport = 4440\nuser = \"postgres\"\n\
-         db_name = \"crossfyre\"\n\n[container]\n\n[extensions]\nmach = 5999\n",
+        "[postgres]\nbackend = \"local\"\nport = 4440\nuser = \"postgres\"\n\
+         db_name = \"crossfyre\"\n\n[extensions]\nambulo = 5999\n",
     )
     .unwrap();
     let r = run_with_env(
         &job("import cfxs, extensions\ndef run():\n    \
-             cfxs.connect().send_result({'port': extensions.get('mach').port})\n"),
+             cfxs.connect().send_result({'port': extensions.get('ambulo').port})\n"),
         &[("CFX_SCRIPT_TOOLCHAIN_DIR", dir.as_os_str())],
         LIMIT,
     );
@@ -386,33 +386,6 @@ fn a_script_runs_in_the_directory_its_caller_was_in_not_the_one_it_started_in() 
     let (cwd, read) = seen.unwrap();
     assert_eq!(cwd, Some(caller));
     assert_eq!(read, "from the caller");
-}
-
-#[cfg(unix)]
-#[test]
-fn a_script_reaches_an_engine_by_its_new_name_and_by_its_old_one() {
-    // Scripts saved before the rename ask for `mach`; new ones ask for `ambulo`.
-    // Both are the same daemon, on the port config.toml gives it under either key.
-    let dir = std::env::temp_dir().join(format!("cfx-script-renamed-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("config.toml"),
-        "[postgres]\nhost = \"localhost\"\nport = 4440\nuser = \"postgres\"\n\
-         db_name = \"crossfyre\"\n\n[container]\n\n[extensions]\nambulo = 5998\n",
-    )
-    .unwrap();
-    let r = run_with_env(
-        &job("import cfxs, extensions\ndef run():\n    \
-             cfxs.connect().send_result({'new': extensions.get('ambulo').port, \
-             'old': extensions.get('mach').port})\n"),
-        &[("CFX_SCRIPT_TOOLCHAIN_DIR", dir.as_os_str())],
-        LIMIT,
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(r.status, 0, "stderr: {}", r.stderr);
-    assert_eq!(types(&r), ["result", "completed"]);
-    assert_eq!(r.messages[0]["data"]["new"], 5998);
-    assert_eq!(r.messages[0]["data"]["old"], 5998);
 }
 
 #[test]

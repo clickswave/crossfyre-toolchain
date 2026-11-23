@@ -1,0 +1,17 @@
+# Synthetic: A Nuxt page with its state script and assets under _nuxt.
+HTTP/1.1 200 OK
+content-type: text/html;charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Nuxt</title>
+<script type="module" src="/_nuxt/entry.abc123.js"></script>
+</head>
+<body>
+<div id="__nuxt"></div>
+<script>window.__NUXT__={}</script>
+</body>
+</html>

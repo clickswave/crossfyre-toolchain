@@ -106,6 +106,14 @@ fun CaptureCard(m: AppModel, tracer: Boolean) {
         }
         return
     }
+    if (phase == Phase.IDLE && m.accountPolicy?.sendsTargets == false) {
+        CfxCard {
+            Row { StateChip(phase) }
+            Text("Policy: private. This account's tools send nothing about targets to Crossfyre, so this phone doesn't capture.", style = lineStyle)
+            Banner(Level.INFO, "To capture here", "Change the policy to connected in account settings, or with crossfyre policy set connected.")
+        }
+        return
+    }
     if (phase == Phase.IDLE && m.qrEnded && !m.fromAccount) {
         CfxCard {
             Row { StateChip(phase) }
@@ -510,6 +518,9 @@ fun SettingsContent(m: AppModel) {
         CfxList {
             CfxRow(u.username.ifEmpty { u.email }, first = true, sub = u.email.takeIf { u.username.isNotEmpty() }, leading = { Avatar(initialsOf(u.username.ifEmpty { u.email })) })
             CfxRow("Signed in with", value = if (m.signedInWith == "browser") "Browser" else "Password")
+            m.accountPolicy?.let { p ->
+                CfxRow("Policy", value = p.name, sub = p.line, valueTone = if (p.sendsTargets) Tone.NONE else Tone.WARN)
+            }
             CfxRow("Sign out", icon = R.drawable.ic_sign_out, sub = "Revokes this phone's key", danger = true, onClick = { m.overlay = Overlay.SignOut })
             DeleteAccountRow(m)
         }

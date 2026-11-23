@@ -1,0 +1,19 @@
+# Synthetic: A site behind Cloudflare, with its bot-management cookie.
+HTTP/1.1 200 OK
+date: Fri, 20 Nov 2026 06:00:00 GMT
+content-type: text/html; charset=UTF-8
+set-cookie: __cf_bm=
+cf-cache-status: DYNAMIC
+server: cloudflare
+cf-ray: 8e1f2a3b4c5d6e7f-BOM
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Example</title>
+</head>
+<body>
+<div></div>
+</body>
+</html>

@@ -1,0 +1,13 @@
+id: express
+info:
+  name: Express
+  category: Framework
+  metadata:
+    vendor: openjsf
+    product: express
+    target_sw: node.js
+implies: [nodejs]
+detect:
+  any:
+    - header: { name: x-powered-by, regex: '(?i)express' }
+    - not_found: { regex: '<pre>Cannot GET /' }

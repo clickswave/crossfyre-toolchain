@@ -13,10 +13,25 @@ use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+/// How long a connection to an engine on this host may take to be made. One that is
+/// listening answers at once; one that is not is refused at once, except where the port
+/// is held by a socket that does not listen and the system drops the attempt unanswered.
+pub(crate) const CONNECT_WITHIN: Duration = Duration::from_secs(10);
+
 /// Connect to the engine at `addr`. A listener another account owns is refused before
-/// anything is written to it.
+/// anything is written to it, and so is a connection that met itself, which a connect to
+/// a port nothing listens on can make when the system picks that same port for its own
+/// end: it would wait for an answer that never comes.
 pub(crate) async fn connect(addr: &str) -> io::Result<tokio::net::TcpStream> {
-    let stream = tokio::net::TcpStream::connect(addr).await?;
+    let stream = tokio::time::timeout(CONNECT_WITHIN, tokio::net::TcpStream::connect(addr))
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("no answer within {}s", CONNECT_WITHIN.as_secs()),
+            )
+        })??;
+    not_itself(&stream)?;
     let ends = (stream.local_addr()?, stream.peer_addr()?);
     let trusted = trusted();
     // Reading the kernel's tables takes a few milliseconds on a host with many
@@ -26,6 +41,20 @@ pub(crate) async fn connect(addr: &str) -> io::Result<tokio::net::TcpStream> {
         .map_err(io::Error::other)?
         .map_err(|e| e.into_io(ends.1))?;
     Ok(stream)
+}
+
+/// Refused when `stream` is a connection to itself: nothing listens on its port.
+fn not_itself(stream: &tokio::net::TcpStream) -> io::Result<()> {
+    if stream.local_addr()? == stream.peer_addr()? {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            format!(
+                "nothing listens on {}: the connection met itself",
+                stream.peer_addr()?
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// [`connect`] without a runtime, waiting at most `timeout` for the connection.
@@ -237,6 +266,27 @@ fn table_addr(field: &str) -> Option<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A connect to a port nothing listens on can meet itself when the system gives the
+    /// connecting socket that same port. Such a connection is refused, not waited on.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_connection_that_met_itself_is_refused() {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = socket.local_addr().unwrap();
+        let stream = socket
+            .connect(addr)
+            .await
+            .expect("a socket can meet itself");
+        assert_eq!(stream.local_addr().unwrap(), stream.peer_addr().unwrap());
+        let err = not_itself(&stream).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+        assert!(
+            err.to_string().ends_with("the connection met itself"),
+            "{err}"
+        );
+    }
 
     #[cfg(target_endian = "little")]
     #[test]

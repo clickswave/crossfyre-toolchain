@@ -2,17 +2,13 @@ name: CI
 
 # What this guards, in priority order:
 #
-#   1. The OPEN checkout builds. This repo is open-core: `adaptive-private/`,
-#      `core/src/egress/private.rs` and `.cargo/config.toml` exist in first-party
-#      working copies and are git-ignored. Locally, `.cargo/config.toml` swaps the
-#      committed `adaptive` crate for the private drop-in and `core/build.rs`
-#      compiles the private egress module, so a first-party build is NOT the same
-#      build the public gets. CI runs on a clean checkout, which is the only
-#      honest test that the open baseline still compiles on its own.
+#   1. The checkout builds as it is. What is closed comes as separate components
+#      after login, and none of it is compiled into these binaries. The one
+#      drop-in left, `plessor/src/authz/private.rs`, is git-ignored and compiled
+#      only under plessor's `closed-authz` feature, for plessor-authz.
 #
-#   2. Those private paths never get committed. A stray `git add -A` would leak
-#      the tuned pacing crate and the isolated-egress implementation. The
-#      open-core job fails the build if any of them appear.
+#   2. That drop-in never gets committed. A stray `git add -A` would leak it. The
+#      open-core job fails the build if it appears.
 #
 # rustfmt and clippy are both REQUIRED: the workspace is formatted and at zero
 # clippy warnings. The dependency-advisory job is enforced on the nightly
@@ -53,23 +49,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Private drop-ins must not be committed
+      - name: The authorization drop-in must not be committed
         run: |
           set -eu
           leaked=0
-          # The authz drop-in sat under cortex/ before 0.1.31; both paths are checked
-          # for one more release.
-          for p in adaptive-private .cargo/config.toml core/src/egress/private.rs \
-                   plessor/src/authz/private.rs cortex/src/authz/private.rs; do
-            if git ls-files --error-unmatch "$p" >/dev/null 2>&1; then
-              echo "::error file=$p::$p is tracked in git. This is a private \
-          drop-in and must never ship in the open repo."
-              leaked=1
-            fi
-          done
-          # Also catch the whole directory being added under any path.
-          if git ls-files | grep -qE '(^|/)adaptive-private/|(^|/)egress/private\.rs$|(^|/)authz/private\.rs$'; then
-            echo "::error::a private drop-in path is tracked in git"
+          # Under any path, should the engine's directory move.
+          if git ls-files | grep -qE '(^|/)authz/private\.rs$'; then
+            echo "::error::the authorization drop-in is tracked in git and must never ship in the open repo"
             leaked=1
           fi
           if [ "$leaked" -ne 0 ]; then
@@ -81,13 +67,8 @@ jobs:
       - name: The open baseline is what actually gets compiled
         run: |
           set -eu
-          test ! -e .cargo/config.toml || { echo "::error::.cargo/config.toml present in a clean checkout"; exit 1; }
-          test -f adaptive/src/lib.rs        || { echo "::error::open adaptive crate missing"; exit 1; }
-          test -f core/src/egress/baseline.rs || { echo "::error::open egress baseline missing"; exit 1; }
-          test ! -e core/src/egress/private.rs
           test -f plessor/src/authz/baseline.rs || { echo "::error::open authz baseline missing"; exit 1; }
           test ! -e plessor/src/authz/private.rs
-          test ! -e cortex/src/authz/private.rs
           echo "clean checkout resolves to the open baseline"
 
       # The release workflow signs provenance, so what it runs is pinned by commit
@@ -174,8 +155,8 @@ jobs:
       # and the default launch timeout is marginal there.
       - name: Test
         env:
-          AMBULO_BROWSER_NO_SANDBOX: '1'
-          AMBULO_BROWSER_LAUNCH_TIMEOUT_SECS: '90'
+          CFX_BROWSER_NO_SANDBOX: '1'
+          CFX_BROWSER_LAUNCH_TIMEOUT_SECS: '90'
         run: cargo test --workspace --locked --no-fail-fast
 
   # The build and clippy jobs below, for each target the release workflow publishes
@@ -253,9 +234,10 @@ jobs:
           PYO3_PYTHON: ${{ steps.python.outputs.python-path }}
         run: cargo clippy --workspace ${{ matrix.skip }} --all-targets --locked --target ${{ matrix.target }} -- -D warnings
 
-      # The impersonate feature compiles BoringSSL, which builds with MSVC on Windows
-      # and not with MinGW, so this is also what shows the MSVC target is the one the
-      # release can ship it on.
+      # The four engines as the release builds them: each on its own, with BoringSSL for
+      # a browser's TLS and HTTP/2 fingerprint. BoringSSL builds with MSVC on Windows and
+      # not with MinGW, so this is also what shows the MSVC target is the one the release
+      # can ship it on.
       - name: clippy (impersonate feature)
         run: |
           cargo clippy --locked --all-targets --target ${{ matrix.target }} \
@@ -265,10 +247,20 @@ jobs:
 
       # The redirect tests in ambulo and cfx_core listen on 127.0.0.2 as a second
       # host. Linux and Windows answer on all of 127.0.0.0/8, and macOS only on
-      # the addresses lo0 has.
+      # the addresses lo0 has. Both test steps below run them, so this comes first.
       - name: Give lo0 a second address
         if: runner.os == 'macOS'
         run: sudo ifconfig lo0 alias 127.0.0.2 up
+
+      - name: test (impersonate feature, each engine as released)
+        env:
+          CFX_BROWSER_NO_SANDBOX: '1'
+          CFX_BROWSER_LAUNCH_TIMEOUT_SECS: '90'
+        run: |
+          set -eu
+          for p in ambulo voyage toolmark plessor; do
+            cargo test --locked --no-fail-fast --target ${{ matrix.target }} -p "$p" --features impersonate
+          done
 
       - name: Test
         env:
@@ -335,14 +327,16 @@ jobs:
         run: cargo build --locked -p plessor -p ambulo
 
       - name: Write the toolchain config
-        # ambulo, doorward and voyage refuse to start in daemon mode without this and
-        # tell you to run `crossfyre init`. The CLI that would write it is not
-        # in this repo, and standalone terminal use never reads it, so the file
-        # is the whole dependency. Matches the postgres service above.
+        # ambulo, doorward and voyage find their database through this file, and in
+        # daemon mode wait, saying why, until it names one they can reach. The CLI
+        # that would write it is not in this repo, and standalone terminal use never
+        # reads it, so the file is the whole dependency. It names the postgres service
+        # above as a database the user runs, so the engines make no cluster of their own.
         run: |
           mkdir -p ~/.config/crossfyre
           cat > ~/.config/crossfyre/config.toml <<'TOML'
           [postgres]
+          backend = "external"
           host = "127.0.0.1"
           port = 5432
           user = "crossfyre"
@@ -360,11 +354,11 @@ jobs:
         # ambulo falls back to static extraction, and the case fails as two
         # missing URLs rather than as the browser problem it is.
         env:
-          AMBULO_BROWSER_NO_SANDBOX: '1'
+          CFX_BROWSER_NO_SANDBOX: '1'
           # The default 20s is marginal here. The same commit launched inside it
           # on one run and missed it on another running at the same time, which
           # reported as a detection regression rather than as a slow machine.
-          AMBULO_BROWSER_LAUNCH_TIMEOUT_SECS: '90'
+          CFX_BROWSER_LAUNCH_TIMEOUT_SECS: '90'
         run: python3 tests/oracles/run.py
 
   fmt:
@@ -372,9 +366,9 @@ jobs:
     runs-on: ubuntu-26.04
     # Required. This is green as of the workspace-wide rustfmt pass, and it also
     # guards the fix that made `cargo fmt` work on a public checkout at all: the
-    # egress module used to declare two cfg-gated `mod imp;` arms, and rustfmt
+    # authz module once declared two cfg-gated `mod imp;` arms, and rustfmt
     # resolves module paths without evaluating cfg, so it hard-errored on the
-    # private path that only exists in first-party clones.
+    # private path a public checkout lacks.
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust with rustfmt
@@ -434,20 +428,20 @@ jobs:
 
       # The impersonate feature swaps the engines' HTTP client from reqwest to
       # wreq, so `transport::Error` becomes a different type and anything naming
-      # reqwest directly stops compiling. Nothing else here builds that
-      # combination, and the only other thing that does is the release script, so
-      # for three weeks from 2026-09-11 `ambulo` could not be released at all:
-      # `fetch_reason` took a `&reqwest::Error` and the default build resolved it
-      # against ambulo's own direct reqwest dependency. Found by a release failing,
-      # which is the wrong way to find it.
-      #
-      # This builds BoringSSL and is therefore slow. Worth it: the artifacts we
-      # actually ship are built with this feature on.
-      - name: build (impersonate feature, which is what ships)
+      # reqwest directly stops compiling. The workspace build above is without it, as
+      # it has to be: built together with the CLI, BoringSSL and the OpenSSL cfx_core
+      # links for the trace proxy define the same symbols. Every published build turns
+      # it on, building each engine on its own, so these build, lint and test each
+      # engine that way. For three weeks from 2026-09-11 `ambulo` could not be
+      # released at all: `fetch_reason` took a `&reqwest::Error` and the default build
+      # resolved it against ambulo's own direct reqwest dependency. Found by a release
+      # failing, which is the wrong way to find it.
+      - name: build (impersonate feature, each engine as released)
         run: |
-          cargo build --locked \
-            -p ambulo -p voyage -p toolmark -p plessor \
-            --features ambulo/impersonate,voyage/impersonate,toolmark/impersonate,plessor/impersonate
+          set -eu
+          for p in ambulo voyage toolmark plessor; do
+            cargo build --locked -p "$p" --features impersonate
+          done
 
       # Code under the impersonate feature is compiled out of the default build, so
       # the workspace clippy and test runs above never see it: transport's browser
@@ -461,17 +455,38 @@ jobs:
             --features transport/impersonate,ambulo/impersonate,voyage/impersonate,toolmark/impersonate,plessor/impersonate \
             -- -D warnings
 
-      - name: test (impersonate feature)
+      - name: test (impersonate feature, each engine as released)
+        env:
+          CFX_BROWSER_NO_SANDBOX: '1'
+          CFX_BROWSER_LAUNCH_TIMEOUT_SECS: '90'
         run: |
-          cargo test --locked -p transport -p plessor \
-            --features transport/impersonate,plessor/impersonate
+          set -eu
+          cargo test --locked -p transport --features impersonate
+          for p in ambulo voyage toolmark plessor; do
+            cargo test --locked --no-fail-fast -p "$p" --features impersonate
+          done
+
+      # The notices a release archive carries, for this target: a crate under a licence
+      # scripts/notices/about.toml does not accept, or a new crate that compiles C code
+      # of its own, shows here, on the pull request that brings it, and not at a tag.
+      - name: Third-party notices
+        run: |
+          set -eu
+          cargo install --locked cargo-about@0.9.2 --features cli
+          # notices.py reads the crates offline, and cargo metadata wants those of
+          # every platform, which a build for one target does not download.
+          cargo fetch --locked
+          python3 -I scripts/test_notices.py
+          python3 -I scripts/notices.py --target x86_64-unknown-linux-gnu \
+            --out "$RUNNER_TEMP/THIRD-PARTY-NOTICES.txt"
 
   impersonate-aarch64:
     name: impersonate feature (aarch64)
     runs-on: ubuntu-24.04-arm
-    # The impersonate build, clippy and tests of the clippy job, on arm64. BoringSSL is
-    # compiled for each target, so a break in this feature that only arm64 shows would
-    # otherwise first appear in an arm64 release build.
+    # The impersonate build, clippy and tests of the clippy job, on arm64, each engine as
+    # the release builds it. BoringSSL is compiled for each target, so a break in this
+    # feature that only arm64 shows would otherwise first appear in an arm64 release
+    # build.
     steps:
       - uses: actions/checkout@v4
 
@@ -500,11 +515,12 @@ jobs:
           key: impersonate-arm-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: impersonate-arm-${{ runner.os }}-
 
-      - name: build (impersonate feature, aarch64)
+      - name: build (impersonate feature, aarch64, each engine as released)
         run: |
-          cargo build --locked \
-            -p ambulo -p voyage -p toolmark -p plessor \
-            --features ambulo/impersonate,voyage/impersonate,toolmark/impersonate,plessor/impersonate
+          set -eu
+          for p in ambulo voyage toolmark plessor; do
+            cargo build --locked -p "$p" --features impersonate
+          done
 
       - name: clippy (impersonate feature, aarch64)
         run: |
@@ -513,10 +529,16 @@ jobs:
             --features transport/impersonate,ambulo/impersonate,voyage/impersonate,toolmark/impersonate,plessor/impersonate \
             -- -D warnings
 
-      - name: test (impersonate feature, aarch64)
+      - name: test (impersonate feature, aarch64, each engine as released)
+        env:
+          CFX_BROWSER_NO_SANDBOX: '1'
+          CFX_BROWSER_LAUNCH_TIMEOUT_SECS: '90'
         run: |
-          cargo test --locked -p transport -p plessor \
-            --features transport/impersonate,plessor/impersonate
+          set -eu
+          cargo test --locked -p transport --features impersonate
+          for p in ambulo voyage toolmark plessor; do
+            cargo test --locked --no-fail-fast -p "$p" --features impersonate
+          done
 
   audit:
     name: dependency advisories

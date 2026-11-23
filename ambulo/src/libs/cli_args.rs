@@ -50,25 +50,6 @@ impl std::fmt::Display for LogLevel {
     }
 }
 
-#[derive(Clone, Debug, ValueEnum)]
-pub enum OutputFormat {
-    Text,
-    Csv,
-}
-
-impl std::fmt::Display for OutputFormat {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                OutputFormat::Text => "text",
-                OutputFormat::Csv => "csv",
-            }
-        )
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Top-level CLI
 // ---------------------------------------------------------------------------
@@ -82,30 +63,44 @@ impl std::fmt::Display for OutputFormat {
 /// |                 clickswave.org                  |{n}
 /// |-------------------------------------------------|{n}
 #[derive(Parser, Debug)]
-// `bin_name` is fixed so help names the engine as it is now called, even when it
-// is started through the link its old name left behind.
-#[command(name = "ambulo", bin_name = "ambulo", author, version, about, long_about = None)]
+#[command(name = "ambulo", author, version, about, long_about = None)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
 
-    /// Run as a background TCP daemon service
-    #[arg(long, default_value_t = false)]
-    pub daemon: bool,
-
-    /// Port for daemon mode
-    #[arg(long, default_value_t = 4441)]
+    /// The port the daemon listens on, and the one the commands here reach it on
+    #[arg(
+        long,
+        global = true,
+        help_heading = "Global options",
+        default_value_t = dguard::ports::AMBULO
+    )]
     pub port: u16,
 
-    /// Show the live dashboard instead of streaming JSON. Ignored when stdout is
-    /// not a terminal, so piping still produces parseable output.
-    #[arg(long, default_value_t = false)]
-    pub tui: bool,
-
-    /// Never draw the dashboard; stream newline-delimited JSON instead.
-    #[arg(long, default_value_t = false)]
+    /// Never draw the dashboard; stream newline-delimited JSON instead, as piped or
+    /// redirected output always gets
+    #[arg(
+        long,
+        global = true,
+        help_heading = "Global options",
+        default_value_t = false
+    )]
     pub no_tui: bool,
+
+    /// Never start the daemon: when it is not running, say so and stop. Setting
+    /// CFX_NO_AUTOSTART=1 does the same.
+    #[arg(
+        long,
+        global = true,
+        help_heading = "Global options",
+        default_value_t = false
+    )]
+    pub no_autostart: bool,
 }
+
+/// How long the dashboard waits for an event before it draws again, unless
+/// `--event-poll-timeout` says otherwise.
+pub const EVENT_POLL_TIMEOUT_MS: u64 = 1000;
 
 #[derive(Subcommand, Debug)]
 // clap subcommand enum: the large variant is the fully-populated scan config,
@@ -117,10 +112,17 @@ pub enum Commands {
     Scan(ScanArgs),
     /// Send a JSON op to the daemon and print the reply. `operation` defaults to
     /// `probe`, which checks a single URL with no wordlist and no dashboard.
-    #[command(alias = "scan-exec")]
     Exec(ExecArgs),
-    /// Database management
-    Db(DbArgs),
+    /// The scans this engine keeps, the latest first, and a stopped one to take up again
+    Scans,
+    /// What this engine keeps: delete one scan, old scans, or everything
+    Db {
+        #[command(subcommand)]
+        action: dguard::DbAction,
+    },
+    /// Run as this engine's daemon, which the commands here and the node talk to on
+    /// --port
+    Daemon,
     /// Print a shell completion script to stdout, for example:
     ///   ambulo completions bash > ~/.local/share/bash-completion/completions/ambulo
     Completions {
@@ -135,25 +137,20 @@ pub struct ExecArgs {
     pub json: String,
 }
 
-#[derive(ClapArgs, Clone, Debug)]
-pub struct DbArgs {
-    /// Remove all rows from every table (keeps schema intact)
-    #[arg(long, default_value_t = false)]
-    pub full_reset: bool,
-}
-
 // ---------------------------------------------------------------------------
 // Fuzz subcommand args
 // ---------------------------------------------------------------------------
 
 #[derive(ClapArgs, Clone, Debug)]
 pub struct ScanArgs {
-    /// Specify the URL(s) to target
-    #[arg(short, long)]
+    /// The URLs to scan, one after another. ::FUZZ:: marks where each word goes, and
+    /// without it each word goes at the end of the path
+    #[arg(value_name = "URL", required_unless_present = "interactive")]
     pub url: Vec<String>,
 
-    /// Specify the wordlist path
-    #[arg(short, long, default_value_t = format!(""))]
+    /// The wordlist, one word to a line. It is read here and its words sent to the
+    /// daemon, so any file you can read will do
+    #[arg(short, long, default_value_t = String::new(), hide_default_value = true)]
     pub wordlist_path: String,
 
     /// Specify what point of the URL should be replaced with words
@@ -204,6 +201,11 @@ pub struct ScanArgs {
     #[arg(long, default_value_t = false)]
     pub fresh_start: bool,
 
+    /// Take up stopped scan ID again, asked for as it was first asked for: how one given
+    /// credentials, which are not kept, is taken up. `ambulo scans` lists the scans
+    #[arg(long, value_name = "ID", conflicts_with = "fresh_start")]
+    pub resume: Option<String>,
+
     /// Use a random user agent for the whole scan
     #[arg(long, default_value_t = false)]
     pub random_user_agent_scan: bool,
@@ -215,14 +217,6 @@ pub struct ScanArgs {
     /// Append trailing slash to URLs
     #[arg(long, default_value_t = false)]
     pub append_slash: bool,
-
-    /// Save response body for each request
-    #[arg(long, default_value_t = false)]
-    pub save_response_body: bool,
-
-    /// Save response headers for each request
-    #[arg(long, default_value_t = true)]
-    pub save_response_headers: bool,
 
     /// User agent string
     #[arg(long, default_value_t = adaptive::identity::resolve(&adaptive::identity::Mode::Evasive, None).user_agent)]
@@ -236,14 +230,6 @@ pub struct ScanArgs {
     #[arg(long)]
     pub identify: Option<String>,
 
-    /// Suppress exit banner
-    #[arg(long, default_value_t = false)]
-    pub no_exit_banner: bool,
-
-    /// Drop and recreate the database before scanning
-    #[arg(long, default_value_t = false)]
-    pub recreate_db: bool,
-
     /// Delay in seconds before starting
     #[arg(long, default_value_t = 0)]
     pub launch_delay: i64,
@@ -252,21 +238,9 @@ pub struct ScanArgs {
     #[arg(long, value_enum, default_value_t = LogLevel::Info)]
     pub log_level: LogLevel,
 
-    /// Output format
-    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
-    pub output_format: OutputFormat,
-
-    /// Output file path
-    #[arg(short, long, default_value_t = format!(""))]
-    pub output_path: String,
-
     /// TUI event polling timeout in ms
-    #[arg(long, default_value_t = 1000)]
+    #[arg(long, default_value_t = EVENT_POLL_TIMEOUT_MS)]
     pub event_poll_timeout: u64,
-
-    /// [UNSTABLE] Enable TUI offset pagination
-    #[arg(long, default_value_t = false)]
-    pub enable_offset_pagination: bool,
 
     /// Interactive mode - prompts for required options
     #[arg(long, default_value_t = false)]
@@ -290,6 +264,16 @@ pub struct ScanArgs {
     /// inherits, and the daemon sets it from the egress wrapper a node sends.
     #[arg(skip)]
     pub egress: transport::Egress,
+
+    /// Names pinned to addresses, which every request of the scan dials. Not a flag: a
+    /// caller that checked the addresses itself sends them to the daemon.
+    #[arg(skip)]
+    pub resolve: Vec<(String, std::net::SocketAddr)>,
+
+    /// Refuse to dial private, loopback, link-local and reserved addresses. Not a flag,
+    /// for the same caller.
+    #[arg(skip)]
+    pub block_internal: bool,
 }
 
 // Re-export FuzzArgs as Args so the rest of the codebase is unchanged.
@@ -431,7 +415,7 @@ impl ScanArgs {
 /// Scan arguments as the command line gives them by default, for tests.
 #[cfg(test)]
 pub(crate) fn defaults_for_tests() -> ScanArgs {
-    match Cli::try_parse_from(["ambulo", "scan", "--url", "http://h/::FUZZ::"])
+    match Cli::try_parse_from(["ambulo", "scan", "http://h/::FUZZ::"])
         .unwrap()
         .command
     {
@@ -456,21 +440,64 @@ mod tests {
         // `index.php/` is a different resource from `index.php`, and on most
         // servers a missing one. The slash was on by default with no way to
         // turn it off, so every file in a wordlist was requested as a directory.
-        let mut args = scan_args(&["ambulo", "scan", "--url", "http://h/::FUZZ::"]);
+        let mut args = scan_args(&["ambulo", "scan", "http://h/::FUZZ::"]);
         args.validate_urls().unwrap();
         assert_eq!(args.url, ["http://h/::FUZZ::"]);
     }
 
     #[test]
     fn append_slash_asks_for_directories() {
-        let mut args = scan_args(&[
-            "ambulo",
-            "scan",
-            "--url",
-            "http://h/::FUZZ::",
-            "--append-slash",
-        ]);
+        let mut args = scan_args(&["ambulo", "scan", "http://h/::FUZZ::", "--append-slash"]);
         args.validate_urls().unwrap();
         assert_eq!(args.url, ["http://h/::FUZZ::/"]);
+    }
+
+    #[test]
+    fn no_autostart_goes_before_or_after_the_command() {
+        let parsed = |argv: &[&str]| Cli::try_parse_from(argv).expect("parses").no_autostart;
+        assert!(parsed(&["ambulo", "--no-autostart", "db", "reset"]));
+        assert!(parsed(&["ambulo", "db", "reset", "--no-autostart"]));
+        assert!(!parsed(&["ambulo", "db", "reset"]));
+    }
+
+    #[test]
+    fn the_daemon_is_a_command_with_its_port_after_it() {
+        let argv: Vec<String> = std::iter::once("ambulo".to_string())
+            .chain(dguard::daemon_args(5000))
+            .collect();
+        let cli = Cli::try_parse_from(&argv).expect("parses");
+        assert!(matches!(cli.command, Some(Commands::Daemon)), "{argv:?}");
+        assert_eq!(cli.port, 5000);
+        assert!(
+            Cli::try_parse_from(["ambulo", "--daemon"]).is_err(),
+            "the old flag"
+        );
+    }
+
+    #[test]
+    fn the_urls_follow_scan_and_the_old_names_are_gone() {
+        let args = scan_args(&["ambulo", "scan", "http://a/::FUZZ::", "http://b/"]);
+        assert_eq!(args.url, ["http://a/::FUZZ::", "http://b/"]);
+        assert!(
+            Cli::try_parse_from(["ambulo", "scan", "--interactive"]).is_ok(),
+            "asked for"
+        );
+        for old in [
+            &["ambulo", "scan"][..],
+            &["ambulo", "scan", "-u", "http://a/"],
+            &["ambulo", "scan", "--url", "http://a/"],
+            &["ambulo", "scan-exec", "{}"],
+        ] {
+            assert!(Cli::try_parse_from(old).is_err(), "{old:?}");
+        }
+    }
+
+    #[test]
+    fn no_tui_goes_before_or_after_the_command_and_tui_is_gone() {
+        let parsed = |argv: &[&str]| Cli::try_parse_from(argv).expect("parses").no_tui;
+        assert!(parsed(&["ambulo", "--no-tui", "scan", "http://h/"]));
+        assert!(parsed(&["ambulo", "scan", "http://h/", "--no-tui"]));
+        assert!(!parsed(&["ambulo", "scan", "http://h/"]));
+        assert!(Cli::try_parse_from(["ambulo", "--tui", "scan", "http://h/"]).is_err());
     }
 }

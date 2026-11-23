@@ -1,0 +1,9 @@
+id: gsap
+info:
+  name: GSAP
+  category: JavaScript Library
+detect:
+  any:
+    - script_src: { regex: '/gsap(?:\.min)?\.js' }
+version:
+  - script_src: { regex: '(?:gsap/|gsap@)([0-9]+\.[0-9]+\.[0-9]+)' }

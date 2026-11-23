@@ -1,11 +1,12 @@
-use crate::libs::ambulo_db::AmbuloDb;
-use crate::libs::cli_args::{Args, HttpMethod, LogLevel, OutputFormat};
+use crate::libs::ambulo_db::{AmbuloDb, ScanStore};
+use crate::libs::cli_args::{Args, HttpMethod, LogLevel};
 use crate::scanner::{Scanner, StreamEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
+use tokio::io::Lines;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream, tcp::OwnedWriteHalf};
+use tokio::net::{TcpListener, TcpStream, tcp::OwnedReadHalf, tcp::OwnedWriteHalf};
 use tokio::sync::mpsc;
 use transport::Client;
 use uuid::Uuid;
@@ -60,10 +61,16 @@ struct DaemonResponse {
 }
 
 /// Scan-specific parameters.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct ScanParams {
     endpoint: String,
+    /// A wordlist file, which is read only inside the permitted directories.
+    #[serde(default)]
     wordlist: String,
+    /// In place of `wordlist`: the name of a list whose words follow the request on
+    /// the connection (see [`dguard::WordChunks`]). Only a stream scan takes them.
+    #[serde(default)]
+    wordlist_follows: Option<String>,
     #[serde(default = "default_method")]
     method: String,
     #[serde(default = "default_tasks")]
@@ -105,6 +112,39 @@ struct ScanParams {
     identify: Option<String>,
     #[serde(default)]
     auth: ScanAuth,
+    /// Keep the cookies the target sets, and send them back.
+    #[serde(default)]
+    store_cookies: bool,
+    /// One random User-Agent for the whole scan, or a new one for every request.
+    #[serde(default)]
+    random_user_agent_scan: bool,
+    #[serde(default)]
+    random_user_agent_request: bool,
+    /// Put a `/` at the end of every URL.
+    #[serde(default)]
+    append_slash: bool,
+    /// The User-Agent to send, in place of the one the identity mode picks.
+    #[serde(default)]
+    user_agent: Option<String>,
+    /// The least important lines the scan's log keeps: debug, info, warn or error.
+    #[serde(default)]
+    log_level: Option<String>,
+    /// The id of a stopped scan this request takes up again, asking for it with its
+    /// settings, credentials included: how one given credentials, which are not kept, is
+    /// taken up. Not one of the scan's settings.
+    #[serde(default, skip_serializing)]
+    resume: Option<String>,
+    /// Names pinned to addresses, `[["app.example.com", "203.0.113.7:443"], ...]`, which
+    /// every request of the scan dials. A caller that has already decided which addresses
+    /// of a name may be dialled sends them, so the name is not looked up again here and
+    /// answered with somewhere else.
+    #[serde(default)]
+    resolve: Vec<(String, std::net::SocketAddr)>,
+    /// Refuse to dial a private, loopback, link-local or reserved address that a name
+    /// resolves to, or that a redirect names. A pinned address, and an address written
+    /// as the target, are the caller's to have checked.
+    #[serde(default)]
+    block_internal: bool,
     /// Set by the daemon from the egress wrapper. See `DaemonRequest::egress`.
     #[serde(skip)]
     egress: transport::Egress,
@@ -116,15 +156,23 @@ fn default_evasive() -> bool {
 
 /// Auth applied to every probe in an authenticated content-discovery scan. Same
 /// shape the crawler receives (`AuthContext::to_json` on the node side).
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 struct ScanAuth {
     #[serde(default)]
     headers: std::collections::HashMap<String, String>,
     #[serde(default)]
     cookies: String,
+    /// `username:password`, sent as basic auth.
+    #[serde(default)]
+    basic_auth: String,
 }
 
 impl ScanAuth {
+    /// Whether the scan authenticates to its target with these.
+    fn carries_credentials(&self) -> bool {
+        !self.headers.is_empty() || !self.cookies.trim().is_empty() || !self.basic_auth.is_empty()
+    }
+
     /// Flatten into the `headers` list the prober consumes ("Key: Value"). The
     /// Cookie header carries the resolved cookie string verbatim rather than
     /// going through the prober's `cookies` list, which reparses `k:v` pairs and
@@ -203,6 +251,8 @@ pub async fn run_on(listener: TcpListener, db: AmbuloDb) -> Result<(), Box<dyn s
     let addr = listener.local_addr()?;
     let gate = dguard::Gate::from_env();
     gate.announce("Ambulo", addr);
+    dguard::exit_when_idle("ambulo");
+    eprintln!("[ambulo] {}", cfx_pacing::load().say());
 
     let db = Arc::new(db);
     // Shared by every probe that comes without an egress wrapper. A wrapped probe
@@ -215,16 +265,14 @@ pub async fn run_on(listener: TcpListener, db: AmbuloDb) -> Result<(), Box<dyn s
     // Background task: delete expired probe_results + GC old scans every 5 min.
     {
         let db_cleanup = Arc::clone(&db);
-        // Scans older than this are reclaimed (see AmbuloDb::gc_old_scans). Default
+        // Scans older than this are deleted (see AmbuloDb::delete_old_scans). Default
         // 7 days: comfortably longer than any real scan (so a running/paused scan
         // is never touched) while still bounding the table. Tunable per node.
-        let retention_hours: i64 = dguard::env_renamed(
-            "CROSSFYRE_AMBULO_SCAN_RETENTION_HOURS",
-            "CROSSFYRE_MACH_SCAN_RETENTION_HOURS",
-        )
-        .and_then(|v| v.parse::<i64>().ok())
-        .filter(|&h| h > 0)
-        .unwrap_or(168);
+        let retention_hours: i64 = std::env::var("CROSSFYRE_AMBULO_SCAN_RETENTION_HOURS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|&h| h > 0)
+            .unwrap_or(168);
         tokio::spawn(async move {
             let interval = std::time::Duration::from_secs(300);
             loop {
@@ -234,11 +282,9 @@ pub async fn run_on(listener: TcpListener, db: AmbuloDb) -> Result<(), Box<dyn s
                 {
                     println!("Cleaned up {n} expired probe result(s)");
                 }
-                match db_cleanup.gc_old_scans(retention_hours).await {
+                match db_cleanup.delete_old_scans(retention_hours).await {
                     Ok(n) if n > 0 => {
-                        println!(
-                            "GC: reclaimed {n} scan_entries from scans older than {retention_hours}h"
-                        )
+                        println!("GC: deleted {n} scan(s) older than {retention_hours}h")
                     }
                     Err(e) => eprintln!("GC: scan sweep failed: {e}"),
                     _ => {}
@@ -254,7 +300,7 @@ pub async fn run_on(listener: TcpListener, db: AmbuloDb) -> Result<(), Box<dyn s
         let db_clone = Arc::clone(&db);
         let client_clone = Arc::clone(&probe_client);
         let client_noredir_clone = Arc::clone(&probe_client_noredirect);
-        tokio::spawn(async move {
+        dguard::spawn_busy(async move {
             if let Err(e) = handle_connection(
                 stream,
                 gate_clone,
@@ -356,19 +402,64 @@ async fn handle_connection(
                 &mut writer,
                 &serde_json::json!({
                     "type": "capabilities",
+                    "scan": ["resolve", "block_internal", "follow_redirects"],
                     // The version of the egress wrapper this daemon reads.
                     "egress": transport::WIRE_VERSION,
+                    // Which pacing this daemon runs: `module <version>`, or `baseline (<why>)`.
+                    "pacing": cfx_pacing::load().label(),
+                    // Which process answers, for the client that started it.
+                    "pid": std::process::id(),
                 }),
             )
             .await?;
             continue;
         }
 
-        // Stream mode takes over the connection for the duration of the operation.
+        // The scans this daemon keeps, the latest first, one as it was kept, and what they
+        // found, oldest first.
+        if req.operation == "scans" {
+            let answer = cfx_db::scans::answer_scans(db.pool(), cfx_db::scans::Listed::why_not);
+            write_json(&mut writer, &answer.await).await?;
+            continue;
+        }
+        if req.operation == "scan_info" {
+            let id = req.params["id"].as_str().unwrap_or_default();
+            write_json(
+                &mut writer,
+                &cfx_db::found::answer_scan(db.pool(), id).await,
+            )
+            .await?;
+            continue;
+        }
+        if req.operation == "finding" {
+            let id = req.params["id"].as_i64().unwrap_or(0);
+            write_json(
+                &mut writer,
+                &cfx_db::found::answer_finding(db.pool(), id).await,
+            )
+            .await?;
+            continue;
+        }
+        if req.operation == "findings" {
+            let answer = cfx_db::found::answer_findings(
+                db.pool(),
+                req.params["scan"].as_str(),
+                req.params["after"].as_i64(),
+                req.params["limit"].as_i64().unwrap_or(200),
+            );
+            write_json(&mut writer, &answer.await).await?;
+            continue;
+        }
+
+        // Every operation from here on sends: say which pacing it runs with.
+        eprintln!("[ambulo] {}: {}", req.operation, cfx_pacing::load().say());
+
+        // Stream mode takes over the connection for the duration of the operation. A
+        // stopped scan taken up again streams as the scan did.
         if req.response == "stream" {
             match req.operation.as_str() {
                 "crawl" => handle_stream_crawl(req, writer).await?,
-                _ => handle_stream_scan(req, writer, Arc::clone(&db)).await?,
+                _ => handle_stream_scan(req, writer, &mut lines, &gate, Arc::clone(&db)).await?,
             }
             return Ok(());
         }
@@ -386,6 +477,8 @@ async fn handle_connection(
     Ok(())
 }
 
+/// Send `value` to the client, made safe to leave the engine (see
+/// [`cfx_db::scans::safe_stream`]): the node relays it to Cloud as it is.
 async fn write_json<W, T>(
     writer: &mut W,
     value: &T,
@@ -394,7 +487,7 @@ where
     W: AsyncWriteExt + Unpin,
     T: Serialize,
 {
-    let mut s = serde_json::to_string(value)?;
+    let mut s = serde_json::to_string(&cfx_db::scans::safe_stream(&serde_json::to_value(value)?))?;
     s.push('\n');
     writer.write_all(s.as_bytes()).await?;
     Ok(())
@@ -407,22 +500,37 @@ where
 async fn handle_stream_scan(
     req: DaemonRequest,
     mut writer: OwnedWriteHalf,
+    lines: &mut Lines<BufReader<OwnedReadHalf>>,
+    gate: &dguard::Gate,
     db: Arc<AmbuloDb>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let operation_id = Uuid::new_v4().to_string();
 
-    let scan_params: ScanParams = match serde_json::from_value(req.params.clone()) {
-        Ok(p) => ScanParams {
-            egress: req.egress.clone(),
-            ..p
-        },
-        Err(e) => {
+    // The scan as asked for, or a stopped one taken up again with the settings it was
+    // kept with.
+    let asked = match req.operation.as_str() {
+        "resume" => taken_up(&req, &db)
+            .await
+            .map(|(p, running)| (p, Some(running))),
+        _ => serde_json::from_value::<ScanParams>(req.params.clone())
+            .map(|p| (p, None))
+            .map_err(|e| format!("Invalid scan params: {e}")),
+    };
+    let (scan_params, taken) = match asked {
+        Ok((p, taken)) => (
+            ScanParams {
+                egress: req.egress.clone(),
+                ..p
+            },
+            taken,
+        ),
+        Err(message) => {
             write_json(
                 &mut writer,
                 &serde_json::json!({
                     "type": "error",
                     "operation_id": operation_id,
-                    "message": format!("Invalid scan params: {}", e),
+                    "message": message,
                 }),
             )
             .await?;
@@ -431,17 +539,27 @@ async fn handle_stream_scan(
     };
 
     if req.save {
-        let params_str = serde_json::to_string(&req.params).unwrap_or_default();
-        let _ = db
-            .create_operation(&operation_id, "scan", &params_str)
-            .await;
+        let _ = cfx_db::scans::record_operation(
+            db.pool(),
+            &operation_id,
+            "scan",
+            None,
+            &req.params.to_string(),
+        )
+        .await;
     }
 
-    // Set up the scan (wordlist, DB entries, etc.). Pass operation_id so this
-    // stream scan gets its OWN isolated scan record - concurrent scans of the
-    // same target/wordlist no longer share a row and clobber each other.
-    let (scanner, total, scan_id) = match prepare_scan(&scan_params, &db, Some(&operation_id)).await
-    {
+    // Set up the scan: its wordlist, and its entries, or those of the stopped scan it
+    // takes up again.
+    let begin = match (taken, &scan_params.wordlist_follows) {
+        (Some(running), _) => Begin::TakenUp(running),
+        (None, Some(name)) => Begin::Asked(ScanWords::Following {
+            name,
+            chunks: dguard::WordChunks::new(lines, gate),
+        }),
+        (None, None) => Begin::Asked(ScanWords::Named(&scan_params.wordlist)),
+    };
+    let (scanner, total, running) = match prepare_scan(&scan_params, &db, begin).await {
         Ok(v) => v,
         Err(e) => {
             write_json(
@@ -457,33 +575,31 @@ async fn handle_stream_scan(
         }
     };
 
-    // Send "ack" with operation_id and total entry count
-    write_json(
-        &mut writer,
-        &StreamEvent {
-            kind: "ack".to_string(),
-            operation_id: Some(operation_id.clone()),
-            total: Some(total),
-            tested: None,
-            retries: None,
-            url: None,
-            status: None,
-            code: None,
-            body_length: None,
-            headers_length: None,
-            found: None,
-            not_found: None,
-            error: None,
-            log_level: None,
-            message: None,
-            concurrency: None,
-            delay_ms: None,
-            posture: None,
-            score: None,
-            final_url: None,
-        },
-    )
-    .await?;
+    // Send "ack" with operation_id, total entry count, and the scan it is kept as
+    let mut ack = serde_json::to_value(StreamEvent {
+        kind: "ack".to_string(),
+        operation_id: Some(operation_id.clone()),
+        total: Some(total),
+        tested: None,
+        retries: None,
+        url: None,
+        status: None,
+        code: None,
+        body_length: None,
+        headers_length: None,
+        found: None,
+        not_found: None,
+        error: None,
+        log_level: None,
+        message: None,
+        concurrency: None,
+        delay_ms: None,
+        posture: None,
+        score: None,
+        final_url: None,
+    })?;
+    ack["scan"] = serde_json::json!(running.id);
+    write_json(&mut writer, &ack).await?;
 
     // Create event channel and run the scan
     let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
@@ -491,36 +607,44 @@ async fn handle_stream_scan(
     let oid = operation_id.clone();
     let save = req.save;
     let db_clone = Arc::clone(&db);
+    // What the scan found and how far it got, as every engine keeps it: a path found is a
+    // finding, one tried and not found is not. Its log lines the scan keeps itself.
+    let mut keeper = cfx_db::found::Keeper::new(db.pool(), Some(running.id.as_str()));
 
-    tokio::spawn(async move {
-        match scanner.run_headless_stream(tx).await {
-            Ok(_) => {
-                if save {
-                    let _ = db_clone
-                        .update_operation_status(&oid, "completed", None)
-                        .await;
-                }
-            }
-            Err(e) => {
-                if save {
-                    let _ = db_clone
-                        .update_operation_status(&oid, "error", Some(&e.to_string()))
-                        .await;
-                }
-            }
+    dguard::spawn_busy(async move {
+        let ran = scanner.run_headless_stream(tx).await;
+        // Stopped when the caller went away before every request was sent, so that the
+        // same scan again takes it up where it was.
+        let _ = db_clone.end_scan(running, ran.is_err()).await;
+        if save {
+            let (status, result) = match &ran {
+                Ok(_) => (cfx_db::scans::Status::Completed, None),
+                Err(e) => (cfx_db::scans::Status::Failed, Some(e.as_str())),
+            };
+            let _ = cfx_db::scans::finish_operation(db_clone.pool(), &oid, status, result).await;
         }
-        // Isolated per-connection scan: drop its now-unreferenced rows so the
-        // isolation doesn't grow the ambulo DB unbounded. Runs after the scanner
-        // finishes, even if the client disconnected mid-stream.
-        let _ = db_clone.delete_scan(scan_id).await;
     });
 
     // Forward all events to the TCP stream
     while let Some(event) = rx.recv().await {
+        if kept(&event) {
+            keeper.event(&serde_json::to_value(&event)?).await;
+        }
         write_json(&mut writer, &event).await?;
     }
+    let _ = keeper.flush().await;
 
     Ok(())
+}
+
+/// Whether `event` is kept with its scan as every engine keeps one: a path found, and
+/// everything but a result and a log line, which the scan keeps itself.
+fn kept(event: &StreamEvent) -> bool {
+    match event.kind.as_str() {
+        "log" => false,
+        "result" => event.status.as_deref() == Some("found"),
+        _ => true,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -550,7 +674,7 @@ async fn handle_stream_crawl(
     };
 
     let (tx, mut rx) = mpsc::unbounded_channel::<crate::crawler::CrawlEvent>();
-    tokio::spawn(async move {
+    dguard::spawn_busy(async move {
         crate::crawler::run_stream(params, tx).await;
     });
 
@@ -590,21 +714,24 @@ async fn dispatch(
                 }
             };
 
-            if req.save {
-                let params_str = serde_json::to_string(&req.params).unwrap_or_default();
-                if let Err(e) = db
-                    .create_operation(&operation_id, "scan", &params_str)
-                    .await
-                {
-                    eprintln!("Failed to save operation: {e}");
-                }
+            if req.save
+                && let Err(e) = cfx_db::scans::record_operation(
+                    db.pool(),
+                    &operation_id,
+                    "scan",
+                    None,
+                    &req.params.to_string(),
+                )
+                .await
+            {
+                eprintln!("Failed to save operation: {e}");
             }
 
             match req.response.as_str() {
                 "instant" => run_scan_instant(operation_id, scan_params, db, req.save).await,
                 _ => {
                     let oid = operation_id.clone();
-                    tokio::spawn(async move {
+                    dguard::spawn_busy(async move {
                         run_scan_background(oid, scan_params, db).await;
                     });
                     DaemonResponse {
@@ -650,18 +777,34 @@ async fn dispatch(
             };
             run_probe(probe_params, client, db).await
         }
-        "db_reset" => match db.truncate_tables().await {
-            Ok(_) => DaemonResponse {
+        "db_reset" => {
+            match cfx_db::scans::reset(db.pool(), &crate::libs::ambulo_db::ENGINE).await {
+                Ok(_) => DaemonResponse {
+                    operation_id,
+                    status: "completed".to_string(),
+                    results: None,
+                    message: Some("All tables truncated.".to_string()),
+                },
+                Err(e) => DaemonResponse {
+                    operation_id,
+                    status: "error".to_string(),
+                    results: None,
+                    message: Some(format!("DB reset failed: {e}")),
+                },
+            }
+        }
+        "purge" => match cfx_db::scans::purge_operation(db.pool(), &req.params).await {
+            Ok(done) => DaemonResponse {
                 operation_id,
                 status: "completed".to_string(),
                 results: None,
-                message: Some("All tables truncated.".to_string()),
+                message: Some(done),
             },
-            Err(e) => DaemonResponse {
+            Err(why) => DaemonResponse {
                 operation_id,
                 status: "error".to_string(),
                 results: None,
-                message: Some(format!("DB reset failed: {e}")),
+                message: Some(why),
             },
         },
         unknown => DaemonResponse {
@@ -684,9 +827,13 @@ async fn run_scan_instant(
             let result_json = serde_json::to_value(&results.found).unwrap_or(Value::Null);
             if save {
                 let s = serde_json::to_string(&result_json).unwrap_or_default();
-                let _ = db
-                    .update_operation_status(&operation_id, "completed", Some(&s))
-                    .await;
+                let _ = cfx_db::scans::finish_operation(
+                    db.pool(),
+                    &operation_id,
+                    cfx_db::scans::Status::Completed,
+                    Some(&s),
+                )
+                .await;
             }
             DaemonResponse {
                 operation_id,
@@ -697,9 +844,13 @@ async fn run_scan_instant(
         }
         Err(e) => {
             if save {
-                let _ = db
-                    .update_operation_status(&operation_id, "error", Some(&e.to_string()))
-                    .await;
+                let _ = cfx_db::scans::finish_operation(
+                    db.pool(),
+                    &operation_id,
+                    cfx_db::scans::Status::Failed,
+                    Some(&e.to_string()),
+                )
+                .await;
             }
             DaemonResponse {
                 operation_id,
@@ -715,14 +866,22 @@ async fn run_scan_background(operation_id: String, params: ScanParams, db: Arc<A
     match run_scan(&params, &db).await {
         Ok(results) => {
             let s = serde_json::to_string(&results.found).unwrap_or_default();
-            let _ = db
-                .update_operation_status(&operation_id, "completed", Some(&s))
-                .await;
+            let _ = cfx_db::scans::finish_operation(
+                db.pool(),
+                &operation_id,
+                cfx_db::scans::Status::Completed,
+                Some(&s),
+            )
+            .await;
         }
         Err(e) => {
-            let _ = db
-                .update_operation_status(&operation_id, "error", Some(&e.to_string()))
-                .await;
+            let _ = cfx_db::scans::finish_operation(
+                db.pool(),
+                &operation_id,
+                cfx_db::scans::Status::Failed,
+                Some(&e.to_string()),
+            )
+            .await;
         }
     }
 }
@@ -731,18 +890,62 @@ async fn run_scan_background(operation_id: String, params: ScanParams, db: Arc<A
 // Shared scan setup → returns (Scanner, total_entries)
 // ---------------------------------------------------------------------------
 
-/// `isolate`: when `Some(op_id)`, the op id is folded into the scan's config
-/// hash so this scan gets its OWN scan record instead of being deduped onto a
-/// shared one by (url, wordlist, method). Stream scans pass their per-connection
-/// operation_id here: without it, two concurrent scans of the same target +
-/// wordlist collapse onto one `scans` row and clobber each other's entries and
-/// results (findings lost / delivered to the wrong connection). `None` keeps the
-/// legacy shared/cached behaviour for one-off (non-stream) scans.
+/// Where the words of a scan come from.
+enum ScanWords<'a> {
+    /// The wordlist file at this path.
+    Named(&'a str),
+    /// The connection, after the request: the list `name`, chunk by chunk.
+    Following {
+        name: &'a str,
+        chunks: dguard::WordChunks<'a, BufReader<OwnedReadHalf>>,
+    },
+}
+
+/// How a scan begins.
+enum Begin<'a> {
+    /// As its request asks, with its words.
+    Asked(ScanWords<'a>),
+    /// A stopped scan taken up again with the settings it was kept with, its requests
+    /// queued already.
+    TakenUp(cfx_db::scans::Running),
+}
+
+/// The stopped scan a `resume` request names, taken up again, with the settings it was
+/// kept with: or why it cannot be.
+async fn taken_up(
+    req: &DaemonRequest,
+    db: &AmbuloDb,
+) -> Result<(ScanParams, cfx_db::scans::Running), String> {
+    let id = req.params["scan"]
+        .as_str()
+        .ok_or("a resume names the scan to take up again")?;
+    let (running, settings) = cfx_db::scans::take_up(db.pool(), id, None)
+        .await
+        .map_err(|e| e.to_string())?;
+    match serde_json::from_value(settings) {
+        Ok(params) => Ok((params, running)),
+        Err(e) => {
+            let _ = cfx_db::scans::finish(running, cfx_db::scans::Status::Stopped).await;
+            Err(format!(
+                "scan {id} was kept with settings this ambulo cannot read: {e}"
+            ))
+        }
+    }
+}
+
+/// Set up a scan of `params` as it begins: its wordlist, kept once, and the scan
+/// itself. A stopped scan with the same URLs, words and method, or the one the request
+/// names to take up, is taken up again with the requests it had not sent, unless the
+/// request asks for a fresh start; otherwise every request is queued for a new scan.
+/// Two of the same scan at once are two scans.
 async fn prepare_scan(
     params: &ScanParams,
     db: &Arc<AmbuloDb>,
-    isolate: Option<&str>,
-) -> Result<(Scanner, usize, i64), Box<dyn std::error::Error + Send + Sync>> {
+    begin: Begin<'_>,
+) -> Result<
+    (Scanner<ScanStore>, usize, cfx_db::scans::Running),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     let http_method = parse_method(&params.method);
 
     let mut endpoint = params.endpoint.clone();
@@ -758,112 +961,128 @@ async fn prepare_scan(
     }
 
     let config = build_args(params, endpoint, http_method);
+    let words = match begin {
+        Begin::TakenUp(running) => return scan_on(params, db, config, running, None).await,
+        Begin::Asked(words) => words,
+    };
 
-    // Every scan path reaches here, so this is the one place the wordlist has to
+    // Every scan path reaches here, so this is the one place a wordlist file has to
     // be contained. `wordlist` is a filesystem path from the request and the
     // scanner emits one request per line to a target the same request names,
     // which made an arbitrary file readable one line at a time by anyone who
-    // could reach this daemon. WordlistConfig opens it once, inside the
-    // permitted directories, and reads only through that handle.
-    let wordlist_config = crate::libs::wordlist_config::WordlistConfig::new(&params.wordlist)
-        .await
-        .map_err(|e| format!("Wordlist error: {e}"))?;
-
-    let wordlist = match db.find_wordlist(&wordlist_config.hash).await {
-        Ok(w) => w,
-        Err(sqlx::Error::RowNotFound) => db
-            .create_wordlist(&wordlist_config)
-            .await
-            .map_err(|e| format!("DB: {e}"))?,
-        Err(e) => return Err(format!("DB: {e}").into()),
-    };
-
-    let words = db
-        .fetch_words(&wordlist.id)
-        .await
-        .map_err(|e| format!("DB: {e}"))?;
-
-    let mut scan_config = serde_json::json!({
-        "urls": &config.url,
-        "wordlist_hash": &wordlist_config.hash,
-        "method": &config.http_method.to_string(),
-    });
-    // Per-connection isolation (stream scans): make the hash unique so concurrent
-    // scans never share a `scans` row. Omitted when None so one-off scans keep
-    // the exact same hash and can still reuse a cached scan.
-    if let Some(iso) = isolate {
-        scan_config["isolate"] = serde_json::json!(iso);
+    // could reach this daemon. FileWords opens it once, inside the permitted
+    // directories, and reads only through that handle. Words that follow the
+    // request come from the client, which read a file it may read itself.
+    let wordlist = match words {
+        ScanWords::Named(path) => {
+            let mut file = crate::libs::wordlist_source::FileWords::open(path)
+                .map_err(|e| format!("Wordlist error: {e}"))?;
+            let name = file.name.clone();
+            db.store_wordlist(&name, &mut file).await
+        }
+        ScanWords::Following { name, mut chunks } => {
+            if !params.wordlist.is_empty() {
+                return Err("a scan names a wordlist or sends its words, not both".into());
+            }
+            db.store_wordlist(name, &mut chunks).await
+        }
     }
-    let scan_config_json = serde_json::to_string(&scan_config)?;
-    let scan_config_hash = crate::libs::sha::sha512_from_string(scan_config_json)
-        .await
-        .map_err(|e| format!("Hash: {e}"))?;
+    .map_err(|e| format!("Wordlist error: {e}"))?;
 
-    let mut scan = match db.find_scan(&scan_config_hash).await {
-        Ok(s) if params.fresh_start => db
-            .fresh_start_scan(&s.id)
-            .await
-            .map_err(|e| format!("DB: {e}"))?,
-        Ok(s) => s,
-        Err(sqlx::Error::RowNotFound) => db
-            .create_scan(
-                &scan_config_hash,
-                &wordlist.id,
-                &config.http_method.to_string(),
-            )
-            .await
-            .map_err(|e| format!("DB: {e}"))?,
-        Err(e) => return Err(format!("DB: {e}").into()),
+    // A scan that authenticates (headers, cookies, basic auth, or a user, a password or a
+    // token in a URL) is known by its id alone, and keeps nothing derived from them; one
+    // that does not, by what it asks for. Its own marker is no credential.
+    let authenticated = params.auth.carries_credentials()
+        || config
+            .url
+            .iter()
+            .any(|u| cfx_db::scans::safe_url_keeping(u, &params.fuzz_marker) != *u);
+    let scan_config_hash = if authenticated {
+        None
+    } else {
+        let scan_config = serde_json::json!({
+            "urls": &config.url,
+            "wordlist_hash": &wordlist.hash,
+            "method": &config.http_method.to_string(),
+        });
+        Some(
+            crate::libs::sha::sha512_from_string(serde_json::to_string(&scan_config)?)
+                .await
+                .map_err(|e| format!("Hash: {e}"))?,
+        )
     };
-
-    let logger = db
-        .spawn_logger(&scan.id, &config.log_level.to_string())
-        .await
-        .map_err(|e| format!("DB: {e}"))?;
-
-    let urls = match db.find_urls(&scan.id).await {
-        Ok(u) => u,
-        Err(sqlx::Error::RowNotFound) => db
-            .create_urls(&scan.id, &config.url)
+    let key = match &scan_config_hash {
+        Some(hash) => cfx_db::scans::Key::Settings(hash),
+        None => cfx_db::scans::Key::Authenticated,
+    };
+    let settings = serde_json::to_string(params)?;
+    let target = config.url.join(", ");
+    let asked = cfx_db::scans::Asked::new(&target, &settings).keeping(&params.fuzz_marker);
+    let running = match &params.resume {
+        Some(id) => {
+            cfx_db::scans::take_up(db.pool(), id, Some(asked))
+                .await
+                .map_err(|e| e.to_string())?
+                .0
+        }
+        None => cfx_db::scans::start(db.pool(), asked, key, params.fresh_start)
             .await
             .map_err(|e| format!("DB: {e}"))?,
-        Err(e) => return Err(format!("DB: {e}").into()),
     };
+    scan_on(params, db, config, running, Some(wordlist.id)).await
+}
 
-    if scan.status == "created" {
-        db.create_scan_entries(&urls, &scan, &words)
-            .await
-            .map_err(|e| format!("DB: {e}"))?;
-        scan.status = db
-            .set_scan_status(&scan.id, "populated")
-            .await
-            .map_err(|e| format!("DB: {e}"))?;
+/// The scanner of `running`, a scan of `params` with `config`: a new one's requests,
+/// one for each word of wordlist `words`, queued, or those a scan taken up again had
+/// not sent queued again.
+async fn scan_on(
+    params: &ScanParams,
+    db: &Arc<AmbuloDb>,
+    config: crate::libs::cli_args::Args,
+    running: cfx_db::scans::Running,
+    words: Option<i64>,
+) -> Result<
+    (Scanner<ScanStore>, usize, cfx_db::scans::Running),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    // What fails from here on ends the scan as failed, rather than leaving it running.
+    let queued = async {
+        match (running.resumed, words) {
+            (false, Some(words)) => {
+                db.queue_scan(&running.id, &config.url, words, &params.fuzz_marker)
+                    .await?
+            }
+            _ => db.requeue_unfinished(&running.id).await?,
+        }
+        db.entries(&running.id).await
     }
+    .await;
+    let total = match queued {
+        Ok(total) => total,
+        Err(e) => {
+            let _ = cfx_db::scans::finish(running, cfx_db::scans::Status::Failed).await;
+            return Err(format!("DB: {e}").into());
+        }
+    };
 
-    db.reset_halted_scan_entries(&scan.id)
-        .await
-        .map_err(|e| format!("DB: {e}"))?;
+    let store = db.scan_store(running.id.clone(), &config);
+    let scanner = Scanner::new(config, store);
 
-    let (_, _, _, total) = db
-        .fetch_total_scan_entries(scan.id)
-        .await
-        .map_err(|e| format!("DB: {e}"))?;
-
-    let scan_db = db.clone_with_config(config.clone());
-    let scanner = Scanner::new(config, scan_db, logger, scan.id);
-
-    Ok((scanner, total, scan.id))
+    Ok((scanner, total as usize, running))
 }
 
 async fn run_scan(
     params: &ScanParams,
     db: &Arc<AmbuloDb>,
 ) -> Result<crate::scanner::ScanResults, Box<dyn std::error::Error + Send + Sync>> {
-    let (scanner, _, _) = prepare_scan(params, db, None).await?;
-    scanner
-        .run_headless()
-        .await
-        .map_err(|e| format!("Scan: {e}").into())
+    if params.wordlist_follows.is_some() {
+        return Err("words can follow only a stream scan's request".into());
+    }
+    let (scanner, _, running) =
+        prepare_scan(params, db, Begin::Asked(ScanWords::Named(&params.wordlist))).await?;
+    let ran = scanner.run_headless().await;
+    let _ = db.end_scan(running, ran.is_err()).await;
+    ran.map_err(|e| format!("Scan: {e}").into())
 }
 
 // ---------------------------------------------------------------------------
@@ -889,8 +1108,8 @@ fn build_args(params: &ScanParams, endpoint: String, http_method: HttpMethod) ->
         // Authenticated scan: the credential's headers + Cookie land here so the
         // prober sends every probe as the logged-in user. Empty for anonymous.
         headers: params.auth.to_header_lines(),
-        basic_auth: String::new(),
-        store_cookies: false,
+        basic_auth: params.auth.basic_auth.clone(),
+        store_cookies: params.store_cookies,
         success_status_codes: params.success_status_codes.clone(),
         follow_redirects: params.follow_redirects,
         follow_redirects_depth: params.follow_redirects_depth,
@@ -898,21 +1117,20 @@ fn build_args(params: &ScanParams, endpoint: String, http_method: HttpMethod) ->
         interval: params.delay,
         tasks: params.tasks,
         fresh_start: params.fresh_start,
-        random_user_agent_scan: false,
-        random_user_agent_request: false,
-        append_slash: false,
-        save_response_body: false,
-        save_response_headers: true,
-        user_agent: adaptive::identity::resolve(&adaptive::identity::Mode::Evasive, None)
-            .user_agent,
-        no_exit_banner: true,
-        recreate_db: false,
+        resume: params.resume.clone(),
+        random_user_agent_scan: params.random_user_agent_scan,
+        random_user_agent_request: params.random_user_agent_request,
+        append_slash: params.append_slash,
+        user_agent: params.user_agent.clone().unwrap_or_else(|| {
+            adaptive::identity::resolve(&adaptive::identity::Mode::Evasive, None).user_agent
+        }),
         launch_delay: 0,
-        log_level: LogLevel::Info,
-        output_format: OutputFormat::Text,
-        output_path: String::new(),
-        event_poll_timeout: 1000,
-        enable_offset_pagination: false,
+        log_level: params
+            .log_level
+            .as_deref()
+            .and_then(|level| <LogLevel as clap::ValueEnum>::from_str(level, true).ok())
+            .unwrap_or(LogLevel::Info),
+        event_poll_timeout: crate::libs::cli_args::EVENT_POLL_TIMEOUT_MS,
         interactive: false,
         adaptive_rate: params.adaptive_rate,
         adaptive_resilience: params.adaptive_resilience,
@@ -920,6 +1138,8 @@ fn build_args(params: &ScanParams, endpoint: String, http_method: HttpMethod) ->
         evasive: params.evasive,
         identify: params.identify.clone(),
         egress: params.egress.clone(),
+        resolve: params.resolve.clone(),
+        block_internal: params.block_internal,
     }
 }
 
@@ -979,6 +1199,177 @@ async fn run_probe(params: ProbeParams, client: Arc<Client>, db: Arc<AmbuloDb>) 
     }
 }
 
+/// Answer a caller while the database is not ready: one error line saying `why`, and
+/// then the end of the connection. What the caller sent is read meanwhile, until it hangs
+/// up or a few seconds pass: a connection closed with any of it unread is reset, and
+/// Windows then gives the caller the reset in place of the line.
+pub(crate) async fn answer_not_ready(sock: TcpStream, why: String) {
+    use tokio::io::AsyncReadExt;
+    let (mut reader, mut writer) = sock.into_split();
+    let msg = serde_json::json!({
+        "type": "error",
+        "message": format!("ambulo is not ready, waiting for its database: {why}"),
+    });
+    let msg = cfx_db::scans::safe_stream(&msg);
+    let _ = writer.write_all(format!("{msg}\n").as_bytes()).await;
+    let _ = writer.shutdown().await;
+    let mut sent = [0u8; 8192];
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while matches!(reader.read(&mut sent).await, Ok(n) if n > 0) {}
+    })
+    .await;
+}
+
+#[cfg(test)]
+mod kept_tests {
+    //! What a content discovery found, kept as every engine keeps it, and read back.
+    use super::*;
+
+    /// What a daemon on `port` answers `ask` with.
+    async fn answer(port: u16, ask: serde_json::Value) -> serde_json::Value {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let (r, mut w) = stream.into_split();
+        w.write_all(format!("{ask}\n").as_bytes()).await.unwrap();
+        let line = BufReader::new(r)
+            .lines()
+            .next_line()
+            .await
+            .unwrap()
+            .unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    fn event(kind: &str, status: Option<&str>) -> StreamEvent {
+        StreamEvent {
+            kind: kind.into(),
+            url: Some("http://app.test/admin".into()),
+            status: status.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// A path found is kept with its scan; one not found, and a log line, which the scan
+    /// keeps itself, are not.
+    #[test]
+    fn only_a_path_found_is_kept() {
+        assert!(kept(&event("result", Some("found"))));
+        assert!(!kept(&event("result", Some("not_found"))));
+        assert!(!kept(&event("log", None)));
+        assert!(kept(&event("progress", None)));
+    }
+
+    /// The paths a scan kept are what the daemon's `findings` and `scan_info` answers give
+    /// back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs PostgreSQL's programs"]
+    async fn the_paths_kept_are_read_back() {
+        let scratch = cfx_db::testing::Scratch::new(&crate::libs::ambulo_db::ENGINE).await;
+        let running = cfx_db::scans::start(
+            &scratch.pool,
+            cfx_db::scans::Asked::new("http://app.test", r#"{"endpoint":"http://app.test"}"#),
+            cfx_db::scans::Key::Settings("k"),
+            true,
+        )
+        .await
+        .unwrap();
+        let mut keeper = cfx_db::found::Keeper::new(&scratch.pool, Some(&running.id));
+        for ev in [
+            event("result", Some("found")),
+            event("result", Some("not_found")),
+        ] {
+            if kept(&ev) {
+                keeper.event(&serde_json::to_value(&ev).unwrap()).await;
+            }
+        }
+        cfx_db::scans::finish(running, cfx_db::scans::Status::Completed)
+            .await
+            .unwrap();
+        let db = Arc::new(AmbuloDb::new(scratch.pool.clone()));
+        let follow = Arc::new(build_probe_client(true, &transport::Egress::Inherit).unwrap());
+        let stay = Arc::new(build_probe_client(false, &transport::Egress::Inherit).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(handle_connection(
+                    stream,
+                    dguard::Gate::default(),
+                    Arc::clone(&db),
+                    Arc::clone(&follow),
+                    Arc::clone(&stay),
+                ));
+            }
+        });
+        let found = answer(port, serde_json::json!({"operation": "findings"})).await;
+        let rows = found["findings"].as_array().expect("rows");
+        assert_eq!(rows.len(), 1, "{found}");
+        assert_eq!(rows[0]["data"]["url"], "http://app.test/admin");
+        let scan = answer(
+            port,
+            serde_json::json!({"operation": "scan_info", "id": rows[0]["scan"]}),
+        )
+        .await;
+        assert_eq!(scan["scan"]["findings"], 1, "{scan}");
+        scratch.done().await;
+    }
+}
+
+#[cfg(test)]
+mod not_ready_tests {
+    use super::*;
+
+    /// A caller that sends its request, and words after it as a scan with a wordlist
+    /// does, reads why the daemon cannot serve it yet. Closed with the request unread, the
+    /// connection was reset, and on Windows the caller saw only that.
+    #[tokio::test]
+    async fn a_caller_while_the_database_is_not_ready_reads_why() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            answer_not_ready(sock, "PostgreSQL is not installed here".to_string()).await;
+        });
+        let client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let (reader, mut writer) = client.into_split();
+        writer
+            .write_all(b"{\"operation\":\"scan\",\"wordlist_follows\":true}\n")
+            .await
+            .unwrap();
+        let words = tokio::spawn(async move {
+            let chunk = format!("{{\"words\":[{}]}}\n", vec!["\"word\""; 512].join(","));
+            for _ in 0..64 {
+                if writer.write_all(chunk.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .await
+            .expect("the line saying why");
+        assert!(
+            line.contains(
+                "ambulo is not ready, waiting for its database: PostgreSQL is not installed here"
+            ),
+            "{line}"
+        );
+        // And then the end of the connection, not a reset, which Windows reports in place
+        // of the line it discards.
+        let mut rest = String::new();
+        assert_eq!(
+            reader.read_line(&mut rest).await.map_err(|e| e.kind()),
+            Ok(0)
+        );
+        words.await.unwrap();
+        server.await.unwrap();
+    }
+}
+
 #[cfg(test)]
 mod egress_tests {
     //! The egress wrapper. A fixture that counts its connections sits behind a
@@ -995,9 +1386,7 @@ mod egress_tests {
     async fn daemon() -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("addr").port();
-        let db = Arc::new(AmbuloDb::unconnected(
-            &crate::libs::cli_args::defaults_for_tests(),
-        ));
+        let db = Arc::new(AmbuloDb::unconnected());
         let follow = Arc::new(build_probe_client(true, &transport::Egress::Inherit).unwrap());
         let stay = Arc::new(build_probe_client(false, &transport::Egress::Inherit).unwrap());
         tokio::spawn(async move {
@@ -1078,6 +1467,77 @@ mod egress_tests {
             );
         }
         assert_all_through(&fx, &proxy, &[]);
+    }
+
+    /// A site whose page links on to another with the same query, and that keeps each
+    /// request it was sent.
+    async fn recording_site() -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::AsyncReadExt;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let kept = Arc::clone(&kept);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 16384];
+                    while let Ok(n) = sock.read(&mut buf).await {
+                        if n == 0 {
+                            return;
+                        }
+                        kept.lock()
+                            .unwrap()
+                            .push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                        let body = "<html><body><a href=\"/next?token=am-secret-1\">next</a></body></html>";
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n",
+                            body.len()
+                        );
+                        if sock.write_all(head.as_bytes()).await.is_err()
+                            || sock.write_all(body.as_bytes()).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    /// A crawl from a seed with a secret in its query, sent with a credential header,
+    /// reaches the target with both, and nothing that comes out carries either, though
+    /// the page links on with the same secret.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_crawl_sends_no_secret_out() {
+        let (tport, seen) = recording_site().await;
+        let dport = daemon().await;
+        let op = serde_json::json!({
+            "operation": "crawl",
+            "response": "stream",
+            "seed": format!("http://127.0.0.1:{tport}/?token=am-secret-1&x=1"),
+            "max_pages": 5,
+            "evasive": false,
+            "auth": {"headers": {"X-Api-Key": "am-secret-2"}, "cookies": ""},
+        });
+        let events = exchange(dport, &op).await;
+        let sent = seen.lock().unwrap().join("\n");
+        for secret in ["am-secret-1", "am-secret-2"] {
+            assert!(sent.contains(secret), "the target was never sent {secret}");
+        }
+        assert!(
+            sent.contains("GET /next?"),
+            "the crawl did not follow the link: {sent}"
+        );
+        let out = serde_json::to_string(&events).unwrap();
+        assert!(
+            out.contains("/next"),
+            "the crawl said nothing of what it found: {out}"
+        );
+        for secret in ["am-secret-1", "am-secret-2"] {
+            assert!(!out.contains(secret), "{secret} went out: {out}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1243,7 +1703,67 @@ mod egress_tests {
         )
         .await;
         assert_eq!(events[0]["type"], "capabilities", "{events:?}");
+        // Which pacing runs, as the engine said it when it started.
+        assert_eq!(events[0]["pacing"], cfx_pacing::load().label().as_str());
         assert_eq!(events[0]["egress"], 1, "{events:?}");
+        assert_eq!(events[0]["pid"], std::process::id(), "{events:?}");
+        assert_eq!(
+            events[0]["scan"],
+            serde_json::json!(["resolve", "block_internal", "follow_redirects"]),
+            "{events:?}"
+        );
+    }
+
+    /// A scan's prober dials a name pinned to an address there, and with block_internal
+    /// it dials no internal address a name resolves to. `pinned.invalid` never resolves,
+    /// so a request that arrives for it came through the pin; `localhost` resolves to
+    /// loopback.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn content_discovery_dials_the_pins_and_no_internal_address_on_request() {
+        let fx = Fixture::http("text/html", PAGE.into()).await;
+        let prober = |host: &str, extra: Value| {
+            let mut asked = serde_json::json!({
+                "endpoint": format!("http://{host}:{}/::FUZZ::", fx.port),
+                "wordlist": "/dev/null",
+                "evasive": false,
+            });
+            for (k, v) in extra.as_object().unwrap() {
+                asked[k] = v.clone();
+            }
+            let params: ScanParams = serde_json::from_value(asked).unwrap();
+            build_args(&params, params.endpoint.clone(), HttpMethod::Get)
+        };
+        let work = |host: &str| crate::store::Work {
+            url: format!("http://{host}:{}/admin", fx.port),
+            entry_id: 1,
+            method: "get".into(),
+        };
+        let pin =
+            serde_json::json!({"resolve": [["pinned.invalid", format!("127.0.0.1:{}", fx.port)]]});
+        let pinned = crate::prober::Prober::new(&prober("pinned.invalid", pin))
+            .await
+            .unwrap();
+        assert!(
+            pinned
+                .probe_url(&work("pinned.invalid"), false)
+                .await
+                .is_ok()
+        );
+        assert_eq!(fx.requests().len(), 1);
+
+        let fenced = crate::prober::Prober::new(&prober(
+            "localhost",
+            serde_json::json!({"block_internal": true}),
+        ))
+        .await
+        .unwrap();
+        assert!(fenced.probe_url(&work("localhost"), false).await.is_err());
+        assert_eq!(fx.requests().len(), 1, "an internal address was dialled");
+        let open = crate::prober::Prober::new(&prober("localhost", serde_json::json!({})))
+            .await
+            .unwrap();
+        assert!(open.probe_url(&work("localhost"), false).await.is_ok());
+        assert_eq!(fx.requests().len(), 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1265,7 +1785,7 @@ mod egress_tests {
         };
         let args = build_args(&params, params.endpoint.clone(), HttpMethod::Get);
         let prober = crate::prober::Prober::new(&args).await.unwrap();
-        let work = crate::libs::ambulo_db::Work {
+        let work = crate::store::Work {
             url: format!("{}/admin", fx.base()),
             entry_id: 1,
             method: "get".into(),
@@ -1290,9 +1810,7 @@ mod http_request_tests {
     async fn daemon() -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("addr").port();
-        let db = Arc::new(AmbuloDb::unconnected(
-            &crate::libs::cli_args::defaults_for_tests(),
-        ));
+        let db = Arc::new(AmbuloDb::unconnected());
         let follow = Arc::new(build_probe_client(true, &transport::Egress::Inherit).unwrap());
         let stay = Arc::new(build_probe_client(false, &transport::Egress::Inherit).unwrap());
         tokio::spawn(async move {
@@ -1396,9 +1914,7 @@ mod probe_redirect_tests {
         }))
         .unwrap();
         let client = Arc::new(build_probe_client(true, &transport::Egress::Inherit).unwrap());
-        let db = Arc::new(AmbuloDb::unconnected(
-            &crate::libs::cli_args::defaults_for_tests(),
-        ));
+        let db = Arc::new(AmbuloDb::unconnected());
         run_probe(params, client, db).await
     }
 
@@ -1445,5 +1961,98 @@ mod probe_redirect_tests {
         });
         let r = probe(&format!("http://127.0.0.1:{a}/"), "get").await;
         assert_eq!(r.results.as_ref().unwrap()["code"], 200, "{:?}", r.results);
+    }
+}
+
+#[cfg(test)]
+mod flag_tests {
+    use super::*;
+    use clap::Parser;
+
+    /// A scan taken up again from what was kept runs with the settings it was asked for.
+    #[test]
+    fn what_is_kept_of_a_scans_settings_reads_back_as_them() {
+        let params: ScanParams = serde_json::from_value(serde_json::json!({
+            "endpoint": "https://app.example/api?key=::FUZZ::",
+            "wordlist_follows": "words.txt",
+            "auth": {"headers": {}, "cookies": "", "basic_auth": ""},
+            "store_cookies": true,
+        }))
+        .unwrap();
+        let kept = cfx_db::scans::Asked::new("", &serde_json::to_string(&params).unwrap())
+            .keeping(&params.fuzz_marker)
+            .kept_params();
+        let back: ScanParams = serde_json::from_str(&kept).unwrap();
+        assert_eq!(
+            serde_json::to_value(&back).unwrap(),
+            serde_json::to_value(&params).unwrap()
+        );
+    }
+
+    /// Every flag of `ambulo scan` the scanner can honour, from the command line through
+    /// the request the client sends and the daemon reads, into the scanner's settings.
+    #[test]
+    fn every_scan_flag_reaches_the_scanner() {
+        let cli = crate::libs::cli_args::Cli::try_parse_from([
+            "ambulo",
+            "scan",
+            "https://app.example/::FUZZ::",
+            "-w",
+            "words.txt",
+            "--headers",
+            "X-Team: red",
+            "--cookies",
+            "sid: abc",
+            "--basic-auth",
+            "u:p",
+            "--store-cookies",
+            "-i",
+            "250",
+            "--random-user-agent-scan",
+            "--random-user-agent-request",
+            "--append-slash",
+            "--user-agent",
+            "ua-1",
+            "--identify",
+            "team-7",
+            "--log-level",
+            "warn",
+            "--adaptive-rate",
+            "--adaptive-resilience",
+            "--posture",
+            "gentle",
+            "--resume",
+            "s-1",
+        ])
+        .unwrap();
+        let Some(crate::libs::cli_args::Commands::Scan(args)) = cli.command else {
+            panic!("not a scan");
+        };
+        let request = crate::scan_request(&args, &args.url[0]);
+        let params: ScanParams = serde_json::from_value(request).unwrap();
+        let config = build_args(
+            &params,
+            params.endpoint.clone(),
+            parse_method(&params.method),
+        );
+        assert_eq!(config.headers, ["X-Team: red", "Cookie: sid=abc"]);
+        assert_eq!(config.basic_auth, "u:p");
+        assert!(config.store_cookies);
+        assert_eq!(config.interval, 250);
+        assert!(config.random_user_agent_scan);
+        assert!(config.random_user_agent_request);
+        assert!(config.append_slash);
+        assert_eq!(config.user_agent, "ua-1");
+        assert_eq!(config.identify.as_deref(), Some("team-7"));
+        assert!(matches!(config.log_level, LogLevel::Warn));
+        assert!(config.adaptive_rate);
+        assert!(config.adaptive_resilience);
+        assert_eq!(config.posture, "gentle");
+        assert!(params.auth.carries_credentials());
+        assert_eq!(params.resume.as_deref(), Some("s-1"));
+        assert!(
+            !serde_json::to_string(&params).unwrap().contains("s-1"),
+            "the scan to take up is not one of its settings"
+        );
     }
 }

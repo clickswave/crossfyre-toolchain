@@ -1,0 +1,12 @@
+id: moment
+info:
+  name: Moment.js
+  category: JavaScript Library
+  metadata:
+    vendor: momentjs
+    product: moment
+detect:
+  any:
+    - script_src: { regex: '/moment(?:\.min)?\.js' }
+version:
+  - script_src: { regex: '(?:moment\.js/|moment@)([0-9]+\.[0-9]+\.[0-9]+)' }

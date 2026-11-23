@@ -1,0 +1,17 @@
+# Synthetic: A page served from a Varnish cache.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+via: 1.1 varnish (Varnish/7.4)
+x-varnish: 32770 3
+age: 120
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>News</title>
+</head>
+<body>
+<div></div>
+</body>
+</html>

@@ -1,0 +1,33 @@
+id: f5-big-ip
+info:
+  name: F5 BIG-IP
+  category: Load Balancer
+  metadata:
+    vendor: f5
+    product:
+      - big-ip_local_traffic_manager
+      - big-ip_access_policy_manager
+      - big-ip_advanced_firewall_manager
+      - big-ip_application_security_manager
+      - big-ip_advanced_web_application_firewall
+      - big-ip_global_traffic_manager
+      - big-ip_domain_name_system
+      - big-ip_link_controller
+      - big-ip_policy_enforcement_manager
+      - big-ip_analytics
+      - big-ip_application_acceleration_manager
+      - big-ip_fraud_protection_service
+      - big-ip_ddos_hybrid_defender
+      - big-ip_ssl_orchestrator
+      - big-ip_websafe
+      - big-ip_edge_gateway
+      - big-ip_webaccelerator
+      - big-ip_carrier-grade_nat
+      - big-ip_application_visibility_and_reporting
+      - big-ip_protocol_security_module
+      - big-ip_wan_optimization_manager
+      - big-ip_automation_toolchain
+detect:
+  any:
+    - cookie: { name: '^BIGipServer' }
+    - html: { regex: '<title>BIG-IP&reg;-' }

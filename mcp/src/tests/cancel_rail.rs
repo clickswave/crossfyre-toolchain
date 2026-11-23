@@ -88,8 +88,11 @@ async fn a_call_cancelled_while_waiting_cancels_its_scan() {
     let peer = FakePeer::new(Elicit::None);
     let ct = CancellationToken::new();
     let stop = ct.clone();
+    // Cancelled once plessor has the scan, so the call is cancelled while it waits for
+    // it, however long the checks before the start take on this machine.
+    let engine = plessor.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        eventually("the scan to start", 10, || engine.ops().len() == 1).await;
         stop.cancel();
     });
     let started = std::time::Instant::now();
@@ -107,7 +110,8 @@ async fn a_call_cancelled_while_waiting_cancels_its_scan() {
     let line = t.audit_lines().into_iter().last().unwrap();
     assert_eq!(line["decision"], "cancelled");
     let id = line["scan_id"].as_str().unwrap().to_string();
-    assert_eq!(t.mcp.jobs.read_meta(&id).unwrap().status, "cancelled");
+    let got = ok(&t.call(&peer, "get_scan", json!({"scan_id": id})).await).clone();
+    assert_eq!(got["status"], "cancelled", "{got}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -125,34 +129,30 @@ async fn stopping_the_server_marks_its_scans_interrupted() {
     let peer = FakePeer::new(Elicit::None);
     let id = start(&t, &peer, target.port).await;
     t.mcp.shutdown().await;
-    let m = t.mcp.jobs.read_meta(&id).unwrap();
-    assert_eq!(m.status, "interrupted");
-    assert_eq!(m.error.as_deref(), Some("server stopped"));
     eventually("the cancel line", 3, || plessor.cancels() == 1).await;
+    // The engine keeps it as stopped, and nobody cancelled it: it was interrupted.
+    let got = ok(&t.call(&peer, "get_scan", json!({"scan_id": id})).await).clone();
+    assert_eq!(got["status"], "interrupted", "{got}");
 }
 
 #[tokio::test]
 async fn a_fingerprint_still_in_progress_is_not_reported_as_ended() {
-    let t = scope(&["a.test".into()], "").build();
-    let meta = crate::jobs::JobMeta::new(
-        &t.mcp.session,
-        crate::jobs::NewJob {
-            tool: "fingerprint",
-            engine: "toolmark",
-            target: "http://a.test/",
-            endpoints: Vec::new(),
-            scope_sha256: None,
-            cancellable: false,
-            test_writes: false,
-        },
+    let toolmark = stub_engine(StubOpts::default()).await;
+    let t = scope(&["a.test".into()], "")
+        .toolmark(toolmark.port)
+        .build();
+    let kept = toolmark.kept.lock().unwrap().scan(
+        "http://a.test/",
+        "running",
+        json!({"operation": "fingerprint",
+               "mcp": {"tool": "fingerprint", "process": t.mcp.session}}),
+        &now_utc(),
     );
-    assert_eq!(meta.status, "running");
-    t.mcp.jobs.write_meta(&meta).unwrap();
     let r = t
         .call(
             &FakePeer::new(Elicit::None),
             "cancel_scan",
-            json!({"scan_id": meta.id}),
+            json!({"scan_id": format!("s_toolmark_{kept}")}),
         )
         .await;
     assert_eq!(reason(&r), "invalid_arguments", "{}", r.text);

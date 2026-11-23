@@ -1,0 +1,3 @@
+# Synthetic: OpenSMTPD's greeting.
+smtp
+mail.example.test ESMTP OpenSMTPD

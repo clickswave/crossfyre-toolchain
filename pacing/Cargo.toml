@@ -1,0 +1,20 @@
+[package]
+name = "cfx_pacing"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+description = "Loads a verified pacing module beside the binaries and installs it as the adaptive crate's backend; the baseline answers without one."
+
+[dependencies]
+adaptive = { path = "../adaptive" }
+# A WebAssembly interpreter in pure Rust: no JIT, no C, the same on every platform.
+wasmi = { version = "1.1.0", default-features = false, features = ["std"] }
+# A module is code, so it has to carry the release key's signature, as a binary's
+# manifest does.
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+base64 = "0.21.0"
+
+[dev-dependencies]
+# Test modules written as text.
+wat = "1"

@@ -1,0 +1,18 @@
+# Synthetic: A Vue 3 application rendered in the browser. The page the server sends is a
+# shell; the page in vue-rendered.rendered.html, as a browser built it, has the mark
+# Vue 3 puts on the element it mounts the application on.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Board</title>
+<script type="module" crossorigin src="/assets/index-4b2c1d.js"></script>
+</head>
+<body>
+<div id="app"></div>
+</body>
+</html>

@@ -1,0 +1,3 @@
+# Synthetic: ProFTPD as Debian ships it, whose server name says Debian.
+ftp
+ProFTPD 1.3.5e Server (Debian) [::ffff:10.0.0.5

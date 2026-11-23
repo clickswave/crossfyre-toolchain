@@ -10,7 +10,7 @@
 //!
 //! This is the PUBLIC baseline: a few standard, transparent transforms. The tuned
 //! ordering and the richer set (keyword case folding, comment injection, unicode
-//! and mixed encodings, parameter pollution) live in the private drop-in, because
+//! and mixed encodings, parameter pollution) live in the pacing module, because
 //! the exact mutation policy is what a WAF vendor would want to fingerprint.
 
 /// Split a URL into (scheme://authority, path+query). Mutations only touch the
@@ -59,6 +59,9 @@ fn double_encode_traversal(s: &str) -> String {
 /// Produce up to `max` alternative encodings of the request. Returns `(url, body)`
 /// pairs that differ from the input; the original is never included.
 pub fn variants(url: &str, body: Option<&str>, max: usize) -> Vec<(String, Option<String>)> {
+    if let Some(v) = from_module(url, body, max) {
+        return v;
+    }
     let (authority, tail) = split_authority(url);
     let mut out: Vec<(String, Option<String>)> = Vec::new();
     let mut push = |new_tail: String| {
@@ -88,6 +91,42 @@ pub fn variants(url: &str, body: Option<&str>, max: usize) -> Vec<(String, Optio
     out.dedup();
     out.truncate(max);
     out
+}
+
+/// The installed module's variants, held to the request: at most `max`, none equal
+/// to it, each to the same scheme, host and port, each no longer than four times its
+/// part of the original and a little more, and none carrying a control character.
+/// None without a module or a readable answer, or for a URL without an authority.
+fn from_module(url: &str, body: Option<&str>, max: usize) -> Option<Vec<(String, Option<String>)>> {
+    #[derive(serde::Serialize)]
+    struct Ask<'a> {
+        url: &'a str,
+        body: Option<&'a str>,
+        max: usize,
+    }
+    let (authority, _) = split_authority(url);
+    if authority.is_empty() || !crate::backend::installed() {
+        return None;
+    }
+    let asked: Vec<(String, Option<String>)> =
+        crate::backend::ask("evasion.variants", &Ask { url, body, max })?;
+    let room = |original: usize| original.saturating_mul(4).saturating_add(64);
+    let clean = |s: &str| !s.chars().any(char::is_control);
+    let mut out: Vec<(String, Option<String>)> = Vec::new();
+    for (u, b) in asked {
+        let same_place = split_authority(&u).0 == authority;
+        let fits = u.len() <= room(url.len())
+            && b.as_ref()
+                .is_none_or(|b| b.len() <= room(body.map_or(0, str::len)));
+        let changed = u != url || b.as_deref() != body;
+        if same_place && fits && changed && clean(&u) && !out.contains(&(u.clone(), b.clone())) {
+            out.push((u, b));
+        }
+        if out.len() >= max {
+            break;
+        }
+    }
+    Some(out)
 }
 
 #[cfg(test)]

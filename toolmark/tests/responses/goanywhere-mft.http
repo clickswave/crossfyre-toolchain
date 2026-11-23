@@ -1,0 +1,15 @@
+# Synthetic: GoAnywhere MFT's sign-in page, whose pages come from /goanywhere/.
+HTTP/1.1 200 OK
+content-type: text/html
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>GoAnywhere</title>
+</head>
+<body>
+<form id="loginForm" method="post" action="/goanywhere/auth/Login.xhtml"></form>
+</body>
+</html>

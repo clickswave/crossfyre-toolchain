@@ -1,0 +1,14 @@
+id: openssh
+info:
+  name: OpenSSH
+  category: SSH Server
+  metadata:
+    vendor: openbsd
+    product: openssh
+detect:
+  any:
+    - banner: { name: ssh, regex: 'OpenSSH_[0-9]' }
+version:
+  - banner: { name: ssh, regex: 'OpenSSH_([0-9]+\.[0-9]+(?:p[0-9]+)?)' }
+distro:
+  - banner: { name: ssh, regex: 'OpenSSH_\S+ ((?:Ubuntu|Debian|Raspbian)-\S+)' }

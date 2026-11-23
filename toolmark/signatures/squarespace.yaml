@@ -1,0 +1,8 @@
+id: squarespace
+info:
+  name: Squarespace
+  category: CMS
+detect:
+  any:
+    - header: { name: server, regex: '(?i)squarespace' }
+    - html: { regex: '(?i)static1\.squarespace\.com' }

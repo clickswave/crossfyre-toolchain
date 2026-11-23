@@ -1,0 +1,9 @@
+id: bitrix
+info:
+  name: 1C-Bitrix Site Manager
+  category: CMS
+implies: [php]
+detect:
+  any:
+    - header: { name: x-powered-cms, regex: '^Bitrix Site Manager' }
+    - cookie: { name: '^BITRIX_SM_' }

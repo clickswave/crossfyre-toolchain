@@ -1,0 +1,11 @@
+id: manageengine-servicedesk-plus
+info:
+  name: ManageEngine ServiceDesk Plus
+  category: Issue Tracker
+  metadata:
+    vendor: zohocorp
+    product: manageengine_servicedesk_plus
+implies: [java]
+detect:
+  any:
+    - html: { regex: '<title>\s*ManageEngine ServiceDesk Plus' }

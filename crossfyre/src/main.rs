@@ -12,9 +12,9 @@ use clap::{CommandFactory, Parser, Subcommand};
 )]
 struct Cli {
     /// Use another config directory, the one that holds `nodes.d` and
-    /// `config.toml`. The default is `$XDG_CONFIG_HOME/crossfyre` of the user who
-    /// ran the command, so `sudo` keeps using your home and not root's. Give a
-    /// path to keep a separate set of nodes, for example
+    /// `config.toml`. The default is the one the engines read, `~/.config/crossfyre`
+    /// on Linux, of the user who ran the command, so `sudo` keeps using your home and
+    /// not root's. Give a path to keep a separate set of nodes, for example
     /// `--data-dir ~/.config/crossfyre-lab`.
     #[arg(long, global = true, value_name = "PATH")]
     data_dir: Option<std::path::PathBuf>,
@@ -64,6 +64,20 @@ enum Commands {
 
     /// Log out: remove the saved account session (auth.toml).
     Logout,
+
+    /// What this machine may send to Crossfyre: connected or private, which are your
+    /// account's, or offline, which is this machine's alone.
+    ///
+    ///   crossfyre policy list           the three, what each sends, and which is active
+    ///   crossfyre policy set private    or connected, or offline; with no name, a picker
+    ///
+    /// CROSSFYRE_POLICY tightens one run (CROSSFYRE_POLICY=offline crossfyre ...) and
+    /// never loosens it.
+    #[command(verbatim_doc_comment)]
+    Policy {
+        #[command(subcommand)]
+        action: PolicyAction,
+    },
 
     /// Manage Crossfyre nodes: register this host (`node init`), see your fleet
     /// (`node list`), bring nodes online (`node up` / `node down`), or check the
@@ -158,8 +172,12 @@ enum Commands {
     },
 
     /// Update from the release manifest: `self`, an extension name, or `all`
-    /// (default: self + every installed extension). For a single extension you
-    /// can also use `crossfyre extension update <name>`.
+    /// (default: self + every installed extension, the data the engines read, and the
+    /// closed components installed here). `data` takes only that data: the template and
+    /// signature pack and the CVE dataset. `components` installs and updates the closed
+    /// components the signed-in plan includes (plessor-authz, pacing and egress), and
+    /// one of their names only that one. For a single extension you can also use
+    /// `crossfyre extension update <name>`.
     Update {
         target: Option<String>,
         /// Re-download and reinstall even when the installed version already
@@ -168,13 +186,19 @@ enum Commands {
         /// release that kept its version number.
         #[arg(long)]
         force: bool,
+        /// Take a release older than what is installed. Without it, an update
+        /// refuses to go back, so a manifest kept from before cannot take a
+        /// machine back to a release with a known flaw.
+        #[arg(long)]
+        allow_downgrade: bool,
     },
 
     /// Show a full overview of the local node daemons, extensions and database.
     /// (For one area, use `crossfyre node status` or `crossfyre extension list`.)
     Status,
 
-    /// Manage the toolchain Postgres container.
+    /// The database the engines keep their state in: the local one crossfyre makes and
+    /// runs as you, or one you run yourself.
     Db {
         #[command(subcommand)]
         command: cfx_core::DbCommands,
@@ -183,13 +207,13 @@ enum Commands {
     /// Check the environment for common problems.
     Doctor,
 
-    /// Remove Crossfyre services, extensions, binaries and the database
-    /// container from this host.
+    /// Remove Crossfyre services, extensions, binaries and the local database
+    /// from this host.
     Uninstall {
         /// Also remove the config root (node registrations included)
         #[arg(long, conflicts_with = "keep_data")]
         purge: bool,
-        /// Keep the database container, and the scan state in it
+        /// Stop the local database and keep it, with the scan state in it
         #[arg(long)]
         keep_data: bool,
         /// Do not ask first (for scripts, such as a package's removal script)
@@ -381,10 +405,22 @@ enum NodeAction {
 }
 
 #[derive(Subcommand, Debug)]
+enum PolicyAction {
+    /// The three policies, what each sends, which is active and when it last changed.
+    List,
+    /// Set this machine's policy: connected or private for the account, offline for
+    /// this machine. With no name, a picker at a terminal.
+    Set {
+        /// connected, private or offline
+        name: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum OastAction {
     /// Install the OAST server as a systemd service (cf-oast) on this machine for your domain, then obtain
     /// a wildcard TLS cert (ACME DNS-01) and print the DNS-delegation records to add.
-    /// Re-run after adding the records to finish TLS. Needs root (sudo).
+    /// Re-run after adding the records to finish TLS. Needs root, which it asks sudo for.
     Setup {
         /// The delegated zone callbacks arrive on, e.g. oob.example.com
         #[arg(long)]
@@ -441,6 +477,9 @@ enum ExtensionAction {
         /// Re-download even if the installed version already matches.
         #[arg(long)]
         force: bool,
+        /// Take a release older than what is installed.
+        #[arg(long)]
+        allow_downgrade: bool,
     },
     /// Start an extension daemon.
     Start { name: String },
@@ -470,7 +509,7 @@ fn node_worker() -> Option<std::path::PathBuf> {
             .ok()
             .and_then(|p| {
                 p.parent()
-                    .map(|d| d.join(cfx_core::toolchain::config::ext_file_name("node")))
+                    .map(|d| d.join(cfx_core::toolchain::config::file_name("node")))
             })
             .filter(|p| p.exists())
     };
@@ -478,7 +517,7 @@ fn node_worker() -> Option<std::path::PathBuf> {
 }
 
 /// Run the `node` worker's supervisor in the foreground (fallback for hosts
-/// with no OS service).
+/// with no OS service). On Unix it takes this process's place.
 fn exec_node_supervise(
     base: &std::path::Path,
     force: bool,
@@ -490,20 +529,40 @@ fn exec_node_supervise(
             cfx_core::os::elevated("crossfyre node init")
         )
     })?;
-    let mut cmd = std::process::Command::new(node);
+    let mut cmd = std::process::Command::new(&node);
     cmd.arg("supervise").arg("--data-dir").arg(base);
     if force {
         cmd.arg("--force");
     }
-    if !cmd.status()?.success() {
-        return Err("node supervise exited with an error".into());
+    // On Unix the supervisor takes this process's place, so it is the command sudo runs
+    // and a Ctrl+C reaches it to stop the node and the engines in order. Waited on, this
+    // CLI died of the Ctrl+C at once, sudo closed the terminal behind it, and the
+    // supervisor died of that halfway through.
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::process::CommandExt;
+        let _ = std::io::stdout().flush();
+        let err = cmd.exec();
+        Err(format!(
+            "could not run the node supervisor {}: {err}",
+            node.display()
+        )
+        .into())
     }
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        if !cmd.status()?.success() {
+            return Err("node supervise exited with an error".into());
+        }
+        Ok(())
+    }
 }
 
 // An error is printed as the sentence it is. Returned from `main`, Rust prints it
 // in debug form: in quotes, with any line break shown as a backslash and an n.
 fn main() -> std::process::ExitCode {
+    cfx_core::api::name_client("crossfyre", env!("CARGO_PKG_VERSION"));
     let outcome = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -520,6 +579,16 @@ fn main() -> std::process::ExitCode {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    // Run by a user, a command that needs root runs again through sudo.
+    #[cfg(unix)]
+    if !cfx_core::os::is_elevated()
+        && let Some(command) = needs_root(
+            &cli.command,
+            &cfx_core::toolchain::install::may_replace_binaries,
+        )
+    {
+        cfx_core::os::rerun_as_root(command);
+    }
     let base = cfx_core::resolve_data_dir(cli.data_dir.as_deref())?;
     // Make --data-dir mean what it says: config.toml lives under the same root
     // as nodes.d and auth.toml, so an isolated node set gets its own database
@@ -527,11 +596,29 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     cfx_core::toolchain::config::set_toolchain_dir(base.clone());
     // Named in the User-Agent of requests to the release origin.
     cfx_core::toolchain::release_http::set_version(env!("CARGO_PKG_VERSION"));
+    // On a machine taken offline, only a login or an update run by hand reaches
+    // Crossfyre, and says so, and setting a policy to leave offline. Anything else that
+    // would says why it does not run.
+    match when_offline(&cli.command) {
+        Offline::Refuse(what) => {
+            if let Some(why) = cfx_core::policy::offline_refuses(&base, what) {
+                return Err(why.into());
+            }
+        }
+        Offline::Say(what) => {
+            if let Some(line) = cfx_core::policy::offline_line(&base) {
+                cfx_core::toolchain::ui::warn(&format!(
+                    "{line}. {what} contacts Crossfyre all the same, as you ran it."
+                ));
+            }
+        }
+        Offline::Free => {}
+    }
 
     // No account gate here on purpose. The engines are free, and every command
     // that isn't node enrolment is either local or served from the PUBLIC
     // release manifest (bins.crossfyre.io): `extension` install/manage,
-    // `update`, `status`, `db` (the local container) and `run` (a .cfx script
+    // `update`, `status`, `db` (the local database) and `run` (a .cfx script
     // with no control plane) never touch the account session, so forcing a login
     // to install or use them is friction with nothing behind it.
     //
@@ -567,6 +654,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Logout => {
             cfx_core::auth::run_logout(&base);
         }
+        Commands::Policy { action } => match action {
+            PolicyAction::List => cfx_core::policy::command::run_list(&base).await?,
+            PolicyAction::Set { name } => {
+                cfx_core::policy::command::run_set(&base, name.as_deref()).await?
+            }
+        },
         Commands::Node { action } => match action {
             NodeAction::Init {
                 force,
@@ -580,7 +673,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let api_url = api_url
                     .or_else(|| cfx_core::auth::load_account(&base).map(|a| a.api_url))
                     .unwrap_or_else(|| cfx_core::auth::DEFAULT_API_URL.to_string());
-                cfx_core::run_init(force, &api_url, &base, no_service, node_key, no_prompt).await?;
+                cfx_core::run_init(
+                    force,
+                    &api_url,
+                    &base,
+                    no_service,
+                    node_key,
+                    no_prompt,
+                    env!("CARGO_PKG_VERSION"),
+                )
+                .await?;
             }
             NodeAction::Remove {
                 node_id,
@@ -632,15 +734,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             ExtensionAction::List => cfx_core::toolchain::status::extensions()?,
             ExtensionAction::Install { name, force } => match name.as_deref() {
                 Some(ext) => {
-                    if force {
-                        cfx_core::toolchain::install::install(ext, true).await?;
-                        for e in cfx_core::toolchain::resolve_extensions(ext)? {
-                            cfx_core::toolchain::service::enable(e)?;
-                            cfx_core::toolchain::service::start(e)?;
-                        }
-                    } else {
-                        cfx_core::toolchain::install::install_and_start(ext).await?;
-                    }
+                    let writer =
+                        cfx_core::toolchain::install::Writer::cli(env!("CARGO_PKG_VERSION"));
+                    cfx_core::toolchain::install::install_and_start(ext, force, writer).await?;
                 }
                 None => cfx_core::toolchain::print_extension_usage("install"),
             },
@@ -648,11 +744,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Some(ext) => cfx_core::toolchain::install::remove(ext)?,
                 None => cfx_core::toolchain::print_extension_usage("remove"),
             },
-            ExtensionAction::Update { name, force } => {
+            ExtensionAction::Update {
+                name,
+                force,
+                allow_downgrade,
+            } => {
                 let updated = cfx_core::toolchain::install::update(
                     name.as_deref(),
                     env!("CARGO_PKG_VERSION"),
                     force,
+                    allow_downgrade,
+                    &base,
                 )
                 .await?;
                 if !updated.succeeded() {
@@ -730,6 +832,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             proxy_port,
             seed_credentials,
         } => {
+            // What it captures goes to Crossfyre, so the policy decides before anything
+            // is opened.
+            if let Some(why) = cfx_core::policy::turned_off(&base, "crossfyre trace") {
+                return Err(why.into());
+            }
             let method = match method.to_lowercase().as_str() {
                 "keylog" | "packet" | "pcap" => cfx_core::toolchain::trace::CaptureMethod::Keylog,
                 _ => cfx_core::toolchain::trace::CaptureMethod::Proxy,
@@ -749,17 +856,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             })
             .await?;
         }
-        Commands::Update { target, force } => {
+        Commands::Update {
+            target,
+            force,
+            allow_downgrade,
+        } => {
             let updated = cfx_core::toolchain::install::update(
                 target.as_deref(),
                 env!("CARGO_PKG_VERSION"),
                 force,
+                allow_downgrade,
+                &base,
             )
-            .await;
-            // Here and in `node init` only, both run by a person: the node's own update
-            // runs as a root service and leaves a home directory alone.
-            cfx_core::toolchain::rcfile::fix_for_invoking_user();
-            let updated = updated?;
+            .await?;
             if updated.restart && cfx_core::toolchain::service::node_service_exists() {
                 step("Restarting the node service to pick up the new binary...");
                 let _ = cfx_core::toolchain::service::restart(
@@ -773,10 +882,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Status => {
-            cfx_core::toolchain::status::overview(&base)?;
+            cfx_core::toolchain::status::overview(&base).await?;
         }
         Commands::Db { command } => {
-            cfx_core::toolchain::db::run(&command)?;
+            cfx_core::toolchain::db::run(&command).await?;
         }
         Commands::Doctor => {
             cfx_core::toolchain::doctor::run(&base).await?;
@@ -812,8 +921,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .iter()
                 .map(|e| cfx_mcp::EngineInfo {
                     name: e.name.to_string(),
-                    port: config::engine_port(e.id),
-                    installed: config::is_extension_installed(e.id),
+                    port: config::engine_port(e.name),
+                    installed: config::is_extension_installed(e.name),
                 })
                 .collect();
             let opts = cfx_mcp::Options {
@@ -832,6 +941,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 cloud_file,
                 no_cloud,
+                policy_dir: base.clone(),
             };
             match cfx_mcp::serve(opts).await {
                 // Exit here rather than returning: a read of stdin still parked on the
@@ -856,6 +966,100 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// What a command does on a machine taken offline.
+#[derive(Debug, PartialEq, Eq)]
+enum Offline {
+    /// It would contact Crossfyre, which an offline machine does not: it says why.
+    Refuse(&'static str),
+    /// It contacts Crossfyre because the person ran it, and says so first.
+    Say(&'static str),
+    /// It contacts nothing, or says for itself what offline means for it.
+    Free,
+}
+
+/// Which [`Offline`] `cmd` is. A login says it for itself, a trace is refused by its own
+/// policy check, `policy set` is how a machine leaves offline, and doctor leaves out the
+/// checks that would reach Crossfyre.
+fn when_offline(cmd: &Commands) -> Offline {
+    match cmd {
+        Commands::Update { .. } => Offline::Say("crossfyre update"),
+        Commands::Extension {
+            action: ExtensionAction::Update { .. },
+        } => Offline::Say("crossfyre extension update"),
+        Commands::Extension {
+            action: ExtensionAction::Install { .. },
+        } => Offline::Refuse("crossfyre extension install"),
+        Commands::Node { action } => match action {
+            NodeAction::Init { .. } => Offline::Refuse("crossfyre node init"),
+            NodeAction::List { .. } => Offline::Refuse("crossfyre node list"),
+            NodeAction::Remove { .. } => Offline::Refuse("crossfyre node remove"),
+            NodeAction::Up { .. } => Offline::Refuse("crossfyre node up"),
+            _ => Offline::Free,
+        },
+        Commands::Mcp {
+            command: Some(McpCommand::Cloud(cloud)),
+            ..
+        } => match cloud {
+            CloudCommand::Login { .. } => Offline::Say("crossfyre mcp cloud login"),
+            CloudCommand::Status { .. } => Offline::Refuse("crossfyre mcp cloud status"),
+            CloudCommand::Logout { revoke: true, .. } => {
+                Offline::Refuse("crossfyre mcp cloud logout --revoke")
+            }
+            CloudCommand::Logout { .. } => Offline::Free,
+        },
+        _ => Offline::Free,
+    }
+}
+
+/// The command as a person names it, as `node init`, when it needs root on Linux and
+/// macOS, where it then runs itself again through sudo. The node service, the node's
+/// configs (which only root may change, and which `node remove` reads and deletes),
+/// uninstall and the OAST service always need it. `update` and the commands that install
+/// or remove an engine need it when this user may not replace what is in the bin
+/// directory, as in the installer's /opt/crossfyre/bin: `binaries_writable` says.
+#[cfg(unix)]
+fn needs_root(command: &Commands, binaries_writable: &dyn Fn() -> bool) -> Option<&'static str> {
+    match command {
+        Commands::Node { action } => match action {
+            NodeAction::Init { .. } => Some("node init"),
+            NodeAction::Up { .. } => Some("node up"),
+            NodeAction::Down => Some("node down"),
+            NodeAction::Restart => Some("node restart"),
+            NodeAction::Enable => Some("node enable"),
+            NodeAction::Disable => Some("node disable"),
+            NodeAction::Remove {
+                node_id,
+                inactive,
+                all,
+            } if node_id.is_some() || *inactive || *all => Some("node remove"),
+            NodeAction::Remove { .. } | NodeAction::List { .. } | NodeAction::Status => None,
+        },
+        Commands::Uninstall { .. } => Some("uninstall"),
+        Commands::Oast {
+            action: OastAction::Setup { .. },
+        } if cfg!(target_os = "linux") => Some("oast setup"),
+        // The data goes in the toolchain directory, which needs no rights the bin
+        // directory does.
+        Commands::Update { target, .. }
+            if target.as_deref() != Some(cfx_core::toolchain::install::DATA)
+                && !binaries_writable() =>
+        {
+            Some("update")
+        }
+        Commands::Extension { action } => match action {
+            ExtensionAction::Install { name: Some(_), .. } if !binaries_writable() => {
+                Some("extension install")
+            }
+            ExtensionAction::Remove { name: Some(_) } if !binaries_writable() => {
+                Some("extension remove")
+            }
+            ExtensionAction::Update { .. } if !binaries_writable() => Some("extension update"),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Write `bytes` to stdout. A reader that stops early, as `head` does, closes the pipe,
@@ -920,6 +1124,168 @@ async fn mcp_cloud(base: &std::path::Path, cmd: CloudCommand) {
         Err(e) => {
             eprintln!("crossfyre mcp cloud: {e}");
             std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    fn root_for(args: &[&str], binaries_writable: bool) -> Option<&'static str> {
+        let cli = Cli::try_parse_from(std::iter::once("crossfyre").chain(args.iter().copied()))
+            .expect("parses");
+        needs_root(&cli.command, &|| binaries_writable)
+    }
+
+    #[test]
+    fn the_node_s_service_and_configs_and_uninstall_always_need_root() {
+        for (args, name) in [
+            (&["node", "init"][..], "node init"),
+            (
+                &["node", "init", "--no-service", "--node-key", "k"],
+                "node init",
+            ),
+            (&["node", "up"], "node up"),
+            (&["node", "up", "--force"], "node up"),
+            (&["node", "down"], "node down"),
+            (&["node", "restart"], "node restart"),
+            (&["node", "enable"], "node enable"),
+            (&["node", "disable"], "node disable"),
+            (&["node", "remove", "0b7f5d0e"], "node remove"),
+            (&["node", "remove", "--inactive"], "node remove"),
+            (&["node", "remove", "--all"], "node remove"),
+            (&["uninstall", "--yes"], "uninstall"),
+            (&["uninstall", "--purge"], "uninstall"),
+        ] {
+            for writable in [false, true] {
+                assert_eq!(root_for(args, writable), Some(name), "{args:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn replacing_binaries_needs_root_only_where_this_user_may_not_write_them() {
+        for (args, name) in [
+            (&["update"][..], "update"),
+            (&["update", "self"], "update"),
+            (&["update", "voyage", "--force"], "update"),
+            (&["update", "--allow-downgrade"], "update"),
+            (
+                &["extension", "update", "voyage", "--allow-downgrade"],
+                "extension update",
+            ),
+            (&["extension", "install", "voyage"], "extension install"),
+            (&["extension", "remove", "voyage"], "extension remove"),
+            (&["extension", "update"], "extension update"),
+            (&["extension", "update", "voyage"], "extension update"),
+        ] {
+            assert_eq!(root_for(args, false), Some(name), "{args:?}");
+            assert_eq!(root_for(args, true), None, "{args:?}");
+        }
+    }
+
+    fn offline_for(args: &[&str]) -> Offline {
+        let cli = Cli::try_parse_from(std::iter::once("crossfyre").chain(args.iter().copied()))
+            .expect("parses");
+        when_offline(&cli.command)
+    }
+
+    /// On a machine taken offline, a login or an update run by hand goes and says so, and
+    /// every other command that would reach Crossfyre is refused by name.
+    #[test]
+    fn offline_lets_through_only_what_reaches_crossfyre_on_purpose() {
+        for (args, what) in [
+            (&["update"][..], "crossfyre update"),
+            (&["update", "plessor"], "crossfyre update"),
+            (&["extension", "update"], "crossfyre extension update"),
+            (&["mcp", "cloud", "login"], "crossfyre mcp cloud login"),
+        ] {
+            assert_eq!(offline_for(args), Offline::Say(what), "{args:?}");
+        }
+        for (args, what) in [
+            (
+                &["extension", "install", "voyage"][..],
+                "crossfyre extension install",
+            ),
+            (&["node", "init"], "crossfyre node init"),
+            (&["node", "list"], "crossfyre node list"),
+            (&["node", "remove"], "crossfyre node remove"),
+            (&["node", "up"], "crossfyre node up"),
+            (&["mcp", "cloud", "status"], "crossfyre mcp cloud status"),
+            (
+                &["mcp", "cloud", "logout", "--revoke"],
+                "crossfyre mcp cloud logout --revoke",
+            ),
+        ] {
+            assert_eq!(offline_for(args), Offline::Refuse(what), "{args:?}");
+        }
+        for args in [
+            &["login"][..],
+            &["logout"],
+            &["policy", "set", "connected"],
+            &["policy", "list"],
+            &["status"],
+            &["doctor"],
+            &["run", "x.cfx", "domain:example.com"],
+            &["node", "status"],
+            &["node", "down"],
+            &["extension", "list"],
+            &["mcp", "cloud", "logout"],
+            &["db", "up"],
+        ] {
+            assert_eq!(offline_for(args), Offline::Free, "{args:?}");
+        }
+    }
+
+    /// The data goes in the toolchain directory, so taking it alone asks for no rights,
+    /// whoever may write the bin directory.
+    #[test]
+    fn updating_the_data_alone_needs_no_root() {
+        for writable in [false, true] {
+            assert_eq!(root_for(&["update", "data"], writable), None);
+        }
+    }
+
+    #[test]
+    fn the_oast_service_needs_root_where_it_can_be_set_up() {
+        let args = ["oast", "setup", "--domain", "oob.example.com"];
+        let want = cfg!(target_os = "linux").then_some("oast setup");
+        assert_eq!(root_for(&args, true), want);
+    }
+
+    /// Engines are the user's own services, and the rest reads or talks to the
+    /// account, so none of it asks for root.
+    #[test]
+    fn everything_else_runs_as_the_user() {
+        for args in [
+            &["login"][..],
+            &["logout"],
+            &["policy", "list"],
+            &["policy", "set", "offline"],
+            &["status"],
+            &["doctor"],
+            &["node", "status"],
+            &["node", "list"],
+            &["node", "remove"],
+            &["extension", "list"],
+            &["extension", "install"],
+            &["extension", "remove"],
+            &["extension", "start", "voyage"],
+            &["extension", "stop", "voyage"],
+            &["extension", "restart", "voyage"],
+            &["extension", "enable", "voyage"],
+            &["extension", "disable", "voyage"],
+            &["oast", "status"],
+            &["oast", "serve", "--domain", "oob.example.com"],
+            &["db", "up"],
+            &["mcp"],
+            &["run", "x.cfx", "domain:example.com"],
+            &["completions", "bash"],
+        ] {
+            for writable in [false, true] {
+                assert_eq!(root_for(args, writable), None, "{args:?}");
+            }
         }
     }
 }

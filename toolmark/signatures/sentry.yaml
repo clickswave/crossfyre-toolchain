@@ -1,0 +1,9 @@
+id: sentry
+info:
+  name: Sentry
+  category: Monitoring
+implies: [python, django]
+detect:
+  all:
+    - html: { regex: '(?i)<title>[^<]*Sentry' }
+    - html: { regex: 'csrfmiddlewaretoken' }

@@ -1,6 +1,6 @@
 [package]
 name = "crossfyre"
-version = "0.1.44"
+version = "0.1.45"
 edition = "2024"
 license.workspace = true
 publish.workspace = true
@@ -31,3 +31,7 @@ serde_json = "1"
 sha2 = "0.10"
 # The stand-in Workbench in tests/mcp_stdio.rs speaks the same messages a real one does.
 cfx_bridge = { path = "../bridge" }
+# tests/mcp_stdio.rs holds the ports nothing listens on with sockets bound to them.
+tokio = { version = "1.49.0", features = ["net"] }
+# tests/policy.rs gives each run a data directory of its own.
+tempfile = "3"

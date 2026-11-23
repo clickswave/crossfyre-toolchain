@@ -340,9 +340,8 @@ async fn list_scans(
             Side::After(c) => jobs::parse_scan_cursor(c),
             _ => None,
         };
-        let mut all: Vec<JobMeta> = mcp
-            .jobs
-            .list()
+        let mut all: Vec<JobMeta> = crate::kept::scans(mcp)
+            .await
             .into_iter()
             .filter(|m| status.is_none_or(|s| m.status == s))
             .filter(|m| {
@@ -471,7 +470,7 @@ struct ScanIdArgs {
 
 fn bad_scan_id() -> Refusal {
     Refusal::invalid(
-        "scan_id is s_ followed by 10 lowercase hex characters, or cs_ or ap_ followed by 32",
+        "scan_id is s_, an engine's name, _ and the engine's id for the scan, or cs_ or ap_ followed by 32",
     )
 }
 
@@ -484,7 +483,7 @@ async fn get_scan(
 ) -> Result<Done, Refusal> {
     let a: ScanIdArgs = parse_args(args)?;
     if jobs::valid_scan_id(&a.scan_id) {
-        return local(scans::get_scan(mcp, args));
+        return local(scans::get_scan(mcp, args).await);
     }
     match wire::decode(&a.scan_id) {
         Some((IdKind::Scan, uuid)) => {
@@ -715,9 +714,9 @@ async fn list_findings(
     };
     match (a.scan_id.as_deref(), backend) {
         (Some(id), None | Some("local")) if jobs::valid_scan_id(id) => {
-            local(scans::list_findings(mcp, &local_args()))
+            local(scans::list_findings(mcp, &local_args()).await)
         }
-        (None, Some("local")) => local(scans::list_findings(mcp, &local_args())),
+        (None, Some("local")) => local(scans::list_findings(mcp, &local_args()).await),
         (Some(id), None | Some("cloud")) if id.starts_with("cs_") => {
             let uuid = decode(id, IdKind::Scan, "scan_id")?;
             note.set_scan(id.to_string());
@@ -729,7 +728,7 @@ async fn list_findings(
              for the workspace's verdicts",
         )),
         _ => Err(Refusal::invalid(
-            "scan_id is s_ followed by 10 lowercase hex characters, or cs_ followed by 32, and \
+            "scan_id is s_, an engine's name, _ and the engine's id, or cs_ followed by 32, and \
              backend must match it when both are given",
         )),
     }
@@ -887,7 +886,7 @@ async fn get_finding(
 ) -> Result<Done, Refusal> {
     let a: GetFindingArgs = parse_args(args)?;
     if jobs::valid_finding_id(&a.finding_id) {
-        return local(scans::get_finding(mcp, args));
+        return local(scans::get_finding(mcp, args).await);
     }
     let bytes = in_range(
         "evidence_bytes",
@@ -951,8 +950,8 @@ async fn get_finding(
         }
         _ => {
             return Err(Refusal::invalid(
-                "finding_id is f_ followed by 10 lowercase hex characters, or cf_ or cv_ \
-                 followed by 32",
+                "finding_id is f_, an engine's name, _ and the engine's id for the finding, or \
+                 cf_ or cv_ followed by 32",
             ));
         }
     };

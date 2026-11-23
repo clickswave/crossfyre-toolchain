@@ -1,0 +1,19 @@
+# Synthetic: A WordPress page where a plugin's generator tag comes before WordPress's own.
+HTTP/1.1 200 OK
+date: Fri, 20 Nov 2026 06:00:00 GMT
+server: Apache
+content-type: text/html; charset=UTF-8
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Shop</title>
+<meta name="generator" content="Elementor 3.18.3; features: e_dom_optimization; settings: css_print_method-external" />
+<link rel="stylesheet" href="/wp-content/plugins/elementor/assets/css/frontend.min.css" />
+<meta name="generator" content="WordPress 6.4.2" />
+</head>
+<body>
+<div class="elementor"></div>
+</body>
+</html>

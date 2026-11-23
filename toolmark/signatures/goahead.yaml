@@ -1,0 +1,10 @@
+id: goahead
+info:
+  name: GoAhead
+  category: Web Server
+  metadata:
+    vendor: embedthis
+    product: goahead
+detect:
+  any:
+    - header: { name: server, regex: '^GoAhead' }

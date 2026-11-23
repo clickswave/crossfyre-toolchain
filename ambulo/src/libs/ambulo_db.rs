@@ -1,241 +1,54 @@
-use crate::libs::wordlist_config::WordlistConfig;
-use crate::scanner::{LogTotals, Logs, ScanResult, ScanResults};
-use sqlx::postgres::PgConnectOptions;
-use sqlx::{FromRow, QueryBuilder};
-use std::fmt::Display;
+use crate::libs::wordlist_source::{ListDigest, WordSource};
+use crate::scanner::{ScanResult, ScanResults};
+use crate::store::{Outcome, Store, Work};
+use sqlx::QueryBuilder;
 
-pub struct Work {
-    pub url: String,
-    pub entry_id: i64,
-    pub method: String,
-}
+/// ambulo's part of the database: its schema, and the files that make its tables.
+pub const ENGINE: cfx_db::Engine = cfx_db::Engine {
+    name: "ambulo",
+    schema: "ambulo",
+    version: env!("CARGO_PKG_VERSION"),
+    migrations: &[include_str!("../../migrations/0001_entries.sql")],
+};
 
-impl Display for Work {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "Work {{ url: {}, entry_id: {}, method: {} }}",
-            self.url, self.entry_id, self.method
-        )
-    }
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, FromRow)]
-pub struct ScanEntry {
-    pub id: i64,
-    pub scan_id: i64,
-    pub url_id: i64,
-    pub word_id: i64,
-    pub status: String,
-    pub request_status: i32,
-    pub headers: Option<String>,
-    pub headers_length: i64,
-    pub body: Option<Vec<u8>>,
-    pub body_length: i64,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, FromRow)]
-pub struct Scan {
-    pub id: i64,
-    pub config_hash: String,
-    pub status: String,
-    pub created_at: String,
-    pub updated_at: String,
-    pub notifications: String,
-    pub wordlist_id: i64,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, FromRow)]
-pub struct Log {
-    pub id: i64,
-    pub scan_id: i64,
-    pub message: String,
-    pub level: String,
-    pub created_at: String,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, FromRow)]
+/// A word list as it is kept: by id, and known by the digest of its words.
 pub struct Wordlist {
     pub id: i64,
-    pub name: String,
     pub hash: String,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, FromRow)]
-pub struct Url {
-    pub id: i64,
-    pub url: String,
-    pub scan_id: i64,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, FromRow)]
-pub struct Word {
-    pub id: i64,
-    pub word: String,
-    pub wordlist_id: i64,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, FromRow)]
-pub struct Operation {
-    pub id: String,
-    pub operation: String,
-    pub params: String,
-    pub status: String,
-    pub result: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
 }
 
 #[derive(Clone)]
 pub struct AmbuloDb {
     pool: sqlx::PgPool,
-    config: crate::libs::cli_args::Args,
-}
-
-#[derive(Clone)]
-pub struct Logger {
-    pool: sqlx::PgPool,
-    scan_id: i64,
-    min_log_level: String,
-    log_levels: Vec<&'static str>,
-}
-
-impl Logger {
-    fn accept_log_level(&self, log_level: &str) -> bool {
-        let min_log_level_index = self
-            .log_levels
-            .iter()
-            .position(|&x| x == self.min_log_level)
-            .unwrap_or(0);
-        let current_log_level_index = self
-            .log_levels
-            .iter()
-            .position(|&x| x == log_level)
-            .unwrap_or(0);
-        current_log_level_index >= min_log_level_index
-    }
-
-    async fn insert_log(&self, level: &str, description: &str) -> Result<(), sqlx::Error> {
-        if !self.accept_log_level(level) {
-            return Ok(());
-        }
-
-        sqlx::query("INSERT INTO logs (scan_id, level, description) VALUES ($1, $2, $3)")
-            .bind(self.scan_id)
-            .bind(level)
-            .bind(description)
-            .execute(&self.pool)
-            .await?;
-
-        Ok(())
-    }
-
-    pub async fn error(&self, message: &str) -> Result<(), sqlx::Error> {
-        self.insert_log("error", message).await
-    }
-    pub async fn info(&self, message: &str) -> Result<(), sqlx::Error> {
-        self.insert_log("info", message).await
-    }
-    pub async fn debug(&self, message: &str) -> Result<(), sqlx::Error> {
-        self.insert_log("debug", message).await
-    }
-    pub async fn warn(&self, message: &str) -> Result<(), sqlx::Error> {
-        self.insert_log("warn", message).await
-    }
 }
 
 impl AmbuloDb {
-    /// Bootstrap: connect to the `postgres` maintenance DB, create the `mach` DB if
-    /// missing, then return a pool connected to it.
-    ///
-    /// The database keeps the engine's original name, `mach`. It holds resumable scan
-    /// state, and renaming it would drop every run an operator could still resume.
-    pub async fn init(
-        host: &str,
-        port: u16,
-        user: &str,
-        password: Option<&str>,
-        config: &crate::libs::cli_args::Args,
-    ) -> Result<Self, sqlx::Error> {
-        // Build admin connection options (connect to postgres maintenance DB)
-        let mut admin_opts = PgConnectOptions::new()
-            .host(host)
-            .port(port)
-            .username(user)
-            .database("postgres");
-        if let Some(pwd) = password {
-            admin_opts = admin_opts.password(pwd);
-        }
-
-        let admin_pool = sqlx::PgPool::connect_with(admin_opts).await?;
-
-        // Create the `mach` database if it doesn't exist
-        let db_exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = 'mach')")
-                .fetch_one(&admin_pool)
-                .await?;
-
-        if !db_exists {
-            // CREATE DATABASE cannot run inside a transaction
-            sqlx::query("CREATE DATABASE mach")
-                .execute(&admin_pool)
-                .await?;
-        }
-        drop(admin_pool);
-
-        // Connect to the `mach` database
-        let mut ambulo_opts = PgConnectOptions::new()
-            .host(host)
-            .port(port)
-            .username(user)
-            .database("mach");
-        if let Some(pwd) = password {
-            ambulo_opts = ambulo_opts.password(pwd);
-        }
-
-        let pool = sqlx::PgPool::connect_with(ambulo_opts).await?;
-
-        Ok(Self {
-            pool,
-            config: config.clone(),
-        })
+    /// ambulo's tables on `pool`, a pool [`cfx_db::ensure_ready`] gave for [`ENGINE`].
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self { pool }
     }
 
     /// A handle that has never connected and connects only if it is used, for tests
     /// of daemon paths that do not touch the database.
     #[cfg(test)]
-    pub fn unconnected(config: &crate::libs::cli_args::Args) -> Self {
-        let opts = PgConnectOptions::new()
+    pub fn unconnected() -> Self {
+        let opts = sqlx::postgres::PgConnectOptions::new()
             .host("127.0.0.1")
             .port(1)
             .username("none")
-            .database("mach");
+            .database("none");
         Self {
             pool: sqlx::PgPool::connect_lazy_with(opts),
-            config: config.clone(),
         }
     }
 
-    pub async fn spawn_logger(
-        &self,
-        scan_id: &i64,
-        log_level: &str,
-    ) -> Result<Logger, sqlx::Error> {
-        Ok(Logger {
-            pool: self.pool.clone(),
-            scan_id: *scan_id,
-            min_log_level: log_level.to_string(),
-            log_levels: vec!["debug", "info", "warn", "error"],
-        })
+    /// The pool, for the tables every engine has.
+    pub fn pool(&self) -> &sqlx::PgPool {
+        &self.pool
     }
 
+    /// What probe `operation_id` of `url` found, kept for `volatility_hours`, with no
+    /// credential in the URL.
     // Column-for-column mirror of the table it writes; splitting it into a struct
     // would add a type whose only job is to be destructured immediately.
     #[allow(clippy::too_many_arguments)]
@@ -254,7 +67,7 @@ impl AmbuloDb {
              VALUES ($1, $2, $3, $4, $5, $6, NOW() + ($7 || ' hours')::INTERVAL)",
         )
         .bind(operation_id)
-        .bind(url)
+        .bind(cfx_db::scans::safe_url(url))
         .bind(status)
         .bind(code)
         .bind(body_length)
@@ -272,710 +85,96 @@ impl AmbuloDb {
         Ok(result.rows_affected())
     }
 
-    pub async fn truncate_tables(&self) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "TRUNCATE TABLE probe_results, operations, scan_entries, logs, urls, scans, words, wordlists RESTART IDENTITY CASCADE"
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn create_tables(&self) -> Result<(), sqlx::Error> {
-        // wordlists table
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS wordlists (
-                id BIGSERIAL PRIMARY KEY,
-                name TEXT NOT NULL,
-                hash TEXT UNIQUE
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // words table
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS words (
-                id BIGSERIAL PRIMARY KEY,
-                word TEXT NOT NULL,
-                wordlist_id BIGINT NOT NULL,
-                FOREIGN KEY (wordlist_id) REFERENCES wordlists(id)
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // scans table
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS scans (
-                id BIGSERIAL PRIMARY KEY,
-                config_hash TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                created_at TEXT NOT NULL DEFAULT NOW()::TEXT,
-                updated_at TEXT NOT NULL DEFAULT NOW()::TEXT,
-                notifications TEXT NOT NULL DEFAULT '{}',
-                wordlist_id BIGINT,
-                method TEXT NOT NULL,
-                FOREIGN KEY (wordlist_id) REFERENCES wordlists(id)
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // urls table
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS urls (
-                id BIGSERIAL PRIMARY KEY,
-                url TEXT NOT NULL,
-                scan_id BIGINT NOT NULL,
-                FOREIGN KEY (scan_id) REFERENCES scans(id)
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // scan_entries table
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS scan_entries (
-                id BIGSERIAL PRIMARY KEY,
-                scan_id BIGINT,
-                url_id BIGINT,
-                word_id BIGINT,
-                status TEXT,
-                request_status INTEGER NOT NULL DEFAULT 0,
-                headers TEXT,
-                headers_length BIGINT NOT NULL,
-                body BYTEA,
-                body_length BIGINT NOT NULL,
-                FOREIGN KEY (scan_id) REFERENCES scans(id),
-                FOREIGN KEY (url_id) REFERENCES urls(id),
-                FOREIGN KEY (word_id) REFERENCES words(id)
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // Every hot scan_entries query filters by (scan_id, status): the per-probe
-        // work-claim (status='queued'), the result fetches (found/not_found/error),
-        // the counts, and the processing->queued reset. Without this index those
-        // are sequential scans that grow with the whole table, so a large scan
-        // slows as its own rows accumulate and any orphaned rows make it worse.
-        // Verified: turns the claim from a ~7ms seq scan (200k rows) into a
-        // ~0.08ms index scan, size-independent.
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS scan_entries_scan_status_idx \
-             ON scan_entries(scan_id, status)",
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // logs table
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS logs (
-                id BIGSERIAL PRIMARY KEY,
-                scan_id BIGINT NOT NULL,
-                level TEXT NOT NULL DEFAULT 'debug',
-                description TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT NOW()::TEXT
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // operations table (for daemon mode)
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS operations (
-                id TEXT PRIMARY KEY,
-                operation TEXT NOT NULL,
-                params TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'queued',
-                result TEXT,
-                created_at TEXT NOT NULL DEFAULT NOW()::TEXT,
-                updated_at TEXT NOT NULL DEFAULT NOW()::TEXT
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // probe_results table (for fuzz-exec with volatility > 0)
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS probe_results (
-                id BIGSERIAL PRIMARY KEY,
-                operation_id TEXT NOT NULL,
-                url TEXT NOT NULL,
-                status TEXT NOT NULL,
-                code INTEGER NOT NULL DEFAULT 0,
-                body_length BIGINT NOT NULL DEFAULT 0,
-                headers_length BIGINT NOT NULL DEFAULT 0,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                delete_after TIMESTAMPTZ NOT NULL
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    pub async fn find_wordlist(&self, wordlist_hash: &str) -> Result<Wordlist, sqlx::Error> {
-        sqlx::query_as::<_, Wordlist>("SELECT * FROM wordlists WHERE hash = $1")
-            .bind(wordlist_hash)
-            .fetch_one(&self.pool)
-            .await
-    }
-
-    pub async fn create_words(
+    /// Store the words `source` gives as the wordlist `name`, and say which wordlist
+    /// holds them. A list is known by its [`ListDigest`], so one stored before is used
+    /// again rather than stored twice. The words go in a chunk at a time inside one
+    /// transaction, which is undone when the source fails or the list was already
+    /// here, and only one chunk is ever held in memory.
+    pub(crate) async fn store_wordlist(
         &self,
-        wordlist_id: &i64,
-        words: &[String],
-    ) -> Result<Vec<Word>, sqlx::Error> {
-        const BATCH_SIZE: usize = 1000;
-        for chunk in words.chunks(BATCH_SIZE) {
+        name: &str,
+        source: &mut impl WordSource,
+    ) -> Result<Wordlist, String> {
+        let db = |e: sqlx::Error| format!("DB: {e}");
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let id: i64 =
+            sqlx::query_scalar("INSERT INTO wordlists (name, hash) VALUES ($1, $2) RETURNING id")
+                .bind(name)
+                .bind(format!("pending {}", uuid::Uuid::new_v4()))
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(db)?;
+        let mut digest = ListDigest::default();
+        while let Some(chunk) = source.next_chunk().await? {
+            digest.update(&chunk);
             let mut qb: QueryBuilder<sqlx::Postgres> =
                 QueryBuilder::new("INSERT INTO words (word, wordlist_id) ");
             qb.push_values(chunk.iter(), |mut b, word| {
-                b.push_bind(word.clone()).push_bind(*wordlist_id);
+                b.push_bind(word).push_bind(id);
             });
-            qb.build().execute(&self.pool).await?;
+            qb.build().execute(&mut *tx).await.map_err(db)?;
         }
-
-        sqlx::query_as::<_, Word>("SELECT * FROM words WHERE wordlist_id = $1")
-            .bind(wordlist_id)
-            .fetch_all(&self.pool)
-            .await
-    }
-
-    pub async fn create_wordlist(
-        &self,
-        wordlist_config: &WordlistConfig,
-    ) -> Result<Wordlist, sqlx::Error> {
-        let wordlist = sqlx::query_as::<_, Wordlist>(
-            "INSERT INTO wordlists (name, hash) VALUES ($1, $2) RETURNING *",
-        )
-        .bind(&wordlist_config.name)
-        .bind(&wordlist_config.hash)
-        .fetch_one(&self.pool)
-        .await?;
-
-        let words = wordlist_config.lines().await?;
-        self.create_words(&wordlist.id, &words).await?;
-
-        Ok(wordlist)
-    }
-
-    pub async fn fetch_words(&self, wordlist_id: &i64) -> Result<Vec<Word>, sqlx::Error> {
-        sqlx::query_as::<_, Word>("SELECT * FROM words WHERE wordlist_id = $1")
-            .bind(wordlist_id)
-            .fetch_all(&self.pool)
-            .await
-    }
-
-    pub async fn find_scan(&self, scan_hash: &str) -> Result<Scan, sqlx::Error> {
-        sqlx::query_as::<_, Scan>("SELECT * FROM scans WHERE config_hash = $1")
-            .bind(scan_hash)
-            .fetch_one(&self.pool)
-            .await
-    }
-
-    pub async fn fetch_found_scan_entries(
-        &self,
-        scan_id: i64,
-        limit: usize,
-        offset: usize,
-    ) -> Result<Vec<ScanResult>, sqlx::Error> {
-        let found_entries = if limit == 0 {
-            sqlx::query_as::<_, ScanEntry>(
-                "SELECT * FROM scan_entries WHERE scan_id = $1 AND status = 'found'",
-            )
-            .bind(scan_id)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query_as::<_, ScanEntry>(
-                "SELECT * FROM scan_entries WHERE scan_id = $1 AND status = 'found' LIMIT $2 OFFSET $3",
-            )
-            .bind(scan_id)
-            .bind(limit as i64)
-            .bind(offset as i64)
-            .fetch_all(&self.pool)
-            .await?
-        };
-
-        let mut found_urls = Vec::new();
-        for entry in found_entries {
-            let mut url = sqlx::query_scalar::<_, String>("SELECT url FROM urls WHERE id = $1")
-                .bind(entry.url_id)
-                .fetch_one(&self.pool)
-                .await?;
-            let word = sqlx::query_scalar::<_, String>("SELECT word FROM words WHERE id = $1")
-                .bind(entry.word_id)
-                .fetch_one(&self.pool)
-                .await?;
-            url = url.replace(&self.config.fuzz_marker, &word);
-
-            found_urls.push(ScanResult {
-                url,
-                scan_status: entry.status.clone(),
-                request_status: entry.request_status.to_string(),
-                body_length: entry.body_length,
-                headers_length: entry.headers_length,
-            });
-        }
-        Ok(found_urls)
-    }
-
-    pub async fn fetch_not_found_scan_entries(
-        &self,
-        scan_id: i64,
-        limit: usize,
-        offset: usize,
-    ) -> Result<Vec<ScanResult>, sqlx::Error> {
-        let not_found_entries = if limit == 0 {
-            sqlx::query_as::<_, ScanEntry>(
-                "SELECT * FROM scan_entries WHERE scan_id = $1 AND status = 'not_found'",
-            )
-            .bind(scan_id)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query_as::<_, ScanEntry>(
-                "SELECT * FROM scan_entries WHERE scan_id = $1 AND status = 'not_found' LIMIT $2 OFFSET $3",
-            )
-            .bind(scan_id)
-            .bind(limit as i64)
-            .bind(offset as i64)
-            .fetch_all(&self.pool)
-            .await?
-        };
-
-        let mut not_found_urls = Vec::new();
-        for entry in not_found_entries {
-            let mut url = sqlx::query_scalar::<_, String>("SELECT url FROM urls WHERE id = $1")
-                .bind(entry.url_id)
-                .fetch_one(&self.pool)
-                .await?;
-            let word = sqlx::query_scalar::<_, String>("SELECT word FROM words WHERE id = $1")
-                .bind(entry.word_id)
-                .fetch_one(&self.pool)
-                .await?;
-            url = url.replace(&self.config.fuzz_marker, &word);
-
-            not_found_urls.push(ScanResult {
-                url,
-                scan_status: entry.status.clone(),
-                request_status: entry.request_status.to_string(),
-                body_length: entry.body_length,
-                headers_length: entry.headers_length,
-            });
-        }
-        Ok(not_found_urls)
-    }
-
-    pub async fn fetch_error_scan_entries(
-        &self,
-        scan_id: i64,
-        limit: usize,
-        offset: usize,
-    ) -> Result<Vec<ScanResult>, sqlx::Error> {
-        let error_entries = if limit == 0 {
-            sqlx::query_as::<_, ScanEntry>(
-                "SELECT * FROM scan_entries WHERE scan_id = $1 AND status = 'error'",
-            )
-            .bind(scan_id)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query_as::<_, ScanEntry>(
-                "SELECT * FROM scan_entries WHERE scan_id = $1 AND status = 'error' LIMIT $2 OFFSET $3",
-            )
-            .bind(scan_id)
-            .bind(limit as i64)
-            .bind(offset as i64)
-            .fetch_all(&self.pool)
-            .await?
-        };
-
-        let mut error_urls = Vec::new();
-        for entry in error_entries {
-            let mut url = sqlx::query_scalar::<_, String>("SELECT url FROM urls WHERE id = $1")
-                .bind(entry.url_id)
-                .fetch_one(&self.pool)
-                .await?;
-            let word = sqlx::query_scalar::<_, String>("SELECT word FROM words WHERE id = $1")
-                .bind(entry.word_id)
-                .fetch_one(&self.pool)
-                .await?;
-            url = url.replace(&self.config.fuzz_marker, &word);
-
-            error_urls.push(ScanResult {
-                url,
-                scan_status: entry.status.clone(),
-                request_status: entry.request_status.to_string(),
-                body_length: entry.body_length,
-                headers_length: entry.headers_length,
-            });
-        }
-        Ok(error_urls)
-    }
-
-    pub async fn fetch_total_scan_entries(
-        &self,
-        scan_id: i64,
-    ) -> Result<(usize, usize, usize, usize), sqlx::Error> {
-        let found = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM scan_entries WHERE scan_id = $1 AND status = 'found'",
-        )
-        .bind(scan_id)
-        .fetch_one(&self.pool)
-        .await?;
-
-        let not_found = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM scan_entries WHERE scan_id = $1 AND status = 'not_found'",
-        )
-        .bind(scan_id)
-        .fetch_one(&self.pool)
-        .await?;
-
-        let error = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM scan_entries WHERE scan_id = $1 AND status = 'error'",
-        )
-        .bind(scan_id)
-        .fetch_one(&self.pool)
-        .await?;
-
-        let total =
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM scan_entries WHERE scan_id = $1")
-                .bind(scan_id)
-                .fetch_one(&self.pool)
-                .await?;
-
-        Ok((
-            found as usize,
-            not_found as usize,
-            error as usize,
-            total as usize,
-        ))
-    }
-
-    pub async fn get_scan_results(
-        &self,
-        scan_id: i64,
-        limit: usize,
-        offset: usize,
-    ) -> Result<ScanResults, sqlx::Error> {
-        let found = self
-            .fetch_found_scan_entries(scan_id, limit, offset)
-            .await?;
-        let not_found = self
-            .fetch_not_found_scan_entries(scan_id, limit, offset)
-            .await?;
-        let error = self
-            .fetch_error_scan_entries(scan_id, limit, offset)
-            .await?;
-        let (found_total, not_found_total, error_total, entries_total) =
-            self.fetch_total_scan_entries(scan_id).await?;
-
-        Ok(ScanResults {
-            found,
-            not_found,
-            error,
-            totals: crate::scanner::ScanResultTotals {
-                found: found_total,
-                not_found: not_found_total,
-                error: error_total,
-                entries: entries_total,
-            },
-        })
-    }
-
-    pub async fn get_log_totals(&self) -> Result<LogTotals, sqlx::Error> {
-        let debug_count =
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM logs WHERE level = 'debug'")
-                .fetch_one(&self.pool)
-                .await?;
-        let info_count =
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM logs WHERE level = 'info'")
-                .fetch_one(&self.pool)
-                .await?;
-        let warn_count =
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM logs WHERE level = 'warn'")
-                .fetch_one(&self.pool)
-                .await?;
-        let error_count =
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM logs WHERE level = 'error'")
-                .fetch_one(&self.pool)
-                .await?;
-
-        Ok(LogTotals {
-            debug: debug_count as usize,
-            info: info_count as usize,
-            warn: warn_count as usize,
-            error: error_count as usize,
-            entries: (debug_count + info_count + warn_count + error_count) as usize,
-        })
-    }
-
-    pub async fn get_logs(
-        &self,
-        scan_id: &i64,
-        limit: usize,
-        offset: usize,
-    ) -> Result<Logs, sqlx::Error> {
-        let logs = if limit == 0 {
-            sqlx::query_as::<_, crate::scanner::Log>(
-                "SELECT * FROM logs WHERE scan_id = $1 ORDER BY created_at DESC",
-            )
-            .bind(scan_id)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query_as::<_, crate::scanner::Log>(
-                "SELECT * FROM logs WHERE scan_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
-            )
-            .bind(scan_id)
-            .bind(limit as i64)
-            .bind(offset as i64)
-            .fetch_all(&self.pool)
-            .await?
-        };
-
-        let log_totals = self.get_log_totals().await?;
-
-        Ok(Logs {
-            logs,
-            totals: log_totals,
-        })
-    }
-
-    // Column-for-column mirror of the table it writes; splitting it into a struct
-    // would add a type whose only job is to be destructured immediately.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn update_work_status(
-        &self,
-        entry_id: i64,
-        status: &str,
-        response_status: &str,
-        body: Option<Vec<u8>>,
-        headers: Option<Vec<String>>,
-        headers_length: i64,
-        body_length: i64,
-    ) -> Result<(), sqlx::Error> {
-        let response_status_int: i32 = response_status.parse().unwrap_or(0);
-        sqlx::query(
-            "UPDATE scan_entries SET status = $1, request_status = $2, body = $3, headers = $4, headers_length = $5, body_length = $6 WHERE id = $7",
-        )
-        .bind(status)
-        .bind(response_status_int)
-        .bind(body)
-        .bind(headers.map(|h| serde_json::to_string(&h).unwrap()))
-        .bind(headers_length)
-        .bind(body_length)
-        .bind(entry_id)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    pub async fn create_scan(
-        &self,
-        scan_config_hash: &str,
-        wordlist_id: &i64,
-        http_method: &str,
-    ) -> Result<Scan, sqlx::Error> {
-        sqlx::query_as::<_, Scan>(
-            "INSERT INTO scans (config_hash, status, wordlist_id, method) VALUES ($1, 'created', $2, $3) RETURNING *",
-        )
-        .bind(scan_config_hash)
-        .bind(wordlist_id)
-        .bind(http_method)
-        .fetch_one(&self.pool)
-        .await
-    }
-
-    pub async fn create_urls(
-        &self,
-        scan_id: &i64,
-        urls: &[String],
-    ) -> Result<Vec<Url>, sqlx::Error> {
-        let mut qb: QueryBuilder<sqlx::Postgres> =
-            QueryBuilder::new("INSERT INTO urls (url, scan_id) ");
-        qb.push_values(urls.iter(), |mut b, url| {
-            b.push_bind(url.clone()).push_bind(*scan_id);
-        });
-        qb.build().execute(&self.pool).await?;
-
-        sqlx::query_as::<_, Url>("SELECT * FROM urls WHERE scan_id = $1")
-            .bind(scan_id)
-            .fetch_all(&self.pool)
-            .await
-    }
-
-    pub async fn find_urls(&self, scan_id: &i64) -> Result<Vec<Url>, sqlx::Error> {
-        let urls = sqlx::query_as::<_, Url>("SELECT * FROM urls WHERE scan_id = $1")
-            .bind(scan_id)
-            .fetch_all(&self.pool)
-            .await?;
-
-        if urls.is_empty() {
-            return Err(sqlx::Error::RowNotFound);
-        }
-
-        Ok(urls)
-    }
-
-    pub async fn fresh_start_scan(&self, scan_id: &i64) -> Result<Scan, sqlx::Error> {
-        sqlx::query("UPDATE scans SET status = 'created' WHERE id = $1")
-            .bind(scan_id)
-            .execute(&self.pool)
-            .await?;
-
-        sqlx::query("DELETE FROM logs WHERE scan_id = $1")
-            .bind(scan_id)
-            .execute(&self.pool)
-            .await?;
-
-        sqlx::query("DELETE FROM scan_entries WHERE scan_id = $1")
-            .bind(scan_id)
-            .execute(&self.pool)
-            .await?;
-
-        sqlx::query_as::<_, Scan>("SELECT * FROM scans WHERE id = $1")
-            .bind(scan_id)
-            .fetch_one(&self.pool)
-            .await
-    }
-
-    /// Remove an isolated stream scan and its dependent rows once it has
-    /// finished streaming. Stream scans are unique per connection (see the
-    /// `isolate` arg to prepare_scan), so nothing else references them; deleting
-    /// keeps the ambulo DB from growing unbounded now that concurrent scans no
-    /// longer share (and reuse) one cached scan record. Words/wordlists are
-    /// content-deduped and shared across scans, so they are intentionally kept.
-    pub async fn delete_scan(&self, scan_id: i64) -> Result<(), sqlx::Error> {
-        sqlx::query("DELETE FROM scan_entries WHERE scan_id = $1")
-            .bind(scan_id)
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("DELETE FROM logs WHERE scan_id = $1")
-            .bind(scan_id)
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("DELETE FROM urls WHERE scan_id = $1")
-            .bind(scan_id)
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("DELETE FROM scans WHERE id = $1")
-            .bind(scan_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    /// Age-based garbage collection. Stream scans self-clean on completion
-    /// (daemon `delete_scan`), but scans abandoned mid-run (node disconnect /
-    /// daemon crash) and instant/CLI scans leave their rows behind and grow the
-    /// table unbounded. This deletes everything for scans created before the
-    /// retention cutoff - old enough that no real scan is still running, so it is
-    /// safe even for a scan that still has queued rows (i.e. was abandoned). Words
-    /// and wordlists are content-deduped and shared across scans, so kept.
-    /// Returns the number of scan_entries rows reclaimed.
-    pub async fn gc_old_scans(&self, retention_hours: i64) -> Result<u64, sqlx::Error> {
-        // created_at is stored as NOW()::TEXT; cast back to compare by age.
-        let old_ids: Vec<i64> = sqlx::query_scalar(
-            "SELECT id FROM scans \
-             WHERE created_at::timestamptz < NOW() - make_interval(hours => $1)",
-        )
-        .bind(retention_hours as i32)
-        .fetch_all(&self.pool)
-        .await?;
-        if old_ids.is_empty() {
-            return Ok(0);
-        }
-        // Children before parents (scan_entries + urls FK scans).
-        let reclaimed = sqlx::query("DELETE FROM scan_entries WHERE scan_id = ANY($1)")
-            .bind(&old_ids)
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
-        let _ = sqlx::query("DELETE FROM logs WHERE scan_id = ANY($1)")
-            .bind(&old_ids)
-            .execute(&self.pool)
+        let hash = digest.finish();
+        let stored = sqlx::query("UPDATE wordlists SET hash = $1 WHERE id = $2")
+            .bind(&hash)
+            .bind(id)
+            .execute(&mut *tx)
             .await;
-        let _ = sqlx::query("DELETE FROM urls WHERE scan_id = ANY($1)")
-            .bind(&old_ids)
-            .execute(&self.pool)
-            .await;
-        let _ = sqlx::query("DELETE FROM scans WHERE id = ANY($1)")
-            .bind(&old_ids)
-            .execute(&self.pool)
-            .await;
-        Ok(reclaimed)
-    }
-
-    pub async fn create_scan_entries(
-        &self,
-        urls: &Vec<Url>,
-        scan: &Scan,
-        words: &[Word],
-    ) -> Result<(), sqlx::Error> {
-        const BATCH_SIZE: usize = 1000;
-        for url in urls {
-            for chunk in words.chunks(BATCH_SIZE) {
-                let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
-                    "INSERT INTO scan_entries (word_id, scan_id, url_id, status, headers_length, body_length, headers, body) ",
-                );
-                qb.push_values(chunk.iter(), |mut b, word| {
-                    b.push_bind(word.id)
-                        .push_bind(scan.id)
-                        .push_bind(url.id)
-                        .push_bind("queued")
-                        .push_bind(0i64)
-                        .push_bind(0i64)
-                        .push_bind(Option::<String>::None)
-                        .push_bind(Option::<Vec<u8>>::None);
-                });
-                if let Err(e) = qb.build().execute(&self.pool).await {
-                    eprintln!("Error inserting scan entries: {e:?}");
-                    return Err(e);
-                }
+        match stored {
+            Ok(_) => tx.commit().await.map_err(db)?,
+            // Stored before, or by another scan meanwhile: that copy is the one used.
+            Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => {
+                tx.rollback().await.map_err(db)?;
+                let id = sqlx::query_scalar("SELECT id FROM wordlists WHERE hash = $1")
+                    .bind(&hash)
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(db)?;
+                return Ok(Wordlist { id, hash });
             }
+            Err(e) => return Err(db(e)),
         }
-        Ok(())
+        Ok(Wordlist { id, hash })
     }
 
-    pub async fn set_scan_status(
+    /// Request each of `urls` with every word of wordlist `wordlist_id`, as scan
+    /// `scan_id`: the URLs are kept without a user, a password or a token in them, with
+    /// `fuzz_marker` kept where it stands in place of one (the scan's [`ScanStore`] holds
+    /// them as given), and an entry made for each URL and word. The database makes the entries from the words it holds, so none is read
+    /// here.
+    pub async fn queue_scan(
         &self,
-        scan_id: &i64,
-        status: &str,
-    ) -> Result<String, sqlx::Error> {
-        sqlx::query("UPDATE scans SET status = $1 WHERE id = $2")
-            .bind(status)
+        scan_id: &str,
+        urls: &[String],
+        wordlist_id: i64,
+        fuzz_marker: &str,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        for url in urls {
+            let url_id: i64 =
+                sqlx::query_scalar("INSERT INTO urls (url, scan_id) VALUES ($1, $2) RETURNING id")
+                    .bind(cfx_db::scans::safe_url_keeping(url, fuzz_marker))
+                    .bind(scan_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            sqlx::query(
+                "INSERT INTO scan_entries (word_id, scan_id, url_id) \
+                 SELECT id, $1, $2 FROM words WHERE wordlist_id = $3 ORDER BY id",
+            )
             .bind(scan_id)
-            .execute(&self.pool)
+            .bind(url_id)
+            .bind(wordlist_id)
+            .execute(&mut *tx)
             .await?;
-        Ok(status.to_string())
+        }
+        tx.commit().await
     }
 
-    pub async fn reset_halted_scan_entries(&self, scan_id: &i64) -> Result<(), sqlx::Error> {
+    /// Queue again the entries of scan `scan_id` that were being requested when it
+    /// stopped, so that the scan taken up again requests them.
+    pub async fn requeue_unfinished(&self, scan_id: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "UPDATE scan_entries SET status = 'queued' WHERE status = 'processing' AND scan_id = $1",
+            "UPDATE scan_entries SET status = 'queued' WHERE scan_id = $1 AND status = 'scanning'",
         )
         .bind(scan_id)
         .execute(&self.pool)
@@ -983,109 +182,211 @@ impl AmbuloDb {
         Ok(())
     }
 
-    pub async fn reset_entry_to_queued(&self, entry_id: i64) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE scan_entries SET status = 'queued' WHERE id = $1")
-            .bind(entry_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+    /// How many requests scan `scan_id` makes in all.
+    pub async fn entries(&self, scan_id: &str) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_entries WHERE scan_id = $1")
+            .bind(scan_id)
+            .fetch_one(&self.pool)
+            .await
     }
 
-    pub async fn get_work_one(&self, scan_id: &i64) -> Result<Work, sqlx::Error> {
-        let scan_entry = sqlx::query_as::<_, ScanEntry>(
-            r#"
-            UPDATE scan_entries
-            SET status = 'scanning'
-            WHERE id = (
-                SELECT id FROM scan_entries
-                WHERE scan_id = $1 AND status = 'queued'
-                LIMIT 1
-                FOR UPDATE SKIP LOCKED
-            )
-            RETURNING *
-            "#,
+    /// End scan `scan_id`: completed when it sent every request, stopped when some were
+    /// left unsent, failed when it failed.
+    pub async fn end_scan(
+        &self,
+        scan: cfx_db::scans::Running,
+        failed: bool,
+    ) -> Result<(), sqlx::Error> {
+        let left: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM scan_entries \
+             WHERE scan_id = $1 AND status IN ('queued', 'scanning'))",
         )
-        .bind(scan_id)
+        .bind(&scan.id)
         .fetch_one(&self.pool)
         .await?;
-
-        let url_string = sqlx::query_scalar::<_, String>("SELECT url FROM urls WHERE id = $1")
-            .bind(scan_entry.url_id)
-            .fetch_one(&self.pool)
-            .await?;
-
-        let word_string = sqlx::query_scalar::<_, String>("SELECT word FROM words WHERE id = $1")
-            .bind(scan_entry.word_id)
-            .fetch_one(&self.pool)
-            .await?;
-
-        let full_url = url_string.replace(&self.config.fuzz_marker, &word_string);
-
-        Ok(Work {
-            url: full_url,
-            entry_id: scan_entry.id,
-            method: self.config.http_method.to_string(),
-        })
+        let status = match (failed, left) {
+            (true, _) => cfx_db::scans::Status::Failed,
+            (false, true) => cfx_db::scans::Status::Stopped,
+            (false, false) => cfx_db::scans::Status::Completed,
+        };
+        cfx_db::scans::finish(scan, status).await
     }
 
-    /// Drop all ambulo tables (used by --recreate-db in CLI mode).
-    pub async fn drop_tables(&self) -> Result<(), sqlx::Error> {
-        for table in &[
-            "operations",
-            "logs",
-            "scan_entries",
-            "urls",
-            "scans",
-            "words",
-            "wordlists",
-        ] {
-            sqlx::query(&format!("DROP TABLE IF EXISTS {table} CASCADE"))
+    /// Delete the scans made more than `retention_hours` ago, with everything kept for
+    /// them, and say how many. Word lists are kept: scans share them.
+    pub async fn delete_old_scans(&self, retention_hours: i64) -> Result<u64, sqlx::Error> {
+        let deleted =
+            sqlx::query("DELETE FROM scans WHERE created_at < now() - make_interval(hours => $1)")
+                .bind(retention_hours as i32)
                 .execute(&self.pool)
                 .await?;
-        }
-        Ok(())
+        Ok(deleted.rows_affected())
     }
+}
 
-    /// Return a clone of this AmbuloDb but with a different config (used by daemon per-scan).
-    pub fn clone_with_config(&self, config: crate::libs::cli_args::Args) -> Self {
-        Self {
+/// The levels of a scan's log, least important first.
+const LOG_LEVELS: [&str; 4] = ["debug", "info", "warn", "error"];
+
+/// One scan's [`Store`]: its entries and its log, in ambulo's tables.
+pub struct ScanStore {
+    pool: sqlx::PgPool,
+    scan_id: String,
+    /// The scan's URLs as the request gave them, by the URL kept for each, which has no
+    /// credential in it. They are held here for the scan's life and given again when it
+    /// is taken up again.
+    urls: std::collections::HashMap<String, String>,
+    /// What a request is made from: the scan's URL with the word in place of its marker.
+    fuzz_marker: String,
+    method: String,
+    /// Log lines below this level are not kept.
+    min_level: usize,
+}
+
+impl AmbuloDb {
+    /// The store for scan `scan_id`, run with `config`.
+    pub fn scan_store(&self, scan_id: String, config: &crate::libs::cli_args::Args) -> ScanStore {
+        let level = config.log_level.to_string();
+        ScanStore {
             pool: self.pool.clone(),
-            config,
+            scan_id,
+            urls: config
+                .url
+                .iter()
+                .map(|url| {
+                    let kept = cfx_db::scans::safe_url_keeping(url, &config.fuzz_marker);
+                    (kept, url.clone())
+                })
+                .collect(),
+            fuzz_marker: config.fuzz_marker.clone(),
+            method: config.http_method.to_string(),
+            min_level: LOG_LEVELS.iter().position(|l| *l == level).unwrap_or(0),
         }
     }
+}
 
-    // --- Operations (daemon mode) ---
-
-    pub async fn create_operation(
-        &self,
-        id: &str,
-        operation: &str,
-        params: &str,
-    ) -> Result<Operation, sqlx::Error> {
-        sqlx::query_as::<_, Operation>(
-            "INSERT INTO operations (id, operation, params, status) VALUES ($1, $2, $3, 'queued') RETURNING *",
+impl Store for ScanStore {
+    /// Taken with FOR UPDATE SKIP LOCKED, so two workers never take the same entry.
+    async fn claim(&self) -> Result<Option<Work>, String> {
+        let entry: Option<(i64, String, String)> = sqlx::query_as(
+            r#"
+            WITH taken AS (
+                UPDATE scan_entries
+                SET status = 'scanning'
+                WHERE id = (
+                    SELECT id FROM scan_entries
+                    WHERE scan_id = $1 AND status = 'queued'
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING id, url_id, word_id
+            )
+            SELECT taken.id, urls.url, words.word
+            FROM taken JOIN urls ON urls.id = taken.url_id JOIN words ON words.id = taken.word_id
+            "#,
         )
-        .bind(id)
-        .bind(operation)
-        .bind(params)
-        .fetch_one(&self.pool)
+        .bind(&self.scan_id)
+        .fetch_optional(&self.pool)
         .await
+        .map_err(|e| e.to_string())?;
+        Ok(entry.map(|(entry_id, url, word)| Work {
+            url: self.given(&url).replace(&self.fuzz_marker, &word),
+            entry_id,
+            method: self.method.clone(),
+        }))
     }
 
-    pub async fn update_operation_status(
-        &self,
-        id: &str,
-        status: &str,
-        result: Option<&str>,
-    ) -> Result<(), sqlx::Error> {
+    async fn record(&self, entry: i64, outcome: Outcome<'_>) -> Result<(), String> {
         sqlx::query(
-            "UPDATE operations SET status = $1, result = $2, updated_at = NOW()::TEXT WHERE id = $3",
+            "UPDATE scan_entries SET status = $1, request_status = $2, headers_length = $3, \
+             body_length = $4 WHERE id = $5",
         )
-        .bind(status)
-        .bind(result)
-        .bind(id)
+        .bind(outcome.status)
+        .bind(outcome.code.parse::<i32>().unwrap_or(0))
+        .bind(outcome.headers_length)
+        .bind(outcome.body_length)
+        .bind(entry)
         .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
+
+    async fn release(&self, entry: i64) -> Result<(), String> {
+        sqlx::query("UPDATE scan_entries SET status = 'queued' WHERE id = $1")
+            .bind(entry)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    async fn results(&self) -> Result<ScanResults, String> {
+        results(&self.pool, &self.scan_id, |url, word| {
+            self.given(url).replace(&self.fuzz_marker, word)
+        })
+        .await
+        .map_err(|e| e.to_string())
+    }
+
+    /// A line that cannot be kept is dropped: a scan does not stop over its log.
+    async fn log(&self, level: &str, message: &str) {
+        if LOG_LEVELS.iter().position(|l| *l == level).unwrap_or(0) < self.min_level {
+            return;
+        }
+        let _ = cfx_db::scans::log(&self.pool, Some(&self.scan_id), level, message).await;
+    }
+}
+
+impl ScanStore {
+    /// The URL the request gave for `kept`, a URL as the scan keeps it.
+    fn given(&self, kept: &str) -> String {
+        self.urls
+            .get(kept)
+            .cloned()
+            .unwrap_or_else(|| kept.to_string())
+    }
+}
+
+/// What scan `scan_id` found, in the order its entries were made, with its totals, each
+/// entry's URL made by `request` from the URL kept and the word.
+async fn results(
+    pool: &sqlx::PgPool,
+    scan_id: &str,
+    request: impl Fn(&str, &str) -> String,
+) -> Result<ScanResults, sqlx::Error> {
+    let found: Vec<(String, String, i32, i64, i64)> = sqlx::query_as(
+        "SELECT u.url, w.word, e.request_status, e.body_length, e.headers_length \
+         FROM scan_entries e JOIN urls u ON u.id = e.url_id JOIN words w ON w.id = e.word_id \
+         WHERE e.scan_id = $1 AND e.status = 'found' ORDER BY e.id",
+    )
+    .bind(scan_id)
+    .fetch_all(pool)
+    .await?;
+    let (not_found, error, entries): (i64, i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*) FILTER (WHERE status = 'not_found'), \
+         COUNT(*) FILTER (WHERE status = 'error'), COUNT(*) FROM scan_entries WHERE scan_id = $1",
+    )
+    .bind(scan_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(ScanResults {
+        totals: crate::scanner::ScanResultTotals {
+            found: found.len(),
+            not_found: not_found as usize,
+            error: error as usize,
+            entries: entries as usize,
+        },
+        found: found
+            .into_iter()
+            .map(
+                |(url, word, code, body_length, headers_length)| ScanResult {
+                    url: request(&url, &word),
+                    scan_status: "found".to_string(),
+                    request_status: code.to_string(),
+                    body_length,
+                    headers_length,
+                },
+            )
+            .collect(),
+    })
 }

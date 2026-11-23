@@ -1,0 +1,13 @@
+id: telerik-ui-aspnet-ajax
+info:
+  name: Telerik UI for ASP.NET AJAX
+  category: UI Framework
+  metadata:
+    vendor: telerik
+    product: ui_for_asp.net_ajax
+implies: [aspnet]
+detect:
+  any:
+    - script_src: { regex: '(?i)/Telerik\.Web\.UI\.WebResource\.axd' }
+version:
+  - script_src: { regex: '(?i)Telerik\.Web\.UI(?:%2c|,)(?:\+|%20| )Version(?:%3d|=)([0-9]+\.[0-9]+\.[0-9]+)' }

@@ -103,10 +103,10 @@ pub struct InjectParams {
     #[serde(default = "d_true")]
     pub follow_redirects: bool,
     /// Names pinned to addresses, `[["app.example.com", "203.0.113.7:443"], ...]`,
-    /// used on every connection the pass makes. A caller that has already decided
-    /// which addresses of a name may be dialled sends them, so the name is not looked
-    /// up again here and answered with somewhere else. The opt-in smuggling probe
-    /// opens raw sockets and looks names up itself.
+    /// used on every connection the pass makes, the opt-in smuggling probe's raw
+    /// sockets included. A caller that has already decided which addresses of a name
+    /// may be dialled sends them, so the name is not looked up again here and answered
+    /// with somewhere else.
     #[serde(default)]
     pub resolve: Vec<(String, std::net::SocketAddr)>,
     /// Check certificates on every connection the pass's HTTP clients make, the
@@ -749,6 +749,7 @@ pub async fn run(mut params: InjectParams, tx: mpsc::UnboundedSender<Value>) {
     let raw = Arc::new(crate::rawhttp::Route {
         egress: params.egress.clone(),
         block_internal: params.block_internal,
+        resolve: params.resolve.clone(),
     });
     let race_budget = Arc::new(AtomicUsize::new(if race.is_some() {
         MAX_RACE_ENDPOINTS
@@ -1171,7 +1172,7 @@ async fn escalate_learned(
             })
             .collect();
         let f = Finding::new(
-            "cortex-chain",
+            "plessor-chain",
             // Its own class rather than `ssrf`, and not for tidiness: findings
             // are deduplicated on class, path, parameter and location, so
             // reusing `ssrf` here means this is silently dropped as a repeat of
@@ -3147,7 +3148,7 @@ async fn probe_ssrf_reflected(
     };
 
     let mut f = Finding::new(
-        "cortex-ssrf",
+        "plessor-ssrf",
         "ssrf",
         "Server-side request forgery (response returned to the caller)",
         worst,
@@ -3309,7 +3310,7 @@ async fn probe_ratelimit(client: &Client, ep: &InjEndpoint, seen: &SeenSet) -> O
     if throttled == 0 && ok >= (BURST as u32 * 3 / 4) {
         return Some(
             Finding::new(
-                "cortex-inject",
+                "plessor-inject",
                 "no_rate_limit",
                 "Missing rate limiting on a sensitive endpoint",
                 "medium",
@@ -3370,7 +3371,7 @@ async fn probe_inventory(client: &Client, ep: &InjEndpoint, seen: &SeenSet) -> V
         if resp.status != 404 && resp.status != 410 && resp.status != 0 {
             out.push(
                 Finding::new(
-                    "cortex-inject",
+                    "plessor-inject",
                     "improper_inventory",
                     "Undocumented / shadow API version",
                     "medium",
@@ -3659,7 +3660,7 @@ async fn probe_tampering(client: &Client, site: &Site, baseline: &Resp) -> Optio
         }
         return Some(
             Finding::new(
-                "cortex-tamper",
+                "plessor-tamper",
                 "tampering",
                 "Business logic: a computed value follows an out-of-domain input",
                 "high",
@@ -3813,7 +3814,7 @@ async fn probe_deserialization(client: &Client, site: &Site) -> Option<Value> {
 
     Some(
         Finding::new(
-            "cortex-deserial",
+            "plessor-deserial",
             "deserialization",
             format!("Unsafe deserialization ({})", format.label),
             "critical",
@@ -4009,7 +4010,7 @@ async fn probe_cors(client: &Client, ep: &InjEndpoint, seen: &SeenSet) -> Option
     check(&r2)?;
     Some(
         Finding::new(
-            "cortex-inject",
+            "plessor-inject",
             "cors",
             "CORS misconfiguration (credentialed cross-origin read)",
             "high",
@@ -4843,7 +4844,7 @@ async fn probe_lfi(
                     "critical"
                 };
                 let mut f = Finding::new(
-                    "cortex-inject",
+                    "plessor-inject",
                     "lfi",
                     "Local file inclusion / path traversal",
                     severity,
@@ -5103,7 +5104,7 @@ fn boolean_differential(baseline: &Resp, t: &Resp, f: &Resp, min_diff: i64) -> b
 }
 
 fn finding(class: &str, name: &str, severity: &str, site: &Site, detail: String) -> Value {
-    Finding::new("cortex-inject", class, name, severity, &site.url)
+    Finding::new("plessor-inject", class, name, severity, &site.url)
         .method(&site.method)
         .param(&site.param)
         .location(site.where_token())

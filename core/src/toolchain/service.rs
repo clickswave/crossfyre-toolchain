@@ -3,7 +3,8 @@
 // Two kinds of services:
 //
 // 1. Extension daemons (ambulo, voyage, doorward) - long-lived *per-user* daemons:
-//      Linux   -> systemd user units      (~/.config/systemd/user, systemctl --user)
+//      Linux   -> systemd user units      (~/.config/systemd/user, systemctl --user),
+//                 with lingering on for the user so they run outside a login (see `linger`)
 //      macOS   -> launchd user agents     (~/Library/LaunchAgents, launchctl)
 //      Windows -> scheduled tasks run as the operator (see `win::tasks`)
 //
@@ -70,67 +71,61 @@ fn resolve_targets(target: &str) -> Result<Vec<&'static str>, Box<dyn std::error
     }
 }
 
-/// The name an engine's service is registered under on this machine: its public name,
-/// unless only a unit under its legacy name exists, which is a machine the rename has
-/// not been carried to yet. Anything that is not an engine is its own key.
-fn unit_key(ext: &str) -> String {
-    match super::engine(ext) {
-        Some(e) => match e.legacy {
-            Some(old) if !imp::exists(e.name) && imp::exists(old) => old.to_string(),
-            _ => e.name.to_string(),
-        },
-        None => ext.to_string(),
-    }
-}
-
-/// Every name a unit for `ext` may be registered under, public name first.
-fn unit_keys(ext: &str) -> Vec<&str> {
-    match super::engine(ext) {
-        Some(e) => std::iter::once(e.name).chain(e.legacy).collect(),
-        None => vec![ext],
-    }
-}
-
 // ── Public API ────────────────────────────────────────────────────────
 
-/// Register the service for an extension (write unit/plist/task) under its public
-/// name. Called after install. The service exists but is left disabled until `enable`.
+/// Register the service for an extension (write unit/plist/task) under its name.
+/// Called after install. The service exists but is left disabled until `enable`.
 pub fn create_service_file(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
     imp::create(ext)
 }
 
-/// Is a service registered for an extension, under any name it may have?
+/// Is a service registered for an extension?
 pub fn has_service_file(ext: &str) -> bool {
-    unit_keys(ext).into_iter().any(imp::exists)
+    imp::exists(ext)
 }
 
-/// Remove the service registration for an extension, under every name it may have.
-/// Called during `remove`.
+/// What [`refresh_service_file`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refreshed {
+    /// It was what this build writes already.
+    Current,
+    /// It was missing, or another release wrote it, and it is this build's now.
+    Written,
+    /// As `Written`, and the engine, which was running, was restarted from it.
+    Restarted,
+}
+
+/// Make engine `ext`'s service what this build writes. A unit is a file crossfyre
+/// generates, so one that is missing or that another release wrote, such as one naming
+/// a command line that release had, is written again, and an engine that was running
+/// is restarted to run from it. `node init` and `extension install` do this for an
+/// engine that is installed already, and the node service for every engine when it
+/// starts, which is what carries an upgrade by a package manager or by the dashboard.
+pub fn refresh_service_file(ext: &str) -> Result<Refreshed, Box<dyn std::error::Error>> {
+    imp::refresh(ext)
+}
+
+/// Remove the service registration for an extension. Called during `remove`.
 pub fn remove_service_file(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
-    for key in unit_keys(ext) {
-        imp::delete(key)?;
-    }
-    Ok(())
+    imp::delete(ext)
 }
 
 /// Human-readable run state of an extension's daemon: running | stopped |
 /// failed | disabled | unknown.
 pub fn daemon_status(ext: &str) -> String {
-    imp::status(&unit_key(ext))
+    imp::status(ext)
 }
 
 /// Best-effort stop used before replacing a binary on reinstall. Never errors.
 pub fn try_stop(ext: &str) {
-    let _ = imp::action("stop", &unit_key(ext));
+    let _ = imp::action("stop", ext);
 }
 
-/// Stop and disable `ext`'s service under every name it may have. Never errors.
-pub fn try_stop_and_disable_all(ext: &str) {
-    for key in unit_keys(ext) {
-        if imp::exists(key) {
-            let _ = imp::action("stop", key);
-            let _ = imp::action("disable", key);
-        }
+/// Stop and disable `ext`'s service, when it has one. Never errors.
+pub fn try_stop_and_disable(ext: &str) {
+    if imp::exists(ext) {
+        let _ = imp::action("stop", ext);
+        let _ = imp::action("disable", ext);
     }
 }
 
@@ -147,39 +142,12 @@ pub fn user_unit_dir() -> Option<std::path::PathBuf> {
     }
 }
 
-/// This machine's service manager, as the engine migration drives it.
-pub struct HostUnits;
-
-impl super::migrate::Units for HostUnits {
-    fn exists(&self, key: &str) -> bool {
-        imp::exists(key)
-    }
-    fn stop(&self, key: &str) {
-        let _ = imp::action("stop", key);
-    }
-    fn disable(&self, key: &str) {
-        let _ = imp::action("disable", key);
-    }
-    fn enable(&self, key: &str) {
-        let _ = imp::action("enable", key);
-    }
-    fn start(&self, key: &str) {
-        let _ = imp::action("start", key);
-    }
-    fn remove(&self, key: &str) {
-        let _ = imp::delete(key);
-    }
-    fn create(&self, id: &str) {
-        let _ = imp::create(id);
-    }
-}
-
 pub fn start(target: &str) -> Result<(), Box<dyn std::error::Error>> {
     for t in resolve_targets(target)? {
         if t == NODE_TARGET {
             node::action("start")?;
         } else {
-            imp::action("start", &unit_key(t))?;
+            imp::action("start", t)?;
         }
     }
     Ok(())
@@ -190,7 +158,7 @@ pub fn stop(target: &str) -> Result<(), Box<dyn std::error::Error>> {
         if t == NODE_TARGET {
             node::action("stop")?;
         } else {
-            imp::action("stop", &unit_key(t))?;
+            imp::action("stop", t)?;
         }
     }
     Ok(())
@@ -201,7 +169,7 @@ pub fn restart(target: &str) -> Result<(), Box<dyn std::error::Error>> {
         if t == NODE_TARGET {
             node::action("restart")?;
         } else {
-            imp::action("restart", &unit_key(t))?;
+            imp::action("restart", t)?;
         }
     }
     Ok(())
@@ -212,7 +180,7 @@ pub fn enable(target: &str) -> Result<(), Box<dyn std::error::Error>> {
         if t == NODE_TARGET {
             node::action("enable")?;
         } else {
-            imp::action("enable", &unit_key(t))?;
+            imp::action("enable", t)?;
         }
     }
     Ok(())
@@ -223,7 +191,7 @@ pub fn disable(target: &str) -> Result<(), Box<dyn std::error::Error>> {
         if t == NODE_TARGET {
             node::action("disable")?;
         } else {
-            imp::action("disable", &unit_key(t))?;
+            imp::action("disable", t)?;
         }
     }
     Ok(())
@@ -264,21 +232,20 @@ pub fn list() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     for e in ENGINES {
-        let installed = is_extension_installed(e.id);
-        let key = unit_key(e.id);
-        let has_service = imp::exists(&key);
+        let installed = is_extension_installed(e.name);
+        let has_service = imp::exists(e.name);
 
         let status_str = if !installed {
             "-".to_string()
         } else if !has_service {
             "no service".to_string()
         } else {
-            imp::status(&key)
+            imp::status(e.name)
         };
 
         let enabled_str = if !installed || !has_service {
             "-".to_string()
-        } else if imp::is_enabled(&key) {
+        } else if imp::is_enabled(e.name) {
             "yes".to_string()
         } else {
             "no".to_string()
@@ -308,19 +275,20 @@ pub fn install_node_service(
 ) -> Result<(), Box<dyn std::error::Error>> {
     node::create(cli, data_dir)?;
     node::action("enable")?;
-    node::action("start")?;
+    // One that runs already may run an older node, as after the installer put a new one
+    // in its place, and would run that one until it started again: it is restarted.
+    let how = if node::status() == "running" {
+        "restart"
+    } else {
+        "start"
+    };
+    node::action(how)?;
     Ok(())
-}
-
-/// Run first thing by the node supervisor on macOS: see `node::adopt_root_log`.
-#[cfg(target_os = "macos")]
-pub fn adopt_root_node_log() {
-    node::adopt_root_log();
 }
 
 /// The node worker the node unit runs: the one in the bin directory.
 pub fn node_binary() -> std::path::PathBuf {
-    super::config::get_bin_dir().join(super::config::ext_file_name("node"))
+    super::config::get_bin_dir().join(super::config::file_name("node"))
 }
 
 /// The node unit for a CLI at `cli` whose node worker lives in `bin_dir`.
@@ -335,7 +303,7 @@ pub fn node_unit(
     data_dir: &std::path::Path,
     sudo_user: Option<&str>,
 ) -> Result<String, String> {
-    let node_exe = bin_dir.join(super::config::ext_file_name("node"));
+    let node_exe = bin_dir.join(super::config::file_name("node"));
     let node_exe = unit_line_value(&node_exe.display().to_string())?.to_string();
     let data_dir = unit_line_value(&data_dir.display().to_string())?.to_string();
     let cli_env = quoted_assignment(super::packaging::CLI_ENV, &cli.display().to_string())?;
@@ -349,7 +317,7 @@ pub fn node_unit(
     Ok(format!(
         "[Unit]\n\
          Description=Crossfyre node supervisor\n\
-         After=network-online.target docker.service\n\
+         After=network-online.target\n\
          Wants=network-online.target\n\
          \n\
          [Service]\n\
@@ -385,6 +353,7 @@ fn quoted_assignment(name: &str, value: &str) -> Result<String, String> {
 }
 
 /// One path on the way to a file a root service runs: its owner, group and mode.
+#[cfg(any(unix, test))]
 pub(crate) struct PathOwner {
     pub path: std::path::PathBuf,
     pub uid: u32,
@@ -397,6 +366,7 @@ pub(crate) struct PathOwner {
 /// writable by nobody else, and so must every directory, except that a directory with its
 /// sticky bit set (the Nix store) does not let anyone replace an entry they do not own.
 /// Write access for the root group counts as root's.
+#[cfg(any(unix, test))]
 pub(crate) fn judge_root_run(chain: &[PathOwner]) -> Result<(), String> {
     for (i, p) in chain.iter().enumerate() {
         let others_write = p.mode & 0o002 != 0 || (p.mode & 0o020 != 0 && p.gid != 0);
@@ -625,31 +595,8 @@ pub const NODE_LABEL: &str = "io.crossfyre.node";
 
 /// Where the root node service on macOS logs: a directory only root can change.
 /// launchd opens this path itself, as root, following any link in it, so it cannot be
-/// in the operator's data dir as it once was.
+/// in the operator's data dir.
 pub const NODE_LOG: &str = "/var/log/crossfyre/node.log";
-
-/// `plist`, as [`node_plist`] writes it, with both log entries pointed at `log`; None
-/// when they already are, or when it has no log entries.
-pub fn retarget_log(plist: &str, log: &std::path::Path) -> Option<String> {
-    let want = format!(
-        "<string>{}</string>",
-        plist_string(&log.display().to_string())
-    );
-    let mut out = plist.to_string();
-    let mut found = false;
-    for key in ["StandardOutPath", "StandardErrorPath"] {
-        let head = format!("<key>{key}</key>\n  ");
-        let Some(at) = out.find(&head) else { continue };
-        let start = at + head.len();
-        let Some(len) = out[start..].find("</string>") else {
-            continue;
-        };
-        let end = start + len + "</string>".len();
-        found = true;
-        out.replace_range(start..end, &want);
-    }
-    (found && out != plist).then_some(out)
-}
 
 /// The launchd agent for an engine on macOS: the CLI's `extension host <engine>`, which
 /// starts the engine's daemon (see [`host`]).
@@ -730,39 +677,51 @@ fn host_cli() -> std::path::PathBuf {
         .unwrap_or(stable)
 }
 
-/// Start engine `ext`'s daemon the way its service on macOS or Windows wants it: on its
-/// configured port, told where the toolchain directory is, and with the egress-proxy
-/// variables of the file a systemd unit would have read. Run by the CLI's hidden
-/// `extension host <engine>`, which the launchd agent and the scheduled task name.
+/// Engine `ext`'s daemon as its service runs it: on its configured port, told where the
+/// toolchain directory is, and with the egress-proxy variables of the file a systemd unit
+/// reads. The engine host on macOS and Windows runs it, and so does the node supervisor
+/// where no service manager runs the engines (see `node_engines`).
+pub fn engine_command(ext: &str) -> Result<std::process::Command, String> {
+    let e = super::engine(ext).ok_or_else(|| format!("{ext} is not an engine"))?;
+    let mut cmd = std::process::Command::new(super::config::ext_bin_path(e.name));
+    cmd.args(dguard::daemon_args(super::config::engine_port(e.name)));
+    cmd.env(
+        dguard::TOOLCHAIN_DIR_ENV,
+        super::config::get_toolchain_dir(),
+    );
+    if let Ok(text) = super::sudo_user::read_to_string(&super::config::egress_env_path()) {
+        for (key, value) in env_assignments(&text) {
+            cmd.env(key, value);
+        }
+    }
+    Ok(cmd)
+}
+
+/// Start engine `ext`'s daemon the way its service on macOS or Windows wants it (see
+/// [`engine_command`]). Run by the CLI's hidden `extension host <engine>`, which the
+/// launchd agent and the scheduled task name.
 ///
 /// On macOS this becomes the engine (exec), so launchd supervises the daemon itself. On
 /// Windows it stays to restart the engine when it fails (see `win::host`).
 #[cfg(not(target_os = "linux"))]
 pub fn host(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let e = super::engine(ext).ok_or_else(|| format!("{ext} is not an engine"))?;
-    let bin = super::config::ext_bin_path(e.id);
-    let port = super::config::engine_port(e.id);
-    let mut cmd = std::process::Command::new(&bin);
-    cmd.args(["--daemon", "--port", &port.to_string()]);
-    cmd.env(
-        super::config::TOOLCHAIN_DIR_ENV,
-        super::config::get_toolchain_dir(),
-    );
-    if let Ok(text) = std::fs::read_to_string(super::config::egress_env_path()) {
-        for (key, value) in env_assignments(&text) {
-            cmd.env(key, value);
-        }
-    }
+    let cmd = engine_command(ext)?;
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
+        let mut cmd = cmd;
         let err = cmd.exec();
-        Err(format!("could not start {}: {err}", bin.display()).into())
+        Err(format!(
+            "could not start {}: {err}",
+            std::path::Path::new(cmd.get_program()).display()
+        )
+        .into())
     }
     #[cfg(windows)]
     {
-        let log = super::config::logs_dir().join(format!("{}.log", e.name));
-        super::win::host(e.name, cmd, &log)
+        let name = super::engine(ext).map_or(ext, |e| e.name);
+        let log = super::config::logs_dir().join(format!("{name}.log"));
+        super::win::host(name, cmd, &log)
     }
 }
 
@@ -774,6 +733,83 @@ pub fn node_service_exists() -> bool {
     node::exists()
 }
 
+/// Is systemd the service manager here? The test systemd itself documents: it makes
+/// /run/systemd/system as it starts. WSL without systemd and most containers have none.
+#[cfg(target_os = "linux")]
+pub fn systemd_runs() -> bool {
+    std::path::Path::new("/run/systemd/system").is_dir()
+}
+
+/// What an action on an engine's service says where no service manager runs one.
+pub const NODE_UP_RUNS_ENGINES: &str =
+    "no service manager runs here, so `crossfyre node up` runs the engines";
+
+/// Whether the user's service manager runs, to run the engines' units: it answers on a
+/// bus in their runtime directory, which is what an engine's client looks for before it
+/// starts a unit too. WSL without systemd and most containers run none, systemctl binary
+/// or not, and there `crossfyre node up` runs the engines (see `node_engines`). macOS and
+/// Windows always run theirs.
+pub fn user_manager_runs() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        super::linger::user_bus().is_some_and(|bus| bus.exists())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
+/// [`user_manager_runs`], once what starts the user's service manager has had its chance,
+/// for a command about to give the installed engines their units. Where systemd is the
+/// service manager and no engine has a unit yet, lingering is turned on for the user, so
+/// theirs runs whether or not they are logged in and the engines do not stop at their
+/// logout; and where theirs does not answer, it is waited for for a few seconds, as it
+/// may still be starting, as at boot. Asked once in a process.
+pub fn user_manager_started() -> bool {
+    static STARTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *STARTED.get_or_init(|| {
+        #[cfg(target_os = "linux")]
+        if systemd_runs() && ENGINES.iter().any(|e| is_extension_installed(e.name)) {
+            if !ENGINES.iter().any(|e| imp::exists(e.name)) {
+                super::linger::keep_engines_running();
+            } else if !user_manager_runs() {
+                super::linger::wait_for_manager();
+            }
+        }
+        user_manager_runs()
+    })
+}
+
+/// Say, once in a process, that no service manager runs here, so `crossfyre node up` runs
+/// the engines: what an engine's install says where it makes no unit. Not in a command
+/// that renders its own summary (see [`set_quiet`]).
+pub fn say_node_up_runs_engines() {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    if !quiet() {
+        SAID.call_once(|| {
+            super::ui::step(
+                "No service manager runs here, so `crossfyre node up` runs the engines",
+            );
+        });
+    }
+}
+
+/// Is the node service running, once its service manager is done starting it? A
+/// service can show as starting for a moment after it was told to start, and longer
+/// while it fails and is restarted, so that is waited out for up to ten seconds.
+pub fn node_service_running() -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let status = node::status();
+        let starting = matches!(status.as_str(), "starting" | "activating");
+        if !starting || std::time::Instant::now() >= deadline {
+            return status == "running";
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod node {
     use std::fs;
@@ -783,7 +819,7 @@ mod node {
 
     fn require_root() -> Result<(), Box<dyn std::error::Error>> {
         if unsafe { libc::geteuid() } != 0 {
-            return Err("managing the node service needs root. Re-run with sudo.".into());
+            return Err("managing the node service needs root".into());
         }
         Ok(())
     }
@@ -793,6 +829,11 @@ mod node {
         data_dir: &std::path::Path,
     ) -> Result<(), Box<dyn std::error::Error>> {
         require_root()?;
+        // A unit left where nothing runs it would stand in for a service: `node up` would
+        // ask systemctl to start it rather than run the node itself.
+        if !super::systemd_runs() {
+            return Err("systemd is not running here, so the node cannot run as a service".into());
+        }
         let sudo_user = super::super::sudo_user::sudo_user_info().map(|(_, _, _, name)| name);
         // The supervisor is the separate `node` worker binary in the bin directory,
         // and it runs as root, so it has to be a file only root can replace.
@@ -900,24 +941,6 @@ mod launchd {
         format!("{domain}/{label}")
     }
 
-    /// Load the job from `plist`. A job that was booted out a moment ago may still be
-    /// on its way out, and launchd refuses to load it again until it is gone, so a
-    /// refusal is tried again for a few seconds.
-    fn bootstrap(domain: &str, label: &str, plist: &str) -> Result<(), String> {
-        let mut last = String::new();
-        for _ in 0..20 {
-            match run(&["bootstrap", domain, plist]) {
-                Ok(()) => return Ok(()),
-                Err(e) => last = e,
-            }
-            if loaded(domain, label) {
-                return Ok(());
-            }
-            std::thread::sleep(std::time::Duration::from_millis(250));
-        }
-        Err(last)
-    }
-
     /// Is the job loaded in `domain`?
     pub fn loaded(domain: &str, label: &str) -> bool {
         launchctl(&["print", &target(domain, label)]).is_ok_and(|o| o.status.success())
@@ -938,16 +961,13 @@ mod launchd {
         let t = target(domain, label);
         match action {
             "start" if loaded(domain, label) => run(&["kickstart", &t]),
-            "start" => bootstrap(domain, label, plist),
-            "stop" if loaded(domain, label) => run(&["bootout", &t]),
-            "stop" => Ok(()),
+            "start" => run(&["bootstrap", domain, plist]),
+            "stop" => bootout(domain, label),
             // Booted out and in again, so a plist rewritten since it was loaded (a new
             // port, say) is the one that runs, as a restart after daemon-reload does.
             "restart" => {
-                if loaded(domain, label) {
-                    run(&["bootout", &t])?;
-                }
-                bootstrap(domain, label, plist)
+                bootout(domain, label)?;
+                run(&["bootstrap", domain, plist])
             }
             "enable" => run(&["enable", &t]),
             "disable" => run(&["disable", &t]),
@@ -955,7 +975,7 @@ mod launchd {
         }
     }
 
-    /// running | stopped | failed.
+    /// running | starting | stopped | failed (see [`super::launchd_state`]).
     pub fn status(domain: &str, label: &str) -> String {
         let Ok(out) = launchctl(&["print", &target(domain, label)]) else {
             return "unknown".to_string();
@@ -963,20 +983,7 @@ mod launchd {
         if !out.status.success() {
             return "stopped".to_string();
         }
-        let text = String::from_utf8_lossy(&out.stdout);
-        if text.lines().any(|l| l.trim() == "state = running") {
-            return "running".to_string();
-        }
-        // `last exit code = 1: Operation not permitted`, or `(never exited)`.
-        let failed = text
-            .lines()
-            .filter_map(|l| l.trim().strip_prefix("last exit code = "))
-            .any(|code| {
-                code.chars()
-                    .next()
-                    .is_some_and(|c| c.is_ascii_digit() && c != '0')
-            });
-        if failed { "failed" } else { "stopped" }.to_string()
+        super::launchd_state(&String::from_utf8_lossy(&out.stdout)).to_string()
     }
 
     /// Has `disable` been set for the job? `print-disabled` lists a job switched off as
@@ -990,13 +997,56 @@ mod launchd {
         })
     }
 
-    pub fn bootout(domain: &str, label: &str) {
-        let _ = launchctl(&["bootout", &target(domain, label)]);
+    /// Unload the job if it is loaded, and wait until it is gone. `bootout` returns once
+    /// launchd has sent the job SIGTERM, and the job stays loaded, as `SIGTERMed`, until
+    /// its process exits: about two seconds for the node. Until then launchd refuses to
+    /// load it again, and `kickstart` starts nothing. launchd kills the process
+    /// ExitTimeOut seconds after the SIGTERM, 20 unless the plist sets it, so that is
+    /// waited out with a few seconds to spare.
+    pub fn bootout(domain: &str, label: &str) -> Result<(), String> {
+        if !loaded(domain, label) {
+            return Ok(());
+        }
+        run(&["bootout", &target(domain, label)])?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+        while loaded(domain, label) {
+            if std::time::Instant::now() >= deadline {
+                return Err(format!("{label} was stopped and has not exited"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        Ok(())
     }
 
     pub fn disable(domain: &str, label: &str) {
         let _ = launchctl(&["disable", &target(domain, label)]);
     }
+}
+
+/// A launchd job's state from what `launchctl print` says of it: running; starting while
+/// launchd is still bringing its process up (`xpcproxy`, `spawn scheduled`), as just after
+/// it is loaded; failed when its last exit was a failure; and otherwise stopped.
+#[cfg(any(target_os = "macos", test))]
+fn launchd_state(print: &str) -> &'static str {
+    let state = print
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("state = "))
+        .unwrap_or("");
+    match state {
+        "running" => return "running",
+        "xpcproxy" | "spawn scheduled" => return "starting",
+        _ => {}
+    }
+    // `last exit code = 1: Operation not permitted`, or `(never exited)`.
+    let failed = print
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("last exit code = "))
+        .any(|code| {
+            code.chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit() && c != '0')
+        });
+    if failed { "failed" } else { "stopped" }
 }
 
 // ── macOS: the node supervisor as a launchd daemon ───────────────────
@@ -1010,7 +1060,7 @@ mod node {
 
     fn require_root() -> Result<(), Box<dyn std::error::Error>> {
         if !crate::os::is_elevated() {
-            return Err("managing the node service needs root. Re-run with sudo.".into());
+            return Err("managing the node service needs root".into());
         }
         Ok(())
     }
@@ -1048,7 +1098,7 @@ mod node {
     pub fn delete() -> Result<(), Box<dyn std::error::Error>> {
         if exists() {
             require_root()?;
-            launchd::bootout(DOMAIN, super::NODE_LABEL);
+            launchd::bootout(DOMAIN, super::NODE_LABEL)?;
             fs::remove_file(PLIST)?;
             super::svc_ok(&format!("{} removed", super::NODE_LABEL));
         }
@@ -1057,9 +1107,6 @@ mod node {
 
     pub fn action(action: &str) -> Result<(), Box<dyn std::error::Error>> {
         require_root()?;
-        if matches!(action, "start" | "restart") {
-            retarget_plist();
-        }
         launchd::act(DOMAIN, super::NODE_LABEL, PLIST, action)?;
         if !super::quiet() {
             super::svc_ok(&format!(
@@ -1089,56 +1136,6 @@ mod node {
         let admin = unsafe { libc::getgrnam(c"admin".as_ptr()) };
         let group = (!admin.is_null()).then(|| unsafe { (*admin).gr_gid });
         super::super::root_fs::open_log(std::path::Path::new(super::NODE_LOG), group)
-    }
-
-    /// Points a daemon plist from an earlier release, which logs to the operator's data
-    /// dir, at [`super::NODE_LOG`]. launchd reads it at the next load: `node restart`,
-    /// the restart `crossfyre update` does, or a reboot.
-    fn retarget_plist() {
-        let Ok(body) = fs::read_to_string(PLIST) else {
-            return;
-        };
-        let Some(new) = super::retarget_log(&body, std::path::Path::new(super::NODE_LOG)) else {
-            return;
-        };
-        // The log has to be there, and root's, before launchd is told to open it.
-        if let Err(e) = open_root_log() {
-            eprintln!("[!] could not prepare {}: {e}", super::NODE_LOG);
-            return;
-        }
-        match super::super::root_fs::replace_file(
-            std::path::Path::new(PLIST),
-            new.as_bytes(),
-            0o644,
-            Some((0, 0)),
-        ) {
-            Ok(()) => println!("[node] the node service now logs to {}", super::NODE_LOG),
-            Err(e) => eprintln!("[!] could not update {PLIST}: {e}"),
-        }
-    }
-
-    /// Run first thing by the node supervisor. Under a plist from an earlier release,
-    /// launchd opened the service's output in the operator's data dir, as root and
-    /// through any link left there. This sends the output to [`super::NODE_LOG`]
-    /// instead, before anything is written, and fixes the plist for the next load.
-    pub fn adopt_root_log() {
-        use std::os::fd::AsRawFd;
-        // Only the service: root, started by launchd. Whatever launchd opened for its
-        // output is replaced, a file or not: a link there could as well have led to a
-        // pipe or a terminal the operator reads.
-        let launched = unsafe { libc::geteuid() == 0 && libc::getppid() == 1 };
-        if !launched {
-            return;
-        }
-        // Without the log, nowhere: never on through the file launchd opened.
-        let out = open_root_log().or_else(|_| fs::OpenOptions::new().write(true).open("/dev/null"));
-        if let Ok(out) = out {
-            unsafe {
-                libc::dup2(out.as_raw_fd(), 1);
-                libc::dup2(out.as_raw_fd(), 2);
-            }
-        }
-        retarget_plist();
     }
 }
 
@@ -1216,12 +1213,6 @@ mod imp {
         write_for_invoking_user,
     };
 
-    /// `key` is the name inside the unit name: an engine's public name, or its
-    /// legacy name for a unit registered before the engine took its current one.
-    fn service_name(key: &str) -> String {
-        format!("crossfyre-{key}.service")
-    }
-
     fn unit_dir() -> std::path::PathBuf {
         // Honor SUDO_USER so units land in the real user's
         // ~/.config/systemd/user, not /root's where they'd be invisible.
@@ -1230,7 +1221,6 @@ mod imp {
 
     fn unit_body(ext: &str) -> String {
         let bin = ext_bin_path(ext);
-        let name = super::super::public_name(ext);
         // Daemon port from the host config.toml (defaults to the protocol
         // constant). Baked into ExecStart so a reinstall picks up a changed
         // port; the op-clients and heartbeat read the same source.
@@ -1241,28 +1231,31 @@ mod imp {
         let egress_env = invoking_user_home().join(".config/crossfyre/egress.env");
         format!(
             "[Unit]\n\
-             Description=Crossfyre {name} extension daemon\n\
+             Description=Crossfyre {ext} extension daemon\n\
              After=network.target\n\
              \n\
              [Service]\n\
              Type=simple\n\
              EnvironmentFile=-{egress_env}\n\
-             ExecStart={bin} --daemon --port {port}\n\
+             ExecStart={bin} {daemon}\n\
              Restart=on-failure\n\
              RestartSec=5\n\
              \n\
              [Install]\n\
              WantedBy=default.target\n",
-            name = name,
+            ext = ext,
             bin = bin.display(),
             egress_env = egress_env.display(),
-            port = port,
+            daemon = dguard::daemon_args(port).join(" "),
         )
     }
 
+    /// Write engine `ext`'s unit. The user's service manager that runs it was started first
+    /// where it has to be (see `user_manager_started`), lingering included, so the engines
+    /// run whether or not the user is logged in.
     pub fn create(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
         let dir = unit_dir();
-        let svc = service_name(super::super::public_name(ext));
+        let svc = dguard::unit_name(ext);
         create_dir_all_for_invoking_user(&dir)?;
         // Written into the user's home as root, and handed back to them. Only this one
         // file: the rest of this directory holds the person's own units, and the ones
@@ -1279,10 +1272,12 @@ mod imp {
 
     pub fn delete(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
         if remove_unit(&unit_dir(), ext)? {
-            let _ = cmd_as_invoking_user("systemctl")
-                .args(["--user", "daemon-reload"])
-                .status();
-            super::svc_ok(&format!("{} removed", service_name(ext)));
+            if super::user_manager_runs() {
+                let _ = cmd_as_invoking_user("systemctl")
+                    .args(["--user", "daemon-reload"])
+                    .status();
+            }
+            super::svc_ok(&format!("{} removed", dguard::unit_name(ext)));
         }
         Ok(())
     }
@@ -1290,7 +1285,7 @@ mod imp {
     /// Removes `ext`'s unit from `dir` when it is there, and says whether it was. `dir` is
     /// in the operator's home, so as root no link on the way there is followed.
     fn remove_unit(dir: &std::path::Path, ext: &str) -> std::io::Result<bool> {
-        let path = dir.join(service_name(ext));
+        let path = dir.join(dguard::unit_name(ext));
         if !path.exists() {
             return Ok(false);
         }
@@ -1299,7 +1294,10 @@ mod imp {
     }
 
     pub fn action(action: &str, ext: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let svc = service_name(ext);
+        if !super::user_manager_runs() {
+            return Err(super::NODE_UP_RUNS_ENGINES.into());
+        }
+        let svc = dguard::unit_name(ext);
         let status = cmd_as_invoking_user("systemctl")
             .args(["--user", action, &svc])
             .status()
@@ -1313,8 +1311,15 @@ mod imp {
         Ok(())
     }
 
+    /// Where no service manager runs, `crossfyre node up` runs the engine, and it is running
+    /// when it answers on its port.
     pub fn status(ext: &str) -> String {
-        let svc = service_name(ext);
+        if !super::user_manager_runs() {
+            let port = super::super::config::engine_port(ext);
+            let answers = super::super::status::port_open(port);
+            return if answers { "running" } else { "stopped" }.to_string();
+        }
+        let svc = dguard::unit_name(ext);
         match cmd_as_invoking_user("systemctl")
             .args(["--user", "is-active", &svc])
             .output()
@@ -1330,7 +1335,7 @@ mod imp {
     }
 
     pub fn is_enabled(ext: &str) -> bool {
-        let svc = service_name(ext);
+        let svc = dguard::unit_name(ext);
         cmd_as_invoking_user("systemctl")
             .args(["--user", "is-enabled", &svc])
             .output()
@@ -1339,7 +1344,43 @@ mod imp {
     }
 
     pub fn exists(ext: &str) -> bool {
-        unit_dir().join(service_name(ext)).exists()
+        unit_dir().join(dguard::unit_name(ext)).exists()
+    }
+
+    pub fn refresh(ext: &str) -> Result<super::Refreshed, Box<dyn std::error::Error>> {
+        use super::Refreshed;
+        let path = unit_dir().join(dguard::unit_name(ext));
+        if !path.exists() {
+            create(ext)?;
+            return Ok(Refreshed::Written);
+        }
+        // Asked before the unit changes: a unit another release wrote may be failing over
+        // and over, which systemd shows as activating.
+        let was = status(ext);
+        if !write_if_differs(&path, &unit_body(ext))? {
+            return Ok(Refreshed::Current);
+        }
+        let _ = cmd_as_invoking_user("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status();
+        if !super::quiet() {
+            super::svc_ok(&format!("{} rewritten", dguard::unit_name(ext)));
+        }
+        if matches!(was.as_str(), "running" | "activating") {
+            action("restart", ext)?;
+            return Ok(Refreshed::Restarted);
+        }
+        Ok(Refreshed::Written)
+    }
+
+    /// Write `body` to the unit file at `path` unless it holds `body` already, and say
+    /// whether it was written.
+    fn write_if_differs(path: &std::path::Path, body: &str) -> std::io::Result<bool> {
+        if super::super::sudo_user::read_to_string(path).is_ok_and(|now| now == body) {
+            return Ok(false);
+        }
+        write_for_invoking_user(path, body.as_bytes(), 0o644)?;
+        Ok(true)
     }
 
     #[cfg(test)]
@@ -1348,6 +1389,25 @@ mod imp {
         use crate::toolchain::sudo_user::act_as_root;
         use std::fs;
 
+        #[test]
+        fn a_unit_another_release_wrote_is_written_again_and_one_this_build_wrote_is_not() {
+            let _dir = super::super::super::config::TestToolchainDir::new();
+            let t = tempfile::tempdir().expect("tempdir");
+            let path = t.path().join(dguard::unit_name("voyage"));
+            let body = unit_body("voyage");
+            fs::write(
+                &path,
+                "[Service]\nExecStart=/opt/crossfyre/bin/voyage --daemon --port 4442\n",
+            )
+            .expect("an older unit");
+            assert!(write_if_differs(&path, &body).expect("written"));
+            assert_eq!(fs::read_to_string(&path).expect("read"), body);
+            assert!(
+                !write_if_differs(&path, &body).expect("left"),
+                "written again"
+            );
+        }
+
         /// `sudo crossfyre uninstall` removes the units it made in the operator's
         /// ~/.config/systemd/user, a directory the operator can swap for a link.
         #[test]
@@ -1355,7 +1415,7 @@ mod imp {
             let t = tempfile::tempdir().expect("tempdir");
             let victim = t.path().join("victim");
             fs::create_dir(&victim).expect("victim");
-            let unit = service_name("x");
+            let unit = dguard::unit_name("x");
             fs::write(victim.join(&unit), "root's file\n").expect("victim file");
             let systemd = t.path().join("home/.config/systemd");
             fs::create_dir_all(&systemd).expect("systemd");
@@ -1369,9 +1429,23 @@ mod imp {
         }
 
         #[test]
+        fn an_engine_s_unit_runs_it_as_its_daemon_on_its_port() {
+            let _dir = super::super::super::config::TestToolchainDir::new();
+            let port = super::super::super::config::engine_port("voyage");
+            assert_eq!(port, 24442, "the test's own config gives it");
+            let exec = format!(
+                "ExecStart={} {}",
+                ext_bin_path("voyage").display(),
+                dguard::daemon_args(port).join(" ")
+            );
+            let unit = unit_body("voyage");
+            assert!(unit.lines().any(|l| l == exec), "{unit}");
+        }
+
+        #[test]
         fn removing_a_unit_as_root_removes_it() {
             let t = tempfile::tempdir().expect("tempdir");
-            fs::write(t.path().join(service_name("x")), "x").expect("unit");
+            fs::write(t.path().join(dguard::unit_name("x")), "x").expect("unit");
             let _root = act_as_root();
             assert!(remove_unit(t.path(), "x").expect("remove"));
             assert!(!remove_unit(t.path(), "x").expect("again"));
@@ -1410,8 +1484,7 @@ mod imp {
         launchd::user_domain(uid)
     }
 
-    pub fn create(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let key = super::super::public_name(ext);
+    pub fn create(key: &str) -> Result<(), Box<dyn std::error::Error>> {
         let dir = agents_dir();
         create_dir_all_for_invoking_user(&dir)?;
         let logs = super::super::config::logs_dir();
@@ -1439,7 +1512,7 @@ mod imp {
     pub fn delete(key: &str) -> Result<(), Box<dyn std::error::Error>> {
         let path = plist_path(key);
         if path.exists() {
-            launchd::bootout(&domain(), &label(key));
+            launchd::bootout(&domain(), &label(key))?;
             // In the operator's home: as root, no link on the way there is followed.
             super::super::sudo_user::remove_file(&path)?;
             super::svc_ok(&format!("{} removed", label(key)));
@@ -1467,6 +1540,16 @@ mod imp {
     pub fn exists(key: &str) -> bool {
         plist_path(key).exists()
     }
+
+    /// The agent names `crossfyre extension host <engine>`, which builds the engine's
+    /// command line each time it starts it, so no release's command line is kept in it.
+    pub fn refresh(key: &str) -> Result<super::Refreshed, Box<dyn std::error::Error>> {
+        if !exists(key) {
+            create(key)?;
+            return Ok(super::Refreshed::Written);
+        }
+        Ok(super::Refreshed::Current)
+    }
 }
 
 // ── Windows: scheduled tasks (extensions) ─────────────────────────────
@@ -1476,8 +1559,7 @@ mod imp {
 
     /// Registered from an elevated prompt (or by the node service) the task runs at boot;
     /// from an ordinary one it runs at the operator's logon, and `tasks::create` says so.
-    pub fn create(ext: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let key = super::super::public_name(ext);
+    pub fn create(key: &str) -> Result<(), Box<dyn std::error::Error>> {
         tasks::create(
             key,
             &format!("Crossfyre {key} extension daemon"),
@@ -1521,6 +1603,16 @@ mod imp {
     pub fn exists(key: &str) -> bool {
         tasks::exists(key)
     }
+
+    /// The task names `crossfyre extension host <engine>`, which builds the engine's
+    /// command line each time it starts it, so no release's command line is kept in it.
+    pub fn refresh(key: &str) -> Result<super::Refreshed, Box<dyn std::error::Error>> {
+        if !exists(key) {
+            create(key)?;
+            return Ok(super::Refreshed::Written);
+        }
+        Ok(super::Refreshed::Current)
+    }
 }
 
 #[cfg(test)]
@@ -1528,6 +1620,7 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
 
+    #[cfg(unix)]
     fn exec_start(unit: &str) -> &str {
         unit.lines()
             .find(|l| l.starts_with("ExecStart="))
@@ -1669,25 +1762,6 @@ mod tests {
         assert!(!plist.contains(&format!("{data}/logs")), "{plist}");
     }
 
-    /// A daemon plist written by an earlier release is pointed at the new log, and left
-    /// otherwise as it was.
-    #[test]
-    fn an_old_node_plist_is_pointed_at_the_root_log() {
-        let data = Path::new("/Users/op/Library/Application Support/crossfyre");
-        let old = node_plist(Path::new("/n"), Path::new("/c"), data, Some("op")).replace(
-            NODE_LOG,
-            "/Users/op/Library/Application Support/crossfyre/logs/node.log",
-        );
-        let new = retarget_log(&old, Path::new(NODE_LOG)).expect("rewritten");
-        assert_eq!(
-            new,
-            node_plist(Path::new("/n"), Path::new("/c"), data, Some("op"))
-        );
-        assert_eq!(retarget_log(&new, Path::new(NODE_LOG)), None);
-        // A plist with no log entries at all is left alone.
-        assert_eq!(retarget_log("<plist></plist>", Path::new(NODE_LOG)), None);
-    }
-
     #[test]
     fn a_plist_value_cannot_open_an_element_of_its_own() {
         let plist = agent_plist(
@@ -1723,6 +1797,40 @@ mod tests {
             ),
             "{plist}"
         );
+    }
+
+    /// What `launchctl print` says of a job, as the node's status. Just loaded, a job is
+    /// in launchd's hands until its process runs, and node init, which asks at once, read
+    /// that as stopped and said the node it had just started was not running.
+    #[test]
+    fn a_job_launchd_is_still_starting_is_starting() {
+        let print = |state: &str, exit: &str| {
+            format!(
+                "system/io.crossfyre.node = {{\n\tactive count = 1\n\tstate = {state}\n\t\
+                 program = /opt/crossfyre/bin/node\n\tlast exit code = {exit}\n}}\n"
+            )
+        };
+        assert_eq!(
+            launchd_state(&print("running", "(never exited)")),
+            "running"
+        );
+        assert_eq!(
+            launchd_state(&print("xpcproxy", "(never exited)")),
+            "starting"
+        );
+        assert_eq!(
+            launchd_state(&print("spawn scheduled", "(never exited)")),
+            "starting"
+        );
+        assert_eq!(
+            launchd_state(&print("not running", "(never exited)")),
+            "stopped"
+        );
+        assert_eq!(
+            launchd_state(&print("not running", "1: Operation not permitted")),
+            "failed"
+        );
+        assert_eq!(launchd_state(&print("not running", "0")), "stopped");
     }
 
     #[test]

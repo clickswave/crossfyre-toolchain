@@ -65,14 +65,18 @@ struct Args {
     max_body_bytes: Option<u64>,
 }
 
-fn safe(method: &str) -> bool {
+pub(crate) fn safe(method: &str) -> bool {
     matches!(method, "GET" | "HEAD" | "OPTIONS")
 }
 
 /// What the request asks for by override, when that is not a read: a GET carrying
 /// `X-HTTP-Method-Override: DELETE`, `_method=DELETE` in its query, or a body that sets
 /// `_method`.
-fn overriding_write(url: &str, headers: &[(String, String)], body: Option<&str>) -> Option<Asked> {
+pub(crate) fn overriding_write(
+    url: &str,
+    headers: &[(String, String)],
+    body: Option<&str>,
+) -> Option<Asked> {
     let from_headers = headers
         .iter()
         .filter_map(|(k, v)| overrides::header(k).map(|h| Asked::new(Via::Header(h), Some(v))));
@@ -85,7 +89,7 @@ fn overriding_write(url: &str, headers: &[(String, String)], body: Option<&str>)
 
 /// How a write question names the request: `DELETE request`, or `GET request that
 /// asks for DELETE through the X-HTTP-Method-Override header`.
-fn described(method: &str, overridden: Option<&Asked>) -> String {
+pub(crate) fn described(method: &str, overridden: Option<&Asked>) -> String {
     match overridden {
         Some(a) => a.describe(method),
         None => format!("{method} request"),

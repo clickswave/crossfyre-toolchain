@@ -1,0 +1,10 @@
+id: ingress-nginx
+info:
+  name: Ingress-NGINX Controller
+  category: Reverse Proxy
+  metadata:
+    vendor: kubernetes
+    product: ingress-nginx
+detect:
+  any:
+    - tls: { name: subject, regex: 'CN=Kubernetes Ingress Controller Fake Certificate' }

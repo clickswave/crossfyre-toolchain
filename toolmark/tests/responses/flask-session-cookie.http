@@ -1,0 +1,19 @@
+# Synthetic: A Flask application on the Werkzeug development server, with its signed session
+# cookie.
+HTTP/1.1 200 OK
+server: Werkzeug/3.0.1 Python/3.12.1
+date: Fri, 20 Nov 2026 06:00:00 GMT
+content-type: text/html; charset=utf-8
+vary: Cookie
+set-cookie: session=eyJjc3JmX3Rva2VuIjoiYTU4ZTU5NDc3NjBkOGJhMzZmNmU0Y2NhZjJjOGFjZTRmZmQ0NjkyZCJ9.av_h4A.PE-zCM6OWKErptMECvKAbDc-gEU; HttpOnly; Path=/
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Notes</title>
+</head>
+<body>
+<ul class="notes"></ul>
+</body>
+</html>

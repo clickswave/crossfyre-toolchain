@@ -1,0 +1,14 @@
+id: contact-form-7
+info:
+  name: Contact Form 7
+  category: WordPress Plugin
+  metadata:
+    vendor: rocklobster
+    product: contact_form_7
+    target_sw: wordpress
+implies: [wordpress]
+detect:
+  any:
+    - html: { regex: '(?:src|href)="[^"]*/wp-content/plugins/contact-form-7/' }
+version:
+  - html: { regex: '/wp-content/plugins/contact-form-7/[^"]*\?ver=([0-9]+\.[0-9]+(?:\.[0-9]+)?)"' }

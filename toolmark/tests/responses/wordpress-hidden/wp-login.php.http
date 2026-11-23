@@ -1,0 +1,17 @@
+# Synthetic: WordPress's login page.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Log In</title>
+</head>
+<body>
+<form name="loginform" id="loginform" method="post">
+<input type="submit" name="wp-submit" id="wp-submit" value="Log In">
+</form>
+</body>
+</html>

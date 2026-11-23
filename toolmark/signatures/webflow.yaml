@@ -1,0 +1,8 @@
+id: webflow
+info:
+  name: Webflow
+  category: CMS
+detect:
+  all:
+    - html: { regex: 'data-wf-page="' }
+    - html: { regex: 'data-wf-site="' }

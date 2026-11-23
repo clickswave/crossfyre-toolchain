@@ -38,6 +38,39 @@ data class Workspace(
 data class SignedIn(val key: String, val user: AccountUser)
 
 /**
+ * The account's privacy policy, as Crossfyre answers it: `connected`, under which this
+ * phone captures, or `private`, under which the account's tools send nothing about
+ * targets to Crossfyre, and so this phone neither pairs nor captures. [chosen] is false
+ * for an account that has not chosen one yet, which runs as connected.
+ */
+data class AccountPolicy(
+    val policy: String,
+    val chosen: Boolean,
+    val changedAt: String?,
+    val changedVia: String?,
+) {
+    val sendsTargets: Boolean get() = policy != "private"
+
+    /** "Private", or "Connected", as the Settings row shows it. */
+    val name: String get() = policy.replaceFirstChar { it.uppercase() }
+
+    /** What the Settings row says under the name. */
+    val line: String
+        get() {
+            val changed = when {
+                changedAt != null && changedVia != null -> " Changed $changedAt from $changedVia."
+                changedAt != null -> " Changed $changedAt."
+                else -> ""
+            }
+            return when {
+                !sendsTargets -> "This account's tools send nothing about targets to Crossfyre, so this phone doesn't pair or capture.$changed"
+                !chosen -> "None is chosen yet, so this account runs as connected. Choose one in account settings."
+                else -> "This phone sends what it captures to the workspace it's paired with.$changed"
+            }
+        }
+}
+
+/**
  * What the phone tells the approval page about itself. [client] names the kind
  * of client, which the server uses to word the approval page and the key's name
  * as Crossfyre Mobile rather than as the CLI.
@@ -166,6 +199,8 @@ enum class Refusal {
     NOT_RUNNING,
     /** A signature made more than five minutes from the platform's clock. */
     STALE_SIGNATURE,
+    /** The account's privacy policy is private, under which this phone sends nothing about targets. */
+    POLICY_PRIVATE,
 }
 
 sealed interface Outcome<out T> {
@@ -306,6 +341,7 @@ class AccountApi(origin: String, private val transport: Transport) {
                     )
                 }
                 a.status == 401 -> Outcome.Failed(Problem.SignedOut)
+                a.status == 403 && a.data?.str("policy") == "private" -> a.refusal(Refusal.POLICY_PRIVATE)
                 // Before the words are read for "member": a role can be called Member.
                 a.status == 403 && a.data?.str("reason") == "missing_permission" -> a.roleRefusal()
                 a.status == 403 && a.data?.optBoolean("archived") == true -> a.refusal(Refusal.WORKSPACE_ARCHIVED)
@@ -315,6 +351,16 @@ class AccountApi(origin: String, private val transport: Transport) {
             }
         }
     }
+
+    /** The account's privacy policy, as it is now. */
+    fun policy(key: String): Outcome<AccountPolicy> =
+        call("policy", JSONObject().put("api_key", key)) { a ->
+            when {
+                a.ok -> a.data?.let(::policyOf)?.let { Outcome.Ok(it) } ?: a.unreadable()
+                a.status == 401 -> Outcome.Failed(Problem.SignedOut)
+                else -> a.refusal()
+            }
+        }
 
     /** Revoke the key. A key the server no longer knows is as signed out as it gets. */
     fun logout(key: String): Outcome<Unit> =
@@ -345,6 +391,11 @@ class AccountApi(origin: String, private val transport: Transport) {
             accountType = u.str("account_type").orEmpty(),
             emailVerified = u.optBoolean("email_verified", false),
         )
+    }
+
+    private fun policyOf(d: JSONObject): AccountPolicy? {
+        val policy = d.str("policy")?.takeIf { it == "connected" || it == "private" } ?: return null
+        return AccountPolicy(policy, d.optBoolean("chosen", false), d.str("changed_at"), d.str("changed_via"))
     }
 
     private fun workspace(w: JSONObject): Workspace? {

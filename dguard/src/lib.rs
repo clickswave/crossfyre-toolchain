@@ -20,8 +20,23 @@
 //! Binding off loopback without a token is permitted (an operator may have put
 //! the port behind a firewall or a private network) but it is announced on every
 //! start, because it is the configuration that used to be the silent default.
+//!
+//! It is also where an engine's client starts the engine's daemon when none runs
+//! ([`Daemon`]), and where a daemon started that way exits once nothing uses it
+//! ([`exit_when_idle`]).
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+mod db;
+mod idle;
+pub mod ports;
+mod start;
+mod words;
+
+pub use db::{DbAction, PurgeArgs, answer, ask, list_scans, resume_request, run_db};
+pub use idle::{IDLE_EXIT_ENV, exit_when_idle, spawn_busy};
+pub use start::{Daemon, LOG_LIMIT, NO_AUTOSTART_ENV, daemon_args, not_running, unit_name};
+pub use words::{CHUNK_WORDS, WORDS_FOLLOW, WordChunks, list_name, send_words};
 
 /// Moves a daemon listener off loopback. Value is an IP, not a host name.
 pub const BIND_ENV: &str = "CFX_DAEMON_BIND";
@@ -593,14 +608,8 @@ fn default_roots() -> Vec<std::path::PathBuf> {
 fn handoff_roots() -> Vec<std::path::PathBuf> {
     #[cfg(windows)]
     {
-        use std::path::PathBuf;
         let mut roots = vec![std::env::temp_dir()];
-        // The engine host names the toolchain directory; without it, the default one.
-        let toolchain = std::env::var_os("CROSSFYRE_TOOLCHAIN_DIR")
-            .filter(|d| !d.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("crossfyre")));
-        if let Some(dir) = toolchain {
+        if let Some(dir) = toolchain_dir() {
             roots.push(dir.join("tmp"));
         }
         roots
@@ -1551,8 +1560,78 @@ mod wordlist_tests {
 }
 
 // ---------------------------------------------------------------------------
+// The toolchain directory
+// ---------------------------------------------------------------------------
+
+/// The variable that names the toolchain directory, which holds `config.toml`. The
+/// engine host sets it for the engines it starts on macOS and Windows.
+pub const TOOLCHAIN_DIR_ENV: &str = "CROSSFYRE_TOOLCHAIN_DIR";
+
+/// The toolchain directory: the one [`TOOLCHAIN_DIR_ENV`] names, else
+/// `~/.config/crossfyre` on Linux and `crossfyre` in the per-user config directory
+/// elsewhere (`~/Library/Application Support` on macOS, `%APPDATA%` on Windows), which
+/// is where the CLI writes it. None when there is no home directory to look in.
+pub fn toolchain_dir() -> Option<std::path::PathBuf> {
+    toolchain_dir_from(std::env::var_os(TOOLCHAIN_DIR_ENV))
+}
+
+/// [`toolchain_dir`] given the variable's value, so it is tested without changing the
+/// environment. An empty value names nothing.
+fn toolchain_dir_from(named: Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
+    if let Some(dir) = named.filter(|d| !d.is_empty()) {
+        return Some(dir.into());
+    }
+    let root = if cfg!(target_os = "linux") {
+        dirs::home_dir()?.join(".config")
+    } else {
+        dirs::config_dir()?
+    };
+    Some(root.join("crossfyre"))
+}
+
+#[cfg(test)]
+mod toolchain_dir_tests {
+    use super::toolchain_dir_from;
+    use std::path::PathBuf;
+
+    #[test]
+    fn the_directory_the_variable_names_is_the_one_used() {
+        assert_eq!(
+            toolchain_dir_from(Some("/srv/cfx".into())),
+            Some(PathBuf::from("/srv/cfx"))
+        );
+    }
+
+    #[test]
+    fn an_empty_variable_names_nothing() {
+        assert_eq!(
+            toolchain_dir_from(Some("".into())),
+            toolchain_dir_from(None)
+        );
+    }
+
+    /// ~/.config on Linux whatever XDG_CONFIG_HOME says, as under sudo the CLI finds the
+    /// invoking user's, and the platform's config directory elsewhere.
+    #[test]
+    fn without_the_variable_it_is_in_the_user_s_config_directory() {
+        let home = dirs::home_dir().expect("a home directory");
+        let dir = toolchain_dir_from(None).expect("a toolchain directory");
+        if cfg!(target_os = "linux") {
+            assert_eq!(dir, home.join(".config").join("crossfyre"));
+        } else {
+            assert_eq!(dir, dirs::config_dir().unwrap().join("crossfyre"));
+            assert!(dir.starts_with(&home), "{}", dir.display());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Startup dependencies
 // ---------------------------------------------------------------------------
+
+/// How [`wait_for`] begins each line that says what a daemon waits for. A client that
+/// started the daemon reads it in the daemon's log, and stops waiting itself.
+pub(crate) const WAITING: &str = "[dguard] waiting for ";
 
 /// Wait for a dependency the daemon cannot start without, instead of dying.
 ///
@@ -1604,7 +1683,7 @@ where
                     return Err(e);
                 }
                 eprintln!(
-                    "[dguard] waiting for {what}: {e} (attempt {tries}, retrying in {}s)",
+                    "{WAITING}{what}: {e} (attempt {tries}, retrying in {}s)",
                     wait.as_secs()
                 );
                 tokio::time::sleep(wait).await;
@@ -1642,97 +1721,5 @@ mod wait_for_tests {
         })
         .await;
         assert_eq!(got.unwrap_err(), "still down");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Settings whose environment variable was renamed.
-//
-// An engine's user-facing variables carry the engine's name, so renaming an engine
-// renames them. Machines set them in places nobody revisits (systemd drop-ins, shell
-// profiles, CI), and a scanner that silently stops reading one keeps scanning and
-// reports less, which reads as a clean target. So the old name is still read, after
-// the new one, and saying so is the only side effect.
-// ---------------------------------------------------------------------------
-
-/// The value of `new`, or else of `old`, the name the same setting had before. Reading
-/// `old` prints one line to stderr naming `new`, once per variable per process.
-pub fn env_renamed(new: &str, old: &str) -> Option<String> {
-    static NOTICED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-    let (value, notice) = pick_renamed(new, old, |k| std::env::var(k).ok());
-    if let Some(line) = notice {
-        let mut seen = NOTICED.lock().unwrap_or_else(|p| p.into_inner());
-        if !seen.iter().any(|s| s == old) {
-            seen.push(old.to_string());
-            eprintln!("{line}");
-        }
-    }
-    value
-}
-
-/// The decision behind [`env_renamed`], over any lookup: the value, and the notice to
-/// print when it came from the old name.
-fn pick_renamed(
-    new: &str,
-    old: &str,
-    get: impl Fn(&str) -> Option<String>,
-) -> (Option<String>, Option<String>) {
-    if let Some(v) = get(new) {
-        return (Some(v), None);
-    }
-    match get(old) {
-        Some(v) => (
-            Some(v),
-            Some(format!(
-                "note: {old} is now {new}. The old name is still read for this release; \
-                 set {new} instead."
-            )),
-        ),
-        None => (None, None),
-    }
-}
-
-#[cfg(test)]
-mod env_renamed_tests {
-    use super::pick_renamed;
-
-    fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
-        move |k| {
-            vars.iter()
-                .find(|(n, _)| *n == k)
-                .map(|(_, v)| v.to_string())
-        }
-    }
-
-    #[test]
-    fn the_new_name_is_read_first_and_says_nothing() {
-        let (v, notice) = pick_renamed("NEW_X", "OLD_X", env(&[("NEW_X", "a"), ("OLD_X", "b")]));
-        assert_eq!(v.as_deref(), Some("a"));
-        assert_eq!(notice, None);
-    }
-
-    #[test]
-    fn the_old_name_still_works_and_names_the_new_one() {
-        let (v, notice) = pick_renamed("NEW_X", "OLD_X", env(&[("OLD_X", "b")]));
-        assert_eq!(v.as_deref(), Some("b"));
-        let notice = notice.expect("reading the old name says so");
-        assert!(
-            notice.contains("OLD_X") && notice.contains("NEW_X"),
-            "{notice}"
-        );
-    }
-
-    #[test]
-    fn neither_set_is_unset() {
-        assert_eq!(pick_renamed("NEW_X", "OLD_X", env(&[])), (None, None));
-    }
-
-    #[test]
-    fn an_empty_new_value_still_wins() {
-        // Set-but-empty is how a person turns a setting off; falling through to the
-        // old name would turn it back on behind their back.
-        let (v, notice) = pick_renamed("NEW_X", "OLD_X", env(&[("NEW_X", ""), ("OLD_X", "b")]));
-        assert_eq!(v.as_deref(), Some(""));
-        assert_eq!(notice, None);
     }
 }

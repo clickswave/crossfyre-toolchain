@@ -1,0 +1,14 @@
+id: metabase
+info:
+  name: Metabase
+  category: Monitoring
+  metadata:
+    vendor: metabase
+    product: metabase
+detect:
+  any:
+    - html: { regex: '(?i)<title>\s*Metabase\s*</title>' }
+    - html: { regex: 'window\.MetabaseBootstrap\s*=' }
+version:
+  # The page's bootstrap object carries the build: "version":{"date":...,"tag":"v0.46.6",...}.
+  - html: { regex: '"version"\s*:\s*\{[^}]*"tag"\s*:\s*"v([0-9]+(?:\.[0-9]+)*)"' }

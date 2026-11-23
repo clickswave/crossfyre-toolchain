@@ -1,0 +1,51 @@
+# Lab target memos at http://127.0.0.1:19070/, as toolmark kept it on 2026-11-20.
+HTTP/1.1 200 OK
+accept-ranges: bytes
+cache-control: no-cache, no-store, must-revalidate
+content-length: 2372
+content-type: text/html; charset=utf-8
+expires: 0
+pragma: no-cache
+vary: Origin
+date: Thu, 19 Nov 2026 19:55:51 GMT
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+    <meta http-equiv="Pragma" content="no-cache" />
+    <meta http-equiv="Expires" content="0" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="icon" type="image/webp" href="/logo.webp" />
+    <link rel="manifest" href="/site.webmanifest" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+    <meta name="theme-color" content="#faf9f5" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <!-- memos.metadata.head -->
+    <title>Memos</title>
+    <script type="module" crossorigin src="/assets/index-Bf5o7KgO.js"></script>
+    <link rel="modulepreload" crossorigin href="/assets/rolldown-runtime-BTPm5ob3.js">
+    <link rel="modulepreload" crossorigin href="/assets/preload-helper-DzyYoeor.js">
+    <link rel="modulepreload" crossorigin href="/assets/jsx-runtime-Ddioa4ic.js">
+    <link rel="modulepreload" crossorigin href="/assets/utils-CcA_DoOm.js">
+    <link rel="modulepreload" crossorigin href="/assets/dist-BKXTCP2l.js">
+    <link rel="modulepreload" crossorigin href="/assets/utils-vendor-BBXuc3Qx.js">
+    <link rel="modulepreload" crossorigin href="/assets/i18n-D1c1lJOx.js">
+    <link rel="modulepreload" crossorigin href="/assets/react-dom-NryKi306.js">
+    <link rel="modulepreload" crossorigin href="/assets/composite-DW4Uor_M.js">
+    <link rel="modulepreload" crossorigin href="/assets/dialog-CUVOoW_-.js">
+    <link rel="modulepreload" crossorigin href="/assets/input-DSsJAQ_i.js">
+    <link rel="modulepreload" crossorigin href="/assets/connect-Drv4BRcg.js">
+    <link rel="modulepreload" crossorigin href="/assets/AuthContext-DkwJtzsD.js">
+    <link rel="modulepreload" crossorigin href="/assets/useMemoQueries-CB-DVK8B.js">
+    <link rel="modulepreload" crossorigin href="/assets/chunk-5KNZJZUH-CYHELyaS.js">
+    <link rel="stylesheet" crossorigin href="/assets/index-5uM3jcKD.css">
+  </head>
+  <body class="text-base w-full min-h-svh">
+    <div id="root" class="relative w-full min-h-full"></div>
+    <!-- memos.metadata.body -->
+  </body>
+</html>

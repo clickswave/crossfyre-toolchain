@@ -1,0 +1,12 @@
+# Synthetic: What ingress-nginx answers for a host it has no rule for, from its default
+# backend, under the certificate it makes up when no secret matches, in ingress-nginx.pem.
+HTTP/1.1 404 Not Found
+content-type: text/html
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<html>
+<head><title>404 Not Found</title></head>
+<body>
+<center><h1>404 Not Found</h1></center>
+</body>
+</html>

@@ -65,7 +65,7 @@ def run():
                     "type": "endpoint",
                     "status_code": event.get("code"),
                     "body_length": event.get("body_length"),
-                    "source": "mach",
+                    "source": "ambulo",
                 })
 
         server.log(f"Finished {t.value}: {found_count} endpoint(s) found")

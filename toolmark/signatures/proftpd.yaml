@@ -1,0 +1,14 @@
+id: proftpd
+info:
+  name: ProFTPD
+  category: FTP Server
+  metadata:
+    vendor: proftpd
+    product: proftpd
+detect:
+  any:
+    - banner: { name: ftp, regex: 'ProFTPD' }
+version:
+  - banner: { name: ftp, regex: 'ProFTPD ([0-9]+\.[0-9]+\.[0-9]+[a-z]?)' }
+distro:
+  - banner: { name: ftp, regex: 'ProFTPD \S+ Server \((Debian|Ubuntu)' }

@@ -1,0 +1,7 @@
+id: tilda
+info:
+  name: Tilda
+  category: CMS
+detect:
+  any:
+    - html: { regex: '(?:src|href)="https://(?:static|neo)\.tildacdn\.com/' }

@@ -1,20 +1,22 @@
 // `crossfyre uninstall` - remove everything the toolchain put on this host:
-// extension daemons + binaries, the node service, the Postgres container,
+// extension daemons + binaries, the node service, the local database,
 // and (with --purge) the config root including registered node configs.
-// --keep-data leaves the container, and --yes skips the question, which is how a
-// package's removal script runs it.
-//
-// Also home of the legacy OrionChain cleanup used by `init` to migrate hosts
-// that were set up before the orion -> crossfyre merge.
+// --keep-data stops the local database and leaves it with its data, and --yes skips the
+// question, which is how a package's removal script runs it.
 
-use super::config::{file_name, get_bin_dir, get_toolchain_dir};
-use super::packaging::{Packaging, remove_note};
-use super::sudo_user::cmd_as_invoking_user;
-use super::{ENGINES, EXTENSIONS, install, service};
+#[cfg(any(not(windows), test))]
+use super::config::file_name;
+use super::config::{get_bin_dir, get_toolchain_dir};
+#[cfg(any(not(windows), test))]
+use super::packaging::Packaging;
+#[cfg(not(windows))]
+use super::packaging::remove_note;
+use super::{ENGINES, install, service};
 use std::path::{Path, PathBuf};
 
 /// Where the installer puts everything, and what uninstall removes whole when no package
 /// has files in it.
+#[cfg(any(not(windows), test))]
 const INSTALL_ROOT: &str = "/opt/crossfyre";
 
 /// What `crossfyre uninstall` removes besides the services and binaries.
@@ -22,7 +24,7 @@ const INSTALL_ROOT: &str = "/opt/crossfyre";
 pub struct Scope {
     /// The config root too, node registrations included.
     pub purge: bool,
-    /// Leave the database container, and the scan state in it, in place.
+    /// Stop the local database and leave it, with the scan state in it, in place.
     pub keep_data: bool,
 }
 
@@ -30,13 +32,13 @@ impl Scope {
     fn question(self) -> &'static str {
         match (self.purge, self.keep_data) {
             (true, _) => {
-                "Remove all Crossfyre services, binaries, the database container AND all config/node registrations?"
+                "Remove all Crossfyre services, binaries, the local database AND all config/node registrations?"
             }
             (false, true) => {
-                "Remove all Crossfyre services and binaries? (the database container and config root are kept)"
+                "Remove all Crossfyre services and binaries? (the local database and config root are kept)"
             }
             (false, false) => {
-                "Remove all Crossfyre services, binaries and the database container? (config root is kept)"
+                "Remove all Crossfyre services, binaries and the local database? (config root is kept)"
             }
         }
     }
@@ -47,6 +49,44 @@ impl Scope {
             (false, true) => "services, binaries",
             (false, false) => "services, binaries, database",
         }
+    }
+}
+
+/// What becomes of the local database, in one line: with `keep_data` it is stopped with
+/// `stop` and kept with its data, otherwise stopped and removed with `remove`. A line that
+/// is a warning comes as the error.
+fn local_database(
+    keep_data: bool,
+    stop: impl FnOnce() -> Result<(cfx_db::Stop, PathBuf), Box<dyn std::error::Error>>,
+    remove: impl FnOnce() -> Result<Option<PathBuf>, Box<dyn std::error::Error>>,
+) -> Result<String, String> {
+    use cfx_db::Stop;
+    if keep_data {
+        return match stop() {
+            Ok((Stop::Stopped, dir)) => Ok(format!(
+                "Stopped the local database. It stays in {} with its data.",
+                dir.display()
+            )),
+            Ok((Stop::NotRunning, dir)) => Ok(format!(
+                "The local database was not running. It stays in {} with its data.",
+                dir.display()
+            )),
+            Ok((Stop::NotMade, _)) => Ok("No local database to keep.".to_string()),
+            Ok((Stop::External, _)) => {
+                Ok("config.toml names a database you run, which is left as it is.".to_string())
+            }
+            Err(e) => Err(format!(
+                "Could not stop the local database, which is kept as it is: {e}"
+            )),
+        };
+    }
+    match remove() {
+        Ok(Some(dir)) => Ok(format!(
+            "Removed the local database in {} and its data.",
+            dir.display()
+        )),
+        Ok(None) => Ok("No local database to remove.".to_string()),
+        Err(e) => Err(format!("Kept the local database: {e}")),
     }
 }
 
@@ -72,41 +112,43 @@ pub fn run(scope: Scope, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Extensions: stop, disable, deregister, delete binaries. Then the node
     // service (system scope). Each sub-call prints its own per-item lines.
     section("Services");
-    for ext in EXTENSIONS {
-        if let Err(e) = install::remove(ext) {
-            warn(&format!(
-                "could not remove {}: {e}",
-                super::public_name(ext)
-            ));
+    for e in ENGINES {
+        if let Err(err) = install::remove(e.name) {
+            warn(&format!("could not remove {}: {err}", e.name));
         }
     }
-    // Drop-in directories beside the units, under the public name and the legacy
-    // one. `remove` leaves them, since a person wrote them and a reinstall wants
-    // them back; uninstalling everything is the moment they go too.
+    // Drop-in directories beside the units. `remove` leaves them, since a person
+    // wrote them and a reinstall wants them back; uninstalling everything is the
+    // moment they go too.
     if let Some(dir) = service::user_unit_dir() {
         for e in ENGINES {
-            for key in std::iter::once(e.name).chain(e.legacy) {
-                let d = dir.join(format!("crossfyre-{key}.service.d"));
-                if d.is_dir() && super::sudo_user::remove_dir_all(&d).is_ok() {
-                    ok(&format!("Removed {}", d.display()));
-                }
+            let d = dir.join(format!("{}.d", dguard::unit_name(e.name)));
+            if d.is_dir() && super::sudo_user::remove_dir_all(&d).is_ok() {
+                ok(&format!("Removed {}", d.display()));
             }
         }
     }
+    #[cfg(target_os = "linux")]
+    match super::linger::undo() {
+        Some(Ok(name)) => ok(&format!(
+            "Lingering turned off for {name}, as crossfyre had turned it on for the engines."
+        )),
+        Some(Err(e)) => warn(&format!("could not turn lingering off: {e}")),
+        None => {}
+    }
     let _ = service::remove_node_service();
 
-    // Database container.
+    // The local database is stopped, since nothing is left to use it, and then removed
+    // with its data, or kept with it. A database the operator runs is theirs, and nothing
+    // here touches it.
     section("Database");
-    if scope.keep_data {
-        warn("Database container kept (--keep-data).");
-    } else {
-        let removed = super::db::remove_all();
-        if removed.is_empty() {
-            ok("No database container to remove.");
-        }
-        for name in removed {
-            ok(&format!("Removed database container {name} and its data."));
-        }
+    match local_database(
+        scope.keep_data,
+        super::db::stop_local,
+        super::db::remove_local,
+    ) {
+        Ok(line) => ok(&line),
+        Err(line) => warn(&line),
     }
 
     // The install dir (binaries are already gone; this removes the tree,
@@ -126,6 +168,7 @@ pub fn run(scope: Scope, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
                 for f in unowned_files(&bin, p) {
                     let _ = std::fs::remove_file(f);
                 }
+                let _ = std::fs::remove_dir_all(closed_here(&bin).licences());
                 if !p.owns("cfx-script")
                     && let Some(python) = fetched_python(&bin)
                 {
@@ -251,7 +294,7 @@ fn remove_at_restart(path: &Path) {
 /// Where `remove_at_restart` moves a file it cannot remove now: beside it, under a name
 /// no install writes, so the delete queued for the restart can only ever hit this copy.
 /// Same directory, so the rename never crosses a volume.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(any(windows, test))]
 fn aside_name(path: &Path, tag: &str) -> PathBuf {
     let name = path
         .file_name()
@@ -264,7 +307,7 @@ fn aside_name(path: &Path, tag: &str) -> PathBuf {
 /// whatever cannot, deepest first so a directory comes after what is in it. Returns
 /// whether anything was handed over. A file that cannot be removed does not stop the
 /// rest being removed, as it does in `remove_dir_all`, which gives up at the first.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(any(windows, test))]
 fn clear_tree(dir: &Path, later: &mut dyn FnMut(&Path)) -> bool {
     let mut handed = false;
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -287,24 +330,19 @@ fn clear_tree(dir: &Path, later: &mut dyn FnMut(&Path)) -> bool {
 }
 
 /// Every file name a component may have in the bin directory, with the name of its version
-/// sidecar: the CLI, the node, cfx-script, and each engine under its public name and the
-/// name it had before. cfx-script also has the record of a release that could not start.
+/// sidecar: the CLI, the node, cfx-script and each engine.
+/// cfx-script also has the record of a release that could not start.
+#[cfg(any(not(windows), test))]
 fn component_files(component: &str) -> Vec<String> {
-    let mut names = vec![component.to_string()];
-    if let Some(old) = super::engine(component).and_then(|e| e.legacy) {
-        names.push(old.to_string());
-    }
-    let mut files: Vec<String> = names
-        .into_iter()
-        .flat_map(|n| [file_name(&n), format!("{n}.version")])
-        .collect();
+    let mut files = vec![file_name(component), format!("{component}.version")];
     if component == "cfx-script" {
         files.push("cfx-script.cannot-start".to_string());
     }
     files
 }
 
-/// The components uninstall may find in the bin directory, by public name.
+/// The components uninstall may find in the bin directory.
+#[cfg(any(not(windows), test))]
 fn components() -> Vec<&'static str> {
     let mut out = vec!["crossfyre", "node", "cfx-script"];
     out.extend(ENGINES.iter().map(|e| e.name));
@@ -312,14 +350,26 @@ fn components() -> Vec<&'static str> {
 }
 
 /// What uninstall removes from `bin_dir` for a packaged install: the files of every
-/// component the package does not own, which the CLI fetched there.
+/// component the package does not own, which the CLI fetched there, and those of the
+/// closed components, which no package owns.
+#[cfg(any(not(windows), test))]
 fn unowned_files(bin_dir: &Path, p: &Packaging) -> Vec<PathBuf> {
     components()
         .into_iter()
         .filter(|c| !p.owns(c))
         .flat_map(component_files)
         .map(|f| bin_dir.join(f))
+        .chain(closed_here(bin_dir).component_files())
         .collect()
+}
+
+/// The closed components as they sit in `bin_dir`.
+#[cfg(any(not(windows), test))]
+fn closed_here(bin_dir: &Path) -> super::components::Here {
+    super::components::Here {
+        bin: bin_dir.to_path_buf(),
+        services: false,
+    }
 }
 
 /// The python folder the CLI put beside a cfx-script it fetched into `bin_dir`, when it is
@@ -340,6 +390,7 @@ fn fetched_python(bin_dir: &Path) -> Option<PathBuf> {
 
 /// Does the package have a file under `root`: its packaging.json, the CLI at `cli` when
 /// it owns that, or another component it owns in `bin_dir`?
+#[cfg(any(not(windows), test))]
 fn has_files_under(p: &Packaging, bin_dir: &Path, root: &Path, cli: Option<&Path>) -> bool {
     let owned_in_bin = components()
         .into_iter()
@@ -347,80 +398,6 @@ fn has_files_under(p: &Packaging, bin_dir: &Path, root: &Path, cli: Option<&Path
     p.file.starts_with(root)
         || (p.owns("crossfyre") && cli.is_some_and(|c| c.starts_with(root)))
         || (bin_dir.starts_with(root) && owned_in_bin)
-}
-
-/// Best-effort migration cleanup for hosts initialized before the
-/// orion -> crossfyre merge. Stops and removes the old orion services,
-/// the old install dir, config dir, and the old database container.
-/// Called from `init` when leftovers are detected; every step is optional.
-pub fn cleanup_legacy_orionchain() {
-    let legacy_bin = Path::new("/opt/orionchain");
-    let legacy_cfg = super::sudo_user::invoking_user_config_dir().join("orionchain");
-    if !legacy_bin.exists() && !legacy_cfg.exists() {
-        return;
-    }
-
-    println!("[migrate] Legacy OrionChain install detected. Cleaning up.");
-
-    #[cfg(target_os = "linux")]
-    for tool in EXTENSIONS {
-        let svc = format!("orion-{tool}.service");
-        let _ = cmd_as_invoking_user("systemctl")
-            .args(["--user", "stop", &svc])
-            .output();
-        let _ = cmd_as_invoking_user("systemctl")
-            .args(["--user", "disable", &svc])
-            .output();
-        let unit = super::sudo_user::invoking_user_home()
-            .join(".config/systemd/user")
-            .join(&svc);
-        if unit.exists() {
-            let _ = super::sudo_user::remove_file(&unit);
-            println!("[migrate] Removed old service {svc}");
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let _ = cmd_as_invoking_user("systemctl")
-            .args(["--user", "daemon-reload"])
-            .output();
-    }
-
-    #[cfg(target_os = "macos")]
-    for tool in EXTENSIONS {
-        let plist = super::sudo_user::invoking_user_home()
-            .join("Library/LaunchAgents")
-            .join(format!("com.orionchain.{tool}.plist"));
-        if plist.exists() {
-            let _ = cmd_as_invoking_user("launchctl")
-                .args(["unload", "-w", &plist.to_string_lossy()])
-                .output();
-            let _ = super::sudo_user::remove_file(&plist);
-            println!("[migrate] Removed old launchd agent for {tool}");
-        }
-    }
-
-    // Old database container. Scan state is per-host and disposable; the new
-    // container is provisioned fresh by init.
-    let _ = std::process::Command::new("docker")
-        .args(["rm", "-f", "orion-postgres"])
-        .output();
-
-    if legacy_bin.exists() {
-        match std::fs::remove_dir_all(legacy_bin) {
-            Ok(_) => println!("[migrate] Removed /opt/orionchain"),
-            Err(e) => {
-                eprintln!("[migrate] Could not remove /opt/orionchain: {e} (remove it manually)")
-            }
-        }
-    }
-    if legacy_cfg.exists() {
-        match super::sudo_user::remove_dir_all(&legacy_cfg) {
-            Ok(_) => println!("[migrate] Removed {}", legacy_cfg.display()),
-            Err(e) => eprintln!("[migrate] Could not remove {}: {}", legacy_cfg.display(), e),
-        }
-    }
-    println!("[migrate] Legacy cleanup complete.");
 }
 
 #[cfg(test)]
@@ -503,6 +480,41 @@ mod tests {
     }
 
     #[test]
+    fn keeping_the_data_stops_the_local_database_and_removes_nothing() {
+        let dir = PathBuf::from("/home/op/.config/crossfyre/postgres");
+        let stopped = std::cell::Cell::new(false);
+        let line = local_database(
+            true,
+            || {
+                stopped.set(true);
+                Ok((cfx_db::Stop::Stopped, dir.clone()))
+            },
+            || panic!("removed with --keep-data"),
+        );
+        assert!(stopped.get(), "not stopped");
+        assert_eq!(
+            line,
+            Ok(
+                "Stopped the local database. It stays in /home/op/.config/crossfyre/postgres \
+                 with its data."
+                    .to_string()
+            )
+        );
+        let line = local_database(
+            false,
+            || panic!("stopped and kept without --keep-data"),
+            || Ok(Some(dir.clone())),
+        );
+        assert_eq!(
+            line,
+            Ok(
+                "Removed the local database in /home/op/.config/crossfyre/postgres and its data."
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
     fn keeping_the_data_and_purging_it_are_not_both_asked_for() {
         let both = Scope {
             purge: true,
@@ -517,7 +529,7 @@ mod tests {
         assert!(!keep.what().contains("database"), "{}", keep.what());
         assert!(
             keep.question()
-                .contains("database container and config root are kept")
+                .contains("local database and config root are kept")
         );
     }
 
@@ -542,7 +554,6 @@ mod tests {
             "cfx-script.cannot-start",
             "plessor",
             "plessor.version",
-            "cortex",
         ] {
             assert!(gone.contains(&bin.join(f)), "{f} in {gone:?}");
         }
@@ -579,7 +590,19 @@ mod tests {
             "/opt/crossfyre/bin/packaging.json",
         );
         let bin = Path::new("/opt/crossfyre/bin");
-        assert!(unowned_files(bin, &image).is_empty());
+        // A closed component is no package's: the CLI fetches it after login, so
+        // uninstall takes it away again, the engine and the others alike.
+        let exe = std::env::consts::EXE_SUFFIX;
+        let mut want = vec![
+            bin.join(format!("plessor-authz{exe}")),
+            bin.join("plessor-authz.version"),
+        ];
+        want.extend(closed_here(bin).component_files());
+        assert_eq!(unowned_files(bin, &image), want);
+        assert!(
+            want.contains(&bin.join("pacing.wasm"))
+                && want.contains(&bin.join(format!("cfx-egress{exe}")))
+        );
         let root = Path::new(INSTALL_ROOT);
         assert!(has_files_under(
             &image,

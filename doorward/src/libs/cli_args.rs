@@ -1,11 +1,8 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-// `bin_name` is fixed so help names the engine as it is now called, even when it
-// is started through the link its old name left behind.
 #[command(
     name = "doorward",
-    bin_name = "doorward",
     about = "Network discovery and port scanning daemon",
     version
 )]
@@ -13,23 +10,39 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
 
-    /// Run as a background daemon (TCP server on the given port)
-    #[arg(long, default_value_t = false)]
-    pub daemon: bool,
-
-    /// TCP port to bind (daemon) or connect to (client)
-    #[arg(long, default_value_t = 4443)]
+    /// The port the daemon listens on, and the one the commands here reach it on
+    #[arg(
+        long,
+        global = true,
+        help_heading = "Global options",
+        default_value_t = dguard::ports::DOORWARD
+    )]
     pub port: u16,
 
-    /// Show the live dashboard instead of streaming JSON. Ignored when stdout is
-    /// not a terminal, so piping still produces parseable output.
-    #[arg(long, default_value_t = false)]
-    pub tui: bool,
-
-    /// Never draw the dashboard; stream newline-delimited JSON instead.
-    #[arg(long, default_value_t = false)]
+    /// Never draw the dashboard; stream newline-delimited JSON instead, as piped or
+    /// redirected output always gets
+    #[arg(
+        long,
+        global = true,
+        help_heading = "Global options",
+        default_value_t = false
+    )]
     pub no_tui: bool,
+
+    /// Never start the daemon: when it is not running, say so and stop. Setting
+    /// CFX_NO_AUTOSTART=1 does the same.
+    #[arg(
+        long,
+        global = true,
+        help_heading = "Global options",
+        default_value_t = false
+    )]
+    pub no_autostart: bool,
 }
+
+/// How long the dashboard waits for an event before it draws again, unless
+/// `--event-poll-timeout` says otherwise.
+pub const EVENT_POLL_TIMEOUT_MS: u64 = 500;
 
 #[derive(Subcommand, Clone)]
 pub enum Commands {
@@ -37,10 +50,17 @@ pub enum Commands {
     Scan(ScanArgs),
     /// Send a JSON op to the daemon and print the reply. `operation` defaults to
     /// `probe`, which runs a single probe with no dashboard.
-    #[command(alias = "scan-exec")]
     Exec(ExecArgs),
-    /// Database management
-    Db(DbArgs),
+    /// The scans this engine keeps, the latest first, and a stopped one to take up again
+    Scans,
+    /// What this engine keeps: delete one scan, old scans, or everything
+    Db {
+        #[command(subcommand)]
+        action: dguard::DbAction,
+    },
+    /// Run as this engine's daemon, which the commands here and the node talk to on
+    /// --port
+    Daemon,
     /// Print a shell completion script to stdout, for example:
     ///   doorward completions bash > ~/.local/share/bash-completion/completions/doorward
     Completions {
@@ -51,18 +71,13 @@ pub enum Commands {
 
 #[derive(Parser, Clone)]
 pub struct ScanArgs {
-    /// Target hosts/CIDRs (e.g. 192.168.1.0/24, example.com)
-    #[arg(short = 't', long, num_args = 1..)]
+    /// The hosts, addresses and CIDR ranges to scan (e.g. 192.168.1.0/24 example.com)
+    #[arg(value_name = "TARGET", required = true)]
     pub targets: Vec<String>,
 
     /// Ports to scan (e.g. "1-1024", "80,443,8080", "top-100", "top-1000")
     #[arg(short = 'p', long, default_value = "top-1000")]
     pub ports: String,
-
-    /// Scan technique. Only connect scanning is implemented; `syn` is accepted
-    /// so existing commands keep working, and runs a connect scan.
-    #[arg(long, default_value = "connect")]
-    pub technique: ScanTechnique,
 
     /// Number of concurrent tasks
     #[arg(long, default_value_t = 100)]
@@ -81,16 +96,12 @@ pub struct ScanArgs {
     #[arg(long, default_value_t = false)]
     pub service_detection: bool,
 
-    /// OS fingerprinting (experimental)
-    #[arg(long, default_value_t = false)]
-    pub os_detection: bool,
-
     /// Start fresh (ignore previous scan state)
     #[arg(long, default_value_t = false)]
     pub fresh_start: bool,
 
     /// TUI event poll timeout in ms
-    #[arg(long, default_value_t = 500)]
+    #[arg(long, default_value_t = EVENT_POLL_TIMEOUT_MS)]
     pub event_poll_timeout: u64,
 }
 
@@ -98,48 +109,6 @@ pub struct ScanArgs {
 pub struct ExecArgs {
     /// Raw JSON payload to send to the daemon
     pub json: String,
-}
-
-#[derive(Parser, Clone)]
-pub struct DbArgs {
-    /// Drop and recreate all tables
-    #[arg(long, default_value_t = false)]
-    pub full_reset: bool,
-}
-
-#[derive(Clone, Debug, ValueEnum)]
-pub enum ScanTechnique {
-    /// TCP connect scan (full handshake)
-    Connect,
-    /// Accepted for compatibility. No SYN scan is implemented yet, so it runs
-    /// a connect scan and says so.
-    Syn,
-}
-
-impl ScanTechnique {
-    /// The technique the scan actually runs with.
-    pub fn runs(&self) -> &'static str {
-        "connect"
-    }
-
-    /// What to tell the user before the scan starts, if anything.
-    pub fn notice(&self) -> Option<&'static str> {
-        match self {
-            ScanTechnique::Connect => None,
-            ScanTechnique::Syn => Some(
-                "doorward: SYN scanning is not implemented yet, so this is a TCP connect scan.",
-            ),
-        }
-    }
-}
-
-impl std::fmt::Display for ScanTechnique {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ScanTechnique::Connect => write!(f, "connect"),
-            ScanTechnique::Syn => write!(f, "syn"),
-        }
-    }
 }
 
 /// Well-known port lists for convenience.
@@ -273,27 +242,56 @@ mod resolve_ports_tests {
 }
 
 #[cfg(test)]
-mod technique_tests {
+mod tests {
     use super::*;
 
-    fn scan(argv: &[&str]) -> ScanArgs {
-        match Cli::try_parse_from(argv).expect("arguments parse").command {
-            Some(Commands::Scan(args)) => args,
-            _ => panic!("not a scan"),
+    #[test]
+    fn no_autostart_goes_before_or_after_the_command() {
+        let parsed = |argv: &[&str]| Cli::try_parse_from(argv).expect("parses").no_autostart;
+        assert!(parsed(&["doorward", "--no-autostart", "db", "reset"]));
+        assert!(parsed(&["doorward", "db", "reset", "--no-autostart"]));
+        assert!(!parsed(&["doorward", "db", "reset"]));
+    }
+
+    #[test]
+    fn the_daemon_is_a_command_with_its_port_after_it() {
+        let argv: Vec<String> = std::iter::once("doorward".to_string())
+            .chain(dguard::daemon_args(5000))
+            .collect();
+        let cli = Cli::try_parse_from(&argv).expect("parses");
+        assert!(matches!(cli.command, Some(Commands::Daemon)), "{argv:?}");
+        assert_eq!(cli.port, 5000);
+        assert!(
+            Cli::try_parse_from(["doorward", "--daemon"]).is_err(),
+            "the old flag"
+        );
+    }
+
+    #[test]
+    fn the_targets_follow_scan_and_the_old_names_are_gone() {
+        let cli = Cli::try_parse_from(["doorward", "scan", "10.0.0.5", "example.com", "-p", "80"])
+            .expect("parses");
+        let Some(Commands::Scan(args)) = cli.command else {
+            panic!("not a scan")
+        };
+        assert_eq!(args.targets, ["10.0.0.5", "example.com"]);
+        for old in [
+            &["doorward", "scan"][..],
+            &["doorward", "scan", "-t", "10.0.0.5"],
+            &["doorward", "scan", "--targets", "10.0.0.5"],
+            &["doorward", "scan", "10.0.0.5", "--technique", "syn"],
+            &["doorward", "scan-exec", "{}"],
+        ] {
+            assert!(Cli::try_parse_from(old).is_err(), "{old:?}");
         }
     }
 
     #[test]
-    fn the_default_is_the_scan_that_runs() {
-        let args = scan(&["doorward", "scan", "-t", "10.0.0.5"]);
-        assert_eq!(args.technique.to_string(), "connect");
-    }
-
-    #[test]
-    fn asking_for_syn_still_parses_and_says_it_is_a_connect_scan() {
-        let args = scan(&["doorward", "scan", "-t", "10.0.0.5", "--technique", "syn"]);
-        assert_eq!(args.technique.runs(), "connect");
-        assert!(args.technique.notice().is_some());
-        assert!(ScanTechnique::Connect.notice().is_none());
+    fn no_tui_goes_before_or_after_the_command_and_tui_is_gone() {
+        let parsed = |argv: &[&str]| Cli::try_parse_from(argv).expect("parses").no_tui;
+        assert!(parsed(&["doorward", "--no-tui", "scan", "10.0.0.5"]));
+        assert!(parsed(&["doorward", "scan", "10.0.0.5", "--no-tui"]));
+        assert!(!parsed(&["doorward", "scan", "10.0.0.5"]));
+        assert!(Cli::try_parse_from(["doorward", "--tui", "scan", "10.0.0.5"]).is_err());
     }
 }

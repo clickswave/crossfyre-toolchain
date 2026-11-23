@@ -1,0 +1,14 @@
+id: sharepoint
+info:
+  name: Microsoft SharePoint
+  category: CMS
+  metadata:
+    vendor: microsoft
+    product: sharepoint_server
+implies: [iis, aspnet]
+detect:
+  any:
+    - header: { name: microsoftsharepointteamservices, regex: '.' }
+    - header: { name: sprequestguid, regex: '.' }
+version:
+  - header: { name: microsoftsharepointteamservices, regex: '^([0-9]+(?:\.[0-9]+)*)' }

@@ -28,25 +28,10 @@ Thumbs.db
 .idea/
 .vscode/
 
-# Private tuned drop-in for the `adaptive` crate + its local paths-override.
-# NEVER commit these: the committed `adaptive/` is the open baseline that ships.
-# No trailing slash on purpose. With one, the pattern matches a directory only,
-# and the drop-in is now a symlink into its private origin, so it went back to
-# showing up as untracked in this public repository.
-/adaptive-private
-/.cargo/
-
-# Private isolated-egress drop-in (netns/tunnel/tor). NEVER commit: the committed
-# baseline.rs is the open direct-egress build. build.rs compiles this if present.
-/core/src/egress/private.rs
-
 # Private authorization-oracle drop-in (BOLA/BFLA/BOPLA differential engine). NEVER
 # commit: the committed baseline.rs is the open no-oracle build. plessor/build.rs
-# compiles this if present. The engine's directory was `cortex/` before 0.1.31, and
-# a checkout made before then may still have the drop-in there, so both paths are
-# ignored for one more release.
+# compiles this under the closed-authz feature, for plessor-authz.
 /plessor/src/authz/private.rs
-/cortex/src/authz/private.rs
 
 # Python bytecode from the oracle regression harness.
 __pycache__/

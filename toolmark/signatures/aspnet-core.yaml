@@ -1,0 +1,7 @@
+id: aspnet-core
+info:
+  name: ASP.NET Core
+  category: Framework
+detect:
+  any:
+    - header: { name: server, regex: '(?i)kestrel' }

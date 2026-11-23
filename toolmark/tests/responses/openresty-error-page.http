@@ -1,0 +1,14 @@
+# Synthetic: A 502 from OpenResty behind a proxy that took the version out of Server.
+# OpenResty's own error page still names it.
+HTTP/1.1 502 Bad Gateway
+server: openresty
+date: Fri, 20 Nov 2026 06:00:00 GMT
+content-type: text/html
+
+<html>
+<head><title>502 Bad Gateway</title></head>
+<body>
+<center><h1>502 Bad Gateway</h1></center>
+<hr><center>openresty/1.21.4.3</center>
+</body>
+</html>

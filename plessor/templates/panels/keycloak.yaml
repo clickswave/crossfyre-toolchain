@@ -6,8 +6,6 @@ info:
   tags: panel,keycloak,sso,oidc
   metadata:
     category: panels
-    vendor: redhat
-    product: keycloak
 http:
   - method: GET
     path:

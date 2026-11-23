@@ -1,0 +1,9 @@
+id: modernizr
+info:
+  name: Modernizr
+  category: JavaScript Library
+detect:
+  any:
+    - script_src: { regex: '/modernizr(?:\.min)?\.js' }
+version:
+  - script_src: { regex: 'modernizr/([0-9]+\.[0-9]+\.[0-9]+)/' }

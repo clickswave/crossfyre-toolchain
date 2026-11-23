@@ -1,0 +1,15 @@
+# Synthetic: The login page of ManageEngine ADSelfService Plus.
+HTTP/1.1 200 OK
+content-type: text/html
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ManageEngine - ADSelfService Plus</title>
+</head>
+<body>
+<form name="login" method="post"></form>
+</body>
+</html>

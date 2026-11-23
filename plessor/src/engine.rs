@@ -96,6 +96,13 @@ pub struct ScanParams {
     /// hops and DNS rebinding.
     #[serde(default)]
     pub block_internal: bool,
+    /// Names pinned to addresses, `[["app.example.com", "203.0.113.7:443"], ...]`, used on
+    /// every connection to the target, raw sends included. A caller that has already
+    /// decided which addresses of a name may be dialled sends them, so the name is not
+    /// looked up again here and answered with somewhere else. No challenge solver is
+    /// asked when there are any, since it would look the name up itself.
+    #[serde(default)]
+    pub resolve: Vec<(String, std::net::SocketAddr)>,
     /// Template-id allowlist. Empty = every template the severity filter admits.
     ///
     /// The severity filter alone cannot express "run the exposure pack and
@@ -107,6 +114,22 @@ pub struct ScanParams {
     /// blast radius rather than the engine.
     #[serde(default)]
     pub only: Vec<String>,
+    /// What toolmark saw on the target, by its names for them, part:vendor:product. With
+    /// them, a template about one product runs only where toolmark saw it; with none,
+    /// every template runs, as it always did. See [`template::Choice`].
+    #[serde(default)]
+    pub products: Option<Vec<String>>,
+    /// Which inventory `products` came from and how old it was, said with the templates
+    /// held back.
+    #[serde(default)]
+    pub products_from: Option<String>,
+    /// Run every template, whatever `products` says.
+    #[serde(default)]
+    pub all_templates: bool,
+    /// toolmark's CVE leads for what it saw on the target, from the same inventory as
+    /// `products`, each answered once the templates that check it have run.
+    #[serde(default)]
+    pub leads: Vec<cfx_cve::inventory::HostLead>,
     /// Optional request auth (headers + cookie) resolved from a credential by the
     /// node, so scanning (and later authorization testing) runs authenticated.
     #[serde(default)]
@@ -143,7 +166,6 @@ pub struct OastSpec {
 pub use transport::AuthSpec;
 
 pub(crate) struct BaseResp {
-    #[allow(dead_code)]
     pub(crate) is_https: bool,
     pub(crate) status: u16,
     pub(crate) headers: Vec<(String, String)>,
@@ -159,7 +181,7 @@ pub(crate) struct BaseResp {
 /// Keeping `sec-ch-ua` and the `Sec-Fetch-*` set alongside a scanner name would
 /// be a client claiming to be two different things at once, which is worse than
 /// either alone: it reads as evasion that forgot to change its User-Agent.
-fn announce_as(ident: &mut adaptive::identity::Identity, ua: Option<&str>) {
+pub(crate) fn announce_as(ident: &mut adaptive::identity::Identity, ua: Option<&str>) {
     let Some(ua) = ua.map(str::trim).filter(|u| !u.is_empty()) else {
         return;
     };
@@ -170,6 +192,16 @@ fn announce_as(ident: &mut adaptive::identity::Identity, ua: Option<&str>) {
             || k.starts_with("sec-fetch")
             || k == "upgrade-insecure-requests")
     });
+}
+
+/// Why the challenge solver is not asked to clear this scan's target, or None when it
+/// may be: the scan's egress rules it out, or the scan dials only the addresses its names
+/// were pinned to, and the solver's browser would look them up again itself.
+fn solver_not_used(params: &ScanParams) -> Option<&'static str> {
+    crate::solver::not_used(&params.egress).or_else(|| {
+        (!params.resolve.is_empty())
+            .then_some("challenge solver not used: this op dials only the addresses it was given")
+    })
 }
 
 /// Whether this scan should present a browser TLS/HTTP2 fingerprint.
@@ -183,7 +215,14 @@ fn should_emulate(ua: Option<&str>, mode: &adaptive::identity::Mode) -> bool {
     !announced && !matches!(mode, adaptive::identity::Mode::Fast)
 }
 
-pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
+/// Scan `params.target`, sending what is found on `tx`, keeping the plan in `ledger`, and
+/// with `pack`'s templates when the request asks for the pack.
+pub async fn run<L: crate::ledger::Ledger>(
+    params: ScanParams,
+    tx: mpsc::UnboundedSender<Value>,
+    ledger: std::sync::Arc<L>,
+    pack: std::sync::Arc<template::Pack>,
+) {
     let base = match normalize_base(&params.target) {
         Some(b) => b,
         None => {
@@ -198,75 +237,27 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
     // sends UA + hint headers; the impersonate (wreq) backend presents a real
     // browser TLS/HTTP2 fingerprint, with the emulation profile owning the
     // fingerprint headers. Fast posture skips emulation. Stable-per-target; the
-    // profile choice is the private `adaptive` drop-in.
+    // profile choice is the pacing module's, when one is installed.
     let mode = adaptive::identity::Mode::from_flags(params.evasive, params.identify.clone());
 
-    // Builds an outbound client for a resolved identity. Closed over so a
-    // challenge retry can rebuild it with a rotated identity.
+    // Builds an outbound client for a resolved identity, again with a rotated one when a
+    // challenge retry asks.
     let build_client = |ident: &adaptive::identity::Identity,
                         clearance: Option<&crate::solver::Solved>| {
-        let mut browser_headers = transport::HeaderMap::new();
-        for (k, v) in &ident.headers {
-            if let (Ok(name), Ok(val)) = (
-                transport::HeaderName::from_bytes(k.as_bytes()),
-                transport::HeaderValue::from_str(v),
-            ) {
-                browser_headers.insert(name, val);
-            }
-        }
-        let mut extra_headers = transport::HeaderMap::new();
-        if let Some(auth) = params.auth.as_ref().filter(|a| a.is_meaningful()) {
-            for (k, v) in auth.to_header_map().iter() {
-                extra_headers.insert(k.clone(), v.clone());
-            }
-        }
-        // The attribution token (Identify posture) is an app header: it must
-        // survive emulation, so it goes in extra_headers, not the fingerprint set.
-        if let adaptive::identity::Mode::Identify(token) = &mode {
-            if let Ok(val) = transport::HeaderValue::from_str(token) {
-                extra_headers.insert(transport::HeaderName::from_static("x-bug-bounty"), val);
-            }
-        }
-        // Challenge clearance (from the solver): the cf_clearance cookie must ride
-        // on every request, and the UA must match the solver's browser or the
-        // cookie is rejected - so adopt the solver's UA for the fingerprint too.
-        let mut ua = ident.user_agent.clone();
-        if let Some(sol) = clearance {
-            if let Ok(val) = transport::HeaderValue::from_str(&sol.cookie_header) {
-                extra_headers.insert(transport::header::COOKIE, val);
-            }
-            if let Some(sua) = &sol.user_agent {
-                ua = sua.clone();
-            }
-        }
-        transport::build_client(
-            transport::ClientConfig {
-                timeout: Some(Duration::from_millis(
-                    params.timeout_ms.clamp(1000, 120_000),
-                )),
-                redirect: if params.follow_redirects {
-                    transport::Redirect::Limited(5)
-                } else {
-                    transport::Redirect::None
-                },
-                accept_invalid_certs: true,
-                cookie_store: true,
-                user_agent: Some(ua),
-                browser_headers,
-                extra_headers,
-                emulate: should_emulate(params.user_agent.as_deref(), &mode),
-                resolve: Vec::new(),
-                block_internal: params.block_internal,
-                // A template request goes to the target. Off its origin a 307 or
-                // 308 would carry the payload to a host nobody listed, and the
-                // matchers would read that host's answer as the target's.
-                same_origin_redirects: true,
-            },
-            &params.egress,
-        )
+        scan_client(&params, &mode, ident, clearance)
     };
 
     let _ = tx.send(json!({"type":"ack","target": base}));
+
+    // Which inventory chose the templates and gave the leads, said with both.
+    let from = params
+        .products_from
+        .as_deref()
+        .unwrap_or("the products the scan was given");
+    let mut leads = crate::leads::Leads::new(&params.leads, from);
+    if let Some(given) = leads.given() {
+        let _ = tx.send(given);
+    }
 
     // Fetch the base once and handle any WAF / anti-bot interference before
     // committing to the full scan: a challenge on the base means every
@@ -338,7 +329,7 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
                         // node's own egress. On success, retry the base carrying
                         // that cookie; if there is no solver, or it can't clear, or
                         // the challenge persists even with clearance, report + stop.
-                        if let Some(note) = crate::solver::not_used(&params.egress)
+                        if let Some(note) = solver_not_used(&params)
                             .filter(|_| clearance.is_none() && crate::solver::configured())
                         {
                             let _ = tx.send(json!({
@@ -405,14 +396,14 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
     if blocked {
         let _ = tx.send(
             Finding::new(
-                "cortex",
+                "plessor",
                 "waf",
                 format!("Target behind WAF/anti-bot ({block_label})"),
                 "info",
                 &base,
             )
             .kind("waf")
-            .template("cortex:waf-challenge")
+            .template("plessor:waf-challenge")
             .describe("The base URL returned a WAF/anti-bot challenge that could not be cleared, so active vulnerability templates were skipped. Consider origin discovery, an attribution/allowlist header, or a challenge-solving session.")
             .event(),
         );
@@ -427,6 +418,9 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
     let allow_id = |id: &str| only.is_empty() || only.iter().any(|s| s == &id.to_lowercase());
 
     let mut found: i64 = 0;
+    // Each finding is kept with its proof, which names the slots the scan's credential
+    // fills and never what is in them.
+    let proof_ctx = crate::proof::Ctx::new(params.auth.as_ref());
 
     // --- Passive header checks on the base response (deterministic) ---
     // fetch_base returns None only on a transport-level failure (connection
@@ -440,15 +434,16 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
         for (name, template, severity, description) in header_checks(&resp) {
             if allow(severity) && allow_id(template) {
                 found += 1;
-                let _ = tx.send(
-                    Finding::new("cortex", "misconfig", name, severity, &base)
-                        .template(template)
-                        // These are read off the base response's headers, so the
-                        // location is not a guess.
-                        .location("header")
-                        .describe(description)
-                        .event(),
-                );
+                let mut event = Finding::new("plessor", "misconfig", name, severity, &base)
+                    .template(template)
+                    // These are read off the base response's headers, so the
+                    // location is not a guess.
+                    .location("header")
+                    .describe(description)
+                    .event();
+                event["data"]["proof"] =
+                    json!(header_proof(&proof_ctx, &base, template, name, &resp));
+                let _ = tx.send(event);
             }
         }
         true
@@ -461,21 +456,55 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
         let ext_dir = params
             .templates_dir
             .clone()
-            .or_else(|| dguard::env_renamed("PLESSOR_TEMPLATES_DIR", "CORTEX_TEMPLATES_DIR"));
+            .or_else(|| std::env::var("PLESSOR_TEMPLATES_DIR").ok());
         let external = ext_dir
             .as_deref()
             .map(template::load_dir)
             .unwrap_or_default();
+        // Which pack it is, as the proofs of its templates name it.
+        let pack_named = pack.named.as_str();
         // A directory template with a pack template's id replaces it, so a copy
         // of the pack pointed at with --templates runs each check once.
         let pack: Vec<&template::Template> = if params.pack {
-            template::PACK
+            pack.templates
                 .iter()
                 .filter(|p| !external.iter().any(|e| e.id == p.id))
                 .collect()
         } else {
             Vec::new()
         };
+        // A template about one product runs where toolmark saw that product, and the
+        // ones held back are said, never dropped in silence.
+        let choice = template::Choice::new(params.products.as_deref(), params.all_templates);
+        let (pack, held_pack): (Vec<&template::Template>, Vec<&template::Template>) =
+            pack.into_iter().partition(|t| choice.runs(t));
+        let (external, held_external): (Vec<template::Template>, Vec<template::Template>) =
+            external.into_iter().partition(|t| choice.runs(t));
+        let not_seen = format!("{from} names none of its products");
+        for t in held_pack.iter().copied().chain(held_external.iter()) {
+            leads.record(t, crate::leads::Outcome::NotRun(not_seen.clone()));
+        }
+        let held: Vec<&str> = held_pack
+            .iter()
+            .copied()
+            .chain(held_external.iter())
+            .map(|t| t.id.as_str())
+            .filter(|id| allow_id(id))
+            .collect();
+        if !held.is_empty() {
+            let _ = tx.send(json!({
+                "type": "templates_held_back",
+                "count": held.len(),
+                "templates": held,
+                "from": from,
+                "reason": not_seen,
+                "message": format!(
+                    "{} product templates held back: {from} names none of their products. \
+                     --all-templates runs them",
+                    held.len()
+                ),
+            }));
+        }
         // Count only what will actually run, or a filtered scan reports progress
         // against a denominator it can never reach and the UI sticks at 20%.
         let total = template::BUILTIN
@@ -485,6 +514,65 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
             .filter(|t| allow_id(&t.id))
             .count();
         let mut done = 0usize;
+
+        // The plan: every template, with where it starts. A scan taken up again leaves
+        // out what it had run, unless the templates it started with are gone.
+        use crate::ledger::{Planned, State};
+        let planned: Vec<Planned> = template::BUILTIN
+            .iter()
+            .chain(pack.iter().copied())
+            .chain(external.iter())
+            .map(|t| {
+                let sev = if t.info.severity.is_empty() {
+                    "info".to_string()
+                } else {
+                    t.info.severity.to_lowercase()
+                };
+                let (state, reason) = if !allow_id(&t.id) {
+                    (State::Skipped, Some("not one of the templates asked for"))
+                } else if !params.test_writes && template_changes_target(t) {
+                    (State::HeldBack, Some("what it sends changes the target"))
+                } else if !allow(&sev) {
+                    (State::Skipped, Some("below the severities asked for"))
+                } else {
+                    (State::Queued, None)
+                };
+                Planned {
+                    id: t.id.clone(),
+                    state,
+                    reason,
+                }
+            })
+            .collect();
+        // The templates as they are written: one edited under the same id makes another
+        // pack, and the order a folder happens to be read in does not.
+        let pack_digest = {
+            use sha2::Digest;
+            let mut templates: Vec<(&str, &str)> = template::BUILTIN
+                .iter()
+                .chain(pack.iter().copied())
+                .chain(external.iter())
+                .map(|t| (t.id.as_str(), t.source.as_str()))
+                .collect();
+            templates.sort_unstable();
+            let mut digest = sha2::Sha256::new();
+            digest.update(env!("CARGO_PKG_VERSION"));
+            for part in templates.into_iter().flat_map(|(id, source)| [id, source]) {
+                digest.update((part.len() as u64).to_le_bytes());
+                digest.update(part);
+            }
+            format!("{:x}", digest.finalize())
+        };
+        let planning = ledger.plan(&pack_digest, &planned).await;
+        if planning.replanned {
+            let _ = tx.send(json!({"type":"log","message":
+                "the templates this scan started with are gone, so it was planned again and \
+                 starts over"}));
+        }
+        for data in &planning.found {
+            found += 1;
+            let _ = tx.send(json!({"type":"finding","data": data}));
+        }
 
         // OAST client for out-of-band (interactsh) templates; None disables OOB.
         // Per-scan endpoint (node-resolved) wins over the node env fallback.
@@ -535,6 +623,7 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
         let raw = crate::rawhttp::Route {
             egress: params.egress.clone(),
             block_internal: params.block_internal,
+            resolve: params.resolve.clone(),
         };
         // Templates held back because their method changes the target. Named
         // rather than dropped, so a shorter run is not mistaken for a clean one.
@@ -549,12 +638,38 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
             // only id-allowed templates. The severity filter stays inside the
             // loop, where it has always been counted as work done.
             if !allow_id(&tmpl.id) {
+                leads.record(
+                    tmpl,
+                    crate::leads::Outcome::NotRun("not among the templates asked for".into()),
+                );
+                continue;
+            }
+            // Run before this scan was stopped, and taken up again.
+            if planning.done.contains(&tmpl.id) {
+                let found_then = planning
+                    .found
+                    .iter()
+                    .any(|f| f["template"].as_str() == Some(tmpl.id.as_str()));
+                leads.record(
+                    tmpl,
+                    if found_then {
+                        crate::leads::Outcome::Found
+                    } else {
+                        crate::leads::Outcome::Ran
+                    },
+                );
+                done += 1;
+                let _ = tx.send(json!({"type":"progress","processed": done, "total": total}));
                 continue;
             }
             // A template that overwrites or destroys is not a test of whether it
             // could. POST stays, for the reason the injection engine states.
             if !params.test_writes && template_changes_target(tmpl) {
                 write_templates.push(tmpl.id.clone());
+                leads.record(
+                    tmpl,
+                    crate::leads::Outcome::NotRun("what it sends changes the target".into()),
+                );
                 continue;
             }
             let sev = if tmpl.info.severity.is_empty() {
@@ -563,6 +678,16 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
                 tmpl.info.severity.to_lowercase()
             };
             if allow(&sev) {
+                let pending_before = oob_queue.lock().map(|q| q.len()).unwrap_or_default();
+                let mut confirmed = false;
+                // Where the template came from, as its proofs name it.
+                let origin = if template::BUILTIN.iter().any(|b| std::ptr::eq(b, tmpl)) {
+                    "built in"
+                } else if pack.iter().any(|p| std::ptr::eq(*p, tmpl)) {
+                    pack_named
+                } else {
+                    "a templates folder"
+                };
                 for m in template::eval_template(
                     &client,
                     &base,
@@ -572,17 +697,48 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
                     Some(&oob_queue),
                     params.evasive,
                     &raw,
+                    &proof_ctx,
+                    origin,
                 )
                 .await
                 {
                     found += 1;
-                    let _ = tx.send(
-                        Finding::new("cortex", &m.class, m.name, m.severity, m.matched_at)
+                    confirmed = true;
+                    let mut event =
+                        Finding::new("plessor", &m.class, m.name, m.severity, m.matched_at)
                             .template(m.template_id)
                             .describe(m.description)
-                            .event(),
-                    );
+                            .event();
+                    event["data"]["proof"] = json!(m.proof);
+                    let _ = tx.send(event);
                 }
+                let pending = oob_queue.lock().map(|q| q.len()).unwrap_or_default();
+                let state = if confirmed {
+                    State::Confirmed
+                } else if pending > pending_before {
+                    State::Matched
+                } else {
+                    State::Sent
+                };
+                ledger.state(&tmpl.id, state).await;
+                // One waiting on a callback ran; the callbacks say at the end if it found.
+                leads.record(
+                    tmpl,
+                    if confirmed {
+                        crate::leads::Outcome::Found
+                    } else if tmpl.needs_oob() && oob_reg.is_none() {
+                        crate::leads::Outcome::NotRun(
+                            "out-of-band callbacks were unavailable".into(),
+                        )
+                    } else {
+                        crate::leads::Outcome::Ran
+                    },
+                );
+            } else {
+                leads.record(
+                    tmpl,
+                    crate::leads::Outcome::NotRun("below the severities asked for".into()),
+                );
             }
             done += 1;
             let _ = tx.send(json!({"type":"progress","processed": done, "total": total}));
@@ -590,14 +746,20 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
         if !write_templates.is_empty() {
             write_templates.sort();
             write_templates.dedup();
-            let _ = tx.send(json!({"type":"log","message": format!(
-                "{} template(s) were NOT run: {}. Each one uses a method that overwrites or \
-                 destroys the resource, so sending it IS the change rather than a test of \
-                 whether it is possible. Whatever they check is untested here, not clean. \
-                 Re-run with writes enabled against a target you are willing to change.",
-                write_templates.len(),
-                write_templates.join(", ")
-            )}));
+            let _ = tx.send(json!({
+                "type": "templates_held_back",
+                "count": write_templates.len(),
+                "reason": "what it sends changes the target",
+                "message": format!(
+                    "{} template(s) were NOT run: {}. Each one uses a method that overwrites or \
+                     destroys the resource, so sending it IS the change rather than a test of \
+                     whether it is possible. Whatever they check is untested here, not clean. \
+                     Re-run with writes enabled against a target you are willing to change.",
+                    write_templates.len(),
+                    write_templates.join(", ")
+                ),
+                "templates": write_templates,
+            }));
         }
 
         // Out-of-band template callbacks, collected once for the whole scan.
@@ -619,10 +781,28 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
                         break;
                     }
                 }
+                // Each template waited on: confirmed when one of its callbacks came, and
+                // only sent when none did.
+                let mut waited: std::collections::BTreeMap<String, bool> = Default::default();
                 for p in pending {
-                    if hosts.iter().any(|h| h.contains(&p.marker)) {
+                    let called_back = hosts.iter().any(|h| h.contains(&p.marker));
+                    if let Some(id) = p.finding["template"].as_str() {
+                        *waited.entry(id.to_string()).or_default() |= called_back;
+                    }
+                    if called_back {
                         found += 1;
                         let _ = tx.send(json!({"type":"finding","data": p.finding}));
+                    }
+                }
+                for (id, called_back) in waited {
+                    let state = if called_back {
+                        State::Confirmed
+                    } else {
+                        State::Sent
+                    };
+                    ledger.state(&id, state).await;
+                    if called_back {
+                        leads.update(&id, crate::leads::Outcome::Found);
                     }
                 }
             }
@@ -630,7 +810,123 @@ pub async fn run(params: ScanParams, tx: mpsc::UnboundedSender<Value>) {
         }
     }
 
+    let unrun = if params.passive_only {
+        Some("the scan ran passive checks only")
+    } else if blocked {
+        Some("a WAF challenge on the target stopped the templates")
+    } else if !base_reachable {
+        Some("the target did not answer")
+    } else {
+        None
+    };
+    if let Some(answers) = leads.answers(unrun) {
+        let _ = tx.send(answers);
+    }
     let _ = tx.send(json!({"type":"done","found": found}));
+}
+
+/// The outbound client of a scan asked for with `params`, for the identity `ident` of
+/// posture `mode` and any challenge `clearance`: the scan's credential on every request,
+/// its timeout, redirects and refusal of internal addresses, through its egress. A replay
+/// of a finding's proof goes through the same client.
+pub(crate) fn scan_client(
+    params: &ScanParams,
+    mode: &adaptive::identity::Mode,
+    ident: &adaptive::identity::Identity,
+    clearance: Option<&crate::solver::Solved>,
+) -> Result<transport::Client, transport::BuildError> {
+    let mut browser_headers = transport::HeaderMap::new();
+    for (k, v) in &ident.headers {
+        if let (Ok(name), Ok(val)) = (
+            transport::HeaderName::from_bytes(k.as_bytes()),
+            transport::HeaderValue::from_str(v),
+        ) {
+            browser_headers.insert(name, val);
+        }
+    }
+    let mut extra_headers = transport::HeaderMap::new();
+    if let Some(auth) = params.auth.as_ref().filter(|a| a.is_meaningful()) {
+        for (k, v) in auth.to_header_map().iter() {
+            extra_headers.insert(k.clone(), v.clone());
+        }
+    }
+    // The attribution token (Identify posture) is an app header: it must
+    // survive emulation, so it goes in extra_headers, not the fingerprint set.
+    if let adaptive::identity::Mode::Identify(token) = mode {
+        if let Ok(val) = transport::HeaderValue::from_str(token) {
+            extra_headers.insert(transport::HeaderName::from_static("x-bug-bounty"), val);
+        }
+    }
+    // Challenge clearance (from the solver): the cf_clearance cookie must ride
+    // on every request, and the UA must match the solver's browser or the
+    // cookie is rejected - so adopt the solver's UA for the fingerprint too.
+    let mut ua = ident.user_agent.clone();
+    if let Some(sol) = clearance {
+        if let Ok(val) = transport::HeaderValue::from_str(&sol.cookie_header) {
+            extra_headers.insert(transport::header::COOKIE, val);
+        }
+        if let Some(sua) = &sol.user_agent {
+            ua = sua.clone();
+        }
+    }
+    transport::build_client(
+        transport::ClientConfig {
+            timeout: Some(Duration::from_millis(
+                params.timeout_ms.clamp(1000, 120_000),
+            )),
+            redirect: if params.follow_redirects {
+                transport::Redirect::Limited(5)
+            } else {
+                transport::Redirect::None
+            },
+            accept_invalid_certs: true,
+            cookie_store: true,
+            user_agent: Some(ua),
+            browser_headers,
+            extra_headers,
+            emulate: should_emulate(params.user_agent.as_deref(), mode),
+            resolve: params.resolve.clone(),
+            block_internal: params.block_internal,
+            // A template request goes to the target. Off its origin a 307 or
+            // 308 would carry the payload to a host nobody listed, and the
+            // matchers would read that host's answer as the target's.
+            same_origin_redirects: true,
+        },
+        &params.egress,
+    )
+}
+
+/// The proof of the header check `check`, `name`, on the base response `resp` of `base`:
+/// a GET of the base, and the header it lacked.
+fn header_proof(
+    ctx: &crate::proof::Ctx,
+    base: &str,
+    check: &str,
+    name: &str,
+    resp: &BaseResp,
+) -> crate::proof::Proof {
+    crate::proof::Proof::new(
+        ctx,
+        "built in",
+        crate::proof::Kind::Header,
+        check,
+        vec![crate::proof::Sent {
+            method: "GET".into(),
+            url: base.to_string(),
+            fields: Vec::new(),
+            body: None,
+            raw: false,
+        }],
+        Vec::new(),
+        "and",
+        vec![crate::proof::Fired {
+            matcher: "header".into(),
+            part: "header".into(),
+            evidence: name.to_string(),
+        }],
+        resp.status,
+        &resp.body_prefix,
+    )
 }
 
 /// Does running this template change the target rather than test it?
@@ -648,7 +944,9 @@ fn template_changes_target(tmpl: &template::Template) -> bool {
 }
 
 /// Passive security-header checks. Returns (name, template-id, severity, description).
-fn header_checks(resp: &BaseResp) -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
+pub(crate) fn header_checks(
+    resp: &BaseResp,
+) -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
     let has = |n: &str| resp.headers.iter().any(|(k, _)| k == n);
     let mut out = Vec::new();
     if !has("x-frame-options") && !has("content-security-policy") {
@@ -744,6 +1042,26 @@ fn normalize_base(t: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A scan whose names are pinned is never handed to the challenge solver, whose
+    /// browser would look the names up again; nor is one through a proxy. Any other is.
+    #[test]
+    fn the_solver_is_not_asked_for_a_pinned_or_proxied_scan() {
+        let scan =
+            |v: serde_json::Value| -> super::ScanParams { serde_json::from_value(v).unwrap() };
+        let pinned = scan(serde_json::json!({"target": "http://h",
+                                             "resolve": [["h", "203.0.113.7:80"]]}));
+        assert!(super::solver_not_used(&pinned).is_some_and(|w| w.contains("addresses")));
+        let proxied = super::ScanParams {
+            egress: transport::Egress::Proxy("http://127.0.0.1:9".into()),
+            ..scan(serde_json::json!({"target": "http://h"}))
+        };
+        assert!(super::solver_not_used(&proxied).is_some_and(|w| w.contains("proxy")));
+        assert_eq!(
+            super::solver_not_used(&scan(serde_json::json!({"target": "http://h"}))),
+            None
+        );
+    }
 
     /// The node's scans do not name `pack`, and must keep running exactly the
     /// templates they ran before the pack was compiled in.
@@ -904,5 +1222,195 @@ http:
         let none: Vec<String> = vec![];
         let allow_all = |id: &str| none.is_empty() || none.iter().any(|s| s == &id.to_lowercase());
         assert!(allow_all("anything"));
+    }
+}
+
+#[cfg(test)]
+mod ledger_tests {
+    //! A template scan's plan and the state of each template go to its ledger, and a scan
+    //! taken up again leaves out the templates it had run and reports what they found.
+    use super::*;
+    use crate::ledger::{Ledger, Planned, Planning, State};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// Two of the built-in templates, which a target answering 404 gives nothing.
+    const ASKED: [&str; 2] = ["git-config-exposure", "dotenv-exposure"];
+
+    #[derive(Default)]
+    struct Kept {
+        /// The pack the scan was planned under.
+        pack: Mutex<String>,
+        planned: Mutex<Vec<(String, State, Option<&'static str>)>>,
+        states: Mutex<Vec<(String, State)>>,
+        /// What `plan` answers for a scan taken up again: the templates it had run, and
+        /// what they found.
+        done: Vec<String>,
+        found: Vec<Value>,
+    }
+
+    impl Ledger for Kept {
+        async fn plan(&self, pack: &str, templates: &[Planned]) -> Planning {
+            *self.pack.lock().unwrap() = pack.to_string();
+            *self.planned.lock().unwrap() = templates
+                .iter()
+                .map(|t| (t.id.clone(), t.state, t.reason))
+                .collect();
+            Planning {
+                done: self.done.iter().cloned().collect(),
+                found: self.found.clone(),
+                replanned: false,
+            }
+        }
+        async fn state(&self, id: &str, state: State) {
+            self.states.lock().unwrap().push((id.to_string(), state));
+        }
+    }
+
+    /// A target that answers 404 to everything and counts what it is sent.
+    async fn target() -> (u16, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counted = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let counted = counted.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    while let Ok(n) = s.read(&mut buf).await {
+                        if n == 0 {
+                            return;
+                        }
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        let _ = s
+                            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                            .await;
+                    }
+                });
+            }
+        });
+        (port, hits)
+    }
+
+    /// A scan of the target on `port` for the templates [`ASKED`], and what it said.
+    async fn scan(port: u16, ledger: Arc<Kept>) -> Vec<Value> {
+        scan_with(port, json!({ "only": ASKED }), ledger).await
+    }
+
+    /// A scan of the target on `port` with `asked` among its settings, and what it said.
+    async fn scan_with(port: u16, asked: Value, ledger: Arc<Kept>) -> Vec<Value> {
+        let mut params = json!({
+            "target": format!("http://127.0.0.1:{port}/"),
+            "evasive": false,
+            "timeout_ms": 2000,
+        });
+        if let (Some(params), Value::Object(asked)) = (params.as_object_mut(), asked) {
+            params.extend(asked);
+        }
+        let params: ScanParams = serde_json::from_value(params).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        run(
+            params,
+            tx,
+            ledger,
+            std::sync::Arc::new(template::Pack::compiled()),
+        )
+        .await;
+        let mut said = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            said.push(event);
+        }
+        said
+    }
+
+    #[tokio::test]
+    async fn the_plan_and_each_templates_state_are_kept_and_what_ran_is_left_out() {
+        let (port, hits) = target().await;
+        let first = Arc::new(Kept::default());
+        scan(port, first.clone()).await;
+        let planned = first.planned.lock().unwrap().clone();
+        assert_eq!(planned.len(), template::BUILTIN.len());
+        let queued: Vec<&str> = planned
+            .iter()
+            .filter(|(_, state, _)| *state == State::Queued)
+            .map(|(id, _, _)| id.as_str())
+            .collect();
+        assert_eq!(queued, ASKED);
+        for (id, state, reason) in &planned {
+            if !ASKED.contains(&id.as_str()) {
+                assert_eq!(
+                    (*state, *reason),
+                    (State::Skipped, Some("not one of the templates asked for")),
+                    "{id}"
+                );
+            }
+        }
+        assert_eq!(
+            *first.states.lock().unwrap(),
+            ASKED.map(|id| (id.to_string(), State::Sent)),
+            "each template's state is kept as it runs"
+        );
+        let all_of_it = hits.swap(0, Ordering::SeqCst);
+
+        // Taken up again with the first template run, and what it had found.
+        let earlier = json!({"name": "found before the scan stopped", "template": ASKED[0]});
+        let again = Arc::new(Kept {
+            done: vec![ASKED[0].to_string()],
+            found: vec![earlier.clone()],
+            ..Kept::default()
+        });
+        let said = scan(port, again.clone()).await;
+        assert_eq!(
+            *again.states.lock().unwrap(),
+            [(ASKED[1].to_string(), State::Sent)],
+            "only the template not yet run runs"
+        );
+        let resumed = hits.load(Ordering::SeqCst);
+        assert!(
+            resumed < all_of_it,
+            "the template already run was sent again: {resumed} of {all_of_it}"
+        );
+        assert!(
+            said.contains(&json!({"type": "finding", "data": earlier})),
+            "what it had found is reported again: {said:?}"
+        );
+        assert_eq!(said.last(), Some(&json!({"type": "done", "found": 1})));
+    }
+
+    /// A template that looks for `WORD` at /p/t1.
+    const T1: &str = r#"id: t1
+info:
+  name: lab t1
+  severity: low
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/p/t1"
+    matchers:
+      - type: word
+        words:
+          - "WORD"
+"#;
+
+    #[tokio::test]
+    async fn a_template_edited_under_the_same_id_makes_another_pack() {
+        let (port, _) = target().await;
+        let dir = std::env::temp_dir().join(format!("plessor-pack-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let asked = json!({ "templates_dir": dir.to_string_lossy(), "only": ["t1"] });
+        std::fs::write(dir.join("t1.yaml"), T1.replace("WORD", "WRONG-t1")).unwrap();
+        let first = Arc::new(Kept::default());
+        scan_with(port, asked.clone(), first.clone()).await;
+        let again = Arc::new(Kept::default());
+        scan_with(port, asked.clone(), again.clone()).await;
+        let pack = |kept: &Kept| kept.pack.lock().unwrap().clone();
+        assert_eq!(pack(&again), pack(&first), "nothing changed");
+        std::fs::write(dir.join("t1.yaml"), T1.replace("WORD", "FOUND-t1")).unwrap();
+        let edited = Arc::new(Kept::default());
+        scan_with(port, asked, edited.clone()).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_ne!(pack(&edited), pack(&first), "its matcher was edited");
     }
 }

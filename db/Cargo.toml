@@ -1,0 +1,37 @@
+[package]
+name = "cfx_db"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+homepage = "https://clickswave.org"
+repository = "https://github.com/clickswave/crossfyre-toolchain"
+keywords = ["postgres", "database"]
+description = "The engines' Postgres: which database config.toml names, making and running the local one, and what to run when it cannot be reached."
+authors = ["Clickswave <team@clickswave.org>"]
+
+# The engines and cfx_core both link this. It must not depend on cfx_core, which the
+# engines do not link.
+[dependencies]
+dguard = { path = "../dguard" }
+getrandom = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The one place the engines' sqlx gets its runtime and its TLS. Each engine's own sqlx
+# dependency names only the features its queries use.
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
+tokio = { version = "1", features = ["rt", "time"] }
+toml = "1.0.3"
+tempfile = { version = "3", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+# The lock around making and starting the local database, and telling root apart.
+libc = "0.2"
+
+[features]
+# testing::Scratch, a database of a test's own, for other crates' tests.
+testing = ["dep:tempfile", "tokio/net"]
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "time"] }

@@ -8,7 +8,7 @@
 //! implementation is the documented next step (docs/tier1-engines-plan.md s6).
 
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 use transport::Client;
 
@@ -19,6 +19,34 @@ pub struct Template {
     pub info: Info,
     #[serde(default, alias = "requests")]
     pub http: Vec<HttpReq>,
+    /// The text it was read from, so that a scan taken up again can tell a template
+    /// edited under the same id from the one it was planned with.
+    #[serde(skip)]
+    pub source: String,
+}
+
+impl Template {
+    /// The template `text` holds, or None when it is not one this engine reads.
+    fn parse(text: &str) -> Option<Template> {
+        let mut template: Template = serde_yaml::from_str(text).ok()?;
+        template.source = text.to_string();
+        Some(template)
+    }
+
+    /// Whether it checks `cve`, as its `info.classification.cve-id` names one or a list.
+    pub fn checks_cve(&self, cve: &str) -> bool {
+        let named = |v: &serde_yaml::Value| v.as_str().is_some_and(|c| c.eq_ignore_ascii_case(cve));
+        match &self.info.classification.cve_id {
+            Some(serde_yaml::Value::Sequence(list)) => list.iter().any(named),
+            Some(one) => named(one),
+            None => false,
+        }
+    }
+
+    /// Some of what it checks is confirmed only by an out-of-band callback.
+    pub fn needs_oob(&self) -> bool {
+        self.http.iter().any(references_oob)
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -36,6 +64,16 @@ pub struct Info {
     pub tags: String,
     #[serde(default)]
     pub metadata: Meta,
+    #[serde(default)]
+    pub classification: Classification,
+}
+
+/// What the template is a check for, by public identifiers. Read loosely, as nuclei
+/// writes `cve-id` as one or a list, so that neither keeps a template from loading.
+#[derive(Debug, Deserialize, Default)]
+pub struct Classification {
+    #[serde(default, rename = "cve-id")]
+    pub cve_id: Option<serde_yaml::Value>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -44,6 +82,14 @@ pub struct Meta {
     /// template carries no tags.
     #[serde(default)]
     pub category: String,
+    /// The product the template is about, as its CPE names it, which toolmark names it by.
+    #[serde(default)]
+    pub vendor: Option<String>,
+    #[serde(default)]
+    pub product: Option<String>,
+    /// The product cannot be seen from outside, so toolmark has no signature for it.
+    #[serde(default)]
+    pub unseen: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,7 +138,7 @@ const MAX_PAYLOAD_REQUESTS: usize = 256;
 /// does not multiply request volume on unprotected targets.
 const MAX_EVASION_VARIANTS: usize = 8;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Matcher {
     #[serde(rename = "type")]
     pub mtype: String,
@@ -134,6 +180,8 @@ pub struct Match {
     pub severity: String,
     pub description: String,
     pub matched_at: String,
+    /// What found it, to check it again with.
+    pub proof: crate::proof::Proof,
 }
 
 struct Resp {
@@ -158,7 +206,8 @@ fn references_oob(req: &HttpReq) -> bool {
 /// Execute a template against `base` (e.g. "https://example.com"), returning
 /// confirmed matches. Response-based matchers are re-requested once (reproduce);
 /// out-of-band (interactsh) requests are confirmed by an actual OAST callback.
-/// `unsafe` requests go out over raw sockets by `raw`, the op's egress.
+/// `unsafe` requests go out over raw sockets by `raw`, the op's egress. Each match, and
+/// each finding waiting on a callback, carries its proof, of a template from `pack`.
 #[allow(clippy::too_many_arguments)]
 pub async fn eval_template(
     client: &Client,
@@ -169,6 +218,8 @@ pub async fn eval_template(
     oob_queue: Option<&crate::inject::OobQueue>,
     evasive: bool,
     raw: &crate::rawhttp::Route,
+    proof: &crate::proof::Ctx,
+    pack: &str,
 ) -> Vec<Match> {
     let mut out = Vec::new();
     for req in &tmpl.http {
@@ -184,15 +235,17 @@ pub async fn eval_template(
             // to what the injector was doing, but it is the same mistake and it
             // is paid on every scan, so it goes the same way.
             let (host, marker) = oc.host_marked(reg);
-            let mut fired = false;
+            let mut sent = Vec::new();
             for raw_path in &req.path {
                 for mut v in expand_request(req, raw_path, base, MAX_PAYLOAD_REQUESTS) {
+                    let mut kept = v.clone();
+                    apply_oob(&mut kept, crate::proof::OAST_SLOT);
                     apply_oob(&mut v, &host);
                     let _ = fetch(client, &method, &v).await;
-                    fired = true;
+                    sent.push(sent_as(&method, &kept, false));
                 }
             }
-            if !fired {
+            if sent.is_empty() {
                 continue;
             }
             {
@@ -203,7 +256,7 @@ pub async fn eval_template(
                 };
                 // Built now, released only if this template's marker calls back.
                 let finding = cfx_finding::Finding::new(
-                    "cortex",
+                    "plessor",
                     &class_from_tags(&tmpl.info.tags, &tmpl.id, &tmpl.info.metadata.category),
                     if tmpl.info.name.is_empty() {
                         tmpl.id.clone()
@@ -223,6 +276,23 @@ pub async fn eval_template(
                      scan knows, so the payload was processed."
                 ))
                 .build();
+                let mut finding = finding;
+                finding["proof"] = serde_json::json!(crate::proof::Proof::new(
+                    proof,
+                    pack,
+                    crate::proof::Kind::Template,
+                    &tmpl.id,
+                    sent,
+                    Vec::new(),
+                    "and",
+                    vec![crate::proof::Fired {
+                        matcher: "callback".into(),
+                        part: String::new(),
+                        evidence: "the target called back to the out-of-band host".into(),
+                    }],
+                    0,
+                    "",
+                ));
                 if let Ok(mut v) = q.lock() {
                     v.push(crate::inject::PendingOob { marker, finding });
                 }
@@ -279,9 +349,9 @@ pub async fn eval_template(
                     Some(r) => r,
                     None => continue,
                 };
-                if !matches_all(req, &r2) {
+                let Some(fired) = fired(req, &r2) else {
                     continue;
-                }
+                };
 
                 let mut description = tmpl.info.description.clone();
                 if evaded {
@@ -302,11 +372,108 @@ pub async fn eval_template(
                     },
                     description,
                     matched_at: winner.url.clone(),
+                    proof: crate::proof::Proof::new(
+                        proof,
+                        pack,
+                        crate::proof::Kind::Template,
+                        &tmpl.id,
+                        vec![sent_as(&method, &winner, req.unsafe_raw)],
+                        req.matchers.clone(),
+                        &req.matchers_condition,
+                        fired,
+                        r2.status,
+                        &r2.body,
+                    ),
                 });
             }
         }
     }
     out
+}
+
+/// What a proof's requests came to when they were sent again.
+pub(crate) enum Again {
+    /// The last answer met the proof's matchers: each that fired, and on what.
+    Fired {
+        fired: Vec<crate::proof::Fired>,
+        status: u16,
+        body: String,
+    },
+    /// The target answered, and the matchers did not hold.
+    Quiet { status: u16, body: String },
+    /// A request had no answer.
+    Unreachable,
+}
+
+/// Send `requests` again in order, `raw` where a proof says it went raw, and judge the last
+/// answer by `matchers` under `condition`, as the scan that found it did.
+pub(crate) async fn send_again(
+    client: &Client,
+    raw: &crate::rawhttp::Route,
+    requests: &[crate::proof::Sent],
+    matchers: &[Matcher],
+    condition: &str,
+) -> Again {
+    let mut last = None;
+    for sent in requests {
+        let v = ReqVariant {
+            url: sent.url.clone(),
+            headers: sent.fields.clone(),
+            body: sent.body.clone(),
+        };
+        match send_variant(client, raw, &sent.method, sent.raw, &v).await {
+            Some(answer) => last = Some(answer),
+            None => return Again::Unreachable,
+        }
+    }
+    let Some(answer) = last else {
+        return Again::Unreachable;
+    };
+    match judge(matchers, condition, &answer) {
+        Some(fired) => Again::Fired {
+            fired,
+            status: answer.status,
+            body: answer.body,
+        },
+        None => Again::Quiet {
+            status: answer.status,
+            body: answer.body,
+        },
+    }
+}
+
+/// Send each of `requests` and keep no answer, as an out-of-band check's are judged by
+/// whether the target calls back. False when none was answered.
+pub(crate) async fn send_blind(
+    client: &Client,
+    raw: &crate::rawhttp::Route,
+    requests: &[crate::proof::Sent],
+) -> bool {
+    let mut answered = false;
+    for sent in requests {
+        let v = ReqVariant {
+            url: sent.url.clone(),
+            headers: sent.fields.clone(),
+            body: sent.body.clone(),
+        };
+        answered |= send_variant(client, raw, &sent.method, sent.raw, &v)
+            .await
+            .is_some();
+    }
+    answered
+}
+
+/// `v`, sent with `method`, as a proof records it.
+fn sent_as(method: &str, v: &ReqVariant, raw: bool) -> crate::proof::Sent {
+    let mut fields = v.headers.clone();
+    fields.sort();
+    crate::proof::Sent {
+        method: method.to_string(),
+        url: v.url.clone(),
+        fields,
+        body: v.body.clone(),
+        raw,
+    }
 }
 
 fn substitute_oob(s: &str, host: &str) -> String {
@@ -530,21 +697,83 @@ fn retry_after_ms(headers: &reqwest::header::HeaderMap, attempt: u32) -> u64 {
 }
 
 fn matches_all(req: &HttpReq, resp: &Resp) -> bool {
-    if req.matchers.is_empty() {
-        return false;
+    fired(req, resp).is_some()
+}
+
+/// When `req`'s matchers say `resp` matches, each matcher that held and what it held on;
+/// None when they do not.
+fn fired(req: &HttpReq, resp: &Resp) -> Option<Vec<crate::proof::Fired>> {
+    judge(&req.matchers, &req.matchers_condition, resp)
+}
+
+/// [`fired`] for `matchers` under `condition`, as a replay of a proof judges.
+fn judge(matchers: &[Matcher], condition: &str, resp: &Resp) -> Option<Vec<crate::proof::Fired>> {
+    if matchers.is_empty() {
+        return None;
     }
-    let cond_and = req.matchers_condition.to_lowercase() != "or";
-    let mut any = false;
+    let cond_and = condition.to_lowercase() != "or";
+    let mut fired = Vec::new();
     let mut all = true;
-    for m in &req.matchers {
+    for m in matchers {
         let mut matched = matches_one(m, resp);
         if m.negative {
             matched = !matched;
         }
-        any = any || matched;
-        all = all && matched;
+        if matched {
+            fired.push(crate::proof::Fired {
+                matcher: m.mtype.clone(),
+                part: m.part.clone(),
+                evidence: evidence_of(m, resp),
+            });
+        } else {
+            all = false;
+        }
     }
-    if cond_and { all } else { any }
+    let matches = if cond_and { all } else { !fired.is_empty() };
+    matches.then_some(fired)
+}
+
+/// What `m`, which held on `resp`, held on: the status or size it saw, the words it
+/// found, the text each pattern matched, or the expressions that held. A negative
+/// matcher held on what was not there.
+fn evidence_of(m: &Matcher, resp: &Resp) -> String {
+    if m.negative {
+        return "not present".to_string();
+    }
+    let hay = part_text(&m.part, resp);
+    match m.mtype.as_str() {
+        "status" => format!("status {}", resp.status),
+        "size" => format!("size {}", resp.body.len()),
+        "word" => {
+            let header_part = matches!(m.part.as_str(), "header" | "all_headers");
+            let hay = if header_part { hay.to_lowercase() } else { hay };
+            m.words
+                .iter()
+                .filter(|w| {
+                    if header_part {
+                        hay.contains(&w.to_lowercase())
+                    } else {
+                        hay.contains(w.as_str())
+                    }
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+        "regex" => m
+            .regex
+            .iter()
+            .filter_map(|p| {
+                Regex::new(p)
+                    .ok()?
+                    .find(&hay)
+                    .map(|f| f.as_str().to_string())
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        "dsl" => m.dsl.join(" && "),
+        _ => String::new(),
+    }
 }
 
 /// Does this response simply echo the requested path back into its body?
@@ -993,26 +1222,193 @@ http:
 pub static BUILTIN: LazyLock<Vec<Template>> = LazyLock::new(|| {
     BUILTIN_YAML
         .iter()
-        .filter_map(|y| serde_yaml::from_str::<Template>(y).ok())
+        .filter_map(|y| Template::parse(y))
         .collect()
 });
 
 mod pack;
 use pack::PACK_YAML;
 
-/// The starter pack in templates/, compiled in. Parsed with the same rules as
-/// `load_dir`, so a file that does not parse, or carries no request, is skipped
-/// here exactly as it would be from disk.
-pub static PACK: LazyLock<Vec<Template>> = LazyLock::new(|| {
-    PACK_YAML
-        .iter()
-        .filter_map(|(_, y)| serde_yaml::from_str::<Template>(y).ok())
-        .filter(|t| !t.http.is_empty())
-        .collect()
-});
+/// Which templates a scan runs, from the products toolmark saw on the target. A template
+/// that names no product is general and always runs, and so does one whose product cannot
+/// be seen from outside; one that names a product runs where toolmark saw it. With no
+/// products given, or `--all-templates`, every template runs.
+pub struct Choice {
+    seen: Option<std::collections::HashSet<(String, String)>>,
+}
+
+impl Choice {
+    /// From `products` as toolmark names them, part:vendor:product. A name that is not
+    /// one is passed over.
+    pub fn new(products: Option<&[String]>, all: bool) -> Self {
+        let seen = products.filter(|_| !all).map(|names| {
+            names
+                .iter()
+                .filter_map(|name| {
+                    let mut parts = name.splitn(3, ':');
+                    let (_, vendor, product) = (parts.next()?, parts.next()?, parts.next()?);
+                    Some((vendor.to_string(), product.to_string()))
+                })
+                .collect()
+        });
+        Self { seen }
+    }
+
+    /// Whether `t` runs.
+    pub fn runs(&self, t: &Template) -> bool {
+        let meta = &t.info.metadata;
+        match (&self.seen, &meta.vendor, &meta.product) {
+            (Some(seen), Some(vendor), Some(product)) if !meta.unseen => {
+                seen.contains(&(vendor.clone(), product.clone()))
+            }
+            _ => true,
+        }
+    }
+}
+
+/// The pack's templates plessor runs beside its built-in checks, crossfyre-templates'
+/// plessor folder, and where they come from. A release compiles in a copy (templates/),
+/// and the pack `crossfyre update` puts in the toolchain directory takes its place when it
+/// is later and every template in it reads.
+pub struct Pack {
+    pub templates: Vec<Template>,
+    pub from: String,
+    /// Which pack it is, as a proof names it: its name, sequence and commit, and whether it
+    /// is the copy compiled in, with no path of the machine's.
+    pub named: String,
+}
+
+/// The templates in `files`, by path and text, or each one that plessor would not run:
+/// all of them read, or none is used.
+fn read_pack(files: &[(&str, &str)]) -> Result<Vec<Template>, Vec<String>> {
+    let mut problems = Vec::new();
+    let mut templates = Vec::new();
+    for (path, text) in files {
+        match Template::parse(text) {
+            Some(t) if !t.http.is_empty() => templates.push(t),
+            Some(_) => problems.push(format!("{path}: it has no request")),
+            None => problems.push(format!("{path}: it is not a template plessor reads")),
+        }
+    }
+    if problems.is_empty() {
+        Ok(templates)
+    } else {
+        Err(problems)
+    }
+}
+
+/// The first seven characters of a commit, as it is named in a log.
+fn short(commit: &str) -> &str {
+    commit.get(..7).unwrap_or(commit)
+}
+
+impl Pack {
+    /// The pack in the toolchain directory `dir` when there is one to use, else the copy
+    /// compiled in. One there that is not used says why.
+    pub fn load(dir: Option<&std::path::Path>) -> Self {
+        dir.and_then(Self::from_dir).unwrap_or_else(Self::compiled)
+    }
+
+    /// The copy compiled in.
+    pub fn compiled() -> Self {
+        let templates = read_pack(PACK_YAML).unwrap_or_else(|problems| {
+            panic!("the templates compiled into plessor read, as their test shows: {problems:?}")
+        });
+        let from = format!(
+            "crossfyre-templates {} ({}), compiled in",
+            cfx_pack::COMPILED.sequence,
+            short(cfx_pack::COMPILED.commit)
+        );
+        Self {
+            templates,
+            named: from.clone(),
+            from,
+        }
+    }
+
+    fn from_dir(dir: &std::path::Path) -> Option<Self> {
+        let path = cfx_pack::path_in(dir);
+        let pack = match cfx_pack::installed(dir) {
+            Ok(Some(pack)) => pack,
+            Ok(None) => return None,
+            Err(e) => {
+                eprintln!("[plessor] the pack at {} is not used: {e}", path.display());
+                return None;
+            }
+        };
+        if !pack.replaces_compiled() {
+            eprintln!(
+                "[plessor] the pack at {} is {} {}, which is no later than the copy compiled in, {}",
+                path.display(),
+                pack.name(),
+                pack.sequence(),
+                cfx_pack::COMPILED.sequence
+            );
+            return None;
+        }
+        let files: Vec<(&str, &str)> = pack.files_in("plessor").collect();
+        match read_pack(&files) {
+            Ok(templates) => {
+                let named = format!(
+                    "crossfyre-templates {} ({})",
+                    pack.sequence(),
+                    short(pack.commit())
+                );
+                Some(Self {
+                    templates,
+                    from: format!("{named}, from {}", path.display()),
+                    named,
+                })
+            }
+            Err(problems) => {
+                eprintln!(
+                    "[plessor] the pack at {} is not used, as not all of it reads:",
+                    path.display()
+                );
+                for problem in problems {
+                    eprintln!("[plessor]   {problem}");
+                }
+                None
+            }
+        }
+    }
+}
+
+/// The pack the daemon runs now, and where it reads it again from.
+pub struct Packs {
+    dir: Option<std::path::PathBuf>,
+    now: std::sync::RwLock<std::sync::Arc<Pack>>,
+}
+
+impl Packs {
+    /// What is in the toolchain directory `dir`, or compiled in.
+    pub fn load(dir: Option<&std::path::Path>) -> Self {
+        Self {
+            dir: dir.map(std::path::Path::to_path_buf),
+            now: std::sync::RwLock::new(std::sync::Arc::new(Pack::load(dir))),
+        }
+    }
+
+    /// The pack now. A scan takes it once, as it starts.
+    pub fn now(&self) -> std::sync::Arc<Pack> {
+        self.now.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Read the toolchain directory again, and say where the templates come from now.
+    /// What a scan already took stays as it was.
+    pub async fn reload(&self) -> Result<String, String> {
+        let dir = self.dir.clone();
+        let pack = tokio::task::spawn_blocking(move || Pack::load(dir.as_deref()))
+            .await
+            .map_err(|e| format!("nothing was read again: {e}"))?;
+        let said = format!("templates from {}", pack.from);
+        *self.now.write().unwrap_or_else(|e| e.into_inner()) = std::sync::Arc::new(pack);
+        Ok(said)
+    }
+}
 
 /// Load external nuclei templates (*.yaml / *.yml) from a directory, recursing
-/// into subdirectories so a categorized pack (technologies/, exposures/, cves/,
+/// into subdirectories so a categorized pack (exposures/, cves/, panels/,
 /// ...) loads as one set. Templates that fail to parse against the supported
 /// subset, or carry no runnable request, are skipped rather than aborting the
 /// load. A hidden directory (leading dot) is skipped so stray editor/VCS state
@@ -1049,10 +1445,111 @@ fn load_dir_into(dir: &std::path::Path, out: &mut Vec<Template>) {
             continue;
         }
         if let Ok(text) = std::fs::read_to_string(&path)
-            && let Ok(t) = serde_yaml::from_str::<Template>(&text)
+            && let Some(t) = Template::parse(&text)
             && !t.http.is_empty()
         {
             out.push(t);
+        }
+    }
+}
+
+/// The matcher types plessor runs; any other never matches.
+const MATCHERS: &[&str] = &["status", "size", "word", "regex", "dsl"];
+
+/// Why `text` is no template plessor runs: it does not parse, has no request, a matcher
+/// of a type plessor does not run, or a pattern that does not compile. The template when
+/// it is one.
+pub fn check(text: &str) -> Result<Template, String> {
+    let template: Template = serde_yaml::from_str(text).map_err(|e| e.to_string())?;
+    if template.http.is_empty() {
+        return Err("it has no request".to_string());
+    }
+    for m in template.http.iter().flat_map(|h| &h.matchers) {
+        if !MATCHERS.contains(&m.mtype.as_str()) {
+            return Err(format!("plessor runs no {:?} matcher", m.mtype));
+        }
+        for pattern in &m.regex {
+            Regex::new(pattern)
+                .map_err(|e| format!("pattern {pattern:?} does not compile: {e}"))?;
+        }
+    }
+    Ok(template)
+}
+
+/// Each template in `dir` and its subfolders, checked as [`check`] checks one, with the
+/// vendor and product each that names one names: each must be one of `known`, as
+/// `vendor:product`, unless the template says its product cannot be seen from outside.
+/// What is wrong, by file; nothing when all is well. Ids must be unique.
+pub fn check_dir(
+    dir: &std::path::Path,
+    known: Option<&std::collections::HashSet<String>>,
+) -> Vec<String> {
+    let mut files = Vec::new();
+    collect_yaml(dir, &mut files);
+    files.sort();
+    let mut problems = Vec::new();
+    let mut ids: std::collections::HashMap<String, String> = Default::default();
+    for path in files {
+        // A file as the templates repository names it: from `dir`, with `/` on every
+        // system, so the same template reads the same on Windows.
+        let shown = path
+            .strip_prefix(dir)
+            .unwrap_or(&path)
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        let template = match std::fs::read_to_string(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|t| check(&t))
+        {
+            Ok(t) => t,
+            Err(why) => {
+                problems.push(format!("{shown}: {why}"));
+                continue;
+            }
+        };
+        if let Some(first) = ids.insert(template.id.clone(), shown.clone()) {
+            problems.push(format!("{shown}: the id {} is also {first}'s", template.id));
+        }
+        let meta = &template.info.metadata;
+        if meta.vendor.is_some() != meta.product.is_some() {
+            problems.push(format!(
+                "{shown}: it names a vendor or a product alone; give both, as the CPE does, \
+                 or neither"
+            ));
+        }
+        if let (Some(known), Some(vendor), Some(product), false) =
+            (known, &meta.vendor, &meta.product, meta.unseen)
+            && !known.contains(&format!("{vendor}:{product}"))
+        {
+            problems.push(format!(
+                "{shown}: toolmark names no {vendor}:{product}; give it a signature, or say \
+                 `unseen: true` when it cannot be seen from outside"
+            ));
+        }
+    }
+    problems
+}
+
+fn collect_yaml(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let hidden = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with('.'));
+        if path.is_dir() && !hidden {
+            collect_yaml(&path, out);
+        } else if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e == "yaml" || e == "yml")
+        {
+            out.push(path);
         }
     }
 }
@@ -1137,7 +1634,7 @@ pub fn class_from_tags(tags: &str, template_id: &str, category: &str) -> String 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #[test]
     fn template_class_comes_from_tags() {
         use super::class_from_tags;
@@ -1208,11 +1705,12 @@ mod tests {
         );
         assert_eq!(super::PACK_YAML.len(), walk_yaml(std::path::Path::new(dir)));
         let mut on_disk: Vec<String> = super::load_dir(dir).into_iter().map(|t| t.id).collect();
-        let mut compiled: Vec<String> = super::PACK.iter().map(|t| t.id.clone()).collect();
+        let pack = super::Pack::compiled();
+        let mut compiled: Vec<String> = pack.templates.iter().map(|t| t.id.clone()).collect();
         on_disk.sort();
         compiled.sort();
         assert_eq!(compiled, on_disk);
-        for t in super::PACK.iter() {
+        for t in &pack.templates {
             assert!(
                 !super::BUILTIN.iter().any(|b| b.id == t.id),
                 "pack template {} has a built-in check's id",
@@ -1403,7 +1901,9 @@ mod tests {
         // A client carrying a credential or an attribution token gets a redirect
         // to another host back unfollowed, so the template has to read the
         // redirect itself as well as the page it lands on.
-        let t = super::PACK
+        let pack = super::Pack::compiled();
+        let t = pack
+            .templates
             .iter()
             .find(|t| t.id == "open-redirect-param")
             .expect("open-redirect template in the pack");
@@ -1447,5 +1947,182 @@ mod tests {
             req,
             &resp(200, "location: https://example.com/\n", "")
         ));
+    }
+
+    fn template(id: &str, meta: &str, matcher: &str) -> String {
+        format!(
+            "id: {id}\ninfo:\n  name: {id}\n  severity: info\n  metadata:\n    category: cves\n{meta}\
+             http:\n  - method: GET\n    path:\n      - \"{{{{BaseURL}}}}/\"\n    matchers:\n{matcher}"
+        )
+    }
+
+    const WORD: &str = "      - type: word\n        words:\n          - ok\n";
+
+    #[test]
+    fn a_template_plessor_would_not_run_does_not_pass_the_check() {
+        use super::check;
+        assert!(check(&template("fine", "", WORD)).is_ok());
+        let none = "id: none\ninfo:\n  name: none\n";
+        assert_eq!(check(none).err().as_deref(), Some("it has no request"));
+        let binary = template(
+            "binary",
+            "",
+            "      - type: binary\n        binary:\n          - 00\n",
+        );
+        assert!(check(&binary).unwrap_err().contains("\"binary\""));
+        let regex = template(
+            "regex",
+            "",
+            "      - type: regex\n        regex:\n          - '(unclosed'\n",
+        );
+        assert!(check(&regex).unwrap_err().contains("does not compile"));
+        assert!(check("id: [").is_err());
+    }
+
+    /// Ids are unique across the folder and its subfolders, a product a template names
+    /// is one toolmark names unless the template says it cannot be seen from outside,
+    /// and a hidden folder, as .git is, is not read.
+    #[test]
+    fn the_folder_check_finds_a_taken_id_and_a_product_toolmark_does_not_name() {
+        let dir = std::env::temp_dir().join(format!("plessor-check-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for sub in ["cves", ".git", "misc"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        let named = |vendor: &str, product: &str, unseen: bool| {
+            format!(
+                "    vendor: {vendor}\n    product: {product}\n{}",
+                if unseen { "    unseen: true\n" } else { "" }
+            )
+        };
+        let write = |path: &str, text: String| std::fs::write(dir.join(path), text).unwrap();
+        write(
+            "cves/a.yaml",
+            template("a", &named("acme", "widget", false), WORD),
+        );
+        write(
+            "cves/b.yaml",
+            template("b", &named("acme", "gadget", false), WORD),
+        );
+        write(
+            "cves/c.yaml",
+            template("c", &named("acme", "inside", true), WORD),
+        );
+        write("misc/d.yaml", template("a", "", WORD));
+        write("misc/f.yaml", template("f", "    vendor: acme\n", WORD));
+        write(".git/e.yaml", "id: [".to_string());
+        let known: std::collections::HashSet<String> = ["acme:widget".to_string()].into();
+
+        let problems = super::check_dir(&dir, Some(&known));
+        assert_eq!(problems.len(), 3, "{problems:?}");
+        assert!(problems[0].starts_with("cves/b.yaml: toolmark names no acme:gadget"));
+        assert_eq!(problems[1], "misc/d.yaml: the id a is also cves/a.yaml's");
+        assert!(problems[2].starts_with("misc/f.yaml: it names a vendor or a product alone"));
+        // Without the names, only the templates themselves are checked.
+        assert_eq!(super::check_dir(&dir, None).len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A template that fires on any page that says ok, for the pack tests.
+    pub(crate) const ACME_PROBE: (&str, &str) = (
+        "plessor/misconfigurations/acme-probe.yaml",
+        "id: acme-probe\ninfo:\n  name: Acme probe\n  severity: info\n  metadata:\n    \
+         category: misconfigurations\nhttp:\n  - method: GET\n    path:\n      - \
+         \"{{BaseURL}}/acme-probe\"\n    matchers-condition: and\n    matchers:\n      - \
+         type: word\n        words:\n          - ok\n      - type: status\n        status:\n          \
+         - 200\n",
+    );
+
+    /// A pack numbered `sequence` of the templates compiled in, with `extra` added, put
+    /// where `crossfyre update` keeps it in the toolchain directory `dir`.
+    pub(crate) fn install_pack(dir: &std::path::Path, sequence: u64, extra: &[(&str, &str)]) {
+        let mut files = serde_json::Map::new();
+        for (path, text) in super::PACK_YAML.iter().chain(extra) {
+            let path = path.strip_prefix("plessor/").unwrap_or(path);
+            files.insert(format!("plessor/{path}"), serde_json::json!(text));
+        }
+        let pack = serde_json::json!({"format": 1, "name": cfx_pack::NAME, "sequence": sequence,
+            "made": "2026-11-21T07:00:00Z", "commit": "abcdef0123456789", "files": files});
+        let path = cfx_pack::path_in(dir);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, pack.to_string()).unwrap();
+    }
+
+    fn ids(pack: &super::Pack) -> Vec<&str> {
+        pack.templates.iter().map(|t| t.id.as_str()).collect()
+    }
+
+    /// A later pack in the toolchain directory takes the place of the copy compiled in,
+    /// and says which it is. One no later, of another name, that does not read, or with a
+    /// template plessor would not run, is not used.
+    #[test]
+    fn a_later_pack_takes_the_place_of_the_compiled_copy_when_all_of_it_reads() {
+        let later = cfx_pack::COMPILED.sequence + 1;
+        let dir = std::env::temp_dir().join(format!("plessor-packs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(super::Pack::load(Some(&dir)).from.ends_with("compiled in"));
+        install_pack(&dir, later, &[ACME_PROBE]);
+        let pack = super::Pack::load(Some(&dir));
+        assert!(ids(&pack).contains(&"acme-probe"));
+        assert_eq!(
+            pack.templates.len(),
+            super::Pack::compiled().templates.len() + 1
+        );
+        assert_eq!(
+            pack.from,
+            format!(
+                "crossfyre-templates {later} (abcdef0), from {}",
+                cfx_pack::path_in(&dir).display()
+            )
+        );
+        let no_request = ("plessor/x/none.yaml", "id: none\ninfo:\n  name: none\n");
+        let broken = ("plessor/x/broken.yaml", "id: [");
+        for (sequence, extra) in [
+            (cfx_pack::COMPILED.sequence, &[ACME_PROBE][..]),
+            (later, &[ACME_PROBE, no_request][..]),
+            (later, &[ACME_PROBE, broken][..]),
+        ] {
+            install_pack(&dir, sequence, extra);
+            let pack = super::Pack::load(Some(&dir));
+            assert!(pack.from.ends_with("compiled in"), "{sequence} {extra:?}");
+            assert!(!ids(&pack).contains(&"acme-probe"));
+        }
+        std::fs::write(cfx_pack::path_in(&dir), b"not a pack").unwrap();
+        assert!(super::Pack::load(Some(&dir)).from.ends_with("compiled in"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A template about one product runs where toolmark saw it; a general one, or one
+    /// whose product cannot be seen from outside, always runs; with no products, or with
+    /// --all-templates, everything runs.
+    #[test]
+    fn a_product_template_runs_where_toolmark_saw_its_product() {
+        let parse = |meta: &str| super::check(&template("t", meta, WORD)).unwrap();
+        let general = parse("");
+        let apache = parse("    vendor: apache\n    product: http_server\n");
+        let metabase = parse("    vendor: metabase\n    product: metabase\n");
+        let unseen = parse("    vendor: apache\n    product: log4j\n    unseen: true\n");
+        let seen = ["a:apache:http_server".to_string(), "not a name".to_string()];
+        let choice = super::Choice::new(Some(&seen), false);
+        assert!(choice.runs(&general) && choice.runs(&apache) && choice.runs(&unseen));
+        assert!(!choice.runs(&metabase), "toolmark did not see Metabase");
+        for everything in [
+            super::Choice::new(None, false),
+            super::Choice::new(Some(&seen), true),
+        ] {
+            assert!(
+                [&general, &apache, &metabase, &unseen]
+                    .iter()
+                    .all(|t| everything.runs(t))
+            );
+        }
+        let nothing_seen = super::Choice::new(Some(&[]), false);
+        assert!(!nothing_seen.runs(&apache) && nothing_seen.runs(&general));
+    }
+
+    #[test]
+    fn the_shipped_templates_pass_the_check() {
+        let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/templates"));
+        assert_eq!(super::check_dir(dir, None), Vec::<String>::new());
     }
 }

@@ -1,0 +1,16 @@
+# Synthetic: Django's admin login page.
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+date: Fri, 20 Nov 2026 06:00:00 GMT
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Log in | Django site admin</title>
+</head>
+<body>
+<div id="site-name"><a href="/admin/">Django administration</a></div>
+<form method="post"><input type="text" name="username" id="id_username"></form>
+</body>
+</html>

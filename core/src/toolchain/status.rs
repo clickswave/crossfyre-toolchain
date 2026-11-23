@@ -1,12 +1,13 @@
 // `crossfyre status [nodes|extensions|db]` - the one place to look when
-// something is off. Probes ports, pid files, and the container. The one thing
+// something is off. Probes ports, pid files, and the database. The one thing
 // it changes is a pid file naming a process that is gone, which it removes.
 
-use super::config::{is_extension_installed, load_config};
+use super::config::is_extension_installed;
 use super::{ENGINES, service, sudo_user};
 use std::path::Path;
 
-fn port_open(port: u16) -> bool {
+/// Whether something answers on 127.0.0.1:`port`.
+pub(crate) fn port_open(port: u16) -> bool {
     std::net::TcpStream::connect_timeout(
         &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
         std::time::Duration::from_millis(300),
@@ -15,12 +16,12 @@ fn port_open(port: u16) -> bool {
 }
 
 /// `crossfyre status` - everything at a glance.
-pub fn overview(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn overview(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // The same header every other command prints, in place of a ruled line of its own.
     super::ui::title("Crossfyre status", "");
     nodes(base)?;
     extensions()?;
-    db()?;
+    db().await?;
     Ok(())
 }
 
@@ -162,7 +163,7 @@ pub fn extensions() -> Result<(), Box<dyn std::error::Error>> {
     );
     section("Extensions");
     for e in ENGINES {
-        let (ext, port) = (e.id, &e.port);
+        let (ext, port) = (e.name, &e.port);
         let installed = is_extension_installed(ext);
         let daemon = if installed {
             service::daemon_status(ext)
@@ -177,7 +178,7 @@ pub fn extensions() -> Result<(), Box<dyn std::error::Error>> {
 
         let mid = dim(&format!("port {port}"));
         let (sym, status) = if !installed {
-            (dot(), dim("not installed"))
+            (dot(), dim(e.not_installed()))
         } else {
             let listen_note = if listening == "yes" {
                 dim("listening")
@@ -193,49 +194,136 @@ pub fn extensions() -> Result<(), Box<dyn std::error::Error>> {
         };
         println!("{}", row(&sym, e.name, &mid, &status));
     }
+    // What comes with a plan rather than with the release, and at which version.
+    section("Components");
+    for (component, said) in super::components::rows(&super::components::Here::this_host()) {
+        let installed = said != super::NEEDS_A_PLAN;
+        let (sym, version) = if installed {
+            (check(), format!("v{said}"))
+        } else {
+            (dot(), dim(&said))
+        };
+        println!("{}", row(&sym, component, "", &version));
+    }
     end();
     Ok(())
 }
 
-/// `crossfyre status db` - Postgres container state.
-pub fn db() -> Result<(), Box<dyn std::error::Error>> {
-    match load_config() {
-        Ok(config) => {
-            let listening = port_open(config.postgres.port);
+/// `crossfyre status db` and `crossfyre db status`: which database the engines use, and
+/// whether it runs.
+pub async fn db() -> Result<(), Box<dyn std::error::Error>> {
+    use super::ui::*;
+
+    section("Database");
+    match super::db::status() {
+        Err(e) => println!("{}", row(&cross(), "database", "", &e.to_string())),
+        Ok(None) => {
             println!(
-                "  postgres: port {} {}",
-                config.postgres.port,
-                if listening {
-                    "(accepting connections)"
-                } else {
-                    "(not reachable)"
-                }
+                "{}",
+                row(&dot(), "database", "", &dim("no config.toml yet"))
             );
-            if let Some(ref id) = config.container.id {
-                println!("  container: {}", &id[..id.len().min(12)]);
-            } else {
-                println!("  container: none recorded. `crossfyre db up` creates one");
-            }
-            // Extension binaries are useless without the db; nudge if it's down.
-            if !listening && super::EXTENSIONS.iter().any(|e| is_extension_installed(e)) {
-                println!(
-                    "  hint: extensions are installed but the database is down. Start it with `crossfyre db start`"
-                );
-            }
+            hint("`crossfyre db up` makes the local database.");
         }
-        Err(_) => {
-            println!(
-                "  postgres: no toolchain config yet. The first `crossfyre node init` or `crossfyre db up` creates it"
-            );
+        Ok(Some(db)) => {
+            let at = db.settings.address();
+            match (&db.settings.backend, &db.cluster) {
+                (cfx_db::Backend::External { .. }, _) if db.running => println!(
+                    "{}",
+                    row(&check(), "external", &at, &format!("{GREEN}answers{RESET}"))
+                ),
+                (cfx_db::Backend::External { .. }, _) => {
+                    println!("{}", row(&cross(), "external", &at, "does not answer"));
+                    hint(
+                        "It is a database you run: start it, or record another with `crossfyre db external`.",
+                    );
+                }
+                (cfx_db::Backend::Local, None) => {
+                    println!("{}", row(&dot(), "local", &at, &dim("not made yet")));
+                    hint("`crossfyre db up` makes it.");
+                }
+                (cfx_db::Backend::Local, Some((dir, major))) => {
+                    let made_by = major
+                        .map(|m| format!(", PostgreSQL {m}"))
+                        .unwrap_or_default();
+                    let mid = format!("{at}  {}", dim(&format!("{}{made_by}", dir.display())));
+                    if db.running {
+                        println!(
+                            "{}",
+                            row(&check(), "local", &mid, &format!("{GREEN}running{RESET}"))
+                        );
+                    } else if db.port_taken {
+                        println!(
+                            "{}",
+                            row(
+                                &bang(),
+                                "local",
+                                &mid,
+                                &format!(
+                                    "{YELLOW}stopped{RESET}, and something else holds its port"
+                                )
+                            )
+                        );
+                        hint(
+                            "If that is the crossfyre-postgres container an earlier version made, `docker rm -f crossfyre-postgres` removes it.",
+                        );
+                    } else {
+                        println!("{}", row(&dot(), "local", &mid, &dim("stopped")));
+                        hint("`crossfyre db up` starts it.");
+                    }
+                }
+            }
+            if db.running {
+                held(&db.settings).await;
+            }
         }
     }
-    println!();
+    end();
     Ok(())
+}
+
+/// A row for each engine that keeps something in the database: its scans, and the space
+/// its tables take.
+async fn held(settings: &cfx_db::Settings) {
+    use super::ui::*;
+    match cfx_db::held(settings).await {
+        Err(e) => println!("{}", row(&cross(), "engines", "", &e.to_string())),
+        Ok(engines) if engines.is_empty() => {
+            println!("{}", row(&dot(), "engines", "", &dim("nothing kept yet")))
+        }
+        Ok(engines) => {
+            for h in engines {
+                let scans = if h.scans == 1 {
+                    "1 scan".to_string()
+                } else {
+                    format!("{} scans", h.scans)
+                };
+                println!("{}", row(&dot(), &h.engine, &scans, &dim(&size(h.bytes))));
+            }
+        }
+    }
+}
+
+/// `bytes` as people read it: 812 kB, 3.4 MB.
+fn size(bytes: i64) -> String {
+    let b = bytes.max(0) as f64;
+    match b {
+        b if b < 1024.0 * 1024.0 => format!("{:.0} kB", b / 1024.0),
+        b if b < 1024.0 * 1024.0 * 1024.0 => format!("{:.1} MB", b / (1024.0 * 1024.0)),
+        b => format!("{:.1} GB", b / (1024.0 * 1024.0 * 1024.0)),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_engines_holding_reads_in_the_unit_that_fits_it() {
+        assert_eq!(size(0), "0 kB");
+        assert_eq!(size(812 * 1024), "812 kB");
+        assert_eq!(size(3 * 1024 * 1024 + 400 * 1024), "3.4 MB");
+        assert_eq!(size(5 * 1024 * 1024 * 1024), "5.0 GB");
+    }
     use crate::toolchain::sudo_user::act_as_root;
     use std::fs;
 

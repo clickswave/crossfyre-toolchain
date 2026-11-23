@@ -1,4 +1,7 @@
 use crate::fingerprint::{self, FpParams};
+use crate::knowledge::{Knowledge, Known};
+use crate::libs::toolmark_db::ToolmarkDb;
+use cfx_db::scans::Status;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -9,17 +12,11 @@ use tokio::sync::mpsc;
 #[derive(Debug, Deserialize)]
 struct DaemonRequest {
     operation: String,
-    #[serde(default = "default_response")]
-    #[allow(dead_code)]
-    response: String,
     #[serde(flatten)]
     params: Value,
     /// From the egress wrapper, never from the request's own fields.
     #[serde(skip)]
     egress: transport::Egress,
-}
-fn default_response() -> String {
-    "stream".to_string()
 }
 
 /// One request line: the operation it asks for, unwrapped, with the egress its
@@ -35,20 +32,30 @@ fn parse_request(line: &str) -> Result<DaemonRequest, String> {
     Ok(req)
 }
 
-pub async fn run(port: u16) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(
+    port: u16,
+    db: ToolmarkDb,
+    knowledge: std::sync::Arc<Knowledge>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Loopback unless an operator opts out: this channel has no per-request
     // credential of its own, so the bind address is the boundary.
     let addr = dguard::bind_addr(port);
     let gate = dguard::Gate::from_env();
     let listener = TcpListener::bind(addr).await?;
     gate.announce("Toolmark", addr);
+    dguard::exit_when_idle("toolmark");
+    eprintln!("[toolmark] {}", cfx_pacing::load().say());
+
+    eprintln!("[toolmark] {}", knowledge.now().said());
 
     loop {
         let (stream, addr) = listener.accept().await?;
         let _ = stream.set_nodelay(true);
         let gate_clone = gate.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, gate_clone).await {
+        let db = db.clone();
+        let knowledge = knowledge.clone();
+        dguard::spawn_busy(async move {
+            if let Err(e) = handle_connection(stream, gate_clone, db, knowledge).await {
                 eprintln!("Connection error from {addr}: {e}");
             }
         });
@@ -58,6 +65,8 @@ pub async fn run(port: u16) -> Result<(), Box<dyn std::error::Error>> {
 async fn handle_connection(
     stream: TcpStream,
     gate: dguard::Gate,
+    db: ToolmarkDb,
+    knowledge: std::sync::Arc<Knowledge>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -90,14 +99,116 @@ async fn handle_connection(
 
         match req.operation.as_str() {
             "fingerprint" => {
-                handle_fingerprint(req.params, req.egress, &mut writer).await?;
+                eprintln!("[toolmark] fingerprint: {}", cfx_pacing::load().say());
+                let known = knowledge.now();
+                handle_fingerprint(req.params, req.egress, &mut writer, &db, known).await?;
                 return Ok(());
             }
             // Non-HTTP service identification: what is really listening on a
             // port, and whether it lets anyone in.
             "services" => {
-                handle_services(req.params, req.egress, &mut writer).await?;
+                eprintln!("[toolmark] services: {}", cfx_pacing::load().say());
+                let known = knowledge.now();
+                handle_services(req.params, req.egress, &mut writer, &db, known).await?;
                 return Ok(());
+            }
+            // The scans this daemon keeps, the latest first, one as it was kept, and what
+            // they found, oldest first.
+            "scans" => write_line(&mut writer, &db.scans().await).await?,
+            "scan_info" => {
+                let id = req.params["id"].as_str().unwrap_or_default();
+                write_line(
+                    &mut writer,
+                    &cfx_db::found::answer_scan(db.pool(), id).await,
+                )
+                .await?
+            }
+            "finding" => {
+                let id = req.params["id"].as_i64().unwrap_or(0);
+                write_line(
+                    &mut writer,
+                    &cfx_db::found::answer_finding(db.pool(), id).await,
+                )
+                .await?
+            }
+            "findings" => {
+                let answer = cfx_db::found::answer_findings(
+                    db.pool(),
+                    req.params["scan"].as_str(),
+                    req.params["after"].as_i64(),
+                    req.params["limit"].as_i64().unwrap_or(200),
+                )
+                .await;
+                write_line(&mut writer, &answer).await?
+            }
+            // What it knows runs where.
+            "inventory" => {
+                let answer = crate::inventory::with_leads(
+                    db.inventory().await,
+                    &knowledge.now(),
+                    &db.answered().await,
+                );
+                write_line(&mut writer, &answer).await?
+            }
+            // What a plessor scan's templates said of the leads it was given for one host,
+            // written back by the client that gave them.
+            "lead_answers" => {
+                let reply =
+                    match serde_json::from_value::<cfx_cve::inventory::AnswersBack>(req.params) {
+                        Ok(asked) => match db
+                            .answer_leads(&asked.host, asked.port, &asked.scan, &asked.answers)
+                            .await
+                        {
+                            Ok(kept) => serde_json::json!({"status": "completed", "kept": kept}),
+                            Err(e) => serde_json::json!({"status": "error",
+                            "message": format!("could not keep the answers: {e}")}),
+                        },
+                        Err(e) => serde_json::json!({"status": "error",
+                        "message": format!("Invalid lead_answers: {e}")}),
+                    };
+                write_line(&mut writer, &reply).await?;
+            }
+            // Read the pack and the CVE dataset in the toolchain directory again, as
+            // `crossfyre update` asks after it writes new ones. A scan running goes on
+            // with what it started with.
+            "reload" => {
+                let reply = match knowledge.reload().await {
+                    Ok(said) => serde_json::json!({"status": "completed", "message": said}),
+                    Err(why) => serde_json::json!({"status": "error", "message": why}),
+                };
+                write_line(&mut writer, &reply).await?;
+            }
+            // The signatures and CVE data it has now, over the pages and products it
+            // kept, and nothing sent.
+            "rematch" => {
+                handle_rematch(&mut writer, &db, knowledge.now()).await?;
+                return Ok(());
+            }
+            "resume" => {
+                write_line(
+                    &mut writer,
+                    &serde_json::json!({
+                        "type": "error",
+                        "message": crate::libs::toolmark_db::NOTHING_TO_TAKE_UP,
+                    }),
+                )
+                .await?;
+            }
+            "db_reset" | "purge" => {
+                let done = match req.operation.as_str() {
+                    "db_reset" => {
+                        cfx_db::scans::reset(db.pool(), &crate::libs::toolmark_db::ENGINE)
+                            .await
+                            .map(|()| "All tables truncated.".to_string())
+                            .map_err(|e| format!("DB reset failed: {e}"))
+                    }
+                    _ => cfx_db::scans::purge_operation(db.pool(), &req.params).await,
+                };
+                let reply = match done {
+                    Ok(message) => serde_json::json!({"status": "completed", "message": message}),
+                    Err(message) => serde_json::json!({"status": "error", "message": message}),
+                };
+                write_line(&mut writer, &reply).await?;
             }
             // What this daemon honours beyond the original protocol. A caller that
             // must not run on a daemon that would ignore an option asks first, and an
@@ -111,6 +222,10 @@ async fn handle_connection(
                         "fingerprint": ["resolve", "block_internal"],
                         // The version of the egress wrapper this daemon reads.
                         "egress": transport::WIRE_VERSION,
+                        // Which pacing this daemon runs: `module <version>`, or `baseline (<why>)`.
+                        "pacing": cfx_pacing::load().label(),
+                        // Which process answers, for the client that started it.
+                        "pid": std::process::id(),
                     }),
                 )
                 .await?;
@@ -135,8 +250,10 @@ async fn handle_fingerprint(
     params: Value,
     egress: transport::Egress,
     writer: &mut OwnedWriteHalf,
+    db: &ToolmarkDb,
+    known: std::sync::Arc<Known>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let fp: FpParams = match serde_json::from_value(params) {
+    let fp: FpParams = match serde_json::from_value(params.clone()) {
         Ok(p) => FpParams { egress, ..p },
         Err(e) => {
             write_line(
@@ -151,12 +268,68 @@ async fn handle_fingerprint(
         }
     };
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
-    tokio::spawn(async move {
-        fingerprint::run(fp, tx).await;
+    let scan = db.start("fingerprint", &fp.target, &params).await;
+    let observer = std::sync::Arc::new(db.observer(scan.as_ref(), &params));
+    let (tx, rx) = mpsc::unbounded_channel::<Value>();
+    let op = dguard::spawn_busy(async move {
+        fingerprint::run(fp, tx, observer, known).await;
     });
+    forward(op, rx, writer, db, scan).await
+}
 
-    while let Some(ev) = rx.recv().await {
+/// Run the signatures toolmark has now over the pages it kept, and keep what is new as
+/// a fingerprint's findings are kept.
+async fn handle_rematch(
+    writer: &mut OwnedWriteHalf,
+    db: &ToolmarkDb,
+    known: std::sync::Arc<Known>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let scan = db
+        .start("rematch", "the pages toolmark kept", &serde_json::json!({}))
+        .await;
+    let (tx, rx) = mpsc::unbounded_channel::<Value>();
+    let kept = db.clone();
+    let op = dguard::spawn_busy(async move {
+        crate::rematch::run(&kept, &known, tx).await;
+    });
+    forward(op, rx, writer, db, scan).await
+}
+
+/// Write the events of scan `op` as they come, and keep what they found. The scan is
+/// kept to its end, after a caller that went away too.
+async fn forward(
+    op: tokio::task::JoinHandle<()>,
+    mut rx: mpsc::UnboundedReceiver<Value>,
+    writer: &mut OwnedWriteHalf,
+    db: &ToolmarkDb,
+    scan: Option<cfx_db::scans::Running>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (out, mut written) = mpsc::unbounded_channel::<Value>();
+    let keeping = db.clone();
+    dguard::spawn_busy(async move {
+        let id = scan.as_ref().map(|s| s.id.clone());
+        // What the scan found, said and how far it got, as every engine keeps it, beside
+        // the inventory toolmark keeps of its own.
+        let mut keeper = cfx_db::found::Keeper::new(keeping.pool(), id.as_deref());
+        while let Some(mut ev) = rx.recv().await {
+            keeping.event(id.as_deref(), &ev).await;
+            keeper.event(&ev).await;
+            // The ack names the scan it is kept as, for a client to read it back by.
+            if ev["type"] == "ack"
+                && let Some(id) = &id
+            {
+                ev["scan"] = Value::String(id.clone());
+            }
+            let _ = out.send(ev);
+        }
+        let ended = match op.await {
+            Ok(()) => Status::Completed,
+            Err(_) => Status::Failed,
+        };
+        let _ = keeper.flush().await;
+        keeping.finish(scan, ended).await;
+    });
+    while let Some(ev) = written.recv().await {
         write_line(writer, &ev).await?;
     }
     Ok(())
@@ -166,8 +339,10 @@ async fn handle_services(
     params: Value,
     egress: transport::Egress,
     writer: &mut OwnedWriteHalf,
+    db: &ToolmarkDb,
+    known: std::sync::Arc<Known>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let sp: crate::services::SvcParams = match serde_json::from_value(params) {
+    let sp: crate::services::SvcParams = match serde_json::from_value(params.clone()) {
         Ok(p) => crate::services::SvcParams { egress, ..p },
         Err(e) => {
             write_line(
@@ -182,22 +357,21 @@ async fn handle_services(
         }
     };
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
-    tokio::spawn(async move {
-        crate::services::run(sp, tx).await;
+    let scan = db.start("services", &sp.targets.join(", "), &params).await;
+    let (tx, rx) = mpsc::unbounded_channel::<Value>();
+    let op = dguard::spawn_busy(async move {
+        crate::services::run(sp, tx, known).await;
     });
-
-    while let Some(ev) = rx.recv().await {
-        write_line(writer, &ev).await?;
-    }
-    Ok(())
+    forward(op, rx, writer, db, scan).await
 }
 
+/// Send `v` to the client, made safe to leave the engine (see
+/// [`cfx_db::scans::safe_stream`]): the node relays it to Cloud as it is.
 async fn write_line(
     writer: &mut OwnedWriteHalf,
     v: &Value,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut s = serde_json::to_string(v)?;
+    let mut s = serde_json::to_string(&cfx_db::scans::safe_stream(v))?;
     s.push('\n');
     writer.write_all(s.as_bytes()).await?;
     Ok(())
@@ -213,6 +387,60 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, Lines};
     use tokio::net::tcp::OwnedReadHalf;
+
+    /// `reload`, as `crossfyre update` sends it after it writes new data, reads the
+    /// toolchain directory again and says what toolmark knows now.
+    #[tokio::test]
+    async fn reload_is_answered_with_what_is_known_now() {
+        let dport = daemon().await;
+        let stream = TcpStream::connect(("127.0.0.1", dport))
+            .await
+            .expect("connect");
+        let (reader, mut writer) = stream.into_split();
+        writer
+            .write_all(b"{\"operation\":\"reload\"}\n")
+            .await
+            .expect("send");
+        let mut lines = BufReader::new(reader).lines();
+        let line = lines.next_line().await.expect("read").expect("an answer");
+        let answer: Value = serde_json::from_str(&line).expect("json");
+        assert_eq!(answer["status"], "completed", "{answer}");
+        assert_eq!(
+            answer["message"],
+            Knowledge::load(None).now().said(),
+            "{answer}"
+        );
+    }
+
+    /// An answer that is not one of the three is refused before anything is written, so
+    /// no client can keep a lead as "not exploitable".
+    #[tokio::test]
+    async fn lead_answers_take_only_the_three_answers() {
+        let dport = daemon().await;
+        let stream = TcpStream::connect(("127.0.0.1", dport))
+            .await
+            .expect("connect");
+        let (reader, mut writer) = stream.into_split();
+        let ask = serde_json::json!({"operation": "lead_answers", "response": "instant",
+            "host": "app.test", "port": 80, "scan": "s1",
+            "answers": [{"cve": "CVE-2021-41773", "product": "Apache HTTP Server",
+                         "answer": "not exploitable"}]});
+        writer
+            .write_all(format!("{ask}\n").as_bytes())
+            .await
+            .expect("send");
+        let mut lines = BufReader::new(reader).lines();
+        let line = lines.next_line().await.expect("read").expect("an answer");
+        let answer: Value = serde_json::from_str(&line).expect("json");
+        assert_eq!(answer["status"], "error", "{answer}");
+        assert!(
+            answer["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("Invalid lead_answers"),
+            "{answer}"
+        );
+    }
 
     /// A page that answers every request and counts them.
     async fn target() -> (u16, Arc<AtomicUsize>) {
@@ -259,7 +487,12 @@ mod tests {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
-                tokio::spawn(handle_connection(stream, dguard::Gate::default()));
+                tokio::spawn(handle_connection(
+                    stream,
+                    dguard::Gate::default(),
+                    ToolmarkDb::unconnected(),
+                    std::sync::Arc::new(Knowledge::load(None)),
+                ));
             }
         });
         port
@@ -301,6 +534,142 @@ mod tests {
         (caps, events)
     }
 
+    /// A page that names itself as nginx with a version, answers with a session cookie of
+    /// its own, and keeps each request it was sent.
+    async fn recording_page() -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let kept = Arc::clone(&kept);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 16384];
+                    while let Ok(n) = sock.read(&mut buf).await {
+                        if n == 0 {
+                            return;
+                        }
+                        kept.lock()
+                            .unwrap()
+                            .push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                        let body = b"<html><head><title>x</title></head><body>ok</body></html>";
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nServer: nginx/1.24.0\r\n\
+                             Set-Cookie: sid=page-secret-3; Path=/\r\n\
+                             Content-Type: text/html\r\nContent-Length: {}\r\n\r\n",
+                            body.len()
+                        );
+                        if sock.write_all(head.as_bytes()).await.is_err()
+                            || sock.write_all(body).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    /// A fingerprint of a target with a secret in its query, sent with a credential
+    /// header, reaches the target with both, and nothing that comes out carries either,
+    /// nor the session cookie the target gave.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fingerprint_sends_no_secret_out() {
+        let (tport, seen) = recording_page().await;
+        let dport = daemon().await;
+        let (_, events) = ask_then_run(
+            dport,
+            serde_json::json!({
+                "operation": "fingerprint",
+                "target": format!("http://127.0.0.1:{tport}/?token=tm-secret-1&x=1"),
+                "evasive": false,
+                "auth": {"headers": {"X-Api-Key": "tm-secret-2"}, "cookies": ""},
+            }),
+        )
+        .await;
+        let sent = seen.lock().unwrap().join("\n");
+        for secret in ["tm-secret-1", "tm-secret-2"] {
+            assert!(sent.contains(secret), "the target was never sent {secret}");
+        }
+        assert!(
+            events
+                .iter()
+                .any(|e| e["type"] == "finding" && e["data"]["name"] == "Nginx"),
+            "nginx was not found: {events:?}"
+        );
+        let out = serde_json::to_string(&events).unwrap();
+        for secret in ["tm-secret-1", "tm-secret-2", "page-secret-3"] {
+            assert!(!out.contains(secret), "{secret} went out: {out}");
+        }
+    }
+
+    /// What a fingerprint found is kept as every engine keeps it, beside the inventory, and
+    /// the `findings` and `scan_info` answers give it back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs PostgreSQL's programs"]
+    async fn a_fingerprint_is_kept_and_read_back() {
+        let scratch = cfx_db::testing::Scratch::new(&crate::libs::toolmark_db::ENGINE).await;
+        let db = ToolmarkDb::new(scratch.pool.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let dport = listener.local_addr().expect("addr").port();
+        let serving = db.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(handle_connection(
+                    stream,
+                    dguard::Gate::default(),
+                    serving.clone(),
+                    std::sync::Arc::new(Knowledge::load(None)),
+                ));
+            }
+        });
+        let (tport, _) = recording_page().await;
+        let (_, events) = ask_then_run(
+            dport,
+            serde_json::json!({"operation": "fingerprint",
+                "target": format!("http://127.0.0.1:{tport}/"), "evasive": false}),
+        )
+        .await;
+        let answer = |op: Value| async move {
+            let stream = TcpStream::connect(("127.0.0.1", dport)).await.unwrap();
+            let (r, mut w) = stream.into_split();
+            w.write_all(format!("{op}\n").as_bytes()).await.unwrap();
+            let line = BufReader::new(r)
+                .lines()
+                .next_line()
+                .await
+                .unwrap()
+                .unwrap();
+            serde_json::from_str::<Value>(&line).unwrap()
+        };
+        let found = answer(serde_json::json!({"operation": "findings"})).await;
+        let rows = found["findings"].as_array().expect("rows");
+        let nginx = rows
+            .iter()
+            .find(|r| r["data"]["name"] == "Nginx")
+            .unwrap_or_else(|| panic!("{found}"));
+        assert_eq!(nginx["kind"], "technology");
+        let ack = events.iter().find(|e| e["type"] == "ack").expect("an ack");
+        assert_eq!(
+            ack["scan"], nginx["scan"],
+            "the ack names the scan it is kept as"
+        );
+        // The scan is finished as its last event goes out, so it may be a moment after.
+        let mut scan = Value::Null;
+        for _ in 0..50 {
+            scan = answer(serde_json::json!({"operation": "scan_info", "id": nginx["scan"]})).await;
+            if scan["scan"]["status"] == "completed" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(scan["scan"]["status"], "completed", "{scan}");
+        assert_eq!(scan["scan"]["findings"], rows.len(), "{scan}");
+        scratch.done().await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_pinned_name_is_fetched_at_the_pinned_address() {
         let (tport, seen) = target().await;
@@ -319,6 +688,8 @@ mod tests {
         )
         .await;
         assert_eq!(caps["type"], "capabilities", "{caps}");
+        // Which pacing runs, as the engine said it when it started.
+        assert_eq!(caps["pacing"], cfx_pacing::load().label().as_str());
         for want in ["resolve", "block_internal"] {
             assert!(
                 caps["fingerprint"]
@@ -444,12 +815,35 @@ mod tests {
         assert_all_through(&fx, &proxy, &events);
     }
 
+    /// A port that refuses every connection for the rest of this test process. A socket is
+    /// bound to it and never listens, so no other test is given the port, and no connect can
+    /// be given it as its own end and meet itself, as one to a freed port can, and then wait
+    /// forever. macOS drops a connection to such a socket unanswered, so there the port is the
+    /// local end of a connection to a listener of its own instead.
+    fn closed_port() -> u16 {
+        static HELD: std::sync::Mutex<Vec<Box<dyn std::any::Any + Send>>> =
+            std::sync::Mutex::new(Vec::new());
+        #[cfg(not(target_os = "macos"))]
+        let (port, held): (u16, Box<dyn std::any::Any + Send>) = {
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            (socket.local_addr().unwrap().port(), Box::new(socket))
+        };
+        #[cfg(target_os = "macos")]
+        let (port, held): (u16, Box<dyn std::any::Any + Send>) = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let near = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+            let (far, _) = l.accept().unwrap();
+            (near.local_addr().unwrap().port(), Box::new((near, far)))
+        };
+        HELD.lock().unwrap().push(held);
+        port
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_dead_proxy_fails_the_fingerprint_and_nothing_goes_direct() {
         let fx = Fixture::http("text/html", "ok".into()).await;
-        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = dead.local_addr().unwrap().port();
-        drop(dead);
+        let port = closed_port();
         let dport = daemon().await;
         let op = serde_json::json!({
             "operation": "fingerprint",
@@ -499,6 +893,7 @@ mod tests {
         .await;
         assert_eq!(events[0]["type"], "capabilities", "{events:?}");
         assert_eq!(events[0]["egress"], 1, "{events:?}");
+        assert_eq!(events[0]["pid"], std::process::id(), "{events:?}");
     }
 }
 
@@ -517,7 +912,12 @@ mod http_request_tests {
         let port = listener.local_addr().expect("addr").port();
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                tokio::spawn(handle_connection(stream, dguard::Gate::default()));
+                tokio::spawn(handle_connection(
+                    stream,
+                    dguard::Gate::default(),
+                    ToolmarkDb::unconnected(),
+                    std::sync::Arc::new(Knowledge::load(None)),
+                ));
             }
         });
         port

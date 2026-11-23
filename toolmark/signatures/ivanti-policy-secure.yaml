@@ -1,0 +1,8 @@
+id: ivanti-policy-secure
+info:
+  name: Ivanti Policy Secure
+  category: Network Access Control
+  metadata:
+    vendor: ivanti
+    product: policy_secure
+refines: ivanti-gateway

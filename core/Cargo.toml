@@ -14,7 +14,15 @@ path = "src/lib.rs"
 
 [dependencies]
 dguard = { path = "../dguard" }
+# What `crossfyre update` brings the engines: the crossfyre-templates pack and the CVE
+# dataset, and where each goes in the toolchain directory.
+cfx_pack = { path = "../pack" }
+cfx_cve = { path = "../cve" }
+# The engines' database settings in config.toml, and the password they get.
+cfx_db = { path = "../db" }
 adaptive = { path = "../adaptive" }
+# Installs the pacing module, after checking it as an engine will (components.rs).
+cfx_pacing = { path = "../pacing" }
 async-nats = "0.50.0"
 # Direct handle so run_daemon can install a rustls CryptoProvider before the
 # NATS TLS handshake (both aws-lc-rs and ring are in the workspace graph).
@@ -25,7 +33,6 @@ dialoguer = { version = "0.12.0", features = ["password"] }
 dirs = "6.0.0"
 futures-util = "0.3"
 libc = "0.2"
-nats-jwt = "0.3.0"
 nkeys = "0.4.5"
 # `native-tls-vendored` adds an OpenSSL backend (statically built, so no system libssl needed and it
 # cross-compiles cleanly) ALONGSIDE reqwest's default rustls. The trace proxy's forwarder opts into it
@@ -54,10 +61,12 @@ cfx_tunnel = { path = "../tunnel" }
 getrandom = "0.3"
 # The gateway's place for a scope check on each connection, unused until that check lands.
 cfx_scope = { path = "../scope" }
+# The privacy policy and policy.toml, read here the way every program on the machine reads
+# them; this crate writes the file.
+cfx_policy = { path = "../policy" }
 # Web Tracer Method 2 (local intercepting proxy): a Burp-style MITM proxy built in-process so capture
-# needs only a browser (no Wireshark). rcgen mints a session CA + per-host leaf certs; hyper serves
+# needs only a browser (no Wireshark). cfx_capture mints a session CA + per-host leaf certs; hyper serves
 # HTTP/1.1 over the tokio-rustls-terminated tunnel; reqwest (above) forwards to the origin.
-rcgen = "0.13"
 cfx_capture = { path = "../capture" }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
@@ -66,10 +75,16 @@ tokio-rustls = "0.26"
 toml = "1.0.3"
 
 [dev-dependencies]
+# Pacing modules written as text, for the components tests.
+wat = "1"
 # A recording SOCKS5 proxy and counting listeners, for the gateway's tests.
 cfx_tunnel = { path = "../tunnel", features = ["recorder"] }
+# A certificate for the TLS origin the gateway's tests send to.
+rcgen = "0.13"
 # The shape of the release client's User-Agent.
 regex = "1"
+# Time that stands still until a test's tasks wait, for the node's start retries.
+tokio = { version = "1.49.0", features = ["test-util"] }
 
 # Windows: the node supervisor runs as a service (windows-service), the engines as
 # scheduled tasks registered through the Task Scheduler's COM interface (the `windows`

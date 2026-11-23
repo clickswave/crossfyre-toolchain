@@ -1,0 +1,41 @@
+# Lab target mutillidae at http://127.0.0.1:7012/, as toolmark kept it on 2026-11-20.
+# The body is cut after </head>.
+HTTP/1.1 200 OK
+date: Thu, 19 Nov 2026 19:55:06 GMT
+server: Apache/2.4.67 (Debian)
+x-powered-by: PHP/8.5.7
+set-cookie: PHPSESSID=
+set-cookie: showhints=
+expires: Thu, 19 Nov 1981 08:52:00 GMT
+cache-control: public
+logged-in-user: 
+x-xss-protection: 0;
+strict-transport-security: max-age=0
+referrer-policy: unsafe-url
+cross-origin-opener-policy: unsafe-none
+vary: Accept-Encoding
+content-type: text/html;charset=UTF-8
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
+
+	<link rel="shortcut icon" href="./images/favicon.ico" type="image/x-icon" />
+
+	<link rel="stylesheet" type="text/css" href="styles/global-styles.css" />
+	<link rel="stylesheet" type="text/css" href="styles/ddsmoothmenu/ddsmoothmenu.css" />
+	<link rel="stylesheet" type="text/css" href="javascript/jQuery/colorbox/colorbox.css" />
+	<link rel="stylesheet" type="text/css" href="styles/gritter/jquery.gritter.css" />
+
+	<script src="javascript/jQuery/jquery.js"></script>
+	<script src="javascript/jQuery/colorbox/jquery.colorbox-min.js"></script>
+	<script src="javascript/ddsmoothmenu/ddsmoothmenu.js"></script>
+	<script src="javascript/gritter/jquery.gritter.min.js"></script>
+	<script src="javascript/hints/hints-menu.js"></script>
+	<script src="javascript/inline-initializers/jquery-init.js"></script>
+	<script src="javascript/inline-initializers/ddsmoothmenu-init.js"></script>
+	<script src="javascript/inline-initializers/populate-web-storage.js"></script>
+	<script src="javascript/inline-initializers/gritter-init.js"></script>
+	<script src="javascript/inline-initializers/hints-menu-init.js"></script>
+</head>

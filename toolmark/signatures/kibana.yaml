@@ -1,0 +1,13 @@
+id: kibana
+info:
+  name: Kibana
+  category: Monitoring
+  metadata:
+    vendor: elastic
+    product: kibana
+detect:
+  any:
+    - header: { name: kbn-name, regex: '.' }
+    - header: { name: kbn-version, regex: '.' }
+version:
+  - header: { name: kbn-version, regex: '^([0-9]+(?:\.[0-9]+)*)' }

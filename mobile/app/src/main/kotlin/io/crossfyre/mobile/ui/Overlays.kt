@@ -38,6 +38,7 @@ import io.crossfyre.mobile.Scope
 import io.crossfyre.mobile.ago
 import io.crossfyre.mobile.displayHost
 import io.crossfyre.mobile.patch.restoreOffer
+import io.crossfyre.mobile.policyNotice
 
 /** The four facts of what a capture does, shared by the disclosure and the how-to sheet. */
 @Composable
@@ -313,6 +314,13 @@ fun BoxScope.Overlays(m: AppModel) {
             actions = { CfxButton("OK", Kind.TEXT) { m.overlay = null } },
         ) {
             Text("That QR code is not a Crossfyre pairing code. Pairing codes come from a Web Tracer session in the dashboard, and point at an https address.")
+        }
+
+        Overlay.PolicyPrivate -> CfxDialog(
+            "This account is private", onDismiss = { m.overlay = null },
+            actions = { CfxButton("OK", Kind.TEXT) { m.overlay = null } },
+        ) {
+            Text(policyNotice().body)
         }
 
         Overlay.ResetCert -> {

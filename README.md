@@ -21,7 +21,7 @@ Five engines for recon and vulnerability scanning, written in Rust, that you run
 | [`toolmark`](toolmark/) | Fingerprints services and technologies, and flags CVE leads by version. |
 | [`plessor`](plessor/) | Tests for vulnerabilities with nuclei-compatible templates and an injection engine, and confirms each finding before it reports it. |
 
-Alongside them: [`crossfyre`](crossfyre/), the CLI that installs and updates everything, [`node`](node/), the agent that runs the engines for the platform, [`oast`](oast/), an out-of-band server you can host so `plessor` confirms blind bugs on your own domain, and [`mobile`](mobile/), Crossfyre Mobile for Android, which is [on Google Play](https://play.google.com/store/apps/details?id=io.crossfyre.mobile).
+Alongside them: [`crossfyre`](crossfyre/), the CLI that installs and updates everything, [`node`](node/), the agent that runs the engines for the platform, [`oast`](oast/), an out-of-band server you can host with `crossfyre oast serve` so `plessor` confirms blind bugs on your own domain, and [`mobile`](mobile/), Crossfyre Mobile for Android, which is [on Google Play](https://play.google.com/store/apps/details?id=io.crossfyre.mobile).
 
 This repository began as [voyage](https://github.com/clickswave/crossfyre-toolchain/tree/voyage), the standalone subdomain finder, and its history is kept on that branch. ambulo began as [mach](https://github.com/clickswave/mach).
 
@@ -76,7 +76,7 @@ These install the `crossfyre` CLI for your own user, and the package manager kee
 
 </details>
 
-`crossfyre update all` updates the engines. [crossfyre.io/docs/install](https://crossfyre.io/docs/install) covers the .deb, signature checks and removal.
+`crossfyre update all` updates the engines, and with them the templates, signatures and CVE data they read, which `crossfyre update data` takes on its own, signed and with no new binary. [crossfyre.io/docs/install](https://crossfyre.io/docs/install) covers the .deb, signature checks and removal.
 
 When the CLI fetches from bins.crossfyre.io, the request's User-Agent carries its name, version and platform and whether it is an install, an update or a check of the release manifest, and nothing else.
 
@@ -84,20 +84,20 @@ When the CLI fetches from bins.crossfyre.io, the request's User-Agent carries it
 
 ```sh
 # Subdomains of a domain
-voyage scan --domain example.com --wordlist-path /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt
+voyage scan example.com --wordlist-path /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt
 
 # Ports and services across a range
-doorward scan --targets 10.0.0.0/24 --ports top-1000 --service-detection
+doorward scan 10.0.0.0/24 --ports top-1000 --service-detection
 
 # Content discovery, fuzzing the path at ::FUZZ::
-ambulo scan --url https://example.com/::FUZZ:: --wordlist-path /usr/share/seclists/Discovery/Web-Content/common.txt
+ambulo scan https://example.com/::FUZZ:: --wordlist-path /usr/share/seclists/Discovery/Web-Content/common.txt
 ```
 
-Wordlists are read only from a few directories, since the daemon would otherwise read any file a request names: `/usr/share/wordlists` and `/usr/share/seclists` on Linux, and Homebrew's seclists on macOS. The temp directory is read only for the lists the node hands over. Add your own directories with `CFX_WORDLIST_ROOTS`, separated like `PATH`.
+A wordlist can be any file you can read: the command line reads it and sends its words to the daemon, a chunk at a time. A request that names a wordlist path instead, as the node's do, is read by the daemon only from a few directories, since it would otherwise read any file a request names: `/usr/share/wordlists` and `/usr/share/seclists` on Linux, Homebrew's seclists on macOS, and in the temp directory only the lists the node hands over. Add your own directories for those with `CFX_WORDLIST_ROOTS`, separated like `PATH`.
 
-In a terminal `voyage`, `doorward` and `ambulo` draw a live dashboard. `toolmark` and `plessor` finish a single target in seconds, so they print JSON unless you put `--tui` before `scan`, as in `toolmark --tui scan https://example.com`. Piped or redirected, every engine writes newline-delimited JSON, one event per line, and exits non-zero if the run ends in an error. `voyage`, `doorward` and `ambulo` save findings as they go, so a stopped scan resumes where it left off. Add `--help` to any command for the rest.
+In a terminal every engine's `scan` draws a live dashboard, and so do `toolmark services` and `plessor inject`. `--no-tui` prints JSON instead, and `exec` always does. Piped or redirected, every engine writes newline-delimited JSON, one event per line, and exits non-zero if the run ends in an error. `voyage`, `doorward` and `ambulo` save findings as they go, so a stopped scan resumes where it left off. Add `--help` to any command for the rest.
 
-From 0.1.38, `crossfyre completions <shell>` prints a completion script for bash, zsh, fish, powershell or elvish: `crossfyre completions bash > ~/.local/share/bash-completion/completions/crossfyre`. Each engine takes the same command, as in `voyage completions zsh`.
+From 0.1.38, `crossfyre completions <shell>` prints a completion script for bash, zsh, fish, powershell or elvish: `mkdir -p ~/.local/share/bash-completion/completions && crossfyre completions bash > ~/.local/share/bash-completion/completions/crossfyre`. Each engine takes the same command, as in `voyage completions zsh`.
 
 From 0.1.38, `crossfyre mcp` serves `toolmark` and `plessor` to an MCP client over stdio, so an agent can fingerprint a service, test endpoints for injection and replay single requests, and refuses any destination that a scope file you write does not list. See [crossfyre/MCP.md](crossfyre/MCP.md).
 
@@ -112,6 +112,36 @@ crossfyre node init
 
 The platform is optional. Nothing here needs it.
 
+## What comes with a plan
+
+Three components are not in this repository. They come with a Crossfyre plan that includes them, and the CLI installs them beside the binaries once you log in:
+
+| Component | What it adds | Without it |
+| --- | --- | --- |
+| `plessor-authz` | plessor's authorization testing (BOLA, BFLA and BOPLA), as a daemon of its own on port 4446, which the node sends a scan's authorization tests to | plessor's `authz` operation says it needs plessor-authz and reports no findings |
+| `pacing`, the pacing module | Pacing tuned to how each target answers | The engines pace with the baseline in [`adaptive`](adaptive/) |
+| `egress`, the egress helper | Brings up a node's VPN or Tor tunnel when it has one | The node sends from the machine's own address, or, with the node's kill switch on, runs no ops until a helper answers |
+
+`crossfyre login` offers to install the ones your plan includes, `crossfyre update components` installs them later, `crossfyre node init` installs what a node needs with the node's own key, `crossfyre update` keeps them current, and `crossfyre status` lists them with their versions. Each file is checked against a manifest signed with the release key before it is installed, and an engine checks the pacing module's own signature each time it loads it. Every engine says which pacing it runs as it starts, `pacing: module <version>` or `pacing: baseline (<why>)`. When a plan ends, what is installed stays and stops being updated.
+
+## How the engines run
+
+Each engine is a daemon and the commands that talk to it. The daemon does the work, on 127.0.0.1 and a port of its own (ambulo 4441, voyage 4442, doorward 4443, toolmark 4444, plessor 4445), and the commands you type are its clients. When a command finds no daemon on its port it starts one: on Linux the engine's systemd user unit, when `crossfyre` registered one for you, and otherwise the engine's own binary, which writes to `logs/<engine>.log` in the toolchain directory (`~/.config/crossfyre` on Linux). The command says `started voyage daemon (pid N)` on stderr, so its JSON on stdout stays clean.
+
+A daemon started from the binary exits once it has had no client and no scan for 30 minutes. For another limit, set `CFX_DAEMON_IDLE_EXIT` to a number of seconds in the environment of the command that starts it. `voyage daemon`, and the same for every engine, runs one by hand, which never exits on its own. `--no-autostart` or `CFX_NO_AUTOSTART=1` turns the starting off. Nothing is started for a command run with sudo, since the daemons and their database belong to your user.
+
+Where no service manager runs, as on WSL without systemd and in most containers, `crossfyre node up` runs the engines along with the node. It runs them as you, starts one again when it exits and stops them when it stops, and `crossfyre extension start` says so instead of starting one. `node up` runs in the foreground there, so start it where it keeps running, such as a container's command or tmux. On WSL, turning systemd on lets the services run the engines instead.
+
+## Where scan state is kept
+
+Every engine keeps its scans in PostgreSQL. voyage, doorward and ambulo keep the state of each one, so a stopped scan picks up where it left off, and so does a plessor template scan. toolmark keeps what it found on each host and when that changed. `config.toml` in the toolchain directory names the database they use.
+
+By default it is a local one: a PostgreSQL cluster of your own in the toolchain directory, made with the PostgreSQL programs installed on the machine (on Debian, Ubuntu or Kali, `sudo apt install postgresql`). It runs as you, listens on 127.0.0.1 only, and its generated password is kept in `config.toml`. The first daemon to start makes it, or `crossfyre db up` does ahead of time. `crossfyre db stop` stops it, and `crossfyre db status` says how it is.
+
+To use a PostgreSQL server you run yourself, record it with `crossfyre db external HOST PORT USER`. It asks for the password, or reads it from `CROSSFYRE_DB_PASSWORD`, and records the server only once it lets that user in. The engines keep their tables in one database there, `crossfyre` unless `db_name` in config.toml names another, with a schema each. The local database is stopped and kept with its settings, and `crossfyre db up` goes back to it.
+
+A scan's settings are kept so that it can be taken up again, without the credentials it was given: a scan that needs them is given them again. Each engine's `scans` command lists the scans it keeps, the latest first, and takes a stopped one up again by its id; one given credentials is taken up by a request that asks for it as it was first asked for and names its id, as `ambulo scan --resume ID` does. `crossfyre db status` says how much each engine keeps. `crossfyre db purge --scan ID` deletes one scan with what it found, and `crossfyre db purge --older-than DAYS` every scan made longer ago than that, from every engine; a running scan is left alone. Each engine's own `db purge` does the same for that engine, and its `db reset` deletes everything it keeps.
+
 ## Build from source
 
 With a stable [Rust toolchain](https://rustup.rs):
@@ -124,23 +154,18 @@ cargo build --release
 
 Or install one engine with `cargo install --git https://github.com/clickswave/crossfyre-toolchain.git ambulo`.
 
-A source build sets up no services, so before the first scan start the Postgres container the engines keep their state in (this needs Docker), then the daemon of each engine you use:
+A plain source build gives ambulo, voyage, toolmark and plessor rustls, with a TLS fingerprint a WAF can tell from a browser's. The released binaries are built each on its own, those four with `--features impersonate`, which puts them on BoringSSL and presents a browser's TLS and HTTP/2 fingerprint: `cargo build --release -p plessor --features impersonate`. That needs CMake and Clang (`sudo apt install cmake clang libclang-dev` on Debian, Ubuntu or Kali; `brew install cmake` on macOS; the MSVC toolchain, CMake and NASM on Windows, as MinGW cannot build BoringSSL). Build the four one at a time, and not together with the CLI: BoringSSL and the OpenSSL the CLI links define the same symbols.
 
-```sh
-crossfyre db up
-ambulo --daemon &
-```
-
-The container is published on 127.0.0.1 only, with a generated password kept in the toolchain's `config.toml`, which the engines read when they start.
+A source build sets up no services, and needs none: the first command you give an engine starts its daemon, and the first engine daemon to start makes the local database, so install PostgreSQL's programs before the first scan. [How the engines run](#how-the-engines-run) has the rest.
 
 `cfx-script` embeds Python, so building it needs one. On Linux that is your distribution's Python and its development files. On macOS it has to be Python 3.10 or later, and the `python3` that comes with the Xcode command line tools is 3.9, so name another one: `PYO3_PYTHON=/opt/homebrew/bin/python3 cargo build --release`. Windows needs no Python to build it, and Python 3.10 or later to run scripts.
 
-A source build, like the binaries on the [Releases](../../releases) page, is the open build. The installer ships the first-party build, which adds the authorization checks, per-node egress isolation, tuned pacing and the browser-fingerprint transport.
+The binaries on the [Releases](../../releases) page are the ones the installer and the package managers install, built by GitHub Actions from the tag, and `gh attestation verify` says which commit each came from. What a plan adds is the three components in [What comes with a plan](#what-comes-with-a-plan), none of which is compiled into them.
 
 <details>
 <summary>Running an engine as a daemon on another address</summary>
 
-Every engine can run as a daemon (`--daemon`) that its client talks to over loopback. The protocol is unauthenticated, so the bind address is the security boundary. `CFX_DAEMON_BIND` moves the listener to another IP, and `CFX_DAEMON_TOKEN` makes it require a token, which the clients and the node read from the same variable. If you move the listener, set the token: `ambulo` takes a wordlist path, so an open daemon can be made to read files.
+Every engine can run as a daemon (`<engine> daemon`) that its client talks to over loopback. The protocol is unauthenticated, so the bind address is the security boundary. `CFX_DAEMON_BIND` moves the listener to another IP, and `CFX_DAEMON_TOKEN` makes it require a token, which the clients and the node read from the same variable. If you move the listener, set the token: `ambulo` takes a wordlist path, so an open daemon can be made to read files.
 
 </details>
 
@@ -160,7 +185,8 @@ Every engine can run as a daemon (`--daemon`) that its client talks to over loop
 | [`mcp`](mcp/) | The `crossfyre mcp` server: the engines as MCP tools, fenced by a scope file you write, with an audit line for every call. |
 | [`spec`](spec/) | Reads OpenAPI, Swagger, Postman, HAR and Insomnia files. |
 | [`surface`](surface/) | Describes a scanned attack surface and diffs it between runs. |
-| [`adaptive`](adaptive/) | The engines' pacing and retry decisions, with an untuned baseline. |
+| [`adaptive`](adaptive/) | The engines' pacing and retry decisions, answered by the pacing module when one is installed and by the baseline otherwise. |
+| [`pacing`](pacing/) | Checks the pacing module's signature and runs it, with a limit on what each call may use. |
 | [`relsign`](relsign/) | Signs the release manifest. Used to build releases, not shipped. |
 
 </details>

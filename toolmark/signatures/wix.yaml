@@ -1,0 +1,8 @@
+id: wix
+info:
+  name: Wix
+  category: CMS
+detect:
+  any:
+    - header: { name: x-wix-request-id, regex: '.+' }
+    - html: { regex: '(?i)static\.wixstatic\.com' }

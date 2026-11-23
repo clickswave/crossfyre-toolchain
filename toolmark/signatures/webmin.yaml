@@ -1,0 +1,18 @@
+id: webmin
+info:
+  name: Webmin
+  category: Control Panel
+  metadata:
+    vendor: webmin
+    product: webmin
+refines: miniserv
+detect:
+  any:
+    - html: { regex: '<title>\s*Login to Webmin\s*</title>' }
+    - all:
+        - header: { name: server, regex: '^MiniServ/' }
+        - none:
+            - html: { regex: '<title>\s*Login to Usermin\s*</title>' }
+        - path: { path: /session_login.cgi, regex: '<title>\s*Login to Webmin\s*</title>' }
+version:
+  - header: { name: server, regex: '^MiniServ/([0-9]+(?:\.[0-9]+)*)' }

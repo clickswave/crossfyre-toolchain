@@ -2,20 +2,21 @@
 //! signed in as the captured session.
 //!
 //! The request is read whole from the project, and its cookies and headers are handed
-//! to plessor on loopback as the scan's `auth`. They are never written to a job file, a
-//! result or the audit log. The destination has to be admitted by the scope file and by
+//! to plessor on loopback as the scan's `auth`, which no engine keeps. They are never
+//! written to a result or the audit log. The destination has to be admitted by the scope file and by
 //! the open project's scope, plessor's follow-ups are held to what both lists admit, and
 //! the scan is cancelled if the project's scope stops admitting it or the project closes.
 
 use super::{ask, bridge_refusal, parse_handle, route};
 use crate::confirm::{AskKind, WriteAsk};
 use crate::core::{
-    CallNote, Done, Intent, Mcp, Reason, Refusal, RefusedDest, RunningJob, RunningMap,
-    TrafficRequest, cancel_job,
+    CallNote, CancelledSet, Done, Intent, Mcp, Reason, Refusal, RefusedDest, RunningJob,
+    RunningMap, TrafficRequest, cancel_job,
 };
-use crate::jobs::{self, JobStore};
+use crate::jobs;
 use crate::peer::ClientPeer;
-use crate::tools::inject::{Plan, parse_classes, start_scan};
+use crate::tools::engine_scan::{Plan, Run, start_scan};
+use crate::tools::inject::parse_classes;
 use crate::tools::overrides::{self, Asked, Via};
 use crate::tools::{in_range, parse_args};
 use crate::workbench::{Instance, REQUEST_WAIT};
@@ -526,24 +527,27 @@ pub(crate) async fn run(
         o.project.uid.clone(),
         target,
         events,
-        Arc::clone(&mcp.jobs),
         Arc::clone(&mcp.running),
+        Arc::clone(&mcp.cancelled),
     );
     let plan = Plan {
         tool: "workbench_test_injection",
-        origin,
-        endpoints: vec![op],
-        // The job file outlives the call; a token in the query does not go in it.
+        target: origin,
+        run: Run::Inject {
+            endpoints: vec![op],
+            classes,
+            auth: session(&src),
+            scope,
+        },
+        // What plessor keeps of the scan outlives the call; a token in the query does not
+        // go in it.
         shown_endpoints: vec![redact::redact_url(&dest.url)],
-        classes,
         test_writes: a.test_writes,
-        auth: session(&src),
         source: Some(json!({"workbench": {
             "pid": o.inst.pid,
             "project_uid": o.project.uid,
             "exchange": handle,
         }})),
-        scope,
         wait,
         write,
         on_start: Some(Box::new(on_start)),
@@ -560,8 +564,8 @@ fn keep_in_scope(
     uid: String,
     dest: Dest,
     mut events: broadcast::Receiver<Event>,
-    store: Arc<JobStore>,
     running: RunningMap,
+    cancelled: CancelledSet,
 ) -> impl FnOnce(Arc<RunningJob>) + Send + 'static {
     move |job: Arc<RunningJob>| {
         tokio::spawn(async move {
@@ -601,7 +605,10 @@ fn keep_in_scope(
                 if let Ok(mut m) = job.meta.lock() {
                     m.note(format!("cancelled: {why}"));
                 }
-                cancel_job(&store, &running, &job).await;
+                if let Ok(mut c) = cancelled.lock() {
+                    c.entry(job.id.clone()).or_default().why = Some(format!("cancelled: {why}"));
+                }
+                cancel_job(&running, &cancelled, &job).await;
                 return;
             }
         });

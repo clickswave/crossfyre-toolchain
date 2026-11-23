@@ -6,8 +6,6 @@
 //! none of those characters left, inside the caps.
 
 use super::support::*;
-use crate::findings::{self, Stamp};
-use crate::jobs::{self, JobMeta, NewJob};
 use crate::tools::result_size;
 use crate::untrusted::{RESULT_CAP, longest_backtick_run};
 use serde_json::{Value, json};
@@ -62,7 +60,7 @@ async fn a_hostile_finding_arrives_as_labelled_clean_capped_data() {
         events: vec![json!({"type": "finding", "data": {
             "type": "vulnerability", "vuln_class": "sqli", "name": format!("SQL injection {HOSTILE}"),
             "severity": "HIGH", "confidence": "confirmed", "description": HOSTILE,
-            "source": "cortex-inject", "url": format!("http://127.0.0.1:{}/?q=1", target.port),
+            "source": "plessor-inject", "url": format!("http://127.0.0.1:{}/?q=1", target.port),
             "method": "GET", "param": "q", "location": "query", "evidence": evidence,
             "payload_echo": HOSTILE,
         }})],
@@ -160,48 +158,40 @@ async fn a_hostile_page_title_stays_under_target_data() {
     );
     assert_eq!(v["cve_leads"][0]["severity"], "high");
     assert_eq!(v["cve_leads"][0]["confidence"], "version-inferred");
+    // Each lead says which data it came from, and what may make it wrong.
+    assert_eq!(
+        v["cve_leads"][0]["cve_data"],
+        "built-in known-exploited snapshot"
+    );
+    assert_eq!(v["cve_leads"][0]["backport"], true);
 }
 
 #[tokio::test]
 async fn a_page_of_the_largest_findings_fits_and_pages_on() {
-    let t = scope(&["a.test".into()], "").build();
-    let meta = JobMeta::new(
-        &t.mcp.session,
-        NewJob {
-            tool: "test_injection",
-            engine: "plessor",
-            target: "http://a.test",
-            endpoints: Vec::new(),
-            scope_sha256: None,
-            cancellable: true,
-            test_writes: false,
-        },
-    );
-    t.mcp.jobs.write_meta(&meta).unwrap();
+    let plessor = stub_engine(StubOpts::default()).await;
+    let t = scope(&["a.test".into()], "").plessor(plessor.port).build();
     let big = "\"`<x>".repeat(4000);
-    let fs: Vec<Value> = (1..=50)
-        .map(|i| {
-            findings::from_plessor(
-                &json!({"vuln_class": big, "name": big, "severity": "critical",
-                        "confidence": big, "url": big, "method": big, "param": big,
-                        "location": big, "template": big, "source": big,
-                        "description": big, "evidence": big, "extra": big}),
-                Stamp {
-                    id: jobs::new_id("f"),
-                    scan_id: &meta.id,
-                    seq: i,
-                    recorded_ms: 1_000 + i as i64,
-                },
-            )
-        })
-        .collect();
-    t.mcp.jobs.append_findings(&meta.id, &fs).unwrap();
+    let scan = {
+        let mut k = plessor.kept.lock().unwrap();
+        let scan = k.scan("http://a.test", "completed", json!({}), &now_utc());
+        for _ in 1..=50 {
+            k.finding(
+                &scan,
+                json!({"vuln_class": big, "name": big, "severity": "critical",
+                       "confidence": big, "url": big, "method": big, "param": big,
+                       "location": big, "template": big, "source": big,
+                       "description": big, "evidence": big, "extra": big}),
+                &now_utc(),
+            );
+        }
+        format!("s_plessor_{scan}")
+    };
 
     let peer = FakePeer::new(Elicit::None);
     let mut seen = std::collections::HashSet::new();
     let mut cursor: Option<String> = None;
     for _ in 0..50 {
-        let mut args = json!({"scan_id": meta.id, "limit": 50});
+        let mut args = json!({"scan_id": scan, "limit": 50});
         if let Some(c) = &cursor {
             args["cursor"] = json!(c);
         }
