@@ -155,6 +155,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // -----------------------------------------------------------------------
+    // Man subcommand - print the roff man page to stdout (no daemon needed)
+    // -----------------------------------------------------------------------
+    if let Some(Commands::Man) = &cli.command {
+        let mut page = Vec::new();
+        clap_mangen::Man::new(Cli::command()).render(&mut page)?;
+        print_all(&page)?;
+        return Ok(());
+    }
+
+    // -----------------------------------------------------------------------
     // Fuzz subcommand - client that talks to the running daemon
     // -----------------------------------------------------------------------
     let mut fuzz_args = match cli.command {
@@ -163,6 +173,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         | Some(Commands::Scans)
         | Some(Commands::Db { .. })
         | Some(Commands::Completions { .. })
+        | Some(Commands::Man)
         | Some(Commands::Daemon)
         | None => {
             eprintln!(
