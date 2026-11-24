@@ -4,12 +4,11 @@
 use super::{Machine, Policy};
 use crate::api::SendApi;
 
-/// The account's policy as Crossfyre answers it.
+/// The account's policy as Crossfyre answers it, with when and where its owner last
+/// changed it: neither, while it is the connected an account starts with.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Remote {
     pub policy: Policy,
-    /// Whether the account has chosen one; one that has not runs as connected.
-    pub chosen: bool,
     pub changed_at: Option<String>,
     pub changed_via: Option<String>,
 }
@@ -96,7 +95,6 @@ pub fn remote(data: &serde_json::Value) -> Option<Remote> {
     let policy = Policy::parse(data["policy"].as_str()?).filter(|p| p.is_account())?;
     Some(Remote {
         policy,
-        chosen: data["chosen"].as_bool().unwrap_or(false),
         changed_at: data["changed_at"].as_str().map(str::to_string),
         changed_via: data["changed_via"].as_str().map(str::to_string),
     })
@@ -119,7 +117,7 @@ impl Cloud for Crossfyre {
 
 /// Take the account's policy into `machine`, as Crossfyre gave it.
 pub fn take(machine: &mut Machine, r: &Remote) {
-    machine.account = r.chosen.then_some(r.policy);
+    machine.account = Some(r.policy);
     machine.changed_at = r.changed_at.clone();
     machine.changed_via = r.changed_via.clone();
     machine.unsent = false;

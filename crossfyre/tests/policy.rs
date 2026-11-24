@@ -125,3 +125,41 @@ fn an_offline_machine_lists_no_nodes_and_contacts_nothing() {
         "an offline machine contacted Crossfyre"
     );
 }
+
+/// `policy set private` says what stops working before it sets the policy, and setting
+/// connected, which stops nothing, says none of it.
+#[test]
+fn setting_private_says_what_stops_working_first() {
+    let data = tempfile::tempdir().unwrap();
+    let set = |name: &str| {
+        let out = Command::new(env!("CARGO_BIN_EXE_crossfyre"))
+            .arg("--data-dir")
+            .arg(data.path())
+            .args(["policy", "set", name])
+            .env_remove("CROSSFYRE_POLICY")
+            .env("NO_COLOR", "1")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "policy set {name} failed");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let connected = set("connected");
+    let private = set("private");
+    let saved = private
+        .find("policy: private on this machine")
+        .expect("the policy was not set");
+    for line in cfx_core::policy::PRIVATE_STOPS {
+        assert!(!connected.contains(line), "connected warned: {connected}");
+        let said = private
+            .find(line)
+            .unwrap_or_else(|| panic!("not said: {line}\n{private}"));
+        assert!(said < saved, "said after the policy was set: {line}");
+    }
+    // Already private, there is nothing new to stop.
+    let again = set("private");
+    assert!(
+        !again.contains(cfx_core::policy::PRIVATE_STOPS[0]),
+        "{again}"
+    );
+}

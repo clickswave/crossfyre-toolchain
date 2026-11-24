@@ -59,7 +59,7 @@ fn the_variable_tightens_a_run_and_never_loosens_it() {
 }
 
 /// The state as the CLI writes it, read back by any program; what does not read is the
-/// default, connected and not chosen.
+/// default, connected.
 #[test]
 fn the_state_reads_as_it_was_written_and_garbage_as_the_default() {
     let dir = tempfile::tempdir().unwrap();
