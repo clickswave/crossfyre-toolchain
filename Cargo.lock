@@ -1147,9 +1147,9 @@ dependencies = [
 
 [[package]]
 name = "cookie"
-version = "0.18.1"
+version = "0.18.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ddef33a339a91ea89fb53151bd0a4689cfce27055c291dfa69945475d22c747"
+checksum = "d55f2d6c30eeec7d5c6f98bd4395d4abb1895629eab97ee6522d340623615f8a"
 dependencies = [
  "percent-encoding",
  "time",
@@ -1750,9 +1750,9 @@ dependencies = [
 
 [[package]]
 name = "etherparse"
-version = "0.20.3"
+version = "0.20.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aeebdb565da33451794551a771bd0b4e6f416d3182adc3ed2837f614d6168f9a"
+checksum = "73d959354dc058031f9944438972841ce014100e8692bbfe56d4ba7947fed59c"
 dependencies = [
  "arrayvec",
 ]
