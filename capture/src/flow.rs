@@ -167,12 +167,7 @@ where
         // one CDN address. Whatever is read here is replayed verbatim, so the
         // decision costs the connection nothing either way.
         let mut head = first[..n].to_vec();
-        let mut probe = [0u8; 2048];
-        // One read is enough in practice (a ClientHello arrives in one segment)
-        // and a second could block a connection that has nothing more to send.
-        if let Ok(m) = client.read(&mut probe).await {
-            head.extend_from_slice(&probe[..m]);
-        }
+        read_first_record(&mut client, &mut head).await;
         let sni = crate::sni::server_name(&head);
 
         // Name every TLS flow, decryptable or not. Until now a host we could not
@@ -288,6 +283,41 @@ fn admit_flow(cfg: &CaptureCfg, sni: Option<&str>, target_host: &str, target_por
     }
     true
 }
+
+/// Read the rest of the TLS record `head` begins, the ClientHello, and no further.
+///
+/// One read used to be taken as enough. A ClientHello carrying a post-quantum key
+/// share is larger than a TCP segment, so it arrives in two, and with the
+/// extension order a browser randomises, the server name was as often as not in
+/// the part not yet read: the flow was intercepted although its host was on the
+/// bypass list. Reading exactly as far as the record's own length cannot wait on
+/// a client with nothing more to send, since the client has said how much it is
+/// sending. A record is at most 2^14 bytes; a read that fails or ends just stops,
+/// and the handshake then fails as it would have.
+async fn read_first_record<C: AsyncRead + Unpin>(client: &mut C, head: &mut Vec<u8>) {
+    const MAX_RECORD: usize = 1 << 14;
+    let mut probe = [0u8; 4096];
+    loop {
+        let want = match head.get(3..5) {
+            Some(len) => 5 + (u16::from_be_bytes([len[0], len[1]]) as usize).min(MAX_RECORD),
+            None => 5,
+        };
+        if head.len() >= want {
+            return;
+        }
+        let room = (want - head.len()).min(probe.len());
+        match client.read(&mut probe[..room]).await {
+            Ok(0) | Err(_) => return,
+            Ok(m) => head.extend_from_slice(&probe[..m]),
+        }
+    }
+}
+
+/// The largest request body capture buffers. Every request is read whole before
+/// it goes on, so the gate and the record see what is sent; without a limit, one
+/// upload held the proxy's memory for as long as it kept coming. A larger one is
+/// answered 413 and not sent.
+const MAX_REQUEST_BODY: usize = 32 * 1024 * 1024;
 
 /// What every request on one connection needs, so the count stays a property of
 /// the connection rather than another positional argument.
@@ -581,9 +611,23 @@ async fn forward(
         .unwrap_or(target_host)
         .to_string();
 
-    // Buffer the request body so we can read its field names AND replay it upstream.
+    // Buffer the request body so we can read its field names AND replay it upstream,
+    // up to a limit: the app sending it is whatever the operator opened.
     let (parts, body) = req.into_parts();
-    let body_bytes = body.collect().await?.to_bytes();
+    let body_bytes =
+        match http_body_util::Limited::new(body, MAX_REQUEST_BODY)
+            .collect()
+            .await
+        {
+            Ok(b) => b.to_bytes(),
+            Err(e) if e.is::<http_body_util::LengthLimitError>() => {
+                log::warn!("refused a request body over {MAX_REQUEST_BODY} bytes to {host_hdr}");
+                return Ok(Response::builder().status(413).body(fixed_body(
+                    Bytes::from_static(b"request body too large to capture"),
+                ))?);
+            }
+            Err(e) => return Err(e),
+        };
     let body_params = body_field_names(content_type.as_deref(), &body_bytes);
     let full_url = format!("{scheme}://{host_hdr}{pq}");
 
@@ -1415,6 +1459,153 @@ mod tests {
     // were arriving as mojibake: the proxy sees the compressed bytes, and
     // from_utf8_lossy on a deflate stream is not reversible, so the decode has
     // to happen before the event is built.
+    /// A ClientHello whose server name comes after `pad` bytes of padding, as a
+    /// browser's does when a post-quantum key share is ahead of it.
+    fn hello_after(pad: usize, name: &str) -> Vec<u8> {
+        let mut ext = vec![0x00, 0x15]; // padding
+        ext.extend_from_slice(&(pad as u16).to_be_bytes());
+        ext.extend(std::iter::repeat_n(0u8, pad));
+        ext.extend_from_slice(&[0x00, 0x00]); // server_name
+        let mut sni = vec![0x00];
+        sni.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        sni.extend_from_slice(name.as_bytes());
+        let mut list = (sni.len() as u16).to_be_bytes().to_vec();
+        list.extend_from_slice(&sni);
+        ext.extend_from_slice(&(list.len() as u16).to_be_bytes());
+        ext.extend_from_slice(&list);
+
+        let mut body = vec![0x03, 0x03];
+        body.extend_from_slice(&[0u8; 32]);
+        body.push(0);
+        body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]);
+        body.extend_from_slice(&[0x01, 0x00]);
+        body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        body.extend_from_slice(&ext);
+        let mut hs = vec![0x01];
+        hs.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        hs.extend_from_slice(&body);
+        let mut rec = vec![0x16, 0x03, 0x01];
+        rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        rec.extend_from_slice(&hs);
+        rec
+    }
+
+    /// A ClientHello larger than one segment arrives in more than one read. The
+    /// server name in its second part still decides whether the flow is bypassed.
+    #[tokio::test]
+    async fn a_server_name_past_the_first_read_is_still_seen() {
+        let hello = hello_after(3000, "pinned.example");
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_port = origin.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = origin.accept().await {
+                let mut sink = Vec::new();
+                let _ = s.read_to_end(&mut sink).await;
+            }
+        });
+
+        let ca = Arc::new(crate::generate_ca().unwrap());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<TraceEvent>();
+        let mitm = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mitm_port = mitm.local_addr().unwrap().port();
+        let flow = tokio::spawn(async move {
+            let (client, _) = mitm.accept().await.unwrap();
+            serve_mitm_flow(
+                client,
+                "127.0.0.1".into(),
+                origin_port,
+                ca,
+                Egress::Direct,
+                tx,
+                crate::CaptureCfg {
+                    bypass_hosts: vec!["pinned.example".into()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())
+        });
+
+        let mut app = TcpStream::connect(("127.0.0.1", mitm_port)).await.unwrap();
+        app.write_all(&hello[..1000]).await.unwrap();
+        app.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        app.write_all(&hello[1000..]).await.unwrap();
+        app.shutdown().await.unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), flow)
+            .await
+            .expect("the flow ended")
+            .unwrap();
+        assert!(
+            matches!(&outcome, Ok(o) if o.bypassed),
+            "the flow was not bypassed: {:?}",
+            outcome.map(|o| (o.tls, o.bypassed, o.refused))
+        );
+    }
+
+    /// The body is buffered to be read and replayed, and the app under capture is
+    /// whatever the operator opened, a web page included, so its size is bounded.
+    #[tokio::test]
+    async fn a_request_body_past_the_limit_is_refused() {
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_port = origin.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = origin.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 1 << 16];
+                    let mut seen = 0usize;
+                    while let Ok(n) = s.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        seen += n;
+                        if seen > MAX_REQUEST_BODY {
+                            let _ = s
+                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                                .await;
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let ca = Arc::new(crate::generate_ca().unwrap());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<TraceEvent>();
+        let mitm = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mitm_port = mitm.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (client, _) = mitm.accept().await.unwrap();
+            let _ = serve_mitm_flow(
+                client,
+                "127.0.0.1".into(),
+                origin_port,
+                ca,
+                Egress::Direct,
+                tx,
+                crate::CaptureCfg::default(),
+            )
+            .await;
+        });
+
+        let tcp = TcpStream::connect(("127.0.0.1", mitm_port)).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(tcp))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/upload")
+            .header(HOST, "uploads.test")
+            .body(Full::new(Bytes::from(vec![b'a'; MAX_REQUEST_BODY + 1])))
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+        assert_eq!(resp.status(), 413);
+    }
+
     #[tokio::test]
     async fn a_gzip_response_is_captured_as_readable_text() {
         use std::io::Write as _;
