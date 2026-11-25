@@ -110,9 +110,10 @@ class HttpTransportTest {
 
     @Test(expected = IOException::class)
     fun nothing_listening_is_an_io_failure() {
-        val port = server.localPort
-        server.close()
-        HttpTransport(connectTimeoutMs = 2_000).post("http://127.0.0.1:$port/x", "{}")
+        // Port 1 sits below the ephemeral range, so no other test's server
+        // can take it. A port freed by closing this test's server could be
+        // handed to a test running in parallel, and the connect would succeed.
+        HttpTransport(connectTimeoutMs = 2_000).post("http://127.0.0.1:1/x", "{}")
     }
 
     @Test
