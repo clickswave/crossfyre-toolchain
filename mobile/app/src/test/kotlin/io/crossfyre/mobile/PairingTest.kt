@@ -39,6 +39,18 @@ class PairingTest {
     }
 
     @Test
+    fun a_name_that_starts_like_a_private_address_is_not_one() {
+        // Names, not addresses: whoever owns the domain decides where they point.
+        for (host in listOf("10.example.com", "192.168.evil.example", "172.16.0.example", "127.0.0.1.example")) {
+            assertNull(host, Pairing.normaliseApiUrl("http://$host:12004", allowLocalHttp = true))
+        }
+        assertNull(Pairing.normaliseApiUrl("http://10.0.0.256:12004", allowLocalHttp = true))
+        assertEquals("http://172.20.1.9:12004", Pairing.normaliseApiUrl("http://172.20.1.9:12004", allowLocalHttp = true))
+        assertEquals("http://127.0.0.1:12004", Pairing.normaliseApiUrl("http://127.0.0.1:12004", allowLocalHttp = true))
+        assertEquals("http://localhost:12004", Pairing.normaliseApiUrl("http://localhost:12004", allowLocalHttp = true))
+    }
+
+    @Test
     fun a_yes_to_full_requests_covers_only_the_pairing_it_was_given_for() {
         val mine = Pairing("https://crossfyre.io", "wf-mine", "cfxt_1")
         val given = FullCapturePrefs.keyOf(mine)

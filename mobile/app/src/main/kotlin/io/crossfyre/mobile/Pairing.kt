@@ -108,12 +108,24 @@ data class Pairing(val apiUrl: String, val workflowId: String, val token: String
             }
         }
 
-        private fun isLocalHost(host: String): Boolean =
-            host == "localhost" ||
-                host == "127.0.0.1" ||
-                host.startsWith("10.") ||
-                host.startsWith("192.168.") ||
-                Regex("^172\\.(1[6-9]|2[0-9]|3[01])\\.").containsMatchIn(host)
+        /**
+         * Loopback or a private IPv4 address, read as four numbers. A prefix
+         * test on the text also matched names such as `10.example.com`, which
+         * point wherever their owner likes.
+         */
+        private fun isLocalHost(host: String): Boolean {
+            if (host == "localhost") return true
+            val parts = host.split('.')
+            if (parts.size != 4) return false
+            val o = parts.map { p ->
+                if (p.isEmpty() || p.length > 3 || !p.all { it in '0'..'9' }) return false
+                p.toInt().takeIf { it <= 255 } ?: return false
+            }
+            return o == listOf(127, 0, 0, 1) ||
+                o[0] == 10 ||
+                (o[0] == 192 && o[1] == 168) ||
+                (o[0] == 172 && o[1] in 16..31)
+        }
 
         /** Host shown to the user in the pairing confirmation. */
         fun hostOf(apiUrl: String): String =
