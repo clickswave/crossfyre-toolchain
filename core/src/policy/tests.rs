@@ -158,10 +158,32 @@ async fn unreachable_a_tightening_holds_here_and_a_loosening_changes_nothing() {
 
     // The next contact sends the tightening, then reads the account's back.
     let up = Fake::answering(Policy::Connected);
-    let m = command::refresh(dir.path(), &session(), &up).await.unwrap();
+    let m = command::refresh(dir.path(), &session(), &up, None)
+        .await
+        .unwrap();
     assert_eq!(up.calls(), ["set private", "fetch"]);
     assert_eq!((m.account, m.unsent), (Some(Policy::Private), false));
     assert_eq!(load(dir.path()), m);
+}
+
+/// CROSSFYRE_POLICY=offline makes the run offline, and an offline run makes no
+/// contact, as one on a machine taken offline does not. A looser value changes nothing.
+#[tokio::test]
+async fn a_run_made_offline_by_the_variable_makes_no_contact() {
+    let dir = tempfile::tempdir().unwrap();
+    let cloud = Fake::answering(Policy::Private);
+    let m = command::refresh(dir.path(), &session(), &cloud, Some("offline"))
+        .await
+        .unwrap();
+    assert!(cloud.calls().is_empty(), "{:?}", cloud.calls());
+    assert_eq!(m, Machine::default());
+    assert_eq!(load(dir.path()), Machine::default());
+
+    let m = command::refresh(dir.path(), &session(), &cloud, Some("private"))
+        .await
+        .unwrap();
+    assert_eq!(cloud.calls(), ["fetch"]);
+    assert_eq!(m.account, Some(Policy::Private));
 }
 
 #[tokio::test]
@@ -234,7 +256,7 @@ async fn offline_is_recorded_with_why_and_a_node_here_stops_only_when_told() {
     assert!(command::why(&m, true).starts_with("offline since "));
 
     // Offline, a contact asks Crossfyre nothing.
-    let m = command::refresh(dir.path(), &session(), &cloud)
+    let m = command::refresh(dir.path(), &session(), &cloud, None)
         .await
         .unwrap();
     assert!(cloud.calls().is_empty());
@@ -293,7 +315,7 @@ async fn a_session_crossfyre_does_not_take_puts_the_machine_offline() {
     let m = load(dir.path());
     assert_eq!(m.account, None);
     assert_eq!(m.offline.map(|o| o.reason), Some(Reason::SessionEnded));
-    command::refresh(dir.path(), &session(), &cloud)
+    command::refresh(dir.path(), &session(), &cloud, None)
         .await
         .unwrap();
     assert_eq!(cloud.calls(), ["set private"]);
@@ -306,7 +328,7 @@ async fn a_revoked_session_is_noticed_at_the_next_contact() {
     logged_in(dir.path(), "u1");
     let cloud = Fake::failing(Failed::NotLoggedIn("The key is invalid or revoked.".into()));
     assert!(matches!(
-        command::refresh(dir.path(), &session(), &cloud).await,
+        command::refresh(dir.path(), &session(), &cloud, None).await,
         Err(Failed::NotLoggedIn(_))
     ));
     assert_eq!(
