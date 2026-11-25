@@ -107,7 +107,15 @@ pub async fn send(req: RawReq<'_>) -> Option<RawResp> {
 /// URL a check admitted can still open a connection somewhere else. The authority
 /// ends where the url crate ends it, at the first '/', '?', '#' or '\\', and a URL
 /// whose host or port the two readings disagree on is not sent.
+///
+/// Nor is a URL with an ASCII control character anywhere in it. The url crate
+/// drops tab, CR and LF wherever they are before it reads the host, so such a URL
+/// passes the check above, while the request-target is cut from the text as
+/// written and would carry a CR LF into the request line.
 fn split(url: &str) -> Option<(bool, String, u16, String)> {
+    if url.bytes().any(|b| b.is_ascii_control()) {
+        return None;
+    }
     let (https, rest) = if let Some(r) = url.strip_prefix("https://") {
         (true, r)
     } else if let Some(r) = url.strip_prefix("http://") {
@@ -813,6 +821,24 @@ mod tests {
         assert_eq!(port, 80);
         // the traversal is untouched (url::Url would have flattened it)
         assert_eq!(target, "/cgi-bin/.%2e/.%2e/etc/passwd");
+    }
+
+    #[test]
+    fn a_control_character_is_never_written_into_the_request() {
+        // The url crate drops tab, CR and LF from anywhere in a URL before it reads
+        // the host, while the request-target is cut from the text as written. A URL
+        // carrying them passed the host check and put a new header line, or a second
+        // request, into what was sent.
+        for url in [
+            "http://h.test/a\r\nX-Injected: 1",
+            "http://h.test/a HTTP/1.1\r\nHost: other.test\r\n\r\nGET /b",
+            "http://h.test/a\nb",
+            "http://h.test/a\tb",
+            "http://h.test/a\x00b",
+            "http://h.test/a\x7fb",
+        ] {
+            assert_eq!(split(url), None, "{url:?}");
+        }
     }
 
     #[test]
