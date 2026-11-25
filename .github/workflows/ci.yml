@@ -540,6 +540,73 @@ jobs:
             cargo test --locked --no-fail-fast -p "$p" --features impersonate
           done
 
+  android:
+    name: Android app
+    runs-on: ubuntu-26.04
+    # The app's unit tests, and its native core built for the two ABIs it ships.
+    # The host jobs above compile mobile/rust for Linux and macOS only, and before
+    # this job nothing in CI ran the Kotlin tests at all.
+    #
+    # Neither step needs a secret. Without keystore.properties the app builds
+    # unsigned, and without firebase.properties it builds with no push, which is
+    # how a contributor's checkout builds too. The unit tests run on the JVM and
+    # never load the native library, so the two steps are independent.
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Gradle fails on a newer JDK with nothing but its version as the message.
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      # :app:test is every variant, three environments by two builds by debug and
+      # release, and their Kotlin compiles share one compiler daemon, as many at
+      # once as Gradle has workers. At the 2 GB it inherits from gradle.properties,
+      # a clean build runs it out of memory. Four workers at 3 GB is a clean build
+      # that passes, and matches the runner's four cores.
+      - name: Unit tests
+        working-directory: mobile
+        run: >-
+          ./gradlew :app:test --no-daemon --console=plain --max-workers=4
+          -Pkotlin.daemon.jvmargs=-Xmx3g
+
+      - name: Install Rust with the Android targets
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --no-self-update \
+            --target aarch64-linux-android,x86_64-linux-android
+          rustup default 1.88.0
+          rustc --version && cargo --version
+
+      - name: Name the image for the cache key
+        id: env
+        run: echo "image=$ImageOS" >> "$GITHUB_OUTPUT"
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: android-${{ steps.env.outputs.image }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: android-${{ steps.env.outputs.image }}-
+
+      # The NDK the release builds with, which is not the image's default. The
+      # runner image carries the SDK manager to install it.
+      - name: Install cargo-ndk and NDK 27.2
+        run: |
+          set -eu
+          cargo install --locked cargo-ndk@4.1.2
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;27.2.12479018" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Cross-compile the native core (arm64-v8a, x86_64)
+        working-directory: mobile/rust
+        run: cargo ndk -t arm64-v8a -t x86_64 build --locked
+
   audit:
     name: dependency advisories
     runs-on: ubuntu-26.04
