@@ -123,7 +123,7 @@ object Patcher {
         }
 
         // 2. Straight to storage, not through the control plane.
-        val put = (URL(uploadUrl).openConnection() as HttpURLConnection).apply {
+        val put = (storageUrl(uploadUrl).openConnection() as HttpURLConnection).apply {
             requestMethod = "PUT"
             doOutput = true
             connectTimeout = 30_000
@@ -167,7 +167,7 @@ object Patcher {
         // 4. Wait for the worker. Polling rather than a held connection is the
         //    point: the phone can lose signal here and pick the answer back up.
         progress(Step(PatchStep.SERVER))
-        var downloadUrl = ""
+        var downloadUrl: URL? = null
         var expectedSha = ""
         var anyCert = false
         val deadline = System.currentTimeMillis() + PATCH_WAIT_MS
@@ -182,8 +182,8 @@ object Patcher {
             ).optJSONObject("data") ?: JSONObject()
             when (st.optString("status")) {
                 "done" -> {
-                    downloadUrl = st.optString("download_url", "")
-                    expectedSha = st.optString("sha256", "")
+                    downloadUrl = storageUrl(st.optString("download_url", ""))
+                    expectedSha = checksum(st.optString("sha256", ""))
                     anyCert = acceptsAnyCert(st)
                     break
                 }
@@ -193,10 +193,10 @@ object Patcher {
                 )
             }
         }
-        if (downloadUrl.isEmpty()) throw IllegalStateException("The patch took too long, so it was abandoned.")
+        if (downloadUrl == null) throw IllegalStateException("The patch took too long, so it was abandoned.")
 
         // 5. Fetch from storage, hashing as it lands.
-        val get = (URL(downloadUrl).openConnection() as HttpURLConnection).apply {
+        val get = (downloadUrl.openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
             connectTimeout = 30_000
             readTimeout = 600_000
@@ -229,12 +229,10 @@ object Patcher {
         }
         // The bytes came from storage rather than from the service that made
         // them, so check they are the ones it said it produced before unpacking
-        // anything. Skipped only when the server published no hash to check.
-        if (expectedSha.isNotBlank()) {
-            val got = digest.digest().joinToString("") { "%02x".format(it) }
-            if (!got.equals(expectedSha, ignoreCase = true)) {
-                throw IllegalStateException("The downloaded app did not match its checksum, so it was not installed.")
-            }
+        // anything.
+        val got = digest.digest().joinToString("") { "%02x".format(it) }
+        if (got != expectedSha) {
+            throw IllegalStateException("The downloaded app did not match its checksum, so it was not installed.")
         }
 
         progress(Step(PatchStep.DOWNLOAD, 100f))
@@ -349,6 +347,32 @@ object Patcher {
             zos.write(caPem.toByteArray(Charsets.UTF_8))
             zos.closeEntry()
         }
+    }
+
+    /**
+     * An upload or download address from the patch service, which must be https.
+     * The app's own packages go up to one and an app to install comes down from
+     * the other, and neither may cross the network in the clear.
+     */
+    internal fun storageUrl(raw: String): URL {
+        val url = runCatching { java.net.URI(raw).toURL() }.getOrNull()
+        if (url == null || !url.protocol.equals("https", ignoreCase = true) || url.host.isNullOrEmpty()) {
+            throw IllegalStateException("The patch service gave a storage address that is not https, so nothing was sent.")
+        }
+        return url
+    }
+
+    /**
+     * The SHA-256 a finished job published for its build, as 64 hex digits. The
+     * bytes come from storage rather than from the service that built them, so
+     * a job that names no checksum leaves nothing to check them against, and
+     * nothing is downloaded.
+     */
+    internal fun checksum(raw: String): String {
+        if (raw.length != 64 || !raw.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) {
+            throw IllegalStateException("The patch service did not give a checksum for the patched app, so it was not downloaded.")
+        }
+        return raw.lowercase()
     }
 
     /** How long to wait for a rebuild before giving up, and how often to ask. */
