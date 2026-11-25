@@ -1149,7 +1149,7 @@ async fn run_browser_tier(
         return;
     };
     let (browser, mut cdp) =
-        match cfx_browser::Browser::launch(&exe, cfx_browser::no_sandbox()).await {
+        match cfx_browser::Browser::launch(&exe, cfx_browser::no_sandbox(), &[]).await {
             Ok(b) => b,
             Err(e) => {
                 let _ = tx.send(CrawlEvent::note(format!(
