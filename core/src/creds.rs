@@ -536,8 +536,17 @@ async fn login_flow(
         }
     }
 
-    // Captured cookies for the login host.
-    let cookies = jar_cookie_header(&jar, &final_url);
+    // Captured cookies for the login host: where the login ended when that is still
+    // the login host, and the login URL itself when a redirect took it elsewhere. The
+    // other host's cookies are not this credential's session, and they would go to the
+    // target with every request.
+    let login = reqwest::Url::parse(login_url).map_err(|e| format!("login_url: {e}"))?;
+    let cookie_url = if keeps_origin(&login, &final_url) {
+        &final_url
+    } else {
+        &login
+    };
+    let cookies = jar_cookie_header(&jar, cookie_url);
 
     let ctx = AuthContext {
         headers,
@@ -988,6 +997,28 @@ mod redirect_tests {
         assert_eq!(seen.len(), 1, "the 303 was not followed");
         assert!(seen[0].starts_with("GET /home "), "{}", seen[0]);
         assert!(!seen[0].contains("saved-password"), "{}", seen[0]);
+    }
+
+    /// The session is the login host's. A login that ends on another host, as one sent
+    /// on to a landing page elsewhere does, keeps the cookies the login host set and
+    /// takes none from the other host.
+    #[tokio::test]
+    async fn a_login_keeps_the_login_host_s_cookies_after_a_redirect_away() {
+        let (b, b_seen) = listener("127.0.0.2", |_| {
+            "HTTP/1.1 200 OK\r\nSet-Cookie: elsewhere=from-other-host; Path=/\r\n\
+             Content-Length: 2\r\nConnection: close\r\n\r\nok"
+                .to_string()
+        });
+        let to = format!("http://127.0.0.2:{b}/home");
+        let (a, _) = listener("127.0.0.1", move |_| redirect("302 Found", &to));
+        let c = cred(
+            "login_flow",
+            json!({"login_url": format!("http://127.0.0.1:{a}/login")}),
+            json!({"username": "alice", "password": "saved-password"}),
+        );
+        let ctx = login_flow(&c, None).await.unwrap();
+        assert_eq!(b_seen.lock().unwrap().len(), 1, "the 302 was not followed");
+        assert_eq!(ctx.cookies.as_deref(), Some("sid=on-login-host"));
     }
 
     #[tokio::test]
