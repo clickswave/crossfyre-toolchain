@@ -40,7 +40,7 @@ serde_json = "1"
 # the HTTP/2 preface, and the hashes JA4 is made of. All four are already in the
 # lock through other crates.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rcgen = "0.13"
+rcgen = "0.14"
 sha2 = "0.10"
 brotli = "8"
 

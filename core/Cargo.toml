@@ -80,7 +80,7 @@ wat = "1"
 # A recording SOCKS5 proxy and counting listeners, for the gateway's tests.
 cfx_tunnel = { path = "../tunnel", features = ["recorder"] }
 # A certificate for the TLS origin the gateway's tests send to.
-rcgen = "0.13"
+rcgen = "0.14"
 # The shape of the release client's User-Agent.
 regex = "1"
 # Time that stands still until a test's tasks wait, for the node's start retries.

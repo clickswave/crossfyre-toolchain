@@ -10,7 +10,7 @@ description = "Shared traffic-capture core (session CA, per-SNI MITM leaves, egr
 cfx_scope = { path = "../scope" }
 rustls = { version = "0.23", features = ["aws_lc_rs"] }
 tokio-rustls = "0.26"
-rcgen = "0.13"
+rcgen = "0.14"
 # `time` for the upstream proxy's handshake deadline: a proxy that accepts the connection
 # and never answers the CONNECT would otherwise hold the flow open for as long as the
 # window is.
