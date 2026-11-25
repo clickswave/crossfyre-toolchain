@@ -263,6 +263,12 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             print_all(&script)?;
             Ok(())
         }
+        Some(Commands::Man) => {
+            let mut page = Vec::new();
+            clap_mangen::Man::new(Cli::command()).render(&mut page)?;
+            print_all(&page)?;
+            Ok(())
+        }
         Some(Commands::Daemon) | None => {
             eprintln!(
                 "No command given. Use `plessor scan <target>`, `plessor inject <url>...`, `plessor exec <json>`, or `plessor daemon`."

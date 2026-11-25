@@ -77,6 +77,10 @@ pub enum Commands {
         /// The shell to generate completions for
         shell: clap_complete::Shell,
     },
+    /// Print the plessor man page (roff) to stdout, for example:
+    ///   plessor man > plessor.1
+    #[command(hide = true)]
+    Man,
 }
 
 #[derive(Parser, Clone)]

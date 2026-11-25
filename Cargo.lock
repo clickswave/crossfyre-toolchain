@@ -3593,6 +3593,7 @@ dependencies = [
  "cfx_tunnel",
  "clap",
  "clap_complete",
+ "clap_mangen",
  "dguard",
  "rand 0.8.7",
  "ratatui",
