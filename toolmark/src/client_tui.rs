@@ -1,25 +1,25 @@
 //! Toolmark's dashboard.
 //!
-//! Chrome, keys and logs come from `cfx_tui`. What stays here is the part that
-//! is about fingerprinting: sorting findings into technology, service and
-//! vulnerability, and showing them as they arrive.
+//! The screen, the keys and the logs come from `cfx_tui`. What stays here is
+//! the part that is about fingerprinting: sorting findings into technology,
+//! service and vulnerability, and listing them as they arrive.
 //!
 //! Toolmark examines one target rather than working through a list, so there is
-//! no total to count against and no gauge. The header shows a running count
+//! no total to count against and no bar to fill. It reports a running count
 //! instead, which is honest about not knowing how much is left.
 
-use cfx_tui::{Dashboard, Level, Logs, Stat, View, widgets};
-use ratatui::{
-    Frame,
-    layout::{Constraint, Direction, Layout, Rect},
-    style::Style,
-    widgets::{Block, Borders, Cell, Row, Table, TableState},
-};
+use cfx_tui::{Cell, Column, Dashboard, Level, Logs, Progress, Stat, View};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
 const FINDINGS: char = 'f';
 const VIEWS: &[View] = &[View::new(FINDINGS, "Findings")];
+const COLUMNS: &[Column] = &[
+    Column::new("Severity", 10),
+    Column::new("Type", 14),
+    Column::new("Name", 40),
+    Column::rest("Detail"),
+];
 
 struct Finding {
     severity: String,
@@ -34,7 +34,6 @@ struct Toolmark {
     services: usize,
     vulnerabilities: usize,
     findings: Vec<Finding>,
-    table: TableState,
     logs: Logs,
     done: bool,
 }
@@ -47,7 +46,6 @@ impl Toolmark {
             services: 0,
             vulnerabilities: 0,
             findings: Vec::new(),
-            table: TableState::default(),
             logs: Logs::new(),
             done: false,
         }
@@ -102,8 +100,6 @@ impl Toolmark {
                     name,
                     detail,
                 });
-                self.table
-                    .select(Some(self.findings.len().saturating_sub(1)));
             }
             "error" => {
                 self.done = true;
@@ -122,67 +118,6 @@ impl Toolmark {
             _ => {}
         }
     }
-
-    fn render_findings(&mut self, frame: &mut Frame, area: Rect) {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(widgets::GAUGE_HEIGHT),
-                Constraint::Length(widgets::STATS_HEIGHT),
-                Constraint::Min(0),
-            ])
-            .split(area);
-
-        widgets::progress_open(frame, rows[0], self.findings.len(), "Progress", "findings");
-        widgets::stats(
-            frame,
-            rows[1],
-            &[
-                Stat::new("Technologies", self.technologies),
-                Stat::new("Services", self.services),
-                Stat::bad("Vulnerabilities", self.vulnerabilities),
-            ],
-        );
-
-        let header = Row::new(
-            ["Severity", "Type", "Name", "Detail"]
-                .iter()
-                .map(|h| Cell::from(*h).style(cfx_tui::theme::title())),
-        )
-        .height(1);
-
-        let body: Vec<Row> = self
-            .findings
-            .iter()
-            .map(|f| {
-                Row::new(vec![
-                    Cell::from(f.severity.clone())
-                        .style(Style::default().fg(severity_colour(&f.severity))),
-                    Cell::from(f.kind.clone()).style(cfx_tui::theme::label()),
-                    Cell::from(f.name.clone()),
-                    Cell::from(f.detail.clone()).style(cfx_tui::theme::label()),
-                ])
-            })
-            .collect();
-
-        frame.render_stateful_widget(
-            Table::new(body, widgets::table_constraints(&[10, 14, 40]))
-                .header(header)
-                .block(Block::default().borders(Borders::ALL).title("Findings"))
-                .row_highlight_style(cfx_tui::theme::selected()),
-            rows[2],
-            &mut self.table,
-        );
-    }
-}
-
-fn severity_colour(severity: &str) -> ratatui::style::Color {
-    match severity {
-        "critical" | "high" => cfx_tui::theme::BAD,
-        "medium" => cfx_tui::theme::WARN,
-        "low" => cfx_tui::theme::TEXT,
-        _ => cfx_tui::theme::MUTED,
-    }
 }
 
 impl Dashboard for Toolmark {
@@ -190,7 +125,7 @@ impl Dashboard for Toolmark {
         "TOOLMARK"
     }
 
-    fn subtitle(&self) -> &str {
+    fn target(&self) -> &str {
         &self.target
     }
 
@@ -202,10 +137,37 @@ impl Dashboard for Toolmark {
         VIEWS
     }
 
-    fn render(&mut self, key: char, frame: &mut Frame, area: Rect) {
-        if key == FINDINGS {
-            self.render_findings(frame, area);
+    fn progress(&self) -> Progress {
+        Progress::Open {
+            done: self.findings.len(),
+            unit: "findings",
         }
+    }
+
+    fn stats(&self) -> Vec<Stat> {
+        vec![
+            Stat::count("Technologies", self.technologies),
+            Stat::count("Services", self.services),
+            Stat::count("Vulnerabilities", self.vulnerabilities).bad(),
+        ]
+    }
+
+    fn columns(&self, _view: char) -> &'static [Column] {
+        COLUMNS
+    }
+
+    fn len(&self, _view: char) -> usize {
+        self.findings.len()
+    }
+
+    fn row(&self, _view: char, index: usize) -> Vec<Cell> {
+        let finding = &self.findings[index];
+        vec![
+            Cell::severity(&finding.severity),
+            Cell::muted(&finding.kind),
+            Cell::plain(&finding.name),
+            Cell::muted(&finding.detail),
+        ]
     }
 
     fn logs(&mut self) -> &mut Logs {
@@ -220,9 +182,12 @@ pub async fn run(rx: mpsc::UnboundedReceiver<Value>, target: String) -> std::io:
         let mut app = Toolmark::new(target);
         let mut rx = rx;
         cfx_tui::run(&mut app, 50, |app| {
+            let mut came = false;
             while let Ok(event) = rx.try_recv() {
                 app.apply(event);
+                came = true;
             }
+            came
         })
     })
     .await

@@ -1,116 +1,77 @@
-//! The pieces every tool draws.
+//! What a tool reports besides its rows: its counters and its log.
 //!
-//! Each one is a plain function taking data, not engine types, so this crate
-//! stays a rendering layer and never becomes a route for internals to travel.
+//! Each is plain data, not an engine type, so this crate stays a rendering
+//! layer and never becomes a route for internals to travel.
 
-use crate::theme;
-use ratatui::{
-    Frame,
-    layout::{Constraint, Rect},
-    style::Style,
-    text::{Line, Span},
-    widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph},
-};
+use crate::sheet::{Cell, Column};
+use crate::theme::Tone;
 
-/// A counter on the stats row: "Found 142".
+/// A counter in the run panel: "found 142".
 pub struct Stat {
     pub label: &'static str,
     pub value: String,
-    pub style: Style,
+    pub tone: Tone,
+    /// A count of nothing. A bad counter at zero is not bad, and is not drawn
+    /// as though it were.
+    zero: bool,
 }
 
 impl Stat {
-    pub fn new(label: &'static str, value: impl ToString) -> Self {
+    /// A count, with its thousands grouped.
+    pub fn count(label: &'static str, count: usize) -> Self {
         Self {
             label,
-            value: value.to_string(),
-            style: theme::value(),
+            value: grouped(count),
+            tone: Tone::Plain,
+            zero: count == 0,
         }
     }
 
-    pub fn good(label: &'static str, value: impl ToString) -> Self {
+    /// A value that is not a single count: "2 of 5".
+    pub fn text(label: &'static str, value: impl Into<String>) -> Self {
         Self {
             label,
-            value: value.to_string(),
-            style: theme::good(),
+            value: value.into(),
+            tone: Tone::Plain,
+            zero: false,
         }
     }
 
-    pub fn bad(label: &'static str, value: impl ToString) -> Self {
-        Self {
-            label,
-            value: value.to_string(),
-            style: theme::bad(),
+    pub fn good(mut self) -> Self {
+        self.tone = Tone::Good;
+        self
+    }
+
+    /// Bad once there is at least one.
+    pub fn bad(mut self) -> Self {
+        if !self.zero {
+            self.tone = Tone::Bad;
         }
+        self
     }
 }
 
-/// Height the stats row needs, so callers can size their layout without
-/// hard-coding a number that drifts when the border style changes.
-pub const STATS_HEIGHT: u16 = 3;
-/// Height the progress gauge needs.
-pub const GAUGE_HEIGHT: u16 = 3;
-
-pub fn stats(frame: &mut Frame, area: Rect, items: &[Stat]) {
-    let mut spans = vec![Span::raw("  ")];
-    for (i, s) in items.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw("   "));
+/// `12000` as `12,000`.
+pub fn grouped(count: usize) -> String {
+    let digits = count.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
         }
-        spans.push(Span::styled(format!("{}: ", s.label), theme::label()));
-        spans.push(Span::styled(s.value.clone(), s.style));
+        out.push(digit);
     }
-    frame.render_widget(
-        Paragraph::new(Line::from(spans))
-            .block(Block::default().borders(Borders::ALL).title("Stats")),
-        area,
-    );
+    out
 }
 
-/// Progress gauge. `total` of zero renders an empty bar rather than dividing
-/// by it, which happens whenever a run starts before its work is counted.
-pub fn progress(frame: &mut Frame, area: Rect, done: usize, total: usize, title: &str) {
-    let ratio = if total > 0 {
-        (done as f64 / total as f64).min(1.0)
-    } else {
-        0.0
-    };
-    frame.render_widget(
-        Gauge::default()
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(title.to_string()),
-            )
-            .gauge_style(Style::default().fg(theme::ACCENT))
-            .ratio(ratio)
-            .label(format!("{done} / {total}")),
-        area,
-    );
-}
-
-/// Progress for a run with no known total, where a gauge would be a lie.
-pub fn progress_open(frame: &mut Frame, area: Rect, done: usize, title: &str, unit: &str) {
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(done.to_string(), theme::title()),
-            Span::raw(" "),
-            Span::styled(unit.to_string(), theme::label()),
-        ]))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(title.to_string()),
-        ),
-        area,
-    );
-}
-
-pub fn table_constraints(widths: &[u16]) -> Vec<Constraint> {
-    let mut c: Vec<Constraint> = widths.iter().map(|w| Constraint::Length(*w)).collect();
-    c.push(Constraint::Min(0));
-    c
+/// How far a run is.
+pub enum Progress {
+    /// Work counted out before it began: `done` of `total`.
+    Counted { done: usize, total: usize },
+    /// Work with no known total, where a bar filling up would be a lie.
+    Open { done: usize, unit: &'static str },
+    /// Not a run at all: a server that waits.
+    None,
 }
 
 // ---------------------------------------------------------------------------
@@ -143,31 +104,32 @@ impl Level {
         }
     }
 
-    fn tag(self) -> (&'static str, ratatui::style::Color) {
-        match self {
-            Level::Error => ("ERR", theme::BAD),
-            Level::Warn => ("WRN", theme::WARN),
-            Level::Debug => ("DBG", theme::MUTED),
-            Level::Info => ("INF", theme::ACCENT),
-        }
+    fn cell(self) -> Cell {
+        let (word, tone) = match self {
+            Level::Error => ("error", Tone::Bad),
+            Level::Warn => ("warn", Tone::Warn),
+            Level::Debug => ("debug", Tone::Muted),
+            Level::Info => ("info", Tone::Muted),
+        };
+        Cell::toned(word, tone)
     }
 }
 
-/// Scrollback shared by every tool, with the selection pinned to the newest
-/// line so a long run reads like a tail rather than freezing at the top.
+/// Scrollback shared by every tool.
 #[derive(Default)]
 pub struct Logs {
     entries: Vec<LogEntry>,
-    state: ListState,
     /// Keeps memory flat on runs that log heavily. Zero means unbounded.
     cap: usize,
 }
 
 impl Logs {
+    pub(crate) const COLUMNS: &'static [Column] =
+        &[Column::new("Level", 6), Column::rest("Message")];
+
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
-            state: ListState::default(),
             cap: 5_000,
         }
     }
@@ -181,8 +143,6 @@ impl Logs {
             let drop = self.entries.len() - self.cap;
             self.entries.drain(0..drop);
         }
-        self.state
-            .select(Some(self.entries.len().saturating_sub(1)));
     }
 
     pub fn info(&mut self, message: impl Into<String>) {
@@ -197,25 +157,43 @@ impl Logs {
         self.entries.is_empty()
     }
 
-    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
-        let items: Vec<ListItem> = self
-            .entries
-            .iter()
-            .map(|e| {
-                let (tag, colour) = e.level.tag();
-                ListItem::new(Line::from(vec![
-                    Span::styled(format!("[{tag}] "), Style::default().fg(colour)),
-                    Span::raw(e.message.clone()),
-                ]))
-            })
-            .collect();
+    /// One line, as a row under [`Logs::COLUMNS`].
+    pub(crate) fn row(&self, index: usize) -> Vec<Cell> {
+        let entry = &self.entries[index];
+        vec![entry.level.cell(), Cell::plain(entry.message.clone())]
+    }
+}
 
-        frame.render_stateful_widget(
-            List::new(items)
-                .block(Block::default().borders(Borders::ALL).title("Logs"))
-                .highlight_style(theme::selected()),
-            area,
-            &mut self.state,
-        );
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counts_have_their_thousands_grouped() {
+        for (count, shown) in [
+            (0, "0"),
+            (999, "999"),
+            (1_000, "1,000"),
+            (12_000, "12,000"),
+            (1_234_567, "1,234,567"),
+        ] {
+            assert_eq!(grouped(count), shown);
+        }
+    }
+
+    #[test]
+    fn a_bad_counter_is_bad_only_above_zero() {
+        assert_eq!(Stat::count("Errors", 0).bad().tone, Tone::Plain);
+        assert_eq!(Stat::count("Errors", 3).bad().tone, Tone::Bad);
+    }
+
+    #[test]
+    fn the_log_drops_its_oldest_lines_past_the_cap() {
+        let mut logs = Logs::new();
+        for i in 0..5_010 {
+            logs.info(format!("line {i}"));
+        }
+        assert_eq!(logs.len(), 5_000);
+        assert_eq!(logs.row(0)[1].text, "line 10");
     }
 }

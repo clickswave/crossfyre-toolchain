@@ -88,6 +88,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             stream_enum(
                 &daemon,
                 &request,
+                scan["target"].as_str().unwrap_or_default(),
                 None,
                 tui,
                 EVENT_POLL_TIMEOUT_MS,
@@ -239,6 +240,7 @@ async fn scan_domain(
     stream_enum(
         daemon,
         &request,
+        domain,
         wordlist,
         tui,
         enum_args.event_poll_timeout,
@@ -249,11 +251,13 @@ async fn scan_domain(
 
 /// Send `request` to the daemon, with the words of the file at `wordlist` after it when
 /// there is one, and show the enumeration it starts: drawn on the dashboard when `tui`,
-/// polling for events every `poll_timeout` ms, and otherwise written out as the daemon's
-/// own newline-delimited JSON, with no log line below level `least`.
+/// under `target`'s name, polling for events every `poll_timeout` ms, and otherwise
+/// written out as the daemon's own newline-delimited JSON, with no log line below level
+/// `least`.
 async fn stream_enum(
     daemon: &dguard::Daemon,
     request: &serde_json::Value,
+    target: &str,
     wordlist: Option<&std::path::Path>,
     tui: bool,
     poll_timeout: u64,
@@ -312,7 +316,7 @@ async fn stream_enum(
         });
 
         // Blocks until the user quits or the run completes.
-        client_tui::run(rx, operation_id, total, poll_timeout).await?;
+        client_tui::run(rx, target.to_string(), operation_id, total, poll_timeout).await?;
         return Ok(());
     }
 

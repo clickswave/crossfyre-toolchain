@@ -110,7 +110,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "ambulo"
-version = "0.0.25"
+version = "0.0.26"
 dependencies = [
  "adaptive",
  "base64 0.22.1",
@@ -121,11 +121,10 @@ dependencies = [
  "cfx_tunnel",
  "clap",
  "clap_complete",
- "crossterm",
+ "clap_mangen",
  "dguard",
  "dialoguer 0.11.0",
  "libc",
- "ratatui",
  "regex",
  "reqwest 0.12.28",
  "serde",
@@ -679,7 +678,7 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
 name = "cfx-script"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "cfx_core",
  "dguard",
@@ -924,6 +923,8 @@ dependencies = [
  "crossterm",
  "ratatui",
  "serde_json",
+ "terminal-colorsaurus",
+ "unicode-width",
 ]
 
 [[package]]
@@ -1311,7 +1312,7 @@ checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 
 [[package]]
 name = "crossfyre"
-version = "0.1.45"
+version = "0.1.46"
 dependencies = [
  "cfx_bridge",
  "cfx_core",
@@ -1334,6 +1335,7 @@ version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b9f2e4c67f833b660cdb0a3523065869fb35570177239812ed4c905aeff87b"
 dependencies = [
+ "base64 0.22.1",
  "bitflags 2.13.1",
  "crossterm_winapi",
  "derive_more",
@@ -1625,7 +1627,7 @@ dependencies = [
 
 [[package]]
 name = "doorward"
-version = "0.0.18"
+version = "0.0.19"
 dependencies = [
  "adaptive",
  "cfx_db",
@@ -1634,8 +1636,8 @@ dependencies = [
  "cfx_tunnel",
  "clap",
  "clap_complete",
+ "clap_mangen",
  "dguard",
- "ratatui",
  "serde",
  "serde_json",
  "sqlx",
@@ -3108,7 +3110,7 @@ dependencies = [
 
 [[package]]
 name = "node"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "cfx_core",
  "cfx_pacing",
@@ -3234,7 +3236,6 @@ dependencies = [
  "base64 0.22.1",
  "cfx_tui",
  "rand 0.8.7",
- "ratatui",
  "rsa",
  "rustls",
  "rustls-pemfile",
@@ -3575,7 +3576,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "plessor"
-version = "0.0.35"
+version = "0.0.36"
 dependencies = [
  "adaptive",
  "aes-gcm",
@@ -3591,9 +3592,9 @@ dependencies = [
  "cfx_tunnel",
  "clap",
  "clap_complete",
+ "clap_mangen",
  "dguard",
  "rand 0.8.7",
- "ratatui",
  "rcgen",
  "regex",
  "reqwest 0.12.28",
@@ -5181,6 +5182,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "terminal-colorsaurus"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a46bb5364467da040298c573c8a95dbf9a512efc039630409a03126e3703e90"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "memchr",
+ "mio",
+ "terminal-trx",
+ "windows-sys 0.61.2",
+ "xterm-color",
+]
+
+[[package]]
+name = "terminal-trx"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b3f27d9a8a177e57545481faec87acb45c6e854ed1e5a3658ad186c106f38ed"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "terminfo"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5539,7 +5566,7 @@ checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
 name = "toolmark"
-version = "0.0.17"
+version = "0.0.18"
 dependencies = [
  "adaptive",
  "base64 0.22.1",
@@ -5553,10 +5580,10 @@ dependencies = [
  "cfx_tunnel",
  "clap",
  "clap_complete",
+ "clap_mangen",
  "dguard",
  "flate2",
  "md5",
- "ratatui",
  "rcgen",
  "regex",
  "rustls",
@@ -5896,7 +5923,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voyage"
-version = "0.0.18"
+version = "0.0.19"
 dependencies = [
  "adaptive",
  "cfx_db",
@@ -5912,7 +5939,6 @@ dependencies = [
  "hickory-proto",
  "hickory-resolver",
  "ipnet",
- "ratatui",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -6760,6 +6786,12 @@ dependencies = [
  "spki",
  "tls_codec",
 ]
+
+[[package]]
+name = "xterm-color"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7008a9d8ba97a7e47d9b2df63fcdb8dade303010c5a7cd5bf2469d4da6eba673"
 
 [[package]]
 name = "yasna"

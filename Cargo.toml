@@ -29,9 +29,9 @@ publish = false
 # Android-only at compile time. Verified against exactly what CI runs (check,
 # build --all-targets, test, fmt --check, clippy -D warnings), all green.
 #
-# So CI proves the crate compiles and lints, but NOT that it cross-compiles for
-# Android. That gap is real and is covered by the release's reproducible-build
-# check instead, which does a genuine `cargo ndk` build.
+# So the host jobs prove the crate compiles and lints, but not that it
+# cross-compiles for Android. The android job in ci.yml covers that with a real
+# `cargo ndk` build for arm64-v8a and x86_64, the two ABIs the app ships.
 # If a future change makes this host-hostile, exclude it from the build job
 # rather than dropping it from the workspace: the `cfx_capture` path dependency
 # resolves because it is a member.

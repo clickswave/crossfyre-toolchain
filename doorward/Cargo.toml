@@ -1,6 +1,6 @@
 [package]
 name = "doorward"
-version = "0.0.18"
+version = "0.0.19"
 edition = "2024"
 license.workspace = true
 publish.workspace = true
@@ -29,13 +29,13 @@ cfx_tunnel = { path = "../tunnel" }
 tokio = { version = "1.47.1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "time"] }
 clap = { version = "4.5.42", features = ["derive"] }
 clap_complete = "4.6.9"
+clap_mangen = "0.3.3"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { version = "1.0.142", features = [] }
 # Its runtime and TLS come with cfx_db, which makes every connection.
 sqlx = { version = "0.8.6", features = ["postgres"] }
 uuid = { version = "1.18.0", features = ["v4"] }
 cfx_tui = { path = "../tui" }
-ratatui = { version = "0.30.0-alpha.5", features = ["crossterm"] }
 
 [dev-dependencies]
 # A database of a test's own, for what the engine keeps.

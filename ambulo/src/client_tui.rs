@@ -1,21 +1,21 @@
 //! Ambulo's dashboard.
 //!
-//! The chrome, key handling and logs come from `cfx_tui`. What is left here is
+//! The screen, the keys and the logs come from `cfx_tui`. What is left here is
 //! the part that is actually about content discovery: turning stream events
-//! into counters, and drawing the table of what was found.
+//! into counters, and listing what was found.
 
 use crate::scanner::StreamEvent;
-use cfx_tui::{Dashboard, Level, Logs, Stat, View, widgets};
-use ratatui::{
-    Frame,
-    layout::{Constraint, Direction, Layout, Rect},
-    style::Style,
-    widgets::{Block, Borders, Cell, Row, Table, TableState},
-};
+use cfx_tui::{Cell, Column, Dashboard, Level, Logs, Progress, Stat, View};
 use tokio::sync::mpsc;
 
 const HITS: char = 'h';
 const VIEWS: &[View] = &[View::new(HITS, "Hits")];
+const COLUMNS: &[Column] = &[
+    Column::new("Code", 6),
+    Column::new("Body", 10),
+    Column::new("Headers", 10),
+    Column::rest("URL"),
+];
 
 struct Hit {
     url: String,
@@ -25,14 +25,13 @@ struct Hit {
 }
 
 struct Ambulo {
-    operation_id: String,
+    target: String,
     total: usize,
     scanned: usize,
     found: usize,
     not_found: usize,
     errors: usize,
     hits: Vec<Hit>,
-    table: TableState,
     logs: Logs,
     done: bool,
     #[cfg(feature = "tuning")]
@@ -40,16 +39,15 @@ struct Ambulo {
 }
 
 impl Ambulo {
-    fn new(operation_id: String, total: usize) -> Self {
+    fn new(target: String, total: usize) -> Self {
         Self {
-            operation_id,
+            target,
             total,
             scanned: 0,
             found: 0,
             not_found: 0,
             errors: 0,
             hits: Vec::new(),
-            table: TableState::default(),
             logs: Logs::new(),
             done: false,
             #[cfg(feature = "tuning")]
@@ -71,9 +69,6 @@ impl Ambulo {
                                 body: event.body_length.unwrap_or(0),
                                 headers: event.headers_length.unwrap_or(0),
                             });
-                            // Follow the newest hit, so a long run reads as a
-                            // feed rather than stalling on the first result.
-                            self.table.select(Some(self.hits.len().saturating_sub(1)));
                         }
                     }
                     "not_found" => self.not_found += 1,
@@ -127,58 +122,6 @@ impl Ambulo {
             _ => {}
         }
     }
-
-    fn render_hits(&mut self, frame: &mut Frame, area: Rect) {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(widgets::GAUGE_HEIGHT),
-                Constraint::Length(widgets::STATS_HEIGHT),
-                Constraint::Min(0),
-            ])
-            .split(area);
-
-        widgets::progress(frame, rows[0], self.scanned, self.total, "Progress");
-        widgets::stats(
-            frame,
-            rows[1],
-            &[
-                Stat::good("Found", self.found),
-                Stat::new("Not found", self.not_found),
-                Stat::bad("Errors", self.errors),
-            ],
-        );
-
-        let header = Row::new(
-            ["Code", "Body", "Headers", "URL"]
-                .iter()
-                .map(|h| Cell::from(*h).style(cfx_tui::theme::title())),
-        )
-        .height(1);
-
-        let body: Vec<Row> = self
-            .hits
-            .iter()
-            .map(|h| {
-                Row::new(vec![
-                    Cell::from(h.code.clone())
-                        .style(Style::default().fg(cfx_tui::theme::status_code(&h.code))),
-                    Cell::from(h.body.to_string()),
-                    Cell::from(h.headers.to_string()),
-                    Cell::from(h.url.clone()),
-                ])
-            })
-            .collect();
-
-        frame.render_stateful_widget(
-            Table::new(body, widgets::table_constraints(&[6, 10, 10]))
-                .header(header)
-                .block(Block::default().borders(Borders::ALL).title("Found"))
-                .row_highlight_style(cfx_tui::theme::selected()),
-            rows[2],
-            &mut self.table,
-        );
-    }
 }
 
 impl Dashboard for Ambulo {
@@ -186,8 +129,8 @@ impl Dashboard for Ambulo {
         "AMBULO"
     }
 
-    fn subtitle(&self) -> &str {
-        &self.operation_id
+    fn target(&self) -> &str {
+        &self.target
     }
 
     fn finished(&self) -> bool {
@@ -198,10 +141,37 @@ impl Dashboard for Ambulo {
         VIEWS
     }
 
-    fn render(&mut self, key: char, frame: &mut Frame, area: Rect) {
-        if key == HITS {
-            self.render_hits(frame, area);
+    fn progress(&self) -> Progress {
+        Progress::Counted {
+            done: self.scanned,
+            total: self.total,
         }
+    }
+
+    fn stats(&self) -> Vec<Stat> {
+        vec![
+            Stat::count("Found", self.found).good(),
+            Stat::count("Not found", self.not_found),
+            Stat::count("Errors", self.errors).bad(),
+        ]
+    }
+
+    fn columns(&self, _view: char) -> &'static [Column] {
+        COLUMNS
+    }
+
+    fn len(&self, _view: char) -> usize {
+        self.hits.len()
+    }
+
+    fn row(&self, _view: char, index: usize) -> Vec<Cell> {
+        let hit = &self.hits[index];
+        vec![
+            Cell::status_code(&hit.code),
+            Cell::plain(hit.body.to_string()),
+            Cell::muted(hit.headers.to_string()),
+            Cell::plain(&hit.url),
+        ]
     }
 
     fn logs(&mut self) -> &mut Logs {
@@ -216,17 +186,24 @@ impl Dashboard for Ambulo {
 
 pub async fn run(
     rx: mpsc::UnboundedReceiver<StreamEvent>,
+    target: String,
     operation_id: String,
     total: usize,
     poll_timeout: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     tokio::task::spawn_blocking(move || {
-        let mut app = Ambulo::new(operation_id, total);
+        let mut app = Ambulo::new(target, total);
+        // The header names the target, so the operation is kept where it can
+        // still be read: the first line of the log.
+        app.logs.info(format!("operation {operation_id}"));
         let mut rx = rx;
         cfx_tui::run(&mut app, poll_timeout, |app| {
+            let mut came = false;
             while let Ok(event) = rx.try_recv() {
                 app.apply(event);
+                came = true;
             }
+            came
         })
     })
     .await?

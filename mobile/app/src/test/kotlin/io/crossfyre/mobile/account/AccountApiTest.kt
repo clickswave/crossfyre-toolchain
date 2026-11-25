@@ -321,20 +321,22 @@ class AccountApiTest {
     @Test
     fun the_accounts_policy_is_read_as_cli_policy_gives_it() {
         val fake = Fake(envelope(200, "ok", JSONObject()
-            .put("policy", "private").put("chosen", true)
+            .put("policy", "private")
             .put("changed_at", "2026-11-22T05:30:07Z").put("changed_via", "web")))
         val p = ok(api(fake).policy("cfk_k"))
         val (url, body) = fake.calls.single()
         assertEquals("https://crossfyre.io/api/v1/cli/policy", url)
         assertEquals("cfk_k", body.getString("api_key"))
-        assertEquals(AccountPolicy("private", true, "2026-11-22T05:30:07Z", "web"), p)
+        assertEquals(AccountPolicy("private", "2026-11-22T05:30:07Z", "web"), p)
         assertFalse(p.sendsTargets)
         assertTrue(p.line, p.line.startsWith("This account's tools send nothing about targets"))
         assertTrue(p.line, p.line.endsWith("Changed 2026-11-22T05:30:07Z from web."))
 
-        val unchosen = ok(api(Fake(envelope(200, "ok", JSONObject().put("policy", "connected").put("chosen", false)))).policy("cfk_k"))
-        assertTrue(unchosen.sendsTargets)
-        assertTrue(unchosen.line, unchosen.line.startsWith("None is chosen yet"))
+        // An account that never changed its policy has the connected it started with.
+        val fresh = ok(api(Fake(envelope(200, "ok", JSONObject().put("policy", "connected")))).policy("cfk_k"))
+        assertEquals(AccountPolicy("connected", null, null), fresh)
+        assertTrue(fresh.sendsTargets)
+        assertEquals("This phone sends what it captures to the workspace it's paired with.", fresh.line)
         assertEquals(Problem.SignedOut, problem(api(Fake(envelope(401, "Not logged in"))).policy("cfk_gone")))
         // Offline is a mode of a machine, never an account's, so it does not read as one.
         assertTrue(problem(api(Fake(envelope(200, "ok", JSONObject().put("policy", "offline")))).policy("cfk_k")) is Problem.Broken)

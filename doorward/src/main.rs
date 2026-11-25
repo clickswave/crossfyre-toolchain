@@ -82,7 +82,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .await??;
         if let Some(scan) = chosen {
             let request = dguard::resume_request(scan["id"].as_str().unwrap_or_default());
-            stream_scan(&daemon, &request, tui, EVENT_POLL_TIMEOUT_MS).await?;
+            stream_scan(
+                &daemon,
+                &request,
+                scan["target"].as_str().unwrap_or_default(),
+                tui,
+                EVENT_POLL_TIMEOUT_MS,
+            )
+            .await?;
         }
         return Ok(());
     }
@@ -94,6 +101,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let mut script = Vec::new();
         clap_complete::generate(*shell, &mut Cli::command(), "doorward", &mut script);
         print_all(&script)?;
+        return Ok(());
+    }
+
+    // -----------------------------------------------------------------------
+    // Man subcommand - print the roff man page to stdout (no daemon needed)
+    // -----------------------------------------------------------------------
+    if let Some(Commands::Man) = &cli.command {
+        let mut page = Vec::new();
+        clap_mangen::Man::new(Cli::command()).render(&mut page)?;
+        print_all(&page)?;
         return Ok(());
     }
 
@@ -113,15 +130,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let ports = libs::cli_args::resolve_ports(&scan_args.ports);
     let request = scan_request(&scan_args, &ports);
     let tui = cfx_tui::wanted(cli.no_tui);
-    stream_scan(&daemon, &request, tui, scan_args.event_poll_timeout).await
+    stream_scan(
+        &daemon,
+        &request,
+        &scan_args.targets.join(", "),
+        tui,
+        scan_args.event_poll_timeout,
+    )
+    .await
 }
 
 /// Send `request` to the daemon and show the scan it starts: drawn on the dashboard when
-/// `tui`, polling for events every `poll_timeout` ms, and otherwise written out as the
-/// daemon's own newline-delimited JSON.
+/// `tui`, under `target`'s name, polling for events every `poll_timeout` ms, and otherwise
+/// written out as the daemon's own newline-delimited JSON.
 async fn stream_scan(
     daemon: &dguard::Daemon,
     request: &serde_json::Value,
+    target: &str,
     tui: bool,
     poll_timeout: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -162,7 +187,7 @@ async fn stream_scan(
         });
 
         // Blocks until the user quits or the run completes.
-        client_tui::run(rx, operation_id, total, poll_timeout).await?;
+        client_tui::run(rx, target.to_string(), operation_id, total, poll_timeout).await?;
         return Ok(());
     }
 

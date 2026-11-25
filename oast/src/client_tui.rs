@@ -2,7 +2,8 @@
 //!
 //! Every other tool runs a scan that finishes; oast is a server that waits, so
 //! its dashboard is a feed rather than a progress view. It shows the listeners,
-//! how long it has been up, and interactions as they arrive.
+//! how long it has been up, which is the clock in the border, and interactions
+//! as they arrive.
 //!
 //! Only envelope metadata is shown, never interaction contents. The server
 //! seals the plaintext and does not keep it, and the dashboard holds to the
@@ -10,16 +11,16 @@
 //! works without putting a captured request on screen.
 
 use crate::store::Envelope;
-use cfx_tui::{Dashboard, Logs, Stat, View, widgets};
-use ratatui::{
-    Frame,
-    layout::{Constraint, Direction, Layout, Rect},
-    style::Style,
-    widgets::{Block, Borders, Cell, Row, Table, TableState},
-};
+use cfx_tui::{Cell, Column, Dashboard, Logs, Progress, Stat, Tone, View};
 
 const FEED: char = 'f';
 const VIEWS: &[View] = &[View::new(FEED, "Feed")];
+const COLUMNS: &[Column] = &[
+    Column::new("Time", 10),
+    Column::new("Protocol", 10),
+    Column::new("Source", 22),
+    Column::rest("Correlation"),
+];
 
 struct Hit {
     time: String,
@@ -32,11 +33,9 @@ struct Hit {
 /// an [`crate::store::Interaction`].
 pub struct Oast {
     listeners: String,
-    started_at: std::time::Instant,
     dns: usize,
     http: usize,
     hits: Vec<Hit>,
-    table: TableState,
     logs: Logs,
 }
 
@@ -44,11 +43,9 @@ impl Oast {
     pub fn new(listeners: String) -> Self {
         Self {
             listeners,
-            started_at: std::time::Instant::now(),
             dns: 0,
             http: 0,
             hits: Vec::new(),
-            table: TableState::default(),
             logs: Logs::new(),
         }
     }
@@ -64,66 +61,10 @@ impl Oast {
             source: env.remote_addr,
             correlation: env.corr_prefix,
         });
-        // A server can run for days. Keep the feed bounded so memory stays flat,
-        // and follow the newest line.
+        // A server can run for days. Keep the feed bounded so memory stays flat.
         if self.hits.len() > 2_000 {
             self.hits.remove(0);
         }
-        self.table.select(Some(self.hits.len().saturating_sub(1)));
-    }
-
-    fn render_feed(&mut self, frame: &mut Frame, area: Rect) {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(widgets::STATS_HEIGHT),
-                Constraint::Min(0),
-            ])
-            .split(area);
-
-        widgets::stats(
-            frame,
-            rows[0],
-            &[
-                Stat::new("Uptime", fmt_uptime(self.started_at.elapsed().as_secs())),
-                Stat::new("DNS", self.dns),
-                Stat::new("HTTP", self.http),
-            ],
-        );
-
-        let header = Row::new(
-            ["Time", "Protocol", "Source", "Correlation"]
-                .iter()
-                .map(|h| Cell::from(*h).style(cfx_tui::theme::title())),
-        )
-        .height(1);
-
-        let body: Vec<Row> = self
-            .hits
-            .iter()
-            .map(|h| {
-                let colour = match h.protocol.as_str() {
-                    "dns" => cfx_tui::theme::ACCENT,
-                    "https" => cfx_tui::theme::GOOD,
-                    _ => cfx_tui::theme::TEXT,
-                };
-                Row::new(vec![
-                    Cell::from(h.time.clone()).style(cfx_tui::theme::label()),
-                    Cell::from(h.protocol.clone()).style(Style::default().fg(colour)),
-                    Cell::from(h.source.clone()),
-                    Cell::from(h.correlation.clone()).style(cfx_tui::theme::label()),
-                ])
-            })
-            .collect();
-
-        frame.render_stateful_widget(
-            Table::new(body, widgets::table_constraints(&[10, 10, 22]))
-                .header(header)
-                .block(Block::default().borders(Borders::ALL).title("Interactions"))
-                .row_highlight_style(cfx_tui::theme::selected()),
-            rows[1],
-            &mut self.table,
-        );
     }
 }
 
@@ -132,24 +73,53 @@ impl Dashboard for Oast {
         "OAST"
     }
 
-    fn subtitle(&self) -> &str {
+    fn target(&self) -> &str {
         &self.listeners
     }
 
-    // A server is never "done". It runs until the operator quits, so the header
-    // stays on RUNNING for the life of the process.
+    fn doing(&self) -> &'static str {
+        "listening"
+    }
+
+    // A server is never "done". It runs until the operator quits, so it is
+    // listening for the life of the process.
     fn finished(&self) -> bool {
         false
     }
 
-    fn views(&self) -> &'static [View] {
-        VIEWS
+    fn progress(&self) -> Progress {
+        Progress::None
     }
 
-    fn render(&mut self, key: char, frame: &mut Frame, area: Rect) {
-        if key == FEED {
-            self.render_feed(frame, area);
-        }
+    fn stats(&self) -> Vec<Stat> {
+        vec![Stat::count("DNS", self.dns), Stat::count("HTTP", self.http)]
+    }
+
+    fn columns(&self, _view: char) -> &'static [Column] {
+        COLUMNS
+    }
+
+    fn len(&self, _view: char) -> usize {
+        self.hits.len()
+    }
+
+    fn row(&self, _view: char, index: usize) -> Vec<Cell> {
+        let hit = &self.hits[index];
+        let protocol = match hit.protocol.as_str() {
+            "dns" => Tone::Accent,
+            "https" => Tone::Good,
+            _ => Tone::Plain,
+        };
+        vec![
+            Cell::muted(&hit.time),
+            Cell::toned(&hit.protocol, protocol),
+            Cell::plain(&hit.source),
+            Cell::muted(&hit.correlation),
+        ]
+    }
+
+    fn views(&self) -> &'static [View] {
+        VIEWS
     }
 
     fn logs(&mut self) -> &mut Logs {
@@ -163,17 +133,13 @@ pub fn run(listeners: String, rx: std::sync::mpsc::Receiver<Envelope>) -> std::i
     let mut app = Oast::new(listeners);
     app.logs.info("listening for interactions");
     cfx_tui::run(&mut app, 100, |app| {
+        let mut came = false;
         while let Ok(env) = rx.try_recv() {
             app.apply(env);
+            came = true;
         }
+        came
     })
-}
-
-fn fmt_uptime(secs: u64) -> String {
-    let h = secs / 3600;
-    let m = (secs % 3600) / 60;
-    let s = secs % 60;
-    format!("{h:02}:{m:02}:{s:02}")
 }
 
 /// Wall-clock HH:MM:SS in UTC from a unix timestamp, without pulling in a date

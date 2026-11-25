@@ -1,20 +1,23 @@
 //! Doorward's dashboard.
 //!
-//! Chrome, keys and logs come from `cfx_tui`. What stays here is the part that
-//! is about port scanning: counting states and listing what answered.
+//! The screen, the keys and the logs come from `cfx_tui`. What stays here is
+//! the part that is about port scanning: counting states and listing what
+//! answered.
 
 use crate::scanner::StreamEvent;
-use cfx_tui::{Dashboard, Level, Logs, Stat, View, widgets};
-use ratatui::{
-    Frame,
-    layout::{Constraint, Direction, Layout, Rect},
-    style::Style,
-    widgets::{Block, Borders, Cell, Row, Table, TableState},
-};
+use cfx_tui::{Cell, Column, Dashboard, Level, Logs, Progress, Stat, Tone, View};
 use tokio::sync::mpsc;
 
 const PORTS: char = 'p';
 const VIEWS: &[View] = &[View::new(PORTS, "Ports")];
+const COLUMNS: &[Column] = &[
+    Column::new("Host", 22),
+    Column::new("Port", 7),
+    Column::new("State", 9),
+    Column::new("Service", 14),
+    Column::new("Latency", 9),
+    Column::rest("Banner"),
+];
 
 struct Finding {
     host: String,
@@ -26,14 +29,13 @@ struct Finding {
 }
 
 struct Doorward {
-    operation_id: String,
+    target: String,
     total: usize,
     received: usize,
     open: usize,
     closed: usize,
     filtered: usize,
     findings: Vec<Finding>,
-    table: TableState,
     logs: Logs,
     done: bool,
     // Latest governor telemetry, for the pacing strip. The daemon already
@@ -45,16 +47,15 @@ struct Doorward {
 }
 
 impl Doorward {
-    fn new(operation_id: String, total: usize) -> Self {
+    fn new(target: String, total: usize) -> Self {
         Self {
-            operation_id,
+            target,
             total,
             received: 0,
             open: 0,
             closed: 0,
             filtered: 0,
             findings: Vec::new(),
-            table: TableState::default(),
             logs: Logs::new(),
             done: false,
             #[cfg(feature = "tuning")]
@@ -86,8 +87,6 @@ impl Doorward {
                             .unwrap_or_default(),
                         banner: event.banner.unwrap_or_default(),
                     });
-                    self.table
-                        .select(Some(self.findings.len().saturating_sub(1)));
                 }
             }
             "log" => {
@@ -129,64 +128,6 @@ impl Doorward {
             _ => {}
         }
     }
-
-    fn render_ports(&mut self, frame: &mut Frame, area: Rect) {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(widgets::GAUGE_HEIGHT),
-                Constraint::Length(widgets::STATS_HEIGHT),
-                Constraint::Min(0),
-            ])
-            .split(area);
-
-        widgets::progress(frame, rows[0], self.received, self.total, "Progress");
-        widgets::stats(
-            frame,
-            rows[1],
-            &[
-                Stat::good("Open", self.open),
-                Stat::new("Filtered", self.filtered),
-                Stat::new("Closed", self.closed),
-            ],
-        );
-
-        let header = Row::new(
-            ["Host", "Port", "State", "Service", "Latency", "Banner"]
-                .iter()
-                .map(|h| Cell::from(*h).style(cfx_tui::theme::title())),
-        )
-        .height(1);
-
-        let body: Vec<Row> = self
-            .findings
-            .iter()
-            .map(|f| {
-                let colour = match f.status.as_str() {
-                    "open" => cfx_tui::theme::GOOD,
-                    "filtered" => cfx_tui::theme::WARN,
-                    _ => cfx_tui::theme::MUTED,
-                };
-                Row::new(vec![
-                    Cell::from(f.host.clone()),
-                    Cell::from(f.port.clone()),
-                    Cell::from(f.status.clone()).style(Style::default().fg(colour)),
-                    Cell::from(f.service.clone()),
-                    Cell::from(f.latency.clone()).style(cfx_tui::theme::label()),
-                    Cell::from(f.banner.clone()).style(cfx_tui::theme::label()),
-                ])
-            })
-            .collect();
-
-        frame.render_stateful_widget(
-            Table::new(body, widgets::table_constraints(&[22, 7, 9, 14, 9]))
-                .header(header)
-                .block(Block::default().borders(Borders::ALL).title("Results"))
-                .row_highlight_style(cfx_tui::theme::selected()),
-            rows[2],
-            &mut self.table,
-        );
-    }
 }
 
 impl Dashboard for Doorward {
@@ -194,8 +135,8 @@ impl Dashboard for Doorward {
         "DOORWARD"
     }
 
-    fn subtitle(&self) -> &str {
-        &self.operation_id
+    fn target(&self) -> &str {
+        &self.target
     }
 
     fn finished(&self) -> bool {
@@ -206,10 +147,44 @@ impl Dashboard for Doorward {
         VIEWS
     }
 
-    fn render(&mut self, key: char, frame: &mut Frame, area: Rect) {
-        if key == PORTS {
-            self.render_ports(frame, area);
+    fn progress(&self) -> Progress {
+        Progress::Counted {
+            done: self.received,
+            total: self.total,
         }
+    }
+
+    fn stats(&self) -> Vec<Stat> {
+        vec![
+            Stat::count("Open", self.open).good(),
+            Stat::count("Filtered", self.filtered),
+            Stat::count("Closed", self.closed),
+        ]
+    }
+
+    fn columns(&self, _view: char) -> &'static [Column] {
+        COLUMNS
+    }
+
+    fn len(&self, _view: char) -> usize {
+        self.findings.len()
+    }
+
+    fn row(&self, _view: char, index: usize) -> Vec<Cell> {
+        let found = &self.findings[index];
+        let state = match found.status.as_str() {
+            "open" => Tone::Good,
+            "filtered" => Tone::Warn,
+            _ => Tone::Muted,
+        };
+        vec![
+            Cell::plain(&found.host),
+            Cell::plain(&found.port),
+            Cell::toned(&found.status, state),
+            Cell::plain(&found.service),
+            Cell::muted(&found.latency),
+            Cell::muted(&found.banner),
+        ]
     }
 
     fn logs(&mut self) -> &mut Logs {
@@ -224,17 +199,24 @@ impl Dashboard for Doorward {
 
 pub async fn run(
     rx: mpsc::UnboundedReceiver<StreamEvent>,
+    target: String,
     operation_id: String,
     total: usize,
     poll_timeout: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     tokio::task::spawn_blocking(move || {
-        let mut app = Doorward::new(operation_id, total);
+        let mut app = Doorward::new(target, total);
+        // The header names the target, so the operation is kept where it can
+        // still be read: the first line of the log.
+        app.logs.info(format!("operation {operation_id}"));
         let mut rx = rx;
         cfx_tui::run(&mut app, poll_timeout, |app| {
+            let mut came = false;
             while let Ok(event) = rx.try_recv() {
                 app.apply(event);
+                came = true;
             }
+            came
         })
     })
     .await?

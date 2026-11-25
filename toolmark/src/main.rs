@@ -115,6 +115,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             print_all(&script)?;
             Ok(())
         }
+        Some(Commands::Man) => {
+            let mut page = Vec::new();
+            clap_mangen::Man::new(Cli::command()).render(&mut page)?;
+            print_all(&page)?;
+            Ok(())
+        }
         Some(Commands::Check(args)) => check(&args),
         Some(Commands::Daemon) | None => {
             eprintln!(

@@ -771,7 +771,6 @@ pub async fn run_login(
                 .interact()
                 .unwrap_or(false)
         },
-        || ask.then(crate::policy::command::pick_for_account).flatten(),
     )
     .await;
     ok(&policy.line);

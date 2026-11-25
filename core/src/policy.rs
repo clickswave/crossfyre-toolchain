@@ -7,9 +7,11 @@
 
 use std::path::Path;
 
-pub use cfx_policy::{ALL, ENV, InForce, Machine, Offline, Policy, Reason, in_force, path};
+pub use cfx_policy::{
+    ALL, ENV, InForce, Machine, Offline, PRIVATE_STOPS, Policy, Reason, in_force, path,
+};
 
-/// This machine's state, the default one (connected, not chosen) when there is none.
+/// This machine's state, the default one (connected) when there is none.
 pub fn load(data_dir: &Path) -> Machine {
     crate::toolchain::sudo_user::read_to_string(&path(data_dir))
         .map(|raw| Machine::from_toml(&raw))

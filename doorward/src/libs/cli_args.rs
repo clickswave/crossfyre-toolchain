@@ -67,6 +67,10 @@ pub enum Commands {
         /// The shell to generate completions for
         shell: clap_complete::Shell,
     },
+    /// Print the doorward man page (roff) to stdout, for example:
+    ///   doorward man > doorward.1
+    #[command(hide = true)]
+    Man,
 }
 
 #[derive(Parser, Clone)]

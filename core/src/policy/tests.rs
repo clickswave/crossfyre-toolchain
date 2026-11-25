@@ -60,7 +60,6 @@ impl Fake {
     fn answer(&self) -> Result<Remote, Failed> {
         self.account.lock().unwrap().clone().map(|policy| Remote {
             policy,
-            chosen: true,
             changed_at: Some("2026-11-22T05:30:07Z".into()),
             changed_via: Some("web".into()),
         })
@@ -326,16 +325,10 @@ async fn login(
     same: bool,
     cloud: &Fake,
     leave: Option<bool>,
-    choose: Option<Policy>,
 ) -> command::AtLogin {
-    command::at_login(
-        dir,
-        &session(),
-        same,
-        cloud,
-        || leave.expect("login asked to leave offline"),
-        || choose,
-    )
+    command::at_login(dir, &session(), same, cloud, || {
+        leave.expect("login asked to leave offline")
+    })
     .await
 }
 
@@ -354,7 +347,7 @@ async fn login_takes_the_accounts_policy_and_says_which() {
     )
     .unwrap();
     let cloud = Fake::answering(Policy::Connected);
-    let got = login(dir.path(), false, &cloud, None, None).await;
+    let got = login(dir.path(), false, &cloud, None).await;
     assert_eq!(cloud.calls(), ["fetch"]);
     assert_eq!(got.machine.account, Some(Policy::Connected));
     assert_eq!(
@@ -377,7 +370,7 @@ async fn a_held_tightening_goes_to_its_own_account_alone() {
     let dir = tempfile::tempdir().unwrap();
     save(dir.path(), &held).unwrap();
     let cloud = Fake::answering(Policy::Connected);
-    let got = login(dir.path(), true, &cloud, None, None).await;
+    let got = login(dir.path(), true, &cloud, None).await;
     assert_eq!(cloud.calls(), ["set private", "fetch"]);
     assert_eq!(
         (got.machine.account, got.machine.unsent),
@@ -387,7 +380,7 @@ async fn a_held_tightening_goes_to_its_own_account_alone() {
     let dir = tempfile::tempdir().unwrap();
     save(dir.path(), &held).unwrap();
     let cloud = Fake::answering(Policy::Connected);
-    let got = login(dir.path(), false, &cloud, None, None).await;
+    let got = login(dir.path(), false, &cloud, None).await;
     assert_eq!(cloud.calls(), ["fetch"]);
     assert_eq!(
         (got.machine.account, got.machine.unsent),
@@ -398,7 +391,7 @@ async fn a_held_tightening_goes_to_its_own_account_alone() {
     let dir = tempfile::tempdir().unwrap();
     save(dir.path(), &held).unwrap();
     let down = Fake::failing(Failed::Unreachable("connection refused".into()));
-    let got = login(dir.path(), false, &down, None, None).await;
+    let got = login(dir.path(), false, &down, None).await;
     assert_eq!(
         (got.machine.account, got.machine.unsent),
         (Some(Policy::Private), false)
@@ -420,7 +413,7 @@ async fn login_asks_before_leaving_an_offline_the_user_chose() {
     let dir = tempfile::tempdir().unwrap();
     save(dir.path(), &chosen(Reason::Chosen)).unwrap();
     let cloud = Fake::answering(Policy::Private);
-    let got = login(dir.path(), true, &cloud, Some(false), None).await;
+    let got = login(dir.path(), true, &cloud, Some(false)).await;
     assert_eq!(got.machine.active(), Policy::Offline);
     assert_eq!(got.machine.account, Some(Policy::Private));
     assert!(
@@ -431,26 +424,25 @@ async fn login_asks_before_leaving_an_offline_the_user_chose() {
     );
     assert_eq!(cloud.calls(), ["fetch"]);
 
-    let got = login(dir.path(), true, &cloud, Some(true), None).await;
+    let got = login(dir.path(), true, &cloud, Some(true)).await;
     assert_eq!(got.machine.offline, None);
     assert_eq!(got.machine.active(), Policy::Private);
 
     let dir = tempfile::tempdir().unwrap();
     save(dir.path(), &chosen(Reason::SessionEnded)).unwrap();
-    let got = login(dir.path(), true, &cloud, None, None).await;
+    let got = login(dir.path(), true, &cloud, None).await;
     assert_eq!(got.machine.offline, None);
 }
 
-/// An account with no policy yet is asked for one, connected selected, when someone is
-/// here; with nobody here, it is left unchosen, which runs as connected, and says so.
+/// A first login asks nothing: an account that never changed its policy has the
+/// connected it started with, and login takes that as it takes any other.
 #[tokio::test]
-async fn a_first_login_asks_for_a_policy_or_leaves_it_unchosen() {
-    /// Crossfyre for an account that has chosen none.
-    struct Unchosen(Fake);
-    impl Cloud for Unchosen {
+async fn a_first_login_takes_connected_and_asks_nothing() {
+    /// Crossfyre for an account that never changed its policy.
+    struct Fresh(Fake);
+    impl Cloud for Fresh {
         async fn fetch(&self, s: &Session) -> Result<Remote, Failed> {
             self.0.fetch(s).await.map(|r| Remote {
-                chosen: false,
                 changed_at: None,
                 changed_via: None,
                 ..r
@@ -460,32 +452,39 @@ async fn a_first_login_asks_for_a_policy_or_leaves_it_unchosen() {
             self.0.set(s, policy).await
         }
     }
-    let cloud = Unchosen(Fake::answering(Policy::Connected));
+    let cloud = Fresh(Fake::answering(Policy::Connected));
     let dir = tempfile::tempdir().unwrap();
-    let got = command::at_login(dir.path(), &session(), false, &cloud, || false, || None).await;
-    assert_eq!(cloud.0.calls(), ["fetch"]);
-    assert_eq!(got.machine.account, None);
-    assert_eq!(got.machine.active(), Policy::Connected);
+    let got = command::at_login(dir.path(), &session(), false, &cloud, || false).await;
     assert_eq!(
-        got.line,
-        "policy: connected, as none is chosen yet; choose one with crossfyre policy set"
+        cloud.0.calls(),
+        ["fetch"],
+        "login set a policy nobody chose"
     );
+    assert_eq!(got.machine.account, Some(Policy::Connected));
+    assert_eq!(got.line, "policy: the account's connected");
+    assert_eq!(got.note, None);
+}
 
-    let got = command::at_login(
-        dir.path(),
-        &session(),
-        true,
-        &cloud,
-        || false,
-        || Some(Policy::Private),
-    )
-    .await;
-    assert_eq!(cloud.0.calls(), ["fetch", "fetch", "set private"]);
-    assert_eq!(got.machine.account, Some(Policy::Private));
-    assert!(
-        got.line.starts_with("policy: the account's private"),
-        "{}",
-        got.line
+/// Going private says what stops, once: not for connected or offline, and not on a
+/// machine that is private already.
+#[test]
+fn only_going_private_says_what_stops() {
+    let private = Machine {
+        account: Some(Policy::Private),
+        ..Machine::default()
+    };
+    assert_eq!(
+        command::going_private(&Machine::default(), Policy::Private),
+        Some(PRIVATE_STOPS)
+    );
+    assert_eq!(command::going_private(&private, Policy::Private), None);
+    assert_eq!(
+        command::going_private(&Machine::default(), Policy::Connected),
+        None
+    );
+    assert_eq!(
+        command::going_private(&Machine::default(), Policy::Offline),
+        None
     );
 }
 
@@ -517,7 +516,7 @@ fn why_says_when_the_policy_last_changed() {
     );
     assert_eq!(
         command::why(&Machine::default(), true),
-        "connected until a policy is chosen"
+        "connected, as every account starts"
     );
 }
 
@@ -526,7 +525,6 @@ fn why_says_when_the_policy_last_changed() {
 fn the_accounts_policy_reads_from_crossfyres_answer() {
     let got = super::cloud::remote(&serde_json::json!({
         "policy": "private",
-        "chosen": true,
         "changed_at": "2026-11-22T05:30:07Z",
         "changed_via": "cli: laptop",
     }))
@@ -535,21 +533,28 @@ fn the_accounts_policy_reads_from_crossfyres_answer() {
         got,
         Remote {
             policy: Policy::Private,
-            chosen: true,
             changed_at: Some("2026-11-22T05:30:07Z".into()),
             changed_via: Some("cli: laptop".into()),
         }
     );
-    let unchosen = super::cloud::remote(&serde_json::json!({ "policy": "connected" })).unwrap();
+    // An account that never changed its policy has the connected it started with, and
+    // no change to tell of.
+    let fresh = super::cloud::remote(&serde_json::json!({ "policy": "connected" })).unwrap();
     let mut m = Machine {
         account: Some(Policy::Private),
         unsent: true,
         ..Machine::default()
     };
-    super::cloud::take(&mut m, &unchosen);
-    assert_eq!(m, Machine::default());
+    super::cloud::take(&mut m, &fresh);
     assert_eq!(
-        super::cloud::remote(&serde_json::json!({ "policy": "offline", "chosen": true })),
+        m,
+        Machine {
+            account: Some(Policy::Connected),
+            ..Machine::default()
+        }
+    );
+    assert_eq!(
+        super::cloud::remote(&serde_json::json!({ "policy": "offline" })),
         None
     );
 }

@@ -184,18 +184,15 @@ pub struct AtLogin {
 }
 
 /// After `crossfyre login` saved `session`: leave offline, asking first when the user
-/// chose it, and take the account's policy in place of whatever this machine had. An
-/// account with none yet is asked for one when someone is here to answer, and is left
-/// without one otherwise, running as connected. `same_account` says the session is the
-/// account's this machine had before, so a tightening held for it is sent; another
-/// account's never is. `choose` answers None when nobody is here.
+/// chose it, and take the account's policy in place of whatever this machine had.
+/// `same_account` says the session is the account's this machine had before, so a
+/// tightening held for it is sent; another account's never is.
 pub async fn at_login(
     data_dir: &Path,
     session: &Session,
     same_account: bool,
     cloud: &impl Cloud,
     leave_offline: impl FnOnce() -> bool,
-    choose: impl FnOnce() -> Option<Policy>,
 ) -> AtLogin {
     let mut machine = super::load(data_dir);
     let stays = machine
@@ -211,20 +208,6 @@ pub async fn at_login(
     }
     let mut note = None;
     match sync(&mut machine, session, cloud).await {
-        Ok(()) if machine.account.is_none() => {
-            if let Some(p) = choose() {
-                match cloud.set(session, p).await {
-                    Ok(remote) => super::cloud::take(&mut machine, &remote),
-                    Err(e) => {
-                        note = Some(format!(
-                            "{} was not saved to Crossfyre ({e}). Choose again with crossfyre \
-                             policy set.",
-                            p.key()
-                        ))
-                    }
-                }
-            }
-        }
         Ok(()) => {}
         Err(Failed::NotLoggedIn(why)) => {
             machine.offline = Some(Offline {
@@ -259,27 +242,8 @@ fn login_line(machine: &Machine) -> String {
             machine.account.unwrap_or(Policy::Connected).key()
         ),
         (Some(o), _) => format!("policy: offline ({})", o.reason.says()),
-        (None, None) => {
-            "policy: connected, as none is chosen yet; choose one with crossfyre policy set".into()
-        }
-        (None, Some(_)) => format!("policy: {}", why(machine, true)),
+        (None, _) => format!("policy: {}", why(machine, true)),
     }
-}
-
-/// The question a first login asks an account with no policy yet: connected or private,
-/// with connected selected. None when it is not answered.
-pub fn pick_for_account() -> Option<Policy> {
-    let items: Vec<String> = [Policy::Connected, Policy::Private]
-        .iter()
-        .map(|p| format!("{:<10} {}", p.key(), p.sends()))
-        .collect();
-    let pick = dialoguer::Select::new()
-        .with_prompt("Your account has no policy yet. Which should it have?")
-        .items(&items)
-        .default(0)
-        .interact()
-        .ok()?;
-    [Policy::Connected, Policy::Private].get(pick).copied()
 }
 
 /// `crossfyre policy list`.
@@ -343,7 +307,7 @@ pub fn why(machine: &Machine, logged_in: bool) -> String {
         _ => String::new(),
     };
     match (machine.account, logged_in) {
-        (None, _) => "connected until a policy is chosen".to_string(),
+        (None, _) => "connected, as every account starts".to_string(),
         (Some(p), true) if machine.unsent => {
             format!(
                 "{} set here{changed}, sent to Crossfyre at its next contact",
@@ -360,8 +324,15 @@ pub fn why(machine: &Machine, logged_in: bool) -> String {
     }
 }
 
+/// What stops working when `machine` goes to `want`, when that is private and the
+/// machine is not private already. Nothing stops for any other change.
+pub fn going_private(machine: &Machine, want: Policy) -> Option<[&'static str; 4]> {
+    (want == Policy::Private && machine.account != Some(Policy::Private))
+        .then_some(super::PRIVATE_STOPS)
+}
+
 /// `crossfyre policy set [name]`. With no name, a picker at a terminal; without one,
-/// the names to choose from.
+/// the names to choose from. Private says what stops working before it is set.
 pub async fn run_set(
     data_dir: &Path,
     name: Option<&str>,
@@ -396,6 +367,12 @@ pub async fn run_set(
         }
     };
     title("Crossfyre policy", want.key());
+    if let Some(stops) = going_private(&super::load(data_dir), want) {
+        warn("Private stops these for the account:");
+        for line in stops {
+            step(line);
+        }
+    }
     let session = crate::auth::load_account(data_dir).map(|a| Session::of(&a));
     let ask = || {
         warn(

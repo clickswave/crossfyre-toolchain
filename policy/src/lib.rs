@@ -69,6 +69,16 @@ impl Policy {
     }
 }
 
+/// What stops working for an account that goes private, each line led by the feature it
+/// is about. `crossfyre policy set private` prints them before it sets the policy, and
+/// account settings shows the same lines before it saves one.
+pub const PRIVATE_STOPS: [&str; 4] = [
+    "Web Tracer: no session starts or is re-armed, and a running one stops taking captures.",
+    "crossfyre trace: does not start.",
+    "Crossfyre Mobile: does not pair or capture, and does not patch a pinned app.",
+    "crossfyre mcp: an agent's Cloud scope checks and scan launches are refused.",
+];
+
 /// Why this machine is offline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -99,7 +109,8 @@ pub struct Offline {
 /// What this machine holds: the account's policy as it last had it, and its own mode.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Machine {
-    /// The account's policy, none until the account has one here. Never offline.
+    /// The account's policy as this machine last had it, none on a machine that has
+    /// neither fetched one nor been set one, which runs as connected. Never offline.
     #[serde(default)]
     pub account: Option<Policy>,
     /// When the account's policy last changed, and where, as Crossfyre recorded it, or
@@ -126,8 +137,8 @@ impl Machine {
         }
     }
 
-    /// The state as policy.toml holds it, the default (connected, not chosen) when it
-    /// does not read.
+    /// The state as policy.toml holds it, the default (connected) when it does not
+    /// read.
     pub fn from_toml(raw: &str) -> Machine {
         toml::from_str(raw).unwrap_or_default()
     }

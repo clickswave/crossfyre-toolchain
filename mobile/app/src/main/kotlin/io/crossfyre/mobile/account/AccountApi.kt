@@ -40,12 +40,11 @@ data class SignedIn(val key: String, val user: AccountUser)
 /**
  * The account's privacy policy, as Crossfyre answers it: `connected`, under which this
  * phone captures, or `private`, under which the account's tools send nothing about
- * targets to Crossfyre, and so this phone neither pairs nor captures. [chosen] is false
- * for an account that has not chosen one yet, which runs as connected.
+ * targets to Crossfyre, and so this phone neither pairs nor captures. An account starts
+ * as connected, and [changedAt] and [changedVia] are null until its owner changes that.
  */
 data class AccountPolicy(
     val policy: String,
-    val chosen: Boolean,
     val changedAt: String?,
     val changedVia: String?,
 ) {
@@ -64,7 +63,6 @@ data class AccountPolicy(
             }
             return when {
                 !sendsTargets -> "This account's tools send nothing about targets to Crossfyre, so this phone doesn't pair or capture.$changed"
-                !chosen -> "None is chosen yet, so this account runs as connected. Choose one in account settings."
                 else -> "This phone sends what it captures to the workspace it's paired with.$changed"
             }
         }
@@ -395,7 +393,7 @@ class AccountApi(origin: String, private val transport: Transport) {
 
     private fun policyOf(d: JSONObject): AccountPolicy? {
         val policy = d.str("policy")?.takeIf { it == "connected" || it == "private" } ?: return null
-        return AccountPolicy(policy, d.optBoolean("chosen", false), d.str("changed_at"), d.str("changed_via"))
+        return AccountPolicy(policy, d.str("changed_at"), d.str("changed_via"))
     }
 
     private fun workspace(w: JSONObject): Workspace? {

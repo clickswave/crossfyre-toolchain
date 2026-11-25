@@ -1,24 +1,24 @@
 //! A read-only list an engine keeps, shown as a table: toolmark's inventory of what it
 //! found running where.
 
-use crate::theme;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crate::chrome::{self, Hint};
+use crate::sheet::{self, Cell, Column, Scroll};
+use crate::theme::{self, Tone};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout},
-    text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Row, Table, TableState},
+    layout::{Constraint, Layout},
+    text::Span,
 };
 use std::io;
 
-/// One table to show: engine `name`'s view `title`, a line saying how much it holds, and
-/// `rows` under `header`, each column at least as wide as `widths` says.
-pub struct List<'a> {
-    pub name: &'a str,
-    pub title: &'a str,
+/// One table to show: engine `name`'s list `title`, a line saying how much it holds, and
+/// `rows` under `columns`.
+pub struct List {
+    pub name: &'static str,
+    pub title: &'static str,
     pub summary: String,
-    pub header: &'a [&'a str],
-    pub widths: &'a [u16],
+    pub columns: &'static [Column],
     pub rows: Vec<Vec<String>>,
 }
 
@@ -30,17 +30,21 @@ pub fn show(list: &List) -> io::Result<()> {
     let mut terminal = crate::enter()?;
     // The terminal is given back even if drawing panics, as the dashboard's is.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut at = 0usize;
+        let mut scroll = Scroll::new(false);
         loop {
-            terminal.draw(|f| paint(f, list, at))?;
+            terminal.draw(|f| paint(f, list, &mut scroll))?;
             if let Event::Key(key) = event::read()?
                 && key.kind == KeyEventKind::Press
             {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                    KeyCode::Down => at = (at + 1).min(list.rows.len().saturating_sub(1)),
-                    KeyCode::Up => at = at.saturating_sub(1),
-                    _ => {}
+                    // Raw mode keeps Ctrl-C from the shell, so it is honoured here.
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(());
+                    }
+                    code => {
+                        scroll.moved(code, list.rows.len());
+                    }
                 }
             }
         }
@@ -52,41 +56,42 @@ pub fn show(list: &List) -> io::Result<()> {
     }
 }
 
-fn paint(frame: &mut Frame, list: &List, at: usize) {
-    let areas = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .split(frame.area());
-    let header = Line::from(vec![
-        Span::styled(format!("  {}  ", list.name), theme::title()),
-        Span::styled(list.title.to_string(), theme::value()),
-        Span::styled(format!("    {}", list.summary), theme::label()),
-    ]);
-    frame.render_widget(
-        Paragraph::new(header).block(Block::default().borders(Borders::ALL)),
-        areas[0],
-    );
-    if list.rows.is_empty() {
-        frame.render_widget(
-            Paragraph::new("  Nothing kept yet.").style(theme::label()),
-            areas[1],
-        );
+fn paint(frame: &mut Frame, list: &List, scroll: &mut Scroll) {
+    let [panel, keys] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(frame.area());
+    let place = if list.rows.is_empty() {
+        Vec::new()
     } else {
-        let rows = list.rows.iter().map(|r| Row::new(r.clone()));
-        let table = Table::new(rows, crate::widgets::table_constraints(list.widths))
-            .header(Row::new(list.header.to_vec()).style(theme::label()))
-            .block(Block::default().borders(Borders::ALL))
-            .row_highlight_style(theme::selected());
-        let mut state = TableState::default().with_selected(Some(at));
-        frame.render_stateful_widget(table, areas[1], &mut state);
-    }
-    frame.render_widget(
-        Paragraph::new("  Up and down to move, q to exit.").style(theme::label()),
-        areas[2],
+        vec![Span::styled(
+            format!("{} of {}", scroll.place(), list.rows.len()),
+            theme::label(),
+        )]
+    };
+    let block = chrome::panel(
+        chrome::heading(list.name, vec![Span::styled(list.title, theme::value())]),
+        chrome::trailing(place),
+    );
+    let inside = block.inner(panel);
+    frame.render_widget(block, panel);
+    let rows = chrome::note(frame, inside, &list.summary, Tone::Muted);
+    let row = |i: usize| list.rows[i].iter().map(Cell::plain).collect();
+    sheet::draw(
+        frame,
+        rows,
+        list.columns,
+        list.rows.len(),
+        &row,
+        scroll,
+        "Nothing kept yet.",
+    );
+    chrome::footer(
+        frame,
+        keys,
+        vec![
+            Hint::new("↑↓", "scroll", 1),
+            Hint::new("g/G", "ends", 2),
+            Hint::new("q", "quit", 0),
+        ],
     );
 }
 
@@ -95,21 +100,28 @@ mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
 
+    const COLUMNS: &[Column] = &[
+        Column::new("Host", 20),
+        Column::new("Product", 16),
+        Column::rest("Version"),
+    ];
+
     #[test]
     fn a_list_shows_its_header_and_rows() {
         let list = List {
             name: "TOOLMARK",
-            title: "INVENTORY",
+            title: "Inventory",
             summary: "2 products on 1 host".into(),
-            header: &["HOST", "PRODUCT", "VERSION"],
-            widths: &[20, 16, 10],
+            columns: COLUMNS,
             rows: vec![
                 vec!["app.test:443".into(), "Nginx".into(), "1.24.0".into()],
                 vec!["app.test:443".into(), "WordPress".into(), ">= 5.0".into()],
             ],
         };
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
-        terminal.draw(|f| paint(f, &list, 1)).unwrap();
+        let mut scroll = Scroll::new(false);
+        scroll.moved(KeyCode::Down, 2);
+        terminal.draw(|f| paint(f, &list, &mut scroll)).unwrap();
         let screen: String = terminal
             .backend()
             .buffer()
@@ -118,7 +130,9 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
         for shown in [
-            "INVENTORY",
+            "TOOLMARK",
+            "Inventory",
+            "2 of 2",
             "2 products on 1 host",
             "PRODUCT",
             "Nginx",

@@ -27,8 +27,10 @@ on:
     - cron: "17 6 * * *"
 
 # Cancel superseded runs on the same ref: this workspace is not cheap to build.
+# The event is part of the group so the daily schedule never cancels a push
+# run, which would leave that commit marked cancelled.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 env:
@@ -47,7 +49,7 @@ jobs:
     name: open-core boundary
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: The authorization drop-in must not be committed
         run: |
@@ -89,13 +91,13 @@ jobs:
     # that image's Python 3.12. Moving to the next image should be a commit.
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # cfx-script links libpython on Linux. Without PYO3_PYTHON, pyo3 runs the first
       # python3 on PATH and only rebuilds when PATH itself changes, not when the image
       # swaps the interpreter behind it. 3.13 is the minor version the Linux release
       # ships with cfx-script (LINUX_PYTHON in release.yml).
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         id: python
         with:
           python-version: "3.13"
@@ -126,7 +128,7 @@ jobs:
           rustc --version && cargo --version
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry/index
@@ -191,9 +193,9 @@ jobs:
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         id: python
         with:
           python-version: "3.12"
@@ -214,7 +216,7 @@ jobs:
           echo "C:\\Program Files\\NASM" >> "$GITHUB_PATH"
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry/index
@@ -301,7 +303,7 @@ jobs:
     # negative result gets no scrutiny, so each case asserts what must NOT be
     # reported as well as what must.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust
         run: |
@@ -313,7 +315,7 @@ jobs:
         run: echo "image=$ImageOS" >> "$GITHUB_OUTPUT"
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry/index
@@ -370,7 +372,7 @@ jobs:
     # resolves module paths without evaluating cfg, so it hard-errored on the
     # private path a public checkout lacks.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install Rust with rustfmt
         run: |
           rustup toolchain install 1.88.0 --profile minimal --component rustfmt --no-self-update
@@ -386,7 +388,7 @@ jobs:
     # carries a comment saying why, so a future warning means new code, not
     # inherited debt.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust with lint components
         run: |
@@ -395,7 +397,7 @@ jobs:
 
       # As in the build job: cfx-script's pyo3 is checked against a named Python, and
       # the cache follows the image and that Python.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         id: python
         with:
           python-version: "3.13"
@@ -407,7 +409,7 @@ jobs:
           echo "image=$ImageOS" >> "$GITHUB_OUTPUT"
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry/index
@@ -488,7 +490,7 @@ jobs:
     # feature that only arm64 shows would otherwise first appear in an arm64 release
     # build.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust and the BoringSSL build tools
         run: |
@@ -505,7 +507,7 @@ jobs:
           rustc --version && cargo --version
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry/index
@@ -540,6 +542,77 @@ jobs:
             cargo test --locked --no-fail-fast -p "$p" --features impersonate
           done
 
+  android:
+    name: Android app
+    runs-on: ubuntu-26.04
+    # The app's unit tests, and its native core built for the two ABIs it ships.
+    # The host jobs above compile mobile/rust for Linux and macOS only, and before
+    # this job nothing in CI ran the Kotlin tests at all.
+    #
+    # Neither step needs a secret. Without keystore.properties the app builds
+    # unsigned, and without firebase.properties it builds with no push, which is
+    # how a contributor's checkout builds too. The unit tests run on the JVM and
+    # never load the native library, so the two steps are independent.
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Gradle fails on a newer JDK with nothing but its version as the message.
+      - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      # :app:test is every variant, three environments by two builds by debug and
+      # release, and their Kotlin compiles share one compiler daemon, as many at
+      # once as Gradle has workers. At the 2 GB it inherits from gradle.properties,
+      # a clean build runs it out of memory. Four workers at 3 GB is a clean build
+      # that passes, and matches the runner's four cores.
+      - name: Unit tests
+        working-directory: mobile
+        run: >-
+          ./gradlew :app:test --no-daemon --console=plain --max-workers=4
+          -Pkotlin.daemon.jvmargs=-Xmx3g
+
+      - name: Install Rust with the Android targets
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --no-self-update \
+            --target aarch64-linux-android,x86_64-linux-android
+          rustup default 1.88.0
+          rustc --version && cargo --version
+
+      - name: Name the image for the cache key
+        id: env
+        run: echo "image=$ImageOS" >> "$GITHUB_OUTPUT"
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: android-${{ steps.env.outputs.image }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: android-${{ steps.env.outputs.image }}-
+
+      # The NDK the release builds with, which is not the image's default. The
+      # runner image carries the SDK manager to install it, and names its own
+      # default NDK in both variables below, so both are pointed at this one.
+      - name: Install cargo-ndk and NDK 27.2
+        run: |
+          set -eu
+          cargo install --locked cargo-ndk@4.1.2
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;27.2.12479018" > /dev/null
+          ndk="$ANDROID_HOME/ndk/27.2.12479018"
+          test -f "$ndk/source.properties"
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ndk" >> "$GITHUB_ENV"
+
+      - name: Cross-compile the native core (arm64-v8a, x86_64)
+        working-directory: mobile/rust
+        run: cargo ndk -t arm64-v8a -t x86_64 build --locked
+
   audit:
     name: dependency advisories
     runs-on: ubuntu-26.04
@@ -554,7 +627,7 @@ jobs:
     # right place to decide whether to upgrade, ignore, or drop a dependency.
     continue-on-error: ${{ github.event_name != 'schedule' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       # The ignore of RUSTSEC-2026-0459 below holds only while no build compiles

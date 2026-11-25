@@ -19,7 +19,6 @@ path = "src/lib.rs"
 
 [dependencies]
 cfx_tui = { path = "../tui" }
-ratatui = { version = "0.30.0-alpha.5", features = ["crossterm"] }
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
 axum = "0.8.8"
 axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }

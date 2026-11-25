@@ -209,8 +209,9 @@ android {
         // classes they touch in passing answer defaults instead of throwing.
         unitTests.isReturnDefaultValues = true
     }
-    // The native lib is prebuilt into src/main/jniLibs by `cargo ndk` (see rust/). In CI this is a
-    // gradle task that shells `cargo ndk -t arm64-v8a -t x86_64 -o app/src/main/jniLibs build --release`.
+    // The native lib is prebuilt into src/main/jniLibs by `cargo ndk` (see rust/ and build.sh); no
+    // gradle task builds it. The unit tests run on the JVM and do not load it. The android job in
+    // ci.yml runs them and, as a separate step, cross-compiles rust/ for both ABIs with cargo ndk.
 }
 
 dependencies {
