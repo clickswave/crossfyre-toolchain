@@ -249,6 +249,15 @@ fn start(
         shut_down_in_background(stale);
     }
 
+    // Taken now, while the service still holds the fd it passed in. See `netstack::Tunnel`.
+    let tunnel = match unsafe { netstack::Tunnel::dup(tun_fd) } {
+        Ok(t) => t,
+        Err(e) => {
+            log::error!("startCapture: could not take the tunnel: {e}");
+            return false;
+        }
+    };
+
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -287,7 +296,7 @@ fn start(
             cfg_wf,
             cfg_token,
         );
-        if let Err(e) = netstack::run(tun_fd, ca, egress, tx, capture_cfg).await {
+        if let Err(e) = netstack::run(tunnel, ca, egress, tx, capture_cfg).await {
             log::error!("netstack ended: {e}");
         }
     });
@@ -564,6 +573,93 @@ mod tests {
                 "{export} names a class other than {package}.Native, so nothing can call it"
             );
         }
+    }
+}
+
+/// When the native copy of the tunnel is taken, against when Kotlin closes its own.
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+mod tunnel {
+    use std::io::Read;
+
+    unsafe extern "C" {
+        fn socketpair(domain: i32, kind: i32, protocol: i32, fds: *mut i32) -> i32;
+        fn close(fd: i32) -> i32;
+        fn read(fd: i32, buf: *mut core::ffi::c_void, count: usize) -> isize;
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+
+    /// 0 at end of file, -1 while the other end is still open somewhere.
+    fn read_now(fd: i32) -> isize {
+        let mut b = [0u8; 1];
+        unsafe { read(fd, b.as_mut_ptr() as *mut _, 1) }
+    }
+
+    /// The service closes its tunnel fd as soon as Stop returns, and can do so
+    /// at any moment after start returns. The native copy has to exist by then:
+    /// taken later, from a task waiting on the control plane, it is a dup of a
+    /// closed number, or of whatever the process opened under that number since.
+    #[test]
+    fn the_tunnel_is_held_before_start_returns() {
+        let _tunnel = crate::tunfd::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let _stats = crate::stats::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        // A control plane that takes the connection and never answers.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = format!("http://{}", silent.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let mut open = Vec::new();
+            for conn in silent.incoming().flatten() {
+                let mut conn = conn;
+                let mut buf = [0u8; 4096];
+                let _ = conn.set_nonblocking(true);
+                let _ = conn.read(&mut buf);
+                open.push(conn);
+            }
+        });
+
+        // A stream socket pair stands in for the tunnel: the peer reads end of
+        // file only once every copy of the other end is closed.
+        let mut fds = [0i32; 2];
+        assert_eq!(
+            unsafe {
+                socketpair(
+                    1, /* AF_UNIX */
+                    1, /* SOCK_STREAM */
+                    0,
+                    fds.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        let (tun, peer) = (fds[0], fds[1]);
+        unsafe {
+            fcntl(peer, 4 /* F_SETFL */, 0x800 /* O_NONBLOCK */)
+        };
+
+        assert!(super::start(tun, api, "wf".into(), "tok".into(), false));
+        // What the service does with its own copy when the VPN goes away.
+        unsafe { close(tun) };
+        let held = read_now(peer);
+
+        super::stop();
+        let mut after = read_now(peer);
+        for _ in 0..50 {
+            if after == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            after = read_now(peer);
+        }
+        unsafe { close(peer) };
+        assert_eq!(
+            held, -1,
+            "nothing native held the tunnel when start returned"
+        );
+        assert_eq!(after, 0, "stop should let go of the tunnel");
     }
 }
 

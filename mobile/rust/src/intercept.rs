@@ -12,6 +12,9 @@ use tokio::time::Instant;
 use cfx_capture::{EditedRequest, InterceptDecision, InterceptGate};
 use serde_json::json;
 
+/// How long capture waits for the control plane's config before starting on the defaults.
+const CONFIG_WAIT: Duration = Duration::from_secs(10);
+
 /// Ask the control plane whether full capture / manual interception is on.
 ///
 /// The shared-config fetch.
@@ -50,7 +53,15 @@ pub async fn fetch_capture_config(
         device_allows_full,
         device_allows_full,
     );
-    match client.post(&url).json(&body).send().await {
+    // Bounded, because the tunnel is up and nothing reads it until this answers.
+    // A control plane that never does gets the defaults, as one that fails does.
+    match client
+        .post(&url)
+        .json(&body)
+        .timeout(CONFIG_WAIT)
+        .send()
+        .await
+    {
         Ok(r) => match r.json::<serde_json::Value>().await {
             Ok(v) => cfx_capture::CaptureConfig::parse(&v),
             Err(e) => {
@@ -231,5 +242,30 @@ impl InterceptGate for HttpGate {
         body: &'a [u8],
     ) -> Pin<Box<dyn std::future::Future<Output = InterceptDecision> + Send + 'a>> {
         Box::pin(self.decide_async(method, url, headers, body))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    /// The tunnel is up and nothing reads it until the config answers, so a control
+    /// plane that takes the connection and says nothing must not hold capture forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_control_plane_gets_the_defaults() {
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = format!("http://{}", silent.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut open = Vec::new();
+            while let Ok((conn, _)) = silent.accept().await {
+                open.push(conn);
+            }
+        });
+        let http = reqwest::Client::new();
+        let asked = super::fetch_capture_config(&http, &api, "wf", "tok", false);
+        let cfg = tokio::time::timeout(Duration::from_secs(600), asked)
+            .await
+            .expect("the config fetch should give up on its own");
+        assert!(!cfg.is_manual());
     }
 }
