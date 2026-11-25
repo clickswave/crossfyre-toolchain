@@ -55,8 +55,20 @@ const STDERR_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 /// Where the helper is: `CROSSFYRE_CFX_SCRIPT` when set, else beside this binary
 /// (the installer puts it next to `node` and the CLI), else in the bin directory
 /// (where a packaged CLI, which lives elsewhere, has it fetched), else on PATH.
+///
+/// As root, or elevated on Windows, as the node service runs, only the two places the
+/// installer writes are looked in. The variable and PATH come from whoever started the
+/// process: an elevated prompt inherits the user's own environment, which any program
+/// that user runs can change, and a directory on PATH may be one anybody can write.
 pub fn helper_path() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("CROSSFYRE_CFX_SCRIPT") {
+    helper_path_from(crate::os::is_elevated(), |name| std::env::var_os(name))
+}
+
+/// [`helper_path`] for a process that is `elevated` or not, reading the environment
+/// through `env`.
+fn helper_path_from(elevated: bool, env: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    let env = |name: &str| if elevated { None } else { env(name) };
+    if let Some(p) = env("CROSSFYRE_CFX_SCRIPT") {
         return Some(PathBuf::from(p));
     }
     let file = crate::toolchain::config::file_name(HELPER);
@@ -71,7 +83,7 @@ pub fn helper_path() -> Option<PathBuf> {
     if installed.is_file() {
         return Some(installed);
     }
-    std::env::var_os("PATH").and_then(|paths| {
+    env("PATH").and_then(|paths| {
         std::env::split_paths(&paths)
             .map(|dir| dir.join(&file))
             .find(|p| p.is_file())
@@ -553,6 +565,36 @@ mod tests {
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    /// Root, or an elevated Windows process, takes the helper only from where the
+    /// installer puts it. CROSSFYRE_CFX_SCRIPT and PATH are the caller's to set, and a
+    /// directory on PATH may be one anybody can write.
+    #[test]
+    fn elevated_the_helper_is_not_taken_from_the_environment() {
+        let planted = fake_helper("planted", "exit 0");
+        let dir = planted.parent().unwrap().as_os_str().to_os_string();
+        let env = |name: &str| match name {
+            "CROSSFYRE_CFX_SCRIPT" => Some(OsString::from("/nonexistent/named-helper")),
+            "PATH" => Some(dir.clone()),
+            _ => None,
+        };
+        let found = helper_path_from(true, env);
+        assert_ne!(
+            found.as_deref(),
+            Some(Path::new("/nonexistent/named-helper"))
+        );
+        assert_ne!(found.as_deref(), Some(planted.as_path()));
+
+        let only_path = |name: &str| (name == "PATH").then(|| dir.clone());
+        let found = helper_path_from(true, only_path);
+        assert_ne!(found.as_deref(), Some(planted.as_path()));
+
+        // Not elevated, both are honoured as before.
+        assert_eq!(
+            helper_path_from(false, env),
+            Some(PathBuf::from("/nonexistent/named-helper"))
+        );
     }
 
     async fn collect(helper: &Path) -> (ExecutionResult, bool, Vec<serde_json::Value>) {
