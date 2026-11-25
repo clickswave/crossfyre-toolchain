@@ -90,7 +90,7 @@ tokio = { version = "1.49.0", features = ["test-util"] }
 # scheduled tasks registered through the Task Scheduler's COM interface (the `windows`
 # crate, at the version sysinfo already brings), and the rest is plain Win32.
 [target.'cfg(windows)'.dependencies]
-windows-service = "0.7"
+windows-service = "0.8"
 windows = { version = "0.57", features = [
     "Win32_Foundation",
     "Win32_System_Com",
