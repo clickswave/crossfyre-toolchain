@@ -203,9 +203,18 @@ fn is_plain_name(name: &str) -> bool {
 pub const PROFILE_PREFERENCES: &str = r#"{"net":{"network_prediction_options":2}}"#;
 
 /// Create the throwaway profile with [`PROFILE_PREFERENCES`] in place.
+///
+/// The profile comes to hold the session the browser is handed and every cookie a
+/// target sets, so on Unix it is readable by its owner alone. It is created new, and a
+/// directory that is already at the path, which another account could have made, is
+/// an error rather than a profile.
 fn write_profile(profile: &std::path::Path) -> std::io::Result<()> {
+    let mut dir = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut dir, 0o700);
+    dir.create(profile)?;
     let default = profile.join("Default");
-    std::fs::create_dir_all(&default)?;
+    dir.create(&default)?;
     std::fs::write(default.join("Preferences"), PROFILE_PREFERENCES)
 }
 
@@ -227,10 +236,16 @@ const EXITED_EARLY: &str = "the browser exited before it was ready. On a contain
      usually means it needs --no-sandbox; set CFX_BROWSER_NO_SANDBOX=1 to allow that, \
      knowing it removes renderer isolation.";
 
-/// Whether the browser may be started without its sandbox: `CFX_BROWSER_NO_SANDBOX` is
-/// set, as a container whose sandbox does not start needs.
+/// Whether the browser may be started without its sandbox: `CFX_BROWSER_NO_SANDBOX=1`,
+/// as a container whose sandbox does not start needs.
 pub fn no_sandbox() -> bool {
-    std::env::var("CFX_BROWSER_NO_SANDBOX").is_ok()
+    sandbox_turned_off(std::env::var("CFX_BROWSER_NO_SANDBOX").ok().as_deref())
+}
+
+/// Only `1` turns the sandbox off. A variable that is merely set, to `0`, `false` or
+/// nothing, reads as someone meaning to keep it.
+fn sandbox_turned_off(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "1")
 }
 
 impl Browser {
@@ -1026,6 +1041,39 @@ mod tests {
                 .iter()
                 .any(|f| f.starts_with("--host-resolver-rules"))
         );
+    }
+
+    /// Only `1` turns the sandbox off. A value meant to say no, or left empty, keeps it.
+    #[test]
+    fn only_one_turns_the_sandbox_off() {
+        assert!(sandbox_turned_off(Some("1")));
+        assert!(sandbox_turned_off(Some(" 1 ")));
+        for keeps in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("no"),
+            Some("off"),
+        ] {
+            assert!(!sandbox_turned_off(keeps), "{keeps:?}");
+        }
+    }
+
+    /// The profile holds the session the browser is given and every cookie a target
+    /// sets, so no other account on the machine may read it, and a directory someone
+    /// else made at that path first is not used.
+    #[cfg(unix)]
+    #[test]
+    fn the_profile_is_the_owners_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("cfx-browser-mode-{}", uuid::Uuid::new_v4()));
+        write_profile(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        let again = write_profile(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(mode, 0o700, "{mode:o}");
+        assert!(again.is_err(), "a directory already there was used");
     }
 
     #[cfg(not(unix))]
