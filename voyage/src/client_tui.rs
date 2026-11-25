@@ -1,20 +1,16 @@
 //! Voyage's dashboard.
 //!
-//! Chrome, keys and logs come from `cfx_tui`. What stays here is the part that
-//! is about subdomain enumeration: counting results and listing what turned
-//! up, alongside the source that found it.
+//! The screen, the keys and the logs come from `cfx_tui`. What stays here is
+//! the part that is about subdomain enumeration: counting results and listing
+//! what turned up, alongside the source that found it.
 
 use crate::scanner::StreamEvent;
-use cfx_tui::{Dashboard, Level, Logs, Stat, View, widgets};
-use ratatui::{
-    Frame,
-    layout::{Constraint, Direction, Layout, Rect},
-    widgets::{Block, Borders, Cell, Row, Table, TableState},
-};
+use cfx_tui::{Cell, Column, Dashboard, Level, Logs, Progress, Stat, View};
 use tokio::sync::mpsc;
 
 const FOUND: char = 'f';
 const VIEWS: &[View] = &[View::new(FOUND, "Found")];
+const COLUMNS: &[Column] = &[Column::new("Source", 14), Column::rest("Subdomain")];
 
 struct Subdomain {
     name: String,
@@ -22,13 +18,12 @@ struct Subdomain {
 }
 
 struct Voyage {
-    operation_id: String,
+    target: String,
     total: usize,
     scanned: usize,
     found: usize,
     not_found: usize,
     subdomains: Vec<Subdomain>,
-    table: TableState,
     logs: Logs,
     done: bool,
     #[cfg(feature = "tuning")]
@@ -36,15 +31,14 @@ struct Voyage {
 }
 
 impl Voyage {
-    fn new(operation_id: String, total: usize) -> Self {
+    fn new(target: String, total: usize) -> Self {
         Self {
-            operation_id,
+            target,
             total,
             scanned: 0,
             found: 0,
             not_found: 0,
             subdomains: Vec::new(),
-            table: TableState::default(),
             logs: Logs::new(),
             done: false,
             #[cfg(feature = "tuning")]
@@ -64,10 +58,6 @@ impl Voyage {
                                 name,
                                 source: event.source.unwrap_or_default(),
                             });
-                            // Follow the newest result so a long enumeration
-                            // reads as a feed rather than freezing at the top.
-                            self.table
-                                .select(Some(self.subdomains.len().saturating_sub(1)));
                         }
                     }
                     _ => self.not_found += 1,
@@ -115,54 +105,6 @@ impl Voyage {
             _ => {}
         }
     }
-
-    fn render_found(&mut self, frame: &mut Frame, area: Rect) {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(widgets::GAUGE_HEIGHT),
-                Constraint::Length(widgets::STATS_HEIGHT),
-                Constraint::Min(0),
-            ])
-            .split(area);
-
-        widgets::progress(frame, rows[0], self.scanned, self.total, "Progress");
-        widgets::stats(
-            frame,
-            rows[1],
-            &[
-                Stat::good("Found", self.found),
-                Stat::new("Not found", self.not_found),
-            ],
-        );
-
-        let header = Row::new(
-            ["Source", "Subdomain"]
-                .iter()
-                .map(|h| Cell::from(*h).style(cfx_tui::theme::title())),
-        )
-        .height(1);
-
-        let body: Vec<Row> = self
-            .subdomains
-            .iter()
-            .map(|s| {
-                Row::new(vec![
-                    Cell::from(s.source.clone()).style(cfx_tui::theme::label()),
-                    Cell::from(s.name.clone()),
-                ])
-            })
-            .collect();
-
-        frame.render_stateful_widget(
-            Table::new(body, widgets::table_constraints(&[14]))
-                .header(header)
-                .block(Block::default().borders(Borders::ALL).title("Subdomains"))
-                .row_highlight_style(cfx_tui::theme::selected()),
-            rows[2],
-            &mut self.table,
-        );
-    }
 }
 
 impl Dashboard for Voyage {
@@ -170,8 +112,8 @@ impl Dashboard for Voyage {
         "VOYAGE"
     }
 
-    fn subtitle(&self) -> &str {
-        &self.operation_id
+    fn target(&self) -> &str {
+        &self.target
     }
 
     fn finished(&self) -> bool {
@@ -182,10 +124,31 @@ impl Dashboard for Voyage {
         VIEWS
     }
 
-    fn render(&mut self, key: char, frame: &mut Frame, area: Rect) {
-        if key == FOUND {
-            self.render_found(frame, area);
+    fn progress(&self) -> Progress {
+        Progress::Counted {
+            done: self.scanned,
+            total: self.total,
         }
+    }
+
+    fn stats(&self) -> Vec<Stat> {
+        vec![
+            Stat::count("Found", self.found).good(),
+            Stat::count("Not found", self.not_found),
+        ]
+    }
+
+    fn columns(&self, _view: char) -> &'static [Column] {
+        COLUMNS
+    }
+
+    fn len(&self, _view: char) -> usize {
+        self.subdomains.len()
+    }
+
+    fn row(&self, _view: char, index: usize) -> Vec<Cell> {
+        let found = &self.subdomains[index];
+        vec![Cell::muted(&found.source), Cell::plain(&found.name)]
     }
 
     fn logs(&mut self) -> &mut Logs {
@@ -200,12 +163,16 @@ impl Dashboard for Voyage {
 
 pub async fn run(
     rx: mpsc::UnboundedReceiver<StreamEvent>,
+    target: String,
     operation_id: String,
     total: usize,
     poll_timeout: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     tokio::task::spawn_blocking(move || {
-        let mut app = Voyage::new(operation_id, total);
+        let mut app = Voyage::new(target, total);
+        // The header names the target, so the operation is kept where it can
+        // still be read: the first line of the log.
+        app.logs.info(format!("operation {operation_id}"));
         let mut rx = rx;
         cfx_tui::run(&mut app, poll_timeout, |app| {
             while let Ok(event) = rx.try_recv() {

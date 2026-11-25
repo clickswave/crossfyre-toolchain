@@ -139,7 +139,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .await??;
         if let Some(scan) = chosen {
             let request = dguard::resume_request(scan["id"].as_str().unwrap_or_default());
-            stream_scan(&daemon, &request, None, tui, EVENT_POLL_TIMEOUT_MS).await?;
+            stream_scan(
+                &daemon,
+                &request,
+                scan["target"].as_str().unwrap_or_default(),
+                None,
+                tui,
+                EVENT_POLL_TIMEOUT_MS,
+            )
+            .await?;
         }
         return Ok(());
     }
@@ -282,6 +290,7 @@ async fn scan_url(
     stream_scan(
         daemon,
         &request,
+        url,
         Some(wordlist),
         tui,
         fuzz_args.event_poll_timeout,
@@ -290,12 +299,13 @@ async fn scan_url(
 }
 
 /// Send `request` to the daemon, with the words of the file at `wordlist` after it when
-/// there is one, and show the scan it starts: drawn on the dashboard when `tui`, polling
-/// for events every `poll_timeout` ms, and otherwise written out as the daemon's own
-/// newline-delimited JSON.
+/// there is one, and show the scan it starts: drawn on the dashboard when `tui`, under
+/// `target`'s name, polling for events every `poll_timeout` ms, and otherwise written out
+/// as the daemon's own newline-delimited JSON.
 async fn stream_scan(
     daemon: &dguard::Daemon,
     request: &serde_json::Value,
+    target: &str,
     wordlist: Option<&std::path::Path>,
     tui: bool,
     poll_timeout: u64,
@@ -347,7 +357,7 @@ async fn stream_scan(
         });
 
         // Blocks until the user quits or the run completes.
-        client_tui::run(rx, operation_id, total, poll_timeout).await?;
+        client_tui::run(rx, target.to_string(), operation_id, total, poll_timeout).await?;
         return Ok(());
     }
 

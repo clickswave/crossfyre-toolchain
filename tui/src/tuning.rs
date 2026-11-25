@@ -8,16 +8,11 @@
 //! Tools report through [`Snapshot`], which holds numbers and short strings
 //! only. Nothing in here reaches into engine types.
 
-use crate::theme;
+use crate::theme::{self, Tone};
 use ratatui::{
-    Frame,
-    layout::Rect,
+    style::Modifier,
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
 };
-
-/// Height the panel needs, so callers can size a layout around it.
-pub const HEIGHT: u16 = 3;
 
 /// What a tool reports each tick. Every field is optional: a tool fills in
 /// what it knows and leaves the rest, rather than inventing values to fit.
@@ -45,36 +40,36 @@ impl Snapshot {
     }
 }
 
-pub fn render(frame: &mut Frame, area: Rect, snap: &Snapshot) {
-    let mut spans = vec![Span::raw("  ")];
+/// The pacing line, which sits under the counters in the run panel.
+pub fn line(snap: &Snapshot) -> Line<'static> {
+    let mut spans = Vec::new();
 
-    let mut field = |label: &str, value: String, style: ratatui::style::Style| {
-        if !spans.is_empty() && spans.len() > 1 {
+    let mut field = |label: &str, value: String, tone: Tone| {
+        if !spans.is_empty() {
             spans.push(Span::raw("   "));
         }
-        spans.push(Span::styled(format!("{label}: "), theme::label()));
-        spans.push(Span::styled(value, style));
+        spans.push(Span::styled(format!("{label} "), theme::label()));
+        spans.push(Span::styled(
+            value,
+            theme::tone(tone).add_modifier(Modifier::BOLD),
+        ));
     };
 
     if let (Some(n), Some(lim)) = (snap.in_flight, snap.limit) {
-        field("Workers", format!("{n} / {lim}"), theme::value());
+        field("workers", format!("{n} / {lim}"), Tone::Plain);
     } else if let Some(n) = snap.in_flight {
-        field("Workers", n.to_string(), theme::value());
+        field("workers", n.to_string(), Tone::Plain);
     }
     if let Some(r) = snap.rate {
-        field("Rate", format!("{r:.0}/s"), theme::value());
+        field("rate", format!("{r:.0}/s"), Tone::Plain);
     }
     if let Some(p) = &snap.posture {
-        field("Posture", p.clone(), theme::title());
+        field("posture", p.clone(), Tone::Accent);
     }
     if let Some(t) = snap.throttled {
-        let style = if t > 0 { theme::bad() } else { theme::value() };
-        field("Throttled", t.to_string(), style);
+        let tone = if t > 0 { Tone::Bad } else { Tone::Plain };
+        field("throttled", t.to_string(), tone);
     }
 
-    frame.render_widget(
-        Paragraph::new(Line::from(spans))
-            .block(Block::default().borders(Borders::ALL).title("Pacing")),
-        area,
-    );
+    Line::from(spans)
 }

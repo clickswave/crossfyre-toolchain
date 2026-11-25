@@ -40,8 +40,6 @@ sha2 = "0.10.9"
 serde_json = { version = "1.0.142", features = [] }
 reqwest = { version = "0.12.22", default-features = false, features = ["rustls-tls", "http2", "charset", "cookies"] }
 cfx_tui = { path = "../tui" }
-ratatui = { version = "0.30.0-alpha.5", features = ["crossterm"] }
-crossterm = "0.29.0"
 regex = "1"
 uuid = { version = "1.18.0", features = ["v4"] }
 base64 = "0.22.1"

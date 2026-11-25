@@ -1,13 +1,14 @@
 //! The Scans view: the scans an engine's daemon keeps, the latest first, as its `scans`
 //! operation lists them, and a stopped one to take up again.
 
-use crate::theme;
+use crate::chrome::{self, Hint};
+use crate::sheet::{self, Cell, Column, Scroll};
+use crate::theme::{self, Tone};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
-    text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
+    layout::{Constraint, Layout},
+    text::Span,
 };
 use serde_json::Value;
 use std::io;
@@ -115,68 +116,64 @@ fn pick(name: &str, scans: &[Value]) -> io::Result<Option<usize>> {
     }
 }
 
-fn paint(frame: &mut Frame, name: &str, picker: &Picker) {
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .split(frame.area());
-    let header = Line::from(vec![
-        Span::styled(format!("  {name}  "), theme::title()),
-        Span::styled("SCANS", theme::value()),
-        Span::styled(format!("    {} kept", picker.scans.len()), theme::label()),
-    ]);
-    frame.render_widget(
-        Paragraph::new(header).block(Block::default().borders(Borders::ALL)),
-        rows[0],
-    );
-    body(frame, picker, rows[1]);
-    let footer = picker.said.clone().unwrap_or_else(|| {
-        "  Up and down to choose, Enter takes a stopped scan up again, q to exit.".to_string()
-    });
-    frame.render_widget(Paragraph::new(footer).style(theme::label()), rows[2]);
-}
+const COLUMNS: &[Column] = &[
+    Column::new("Status", 10),
+    Column::new("Last changed", 20),
+    Column::rest("Target"),
+    Column::new("ID", 8),
+];
 
-fn body(frame: &mut Frame, picker: &Picker, area: Rect) {
-    if picker.scans.is_empty() {
-        frame.render_widget(
-            Paragraph::new("  No scans kept yet.").style(theme::label()),
-            area,
-        );
-        return;
-    }
-    let rows = picker.scans.iter().map(|scan| {
+fn paint(frame: &mut Frame, name: &str, picker: &Picker) {
+    let [panel, keys] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(frame.area());
+    let block = chrome::panel(
+        chrome::heading(name, vec![Span::styled("Scans", theme::value())]),
+        chrome::trailing(vec![Span::styled(
+            format!("{} kept", picker.scans.len()),
+            theme::label(),
+        )]),
+    );
+    let inside = block.inner(panel);
+    frame.render_widget(block, panel);
+
+    let row = |i: usize| {
+        let scan = &picker.scans[i];
         let status = text(&scan["status"]);
-        let colour = match status {
-            "stopped" => theme::WARN,
-            "completed" => theme::GOOD,
-            "failed" => theme::BAD,
-            _ => theme::ACCENT,
+        let tone = match status {
+            "stopped" => Tone::Warn,
+            "completed" => Tone::Good,
+            "failed" => Tone::Bad,
+            _ => Tone::Accent,
         };
-        Row::new(vec![
-            Cell::from(status.to_string()).style(ratatui::style::Style::default().fg(colour)),
-            Cell::from(when(text(&scan["updated_at"]))),
-            Cell::from(text(&scan["target"]).to_string()),
-            Cell::from(text(&scan["id"]).chars().take(8).collect::<String>()),
-        ])
-    });
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(10),
-            Constraint::Length(20),
-            Constraint::Min(20),
-            Constraint::Length(8),
-        ],
-    )
-    .header(Row::new(["STATUS", "LAST CHANGED", "TARGET", "ID"]).style(theme::label()))
-    .block(Block::default().borders(Borders::ALL))
-    .row_highlight_style(theme::selected());
-    let mut state = TableState::default().with_selected(Some(picker.chosen));
-    frame.render_stateful_widget(table, area, &mut state);
+        vec![
+            Cell::toned(status, tone),
+            Cell::plain(when(text(&scan["updated_at"]))),
+            Cell::plain(text(&scan["target"])),
+            Cell::muted(text(&scan["id"]).chars().take(8).collect::<String>()),
+        ]
+    };
+    sheet::draw(
+        frame,
+        inside,
+        COLUMNS,
+        picker.scans.len(),
+        &row,
+        &mut Scroll::at(picker.chosen),
+        "No scans kept yet.",
+    );
+
+    match &picker.said {
+        Some(line) => chrome::said(frame, keys, line),
+        None => chrome::footer(
+            frame,
+            keys,
+            vec![
+                Hint::new("↑↓", "choose", 2),
+                Hint::new("Enter", "take a stopped scan up again", 1),
+                Hint::new("q", "quit", 0),
+            ],
+        ),
+    }
 }
 
 /// `stamp`, an RFC 3339 time in UTC, to the minute.
@@ -248,7 +245,7 @@ mod tests {
             .collect();
         for shown in [
             "VOYAGE",
-            "SCANS",
+            "Scans",
             "2 kept",
             "stopped",
             "2026-11-19 16:39 UTC",
@@ -256,7 +253,7 @@ mod tests {
             "11111111",
             "completed",
             "old.example",
-            "Enter takes a stopped scan up again",
+            "take a stopped scan up again",
         ] {
             assert!(screen.contains(shown), "{shown} is not on the screen");
         }

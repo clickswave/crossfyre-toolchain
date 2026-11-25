@@ -94,11 +94,21 @@ fn print(out: &mut impl io::Write, rows: &[Value]) -> io::Result<()> {
     }
 }
 
+const COLUMNS: &[cfx_tui::Column] = &[
+    cfx_tui::Column::new("Host", 26),
+    cfx_tui::Column::new("Product", 24),
+    cfx_tui::Column::new("Version", 14),
+    cfx_tui::Column::new("Vendor", 14),
+    cfx_tui::Column::new("CVE leads", 12),
+    cfx_tui::Column::new("Checked by plessor", 34),
+    cfx_tui::Column::rest("Last seen"),
+];
+
 /// The inventory as the table shows it: a host and port, the product, its version, its
 /// vendor, its CVE leads with how many are known to be exploited, what plessor's
 /// templates said of those it answered, and when it was last seen, to the minute. A lead
 /// checked and not found has the line that this is no proof in the summary.
-fn list(rows: &[Value]) -> cfx_tui::table::List<'static> {
+fn list(rows: &[Value]) -> cfx_tui::table::List {
     let text = |row: &Value, key: &str| row[key].as_str().unwrap_or_default().to_string();
     let or_dash = |s: String| if s.is_empty() { "-".to_string() } else { s };
     let table: Vec<Vec<String>> = rows
@@ -136,7 +146,7 @@ fn list(rows: &[Value]) -> cfx_tui::table::List<'static> {
         |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
     cfx_tui::table::List {
         name: "TOOLMARK",
-        title: "INVENTORY",
+        title: "Inventory",
         summary: format!(
             "{} on {}{}{}",
             plural(table.len(), "product", "products"),
@@ -151,16 +161,7 @@ fn list(rows: &[Value]) -> cfx_tui::table::List<'static> {
                 String::new()
             }
         ),
-        header: &[
-            "HOST",
-            "PRODUCT",
-            "VERSION",
-            "VENDOR",
-            "CVE LEADS",
-            "CHECKED BY PLESSOR",
-            "LAST SEEN",
-        ],
-        widths: &[26, 24, 14, 14, 12, 34],
+        columns: COLUMNS,
         rows: table,
     }
 }

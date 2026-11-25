@@ -36,7 +36,6 @@ serde_json = { version = "1.0.142", features = [] }
 sqlx = { version = "0.8.6", features = ["postgres"] }
 uuid = { version = "1.18.0", features = ["v4"] }
 cfx_tui = { path = "../tui" }
-ratatui = { version = "0.30.0-alpha.5", features = ["crossterm"] }
 
 [dev-dependencies]
 # A database of a test's own, for what the engine keeps.

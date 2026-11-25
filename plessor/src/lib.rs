@@ -426,9 +426,19 @@ fn show_findings(rows: &[serde_json::Value], tui: bool) -> std::io::Result<()> {
     cfx_tui::table::show(&findings_list(rows))
 }
 
+#[cfg(feature = "daemon")]
+const FINDINGS_COLUMNS: &[cfx_tui::Column] = &[
+    cfx_tui::Column::new("ID", 8),
+    cfx_tui::Column::new("Severity", 10),
+    cfx_tui::Column::new("Name", 34),
+    cfx_tui::Column::new("Where", 40),
+    cfx_tui::Column::new("Proof", 14),
+    cfx_tui::Column::rest("Found"),
+];
+
 /// The findings as the table shows them.
 #[cfg(feature = "daemon")]
-fn findings_list(rows: &[serde_json::Value]) -> cfx_tui::table::List<'static> {
+fn findings_list(rows: &[serde_json::Value]) -> cfx_tui::table::List {
     let text = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_string();
     let has_proof = |row: &serde_json::Value| row["data"].get("proof").is_some();
     let table: Vec<Vec<String>> = rows
@@ -455,13 +465,12 @@ fn findings_list(rows: &[serde_json::Value]) -> cfx_tui::table::List<'static> {
     let proofs = rows.iter().filter(|r| has_proof(r)).count();
     cfx_tui::table::List {
         name: "PLESSOR",
-        title: "FINDINGS",
+        title: "Findings",
         summary: format!(
             "{} findings, {proofs} with a proof: `plessor verify <id>` checks one again",
             table.len()
         ),
-        header: &["ID", "SEVERITY", "NAME", "WHERE", "PROOF", "FOUND"],
-        widths: &[8, 10, 34, 40, 14],
+        columns: FINDINGS_COLUMNS,
         rows: table,
     }
 }

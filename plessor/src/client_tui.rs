@@ -1,30 +1,40 @@
 //! Plessor's dashboard.
 //!
-//! Chrome, keys and logs come from `cfx_tui`. What stays here is the part that
-//! is about vulnerability scanning: tracking template progress, listing
+//! The screen, the keys and the logs come from `cfx_tui`. What stays here is
+//! the part that is about vulnerability scanning: tracking template progress, listing
 //! matches worst-first, since a critical three screens down is a critical
 //! nobody saw, listing the templates the scan held back, so a shorter run is
 //! not taken for a clean one, and toolmark's CVE leads for the target beside
 //! the findings, with what the templates said of each.
 
-use cfx_tui::{Dashboard, Level, Logs, Stat, View, widgets};
-use ratatui::{
-    Frame,
-    layout::{Constraint, Direction, Layout, Rect},
-    style::Style,
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
-};
+use cfx_tui::{Cell, Column, Dashboard, Level, Logs, Progress, Stat, Tone, View};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
 const FINDINGS: char = 'f';
 const LEADS: char = 'c';
 const HELD_BACK: char = 'h';
+// None of the three is kept in arrival order: findings are worst first, and the
+// other two are lists read from the top. So none follows its newest row.
 const VIEWS: &[View] = &[
-    View::new(FINDINGS, "Findings"),
-    View::new(LEADS, "CVE leads"),
-    View::new(HELD_BACK, "Held back"),
+    View::new(FINDINGS, "Findings").from_top(),
+    View::new(LEADS, "CVE leads").from_top(),
+    View::new(HELD_BACK, "Held back").from_top(),
 ];
+const FINDING_COLUMNS: &[Column] = &[
+    Column::new("Severity", 10),
+    Column::new("Name", 44),
+    Column::rest("Matched at"),
+];
+const LEAD_COLUMNS: &[Column] = &[
+    Column::new("CVE", 16),
+    Column::new("Product", 22),
+    Column::new("Severity", 10),
+    Column::new("KEV", 4),
+    Column::new("Answer", 20),
+    Column::rest("By, or why not"),
+];
+const HELD_BACK_COLUMNS: &[Column] = &[Column::new("Template", 40), Column::rest("Why")];
 
 struct Finding {
     severity: String,
@@ -60,14 +70,11 @@ struct Plessor {
     critical: usize,
     high: usize,
     findings: Vec<Finding>,
-    table: TableState,
     leads: Vec<Lead>,
     leads_from: String,
     /// The line said with a lead checked and not found: that it is no proof.
     not_proof: Option<String>,
-    leads_table: TableState,
     held: Vec<HeldBack>,
-    held_table: TableState,
     logs: Logs,
     done: bool,
 }
@@ -82,13 +89,10 @@ impl Plessor {
             critical: 0,
             high: 0,
             findings: Vec::new(),
-            table: TableState::default(),
             leads: Vec::new(),
             leads_from: String::new(),
             not_proof: None,
-            leads_table: TableState::default(),
             held: Vec::new(),
-            held_table: TableState::default(),
             logs: Logs::new(),
             done: false,
         }
@@ -206,161 +210,6 @@ impl Plessor {
             _ => {}
         }
     }
-
-    fn render_findings(&mut self, frame: &mut Frame, area: Rect) {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(widgets::GAUGE_HEIGHT),
-                Constraint::Length(widgets::STATS_HEIGHT),
-                Constraint::Min(0),
-            ])
-            .split(area);
-
-        widgets::progress(frame, rows[0], self.processed, self.total, "Templates");
-        widgets::stats(
-            frame,
-            rows[1],
-            &[
-                Stat::bad("Critical", self.critical),
-                Stat::new("High", self.high),
-                Stat::new("Total", self.found),
-                Stat::new(
-                    "Leads confirmed",
-                    self.leads
-                        .iter()
-                        .filter(|l| l.answer == "confirmed")
-                        .count(),
-                ),
-                Stat::new("Held back", self.held.len()),
-            ],
-        );
-
-        let header = Row::new(
-            ["Severity", "Name", "Matched at"]
-                .iter()
-                .map(|h| Cell::from(*h).style(cfx_tui::theme::title())),
-        )
-        .height(1);
-
-        let body: Vec<Row> = self
-            .findings
-            .iter()
-            .map(|f| {
-                Row::new(vec![
-                    Cell::from(f.severity.clone())
-                        .style(Style::default().fg(severity_colour(&f.severity))),
-                    Cell::from(f.name.clone()),
-                    Cell::from(f.matched_at.clone()).style(cfx_tui::theme::label()),
-                ])
-            })
-            .collect();
-
-        frame.render_stateful_widget(
-            Table::new(body, widgets::table_constraints(&[10, 44]))
-                .header(header)
-                .block(Block::default().borders(Borders::ALL).title("Findings"))
-                .row_highlight_style(cfx_tui::theme::selected()),
-            rows[2],
-            &mut self.table,
-        );
-    }
-
-    fn render_leads(&mut self, frame: &mut Frame, area: Rect) {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(2)])
-            .split(area);
-        let header = Row::new(
-            [
-                "CVE",
-                "Product",
-                "Severity",
-                "KEV",
-                "Answer",
-                "By, or why not",
-            ]
-            .iter()
-            .map(|h| Cell::from(*h).style(cfx_tui::theme::title())),
-        )
-        .height(1);
-        let body: Vec<Row> = self
-            .leads
-            .iter()
-            .map(|l| {
-                let answer = if l.answer.is_empty() {
-                    "waiting"
-                } else {
-                    l.answer.as_str()
-                };
-                let colour = match answer {
-                    "confirmed" => cfx_tui::theme::BAD,
-                    "waiting" => cfx_tui::theme::MUTED,
-                    _ => cfx_tui::theme::TEXT,
-                };
-                Row::new(vec![
-                    Cell::from(l.cve.clone()),
-                    Cell::from(l.product.clone()),
-                    Cell::from(l.severity.clone())
-                        .style(Style::default().fg(severity_colour(&l.severity))),
-                    Cell::from(if l.kev { "yes" } else { "" }),
-                    Cell::from(answer.to_string()).style(Style::default().fg(colour)),
-                    Cell::from(l.by.clone()).style(cfx_tui::theme::label()),
-                ])
-            })
-            .collect();
-        let title = if self.leads_from.is_empty() {
-            "CVE leads".to_string()
-        } else {
-            format!("CVE leads from {}", self.leads_from)
-        };
-        frame.render_stateful_widget(
-            Table::new(body, widgets::table_constraints(&[16, 22, 9, 4, 20]))
-                .header(header)
-                .block(Block::default().borders(Borders::ALL).title(title))
-                .row_highlight_style(cfx_tui::theme::selected()),
-            rows[0],
-            &mut self.leads_table,
-        );
-        // A lead checked and not found is no proof, said under the table wherever one is.
-        if let Some(line) = &self.not_proof {
-            frame.render_widget(
-                Paragraph::new(line.as_str()).style(Style::default().fg(cfx_tui::theme::WARN)),
-                rows[1],
-            );
-        }
-    }
-
-    fn render_held_back(&mut self, frame: &mut Frame, area: Rect) {
-        let header = Row::new(
-            ["Template", "Why"]
-                .iter()
-                .map(|h| Cell::from(*h).style(cfx_tui::theme::title())),
-        )
-        .height(1);
-        let body: Vec<Row> = self
-            .held
-            .iter()
-            .map(|h| {
-                Row::new(vec![
-                    Cell::from(h.template.clone()),
-                    Cell::from(h.why.clone()).style(cfx_tui::theme::label()),
-                ])
-            })
-            .collect();
-        frame.render_stateful_widget(
-            Table::new(body, widgets::table_constraints(&[40]))
-                .header(header)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("Held back: not run, so not tested"),
-                )
-                .row_highlight_style(cfx_tui::theme::selected()),
-            area,
-            &mut self.held_table,
-        );
-    }
 }
 
 /// Lower is worse, so a numeric sort puts criticals first.
@@ -374,21 +223,12 @@ fn severity_rank(severity: &str) -> u8 {
     }
 }
 
-fn severity_colour(severity: &str) -> ratatui::style::Color {
-    match severity {
-        "critical" | "high" => cfx_tui::theme::BAD,
-        "medium" => cfx_tui::theme::WARN,
-        "low" => cfx_tui::theme::TEXT,
-        _ => cfx_tui::theme::MUTED,
-    }
-}
-
 impl Dashboard for Plessor {
     fn name(&self) -> &str {
         "PLESSOR"
     }
 
-    fn subtitle(&self) -> &str {
+    fn target(&self) -> &str {
         &self.target
     }
 
@@ -400,12 +240,90 @@ impl Dashboard for Plessor {
         VIEWS
     }
 
-    fn render(&mut self, key: char, frame: &mut Frame, area: Rect) {
-        match key {
-            FINDINGS => self.render_findings(frame, area),
-            LEADS => self.render_leads(frame, area),
-            HELD_BACK => self.render_held_back(frame, area),
-            _ => {}
+    fn progress(&self) -> Progress {
+        Progress::Counted {
+            done: self.processed,
+            total: self.total,
+        }
+    }
+
+    fn stats(&self) -> Vec<Stat> {
+        let confirmed = self
+            .leads
+            .iter()
+            .filter(|l| l.answer == "confirmed")
+            .count();
+        vec![
+            Stat::count("Critical", self.critical).bad(),
+            Stat::count("High", self.high),
+            Stat::count("Total", self.found),
+            Stat::text(
+                "Leads confirmed",
+                format!("{confirmed} of {}", self.leads.len()),
+            ),
+        ]
+    }
+
+    fn columns(&self, view: char) -> &'static [Column] {
+        match view {
+            LEADS => LEAD_COLUMNS,
+            HELD_BACK => HELD_BACK_COLUMNS,
+            _ => FINDING_COLUMNS,
+        }
+    }
+
+    fn len(&self, view: char) -> usize {
+        match view {
+            LEADS => self.leads.len(),
+            HELD_BACK => self.held.len(),
+            _ => self.findings.len(),
+        }
+    }
+
+    fn row(&self, view: char, index: usize) -> Vec<Cell> {
+        match view {
+            LEADS => {
+                let lead = &self.leads[index];
+                let (answer, tone) = match lead.answer.as_str() {
+                    "" => ("waiting", Tone::Muted),
+                    "confirmed" => ("confirmed", Tone::Bad),
+                    other => (other, Tone::Plain),
+                };
+                vec![
+                    Cell::plain(&lead.cve),
+                    Cell::plain(&lead.product),
+                    Cell::severity(&lead.severity),
+                    Cell::plain(if lead.kev { "yes" } else { "" }),
+                    Cell::toned(answer, tone),
+                    Cell::muted(&lead.by),
+                ]
+            }
+            HELD_BACK => {
+                let held = &self.held[index];
+                vec![Cell::plain(&held.template), Cell::muted(&held.why)]
+            }
+            _ => {
+                let finding = &self.findings[index];
+                vec![
+                    Cell::severity(&finding.severity),
+                    Cell::plain(&finding.name),
+                    Cell::muted(&finding.matched_at),
+                ]
+            }
+        }
+    }
+
+    fn note(&self, view: char) -> Option<Cell> {
+        match view {
+            // A lead checked and not found is no proof, said under the table wherever
+            // one is. Until then the line says where the leads came from.
+            LEADS => match &self.not_proof {
+                Some(line) => Some(Cell::toned(line, Tone::Warn)),
+                None if self.leads_from.is_empty() => None,
+                None => Some(Cell::muted(format!("From {}.", self.leads_from))),
+            },
+            HELD_BACK => Some(Cell::muted("Not run, so not tested.")),
+            _ => None,
         }
     }
 
