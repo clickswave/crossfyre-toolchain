@@ -1,0 +1,81 @@
+name: CodeQL
+
+# Static analysis of the Rust workspace, the Android app's Kotlin, the Python
+# scripts and these workflows.
+#
+# This replaces the repository's default setup, which analyzed only actions and
+# python. Default setup cannot take Rust through the API, and Kotlin has no
+# build-mode none: CodeQL reads Kotlin by watching the compiler, so the app has
+# to be compiled here, which default setup's autobuild does not know how to do
+# for a Gradle project under mobile/. A workflow can do both. Default setup has
+# to stay off while this runs, because GitHub refuses uploads from a workflow
+# when it is on.
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+  # Queries improve between our commits, so the weekly run finds what a new
+  # release of them catches in code nobody has touched.
+  schedule:
+    - cron: "41 4 * * 1"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: analyze (${{ matrix.language }})
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: actions
+            build-mode: none
+          - language: python
+            build-mode: none
+          - language: rust
+            build-mode: none
+          - language: java-kotlin
+            build-mode: manual
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install JDK 17 for the Android build
+        if: matrix.language == 'java-kotlin'
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      # The Kotlin sources of both builds: direct carries the patch feature and
+      # play its stand-in. CodeQL sees only what the compiler compiles, so the
+      # Kotlin compiler runs inside Gradle's process rather than in a daemon of
+      # its own, and nothing is taken from a cache.
+      - name: Compile the Android app
+        if: matrix.language == 'java-kotlin'
+        working-directory: mobile
+        run: >-
+          ./gradlew --no-daemon --no-build-cache --console=plain
+          -Pkotlin.compiler.execution.strategy=in-process
+          :app:compileDevDirectDebugKotlin :app:compileDevPlayDebugKotlin
+
+      - uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          category: "/language:${{ matrix.language }}"
