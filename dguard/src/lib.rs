@@ -29,12 +29,14 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 mod db;
 mod idle;
+mod lines;
 pub mod ports;
 mod start;
 mod words;
 
 pub use db::{DbAction, PurgeArgs, answer, ask, list_scans, resume_request, run_db};
 pub use idle::{IDLE_EXIT_ENV, exit_when_idle, spawn_busy};
+pub use lines::{Lines, MAX_LINE};
 pub use start::{Daemon, LOG_LIMIT, NO_AUTOSTART_ENV, daemon_args, not_running, unit_name};
 pub use words::{CHUNK_WORDS, WORDS_FOLLOW, WordChunks, list_name, send_words};
 

@@ -2,7 +2,7 @@ use crate::libs::doorward_db::DoorwardDb;
 use crate::scanner::{self, ScanParams, StreamEvent};
 use serde::Deserialize;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
@@ -94,7 +94,7 @@ async fn handle_connection(
     db: Arc<DoorwardDb>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    let mut lines = dguard::Lines::new(BufReader::new(reader));
 
     while let Some(line) = lines.next_line().await? {
         let line = line.trim().to_string();
