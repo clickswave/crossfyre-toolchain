@@ -143,12 +143,36 @@ fn spawn_quiet(cmd: &str, args: &[&str]) -> bool {
         .is_ok()
 }
 
-/// Best-effort: open `url` in the operator's browser. Never fatal.
+/// `url` as it is handed to the browser, when it is a web page: https, or http on this
+/// machine. The link comes from the server, and the opener on every platform runs a
+/// program or a file just as readily as it opens a page.
+fn browsable(url: &str) -> Option<String> {
+    let url = reqwest::Url::parse(url.trim()).ok()?;
+    let host = url.host_str()?;
+    let here = host == "localhost"
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    match url.scheme() {
+        "https" => Some(url.into()),
+        "http" if here => Some(url.into()),
+        _ => None,
+    }
+}
+
+/// Best-effort: open `url` in the operator's browser. Never fatal. Anything but a web
+/// page ([`browsable`]) is left for the operator to open by hand.
 ///
 /// On Linux under `sudo`, root has no GUI session, so `xdg-open` as root does
 /// nothing. Re-launch it as the invoking user ($SUDO_USER), preserving the
 /// display/session env vars so it lands in their actual desktop session.
 fn open_browser(url: &str) -> bool {
+    let Some(url) = browsable(url) else {
+        return false;
+    };
+    let url = url.as_str();
     if cfg!(target_os = "macos") {
         return spawn_quiet("open", &[url]);
     }
@@ -845,6 +869,38 @@ pub async fn ensure_logged_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a web page is opened: the server's link could otherwise name a program, a
+    /// file on a share, or another scheme's handler.
+    #[test]
+    fn only_a_web_page_is_handed_to_the_browser() {
+        for ok in [
+            "https://crossfyre.io/device?code=AB-CD&x=1",
+            "http://localhost:5173/device",
+            "http://127.0.0.1:8080/device",
+            "http://[::1]/device",
+        ] {
+            assert!(browsable(ok).is_some(), "{ok}");
+        }
+        for bad in [
+            r"C:\Windows\System32\calc.exe",
+            r"\\attacker\share\run.exe",
+            "file:///C:/Windows/System32/calc.exe",
+            "ms-settings:privacy",
+            "search-ms:query=x",
+            "http://crossfyre.io/device",
+            "http://192.168.1.10/device",
+            "javascript:alert(1)",
+            "-https://crossfyre.io",
+            "",
+        ] {
+            assert_eq!(browsable(bad), None, "{bad}");
+        }
+        assert_eq!(
+            browsable(" https://crossfyre.io/device ").as_deref(),
+            Some("https://crossfyre.io/device")
+        );
+    }
 
     /// The account file is owner-only.
     ///
