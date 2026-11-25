@@ -198,9 +198,12 @@ pub async fn run(
         app.logs.info(format!("operation {operation_id}"));
         let mut rx = rx;
         cfx_tui::run(&mut app, poll_timeout, |app| {
+            let mut came = false;
             while let Ok(event) = rx.try_recv() {
                 app.apply(event);
+                came = true;
             }
+            came
         })
     })
     .await?

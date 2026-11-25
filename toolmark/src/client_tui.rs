@@ -182,9 +182,12 @@ pub async fn run(rx: mpsc::UnboundedReceiver<Value>, target: String) -> std::io:
         let mut app = Toolmark::new(target);
         let mut rx = rx;
         cfx_tui::run(&mut app, 50, |app| {
+            let mut came = false;
             while let Ok(event) = rx.try_recv() {
                 app.apply(event);
+                came = true;
             }
+            came
         })
     })
     .await

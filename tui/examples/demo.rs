@@ -64,12 +64,14 @@ impl Demo {
         &self.tool.sheets[at.unwrap_or(0)]
     }
 
-    fn pump(&mut self) {
+    fn pump(&mut self) -> bool {
+        let before = self.logged;
         while self.logged < self.arrived() {
             let row = self.tool.sheets[0].rows[self.logged];
             self.logs.info(format!("found {}", row.join(" ")));
             self.logged += 1;
         }
+        self.logged != before
     }
 }
 

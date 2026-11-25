@@ -924,6 +924,7 @@ dependencies = [
  "ratatui",
  "serde_json",
  "terminal-colorsaurus",
+ "unicode-width",
 ]
 
 [[package]]

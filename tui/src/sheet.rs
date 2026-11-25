@@ -167,6 +167,14 @@ impl Scroll {
         self.at + 1
     }
 
+    /// Something arrived, so the rows the filter let through may no longer be
+    /// the ones it would. A list can change without changing its length: a
+    /// capped log drops a line for every one it takes, and a row can be
+    /// rewritten where it stands.
+    pub fn forget(&mut self) {
+        self.matches = None;
+    }
+
     pub fn set_filter(&mut self, filter: String) {
         self.filter = filter;
         self.matches = None;
@@ -177,8 +185,9 @@ impl Scroll {
 
     /// Work out which rows the filter lets through and say how many.
     ///
-    /// Kept until the list grows or the filter changes: a run can hold tens of
-    /// thousands of rows and is drawn many times a second.
+    /// Kept until something arrives, the list changes length or the filter
+    /// changes: a finished run can hold tens of thousands of rows and is drawn
+    /// many times a second.
     pub fn shown(&mut self, len: usize, row: &dyn Fn(usize) -> Vec<Cell>) -> usize {
         if self.filter.is_empty() {
             self.matches = None;
@@ -226,7 +235,10 @@ impl Scroll {
     /// Bring the selection and the window into line with `shown` rows on a
     /// screen that fits `height` of them.
     fn settle(&mut self, shown: usize, height: usize) {
-        self.page = height.max(1);
+        // A table with room only for its headings still has a selection, and
+        // the window around it is worked out as though one row fitted.
+        let height = height.max(1);
+        self.page = height;
         if shown == 0 {
             self.at = 0;
             self.top = 0;
@@ -423,5 +435,34 @@ mod tests {
         assert_eq!(scroll.selected(0), None);
         scroll.set_filter(String::new());
         assert_eq!(scroll.shown(2, &rows(names)), 2);
+    }
+
+    #[test]
+    fn a_filter_is_worked_out_again_when_rows_change_in_place() {
+        let mut scroll = Scroll::new(false);
+        scroll.set_filter("waiting".into());
+        assert_eq!(scroll.shown(2, &rows(&["a waiting", "b waiting"])), 2);
+        // The same two rows, one of them answered since: the count is the
+        // same, so only being told that something arrived can catch it.
+        scroll.forget();
+        assert_eq!(scroll.shown(2, &rows(&["a confirmed", "b waiting"])), 1);
+        assert_eq!(scroll.selected(1), Some(1));
+    }
+
+    #[test]
+    fn a_table_with_room_only_for_its_headings_still_draws() {
+        use ratatui::{Terminal, backend::TestBackend};
+        const COLUMNS: &[Column] = &[Column::rest("Host")];
+        let names: &'static [&'static str] = &["a", "b", "c"];
+        for height in 1..4 {
+            let mut terminal = Terminal::new(TestBackend::new(20, height)).unwrap();
+            for follows in [true, false] {
+                let mut scroll = Scroll::new(follows);
+                scroll.moved(KeyCode::End, 3);
+                terminal
+                    .draw(|f| draw(f, f.area(), COLUMNS, 3, &rows(names), &mut scroll, ""))
+                    .unwrap();
+            }
+        }
     }
 }

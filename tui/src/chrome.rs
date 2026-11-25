@@ -10,6 +10,7 @@ use ratatui::{
     widgets::{Block, BorderType, Paragraph, Wrap},
 };
 use std::time::Duration;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// A rounded panel with `left` and `right` set into its top border.
 pub(crate) fn panel<'a>(left: Line<'a>, right: Line<'a>) -> Block<'a> {
@@ -70,7 +71,7 @@ pub(crate) fn pad(inside: Rect) -> Rect {
 /// rows off the screen.
 pub(crate) fn note(frame: &mut Frame, inside: Rect, text: &str, tone: Tone) -> Rect {
     let padded = pad(inside);
-    let needs = (text.chars().count() as u16)
+    let needs = (text.width() as u16)
         .div_ceil(padded.width.max(1))
         .clamp(1, 2)
         .min(inside.height);
@@ -108,7 +109,7 @@ impl Hint {
 
     fn width(&self) -> usize {
         // " key " as a cap, a space, the word, and two spaces to the next.
-        self.key.chars().count() + self.does.chars().count() + 5
+        self.key.width() + self.does.width() + 5
     }
 }
 
@@ -159,14 +160,26 @@ pub(crate) fn clock(elapsed: Duration) -> String {
 }
 
 /// `text` cut to `room` columns, ending in an ellipsis where it was cut.
+///
+/// Columns, not letters: a CJK letter or an emoji takes two.
 pub(crate) fn shorten(text: &str, room: usize) -> String {
-    if text.chars().count() <= room {
+    if text.width() <= room {
         return text.to_string();
     }
-    let mut cut: String = text.chars().take(room.saturating_sub(1)).collect();
-    if room > 0 {
-        cut.push('…');
+    if room == 0 {
+        return String::new();
     }
+    let mut cut = String::new();
+    let mut used = 0;
+    for letter in text.chars() {
+        let takes = letter.width().unwrap_or(0);
+        if used + takes > room - 1 {
+            break;
+        }
+        cut.push(letter);
+        used += takes;
+    }
+    cut.push('…');
     cut
 }
 
@@ -196,6 +209,16 @@ mod tests {
         assert_eq!(shorten("orbital.example", 20), "orbital.example");
         assert_eq!(shorten("orbital.example", 8), "orbital…");
         assert_eq!(shorten("orbital.example", 0), "");
+    }
+
+    #[test]
+    fn wide_letters_are_cut_by_the_columns_they_take() {
+        // Each of these takes two columns, so five columns hold two and the
+        // ellipsis.
+        assert_eq!(shorten("日本語テスト", 5), "日本…");
+        assert_eq!(shorten("日本語", 6), "日本語");
+        // A cut never leaves a column over that a wide letter would cross.
+        assert_eq!(shorten("日本語テスト", 4), "日…");
     }
 
     #[test]

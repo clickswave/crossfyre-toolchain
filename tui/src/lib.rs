@@ -42,6 +42,7 @@ use sheet::Scroll;
 use std::collections::VecDeque;
 use std::io::{self, IsTerminal};
 use std::time::{Duration, Instant};
+use unicode_width::UnicodeWidthStr;
 
 pub use sheet::{Cell, Column};
 pub use theme::Tone;
@@ -164,14 +165,15 @@ pub fn wanted_from(no_tui: bool, available: bool) -> bool {
 /// Drive a dashboard until the user quits.
 ///
 /// `pump` is called every tick to drain whatever the tool is receiving into
-/// its own state. The driver never sees the events, only the effect.
+/// its own state, and says whether anything came. The driver never sees the
+/// events, only the effect.
 ///
 /// Blocking, and expects to own the terminal. Under tokio, wrap the call in
 /// `spawn_blocking`.
 pub fn run<D: Dashboard>(
     dashboard: &mut D,
     tick_ms: u64,
-    mut pump: impl FnMut(&mut D),
+    mut pump: impl FnMut(&mut D) -> bool,
 ) -> io::Result<()> {
     debug_assert!(
         dashboard
@@ -246,6 +248,13 @@ impl Ui {
             started: now,
             finished: None,
             pace: Pace::default(),
+        }
+    }
+
+    /// Rows arrived: every view works its filter out again.
+    fn forget(&mut self) {
+        for (_, scroll) in &mut self.scrolls {
+            scroll.forget();
         }
     }
 
@@ -384,7 +393,7 @@ fn drive<D: Dashboard>(
     terminal: &mut Term,
     dashboard: &mut D,
     tick_ms: u64,
-    pump: &mut impl FnMut(&mut D),
+    pump: &mut impl FnMut(&mut D) -> bool,
 ) -> io::Result<()> {
     let mut ui = Ui::new(dashboard, Instant::now());
     // Cap the tick so the UI stays responsive to keys even when a tool asks
@@ -394,7 +403,9 @@ fn drive<D: Dashboard>(
     loop {
         let now = Instant::now();
         if !dashboard.finished() {
-            pump(dashboard);
+            if pump(dashboard) {
+                ui.forget();
+            }
         } else if ui.finished.is_none() {
             ui.finished = Some(now);
             // Say so once, in the logs, so the reason the numbers stopped
@@ -502,7 +513,7 @@ fn run_panel<D: Dashboard>(
     // The target gives way before anything else does: its start is what
     // identifies it, and the state and the clock are short.
     let name = dashboard.name();
-    let taken = right.width() + name.chars().count() + 8;
+    let taken = right.width() + name.width() + 8;
     let target = chrome::shorten(
         dashboard.target(),
         (area.width as usize).saturating_sub(taken),

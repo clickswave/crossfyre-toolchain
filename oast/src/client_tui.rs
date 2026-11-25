@@ -133,9 +133,12 @@ pub fn run(listeners: String, rx: std::sync::mpsc::Receiver<Envelope>) -> std::i
     let mut app = Oast::new(listeners);
     app.logs.info("listening for interactions");
     cfx_tui::run(&mut app, 100, |app| {
+        let mut came = false;
         while let Ok(env) = rx.try_recv() {
             app.apply(env);
+            came = true;
         }
+        came
     })
 }
 

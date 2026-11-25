@@ -177,14 +177,14 @@ fn detect() -> Palette {
 
 /// Ask the terminal for its foreground and background.
 ///
-/// A terminal that does not answer costs the timeout once, at start, so the
-/// timeout is short: the fallback is the dark palette, which is what most
-/// terminals are.
+/// The wait is the crate's own, a second. A terminal that cannot answer says
+/// so at once, since the question goes out with a second one that nearly
+/// every terminal answers. The wait is for a reply that is slow, as over SSH,
+/// and a shorter one would not stop that reply: it would arrive after the
+/// screen was taken over and be read as keys, `g` and `/` among them.
 fn ask_terminal() -> Option<Seen> {
     use terminal_colorsaurus::{QueryOptions, ThemeMode, color_palette};
-    let mut options = QueryOptions::default();
-    options.timeout = std::time::Duration::from_millis(300);
-    let colours = color_palette(options).ok()?;
+    let colours = color_palette(QueryOptions::default()).ok()?;
     Some(Seen {
         foreground: colours.foreground.scale_to_8bit(),
         background: colours.background.scale_to_8bit(),
