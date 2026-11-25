@@ -378,7 +378,6 @@ pub async fn run(params: GraphqlParams, tx: mpsc::UnboundedSender<Value>) {
                 params.timeout_ms,
                 params.block_internal,
                 &params.egress,
-                false,
             ),
             &tx,
         )

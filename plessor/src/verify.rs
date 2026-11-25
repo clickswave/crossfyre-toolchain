@@ -302,7 +302,6 @@ async fn called_back(
         scan.timeout_ms,
         scan.block_internal,
         &scan.egress,
-        false,
     ) {
         Ok(http) => http,
         Err(e) => return failed(format!("no client for the out-of-band API: {e}")),

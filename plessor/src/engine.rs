@@ -592,7 +592,6 @@ pub async fn run<L: crate::ledger::Ledger>(
                     params.timeout_ms,
                     params.block_internal,
                     &params.egress,
-                    false,
                 ),
                 &tx,
             )

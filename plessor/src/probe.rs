@@ -163,7 +163,9 @@ fn build(
 
 /// A client for the out-of-band API, which is not the target. It has no `auth`, so a
 /// session handed in for the target is never sent there, and none of the target's name
-/// pins.
+/// pins. It always checks the certificate: what the scan accepts from the target says
+/// nothing about our own server, and whoever answered in its place would read each
+/// correlation's secret and decide which callbacks the scan is shown.
 pub fn oast_client(
     evasive: bool,
     identify: Option<String>,
@@ -171,7 +173,6 @@ pub fn oast_client(
     timeout_ms: u64,
     block_internal: bool,
     egress: &transport::Egress,
-    verify_certs: bool,
 ) -> Result<Client, String> {
     build(
         ClientOpts {
@@ -183,7 +184,7 @@ pub fn oast_client(
             min_timeout_ms: 0,
             block_internal,
             egress,
-            verify_certs,
+            verify_certs: true,
         },
         transport::Redirect::Limited(3),
         Vec::new(),
@@ -1072,6 +1073,90 @@ mod redirect_tests {
             b_seen.lock().unwrap().is_empty(),
             "another origin was sent the probe: {:?}",
             b_seen.lock().unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
+mod oast_client_tests {
+    //! The out-of-band API is our own service, not a scan target, so its client checks
+    //! the certificate whatever the scan was told about the target's.
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// An HTTPS listener whose certificate nothing vouches for, as a machine in the
+    /// middle of the out-of-band API would present. Counts the requests that reach it.
+    async fn self_signed_api() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("mint");
+        let der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
+        let key =
+            rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der()).expect("key");
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("tls protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(vec![der], key)
+        .expect("server config");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&seen);
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (acceptor, count) = (acceptor.clone(), Arc::clone(&count));
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let mut buf = [0u8; 4096];
+                    if tls.read(&mut buf).await.unwrap_or(0) > 0 {
+                        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let _ = tls
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\
+                                  Connection: close\r\n\r\n{\"ok\":true}",
+                            )
+                            .await;
+                    }
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    #[tokio::test]
+    async fn the_out_of_band_client_refuses_a_certificate_nothing_vouches_for() {
+        let (port, seen) = self_signed_api().await;
+        let http = super::oast_client(
+            false,
+            None,
+            "https://target.example/",
+            5000,
+            false,
+            &transport::Egress::Direct,
+        )
+        .expect("client builds");
+        let r = http
+            .get(format!("https://localhost:{port}/config"))
+            .send()
+            .await;
+        assert!(
+            r.is_err(),
+            "the out-of-band client accepted a self-signed certificate: {:?}",
+            r.map(|r| r.status())
+        );
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a request reached a server whose certificate nothing vouches for"
         );
     }
 }
