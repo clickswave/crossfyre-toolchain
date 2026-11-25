@@ -24,6 +24,10 @@ pub const CORR_LEN: usize = 20;
 /// reaped every 60s, so this is a burst ceiling, not a hard lifetime quota.
 pub const MAX_REGISTRATIONS: usize = 200_000;
 
+/// The longest secret a registration may present. Clients send 32 characters;
+/// this is a bound on what is read, not a policy on what is strong enough.
+pub const MAX_SECRET: usize = 256;
+
 pub fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -113,9 +117,17 @@ impl Store {
     }
 
     /// Register a correlation id with a public key + secret. False if the pubkey is
-    /// malformed.
+    /// malformed, or any field is not the shape a client sends.
+    ///
+    /// The id must be exactly what a callback can carry, CORR_LEN lowercase letters
+    /// and digits, since [`corr_from_host`] matches nothing else. Anything longer
+    /// was kept for the life of the registration while never being reachable.
     pub fn register(&self, corr_id: &str, pubkey: &str, secret: &str) -> bool {
-        if corr_id.len() < CORR_LEN || !crypto::valid_pubkey(pubkey) {
+        let id_fits = corr_id.len() == CORR_LEN
+            && corr_id
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+        if !id_fits || secret.len() > MAX_SECRET || !crypto::valid_pubkey(pubkey) {
             return false;
         }
         if let Ok(mut m) = self.regs.lock() {
@@ -319,5 +331,56 @@ mod corr_tests {
         let host = format!("{CORR}rand1234567890.two.example");
         let pool = vec!["one.example".to_string(), "two.example".to_string()];
         assert_eq!(corr_from_any(&host, &pool), Some(CORR.to_string()));
+    }
+}
+
+#[cfg(test)]
+mod register_tests {
+    use super::{CORR_LEN, Store};
+    use base64::Engine as _;
+    use rand::rngs::OsRng;
+    use rsa::pkcs1::EncodeRsaPublicKey;
+    use rsa::{BigUint, RsaPrivateKey};
+
+    const CORR: &str = "abcdefghij0123456789";
+
+    fn pubkey(exp: u32) -> String {
+        let key = RsaPrivateKey::new_with_exp(&mut OsRng, 1024, &BigUint::from(exp)).unwrap();
+        let der = key.to_public_key().to_pkcs1_der().unwrap();
+        base64::engine::general_purpose::STANDARD.encode(der.as_bytes())
+    }
+
+    /// `/register` is open to anyone and every registration is kept until it
+    /// expires, so what one may hold is bounded, field by field.
+    #[test]
+    fn a_registration_holds_only_what_a_client_sends() {
+        let store = Store::new(60);
+        let key = pubkey(65537);
+        assert_eq!(CORR.len(), CORR_LEN);
+        assert!(store.register(CORR, &key, "secret"));
+
+        // A correlation id a callback can never carry: callbacks are matched on
+        // exactly CORR_LEN lowercase letters and digits.
+        let long = format!("{CORR}{}", "x".repeat(2 * 1024 * 1024));
+        assert!(!store.register(&long, &key, "secret"));
+        assert!(!store.register("ABCDEFGHIJ0123456789", &key, "secret"));
+        assert!(!store.register("abcdefghij012345678.", &key, "secret"));
+
+        // A key padded out to megabytes with what the decoder trims away.
+        let padded = format!("{}{key}", " ".repeat(2 * 1024 * 1024));
+        assert!(!store.register("bbcdefghij0123456789", &padded, "secret"));
+
+        // A secret is hashed, but it is still read whole first.
+        let secret = "s".repeat(2 * 1024 * 1024);
+        assert!(!store.register("cbcdefghij0123456789", &key, &secret));
+    }
+
+    /// Every callback is sealed to the registered key on the server's own time,
+    /// so the key may not choose a public exponent that makes that slow.
+    #[test]
+    fn a_key_with_an_unusual_exponent_is_refused() {
+        let store = Store::new(60);
+        assert!(!store.register(CORR, &pubkey(3), "secret"));
+        assert!(!store.register(CORR, &pubkey((1 << 31) - 1), "secret"));
     }
 }

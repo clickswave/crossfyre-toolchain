@@ -10,6 +10,7 @@ use crate::Config;
 use crate::store::{Interaction, Store, now_unix};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
+use tokio::sync::Semaphore;
 
 pub async fn serve(
     cfg: Config,
@@ -17,6 +18,7 @@ pub async fn serve(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let sock = UdpSocket::bind(&cfg.dns_addr).await?;
     tracing::info!("oast dns responder on {}", cfg.dns_addr);
+    let sealing = Arc::new(Semaphore::new(SEALING));
     let mut buf = [0u8; 512];
     loop {
         let (n, peer) = match sock.recv_from(&mut buf).await {
@@ -26,23 +28,37 @@ pub async fn serve(
         let Some((qname, resp)) = handle_query(&buf[..n], &cfg) else {
             continue;
         };
-        let ql = qname.to_ascii_lowercase();
-        if let Some(corr) = crate::store::corr_from_any(&ql, &cfg.domains) {
-            store.capture(
-                &corr,
-                &Interaction {
-                    protocol: "dns".to_string(),
-                    full_host: ql,
-                    remote_addr: peer.ip().to_string(),
-                    at_unix: now_unix(),
-                    detail: format!("DNS {qname}"),
-                    raw: String::new(),
-                },
-            );
-        }
         let _ = sock.send_to(&resp, peer).await;
+        let ql = qname.to_ascii_lowercase();
+        let Some(corr) = crate::store::corr_from_any(&ql, &cfg.domains) else {
+            continue;
+        };
+        // Sealing is an RSA operation per callback. Done here, it held up every
+        // other query behind it, and anyone who registered a correlation could
+        // send as many callbacks to it as they liked. It runs off this loop, a
+        // bounded number at a time, and a callback past that bound is dropped.
+        let Ok(permit) = Arc::clone(&sealing).try_acquire_owned() else {
+            tracing::warn!(corr = %corr, "oast dns callback dropped: too many being sealed");
+            continue;
+        };
+        let interaction = Interaction {
+            protocol: "dns".to_string(),
+            full_host: ql,
+            remote_addr: peer.ip().to_string(),
+            at_unix: now_unix(),
+            detail: format!("DNS {qname}"),
+            raw: String::new(),
+        };
+        let store = Arc::clone(&store);
+        tokio::task::spawn_blocking(move || {
+            store.capture(&corr, &interaction);
+            drop(permit);
+        });
     }
 }
+
+/// How many DNS callbacks may be sealed at once.
+const SEALING: usize = 64;
 
 /// Parse a DNS query and build a response, returning (qname, response_bytes).
 fn handle_query(q: &[u8], cfg: &Config) -> Option<(String, Vec<u8>)> {
