@@ -50,8 +50,14 @@ pub fn client() -> reqwest::Client {
 }
 
 /// The builder [`client`] finishes, for a call that needs more set on it.
+///
+/// It follows no redirect. Calls carry the account's key, a password or a pairing token
+/// in their bodies, and a 307 or 308 would have that body sent on to wherever the answer
+/// points, another host or plain http included. The API answers no call with one.
 pub fn builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder().user_agent(user_agent())
+    reqwest::Client::builder()
+        .user_agent(user_agent())
+        .redirect(reqwest::redirect::Policy::none())
 }
 
 /// Sending a request to the API, in place of `send`.
@@ -123,6 +129,77 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(seen.join().unwrap(), user_agent().to_ascii_lowercase());
+    }
+
+    /// A loopback listener that answers every request with `reply` and keeps what it read,
+    /// head and body.
+    fn answering(reply: String) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { return };
+                let mut reader = BufReader::new(conn.try_clone().unwrap());
+                let mut req = String::new();
+                let mut len = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                    req.push_str(&line);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let mut body = vec![0u8; len];
+                let _ = std::io::Read::read_exact(&mut reader, &mut body);
+                req.push_str(&String::from_utf8_lossy(&body));
+                log.lock().unwrap().push(req);
+                let _ = conn.write_all(reply.as_bytes());
+            }
+        });
+        (port, seen)
+    }
+
+    /// A call carries the account's key or password in its body, and a 307 or 308 would
+    /// have the client send that body on to wherever the answer points. The API answers
+    /// no call with a redirect, so none is followed.
+    #[tokio::test]
+    async fn an_api_call_does_not_follow_a_redirect() {
+        let (elsewhere, seen) =
+            answering("HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n".to_string());
+        for status in [
+            "307 Temporary Redirect",
+            "308 Permanent Redirect",
+            "302 Found",
+        ] {
+            let (api, _) = answering(format!(
+                "HTTP/1.1 {status}\r\nlocation: http://127.0.0.1:{elsewhere}/collect\r\n\
+                 content-length: 0\r\nconnection: close\r\n\r\n"
+            ));
+            let resp = client()
+                .post(format!("http://127.0.0.1:{api}/api/v1/authorize-node"))
+                .json(&serde_json::json!({ "api_key": "cfk_saved_key" }))
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                resp.status().is_redirection(),
+                "{status}: {}",
+                resp.status()
+            );
+        }
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a redirect was followed: {:?}",
+            seen.lock().unwrap()
+        );
     }
 
     #[test]

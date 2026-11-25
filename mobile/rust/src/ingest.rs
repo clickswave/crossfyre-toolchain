@@ -25,10 +25,7 @@ pub async fn run(
     workflow_id: String,
     token: String,
 ) {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .build()
-        .unwrap_or_default();
+    let client = client();
     let url = format!("{}/api/v1/web-trace/ingest", api_url.trim_end_matches('/'));
     let mut batch: Vec<TraceEvent> = Vec::new();
     // The sequence number of the newest event in `batch`, so a delivered batch can be marked sent
@@ -74,6 +71,16 @@ pub async fn run(
             }
         }
     }
+}
+
+/// The client batches go out on. Every batch carries the session's token in its body, so
+/// it follows no redirect: a 307 or 308 would send that body on to wherever it points.
+fn client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_default()
 }
 
 /// What became of one batch.
@@ -206,6 +213,46 @@ mod tests {
             }
         });
         (url, n)
+    }
+
+    /// A listener that answers every request with `reply` and counts those it read.
+    async fn answering(reply: String) -> (String, Arc<AtomicUsize>) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let n = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&n);
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                seen.fetch_add(1, Ordering::SeqCst);
+                let mut chunk = [0u8; 8192];
+                let _ = s.read(&mut chunk).await;
+                let _ = s.write_all(reply.as_bytes()).await;
+            }
+        });
+        (url, n)
+    }
+
+    /// A batch carries the token in its body, which a followed 307 or 308 sends on to
+    /// wherever the answer points.
+    #[tokio::test]
+    async fn a_batch_does_not_follow_a_redirect() {
+        let ok = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (elsewhere, asked) = answering(ok.to_string()).await;
+        for status in ["307 Temporary Redirect", "308 Permanent Redirect"] {
+            let (ingest, _) = answering(format!(
+                "HTTP/1.1 {status}\r\nLocation: {elsewhere}/collect\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            ))
+            .await;
+            let res = client()
+                .post(format!("{ingest}/api/v1/web-trace/ingest"))
+                .json(&serde_json::json!({ "token": "token-1", "events": [] }))
+                .send()
+                .await
+                .unwrap();
+            assert!(res.status().is_redirection(), "{status}: {}", res.status());
+        }
+        assert_eq!(asked.load(Ordering::SeqCst), 0, "a redirect was followed");
     }
 
     // The counters are process globals, so this holds the lock the other tests that touch them
