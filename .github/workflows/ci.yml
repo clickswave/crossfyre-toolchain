@@ -27,8 +27,10 @@ on:
     - cron: "17 6 * * *"
 
 # Cancel superseded runs on the same ref: this workspace is not cheap to build.
+# The event is part of the group so the daily schedule never cancels a push
+# run, which would leave that commit marked cancelled.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 env:
